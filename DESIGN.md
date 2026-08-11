@@ -1186,7 +1186,8 @@ backend/lftpweb/
   api/{files,jobs,settings,auth,health,logs,backup}.py   api/ws.py
   core/engine.py      core/remote.py     core/local_scan.py   core/lftp.py
   core/queue.py       core/scheduler.py  core/progress.py     core/reconcile.py
-  core/autoqueue.py   core/postprocess.py core/events.py      core/backup.py
+  core/patterns.py    core/autoqueue.py  core/postprocess.py  core/events.py
+  core/backup.py
   core/sync.py                     # deferred (§7) — mount gate, grace period, delete policy
   remote_agent/scan_fs.py          # stdlib-only fallback scanner
 frontend/   Vite app — routes Files / Transfers / History / Settings
@@ -1194,10 +1195,17 @@ tests/      unit + integration
 private_data/   gitignored — local scratch, test fixtures, sample trees, scratch compose (§12.1)
 ```
 
-`core/scheduler.py` is deliberately separate from `core/queue.py`: the queue owns job lifecycle
-and process supervision, the scheduler owns the admission decision (§4.5). The admission rule
-is the piece most likely to change and the piece most worth unit-testing in isolation, so it
-does not belong tangled up with subprocess handling.
+Two of these are separate modules on purpose, and both for the same reason — the interesting
+logic is a pure function that deserves to be tested without a subprocess or a filesystem:
+
+- **`core/scheduler.py`** vs `core/queue.py`. The queue owns job lifecycle and process
+  supervision; the scheduler owns only the admission decision (§4.5) — `(N, B, running, queue)`
+  in, an admit list out.
+- **`core/patterns.py`** vs `core/autoqueue.py`. `autoqueue` decides *when* to evaluate;
+  `patterns` decides *what matches*. It must be one module because §4.7 requires the identical
+  compiled pattern set to be used in two places — building the lftp `--exclude-glob` arguments
+  and telling the reconciler what an item is supposed to contain. Two copies of that logic
+  drifting apart is precisely the bug that leaves every filtered release stuck in `PARTIAL`.
 
 **Versioning.** `backend/lftpweb/__init__.py` holds `__version__` as a bare string (no `v`
 prefix) and is the only place the version is written. First release is **`0.0.1`**. The API
