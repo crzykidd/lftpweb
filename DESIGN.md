@@ -5,7 +5,7 @@ lftp as the transfer engine.*
 
 Sections are numbered so feedback can be given by reference (e.g. "§4.3 — no, do it this way").
 
-**Status:** draft, pending review. Nothing implemented yet.
+**Status:** draft, pending review. Nothing implemented yet. First version will be **`0.0.1`**.
 
 ---
 
@@ -164,7 +164,12 @@ path_queue(
 -- Note: no bandwidth / concurrency / parallelism columns. Those are site-level (§4.5) —
 -- a queue governs what and where, never how fast.
 
-pattern(id, queue_id NULL, kind TEXT, -- 'include' | 'exclude'
+-- Three kinds, doing three different jobs (§4.7). Conflating them is the classic mistake:
+--   'select'       — item name; which releases auto-queue picks up
+--   'skip'         — item name; releases auto-queue never picks up
+--   'file_exclude' — paths inside an item; files never transferred (lftp --exclude-glob)
+-- queue_id NULL = applies to every queue.
+pattern(id, queue_id NULL, kind TEXT,
         expr TEXT, enabled, created_at)
 
 -- One row per item we have ever cared about; the durable lifecycle record
@@ -175,6 +180,8 @@ item(
   first_seen_at, downloaded_at NULL, extracted_at NULL, verified_at NULL,
   first_missing_at NULL,             -- when local absence was first observed → grace period (§7)
   remote_deleted_at NULL,            -- when we deleted the remote copy, if we did
+  auto_queue_suppressed BOOL,        -- set on user stop/dequeue and on exhausted retries (§4.6)
+  suppressed_reason TEXT NULL,       -- 'user_stopped' | 'retries_exhausted' | 'permanent_error'
   error_class NULL, error_detail NULL,
   UNIQUE(queue_id, rel_path))
 
@@ -225,10 +232,12 @@ REMOTE_ONLY    remote exists, nothing local
 QUEUED         accepted into the job queue, no process yet
 DOWNLOADING    an lftp process is running for it
 PARTIAL        local < remote (or incomplete children), no active job — re-queueable
+STOPPED        user stopped or dequeued it; partial data kept. Never auto-restarted (§4.6)
 DOWNLOADED     complete
+EXCLUDED       matched a file-exclude pattern; deliberately not transferred, not "missing" (§4.7)
 VERIFYING / VERIFIED / CORRUPT
 EXTRACTING / EXTRACTED / EXTRACT_FAILED
-FAILED         last attempt failed; carries error_class + output_tail
+FAILED         retries exhausted or a permanent error; carries error_class + output_tail
 LOCAL_ONLY     present locally, absent remotely, never tracked
 REMOVED_LOCAL  was downloaded, now absent locally, remote still present
 REMOVED_BOTH   was downloaded, absent locally, remote deleted by us — terminal, kept as history
@@ -238,10 +247,11 @@ REMOVED_BOTH   was downloaded, absent locally, remote deleted by us — terminal
 deletion became real: "gone locally" and "gone from both sides" are now distinct states with
 distinct consequences, and a name that could be read either way is a bug waiting to happen.
 
-Six rules that are easy to get wrong and that want review:
+Eight rules that are easy to get wrong and that want review:
 
 1. A **directory** is `DOWNLOADED` only when every non-directory descendant that has a remote
-   size is itself complete. Otherwise `PARTIAL`.
+   size **and is not `EXCLUDED`** is itself complete. Otherwise `PARTIAL`. The exclusion clause
+   is load-bearing — see rule 8.
 2. `local_size < remote_size` with **no active job** ⇒ `PARTIAL`, never `DOWNLOADED`. This is
    what makes a stopped transfer resumable rather than silently "done".
 3. Previously downloaded, now absent locally, still present remotely ⇒ `REMOVED_LOCAL`, and
@@ -258,6 +268,16 @@ Six rules that are easy to get wrong and that want review:
 6. `REMOVED_BOTH` is terminal and is **never** re-queued or re-scanned into `REMOTE_ONLY`. If
    the same `rel_path` reappears remotely later it is a genuinely new item as far as the
    lifecycle is concerned; the old row stays as history.
+7. **`STOPPED` and `FAILED` are never picked up by auto-queue** (§4.6). They carry
+   `auto_queue_suppressed`, cleared only by a deliberate user re-queue. Without this rule the
+   retry policy is decorative: auto-queue would restart a stopped job on its next pass.
+8. **`EXCLUDED` is not "missing".** A file skipped by a file-exclude pattern (§4.7) is remote,
+   absent locally, and *supposed* to be. The reconciler must evaluate the same patterns lftp
+   is given, or every filtered directory stays `PARTIAL` forever — never `DOWNLOADED`, never
+   post-processed, never deleted in `move` mode, and re-queued on every pass.
+   The same holds one level up: a directory whose children are **all** excluded is vacuously
+   `DOWNLOADED`, and its local directory may legitimately not exist, because lftp does not
+   create a directory it has nothing to put in. Completeness must not require it.
 
 ---
 
@@ -299,12 +319,15 @@ the captured error text clean.
 - On nonzero, classify the captured output into `AUTH_FAILED`, `HOST_UNREACHABLE`,
   `TLS_ERROR`, `PERMISSION_DENIED`, `DISK_FULL`, `REMOTE_GONE`, `UNKNOWN`, and store the last
   ~4 KB on the `job` row so the UI can show *why* rather than a red dot.
-- Retry with exponential backoff **only** on transient classes; `AUTH_FAILED` and
-  `PERMISSION_DENIED` stop and surface immediately rather than hammering the seedbox.
-- Concurrency: `asyncio.Semaphore(max_concurrent_jobs)`; the **job queue** is ours, so
-  reordering, priority, and pause-all are trivial. ("Job queue" throughout this document means
-  the pending-transfer queue owned by `core/queue.py`. A user-facing **queue** is a named path
-  queue — see §3.1 and §9.)
+- **Retry only on transient classes**, with exponential backoff, bounded by `max_attempts`
+  (default 3): `HOST_UNREACHABLE`, `TLS_ERROR`, timeouts, connection resets.
+- **Never retry permanent classes.** `AUTH_FAILED`, `PERMISSION_DENIED`, `REMOTE_GONE`, and
+  `DISK_FULL` surface immediately rather than hammering the seedbox or the disk.
+- Attempts exhausted, or a permanent class ⇒ `FAILED`, **and no further automatic attempt from
+  any path** (§4.6).
+- Concurrency: the **job queue** is ours, so reordering, priority, and pause-all are trivial.
+  ("Job queue" throughout this document means the pending-transfer queue owned by
+  `core/queue.py`. A user-facing **queue** is a named path queue — see §3.1 and §9.)
 
 ### 4.4 Progress without parsing
 
@@ -482,6 +505,149 @@ for too much". Therefore:
   queue raise them independently makes that ceiling unenforceable. One site, one set of
   transfer knobs.
 
+### 4.6 Stopping, and what never restarts by itself
+
+**Stopping is a user action, and it is terminal.** It is never a pause, and it never leads to
+an automatic retry.
+
+- **Running job:** SIGTERM to that one PID (§4.1). Not SIGKILL — SIGTERM lets lftp flush its
+  `.lftp-pget-status` sidecar so the partial is resumable (§4.4). SIGKILL only after a grace
+  timeout, ~10 s.
+- **Queued but not started:** it is simply removed from the job queue.
+- Either way the item lands in `STOPPED`, **partial data is kept**, and re-queueing later
+  resumes via `-c` rather than restarting.
+
+**The rule that makes this mean anything:**
+
+> A stopped item, and an item whose retries are exhausted, carry `auto_queue_suppressed`.
+> **Auto-queue skips them.** Only a deliberate user re-queue clears the flag.
+
+Without it the retry policy in §4.3 is decorative. Auto-queue runs on a scan cadence; a stopped
+job would match its pattern again on the next pass and restart 30 seconds later, forever —
+which is both an infinite retry loop wearing a different hat and a UI that ignores the user.
+The same applies to `FAILED`: a permanent `AUTH_FAILED` must not be retried every 30 s because
+auto-queue never learned about the failure.
+
+Manual re-queue always wins. It clears suppression, resets `attempt`, and puts the item back in
+the job queue — that is the intended way to say "try again", and it is explicit.
+
+`REMOVED_LOCAL` is suppressed for the same reason by §3.2 rule 3, though on different grounds:
+not "the user stopped it" but "the user deliberately removed it."
+
+### 4.7 What enters the queue: manual add, auto-queue, and patterns
+
+Two intake paths.
+
+**Manual.** Select one or more items in Files and queue them. Always available, always wins:
+it clears `auto_queue_suppressed` (§4.6) and ignores every pattern. An explicit user action is
+never second-guessed by a filter.
+
+**Auto-queue.** Per path queue, off by default, evaluated against newly-seen remote items on
+each scan. Skips anything suppressed, `STOPPED`, `FAILED`, `REMOVED_LOCAL`, or `REMOVED_BOTH`.
+
+#### Three pattern kinds, doing three different jobs
+
+Conflating these is the classic mistake, so they are separate lists with separate semantics:
+
+| Kind | Matches against | Effect | Enforced by |
+|---|---|---|---|
+| **select** | the item name (the release dir or file) | which items auto-queue picks up | us, in `core/autoqueue.py` |
+| **skip** | the item name | items auto-queue never picks up | us, in `core/autoqueue.py` |
+| **file_exclude** | paths *inside* an item | files never transferred at all | lftp, via `--exclude-glob` |
+
+`*.nfo` is a **file_exclude** — you still want the release, minus the junk. `*SAMPLE*` is
+usually a **skip** — you don't want the item at all. `*` as a select means "everything", which
+is the same as having no select patterns with *patterns-only* off.
+
+#### What counts as an item
+
+An **item** is a top-level entry of a queue's `remote_path` — **either a directory or a loose
+file**. Nothing deeper is an item; deeper paths are children of one.
+
+| Item | Transferred with | `select` / `skip` match against |
+|---|---|---|
+| `Some.Release.S03E04/` | `mirror -c` | `Some.Release.S03E04` |
+| `Movie.2024.1080p.mkv` | `pget -c` | `Movie.2024.1080p.mkv` |
+
+So `*.mkv` as a **select** does exactly what you'd expect for a loose `.mkv` sitting in the
+root — it matches, and the file is queued as a `pget`. What it does *not* do is match
+`Movie.2024/` that happens to contain an mkv, because a directory is matched on its own name.
+That's the only place the intuition breaks, and it breaks in one direction: item patterns see
+item names, never contents.
+
+If the intent is "out of each release, pull only the video", that's a `file_exclude` list
+(exclude everything you don't want), not a select.
+
+#### `file_exclude` also applies to loose top-level files
+
+A queue whose root holds both `Some.Release/` and a stray `notes.nfo` would otherwise treat
+`*.nfo` inconsistently: suppressed inside the release, downloaded at the root. So when the item
+being evaluated is a **file**, both `skip` *and* `file_exclude` are tested against its name.
+
+The pattern means "I don't want files like this." Where the file happens to sit shouldn't change
+the answer, and requiring the user to enter `*.nfo` twice — once as a skip, once as a
+file_exclude — is a trap rather than a feature.
+
+#### Directories with nothing left in them
+
+If every child of a directory is excluded, two things follow that the reconciler has to get
+right:
+
+- **It is vacuously `DOWNLOADED`**, not `PARTIAL`. There is nothing outstanding to fetch.
+- **The local directory may not exist at all**, because lftp does not create a directory it has
+  nothing to put in. So completeness must not require the local directory to be present when
+  all of its expected children are `EXCLUDED`.
+
+This is the same class of bug as §3.2 rule 8, one level up: an absence that is intended must not
+be read as an absence that is missing.
+
+#### Matching semantics
+
+- **Case-insensitive**, always.
+- **Glob (`fnmatch`) when the pattern contains `*`, `?`, or `[`; plain substring otherwise.**
+  So `1080p` matches `Some.Show.1080p.WEB` without demanding `*1080p*`, while `*.nfo` behaves
+  strictly as a glob. SeedSync tries *substring OR glob* on every pattern, which is friendlier
+  still but ambiguous the moment a pattern contains a metacharacter — this rule is the same
+  convenience without the ambiguity.
+- **Skip beats select.** Evaluated after, and it wins.
+- **No select patterns** ⇒ everything matches, unless *patterns-only* is on for that queue, in
+  which case nothing does.
+- **Retroactive.** Adding a pattern re-evaluates the whole known model, not just future scans —
+  otherwise "add a pattern" silently means "add a pattern, for things I haven't seen yet."
+- Patterns are per-queue, or global with `queue_id NULL` (§3.1).
+
+#### File excludes must reach the reconciler, not just lftp
+
+This is the one that bites, and it is not obvious.
+
+`--exclude-glob '*.nfo'` means those files never arrive. But completeness (§3.2 rule 1) is
+computed by comparing every remote child against local — so an excluded `.nfo` is remote,
+locally absent, and counted as missing. The directory is then **permanently `PARTIAL`**: never
+`DOWNLOADED`, never verified, never extracted, never deleted under `move`, and re-queued on
+every single pass. One exclude pattern would quietly break the whole pipeline for every item it
+touches.
+
+So: **one pattern evaluator, used in two places.** The same compiled file_exclude set that
+builds the lftp command line is applied by the reconciler when it decides what an item is
+*supposed* to contain. Excluded children are marked `EXCLUDED` and do not count toward
+completeness.
+
+Two consequences worth knowing:
+
+- **Changing file_excludes retroactively changes completeness.** Tightening them can make a
+  `DOWNLOADED` item incomplete; loosening them can complete a `PARTIAL` one. That is correct
+  behavior, but it should be surfaced in the pattern preview rather than discovered.
+- **`EXCLUDED` is a real state, not an absence** (§3.2 rule 8), so the UI can show *why* a file
+  isn't there — which is the difference between a filter working and a transfer being broken.
+
+#### Preview
+
+The Settings → Queues pattern editor runs the live evaluator against the current remote tree
+and shows, for the queue being edited: which items would be **selected**, which **skipped**, and
+within a sampled item, which files would be **excluded**. Patterns are the feature most likely
+to be got subtly wrong, and the only cheap fix is showing the answer before it is saved.
+
+
 ---
 
 ## 5. Remote scanning
@@ -558,23 +724,27 @@ lftpweb ever touches the remote side.
 |---|---|---|
 | `copy` | Download; **never** touch the remote. Local deletes do not propagate. **Default.** | v1 |
 | `move` | Download, verify, then delete the remote copy. | v1 |
-| `sync` | Copy, plus propagate *local* deletes back to the remote. | **phase 2** |
+| `sync` | Copy, plus propagate *local* deletes back to the remote. | **not scheduled** |
 
 `copy` is the default and is the only mode that is safe under every deployment shape. The other
 two perform an irreversible operation on a machine we don't own, so the rest of this section is
 mostly about why that is acceptable here and what keeps it acceptable.
 
-> **`sync` is designed now and built in phase 2.** v1 implements `copy` and `move` only. The
-> whole section stays because the seam has to exist before the feature does — the state model
-> (§3.2), the `event` audit trail (§3.1), and the deletion mechanism (§7.4) are all v1 work that
-> `sync` later plugs into, and the safety reasoning in §7.1–7.3 is the most valuable part of the
-> design regardless of when it ships. What defers with it is everything that exists *solely* to
-> make local-delete propagation safe: the mount sentinel, the grace period and
-> `item.first_missing_at`, dry-run mode, and the rate-based backstop (§7.3).
+> **`sync` is deferred, not scheduled.** lftpweb ships `copy` and `move`. Backwards
+> delete-propagation is a **possible later feature, to be built only if it turns out to be
+> wanted** — it is not on the roadmap and no phase depends on it.
 >
-> What does **not** defer: `move` also deletes remote data, so every rail that gates *any*
-> remote delete is v1 — verification before deletion, deletes through our own asyncssh path
-> (§7.4), and the full `event` audit trail.
+> This section stays anyway, for two reasons. First, the seam is v1 work regardless: the state
+> model (§3.2), the `event` audit trail (§3.1), and the deletion mechanism (§7.4) all exist to
+> serve `move`, and `sync` would plug into them rather than requiring a redesign. Second, the
+> safety reasoning in §7.1–7.3 is the durable part — it is what a future session needs in order
+> to decide whether to build this at all, and reconstructing it later from scratch is exactly
+> how an irreversible feature ships with the wrong rails.
+>
+> Deferred with it: the mount sentinel, the grace period and `item.first_missing_at`, dry-run
+> mode, and the rate-based backstop (§7.3). **Not deferred:** `move` deletes remote data too, so
+> verification before deletion, deletes through our own asyncssh path (§7.4), and the full
+> `event` audit trail are all v1.
 
 ### 7.1 Why remote deletion is safe here: the hardlink pickup directory
 
@@ -636,8 +806,8 @@ This inverts the usual safety design, and the inversion has to be respected:
 
 ### 7.3 Rails on delete propagation
 
-*Ships with `sync` in phase 2, except the verification gate and audit trail, which are v1
-because `move` needs them.*
+*Deferred with `sync` (§7) — not built in v1. The verification gate and audit trail are the
+exceptions: `move` needs them, so they ship.*
 
 **The mount / sentinel gate.** This is the one that matters.
 
@@ -741,7 +911,7 @@ is one click everywhere rather than a mental filter.
 │  Settings│                                                              │
 │          │                                                              │
 │ ──────── │                                                              │
-│ v0.1.0 ↗ │  ← bottom-left, links to the GitHub release notes            │
+│ v0.0.1 ↗ │  ← bottom-left, links to the GitHub release notes            │
 └──────────┴─────────────────────────────────────────────────────────────┘
 ```
 
@@ -1011,12 +1181,13 @@ docker-compose.yml          production
 docker-compose.dev.yml      development
 docker-compose.test.yml     the fake-seedbox integration harness (§14)
 backend/lftpweb/
+  __init__.py                      # __version__ — the single source of truth, starts at 0.0.1
   main.py config.py db.py models.py auth.py logsetup.py
   api/{files,jobs,settings,auth,health,logs,backup}.py   api/ws.py
   core/engine.py      core/remote.py     core/local_scan.py   core/lftp.py
   core/queue.py       core/scheduler.py  core/progress.py     core/reconcile.py
   core/autoqueue.py   core/postprocess.py core/events.py      core/backup.py
-  core/sync.py                     # phase 2 — mount gate, grace period, delete decisions
+  core/sync.py                     # deferred (§7) — mount gate, grace period, delete policy
   remote_agent/scan_fs.py          # stdlib-only fallback scanner
 frontend/   Vite app — routes Files / Transfers / History / Settings
 tests/      unit + integration
@@ -1027,6 +1198,12 @@ private_data/   gitignored — local scratch, test fixtures, sample trees, scrat
 and process supervision, the scheduler owns the admission decision (§4.5). The admission rule
 is the piece most likely to change and the piece most worth unit-testing in isolation, so it
 does not belong tangled up with subprocess handling.
+
+**Versioning.** `backend/lftpweb/__init__.py` holds `__version__` as a bare string (no `v`
+prefix) and is the only place the version is written. First release is **`0.0.1`**. The API
+exposes it at `/api/health`, the UI renders it bottom-left (§9.1), and the release-notes link
+is built from it against a repo base URL held in config — so the link works the moment the
+GitHub repo exists, without touching the component.
 
 ### 12.1 `private_data/` and the gitignore
 
@@ -1061,8 +1238,10 @@ Each phase ends at something that can actually be looked at and judged.
    Transfers view with the item drawer. **The load-bearing phase.** *Done when:* you can queue
    a directory, watch it move, stop it, and resume it; and the worked examples in §4.5 hold
    against a real seedbox. Also where the live-retune experiment gets tested or discarded.
-4. **Auto-queue** — patterns (case-insensitive substring OR glob), applied retroactively when a
-   pattern is added, exclude globs, per-queue enable.
+4. **Auto-queue + patterns** (§4.7) — the three pattern kinds and one shared evaluator, wired
+   into both the lftp command line and the reconciler; retroactive re-evaluation on pattern
+   change; per-queue enable; the live preview. *Done when:* a `file_exclude` of `*.nfo` leaves
+   its release `DOWNLOADED`, not permanently `PARTIAL`.
 5. **Post-processing + `move` mode** — verify, extract, staging move; and remote deletion on
    verified completion via §7.4, with its audit trail. `move` ships here because it is
    verification plus one delete call, and the delete path it establishes is what `sync` later
@@ -1075,12 +1254,13 @@ Each phase ends at something that can actually be looked at and judged.
    state (§8), log redaction, rate limits, the compose hardening in §11.1.
 9. **Polish** — bulk ops, filters, virtualization tuning, docs.
 
-**phase 2**
+That is the whole of v1. `0.0.1` is the first version (§12).
 
-10. **`sync` mode** — local-delete propagation, the mount sentinel gate, grace period, dry-run,
-    and the rate-based backstop (§7.3). Depends on 3, 5, and wants 6 to review what it did.
-    *Done when:* a dry-run on a real tree lists exactly the right deletes, and an unmounted
-    local root propagates none.
+**Not scheduled.** `sync` mode — local-delete propagation with the mount sentinel gate, grace
+period, dry-run, and rate-based backstop (§7.3) — is a possible later feature, built only if it
+proves wanted. Nothing in phases 1–9 depends on it. If it is ever picked up it depends on 3 and
+5, and wants 6 to review what it did; *done when* a dry-run on a real tree lists exactly the
+right deletes, and an unmounted local root propagates none.
 
 ---
 
@@ -1107,9 +1287,25 @@ in the project and it's cheap.
   oversubscribing then freezing admissions. Pure function over (N, B, running, queue) → the
   admit list, so it tests without a single subprocess.
 - Worst-case connection-count arithmetic and its warning threshold.
+- **Pattern evaluator (§4.7)** — glob-vs-substring dispatch, case-insensitivity, skip-beats-
+  select, empty-select behavior with and without *patterns-only*.
+- **Excluded files do not count toward completeness** — a release with `*.nfo` excluded reaches
+  `DOWNLOADED`, and does not sit `PARTIAL` forever. The single highest-value test in this
+  group; it is the failure that would silently break the pipeline for every filtered item.
+- **Loose top-level files (§4.7)** — a root-level `Movie.mkv` is an item, matched by a `*.mkv`
+  select and transferred with `pget`; a root-level `notes.nfo` is suppressed by a `*.nfo`
+  `file_exclude` rather than downloaded; and a `*.mkv` select does **not** match a directory
+  containing an mkv.
+- **A directory whose children are all excluded** is `DOWNLOADED` even though the local
+  directory was never created.
+- **Suppression (§4.6)** — a `STOPPED` item is not resurrected by an auto-queue pass whose
+  patterns still match it; likewise `FAILED` after exhausted retries; and a manual re-queue
+  does clear both.
+- **Retry classification** — transient classes retry to `max_attempts` then stop; permanent
+  classes never retry at all.
 
 **Sync-mode tests — the highest-consequence logic in the project**, because the operation under
-test is irreversible. Most of these land with `sync` in phase 2; the verification gate and audit
+test is irreversible. Most are deferred with `sync` (§7); the verification gate and audit
 assertions are v1, because `move` deletes too.
 
 - **Mount gate.** Simulate an unmounted / missing / sentinel-less local root against a tree of
@@ -1148,18 +1344,19 @@ Ordered roughly by consequence.
 
 | # | Risk | Mitigation / status |
 |---|---|---|
-| 15.1 | **The mount sentinel is a single point of failure for an irreversible operation** (§7.3). Because move-on-import makes local deletes routine (§7.2), there is no anomaly signal left to fall back on — if the gate is wrong, `sync` wipes the seedbox. | The highest-value tests in the project (§14) target exactly this. Ships in phase 2, not v1, so it gets built after the surrounding machinery is proven rather than alongside it. `copy` remains the default. |
-| 15.2 | **Routine deletes mean anomaly detection cannot be a safeguard.** A count-based circuit breaker false-positives on every bulk import, so it was rejected outright rather than tuned. | The rate-based backstop is explicitly a backstop, not a safeguard. The gate carries the load, and the design says so instead of implying defence in depth that isn't there. |
-| 15.3 | **Misconfiguration hazard: pointing a `move` / `sync` queue at a live torrent data directory** rather than a hardlink pickup dir destroys seeding torrents (§7.1). The safety property belongs to the directory, not to lftpweb. | Warning in the doc *and* inline at the mode selector; explicit confirmation to leave `copy`; dry-run offered on the way in. |
-| 15.4 | **Bandwidth goes under-utilized** when a job keeps its half-share after its partner finishes (§4.5). Allocations are never re-shaped. | Accepted, and it is the price of not needing a control channel. The Phase 3 live-retune experiment closes it without redesign if it pans out. |
+| 15.1 | **Misconfiguration hazard: pointing a `move` queue at a live torrent data directory** rather than a hardlink pickup dir destroys seeding torrents (§7.1). The safety property belongs to the directory you point at, not to lftpweb. | The one delete-related risk that is *live in v1*, because `move` ships. Warning in the doc *and* inline at the mode selector; explicit confirmation to leave `copy`; `copy` is the default. |
+| 15.2 | **Bandwidth goes under-utilized** when a job keeps its half-share after its partner finishes (§4.5). Allocations are never re-shaped. | Accepted, and it is the price of not needing a control channel. The build-phase-3 live-retune experiment closes it without redesign if it pans out. |
+| 15.3 | *(Deferred with `sync`, §7.)* **The mount sentinel would be a single point of failure for an irreversible operation** (§7.3). Because move-on-import makes local deletes routine (§7.2), there is no anomaly signal to fall back on — if the gate were wrong, `sync` would wipe the seedbox. | **Not a v1 risk: `sync` is not being built.** Recorded because it is the reason the feature is deferred, and the thing to re-read before anyone reconsiders. |
+| 15.4 | *(Deferred with `sync`.)* **Routine deletes mean anomaly detection cannot be a safeguard.** A count-based circuit breaker false-positives on every bulk import, so it was rejected outright rather than tuned. | Same status as 15.3. If `sync` is ever picked up, the rate-based backstop is explicitly a backstop, not a safeguard — the gate would carry the load. |
 | 15.5 | **Restore without the encryption key** leaves credentials unrecoverable (§8, §10.2). | Deliberate — it keeps backups free of secrets. Handled as a designed "credentials need re-entry" state rather than a wave of `AUTH_FAILED` jobs. |
 | 15.6 | **NFS identity mismatch** — wrong uid/gid, or an entrypoint that insists on chowning a `root_squash` share (§11.2). | Chown `/config` only; treat data-volume chown failure as a warning; verify writability at startup and name the path and effective uid/gid in the error. |
-| 15.7 | **`find -printf` is GNU-specific** | Stdlib script fallback over SFTP; needs a one-line check against the actual seedbox in build phase 2. |
+| 15.7 | **`find -printf` is GNU-specific** | Stdlib script fallback over SFTP; needs a one-line check against the actual seedbox in build phase 2 (§13). |
 | 15.8 | **Sparse-file progress depends on `.lftp-pget-status`** (§4.4) | Pinned by unit tests; degrades to raw size — monotonic, and never wrong about completion, because completion is the exit code. |
 | 15.9 | **Many concurrent small files** make per-file stat sampling expensive | The sampler only stats the active set, never the tree. If a mirror runs thousands of files at once, fall back to sampling the job's local subtree total. |
 | 15.10 | **Filenames with odd bytes** | `surrogateescape` end to end (scan → DB → JSON → UI), tested explicitly. |
 | 15.11 | **No `jobs -v` anywhere** | If per-connection chunk detail is ever wanted, add it as a strictly optional, failure-tolerant *enrichment* — never a source of truth (§1.3). |
 
 **Open questions:** none outstanding. The four carried by earlier drafts are settled — path
-queues under a single host (§3.1, §9), all three sync modes designed with `sync` deferred to
-phase 2 (§7), no `*arr` integration, and History as its own page grouped by queue (§9.2).
+queues under a single host (§3.1, §9), `copy` and `move` shipping with backwards `sync`
+deferred entirely (§7), no `*arr` integration, and History as its own page grouped by queue
+(§9.2).

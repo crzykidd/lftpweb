@@ -6,6 +6,68 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-11 — Stop is terminal; auto-queue must never resurrect it
+
+**Decision:** stopping a job is a user action with no automatic retry. The item lands in
+`STOPPED` with its partial data kept, and carries `auto_queue_suppressed` so auto-queue skips
+it. Same flag on `FAILED` after exhausted retries. Only a deliberate manual re-queue clears it.
+See `DESIGN.md` §4.6.
+
+**Why it needs saying at all.** The retry policy in §4.3 (transient classes retry with backoff
+to `max_attempts`, permanent classes never retry) is meaningless without this. Auto-queue runs
+on a scan cadence and matches on patterns; a stopped job still matches its pattern, so the next
+pass would re-queue it ~30 s later, forever. That is an unbounded retry loop wearing a
+different hat, and a UI that ignores an explicit user instruction. The suppression flag is what
+makes "stop" mean stop.
+
+**Also decided:** stop sends SIGTERM, not SIGKILL, so lftp flushes its `.lftp-pget-status`
+sidecar and the partial stays resumable; SIGKILL only after a ~10 s grace period.
+
+---
+
+## 2026-08-11 — Three pattern kinds, one evaluator, used by both lftp and the reconciler
+
+**Decision:** auto-queue patterns split into `select` / `skip` (matched against the item name,
+enforced by us) and `file_exclude` (matched against paths inside an item, enforced by lftp via
+`--exclude-glob`). Matching is case-insensitive, glob when the pattern contains `*?[` and plain
+substring otherwise, with skip beating select. `DESIGN.md` §4.7.
+
+**Rejected: SeedSync's substring-OR-glob on every pattern.** Friendlier, but ambiguous as soon
+as a pattern contains a metacharacter — `*.nfo` would match both ways with different results.
+Dispatching on whether metacharacters are present keeps the convenience (`1080p` works without
+`*1080p*`) and drops the ambiguity.
+
+**The bug this uncovered — the important part.** File excludes are passed to lftp, so those
+files never arrive. But completeness (§3.2 rule 1) compares every remote child against local,
+so an excluded `.nfo` reads as missing and the directory is **permanently `PARTIAL`** — never
+`DOWNLOADED`, never verified, never extracted, never deleted under `move`, and re-queued on
+every pass. A single exclude pattern would have quietly broken the pipeline for every item it
+touched.
+
+**Fix:** one compiled pattern set, used in two places — building the lftp command line *and*
+deciding what the reconciler expects an item to contain. Excluded children are marked
+`EXCLUDED`, a real state rather than an absence, and don't count toward completeness. The
+consequence, accepted: changing `file_exclude` patterns retroactively changes completeness in
+both directions, so the pattern preview has to show it rather than let it be discovered.
+
+**Follow-on: an item is a top-level entry, directory *or* loose file.** A root-level
+`Movie.mkv` is an item in its own right, matched by a `*.mkv` select and transferred with
+`pget`; a directory is matched on its own name, so `*.mkv` does not match `Movie.2024/`
+containing an mkv. Item patterns see item names, never contents.
+
+That raised two edge cases, both resolved toward "an intended absence is not a missing one":
+
+- **`file_exclude` also applies to loose top-level files.** Otherwise `*.nfo` would suppress
+  nfos inside releases while happily downloading a stray `notes.nfo` at the root. When the item
+  is a file, both `skip` and `file_exclude` are tested against its name — making the user enter
+  the same pattern twice would be a trap, not a feature.
+- **A directory whose children are all excluded is vacuously `DOWNLOADED`, and its local
+  directory may not exist at all**, because lftp does not create a directory it has nothing to
+  put in. Completeness must not require it. Same bug class as the exclusion bug above, one
+  level up.
+
+---
+
 ## 2026-08-11 — Alpine base, and `7zz` as the single extraction tool
 
 **Decision:** `python:3.13-alpine` runtime (`node:22-alpine` builder), with the `7zip` package
@@ -75,10 +137,17 @@ unenforceable. A queue governs *what* and *where*, never *how fast*.
 
 ---
 
-## 2026-08-11 — `sync` mode deferred to phase 2; hardlink pickup dir is what makes deletion safe
+## 2026-08-11 — `sync` mode deferred indefinitely; hardlink pickup dir is what makes deletion safe
 
-**Decision:** v1 ships `copy` and `move`. `sync` — propagating local deletes back to the remote
-— is designed in full now (`DESIGN.md` §7) and built in phase 2.
+**Decision:** lftpweb ships `copy` and `move`. `sync` — propagating local deletes back to the
+remote — is designed in full now (`DESIGN.md` §7) but **not scheduled**. It is a possible later
+feature, built only if it proves wanted. No build phase depends on it.
+
+An earlier draft of this entry called it "phase 2", which read as a commitment. It isn't one.
+The design is kept because the seam (`event` audit, §7.4 deletion path, the state model) is v1
+work for `move` regardless, and because the safety reasoning below is what a future session
+would need in order to decide whether to build it at all — reconstructing that from scratch is
+exactly how an irreversible feature ships with the wrong rails.
 
 **Why remote deletion is safe here at all.** The torrent client hardlinks completed files into a
 separate pickup directory, and lftpweb points at the pickup dir, never at the torrent data
