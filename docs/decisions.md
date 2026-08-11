@@ -6,6 +6,138 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-11 — Phase 1 review: each migration must be atomic, or a failure wedges the install
+
+**Found in review of the phase 1 build, not by the build itself.** The first migration runner
+called `executescript(file)` and then, separately, inserted the `schema_version` row and
+committed. `sqlite3.executescript()` commits any open transaction before it runs and then lets
+the script's statements commit as they go — so it is not atomic.
+
+Demonstrated rather than assumed. Given a migration `002` whose second statement fails:
+
+- statement 1 stays **committed**, statement 2 fails,
+- the `schema_version` row is never written,
+- so the next start re-runs `002` from the top, hits `table beta already exists`, and the
+  install is **permanently stuck** — no forward path without hand-written SQL repair.
+
+That is the worst class of bug for this component: it corrupts the thing that is supposed to
+make schema change safe, it only fires on the unhappy path, and §10.2's pre-migration backup
+is build phase 7, so today there is no safety net behind it.
+
+**Fix:** `migrate()` wraps each migration's text *and* its `schema_version` insert in a single
+`BEGIN`/`COMMIT` inside the script it hands to `executescript()`, and rolls back on failure. It
+has to be done by wrapping the script text — an outer `BEGIN` around the `executescript()` call
+would be discarded by the implicit commit. Two rules now documented in `db.py`: migration files
+must contain no transaction control of their own, and no pragmas that cannot run inside a
+transaction (connection pragmas belong in `connect()`).
+
+Covered by `tests/test_db.py::test_failed_migration_is_rolled_back_entirely`, which asserts the
+partial migration leaves nothing behind *and* that a corrected migration then applies cleanly —
+the property that actually matters.
+
+---
+
+## 2026-08-11 — Phase 1: app ports moved to 8087 (API/SPA) and 5187 (Vite dev), not 8080/5173
+
+**Decision:** `LFTPWEB_PORT` defaults to `8087` (config, Dockerfile `ENV`/`EXPOSE`/`HEALTHCHECK`/
+`CMD`, both compose files), and the Vite dev server defaults to `5187`. Plain literals in
+`docker-compose.yml` and `docker-compose.dev.yml` — no `.env` interpolation.
+
+**Why.** The build host already runs other stacks on 8080, 5173, 8090, and several other
+common defaults. Chosen deliberately rather than discovered by collision on someone's
+seedbox later. Anyone deploying this can still just edit the compose file port lines.
+
+---
+
+## 2026-08-11 — Phase 1: hand-rolled migrations, not Alembic
+
+**Decision:** numbered SQL files in `backend/lftpweb/migrations/NNN_description.sql`,
+applied in order by a small runner in `db.py`, tracked in a `schema_version` table.
+
+**Rejected: Alembic.** The schema in DESIGN.md §3.1 is raw SQL with no ORM — there are no
+SQLAlchemy models for Alembic to diff against, so it would only be driven manually via
+`op.execute()`, which is friction without the autogeneration benefit that's Alembic's main
+draw. §10.2's backup-before-migration hook is a few lines in `migrate()` either way, so
+there's no capability Alembic buys that this repo needs.
+
+---
+
+## 2026-08-11 — Phase 1: `cap_drop: ALL` needs `CHOWN`/`SETUID`/`SETGID` added back
+
+**Found during the container build, not anticipated by DESIGN.md.** §11.1 specifies
+`cap_drop: ALL` and, separately in §11.2, a root-starting entrypoint that `chown`s `/config`
+and drops privileges via `su-exec` (a `setuid`/`setgid` call). Tested literally: with
+`cap_drop: ALL` and nothing added back, the container crash-loops before the app starts —
+`chown(2)` and `setuid(2)`/`setgid(2)` are themselves capability-gated on modern kernels,
+even for uid 0. Root without capabilities can't do either.
+
+**Fix:** `docker-compose.yml` keeps `cap_drop: ALL` and adds back exactly `CHOWN`, `SETUID`,
+`SETGID` — the standard "drop everything, re-grant the minimum" pattern. This only affects
+the entrypoint's brief root phase; once `su-exec` drops to the unprivileged PUID/PGID, the
+running app process has none of these capabilities. `DESIGN.md` §11.1's "the app needs no
+capabilities at all" is true of the *running app* and should probably be read that way, but
+the compose file as literally described doesn't boot — worth a look next design pass.
+
+---
+
+## 2026-08-11 — Phase 1: entrypoint never creates a passwd/group entry for PUID/PGID
+
+**Found during the container build.** `docker-compose.yml`'s `read_only: true` (§11.1) makes
+the whole root filesystem read-only except `/config`, `/downloads`, `/staging`, and a `/run`
+tmpfs. An `addgroup`/`adduser` step — needed only to give PUID/PGID a friendly name for
+logging — writes to `/etc/passwd` and `/etc/group`, both on the read-only root, and fails
+outright under that profile.
+
+**Fix:** the entrypoint (`docker/entrypoint.sh`) never calls `addgroup`/`adduser`. `su-exec`
+and `chown` both accept raw numeric `uid:gid` without an NSS entry, so nothing actually
+needed one; log lines just print the numeric ids instead of a resolved username. Also fixed
+in the same pass: an early version of `check_writable()`'s non-fatal path returned a nonzero
+exit status from its own `if` test, which `set -e` treated as a script failure and aborted
+startup even though the check was designed to only warn — every non-fatal branch now ends
+with an explicit `return 0`.
+
+---
+
+## 2026-08-11 — Phase 1: `/api/health` carries `repo_url`, beyond §12's literal 4-field shape
+
+**Ambiguity found during the build.** DESIGN.md §12 defines `/api/health` as
+`{status, version, db, uptime_s}`, but separately requires the nav's version link to use
+`LFTPWEB_REPO_URL` (§9.1, §12) — a container env var, i.e. a *runtime* value, set after the
+SPA has already been built into static files in the Docker image. A Vite build-time constant
+can't carry a value that isn't known until the container starts, so the frontend has to fetch
+it from the backend, and health is already the request the UI makes to render the version.
+
+**Decision:** added a fifth field, `repo_url`, to `HealthResponse` rather than introducing a
+new endpoint. Smallest change that satisfies both requirements; flagged here since it
+deviates from the literal shape the design doc states.
+
+---
+
+## 2026-08-11 — Phase 1: `docker-compose.yml`'s `image:` is a placeholder
+
+**Decision:** `image: ghcr.io/crzynet/lftpweb:0.0.1`, not a digest. DESIGN.md §11.2 describes
+production as "pulled by digest from the registry," but this repo has no GitHub remote and no
+CI (`code-checkin-and-pr` deferred — see below), so no image has ever been published for a
+digest to pin. The placeholder documents the eventual shape; replace with a real
+`ghcr.io/<owner>/lftpweb@sha256:...` once that standard's registry side is adopted.
+
+---
+
+## 2026-08-11 — Phase 1: venv kept at the identical absolute path across every Docker stage
+
+**Found during the container build.** `uv sync` bakes an *absolute* path to the venv's own
+python into every console-script shebang (e.g. `#!/build/.venv/bin/python`) and into
+`pyvenv.cfg`. An earlier draft of the Dockerfile built the venv at `/build/.venv` in the
+python-builder stage and `COPY --from=`'d it to `/opt/venv` in the runtime stage — every
+script under `/opt/venv/bin` (including `uvicorn`) then had a shebang pointing at
+`/build/.venv/bin/python`, which doesn't exist in the runtime stage, so every attempt to run
+it failed with a bare `No such file or directory` and no other clue. Fixed by using `WORKDIR
+/app` — and therefore `/app/.venv` — identically in `python-base`, `python-builder`, `dev`,
+and `runtime`, so the `COPY --from=` carries a venv forward that's still valid at its own
+recorded path.
+
+---
+
 ## 2026-08-11 — Stop is terminal; auto-queue must never resurrect it
 
 **Decision:** stopping a job is a user action with no automatic retry. The item lands in

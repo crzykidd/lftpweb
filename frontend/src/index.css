@@ -1,0 +1,18 @@
+@import "tailwindcss";
+
+/* Tailwind class strategy for theme (dark:/light: variants driven off <html class="dark">),
+ * DESIGN.md §9.1. `system` is the default and is applied in hooks/useTheme.ts by toggling
+ * this class to match prefers-color-scheme; `dark` / `light` are explicit user overrides
+ * persisted to localStorage.
+ */
+@custom-variant dark (&:where(.dark, .dark *));
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+}

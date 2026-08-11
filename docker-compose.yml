@@ -1,0 +1,59 @@
+# Production compose (DESIGN.md §11.2): pulls a published image, NFS-style bind mounts, a
+# dedicated uid/gid, and the hardening from §11.1 — read-only rootfs, all capabilities
+# dropped, no-new-privileges, a small /run tmpfs.
+#
+# `image:` is a placeholder. This repo has no GitHub remote and no CI yet (see
+# docs/decisions.md, "code-checkin-and-pr deferred until the first GitHub push"), so no
+# image has ever been published for a digest to pin. Replace with a real
+# `ghcr.io/<owner>/lftpweb@sha256:...` once the registry side of that standard is adopted.
+
+services:
+  lftpweb:
+    image: ghcr.io/crzynet/lftpweb:0.0.1
+    container_name: lftpweb
+    restart: unless-stopped
+    ports:
+      # Not 8080: chosen to avoid collisions with other dev stacks on the shared build
+      # host (see docs/decisions.md). Edit here if it collides on yours too.
+      - "8087:8087"
+    environment:
+      # Dedicated NFS uid/gid — must match the export's expected identity. The
+      # entrypoint (docker/entrypoint.sh) applies these and drops root via su-exec.
+      PUID: "1000"
+      PGID: "1000"
+      UMASK: "022"
+      LFTPWEB_LOG_LEVEL: "INFO"
+      # Empty by default: the version in the nav renders as plain text, not a dead link,
+      # until this repo has a GitHub remote (DESIGN.md §9.1).
+      LFTPWEB_REPO_URL: ""
+    volumes:
+      # NFS-backed bind mounts in production — paths are illustrative; point these at the
+      # real exports. /staging is optional (DESIGN.md §6) and only needed if a queue uses
+      # a staging-then-move workflow.
+      - /srv/nfs/lftpweb/config:/config
+      - /srv/nfs/downloads:/downloads
+      - /srv/nfs/staging:/staging
+    read_only: true
+    tmpfs:
+      - /run
+    cap_drop:
+      - ALL
+    # DESIGN.md §11.1 says "cap_drop: ALL — the app needs no capabilities at all", which
+    # is true of the *running app* but not of the entrypoint's brief root phase: chown(2)
+    # and setuid(2)/setgid(2) (dropping from root to PUID/PGID, §11.2) are themselves
+    # capability-gated on modern kernels, even for uid 0 — cap_drop: ALL with nothing
+    # added back makes the container crash-loop before the app ever starts. This is the
+    # minimum added back to un-break that; see docs/decisions.md. The app process itself
+    # ends up with none of these once su-exec drops privileges.
+    cap_add:
+      - CHOWN
+      - SETUID
+      - SETGID
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8087/api/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3

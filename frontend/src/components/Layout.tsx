@@ -1,0 +1,62 @@
+import { NavLink, Outlet, useLocation } from 'react-router-dom'
+import { NAV_ITEMS, SETTINGS_TABS } from '../nav'
+import { StatsHeader } from './StatsHeader'
+import { ThemeToggle } from './ThemeToggle'
+import { VersionLink } from './VersionLink'
+
+const navLinkClasses = ({ isActive }: { isActive: boolean }) =>
+  `block rounded-md px-3 py-2 text-sm font-medium transition-colors ${
+    isActive
+      ? 'bg-zinc-900 text-white dark:bg-zinc-100 dark:text-zinc-900'
+      : 'text-zinc-700 hover:bg-zinc-100 dark:text-zinc-300 dark:hover:bg-zinc-800'
+  }`
+
+const tabLinkClasses = ({ isActive }: { isActive: boolean }) =>
+  `border-b-2 px-3 py-2 text-sm font-medium transition-colors ${
+    isActive
+      ? 'border-zinc-900 text-zinc-900 dark:border-zinc-100 dark:text-zinc-100'
+      : 'border-transparent text-zinc-500 hover:text-zinc-800 dark:text-zinc-400 dark:hover:text-zinc-200'
+  }`
+
+/** The app chrome: left nav, top tabs (only where a section has more than one page —
+ * Settings today), and the stats header. Every later phase's pages render into the
+ * <Outlet />. DESIGN.md §9.1.
+ */
+export function Layout() {
+  const location = useLocation()
+  const inSettings = location.pathname.startsWith('/settings')
+
+  return (
+    <div className="flex h-full min-h-screen bg-white text-zinc-900 dark:bg-zinc-950 dark:text-zinc-100">
+      <aside className="flex w-48 shrink-0 flex-col justify-between border-r border-zinc-200 p-3 dark:border-zinc-800">
+        <nav className="flex flex-col gap-1">
+          {NAV_ITEMS.map((item) => (
+            <NavLink key={item.path} to={item.path} className={navLinkClasses}>
+              {item.label}
+            </NavLink>
+          ))}
+        </nav>
+        <div className="flex flex-col gap-2 border-t border-zinc-200 pt-3 dark:border-zinc-800">
+          <ThemeToggle />
+          <VersionLink />
+        </div>
+      </aside>
+
+      <div className="flex min-w-0 flex-1 flex-col">
+        <StatsHeader />
+        {inSettings && (
+          <nav className="flex gap-1 overflow-x-auto border-b border-zinc-200 px-4 dark:border-zinc-800">
+            {SETTINGS_TABS.map((tab) => (
+              <NavLink key={tab.path} to={tab.path} className={tabLinkClasses}>
+                {tab.label}
+              </NavLink>
+            ))}
+          </nav>
+        )}
+        <main className="min-w-0 flex-1 overflow-auto p-4">
+          <Outlet />
+        </main>
+      </div>
+    </div>
+  )
+}

@@ -1,0 +1,33 @@
+[project]
+name = "lftpweb"
+description = "Containerized web interface for keeping a local directory in sync with a seedbox, using lftp as the transfer engine."
+requires-python = ">=3.12"
+dynamic = ["version"]
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "aiosqlite>=0.20",
+    "pydantic>=2.9",
+    "pydantic-settings>=2.6",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "httpx>=0.27",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.version]
+path = "backend/lftpweb/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["backend/lftpweb"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

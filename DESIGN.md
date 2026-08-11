@@ -1128,7 +1128,11 @@ the compose file as much as the Dockerfile:
   underneath you.
 - **Run as non-root.** Privileges are dropped before the app starts; nothing but the entrypoint
   ever runs as root.
-- **`cap_drop: ALL`** — the app needs no capabilities at all.
+- **`cap_drop: ALL`, then add back exactly `CHOWN`, `SETUID`, `SETGID`.** The *running app*
+  needs no capabilities — but the entrypoint does, briefly, before it drops privileges. `chown(2)`
+  and `setuid(2)`/`setgid(2)` are capability-gated even for uid 0, so a literal `cap_drop: ALL`
+  crash-loops the container before the app starts. Verified in build phase 1. Once `su-exec`
+  drops to `PUID`/`PGID`, the app process holds none of the three.
 - **`no-new-privileges: true`**.
 - **Read-only root filesystem**, with `/config`, `/downloads`, `/staging` and a small `/run`
   tmpfs as the only writable paths.
@@ -1166,6 +1170,10 @@ identity — not merely have permission locally.
   share is the server's business; our job is to run as the right uid and get out of the way.
 - **`UMASK` matters more than usual here**, because every file we create lands on a share that
   other services (the `*arr` stack, the media server) also read. Default `022`, configurable.
+- **Never create a passwd/group entry for `PUID`/`PGID`.** `read_only: true` puts `/etc/passwd`
+  and `/etc/group` on the read-only root, so an `addgroup`/`adduser` step fails outright.
+  `su-exec` and `chown` both take a raw numeric `uid:gid`, so nothing needs an NSS entry — log
+  lines just print numeric ids. Verified in build phase 1.
 - Startup should **verify writability** of each configured local path as its identity and
   report a clear error naming the path and the effective uid/gid — the single most common
   deployment failure, and one that otherwise surfaces as inscrutable transfer errors much
@@ -1209,9 +1217,11 @@ logic is a pure function that deserves to be tested without a subprocess or a fi
 
 **Versioning.** `backend/lftpweb/__init__.py` holds `__version__` as a bare string (no `v`
 prefix) and is the only place the version is written. First release is **`0.0.1`**. The API
-exposes it at `/api/health`, the UI renders it bottom-left (§9.1), and the release-notes link
-is built from it against a repo base URL held in config — so the link works the moment the
-GitHub repo exists, without touching the component.
+exposes it at `/api/health` — along with `repo_url`, because `LFTPWEB_REPO_URL` is a *runtime*
+container env var while the SPA is built into static files long before that env exists, so a
+Vite build-time constant cannot carry it. The UI renders the version bottom-left (§9.1) and
+builds the release-notes link from those two fields, degrading to plain text when `repo_url` is
+empty — so the link starts working the moment the GitHub repo exists, without a rebuild.
 
 ### 12.1 `private_data/` and the gitignore
 
