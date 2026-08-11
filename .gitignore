@@ -1,3 +1,16 @@
+# Local scratch, fixtures, build output, anything machine-specific.
+# One directory instead of a growing list of patterns: new kinds of scratch file are
+# safe by default, and "is this safe to share?" has a single answer. See DESIGN.md §12.1.
+private_data/
+
+# Runtime data — never commit a live config db, keys, logs, backups, or downloads
+config/
+downloads/
+staging/
+*.db
+*.db-wal
+*.db-shm
+
 # Python
 __pycache__/
 *.py[cod]
@@ -20,17 +33,8 @@ coverage/
 .env.*
 !.env.example
 
-# Docker
+# Docker — committed: docker-compose.yml, .dev.yml, .test.yml
 docker-compose.override.yml
-compose.dev.yml
-
-# Runtime data (never commit a live config db, keys, or downloads)
-config/
-downloads/
-staging/
-*.db
-*.db-wal
-*.db-shm
 
 # Claude
 .claude/settings.local.json
