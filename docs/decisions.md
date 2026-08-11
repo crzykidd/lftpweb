@@ -6,6 +6,209 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-11 — Phase 2: `asyncssh.connect()` fails outright under DESIGN.md §11.2's own
+## numeric-uid convention — `getpass.getuser()` raises `OSError` on Python 3.13
+
+**Found running the actual built container against the fake seedbox, not anticipated by
+DESIGN.md.** `core/remote.py`'s connections all failed with `"No username set in the
+environment"` the moment lftpweb ran inside its own container (uid 1000 via compose's native
+`user:`, no `/etc/passwd` entry — exactly §11.2's documented identity model, and exactly what
+the PUID/PGID entrypoint also produces). Traced to `asyncssh.connect()`: it unconditionally
+calls `getpass.getuser()` early in connection setup, for SSH-config `%u` templating, completely
+independent of the `username=` kwarg we always pass. `getpass.getuser()` falls through to
+`pwd.getpwuid(os.getuid())`, which raises `KeyError` for an unregistered uid — and on Python
+3.13, `getpass.getuser()` itself catches that `KeyError` and re-raises `OSError('No username
+set in the environment')`. asyncssh's own `except KeyError:` around the call does not catch an
+`OSError`, so the exception propagates and every connection attempt fails, for every auth
+method, before authentication is ever reached.
+
+**Fix:** `core/remote.py` sets `LOGNAME` at import time — but only if none of
+`LOGNAME`/`USER`/`LNAME`/`USERNAME` is already set, so a real environment value is never
+overridden. `getpass.getuser()` checks the environment before touching `pwd`, so this sidesteps
+the crash entirely without touching container identity, `/etc/passwd`, or asyncssh itself.
+Covered by `tests/test_remote_username_env.py`, and reproduced for real: verified failing
+against the fully-built runtime image before the fix, and succeeding after, both against the
+fake seedbox over the container network (see the phase 2 report for the exact commands).
+
+**Why this belongs in code, not compose.** The trigger is the numeric-uid-with-no-passwd-entry
+convention §11.2 already committed to for *both* supported identity mechanisms (PUID/PGID and
+compose's native `user:`), so every deployment shape this project supports hits it. Fixing it
+by adding `environment: USER=...` to the compose files would work for the two committed compose
+files but silently reintroduce the bug for anyone deploying with their own compose/Kubernetes
+manifest that follows the same PUID/PGID convention — the fix belongs where the assumption that
+breaks it (§11.2) is made, which is the application, not any one deployment's config.
+
+---
+
+## 2026-08-11 — Phase 2: `known_hosts=None` in asyncssh silently disables host-key
+## verification *and* skips the `validate_host_public_key` callback entirely
+
+**Found while building the accept-and-pin flow, not anticipated.** The natural-looking way to
+say "we're doing our own host-key checking" is `asyncssh.connect(..., known_hosts=None,
+client_factory=OurClient)`, expecting `OurClient.validate_host_public_key` to be consulted for
+every key. It never is: asyncssh's `_connection_made()` sets `self._trusted_host_keys = None`
+whenever `known_hosts is None`, and `validate_host_public_key` is only called when
+`self._trusted_host_keys is not None`. The practical effect: with `known_hosts=None`, asyncssh
+trusts *any* server host key unconditionally and never asks our callback anything — the
+accept-and-pin policy (DESIGN.md §5, §8) silently never ran, and *every* `known_hosts_policy`,
+including `strict`, would have behaved as `insecure`.
+
+**Fix:** pass `known_hosts=asyncssh.SSHKnownHosts()` — a real, empty, in-memory known-hosts
+object, not `None` and not an empty string/list/bytes (any of which cause asyncssh to fall back
+to probing `~/.ssh/known_hosts` on whatever filesystem the process happens to see, which is
+worse). An empty `SSHKnownHosts` is non-falsy and holds zero trusted keys, so asyncssh always
+defers to `validate_host_public_key`, which is where `core/remote.py`'s
+`known_hosts_policy` (`accept-and-pin` / `strict` / `insecure`) is actually enforced, via a
+small JSON pin store (`KnownHostsStore`) rather than OpenSSH's own known_hosts file format.
+Verified live against the fake seedbox: first connection pins and logs the key; a corrupted
+pin is rejected as `HOST_KEY_MISMATCH` on the next fresh connection; `strict` against a never-
+pinned host reports `HOST_KEY_UNKNOWN`. See `tests/test_known_hosts_store.py` and the phase 2
+report's edge-case script for the exact assertions.
+
+**Also decided: `insecure` bypasses the pin store entirely, checked first.** An earlier draft
+checked the stored pin before checking policy, so an `insecure` host that happened to have a
+pin recorded under a different policy earlier would be rejected as a "mismatch" — exactly
+backwards for a policy that means "never verify." `insecure` is now the first check in
+`validate_host_public_key`, unconditional, and never reads or writes the pin store.
+
+---
+
+## 2026-08-11 — Phase 2: credential encryption at rest ships now, not in build phase 8
+
+**Decision, mandated by the phase 2 prompt rather than discovered during the build:** §8's
+encryption scheme (`core/crypto.py`) — a per-install secret in `<config_dir>/secret.key`, mode
+0600, generated on first run; a Fernet key derived from it via HKDF-SHA256; `host.password_enc`
+encrypted at rest — ships in phase 2, the phase where a seedbox password first exists, rather
+than waiting for phase 8 as `DESIGN.md` §13's build order literally lists it. Phase 8 still
+owns the *rest* of §8: auth modes, sessions, API keys, rate limiting.
+
+**The secret is deliberately not backed up** (§8/§10.2 — `core/backup.py` is phase 7 and will
+need to exclude `secret.key` from `VACUUM INTO` targets when it lands), so a restore to a fresh
+install cannot recover a stored password. `DecryptionError` is how `core/engine.py` and
+`api/settings.py` detect that case: `load_host_config` catches it and proceeds with
+`password=None` rather than crashing, and `GET /api/settings/host` reports
+`credentials_need_reentry: true` so the UI can surface it — the full "hold all transfers for
+this host" behavior §8 describes waits for phase 3's job engine to have transfers to hold.
+
+---
+
+## 2026-08-11 — Phase 2: `item` rows persist per-node (file *and* directory), not just
+## §4.7's top-level "item" concept
+
+**Ambiguity found in `DESIGN.md`, resolved with the smallest reasonable call.** §4.7 defines
+"item" narrowly — a top-level entry of a queue's `remote_path`, either a directory or a loose
+file, the granularity auto-queue patterns match against. But the `item` table (§3.1) has
+`UNIQUE(queue_id, rel_path)` with no depth restriction, and §9.2's item drawer promises
+"per-file status... over the whole tree" for everything inside a release. Read literally, §4.7's
+item definition and the `item` table's evident scope disagree.
+
+**Resolution:** `core/engine.py` persists one `item` row per node the reconciler produces —
+every file and every directory in the merged tree, not only top-level entries — because that's
+what the Files page (a full tree, not a flat item list) and the future item drawer both need,
+and nothing in §3.1's schema forbids it. §4.7's narrower "item" remains the correct unit for
+auto-queue pattern matching (phase 4); the two uses of the word describe different granularities
+of the same table, and phase 4 should pattern-match against top-level rows specifically rather
+than assuming every persisted row is an auto-queue item.
+
+---
+
+## 2026-08-11 — Phase 2: a directory with zero local presence reads as `REMOTE_ONLY`, not
+## `PARTIAL` — `DESIGN.md` §3.2 rule 1 doesn't say
+
+**Ambiguity found in `DESIGN.md`, resolved with the smallest reasonable call — surfaced for
+review, not silently decided.** Rule 1 states a directory is `DOWNLOADED` only when every
+relevant descendant file is complete, "otherwise `PARTIAL`" — a strict binary, with no
+carve-out for a directory that has *zero* local presence at all (nothing queued or downloaded
+yet). Read literally, a totally-untouched remote-only release directory would show `PARTIAL`,
+which reads to a user as "download interrupted," not "nothing has happened yet."
+
+**Decision:** `core/reconcile.py` computes three directory states from rule 1's own
+completeness accounting (already computed for `DOWNLOADED` vs not): `DOWNLOADED` when every
+relevant file is complete (or vacuously, when there are none), `REMOTE_ONLY` when *no* relevant
+file has any local copy, and `PARTIAL` only for the genuine in-between. This is additive to
+rule 1, not a departure from it — the `DOWNLOADED`/not-`DOWNLOADED` boundary rule 1 specifies is
+unchanged; only the "otherwise" is split into two states instead of collapsed into one. Pinned
+by `tests/test_reconcile.py::test_directory_remote_only_with_zero_local_presence` and the
+directory-state table alongside it.
+
+---
+
+## 2026-08-11 — Phase 2: one combined scan interval, not `DESIGN.md` §5's separate 30s
+## remote / 10s local cadences
+
+**Deviation recorded rather than silently taken.** §5 specifies remote scans every 30s and a
+faster local-only walk every 10s, with the gap covered by phase 3's 1 Hz active-file
+`ProgressSampler`. `core/engine.py` runs one interval (default 30s, `LFTPWEB_SCAN_INTERVAL_S`)
+that scans both sides together, plus `request_rescan()` for an immediate on-demand pass (used
+by `POST /api/files/rescan` and after a host/queue config change).
+
+**Why this is acceptable now.** The faster local-only cadence exists to catch local filesystem
+changes (an import finishing, a manual delete) between the more expensive remote round-trips —
+a scale/responsiveness optimization. With no active transfers yet (phase 3), nothing is
+producing local changes on that kind of timescale, and every phase 2 verification (including
+the delete/restore flip test) uses `request_rescan()` rather than waiting on a timer. Splitting
+the cadence is deferred to whenever it's actually needed, not dropped — `Engine.scan_queue`
+already separates the remote scan, the local scan, and the reconcile call, so adding a second,
+faster local-only loop later doesn't require restructuring it.
+
+---
+
+## 2026-08-11 — Phase 2: WebSocket "deltas" are per-queue full snapshots, not row-level diffs
+
+**Scoped-down interpretation of `DESIGN.md` §2/§9, recorded rather than silently taken.** "A
+full model snapshot on connect, deltas thereafter" is read literally as row-level diffing
+elsewhere in the doc's vocabulary (e.g. the `item` table's change tracking). Phase 2's
+`api/ws.py` instead sends one `queue_snapshot` message — the complete fresh state of one
+queue — every time `core/engine.py` finishes scanning that queue, and the frontend
+(`useFilesSocket.ts`) merges it into a `queue_id`-keyed map. A queue that hasn't rescanned since
+connecting keeps showing its last-known state rather than vanishing.
+
+**Why this is acceptable now.** A reconciled tree is idempotent state, not an event log — the
+whole tree is cheap to hold and to replace outright (`RemoteConnectionPool`'s find output for
+the seed tree is a few KB), and there is no job/lifecycle history yet whose *transitions*
+specifically need to be pushed. Row-level diffing becomes worth the complexity once phase 3's
+per-file progress ticks at ~1 Hz on the active set (§4.4) — pushing a whole queue's tree on
+every progress tick would not scale the way pushing one row's bytes-done does. Flagged here so
+phase 3 doesn't inherit this shape by default.
+
+---
+
+## 2026-08-11 — Phase 2: the fake seedbox's SSH keypair and password are committed, on purpose
+
+**Decision.** `docker/test-seedbox/test_key`(`.pub`) and the hardcoded `testpass123` in
+`sshd_config`/the two Dockerfiles are committed to the repo, despite the general rule (§12.1,
+`.gitignore`) that credentials never get committed. This is not an exception to that rule —
+these are not credentials to anything real: the containers they authenticate are built from
+this repo, reachable only on `127.0.0.1`, hold a synthetic tree of known sizes, and are torn
+down after every verification run. Requiring them to be generated fresh on every `docker
+compose -f docker-compose.test.yml up` would only add friction for zero safety benefit, since
+there is nothing behind them to protect.
+
+**Why a real GNU + a real busybox container, not one container with two `find` shims.**
+DESIGN.md §15.7 records `find -printf` as GNU-specific and calls for verifying the fallback
+against the real thing. Faking busybox's behavior inside a GNU environment (a wrapper script,
+an alias) would test the fallback *trigger* logic but not the actual busybox error text
+`core/remote.py`'s detection regex has to match — and that text (`"find: unrecognized:
+-printf"`) was itself discovered by running the real binary, not by reading busybox's source.
+`docker/test-seedbox/Dockerfile.busybox` deliberately does not install `findutils`, which is
+the one thing that would silently stop testing what it exists to test.
+
+---
+
+## 2026-08-11 — Phase 2: the Files tree is not yet virtualized
+
+**Deviation recorded rather than silently taken.** `DESIGN.md` §9.2 calls for a virtualized
+tree "smooth at 10k+ rows." `frontend/src/components/FileTree.tsx` renders the full DOM tree
+with plain React recursion and no virtualization library — none is installed yet, and adding
+one is a dependency decision worth making deliberately rather than as a side effect of phase 2.
+§13's build order lists "virtualization tuning" explicitly under phase 9 (Polish), so this is
+read as on-schedule rather than a phase 2 gap: the fake seedbox's tree (17 nodes) and any
+realistic dev-scale queue are nowhere near where non-virtualized rendering degrades, and
+nothing about the read-only, collapsible, per-row-state-chip shape this phase built needs to
+change to add virtualization later — only the row-rendering internals of `FileTree.tsx` would.
+
+---
+
 ## 2026-08-11 — Phase 1 review: each migration must be atomic, or a failure wedges the install
 
 **Found in review of the phase 1 build, not by the build itself.** The first migration runner

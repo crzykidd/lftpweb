@@ -1,0 +1,29 @@
+# Fake seedbox #2: Alpine, so `find` is busybox's applet, which does **not** support
+# `-printf` — this is the container that exercises core/remote.py's fallback path
+# (remote_agent/scan_fs.py uploaded over SFTP and run with the remote python3). Deliberately
+# does NOT install the `findutils` package, which is the whole point: if it were installed,
+# busybox's `find` would be shadowed and this container would stop testing what it's for.
+
+FROM alpine:3.20
+
+RUN apk add --no-cache openssh python3 \
+    && ssh-keygen -A \
+    && mkdir -p /var/run/sshd
+
+# Test-only throwaway credentials (see sshd_config's comment).
+RUN adduser -D -s /bin/sh seeduser \
+    && echo 'seeduser:testpass123' | chpasswd \
+    && mkdir -p /home/seeduser/.ssh \
+    && chmod 700 /home/seeduser/.ssh
+
+COPY test_key.pub /home/seeduser/.ssh/authorized_keys
+COPY sshd_config /etc/ssh/sshd_config
+COPY seed_tree.sh /usr/local/bin/seed_tree.sh
+
+RUN chmod +x /usr/local/bin/seed_tree.sh \
+    && chmod 600 /home/seeduser/.ssh/authorized_keys \
+    && /usr/local/bin/seed_tree.sh /data/pickup \
+    && chown -R seeduser:seeduser /home/seeduser /data
+
+EXPOSE 22
+CMD ["/usr/sbin/sshd", "-D", "-e"]

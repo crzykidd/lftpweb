@@ -28,5 +28,9 @@ class Settings(BaseSettings):
     # the GitHub repo does not exist yet.
     repo_url: str = ""
 
+    # DESIGN.md §5: remote scan cadence. Phase 2 uses one combined interval for remote +
+    # local scanning rather than §5's separate 30s/10s cadences — see docs/decisions.md.
+    scan_interval_s: float = 30.0
+
 
 settings = Settings()

@@ -9,6 +9,12 @@ dependencies = [
     "aiosqlite>=0.20",
     "pydantic>=2.9",
     "pydantic-settings>=2.6",
+    # Remote scanning + Test connection + (later) remote deletes over one pooled connection
+    # (DESIGN.md §5). Key/agent/password auth, known_hosts policies.
+    "asyncssh>=2.18",
+    # Credential encryption at rest (DESIGN.md §8), moved up from phase 8 to phase 2 because
+    # this is the phase where a seedbox password first exists — see docs/decisions.md.
+    "cryptography>=43",
 ]
 
 [dependency-groups]

@@ -1,0 +1,36 @@
+# The fake-seedbox integration harness (DESIGN.md §11.2, §14). Two throwaway sshd containers
+# seeded with an identical, known-size tree (docker/test-seedbox/seed_tree.sh):
+#
+#   seedbox-gnu      — Debian + GNU findutils: exercises core/remote.py's primary scan path
+#                       (`find -printf`).
+#   seedbox-busybox  — Alpine, deliberately *without* findutils: `find` is busybox's applet,
+#                       which does not support `-printf`, so this exercises the fallback path
+#                       (remote_agent/scan_fs.py uploaded over SFTP and run with python3) —
+#                       the single highest-value piece of test infrastructure in the project
+#                       (§14), and exactly the risk §15.7 records.
+#
+# Test-only, hardcoded credentials (both a password and an ed25519 keypair — see
+# docker/test-seedbox/), reachable only on localhost, holding no real data. Never used for
+# anything but this harness.
+#
+# Run: docker compose -f docker-compose.test.yml up --build -d
+# Then point lftpweb's host settings at 127.0.0.1:2222 (GNU) or 127.0.0.1:2223 (busybox),
+# username "seeduser", remote_path "/data/pickup".
+# Tear down: docker compose -f docker-compose.test.yml down
+
+services:
+  seedbox-gnu:
+    build:
+      context: docker/test-seedbox
+      dockerfile: Dockerfile.gnu
+    container_name: lftpweb-test-seedbox-gnu
+    ports:
+      - "2222:22"
+
+  seedbox-busybox:
+    build:
+      context: docker/test-seedbox
+      dockerfile: Dockerfile.busybox
+    container_name: lftpweb-test-seedbox-busybox
+    ports:
+      - "2223:22"

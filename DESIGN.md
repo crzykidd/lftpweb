@@ -1249,8 +1249,12 @@ Each phase ends at something that can actually be looked at and judged.
    config, healthcheck, both compose files, SPA shell with nav / theme / version link.
    *Done when:* container starts, UI loads, `/api/health` is green.
 2. **Scanning + model** — asyncssh connect/test, remote `find` scan, local walk, reconciler,
-   read-only Files tree pushed over WS, grouped by queue. *Done when:* the real seedbox tree
-   renders with correct sizes and correct REMOTE_ONLY / LOCAL_ONLY / PARTIAL classification.
+   read-only Files tree pushed over WS, grouped by queue. Also **credential encryption at rest**
+   (§8): this is the phase where a seedbox password first exists, and storing it in plaintext
+   until phase 8 is not acceptable even in a dev build. Phase 8 keeps the rest of §8.
+   Also builds the §14 fake seedbox, since there is nothing to scan without it.
+   *Done when:* the real seedbox tree renders with correct sizes and correct REMOTE_ONLY /
+   LOCAL_ONLY / PARTIAL classification.
 3. **Transfer engine + scheduler** — process supervision, job queue, the admission-control
    scheduler (§4.5) with fast lane and priority, FS-derived progress, queue/stop/retry,
    Transfers view with the item drawer. **The load-bearing phase.** *Done when:* you can queue
@@ -1268,8 +1272,10 @@ Each phase ends at something that can actually be looked at and judged.
    delete audit legibly.
 7. **Operations** — rotating app log and its viewer, `VACUUM INTO` backup on schedule,
    pre-migration backup, manual backup + download (§10).
-8. **Auth + hardening** — the three modes, credential encryption, the credentials-need-re-entry
-   state (§8), log redaction, rate limits, the compose hardening in §11.1.
+8. **Auth + hardening** — the three auth modes, sessions, API keys, log redaction, rate limits,
+   the compose hardening in §11.1, and the full "hold transfers for this host" behavior behind
+   the credentials-need-re-entry state. (Credential *encryption* itself moved to phase 2 —
+   see above.)
 9. **Polish** — bulk ops, filters, virtualization tuning, docs.
 
 That is the whole of v1. `0.0.1` is the first version (§12).

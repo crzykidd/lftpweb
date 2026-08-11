@@ -1,0 +1,12 @@
+# Minimal sshd config for the fake seedbox (DESIGN.md §14). Shared by both the GNU-findutils
+# and busybox images. Test-only: password auth is enabled with a throwaway, hardcoded
+# password (see Dockerfile.* — "testpass123") because this container is never reachable
+# outside localhost and holds no real data. Do not reuse this config for anything real.
+Port 22
+PermitRootLogin no
+PasswordAuthentication yes
+PubkeyAuthentication yes
+AuthorizedKeysFile .ssh/authorized_keys
+KbdInteractiveAuthentication no
+UsePAM no
+Subsystem sftp internal-sftp
