@@ -18,12 +18,28 @@ services:
       context: .
       dockerfile: docker/Dockerfile
       target: dev
+      args:
+        # Must match `user:` below — the dev stage creates a passwd entry for this uid so
+        # lftp's ssh doesn't fatal with "No user exists for uid N". See the comment there.
+        DEV_UID: "${UID:-1000}"
+        DEV_GID: "${GID:-1000}"
     user: "${UID:-1000}:${GID:-1000}"
     ports:
       - "8087:8087"
     environment:
       LFTPWEB_LOG_LEVEL: "DEBUG"
       LFTPWEB_REPO_URL: ""
+    # Per-job lftp rc files (credentials + the known_hosts pin, mode 0600) live here and are
+    # unlinked when the job exits — DESIGN.md §4.2/§11.1 require a tmpfs so a password never
+    # touches disk. The runtime image gets this from `docker/entrypoint.sh`, which creates and
+    # chowns the directory while still root; the dev stage has no entrypoint and starts uvicorn
+    # directly as the developer's uid, so bare root-owned /run is unwritable and every spawn
+    # fails `SPAWN_FAILED: PermissionError: '/run/lftpweb'` while scanning and the whole UI
+    # keep working. Mounting a uid-owned tmpfs at the same path fixes it without overriding
+    # LFTPWEB_RUN_DIR to somewhere on the writable layer, which would put those credentials on
+    # real disk in dev.
+    tmpfs:
+      - /run/lftpweb:uid=${UID:-1000},gid=${GID:-1000},mode=0700
     volumes:
       - ./backend:/app/backend
       - ./private_data/dev-config:/config

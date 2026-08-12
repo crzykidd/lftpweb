@@ -6,6 +6,7 @@ disk has already leaked.
 from __future__ import annotations
 
 import logging
+import os
 import re
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -13,6 +14,32 @@ from pathlib import Path
 MAX_BYTES = 5 * 1024 * 1024  # 5 MB
 BACKUP_COUNT = 5  # 5 files -> 25 MB ceiling
 LOG_FILENAME = "lftpweb.log"  # named here so api/logs.py never hardcodes it separately
+
+# Third-party loggers that inherit the *root* level, and so light up in full whenever
+# LFTPWEB_LOG_LEVEL is lowered to debug this application's own code. Measured on a running
+# dev instance: 37,388 aiosqlite lines (every statement logged twice, and the scheduler polls
+# settings once a second) against exactly 1 line from lftpweb itself. That is not merely
+# unreadable — the handler below has a fixed 25 MB budget, so library chatter actively evicts
+# the lines an incident would need, and Settings -> Logs ends up tailing noise.
+#
+# Each entry is a *floor*, never a ceiling: a quieter root level still wins (see the max()
+# below), so this can only suppress, never force output the operator asked to be rid of.
+_THIRD_PARTY_FLOORS = {
+    "aiosqlite": logging.WARNING,
+    "asyncssh": logging.WARNING,
+    "websockets": logging.WARNING,
+}
+
+# The escape hatch, and it is load-bearing rather than a courtesy: asyncssh's own output is how
+# connection problems get diagnosed here (it is what distinguishes "the pooled connection is
+# being reused" from "we reconnect every scan"), and this project's hardest bugs were found by
+# reading transport-level logs. `LFTPWEB_DEBUG_LIBS=asyncssh,aiosqlite` drops the floor for the
+# named loggers so they follow the root level again.
+#
+# Read from the environment here rather than threaded through `config.py`'s Settings: logging is
+# configured before the app (and therefore before Settings) is built, and this keeps the knob in
+# the same module as the behaviour it controls.
+DEBUG_LIBS_ENV = "LFTPWEB_DEBUG_LIBS"
 
 _LOG_FORMAT = "%(asctime)s %(levelname)-8s %(name)s: %(message)s"
 
@@ -82,3 +109,26 @@ def setup_logging(config_dir: str, log_level: str) -> None:
     root.addHandler(console_handler)
 
     logging.getLogger("uvicorn.access").addFilter(PollingNoiseFilter())
+    _apply_third_party_floors(root.level)
+
+
+def _apply_third_party_floors(root_level: int) -> None:
+    """Keep library loggers from drowning this application's own output (see
+    `_THIRD_PARTY_FLOORS`). Same intent as the `PollingNoiseFilter` above, one level up: that
+    one drops individual noisy records, this one stops whole libraries inheriting a debug root.
+    """
+    verbose = {
+        name.strip().lower()
+        for name in os.environ.get(DEBUG_LIBS_ENV, "").split(",")
+        if name.strip()
+    }
+    for name, floor in _THIRD_PARTY_FLOORS.items():
+        logger = logging.getLogger(name)
+        if name in verbose:
+            # NOTSET means "inherit", so the logger follows the root level again — this is an
+            # opt-in to the full firehose, which is exactly what a connection bug wants.
+            logger.setLevel(logging.NOTSET)
+        else:
+            # max(): levels are numerically higher when *less* verbose, so a root of ERROR
+            # stays ERROR rather than being loosened back to WARNING by this floor.
+            logger.setLevel(max(floor, root_level))

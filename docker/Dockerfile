@@ -57,6 +57,28 @@ FROM python-base AS python-builder
 RUN uv sync --locked --no-dev --no-editable
 
 FROM python-base AS dev
+# The same transfer/archive tooling the runtime stage installs. Without it the dev container
+# can scan (asyncssh is pure Python) but every transfer dies `SPAWN_FAILED: FileNotFoundError`
+# the moment core/lftp.py tries to exec `lftp` — a failure that only surfaces on the first
+# Queue click, long after the environment looks healthy.
+RUN apk add --no-cache lftp openssh-client 7zip
+
+# Must match docker-compose.dev.yml's `user:` (the developer's own uid/gid, §11.2), same
+# reasoning as the frontend-dev stage above — but here it is /etc/passwd, not file ownership,
+# that matters. lftp shells out to OpenSSH, and OpenSSH fatals with "No user exists for uid N"
+# when the running uid has no passwd entry: asyncssh has an env fallback (core/remote.py sets
+# LOGNAME for exactly this), OpenSSH has none. So scanning would keep working while every
+# transfer failed — the single nastiest failure mode this project has hit on real hardware.
+# The runtime stage solves it differently, symlinking /etc/passwd into the /run tmpfs and
+# writing it in the entrypoint, because there the uid is a runtime PUID/PGID and the root
+# filesystem is read-only; this stage knows its uid at build time and can just create the user.
+ARG DEV_UID=1000
+ARG DEV_GID=1000
+RUN if ! getent group "${DEV_GID}" >/dev/null; then addgroup -g "${DEV_GID}" devgroup; fi \
+    && if ! getent passwd "${DEV_UID}" >/dev/null; then \
+         adduser -D -H -u "${DEV_UID}" -G "$(getent group "${DEV_GID}" | cut -d: -f1)" devuser; \
+       fi
+
 # Editable (the default) + dev dependency group: installs a reference back to
 # /app/backend/lftpweb rather than a frozen copy, so docker-compose.dev.yml bind-mounting
 # fresh source over /app/backend takes effect without a rebuild.
