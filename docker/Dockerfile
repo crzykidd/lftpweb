@@ -82,7 +82,16 @@ ENV PATH="/app/.venv/bin:${PATH}" \
     LFTPWEB_CONFIG_DIR=/config \
     LFTPWEB_PORT=8087
 
-VOLUME ["/config", "/downloads"]
+# Deliberately NO `VOLUME` declaration.
+#
+# `VOLUME ["/config", "/downloads"]` made Docker materialise a root-owned *anonymous* volume
+# at any of those paths the operator didn't mount — so a deployment whose queues live on an
+# NFS share at /mnt/... still got a phantom /downloads it never asked for, failing the
+# entrypoint's writability probe and warning about a path in no way in use. Anonymous volumes
+# also accumulate invisibly and survive `docker compose down`.
+#
+# The compose files declare the real mounts explicitly, which is the only place that belongs.
+# A queue's local_path may be any mounted path; /downloads is a convention, not a requirement.
 EXPOSE 8087
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
