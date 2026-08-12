@@ -320,3 +320,6 @@ def test_rc_always_bounds_retries_and_timeouts():
     assert "set net:max-retries 3;" in rc
     assert "set net:timeout 30s;" in rc
     assert "set net:reconnect-interval-base 5s;" in rc
+    # One connection for anything under 1 MiB: `pget -n 4` on a 16-byte file otherwise opens
+    # four SSH connections to move 16 bytes, and multiplies any handshake failure by four.
+    assert "set pget:min-chunk-size 1048576;" in rc

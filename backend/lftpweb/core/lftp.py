@@ -63,6 +63,7 @@ DEFAULT_RUN_DIR = "/run/lftpweb"
 # never the whole transcript (that would start drifting toward "parse this for progress").
 # Bounded so a connection that cannot succeed fails fast instead of retrying forever — see
 # the block in `build_rc_text` for what happened when these were left at lftp's defaults.
+DEFAULT_MIN_CHUNK_SIZE = 1024 * 1024  # 1 MiB — below this, one connection is plenty
 DEFAULT_MAX_RETRIES = 3
 DEFAULT_NET_TIMEOUT_S = 30
 DEFAULT_RECONNECT_INTERVAL_BASE_S = 5
@@ -193,6 +194,7 @@ def build_rc_text(
     pget_n: int,
     save_status_interval_s: int,
     extra_settings: str,
+    min_chunk_size: int = DEFAULT_MIN_CHUNK_SIZE,
     max_retries: int = DEFAULT_MAX_RETRIES,
     net_timeout_s: int = DEFAULT_NET_TIMEOUT_S,
     reconnect_interval_base_s: int = DEFAULT_RECONNECT_INTERVAL_BASE_S,
@@ -221,6 +223,13 @@ def build_rc_text(
         #
         # DESIGN.md §9.3 lists these as host-level knobs; they were in the design's knob list
         # but had never been written to the rc file.
+        # Never fan a small file out across N connections. Without this, `pget -n 4` splits a
+        # 16-byte file into four chunks and opens four SSH connections to move 16 bytes —
+        # pointless on its own, and it multiplies any connection failure by N (observed
+        # against a real seedbox: four connections each retrying a failing handshake). It also
+        # burns the host-wide connection ceiling §4.5 warns about. lftp uses one connection for
+        # anything smaller than this. §9.3 lists the knob; it was never written to the rc.
+        f"set pget:min-chunk-size {min_chunk_size};",
         f"set net:max-retries {max_retries};",
         f"set net:timeout {net_timeout_s}s;",
         f"set net:reconnect-interval-base {reconnect_interval_base_s}s;",
