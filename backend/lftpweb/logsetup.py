@@ -38,6 +38,24 @@ class CredentialRedactor(logging.Filter):
         return _CREDENTIAL_RE.sub(lambda m: f"{m.group('scheme')}{m.group('user')}:***@", text)
 
 
+# Endpoints the UI polls on a timer. At ~1 Hz these access-log lines bury everything that
+# matters — a real deployment's log was wall-to-wall "GET /api/stats 200 OK" with the job
+# lifecycle nowhere to be seen. Dropped from the access log only; the requests still serve
+# normally, and any non-2xx response is kept because that is a real signal.
+_POLLED_PATHS = ("/api/stats", "/api/health", "/api/ws")
+
+
+class PollingNoiseFilter(logging.Filter):
+    """Drop successful uvicorn access records for endpoints the UI polls continuously."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        message = record.getMessage()
+        if not any(path in message for path in _POLLED_PATHS):
+            return True
+        # Keep anything that isn't a plain success — errors are worth seeing even here.
+        return " 2" not in message and "accepted" not in message
+
+
 def setup_logging(config_dir: str, log_level: str) -> None:
     """Configure the root logger with a rotating file handler and a console handler."""
     log_dir = Path(config_dir) / "logs"
@@ -61,3 +79,5 @@ def setup_logging(config_dir: str, log_level: str) -> None:
     root.handlers.clear()
     root.addHandler(file_handler)
     root.addHandler(console_handler)
+
+    logging.getLogger("uvicorn.access").addFilter(PollingNoiseFilter())

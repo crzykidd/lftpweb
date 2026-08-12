@@ -394,6 +394,9 @@ class TransferQueue:
             # size). `cmd:fail-exit true` guarantees exit 0 only on a complete transfer
             # (§4.3), so the true byte count here is simply the job's own `bytes_total`
             # (already known from the remote scan at admission time), not a re-measurement.
+            logger.info(
+                "job %s succeeded: %s (%s bytes)", proc.job_id, proc.rel_path, proc.bytes_total
+            )
             await self.db.execute(
                 "UPDATE job SET state = 'succeeded', pid = NULL, exit_code = 0, output_tail = NULL, "
                 "bytes_done = COALESCE((SELECT remote_size FROM item WHERE item.id = job.item_id), bytes_done), "
@@ -416,6 +419,9 @@ class TransferQueue:
             return
 
         error_class = lftp.classify_output(tail)
+        logger.warning(
+            "job %s failed: %s (exit %s, %s)", proc.job_id, proc.rel_path, exit_code, error_class
+        )
         await self.db.execute(
             "UPDATE job SET state = 'failed', pid = NULL, exit_code = ?, error_class = ?, "
             "output_tail = ?, finished_at = ? WHERE id = ?",
@@ -693,6 +699,20 @@ class TransferQueue:
             wait_task=wait_task,
         )
         self._running[decision.job_id] = proc
+
+        # A transfer starting/finishing is the single thing an operator most wants in the
+        # log (DESIGN.md §10.1). Until this existed, `POST /api/jobs` was followed by total
+        # silence: no way to tell whether lftp had spawned, succeeded, or was still going.
+        logger.info(
+            "job %s spawned: %s %s -> %s (pid %s, %s B/s cap%s)",
+            decision.job_id,
+            job_row["kind"],
+            remote_full,
+            local_full,
+            spawned.pid,
+            decision.rate_limit_bps,
+            ", start-now" if decision.forced_full_rate else "",
+        )
 
         started_at = _now_iso()
         await self.db.execute(
