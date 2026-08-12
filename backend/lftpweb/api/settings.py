@@ -198,6 +198,29 @@ def _queue_out_from_row(row) -> PathQueueOut:
     )
 
 
+# Only `copy` actually does anything today. `move` (delete the remote after a verified
+# transfer) is DESIGN.md §13 phase 5, and `sync` (propagate local deletes) is §7, unscheduled.
+# Both are valid values in the schema, and the column exists so those phases can drop in — but
+# accepting one now stores a setting that silently behaves as `copy`. On a seedbox that means
+# an operator believes their disk is being reclaimed while it quietly fills. Refusing with a
+# clear reason beats a switch that lies.
+IMPLEMENTED_SYNC_MODES = frozenset({"copy"})
+
+_UNIMPLEMENTED_REASON = {
+    "move": "delete-after-download is build phase 5 (DESIGN.md §13); not implemented yet",
+    "sync": "local-delete propagation is not scheduled (DESIGN.md §7)",
+}
+
+
+def _reject_unimplemented_sync_mode(mode: str) -> None:
+    if mode not in IMPLEMENTED_SYNC_MODES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"sync_mode '{mode}' is not available: "
+            f"{_UNIMPLEMENTED_REASON.get(mode, 'unknown mode')}. Use 'copy'.",
+        )
+
+
 @router.get("/queues", response_model=list[PathQueueOut])
 async def list_queues(request: Request) -> list[PathQueueOut]:
     cursor = await request.app.state.db.execute(
@@ -210,6 +233,7 @@ async def list_queues(request: Request) -> list[PathQueueOut]:
 
 @router.post("/queues", response_model=PathQueueOut, status_code=201)
 async def create_queue(body: PathQueueIn, request: Request) -> PathQueueOut:
+    _reject_unimplemented_sync_mode(body.sync_mode)
     db = request.app.state.db
     host_row = await _get_host_row(db)
     if host_row is None:
@@ -245,6 +269,7 @@ async def create_queue(body: PathQueueIn, request: Request) -> PathQueueOut:
 
 @router.put("/queues/{queue_id}", response_model=PathQueueOut)
 async def update_queue(queue_id: int, body: PathQueueIn, request: Request) -> PathQueueOut:
+    _reject_unimplemented_sync_mode(body.sync_mode)
     db = request.app.state.db
     cursor = await db.execute(
         "UPDATE path_queue SET name = ?, remote_path = ?, local_path = ?, staging_path = ?, "

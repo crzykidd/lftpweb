@@ -192,8 +192,8 @@ export function QueuesTab() {
             onChange={(e) => update('sync_mode', e.target.value as SyncMode)}
           >
             <option value="copy">copy — download only, never touches the remote (default)</option>
-            <option value="move">move — download, verify, then delete the remote copy</option>
-            <option value="sync">sync — not yet implemented (DESIGN.md §7, deferred)</option>
+            <option value="move" disabled>move — not yet implemented (DESIGN.md §13 phase 5)</option>
+            <option value="sync" disabled>sync — not scheduled (DESIGN.md §7)</option>
           </select>
         </label>
         <label className="flex items-center gap-2">

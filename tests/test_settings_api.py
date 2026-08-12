@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from fastapi.testclient import TestClient
 
 from lftpweb.main import app
@@ -150,3 +152,25 @@ def test_queue_crud(isolated_config):
         resp = client.delete(f"/api/settings/queues/{queue['id']}")
         assert resp.status_code == 204
         assert client.get("/api/settings/queues").json() == []
+
+
+@pytest.mark.parametrize("mode", ["move", "sync"])
+def test_unimplemented_sync_modes_are_rejected(isolated_config, mode):
+    """A mode that silently behaves as `copy` is worse than one that isn't offered.
+
+    `sync_mode` accepts three values in the schema so phases 5 and beyond can drop in, but
+    only `copy` does anything today. Accepting `move` stored a setting an operator reasonably
+    reads as "my seedbox is being cleaned up" while the disk quietly filled instead. Found on
+    a real deployment.
+    """
+    body = {
+        "name": "q",
+        "remote_path": "/remote",
+        "local_path": "/tmp/local",
+        "enabled": True,
+        "sync_mode": mode,
+    }
+    with TestClient(app) as client:
+        response = client.post("/api/settings/queues", json=body)
+    assert response.status_code == 400
+    assert "not available" in response.json()["detail"]
