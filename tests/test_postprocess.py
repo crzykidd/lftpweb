@@ -12,11 +12,13 @@ either name. Skipped automatically if no such binary is on PATH.
 
 from __future__ import annotations
 
+import asyncio
 import errno
 import os
 import shutil
 import subprocess
 import zipfile
+from pathlib import Path
 
 import aiosqlite
 import pytest
@@ -203,6 +205,142 @@ def test_extract_corrupt_archive_fails_without_raising(tmp_path):
     assert "broken.zip" in result.detail
 
 
+@pytestmark_7z
+def test_extract_success_merges_into_existing_item_dir_and_removes_unpack_dir(tmp_path):
+    """This task's own "done when": extraction stages into `_UNPACK_<name>`, then merges into
+    the item's own directory -- which already holds the source archive, so this is a merge
+    into an *existing* directory, not a fresh move (DESIGN.md §6, docs/decisions.md).
+    """
+    item = tmp_path / "Release"
+    item.mkdir()
+    with zipfile.ZipFile(item / "payload.zip", "w") as zf:
+        zf.writestr("inner.txt", "zip contents")
+
+    result = extract.extract_item(item, binary=_SEVEN_ZIP_BIN)
+
+    assert result.ok, result.detail
+    assert (item / "inner.txt").read_text() == "zip contents"
+    assert (item / "payload.zip").exists()  # the archive itself is left alone
+    assert not (tmp_path / f"{extract.UNPACK_PREFIX}Release").exists()
+    assert not (tmp_path / f"{extract.FAILED_PREFIX}Release").exists()
+
+
+@pytestmark_7z
+def test_extract_nested_archive_merges_into_existing_subdirectory(tmp_path):
+    """A multi-CD-style release: the archive lives under a subdirectory of the item, and that
+    subdirectory already exists at the final location -- staging must reproduce the same
+    layout and merge recurses one level deeper, not just at the item root.
+    """
+    item = tmp_path / "Release"
+    (item / "CD1").mkdir(parents=True)
+    with zipfile.ZipFile(item / "CD1" / "cd1.zip", "w") as zf:
+        zf.writestr("track1.bin", "cd1 contents")
+
+    result = extract.extract_item(item, binary=_SEVEN_ZIP_BIN)
+
+    assert result.ok, result.detail
+    assert (item / "CD1" / "track1.bin").read_text() == "cd1 contents"
+    assert not (tmp_path / f"{extract.UNPACK_PREFIX}Release").exists()
+
+
+@pytestmark_7z
+def test_extract_to_target_dir_stages_under_that_target_too(tmp_path):
+    """DESIGN.md §6's `extract_target_dir` keeps taking precedence when set; `_UNPACK_`
+    staging still applies, as a sibling of the configured target (docs/decisions.md).
+    """
+    item = tmp_path / "Release"
+    item.mkdir()
+    with zipfile.ZipFile(item / "payload.zip", "w") as zf:
+        zf.writestr("inner.txt", "elsewhere")
+
+    target = tmp_path / "extracted" / "Release"
+    result = extract.extract_item(item, target_dir=target, binary=_SEVEN_ZIP_BIN)
+
+    assert result.ok, result.detail
+    assert (target / "inner.txt").read_text() == "elsewhere"
+    assert not (target.parent / f"{extract.UNPACK_PREFIX}Release").exists()
+
+
+@pytestmark_7z
+def test_extract_loose_top_level_archive_file_in_place(tmp_path):
+    """§4.7's loose top-level file case: `root` *is* the archive, not a directory containing
+    it. "In place" means the containing directory -- matching the pre-staging behavior of
+    extracting to `archive.parent` -- and must not crash trying to treat the archive itself
+    as the item's own directory.
+    """
+    local_root = tmp_path / "local"
+    local_root.mkdir()
+    archive = local_root / "payload.zip"
+    with zipfile.ZipFile(archive, "w") as zf:
+        zf.writestr("inner.txt", "loose file contents")
+
+    result = extract.extract_item(archive, binary=_SEVEN_ZIP_BIN)
+
+    assert result.ok, result.detail
+    assert (local_root / "inner.txt").read_text() == "loose file contents"
+
+
+@pytestmark_7z
+def test_extract_failure_leaves_failed_dir_as_evidence_and_no_unpack_dir(tmp_path):
+    item = tmp_path / "Release"
+    item.mkdir()
+    (item / "broken.zip").write_bytes(b"not actually a zip file")
+
+    result = extract.extract_item(item, binary=_SEVEN_ZIP_BIN)
+
+    assert result.ok is False
+    failed_dir = tmp_path / f"{extract.FAILED_PREFIX}Release"
+    assert not (tmp_path / f"{extract.UNPACK_PREFIX}Release").exists()
+    assert failed_dir.is_dir()
+    # Nothing landed under the final name -- the failure is confined to the evidence dir.
+    assert not (item / "inner.txt").exists()
+
+
+@pytestmark_7z
+def test_extract_failed_dir_from_a_previous_attempt_is_replaced_not_a_conflict(tmp_path):
+    item = tmp_path / "Release"
+    item.mkdir()
+    (item / "broken.zip").write_bytes(b"not actually a zip file")
+    failed_dir = tmp_path / f"{extract.FAILED_PREFIX}Release"
+    failed_dir.mkdir()
+    (failed_dir / "stale-evidence.txt").write_text("from a previous attempt")
+
+    result = extract.extract_item(item, binary=_SEVEN_ZIP_BIN)
+
+    assert result.ok is False
+    assert failed_dir.is_dir()
+    assert not (failed_dir / "stale-evidence.txt").exists()  # replaced, not merged with
+
+
+@pytestmark_7z
+def test_extract_never_writes_the_final_name_mid_extraction(tmp_path, monkeypatch):
+    """The whole point of this task: an *arr watching `item` must see nothing, then see a
+    complete release -- never a growing file at its final name while extraction runs.
+    """
+    item = tmp_path / "Release"
+    item.mkdir()
+    with zipfile.ZipFile(item / "payload.zip", "w") as zf:
+        zf.writestr("inner.txt", "zip contents")
+
+    real_run_7z = extract._run_7z
+    seen_targets = []
+
+    def spying_run_7z(binary, args):
+        o_arg = next(a for a in args if a.startswith("-o"))
+        seen_targets.append(Path(o_arg[2:]))
+        assert not (item / "inner.txt").exists(), "must not appear at the final name mid-run"
+        return real_run_7z(binary, args)
+
+    monkeypatch.setattr(extract, "_run_7z", spying_run_7z)
+
+    result = extract.extract_item(item, binary=_SEVEN_ZIP_BIN)
+
+    assert result.ok, result.detail
+    assert len(seen_targets) == 1
+    assert seen_targets[0].name.startswith(extract.UNPACK_PREFIX)
+    assert (item / "inner.txt").read_text() == "zip contents"
+
+
 def test_extract_no_archives_is_a_no_op_success(tmp_path):
     item = tmp_path / "Release"
     item.mkdir()
@@ -319,6 +457,82 @@ def test_move_tree_refuses_to_overwrite_an_existing_destination(tmp_path):
     with pytest.raises(FileExistsError):
         postprocess.move_tree(src, dst)
     assert (dst / "a.txt").read_text() == "already here"
+
+
+# --- move_tree(merge=True) -- core/extract.py's _UNPACK_ -> final-directory merge (this task) -
+
+
+def test_move_tree_merge_into_existing_directory_combines_contents(tmp_path):
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "new.txt").write_text("from src")
+    dst = tmp_path / "dst"
+    dst.mkdir()
+    (dst / "existing.txt").write_text("already there")
+
+    postprocess.move_tree(src, dst, merge=True)
+
+    assert not src.exists()
+    assert (dst / "existing.txt").read_text() == "already there"
+    assert (dst / "new.txt").read_text() == "from src"
+
+
+def test_move_tree_merge_recurses_into_same_named_subdirectories(tmp_path):
+    src = tmp_path / "src"
+    (src / "Subs").mkdir(parents=True)
+    (src / "Subs" / "new.srt").write_text("new sub")
+    dst = tmp_path / "dst"
+    (dst / "Subs").mkdir(parents=True)
+    (dst / "Subs" / "existing.srt").write_text("existing sub")
+
+    postprocess.move_tree(src, dst, merge=True)
+
+    assert not src.exists()
+    assert (dst / "Subs" / "existing.srt").read_text() == "existing sub"
+    assert (dst / "Subs" / "new.srt").read_text() == "new sub"
+
+
+def test_move_tree_merge_moves_a_new_subdirectory_wholesale(tmp_path):
+    """A src subdirectory with no same-named counterpart at dst doesn't need to recurse --
+    the whole subtree moves in one `move_tree` call, same as any other non-colliding entry.
+    """
+    src = tmp_path / "src"
+    (src / "NewSub").mkdir(parents=True)
+    (src / "NewSub" / "f.txt").write_text("new subtree")
+    dst = tmp_path / "dst"
+    dst.mkdir()
+
+    postprocess.move_tree(src, dst, merge=True)
+
+    assert not src.exists()
+    assert (dst / "NewSub" / "f.txt").read_text() == "new subtree"
+
+
+def test_move_tree_merge_raises_on_a_genuine_file_collision(tmp_path):
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "clash.txt").write_text("from src")
+    dst = tmp_path / "dst"
+    dst.mkdir()
+    (dst / "clash.txt").write_text("already there")
+
+    with pytest.raises(FileExistsError):
+        postprocess.move_tree(src, dst, merge=True)
+    # Nothing silently overwritten or partially moved -- both sides untouched by the failure.
+    assert (dst / "clash.txt").read_text() == "already there"
+    assert (src / "clash.txt").read_text() == "from src"
+
+
+def test_move_tree_merge_without_an_existing_destination_behaves_like_a_plain_move(tmp_path):
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "a.txt").write_text("data")
+    dst = tmp_path / "dst"  # does not exist yet
+
+    postprocess.move_tree(src, dst, merge=True)
+
+    assert not src.exists()
+    assert (dst / "a.txt").read_text() == "data"
 
 
 # --- PostprocessSettings load/save ------------------------------------------------------------
@@ -566,3 +780,125 @@ async def test_every_step_defaults_off_for_a_copy_mode_queue(tmp_path):
 
 async def _async_host() -> HostConfig:
     return _host_config()
+
+
+# --- The states this module owns: precedence over a rescan, and the in-flight registry -------
+#
+# The engine-side half (a real scan pass against a real `item` row) lives in
+# `tests/test_state_persistence.py`; these are the two pure/local seams it leans on.
+
+
+@pytest.mark.parametrize(
+    ("prev_state", "structural_state", "expected"),
+    [
+        # The four outcomes are refinements of DOWNLOADED, so they win over a fresh one.
+        ("VERIFIED", "DOWNLOADED", True),
+        ("CORRUPT", "DOWNLOADED", True),
+        ("EXTRACTED", "DOWNLOADED", True),
+        ("EXTRACT_FAILED", "DOWNLOADED", True),
+        # ...and only over DOWNLOADED. PARTIAL means the bytes are no longer all there
+        # (DESIGN.md §3.2 rule 2), REMOTE_ONLY is absence and belongs to the grace period in
+        # core/mount_sentinel.py -- neither may be overridden by a stale outcome.
+        ("VERIFIED", "PARTIAL", False),
+        ("EXTRACTED", "PARTIAL", False),
+        ("CORRUPT", "REMOTE_ONLY", False),
+        ("EXTRACT_FAILED", "REMOTE_ONLY", False),
+        # Transient states are protected by `in_flight_item_ids()` (i.e. by a worker actually
+        # running), never by the state string -- otherwise a crash would wedge the item.
+        ("VERIFYING", "DOWNLOADED", False),
+        ("EXTRACTING", "DOWNLOADED", False),
+        # States this module doesn't own are none of its business.
+        ("DOWNLOADED", "DOWNLOADED", False),
+        ("STOPPED", "DOWNLOADED", False),
+        ("REMOVED_LOCAL", "DOWNLOADED", False),
+        (None, "DOWNLOADED", False),
+    ],
+)
+def test_outcome_survives_rescan(prev_state, structural_state, expected):
+    assert postprocess.outcome_survives_rescan(prev_state, structural_state) is expected
+
+
+def test_owned_states_cover_exactly_the_six_states_design_3_2_names():
+    assert postprocess.OWNED_STATES == {
+        "VERIFYING",
+        "VERIFIED",
+        "CORRUPT",
+        "EXTRACTING",
+        "EXTRACTED",
+        "EXTRACT_FAILED",
+    }
+    assert not (postprocess.TRANSIENT_STATES & postprocess.TERMINAL_STATES)
+
+
+def _bare_pipeline(db=None):
+    return postprocess.PostprocessPipeline(db=db, events=EventBus(), remote_pool=_FakeRemotePool())
+
+
+async def test_in_flight_holds_the_item_for_exactly_the_length_of_the_run(monkeypatch):
+    pipeline = _bare_pipeline()
+    seen: list[frozenset[int]] = []
+
+    async def _fake_process(item_id, settings=None):  # noqa: ARG001
+        seen.append(pipeline.in_flight_item_ids())
+
+    monkeypatch.setattr(pipeline, "_process_item", _fake_process)
+
+    assert pipeline.in_flight_item_ids() == frozenset()
+    await pipeline.process_item(42)
+    assert seen == [frozenset({42})]
+    assert pipeline.in_flight_item_ids() == frozenset()
+
+
+async def test_a_worker_that_raises_still_releases_the_item(monkeypatch):
+    """The wedge guard: if the item stayed in the set, `core/engine.py` would keep protecting
+    a `VERIFYING`/`EXTRACTING` state with nobody working on it, for the life of the process.
+    """
+    pipeline = _bare_pipeline()
+
+    async def _boom(item_id, settings=None):  # noqa: ARG001
+        raise RuntimeError("worker died mid-extract")
+
+    monkeypatch.setattr(pipeline, "_process_item", _boom)
+
+    with pytest.raises(RuntimeError):
+        await pipeline.process_item(7)
+    assert pipeline.in_flight_item_ids() == frozenset()
+
+    # And through the guarded path the pipeline actually uses (which swallows the exception
+    # so one bad item can't break the others), the item is released just the same.
+    db = await _make_db()
+    try:
+        pipeline.db = db
+        await pipeline._run_guarded(7)
+        assert pipeline.in_flight_item_ids() == frozenset()
+    finally:
+        await db.close()
+
+
+async def test_overlapping_runs_for_one_item_release_only_once_both_are_done(monkeypatch):
+    """`concurrency > 1` allows two triggers for the same item to overlap; the first to finish
+    must not un-protect an item the second is still working on.
+    """
+    pipeline = _bare_pipeline()
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def _slow(item_id, settings=None):  # noqa: ARG001
+        started.set()
+        await release.wait()
+
+    monkeypatch.setattr(pipeline, "_process_item", _slow)
+
+    slow = asyncio.create_task(pipeline.process_item(9))
+    await started.wait()
+
+    async def _fast(item_id, settings=None):  # noqa: ARG001
+        return None
+
+    monkeypatch.setattr(pipeline, "_process_item", _fast)
+    await pipeline.process_item(9)  # the overlapping run finishes first
+    assert pipeline.in_flight_item_ids() == frozenset({9}), "the slow run is still going"
+
+    release.set()
+    await slow
+    assert pipeline.in_flight_item_ids() == frozenset()

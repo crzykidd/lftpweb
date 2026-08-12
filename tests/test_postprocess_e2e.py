@@ -1,16 +1,20 @@
-"""End-to-end verification for phase 5's `move` mode against the **real fake seedbox**
-(DESIGN.md §14) -- real ssh, real sftp, real lftp, real asyncssh delete, wired exactly the way
-`main.py` wires it (`TransferQueue.postprocess` set, triggered from `_reap_one`'s job-success
-path, never called directly). Skipped automatically if the seedbox isn't reachable
+"""End-to-end verification for phase 5's `move` mode, and (this task) the `_UNPACK_` extraction
+staging convention, against the **real fake seedbox** (DESIGN.md §14) -- real ssh, real sftp,
+real lftp, real asyncssh delete, real 7zz/7z, wired exactly the way `main.py` wires it
+(`TransferQueue.postprocess` set, triggered from `_reap_one`'s job-success path, never called
+directly). Skipped automatically if the seedbox isn't reachable
 (`docker compose -f docker-compose.test.yml up -d` first).
 
 This is the phase's own "done when": a `move` queue transfers an item, verifies it, and the
 remote copy is **gone from the seedbox afterwards** -- confirmed by scanning the remote again
-with a fresh `RemoteConnectionPool`, not by trusting `item.remote_deleted_at` alone.
+with a fresh `RemoteConnectionPool`, not by trusting `item.remote_deleted_at` alone. The
+extraction test added by this task has its own "done when": a downloaded archive is extracted
+through the full pipeline exactly as production wires it, and the result on disk carries only
+the merged final content -- no `_UNPACK_`/`_FAILED_` staging directory left behind.
 
 Deliberately does **not** reuse `docker/test-seedbox/seed_tree.sh`'s baked-in fixture files --
 those are shared by every other test in this suite (test_queue.py, test_autoqueue_e2e.py, ...)
-and a `move` queue *deletes its source*. This test uploads its own throwaway file into a
+and a `move` queue *deletes its source*. These tests upload their own throwaway content into a
 dedicated, uniquely-named remote subdirectory over SFTP at setup time instead, so a successful
 run can never affect any other test's fixture data on the same shared container.
 """
@@ -18,12 +22,18 @@ run can never affect any other test's fixture data on the same shared container.
 from __future__ import annotations
 
 import asyncio
+import functools
+import io
+import os
+import shutil
 import socket
+import zipfile
 from uuid import uuid4
 
 import aiosqlite
 import pytest
 
+from lftpweb.core import extract
 from lftpweb.core.events import EventBus
 from lftpweb.core.postprocess import (
     PostprocessPipeline,
@@ -243,6 +253,167 @@ async def test_move_mode_transfers_verifies_and_deletes_the_remote_copy(db, tmp_
     finally:
         # Best-effort cleanup of the throwaway remote subdirectory (harmless if the delete
         # above already removed it).
+        try:
+            await scan_pool.delete_path(host, f"/data/pickup/{remote_subdir}")
+        except Exception:  # noqa: BLE001 - cleanup only
+            pass
+        await scan_pool.close()
+
+
+_SEVEN_ZIP_BIN = os.environ.get("LFTPWEB_7Z_BIN") or next(
+    (b for b in ("7zz", "7z") if shutil.which(b)), None
+)
+
+
+async def test_extract_stages_through_unpack_and_merges_into_final_directory(
+    db, tmp_path, monkeypatch
+):
+    """This task's own e2e coverage: a `copy`-mode queue transfers a directory item containing
+    a zip archive, the pipeline extracts it for real (the dev host's 7z, via `LFTPWEB_7Z_BIN`
+    -- see `tests/test_postprocess.py`'s module docstring), and the only thing left on disk is
+    the merged final content. No `_UNPACK_`/`_FAILED_` directory anywhere under the local root.
+    """
+    if _SEVEN_ZIP_BIN is None:
+        pytest.skip("no 7zz/7z binary on PATH -- `apt-get install 7zip` or similar")
+    # Unlike the unit tests in test_postprocess.py, this goes through the real production call
+    # site (`postprocess.py._do_extract`), which never passes `binary=` -- it relies on
+    # `extract_item`'s default, which (being a plain default argument) is bound to
+    # `extract.DEFAULT_BINARY`'s value at *function-definition* time, so patching the module
+    # attribute afterwards has no effect. Patch the function itself instead: same
+    # accommodation for this dev host's differently-named 7-Zip binary, applied at the one
+    # call site that doesn't expose a parameter for it.
+    monkeypatch.setattr(
+        extract, "extract_item", functools.partial(extract.extract_item, binary=_SEVEN_ZIP_BIN)
+    )
+
+    remote_subdir = f"phase5-extract-e2e-{uuid4().hex[:12]}"
+    rel_path = "Release"
+    archive_buf = io.BytesIO()
+    with zipfile.ZipFile(archive_buf, "w") as zf:
+        zf.writestr("inner.txt", "extracted via the real postprocessing pipeline")
+    archive_content = archive_buf.getvalue()
+
+    scan_pool = RemoteConnectionPool(tmp_path / "known_hosts_scan")
+    host = _host_config()
+    try:
+        conn = await scan_pool.get_connection(host)
+        async with conn.start_sftp_client() as sftp:
+            await sftp.makedirs(f"/data/pickup/{remote_subdir}/{rel_path}", exist_ok=True)
+            async with sftp.open(f"/data/pickup/{remote_subdir}/{rel_path}/payload.zip", "wb") as f:
+                await f.write(archive_content)
+
+        entries, _ = await scan_pool.scan(host, f"/data/pickup/{remote_subdir}")
+        assert f"{rel_path}/payload.zip" in entries, "setup fixture failed to upload"
+        remote_size = entries[f"{rel_path}/payload.zip"].size
+
+        local_dir = tmp_path / "local"
+        local_dir.mkdir()
+        cursor = await db.execute(
+            "INSERT INTO host (name, address, port, username, auth_method, password_enc, "
+            "known_hosts_policy) VALUES ('seedbox', ?, ?, ?, 'password', NULL, 'insecure')",
+            (SEEDBOX_HOST, SEEDBOX_PORT, SEEDBOX_USER),
+        )
+        host_id = cursor.lastrowid
+        cursor = await db.execute(
+            "INSERT INTO path_queue (host_id, name, remote_path, local_path, enabled, "
+            "sync_mode, auto_verify, auto_extract) VALUES "
+            "(?, 'e2e-extract', ?, ?, 1, 'copy', 0, 1)",
+            (host_id, f"/data/pickup/{remote_subdir}", str(local_dir)),
+        )
+        queue_id = cursor.lastrowid
+        cursor = await db.execute(
+            "INSERT INTO item (queue_id, rel_path, is_dir, remote_size, local_size, state) "
+            "VALUES (?, ?, 1, ?, 0, 'REMOTE_ONLY')",
+            (queue_id, rel_path, remote_size),
+        )
+        item_id = cursor.lastrowid
+        await db.commit()
+
+        await save_transfer_settings(
+            db,
+            TransferSettings(
+                max_bandwidth_bps=10_000_000,
+                max_concurrent_transfers=2,
+                small_item_threshold_bytes=0,
+                small_lane_reserve_bps=0,
+                min_share_floor_bps=0,
+                mirror_parallel_transfer_count=2,
+                mirror_use_pget_n=2,
+                pget_default_n=2,
+            ),
+        )
+
+        async def host_provider():
+            return host
+
+        events = EventBus()
+        pipeline_pool = RemoteConnectionPool(tmp_path / "known_hosts_pipeline")
+        # verify is off (copy mode doesn't force it) -- only extraction is under test here.
+        await save_postprocess_settings(
+            db, PostprocessSettings(extract_enabled=True, extract_passwords=())
+        )
+        pipeline = PostprocessPipeline(
+            db=db, events=events, remote_pool=pipeline_pool, host_provider=host_provider
+        )
+
+        q = TransferQueue(
+            db=db,
+            config_dir=str(tmp_path),
+            events=events,
+            run_dir=str(tmp_path / "run"),
+            tick_s=0.2,
+            host_provider=host_provider,
+        )
+        q.postprocess = pipeline
+
+        await q.start()
+        try:
+            await q.enqueue_item(item_id)
+
+            async def job_succeeded():
+                row = await (
+                    await db.execute(
+                        "SELECT state FROM job WHERE item_id = ? ORDER BY id DESC LIMIT 1",
+                        (item_id,),
+                    )
+                ).fetchone()
+                return row is not None and row["state"] == "succeeded"
+
+            assert await _wait_until(job_succeeded, timeout_s=30), "transfer job never succeeded"
+
+            async def extraction_finished():
+                row = await (
+                    await db.execute("SELECT state FROM item WHERE id = ?", (item_id,))
+                ).fetchone()
+                return row is not None and row["state"] in ("EXTRACTED", "EXTRACT_FAILED")
+
+            assert await _wait_until(
+                extraction_finished, timeout_s=30
+            ), "postprocessing never reached a terminal extraction state"
+
+            item_row = await (
+                await db.execute("SELECT state FROM item WHERE id = ?", (item_id,))
+            ).fetchone()
+            assert item_row["state"] == "EXTRACTED"
+
+            events_rows = await (
+                await db.execute("SELECT kind, message FROM event WHERE item_id = ?", (item_id,))
+            ).fetchall()
+            extract_events = [r["message"] for r in events_rows if r["kind"] == "extract"]
+            assert extract_events, "no extract event recorded"
+            assert "1 of 1" in extract_events[0]
+        finally:
+            await q.stop()
+
+        # --- The actual proof: only the merged final content remains on disk ---------------
+        item_dir = local_dir / rel_path
+        assert (
+            item_dir / "inner.txt"
+        ).read_text() == "extracted via the real postprocessing pipeline"
+        assert (item_dir / "payload.zip").exists(), "the source archive is left in place"
+        assert not (local_dir / f"{extract.UNPACK_PREFIX}{rel_path}").exists()
+        assert not (local_dir / f"{extract.FAILED_PREFIX}{rel_path}").exists()
+    finally:
         try:
             await scan_pool.delete_path(host, f"/data/pickup/{remote_subdir}")
         except Exception:  # noqa: BLE001 - cleanup only

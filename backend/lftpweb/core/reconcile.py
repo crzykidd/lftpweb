@@ -63,13 +63,23 @@ def default_counts_predicate(rel_path: str, entry: RemoteEntry) -> bool:  # noqa
 
 @dataclass(frozen=True)
 class ReconciledNode:
-    """One row of the unified model — what `core/engine.py` persists to `item` and what the
-    Files page renders. `remote_size`/`local_size` are `None` when the side is absent.
+    """One row of this module's output — a *candidate* reading of an item, which
+    `core/engine.py._persist` arbitrates against the persisted one before anything is stored
+    or published. `remote_size`/`local_size` are `None` when the side is absent.
+
+    **`structural_state`, not `state`, and the name is load-bearing.** This field is what the
+    remote-vs-local byte comparison says on its own, with no knowledge of a running job
+    (`core/queue.py`), a post-processing outcome (`core/postprocess.py`) or §7.3's
+    `REMOVED_LOCAL` grace period (`core/mount_sentinel.py`) — all three of which routinely
+    win over it. Called `state`, it read as *the* state at every call site, and the engine
+    duly published it to the WebSocket while writing something different to `item`; see
+    `core/itemview.py` for what that cost. Publishing the structural reading now requires
+    explicitly asking for it by name.
     """
 
     rel_path: str
     is_dir: bool
-    state: str
+    structural_state: str
     remote_size: int | None
     local_size: int | None
     remote_mtime: float | None
@@ -154,6 +164,16 @@ def reconcile(
     complete_totals = _rollup(remote_tree, complete_own)
     local_present_totals = _rollup(remote_tree, local_present_own)
 
+    # Disambiguates rule 1's vacuous `relevant == 0` case below (§3.2 rule 8, §4.7 "Directories
+    # with nothing left in them"). `relevant_totals` is 0 both when every remote file under a
+    # directory was excluded by a `file_exclude` pattern *and* when the directory has no remote
+    # files under it at all — the predicate is only ever asked about files that exist, so it
+    # can't tell "excluded" from "nothing to exclude" apart. This rollup counts every remote
+    # *file* under a directory before the predicate runs, so `remote_file_totals.get(path) == 0`
+    # means genuinely nothing remote under here, full stop.
+    remote_file_own: dict[str, int] = {p: (0 if e.is_dir else 1) for p, e in remote_tree.items()}
+    remote_file_totals = _rollup(remote_tree, remote_file_own)
+
     nodes: dict[str, ReconciledNode] = {}
     for path in all_paths:
         is_dir = is_dir_by_path[path]
@@ -171,10 +191,29 @@ def reconcile(
                 complete = complete_totals.get(path, 0)
                 local_present = local_present_totals.get(path, 0)
                 if relevant == 0:
-                    # Rule 1's vacuous case: nothing under this directory counts toward
-                    # completeness (empty, or — once phase 4 wires the predicate — every
-                    # child excluded). §4.7: "vacuously DOWNLOADED", not PARTIAL.
-                    state = STATE_DOWNLOADED
+                    # Rule 1's vacuous case splits two ways that `relevant == 0` alone cannot
+                    # tell apart (see `remote_file_totals` above):
+                    if remote_file_totals.get(path, 0) == 0:
+                        # No remote files anywhere under this directory — a genuinely empty
+                        # remote directory (or one containing only other empty directories).
+                        # DESIGN.md §3.2/§4.7 are silent on this exact case (rule 8's "vacuously
+                        # DOWNLOADED" is about *excluded* children, not an absence of children);
+                        # this task's decision follows the phase 2 precedent one branch up
+                        # (LOCAL_ONLY) and the REMOTE_ONLY-over-PARTIAL call for zero local
+                        # presence: not yet mirrored locally reads REMOTE_ONLY, so it is still
+                        # eligible to be picked up (mirrored, then immediately DOWNLOADED on the
+                        # next scan) rather than reading as permanently, vacuously done.
+                        state = STATE_DOWNLOADED if local_entry is not None else STATE_REMOTE_ONLY
+                    else:
+                        # Remote files exist under here but every one of them was matched by a
+                        # file_exclude pattern. §3.2 rule 8 / §4.7 "Directories with nothing
+                        # left in them": vacuously DOWNLOADED regardless of local presence —
+                        # lftp does not create a directory it has nothing to put in, so
+                        # completeness must not require the local directory to exist. This is
+                        # the load-bearing branch that stops a filtered release sitting
+                        # incomplete and being re-queued on every auto-queue pass (phase 4,
+                        # docs/decisions.md) — do not collapse it back into the branch above.
+                        state = STATE_DOWNLOADED
                 elif complete == relevant:
                     state = STATE_DOWNLOADED
                 elif local_present == 0:
@@ -205,7 +244,7 @@ def reconcile(
         nodes[path] = ReconciledNode(
             rel_path=path,
             is_dir=is_dir,
-            state=state,
+            structural_state=state,
             remote_size=remote_size_totals.get(path) if remote_entry is not None else None,
             local_size=local_size_totals.get(path) if local_entry is not None else None,
             remote_mtime=remote_entry.mtime if (remote_entry is not None and not is_dir) else None,

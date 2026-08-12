@@ -7,6 +7,8 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
+import pytest
+
 from lftpweb.core.mount_sentinel import (
     DEFAULT_GRACE_S,
     SENTINEL_NAME,
@@ -165,3 +167,80 @@ def test_removed_local_is_sticky_regardless_of_mount_state():
     )
     assert state == "REMOVED_LOCAL"
     assert first_missing_at == "2026-01-01T00:00:00.000000Z"
+
+
+# --- ...and the same for every state core/postprocess.py owns (DESIGN.md §3.2, §6) --------
+#
+# Each of the six is only ever written to an item that had already reached DOWNLOADED, so
+# "locally absent now" means exactly what it means for a plain DOWNLOADED item. Leaving them
+# out of the sticky set -- as this module did until the post-processing states were made to
+# survive a rescan at all -- would persist a fresh REMOTE_ONLY for them instead, and
+# auto-queue would re-download every release an *arr importer had just moved out.
+
+
+@pytest.mark.parametrize(
+    "prev_state",
+    ["DOWNLOADED", "VERIFYING", "VERIFIED", "CORRUPT", "EXTRACTING", "EXTRACTED", "EXTRACT_FAILED"],
+)
+def test_every_complete_local_state_starts_the_clock_and_holds_itself(prev_state):
+    state, first_missing_at = resolve_absence(
+        prev_state=prev_state,
+        prev_first_missing_at=None,
+        structural_state="REMOTE_ONLY",
+        mount_ok=True,
+        now=datetime.now(UTC),
+    )
+    # The item keeps reading CORRUPT/EXTRACT_FAILED/... during the window rather than being
+    # downgraded to DOWNLOADED first: the failure a user needs to see must not be lost on the
+    # way to REMOVED_LOCAL.
+    assert state == prev_state
+    assert first_missing_at is not None
+
+
+@pytest.mark.parametrize(
+    "prev_state",
+    ["DOWNLOADED", "VERIFYING", "VERIFIED", "CORRUPT", "EXTRACTING", "EXTRACTED", "EXTRACT_FAILED"],
+)
+def test_every_complete_local_state_reaches_removed_local_after_the_grace_period(prev_state):
+    now = datetime.now(UTC)
+    started = (now - timedelta(seconds=DEFAULT_GRACE_S + 1)).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    state, first_missing_at = resolve_absence(
+        prev_state=prev_state,
+        prev_first_missing_at=started,
+        structural_state="REMOTE_ONLY",
+        mount_ok=True,
+        now=now,
+    )
+    assert state == "REMOVED_LOCAL"
+    assert first_missing_at == started
+
+
+@pytest.mark.parametrize("prev_state", ["VERIFIED", "CORRUPT", "EXTRACTED", "EXTRACT_FAILED"])
+def test_the_mount_gate_applies_to_post_processing_states_too(prev_state):
+    state, first_missing_at = resolve_absence(
+        prev_state=prev_state,
+        prev_first_missing_at=None,
+        structural_state="REMOTE_ONLY",
+        mount_ok=False,
+        now=datetime.now(UTC),
+    )
+    assert state == prev_state
+    assert first_missing_at is None  # a dropped mount never starts the clock
+
+
+@pytest.mark.parametrize("prev_state", ["VERIFIED", "CORRUPT", "EXTRACTED", "EXTRACT_FAILED"])
+@pytest.mark.parametrize("structural_state", ["DOWNLOADED", "PARTIAL"])
+def test_presence_is_not_this_functions_decision(prev_state, structural_state):
+    # Content still present is not absence: whether an outcome outranks a fresh DOWNLOADED is
+    # decided by core/postprocess.py.outcome_survives_rescan, applied by core/engine.py before
+    # this function is consulted. Returning None here keeps the two halves from overlapping.
+    assert (
+        resolve_absence(
+            prev_state=prev_state,
+            prev_first_missing_at=None,
+            structural_state=structural_state,
+            mount_ok=True,
+            now=datetime.now(UTC),
+        )
+        is None
+    )

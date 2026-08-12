@@ -9,6 +9,7 @@ export const NAV_ITEMS: NavItem[] = [
   { path: '/files', label: 'Files' },
   { path: '/transfers', label: 'Transfers' },
   { path: '/history', label: 'History' },
+  { path: '/dashboard', label: 'Dashboard' },
   { path: '/settings', label: 'Settings' },
 ]
 

@@ -19,7 +19,7 @@ from lftpweb.core.postprocess import (
     load_postprocess_settings,
     save_postprocess_settings,
 )
-from lftpweb.core.remote import HostConfig
+from lftpweb.core.remote import HostConfig, parse_connection_limit
 from lftpweb.models import (
     HostIn,
     HostOut,
@@ -46,7 +46,7 @@ router = APIRouter(prefix="/api/settings")
 async def _get_host_row(db):
     cursor = await db.execute(
         "SELECT id, name, address, port, username, auth_method, key_path, password_enc, "
-        "known_hosts_policy FROM host ORDER BY id LIMIT 1"
+        "known_hosts_policy, connection_overrides FROM host ORDER BY id LIMIT 1"
     )
     return await cursor.fetchone()
 
@@ -63,6 +63,14 @@ def _host_out_from_row(row, credentials_need_reentry: bool = False) -> HostOut:
         has_password=bool(row["password_enc"]),
         known_hosts_policy=row["known_hosts_policy"],
         credentials_need_reentry=credentials_need_reentry,
+        # Read-only surfacing of DESIGN.md §4.5/§9.3's "first-class, host-level"
+        # net:connection-limit -- see core/remote.py.parse_connection_limit's docstring for
+        # why this is dug out of the `connection_overrides` JSON blob rather than a real
+        # column, and docs/decisions.md (2026-08-12) for the divergence this papers over.
+        # There is still no `HostIn` field to *set* it -- only Settings → Transfer's
+        # connection-count warning reads this, and it reads only what happens to already be
+        # in the blob (nothing today writes to it via the UI).
+        net_connection_limit=parse_connection_limit(row["connection_overrides"]),
     )
 
 
@@ -466,6 +474,11 @@ async def pattern_preview(
     *unsaved* pattern set in the request body against the queue's current remote tree
     (`engine.models`), never against what's actually stored in the `pattern` table. Patterns
     are the feature most likely to be subtly wrong; this is the cheap fix.
+
+    `engine.models` holds `core/itemview.py` projections (plain dicts) rather than
+    `ReconciledNode` objects -- see that module for why the engine caches what it persisted
+    instead of what it reconciled. Only `rel_path` and `is_dir` are read here, and neither is
+    affected by which of the two the model happens to be.
     """
     engine = request.app.state.engine
     nodes = engine.models.get(queue_id)
@@ -483,9 +496,9 @@ async def pattern_preview(
     for rel_path, node in sorted(nodes.items()):
         if "/" in rel_path:
             continue  # only top-level entries are "items" (DESIGN.md §4.7)
-        matched = compiled.item_matches(rel_path, is_file=not node.is_dir)
-        items.append(PatternPreviewItem(rel_path=rel_path, is_dir=node.is_dir, matched=matched))
-        if node.is_dir:
+        matched = compiled.item_matches(rel_path, is_file=not node["is_dir"])
+        items.append(PatternPreviewItem(rel_path=rel_path, is_dir=node["is_dir"], matched=matched))
+        if node["is_dir"]:
             # Prefer sampling a directory that would actually be picked up -- that's the one
             # a user editing patterns wants to see the file-level effect on. Fall back to any
             # directory item if nothing matched, so the sample panel isn't just empty.
@@ -500,7 +513,7 @@ async def pattern_preview(
     if sample_item is not None:
         prefix = f"{sample_item}/"
         for rel_path, node in sorted(nodes.items()):
-            if node.is_dir or not rel_path.startswith(prefix):
+            if node["is_dir"] or not rel_path.startswith(prefix):
                 continue
             basename = rel_path.rsplit("/", 1)[-1]
             sample_files.append(

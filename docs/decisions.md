@@ -6,6 +6,799 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-12 — The `item` table is the single authority for item state: the WebSocket now
+## publishes a projection of the database, `ReconciledNode.state` became `structural_state`,
+## and all four item-view implementations collapsed into one
+
+**Handoff prompt `prompts/2026-08-12-ws-publishes-persisted-state.md`, executed end to end.**
+`Engine.scan_queue` diffed and published `core/reconcile.py`'s *structural* nodes while
+`_persist` wrote a possibly different state to `item`, so the wire and the database disagreed
+for every row `_persist` overrode — a `REMOVED_LOCAL` item, or one held `DOWNLOADED` through
+§7.3's grace window, has been published as `REMOTE_ONLY` (Queue button and all) since phase 4,
+while `GET /api/files` showed the truth. Recorded as point 7 of the post-processing entry
+below, where it was found.
+
+**1. The rule adopted, and the cheaper fix rejected.** The rule is *the `item` table is the
+single authority for item state; the in-memory model is a cache **of** it; nothing publishes a
+value it did not read back.* **Rejected: have `_persist` return the states it wrote and patch
+them onto the in-memory nodes before diffing** — fewer lines and it fixes today's symptom, but
+it leaves two places computing what an item's state is, kept in agreement by remembering to,
+which is exactly how this bug arose. The order in `scan_queue` is now the invariant: reconcile
+→ persist → **read back** → diff → publish.
+
+**2. `_refresh_item_ids` became `_project`, widened rather than added.** That method already
+ran `SELECT id, rel_path FROM item WHERE queue_id = ?` once per scan, after the upsert, for
+every node in the tree. It now selects the display columns too (`core/itemview.py`'s
+`ITEM_VIEW_COLUMNS`) and returns `rel_path -> ItemView`, which becomes `Engine.models`. No new
+query, no extra round trip, no asymptotic change — `reconcile` is already O(tree). Every field
+the wire carries was verified to be an `item` column first; two need conversion on the way out
+(`is_dir` is 0/1, and `remote_mtime` lives in a TEXT-affinity column so a float written in
+comes back a string), which is one more reason it belongs in a single shared function.
+
+**3. `_project` filters to the `rel_path`s `_persist` just wrote, and that filter is
+load-bearing — not tidiness.** Nothing ever deletes an `item` row (§3.2 rule 6 keeps
+`REMOVED_BOTH` as history; every other vanished path simply stops being upserted). An
+unfiltered projection would therefore resurrect rows that had left both trees *and* leave
+`diff_nodes`'s `removed` list permanently empty, since a row that is never deleted can never
+disappear from the projection. `_persist` now returns the set it wrote. The published node set
+is consequently identical to the pre-change one; only the *values* changed source. **This
+leaves one difference between the two views intentionally unclosed:** `GET /api/files` returns
+every persisted row for a queue, the socket returns the current scan's node set, so a stale row
+for a path that has left both trees appears in REST and not on the socket. Confirmed live (27
+REST rows vs. 6 socket nodes against the dev seedbox, whose contents changed under earlier
+testing). That is a question about *row lifetime*, not about who owns `state`, and answering it
+means deciding when an `item` row may be deleted — out of scope here, worth its own task.
+
+**4. `snapshot()` re-reads the database and is now `async`.** Serving the cached model would
+have left the reload path — the way this bug is actually visible to a user — still able to
+disagree: `core/queue.py` and `core/postprocess.py` write `item.state` the instant a job or a
+pipeline step moves, and a client connecting after that push but before the next scan (up to
+30s) would get a snapshot older than the database. One query per queue per *connection* is
+nothing; `api/ws.py` awaits it. Accepted, minor: because `api/ws.py` subscribes before
+snapshotting, a fresh snapshot can now be marginally *newer* than an already-queued
+`item_delta`, which then re-applies an equal-or-slightly-older value for one row. The window is
+a single await, the client merge is last-write-wins per `rel_path`, and the next tick corrects
+it. **Rejected: snapshot before subscribing**, which trades that for genuinely losing updates.
+
+**5. The rename is the part that prevents recurrence.** `ReconciledNode.state` →
+`structural_state`. As `state` it read as *the* state at every call site, which is precisely
+how the engine came to publish it; asking for the structural value now requires naming it.
+Call sites: `core/reconcile.py` (the dataclass and its one constructor), `core/engine.py`
+(`_persist`'s four reads), `tests/test_reconcile.py` (31 assertions), `tests/test_settings_api.py`.
+`core/mount_sentinel.resolve_absence`'s parameter was *already* called `structural_state` — the
+vocabulary existed at the boundary and simply hadn't reached the dataclass.
+
+**6. Four implementations of the item view collapsed into one — `core/itemview.py`.**
+`Engine.serialize_node`, `TransferQueue._publish_item_state`, `PostprocessPipeline._publish`
+and `api/files.py` each built the same seven-key dict by hand. The prompt asked only for
+`api/files.py`; the other two were the same duplication and the same drift risk (the engine's
+copy is the one that drifted), so all four now call `item_view(row)`. `models.FileNode`'s
+fields are exactly its keys, so the REST path is `FileNode(**item_view(row))`. The module is a
+dependency-free leaf, so no import cycle: engine/queue/postprocess/api all import *it*.
+
+**7. Scan path vs `item_delta` — which transitions each covers, and why no second mechanism
+was created.** They partition by *what causes* the transition, not by which state it is:
+
+- **`item_delta` covers writer-driven transitions** — `core/queue.py` (QUEUED, DOWNLOADING,
+  STOPPED, FAILED, DOWNLOADED on reap, plus the ~1 Hz `local_size` tick) and
+  `core/postprocess.py` (the six §6 states). The writer knows the instant it changes something
+  and pushes exactly one row, sub-second. Nothing here changed.
+- **The scan path covers scan-derived transitions** — everything `_persist` *arbitrates* rather
+  than is told: §7.3's grace period expiring into `REMOVED_LOCAL`, the mount gate holding a
+  last-known-good state, `outcome_survives_rescan` reasserting an outcome over a fresh
+  structural reading, and the plain structural changes it always covered. **These have no
+  writer to push them** — no module "decides" a grace period elapsed; a scan observes it. Before
+  this change they reached the wire not at all, because the structural node they were derived
+  from was byte-identical to the previous scan's, so `diff_nodes` saw nothing.
+
+So the scan path gained no new *responsibility* — `queue_delta` already fired on every scan and
+already carried changed rows; it now carries the value that was persisted instead of the one
+that was proposed. The overlap is that a writer-driven transition already delivered by
+`item_delta` will also appear in the next scan's `queue_delta`, because the diff baseline
+(`Engine.models`) is only refreshed on a scan. That is at most one extra row per changed item,
+carrying the identical value the client already merged into the same `rel_path` key.
+**Rejected: having `core/queue.py` update `Engine.models` when it writes**, to suppress that
+duplicate — it would put a second writer on the engine's diff baseline and reintroduce exactly
+the cross-module "keep these two in agreement" coupling this task removes, to save a few
+hundred bytes every 30 seconds.
+
+**8. The delta-size property (phase 3b) is preserved and now proven under overrides.** Making
+effective-state changes visible to the diff is the point, and the tempting way to make the wire
+agree with the database — re-send more rows — is the named regression here. The new
+`test_published_state_is_the_persisted_state_not_the_structural_one` runs at `n = 20` and
+`n = 5000` with four items carrying a post-processing outcome, a protected job-lifecycle state,
+an expiring grace period and a plain structural state: exactly the three whose *persisted* state
+changed are sent, the payload stays under 2 KB at both sizes, and every node on the wire is
+asserted equal to its `item.state` row — in the delta and in the connect-time snapshot alike.
+The pre-existing 20-vs-5000 assertions are untouched and still pass.
+
+**9. Tests: 486 → 489.** Three added to `tests/test_ws_deltas.py` (the parametrized invariant
+above, plus `test_snapshot_reflects_a_lifecycle_write_made_since_the_last_scan` for the reload
+path with no scan in between). `uv run ruff format --check .` and `uv run ruff check .` both
+clean. Verified live against the running dev stack over `ws://localhost:8087/api/ws`: the
+connect snapshot and a reconnect both carry `FAILED` and two `REMOVED_LOCAL` nodes — the exact
+states that were published as `REMOTE_ONLY` before — and every WS node matches `GET /api/files`
+field-for-field (0 mismatches over 6 nodes). Idle `queue_delta`s stayed at 144 bytes with
+`changed=0`. No browser exists here; the Files page itself was not rendered.
+
+**10. `DESIGN.md` §2/§9 say nothing about which of the two readings is published** and should —
+proposed wording is in the session report; not edited here, per the prompt.
+
+---
+
+## 2026-08-12 — Files tree Expand all / Collapse all — disabled while a filter is active,
+## selection already survives collapse for free
+
+**Handoff prompt `prompts/2026-08-12-files-expand-collapse-all.md`, executed end to end.**
+Added `expandAll`/`collapseAll` to `FileTree.tsx`, two peer buttons next to the existing
+search/state filter controls. `collapsed` (`useState<Set<string>>`, defaults empty/expanded)
+made expand-all a plain `setCollapsed(new Set())`; collapse-all fills it from `fullFlat` — the
+component's existing full, uncollapsed flatten of the whole tree (built for the filter and
+selection-survival reasons in the phase 9 entry below) — filtered to `is_dir` and mapped to
+`rel_path`. Both are single `Set` replacements, O(tree size), no DOM walking, no per-row
+effects, matching the prompt's ask directly.
+
+**1. Both controls are `disabled` (not hidden) while a text/state filter is active.** Phase 9
+made filtering ignore `collapsed` entirely — while a filter is active, `flat` is built from
+`visiblePaths` over the fully-expanded `fullFlat`, so collapse state has zero visible effect on
+the rendered rows (see phase 9's decision #3, below). Clicking "Collapse all" mid-filter would
+therefore appear to do nothing, then silently apply itself the instant the user clears the
+filter and the tree snaps shut without them having asked for that *now*. Disabling with a
+`title` ("Clear filters to change collapse state") makes that invisible-state problem legible
+instead of shipping a control that quietly no-ops. **Rejected: let it act while filtering,
+since collapse state is technically still just a `Set` update.** Correct mechanically, but
+reintroduces exactly the "confusing, non-obvious failure mode" phase 9's own filter design was
+written to avoid — acting on state the user cannot currently see.
+
+**2. Disabled (not hidden) when the tree has no directories at all**, via a new `hasDirectories
+= fullFlat.some(e => e.is_dir)` memo. Kept both buttons always mounted (rather than
+conditionally rendering them away) so the toolbar's layout doesn't shift based on tree shape,
+consistent with how the bulk-action buttons in this same file stay mounted and toggle
+`disabled` on `bulkBusy` rather than unmounting.
+
+**3. Selection needed no changes to survive collapse — verified, not assumed.** `selected` is a
+`Set<string>` of paths; `selectedEntries` and the bulk-action bar's count are both derived via
+`byPath`, which is built from `fullFlat` (every node, collapse-independent), never from `flat`
+(the collapse/filter-respecting render list). Collapsing or expanding — one directory at a time
+or all at once — never touches `selected`, so a selected node inside a newly-collapsed
+directory stays selected and still counts toward "N selected" even though its row is no longer
+rendered. The one place `flat` *does* matter for selection is shift-range (`toggleSelect`'s
+`fromIdx`/`toIdx` lookup), which — unchanged by this task — only spans currently-*visible* rows,
+identical to the pre-existing single-directory-collapse behavior; collapse-all does not make
+shift-range select hidden rows, it just changes which rows are visible to shift-range over,
+exactly as one-at-a-time collapsing already did.
+
+---
+
+## 2026-08-12 — Throughput metrics store and the Dashboard page: two tables (samples +
+## heartbeat) for idle-vs-down, per-job `bytes_start`-relative deltas for the non-monotonic
+## trap, and covering indexes proven at ~430k rows
+
+**Handoff prompt `prompts/2026-08-12-throughput-metrics-and-dashboard.md`, executed end to
+end.** lftpweb stored no metrics before this (`core/progress.py`'s speed/ETA was in-memory
+only). Added `core/metrics.py` (a 30s sampler decoupled from the ~1 Hz transfer tick,
+retention/pruning), migration `005_throughput_metrics.sql`, `api/metrics.py`
+(`/api/metrics/throughput`, `/api/settings/metrics`), and a new Dashboard page with two
+hand-rolled SVG charts. Every decision the prompt asked to be recorded:
+
+**1. Schema: `metric_sample(queue_id, ts, bytes_delta)` plus a *separate* `metric_heartbeat(ts)`
+table, not one row per queue per interval.** `metric_sample` gets a row only when a queue's
+running jobs moved a nonzero number of bytes in the ~30s window; `metric_heartbeat` gets
+exactly one row every sample tick, unconditionally, whether or not anything was transferring.
+Idle (heartbeats continue, no `metric_sample` row for a queue) and down (no heartbeat at all
+for a stretch of time) are told apart by which of the two tables has rows for a given moment —
+never by writing an explicit zero. **Rejected: a heartbeat *column* on a per-queue zero row
+instead of a second table.** Would still mean writing a row per queue per interval regardless
+of activity — exactly the "inflates the table for an instance that transfers nothing" the
+prompt warned against — for no benefit over one small, queue-independent table.
+
+**2. Two covering indexes, chosen for the two query shapes, proven with EXPLAIN QUERY PLAN and
+benchmarked at real scale.** `idx_metric_sample_queue_ts (queue_id, ts, bytes_delta)` for "one
+queue's series over a time range"; `idx_metric_sample_ts_queue (ts, queue_id, bytes_delta)`
+for "site total over a time range, bucketed" (no `queue_id` filter, `GROUP BY bucket,
+queue_id`). Both are fully covering — every column either query touches is in the index, so
+SQLite never has to read the base table. Seeded a throwaway database at 30 days × 5 queues ×
+30s (432,000 `metric_sample` rows, ~50–100% queue-fill density tried both ways) and ran both
+shapes:
+
+```
+Query 1 (site total, hourly buckets, last 24h, all 5 queues active — 14,400 rows in range):
+  EXPLAIN QUERY PLAN: SEARCH metric_sample USING COVERING INDEX idx_metric_sample_ts_queue
+                       (ts>? AND ts<?);  USE TEMP B-TREE FOR GROUP BY
+  best 4.14 ms / avg 4.45 ms over 5 runs — single-digit ms, as the prompt required.
+
+Query 1, worst case (same shape, full 30-day retention window, 432,000 rows in range):
+  same covering-index plan; best 147.28 ms — never issued by the product (UI caps at 24h) but
+  confirms the index still avoids a table scan at the full retention ceiling.
+
+Query 2 (one queue, 1-minute buckets, last 1h — 60 rows in range):
+  EXPLAIN QUERY PLAN: SEARCH metric_sample USING COVERING INDEX idx_metric_sample_queue_ts
+                       (queue_id=? AND ts>? AND ts<?);  USE TEMP B-TREE FOR GROUP BY
+  best 0.12 ms / avg 0.13 ms.
+
+Query 2, worst case (one queue, hourly buckets, full 30-day window, 86,400 rows in range):
+  same covering-index plan; best 23.80 ms.
+
+prune_metrics (retention_days=7, deletes ~23 of 30 days from the full 432k-row db): 372 ms —
+runs from an hourly background loop, never on a request path.
+```
+
+No `SCAN` (full table scan) in any plan. The `USE TEMP B-TREE FOR GROUP BY`/`FOR DISTINCT`
+steps are unavoidable — the bucket boundary is a computed expression of `ts`
+(`(CAST(strftime('%s', ts) AS INTEGER) / ?) * ?`), and SQLite can't use a plain index to
+pre-sort by an expression it has to evaluate per row — but they operate only on the rows the
+covering index already narrowed down to, which is why the timings stay small even at the
+worst-case end. Benchmark script and raw output not committed (throwaway, per the prompt);
+reproducible from `core/metrics.py`'s own query functions.
+
+**3. Sample interval 30s, via a tick counter on `TransferQueue.tick()`, not a second
+`asyncio` timer.** `ThroughputSampler.tick()` is called every real transfer-queue tick
+(~1 Hz, DESIGN.md §4.4) and only acts — writes a heartbeat, and any nonzero per-queue
+`metric_sample` rows — every 30th call. Two reasons this beats a wall-clock check
+(`BackupScheduler`'s pattern): it piggybacks on a loop that already exists instead of opening a
+second one, and it can't drift out of step with the transfer engine's own notion of a "tick"
+the way two independent `asyncio.sleep` loops eventually do. If `transfer_tick_s` is ever
+reconfigured, the sample cadence scales with it (still 30 ticks) instead of silently
+decoupling from it.
+
+**4. The non-monotonic trap, closed by tracking `bytes_done - bytes_start` per job, not
+`bytes_done` alone, keyed by job id.** `job.bytes_done` is the *absolute* local footprint
+`core/progress.py` measures for a running job's `local_root` — not a per-job delta — so a
+retried transfer's new job row starts life already holding whatever the failed attempt left on
+disk (`-c` resumes, it doesn't restart from zero). Differencing `bytes_done` across ticks by
+job id alone means the moment a job is retried, the new job id's first `bytes_done` already
+includes bytes an *earlier, different* job moved — a phantom spike. Fixed by tracking
+`bytes_done - bytes_start` (mirroring `job.bytes_start`, already written at spawn time by
+`core/queue.py._admit`) per job id: this quantity is zero at a job's first tick and can only
+grow with bytes *that job* itself moved, so a retry's new job id starts its own tracking at
+zero and can never inherit a dead job's history. `_RunningProcess` grew a `bytes_start` field
+(mirroring the same value already written to `job.bytes_start`) so `TransferQueue._sample_metrics`
+never needs a second DB read to feed this.
+
+**A job's *first* sample is deliberately NOT "no history, delta 0."** The naive-looking
+alternative — `prev is None` ⇒ delta 0 — would silently drop whatever a job moved in its first
+~30s window. Since `bytes_done - bytes_start` already excludes everything on disk before that
+job started, the whole first-sighting amount is real, newly-moved data belonging to that job,
+not history inherited from whichever job ran before it. Pinned by
+`tests/test_metrics.py::test_job_restarting_mid_flight_produces_no_negative_or_inflated_sample`:
+job 1 accumulates 8 MB and dies; job 2 resumes (`bytes_start=8_000_000`) and moves 2 MB more;
+the two recorded samples are `[8_000_000, 2_000_000]` — no negative, no 10 MB phantom spike,
+and the two deltas sum to exactly what was ever on disk.
+
+**5. Retention: `MetricsSettings.retention_days` (default 7, max 30), same `setting`-table
+JSON pattern as `BackupSettings`/`TransferSettings`, pruned by `MetricsRetentionScheduler` —
+same `_task`/`start()`/`stop()` shape as `BackupScheduler`, but with no "was one already taken"
+due-check.** Pruning is an idempotent, cheap `DELETE ... WHERE ts < cutoff` (unlike taking a
+backup, a real and costly action) — the scheduler just runs on a fixed hourly cadence.
+Out-of-range values are a 422 at `PUT /api/settings/metrics`, not a silent clamp — verified
+live: `31` and `0` both rejected, `14` round-trips.
+
+**6. Bucket widths per range, chosen so the two charts agree on the 24h case and the point
+count stays readable at every range:** 1h → 60 × 1-minute buckets; 12h → 48 × 15-minute
+buckets; 24h → 24 × 1-hour buckets — the same hourly width the bytes-per-hour bar chart
+always uses, so "one bar" and "one point on the 24h speed line" mean the same slice of time.
+
+**7. One endpoint, `GET /api/metrics/throughput?range=&queue_id=`, serves both query shapes
+via an optional filter — mirroring `api/history.py`'s convention rather than adding a second
+endpoint.** Omitted `queue_id` is the "site total, bucketed, broken down by queue" shape
+(index 2); a real `queue_id` is the "one queue's series" shape (index 1). The Dashboard's
+Chart 2 grew a queue selector (site total / one queue) specifically so this second shape has a
+real caller in the UI, not just a code path exercised only by tests.
+
+**8. Dashboard: two hand-rolled inline-SVG charts, no charting dependency** (decision 3,
+already made) — `frontend/src/components/charts/{BytesPerHourChart,SpeedLineChart}.tsx`, a
+small `queueColors.ts` (fixed categorical color order by queue id, per the dataviz skill:
+"assign categorical hues in fixed order, never cycled" — a filter or queue-selector change
+never repaints a queue's own color), and `chartTheme.css` (the skill's validated default
+palette, as CSS custom properties riding the app's existing `.dark` ancestor-class strategy,
+not a second dark-mode mechanism). **Down renders as a gap in both charts, never a zero**: the
+bar chart draws a short muted dash at the baseline instead of a bar; the line chart breaks the
+path into separate `<path>` segments at every down bucket rather than interpolating or
+dropping to zero. Both degrade to an explicit "No throughput data yet" panel with no data at
+all, and both carry a `sr-only` data table alongside the SVG as the accessible text
+alternative (this project had no prior chart to establish the convention from, so this pairing
+— visual chart + hidden table with the same numbers — is the one adopted here). **Simplified
+relative to the dataviz skill's full mark/interaction spec, flagged rather than silently
+shipped:** native SVG `<title>` tooltips instead of a custom crosshair/hover-tooltip layer, and
+uniform corner rounding instead of "rounded data-ends anchored to the baseline only" — both
+accepted trade-offs against the no-dependency, hand-rolled-SVG constraint and this task's time
+budget, not overlooked.
+
+**9. Chart 2 (speed) renders exactly one line at a time — site total or one selected queue,
+never several lines at once.** The prompt's own wording for Chart 2 ("speed over time, line
+chart, with a 1h/12h/24h selector") is narrower than Chart 1's explicit "stacked or grouped per
+queue with a site total." A single-series line needs no legend box (the dataviz skill: "a
+single series needs no legend box — the title names it"), and a queue selector doing real work
+is what gives the "one queue's series" query shape (decision 7) a genuine caller instead of an
+endpoint feature nothing in the UI exercises. **Rejected: N simultaneous per-queue lines,
+matching Chart 1's breakdown.** Would exercise the breakdown query shape a second time (Chart
+1 already does), needs a legend, and multiplies the "which line is which" cognitive load on a
+chart whose whole point is "how fast, right now" — a queue-scoped drill-down reads more useful
+than an always-on multi-line tangle for that question.
+
+**10. Verified against the running dev stack, not just `pytest`.** `docker compose -f
+docker-compose.dev.yml restart backend` (explicitly permitted — leaves the stack running, per
+the prompt) picked up the migration automatically (`db.py.migrate()`'s own pre-migration
+backup fired, unconditionally, as it does for every migration). Confirmed live over real HTTP:
+`GET/PUT /api/settings/metrics` round-trips and rejects `0`/`31`; `GET
+/api/metrics/throughput?range=24h|1h` returns pre-bucketed JSON with `up`/`total_bytes`/
+`by_queue` per bucket; `range=bogus` is a 422. Watched the real sampler run live inside the
+container (`docker exec ... python3 -c "sqlite3..."`): 21 `metric_heartbeat` rows accumulated
+in the ~10 minutes after restart, spaced ~30s apart, `metric_sample` at 0 rows the whole time
+(the dev stack's one queued job is `SPAWN_FAILED` on a missing host key — pre-existing,
+unrelated to this task — so nothing actually transferred to produce a nonzero delta; the
+heartbeat-only behavior is exactly the idle case this design exists to render honestly). Every
+new frontend module (`DashboardPage.tsx`, both chart components, `queueColors.ts`,
+`chartTheme.css`) resolves through the frontend container's live Vite dev server at 200 with
+no transform errors. **Not verified — no browser exists in this environment, stated per every
+UI phase's own standing caveat:** the charts have never been visually confirmed to render, lay
+out, or look correct in either theme; only confirmed to type-check (`tsc -b`), build (`vite
+build`), lint (`oxlint`) clean, and transform without error through the real dev server, with
+every endpoint they call independently verified over HTTP above.
+
+**11. `DESIGN.md` gap, flagged rather than edited (per the prompt, the user decides doc
+changes) — proposed wording for a new §10.4 "Dashboard and metrics" section, and a `metrics`
+row added to §2's component table, is in the session report.** DESIGN.md currently has no
+Dashboard page (§9.2's page list is Files/Transfers/History/Settings) and no metrics store
+(§3.1's schema doesn't mention `metric_sample`/`metric_heartbeat`).
+
+**Backend tests (`tests/test_metrics.py`, `tests/test_metrics_api.py`, both new; 3 lines added
+to `tests/test_auth_api.py`'s `PROTECTED_ROUTE_TEMPLATES` for the two new routes, required by
+its own drift-detection test).** `uv run ruff format --check .` and `uv run ruff check .` both
+clean, repo-wide. Full `uv run pytest`: 486 passed (461 + 25 net new), no regressions.
+
+**Files touched that were already dirty before this session (queue_name/postprocess/transfer-
+settings work, none of it reverted or tidied) — only additive edits layered on top:**
+`backend/lftpweb/core/queue.py` (`_RunningProcess.bytes_start`, `self.metrics`,
+`_sample_metrics()`), `backend/lftpweb/main.py` (router + retention-scheduler wiring),
+`backend/lftpweb/models.py` (`Metrics*` models), `frontend/src/api/client.ts`/`types.ts`
+(`getThroughput`/`getMetricsSettings`/`putMetricsSettings`/`Metrics*` types). Two files
+appeared modified *during* this session that this task did not touch —
+`backend/lftpweb/logsetup.py` (third-party log-level floors) and `README.md` — left
+untouched, per the same "not yours" rule the prompt states for the files it names explicitly.
+
+---
+
+## 2026-08-12 — A genuinely empty remote directory now reads `REMOTE_ONLY`, not vacuously
+## `DOWNLOADED` — told apart from "every child excluded" via a second rollup, not local
+## presence
+
+**Handoff prompt `prompts/2026-08-12-empty-remote-directory-state.md`, executed end to end.**
+Reported by the user against the running dev instance: an empty directory on the seedbox
+showed up in Files as `DOWNLOADED` even though it had never been mirrored locally at all.
+`core/reconcile.py`'s `relevant == 0` branch (rule 1's vacuous case) was unconditionally
+`DOWNLOADED` — correct when every child was excluded by a `file_exclude` pattern (§3.2 rule
+8, §4.7), wrong when the directory simply has nothing under it.
+
+**The two cases were told apart with a new rollup counting raw remote files, not local
+presence.** `relevant_own`/`relevant_totals` are 0 in both cases, because `relevant_own` is 0
+both for an excluded file and for a directory with no files at all — the completeness
+predicate is only ever asked about files that exist, so it can't distinguish "excluded" from
+"nothing to exclude." Added `remote_file_totals`, a rollup (via the module's existing
+`_rollup` idiom, same pattern as `relevant_totals`/`complete_totals`/`local_present_totals`)
+of every remote *file* under a directory, counted *before* the predicate runs. `relevant == 0
+and remote_file_totals == 0` means genuinely nothing remote under here at all; `relevant == 0
+and remote_file_totals > 0` means files exist but every one was excluded — the existing,
+load-bearing DOWNLOADED behavior, unchanged.
+
+**Why a local-presence-only fix was rejected.** The obvious-looking fix — "if `relevant == 0`
+and nothing exists locally, it's REMOTE_ONLY" — cannot tell the two cases apart at all: an
+all-excluded directory (§4.7 "Directories with nothing left in them") *also* legitimately has
+zero local presence, because lftp never creates a directory it has nothing to put in. Keying
+the fix on local presence would flip that case to REMOTE_ONLY too, making a filtered release
+sit incomplete forever and re-queued on every auto-queue pass — exactly the infinite loop
+phase 4's `EXCLUDED` state exists to prevent. `remote_file_totals` is computed from the remote
+tree alone, independent of what's on disk, so it cannot be fooled by that coincidence.
+
+**The empty-directory rule: not-yet-mirrored is `REMOTE_ONLY`, mirrored is `DOWNLOADED` — no
+depth-based special case.** `state = STATE_DOWNLOADED if local_entry is not None else
+STATE_REMOTE_ONLY`, using the directory's own local entry, the same way the `LOCAL_ONLY`
+branch immediately above it uses the directory's own remote entry. This falls out identically
+at any nesting depth: a remote directory containing only other empty directories has
+`remote_file_totals == 0` at every level, so each one independently reads REMOTE_ONLY until
+mirrored, DOWNLOADED once it is — pinned by
+`test_nested_empty_directories_each_follow_the_same_rule_independently`. One consequence
+worth flagging: because directory rollups only ever sum *files* (rule 1's own scope — dirs
+contribute 0 to `relevant`/`complete`), a new empty subdirectory appearing under an
+already-`DOWNLOADED` item never flips that item's own state to PARTIAL/REMOTE_ONLY the way a
+new real file would — so a nested empty directory added after the fact can sit REMOTE_ONLY
+indefinitely, since auto-queue only evaluates *top-level* items and this one's parent is
+already DOWNLOADED and therefore ineligible. In practice this shouldn't arise from normal
+`mirror -c` operation (mirror creates the full directory tree, empty subdirs included, as
+part of a transfer), only if the remote grows a new empty directory under an item that was
+already fully downloaded before this fix shipped. Not fixed here — out of this task's scope
+(the task is the `relevant == 0` branch, not directory-rollup semantics) and not something
+`core/autoqueue.py`'s top-level-only eligibility query can address without also changing what
+"eligible" means for a non-top-level path.
+
+**Checked downstream, per the prompt.** `core/autoqueue.py`'s `ELIGIBLE_STATES =
+("REMOTE_ONLY", "PARTIAL")` and its query is scoped to top-level items only (`instr(rel_path,
+'/') = 0`). A top-level directory that is genuinely empty on the remote and now reads
+REMOTE_ONLY becomes auto-queue-eligible where it wasn't before — **expected and accepted, per
+the prompt**: lftp mirrors it (creating the empty local directory with nothing to transfer),
+the next scan finds `local_entry is not None` and reads DOWNLOADED, and the item converges in
+one scan interval. `core/reconcile.py`'s own rollups (`remote_size_totals`,
+`local_size_totals`) are unaffected — both were already computed over the raw trees,
+independent of the completeness predicate. No other consumer of `STATE_DOWNLOADED`/
+`STATE_REMOTE_ONLY` was found reading `core/reconcile.py`'s output for anything beyond direct
+state comparison (`core/engine.py._persist`, `api/files.py`'s serialization).
+
+**`DESIGN.md` §3.2 is silent on this exact case and should say so** — proposed wording (not
+applied, per the prompt; the user decides doc changes) is in the session report.
+
+**Tests (`tests/test_reconcile.py`, 15 → 18; one repurposed).** The pre-existing
+`test_directory_vacuously_downloaded_when_empty` encoded the bug itself (an empty remote
+directory with zero local presence asserted `DOWNLOADED`) and was rewritten in place as
+`test_directory_empty_remote_no_local_copy_is_remote_only`. Added: the mirrored-empty-
+directory counterpart (`..._already_mirrored_locally_is_downloaded`); an explicit regression
+guard for the all-excluded case, labeled as such in its name and docstring so it isn't later
+read as redundant with the all-excludes test already in the file
+(`test_directory_all_children_excluded_still_downloaded_regression_guard_for_requeue_loop`);
+and the nested-empty-directories test above. `uv run ruff format --check .` and `uv run ruff
+check .` both clean; full `uv run pytest` — 461 passed (458 + 3 net new), no regressions.
+Verified live: `docker compose -f docker-compose.dev.yml restart backend` against the running
+dev stack to pick up the fix, left running per the prompt's instruction not to tear anything
+down.
+
+---
+
+## 2026-08-12 — Post-processing states now survive the periodic rescan: outcomes win over the
+## structural state *while the content is present*, transient states are protected by the live
+## worker, and all six still reach `REMOVED_LOCAL` through §7.3's grace period
+
+**Handoff prompt `prompts/2026-08-12-postprocess-state-persistence.md`, executed end to end.**
+`core/engine.py._persist` recomputed and rewrote every unprotected item's structural state on
+every scan, and none of the six post-processing states (§3.2 lines 238–239) was protected —
+so a verified, extracted release read as plain `DOWNLOADED` within ~30 seconds, and `CORRUPT`
+and `EXTRACT_FAILED` erased themselves before anyone could look at them. Pre-existing since
+phase 5.
+
+**1. The shape of the fix: precedence, not stickiness — and the two halves are one decision.**
+The naive fix (add the six to `_protected_rel_paths`) trades a bad bug for a worse one: an
+unconditionally protected state can never be un-protected, so an `EXTRACTED` item whose local
+copy an *arr importer later moves out stays `EXTRACTED` forever and §3.2 rule 3's
+`REMOVED_LOCAL` transition — the entire point of §7.3's grace period — never fires for it
+again. So the rule implemented is a *precedence* rule with an explicit domain:
+
+- **Content present and complete** (structural `DOWNLOADED`): the outcome wins.
+  `VERIFIED`/`CORRUPT`/`EXTRACTED`/`EXTRACT_FAILED` are refinements of `DOWNLOADED` — each
+  says something about an all-bytes-present item that the byte comparison itself cannot — so
+  `core/postprocess.py` owns `state` exactly the way `core/queue.py` owns it for an active
+  job. New pure predicate `core/postprocess.outcome_survives_rescan()`, applied in `_persist`.
+- **Content absent** (structural `REMOTE_ONLY`): unchanged machinery, extended vocabulary.
+  All six states join `DOWNLOADED` in `core/mount_sentinel.py`'s `_STICKY_PREV_STATES` (now
+  `_COMPLETE_PREV_STATES` + `REMOVED_LOCAL`), so the grace clock starts, the mount gate
+  applies, and the item lands on `REMOVED_LOCAL` exactly as a plain `DOWNLOADED` one does.
+  `resolve_absence` now holds `prev_state` during the window instead of a hardcoded
+  `"DOWNLOADED"` — an item mid-import must keep reading `CORRUPT` for those ten minutes, not
+  be quietly downgraded first.
+- **Content partially present** (structural `PARTIAL`): the structural state wins, outcome
+  dropped. §3.2 rule 2 ("never `DOWNLOADED`") is absolute and an outcome is a stronger claim
+  still; local short of remote means the remote grew (rule 4) or something took bytes away,
+  and the item is genuinely re-queueable again. Deliberately identical to how a plain
+  `DOWNLOADED` item already behaved — no new exception invented for post-processed items.
+
+**The absence half was not optional politeness — without it the fix would have introduced a
+re-download loop.** Because the states weren't sticky, a `VERIFIED`/`EXTRACTED` item that
+went locally absent persisted as a fresh `REMOTE_ONLY` and auto-queue re-fetched the whole
+release. Today that is masked by the very bug being fixed (the rescan had already downgraded
+the item to `DOWNLOADED`, which *is* sticky, before the importer got to it). Making the
+states survive without also making them sticky would have unmasked it.
+
+**2. Transient vs terminal, decided separately — and transient states are protected by the
+worker, never by the state string.** `VERIFYING`/`EXTRACTING` are held only while a worker is
+mid-run, and an extract can easily outlast several 30s scan intervals, so they do need
+protection. But protection keyed on the state string is a wedge: a process killed mid-extract
+leaves `EXTRACTING` in the database with nothing running, and a permanently protected item
+could never be recomputed — precisely the bug phase 3 hit with jobs left `running` by a
+restart (`core/queue.py._reconcile_orphaned_jobs`). So the protection is keyed on
+`PostprocessPipeline.in_flight_item_ids()`, an in-memory count of items a worker is inside
+`process_item` for right now, read by `Engine._protected_rel_paths`.
+
+**How a stuck transient state resolves, explicitly:** it cannot get stuck. The in-flight set
+is in-memory and maintained in a `finally`, so it empties on process death, on an exception,
+and on shutdown cancellation alike; the very next scan (≤30s) recomputes the item structurally
+and it reads `DOWNLOADED`/`PARTIAL` again. **Rejected: a startup sweep** in the shape of
+`_reconcile_orphaned_jobs` — that one exists because `job.state` is durable and something had
+to un-write it; nothing durable is written here, so a sweep would be a second mechanism
+covering a strictly smaller set of cases (it would miss a worker that dies by exception
+without the process restarting). **Also rejected: a timeout** ("protect `EXTRACTING` for at
+most N minutes") — no N is both long enough for a big multi-volume rar set and short enough to
+be a useful recovery bound, and it would re-introduce the wedge for any run that exceeded it.
+
+**3. Rejected: not protecting the transient states at all.** Stomping `EXTRACTING` is only
+cosmetic (nothing acts on `DOWNLOADED` that wouldn't act on `EXTRACTING`; `postprocess.trigger`
+fires from `core/queue.py._reap_one`, never from a scan), and it makes the wedge impossible by
+construction. Dropped because it would mean the one genuinely long-running post-processing step
+shows its own state for less than a scan interval and then lies for the next hour — the state
+exists to be displayed, and the in-flight registry buys the display back with no wedge risk.
+
+**4. Where the vocabulary lives, and the one layering call.** `TRANSIENT_STATES`,
+`TERMINAL_STATES`, `OWNED_STATES` are defined in `core/postprocess.py` — the only writer of
+those states, matching "one owner per concern" — and imported by both `core/engine.py` and
+`core/mount_sentinel.py`. **Rejected: restating the six literals in `mount_sentinel`** to keep
+it a dependency-free leaf module; a second list that must be kept in step is exactly the drift
+this repo extracted `parse_connection_limit()` to avoid, and the import direction is safe
+(nothing in `postprocess.py` imports `mount_sentinel`/`engine`/`autoqueue`; verified there is
+no cycle). If that ever changes, the vocabulary — not the arbitration — is what should move.
+
+**5. The precedence decision is split across two modules on purpose, matching the existing
+seam.** Presence is decided in `_persist` via `postprocess.outcome_survives_rescan()`; absence
+in `mount_sentinel.resolve_absence()`. That is the same division `DOWNLOADED` has had since
+phase 4 (protection in the engine, absence in the sentinel), so `resolve_absence` keeps an
+honest name and neither function grew a second job. **Rejected: folding both halves into one
+renamed `resolve_state()`** in `mount_sentinel` — one decision point, but it puts a rule that
+has nothing to do with mounts inside the mount module and renames a seam two other files and a
+test module reference.
+
+**6. `DESIGN.md` §3.2 is silent on all of this and should say it** — proposed wording is in the
+session report; not edited here, per the prompt (the user decides doc changes). In short: §3.2
+lists the six states but never says who wins when a rescan's structural state disagrees with a
+lifecycle one, which is why this gap survived four phases.
+
+**7. Found while fixing this, deliberately NOT fixed here: `Engine`'s in-memory model — and
+therefore the WebSocket — still publishes the *structural* state, not the persisted one.**
+`scan_queue` diffs and publishes `reconcile()`'s nodes, while `_persist` writes a possibly
+different state to `item`. So the two disagree for every row `_persist` overrides, and since
+the Files page renders purely from the WS stream (`serialize_node`'s own docstring), a
+reconnect re-snapshots the browser back to the structural reading. This is **pre-existing and
+wider than post-processing**: a `REMOVED_LOCAL` item, or one being held `DOWNLOADED` through
+§7.3's grace window, has been published as `REMOTE_ONLY` — complete with a Queue button —
+since phase 4. In practice a connected browser mostly survives it, because `diff_nodes` only
+sends rows whose *structural* node changed, so an item sitting at `EXTRACTED` with stable
+sizes is simply never re-sent; the visible failure is on reload/reconnect. Left out of scope
+on purpose: the fix (have `_persist` return the states it actually wrote, apply them to the
+nodes before diffing/publishing, so the model equals the database) changes what the WS reports
+for `QUEUED`/`DOWNLOADING`/`STOPPED` and `REMOVED_LOCAL` too, which is a decision of its own
+with `tests/test_ws_deltas.py` to extend — not something to slip into a fix about who owns
+`item.state`. Surfaced in the session report as the recommended follow-up.
+
+**8. Tests (`tests/test_state_persistence.py`, new; plus additions to `test_mount_sentinel.py`
+and `test_postprocess.py`).** Table-driven over all six states at three levels: a real
+`Engine.scan_queue` pass against a real `item` row (what actually regressed), the pure
+absence function, and the pure precedence predicate. The three that matter most: each outcome
+survives repeated scans; an `EXTRACTED` item whose local copy vanishes holds its state, keeps
+one unrestarted clock, and lands on `REMOVED_LOCAL`; and a transient state with no live worker
+is recomputed away rather than wedging.
+
+---
+
+## 2026-08-12 — Settings → Transfer built (DESIGN.md §4.5/§9.3), queue name added to the
+## Transfers page (§9.2), and `net:connection-limit`'s missing first-class status confirmed
+## and surfaced read-only rather than fixed
+
+**Handoff prompt `prompts/2026-08-12-transfer-settings-tab.md`, executed end to end.** Closed
+the largest documented UI hole (`README.md`'s "Known gaps") by building a real form over the
+`TransferSettings` API that's been complete since phase 3a, and added `queue_name` to the
+Transfers page so multiple active queues are distinguishable at a glance. Every non-obvious
+call:
+
+**1. MB/MB-per-second unit conversion is decimal (1,000,000 B), not binary MiB —
+`bytesToMB`/`mbToBytes` in `lib/format.ts`.** `core/queue.py.TransferSettings`'s own defaults
+(`10_000_000` bps, `500_000` bps floor, the `1_000_000`-byte "min 1 MB/s" literal in
+`effective_small_lane_reserve_bps()`'s docstring) only come back as clean round numbers under
+a decimal convention — under binary MiB the default ceiling would display as "9.5367... MB/s,"
+which is exactly the kind of drift-on-display DESIGN.md's own "round-tripping without drift"
+requirement was written to prevent. Deliberately a *separate* pair of functions from
+`formatBytes`/`formatRate` (which stay binary/1024-based) rather than reusing them — those
+exist for *display* of live throughput and are never round-tripped back into an editable
+field, so there was no established convention to match, and decimal reads more naturally for
+"MB/s" in a network-transfer context anyway.
+
+**2. The B/2 reserve clamp (`effective_small_lane_reserve_bps()`) is reimplemented client-side
+in `TransferTab.tsx`, not fetched from the server.** The wire value of
+`small_lane_reserve_bps` is the *raw* stored number (verified live: `PUT` with
+`small_lane_reserve_bps: 900000` against a 1,000,000 bps ceiling round-trips back as `900000`,
+not the clamped `500000`) — the API has no endpoint that returns the effective, clamped
+number, only `core/queue.py.scheduler_settings()` (an internal, unexposed call) applies it.
+Rather than add a new endpoint just to preview a pure function of already-fetched fields, the
+clamp math is duplicated by hand in the component with a comment pointing at the backend
+function it mirrors and a note that a live discrepancy is the tell if the two drift. **Applies
+whether the reserve is "derived" (null) or a user-typed custom number** — the docstring's
+"min 1 MB/s, capped at B/2" clamp isn't conditioned on which; the earlier draft only showed
+the effective value in derived mode, matching the prompt's literal wording, but that would
+have hidden the exact same trap (§4.5's "jobs queue and sit there with no error and no log
+line") from someone who typed a custom reserve above B/2 — corrected before finishing, since
+showing it in only one of the two cases only half-closes the gap the tab exists to close.
+
+**3. The live connection-count readout also renders a full DESIGN.md §4.5 admission-formula
+preview** (`admissionPreview()` in `TransferTab.tsx`), not just the multiply-and-compare the
+prompt's own example shows. "Show the resulting per-job bandwidth cap next to it" is
+ambiguous between a naive `(ceiling − reserve) / N` and the actual scheduler behavior, which
+runs the floor loop and can end up admitting *fewer* than N jobs at a higher rate. Implemented
+the real algorithm (evaluated for "N queued, nothing else running," the same shape as §4.5's
+own worked-examples table) rather than the naive division, so the preview never shows a number
+the real scheduler wouldn't produce. When `headroom <= 0` this renders as the reserve-clamp
+warning directly, rather than a silent "0 jobs, $0/s" line that wouldn't read as an error.
+
+**4. `net:connection-limit`'s divergence from DESIGN.md §4.5/§9.3, confirmed rather than
+guessed at, and surfaced read-only, not fixed** — per the prompt's explicit "surface, do not
+decide." Traced end to end: the value lives only in `host.connection_overrides`, a JSON blob
+column with no reader or writer anywhere in the API surface before this session
+(`api/settings.py`'s `HostIn`/`HostOut` never mentioned it; `core/queue.py._connection_limit`
+was the sole reader, used only at job-spawn time). Settings → Connection has no field for it —
+confirmed by reading `ConnectionTab.tsx` and `HostIn` field-by-field, not inferred. Since Part
+A's warning has to read the value from *somewhere*, added exactly one read-only field,
+`HostOut.net_connection_limit`, populated by a new pure function,
+`core/remote.py.parse_connection_limit()` (extracted from `core/queue.py._connection_limit`'s
+inline parsing so the two call sites can't drift on which JSON key wins — `_connection_limit`
+now delegates to it). **No `HostIn` field was added — there is still no way to set this value
+from the UI**, only to see whatever a direct SQL edit put there. Confirmed live: a real
+`GET /api/settings/host` against the running dev stack returns `"net_connection_limit":null`,
+i.e. the warning genuinely cannot fire on this (or any known) install today. Recorded in
+`README.md`'s Known gaps rather than left implicit. **Rejected: promoting
+`connection_overrides` to a real `net_connection_limit` column**, exactly as the prompt
+forbade — would need its own migration and its own `HostIn` write path, neither of which is
+this task's scope.
+
+**5. `list_jobs()`'s new `path_queue` join is an `INNER JOIN`, not a `LEFT JOIN`.** An `item`
+row's `queue_id` is `NOT NULL REFERENCES path_queue (id) ON DELETE CASCADE`
+(`migrations/001_initial_schema.sql`) — deleting a queue cascades to every item under it, so a
+job can never legitimately reference a queue that no longer exists, and an inner join costs
+nothing here that a left join would have bought.
+
+**6. The queue name renders as a small muted tag ahead of the item name on `TransfersPage.tsx`,
+not a separate table column.** The existing row is already a `flex` line of seven fields
+(name, state, file count, percent, rate, ETA, allocation) with no table structure to add a
+column to without a broader layout rework the prompt didn't ask for. A neutral
+`bg-zinc-100`/`text-zinc-500` tag — deliberately *not* reusing `StateChip`'s color palette,
+which is reserved for the state vocabulary — reads as metadata rather than competing with the
+state chip for attention, and satisfies "tell rows apart at a glance" without one.
+
+**7. Validation: `TransferSettingsIn`/`TransferSettingsOut` are literally identical
+(`TransferSettingsIn(TransferSettingsOut): pass`) and neither has a single Pydantic `Field`
+constraint** — confirmed by reading `models.py`, not assumed. The API accepts negative or zero
+bandwidth, concurrency, or attempts for every one of the twelve fields; only the JSON type
+(int vs. float vs. str) is enforced. The frontend adds HTML `min`/`step` attributes as soft UX
+guidance only (matching `BackupTab.tsx`'s existing convention) and does **not** block a save
+the API would accept — there is nothing to disagree about since the backend enforces nothing
+beyond type, and inventing a client-side floor here would be exactly the "don't invent rules
+the API doesn't enforce" the prompt warned against.
+
+---
+
+## 2026-08-12 — `_UNPACK_` extraction staging: extract off to the side, merge into position on
+## success (DESIGN.md §6) — closes the one post-processing step that wrote final-named files
+## incomplete where an *arr could see them
+
+**Handoff prompt `prompts/2026-08-12-unpack-dir-extraction.md`, executed end to end.** Every
+extraction now lands in a `_UNPACK_<name>` directory staged as a *sibling* of its final
+directory, never a child of it, and is merged into position (`core/postprocess.py.move_tree`,
+now with a `merge=True` mode) only once every archive under the item has extracted cleanly.
+Failure renames the staging dir to `_FAILED_<name>` and leaves it as evidence. Both prefixes
+are now filtered out of `core/local_scan.py`'s walk, at any depth, directories only — building
+directly on the mount-sentinel filter this same module grew immediately before this session
+(`.lftpweb-mount-ok`, root-only). Full reasoning below; every non-obvious call recorded.
+
+**1. `move_tree` grew a `merge=True` mode rather than open-coding a merge walk in
+`extract.py`, per the prompt's own instruction.** The one case that has to work is merging
+into an *already-existing* directory — extracting in place, the item's own directory already
+holds the source archive(s) — so `merge=True` does a directory-vs-directory recursive walk
+(`_merge_tree`): a same-named subdirectory on both sides recurses; anything else (a new
+subdirectory, a file) is handed to plain `move_tree`, which moves it wholesale if nothing
+collides or raises `FileExistsError` if it does. A file colliding with existing content is
+surfaced, never silently overwritten — DESIGN.md doesn't say what "merge" should do on a name
+collision, and silently clobbering content that arrived by another route is the wrong default
+for a step this deliberately conservative. **Rejected: move `move_tree` out to a new shared
+module (e.g. `core/fsops.py`) so `extract.py` could import it without a cycle.** The prompt
+was explicit ("the one place that reasoning lives"); a plain function-local import in
+`extract_item` (`postprocess.py` imports `extract` at the top level, so a top-level import the
+other way would cycle) keeps `move_tree` where the prompt wanted it, at the cost of one
+locally-scoped import with a comment explaining why.
+
+**2. Fixed a latent crash for §4.7's loose top-level file case while building this: `root`
+being a file (not a directory) makes "root itself" the wrong final directory.** The original
+per-archive code used `archive.parent` as the in-place destination, which for a loose file
+item (`root` *is* the archive) is `root.parent` — the containing directory, not the archive
+path itself. A first draft of the whole-item staging logic used `root` directly as the final
+directory in every case, which for this one shape would have tried `Path.relative_to()`
+against a file, raising `ValueError` the first time a bare top-level archive got extracted
+in place. Fixed by computing `in_place_dir = root.parent if root.is_file() else root` once,
+used everywhere `root`'s "own directory" is needed. Covered by
+`test_extract_loose_top_level_archive_file_in_place` (`tests/test_postprocess.py`) — this
+path wasn't exercised by any test before this session touched it.
+
+**3. `tests/test_extract.py`, named in the prompt, doesn't exist — `core/extract.py`'s tests
+have lived in `tests/test_postprocess.py` since phase 5.** Extended that file's existing
+"core/extract.py" section instead of creating a new one, matching its established
+`binary=_SEVEN_ZIP_BIN` convention (see that phase's own decisions.md entry, point 9) rather
+than diverging into a second test module for the same production module.
+
+**4. The phase 5 e2e (`tests/test_postprocess_e2e.py`) needed its own accommodation beyond
+what the unit tests use.** The unit tests dodge the dev host's `7zz`-vs-`7z` naming mismatch
+by passing `binary=_SEVEN_ZIP_BIN` straight into `extract.extract_item`. The e2e test goes
+through the real production call site, `postprocess.py._do_extract`, which never passes
+`binary=` at all — it relies on `extract_item`'s default parameter, and Python binds a plain
+default at *function-definition* time, so monkeypatching `extract.DEFAULT_BINARY` afterward
+(tried first) silently does nothing. Fixed by monkeypatching the function itself:
+`monkeypatch.setattr(extract, "extract_item", functools.partial(extract.extract_item,
+binary=_SEVEN_ZIP_BIN))`. Recorded because the failure mode (test passes locally-appears-green
+right up until you check it actually exercised the code path) is exactly the kind of thing a
+future session would burn time rediscovering.
+
+**5. Two things the prompt asked to be reported, not fixed, investigated and confirmed real:**
+
+   - **Yes — a rescan can silently revert `EXTRACTING`/`EXTRACTED`/`VERIFYING`/`VERIFIED`/
+     `CORRUPT`/`EXTRACT_FAILED` back to a freshly-computed structural state.**
+     `core/engine.py._persist`'s `protected` set (`_protected_rel_paths`) only covers items
+     with a `queued`/`running` job or `auto_queue_suppressed = 1` (set only for
+     `STOPPED`/`FAILED`, per `core/queue.py`). None of the post-processing states set either
+     flag, and none of them are in `core/mount_sentinel.py`'s `_STICKY_PREV_STATES`
+     (`{"DOWNLOADED", "REMOVED_LOCAL"}`) either, so `resolve_absence` doesn't protect them —
+     the very next scan (default ~30s cadence, §5) after the reconciler runs writes whatever
+     `node.state` it freshly computed from remote-vs-local bytes straight over the
+     pipeline's own state, with no representation of "post-processing has an opinion here"
+     anywhere in the protection logic. This predates this task (it's a phase-5-era gap, not
+     something the `_UNPACK_` staging introduced) and is real, per the prompt's own
+     instruction: **not fixed here** — it's its own task with its own state-machine
+     reasoning, and folding a `protected` widening into an unrelated extraction change is
+     exactly the kind of accidental §3.2 divergence the prompt called out by name.
+   - **The delete-before-extract ordering in `move` mode reads as incidental, not
+     deliberately reasoned.** DESIGN.md §6's numbered pipeline (verify → extract → move)
+     never mentions the remote delete at all — that's covered separately under §7.4 — and
+     `postprocess.py`'s module docstring and phase 5's own decisions.md entry both give
+     extensive reasoning for verification gating the delete, but neither says anything about
+     *extraction's* position relative to it. The actual code order (verify → move-mode delete
+     → extract → move) appears to follow the prose order the phase-5 docstring happens to
+     describe things in, not a stated safety argument. Consequence, stated plainly: today, a
+     `move`-mode item whose archive fails to extract has *already* had its remote copy
+     deleted (verification passed on the downloaded bytes; extraction is a separate,
+     later, failable step) — `EXTRACT_FAILED` with no remaining remote source to re-fetch
+     from. Flagged, not fixed, per the prompt.
+
+**6. DESIGN.md §6 gap, flagged rather than corrected in-session** (per the working-tree
+constraint, only `docs/decisions.md` was in scope for docs this session): it documents
+extraction's *tools* and *target* but says nothing about the `_UNPACK_`/`_FAILED_` staging
+convention this task adds, and nothing about extraction's ordering relative to the §7.4
+remote delete (see point 5's second bullet). Both are now real, load-bearing behavior that
+the design doc doesn't reflect.
+
+---
+
+## 2026-08-12 — Post-phase-9 documentation currency sweep (no code changed)
+
+A read-through of the state-of-play docs after the overnight run, done in-session rather than
+via a handoff prompt: it touched four doc files but every edit was a correction to text this
+session had just produced or verified, and a fresh agent would have had to re-derive nine
+phases of history to write the same words. Recorded here because that is a deliberate
+departure from the >2-file threshold, not an oversight.
+
+**1. `.claude/commands/release-prep.md` was matching on a README string that no longer
+exists.** Its Step 4 and its `<README_BADGE_PATTERN>` / `<DOCS_TO_SYNC>` bindings all keyed off
+the literal `**Version \`<current>\`. N of 9 build phases complete.**`. Phase 9 rewrote that
+banner to "All 9 build phases are built and unit/integration tested," so the next `/release-prep`
+would have found nothing to update and either silently skipped the README sync or invented a
+line. Re-pointed to match on the `**Version \`` prefix only, with the reason for the looser
+match stated inline. **Rejected: restoring the old README wording so the command matches
+again.** The command exists to serve the docs, not the reverse, and the phase-count phrasing is
+genuinely obsolete now that all nine are done.
+
+**2. `CHANGELOG.md`'s `[Unreleased]` covered phases 1–3 and was rolled forward to all nine.**
+Phases 4–9 each shipped their own docs but none touched the changelog — a real drift from the
+`release-prep-and-cut` rule that `CHANGELOG.md` is the single source of truth for release
+notes, which would have surfaced as a scramble at the first `/release-prep`. The new entries
+are drawn from each phase's `docs/decisions.md` entry, and deliberately carry the
+limitations with the features: `Changed` leads with `sync_mode = 'move'` going from inert to
+live, and `Security` names the SHA-256, login-timing, and fail-open trade-offs rather than
+listing auth as an unqualified win. **Rejected: leaving it for `/release-prep` to reconstruct.**
+That command rolls `[Unreleased]` into a version section; it does not go re-read six phases of
+history, so the gap would have propagated into the actual release notes.
+
+**3. `standards.md`'s `code-checkin-and-pr` row still said the GitHub repo didn't exist and
+that branch protection couldn't be verified yet**, and still listed the first-run lint failures
+(one unused import, ~22 unformatted files) as open. All of that has been true-and-then-false
+since 2026-08-11. Updated to record protection as live and verified via `gh api`, and both lint
+gates as clean since phase 3b.
+
+**4. `prompts/startnewsession.md` carried four "phase 9 is prepared but not committed"
+statements** written before the commit that closed the overnight run. Replaced with the real
+commit (`9272f36`) and CI state, and the three items awaiting the user's decision were promoted
+from a buried warning into a numbered list at the top of "Where we are" — they had been recorded
+as a phase-5 warning banner, which framed a standing open question as a shipped phase's
+footnote.
+
+---
+
 ## 2026-08-12 — Phase 9: polish and documentation reconciliation — every decision recorded,
 ## including which gaps were deliberately named instead of closed
 

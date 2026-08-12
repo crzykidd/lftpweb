@@ -37,6 +37,11 @@ export interface HostOut {
   has_password: boolean
   known_hosts_policy: KnownHostsPolicy
   credentials_need_reentry: boolean
+  // Read-only (DESIGN.md §4.5/§9.3, docs/decisions.md 2026-08-12): whatever currently sits
+  // in `net:connection-limit` inside the host's `connection_overrides` JSON blob, or null if
+  // unset. There is no field on `HostIn` to set it -- Settings → Connection has no UI for
+  // it -- so this is `null` on every install that hasn't hand-edited the database.
+  net_connection_limit: number | null
 }
 
 // Mirrors HostIn — password is plaintext here only, and only ever sent, never received back
@@ -198,6 +203,7 @@ export interface JobOut {
   id: number
   item_id: number
   queue_id: number
+  queue_name: string
   rel_path: string
   is_dir: boolean
   kind: JobKind
@@ -232,6 +238,32 @@ export interface QueueItemRequest {
   item_id: number
   start_now: boolean
 }
+
+// --- Settings -> Transfer (phase 3a API, DESIGN.md §4.5/§9.2/§9.3) -----------------------
+//
+// Mirrors `core/queue.py.TransferSettings` exactly -- twelve fields, one site-wide set
+// (DESIGN.md §4.5: "a queue governs what and where, never how fast"). Bandwidth/size fields
+// are `_bps`/`_bytes` on the wire; TransferTab.tsx converts to/from MB(/s) at the edge, this
+// type stays in the backend's native units so a round-trip through the API never drifts.
+export interface TransferSettingsOut {
+  max_bandwidth_bps: number
+  max_concurrent_transfers: number
+  small_item_threshold_bytes: number
+  small_lane_concurrency: number
+  // null = derived (10% of the ceiling, min 1 MB/s, capped at half the ceiling -- see
+  // `effective_small_lane_reserve_bps()`'s docstring in core/queue.py). TransferTab.tsx must
+  // compute and show that effective value itself; the server doesn't send it separately.
+  small_lane_reserve_bps: number | null
+  min_share_floor_bps: number
+  mirror_parallel_transfer_count: number
+  mirror_use_pget_n: number
+  pget_default_n: number
+  max_attempts: number
+  retry_backoff_base_s: number
+  extra_lftp_settings: string
+}
+
+export type TransferSettingsIn = TransferSettingsOut
 
 // --- History (phase 6, DESIGN.md §9.2 History page) ---------------------------------------
 
@@ -332,6 +364,32 @@ export interface BackupInfoOut {
 
 export interface BackupListResponse {
   backups: BackupInfoOut[]
+}
+
+// --- Metrics / Dashboard (this task -- DESIGN.md new section proposed, docs/decisions.md) --
+
+export interface MetricsSettingsOut {
+  retention_days: number
+}
+
+export type MetricsSettingsIn = MetricsSettingsOut
+
+export type MetricsRange = '1h' | '12h' | '24h'
+
+export interface MetricsBucketOut {
+  ts: string
+  // `false` = no heartbeat fell in this bucket at all -- lftpweb wasn't running. Render as a
+  // gap, never a zero (docs/decisions.md's idle-vs-down decision).
+  up: boolean
+  total_bytes: number | null
+  // JSON object keys are always strings on the wire -- queue_id -> bytes moved this bucket.
+  by_queue: Record<string, number>
+}
+
+export interface MetricsThroughputResponse {
+  range: MetricsRange
+  bucket_seconds: number
+  buckets: MetricsBucketOut[]
 }
 
 // --- Settings -> Logs (phase 7, DESIGN.md §10.1) -----------------------------------------

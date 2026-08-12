@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from lftpweb.core.extract import FAILED_PREFIX, UNPACK_PREFIX
 from lftpweb.core.local_scan import (
     LocalEntry,
     PgetStatus,
@@ -8,6 +9,7 @@ from lftpweb.core.local_scan import (
     parse_pget_status,
     scan_local,
 )
+from lftpweb.core.mount_sentinel import SENTINEL_NAME
 
 
 def test_parse_pget_status_basic():
@@ -133,3 +135,93 @@ def test_effective_file_size_temp_suffixed_file_with_sidecar(tmp_path):
         "size=1000\n0.pos=250\n0.limit=1000\n"
     )
     assert effective_file_size(tmp_path / "movie.mkv") == 250
+
+
+def test_scan_local_skips_mount_sentinel_at_root(tmp_path):
+    """The mount sentinel is lftpweb's own bookkeeping (DESIGN.md §7.3), not content.
+
+    Left in the walk it reconciles to a permanent LOCAL_ONLY node and renders in the Files
+    tree as a file the remote is missing.
+    """
+    (tmp_path / SENTINEL_NAME).write_text("")
+    (tmp_path / "movie.mkv").write_bytes(b"z" * 100)
+
+    entries = scan_local(tmp_path)
+
+    assert SENTINEL_NAME not in entries
+    assert entries["movie.mkv"].size == 100
+
+
+def test_scan_local_keeps_sentinel_named_file_below_root(tmp_path):
+    """Only the root copy is ours. The same name deeper in the tree arrived from the
+    remote and is real content — hiding it would make the item permanently PARTIAL.
+    """
+    nested = tmp_path / "Some.Release"
+    nested.mkdir()
+    (nested / SENTINEL_NAME).write_bytes(b"x" * 5)
+
+    entries = scan_local(tmp_path)
+
+    assert f"Some.Release/{SENTINEL_NAME}" in entries
+
+
+# --- core/extract.py's _UNPACK_/_FAILED_ staging dirs (DESIGN.md §6, this task) --------------
+
+
+def test_scan_local_skips_unpack_staging_dir_at_root(tmp_path):
+    """An in-progress (or crashed) extraction's staging dir is lftpweb's own bookkeeping, not
+    content — left in the walk it would reconcile to a growing LOCAL_ONLY node while
+    extraction runs.
+    """
+    (tmp_path / f"{UNPACK_PREFIX}Release").mkdir()
+    (tmp_path / f"{UNPACK_PREFIX}Release" / "movie.mkv").write_bytes(b"x" * 10)
+    (tmp_path / "movie.mkv").write_bytes(b"z" * 100)
+
+    entries = scan_local(tmp_path)
+
+    assert f"{UNPACK_PREFIX}Release" not in entries
+    assert f"{UNPACK_PREFIX}Release/movie.mkv" not in entries
+    assert entries["movie.mkv"].size == 100
+
+
+def test_scan_local_skips_failed_extraction_dir_at_root(tmp_path):
+    """A `_FAILED_` dir is left forever as diagnostic evidence (DESIGN.md §6) — it must never
+    render as a permanent LOCAL_ONLY node in the Files tree.
+    """
+    (tmp_path / f"{FAILED_PREFIX}Release").mkdir()
+    (tmp_path / f"{FAILED_PREFIX}Release" / "partial.mkv").write_bytes(b"x" * 10)
+
+    entries = scan_local(tmp_path)
+
+    assert f"{FAILED_PREFIX}Release" not in entries
+    assert f"{FAILED_PREFIX}Release/partial.mkv" not in entries
+
+
+def test_scan_local_skips_unpack_and_failed_dirs_at_any_depth(tmp_path):
+    """Unlike the mount sentinel, these can appear next to *any* item, not just the queue
+    root — an item can be nested arbitrarily deep under the scan root.
+    """
+    nested = tmp_path / "Show" / "Season 01"
+    nested.mkdir(parents=True)
+    (nested / f"{UNPACK_PREFIX}Episode.01").mkdir()
+    (nested / f"{UNPACK_PREFIX}Episode.01" / "ep.mkv").write_bytes(b"a" * 5)
+    (nested / f"{FAILED_PREFIX}Episode.02").mkdir()
+    (nested / "Episode.03.mkv").write_bytes(b"b" * 5)
+
+    entries = scan_local(tmp_path)
+
+    assert f"Show/Season 01/{UNPACK_PREFIX}Episode.01" not in entries
+    assert f"Show/Season 01/{FAILED_PREFIX}Episode.02" not in entries
+    assert "Show/Season 01/Episode.03.mkv" in entries
+
+
+def test_scan_local_unpack_prefix_only_hides_directories_not_files(tmp_path):
+    """The prefix match is directories-only (extract.py never produces a file by these names,
+    and a remote release could coincidentally start with the same text) — a file happening to
+    share the prefix is real content and must not be swallowed by the filter.
+    """
+    (tmp_path / f"{UNPACK_PREFIX}notes.txt").write_bytes(b"real remote content")
+
+    entries = scan_local(tmp_path)
+
+    assert f"{UNPACK_PREFIX}notes.txt" in entries

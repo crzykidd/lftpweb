@@ -75,6 +75,11 @@ class HostOut(BaseModel):
     has_password: bool
     known_hosts_policy: KnownHostsPolicy
     credentials_need_reentry: bool = False
+    # Read-only: DESIGN.md §4.5/§9.3 calls `net:connection-limit` "a first-class setting,
+    # host-level" -- it isn't (see core/remote.py.parse_connection_limit and
+    # docs/decisions.md, 2026-08-12). This surfaces whatever is currently in the
+    # `connection_overrides` JSON blob, if anything; there is no `HostIn` field to set it.
+    net_connection_limit: int | None = None
 
 
 class HostTestRequest(BaseModel):
@@ -251,6 +256,7 @@ class JobOut(BaseModel):
     id: int
     item_id: int
     queue_id: int
+    queue_name: str
     rel_path: str
     is_dir: bool
     kind: str
@@ -392,6 +398,30 @@ class BackupInfoOut(BaseModel):
 
 class BackupListResponse(BaseModel):
     backups: list[BackupInfoOut]
+
+
+# --- Metrics / Dashboard (DESIGN.md — new section proposed, see docs/decisions.md) -------
+
+
+class MetricsSettingsOut(BaseModel):
+    retention_days: int
+
+
+class MetricsSettingsIn(MetricsSettingsOut):
+    pass
+
+
+class MetricsBucketOut(BaseModel):
+    ts: str  # bucket start, UTC ISO-8601
+    up: bool  # False = no heartbeat fell in this bucket -- lftpweb wasn't running (a gap)
+    total_bytes: int | None  # None when up is False; sum of by_queue (incl. 0) otherwise
+    by_queue: dict[int, int]  # queue_id -> bytes moved in this bucket; an omitted queue moved 0
+
+
+class MetricsThroughputResponse(BaseModel):
+    range: str
+    bucket_seconds: int
+    buckets: list[MetricsBucketOut]
 
 
 # --- Auth (DESIGN.md §8, phase 8) --------------------------------------------------------

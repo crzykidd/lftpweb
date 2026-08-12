@@ -19,25 +19,35 @@ import pytest
 import lftpweb.core.engine as engine_module
 from lftpweb.core.engine import Engine, QueueConfig, diff_nodes
 from lftpweb.core.events import EventBus
-from lftpweb.core.reconcile import ReconciledNode
+from lftpweb.core.itemview import ItemView, item_view
+from lftpweb.core.local_scan import LocalEntry
+from lftpweb.core.mount_sentinel import DEFAULT_GRACE_S
 from lftpweb.core.remote import HostConfig, RemoteEntry
 from lftpweb.db import migrate
 
 # --- diff_nodes: the pure function, tested directly ----------------------------------------
 
 
-def _node(rel_path: str, size: int) -> ReconciledNode:
-    return ReconciledNode(
-        rel_path=rel_path,
-        is_dir=False,
-        state="REMOTE_ONLY",
-        remote_size=size,
-        local_size=None,
-        remote_mtime=1.0,
+def _node(rel_path: str, size: int) -> ItemView:
+    """A projected `item` row, which is what `diff_nodes` compares now -- see
+    `core/itemview.py`: nothing is published that wasn't read back out of the database, so the
+    diff operates on the persisted projection rather than on `core/reconcile.py`'s structural
+    node.
+    """
+    return item_view(
+        {
+            "id": 1,
+            "rel_path": rel_path,
+            "is_dir": 0,
+            "state": "REMOTE_ONLY",
+            "remote_size": size,
+            "local_size": None,
+            "remote_mtime": 1.0,
+        }
     )
 
 
-def _make_model(n: int) -> dict[str, ReconciledNode]:
+def _make_model(n: int) -> dict[str, ItemView]:
     return {f"file-{i:05d}.bin": _node(f"file-{i:05d}.bin", 1000 + i) for i in range(n)}
 
 
@@ -52,7 +62,7 @@ def test_diff_nodes_reports_only_changed_and_removed_regardless_of_size(n):
 
     changed, removed = diff_nodes(old, new)
 
-    assert {n.rel_path for n in changed} == {
+    assert {n["rel_path"] for n in changed} == {
         "file-00001.bin",
         "file-00002.bin",
         "brand-new-file.bin",
@@ -179,7 +189,7 @@ async def _mutated_delta_payload(tmp_path, monkeypatch, n: int) -> tuple[dict, d
 
         await engine.scan_queue(q, host)  # the mutation
         delta = await subscription.get()
-        full_snapshot = engine.snapshot()[0]
+        full_snapshot = (await engine.snapshot())[0]
         return delta, full_snapshot
     finally:
         await db.close()
@@ -240,11 +250,13 @@ async def test_ws_nodes_carry_item_id_so_the_ui_can_act_on_them(tmp_path, monkey
     """Every node the WebSocket sends must carry its `item.id`.
 
     The Files page renders purely from this stream — never from `GET /api/files` — and every
-    action it offers (Queue, Stop, bulk ops) addresses an item by id. When `serialize_node`
-    omitted it, every row arrived with `id == null` and the UI rendered no action button at
-    all, on every row: a REMOTE_ONLY file could be seen but never queued. Found against a
-    real deployment, because phase 3b verified the API and WS contract with curl and a raw
-    socket client but never clicked the button.
+    action it offers (Queue, Stop, bulk ops) addresses an item by id. When the engine's
+    serializer omitted it, every row arrived with `id == null` and the UI rendered no action
+    button at all, on every row: a REMOTE_ONLY file could be seen but never queued. Found
+    against a real deployment, because phase 3b verified the API and WS contract with curl and
+    a raw socket client but never clicked the button. Now structurally impossible to
+    reintroduce — the projection is built from the `item` row, so the id is its primary key
+    (`core/itemview.py`).
     """
     monkeypatch.setattr(engine_module.local_scan, "scan_local", lambda root: {})  # noqa: ARG005
 
@@ -260,9 +272,175 @@ async def test_ws_nodes_carry_item_id_so_the_ui_can_act_on_them(tmp_path, monkey
         for node in delta["changed"]:
             assert node.get("id") is not None, f"delta node has no id: {node['rel_path']}"
 
-        for message in engine.snapshot():
+        for message in await engine.snapshot():
             assert message["nodes"], "expected nodes in the snapshot"
             for node in message["nodes"]:
                 assert node.get("id") is not None, f"snapshot node has no id: {node['rel_path']}"
+    finally:
+        await db.close()
+
+
+# --- The wire agrees with the database (DESIGN.md §2/§9; core/itemview.py) ------------------
+
+
+def _flat_tree(n: int) -> dict[str, RemoteEntry]:
+    """`n` filler files plus the four the override tests act on -- flat rather than
+    `_release_tree`'s directories so a seeded state belongs to exactly one row and no parent
+    rolls up alongside it.
+    """
+    tree = {
+        name: RemoteEntry(rel_path=name, is_dir=False, size=1_000, mtime=1.0)
+        for name in ("postprocessed.mkv", "lifecycle.mkv", "removed.mkv", "plain.mkv")
+    }
+    for i in range(n):
+        name = f"filler-{i:05d}.bin"
+        tree[name] = RemoteEntry(rel_path=name, is_dir=False, size=1_000 + i, mtime=1.0)
+    return tree
+
+
+def _mirrored_locally(tree: dict[str, RemoteEntry], *, absent: set[str]) -> dict[str, LocalEntry]:
+    return {
+        p: LocalEntry(rel_path=p, is_dir=e.is_dir, size=e.size)
+        for p, e in tree.items()
+        if p not in absent
+    }
+
+
+async def _persisted_states(db, queue_id: int) -> dict[str, str]:
+    cursor = await db.execute("SELECT rel_path, state FROM item WHERE queue_id = ?", (queue_id,))
+    return {row["rel_path"]: row["state"] for row in await cursor.fetchall()}
+
+
+def _assert_wire_matches_db(nodes: list[dict], persisted: dict[str, str]) -> None:
+    """The invariant, asserted directly: for every published node, the state on the wire is
+    the state in the `item` table. Nothing publishes a value it did not read back.
+    """
+    for node in nodes:
+        assert node["state"] == persisted[node["rel_path"]], (
+            f"{node['rel_path']}: wire says {node['state']!r}, "
+            f"database says {persisted[node['rel_path']]!r}"
+        )
+
+
+@pytest.mark.parametrize("n", [20, 5000])
+async def test_published_state_is_the_persisted_state_not_the_structural_one(
+    tmp_path, monkeypatch, n
+):
+    """The bug this file's projection exists to close, at every level at once.
+
+    `core/engine.py._persist` is where an item's state is really decided — `core/queue.py`'s
+    job-lifecycle protection, §6's post-processing precedence, §7.3's `REMOVED_LOCAL` grace
+    period — and none of it used to reach the wire, because the delta was computed from
+    `core/reconcile.py`'s structural nodes *before* any of that arbitration ran. Three of the
+    four items below have a persisted state their structural reading disagrees with; the
+    fourth is the plain case that must keep behaving exactly as it always did.
+
+    Also the delta-size property (phase 3b) under the new diff: making effective-state changes
+    visible to the diff for the first time must not make the delta scale with tree size. Only
+    the three items whose *persisted* state changed are sent, out of `n + 4` — with `n` at
+    both 20 and 5000.
+    """
+    tree = _flat_tree(n)
+    absent = {"removed.mkv"}
+    monkeypatch.setattr(
+        engine_module.local_scan,
+        "scan_local",
+        lambda root: _mirrored_locally(tree, absent=absent),  # noqa: ARG005
+    )
+
+    engine, q, host, db = await _make_engine(tmp_path, [tree, tree])
+    try:
+        subscription = engine.events.subscribe()
+        await engine.scan_queue(q, host)  # baseline: creates the `item` rows
+        await subscription.get()
+
+        # Seed the three overrides the way their real owners would, then rescan. The
+        # structural reading for all three is unchanged from the baseline scan, which is
+        # exactly why the old code published nothing at all for them.
+        cursor = await db.execute("SELECT id, rel_path FROM item WHERE queue_id = ?", (q.id,))
+        ids = {row["rel_path"]: row["id"] for row in await cursor.fetchall()}
+
+        # 1. A post-processing outcome (§6): structurally DOWNLOADED, persisted EXTRACTED.
+        await db.execute(
+            "UPDATE item SET state = 'EXTRACTED' WHERE id = ?", (ids["postprocessed.mkv"],)
+        )
+        # 2. A protected job-lifecycle state (§4.6): structurally DOWNLOADED, persisted
+        #    DOWNLOADING because a job is running for it.
+        await db.execute(
+            "UPDATE item SET state = 'DOWNLOADING' WHERE id = ?", (ids["lifecycle.mkv"],)
+        )
+        await db.execute(
+            "INSERT INTO job (item_id, kind, state, lane) VALUES (?, 'pget', 'running', 'main')",
+            (ids["lifecycle.mkv"],),
+        )
+        # 3. A §7.3 grace period about to expire: structurally REMOTE_ONLY (locally absent),
+        #    and the clock backdated past the window so this scan lands it on REMOVED_LOCAL.
+        #    Nothing pushes an `item_delta` for this transition -- the scan path is its only
+        #    route to the wire.
+        await db.execute(
+            "UPDATE item SET state = 'DOWNLOADED', "
+            "first_missing_at = STRFTIME('%Y-%m-%dT%H:%M:%fZ', 'now', ?) WHERE id = ?",
+            (f"-{int(DEFAULT_GRACE_S) + 60} seconds", ids["removed.mkv"]),
+        )
+        await db.commit()
+
+        await engine.scan_queue(q, host)
+        delta = await subscription.get()
+        persisted = await _persisted_states(db, q.id)
+
+        assert persisted["postprocessed.mkv"] == "EXTRACTED"
+        assert persisted["lifecycle.mkv"] == "DOWNLOADING"
+        assert persisted["removed.mkv"] == "REMOVED_LOCAL"
+        assert persisted["plain.mkv"] == "DOWNLOADED"
+
+        _assert_wire_matches_db(delta["changed"], persisted)
+        assert {node["rel_path"] for node in delta["changed"]} == {
+            "postprocessed.mkv",
+            "lifecycle.mkv",
+            "removed.mkv",
+        }, "only the rows whose persisted state changed belong in the delta"
+        assert len(json.dumps(delta)) < 2000, "the delta must stay proportional to what changed"
+
+        # ...and the connect-time snapshot -- the reload path, which is how this bug was
+        # actually visible to a user -- agrees with the database for every node, not just the
+        # ones that changed.
+        snapshot = (await engine.snapshot())[0]
+        assert len(snapshot["nodes"]) == n + 4
+        _assert_wire_matches_db(snapshot["nodes"], persisted)
+    finally:
+        await db.close()
+
+
+async def test_snapshot_reflects_a_lifecycle_write_made_since_the_last_scan(tmp_path, monkeypatch):
+    """A client connecting between scans must not be handed a model older than the database.
+
+    `core/queue.py` and `core/postprocess.py` write `item.state` the instant a job or a
+    pipeline step moves and push an `item_delta` for it -- but a browser that connects *after*
+    that push has no way to receive it, and the next scan can be up to `scan_interval_s`
+    (default 30s) away. `snapshot()` therefore re-reads the `item` table rather than serving
+    the cached model, which is why it is `async`.
+    """
+    tree = _flat_tree(0)
+    monkeypatch.setattr(
+        engine_module.local_scan,
+        "scan_local",
+        lambda root: _mirrored_locally(tree, absent=set()),  # noqa: ARG005
+    )
+
+    engine, q, host, db = await _make_engine(tmp_path, [tree])
+    try:
+        await engine.scan_queue(q, host)
+
+        # What `TransferQueue.enqueue_item` does, with no scan following it.
+        await db.execute(
+            "UPDATE item SET state = 'QUEUED' WHERE queue_id = ? AND rel_path = 'plain.mkv'",
+            (q.id,),
+        )
+        await db.commit()
+
+        snapshot = (await engine.snapshot())[0]
+        states = {node["rel_path"]: node["state"] for node in snapshot["nodes"]}
+        assert states["plain.mkv"] == "QUEUED"
+        _assert_wire_matches_db(snapshot["nodes"], await _persisted_states(db, q.id))
     finally:
         await db.close()

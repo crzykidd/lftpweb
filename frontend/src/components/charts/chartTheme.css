@@ -1,0 +1,43 @@
+/* Chart color tokens for the Dashboard's two hand-rolled SVG charts (this task -- no charting
+ * dependency, per docs/decisions.md). Values are the dataviz skill's validated default
+ * categorical palette (references/palette.md) -- CVD-safe adjacent pairs in both light and
+ * dark, assigned in fixed order (`lib/charts/queueColors.ts`), never cycled or reassigned
+ * when a filter/selection changes.
+ *
+ * Scoped under `.viz-root` and toggled by the app's existing `.dark` ancestor class
+ * (`hooks/useTheme.ts` / `index.css`'s `@custom-variant dark`) rather than
+ * `prefers-color-scheme` directly -- this app's dark mode is a class strategy with an
+ * explicit user override, and CSS custom properties riding the same class keep the charts in
+ * lockstep with every other themed component instead of re-deriving "is dark" in JS.
+ */
+.viz-root {
+  --chart-grid: #e1e0d9; /* hairline gridlines */
+  --chart-axis: #c3c2b7; /* baseline/axis line */
+  --chart-muted: #898781; /* axis tick labels */
+  --chart-ink: #52514e; /* secondary text (legend labels, captions) */
+  --chart-gap-fill: #e1e0d9; /* the "down" marker -- same tone as gridlines, deliberately recessive */
+  --series-1: #2a78d6;
+  --series-2: #eb6834;
+  --series-3: #1baf7a;
+  --series-4: #eda100;
+  --series-5: #e87ba4;
+  --series-6: #008300;
+  --series-7: #4a3aa7;
+  --series-8: #e34948;
+}
+
+.dark .viz-root {
+  --chart-grid: #2c2c2a;
+  --chart-axis: #383835;
+  --chart-muted: #898781;
+  --chart-ink: #c3c2b7;
+  --chart-gap-fill: #2c2c2a;
+  --series-1: #3987e5;
+  --series-2: #d95926;
+  --series-3: #199e70;
+  --series-4: #c98500;
+  --series-5: #d55181;
+  --series-6: #008300;
+  --series-7: #9085e9;
+  --series-8: #e66767;
+}

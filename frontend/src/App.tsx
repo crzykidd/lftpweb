@@ -3,6 +3,7 @@ import { Layout } from './components/Layout'
 import { FilesPage } from './pages/FilesPage'
 import { TransfersPage } from './pages/TransfersPage'
 import { HistoryPage } from './pages/HistoryPage'
+import { DashboardPage } from './pages/DashboardPage'
 import { LoginPage } from './pages/LoginPage'
 import { ConnectionTab } from './pages/settings/ConnectionTab'
 import { QueuesTab } from './pages/settings/QueuesTab'
@@ -35,6 +36,7 @@ function App() {
         <Route path="files" element={<FilesPage />} />
         <Route path="transfers" element={<TransfersPage />} />
         <Route path="history" element={<HistoryPage />} />
+        <Route path="dashboard" element={<DashboardPage />} />
         <Route path="settings">
           <Route index element={<Navigate to="/settings/connection" replace />} />
           <Route path="connection" element={<ConnectionTab />} />

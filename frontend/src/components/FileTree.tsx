@@ -205,6 +205,11 @@ export function FileTree({ nodes }: { nodes: FileNode[] }) {
 
   const filtersActive = stateFilter !== '' || searchText.trim() !== ''
 
+  // Whether there is any directory to fold/unfold at all -- drives disabling Expand/Collapse
+  // all the same way other controls on this page disable for an empty state, rather than a
+  // click that silently does nothing.
+  const hasDirectories = useMemo(() => fullFlat.some((e) => e.is_dir), [fullFlat])
+
   // A match plus every one of its ancestor directories (so the tree stays navigable down to
   // the hit) -- computed over the *full*, uncollapsed set, then substituted for the normal
   // collapse-respecting flatten below. Filtering while a directory happens to be collapsed
@@ -249,6 +254,17 @@ export function FileTree({ nodes }: { nodes: FileNode[] }) {
       else next.add(path)
       return next
     })
+  }
+
+  /** `collapsed` starts empty (default expanded, see the field above), so expand-all is just
+   * clearing it, and collapse-all is filling it with every directory path. Built from
+   * `fullFlat` -- already a full, uncollapsed walk of the whole tree (above) -- rather than
+   * re-walking `tree`, so this stays one O(tree size) pass over data already computed for
+   * filtering, not a second traversal. Both are pure `Set` replacements, no per-row effects.
+   */
+  const expandAll = () => setCollapsed(new Set())
+  const collapseAll = () => {
+    setCollapsed(new Set(fullFlat.filter((e) => e.is_dir).map((e) => e.rel_path)))
   }
 
   const toggleSelect = (entry: TreeEntry, shiftKey: boolean) => {
@@ -361,6 +377,24 @@ export function FileTree({ nodes }: { nodes: FileNode[] }) {
             </option>
           ))}
         </select>
+        <button
+          type="button"
+          disabled={!hasDirectories || filtersActive}
+          onClick={expandAll}
+          title={filtersActive ? 'Clear filters to change collapse state' : undefined}
+          className="rounded-md border border-zinc-300 px-2 py-1 text-xs font-medium text-zinc-700 hover:bg-zinc-50 disabled:cursor-not-allowed disabled:opacity-50 dark:border-zinc-700 dark:text-zinc-200 dark:hover:bg-zinc-900"
+        >
+          Expand all
+        </button>
+        <button
+          type="button"
+          disabled={!hasDirectories || filtersActive}
+          onClick={collapseAll}
+          title={filtersActive ? 'Clear filters to change collapse state' : undefined}
+          className="rounded-md border border-zinc-300 px-2 py-1 text-xs font-medium text-zinc-700 hover:bg-zinc-50 disabled:cursor-not-allowed disabled:opacity-50 dark:border-zinc-700 dark:text-zinc-200 dark:hover:bg-zinc-900"
+        >
+          Collapse all
+        </button>
         {filtersActive && (
           <>
             <span className="text-xs text-zinc-500 dark:text-zinc-400">

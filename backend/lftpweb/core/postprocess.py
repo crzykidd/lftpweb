@@ -53,6 +53,7 @@ import aiosqlite
 
 from lftpweb.core import audit, extract, verify
 from lftpweb.core.events import EventBus
+from lftpweb.core.itemview import item_view
 from lftpweb.core.remote import HostConfig
 
 logger = logging.getLogger(__name__)
@@ -60,6 +61,55 @@ logger = logging.getLogger(__name__)
 
 def _now_iso() -> str:
     return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
+# --- The states this module owns (DESIGN.md §3.2, §6) ----------------------------------------
+#
+# This module is the *only* writer of these six states, the same way `core/queue.py` is the
+# only writer of QUEUED/DOWNLOADING/STOPPED/FAILED and `core/reconcile.py` is the only
+# producer of the structural ones. They're named here, rather than restated as string
+# literals wherever they're needed, because two other modules have to reason about them and
+# a drifting second list would be silent: `core/engine.py._persist` (whose write must not
+# stomp them) and `core/mount_sentinel.py` (whose grace period must still be able to carry
+# them to REMOVED_LOCAL). Both import from here; nothing here imports either of them.
+
+# Held only while a worker is actually mid-run. Nothing else in the system may infer anything
+# from them -- in particular, a row still carrying one of these after a restart means the
+# worker died, not that work is in progress (see `in_flight_item_ids` for how that resolves).
+TRANSIENT_STATES = frozenset({"VERIFYING", "EXTRACTING"})
+
+# Outcomes. These must survive: `CORRUPT` and `EXTRACT_FAILED` are the two states a user most
+# needs to still be there when they next look at the page, and DESIGN.md §6 ("failures are
+# recorded on the item") is only true if a rescan can't quietly erase them.
+TERMINAL_STATES = frozenset({"VERIFIED", "CORRUPT", "EXTRACTED", "EXTRACT_FAILED"})
+
+OWNED_STATES = TRANSIENT_STATES | TERMINAL_STATES
+
+
+def outcome_survives_rescan(prev_state: str | None, structural_state: str) -> bool:
+    """Whether a persisted post-processing *outcome* must win over the structural state
+    `core/reconcile.py` just recomputed -- the "content is still present" half of the
+    precedence rule (`core/engine.py._persist` is the only caller; the "content has gone
+    absent" half is `core/mount_sentinel.py.resolve_absence`).
+
+    `VERIFIED`/`CORRUPT`/`EXTRACTED`/`EXTRACT_FAILED` are **refinements of `DOWNLOADED`**:
+    each one says something about an item whose bytes are all here that the byte comparison
+    itself cannot say. So an outcome wins over a fresh `DOWNLOADED` -- and only over
+    `DOWNLOADED`:
+
+    - `PARTIAL` (§3.2 rule 2) wins over the outcome instead. Local is short of remote again --
+      the remote grew (rule 4), or something took files away -- so the item is genuinely
+      re-queueable, and "VERIFIED" would be a claim about content that is no longer there.
+      Rule 2's "never DOWNLOADED" is absolute, and an outcome is a stronger claim still.
+    - `REMOTE_ONLY` is absence, which is *not* decided here: it goes to `resolve_absence`, so
+      an item whose local copy was moved out by an importer still reaches `REMOVED_LOCAL`
+      through §7.3's grace period rather than being frozen on its outcome forever.
+
+    Transient states deliberately don't survive on this path. Protecting them is the job of
+    `in_flight_item_ids()`, which is true only while a worker really is running -- so a state
+    left behind by a crashed one is recomputed away on the next scan instead of wedging.
+    """
+    return prev_state in TERMINAL_STATES and structural_state == "DOWNLOADED"
 
 
 # --- Settings (JSON in `setting`, the same pattern core/queue.py.TransferSettings uses) -----
@@ -138,7 +188,7 @@ async def save_postprocess_settings(
 # --- The staging -> final move (DESIGN.md §6) ------------------------------------------------
 
 
-def move_tree(src: Path, dst: Path) -> None:
+def move_tree(src: Path, dst: Path, *, merge: bool = False) -> None:
     """Relocate `src` (file or directory) to `dst`, atomically from an observer's point of
     view: `dst` never exists in a partially-written state.
 
@@ -150,7 +200,20 @@ def move_tree(src: Path, dst: Path) -> None:
     has been written and fsynced does that rename happen. If the copy fails partway, the
     sibling is removed and `dst` is never created -- a partial copy must never be mistaken
     for a complete one.
+
+    `merge=False` (default) refuses to touch an existing `dst` at all -- `FileExistsError`.
+    `merge=True` (used by `core/extract.py`'s `_UNPACK_` staging, DESIGN.md §6: extraction's
+    final directory routinely already exists and already holds the source archives) instead
+    walks `src` and `dst` together: a directory that exists on both sides merges recursively;
+    anything else -- a file colliding with an existing file, or a file/directory type
+    mismatch -- still raises `FileExistsError` rather than silently overwriting content that
+    arrived by another route. Each leaf move reuses this same function (non-merging), so the
+    EXDEV fallback above applies at every level, not just the top.
     """
+    if merge and dst.is_dir() and src.is_dir():
+        _merge_tree(src, dst)
+        return
+
     dst.parent.mkdir(parents=True, exist_ok=True)
     if dst.exists():
         raise FileExistsError(f"move target already exists: {dst}")
@@ -171,6 +234,22 @@ def move_tree(src: Path, dst: Path) -> None:
         raise
     shutil.rmtree(src, ignore_errors=True)
     _fsync_dir(dst.parent)
+
+
+def _merge_tree(src: Path, dst: Path) -> None:
+    """The `merge=True` walk: `src` and `dst` are both directories that already exist. A
+    same-named child directory on both sides recurses; anything else is handed to
+    `move_tree` un-merged, which moves it wholesale if `dst` has no same-named entry yet, or
+    raises `FileExistsError` if it does -- a file colliding with existing content is a
+    conflict to surface, not a byte-for-byte-identical assumption to act on silently.
+    """
+    for entry in sorted(src.iterdir()):
+        dst_entry = dst / entry.name
+        if entry.is_dir() and dst_entry.is_dir():
+            _merge_tree(entry, dst_entry)
+        else:
+            move_tree(entry, dst_entry)
+    src.rmdir()  # every child has been moved out (or the loop already raised)
 
 
 def _copy_tree_fsync(src: Path, dst: Path) -> None:
@@ -230,6 +309,11 @@ class PostprocessPipeline:
         self._sem: asyncio.Semaphore | None = None
         self._sem_size = 0
         self._tasks: set[asyncio.Task] = set()
+        # item id -> how many workers are inside `process_item` for it right now -- see
+        # `in_flight_item_ids`. A count rather than a set because two triggers for the same
+        # item can overlap when `concurrency > 1`, and the first one to finish must not
+        # un-protect an item the second is still working on.
+        self._in_flight: dict[int, int] = {}
 
     def trigger(self, item_id: int) -> None:
         """Fire-and-forget: schedule `process_item` on its own task. Called from
@@ -240,6 +324,25 @@ class PostprocessPipeline:
         )
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
+
+    def in_flight_item_ids(self) -> frozenset[int]:
+        """Items a worker is running for at this instant -- read by `core/engine.py`'s scan
+        pass, which leaves their `state` alone (`Engine._protected_rel_paths`) so a 30s scan
+        can't stomp `VERIFYING`/`EXTRACTING` out from under a job that is genuinely still
+        going, however long it takes.
+
+        **This is deliberately in-memory, and that is the whole recovery mechanism.** A
+        transient state is protected by the worker's own existence, never by the state string
+        itself, so there is no way to wedge an item on one: kill the process mid-extract and
+        the set comes back empty, the next scan recomputes the item structurally, and it
+        reads `DOWNLOADED`/`PARTIAL` again within one scan interval. Same for a worker that
+        dies by exception -- `process_item`'s `finally` clears the entry whatever happens.
+        Phase 3 fixed exactly this bug shape for jobs left `running` by a restart
+        (`core/queue.py._reconcile_orphaned_jobs`) and needed a startup sweep to do it,
+        because `job.state` is durable; nothing durable is written here, so nothing durable
+        needs sweeping.
+        """
+        return frozenset(self._in_flight)
 
     async def wait_idle(self) -> None:
         """Test/shutdown helper: wait for every currently-scheduled item to finish."""
@@ -263,6 +366,23 @@ class PostprocessPipeline:
         return self._sem
 
     async def process_item(self, item_id: int, settings: PostprocessSettings | None = None) -> None:
+        """Run the pipeline for one item, holding it in `in_flight_item_ids()` for exactly as
+        long as that takes -- `finally`, so an exception (or a cancellation on shutdown)
+        releases the item rather than leaving it protected with nobody working on it.
+        """
+        self._in_flight[item_id] = self._in_flight.get(item_id, 0) + 1
+        try:
+            await self._process_item(item_id, settings)
+        finally:
+            remaining = self._in_flight.get(item_id, 1) - 1
+            if remaining > 0:
+                self._in_flight[item_id] = remaining
+            else:
+                self._in_flight.pop(item_id, None)
+
+    async def _process_item(
+        self, item_id: int, settings: PostprocessSettings | None = None
+    ) -> None:
         settings = settings if settings is not None else await load_postprocess_settings(self.db)
         item = await self._fetch_item(item_id)
         if item is None or item["state"] != "DOWNLOADED":
@@ -482,18 +602,6 @@ class PostprocessPipeline:
             {
                 "type": "item_delta",
                 "queue_id": row["queue_id"],
-                "nodes": [
-                    {
-                        "id": row["id"],
-                        "rel_path": row["rel_path"],
-                        "is_dir": bool(row["is_dir"]),
-                        "state": row["state"],
-                        "remote_size": row["remote_size"],
-                        "local_size": row["local_size"],
-                        "remote_mtime": float(row["remote_mtime"])
-                        if row["remote_mtime"] is not None
-                        else None,
-                    }
-                ],
+                "nodes": [item_view(row)],
             }
         )

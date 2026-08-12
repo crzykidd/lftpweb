@@ -2,8 +2,31 @@ from __future__ import annotations
 
 from fastapi.testclient import TestClient
 
-from lftpweb.core.reconcile import ReconciledNode
+from lftpweb.core.itemview import ItemView, item_view
 from lftpweb.main import app
+
+
+def _view(
+    rel_path: str,
+    *,
+    is_dir: bool,
+    remote_size: int | None = None,
+    remote_mtime: float | None = None,
+) -> ItemView:
+    """One node as `Engine._project` would have read it back out of the `item` table -- built
+    through `item_view` itself so the fixture can't drift from the real projection.
+    """
+    return item_view(
+        {
+            "id": abs(hash(rel_path)) % 100_000,
+            "rel_path": rel_path,
+            "is_dir": 1 if is_dir else 0,
+            "state": "REMOTE_ONLY",
+            "remote_size": remote_size,
+            "local_size": None,
+            "remote_mtime": remote_mtime,
+        }
+    )
 
 
 def test_get_host_returns_null_when_unconfigured(isolated_config):
@@ -367,40 +390,18 @@ def test_pattern_preview_shows_selected_skipped_and_excluded_without_saving(isol
         queue = _make_host_and_queue(client)
 
         # Seed the engine's in-memory model directly -- what a real scan would populate --
-        # so the preview can run without a live seedbox connection.
+        # so the preview can run without a live seedbox connection. The model holds
+        # `core/itemview.py` projections of persisted `item` rows, so these are the same
+        # dicts `_project` would have read back.
         app.state.engine.models[queue["id"]] = {
-            "Wanted.Release": ReconciledNode(
-                rel_path="Wanted.Release",
-                is_dir=True,
-                state="REMOTE_ONLY",
-                remote_size=1500,
-                local_size=None,
-                remote_mtime=None,
+            "Wanted.Release": _view("Wanted.Release", is_dir=True, remote_size=1500),
+            "Wanted.Release/movie.mkv": _view(
+                "Wanted.Release/movie.mkv", is_dir=False, remote_size=1000, remote_mtime=1.0
             ),
-            "Wanted.Release/movie.mkv": ReconciledNode(
-                rel_path="Wanted.Release/movie.mkv",
-                is_dir=False,
-                state="REMOTE_ONLY",
-                remote_size=1000,
-                local_size=None,
-                remote_mtime=1.0,
+            "Wanted.Release/notes.nfo": _view(
+                "Wanted.Release/notes.nfo", is_dir=False, remote_size=5, remote_mtime=1.0
             ),
-            "Wanted.Release/notes.nfo": ReconciledNode(
-                rel_path="Wanted.Release/notes.nfo",
-                is_dir=False,
-                state="REMOTE_ONLY",
-                remote_size=5,
-                local_size=None,
-                remote_mtime=1.0,
-            ),
-            "Unwanted.Sample": ReconciledNode(
-                rel_path="Unwanted.Sample",
-                is_dir=True,
-                state="REMOTE_ONLY",
-                remote_size=10,
-                local_size=None,
-                remote_mtime=None,
-            ),
+            "Unwanted.Sample": _view("Unwanted.Sample", is_dir=True, remote_size=10),
         }
 
         resp = client.post(

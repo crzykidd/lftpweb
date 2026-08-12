@@ -25,6 +25,10 @@ import type {
   LoginIn,
   LogFilesResponse,
   LogTailResponse,
+  MetricsRange,
+  MetricsSettingsIn,
+  MetricsSettingsOut,
+  MetricsThroughputResponse,
   PathQueueIn,
   PathQueueOut,
   PatternIn,
@@ -36,6 +40,8 @@ import type {
   QueueAutoQueueStatus,
   StatsResponse,
   TestConnectionResponse,
+  TransferSettingsIn,
+  TransferSettingsOut,
 } from './types'
 
 // The CSRF token issued at login (DESIGN.md §8) — held in memory only, never localStorage
@@ -214,6 +220,16 @@ export function stopItem(itemId: number): Promise<{ applied: boolean }> {
   return sendJson<{ applied: boolean }>(`/api/items/${itemId}/stop`, 'POST')
 }
 
+// --- Settings -> Transfer (phase 3a API, phase-9-follow-up UI -- DESIGN.md §4.5/§9.3) -----
+
+export function getTransferSettings(): Promise<TransferSettingsOut> {
+  return getJson<TransferSettingsOut>('/api/settings/transfer')
+}
+
+export function putTransferSettings(body: TransferSettingsIn): Promise<TransferSettingsOut> {
+  return sendJson<TransferSettingsOut>('/api/settings/transfer', 'PUT', body)
+}
+
 // --- History (phase 6, DESIGN.md §9.2 History page) ---------------------------------------
 
 function queryString(params: object): string {
@@ -285,6 +301,30 @@ export function backupNow(): Promise<BackupInfoOut> {
 
 export function backupDownloadUrl(filename: string): string {
   return `/api/settings/backup/${encodeURIComponent(filename)}/download`
+}
+
+// --- Metrics / Dashboard (this task -- DESIGN.md new section proposed) -------------------
+
+export function getMetricsSettings(): Promise<MetricsSettingsOut> {
+  return getJson<MetricsSettingsOut>('/api/settings/metrics')
+}
+
+export function putMetricsSettings(body: MetricsSettingsIn): Promise<MetricsSettingsOut> {
+  return sendJson<MetricsSettingsOut>('/api/settings/metrics', 'PUT', body)
+}
+
+/** Both Dashboard charts (DESIGN.md new section proposed) -- omit `queueId` for the
+ * all-queues breakdown + site total (bytes/hour bar chart, "All queues" speed line); pass it
+ * for one queue's own series (speed line with a queue selected). Server-side bucketed
+ * (core/metrics.py) -- never raw rows to aggregate here.
+ */
+export function getThroughput(
+  range: MetricsRange,
+  queueId?: number,
+): Promise<MetricsThroughputResponse> {
+  return getJson<MetricsThroughputResponse>(
+    `/api/metrics/throughput${queryString({ range, queue_id: queueId })}`,
+  )
 }
 
 // --- Auth (phase 8, DESIGN.md §8) ---------------------------------------------------------

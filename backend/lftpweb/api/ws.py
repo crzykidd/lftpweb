@@ -27,7 +27,7 @@ async def files_ws(websocket: WebSocket) -> None:
     subscription = engine.events.subscribe()
 
     try:
-        await websocket.send_json({"type": "snapshot", "queues": engine.snapshot()})
+        await websocket.send_json({"type": "snapshot", "queues": await engine.snapshot()})
 
         async def sender() -> None:
             while True:

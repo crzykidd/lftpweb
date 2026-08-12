@@ -25,6 +25,7 @@ def _job_out(row: dict) -> JobOut:
         id=row["id"],
         item_id=row["item_id"],
         queue_id=row["queue_id"],
+        queue_name=row["queue_name"],
         rel_path=row["rel_path"],
         is_dir=bool(row["is_dir"]),
         kind=row["kind"],

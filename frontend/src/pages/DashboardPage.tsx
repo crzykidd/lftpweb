@@ -1,0 +1,123 @@
+import { useCallback, useEffect, useMemo, useState } from 'react'
+import { getThroughput, listQueues } from '../api/client'
+import type { MetricsRange, MetricsThroughputResponse, PathQueueOut } from '../api/types'
+import { BytesPerHourChart } from '../components/charts/BytesPerHourChart'
+import { SpeedLineChart } from '../components/charts/SpeedLineChart'
+import { assignQueueColorSlots, colorVarForSlot } from '../components/charts/queueColors'
+import { usePoll } from '../hooks/usePoll'
+
+const RANGES: { value: MetricsRange; label: string }[] = [
+  { value: '1h', label: '1h' },
+  { value: '12h', label: '12h' },
+  { value: '24h', label: '24h' },
+]
+
+// Refreshed on the same order of cadence as the rest of the app's polled pages (StatsHeader:
+// 5s for numbers that change every tick; History's manual refresh for a paginated list). A
+// dashboard built from 30s-interval samples doesn't need sub-minute polling to feel live --
+// 60s keeps it current without adding load for a page nobody is watching in real time the way
+// they watch Transfers.
+const POLL_INTERVAL_MS = 60_000
+
+const selectClasses =
+  'rounded-md border border-zinc-300 bg-white px-2.5 py-1.5 text-sm text-zinc-900 outline-none focus:border-zinc-500 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100'
+
+/** DESIGN.md — new "Dashboard" page proposed alongside this task (docs/decisions.md); not an
+ * expansion of the header stats (decision 4) -- a new page, so the header doesn't try to
+ * cram a chart into a single row of chrome. Two hand-rolled SVG charts, both fed by
+ * `core/metrics.py`'s throughput sample store: bytes/hour for the last 24h, and speed over a
+ * selectable window, per queue or site-wide.
+ */
+export function DashboardPage() {
+  const [queues, setQueues] = useState<PathQueueOut[]>([])
+  const [range, setRange] = useState<MetricsRange>('24h')
+  const [queueId, setQueueId] = useState<number | undefined>(undefined)
+
+  useEffect(() => {
+    listQueues()
+      .then(setQueues)
+      .catch(() => {
+        // Chart 1's legend/breakdown and Chart 2's queue selector just show nothing extra;
+        // the charts themselves still work off queue ids present in the throughput data.
+      })
+  }, [])
+
+  const dailyFetcher = useCallback(() => getThroughput('24h'), [])
+  const daily = usePoll<MetricsThroughputResponse>(dailyFetcher, POLL_INTERVAL_MS)
+
+  const speedFetcher = useCallback(() => getThroughput(range, queueId), [range, queueId])
+  const speed = usePoll<MetricsThroughputResponse>(speedFetcher, POLL_INTERVAL_MS)
+
+  const colorSlots = useMemo(() => assignQueueColorSlots(queues), [queues])
+  const selectedQueueName = queueId != null ? queues.find((q) => q.id === queueId)?.name : undefined
+  const seriesLabel = selectedQueueName ?? 'All queues'
+  const seriesColor =
+    queueId != null ? colorVarForSlot(colorSlots.get(queueId) ?? 0) : 'var(--series-1)'
+
+  return (
+    <div className="flex flex-col gap-6">
+      <section className="flex flex-col gap-2 rounded-lg border border-zinc-200 p-4 dark:border-zinc-800">
+        {daily ? (
+          <BytesPerHourChart buckets={daily.buckets} queues={queues} />
+        ) : (
+          <div className="flex h-40 items-center justify-center text-sm text-zinc-400 dark:text-zinc-600">
+            Loading…
+          </div>
+        )}
+      </section>
+
+      <section className="flex flex-col gap-3 rounded-lg border border-zinc-200 p-4 dark:border-zinc-800">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <h3 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">
+            Transfer speed — {seriesLabel}
+          </h3>
+          <div className="flex items-center gap-2">
+            <select
+              className={selectClasses}
+              value={queueId ?? ''}
+              onChange={(e) => setQueueId(e.target.value ? Number(e.target.value) : undefined)}
+              aria-label="Queue"
+            >
+              <option value="">All queues</option>
+              {queues.map((q) => (
+                <option key={q.id} value={q.id}>
+                  {q.name}
+                </option>
+              ))}
+            </select>
+            <div className="flex overflow-hidden rounded-md border border-zinc-300 dark:border-zinc-700">
+              {RANGES.map((r) => (
+                <button
+                  key={r.value}
+                  type="button"
+                  onClick={() => setRange(r.value)}
+                  aria-pressed={range === r.value}
+                  className={`px-2.5 py-1.5 text-sm font-medium ${
+                    range === r.value
+                      ? 'bg-zinc-900 text-white dark:bg-zinc-100 dark:text-zinc-900'
+                      : 'bg-white text-zinc-700 hover:bg-zinc-50 dark:bg-zinc-900 dark:text-zinc-200 dark:hover:bg-zinc-800'
+                  }`}
+                >
+                  {r.label}
+                </button>
+              ))}
+            </div>
+          </div>
+        </div>
+
+        {speed ? (
+          <SpeedLineChart
+            buckets={speed.buckets}
+            bucketSeconds={speed.bucket_seconds}
+            seriesLabel={seriesLabel}
+            colorVar={seriesColor}
+          />
+        ) : (
+          <div className="flex h-32 items-center justify-center text-sm text-zinc-400 dark:text-zinc-600">
+            Loading…
+          </div>
+        )}
+      </section>
+    </div>
+  )
+}

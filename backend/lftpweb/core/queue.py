@@ -27,8 +27,10 @@ import aiosqlite
 
 from lftpweb.core import lftp, patterns, scheduler
 from lftpweb.core.events import EventBus
+from lftpweb.core.itemview import item_view
+from lftpweb.core.metrics import RunningJobBytes, ThroughputSampler
 from lftpweb.core.progress import ActiveJob, ProgressSampler
-from lftpweb.core.remote import HostConfig
+from lftpweb.core.remote import HostConfig, parse_connection_limit
 
 logger = logging.getLogger(__name__)
 
@@ -152,6 +154,11 @@ class _RunningProcess:
     remote_mtime: float | None
     spawned: lftp.SpawnedJob
     wait_task: asyncio.Task
+    # Mirrors `job.bytes_start` (the local size already on disk when this job was spawned --
+    # a resume/retry does not start over, `-c`). Carried here so `_sample_metrics` never needs
+    # a second DB read to feed core/metrics.py's non-monotonic-safe per-job delta; see that
+    # module's docstring for why `bytes_done` alone can't be differenced by job id.
+    bytes_start: int = 0
     stop_requested: bool = False
 
 
@@ -193,6 +200,10 @@ class TransferQueue:
         self._running: dict[int, _RunningProcess] = {}  # job_id -> process
         self._backoff_until: dict[int, float] = {}  # item_id -> monotonic time
         self.progress = ProgressSampler()
+        # Throughput metrics (this task, DESIGN.md — new section proposed): same
+        # process-lifetime, tick-driven shape as `self.progress` above -- see
+        # `core/metrics.py`'s module docstring and `_sample_metrics` below.
+        self.metrics = ThroughputSampler(self.db)
         self._last_speeds: dict[int, float] = {}  # job_id -> most recent EMA speed, for stats()
         # `list_jobs()` (an API read path, polled on whatever cadence the frontend chooses)
         # must never call `self.progress.sample()` itself — the sampler's EMA math assumes
@@ -412,6 +423,7 @@ class TransferQueue:
     async def tick(self) -> None:
         await self._reap_finished()
         await self._sample_and_publish_progress()
+        await self._sample_metrics()
         await self._admit()
 
     async def _reap_finished(self) -> None:
@@ -423,6 +435,7 @@ class TransferQueue:
             return  # already reaped (stop_job() and the tick loop can race on the same proc)
         del self._running[proc.job_id]
         self.progress.drop(proc.job_id)
+        self.metrics.drop(proc.job_id)
         self._last_speeds.pop(proc.job_id, None)
         self._last_progress.pop(proc.job_id, None)
 
@@ -598,6 +611,33 @@ class TransferQueue:
                 ],
             }
         )
+
+    async def _sample_metrics(self) -> None:
+        """Feeds `core/metrics.py`'s 30-tick throughput sampler from the exact same per-job
+        byte accounting `_sample_and_publish_progress` just wrote above (`self._last_progress`)
+        -- never a second measurement, and never lftp's own stdout (DESIGN.md §1.3). Called
+        every tick, including ticks where nothing is running (`self._running` empty) --
+        `ThroughputSampler.tick()` needs that to keep the heartbeat alive while lftpweb is
+        idle, which is what tells an idle instance apart from a stopped one (see that module's
+        docstring).
+        """
+        running = [
+            RunningJobBytes(
+                job_id=p.job_id,
+                queue_id=p.queue_id,
+                # `_last_progress` was just populated, for every currently-running job, by
+                # `_sample_and_publish_progress` above in this same tick -- the fallback to
+                # `p.bytes_start` (contribution 0) only matters for a job that somehow never
+                # got a progress sample yet, which shouldn't happen in practice given the call
+                # order but keeps this from raising on a `KeyError` if it ever did.
+                bytes_done=self._last_progress[p.job_id].bytes_done
+                if p.job_id in self._last_progress
+                else p.bytes_start,
+                bytes_start=p.bytes_start,
+            )
+            for p in self._running.values()
+        ]
+        await self.metrics.tick(running)
 
     async def _admit(self) -> None:
         settings = await load_transfer_settings(self.db)
@@ -792,6 +832,7 @@ class TransferQueue:
             remote_mtime=float(item["remote_mtime"]) if item["remote_mtime"] is not None else None,
             spawned=spawned,
             wait_task=wait_task,
+            bytes_start=item["local_size"] or 0,  # same value written to job.bytes_start below
         )
         self._running[decision.job_id] = proc
 
@@ -899,19 +940,7 @@ class TransferQueue:
             {
                 "type": "item_delta",
                 "queue_id": row["queue_id"],
-                "nodes": [
-                    {
-                        "id": row["id"],
-                        "rel_path": row["rel_path"],
-                        "is_dir": bool(row["is_dir"]),
-                        "state": row["state"],
-                        "remote_size": row["remote_size"],
-                        "local_size": row["local_size"],
-                        "remote_mtime": float(row["remote_mtime"])
-                        if row["remote_mtime"] is not None
-                        else None,
-                    }
-                ],
+                "nodes": [item_view(row)],
             }
         )
 
@@ -934,14 +963,9 @@ class TransferQueue:
             "SELECT connection_overrides FROM host WHERE id = ?", (host.id,)
         )
         row = await cursor.fetchone()
-        if row is None or not row["connection_overrides"]:
+        if row is None:
             return None
-        try:
-            overrides = json.loads(row["connection_overrides"])
-        except (ValueError, TypeError):
-            return None
-        value = overrides.get("net:connection-limit") or overrides.get("connection_limit")
-        return int(value) if value else None
+        return parse_connection_limit(row["connection_overrides"])
 
     # --- read models for api/jobs.py --------------------------------------------------------
 
@@ -955,10 +979,19 @@ class TransferQueue:
         `MAX(id)` subquery) — a manual retry inserts a new `queued` row for the same item,
         which is already covered by the first clause and makes the old failed/cancelled row
         irrelevant (superseded), so this doesn't need to filter it out separately.
+
+        Also joins `path_queue` for `queue_name` (DESIGN.md §9.2: with multiple active
+        queues, a Transfers-page row has to say which one it's from). This row set is
+        bounded by construction (the docstring above), unlike `api/history.py`'s unbounded,
+        paginated endpoint — that's why this can inline the join instead of shipping
+        `queue_id` alone and making the client resolve it.
         """
         cursor = await self.db.execute(
-            "SELECT job.*, item.rel_path, item.is_dir, item.queue_id, item.remote_size "
-            "FROM job JOIN item ON item.id = job.item_id "
+            "SELECT job.*, item.rel_path, item.is_dir, item.queue_id, item.remote_size, "
+            "       path_queue.name AS queue_name "
+            "FROM job "
+            "JOIN item ON item.id = job.item_id "
+            "JOIN path_queue ON path_queue.id = item.queue_id "
             "WHERE job.state IN ('queued','running') "
             "   OR (job.state IN ('failed','cancelled') "
             "       AND job.id = (SELECT MAX(j2.id) FROM job j2 WHERE j2.item_id = job.item_id)) "

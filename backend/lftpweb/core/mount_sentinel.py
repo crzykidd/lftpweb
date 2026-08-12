@@ -18,7 +18,8 @@ Two independent mechanisms:
    whose root fails `check()` — not deferred item-by-item, the whole queue's auto-queue pass
    is skipped, surfaced in the log (and, via `AutoQueue.gated`, the API/UI).
 2. **The grace period + `REMOVED_LOCAL` transition (`resolve_absence`).** DESIGN.md §3.2 rule
-   3: an item that was `DOWNLOADED` and is now locally absent (remote still present) becomes
+   3: an item that had a complete local copy — `DOWNLOADED`, or any of the six post-processing
+   states §6 refines it into — and is now locally absent (remote still present) becomes
    `REMOVED_LOCAL`, not a fresh `REMOTE_ONLY` — otherwise auto-queue would cheerfully
    re-fetch something the user (or an *arr import) deliberately removed. Absence must persist
    across several consecutive scans (default ~10 minutes) before the transition sticks, so a
@@ -35,6 +36,8 @@ import os
 from datetime import UTC, datetime
 from pathlib import Path
 
+from lftpweb.core.postprocess import OWNED_STATES as _POSTPROCESS_STATES
+
 logger = logging.getLogger(__name__)
 
 SENTINEL_NAME = ".lftpweb-mount-ok"
@@ -44,10 +47,23 @@ SENTINEL_NAME = ".lftpweb-mount-ok"
 # function's shape.
 DEFAULT_GRACE_S = 600.0
 
-# States for which a fresh REMOTE_ONLY reading is worth reconsidering against history —
-# `DOWNLOADED` is the state the grace clock can start from; `REMOVED_LOCAL` is where it's
-# already landed and must stay landed until the item's local copy genuinely reappears.
-_STICKY_PREV_STATES = frozenset({"DOWNLOADED", "REMOVED_LOCAL"})
+# States that assert "this item's bytes were all here" — the grace clock can start from any
+# of them. `DOWNLOADED` plus every state `core/postprocess.py` owns: each of the six is only
+# ever written to an item that had already reached `DOWNLOADED`, so absence means the same
+# thing for a `VERIFIED`, `CORRUPT` or half-extracted item as it does for a plain one.
+#
+# Leaving them out (as this set did until it was noticed) is not the safe default it looks
+# like. Post-processing is *why* an item's local copy commonly disappears — a staging move
+# does it deliberately (see `core/postprocess.py`'s module docstring), an *arr importer does
+# it right after — so these are precisely the items whose absence the grace period exists to
+# handle. Without them, a `VERIFIED`/`EXTRACTED` item that an importer moves out is persisted
+# as a fresh `REMOTE_ONLY` and auto-queue re-downloads the whole release on the next pass:
+# §3.2 rule 3 defeated for exactly the items it matters most for.
+_COMPLETE_PREV_STATES = frozenset({"DOWNLOADED"}) | _POSTPROCESS_STATES
+
+# ...plus `REMOVED_LOCAL`, where the clock has already landed and must stay landed until the
+# item's local copy genuinely reappears.
+_STICKY_PREV_STATES = _COMPLETE_PREV_STATES | frozenset({"REMOVED_LOCAL"})
 
 
 def check(local_path: str) -> bool:
@@ -101,14 +117,22 @@ def resolve_absence(
     grace_s: float = DEFAULT_GRACE_S,
 ) -> tuple[str, str | None] | None:
     """Decide whether a fresh `REMOTE_ONLY` reading from `core/reconcile.py` should instead
-    be persisted as `DOWNLOADED` (grace period still running, or the mount gate refuses to
-    even start the clock) or `REMOVED_LOCAL` (grace period elapsed — DESIGN.md §3.2 rule 3).
+    be persisted as the previous state (grace period still running, or the mount gate refuses
+    to even start the clock) or `REMOVED_LOCAL` (grace period elapsed — DESIGN.md §3.2 rule
+    3).
 
     Returns `None` when the fresh structural state should be trusted as-is — including every
-    case where the item was never `DOWNLOADED`/`REMOVED_LOCAL` in the first place, and the
+    case where the item never reached a complete-local state in the first place, and the
     case where local presence has returned (the caller's own `structural_state` already
     reflects that as `PARTIAL`/`DOWNLOADED`, and clears `first_missing_at` by simply not
     carrying it forward). Otherwise returns `(state, first_missing_at)` to persist instead.
+
+    The state held *during* the grace window is `prev_state` itself, not a hardcoded
+    `DOWNLOADED`: for the post-processing states in `_COMPLETE_PREV_STATES` that is the whole
+    point — an item mid-import must keep reading `CORRUPT`/`EXTRACT_FAILED` for the ten
+    minutes before the transition lands, rather than being quietly downgraded to `DOWNLOADED`
+    first and losing the failure the user needs to see. For `DOWNLOADED` itself this is the
+    same value it always returned.
 
     `prev_state == 'REMOVED_LOCAL'` is sticky regardless of `mount_ok` — the mount gate's job
     is to keep a dropped mount from *starting* this transition, not to undo one that was
@@ -120,17 +144,17 @@ def resolve_absence(
     if prev_state == "REMOVED_LOCAL":
         return ("REMOVED_LOCAL", prev_first_missing_at)
 
-    # prev_state == "DOWNLOADED": a fresh transition candidate.
+    # A complete-local previous state: a fresh transition candidate.
     if not mount_ok:
         # The mount gate: never start the grace clock on a reading we can't trust to mean
         # what it appears to mean. Keep showing the last-known-good state.
-        return ("DOWNLOADED", prev_first_missing_at)
+        return (prev_state, prev_first_missing_at)
 
     if prev_first_missing_at is None:
-        return ("DOWNLOADED", now.strftime("%Y-%m-%dT%H:%M:%S.%fZ"))
+        return (prev_state, now.strftime("%Y-%m-%dT%H:%M:%S.%fZ"))
 
     first_missing = datetime.fromisoformat(prev_first_missing_at.replace("Z", "+00:00"))
     elapsed = (now - first_missing).total_seconds()
     if elapsed >= grace_s:
         return ("REMOVED_LOCAL", prev_first_missing_at)
-    return ("DOWNLOADED", prev_first_missing_at)
+    return (prev_state, prev_first_missing_at)

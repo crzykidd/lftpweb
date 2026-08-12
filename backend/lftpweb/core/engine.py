@@ -27,10 +27,11 @@ from typing import Any
 
 import aiosqlite
 
-from lftpweb.core import local_scan, mount_sentinel, patterns
+from lftpweb.core import local_scan, mount_sentinel, patterns, postprocess
 from lftpweb.core.autoqueue import AutoQueue, QueueAutoConfig
 from lftpweb.core.crypto import DecryptionError, decrypt_secret
 from lftpweb.core.events import EventBus
+from lftpweb.core.itemview import ITEM_VIEW_COLUMNS, ItemView, item_view
 from lftpweb.core.reconcile import ReconciledNode, reconcile
 from lftpweb.core.remote import HostConfig, RemoteConnectionPool, RemoteScanError
 
@@ -124,33 +125,9 @@ async def load_queues(db: aiosqlite.Connection) -> list[QueueConfig]:
     ]
 
 
-def serialize_node(node: ReconciledNode, item_id: int | None = None) -> dict[str, Any]:
-    """One node as the WebSocket sends it.
-
-    `id` matters more than it looks: every action the Files page offers (Queue, Stop, the
-    bulk operations) addresses an item by its `item.id`, and the page renders purely from
-    this stream — never from `GET /api/files`. Omitting it, as this did until it was caught
-    against a real deployment, means every row arrives with `id == null` and the UI silently
-    renders no action button at all, on every row, forever. `ReconciledNode` has no id of its
-    own (it is the pure reconciler output, produced before anything is persisted), so the id
-    is passed in by the caller from the map built in `_persist`.
-    """
-    from lftpweb.core.util import to_safe_text
-
-    return {
-        "id": item_id,
-        "rel_path": to_safe_text(node.rel_path),
-        "is_dir": node.is_dir,
-        "state": node.state,
-        "remote_size": node.remote_size,
-        "local_size": node.local_size,
-        "remote_mtime": node.remote_mtime,
-    }
-
-
 def diff_nodes(
-    old: dict[str, ReconciledNode], new: dict[str, ReconciledNode]
-) -> tuple[list[ReconciledNode], list[str]]:
+    old: dict[str, ItemView], new: dict[str, ItemView]
+) -> tuple[list[ItemView], list[str]]:
     """The WebSocket delta fix (DESIGN.md §2/§9; docs/decisions.md's phase 2 entry flagged
     this shape as scoped-down and said phase 3 shouldn't inherit it by default).
 
@@ -159,13 +136,20 @@ def diff_nodes(
     sampler makes that shape actively wrong: a queue holding a few thousand files would
     re-serialize and re-send the entire tree to every connected browser every second.
 
-    `ReconciledNode` is a frozen, `eq`-comparable dataclass (`core/reconcile.py`), so
-    "changed" is exactly the identity check below — no field-by-field bookkeeping needed. A
-    node whose `rel_path` didn't exist in `old`, or whose value differs from `old`'s, is
-    "changed"; a `rel_path` present in `old` but absent from `new` is "removed". This is a
-    pure function precisely so it's unit-testable without a running engine or a live SSH
-    connection — see `tests/test_ws_deltas.py`, which is also where "the payload doesn't
-    scale with tree size" is proven, not just asserted.
+    Both sides are `core/itemview.py` projections of the persisted `item` rows — not
+    `core/reconcile.py`'s structural nodes, which is what this diffed until the two were
+    reconciled (see `core/itemview.py`'s module docstring). Diffing what was actually stored
+    is what makes an item whose *effective* state changed while its structural node did not —
+    a §7.3 grace period expiring into `REMOVED_LOCAL`, a post-processing outcome reasserted
+    over a fresh `DOWNLOADED` — visible to the diff at all.
+
+    An `ItemView` is a plain dict of scalars, so "changed" is exactly the equality check
+    below — no field-by-field bookkeeping needed. A node whose `rel_path` didn't exist in
+    `old`, or whose value differs from `old`'s, is "changed"; a `rel_path` present in `old`
+    but absent from `new` is "removed". This is a pure function precisely so it's
+    unit-testable without a running engine or a live SSH connection — see
+    `tests/test_ws_deltas.py`, which is also where "the payload doesn't scale with tree size"
+    is proven, not just asserted.
     """
     changed = [node for rel_path, node in new.items() if old.get(rel_path) != node]
     removed = [rel_path for rel_path in old if rel_path not in new]
@@ -198,10 +182,19 @@ class Engine:
         # means auto-queue is simply never evaluated -- not a crash, not a silent no-op that
         # looks like a bug, just "this capability isn't wired up."
         self.autoqueue = autoqueue
+        # Phase 5's pipeline (DESIGN.md §6), set as a plain attribute after construction for
+        # the same reason `core/queue.py` takes it that way: `main.py`'s lifespan can't build
+        # it until `Engine.pool` exists. Read for one thing only -- `in_flight_item_ids()`,
+        # in `_protected_rel_paths` below. `None` (every existing test's default) simply means
+        # no item is ever reported as mid-postprocessing, which is exactly right for an
+        # engine running without a pipeline attached.
+        self.postprocess: Any = None
 
-        self.models: dict[int, dict[str, ReconciledNode]] = {}
-        # rel_path -> item.id per queue; see `serialize_node` for why the WS needs it.
-        self.item_ids: dict[int, dict[str, int]] = {}
+        # rel_path -> the projection of that item's persisted row, per queue (DESIGN.md §2).
+        # A *cache of the `item` table*, refreshed from it after every persist — never the
+        # structural reading `core/reconcile.py` produced on the way in. See
+        # `core/itemview.py` for why the distinction is the whole point.
+        self.models: dict[int, dict[str, ItemView]] = {}
         self.queue_meta: dict[int, QueueConfig] = {}
         self.scan_errors: dict[int, str | None] = {}
         # A *soft* per-queue note (DESIGN.md §5) — set when a scan completed but skipped one
@@ -294,11 +287,19 @@ class Engine:
             counts_predicate = patterns.build_counts_predicate(compiled)
             nodes = reconcile(remote_tree, local_tree, counts_predicate=counts_predicate)
 
-            old_nodes = self.models.get(q.id, {})
-            changed, removed = diff_nodes(old_nodes, nodes)
+            # Persist first, then read back what was actually stored, then diff *that*
+            # (DESIGN.md §2/§9; `core/itemview.py`). `_persist` is where an item's state is
+            # really decided — job-lifecycle protection, §6's post-processing precedence,
+            # §7.3's grace period — so diffing `nodes` here, as this did until the two views
+            # were reconciled, published a state the database disagreed with. The order is
+            # the invariant: nothing goes on the wire that wasn't read back out of `item`.
+            written = await self._persist(q.id, nodes)
+            published = await self._project(q.id, written)
 
-            self.models[q.id] = nodes
-            await self._persist(q.id, nodes)
+            old_nodes = self.models.get(q.id, {})
+            changed, removed = diff_nodes(old_nodes, published)
+            self.models[q.id] = published
+
             self.scan_errors[q.id] = None
             self.scan_warnings[q.id] = scan_warning
             self.last_scan_at[q.id] = _now_iso()
@@ -310,7 +311,7 @@ class Engine:
                     "type": "queue_delta",
                     "queue_id": q.id,
                     "queue_name": q.name,
-                    "changed": [serialize_node(n, self._node_id(q.id, n)) for n in changed],
+                    "changed": changed,
                     "removed": removed,
                     "scanned_at": self.last_scan_at[q.id],
                     "warning": scan_warning,
@@ -351,13 +352,41 @@ class Engine:
         in particular a job's own success path (`core/queue.py._reap_one`) clears
         `auto_queue_suppressed` and sets `DOWNLOADED` itself, so this scan is free to confirm
         it on the very next pass rather than fighting over it.
+
+        **Extended for phase 5's post-processing states (§3.2, §6), which did not exist when
+        the paragraph above was written.** `core/postprocess.py` is the third owner of
+        `item.state`, and both halves of that ownership are deliberately *not* expressed the
+        same way:
+
+        - **Mid-run** (`VERIFYING`/`EXTRACTING`) an item is protected here — but keyed on the
+          pipeline's in-memory `in_flight_item_ids()`, never on the state string. An extract
+          can run for an hour, far longer than a scan interval, and must not be stomped while
+          it does; but protection that outlived the worker would be a wedge with no way out,
+          which is exactly the bug phase 3 hit with jobs left `running` by a restart
+          (`core/queue.py._reconcile_orphaned_jobs`). Tying it to the live worker means a
+          crash un-protects the item automatically and the next scan recomputes it.
+        - **The outcomes** (`VERIFIED`/`CORRUPT`/`EXTRACTED`/`EXTRACT_FAILED`) are *not*
+          listed here, because unconditional protection is the wrong shape for them: an
+          `EXTRACTED` item whose local copy is later moved out by an importer would stay
+          `EXTRACTED` forever and §3.2 rule 3's `REMOVED_LOCAL` transition would never fire
+          for it again. They win over the structural state only while the content is actually
+          present, which is a decision about *both* states and so lives in `_persist` below
+          (`core/postprocess.py.outcome_survives_rescan`) alongside the absence half
+          (`core/mount_sentinel.py.resolve_absence`).
         """
+        # `frozenset` -> sorted list purely so the SQL parameters are deterministic (log/test
+        # readability); membership is what matters, not order.
+        in_flight = sorted(self.postprocess.in_flight_item_ids()) if self.postprocess else []
+        in_flight_clause = (
+            f" OR item.id IN ({','.join('?' for _ in in_flight)})" if in_flight else ""
+        )
         cursor = await self.db.execute(
             "SELECT item.rel_path FROM item WHERE item.queue_id = ? AND ("
             "  item.auto_queue_suppressed = 1"
             "  OR EXISTS (SELECT 1 FROM job WHERE job.item_id = item.id AND job.state IN ('queued', 'running'))"
+            f"{in_flight_clause}"
             ")",
-            (queue_id,),
+            (queue_id, *in_flight),
         )
         rows = await cursor.fetchall()
         return {row["rel_path"] for row in rows}
@@ -372,16 +401,22 @@ class Engine:
         rows = await cursor.fetchall()
         return {row["rel_path"]: (row["state"], row["first_missing_at"]) for row in rows}
 
-    async def _persist(self, queue_id: int, nodes: dict[str, ReconciledNode]) -> None:
+    async def _persist(self, queue_id: int, nodes: dict[str, ReconciledNode]) -> set[str]:
+        """Write this pass's arbitrated state for every reconciled node, and return the
+        `rel_path`s it wrote (already `to_safe_text`-ed, i.e. keyed exactly as the `item`
+        table stores them) so `_project` knows which rows this scan is entitled to publish.
+        """
         from lftpweb.core.util import to_safe_text
 
         protected = await self._protected_rel_paths(queue_id)
         previous = await self._previous_states(queue_id)
         mount_ok = self.mount_ok.get(queue_id, False)
         now = datetime.now(UTC)
+        written: set[str] = set()
 
         for node in nodes.values():
             rel_path = to_safe_text(node.rel_path)
+            written.add(rel_path)
             if rel_path in protected:
                 await self.db.execute(
                     """
@@ -400,27 +435,38 @@ class Engine:
                         node.remote_size,
                         node.local_size,
                         node.remote_mtime,
-                        node.state,
+                        node.structural_state,
                     ),
                 )
                 continue
 
-            # DESIGN.md §3.2 rule 3, §7.3's grace period, required starting this phase (see
+            # DESIGN.md §3.2 rule 3, §7.3's grace period, required starting phase 4 (see
             # docs/decisions.md and core/mount_sentinel.py's module docstring): a fresh
-            # REMOTE_ONLY reading for something that used to be DOWNLOADED (or already
-            # REMOVED_LOCAL) doesn't get written verbatim -- it's resolved against history
-            # and the mount gate first. Every other node's freshly-computed state is trusted
-            # as-is, exactly like phase 2/3.
+            # REMOTE_ONLY reading for something that used to have a complete local copy (or
+            # is already REMOVED_LOCAL) doesn't get written verbatim -- it's resolved against
+            # history and the mount gate first. The branch above it is the same arbitration
+            # for the opposite reading, presence rather than absence. Every other node's
+            # freshly-computed state is trusted as-is, exactly like phase 2/3.
             prev_state, prev_first_missing_at = previous.get(rel_path, (None, None))
-            override = mount_sentinel.resolve_absence(
-                prev_state=prev_state,
-                prev_first_missing_at=prev_first_missing_at,
-                structural_state=node.state,
-                mount_ok=mount_ok,
-                now=now,
-            )
-            state = override[0] if override is not None else node.state
-            first_missing_at = override[1] if override is not None else None
+            if postprocess.outcome_survives_rescan(prev_state, node.structural_state):
+                # DESIGN.md §3.2/§6: the content is all still here, and a post-processing
+                # outcome says something about it this scan's byte comparison cannot --
+                # `core/postprocess.py` owns `state` for as long as that holds. Without this,
+                # every outcome (including CORRUPT and EXTRACT_FAILED, the two a user most
+                # needs to see) was silently overwritten with a plain DOWNLOADED by the next
+                # scan, within 30 seconds of being set. `first_missing_at` is cleared for the
+                # same reason the branch below clears it: local presence is not in question.
+                state, first_missing_at = prev_state, None
+            else:
+                override = mount_sentinel.resolve_absence(
+                    prev_state=prev_state,
+                    prev_first_missing_at=prev_first_missing_at,
+                    structural_state=node.structural_state,
+                    mount_ok=mount_ok,
+                    now=now,
+                )
+                state = override[0] if override is not None else node.structural_state
+                first_missing_at = override[1] if override is not None else None
 
             await self.db.execute(
                 """
@@ -446,41 +492,63 @@ class Engine:
                 ),
             )
         await self.db.commit()
-        await self._refresh_item_ids(queue_id)
+        return written
 
-    async def _refresh_item_ids(self, queue_id: int) -> None:
-        """Cache `rel_path -> item.id` for this queue, so the WebSocket can carry the id the
-        Files page needs to act on a row (see `serialize_node`). One query per scan, run
-        after the upsert so freshly-inserted rows are included.
+    async def _project(self, queue_id: int, rel_paths: set[str]) -> dict[str, ItemView]:
+        """Read one queue's persisted rows back as the projection everything publishes
+        (`core/itemview.py`), keyed by `rel_path`.
+
+        This is the query `_refresh_item_ids` used to run — `SELECT ... FROM item WHERE
+        queue_id = ?`, once per scan, after the upsert so freshly-inserted rows are included —
+        widened from `id, rel_path` to the display columns. No new query, no extra round trip,
+        and no asymptotic change: `reconcile` is already O(tree).
+
+        **`rel_paths` filters the result to what this pass is entitled to publish**, and it is
+        not incidental. Nothing ever deletes an `item` row (§3.2 rule 6 keeps `REMOVED_BOTH`
+        as history, and every other vanished path simply stops being upserted), so an
+        unfiltered projection would resurrect rows that left both trees — and would leave
+        `diff_nodes`'s `removed` list permanently empty, since a row that is never deleted can
+        never disappear from the projection. Passing the set `_persist` just wrote keeps the
+        published node set identical to the reconciled one, exactly as before; only the
+        *values* now come from the database.
         """
         cursor = await self.db.execute(
-            "SELECT id, rel_path FROM item WHERE queue_id = ?", (queue_id,)
+            f"SELECT {ITEM_VIEW_COLUMNS} FROM item WHERE queue_id = ?",  # noqa: S608 - a module constant, not user input
+            (queue_id,),
         )
-        self.item_ids[queue_id] = {row["rel_path"]: row["id"] for row in await cursor.fetchall()}
+        return {
+            row["rel_path"]: item_view(row)
+            for row in await cursor.fetchall()
+            if row["rel_path"] in rel_paths
+        }
 
-    def _node_id(self, queue_id: int, node: ReconciledNode) -> int | None:
-        from lftpweb.core.util import to_safe_text
-
-        return self.item_ids.get(queue_id, {}).get(to_safe_text(node.rel_path))
-
-    def snapshot(self) -> list[dict[str, Any]]:
+    async def snapshot(self) -> list[dict[str, Any]]:
         """The full current model, one message per queue — what a freshly-connected
         WebSocket client gets before any delta (DESIGN.md §2, §9). This is the *only* place
         a full node list is ever sent; every update after connect is a `queue_delta`
         (`scan_queue`) or an `item_delta` (`core/queue.py`), each proportional to what
         changed rather than to the size of the tree.
+
+        **Re-reads the database rather than serving `self.models` verbatim, and is `async`
+        for that reason.** The cached model is only refreshed on a scan (up to
+        `scan_interval_s`, default 30s), while `core/queue.py` and `core/postprocess.py` write
+        `item.state` the instant a job or a pipeline step moves — they push an `item_delta`
+        for it, but a client connecting *after* that push and *before* the next scan would
+        otherwise be handed a snapshot older than the database it is meant to reflect. Reload
+        is precisely how the structural-vs-persisted disagreement used to become visible
+        (`core/itemview.py`), so the connect path reads back like every other publisher. The
+        cost is one query per queue per connection, not per scan.
         """
         out = []
         for queue_id, nodes in self.models.items():
             meta = self.queue_meta.get(queue_id)
+            current = await self._project(queue_id, set(nodes))
             out.append(
                 {
                     "type": "queue_snapshot",
                     "queue_id": queue_id,
                     "queue_name": meta.name if meta else "",
-                    "nodes": [
-                        serialize_node(n, self._node_id(queue_id, n)) for n in nodes.values()
-                    ],
+                    "nodes": list(current.values()),
                     "scanned_at": self.last_scan_at.get(queue_id),
                     "warning": self.scan_warnings.get(queue_id),
                 }

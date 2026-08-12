@@ -128,6 +128,28 @@ class HostConfig:
     credentials_need_reentry: bool = False
 
 
+def parse_connection_limit(connection_overrides_json: str | None) -> int | None:
+    """Pull `net:connection-limit` out of `host.connection_overrides` (DESIGN.md §3.1's
+    free-form JSON blob), or `None` if it's unset/unparseable.
+
+    DESIGN.md §4.5/§9.3 calls `net:connection-limit` "a first-class setting, host-level, not
+    an advanced afterthought" — it isn't (docs/decisions.md, 2026-08-12): it lives only in
+    this JSON blob, and there is no `PUT` surface anywhere (`api/settings.py`'s `HostIn` has
+    no field for it) that lets a user set it. Both `core/queue.py` (spawns lftp with it, if
+    present) and `api/settings.py` (surfaces the current value read-only on `HostOut`, for
+    the Settings → Transfer connection-count warning) read it through this one function so
+    the two never drift on which JSON key wins.
+    """
+    if not connection_overrides_json:
+        return None
+    try:
+        overrides = json.loads(connection_overrides_json)
+    except (ValueError, TypeError):
+        return None
+    value = overrides.get("net:connection-limit") or overrides.get("connection_limit")
+    return int(value) if value else None
+
+
 @dataclass(frozen=True)
 class RemoteRecord:
     """One raw parsed line from `find -printf` / `scan_fs.py`, before root-relativization."""

@@ -16,6 +16,9 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
+from lftpweb.core.extract import FAILED_PREFIX, UNPACK_PREFIX
+from lftpweb.core.mount_sentinel import SENTINEL_NAME
+
 PGET_STATUS_SUFFIX = ".lftp-pget-status"
 TEMP_FILE_SUFFIX = ".lftp"
 
@@ -161,7 +164,32 @@ def scan_local(root: str | Path) -> dict[str, LocalEntry]:
             name = entry.name
             rel_path = f"{rel_prefix}{name}" if rel_prefix == "" else f"{rel_prefix}/{name}"
 
+            # `core/mount_sentinel.py` writes this at the queue's local root after every
+            # successful scan (DESIGN.md §7.3). It is lftpweb's own bookkeeping, not content
+            # the user asked for, and it exists only locally — so left in the walk it
+            # reconciles to a permanent LOCAL_ONLY node and shows up in the Files tree as a
+            # file the remote is "missing". Filtered here, at the source, rather than in the
+            # UI: the reconciler, the item table, and every completeness count then all see
+            # the same tree the user sees. Root only, since that is the only place the
+            # sentinel is ever written — an identically-named file deeper in the tree came
+            # from the remote and is real content.
+            if (
+                rel_prefix == ""
+                and name == SENTINEL_NAME
+                and not entry.is_dir(follow_symlinks=False)
+            ):
+                continue
+
             if entry.is_dir(follow_symlinks=False):
+                # `core/extract.py`'s `_UNPACK_<name>`/`_FAILED_<name>` staging directories
+                # (DESIGN.md §6) are lftpweb's own bookkeeping too, but unlike the sentinel
+                # they're siblings of the item they belong to, not root-only, so an item can
+                # carry one at any depth. Left in the walk, an in-progress `_UNPACK_` dir
+                # would reconcile to a growing LOCAL_ONLY node while extraction runs, and a
+                # `_FAILED_` dir would sit there forever as a permanent LOCAL_ONLY once
+                # extraction stops touching it -- neither is content the user asked for.
+                if name.startswith(UNPACK_PREFIX) or name.startswith(FAILED_PREFIX):
+                    continue
                 entries[rel_path] = LocalEntry(rel_path=rel_path, is_dir=True)
                 walk(Path(entry.path), rel_path)
                 continue

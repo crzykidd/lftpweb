@@ -19,10 +19,12 @@ from lftpweb import __version__
 from lftpweb.api import auth as auth_api
 from lftpweb.api import backup as backup_api
 from lftpweb.api import files, health, history, jobs, logs, settings as settings_api, stats, ws
+from lftpweb.api import metrics as metrics_api
 from lftpweb.config import settings
 from lftpweb.core import auth
 from lftpweb.core.autoqueue import AutoQueue
 from lftpweb.core.backup import BackupScheduler
+from lftpweb.core.metrics import MetricsRetentionScheduler
 from lftpweb.core.engine import Engine, load_host_config
 from lftpweb.core.events import EventBus
 from lftpweb.core.postprocess import PostprocessPipeline
@@ -86,19 +88,31 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         host_provider=_host_provider,
     )
     app.state.queue.postprocess = app.state.postprocess
+    # Engine needs it too, for one read: which items a verify/extract worker is running for
+    # right now, so a scan pass doesn't overwrite VERIFYING/EXTRACTING mid-run
+    # (Engine._protected_rel_paths). Same plain-attribute wiring, same reason as above.
+    app.state.engine.postprocess = app.state.postprocess
 
     # Phase 7 (DESIGN.md §10.2): the scheduled backup loop, independent of the pre-migration
     # backup above (which fires from db.py.migrate() regardless of this loop ever starting).
     app.state.backup_scheduler = BackupScheduler(db=app.state.db, config_dir=settings.config_dir)
+    # Throughput metrics (this task, DESIGN.md — new section proposed): retention pruning is
+    # its own loop, same shape as the backup scheduler above -- independent of
+    # `TransferQueue.metrics` (core/metrics.py.ThroughputSampler), which is constructed
+    # inside `TransferQueue.__init__` and ticks from `TransferQueue.tick()` itself, not from
+    # here.
+    app.state.metrics_retention = MetricsRetentionScheduler(db=app.state.db)
 
     await app.state.engine.start()
     await app.state.queue.start()
     await app.state.backup_scheduler.start()
+    await app.state.metrics_retention.start()
 
     logger.info("lftpweb %s started", __version__)
     try:
         yield
     finally:
+        await app.state.metrics_retention.stop()
         await app.state.backup_scheduler.stop()
         await app.state.queue.stop()
         # Let any in-flight postprocessing task (verify/extract/move, all still writing to
@@ -127,6 +141,8 @@ def create_app() -> FastAPI:
     app.include_router(backup_api.router)
     app.include_router(auth_api.router)
     app.include_router(auth_api.settings_router)
+    app.include_router(metrics_api.router)
+    app.include_router(metrics_api.settings_router)
     app.include_router(ws.router)
 
     static_dir = Path(settings.static_dir)

@@ -44,7 +44,6 @@ and how it was verified), but real gaps remain:
 
 | | Notes |
 |---|---|
-| Settings → Transfer has no UI | The site-wide bandwidth/concurrency/fast-lane API (§4.5) is complete and has been since phase 3 — there is just no form for it. Reachable today only by calling `/api/settings/transfer` directly. The §9.3 free-text "extra lftp settings" box and the live connection-count-vs-`net:connection-limit` warning live behind this same missing tab. |
 | Files page has no bulk "Delete local" / "Delete remote" | §9.2 lists both alongside Queue/Stop; phase 9 built honest partial-failure reporting and filters for Queue/Stop only, per its own scope. Deletion still only happens automatically through `move` mode's verification-gated pipeline. |
 | Propagating local deletes to the seedbox (`sync` mode) | Designed (`DESIGN.md` §7) but **not scheduled** — built only if it proves wanted. |
 
@@ -86,6 +85,14 @@ reduction made during the build, recorded in full in `docs/decisions.md`:
 - **`password` auth mode with no user configured is treated as open access, not a lockout** —
   see "Locked out?" below. This is deliberate (the alternative bricks the instance on a typo),
   but it means anyone who can reach the API while no user row exists is in without a password.
+- **`net:connection-limit` (DESIGN.md §4.5/§9.3, "a first-class setting, host-level") has no
+  way to be set from the UI at all.** It lives only in a JSON `connection_overrides` blob on
+  the `host` row (`core/remote.py.parse_connection_limit`); Settings → Connection has no field
+  for it, and there is no `PUT` surface anywhere that writes to it. Settings → Transfer's live
+  connection-count readout (§9.3) reads whatever happens to already be in that blob and
+  surfaces it read-only (`HostOut.net_connection_limit`) — on a fresh install, and on every
+  install today, that's `null`, so the "⚠ over net:connection-limit" warning cannot fire until
+  something writes to the blob some other way (direct SQL, for now).
 
 ## Locked out?
 
