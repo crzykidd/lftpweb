@@ -232,7 +232,13 @@ def build_rc_text(
         f"set pget:min-chunk-size {min_chunk_size};",
         f"set net:max-retries {max_retries};",
         f"set net:timeout {net_timeout_s}s;",
-        f"set net:reconnect-interval-base {reconnect_interval_base_s}s;",
+        # No `s` suffix: net:timeout is a time interval and takes "30s", but
+        # net:reconnect-interval-base takes a bare unsigned number. Getting this wrong
+        # makes lftp reject the line with "5s: invalid unsigned number." while still
+        # running the transfer — so the job failed with a misleading HOST_UNREACHABLE.
+        # Every setting here is verified against a real lftp binary by
+        # tests/test_lftp_settings_accepted.py.
+        f"set net:reconnect-interval-base {reconnect_interval_base_s};",
         "set net:reconnect-interval-multiplier 1.5;",
         # DESIGN.md §4.4b: in-flight files carry a `.lftp` suffix so `core/local_scan.py`'s
         # temp-suffix handling has something to strip. lftp's own defaults are `no` / `.in.*`.
