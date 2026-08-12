@@ -34,11 +34,26 @@ check_writable() {
     if su-exec "${PUID}:${PGID}" sh -c "touch '$probe' 2>/dev/null && rm -f '$probe'"; then
         return 0
     fi
-    echo "lftpweb: ERROR: '${path}' is not writable by uid=${PUID} gid=${PGID}." >&2
     if [ "$fatal" = "1" ]; then
+        echo "lftpweb: ERROR: '${path}' is not writable by uid=${PUID} gid=${PGID}." >&2
         exit 1
     fi
+    # Severity must match behaviour. This branch is advisory, so it says WARNING — an
+    # "ERROR:" here reads as a failed startup for something the app carries on past.
+    echo "lftpweb: WARNING: '${path}' is not writable by uid=${PUID} gid=${PGID}." >&2
+    echo "lftpweb:          Only matters if a path queue is configured to use it." >&2
     return 0  # non-fatal: don't let `set -e` treat this function's own report as a script error
+}
+
+# True only for a path that is genuinely a separate mount — i.e. something the operator
+# actually mounted in. An empty directory baked into the image (or the anonymous volume
+# Docker materialises for a VOLUME declaration) shares its parent's device and is not one.
+is_mountpoint() {
+    _p="$1"
+    [ -d "$_p" ] || return 1
+    _d=$(stat -c %d "$_p" 2>/dev/null) || return 1
+    _pd=$(stat -c %d "$_p/.." 2>/dev/null) || return 1
+    [ "$_d" != "$_pd" ]
 }
 
 # /config only. Chowning is recursive because it's our own small app directory (db, logs,
@@ -63,8 +78,14 @@ fi
 # perfectly healthy share. So we don't attempt it at all; we only verify writability under
 # the target identity, and a failure here is a warning naming the path and the effective
 # uid/gid — not fatal, because queues may simply not be configured yet.
+# Only paths the operator actually mounted. `/downloads` and `/staging` are conventional
+# defaults, not requirements — a queue's local_path can be any mounted path (e.g. an NFS
+# share at /mnt/...). Checking them merely because the directory exists produced a confusing
+# warning about `/downloads` for a deployment that never used it: the Dockerfile's
+# `VOLUME ["/config", "/downloads"]` makes Docker materialise a root-owned anonymous volume
+# there whenever nothing is mounted, which then fails the probe for no reason at all.
 for data_path in /downloads /staging; do
-    if [ -d "$data_path" ]; then
+    if is_mountpoint "$data_path"; then
         check_writable "$data_path" 0
     fi
 done
