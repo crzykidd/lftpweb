@@ -289,3 +289,77 @@ class TransferSettingsOut(BaseModel):
 
 class TransferSettingsIn(TransferSettingsOut):
     pass
+
+
+# --- History (DESIGN.md §9.2 History page, phase 6) -------------------------------------
+#
+# Deliberately a *separate* shape from JobOut/JobsResponse (api/jobs.py), even though both
+# ultimately read the `job` table. JobOut carries `output_tail` inline because the Transfers
+# page's row set is bounded by construction (only the active set plus one terminal row per
+# item -- core/queue.py.list_jobs's own docstring). History has no such bound -- a busy
+# install accumulates thousands of terminal jobs -- so shipping ~4KB of output per row in a
+# paginated list response would make the row cap pointless. `has_output_tail` says whether
+# there's anything to fetch; `GET /api/history/jobs/{id}/output` fetches it.
+
+
+class HistoryJobOut(BaseModel):
+    id: int
+    item_id: int
+    queue_id: int
+    queue_name: str
+    rel_path: str
+    is_dir: bool
+    kind: str
+    state: str  # 'succeeded' | 'failed' | 'cancelled' -- this endpoint's whole domain
+    attempt: int
+    queued_at: str
+    started_at: str | None
+    finished_at: str | None
+    bytes_total: int | None
+    bytes_done: int
+    exit_code: int | None
+    error_class: str | None
+    has_output_tail: bool
+
+
+class HistoryJobsResponse(BaseModel):
+    jobs: list[HistoryJobOut]
+    total: int  # count matching the filter, ignoring limit/offset -- what "load more" needs
+    limit: int
+    offset: int
+
+
+class HistoryJobOutputOut(BaseModel):
+    """The on-demand payload for a single failed (or any terminal) job's captured output --
+    phase 3a stores up to ~4KB per failed job precisely so this can show *why*, not a red dot.
+    """
+
+    job_id: int
+    error_class: str | None
+    output_tail: str | None
+
+
+class HistoryEventOut(BaseModel):
+    id: int
+    ts: str
+    level: str
+    kind: str
+    message: str
+    item_id: int | None
+    job_id: int | None
+    # Resolved via a join against item/path_queue so the delete audit is legible without a
+    # second round trip -- "what was deleted, from which queue" (DESIGN.md §7.3) shouldn't
+    # require the UI to cross-reference item ids by hand. `None` when the item (or its queue)
+    # no longer exists -- `event.item_id` is ON DELETE SET NULL, so a deleted queue's old
+    # audit rows survive with the identifying context gone, which is the correct trade for an
+    # audit trail (the record outlives the thing it describes) rather than cascading it away.
+    queue_id: int | None
+    queue_name: str | None
+    rel_path: str | None
+
+
+class HistoryEventsResponse(BaseModel):
+    events: list[HistoryEventOut]
+    total: int
+    limit: int
+    offset: int

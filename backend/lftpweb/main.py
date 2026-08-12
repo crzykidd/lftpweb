@@ -16,7 +16,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from lftpweb import __version__
-from lftpweb.api import files, health, jobs, settings as settings_api, stats, ws
+from lftpweb.api import files, health, history, jobs, settings as settings_api, stats, ws
 from lftpweb.config import settings
 from lftpweb.core.autoqueue import AutoQueue
 from lftpweb.core.engine import Engine, load_host_config
@@ -99,6 +99,7 @@ def create_app() -> FastAPI:
     app.include_router(settings_api.router)
     app.include_router(files.router)
     app.include_router(jobs.router)
+    app.include_router(history.router)
     app.include_router(ws.router)
 
     static_dir = Path(settings.static_dir)

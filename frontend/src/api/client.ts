@@ -1,6 +1,11 @@
 import type {
   FilesResponse,
   HealthResponse,
+  HistoryEventsFilter,
+  HistoryEventsResponse,
+  HistoryJobOutputOut,
+  HistoryJobsFilter,
+  HistoryJobsResponse,
   HostIn,
   HostOut,
   HostTestRequest,
@@ -174,4 +179,38 @@ export function retryItem(itemId: number): Promise<JobOut> {
  */
 export function stopItem(itemId: number): Promise<{ applied: boolean }> {
   return sendJson<{ applied: boolean }>(`/api/items/${itemId}/stop`, 'POST')
+}
+
+// --- History (phase 6, DESIGN.md §9.2 History page) ---------------------------------------
+
+function queryString(params: object): string {
+  const usp = new URLSearchParams()
+  for (const [key, value] of Object.entries(params) as [string, string | number | undefined][]) {
+    if (value !== undefined) usp.set(key, String(value))
+  }
+  const qs = usp.toString()
+  return qs ? `?${qs}` : ''
+}
+
+/** Completed/failed/cancelled jobs (DESIGN.md §9.2) -- this is where a `succeeded` job's own
+ * record lives; the Transfers page (`getJobs`) deliberately never shows it. Server-capped
+ * and paginated (`total`/`limit`/`offset`) -- never assume `jobs.length` is everything.
+ */
+export function getHistoryJobs(filter: HistoryJobsFilter = {}): Promise<HistoryJobsResponse> {
+  return getJson<HistoryJobsResponse>(`/api/history/jobs${queryString(filter)}`)
+}
+
+/** The on-demand fetch for a job's captured lftp output (~4KB, DESIGN.md §9.2) -- never
+ * shipped inline in `getHistoryJobs`'s list payload; see `HistoryJobOut.has_output_tail`.
+ */
+export function getHistoryJobOutput(jobId: number): Promise<HistoryJobOutputOut> {
+  return getJson<HistoryJobOutputOut>(`/api/history/jobs/${jobId}/output`)
+}
+
+/** The `event` table (DESIGN.md §3.1/§7.3/§7.4) -- every remote delete, every delete
+ * withheld with its gating precondition, and every verify/extract/move outcome. Also
+ * server-capped and paginated.
+ */
+export function getHistoryEvents(filter: HistoryEventsFilter = {}): Promise<HistoryEventsResponse> {
+  return getJson<HistoryEventsResponse>(`/api/history/events${queryString(filter)}`)
 }

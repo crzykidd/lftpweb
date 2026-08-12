@@ -6,6 +6,199 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-12 — Phase 6: the History page — every decision made unattended, recorded for
+## review
+
+**Overnight run, no live confirmation possible.** Built `api/history.py` (`GET
+/api/history/jobs`, `GET /api/history/jobs/{id}/output`, `GET /api/history/events`), the
+matching Pydantic shapes in `models.py`, and the History page itself
+(`frontend/src/pages/HistoryPage.tsx`, `components/HistoryJobsSection.tsx`,
+`components/HistoryEventsSection.tsx`) — the first UI for the `job`/`event` tables phase 3a
+and phase 5 have been filling since the very first overnight run. No schema change: every
+column this phase reads already existed. Verified end to end against the real fake seedbox: a
+real transfer landed in `/api/history/jobs` with its exact byte count, and a forced failure
+(wrong password) carried `error_class: "AUTH_FAILED"` and a real, non-empty `output_tail`
+("`pget: /data/pickup/loose-notes2.txt: Login failed: Login incorrect`") fetched through the
+on-demand endpoint. Full detail in the phase report; every non-obvious call is recorded here.
+
+**1. `output_tail` is never in the list payload — a separate `GET
+/api/history/jobs/{id}/output` fetches it on demand.** DESIGN.md §9.2 says a failed row must
+show "the error class and the captured lftp output tail," and the phase 6 prompt says the same
+thing again, plus "whatever the UI needs to render output_tail on demand rather than in the
+list payload" — an explicit steer away from the obvious "just include it" implementation.
+Phase 3a stores up to ~4KB per failed job; `api/jobs.py`'s `JobOut` already inlines it, but
+that endpoint's row set is bounded by construction (only the active set plus one terminal row
+per item — see `core/queue.py.list_jobs`'s own docstring). History has no such bound — a busy
+install accumulates thousands of terminal jobs — so shipping ~4KB × thousands of rows on every
+page load would make the row cap (point 3 below) pointless. `HistoryJobOut.has_output_tail`
+(a cheap boolean, `output_tail IS NOT NULL`) tells the UI whether there's anything to fetch;
+the frontend fetches lazily, only when a user expands a failed row. **Rejected: reuse
+`JobOut`/`api/jobs.py`'s shape verbatim for History too.** Simpler (one less endpoint, one
+less frontend type), but it's the shape the prompt explicitly warned against, and it would
+silently reintroduce the exact "thousands of rows means thousands of 4KB blobs" cost this
+phase is supposed to avoid.
+
+**2. Grouping by queue is a frontend concern over an already-filtered/paginated flat
+response — not a server-side `{queues: [{jobs: [...]}]}` shape like `GET /api/files`
+uses.** DESIGN.md §9.2 says History must be "grouped by queue," the same wording it uses for
+Files, but Files groups server-side because it has no row cap — every item in a queue's
+current tree is returned. History is capped and paginated (point 3): a global `LIMIT` applied
+before grouping means a `{queue_id: [...]}` split computed server-side would represent
+*partial, cap-truncated* per-queue lists that don't obviously correspond to "this queue's
+recent N jobs." Grouping the returned page client-side, by flattening it into
+`(header, job, job, …, header, job, …)` and virtualizing that single flat array (see point 4),
+keeps the server response a plain, easy-to-reason-about page of "the N most recent matching
+rows" while still rendering with queue headers. **Rejected: server-side grouping identical to
+`FilesResponse`.** Would have made the cap's semantics harder to explain ("this queue shows 3
+jobs not because there were only 3, but because the global cap landed there") and doubled the
+response-shape work for no clear benefit, since the frontend needs to flatten it right back
+into one virtualized list anyway (point 4).
+
+**3. Row cap: `LIMIT`/`OFFSET`, default 200, hard-clamped at `MAX_LIMIT = 500` regardless of
+what the caller requests, plus a `total` count for a "load more" button.** The phase 6 prompt
+says "paginate or cap" — chose both: a default page size sane enough to render without the
+caller having to think about it, and a server-enforced ceiling so a buggy or malicious client
+asking for `limit=1000000` can't force an unbounded query (`tests/test_history_api.py::
+test_row_cap_enforced_even_when_a_larger_limit_is_requested` pins this). `total` is a second
+`COUNT(*)` query on the same `WHERE` clause — one extra query per request, judged worth it so
+"load more" can show "247 remaining" instead of guessing. **Rejected: cursor/keyset
+pagination** (`WHERE (finished_at, id) < (?, ?)`) — more efficient at very large offsets and
+immune to page drift when new rows land between pages, but `OFFSET` is simpler to reason
+about and to wire into a "load more" button, and this project's own row counts (a homelab
+install, not a multi-tenant SaaS) don't call for the extra complexity yet. If offset-based
+paging ever becomes visibly slow on a real install, this is the first thing to revisit.
+
+**4. Grouped display + virtualization are the same mechanism: group headers are interleaved
+into one flat array and the whole thing is virtualized together (`@tanstack/react-virtual`,
+already a project dependency since phase 3b), rather than nested per-queue virtualizers.**
+DESIGN.md §9.2 requires both "grouped by queue" and (the phase 6 prompt) "virtualize the
+list; a real install will have thousands of rows." A naive per-queue virtualizer-per-section
+approach (mirroring `FilesPage.tsx`'s server-grouped sections, each with its own `FileTree`)
+works for Files because each queue's own subtree is independently sized and doesn't need to
+share a viewport-relative scroll position with siblings; History's page is one capped,
+globally-ordered (newest-first) list where sections are incidental groupings of adjacent rows,
+not independent trees. One virtualizer over `[header, job, job, header, job, …]` is less code
+and scrolls as one continuous list, which is the more natural reading of "recent history,
+organized by queue" than N independent scroll areas. **Rejected: `FilesPage.tsx`'s
+server-grouped-sections + one virtualizer per section pattern.** Would work, but multiplies
+virtualizer instances for no benefit here and doesn't match how a "history feed" is normally
+browsed (scroll through everything in time order, with queue as a visual grouping cue, not N
+separate lists to scroll independently).
+
+**5. Two independently filtered/paginated sections on one page (`HistoryJobsSection`,
+`HistoryEventsSection`) rather than one merged job+event timeline.** DESIGN.md §9.2 describes
+History as covering "the `job` and `event` tables" with filters that only partly overlap
+(state/error class apply to jobs; kind/level apply to events; date range applies to both) —
+read as two related but distinct views on one page, not one interleaved feed, because merging
+them would mean either inventing a shared filter vocabulary that doesn't fit either table
+well, or a UI where a "date range" filter silently changes what *kind* of row you're looking
+at. **Rejected: one merged, chronologically-interleaved list of jobs and events.** Would read
+more like a single "activity log," but `job` rows and `event` rows have materially different
+shapes (bytes/attempt/exit-code vs. level/kind/message) and DESIGN.md's own phrasing treats
+them as the two things this page must surface, not a single reconciled type.
+
+**6. Delete-audit legibility (DESIGN.md §7.3: "what was deleted, from which queue, under
+which mode, and what gated it… including deletes that were withheld, with the failing
+precondition") is satisfied by resolving `queue_id`/`queue_name`/`rel_path` via a join and
+rendering `event.message` verbatim, not by parsing structured fields out of it.**
+`core/postprocess.py`'s `_maybe_delete_remote` (phase 5, unchanged by this phase) already
+writes messages like `"queue 3 ('e2e-move') mode=move: deleted verified remote copy
+/data/pickup/…"` and `"…mode=move: delete withheld -- verification result was CORRUPT, not
+VERIFIED"` — every fact the prompt asks for (queue, mode, gating condition) is already in that
+string. Extracting it into separate typed columns would mean either a new migration adding
+`mode`/`gating_reason` columns to `event` (schema churn phase 5 didn't ask for and this phase
+wasn't asked to do) or fragile string-parsing on the frontend that breaks the moment a message
+format changes. Chose to resolve only the *relational* context this phase's own tables can
+provide for free (which item/queue an event belongs to, via `event.item_id` → `item.queue_id`
+→ `path_queue.name`) and otherwise trust the message text phase 5 already wrote carefully for
+exactly this audience. `HistoryEventsSection.tsx` gives delete-kind events (`remote_delete`,
+`remote_delete_withheld`, `remote_delete_failed`) a distinct amber background and a "Deletes
+only" quick filter, but does not attempt to reparse the message. **Rejected: add `event.mode`
+and `event.gating_reason` columns via a new migration, populated by `core/postprocess.py`.**
+More queryable/filterable in principle, but it's a phase-5 schema change being made two phases
+late, for a UI need phase 5's existing message strings already meet — see docs/decisions.md's
+own repeated pattern of preferring the smallest change that satisfies the stated requirement.
+
+**7. `event.item_id`/`event.queue_id` resolution uses `LEFT JOIN`, not `JOIN`.**
+`event.item_id` is `ON DELETE SET NULL` (migration 001) specifically so an audit row outlives
+the item it describes — an inner join would silently drop exactly the events most likely to
+matter later (an old delete audit for an item whose queue was since removed).
+`tests/test_history_api.py::test_events_survive_their_item_being_deleted` pins this: the event
+still surfaces, with `queue_id`/`queue_name`/`rel_path` as `None` rather than the row vanishing.
+
+**8. Date-range filters (`since`/`until`) are UTC calendar days via `<input type="date">`,
+not local-timezone-aware.** Every stored timestamp in this project is UTC
+(`STRFTIME('%Y-%m-%dT%H:%M:%fZ','now')`, per `db.py`'s own module docstring), and nothing
+elsewhere in the app does timezone conversion for the user's locale — `FilesPage.tsx` and
+`TransfersPage.tsx` already render raw `Date` objects via `toLocaleString()`/
+`toLocaleTimeString()` without any server-side timezone awareness either. A `since` date is
+sent as `<date>T00:00:00.000000Z` and `until` as `<date>T23:59:59.999999Z`, compared
+lexicographically against `COALESCE(finished_at, queued_at)` (jobs) or `ts` (events). For a
+user well away from UTC this means "yesterday" in the picker can include a few hours of what
+they'd call "today" or vice versa. **Not fixed here**, because fixing it properly needs a
+project-wide decision about timezone display (a Settings-level "display timezone," most
+likely) that touches every existing timestamp render, not just this phase's two new filters —
+out of scope for a phase whose brief is "build the History page," and flagged here rather than
+silently worked around with a per-page hack that the rest of the app doesn't share.
+
+**9. `HistoryJobOut.state` is restricted to `succeeded`/`failed`/`cancelled` at the API
+layer** (`state` query param rejected with 422 for anything else, e.g. `queued`/`running`) —
+**rather than silently ignoring an out-of-domain filter value or accepting it and returning
+zero rows.** This endpoint's entire domain is terminal jobs (DESIGN.md §9.2: "every
+completed, failed, and cancelled transfer" — the Transfers page, `api/jobs.py`, owns
+`queued`/`running`); a caller asking to filter History by `state=running` is asking a
+question this endpoint structurally cannot answer, and returning an empty list would read as
+"no running jobs" rather than "wrong endpoint." A clear 422 is cheaper to debug than a
+plausible-looking empty result. `tests/test_history_smoke.py::
+test_history_jobs_rejects_non_terminal_state_filter` and the equivalent in
+`test_history_api.py` pin this.
+
+**10. No live/WebSocket updates on the History page — filters trigger a fresh fetch, plus a
+manual Refresh button; no polling interval.** Every other list view in this app is either
+WS-driven (Files) or polls every 2s (Transfers, `useJobs.ts`). History is a retrospective,
+filtered/paginated *query* over data that, by definition, stopped changing the moment a job or
+event became terminal — polling a filtered, paginated query on a timer risks silently
+resetting a user's scroll position or "load more" progress out from under them the moment a
+new terminal job lands, which is a worse experience than a page that updates when asked.
+**Rejected: reuse the 2-second poll pattern from `useJobs.ts`.** Would keep the page
+"live" in the same sense Transfers is, but Transfers' poll always re-renders the *same*
+bounded set (active jobs); History's poll would have to somehow preserve filter state, page
+offset, and any expanded failed-row output across every refetch, or accept the scroll-reset
+cost every two seconds — not what "browse what happened" wants.
+
+**Verified, not just asserted:** `tests/test_history_api.py` (22 tests: terminal-state
+filtering, the `succeeded`-jobs-visible-here-not-on-Transfers split, `output_tail` absent from
+the list payload but fetchable via the on-demand endpoint, every filter dimension — queue,
+state, error class, date range, event kind, event level — the row cap clamping an
+over-large `limit` rather than honoring it, offset pagination ordering newest-first, the
+delete-audit message/queue/item resolution, and events surviving their item's deletion).
+`tests/test_history_smoke.py` (5 tests: the routes are wired into the real app, return the
+documented empty shape, and the two HTTP-level edge cases — 404 on an unknown job's output,
+422 on a non-terminal state filter, and the limit clamp visible through the real endpoint, not
+just the function call). `tests/test_history_e2e.py` (2 tests against the real fake seedbox,
+modeled on `tests/test_queue.py`'s own fixtures): a real 512-byte transfer lands in
+`/api/history/jobs` with `bytes_total`/`bytes_done` both `512` and `state: "succeeded"`; a
+forced bad-password failure lands with `error_class: "AUTH_FAILED"` and a real, non-empty
+`output_tail` ("`pget: /data/pickup/loose-notes2.txt: Login failed: Login incorrect`",
+confirmed by direct observation, not just asserted `len() > 0`, per the phase report).
+`uv run pytest`: 268 passed, 0 skipped, 0 failed with the fake seedbox up; 258 passed, 10
+skipped without it. Both lint gates clean (`ruff check` and `ruff format --check`, `--config
+ruff.toml`, repo-wide — `format --check` caught one file `check` alone had missed, exactly the
+failure mode the prompt warned about). `npm run build` and `npm run lint` (oxlint) both clean.
+`docker compose config --quiet` clean on all three compose files. Fake-seedbox containers
+torn down and confirmed removed via `docker ps -a` after the run.
+
+**Not verified — stated plainly, per the prompt's own instruction:** no browser is available
+in this environment. The History page's rendering, the virtualized scroll behavior, the
+group-header flattening, the expand/collapse of a failed job's output block, and every filter
+control's actual on-screen behavior were **never exercised in an actual browser** — only
+confirmed to type-check, build, and lint cleanly. `npm run build`/`npm run lint` prove the
+TypeScript is sound and importable; they do not prove the page renders correctly, scrolls
+correctly, or that the virtualizer's `measureElement` dynamic-height approach behaves as
+intended with real DOM layout. This should be click-tested before being relied on.
+
+---
+
 ## 2026-08-11/12 — Phase 5: post-processing and `move` mode — this phase deletes data on a
 ## machine the user doesn't own; every decision made unattended, recorded for review
 

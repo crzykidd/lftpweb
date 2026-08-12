@@ -228,3 +228,85 @@ export interface QueueItemRequest {
   item_id: number
   start_now: boolean
 }
+
+// --- History (phase 6, DESIGN.md §9.2 History page) ---------------------------------------
+
+/** Deliberately not `JobOut` -- that shape carries `output_tail` inline because the
+ * Transfers page's row set is bounded by construction. History has no such bound (a busy
+ * install accumulates thousands of terminal jobs), so `output_tail` (~4KB/row) is fetched
+ * on demand via `getHistoryJobOutput` instead of shipped in every list row -- see
+ * `has_output_tail`.
+ */
+export interface HistoryJobOut {
+  id: number
+  item_id: number
+  queue_id: number
+  queue_name: string
+  rel_path: string
+  is_dir: boolean
+  kind: JobKind
+  state: 'succeeded' | 'failed' | 'cancelled'
+  attempt: number
+  queued_at: string
+  started_at: string | null
+  finished_at: string | null
+  bytes_total: number | null
+  bytes_done: number
+  exit_code: number | null
+  error_class: string | null
+  has_output_tail: boolean
+}
+
+export interface HistoryJobsResponse {
+  jobs: HistoryJobOut[]
+  total: number
+  limit: number
+  offset: number
+}
+
+export interface HistoryJobOutputOut {
+  job_id: number
+  error_class: string | null
+  output_tail: string | null
+}
+
+export interface HistoryEventOut {
+  id: number
+  ts: string
+  level: 'debug' | 'info' | 'warning' | 'error'
+  kind: string
+  message: string
+  item_id: number | null
+  job_id: number | null
+  queue_id: number | null
+  queue_name: string | null
+  rel_path: string | null
+}
+
+export interface HistoryEventsResponse {
+  events: HistoryEventOut[]
+  total: number
+  limit: number
+  offset: number
+}
+
+export interface HistoryJobsFilter {
+  queue_id?: number
+  state?: 'succeeded' | 'failed' | 'cancelled'
+  error_class?: string
+  since?: string
+  until?: string
+  limit?: number
+  offset?: number
+}
+
+export interface HistoryEventsFilter {
+  kind?: string
+  level?: 'debug' | 'info' | 'warning' | 'error'
+  item_id?: number
+  queue_id?: number
+  since?: string
+  until?: string
+  limit?: number
+  offset?: number
+}

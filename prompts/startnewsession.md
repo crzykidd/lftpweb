@@ -77,16 +77,23 @@ on `dev`, land via PR.
 
 ## Where we are
 
-**Status: phases 1–5 done.** `DESIGN.md` is settled and reviewed. The skeleton (phase 1),
+**Status: phases 1–6 done.** `DESIGN.md` is settled and reviewed. The skeleton (phase 1),
 scanning + reconciliation + read-only Files view (phase 2), the transfer engine + scheduler
 (phase 3a), the Transfers page / item drawer / Files actions / WebSocket delta fix (phase 3b),
-auto-queue + patterns + the mount sentinel (phase 4), and post-processing + `move` mode
-(phase 5) all exist and are verified — see `prompts/done/2026-08-11-phase1-skeleton-and-
-container.md`, `prompts/done/2026-08-11-phase2-scanning-and-model.md`,
+auto-queue + patterns + the mount sentinel (phase 4), post-processing + `move` mode (phase 5),
+and the History page (phase 6) all exist and are verified — see `prompts/done/2026-08-11-
+phase1-skeleton-and-container.md`, `prompts/done/2026-08-11-phase2-scanning-and-model.md`,
 `prompts/done/2026-08-11-phase3a-transfer-engine.md`,
 `prompts/done/2026-08-11-phase3b-transfers-ui.md`,
-`prompts/done/2026-08-11-phase4-autoqueue-and-patterns.md`, and
-`prompts/done/2026-08-11-phase5-postprocessing-and-move.md` for the exact commands run.
+`prompts/done/2026-08-11-phase4-autoqueue-and-patterns.md`,
+`prompts/done/2026-08-11-phase5-postprocessing-and-move.md`, and
+`prompts/done/2026-08-11-phase6-history-page.md` for the exact commands run.
+
+> **Note (2026-08-12):** phase 6's own build was never click-tested in a browser — no browser
+> is available in this environment. The History page type-checks, builds, and lints cleanly,
+> and its backend is verified end to end against the real fake seedbox, but the actual page
+> render, virtualized scroll, and filter controls have not been visually confirmed. Do this
+> before relying on the UI.
 
 > **⚠ Phase 5 makes the user's live queue's `sync_mode = 'move'` row live.** It has been
 > stored that way in the database since before phase 4's guard existed, inert until now
@@ -103,8 +110,8 @@ container.md`, `prompts/done/2026-08-11-phase2-scanning-and-model.md`,
 | 3a — Transfer engine + scheduler (backend) | **done** (2026-08-11) |
 | 3b — Transfers UI, item drawer, WebSocket delta fix | **done** (2026-08-11) |
 | 4 — Auto-queue + patterns | **done** (2026-08-11) |
-| 5 — Post-processing + `move` | **done, not yet committed** (2026-08-12) — see below |
-| 6 — History page | overnight run 2026-08-11 |
+| 5 — Post-processing + `move` | **done** (2026-08-12) |
+| 6 — History page | **done, not yet committed** (2026-08-12) — see below |
 | 7 — Operations (logs, backup) | overnight run 2026-08-11 |
 | 8 — Auth + hardening | overnight run 2026-08-11 |
 | 9 — Polish | overnight run 2026-08-11 |
@@ -284,10 +291,36 @@ verified it, deleted the remote copy, and a **second, independent** remote scan 
 gone. Every decision made unattended is in `docs/decisions.md`'s phase 5 entry — read point 0
 first, it's about the live queue row above.
 
+**Phase 6, in one paragraph:** `api/history.py` adds `GET /api/history/jobs` (completed/
+failed/cancelled jobs — this is where a `succeeded` job's own record lives, since phase 3b's
+`list_jobs()` deliberately excludes it from the Transfers page), `GET
+/api/history/jobs/{id}/output` (the on-demand fetch for a job's ~4KB captured output —
+deliberately *not* inlined in the list payload, since History's row set is unbounded unlike
+Transfers'), and `GET /api/history/events` (the full `event` audit trail, including every
+`remote_delete`/`remote_delete_withheld`/`remote_delete_failed` row phase 5's postprocessing
+pipeline writes). Both list endpoints are `LIMIT`/`OFFSET` paginated with a server-enforced
+cap (`MAX_LIMIT = 500`) and a `total` count, filterable by queue/state/error class/date range
+(jobs) or queue/kind/level/date range (events). No schema change — every column this phase
+reads already existed. The frontend (`pages/HistoryPage.tsx`,
+`components/HistoryJobsSection.tsx`, `components/HistoryEventsSection.tsx`) renders two
+independently filtered sections, each grouped by queue and virtualized
+(`@tanstack/react-virtual`, already a dependency since phase 3b) by flattening queue headers
+and rows into one array a single virtualizer walks. A failed job's row can expand to fetch and
+show its error class plus the real `output_tail`; delete-audit events get a distinct amber
+treatment and a "Deletes only" quick filter, but the legibility DESIGN.md §7.3 asks for comes
+from rendering `core/postprocess.py`'s own carefully-worded event messages verbatim, not from
+new structured columns. Verified end to end against the real fake seedbox: a real 512-byte
+transfer landed in history with `bytes_total`/`bytes_done` both `512`, and a forced
+bad-password failure carried `error_class: "AUTH_FAILED"` and a real, non-empty
+`output_tail`. **Not verified: the actual browser rendering** — no browser is available in
+this environment; only build/lint/type-check and the backend-level e2e were exercised. Every
+decision made unattended, including the no-live-updates call and the UTC-only date-filter
+limitation, is in `docs/decisions.md`'s phase 6 entry.
+
 **Commits so far:** repo init + standard adoption, the design revisions, phase 1 (`b0109ae`),
-phase 2 (`de6d74b`), phase 3a (`36b9123`), phase 3b (`c814aa0`), phase 4 (`db89b63`). All on
-`dev`. Phase 5's work is prepared on the working tree but **not yet committed** — see the
-phase 5 prompt's final report for the proposed commit message.
+phase 2 (`de6d74b`), phase 3a (`36b9123`), phase 3b (`c814aa0`), phase 4 (`db89b63`), phase 5
+(`b0c9cb3`). All on `dev`. Phase 6's work is prepared on the working tree but **not yet
+committed** — see the phase 6 prompt's final report for the proposed commit message.
 
 ---
 
@@ -465,3 +498,10 @@ These are the places where the obvious implementation is wrong. Each is written 
   5 shipped, and was deliberately left untouched** — see the warning near the top of this
   file's "Where we are" and docs/decisions.md's phase 5 entry, point 0. The first thing to tell
   the user when they're back.
+- **A list endpoint over an unbounded table must not inline a per-row blob just because a
+  bounded sibling endpoint does** (phase 6). `api/jobs.py`'s `JobOut` inlines `output_tail`
+  (~4KB) because that endpoint's row set is bounded by construction (`list_jobs()`'s own
+  docstring). `api/history.py` reads the same `job` table with no such bound, so it carries
+  only `has_output_tail` in the list and adds `GET /api/history/jobs/{id}/output` to fetch the
+  blob on demand — copying `JobOut`'s shape onto an unbounded endpoint would have silently
+  reintroduced the "thousands of rows × 4KB" cost the row cap exists to prevent.
