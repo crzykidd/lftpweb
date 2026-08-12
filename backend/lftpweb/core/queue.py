@@ -200,8 +200,47 @@ class TransferQueue:
     # --- lifecycle ---------------------------------------------------------------------
 
     async def start(self) -> None:
+        await self._reconcile_orphaned_jobs()
         if self._task is None:
             self._task = asyncio.create_task(self._loop(), name="lftpweb-transfer-queue-loop")
+
+    async def _reconcile_orphaned_jobs(self) -> None:
+        """Clear `running` rows left behind by a restart.
+
+        A job is only `running` while this process supervises its lftp child, so any such row
+        found at startup is orphaned by definition — the container went away and took the
+        process with it. Left alone the row says `running` forever: it shows up in
+        `list_jobs()` as a phantom transfer that never progresses, and because scans
+        deliberately don't overwrite job-lifecycle states (`_protected_rel_paths`), the item
+        stays `DOWNLOADING` forever too. Observed on a real deployment after an image pull.
+
+        Deliberately *not* suppressed for auto-queue: an interrupted transfer is not a user
+        decision (§4.6), so the item stays eligible to be picked up again. Partial bytes on
+        disk are kept and `-c` resumes from them; the next scan recomputes the item's state
+        from what is actually there.
+        """
+        cursor = await self.db.execute("SELECT id, item_id FROM job WHERE state = 'running'")
+        rows = await cursor.fetchall()
+        if not rows:
+            return
+
+        logger.warning(
+            "clearing %d job(s) left 'running' by a previous run: %s",
+            len(rows),
+            ", ".join(str(r["id"]) for r in rows),
+        )
+        await self.db.execute(
+            "UPDATE job SET state = 'failed', pid = NULL, error_class = 'INTERRUPTED', "
+            "finished_at = ? WHERE state = 'running'",
+            (_now_iso(),),
+        )
+        await self.db.execute(
+            "UPDATE item SET state = 'PARTIAL' WHERE state = 'DOWNLOADING' AND id IN "
+            "(SELECT item_id FROM job WHERE error_class = 'INTERRUPTED')"
+        )
+        await self.db.commit()
+        for row in rows:
+            await self._publish_item_state(row["item_id"])
 
     async def stop(self) -> None:
         """Graceful shutdown (DESIGN.md §10.3): SIGTERM every in-flight lftp child so its
