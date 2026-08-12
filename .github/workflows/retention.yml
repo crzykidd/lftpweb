@@ -1,0 +1,63 @@
+name: Registry retention
+#
+# Implements the `code-checkin-and-pr` registry-retention rules:
+# https://gitea.crzynet.com/crzynet/homelab-configs/src/branch/main/standards/code-checkin-and-pr/README.md#registry-retention
+#
+#   - Keep the 30 most recent :sha-* builds; prune older ones.
+#   - Keep the 15 most recent semver releases; prune older ones.
+#   - Protected tags (:latest, :dev, bare-major like :1) are never pruned by either sweep.
+#
+# Runs after each successful publish, and on a weekly schedule as a backstop in case a
+# publish run's completion event is ever missed.
+
+on:
+  workflow_run:
+    workflows: ["Build and publish Docker image"]
+    types: [completed]
+  schedule:
+    - cron: '0 3 * * 0' # Sunday 03:00 UTC
+
+permissions:
+  packages: write
+
+jobs:
+  prune:
+    name: Prune old image versions
+    runs-on: ubuntu-latest
+    if: >
+      github.event_name == 'schedule' ||
+      github.event.workflow_run.conclusion == 'success'
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Prune old sha-tagged versions (keep 30 most recent)
+        run: |
+          mapfile -t IDS < <(
+            gh api --paginate "/user/packages/container/lftpweb/versions" \
+              --jq '.[] | select(
+                (.metadata.container.tags | any(startswith("sha-"))) and
+                (.metadata.container.tags | any(. == "latest" or . == "dev" or test("^[0-9]+$")) | not)
+              ) | "\(.created_at) \(.id)"' \
+              | sort -r | tail -n +31 | awk '{print $2}'
+          )
+          printf 'Found %d sha versions to prune\n' "${#IDS[@]}"
+          for id in "${IDS[@]}"; do
+            echo "Deleting version $id"
+            gh api --method DELETE "/user/packages/container/lftpweb/versions/$id"
+          done
+
+      - name: Prune old semver versions (keep 15 most recent)
+        run: |
+          mapfile -t IDS < <(
+            gh api --paginate "/user/packages/container/lftpweb/versions" \
+              --jq '.[] | select(
+                (.metadata.container.tags | any(test("^[0-9]+\\.[0-9]+\\.[0-9]+$"))) and
+                (.metadata.container.tags | any(. == "latest" or . == "dev" or test("^[0-9]+$")) | not)
+              ) | "\(.created_at) \(.id)"' \
+              | sort -r | tail -n +16 | awk '{print $2}'
+          )
+          printf 'Found %d semver versions to prune\n' "${#IDS[@]}"
+          for id in "${IDS[@]}"; do
+            echo "Deleting version $id"
+            gh api --method DELETE "/user/packages/container/lftpweb/versions/$id"
+          done

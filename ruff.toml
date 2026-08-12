@@ -1,0 +1,31 @@
+# ruff configuration for lftpweb.
+#
+# Lives in its own root `ruff.toml` rather than `[tool.ruff]` in pyproject.toml. Ruff reads
+# a root `ruff.toml` exactly like a `[tool.ruff]` table would — this is a config-location
+# choice only, not a different mechanism — split out on 2026-08-11 purely to avoid touching
+# pyproject.toml while the 2026-08-11 code-checkin-and-pr adoption ran concurrently with
+# other in-flight work on this repo. Fold into pyproject.toml whenever convenient; nothing
+# here depends on staying separate.
+#
+# Backs the "Backend lint" required check from
+# https://gitea.crzynet.com/crzynet/homelab-configs/src/branch/main/standards/code-checkin-and-pr/README.md
+# (`ruff check` + `ruff format --check`, run in CI against `backend/` and `tests/`).
+#
+# line-length=100 / target-version=py312 matches the convention already in use by sibling
+# crzynet projects (partfolder3d, labelforge) rather than ruff's own defaults (88 / auto) —
+# picked for consistency across the homelab-configs project family, not because 100 is
+# specially correct for this codebase. See the 2026-08-11 adoption report for the current
+# gap: as of adoption, `ruff format --check` still reports ~21 files that predate this
+# config (the codebase was never run through `ruff format`), and `ruff check` reports one
+# unused import (`backend/lftpweb/api/settings.py`). Both are real, both are left for the
+# code owner to fix in a normal commit — this adoption task does not edit backend/ or
+# tests/ to force a clean run.
+target-version = "py312"
+line-length = 100
+
+[lint]
+# Ruff's built-in default selection (pycodestyle errors E4/E7/E9 + pyflakes F). Adopting
+# the standard's "backend lint" check is not the same decision as raising the bar with a
+# wider rule set (isort, pyupgrade, bugbear, …) — that's a separate call for whoever owns
+# backend/ next, made deliberately rather than as a side effect of this adoption.
+select = ["E4", "E7", "E9", "F"]

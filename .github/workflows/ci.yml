@@ -1,0 +1,234 @@
+name: CI
+#
+# Implements the `code-checkin-and-pr` standard's required checks (6 of the 7 — the 7th,
+# SAST, is CodeQL default setup, which GitHub manages itself and does not need a workflow
+# file here — see docs/repo-setup.md):
+# https://gitea.crzynet.com/crzynet/homelab-configs/src/branch/main/standards/code-checkin-and-pr/README.md
+#
+# IMPORTANT — required-status-check naming: GitHub binds branch-protection required
+# checks to the check-run's bare job `name:` (e.g. "Backend lint"), NOT
+# "<workflow name> / <job name>". Keep the `name:` fields below stable — they are exactly
+# what docs/repo-setup.md tells the human to type into main's required-checks list.
+#
+# One workflow covers both trigger shapes the standard asks for (PR-to-main gate, and
+# push-to-dev/main visibility) — job names don't need a "(dev)" suffix trick to avoid
+# colliding with themselves, because there's only one copy of each job name in the repo.
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [dev, main]
+
+# Least-privilege default for every job below; none need to write anything.
+permissions:
+  contents: read
+
+jobs:
+  backend-lint:
+    name: Backend lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+
+      - name: ruff check
+        # Pinned to match the ruff version this repo was validated against locally
+        # (see ruff.toml). `uvx` runs it ephemerally so this never touches
+        # pyproject.toml / uv.lock — ruff is a CI/dev-tool concern, not a runtime dep.
+        run: uvx ruff@0.8.4 check --config ruff.toml .
+
+      - name: ruff format --check
+        run: uvx ruff@0.8.4 format --config ruff.toml --check .
+
+  frontend:
+    name: Frontend lint + typecheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install frontend deps
+        run: npm ci
+        working-directory: frontend
+
+      - name: Lint (oxlint)
+        run: npm run lint
+        working-directory: frontend
+
+      - name: Typecheck + build (tsc -b && vite build)
+        run: npm run build
+        working-directory: frontend
+
+  config-validate:
+    name: Config validation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.13"
+
+      - run: pip install pyyaml
+
+      - name: Validate every checked-in YAML/JSON file parses
+        run: |
+          python3 - <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          import yaml
+
+          SKIP_DIRS = {".git", "node_modules", ".venv", "venv", "private_data", "dist", ".vite"}
+
+          def is_skipped(p: pathlib.Path) -> bool:
+              return any(part in SKIP_DIRS for part in p.parts)
+
+          errors: list[str] = []
+          checked: list[str] = []
+
+          for pattern in ("**/*.yml", "**/*.yaml"):
+              for p in pathlib.Path(".").glob(pattern):
+                  if is_skipped(p):
+                      continue
+                  try:
+                      yaml.safe_load(p.read_text())
+                      checked.append(str(p))
+                  except Exception as e:  # noqa: BLE001 - report, don't crash the scan
+                      errors.append(f"{p}: {e}")
+
+          for p in pathlib.Path(".").glob("**/*.json"):
+              if is_skipped(p):
+                  continue
+              try:
+                  json.loads(p.read_text())
+                  checked.append(str(p))
+              except Exception as e:  # noqa: BLE001
+                  errors.append(f"{p}: {e}")
+
+          print(f"Validated {len(checked)} config files:")
+          for c in sorted(checked):
+              print(f"  - {c}")
+
+          if errors:
+              print("\nFAILED:", file=sys.stderr)
+              for e in errors:
+                  print(f"  - {e}", file=sys.stderr)
+              sys.exit(1)
+          PY
+
+  compose-validate:
+    name: Compose validation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+
+      - name: Validate docker-compose.yml (production)
+        run: docker compose -f docker-compose.yml config --quiet
+
+      - name: Validate docker-compose.dev.yml
+        run: docker compose -f docker-compose.dev.yml config --quiet
+
+      - name: Validate docker-compose.test.yml (fake-seedbox harness)
+        run: docker compose -f docker-compose.test.yml config --quiet
+
+  image-build:
+    name: Image build
+    runs-on: ubuntu-latest
+    # The job always runs (no job-level `if:`) so this required check reports a
+    # conclusion on push events too — a job skipped via job-level `if:` leaves a required
+    # context stuck "Expected" forever and blocks every PR. The actual build stays
+    # PR-only via the step-level `if:` below, per the standard's publishing matrix
+    # ("PR → main: build only — nothing pushed").
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+        if: github.event_name == 'pull_request'
+
+      - name: Build image (no push)
+        if: github.event_name == 'pull_request'
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: .
+          file: docker/Dockerfile
+          target: runtime
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  test:
+    name: Test suite (unit + fake-seedbox integration)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.13"
+
+      - name: Install backend deps
+        run: uv sync --locked
+
+      - name: Generate the fake-seedbox throwaway key
+        run: docker/test-seedbox/gen_key.sh
+
+      - name: Bring up the fake seedbox (docker-compose.test.yml)
+        # tests/test_queue.py and part of the phase-2 suite are gated on 127.0.0.1:2222
+        # being reachable and SKIP silently otherwise (see tests/conftest-style
+        # skipif in those files). Bringing this up for real — and the explicit
+        # skip-guard step below — is what keeps this job from going green while
+        # quietly running none of the highest-value tests in the project.
+        run: docker compose -f docker-compose.test.yml up --build -d
+
+      - name: Wait for the fake seedbox to accept connections
+        run: |
+          for port in 2222 2223; do
+            up=false
+            for _ in $(seq 1 30); do
+              if (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; then
+                exec 3<&- 3>&-
+                up=true
+                break
+              fi
+              sleep 1
+            done
+            if [ "$up" != "true" ]; then
+              echo "::error::fake seedbox never came up on port $port"
+              docker compose -f docker-compose.test.yml logs
+              exit 1
+            fi
+            echo "port $port up"
+          done
+
+      - name: Run test suite (uv run pytest)
+        run: |
+          set -o pipefail
+          uv run pytest -rs -v 2>&1 | tee /tmp/pytest-report.txt
+
+      - name: Fail if the seedbox-gated integration tests were skipped
+        # Belt-and-suspenders: even if pytest itself exits 0 (skips aren't failures by
+        # default), a skipped tests/test_queue.py / tests/test_remote.py run is exactly
+        # the silent-green failure mode this job exists to prevent. Grep the skip
+        # report for the reason string those files use and fail loudly if it appears.
+        if: always()
+        run: |
+          if grep -q "fake seedbox not reachable" /tmp/pytest-report.txt; then
+            echo "::error::Integration tests were SKIPPED — the fake seedbox was not reachable. A green CI that quietly skipped the transfer tests is worse than no CI."
+            exit 1
+          fi
+          echo "Confirmed: no seedbox-skip reason found in the test report."
+
+      - name: Tear down the fake seedbox
+        if: always()
+        run: docker compose -f docker-compose.test.yml down -v

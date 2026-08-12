@@ -11,7 +11,10 @@ truth and its sections are numbered for reference. The one decision everything h
 (local bytes vs. known remote size) and each transfer is its own short-lived lftp process. Do
 not reintroduce `jobs -v` parsing as a source of truth (§1.2 explains why).
 
-**Status:** pre-implementation. `DESIGN.md` is under review; no application code exists yet.
+**Status:** pre-release `0.0.1`, build phases 1–3 of 9 complete (`DESIGN.md` §13) — it connects,
+scans, reconciles, and actually transfers. Auto-queue, post-processing, History, the log viewer,
+backups, and **authentication** are not built yet. `prompts/startnewsession.md` is the current
+state-of-play brief; read it on session start.
 
 ## Stack
 
@@ -24,11 +27,80 @@ This repo adopts crzynet `homelab-configs` standards. [`standards.md`](standards
 standard and the pinned version — read it on session start whenever the work could touch
 anything they govern.
 
-`code-checkin-and-pr` is **not** adopted here — there is no remote yet, so its branch
-protection / PR-check / image-publishing rules have nothing to bind to. Two of its conventions
-are followed voluntarily so the history is already conformant when we do adopt it: commit
-prefixes (`feat:` / `fix:` / `chore:` / `docs:`) and no `Co-authored-by:` trailers. Day-to-day
-work is on `dev`; `main` is left alone.
+<!--
+Source: standards/code-checkin-and-pr @ v1.2.0 (crzynet/homelab-configs).
+Paste the section below verbatim into the adopting project's CLAUDE.md.
+The full standard (publishing matrix, retention, CI check definitions) lives at:
+https://gitea.crzynet.com/crzynet/homelab-configs/src/branch/main/standards/code-checkin-and-pr/README.md
+-->
+
+## Code check-in (operational rules)
+
+This project adopts the `code-checkin-and-pr` standard. The full why-and-how lives at
+the source above; the rules below are the per-session do/don'ts a coding agent must
+honor by default:
+
+- **Never push directly to `main`.** `main` is protected. All changes land via a pull
+  request from `dev` → `main`, and only when every required check is green.
+- **Day-to-day work happens on `dev`** (or a short-lived branch off `dev`). Push to
+  `dev` freely.
+- **Commit message prefixes are required** — Conventional-Commits style:
+  - `feat:` — new user-facing feature
+  - `fix:` — bug fix
+  - `chore:` — config, tooling, dependencies, maintenance
+  - `docs:` — documentation-only changes
+- **Do not add `Co-authored-by:` trailers** unless the user explicitly asks.
+- **Doc updates ship in the same commit as the code they describe** — never as a
+  follow-up commit.
+- **Never bypass hooks** (no `--no-verify`, `--no-gpg-sign`, etc.) unless the user
+  explicitly asks. If a hook fails, fix the underlying issue.
+- **Stable releases are tagged from `main` only.** Don't tag from `dev`.
+
+If you're unsure whether an action would violate one of the above, stop and ask before
+acting.
+
+<!-- end code-checkin-and-pr snippet -->
+
+<!--
+Source: standards/release-prep-and-cut @ v1.0.0 (crzynet/homelab-configs).
+Paste the section below verbatim into the adopting project's CLAUDE.md.
+The full standard (two-phase prep/cut workflow, archive trigger, validation
+steps, adoption checklist) lives at:
+https://gitea.crzynet.com/crzynet/homelab-configs/src/branch/main/standards/release-prep-and-cut/README.md
+-->
+
+## Release process (operational rules)
+
+This project adopts the `release-prep-and-cut` standard. The full why-and-how
+lives at the source above; the rules below are the per-session do/don'ts a
+coding agent must honor by default:
+
+- **The version is stored BARE in the source-of-truth file** — no `v` prefix
+  anywhere in code. The `v` prefix is added in exactly one place: the git tag
+  and matching GitHub release name. Don't add it to README badges, CHANGELOG
+  headers, in-code image tags, or anywhere else.
+- **`CHANGELOG.md` is the single source of truth for release notes.** The PR
+  description (set by `/release-prep`) and the GitHub release body (set by
+  `/release-cut`) reuse the **same section verbatim**. Never author release
+  notes twice.
+- **One commit per release prep.** Version bump + changelog roll + every doc
+  sync ship in a single `chore(release): prepare v<version>` commit. No
+  `Co-authored-by:` trailers.
+- **Never re-tag.** If `v<version>` already exists as a local tag, a remote
+  tag, or a GitHub release, STOP. Never delete-and-recreate; never `--force`.
+  Pick the next version instead.
+- **`/release-cut` only after the PR has merged and CI is green.** The
+  publish-to-`main` workflow must have already pushed `:latest` images to the
+  registry before `/release-cut` runs. If you cannot confirm both — STOP and
+  tell the user to wait.
+- **The release tag is the only thing the cut command writes to `main`.** Both
+  the prep commit and any follow-up docs commit land on `dev` and reach `main`
+  only via PR. Never push directly to `main` as part of a release.
+
+If you're unsure whether an action would violate one of the above, stop and
+ask before acting.
+
+<!-- end release-prep-and-cut snippet -->
 
 <!--
 Source: standards/handoff-prompt-workflow @ v2.0.0 (crzynet/homelab-configs).

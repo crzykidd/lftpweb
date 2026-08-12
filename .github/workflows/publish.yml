@@ -1,0 +1,61 @@
+name: Build and publish Docker image
+#
+# Implements the image-publishing matrix from `code-checkin-and-pr`:
+# https://gitea.crzynet.com/crzynet/homelab-configs/src/branch/main/standards/code-checkin-and-pr/README.md#image-publishing-matrix-post-merge--release
+#
+#   push -> dev                          :dev, :sha-<short>
+#   push -> main (post-merge)            :latest, :sha-<short>
+#   PR -> main                           build only, nothing pushed (see ci.yml's
+#                                         "Image build" job — that's a separate workflow)
+#   GitHub Release published (on main)   :latest, :<semver>, :<major>
+#
+# docker/Dockerfile is multi-stage; `runtime` is its last (and default) stage — pinned
+# explicitly here anyway so a future stage reorder in the Dockerfile can't silently
+# change what gets published.
+
+on:
+  push:
+    branches: [dev, main]
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-push:
+    name: Build and push image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+
+      - uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
+        id: meta
+        with:
+          images: ghcr.io/crzykidd/lftpweb
+          tags: |
+            type=raw,value=dev,enable=${{ github.ref == 'refs/heads/dev' }}
+            type=sha,prefix=sha-,format=short,enable=${{ github.event_name == 'push' }}
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' || github.event_name == 'release' }}
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}
+
+      - uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: .
+          file: docker/Dockerfile
+          target: runtime
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
