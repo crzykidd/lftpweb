@@ -95,22 +95,56 @@ end through the real API and a real WebSocket client against the fake seedbox.
 | 2 — Scanning + model | **done** (2026-08-11) |
 | 3a — Transfer engine + scheduler (backend) | **done** (2026-08-11) |
 | 3b — Transfers UI, item drawer, WebSocket delta fix | **done** (2026-08-11) |
-| 4–9 | not started |
+| 4 — Auto-queue + patterns | overnight run 2026-08-11 |
+| 5 — Post-processing + `move` | overnight run 2026-08-11 |
+| 6 — History page | overnight run 2026-08-11 |
+| 7 — Operations (logs, backup) | overnight run 2026-08-11 |
+| 8 — Auth + hardening | overnight run 2026-08-11 |
+| 9 — Polish | overnight run 2026-08-11 |
 | `sync` mode | **not scheduled** — designed in §7, built only if it proves wanted |
 
-**Current instruction:** build phases 1–3, one at a time — write the handoff prompt, execute it
-via a spawned agent, validate, surface any major design decisions found during the build, then
-**stop after phase 3**. **Phase 3 (3a + 3b) is now fully done — this is the last phase being
-built for now, per that instruction.** Phases 4–9 remain (auto-queue + patterns, post-processing,
-sync mode design already exists but is unscheduled, auth, backup, polish) and **none of them are
-authorised yet — ask before starting phase 4 or any later phase.**
+**Current instruction (2026-08-11, overnight run):** phases 1–3 are done and **proven against
+the user's real seedbox** — a 1.29 GB mkv transferred byte-exact, nested directories, resume
+from partial, live progress. The user has authorised running **phases 4–9 in order,
+unattended**: for each phase write the handoff prompt, execute it via a spawned agent, verify,
+commit, push to `dev`, then start the next. Document every decision made without them.
 
-**The most valuable next step is not a phase.** Everything so far is verified against the
-synthetic fake seedbox — two containers on localhost with a 26 MB tree. Run it against the
-user's real seedbox before building more: does `find -printf` exist there (§15.7 has always
-flagged this), how long does a full scan of a real tree take (the 30 s cadence is a guess), and
-does the connection ceiling hold (2 jobs × 4 parallel × 4 pget-n = 32 sessions, which many
-seedboxes refuse)? That could change what phase 4 should be.
+**SAFETY RULE for the unattended run — every new capability ships defaulting to OFF.** The
+user's live instance may pull `:dev`. Nothing landing overnight may change how their running
+deployment behaves: auto-queue defaults disabled, remote deletion defaults off, auth defaults
+to the current `none`. A capability that turns itself on while they sleep is a bug, not a
+feature.
+
+**Their live config:** one queue, `sync_mode` stored as `move` in the database from before the
+guard existed — it behaves as `copy` (deletion is phase 5) and the API now rejects setting it.
+Worth mentioning to them; not worth silently rewriting their row.
+
+## What real hardware taught us that the fake seedbox could not
+
+Ten fixes came out of the first real deployment. They are the reason to keep testing against
+real infrastructure rather than only the fixture:
+
+- **OpenSSH fatals with "No user exists for uid N"** when the running uid has no `/etc/passwd`
+  entry — which is exactly §11.2's identity model. lftp shells out to ssh, so *every* transfer
+  died while scanning worked (asyncssh has an env fallback; OpenSSH has none). Fixed by
+  symlinking `/etc/passwd` into the `/run` tmpfs and writing it in the entrypoint.
+- **lftp retries forever by default.** `net:max-retries`/`net:timeout` were in §9.3's knob list
+  but never written to the rc, so a failing connection hung as "DOWNLOADING, 0 bytes" instead
+  of failing. Always set now.
+- **`net:reconnect-interval-base` takes a bare number, not `5s`** — lftp rejected the line,
+  carried on, and produced a misleading `HOST_UNREACHABLE`. `tests/test_lftp_settings_accepted.py`
+  now feeds every generated setting to a real lftp binary; asserting the rc *contains* a string
+  only proves we wrote what we meant.
+- **The WebSocket omitted `item.id`**, so every Files row rendered with no action button — a
+  remote file could be seen but never queued. The page renders purely from the WS stream.
+- **`VOLUME` created a phantom root-owned `/downloads`**; the per-job `/run` dir was never
+  created before privileges dropped; `pget -n 4` fanned a 16-byte file across four connections.
+- **Jobs left `running` by a restart** became phantom transfers forever, and their items stayed
+  stuck `DOWNLOADING` because scans deliberately don't overwrite lifecycle states.
+- **A `sync_mode` the UI offered but nothing implemented** silently behaved as `copy`.
+
+The pattern: none were reachable from unit tests or the fake seedbox. Job lifecycle logging and
+`output_tail` are what turned each one from a guess into a diagnosis — keep them.
 
 App ports are **8087** (API/SPA) and **5187** (Vite dev server) — not the more obvious
 8080/5173 — chosen to avoid collisions with other stacks on the shared build host. See
