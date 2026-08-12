@@ -105,8 +105,15 @@ jobs:
                   except Exception as e:  # noqa: BLE001 - report, don't crash the scan
                       errors.append(f"{p}: {e}")
 
+          # tsconfig*.json are JSONC — comments and trailing commas are valid there and Vite
+          # scaffolds them that way, so a strict json.loads() rejects a perfectly good file.
+          # Not a coverage gap: `tsc -b` in the "Frontend lint + typecheck" job parses them for
+          # real and fails on a malformed one.
+          def is_jsonc(p: pathlib.Path) -> bool:
+              return p.name.startswith("tsconfig") and p.suffix == ".json"
+
           for p in pathlib.Path(".").glob("**/*.json"):
-              if is_skipped(p):
+              if is_skipped(p) or is_jsonc(p):
                   continue
               try:
                   json.loads(p.read_text())
@@ -179,6 +186,16 @@ jobs:
 
       - name: Install backend deps
         run: uv sync --locked
+
+      - name: Install lftp
+        # The fake seedbox runs in Docker, but pytest runs on the runner — and
+        # tests/test_queue.py spawns a real `lftp` process (DESIGN.md §4.1). ubuntu-latest
+        # doesn't ship one, so without this every transfer test fails with
+        # `FileNotFoundError: 'lftp'` rather than actually exercising a transfer.
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends lftp
+          lftp --version | head -1
 
       - name: Generate the fake-seedbox throwaway key
         run: docker/test-seedbox/gen_key.sh
