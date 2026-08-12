@@ -170,7 +170,9 @@ def scan_local(root: str | Path) -> dict[str, LocalEntry]:
                 continue  # consumed above
 
             final_name = name[: -len(TEMP_FILE_SUFFIX)] if name.endswith(TEMP_FILE_SUFFIX) else name
-            final_rel_path = f"{rel_prefix}{final_name}" if rel_prefix == "" else f"{rel_prefix}/{final_name}"
+            final_rel_path = (
+                f"{rel_prefix}{final_name}" if rel_prefix == "" else f"{rel_prefix}/{final_name}"
+            )
 
             status = sidecars.get(name)
             if status is not None:

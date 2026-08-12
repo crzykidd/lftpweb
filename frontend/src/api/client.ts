@@ -4,6 +4,8 @@ import type {
   HostIn,
   HostOut,
   HostTestRequest,
+  JobOut,
+  JobsResponse,
   PathQueueIn,
   PathQueueOut,
   StatsResponse,
@@ -80,4 +82,40 @@ export function getFiles(): Promise<FilesResponse> {
 
 export function rescanFiles(): Promise<{ triggered: boolean }> {
   return sendJson<{ triggered: boolean }>('/api/files/rescan', 'POST')
+}
+
+// --- Jobs / transfer engine (DESIGN.md §4, §9.2 Transfers) -------------------------------
+
+export function getJobs(): Promise<JobsResponse> {
+  return getJson<JobsResponse>('/api/jobs')
+}
+
+/** Manual queue (§4.7): always wins over auto-queue suppression. `startNow` requests the
+ * "start now at max bandwidth" admission path (§4.5) at the moment of queueing.
+ */
+export function queueItem(itemId: number, startNow = false): Promise<JobOut> {
+  return sendJson<JobOut>('/api/jobs', 'POST', { item_id: itemId, start_now: startNow })
+}
+
+export function stopJob(jobId: number): Promise<void> {
+  return sendJson<void>(`/api/jobs/${jobId}/stop`, 'POST')
+}
+
+export function moveJobToTop(jobId: number): Promise<void> {
+  return sendJson<void>(`/api/jobs/${jobId}/move-to-top`, 'POST')
+}
+
+export function startJobNow(jobId: number): Promise<{ applied: boolean }> {
+  return sendJson<{ applied: boolean }>(`/api/jobs/${jobId}/start-now`, 'POST')
+}
+
+export function retryItem(itemId: number): Promise<JobOut> {
+  return sendJson<JobOut>(`/api/items/${itemId}/retry`, 'POST')
+}
+
+/** Stop-by-item (DESIGN.md §9.2's Files-page Stop action) -- the Files page only knows the
+ * item, never the job id an item may currently be running under.
+ */
+export function stopItem(itemId: number): Promise<{ applied: boolean }> {
+  return sendJson<{ applied: boolean }>(`/api/items/${itemId}/stop`, 'POST')
 }

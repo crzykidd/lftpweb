@@ -39,7 +39,9 @@ DEFAULT_RETRY_BACKOFF_MAX_S = 15 * 60.0
 # Transient vs. permanent (DESIGN.md §4.3) — the same whitelist `core/lftp.py` uses for the
 # same reason (see its module docstring): only retry what we can positively identify as
 # transient, never "everything that isn't in the permanent list."
-PERMANENT_ERROR_CLASSES = frozenset({"AUTH_FAILED", "PERMISSION_DENIED", "REMOTE_GONE", "DISK_FULL"})
+PERMANENT_ERROR_CLASSES = frozenset(
+    {"AUTH_FAILED", "PERMISSION_DENIED", "REMOTE_GONE", "DISK_FULL"}
+)
 
 
 def _now_iso() -> str:
@@ -125,9 +127,7 @@ async def load_transfer_settings(db: aiosqlite.Connection) -> TransferSettings:
 
 
 async def save_transfer_settings(db: aiosqlite.Connection, settings: TransferSettings) -> None:
-    payload = json.dumps(
-        {f: getattr(settings, f) for f in TransferSettings.__dataclass_fields__}
-    )
+    payload = json.dumps({f: getattr(settings, f) for f in TransferSettings.__dataclass_fields__})
     await db.execute(
         "INSERT INTO setting (key, value, updated_at) VALUES (?, ?, STRFTIME('%Y-%m-%dT%H:%M:%fZ','now')) "
         "ON CONFLICT (key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
@@ -141,12 +141,15 @@ class _RunningProcess:
     job_id: int
     item_id: int
     queue_id: int
+    rel_path: str  # for item_delta WS messages (Files page) -- not used for any lftp command
+    is_dir: bool
     kind: str
     lane: str
     rate_limit_bps: int
     forced_full_rate: bool
     local_root: str  # what progress.py should sample (file path for pget, item dir for mirror)
     bytes_total: int | None
+    remote_mtime: float | None
     spawned: lftp.SpawnedJob
     wait_task: asyncio.Task
     stop_requested: bool = False
@@ -243,7 +246,9 @@ class TransferQueue:
             raise ValueError(f"item {item_id} not found")
         kind = "mirror" if item["is_dir"] else "pget"
         lane = await self._lane_for(item)
-        job_id = await self._insert_job(item_id, kind=kind, lane=lane, attempt=1, forced_full_rate=forced_full_rate)
+        job_id = await self._insert_job(
+            item_id, kind=kind, lane=lane, attempt=1, forced_full_rate=forced_full_rate
+        )
         await self.db.execute(
             "UPDATE item SET state = 'QUEUED', auto_queue_suppressed = 0, suppressed_reason = NULL, "
             "error_class = NULL, error_detail = NULL WHERE id = ?",
@@ -251,6 +256,7 @@ class TransferQueue:
         )
         await self.db.commit()
         self._backoff_until.pop(item_id, None)
+        await self._publish_item_state(item_id)
         self.request_tick()
         return job_id
 
@@ -286,13 +292,18 @@ class TransferQueue:
             )
             await self._suppress_item(row["item_id"], reason="user_stopped", state="STOPPED")
             await self.db.commit()
+            await self._publish_item_state(row["item_id"])
             self.request_tick()
 
     async def move_to_top(self, job_id: int) -> None:
-        cursor = await self.db.execute("SELECT COALESCE(MAX(rank), 0) AS max_rank FROM job WHERE state = 'queued'")
+        cursor = await self.db.execute(
+            "SELECT COALESCE(MAX(rank), 0) AS max_rank FROM job WHERE state = 'queued'"
+        )
         row = await cursor.fetchone()
         new_rank = (row["max_rank"] or 0) + 1
-        await self.db.execute("UPDATE job SET rank = ? WHERE id = ? AND state = 'queued'", (new_rank, job_id))
+        await self.db.execute(
+            "UPDATE job SET rank = ? WHERE id = ? AND state = 'queued'", (new_rank, job_id)
+        )
         await self.db.commit()
         self.request_tick()
 
@@ -308,6 +319,25 @@ class TransferQueue:
         await self.db.execute("UPDATE job SET forced_full_rate = 1 WHERE id = ?", (job_id,))
         await self.db.commit()
         self.request_tick()
+        return True
+
+    async def stop_item(self, item_id: int) -> bool:
+        """Stop-by-item (DESIGN.md §9.2's Files-page Stop action). The Files page only knows
+        the *item* it's showing a row for, never the job id -- `GET /api/files` deliberately
+        doesn't expose one, since an item can outlive several job attempts (§4.3's retries).
+        Resolves to the item's current active (`queued`/`running`) job, if any, and applies
+        the exact same stop semantics as `stop_job` (§4.6). Returns `False` -- a no-op, not
+        an error -- when nothing is active for the item, the same "no-op rather than pretend
+        it did something" shape `start_now` already uses for its own inapplicable case.
+        """
+        cursor = await self.db.execute(
+            "SELECT id FROM job WHERE item_id = ? AND state IN ('queued','running') ORDER BY id DESC LIMIT 1",
+            (item_id,),
+        )
+        row = await cursor.fetchone()
+        if row is None:
+            return False
+        await self.stop_job(row["id"])
         return True
 
     async def retry_item(self, item_id: int) -> int:
@@ -353,6 +383,7 @@ class TransferQueue:
             )
             await self._suppress_item(proc.item_id, reason="user_stopped", state="STOPPED")
             await self.db.commit()
+            await self._publish_item_state(proc.item_id)
             proc.spawned.cleanup()
             return
 
@@ -380,6 +411,7 @@ class TransferQueue:
                 (finished_at, proc.item_id),
             )
             await self.db.commit()
+            await self._publish_item_state(proc.item_id)
             proc.spawned.cleanup()
             return
 
@@ -399,14 +431,20 @@ class TransferQueue:
                 DEFAULT_RETRY_BACKOFF_MAX_S,
             )
             self._backoff_until[proc.item_id] = time.monotonic() + backoff
-            await self._insert_job(proc.item_id, kind=proc.kind, lane=proc.lane, attempt=current_attempt + 1)
+            await self._insert_job(
+                proc.item_id, kind=proc.kind, lane=proc.lane, attempt=current_attempt + 1
+            )
             await self.db.execute(
                 "UPDATE item SET state = 'QUEUED', error_class = ?, error_detail = ? WHERE id = ?",
                 (error_class, tail[-2000:], proc.item_id),
             )
             await self.db.commit()
         else:
-            reason = "retries_exhausted" if error_class not in PERMANENT_ERROR_CLASSES else "permanent_error"
+            reason = (
+                "retries_exhausted"
+                if error_class not in PERMANENT_ERROR_CLASSES
+                else "permanent_error"
+            )
             await self.db.execute(
                 "UPDATE item SET error_class = ?, error_detail = ? WHERE id = ?",
                 (error_class, tail[-2000:], proc.item_id),
@@ -414,21 +452,62 @@ class TransferQueue:
             await self._suppress_item(proc.item_id, reason=reason, state="FAILED")
             await self.db.commit()
 
+        await self._publish_item_state(proc.item_id)
         proc.spawned.cleanup()
 
     async def _sample_and_publish_progress(self) -> None:
+        """The ~1 Hz tick the WS delta fix (DESIGN.md §2/§9) exists for. Two messages come
+        out of here, both bounded by `len(self._running)` — the *active* set — never by the
+        size of a queue's tree, however many thousand files it holds:
+
+        - `progress` (job-centric, Transfers page): bytes/speed/ETA per running job.
+          Unchanged from phase 3a — it was already shaped this way.
+        - `item_delta` (item-centric, Files page): the same tick's local-size/state for the
+          items those jobs belong to, batched per queue, so a downloading item's row updates
+          live instead of waiting for the next full engine scan (up to `scan_interval_s`,
+          default 30s) — the gap that made "stop it and see it go STOPPED without a page
+          refresh" impossible before this phase.
+        """
         if not self._running:
             return
         active = [
-            ActiveJob(job_id=p.job_id, kind=p.kind, local_root=p.local_root, bytes_total=p.bytes_total)
+            ActiveJob(
+                job_id=p.job_id, kind=p.kind, local_root=p.local_root, bytes_total=p.bytes_total
+            )
             for p in self._running.values()
         ]
         results = self.progress.sample(active)
         for job_id, prog in results.items():
-            await self.db.execute("UPDATE job SET bytes_done = ? WHERE id = ?", (prog.bytes_done, job_id))
+            await self.db.execute(
+                "UPDATE job SET bytes_done = ? WHERE id = ?", (prog.bytes_done, job_id)
+            )
+
+        by_queue: dict[int, list[dict[str, Any]]] = {}
+        for p in self._running.values():
+            prog = results.get(p.job_id)
+            if prog is None:
+                continue
+            await self.db.execute(
+                "UPDATE item SET local_size = ? WHERE id = ?", (prog.bytes_done, p.item_id)
+            )
+            by_queue.setdefault(p.queue_id, []).append(
+                {
+                    "id": p.item_id,
+                    "rel_path": p.rel_path,
+                    "is_dir": p.is_dir,
+                    "state": "DOWNLOADING",
+                    "remote_size": p.bytes_total,
+                    "local_size": prog.bytes_done,
+                    "remote_mtime": p.remote_mtime,
+                }
+            )
         await self.db.commit()
         self._last_speeds = {job_id: prog.speed_bps for job_id, prog in results.items()}
         self._last_progress = results
+
+        for queue_id, nodes in by_queue.items():
+            self.events.publish({"type": "item_delta", "queue_id": queue_id, "nodes": nodes})
+
         self.events.publish(
             {
                 "type": "progress",
@@ -491,7 +570,9 @@ class TransferQueue:
                     sched_settings.max_bandwidth_bps,
                     sched_settings.small_lane_reserve_bps,
                     allocated,
-                    sched_settings.max_bandwidth_bps - sched_settings.small_lane_reserve_bps - allocated,
+                    sched_settings.max_bandwidth_bps
+                    - sched_settings.small_lane_reserve_bps
+                    - allocated,
                     sched_settings.max_concurrent_transfers - len(running),
                 )
             return
@@ -573,7 +654,9 @@ class TransferQueue:
             rate_limit_bps=decision.rate_limit_bps,
             connection_limit=connection_limit,
             parallel=settings.mirror_parallel_transfer_count,
-            pget_n=settings.mirror_use_pget_n if job_row["kind"] == "mirror" else settings.pget_default_n,
+            pget_n=settings.mirror_use_pget_n
+            if job_row["kind"] == "mirror"
+            else settings.pget_default_n,
             extra_settings=settings.extra_lftp_settings,
             run_dir=self.run_dir,
         )
@@ -590,17 +673,22 @@ class TransferQueue:
             await self.db.commit()
             return
 
-        wait_task = asyncio.create_task(lftp.wait_and_capture(spawned), name=f"lftpweb-job-{decision.job_id}-wait")
+        wait_task = asyncio.create_task(
+            lftp.wait_and_capture(spawned), name=f"lftpweb-job-{decision.job_id}-wait"
+        )
         proc = _RunningProcess(
             job_id=decision.job_id,
             item_id=item["id"],
             queue_id=item["queue_id"],
+            rel_path=item["rel_path"],
+            is_dir=bool(item["is_dir"]),
             kind=job_row["kind"],
             lane=decision.lane,
             rate_limit_bps=decision.rate_limit_bps,
             forced_full_rate=decision.forced_full_rate,
             local_root=local_root_for_progress,
             bytes_total=item["remote_size"],
+            remote_mtime=float(item["remote_mtime"]) if item["remote_mtime"] is not None else None,
             spawned=spawned,
             wait_task=wait_task,
         )
@@ -621,6 +709,7 @@ class TransferQueue:
         )
         await self.db.execute("UPDATE item SET state = 'DOWNLOADING' WHERE id = ?", (item["id"],))
         await self.db.commit()
+        await self._publish_item_state(item["id"])
 
     # --- small DB helpers ------------------------------------------------------------------
 
@@ -679,6 +768,38 @@ class TransferQueue:
             )
         await self.db.commit()
 
+    async def _publish_item_state(self, item_id: int) -> None:
+        """Push a one-row Files-tree update the moment this module changes an item's
+        lifecycle state (queued, spawned, stopped, failed, succeeded, or requeued after a
+        transient failure) — part of the WS delta fix (DESIGN.md §2/§9). Without this the
+        Files page only learns about a lifecycle change on the *next* full engine scan (up
+        to `scan_interval_s`, default 30s), which is far too slow for "stop it and see it go
+        STOPPED without a page refresh." Proportional by construction: exactly one row,
+        never the tree — see `core/engine.py.diff_nodes` for the scan-driven counterpart.
+        """
+        row = await self._fetch_item(item_id)
+        if row is None:
+            return
+        self.events.publish(
+            {
+                "type": "item_delta",
+                "queue_id": row["queue_id"],
+                "nodes": [
+                    {
+                        "id": row["id"],
+                        "rel_path": row["rel_path"],
+                        "is_dir": bool(row["is_dir"]),
+                        "state": row["state"],
+                        "remote_size": row["remote_size"],
+                        "local_size": row["local_size"],
+                        "remote_mtime": float(row["remote_mtime"])
+                        if row["remote_mtime"] is not None
+                        else None,
+                    }
+                ],
+            }
+        )
+
     async def _suppress_item(self, item_id: int, *, reason: str, state: str) -> None:
         await self.db.execute(
             "UPDATE item SET state = ?, auto_queue_suppressed = 1, suppressed_reason = ? WHERE id = ?",
@@ -694,7 +815,9 @@ class TransferQueue:
         return store.get(host.address, host.port)
 
     async def _connection_limit(self, host: HostConfig) -> int | None:
-        cursor = await self.db.execute("SELECT connection_overrides FROM host WHERE id = ?", (host.id,))
+        cursor = await self.db.execute(
+            "SELECT connection_overrides FROM host WHERE id = ?", (host.id,)
+        )
         row = await cursor.fetchone()
         if row is None or not row["connection_overrides"]:
             return None
@@ -708,10 +831,22 @@ class TransferQueue:
     # --- read models for api/jobs.py --------------------------------------------------------
 
     async def list_jobs(self) -> list[dict]:
+        """The Transfers page's row set (DESIGN.md §9.2). Not just `queued`/`running`:
+        §9.2 explicitly requires "failed rows show the error class and the captured lftp
+        output tail", and a stopped job must be visible as `STOPPED` rather than vanishing
+        the instant it's reaped — DESIGN.md names the Transfers page as where both surface,
+        distinct from the History page's full `job`/`event` audit trail. So this also
+        includes a `failed`/`cancelled` job when it is that item's *most recent* job (the
+        `MAX(id)` subquery) — a manual retry inserts a new `queued` row for the same item,
+        which is already covered by the first clause and makes the old failed/cancelled row
+        irrelevant (superseded), so this doesn't need to filter it out separately.
+        """
         cursor = await self.db.execute(
             "SELECT job.*, item.rel_path, item.is_dir, item.queue_id, item.remote_size "
             "FROM job JOIN item ON item.id = job.item_id "
             "WHERE job.state IN ('queued','running') "
+            "   OR (job.state IN ('failed','cancelled') "
+            "       AND job.id = (SELECT MAX(j2.id) FROM job j2 WHERE j2.item_id = job.item_id)) "
             "ORDER BY job.rank DESC, job.queued_at ASC"
         )
         rows = await cursor.fetchall()

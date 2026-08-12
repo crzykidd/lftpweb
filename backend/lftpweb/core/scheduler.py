@@ -108,7 +108,12 @@ def admit(
     )
     for q in forced:
         decisions.append(
-            AdmitDecision(job_id=q.id, lane=LANE_MAIN, rate_limit_bps=settings.max_bandwidth_bps, forced_full_rate=True)
+            AdmitDecision(
+                job_id=q.id,
+                lane=LANE_MAIN,
+                rate_limit_bps=settings.max_bandwidth_bps,
+                forced_full_rate=True,
+            )
         )
     forced_ids = {d.job_id for d in decisions}
 
@@ -120,7 +125,9 @@ def admit(
     slots = max(settings.max_concurrent_transfers - running_count, 0)
     ready = min(slots, len(main_queue))
 
-    allocated = sum(r.rate_limit_bps for r in main_running) + sum(d.rate_limit_bps for d in decisions)
+    allocated = sum(r.rate_limit_bps for r in main_running) + sum(
+        d.rate_limit_bps for d in decisions
+    )
     headroom = settings.max_bandwidth_bps - settings.small_lane_reserve_bps - allocated
 
     if ready > 0 and headroom > 0:

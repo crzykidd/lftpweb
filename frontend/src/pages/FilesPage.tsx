@@ -1,13 +1,15 @@
 import { useState } from 'react'
 import { rescanFiles } from '../api/client'
 import { FileTree } from '../components/FileTree'
-import { useFilesSocket } from '../hooks/useFilesSocket'
+import { useLiveModel } from '../hooks/useLiveModel'
 
-/** DESIGN.md §9.2 Files page — read-only this phase (no job engine yet to queue/stop/delete
- * against). Live updates over the one WebSocket (§9), grouped and collapsible per queue.
+/** DESIGN.md §9.2 Files page. Live updates over the one WebSocket (§9, DESIGN.md's delta
+ * contract — see `hooks/useLiveModel.ts`), grouped and collapsible per queue. Phase 3b adds
+ * the actions phase 2 explicitly deferred (no job engine existed yet): Queue / Stop per row
+ * and in bulk via multi-select (`FileTree.tsx`), plus virtualization.
  */
 export function FilesPage() {
-  const { queues, state } = useFilesSocket()
+  const { queues, state } = useLiveModel()
   const [rescanning, setRescanning] = useState(false)
 
   const handleRescan = async () => {
@@ -52,6 +54,11 @@ export function FilesPage() {
             </span>
             {queue.error && (
               <span className="text-xs text-red-600 dark:text-red-400">scan error: {queue.error}</span>
+            )}
+            {!queue.error && queue.warning && (
+              <span className="text-xs text-amber-600 dark:text-amber-400" title={queue.warning}>
+                ⚠ {queue.warning}
+              </span>
             )}
           </div>
           <FileTree nodes={queue.nodes} />

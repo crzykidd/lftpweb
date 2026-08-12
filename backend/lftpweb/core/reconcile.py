@@ -135,7 +135,9 @@ def reconcile(
         local_entry = local_tree.get(path)
         relevant_own[path] = 1
         local_present_own[path] = 1 if local_entry is not None else 0
-        complete_own[path] = 1 if (local_entry is not None and local_entry.size >= entry.size) else 0
+        complete_own[path] = (
+            1 if (local_entry is not None and local_entry.size >= entry.size) else 0
+        )
 
     relevant_totals = _rollup(remote_tree, relevant_own)
     complete_totals = _rollup(remote_tree, complete_own)

@@ -12,7 +12,7 @@ import logging
 from fastapi import APIRouter, HTTPException, Request
 
 from lftpweb.core.crypto import DecryptionError, decrypt_secret, encrypt_secret
-from lftpweb.core.remote import HostConfig, RemoteScanError
+from lftpweb.core.remote import HostConfig
 from lftpweb.models import (
     HostIn,
     HostOut,
@@ -77,7 +77,9 @@ async def put_host(body: HostIn, request: Request) -> HostOut:
     # A password is required for auth_method 'password' only when there isn't already one
     # on file — the UI never has the plaintext to send back (§9.2), so a bare "update the
     # address" request must not be forced to re-supply the password too.
-    already_has_password = existing is not None and existing["auth_method"] == "password" and existing["password_enc"]
+    already_has_password = (
+        existing is not None and existing["auth_method"] == "password" and existing["password_enc"]
+    )
     if body.auth_method == "password" and not body.password and not already_has_password:
         raise HTTPException(status_code=422, detail="auth_method 'password' requires password")
 
@@ -169,11 +171,15 @@ async def _resolve_host_config(request: Request, override: HostTestRequest | Non
 
 
 @router.post("/host/test", response_model=TestConnectionResponse)
-async def test_host(request: Request, body: HostTestRequest | None = None) -> TestConnectionResponse:
+async def test_host(
+    request: Request, body: HostTestRequest | None = None
+) -> TestConnectionResponse:
     engine = request.app.state.engine
     host_config = await _resolve_host_config(request, body)
     result = await engine.pool.test_connection(host_config)
-    return TestConnectionResponse(ok=result.ok, error_class=result.error_class, message=result.message)
+    return TestConnectionResponse(
+        ok=result.ok, error_class=result.error_class, message=result.message
+    )
 
 
 # --- Queues --------------------------------------------------------------------------

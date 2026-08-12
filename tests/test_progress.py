@@ -9,7 +9,9 @@ def test_first_sample_has_zero_speed_no_history_to_derive_a_rate_from(tmp_path):
     f = tmp_path / "movie.mkv"
     f.write_bytes(b"x" * 1000)
     sampler = ProgressSampler()
-    result = sampler.sample([ActiveJob(job_id=1, kind="pget", local_root=str(f), bytes_total=10_000)], now=0.0)
+    result = sampler.sample(
+        [ActiveJob(job_id=1, kind="pget", local_root=str(f), bytes_total=10_000)], now=0.0
+    )
     assert result[1].bytes_done == 1000
     assert result[1].speed_bps == 0.0
     assert result[1].eta_s is None  # speed is 0 -> no ETA
@@ -58,15 +60,21 @@ def test_directory_job_honors_pget_status_sidecars_per_file(tmp_path):
     root.mkdir()
     with open(root / "a.mkv", "wb") as f:
         f.truncate(1000)
-    (root / "a.mkv.lftp-pget-status").write_text("size=1000\n0.pos=0\n0.limit=1000\n")  # nothing written yet
+    (root / "a.mkv.lftp-pget-status").write_text(
+        "size=1000\n0.pos=0\n0.limit=1000\n"
+    )  # nothing written yet
     sampler = ProgressSampler()
-    result = sampler.sample([ActiveJob(job_id=1, kind="mirror", local_root=str(root), bytes_total=1000)], now=0.0)
+    result = sampler.sample(
+        [ActiveJob(job_id=1, kind="mirror", local_root=str(root), bytes_total=1000)], now=0.0
+    )
     assert result[1].bytes_done == 0
 
 
 def test_dropping_a_finished_job_clears_its_speed_history():
     sampler = ProgressSampler()
-    sampler.sample([ActiveJob(job_id=1, kind="pget", local_root="/nonexistent", bytes_total=None)], now=0.0)
+    sampler.sample(
+        [ActiveJob(job_id=1, kind="pget", local_root="/nonexistent", bytes_total=None)], now=0.0
+    )
     assert 1 in sampler._prev_bytes
     sampler.drop(1)
     assert 1 not in sampler._prev_bytes
@@ -84,7 +92,11 @@ def test_jobs_no_longer_active_are_pruned_automatically_on_next_sample(tmp_path)
 
 def test_missing_local_root_reads_as_zero_bytes_done_not_an_error(tmp_path):
     sampler = ProgressSampler()
-    jobs = [ActiveJob(job_id=1, kind="pget", local_root=str(tmp_path / "not-started.mkv"), bytes_total=5000)]
+    jobs = [
+        ActiveJob(
+            job_id=1, kind="pget", local_root=str(tmp_path / "not-started.mkv"), bytes_total=5000
+        )
+    ]
     result = sampler.sample(jobs, now=0.0)
     assert result[1].bytes_done == 0
     assert result[1].speed_bps == 0.0

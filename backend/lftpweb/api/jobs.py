@@ -45,6 +45,7 @@ def _job_out(row: dict) -> JobOut:
         eta_s=row.get("eta_s"),
         exit_code=row["exit_code"],
         error_class=row["error_class"],
+        output_tail=row["output_tail"],
     )
 
 
@@ -84,6 +85,12 @@ async def move_to_top(job_id: int, request: Request) -> None:
 @router.post("/api/jobs/{job_id}/start-now", response_model=dict)
 async def start_now(job_id: int, request: Request) -> dict:
     applied = await request.app.state.queue.start_now(job_id)
+    return {"applied": applied}
+
+
+@router.post("/api/items/{item_id}/stop", response_model=dict)
+async def stop_item(item_id: int, request: Request) -> dict:
+    applied = await request.app.state.queue.stop_item(item_id)
     return {"applied": applied}
 
 

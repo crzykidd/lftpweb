@@ -1,0 +1,173 @@
+import { useEffect, useState } from 'react'
+import type { FileNode, QueueFiles } from '../api/types'
+import type { ProgressJob, WsMessage } from '../api/wsTypes'
+
+export type SocketState = 'connecting' | 'open' | 'reconnecting'
+
+const RECONNECT_DELAY_MS = 3000
+
+interface QueueState {
+  queue_id: number
+  queue_name: string
+  scanned_at: string | null
+  error: string | null
+  warning: string | null
+  nodesByPath: Record<string, FileNode>
+}
+
+function mergeNodes(existing: Record<string, FileNode>, incoming: FileNode[]): Record<string, FileNode> {
+  if (incoming.length === 0) return existing
+  const next = { ...existing }
+  for (const node of incoming) next[node.rel_path] = node
+  return next
+}
+
+function toQueueFiles(q: QueueState): QueueFiles {
+  return {
+    queue_id: q.queue_id,
+    queue_name: q.queue_name,
+    scanned_at: q.scanned_at,
+    error: q.error,
+    warning: q.warning,
+    nodes: Object.values(q.nodesByPath),
+  }
+}
+
+/**
+ * DESIGN.md §2/§9: one WebSocket, a full snapshot on connect, deltas thereafter. This is the
+ * single place that WebSocket is opened; both the Files page (the reconciled tree) and the
+ * Transfers page (per-file drawer contents, plus live job progress) read from it, since the
+ * two routes are never mounted at once.
+ *
+ * **The WS delta fix (phase 3b, docs/decisions.md):** phase 2's `queue_snapshot` resent an
+ * entire queue's tree on every scan. `core/engine.py.diff_nodes` now sends only `changed` /
+ * `removed` rel_paths, and `core/queue.py` pushes single-item deltas (`item_delta`) on
+ * lifecycle changes and ~1 Hz progress ticks — all merged into a `rel_path`-keyed map here so
+ * a node that hasn't changed keeps showing its last-known value, exactly like phase 2's
+ * queue-keyed merge did for whole queues.
+ */
+export function useLiveModel(): {
+  queues: QueueFiles[]
+  progressByJobId: Record<number, ProgressJob>
+  state: SocketState
+} {
+  const [queuesById, setQueuesById] = useState<Record<number, QueueState>>({})
+  const [progressByJobId, setProgressByJobId] = useState<Record<number, ProgressJob>>({})
+  const [state, setState] = useState<SocketState>('connecting')
+
+  useEffect(() => {
+    let cancelled = false
+    let ws: WebSocket | null = null
+    let retryTimer: ReturnType<typeof setTimeout> | undefined
+
+    const connect = () => {
+      if (cancelled) return
+      setState((prev) => (prev === 'open' ? 'reconnecting' : 'connecting'))
+
+      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
+      ws = new WebSocket(`${protocol}//${window.location.host}/api/ws`)
+
+      ws.onopen = () => {
+        if (cancelled) return
+        setState('open')
+      }
+
+      ws.onmessage = (event) => {
+        if (cancelled) return
+        let msg: WsMessage
+        try {
+          msg = JSON.parse(event.data as string) as WsMessage
+        } catch {
+          return
+        }
+
+        if (msg.type === 'snapshot') {
+          const next: Record<number, QueueState> = {}
+          for (const q of msg.queues) {
+            const nodesByPath: Record<string, FileNode> = {}
+            for (const node of q.nodes) nodesByPath[node.rel_path] = node
+            next[q.queue_id] = {
+              queue_id: q.queue_id,
+              queue_name: q.queue_name,
+              scanned_at: q.scanned_at,
+              error: null,
+              warning: q.warning,
+              nodesByPath,
+            }
+          }
+          setQueuesById(next)
+        } else if (msg.type === 'queue_delta') {
+          setQueuesById((prev) => {
+            const existing = prev[msg.queue_id]
+            const nodesByPath = mergeNodes(existing?.nodesByPath ?? {}, msg.changed)
+            for (const removedPath of msg.removed) delete nodesByPath[removedPath]
+            return {
+              ...prev,
+              [msg.queue_id]: {
+                queue_id: msg.queue_id,
+                queue_name: msg.queue_name,
+                scanned_at: msg.scanned_at,
+                error: null,
+                warning: msg.warning,
+                nodesByPath,
+              },
+            }
+          })
+        } else if (msg.type === 'item_delta') {
+          setQueuesById((prev) => {
+            const existing = prev[msg.queue_id]
+            if (!existing) return prev // a delta for a queue we haven't snapshotted yet
+            return { ...prev, [msg.queue_id]: { ...existing, nodesByPath: mergeNodes(existing.nodesByPath, msg.nodes) } }
+          })
+        } else if (msg.type === 'scan_error') {
+          setQueuesById((prev) => {
+            const existing = prev[msg.queue_id]
+            return {
+              ...prev,
+              [msg.queue_id]: existing
+                ? { ...existing, error: msg.message }
+                : {
+                    queue_id: msg.queue_id,
+                    queue_name: msg.queue_name,
+                    scanned_at: null,
+                    error: msg.message,
+                    warning: null,
+                    nodesByPath: {},
+                  },
+            }
+          })
+        } else if (msg.type === 'progress') {
+          setProgressByJobId((prev) => {
+            const next = { ...prev }
+            for (const job of msg.jobs) next[job.job_id] = job
+            return next
+          })
+        }
+      }
+
+      ws.onclose = () => {
+        if (cancelled) return
+        setState('reconnecting')
+        retryTimer = setTimeout(connect, RECONNECT_DELAY_MS)
+      }
+
+      ws.onerror = () => {
+        ws?.close()
+      }
+    }
+
+    connect()
+
+    return () => {
+      cancelled = true
+      if (retryTimer) clearTimeout(retryTimer)
+      ws?.close()
+    }
+  }, [])
+
+  const queues = Object.values(queuesById)
+    .map(toQueueFiles)
+    .sort((a, b) => a.queue_id - b.queue_id)
+
+  return { queues, progressByJobId, state }
+}

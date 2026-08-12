@@ -129,5 +129,7 @@ def test_effective_file_size_temp_suffixed_file_with_sidecar(tmp_path):
     temp_path = tmp_path / "movie.mkv.lftp"
     with open(temp_path, "wb") as f:
         f.truncate(1_000)
-    (tmp_path / "movie.mkv.lftp.lftp-pget-status").write_text("size=1000\n0.pos=250\n0.limit=1000\n")
+    (tmp_path / "movie.mkv.lftp.lftp-pget-status").write_text(
+        "size=1000\n0.pos=250\n0.limit=1000\n"
+    )
     assert effective_file_size(tmp_path / "movie.mkv") == 250

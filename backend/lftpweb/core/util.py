@@ -25,4 +25,6 @@ def to_safe_text(value: str) -> str:
     visible `\\xNN` escape instead of raising. A filename must never crash a scan, a DB write,
     or a WebSocket frame — this is what keeps that true at the one place it matters.
     """
-    return value.encode("utf-8", errors="surrogateescape").decode("utf-8", errors="backslashreplace")
+    return value.encode("utf-8", errors="surrogateescape").decode(
+        "utf-8", errors="backslashreplace"
+    )

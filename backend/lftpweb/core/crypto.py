@@ -89,5 +89,7 @@ def decrypt_secret(config_dir: str, ciphertext: str) -> str:
     try:
         plaintext = _fernet(secret).decrypt(ciphertext.encode("ascii"))
     except (InvalidToken, ValueError) as exc:
-        raise DecryptionError("stored credential does not decrypt with the current install secret") from exc
+        raise DecryptionError(
+            "stored credential does not decrypt with the current install secret"
+        ) from exc
     return plaintext.decode("utf-8")

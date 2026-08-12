@@ -77,7 +77,10 @@ JobKind = Literal["mirror", "pget"]
 # costs a UI label and a retry-or-not decision, never correctness of the transfer itself.
 
 ERROR_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
-    ("AUTH_FAILED", re.compile(r"login (failed|incorrect)|permission denied \(publickey", re.IGNORECASE)),
+    (
+        "AUTH_FAILED",
+        re.compile(r"login (failed|incorrect)|permission denied \(publickey", re.IGNORECASE),
+    ),
     ("PERMISSION_DENIED", re.compile(r"permission denied", re.IGNORECASE)),
     ("DISK_FULL", re.compile(r"no space left on device|disk full", re.IGNORECASE)),
     ("REMOTE_GONE", re.compile(r"no such file|not found on server|file not found", re.IGNORECASE)),
@@ -200,7 +203,7 @@ def build_rc_text(
         f"set pget:save-status {save_status_interval_s}s;",
         # DESIGN.md §4.4b: in-flight files carry a `.lftp` suffix so `core/local_scan.py`'s
         # temp-suffix handling has something to strip. lftp's own defaults are `no` / `.in.*`.
-        'set xfer:use-temp-file yes;',
+        "set xfer:use-temp-file yes;",
         'set xfer:temp-file-name "*.lftp";',
         "set mirror:parallel-directories yes;",
     ]
@@ -237,7 +240,9 @@ def build_rc_text(
         password = creds.password
     else:
         password = ""
-    lines.append(f"open -u {_lftp_quote(creds.username)},{_lftp_quote(password)} sftp://{creds.address}:{creds.port};")
+    lines.append(
+        f"open -u {_lftp_quote(creds.username)},{_lftp_quote(password)} sftp://{creds.address}:{creds.port};"
+    )
 
     return "\n".join(lines) + "\n"
 
@@ -428,6 +433,8 @@ async def terminate(job: SpawnedJob, *, grace_s: float = 10.0) -> None:
     try:
         await asyncio.wait_for(job.proc.wait(), timeout=grace_s)
     except TimeoutError:
-        logger.warning("job pid %s did not exit within %.0fs of SIGTERM; sending SIGKILL", job.pid, grace_s)
+        logger.warning(
+            "job pid %s did not exit within %.0fs of SIGTERM; sending SIGKILL", job.pid, grace_s
+        )
         job.proc.kill()
         await job.proc.wait()

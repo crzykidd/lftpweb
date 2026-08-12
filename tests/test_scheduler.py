@@ -33,7 +33,9 @@ def _settings(**overrides) -> SchedulerSettings:
     return SchedulerSettings(**base)
 
 
-def _q(id_: int, queued_at: str, rank: float = 0.0, lane: str = LANE_MAIN, forced: bool = False) -> QueuedJob:
+def _q(
+    id_: int, queued_at: str, rank: float = 0.0, lane: str = LANE_MAIN, forced: bool = False
+) -> QueuedJob:
     return QueuedJob(id=id_, lane=lane, rank=rank, queued_at=queued_at, forced_full_rate=forced)
 
 
@@ -116,7 +118,9 @@ def test_floor_loop_reduces_ready_until_share_clears_the_floor():
 def test_floor_loop_stops_at_ready_one_even_below_the_floor():
     # A single item's share can't be reduced further by shrinking `ready` (already 1) — it is
     # admitted anyway rather than being refused outright.
-    settings = _settings(max_bandwidth_bps=100_000, max_concurrent_transfers=5, min_share_floor_bps=300_000)
+    settings = _settings(
+        max_bandwidth_bps=100_000, max_concurrent_transfers=5, min_share_floor_bps=300_000
+    )
     decisions = admit(settings, running=[], queue=[_q(1, "t1")])
     assert decisions == [AdmitDecision(job_id=1, lane=LANE_MAIN, rate_limit_bps=100_000)]
 
@@ -142,7 +146,11 @@ def test_fast_lane_item_admits_even_when_main_lane_headroom_is_negative():
 
 def test_fast_lane_shares_its_reserve_across_concurrent_small_jobs():
     settings = _settings(small_lane_reserve_bps=1_000_000, small_lane_concurrency=2)
-    queue = [_q(1, "small-1", lane=LANE_SMALL), _q(2, "small-2", lane=LANE_SMALL), _q(3, "small-3", lane=LANE_SMALL)]
+    queue = [
+        _q(1, "small-1", lane=LANE_SMALL),
+        _q(2, "small-2", lane=LANE_SMALL),
+        _q(3, "small-3", lane=LANE_SMALL),
+    ]
     decisions = admit(settings, running=[], queue=queue)
     # Concurrency cap is 2 -> only two admitted, third waits; the reserve splits evenly.
     assert [d.job_id for d in decisions] == [1, 2]
@@ -174,7 +182,9 @@ def test_start_now_admits_unconditionally_at_full_bandwidth():
     running = [RunningJob(id=1, lane=LANE_MAIN, rate_limit_bps=10_000_000)]  # N already full
     queue = [_q(2, "t2", forced=True)]
     decisions = admit(settings, running=running, queue=queue)
-    assert decisions == [AdmitDecision(job_id=2, lane=LANE_MAIN, rate_limit_bps=10_000_000, forced_full_rate=True)]
+    assert decisions == [
+        AdmitDecision(job_id=2, lane=LANE_MAIN, rate_limit_bps=10_000_000, forced_full_rate=True)
+    ]
 
 
 def test_start_now_oversubscription_freezes_further_normal_admission():
@@ -183,7 +193,9 @@ def test_start_now_oversubscription_freezes_further_normal_admission():
     decisions = admit(settings, running=[], queue=queue)
     # Item 1 is force-admitted at the full 10,000,000; that alone drives headroom negative
     # (10,000,000 - 0 - 10,000,000 = 0), so item 2 gets nothing this pass.
-    assert decisions == [AdmitDecision(job_id=1, lane=LANE_MAIN, rate_limit_bps=10_000_000, forced_full_rate=True)]
+    assert decisions == [
+        AdmitDecision(job_id=1, lane=LANE_MAIN, rate_limit_bps=10_000_000, forced_full_rate=True)
+    ]
 
 
 def test_start_now_admission_resumes_once_the_forced_job_finishes():
@@ -211,7 +223,9 @@ def test_low_ceiling_still_admits_work(ceiling):
         max_bandwidth_bps=ceiling, max_concurrent_transfers=2, min_share_floor_bps=1
     ).scheduler_settings()
 
-    assert settings.small_lane_reserve_bps <= ceiling // 2, "reserve must never exceed half the ceiling"
+    assert (
+        settings.small_lane_reserve_bps <= ceiling // 2
+    ), "reserve must never exceed half the ceiling"
 
     queued = [
         QueuedJob(

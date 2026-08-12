@@ -4,7 +4,12 @@ import stat
 
 import pytest
 
-from lftpweb.core.crypto import DecryptionError, decrypt_secret, encrypt_secret, ensure_install_secret
+from lftpweb.core.crypto import (
+    DecryptionError,
+    decrypt_secret,
+    encrypt_secret,
+    ensure_install_secret,
+)
 
 
 def test_ensure_install_secret_generates_and_persists(tmp_path):

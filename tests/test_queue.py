@@ -68,7 +68,9 @@ async def _make_queue_row(db, host_id: int, local_path) -> int:
     return cursor.lastrowid
 
 
-async def _make_item_row(db, queue_id: int, rel_path: str, *, is_dir: bool, remote_size: int) -> int:
+async def _make_item_row(
+    db, queue_id: int, rel_path: str, *, is_dir: bool, remote_size: int
+) -> int:
     cursor = await db.execute(
         "INSERT INTO item (queue_id, rel_path, is_dir, remote_size, local_size, state) "
         "VALUES (?, ?, ?, ?, 0, 'REMOTE_ONLY')",
@@ -107,8 +109,14 @@ async def db(tmp_path):
 
 
 async def _queue_for(
-    db, tmp_path, *, max_bandwidth_bps=10_000_000, max_concurrent_transfers=2, tick_s=0.2,
-    password=SEEDBOX_PASSWORD, small_item_threshold_bytes=0,
+    db,
+    tmp_path,
+    *,
+    max_bandwidth_bps=10_000_000,
+    max_concurrent_transfers=2,
+    tick_s=0.2,
+    password=SEEDBOX_PASSWORD,
+    small_item_threshold_bytes=0,
 ):
     await save_transfer_settings(
         db,
@@ -157,7 +165,9 @@ async def test_small_file_transfers_and_checksum_matches(db, tmp_path):
         job_id = await q.enqueue_item(item_id)
 
         async def done():
-            row = await (await db.execute("SELECT state FROM job WHERE id = ?", (job_id,))).fetchone()
+            row = await (
+                await db.execute("SELECT state FROM job WHERE id = ?", (job_id,))
+            ).fetchone()
             return row is not None and row["state"] == "succeeded"
 
         assert await _wait_until(done, timeout_s=20)
@@ -166,7 +176,9 @@ async def test_small_file_transfers_and_checksum_matches(db, tmp_path):
         assert target.exists()
         assert target.stat().st_size == 512
 
-        item_row = await (await db.execute("SELECT state FROM item WHERE id = ?", (item_id,))).fetchone()
+        item_row = await (
+            await db.execute("SELECT state FROM item WHERE id = ?", (item_id,))
+        ).fetchone()
         assert item_row["state"] == "DOWNLOADED"
     finally:
         await q.stop()
@@ -184,7 +196,11 @@ async def test_stop_mid_transfer_then_resume_continues_from_partial(db, tmp_path
     # `pget` item (manual queueing isn't restricted to top-level items; see docs/decisions.md
     # phase 2's item-table decision).
     item_id = await _make_item_row(
-        db, queue_id, "Movie.Title.2024.2160p/Movie.Title.2024.2160p.mkv", is_dir=False, remote_size=20_971_520
+        db,
+        queue_id,
+        "Movie.Title.2024.2160p/Movie.Title.2024.2160p.mkv",
+        is_dir=False,
+        remote_size=20_971_520,
     )
 
     # Low bandwidth cap makes the "mid-transfer" window deterministic rather than racing a
@@ -195,7 +211,9 @@ async def test_stop_mid_transfer_then_resume_continues_from_partial(db, tmp_path
         job_id = await q.enqueue_item(item_id)
 
         async def running():
-            row = await (await db.execute("SELECT state, pid FROM job WHERE id = ?", (job_id,))).fetchone()
+            row = await (
+                await db.execute("SELECT state, pid FROM job WHERE id = ?", (job_id,))
+            ).fetchone()
             return row is not None and row["state"] == "running" and row["pid"] is not None
 
         assert await _wait_until(running, timeout_s=15)
@@ -206,10 +224,16 @@ async def test_stop_mid_transfer_then_resume_continues_from_partial(db, tmp_path
 
         await q.stop_job(job_id)
 
-        job_row = await (await db.execute("SELECT state FROM job WHERE id = ?", (job_id,))).fetchone()
+        job_row = await (
+            await db.execute("SELECT state FROM job WHERE id = ?", (job_id,))
+        ).fetchone()
         assert job_row["state"] == "cancelled"
 
-        item_row = await (await db.execute("SELECT state, auto_queue_suppressed FROM item WHERE id = ?", (item_id,))).fetchone()
+        item_row = await (
+            await db.execute(
+                "SELECT state, auto_queue_suppressed FROM item WHERE id = ?", (item_id,)
+            )
+        ).fetchone()
         assert item_row["state"] == "STOPPED"
         assert item_row["auto_queue_suppressed"] == 1
 
@@ -221,8 +245,12 @@ async def test_stop_mid_transfer_then_resume_continues_from_partial(db, tmp_path
         from lftpweb.core.local_scan import effective_file_size
 
         partial_size = effective_file_size(target)
-        assert 0 < partial_size < 20_971_520, "partial file must exist (as a .lftp temp file) and be incomplete"
-        assert not target.exists(), "must not have been renamed to its final name yet -- it isn't complete"
+        assert (
+            0 < partial_size < 20_971_520
+        ), "partial file must exist (as a .lftp temp file) and be incomplete"
+        assert (
+            not target.exists()
+        ), "must not have been renamed to its final name yet -- it isn't complete"
         assert target.with_name(target.name + ".lftp").exists()
 
         import os
@@ -235,7 +263,9 @@ async def test_stop_mid_transfer_then_resume_continues_from_partial(db, tmp_path
         assert job_id2 != job_id
 
         async def running2():
-            r = await (await db.execute("SELECT state FROM job WHERE id = ?", (job_id2,))).fetchone()
+            r = await (
+                await db.execute("SELECT state FROM job WHERE id = ?", (job_id2,))
+            ).fetchone()
             return r is not None and r["state"] == "running"
 
         assert await _wait_until(running2, timeout_s=15)
@@ -244,7 +274,9 @@ async def test_stop_mid_transfer_then_resume_continues_from_partial(db, tmp_path
         assert mid_resume_size >= partial_size, "resume must not restart from zero"
 
         async def done2():
-            r = await (await db.execute("SELECT state FROM job WHERE id = ?", (job_id2,))).fetchone()
+            r = await (
+                await db.execute("SELECT state FROM job WHERE id = ?", (job_id2,))
+            ).fetchone()
             return r is not None and r["state"] == "succeeded"
 
         # Resume is still bound by the same 300 KB/s cap (allocations are fixed at spawn --
@@ -272,16 +304,23 @@ async def test_bad_password_classifies_auth_failed_and_never_retries(db, tmp_pat
         job_id = await q.enqueue_item(item_id)
 
         async def failed():
-            row = await (await db.execute("SELECT state FROM job WHERE id = ?", (job_id,))).fetchone()
+            row = await (
+                await db.execute("SELECT state FROM job WHERE id = ?", (job_id,))
+            ).fetchone()
             return row is not None and row["state"] == "failed"
 
         assert await _wait_until(failed, timeout_s=20)
 
-        job_row = await (await db.execute("SELECT error_class FROM job WHERE id = ?", (job_id,))).fetchone()
+        job_row = await (
+            await db.execute("SELECT error_class FROM job WHERE id = ?", (job_id,))
+        ).fetchone()
         assert job_row["error_class"] == "AUTH_FAILED"
 
         item_row = await (
-            await db.execute("SELECT state, auto_queue_suppressed, suppressed_reason FROM item WHERE id = ?", (item_id,))
+            await db.execute(
+                "SELECT state, auto_queue_suppressed, suppressed_reason FROM item WHERE id = ?",
+                (item_id,),
+            )
         ).fetchone()
         assert item_row["state"] == "FAILED"
         assert item_row["auto_queue_suppressed"] == 1
@@ -289,7 +328,9 @@ async def test_bad_password_classifies_auth_failed_and_never_retries(db, tmp_pat
 
         # No automatic retry: only ever one job row for this item.
         await asyncio.sleep(1.0)
-        count_row = await (await db.execute("SELECT COUNT(*) AS n FROM job WHERE item_id = ?", (item_id,))).fetchone()
+        count_row = await (
+            await db.execute("SELECT COUNT(*) AS n FROM job WHERE item_id = ?", (item_id,))
+        ).fetchone()
         assert count_row["n"] == 1
     finally:
         await q.stop()
@@ -310,8 +351,12 @@ async def test_concurrency_two_at_half_third_waits_then_refills(db, tmp_path):
     # compete for the two main-lane slots this test is about. "deep" finishing almost
     # instantly (it's genuinely tiny) is convenient for observing "refill on completion".
     items = [
-        await _make_item_row(db, queue_id, "Some.Release.S01E01.720p.WEB", is_dir=True, remote_size=5_245_952),
-        await _make_item_row(db, queue_id, "Movie.Title.2024.2160p", is_dir=True, remote_size=20_971_520),
+        await _make_item_row(
+            db, queue_id, "Some.Release.S01E01.720p.WEB", is_dir=True, remote_size=5_245_952
+        ),
+        await _make_item_row(
+            db, queue_id, "Movie.Title.2024.2160p", is_dir=True, remote_size=20_971_520
+        ),
         await _make_item_row(db, queue_id, "deep", is_dir=True, remote_size=4_096),
     ]
 
@@ -333,7 +378,11 @@ async def test_concurrency_two_at_half_third_waits_then_refills(db, tmp_path):
 
         assert await _wait_until(two_running, timeout_s=15)
 
-        rows = await (await db.execute("SELECT id, state, rate_limit_bps FROM job WHERE id IN (?,?,?)", tuple(job_ids))).fetchall()
+        rows = await (
+            await db.execute(
+                "SELECT id, state, rate_limit_bps FROM job WHERE id IN (?,?,?)", tuple(job_ids)
+            )
+        ).fetchall()
         by_id = {r["id"]: r for r in rows}
         running_ids = [jid for jid in job_ids if by_id[jid]["state"] == "running"]
         queued_ids = [jid for jid in job_ids if by_id[jid]["state"] == "queued"]
@@ -345,7 +394,9 @@ async def test_concurrency_two_at_half_third_waits_then_refills(db, tmp_path):
         # Let one of the two running jobs finish (whichever is smaller finishes first), then
         # the third should be admitted at the freed share.
         async def third_admitted():
-            r = await (await db.execute("SELECT state FROM job WHERE id = ?", (queued_ids[0],))).fetchone()
+            r = await (
+                await db.execute("SELECT state FROM job WHERE id = ?", (queued_ids[0],))
+            ).fetchone()
             return r["state"] in ("running", "succeeded")
 
         assert await _wait_until(third_admitted, timeout_s=60)
@@ -377,7 +428,9 @@ async def test_spawn_failure_fails_the_job_instead_of_hot_looping(db, tmp_path, 
     monkeypatch.setattr(lftp_module, "spawn", _boom)
     await q.tick()
 
-    row = await (await db.execute("SELECT state, error_class FROM job WHERE id = ?", (job_id,))).fetchone()
+    row = await (
+        await db.execute("SELECT state, error_class FROM job WHERE id = ?", (job_id,))
+    ).fetchone()
     assert row["state"] == "failed"
     assert row["error_class"] == "SPAWN_FAILED"
 

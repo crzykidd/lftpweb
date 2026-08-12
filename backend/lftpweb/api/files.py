@@ -41,6 +41,7 @@ async def get_files(request: Request) -> FilesResponse:
                 queue_name=meta.name,
                 scanned_at=engine.last_scan_at.get(queue_id),
                 error=engine.scan_errors.get(queue_id),
+                warning=engine.scan_warnings.get(queue_id),
                 nodes=[
                     FileNode(
                         id=row["id"],
@@ -49,7 +50,9 @@ async def get_files(request: Request) -> FilesResponse:
                         state=row["state"],
                         remote_size=row["remote_size"],
                         local_size=row["local_size"],
-                        remote_mtime=float(row["remote_mtime"]) if row["remote_mtime"] is not None else None,
+                        remote_mtime=float(row["remote_mtime"])
+                        if row["remote_mtime"] is not None
+                        else None,
                     )
                     for row in rows
                 ],

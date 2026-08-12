@@ -86,6 +86,7 @@ export interface PathQueueOut extends PathQueueIn {
 // --- Files (phase 2, DESIGN.md §9.2) ----------------------------------------------------
 
 export interface FileNode {
+  id: number | null
   rel_path: string
   is_dir: boolean
   state: string
@@ -99,9 +100,59 @@ export interface QueueFiles {
   queue_name: string
   scanned_at: string | null
   error: string | null
+  // A *soft* note (DESIGN.md §5) -- set when the last scan skipped one or more unreadable
+  // remote subtrees (core/remote.py's scan-abort fix, phase 3b) rather than failing
+  // outright. Distinct from `error`, which means the whole scan failed and the tree shown
+  // is stale.
+  warning: string | null
   nodes: FileNode[]
 }
 
 export interface FilesResponse {
   queues: QueueFiles[]
+}
+
+// --- Jobs / transfer engine (phase 3a API, phase 3b UI -- DESIGN.md §4, §9.2 Transfers) ---
+
+export type JobKind = 'mirror' | 'pget'
+export type JobState = 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled'
+export type Lane = 'main' | 'small'
+
+export interface JobOut {
+  id: number
+  item_id: number
+  queue_id: number
+  rel_path: string
+  is_dir: boolean
+  kind: JobKind
+  state: JobState
+  lane: Lane
+  rank: number
+  attempt: number
+  queued_at: string
+  started_at: string | null
+  finished_at: string | null
+  pid: number | null
+  // The allocation this job was admitted with (DESIGN.md §4.5/§9.1) -- fixed for its
+  // lifetime, distinct from `speed_bps` (what it's *actually* pulling right now). Under
+  // admission control a job can hold its full allocation while pulling far less of it.
+  rate_limit_bps: number | null
+  forced_full_rate: boolean
+  bytes_start: number
+  bytes_done: number
+  bytes_total: number | null
+  speed_bps: number | null
+  eta_s: number | null
+  exit_code: number | null
+  error_class: string | null
+  output_tail: string | null
+}
+
+export interface JobsResponse {
+  jobs: JobOut[]
+}
+
+export interface QueueItemRequest {
+  item_id: number
+  start_now: boolean
 }

@@ -75,7 +75,9 @@ async def load_host_config(db: aiosqlite.Connection, config_dir: str) -> HostCon
         try:
             password = decrypt_secret(config_dir, row["password_enc"])
         except DecryptionError as exc:
-            logger.warning("host %s: password does not decrypt (credentials need re-entry): %s", row["id"], exc)
+            logger.warning(
+                "host %s: password does not decrypt (credentials need re-entry): %s", row["id"], exc
+            )
             password = None
 
     return HostConfig(
@@ -124,6 +126,30 @@ def serialize_node(node: ReconciledNode) -> dict[str, Any]:
     }
 
 
+def diff_nodes(
+    old: dict[str, ReconciledNode], new: dict[str, ReconciledNode]
+) -> tuple[list[ReconciledNode], list[str]]:
+    """The WebSocket delta fix (DESIGN.md §2/§9; docs/decisions.md's phase 2 entry flagged
+    this shape as scoped-down and said phase 3 shouldn't inherit it by default).
+
+    Phase 2 published one full-tree `queue_snapshot` — every node, every scan — because
+    nothing else existed yet and a 30s cadence made it cheap. Phase 3a's ~1 Hz progress
+    sampler makes that shape actively wrong: a queue holding a few thousand files would
+    re-serialize and re-send the entire tree to every connected browser every second.
+
+    `ReconciledNode` is a frozen, `eq`-comparable dataclass (`core/reconcile.py`), so
+    "changed" is exactly the identity check below — no field-by-field bookkeeping needed. A
+    node whose `rel_path` didn't exist in `old`, or whose value differs from `old`'s, is
+    "changed"; a `rel_path` present in `old` but absent from `new` is "removed". This is a
+    pure function precisely so it's unit-testable without a running engine or a live SSH
+    connection — see `tests/test_ws_deltas.py`, which is also where "the payload doesn't
+    scale with tree size" is proven, not just asserted.
+    """
+    changed = [node for rel_path, node in new.items() if old.get(rel_path) != node]
+    removed = [rel_path for rel_path in old if rel_path not in new]
+    return changed, removed
+
+
 class Engine:
     """Owns the scan loop, the current in-memory model (one reconciled tree per queue), and
     the pooled remote connection. One instance lives on `app.state.engine` for the process
@@ -146,6 +172,10 @@ class Engine:
         self.models: dict[int, dict[str, ReconciledNode]] = {}
         self.queue_meta: dict[int, QueueConfig] = {}
         self.scan_errors: dict[int, str | None] = {}
+        # A *soft* per-queue note (DESIGN.md §5) — set when a scan completed but skipped one
+        # or more unreadable remote subtrees (core/remote.py's scan-abort fix) rather than
+        # failing outright. Distinct from `scan_errors`, which means the whole scan failed.
+        self.scan_warnings: dict[int, str | None] = {}
         self.last_scan_at: dict[int, str | None] = {}
 
         self._task: asyncio.Task | None = None
@@ -198,28 +228,39 @@ class Engine:
         try:
             if host is None:
                 raise RemoteScanError("no host configured")
-            remote_tree = await self.pool.scan(host, q.remote_path)
+            remote_tree, scan_warning = await self.pool.scan(host, q.remote_path)
             local_tree = local_scan.scan_local(q.local_path)
             nodes = reconcile(remote_tree, local_tree)
+
+            old_nodes = self.models.get(q.id, {})
+            changed, removed = diff_nodes(old_nodes, nodes)
 
             self.models[q.id] = nodes
             await self._persist(q.id, nodes)
             self.scan_errors[q.id] = None
+            self.scan_warnings[q.id] = scan_warning
             self.last_scan_at[q.id] = _now_iso()
+            # The delta itself (DESIGN.md §2/§9): only the rows that changed since the last
+            # scan, not the whole tree — see `diff_nodes`'s docstring. A full snapshot is
+            # sent exactly once per connection, by `snapshot()` below, never here.
             self.events.publish(
                 {
-                    "type": "queue_snapshot",
+                    "type": "queue_delta",
                     "queue_id": q.id,
                     "queue_name": q.name,
-                    "nodes": [serialize_node(n) for n in nodes.values()],
+                    "changed": [serialize_node(n) for n in changed],
+                    "removed": removed,
                     "scanned_at": self.last_scan_at[q.id],
+                    "warning": scan_warning,
                 }
             )
         except Exception as exc:  # noqa: BLE001 - recorded per-queue, never propagated
             message = str(exc)
             self.scan_errors[q.id] = message
             logger.warning("scan failed for queue %s (%s): %s", q.id, q.name, message)
-            self.events.publish({"type": "scan_error", "queue_id": q.id, "queue_name": q.name, "message": message})
+            self.events.publish(
+                {"type": "scan_error", "queue_id": q.id, "queue_name": q.name, "message": message}
+            )
 
     async def _protected_rel_paths(self, queue_id: int) -> set[str]:
         """Items whose `state` this scan pass must **not** overwrite — DESIGN.md never says
@@ -267,7 +308,15 @@ class Engine:
                         local_size = excluded.local_size,
                         remote_mtime = excluded.remote_mtime
                     """,
-                    (queue_id, rel_path, 1 if node.is_dir else 0, node.remote_size, node.local_size, node.remote_mtime, node.state),
+                    (
+                        queue_id,
+                        rel_path,
+                        1 if node.is_dir else 0,
+                        node.remote_size,
+                        node.local_size,
+                        node.remote_mtime,
+                        node.state,
+                    ),
                 )
             else:
                 await self.db.execute(
@@ -281,13 +330,24 @@ class Engine:
                         remote_mtime = excluded.remote_mtime,
                         state = excluded.state
                     """,
-                    (queue_id, rel_path, 1 if node.is_dir else 0, node.remote_size, node.local_size, node.remote_mtime, node.state),
+                    (
+                        queue_id,
+                        rel_path,
+                        1 if node.is_dir else 0,
+                        node.remote_size,
+                        node.local_size,
+                        node.remote_mtime,
+                        node.state,
+                    ),
                 )
         await self.db.commit()
 
     def snapshot(self) -> list[dict[str, Any]]:
         """The full current model, one message per queue — what a freshly-connected
-        WebSocket client gets before any delta (DESIGN.md §2, §9).
+        WebSocket client gets before any delta (DESIGN.md §2, §9). This is the *only* place
+        a full node list is ever sent; every update after connect is a `queue_delta`
+        (`scan_queue`) or an `item_delta` (`core/queue.py`), each proportional to what
+        changed rather than to the size of the tree.
         """
         out = []
         for queue_id, nodes in self.models.items():
@@ -299,6 +359,7 @@ class Engine:
                     "queue_name": meta.name if meta else "",
                     "nodes": [serialize_node(n) for n in nodes.values()],
                     "scanned_at": self.last_scan_at.get(queue_id),
+                    "warning": self.scan_warnings.get(queue_id),
                 }
             )
         return out

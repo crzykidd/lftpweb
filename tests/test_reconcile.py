@@ -27,9 +27,13 @@ from lftpweb.core.remote import RemoteEntry
     ],
 )
 def test_file_state_table(remote_size, local_size, expected):
-    remote_tree = {"f.bin": RemoteEntry(rel_path="f.bin", is_dir=False, size=remote_size, mtime=1.0)}
+    remote_tree = {
+        "f.bin": RemoteEntry(rel_path="f.bin", is_dir=False, size=remote_size, mtime=1.0)
+    }
     local_tree = (
-        {"f.bin": LocalEntry(rel_path="f.bin", is_dir=False, size=local_size)} if local_size is not None else {}
+        {"f.bin": LocalEntry(rel_path="f.bin", is_dir=False, size=local_size)}
+        if local_size is not None
+        else {}
     )
     nodes = reconcile(remote_tree, local_tree)
     assert nodes["f.bin"].state == expected

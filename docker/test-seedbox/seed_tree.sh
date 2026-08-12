@@ -35,5 +35,16 @@ dd if=/dev/zero of="$root/日本語ファイル.txt" bs=1 count=128 status=none 
 mkdir -p "$root/deep/a/b/c/d"
 dd if=/dev/zero of="$root/deep/a/b/c/d/deepest-file.bin" bs=1 count=4096 status=none  # 4,096 bytes
 
-# Grand total across the whole tree:
+# --- an unreadable subdirectory: the phase 2 scan-abort bug's regression fixture -------
+# `chmod 000` denies even the owner (this script's uid, later `chown`'d to seeduser by the
+# Dockerfile — chmod bits apply regardless of who ends up owning it). `find -mindepth 1
+# -printf` can still list this directory's own name (readable via its readable parent) but
+# cannot descend into it, exits nonzero, and — before core/remote.py's fix — took the
+# *entire* scan down with it. `chown -R` afterwards still works because it runs as root,
+# which bypasses permission bits entirely.
+mkdir -p "$root/no-permission/secret"
+dd if=/dev/zero of="$root/no-permission/secret/hidden.bin" bs=1 count=64 status=none  # 64 bytes, never scannable
+chmod 000 "$root/no-permission"
+
+# Grand total across the *readable* part of the tree (excludes no-permission/secret/*):
 #   5,245,952 + 20,971,520 + 512 + 256 + 128 + 4,096 = 26,222,464 bytes

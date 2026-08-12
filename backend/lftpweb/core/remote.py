@@ -186,12 +186,75 @@ def records_to_entries(records: list[RemoteRecord], root: str) -> dict[str, Remo
         if rec.type_char in _DIR_TYPES:
             entries[rel_path] = RemoteEntry(rel_path=rel_path, is_dir=True, size=0, mtime=rec.mtime)
         elif rec.type_char in _FILE_TYPES:
-            entries[rel_path] = RemoteEntry(rel_path=rel_path, is_dir=False, size=rec.size, mtime=rec.mtime)
+            entries[rel_path] = RemoteEntry(
+                rel_path=rel_path, is_dir=False, size=rec.size, mtime=rec.mtime
+            )
         else:
             skipped += 1
     if skipped:
         logger.debug("remote scan of %s: skipped %d non-file/dir entries", root, skipped)
     return entries
+
+
+def _summarize_find_stderr(stderr_text: str) -> str:
+    """Turn `find`'s stderr (one or more `find: 'PATH': REASON` lines, GNU's own format) into
+    a short, queue-level warning string — good enough to show inline in the UI without
+    dumping raw stderr. Falls back to the trimmed raw text for a shape `find` has never
+    actually produced during development, rather than hiding it.
+    """
+    lines = [line.strip() for line in stderr_text.splitlines() if line.strip()]
+    if not lines:
+        return "some paths on the remote could not be scanned"
+    if len(lines) == 1:
+        return f"1 path skipped (could not be read): {lines[0]}"
+    shown = "; ".join(lines[:5])
+    more = f" (+{len(lines) - 5} more)" if len(lines) > 5 else ""
+    return f"{len(lines)} paths skipped (could not be read): {shown}{more}"
+
+
+@dataclass(frozen=True)
+class PrimaryScanOutcome:
+    """What `find -printf` produced, already classified (DESIGN.md §5). Split out from
+    `_run_primary` so the exit-code-vs-partial-failure decision is unit-testable without a
+    live SSH connection, the same way `parse_find_records` is testable without one.
+
+    `raw` is `None` only when `-printf` itself is unsupported (busybox/BSD `find`) — the
+    fallback-trigger signal `scan()` already handled before this existed. `warning` is set
+    when the scan covered *most* of the tree but GNU find's own nonzero exit means at least
+    one subtree could not be read.
+    """
+
+    raw: str | None
+    warning: str | None
+
+
+def interpret_primary_scan_result(
+    exit_status: int, stdout: bytes, stderr: bytes
+) -> PrimaryScanOutcome:
+    """Classify one `find -printf` invocation's result (DESIGN.md §5).
+
+    **The bug this exists to fix** (found live in phase 3, recorded in docs/decisions.md,
+    fixed here in phase 3b): GNU `find` exits nonzero the moment it can't stat/read *one*
+    subdirectory or file anywhere in the tree — even though it already printed every record
+    it *could* reach to stdout, and kept scanning everything else. The previous
+    implementation treated any nonzero exit that wasn't the "-printf unsupported" signature
+    as a hard failure, discarding the entire queue's tree over one unreadable subtree — one
+    permission-denied folder on the seedbox turned into "no folder renders at all," with no
+    indication why. A truly failed scan (bad path, root itself unreadable) still produces no
+    stdout at all and is raised as before; the distinguishing signal is whether `find`
+    produced *any* usable output before it hit the error.
+    """
+    text = stdout.decode("utf-8", errors="surrogateescape")
+    if exit_status == 0:
+        return PrimaryScanOutcome(raw=text, warning=None)
+    if _UNSUPPORTED_PRINTF_RE.search(stderr):
+        return PrimaryScanOutcome(raw=None, warning=None)
+
+    err_text = stderr.decode("utf-8", errors="surrogateescape")
+    if text.strip():
+        return PrimaryScanOutcome(raw=text, warning=_summarize_find_stderr(err_text))
+
+    raise RemoteScanError(f"find failed (exit {exit_status}): {err_text.strip()}")
 
 
 @dataclass
@@ -290,7 +353,9 @@ def _make_client_factory(
     """
 
     class PinningSSHClient(asyncssh.SSHClient):
-        def validate_host_public_key(self, host: str, addr: str, port: int, key: asyncssh.SSHKey) -> bool:
+        def validate_host_public_key(
+            self, host: str, addr: str, port: int, key: asyncssh.SSHKey
+        ) -> bool:
             # 'insecure' means exactly that — never consult or update the pin store, trust
             # whatever key is presented every time. Checked first and unconditionally, so a
             # pin recorded under a *different* policy earlier can't leak into an "insecure"
@@ -355,7 +420,9 @@ class RemoteConnectionPool:
 
     async def _connect(self, host: HostConfig) -> asyncssh.SSHClientConnection:
         result_holder: dict = {}
-        client_factory = _make_client_factory(host.known_hosts_policy, self._store_for(host), result_holder)
+        client_factory = _make_client_factory(
+            host.known_hosts_policy, self._store_for(host), result_holder
+        )
         kwargs: dict = {
             "host": host.address,
             "port": host.port,
@@ -417,48 +484,57 @@ class RemoteConnectionPool:
             return TestConnectionResult(ok=True, error_class=None, message="connected")
         except Exception as exc:  # noqa: BLE001 - classified below for the caller
             error_class, message = _classify_exception(exc)
-            logger.warning("test_connection to %s:%s failed: %s (%s)", host.address, host.port, message, error_class)
+            logger.warning(
+                "test_connection to %s:%s failed: %s (%s)",
+                host.address,
+                host.port,
+                message,
+                error_class,
+            )
             return TestConnectionResult(ok=False, error_class=error_class, message=message)
 
-    async def scan(self, host: HostConfig, remote_path: str) -> dict[str, RemoteEntry]:
+    async def scan(
+        self, host: HostConfig, remote_path: str
+    ) -> tuple[dict[str, RemoteEntry], str | None]:
         """Scan `remote_path` on `host`, trying the primary `find -printf` path first and
         falling back to the uploaded stdlib scanner only when the primary path is detected
         (not assumed) to be unsupported. The detection result is cached per connection so a
         busybox seedbox doesn't retry the failing primary command on every scan.
+
+        Returns `(entries, warning)` — `warning` is a human-readable, queue-level note
+        (DESIGN.md §5) when the primary path skipped one or more unreadable subtrees rather
+        than failing outright (`interpret_primary_scan_result`); `None` otherwise.
         """
         conn = await self.get_connection(host)
 
         if self._supports_printf is not False:
-            raw = await self._run_primary(conn, remote_path)
+            raw, warning = await self._run_primary(conn, remote_path)
             if raw is not None:
                 self._supports_printf = True
                 records = parse_find_records(raw)
-                return records_to_entries(records, remote_path)
+                return records_to_entries(records, remote_path), warning
             self._supports_printf = False
             logger.info(
                 "find -printf unsupported on %s:%s; falling back to remote_agent/scan_fs.py",
-                host.address, host.port,
+                host.address,
+                host.port,
             )
 
         raw = await self._run_fallback(conn, remote_path)
         records = parse_find_records(raw)
-        return records_to_entries(records, remote_path)
+        return records_to_entries(records, remote_path), None
 
-    async def _run_primary(self, conn: asyncssh.SSHClientConnection, remote_path: str) -> str | None:
+    async def _run_primary(
+        self, conn: asyncssh.SSHClientConnection, remote_path: str
+    ) -> tuple[str | None, str | None]:
         cmd = f"find {shlex.quote(remote_path)} -mindepth 1 -printf '%y\\t%s\\t%T@\\t%p\\n'"
         result = await conn.run(cmd, check=False, encoding=None)
         stdout = result.stdout if isinstance(result.stdout, (bytes, bytearray)) else b""
         stderr = result.stderr if isinstance(result.stderr, (bytes, bytearray)) else b""
-        if result.exit_status == 0:
-            return stdout.decode("utf-8", errors="surrogateescape")
-        if _UNSUPPORTED_PRINTF_RE.search(stderr):
-            return None
-        # A nonzero exit for some other reason (bad path, permission denied) is a real
-        # failure, not a "fall back" signal — surface it rather than masking it.
-        raise RemoteScanError(
-            f"find failed on {remote_path} (exit {result.exit_status}): "
-            f"{stderr.decode('utf-8', errors='surrogateescape').strip()}"
-        )
+        outcome = interpret_primary_scan_result(result.exit_status, stdout, stderr)
+        if outcome.warning:
+            logger.warning("scan of %s: %s", remote_path, outcome.warning)
+        return outcome.raw, outcome.warning
 
     async def _run_fallback(self, conn: asyncssh.SSHClientConnection, remote_path: str) -> str:
         remote_tmp = f"/tmp/.lftpweb_scan_fs_{uuid4().hex}.py"

@@ -129,6 +129,10 @@ class QueueFiles(BaseModel):
     queue_name: str
     scanned_at: str | None
     error: str | None = None
+    # A *soft* note (DESIGN.md §5) — set when the last scan skipped one or more unreadable
+    # remote subtrees (core/remote.py's scan-abort fix, phase 3b) rather than failing
+    # outright. Distinct from `error`, which means the whole scan failed.
+    warning: str | None = None
     nodes: list[FileNode] = Field(default_factory=list)
 
 
@@ -168,6 +172,8 @@ class JobOut(BaseModel):
     eta_s: float | None = None
     exit_code: int | None = None
     error_class: str | None = None
+    # DESIGN.md §9.2: "Failed rows show the error class and the captured lftp output tail."
+    output_tail: str | None = None
 
 
 class JobsResponse(BaseModel):
