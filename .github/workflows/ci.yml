@@ -199,7 +199,12 @@ jobs:
               [ -d /run/lftpweb ] || { echo "FAIL: /run/lftpweb missing" >&2; exit 1; }
               owner=$(stat -c %u:%g /run/lftpweb)
               [ "$owner" = "1000:1000" ] || { echo "FAIL: /run/lftpweb owned by $owner" >&2; exit 1; }
-              echo "OK: no phantom /downloads; /run/lftpweb is 0700 and owned by PUID"
+              # OpenSSH fatals with "No user exists for uid N" without an NSS entry, so
+              # every lftp transfer dies while scanning still works. Real deployment bug.
+              getent passwd 1000 >/dev/null || { echo "FAIL: no passwd entry for PUID" >&2; exit 1; }
+              ssh -o BatchMode=yes -o ConnectTimeout=2 nonexistent.invalid true 2>&1 \
+                | grep -q "No user exists" && { echo "FAIL: ssh cannot resolve its own uid" >&2; exit 1; }
+              echo "OK: no phantom /downloads; /run/lftpweb owned by PUID; ssh has an identity"
             '
 
   test:

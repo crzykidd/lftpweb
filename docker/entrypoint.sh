@@ -84,6 +84,24 @@ fi
 #
 # Fatal, not advisory: without this directory no transfer can ever start, so failing at
 # startup with one clear message beats failing per-job forever.
+# Give PUID/PGID a real NSS identity before anything runs as them. /etc/passwd and
+# /etc/group are symlinks into /run (see docker/Dockerfile) precisely so this works under a
+# read-only root filesystem. Without it OpenSSH — and therefore every lftp transfer — fails
+# with "No user exists for uid ${PUID}" while scanning and the whole UI look healthy.
+for _f in passwd group; do
+    if [ -f "/etc/${_f}.base" ]; then
+        cp "/etc/${_f}.base" "/run/${_f}"
+    elif [ ! -f "/run/${_f}" ]; then
+        : > "/run/${_f}"
+    fi
+done
+if ! grep -q "^[^:]*:[^:]*:${PUID}:" /run/passwd 2>/dev/null; then
+    echo "lftpweb:x:${PUID}:${PGID}::/config:/sbin/nologin" >> /run/passwd
+fi
+if ! grep -q "^[^:]*:[^:]*:${PGID}:" /run/group 2>/dev/null; then
+    echo "lftpweb:x:${PGID}:" >> /run/group
+fi
+
 RUN_DIR="${LFTPWEB_RUN_DIR:-/run/lftpweb}"
 if ! mkdir_err="$(mkdir -p "$RUN_DIR" 2>&1)"; then
     echo "lftpweb: ERROR: could not create run dir '${RUN_DIR}': ${mkdir_err}" >&2

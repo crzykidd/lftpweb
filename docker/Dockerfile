@@ -92,6 +92,22 @@ ENV PATH="/app/.venv/bin:${PATH}" \
 #
 # The compose files declare the real mounts explicitly, which is the only place that belongs.
 # A queue's local_path may be any mounted path; /downloads is a convention, not a requirement.
+
+# OpenSSH's client calls getpwuid() on its own uid and fatals with "No user exists for uid N"
+# when there is no /etc/passwd entry — exactly the identity model §11.2 commits to (numeric
+# PUID/PGID, no NSS entry, read-only root). lftp shells out to ssh, so every transfer died with
+# `max-retries exceeded (No user exists for uid 2000)` while scanning worked fine (asyncssh has
+# an env fallback; OpenSSH has none).
+#
+# /etc/passwd cannot be appended to at runtime under `read_only: true`, so it becomes a symlink
+# into the /run tmpfs, which IS writable. docker/entrypoint.sh writes the real content there —
+# base copies plus an entry for PUID/PGID — before dropping privileges. Keep this as the last
+# step touching /etc: anything after it resolving a user would hit a dangling symlink.
+RUN cp /etc/passwd /etc/passwd.base \
+ && cp /etc/group  /etc/group.base \
+ && ln -sf /run/passwd /etc/passwd \
+ && ln -sf /run/group  /etc/group
+
 EXPOSE 8087
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
