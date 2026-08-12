@@ -6,6 +6,205 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-12 — Phase 9: polish and documentation reconciliation — every decision recorded,
+## including which gaps were deliberately named instead of closed
+
+**The last phase — v1 is now fully built.** Two halves: UI polish (§9.2) and reconciling
+`README.md`/`DESIGN.md` §13+§15/`prompts/startnewsession.md` against reality after eight
+phases of incremental docs, several written while later phases were still hypothetical. Full
+detail in the phase report; every non-obvious call, including three gaps found but
+*deliberately not fixed*, is recorded here.
+
+**1. Bulk Queue/Stop uses `Promise.allSettled`, not `Promise.all`, and reports the outcome
+honestly** (`FileTree.tsx`). The prompt's own example — "7 of 10 queued, these 3 failed
+because …" — is structurally impossible with `Promise.all`, which rejects on the *first*
+failure and gives no way to learn what happened to the other nine. Entries that succeed are
+deselected afterward; entries that fail **stay selected**, so the failure banner's list lines
+up with what's still checked and a retry is one click away. **Rejected: clear the whole
+selection regardless of outcome**, matching the pre-phase-9 behavior. Simpler, but it silently
+discards exactly the information ("which ones failed") the prompt asked to surface, and makes
+retrying a partial failure a manual re-select task instead of an immediate re-click.
+
+**2. Files-page text/state filters are entirely client-side, with no new backend endpoint.**
+The Files page is WS-driven (`useLiveModel.ts`) — the whole queue's tree is already fully
+loaded in the browser (DESIGN.md §9's "one WebSocket delivering a full model snapshot on
+connect and deltas thereafter") — so filtering server-side would mean adding a query surface
+to an endpoint that doesn't otherwise exist for this page, for data the client already has in
+full. **Rejected: a server-side filter param on `GET /api/files`.** Would mirror
+`api/history.py`'s pattern, but History filters an *unbounded, paginated* table server never
+fully sends to the client; Files sends its whole (bounded, per-queue) tree already, making a
+round-trip to filter data already in memory pure overhead.
+
+**3. A filter match ignores `collapsed` entirely and is computed by flattening the whole tree
+fully expanded, then keeping only matches plus their ancestor directories** (`FileTree.tsx`'s
+`visiblePaths`). A match inside a directory the user happened to have collapsed must still
+surface — a search that appears to return nothing because the containing folder is collapsed
+would be a confusing, non-obvious failure mode. Collapse state itself is untouched in
+component state and resumes exactly where the user left it the instant both filters clear.
+**Rejected: respect `collapsed` while filtering (i.e., a match inside a collapsed directory
+stays hidden).** Technically simpler (one code path instead of a filter-mode/browse-mode
+branch), but makes the filter feel broken for the single most likely use case — searching for
+something the user knows exists but doesn't remember which collapsed folder it's under.
+
+**4. `host_reachable`/`scheduler_alive` (DESIGN.md §10.3, added to `/api/health` by phase 7
+but deliberately left unsurfaced — see that phase's own decisions.md entry, point 16) were
+added to the stats header (`StatsHeader.tsx`), not a Settings page.** The phase 9 prompt
+offered either. Chose the header because it's the one piece of chrome visible on every page
+regardless of which section the user is in (DESIGN.md §9.1), matching the existing "● live /
+○ connecting…" pattern the Files page already uses for its own WS state — a health signal
+that's only checkable by navigating to a specific Settings tab is easy to forget exists.
+Polled at the same 5 s cadence as `/api/stats`, reusing `usePoll`; `/api/health` is already on
+`logsetup.py`'s `_POLLED_PATHS` access-log exemption list (phase 7), so this is exactly the
+continuous-poll case that exemption was written for, not a new cost.
+
+**5. Bulk "Delete local" / "Delete remote" — named in DESIGN.md §9.2 alongside Queue/Stop —
+were deliberately NOT built this phase.** The phase 9 prompt's own "What to do" section says,
+specifically: "make sure the bulk actions cover Queue / Stop" — narrower than §9.2's full
+four-action list, and this project's own operating rule (`prompts/startnewsession.md`,
+"Operating rules → Scope") is to work only what's named and offer the rest as a one-liner
+rather than fan out. Building manual delete UI would also mean a *new* API surface this
+project has never had (there is currently no manual per-item or bulk delete endpoint at all —
+the only deletion anywhere in the codebase is `move` mode's automatic, verification-gated
+`core/postprocess.py` pipeline) for an operation whose blast radius (deleting real files,
+possibly on the remote seedbox) is exactly the kind of thing this project's own history
+(phase 5's "highest-consequence phase" framing) treats with maximum caution, never as an
+unplanned addition to a "polish" pass. **Rejected: build it anyway, since §9.2 already
+specifies it.** Would close the letter of §9.2, but adds a genuinely new, irreversible-capable
+capability with no prompt asking for it and no time budgeted for the same caution phase 5 gave
+`move` mode (a misconfiguration warning, forced verification, a confirmation gate) — exactly
+the kind of thing this phase's own instructions say to name, not quietly close at 3am. Recorded
+in `README.md`'s "What doesn't yet" table, `DESIGN.md` §13's phase 9 entry, and this file.
+
+**6. Settings → Transfer's missing UI (`TransferTab.tsx`, still `PagePlaceholder`) was found
+during this phase's review and also deliberately NOT built — but its placeholder text was
+corrected.** `core/queue.py`'s `TransferSettings` and `/api/settings/transfer` have been
+complete and tested since phase 3a; phase 5's own decisions.md entry had already flagged this
+gap and speculated "likely phase 9" would pick it up — but phase 9's actual prompt never named
+this tab, scoping its UI work to Files bulk actions/filters and the health readout only.
+Building the full form (site bandwidth/concurrency/fast-lane/parallelism, the §9.3 live
+connection-count-vs-`net:connection-limit` warning, and the free-text "extra lftp settings"
+box) is a materially larger, unscoped addition — effectively an entire unbuilt Settings page —
+not "polish" on top of an existing page. **What was fixed:** the placeholder's own text used
+to say `"Settings → Transfer — bandwidth, concurrency, phase 3"`, which is now actively false
+(phase 3 shipped without building this, so the text pointed at a phase that had already come
+and gone). Updated it to state plainly that the tab has no UI yet and point at `README.md`'s
+"Known gaps" — a one-line, zero-risk truth fix, distinct from building the feature itself.
+Named prominently in `README.md`, `DESIGN.md` §13, and `prompts/startnewsession.md`'s traps
+list rather than left to be rediscovered.
+
+**7. `README.md`'s volume table had `/staging` and `/downloads` backwards relative to what
+phase 5 actually built, and was corrected as a factual bug fix, not a decision.** The old text
+read `/staging` — "optional; download here, move to `/downloads` when complete" — but phase 5
+resolved (decisions.md, phase 5 entry #1) that `local_path` (`/downloads`) is unconditionally
+where lftp writes and what the reconciler scans, and `staging_path` (`/staging`) is the
+post-processing Move step's *destination*, relocated to only after an item is fully downloaded
+and verified — the opposite of "download here first." This has apparently been wrong in
+`README.md` since phase 5 shipped (2026-08-12) and nothing caught it until this reconciliation
+pass reread the volume table against `docs/decisions.md`'s own phase 5 entry. Fixed in place;
+flagged here since it's a correction to *existing*, previously-shipped documentation, not new
+content — exactly the kind of drift this phase exists to catch.
+
+**8. `prompts/startnewsession.md`'s stale "Repo, branches, and what has NOT been pushed"
+section was rewritten based on live checks (`gh api repos/.../branches/main/protection`,
+`git rev-list --left-right --count`), not left as historical narrative describing an empty,
+unprotected repo.** Strictly speaking this goes beyond the three files the phase 9 prompt names
+by title (`README.md`, `DESIGN.md` §13/§15, `startnewsession.md`) only in the sense that it's a
+*different section* of `startnewsession.md` than "Where we are" — still squarely inside the
+one file the prompt names and its own explicit brief ("must accurately say what is built...
+Prune anything that was true mid-build and is now misleading"). The old text described a
+5-step manual bootstrap ("fast-forward `main` to `dev` while no protection exists... only then
+apply protection") as a still-pending to-do; live checks during this phase confirmed
+protection has been applied for some time (8 required status checks, PR required, force-push
+and deletion blocked) and both branches are fully pushed and in sync with `origin`. Left as
+stale narrative, a fresh session could plausibly attempt the now-invalid "fast-forward and
+push directly" step against a branch that would actually reject it — worth fixing rather than
+leaving as an active landmine just because it wasn't one of the three files named by title.
+**Rejected: leave it and just flag it as stale in the report.** The prompt's own emphasis that
+`startnewsession.md` is "the single most important artifact for whoever picks this up next"
+argues for fixing an actively-dangerous inaccuracy discovered while reading the file end to
+end, not filing it as a gap to leave for someone else to trip over.
+
+**9. `CLAUDE.md`'s one-line "Status" summary (`build phases 1–3 of 9 complete... Auto-queue,
+post-processing, History, the log viewer, backups, and authentication are not built yet"`) was
+corrected to a truthful one-liner, even though `CLAUDE.md` is not one of the three files the
+phase 9 prompt names.** This line is the very first thing a fresh session reads after the
+project description, before it ever reaches `startnewsession.md`'s own detailed table, and it
+was flatly false (phases 4–8 have been done since well before this session started). Judged
+this small enough (one paragraph, no structural change, `CLAUDE.md`'s own
+`handoff-prompt-workflow` snippet allows "a genuinely small change... do it in-session") and
+squarely in the spirit of "make the documentation tell the truth about what now exists" to fix
+rather than leave as a known-false first impression. **Rejected: leave it, since it's not one
+of the three named files.** The letter of the prompt's file list would allow leaving it, but
+the prompt's own framing ("this phase is about the docs matching the code") doesn't carve out
+an exception for a file merely because it wasn't named — and the fix cost one paragraph.
+
+**10. The consolidated "Known gaps" list lives in `README.md`, with `startnewsession.md`
+cross-referencing it rather than duplicating it.** The phase 9 prompt says to collect the
+seven-plus gaps "in README.md or startnewsession.md, wherever a reader will find it" — an
+either/or, not both. Chose `README.md` as the one canonical home because it's the universally-
+read top-level entry point (a GitHub visitor reads it before anything else, including
+`startnewsession.md`, which is specifically an *agent* onboarding brief), and because the
+existing "Locked out?" section — the closest precedent for "a known limitation stated plainly
+for an end user" — already lives there. `startnewsession.md`'s own "Where we are" section
+names the headline items and points at `README.md` for the full list rather than repeating it,
+so the two files can't drift out of sync with each other over time.
+
+**11. `DESIGN.md` §13 and §15 were annotated in place (✅ markers, inline "Shipped:"/"Status
+(phase 9):" sentences) rather than rewritten, and §1–§12 were not touched at all** — this
+phase's explicit instruction, followed literally: grepped the diff against the original before
+finishing to confirm no `## 1.` through `## 12.` heading's *content* changed, only the two
+named exceptions. Every §15 risk row keeps its original "Mitigation / status" text verbatim,
+with a new status sentence appended rather than replacing anything, per the prompt's own "with
+the reasoning kept" instruction.
+
+**12. No new automated tests were added this phase.** The prompt's "Verify before reporting"
+list says "add tests for any behaviour you change" — every behavior actually changed this
+phase is frontend-only (bulk-action reporting, client-side filtering, a header readout), and
+this project has no frontend test framework (`frontend/package.json` has no `vitest`/`jest`/
+`@testing-library/*` dependency, and no `*.test.*` file exists anywhere in `frontend/`) — the
+existing bar for frontend correctness across every prior UI phase has been `tsc -b` (type
+correctness) + `oxlint` (lint), not unit tests, and no phase before this one introduced one
+either. **Rejected: add a frontend test framework this phase, to be able to test the new
+filter/bulk-outcome logic properly.** Adding an entire new toolchain (vitest + testing-library
++ jsdom, at minimum) as an unplanned side effect of a "polish" phase is exactly the kind of
+scope expansion this project's own rules warn against — flagged here as a real gap (this
+phase's own frontend logic, like every prior phase's, is unverified by anything beyond
+type-checking and manual code review) rather than silently worked around by adding tooling
+nobody asked for.
+
+**Verified, not just asserted:** `uv run pytest`: 367 passed, 0 skipped (fake seedbox up); 357
+passed, 10 skipped (without it) — no regressions in any earlier phase's tests, and no backend
+code was touched this phase, so this run exists to prove that remains true. Both lint gates
+clean (`ruff check` and `ruff format --check`, `--config ruff.toml`, repo-wide — run exactly as
+the prompt specified, a fourth time now, and clean both times this phase). `npm run build`
+(`tsc -b && vite build`) and `npm run lint` (`oxlint`) clean, run after every substantive
+frontend edit, not just once at the end. `docker compose config --quiet` clean on all three
+compose files. Every `§`-reference across `DESIGN.md`, `CLAUDE.md`, `startnewsession.md`,
+`README.md`, and `docs/decisions.md` was extracted and confirmed to resolve to a real `##`/`###`
+heading or a real `§15.x` table row (script-checked, not eyeballed) — the one exception found,
+a stray `§8.1` in `prompts/done/2026-08-11-design-sync-modes-and-bandwidth.md`, is inside a
+historical, already-`done/` design-draft prompt predating the current section numbering, not
+cited by `CLAUDE.md`/`startnewsession.md`/any code comment, and was left alone as an accurate
+record of what that draft said at the time, not "fixed" to match numbering that postdates it.
+Branch-protection and push-sync state for `main`/`dev` were checked live via `gh api` and
+`git rev-list`, not assumed from prior notes. Fake-seedbox containers (`docker-compose.test.yml`)
+were started twice during this phase's verification and torn down both times, confirmed via
+`docker ps -a`.
+
+**Not verified — stated plainly, as every prior UI phase's report also had to say:** no
+browser is available in this environment, and none has been available for any phase of this
+project. The Files-page filter bar, the bulk-outcome banner (including its "keep failed
+entries selected" behavior), and the new header health readout have never been visually
+confirmed to render, lay out, or behave correctly on click — only confirmed to type-check,
+build, and lint cleanly, with every backend endpoint they call (`/api/health`, `queueItem`,
+`stopItem`) already verified over real HTTP by earlier phases. This is the ninth and last phase
+to carry this exact caveat, which is precisely why it's now stated once, permanently, in
+`README.md`'s pre-release banner and "Known gaps" section, `DESIGN.md` §13's status note, and
+`prompts/startnewsession.md`'s "Where we are" section, rather than only in this file's own
+per-phase report as it was for phases 6, 7, and 8.
+
+---
+
 ## 2026-08-12 — Phase 8: auth and hardening — every decision recorded for review
 
 Built the three `AUTH_MODE`s (`none`/`password`/`proxy`), an API key mechanism independent of

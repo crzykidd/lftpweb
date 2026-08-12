@@ -11,10 +11,12 @@ truth and its sections are numbered for reference. The one decision everything h
 (local bytes vs. known remote size) and each transfer is its own short-lived lftp process. Do
 not reintroduce `jobs -v` parsing as a source of truth (§1.2 explains why).
 
-**Status:** pre-release `0.0.1`, build phases 1–3 of 9 complete (`DESIGN.md` §13) — it connects,
-scans, reconciles, and actually transfers. Auto-queue, post-processing, History, the log viewer,
-backups, and **authentication** are not built yet. `prompts/startnewsession.md` is the current
-state-of-play brief; read it on session start.
+**Status:** pre-release `0.0.1`, all 9 build phases complete (`DESIGN.md` §13) — it connects,
+scans, reconciles, transfers, auto-queues, post-processes, and has auth, ops (logs/backups/
+health), and Files-page polish. Real gaps remain (no UI has ever been click-tested; Settings →
+Transfer has no UI). `prompts/startnewsession.md` is the current state-of-play brief and the
+canonical source for exactly what's built vs. not — read it on session start rather than
+trusting this summary line, which a future phase updating this file may forget to touch again.
 
 ## Stack
 

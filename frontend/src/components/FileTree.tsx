@@ -7,6 +7,9 @@ import { StateChip } from './StateChip'
 
 const ROW_HEIGHT_PX = 32
 
+const inputClasses =
+  'rounded-md border border-zinc-300 bg-white px-2.5 py-1.5 text-sm text-zinc-900 outline-none focus:border-zinc-500 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100'
+
 interface TreeEntry extends FileNode {
   name: string
   depth: number
@@ -149,11 +152,35 @@ function Row({ entry, isCollapsed, isSelected, onToggleCollapse, onToggleSelect,
   )
 }
 
+/** A bulk action's outcome, reported honestly rather than swallowed (phase 9, DESIGN.md
+ * §9.2): "7 of 10 queued" plus which ones failed and why, not a silent `Promise.all` that
+ * throws on the first rejection and leaves the other 9 outcomes unknown to the user.
+ */
+interface BulkFailure {
+  rel_path: string
+  name: string
+  error: string
+}
+
+interface BulkOutcome {
+  action: 'queue' | 'stop'
+  total: number
+  succeeded: number
+  failures: BulkFailure[]
+}
+
+function errorMessage(reason: unknown): string {
+  return reason instanceof Error ? reason.message : String(reason)
+}
+
 /** DESIGN.md §9.2's Files tree: virtualized (`@tanstack/react-virtual`, smooth at 10k+
  * rows -- deferred in phase 2, see docs/decisions.md), collapsible, per-row state chip,
  * size, and a contextual Queue/Stop action. Multi-select with shift-range plus bulk actions
  * (§9.2) lives above the virtualized list so it can act on rows that are currently scrolled
- * out of view, not just what's rendered.
+ * out of view, not just what's rendered. Phase 9 adds text/state filters (client-side --
+ * this page is WS-driven with the whole queue's tree already in the browser, unlike
+ * History's server-paginated model, so there is no endpoint to add) and honest partial-
+ * failure reporting for bulk Queue/Stop.
  */
 export function FileTree({ nodes }: { nodes: FileNode[] }) {
   const tree = useMemo(() => buildTree(nodes), [nodes])
@@ -162,9 +189,50 @@ export function FileTree({ nodes }: { nodes: FileNode[] }) {
   const [lastClickedPath, setLastClickedPath] = useState<string | null>(null)
   const [bulkBusy, setBulkBusy] = useState(false)
   const [rowBusy, setRowBusy] = useState<Set<string>>(new Set())
+  const [bulkOutcome, setBulkOutcome] = useState<BulkOutcome | null>(null)
+  const [searchText, setSearchText] = useState('')
+  const [stateFilter, setStateFilter] = useState('')
 
-  const flat = useMemo(() => flatten(tree, collapsed), [tree, collapsed])
-  const byPath = useMemo(() => new Map(flat.map((e) => [e.rel_path, e])), [flat])
+  // Every entry regardless of collapse state -- selection and the state-filter dropdown's
+  // own option list must survive a directory being collapsed, and a text/state match inside
+  // a collapsed directory must still be findable (below).
+  const fullFlat = useMemo(() => flatten(tree, new Set()), [tree])
+  const byPath = useMemo(() => new Map(fullFlat.map((e) => [e.rel_path, e])), [fullFlat])
+  const availableStates = useMemo(
+    () => [...new Set(nodes.map((n) => n.state))].sort(),
+    [nodes],
+  )
+
+  const filtersActive = stateFilter !== '' || searchText.trim() !== ''
+
+  // A match plus every one of its ancestor directories (so the tree stays navigable down to
+  // the hit) -- computed over the *full*, uncollapsed set, then substituted for the normal
+  // collapse-respecting flatten below. Filtering while a directory happens to be collapsed
+  // must still surface matches inside it, so a filter's flat list ignores `collapsed`
+  // entirely rather than compounding with it.
+  const visiblePaths = useMemo(() => {
+    if (!filtersActive) return null
+    const needle = searchText.trim().toLowerCase()
+    const visible = new Set<string>()
+    for (const entry of fullFlat) {
+      if (stateFilter && entry.state !== stateFilter) continue
+      if (needle && !entry.name.toLowerCase().includes(needle) && !entry.rel_path.toLowerCase().includes(needle)) {
+        continue
+      }
+      let path: string | null = entry.rel_path
+      while (path != null && !visible.has(path)) {
+        visible.add(path)
+        const lastSlash = path.lastIndexOf('/')
+        path = lastSlash === -1 ? null : path.slice(0, lastSlash)
+      }
+    }
+    return visible
+  }, [filtersActive, fullFlat, searchText, stateFilter])
+
+  const flat = useMemo(() => {
+    if (!filtersActive || visiblePaths == null) return flatten(tree, collapsed)
+    return fullFlat.filter((e) => visiblePaths.has(e.rel_path))
+  }, [tree, collapsed, filtersActive, fullFlat, visiblePaths])
 
   const scrollRef = useRef<HTMLDivElement>(null)
   const virtualizer = useVirtualizer({
@@ -228,25 +296,42 @@ export function FileTree({ nodes }: { nodes: FileNode[] }) {
     [selected, byPath],
   )
 
-  const bulkQueue = async () => {
+  /** `Promise.allSettled`, not `Promise.all` -- one rejection must not hide the outcome of
+   * the other N-1 requests, and the caller (DESIGN.md §9.2, phase 9) needs to say "7 of 10
+   * queued, these 3 failed because …" rather than either "all failed" (the first rejection
+   * wins with `Promise.all`) or silently swallowing which ones didn't make it. Entries that
+   * failed stay selected afterward so the summary's list lines up with what's still checked
+   * and a retry is one click away; entries that succeeded are deselected.
+   */
+  const runBulk = async (action: 'queue' | 'stop') => {
+    const targets = selectedEntries
+    if (targets.length === 0) return
     setBulkBusy(true)
+    setBulkOutcome(null)
     try {
-      await Promise.all(selectedEntries.map((e) => queueItem(e.id as number)))
-      clearSelection()
+      const results = await Promise.allSettled(
+        targets.map((e) => (action === 'queue' ? queueItem(e.id as number) : stopItem(e.id as number))),
+      )
+      const failures: BulkFailure[] = []
+      const succeededPaths = new Set<string>()
+      results.forEach((result, i) => {
+        const entry = targets[i]
+        if (result.status === 'fulfilled') succeededPaths.add(entry.rel_path)
+        else failures.push({ rel_path: entry.rel_path, name: entry.name, error: errorMessage(result.reason) })
+      })
+      setSelected((prev) => {
+        const next = new Set(prev)
+        for (const path of succeededPaths) next.delete(path)
+        return next
+      })
+      setBulkOutcome({ action, total: targets.length, succeeded: succeededPaths.size, failures })
     } finally {
       setBulkBusy(false)
     }
   }
 
-  const bulkStop = async () => {
-    setBulkBusy(true)
-    try {
-      await Promise.all(selectedEntries.map((e) => stopItem(e.id as number)))
-      clearSelection()
-    } finally {
-      setBulkBusy(false)
-    }
-  }
+  const bulkQueue = () => runBulk('queue')
+  const bulkStop = () => runBulk('stop')
 
   if (tree.length === 0) {
     return <p className="p-3 text-sm text-zinc-500 dark:text-zinc-400">Nothing scanned yet.</p>
@@ -254,6 +339,47 @@ export function FileTree({ nodes }: { nodes: FileNode[] }) {
 
   return (
     <div className="flex flex-col gap-2">
+      <div className="flex flex-wrap items-center gap-2">
+        <input
+          type="text"
+          className={inputClasses}
+          placeholder="Search name or path…"
+          value={searchText}
+          onChange={(e) => setSearchText(e.target.value)}
+          aria-label="Search files"
+        />
+        <select
+          className={inputClasses}
+          value={stateFilter}
+          onChange={(e) => setStateFilter(e.target.value)}
+          aria-label="Filter by state"
+        >
+          <option value="">All states</option>
+          {availableStates.map((s) => (
+            <option key={s} value={s}>
+              {s}
+            </option>
+          ))}
+        </select>
+        {filtersActive && (
+          <>
+            <span className="text-xs text-zinc-500 dark:text-zinc-400">
+              {flat.length} of {fullFlat.length} shown
+            </span>
+            <button
+              type="button"
+              onClick={() => {
+                setSearchText('')
+                setStateFilter('')
+              }}
+              className="rounded-md px-2 py-1 text-xs font-medium text-zinc-600 underline hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800"
+            >
+              Clear filters
+            </button>
+          </>
+        )}
+      </div>
+
       {selected.size > 0 && (
         <div className="flex items-center gap-2 rounded-md border border-sky-300 bg-sky-50 px-3 py-1.5 text-sm dark:border-sky-900 dark:bg-sky-950/40">
           <span className="font-medium text-sky-900 dark:text-sky-200">{selected.size} selected</span>
@@ -283,39 +409,77 @@ export function FileTree({ nodes }: { nodes: FileNode[] }) {
         </div>
       )}
 
-      <div
-        ref={scrollRef}
-        className="max-h-[70vh] overflow-auto rounded-md border border-zinc-200 dark:border-zinc-800"
-      >
-        <div style={{ height: virtualizer.getTotalSize(), position: 'relative' }}>
-          {virtualizer.getVirtualItems().map((virtualRow) => {
-            const entry = flat[virtualRow.index]
-            return (
-              <div
-                key={entry.rel_path}
-                style={{
-                  position: 'absolute',
-                  top: 0,
-                  left: 0,
-                  width: '100%',
-                  height: virtualRow.size,
-                  transform: `translateY(${virtualRow.start}px)`,
-                }}
-              >
-                <Row
-                  entry={entry}
-                  isCollapsed={collapsed.has(entry.rel_path)}
-                  isSelected={selected.has(entry.rel_path)}
-                  onToggleCollapse={toggleCollapse}
-                  onToggleSelect={toggleSelect}
-                  onAction={runRowAction}
-                  actionBusy={rowBusy.has(entry.rel_path)}
-                />
-              </div>
-            )
-          })}
+      {bulkOutcome && (
+        <div
+          className={`rounded-md border px-3 py-2 text-sm ${
+            bulkOutcome.failures.length === 0
+              ? 'border-emerald-300 bg-emerald-50 text-emerald-900 dark:border-emerald-900 dark:bg-emerald-950/40 dark:text-emerald-200'
+              : 'border-amber-300 bg-amber-50 text-amber-900 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-200'
+          }`}
+        >
+          <div className="flex items-center justify-between gap-3">
+            <span className="font-medium">
+              {bulkOutcome.action === 'queue' ? 'Queue selected' : 'Stop selected'}: {bulkOutcome.succeeded} of{' '}
+              {bulkOutcome.total} succeeded
+              {bulkOutcome.failures.length > 0 && `, ${bulkOutcome.failures.length} failed`}
+            </span>
+            <button
+              type="button"
+              onClick={() => setBulkOutcome(null)}
+              className="shrink-0 text-xs underline decoration-dotted"
+            >
+              Dismiss
+            </button>
+          </div>
+          {bulkOutcome.failures.length > 0 && (
+            <ul className="mt-1.5 list-disc space-y-0.5 pl-5 text-xs">
+              {bulkOutcome.failures.map((f) => (
+                <li key={f.rel_path}>
+                  <span className="font-mono">{f.name}</span> — {f.error}
+                </li>
+              ))}
+            </ul>
+          )}
         </div>
-      </div>
+      )}
+
+      {flat.length === 0 ? (
+        <p className="p-3 text-sm text-zinc-500 dark:text-zinc-400">No files match these filters.</p>
+      ) : (
+        <div
+          ref={scrollRef}
+          className="max-h-[70vh] overflow-auto rounded-md border border-zinc-200 dark:border-zinc-800"
+        >
+          <div style={{ height: virtualizer.getTotalSize(), position: 'relative' }}>
+            {virtualizer.getVirtualItems().map((virtualRow) => {
+              const entry = flat[virtualRow.index]
+              return (
+                <div
+                  key={entry.rel_path}
+                  style={{
+                    position: 'absolute',
+                    top: 0,
+                    left: 0,
+                    width: '100%',
+                    height: virtualRow.size,
+                    transform: `translateY(${virtualRow.start}px)`,
+                  }}
+                >
+                  <Row
+                    entry={entry}
+                    isCollapsed={collapsed.has(entry.rel_path)}
+                    isSelected={selected.has(entry.rel_path)}
+                    onToggleCollapse={toggleCollapse}
+                    onToggleSelect={toggleSelect}
+                    onAction={runRowAction}
+                    actionBusy={rowBusy.has(entry.rel_path)}
+                  />
+                </div>
+              )
+            })}
+          </div>
+        </div>
+      )}
     </div>
   )
 }

@@ -1251,24 +1251,32 @@ The gitignore additionally protects the runtime paths that must never be committ
 
 Each phase ends at something that can actually be looked at and judged.
 
+> **Status (2026-08-12): all 9 phases below shipped.** ✅ marks each one done. Every phase was
+> verified against the real fake seedbox and, for phases 1–3, against real hardware too (see
+> `prompts/startnewsession.md`'s "What real hardware taught us" section); **no UI phase was
+> ever click-tested in an actual browser** — none exists in the environments this project has
+> been built in. Exact commits, test counts, and every non-obvious decision made along the way
+> are in `docs/decisions.md`, newest first, and in `prompts/done/`. `sync` mode (below) remains
+> genuinely unscheduled — nothing changed that.
+
 **v1**
 
-1. **Skeleton + container** — FastAPI, SQLite schema/migrations (`host` + `path_queue`),
+1. ✅ **Skeleton + container** — FastAPI, SQLite schema/migrations (`host` + `path_queue`),
    config, healthcheck, both compose files, SPA shell with nav / theme / version link.
    *Done when:* container starts, UI loads, `/api/health` is green.
-2. **Scanning + model** — asyncssh connect/test, remote `find` scan, local walk, reconciler,
+2. ✅ **Scanning + model** — asyncssh connect/test, remote `find` scan, local walk, reconciler,
    read-only Files tree pushed over WS, grouped by queue. Also **credential encryption at rest**
    (§8): this is the phase where a seedbox password first exists, and storing it in plaintext
    until phase 8 is not acceptable even in a dev build. Phase 8 keeps the rest of §8.
    Also builds the §14 fake seedbox, since there is nothing to scan without it.
    *Done when:* the real seedbox tree renders with correct sizes and correct REMOTE_ONLY /
    LOCAL_ONLY / PARTIAL classification.
-3. **Transfer engine + scheduler** — process supervision, job queue, the admission-control
+3. ✅ **Transfer engine + scheduler** — process supervision, job queue, the admission-control
    scheduler (§4.5) with fast lane and priority, FS-derived progress, queue/stop/retry,
    Transfers view with the item drawer. **The load-bearing phase.** *Done when:* you can queue
    a directory, watch it move, stop it, and resume it; and the worked examples in §4.5 hold
    against a real seedbox. Also where the live-retune experiment gets tested or discarded.
-4. **Auto-queue + patterns** (§4.7) — the three pattern kinds and one shared evaluator, wired
+4. ✅ **Auto-queue + patterns** (§4.7) — the three pattern kinds and one shared evaluator, wired
    into both the lftp command line and the reconciler; retroactive re-evaluation on pattern
    change; per-queue enable; the live preview. *Done when:* a `file_exclude` of `*.nfo` leaves
    its release `DOWNLOADED`, not permanently `PARTIAL`.
@@ -1278,19 +1286,24 @@ Each phase ends at something that can actually be looked at and judged.
    item look locally absent at once. Without the gate, one NFS hiccup either re-downloads the
    entire library (items read `REMOTE_ONLY`) or permanently skips it (items read
    `REMOVED_LOCAL`, §3.2 rule 3). Do not ship auto-queue without it.
-5. **Post-processing + `move` mode** — verify, extract, staging move; and remote deletion on
+5. ✅ **Post-processing + `move` mode** — verify, extract, staging move; and remote deletion on
    verified completion via §7.4, with its audit trail. `move` ships here because it is
    verification plus one delete call, and the delete path it establishes is what `sync` later
    reuses.
-6. **History page** — the `job` / `event` views, grouped by queue, filterable, rendering the
+6. ✅ **History page** — the `job` / `event` views, grouped by queue, filterable, rendering the
    delete audit legibly.
-7. **Operations** — rotating app log and its viewer, `VACUUM INTO` backup on schedule,
+7. ✅ **Operations** — rotating app log and its viewer, `VACUUM INTO` backup on schedule,
    pre-migration backup, manual backup + download (§10).
-8. **Auth + hardening** — the three auth modes, sessions, API keys, log redaction, rate limits,
+8. ✅ **Auth + hardening** — the three auth modes, sessions, API keys, log redaction, rate limits,
    the compose hardening in §11.1, and the full "hold transfers for this host" behavior behind
    the credentials-need-re-entry state. (Credential *encryption* itself moved to phase 2 —
    see above.)
-9. **Polish** — bulk ops, filters, virtualization tuning, docs.
+9. ✅ **Polish** — bulk ops, filters, virtualization tuning, docs. Shipped: Files-page
+   text/state filters, honest partial-failure reporting on bulk Queue/Stop, and a
+   `host_reachable`/`scheduler_alive` header readout. **Not shipped, named rather than
+   silently dropped:** the Settings → Transfer tab (bandwidth/concurrency/§9.3 tuning —
+   the API has been complete since phase 3) and bulk "Delete local"/"Delete remote" on
+   Files — see `README.md`'s "Known gaps" and `docs/decisions.md`'s phase 9 entry.
 
 That is the whole of v1. `0.0.1` is the first version (§12).
 
@@ -1380,19 +1393,24 @@ and its History entry.
 
 Ordered roughly by consequence.
 
+All 15 rows were re-reviewed at phase 9 (2026-08-12) now that v1 is fully built, without
+rewriting the original reasoning — each cell keeps its original mitigation text and gets a
+**Status (phase 9):** sentence appended saying whether the risk is now closed, still live, or
+superseded, and why.
+
 | # | Risk | Mitigation / status |
 |---|---|---|
-| 15.1 | **Misconfiguration hazard: pointing a `move` queue at a live torrent data directory** rather than a hardlink pickup dir destroys seeding torrents (§7.1). The safety property belongs to the directory you point at, not to lftpweb. | The one delete-related risk that is *live in v1*, because `move` ships. Warning in the doc *and* inline at the mode selector; explicit confirmation to leave `copy`; `copy` is the default. |
-| 15.2 | **Bandwidth goes under-utilized** when a job keeps its half-share after its partner finishes (§4.5). Allocations are never re-shaped. | Accepted, and it is the price of not needing a control channel. The build-phase-3 live-retune experiment closes it without redesign if it pans out. |
-| 15.3 | *(Deferred with `sync`, §7.)* **The mount sentinel would be a single point of failure for an irreversible operation** (§7.3). Because move-on-import makes local deletes routine (§7.2), there is no anomaly signal to fall back on — if the gate were wrong, `sync` would wipe the seedbox. | **Not a v1 risk: `sync` is not being built.** Recorded because it is the reason the feature is deferred, and the thing to re-read before anyone reconsiders. |
-| 15.4 | *(Deferred with `sync`.)* **Routine deletes mean anomaly detection cannot be a safeguard.** A count-based circuit breaker false-positives on every bulk import, so it was rejected outright rather than tuned. | Same status as 15.3. If `sync` is ever picked up, the rate-based backstop is explicitly a backstop, not a safeguard — the gate would carry the load. |
-| 15.5 | **Restore without the encryption key** leaves credentials unrecoverable (§8, §10.2). | Deliberate — it keeps backups free of secrets. Handled as a designed "credentials need re-entry" state rather than a wave of `AUTH_FAILED` jobs. |
-| 15.6 | **NFS identity mismatch** — wrong uid/gid, or an entrypoint that insists on chowning a `root_squash` share (§11.2). | Chown `/config` only; treat data-volume chown failure as a warning; verify writability at startup and name the path and effective uid/gid in the error. |
-| 15.7 | **`find -printf` is GNU-specific** | Stdlib script fallback over SFTP; needs a one-line check against the actual seedbox in build phase 2 (§13). |
-| 15.8 | **Sparse-file progress depends on `.lftp-pget-status`** (§4.4) | Pinned by unit tests; degrades to raw size — monotonic, and never wrong about completion, because completion is the exit code. |
-| 15.9 | **Many concurrent small files** make per-file stat sampling expensive | The sampler only stats the active set, never the tree. If a mirror runs thousands of files at once, fall back to sampling the job's local subtree total. |
-| 15.10 | **Filenames with odd bytes** | `surrogateescape` end to end (scan → DB → JSON → UI), tested explicitly. |
-| 15.11 | **No `jobs -v` anywhere** | If per-connection chunk detail is ever wanted, add it as a strictly optional, failure-tolerant *enrichment* — never a source of truth (§1.3). |
+| 15.1 | **Misconfiguration hazard: pointing a `move` queue at a live torrent data directory** rather than a hardlink pickup dir destroys seeding torrents (§7.1). The safety property belongs to the directory you point at, not to lftpweb. | The one delete-related risk that is *live in v1*, because `move` ships. Warning in the doc *and* inline at the mode selector; explicit confirmation to leave `copy`; `copy` is the default. **Status (phase 9): still live, as designed.** Phase 5 shipped exactly this — the doc warning, the inline mode-selector warning, and the confirmation checkbox all exist in code — but the checkbox is enforced client-side only (§7.1, `docs/decisions.md`'s phase 5 entry #13) and, like every other UI in this project, has never been click-tested in a browser. The risk this row names is about the *directory*, not the software, so it cannot be "closed" by any amount of testing — it is a standing warning to read before ever setting `move`. |
+| 15.2 | **Bandwidth goes under-utilized** when a job keeps its half-share after its partner finishes (§4.5). Allocations are never re-shaped. | Accepted, and it is the price of not needing a control channel. The build-phase-3 live-retune experiment closes it without redesign if it pans out. **Status (phase 9): accepted, not closed.** The live-retune experiment (holding lftp's stdin open + `set net:limit-total-rate` mid-job) was confirmed *working* in phase 3 but deliberately never wired into production — admission control stands alone, as the design required. Under-utilization remains a known, accepted trade rather than something later phases revisited. |
+| 15.3 | *(Deferred with `sync`, §7.)* **The mount sentinel would be a single point of failure for an irreversible operation** (§7.3). Because move-on-import makes local deletes routine (§7.2), there is no anomaly signal to fall back on — if the gate were wrong, `sync` would wipe the seedbox. | **Not a v1 risk: `sync` is not being built.** Recorded because it is the reason the feature is deferred, and the thing to re-read before anyone reconsiders. **Status (phase 9): unchanged.** `sync` shipped in none of the 9 phases and remains genuinely unscheduled (§13) — this row's concern was never exercised because the code it describes was never written. |
+| 15.4 | *(Deferred with `sync`.)* **Routine deletes mean anomaly detection cannot be a safeguard.** A count-based circuit breaker false-positives on every bulk import, so it was rejected outright rather than tuned. | Same status as 15.3. If `sync` is ever picked up, the rate-based backstop is explicitly a backstop, not a safeguard — the gate would carry the load. **Status (phase 9): unchanged**, same reasoning as 15.3. |
+| 15.5 | **Restore without the encryption key** leaves credentials unrecoverable (§8, §10.2). | Deliberate — it keeps backups free of secrets. Handled as a designed "credentials need re-entry" state rather than a wave of `AUTH_FAILED` jobs. **Status (phase 9): closed.** Phase 8 built exactly this: `HostConfig.credentials_need_reentry`, `core/queue.py._admit` holding every scheduler decision for the host, and `core/engine.py.scan_queue` failing that queue's scan cleanly before ever attempting a doomed connection — proven by `tests/test_credentials_reentry.py`, not just implemented. Phase 7 separately proved the encryption secret is byte-for-byte absent from a `VACUUM INTO` backup. The frontend's `CredentialsBanner` surfacing it has not been click-tested (see 15.1's caveat). |
+| 15.6 | **NFS identity mismatch** — wrong uid/gid, or an entrypoint that insists on chowning a `root_squash` share (§11.2). | Chown `/config` only; treat data-volume chown failure as a warning; verify writability at startup and name the path and effective uid/gid in the error. **Status (phase 9): mitigated and exercised on real hardware**, not just designed. The first real deployment (phase 1–3 era, see `prompts/startnewsession.md`'s "What real hardware taught us") hit and fixed the closely-related identity problem this row anticipated: OpenSSH fataling with "No user exists for uid N" because asyncssh's own `getpass.getuser()` call crashes under this project's numeric-uid convention. Both fixes are load-bearing in the shipped entrypoint/`core/remote.py`, not just documented. |
+| 15.7 | **`find -printf` is GNU-specific** | Stdlib script fallback over SFTP; needs a one-line check against the actual seedbox in build phase 2 (§13). **Status (phase 9): continuously exercised, beyond the one-line check this row originally asked for.** `docker-compose.test.yml` runs two fake-seedbox variants side by side — one GNU `findutils`, one busybox — specifically so both remote-scan code paths run on every single test suite invocation from phase 2 onward, not once and never again. |
+| 15.8 | **Sparse-file progress depends on `.lftp-pget-status`** (§4.4) | Pinned by unit tests; degrades to raw size — monotonic, and never wrong about completion, because completion is the exit code. **Status (phase 9): pinned by tests and hardened on real hardware.** Phase 3's real-hardware run found `pget:save-status` defaults to a sampler-breaking 10s (a `.lftp-pget-status` sidecar didn't exist yet at the 1s/2s/3s marks a ~1 Hz sampler inspects); every job's rc file now sets `pget:save-status 1s`, closing the gap this row's own mitigation was written to tolerate rather than fix. |
+| 15.9 | **Many concurrent small files** make per-file stat sampling expensive | The sampler only stats the active set, never the tree. If a mirror runs thousands of files at once, fall back to sampling the job's local subtree total. **Status (phase 9): unchanged — still an open, never-load-tested assumption.** The sampler's active-set-only design shipped as described in phase 3, but no phase load-tested thousands of concurrent small files against it to confirm the stated fallback actually engages correctly at that scale; nothing in the real-hardware findings (a 1.29 GB single file) exercised this path. |
+| 15.10 | **Filenames with odd bytes** | `surrogateescape` end to end (scan → DB → JSON → UI), tested explicitly. **Status (phase 9): closed as designed, with one narrow, named, accepted edge case.** `core/remote.py`'s scan parser anchors on the `find -printf` record header rather than naively splitting on `\n`, which handles "paths can contain newlines" (§15.10) in practice — but a path containing the *exact* bytes of a record header immediately after a literal newline would still misparse. A property of the specified `find -printf` output format itself, not something deviating from it would fix; recorded in `prompts/startnewsession.md`'s traps list, not silently accepted as impossible. |
+| 15.11 | **No `jobs -v` anywhere** | If per-connection chunk detail is ever wanted, add it as a strictly optional, failure-tolerant *enrichment* — never a source of truth (§1.3). **Status (phase 9): holding, by design, across all 9 phases.** No phase reintroduced `jobs -v` parsing as a source of truth. The Item drawer's per-file breakdown (§9.2) comes entirely from the reconciler's local-vs-remote comparison instead — exactly the alternative §1.3 argues `jobs -v` could never have offered in the first place. |
 
 **Open questions:** none outstanding. The four carried by earlier drafts are settled — path
 queues under a single host (§3.1, §9), `copy` and `move` shipping with backwards `sync`

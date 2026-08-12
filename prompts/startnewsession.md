@@ -7,13 +7,6 @@ rules to honor, so a new session is productive even with no conversation memory.
 **Keep the "Where we are" section current.** Update it at the end of any phase or whenever a
 significant decision lands, in the same commit as the work.
 
-> **Note (2026-08-11):** phase 3b's session found this repo's working tree already dirty with
-> an *unrelated* concurrent session's repo-bootstrap edits (GitHub repo creation, `LICENSE`,
-> CI, `code-checkin-and-pr` adoption) mid-build, including to this very file. Phase 3b's own
-> edits below are additive on top of that content rather than a rewrite — see
-> `docs/decisions.md`'s "this session ran concurrently with another session" entry before
-> assuming either session's version of this file is the complete picture.
-
 ---
 
 ## What this project is
@@ -51,73 +44,69 @@ length — it is the single most important thing to read before touching the tra
 
 ---
 
-## Repo, branches, and what has NOT been pushed
+## Repo, branches, and what's on GitHub
 
-The GitHub repo exists and is **empty**. Nothing has been pushed yet — check before assuming.
+**Bootstrap is done — this is no longer a pending to-do.** `docs/repo-setup.md` carries the
+one-time runbook that got the repo from "prepared" to "actually on GitHub, with
+`code-checkin-and-pr` fully enforced"; it's a historical record now, not a checklist to
+re-run. As of phase 9 (verified live via `gh api repos/crzykidd/lftpweb/branches/main/
+protection`, not assumed from an old note): **`main` is branch-protected** — 8 required status
+checks (Backend lint, Frontend lint + typecheck, Config validation, Compose validation, Image
+build, Test suite, and CodeQL for both languages), PR required, force-push and deletion both
+blocked. `dev` and `main` are both fully pushed and in sync with `origin` (`git rev-list
+--left-right --count origin/<branch>...<branch>` reads `0 0` for both). `dev` sits ahead of
+`main` by design — protection means `main` only advances via a green PR, so `dev` naturally
+runs ahead between release-prep passes; check the actual commit count
+(`git rev-list --left-right --count main...dev`) rather than trusting a specific number here,
+since it moves.
 
-```
-* dev    all work lives here — every commit since repo init
-  main   still at the repo-init commit, 6+ commits behind
-```
-
-**The bootstrap ordering matters, and doing it out of order is annoying to undo:**
-
-1. Commit outstanding work on `dev`.
-2. **Fast-forward `main` to `dev` while no branch protection exists.**
-3. Push `main`, then `dev`.
-4. Enable CodeQL default setup; let CI run once so GitHub learns the check names.
-5. **Only then** apply branch protection with the required checks.
-
-Do step 5 first and the first action on the new repo is opening a PR to catch `main` up on the
-project's own history — which also can't merge until CI has run anyway. `docs/repo-setup.md`
-carries the full runbook.
-
-After protection is on, `code-checkin-and-pr`'s rules bind for real: never push to `main`, work
-on `dev`, land via PR.
+Day-to-day work happens on `dev`, pushed freely. `main` only ever moves via a PR from `dev`
+with every required check green — never a direct push, never `--force`. This project has not
+yet cut a `v0.0.1` release (`release-prep-and-cut`'s two-phase prep/cut flow) as of phase 9;
+that's a separate, explicit action for the user to request, not something any phase did as a
+side effect of shipping.
 
 ## Where we are
 
-**Status: phases 1–8 done.** `DESIGN.md` is settled and reviewed. The skeleton (phase 1),
-scanning + reconciliation + read-only Files view (phase 2), the transfer engine + scheduler
-(phase 3a), the Transfers page / item drawer / Files actions / WebSocket delta fix (phase 3b),
-auto-queue + patterns + the mount sentinel (phase 4), post-processing + `move` mode (phase 5),
-the History page (phase 6), operations — log viewer + `VACUUM INTO` backups + extended
-health (phase 7), and auth + hardening — the three `AUTH_MODE`s, API keys, CSRF, rate
-limiting, and the finished credentials-need-re-entry behaviour (phase 8) — all exist and are
-verified — see `prompts/done/2026-08-11-phase1-skeleton-and-container.md`,
+**Status: all 9 phases done — v1 is complete.** `DESIGN.md` is settled and reviewed (§13's
+build order is annotated with what shipped; §15's risk table was re-reviewed at phase 9). The
+skeleton (phase 1), scanning + reconciliation + read-only Files view (phase 2), the transfer
+engine + scheduler (phase 3a), the Transfers page / item drawer / Files actions / WebSocket
+delta fix (phase 3b), auto-queue + patterns + the mount sentinel (phase 4), post-processing +
+`move` mode (phase 5), the History page (phase 6), operations — log viewer + `VACUUM INTO`
+backups + extended health (phase 7), auth + hardening — the three `AUTH_MODE`s, API keys,
+CSRF, rate limiting, and the finished credentials-need-re-entry behaviour (phase 8), and polish
+— Files-page filters, honest bulk partial-failure reporting, and the `host_reachable`/
+`scheduler_alive` header readout (phase 9) — all exist and are verified — see
+`prompts/done/2026-08-11-phase1-skeleton-and-container.md`,
 `prompts/done/2026-08-11-phase2-scanning-and-model.md`,
 `prompts/done/2026-08-11-phase3a-transfer-engine.md`,
 `prompts/done/2026-08-11-phase3b-transfers-ui.md`,
 `prompts/done/2026-08-11-phase4-autoqueue-and-patterns.md`,
 `prompts/done/2026-08-11-phase5-postprocessing-and-move.md`,
 `prompts/done/2026-08-11-phase6-history-page.md`,
-`prompts/done/2026-08-11-phase7-operations.md`, and
-`prompts/done/2026-08-11-phase8-auth-and-hardening.md` for the exact commands run.
+`prompts/done/2026-08-11-phase7-operations.md`,
+`prompts/done/2026-08-11-phase8-auth-and-hardening.md`, and
+`prompts/done/2026-08-12-phase9-polish.md` for the exact commands run.
 
-> **⚠ Phase 8's work is prepared on the working tree but NOT YET COMMITTED**, unlike every
-> earlier phase in this table. The task that ran phase 8 was explicitly instructed "do NOT
-> commit — prepare the tree and report back," overriding this file's normal unattended
-> commit-and-push-then-continue flow (below) for this one phase. `AUTH_MODE` still defaults
-> to `none` either way — nothing about being uncommitted changes that. See the phase 8
-> report (linked from its `prompts/done/` file) for the exact file list and the proposed
-> commit message.
-
-> **Note (2026-08-12):** phase 6's own build was never click-tested in a browser — no browser
-> is available in this environment. The History page type-checks, builds, and lints cleanly,
-> and its backend is verified end to end against the real fake seedbox, but the actual page
-> render, virtualized scroll, and filter controls have not been visually confirmed. Do this
-> before relying on the UI. **The same is true of phase 7's Settings → Logs/Backup pages and
-> phase 8's login page, Settings → Auth, and the credentials-need-re-entry banner** —
-> build/lint clean, every backend endpoint verified over real HTTP, but never click-tested in
-> a browser.
+**Real, permanent gaps remain even though all 9 phases shipped — see `README.md`'s "What
+doesn't yet" and "Known gaps" sections for the consolidated, canonical list** (this file
+doesn't duplicate it). The headline items: **no UI screen in this project has ever been opened
+in a browser** (none exists in any environment this project has been built in — every page is
+confirmed to build/type-check/lint cleanly and every endpoint it calls is verified over real
+HTTP, but actual rendering and click-through behavior have never been visually confirmed);
+Settings → Transfer has no UI despite a complete backend API since phase 3; and Files has no
+bulk "Delete local"/"Delete remote" (Queue/Stop only, per phase 9's own scope). Click-test the
+UI before relying on any of it.
 
 > **⚠ Phase 5 makes the user's live queue's `sync_mode = 'move'` row live.** It has been
 > stored that way in the database since before phase 4's guard existed, inert until now
-> because nothing implemented `move` or read `sync_mode` to act on it. As of this phase,
-> `move` **deletes the verified remote copy after every download that queue completes.** The
-> row was deliberately **not** touched or reset — see `docs/decisions.md`'s phase 5 entry,
-> point 0, and the phase 5 report. **Tell the user this first, before anything else, when
-> they're back.**
+> because nothing implemented `move` or read `sync_mode` to act on it. As of phase 5, `move`
+> **deletes the verified remote copy after every download that queue completes.** The row was
+> deliberately **not** touched or reset — see `docs/decisions.md`'s phase 5 entry, point 0, and
+> the phase 5 report. **Tell the user this first, before anything else, when they're back** —
+> this note stays here until they've confirmed they've seen it, not just until the phase that
+> introduced it shipped.
 
 | Phase (`DESIGN.md` §13) | State |
 |---|---|
@@ -129,25 +118,35 @@ verified — see `prompts/done/2026-08-11-phase1-skeleton-and-container.md`,
 | 5 — Post-processing + `move` | **done** (2026-08-12) |
 | 6 — History page | **done** (2026-08-12) |
 | 7 — Operations (logs, backup, health) | **done** (2026-08-11, committed `c6dcc03`) |
-| 8 — Auth + hardening | **done, not yet committed** (2026-08-12) — see below |
-| 9 — Polish | overnight run 2026-08-11 |
+| 8 — Auth + hardening | **done, committed** (2026-08-12, `b936576`) |
+| 9 — Polish + docs reconciliation | **done, not yet committed** (2026-08-12) — see below |
 | `sync` mode | **not scheduled** — designed in §7, built only if it proves wanted |
 
-**Current instruction (2026-08-11, overnight run):** phases 1–3 are done and **proven against
-the user's real seedbox** — a 1.29 GB mkv transferred byte-exact, nested directories, resume
-from partial, live progress. The user has authorised running **phases 4–9 in order,
-unattended**: for each phase write the handoff prompt, execute it via a spawned agent, verify,
-commit, push to `dev`, then start the next. Document every decision made without them.
+> **⚠ Phase 9's work is prepared on the working tree but NOT YET COMMITTED**, per that task's
+> explicit "do NOT commit — prepare the tree and report back" instruction (the same
+> instruction phase 8 was given; phase 8 has since been committed — see the table above and
+> "Commits so far" below). See the phase 9 report (linked from its `prompts/done/` file, once
+> moved there) for the exact file list and the proposed commit message.
 
-**SAFETY RULE for the unattended run — every new capability ships defaulting to OFF.** The
-user's live instance may pull `:dev`. Nothing landing overnight may change how their running
-deployment behaves: auto-queue defaults disabled, remote deletion defaults off, auth defaults
-to the current `none`. A capability that turns itself on while they sleep is a bug, not a
-feature. **Phase 5 is the one deliberate, flagged exception to "nothing changes behavior":**
-`move` mode itself was already stored as their live setting before any guard existed, so
-implementing it changes what their existing configuration does even though every *new* toggle
-this phase adds (global and per-queue post-processing switches, `auto_move`) still defaults
-off exactly like every other phase.
+**Current instruction (2026-08-11, overnight run) — closed out as of phase 9.** Phases 1–3
+were proven against **the user's real seedbox** — a 1.29 GB mkv transferred byte-exact, nested
+directories, resume from partial, live progress — before the user authorised running **phases
+4–9 in order, unattended**: for each phase write the handoff prompt, execute it via a spawned
+agent, verify, commit, push to `dev`, then start the next, documenting every decision made
+without them. That instruction is now fulfilled — phase 9 was the last phase in the list, and
+this file's job going forward is accurate onboarding, not tracking an in-flight overnight run.
+
+**SAFETY RULE that governed the unattended run — every new capability shipped defaulting to
+OFF.** The user's live instance could pull `:dev` at any point during the run. Nothing landing
+overnight was allowed to change how their running deployment behaved: auto-queue defaults
+disabled, remote deletion defaults off, auth defaults to `none`. A capability that turns itself
+on while the user sleeps was treated as a bug, not a feature — this held for every phase.
+**Phase 5 was the one deliberate, flagged exception to "nothing changes behavior":** `move`
+mode itself was already stored as the user's live setting before any guard existed, so
+implementing it changed what their existing configuration did even though every *new* toggle
+that phase added (global and per-queue post-processing switches, `auto_move`) still defaulted
+off exactly like every other phase. Phase 7's scheduled backup was a second, smaller, explicitly
+reasoned exception (see its own `docs/decisions.md` entry) — everything else held the rule.
 
 **Their live config:** one queue, `sync_mode` stored as `move` in the database from before the
 guard existed. As of phase 5 this is **no longer inert** — see the warning banner above. Not
@@ -412,14 +411,49 @@ compose files validate, fake-seedbox containers torn down afterward. **Not verif
 actual browser rendering** of the login page, Settings → Auth, and the credentials banner —
 no browser is available in this environment. Every decision made unattended is in
 `docs/decisions.md`'s phase 8 entry — read points 1–2 first, they're the lockout-recovery
-design; **this phase's work is prepared but deliberately not committed**, per this task's
-explicit instruction (see the banner near the top of this file).
+design. This phase's work was prepared and reported without committing, per that task's
+explicit instruction — **it was committed afterward as `b936576`**, so unlike phase 9 below,
+there is nothing left prepared-but-uncommitted from phase 8.
+
+**Phase 9, in one paragraph:** the UI half (§9.2) added Files-page text/state filters
+(client-side — the page is WS-driven with the whole queue's tree already in the browser, so
+there's no endpoint to add) and honest partial-failure reporting on bulk Queue/Stop
+(`Promise.allSettled`, not `Promise.all` — "7 of 10 queued, these 3 failed because …" rather
+than the first rejection hiding the other nine outcomes), plus a `host_reachable`/
+`scheduler_alive` readout in the stats header (`StatsHeader.tsx`, polling `/api/health` — the
+fields phase 7 added to the response and explicitly deferred the UI for). Virtualization
+(`@tanstack/react-virtual` in `FileTree.tsx`, `ItemDrawer.tsx`, `HistoryJobsSection.tsx`,
+`HistoryEventsSection.tsx`) was reviewed, not changed — all four already use sensible fixed or
+dynamic sizing with 10–16-row overscan; no browser exists to measure actual scroll smoothness,
+so this is a code-review finding, not a measurement. The documentation half — the larger half
+of this phase's actual work — reconciled `README.md`, `DESIGN.md` §13/§15, and this file
+against reality after eight phases of incremental docs, several written while later phases
+were still hypothetical: `DESIGN.md` §13 now marks every phase shipped and names phase 9's own
+two unbuilt items rather than pretending they don't exist; §15's risk table got a "Status
+(phase 9)" line per row saying closed/live/superseded, keeping the original reasoning; and this
+file lost a stale phase-8-not-committed banner (phase 8 was committed as `b936576` since that
+report was written) along with a stale "phases 1–3 of 9" status line that had never been
+updated in `CLAUDE.md`. `README.md` gained a "Known gaps" section consolidating seven
+deliberate scope reductions collected from `docs/decisions.md` across all eight prior phases,
+plus two more found while reconciling this phase (Settings → Transfer has no UI despite a
+complete backend since phase 3; Files has no bulk Delete local/remote) — named rather than
+built, per this phase's own explicit instruction not to close gaps silently. One factual error
+was also caught and fixed: the README's volume table had `/staging` backwards relative to what
+phase 5 actually built (`local_path` is the download target; `staging_path` is where a
+`move`-mode item is *relocated to* afterward — the opposite of "download here, move to
+`/downloads` when complete"). `uv run pytest`: 367 passed, 0 skipped (fake seedbox up), 357
+passed / 10 skipped without it — no regressions, no backend code changed. Both lint gates
+clean. `npm run build`/`npm run lint` clean. All three compose files validate. Fake-seedbox
+containers torn down and confirmed removed via `docker ps -a` afterward. **This phase's work
+is prepared but deliberately not committed**, per that task's explicit instruction — see
+`docs/decisions.md`'s phase 9 entry and the phase 9 report for the exact file list and the
+proposed commit message.
 
 **Commits so far:** repo init + standard adoption, the design revisions, phase 1 (`b0109ae`),
 phase 2 (`de6d74b`), phase 3a (`36b9123`), phase 3b (`c814aa0`), phase 4 (`db89b63`), phase 5
-(`b0c9cb3`), phase 6 (`d76a662`), phase 7 (`c6dcc03`). All on `dev`. Phase 8's work is
-prepared on the working tree but **not yet committed** — see the phase 8 prompt's final
-report for the proposed commit message.
+(`b0c9cb3`), phase 6 (`d76a662`), phase 7 (`c6dcc03`), phase 8 (`b936576`). All on `dev`. Phase
+9's work is prepared on the working tree but **not yet committed** — see the phase 9 prompt's
+final report for the proposed commit message.
 
 ---
 
@@ -445,9 +479,10 @@ report for the proposed commit message.
   of every commit in the history so far. Conventional-Commit prefixes required:
   `feat:` / `fix:` / `chore:` / `docs:`.
 - `code-checkin-and-pr` and `release-prep-and-cut` were adopted 2026-08-11 alongside repo
-  creation; `standards.md` is the in-repo source of truth for what is actually wired. Until
-  branch protection is applied (see the bootstrap ordering above), treat `main` as
-  push-once-then-protected rather than already-protected.
+  creation; `standards.md` is the in-repo source of truth for what is actually wired.
+  **Branch protection on `main` is live** (see "Repo, branches, and what's on GitHub" above,
+  confirmed via `gh api` — not a pending step). Treat `main` as fully protected: PR + all
+  required checks green, no direct push, no force-push, no exceptions.
 - `repo-sandbox-permissions` is **deliberately not adopted** — dedicated dev host, same call
   the user made when de-adopting it from AmmoLedger. Don't "helpfully" add it.
 
@@ -604,3 +639,23 @@ These are the places where the obvious implementation is wrong. Each is written 
   only `has_output_tail` in the list and adds `GET /api/history/jobs/{id}/output` to fetch the
   blob on demand — copying `JobOut`'s shape onto an unbounded endpoint would have silently
   reintroduced the "thousands of rows × 4KB" cost the row cap exists to prevent.
+- **`Settings → Transfer` (`TransferTab.tsx`) still renders `PagePlaceholder`, despite
+  `core/queue.py`'s `TransferSettings` and `api/settings.py`'s `/api/settings/transfer` being
+  complete and tested since phase 3a** (found reconciling docs at phase 9 — phase 5's own
+  `docs/decisions.md` entry had already flagged this as "likely phase 9" territory, but phase
+  9's actual prompt scoped its UI work narrowly and never named this tab). Don't assume every
+  Settings tab has a form behind it just because the others do — check `nav.ts` against the
+  page component before relying on one. Site bandwidth/concurrency/fast-lane tuning, the §9.3
+  live connection-count warning, and the free-text "extra lftp settings" box are all reachable
+  today only via direct API calls. See `README.md`'s "Known gaps."
+- **The Files page's bulk actions cover Queue/Stop only, not the "Delete local"/"Delete
+  remote" DESIGN.md §9.2 also lists** (phase 9's own explicit scope — see its prompt and
+  `docs/decisions.md`). There is no manual per-item or bulk delete endpoint anywhere in the
+  API; the only deletion in this codebase is `move` mode's automatic, verification-gated
+  pipeline (`core/postprocess.py`). Don't assume a "Delete" button exists on the Files page
+  just because DESIGN.md's mockup shows one.
+- **`FileTree.tsx`'s text/state filters ignore `collapsed` entirely while a filter is active**
+  (phase 9) — a match inside a collapsed directory must still surface, so a filtered view is
+  computed by flattening the *whole* tree fully expanded, then keeping only matches and their
+  ancestor directories, rather than trying to reconcile filtering with whatever the user had
+  manually collapsed. Collapse state is restored the instant both filters clear.
