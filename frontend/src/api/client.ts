@@ -1,4 +1,8 @@
 import type {
+  BackupInfoOut,
+  BackupListResponse,
+  BackupSettingsIn,
+  BackupSettingsOut,
   FilesResponse,
   HealthResponse,
   HistoryEventsFilter,
@@ -11,6 +15,8 @@ import type {
   HostTestRequest,
   JobOut,
   JobsResponse,
+  LogFilesResponse,
+  LogTailResponse,
   PathQueueIn,
   PathQueueOut,
   PatternIn,
@@ -213,4 +219,43 @@ export function getHistoryJobOutput(jobId: number): Promise<HistoryJobOutputOut>
  */
 export function getHistoryEvents(filter: HistoryEventsFilter = {}): Promise<HistoryEventsResponse> {
   return getJson<HistoryEventsResponse>(`/api/history/events${queryString(filter)}`)
+}
+
+// --- Settings -> Logs (phase 7, DESIGN.md §10.1) -----------------------------------------
+
+export function getLogFiles(): Promise<LogFilesResponse> {
+  return getJson<LogFilesResponse>('/api/logs/files')
+}
+
+export function getLogTail(lines: number, level?: string): Promise<LogTailResponse> {
+  return getJson<LogTailResponse>(`/api/logs/tail${queryString({ lines, level })}`)
+}
+
+export function logDownloadUrl(filename: string): string {
+  return `/api/logs/${encodeURIComponent(filename)}/download`
+}
+
+// --- Settings -> Backup (phase 7, DESIGN.md §10.2) ---------------------------------------
+
+export function getBackupSettings(): Promise<BackupSettingsOut> {
+  return getJson<BackupSettingsOut>('/api/settings/backup')
+}
+
+export function putBackupSettings(body: BackupSettingsIn): Promise<BackupSettingsOut> {
+  return sendJson<BackupSettingsOut>('/api/settings/backup', 'PUT', body)
+}
+
+export function listBackups(): Promise<BackupListResponse> {
+  return getJson<BackupListResponse>('/api/settings/backup/list')
+}
+
+/** DESIGN.md §10.2's "Backup now" -- always takes one immediately, then prunes to the
+ * configured keep count.
+ */
+export function backupNow(): Promise<BackupInfoOut> {
+  return sendJson<BackupInfoOut>('/api/settings/backup/now', 'POST')
+}
+
+export function backupDownloadUrl(filename: string): string {
+  return `/api/settings/backup/${encodeURIComponent(filename)}/download`
 }

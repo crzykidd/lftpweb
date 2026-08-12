@@ -51,11 +51,17 @@ def _discover_migrations() -> list[tuple[int, str, Path]]:
     return migrations
 
 
-async def migrate(conn: aiosqlite.Connection) -> None:
+async def migrate(conn: aiosqlite.Connection, config_dir: str | None = None) -> None:
     """Apply every migration not yet recorded in schema_version, in order.
 
     Idempotent: re-running against a database already at head applies nothing, because
     each migration's version is checked against schema_version before it runs.
+
+    `config_dir`, when given, is where a backup (DESIGN.md §10.2, `core/backup.py`) is taken
+    *before* the first pending migration runs — the second net, not a replacement for the
+    per-migration transaction/rollback above. `None` (every pre-phase-7 caller, and this
+    module's own tests that pass a bare connection) means "don't back up" rather than
+    guessing a path; `main.py` always passes the real one.
     """
     await conn.execute(
         "CREATE TABLE IF NOT EXISTS schema_version ("
@@ -68,9 +74,30 @@ async def migrate(conn: aiosqlite.Connection) -> None:
     cursor = await conn.execute("SELECT version FROM schema_version")
     applied = {row[0] for row in await cursor.fetchall()}
 
-    for version, name, path in _discover_migrations():
-        if version in applied:
-            continue
+    pending = [m for m in _discover_migrations() if m[0] not in applied]
+    if pending and config_dir is not None:
+        # Imported here, not at module level, so a bare `db.py` import (e.g. this module's
+        # own tests, which construct migrations directories by hand) never needs
+        # core/backup.py's dependencies just to call migrate() without a config_dir.
+        from lftpweb.core.backup import create_backup
+
+        try:
+            info = await create_backup(
+                conn, config_dir, reason=f"pre-migration:{pending[0][0]:03d}"
+            )
+            logger.info("pre-migration backup created: %s", info.filename)
+        except Exception:
+            # A failed backup must not block startup -- the migration below still has its
+            # own transaction/rollback safety net (this is the *second* net, not the only
+            # one), and refusing to start over a full disk or a permissions problem in the
+            # backups directory would be worse than proceeding without one.
+            logger.exception(
+                "pre-migration backup failed; proceeding with migration %03d_%s anyway",
+                pending[0][0],
+                pending[0][1],
+            )
+
+    for version, name, path in pending:
         logger.info("applying migration %03d_%s", version, name)
         # Each migration is atomic: its statements AND the schema_version row that records
         # it commit together, or nothing does.

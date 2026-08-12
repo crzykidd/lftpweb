@@ -19,6 +19,13 @@ class HealthResponse(BaseModel):
     # env var, set after the SPA is already built into static files) and /api/health is
     # already the request the UI makes to render the version — see docs/decisions.md.
     repo_url: str
+    # Phase 7, DESIGN.md §10.3: "reports DB reachability, host reachability, and whether the
+    # scheduler loop is alive." Added, not replacing anything above -- the container
+    # HEALTHCHECK only checks the HTTP status code (docker/Dockerfile), never this body, so
+    # widening the shape can't change container restart behavior. `None` = no host configured
+    # yet (a fresh install), distinct from `False` (a host is configured but unreachable).
+    host_reachable: bool | None = None
+    scheduler_alive: bool = True
 
 
 class StatsResponse(BaseModel):
@@ -363,3 +370,48 @@ class HistoryEventsResponse(BaseModel):
     total: int
     limit: int
     offset: int
+
+
+# --- Settings -> Backup (DESIGN.md §10.2, phase 7) --------------------------------------
+
+
+class BackupSettingsOut(BaseModel):
+    interval_days: float
+    keep_count: int
+
+
+class BackupSettingsIn(BackupSettingsOut):
+    pass
+
+
+class BackupInfoOut(BaseModel):
+    filename: str
+    size_bytes: int
+    created_at: str
+
+
+class BackupListResponse(BaseModel):
+    backups: list[BackupInfoOut]
+
+
+# --- Settings -> Logs (DESIGN.md §10.1, phase 7) ----------------------------------------
+
+
+class LogFileOut(BaseModel):
+    name: str
+    size_bytes: int
+    modified_at: str
+    is_current: bool
+
+
+class LogFilesResponse(BaseModel):
+    files: list[LogFileOut]
+
+
+class LogTailResponse(BaseModel):
+    lines: list[str]
+    # True when the byte cap (`core/logtail.py`'s bounded reverse read) was reached before
+    # `lines` worth of matching content was found -- i.e. a level filter may be under-showing
+    # what's actually in the file, because this endpoint never reads the whole thing to find
+    # out. See core/logtail.py's module docstring.
+    truncated: bool

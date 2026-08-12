@@ -268,6 +268,14 @@ class TransferQueue:
     def request_tick(self) -> None:
         self._wake.set()
 
+    @property
+    def is_alive(self) -> bool:
+        """DESIGN.md §10.3: `/api/health`'s "whether the scheduler loop is alive" -- this is
+        that loop (the admission-control scheduler, §4.5, lives in `core/scheduler.py` as a
+        pure function, but it only ever runs from here).
+        """
+        return self._task is not None and not self._task.done()
+
     async def _loop(self) -> None:
         while True:
             try:

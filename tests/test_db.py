@@ -87,6 +87,79 @@ async def test_failed_migration_is_rolled_back_entirely(tmp_path, monkeypatch):
         await conn.close()
 
 
+async def test_migrate_takes_a_pre_migration_backup_containing_the_prior_schema(
+    tmp_path, monkeypatch
+):
+    """The pre-migration backup, exercised for real (not mocked): create a database at
+    migration N, add a migration N+1, run migrate() again with config_dir wired in, and
+    confirm the backup file both exists and opens -- with the schema as it stood *before*
+    the new migration, proving it was taken before, not after.
+    """
+    import sqlite3
+
+    from lftpweb.core.backup import backup_dir
+
+    migrations = tmp_path / "migrations"
+    migrations.mkdir()
+    (migrations / "001_initial.sql").write_text("CREATE TABLE widget (id INTEGER PRIMARY KEY);")
+    monkeypatch.setattr(db_module, "MIGRATIONS_DIR", migrations)
+
+    config_dir = str(tmp_path)
+    conn = await connect(config_dir)
+    try:
+        await migrate(
+            conn, config_dir
+        )  # database created at migration 1 (its own backup, ignored below)
+        backups_after_first = set(backup_dir(config_dir).glob("*.db"))
+
+        (migrations / "002_add_gadget.sql").write_text(
+            "CREATE TABLE gadget (id INTEGER PRIMARY KEY);"
+        )
+        await migrate(conn, config_dir)  # database at migration 1 -> 2, backup fires first
+
+        backups = set(backup_dir(config_dir).glob("*.db"))
+        new_backups = backups - backups_after_first
+        assert len(new_backups) == 1
+
+        raw = sqlite3.connect(str(next(iter(new_backups))))
+        try:
+            tables = {
+                r[0] for r in raw.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            }
+            assert "widget" in tables
+            assert "gadget" not in tables  # the pre-migration state, not the post-migration one
+
+            versions = {r[0] for r in raw.execute("SELECT version FROM schema_version")}
+            assert versions == {1}
+        finally:
+            raw.close()
+
+        # And the live database did actually move on to migration 2.
+        cursor = await conn.execute("SELECT version FROM schema_version")
+        assert {row[0] for row in await cursor.fetchall()} == {1, 2}
+    finally:
+        await conn.close()
+
+
+async def test_migrate_without_config_dir_takes_no_backup(tmp_path, monkeypatch):
+    """Every pre-phase-7 caller (and this module's own tests above) calls migrate(conn) with
+    no config_dir -- must keep working exactly as before, with no backup attempted.
+    """
+    from lftpweb.core.backup import backup_dir
+
+    migrations = tmp_path / "migrations"
+    migrations.mkdir()
+    (migrations / "001_initial.sql").write_text("CREATE TABLE widget (id INTEGER PRIMARY KEY);")
+    monkeypatch.setattr(db_module, "MIGRATIONS_DIR", migrations)
+
+    conn = await connect(str(tmp_path))
+    try:
+        await migrate(conn)  # no config_dir
+        assert not backup_dir(str(tmp_path)).exists()
+    finally:
+        await conn.close()
+
+
 async def test_wal_and_foreign_keys_enabled(tmp_path):
     conn = await connect(str(tmp_path))
     try:

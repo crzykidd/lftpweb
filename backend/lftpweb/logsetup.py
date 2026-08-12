@@ -12,6 +12,7 @@ from pathlib import Path
 
 MAX_BYTES = 5 * 1024 * 1024  # 5 MB
 BACKUP_COUNT = 5  # 5 files -> 25 MB ceiling
+LOG_FILENAME = "lftpweb.log"  # named here so api/logs.py never hardcodes it separately
 
 _LOG_FORMAT = "%(asctime)s %(levelname)-8s %(name)s: %(message)s"
 
@@ -65,7 +66,7 @@ def setup_logging(config_dir: str, log_level: str) -> None:
     redactor = CredentialRedactor()
 
     file_handler = RotatingFileHandler(
-        log_dir / "lftpweb.log", maxBytes=MAX_BYTES, backupCount=BACKUP_COUNT
+        log_dir / LOG_FILENAME, maxBytes=MAX_BYTES, backupCount=BACKUP_COUNT
     )
     file_handler.setFormatter(formatter)
     file_handler.addFilter(redactor)

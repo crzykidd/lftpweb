@@ -475,6 +475,16 @@ class RemoteConnectionPool:
                 f"(fingerprint {fingerprint}) and known_hosts_policy is 'strict'"
             ) from exc
 
+    @property
+    def is_connected(self) -> bool:
+        """DESIGN.md §10.3: `/api/health`'s "host reachability" -- read from the pooled
+        connection this class already maintains (via the engine's own periodic scans and
+        *Test connection*) rather than opening a fresh SSH connection on every health poll,
+        which would make the health endpoint itself a load-bearing (and slow) network call on
+        a path the UI hits continuously.
+        """
+        return self._conn is not None and not self._conn.is_closed()
+
     async def get_connection(self, host: HostConfig) -> asyncssh.SSHClientConnection:
         async with self._lock:
             if self._conn is not None and self._host == host and not self._conn.is_closed():

@@ -16,9 +16,11 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from lftpweb import __version__
-from lftpweb.api import files, health, history, jobs, settings as settings_api, stats, ws
+from lftpweb.api import backup as backup_api
+from lftpweb.api import files, health, history, jobs, logs, settings as settings_api, stats, ws
 from lftpweb.config import settings
 from lftpweb.core.autoqueue import AutoQueue
+from lftpweb.core.backup import BackupScheduler
 from lftpweb.core.engine import Engine, load_host_config
 from lftpweb.core.events import EventBus
 from lftpweb.core.postprocess import PostprocessPipeline
@@ -35,7 +37,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.started_at = time.monotonic()
     app.state.config_dir = settings.config_dir
     app.state.db = await connect(settings.config_dir)
-    await migrate(app.state.db)
+    # config_dir wires in the pre-migration backup (DESIGN.md §10.2, core/backup.py) --
+    # unconditional whenever a migration is actually about to run, not just when Settings →
+    # Backup's own schedule happens to be enabled.
+    await migrate(app.state.db, settings.config_dir)
 
     app.state.events = EventBus()
 
@@ -75,13 +80,19 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     )
     app.state.queue.postprocess = app.state.postprocess
 
+    # Phase 7 (DESIGN.md §10.2): the scheduled backup loop, independent of the pre-migration
+    # backup above (which fires from db.py.migrate() regardless of this loop ever starting).
+    app.state.backup_scheduler = BackupScheduler(db=app.state.db, config_dir=settings.config_dir)
+
     await app.state.engine.start()
     await app.state.queue.start()
+    await app.state.backup_scheduler.start()
 
     logger.info("lftpweb %s started", __version__)
     try:
         yield
     finally:
+        await app.state.backup_scheduler.stop()
         await app.state.queue.stop()
         # Let any in-flight postprocessing task (verify/extract/move, all still writing to
         # app.state.db) finish before the connection underneath it closes, rather than
@@ -100,6 +111,8 @@ def create_app() -> FastAPI:
     app.include_router(files.router)
     app.include_router(jobs.router)
     app.include_router(history.router)
+    app.include_router(logs.router)
+    app.include_router(backup_api.router)
     app.include_router(ws.router)
 
     static_dir = Path(settings.static_dir)

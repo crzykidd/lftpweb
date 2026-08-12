@@ -6,6 +6,10 @@ export interface HealthResponse {
   db: boolean
   uptime_s: number
   repo_url: string
+  // Phase 7, DESIGN.md §10.3. `null` = no host configured yet (distinct from `false`, "a
+  // host exists but the pooled connection last failed").
+  host_reachable: boolean | null
+  scheduler_alive: boolean
 }
 
 export interface StatsResponse {
@@ -310,3 +314,45 @@ export interface HistoryEventsFilter {
   limit?: number
   offset?: number
 }
+
+// --- Settings -> Backup (phase 7, DESIGN.md §10.2) --------------------------------------
+
+export interface BackupSettingsOut {
+  interval_days: number
+  keep_count: number
+}
+
+export type BackupSettingsIn = BackupSettingsOut
+
+export interface BackupInfoOut {
+  filename: string
+  size_bytes: number
+  created_at: string
+}
+
+export interface BackupListResponse {
+  backups: BackupInfoOut[]
+}
+
+// --- Settings -> Logs (phase 7, DESIGN.md §10.1) -----------------------------------------
+
+export interface LogFileOut {
+  name: string
+  size_bytes: number
+  modified_at: string
+  is_current: boolean
+}
+
+export interface LogFilesResponse {
+  files: LogFileOut[]
+}
+
+export interface LogTailResponse {
+  lines: string[]
+  // True when the bounded read hit its byte cap before satisfying `lines` -- a level filter
+  // may be under-showing what's actually in the file (core/logtail.py never re-scans further
+  // back just to satisfy a filter). See core/logtail.py's module docstring.
+  truncated: boolean
+}
+
+export type LogLevel = 'DEBUG' | 'INFO' | 'WARNING' | 'ERROR' | 'CRITICAL'

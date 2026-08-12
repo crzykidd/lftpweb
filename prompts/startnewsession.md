@@ -77,23 +77,27 @@ on `dev`, land via PR.
 
 ## Where we are
 
-**Status: phases 1–6 done.** `DESIGN.md` is settled and reviewed. The skeleton (phase 1),
+**Status: phases 1–7 done.** `DESIGN.md` is settled and reviewed. The skeleton (phase 1),
 scanning + reconciliation + read-only Files view (phase 2), the transfer engine + scheduler
 (phase 3a), the Transfers page / item drawer / Files actions / WebSocket delta fix (phase 3b),
 auto-queue + patterns + the mount sentinel (phase 4), post-processing + `move` mode (phase 5),
-and the History page (phase 6) all exist and are verified — see `prompts/done/2026-08-11-
+the History page (phase 6), and operations — log viewer + `VACUUM INTO` backups + extended
+health (phase 7) — all exist and are verified — see `prompts/done/2026-08-11-
 phase1-skeleton-and-container.md`, `prompts/done/2026-08-11-phase2-scanning-and-model.md`,
 `prompts/done/2026-08-11-phase3a-transfer-engine.md`,
 `prompts/done/2026-08-11-phase3b-transfers-ui.md`,
 `prompts/done/2026-08-11-phase4-autoqueue-and-patterns.md`,
-`prompts/done/2026-08-11-phase5-postprocessing-and-move.md`, and
-`prompts/done/2026-08-11-phase6-history-page.md` for the exact commands run.
+`prompts/done/2026-08-11-phase5-postprocessing-and-move.md`,
+`prompts/done/2026-08-11-phase6-history-page.md`, and
+`prompts/done/2026-08-11-phase7-operations.md` for the exact commands run.
 
 > **Note (2026-08-12):** phase 6's own build was never click-tested in a browser — no browser
 > is available in this environment. The History page type-checks, builds, and lints cleanly,
 > and its backend is verified end to end against the real fake seedbox, but the actual page
 > render, virtualized scroll, and filter controls have not been visually confirmed. Do this
-> before relying on the UI.
+> before relying on the UI. **The same is true of phase 7's Settings → Logs and Settings →
+> Backup pages** — build/lint clean, every backend endpoint verified over real HTTP, but never
+> click-tested in a browser.
 
 > **⚠ Phase 5 makes the user's live queue's `sync_mode = 'move'` row live.** It has been
 > stored that way in the database since before phase 4's guard existed, inert until now
@@ -111,8 +115,8 @@ phase1-skeleton-and-container.md`, `prompts/done/2026-08-11-phase2-scanning-and-
 | 3b — Transfers UI, item drawer, WebSocket delta fix | **done** (2026-08-11) |
 | 4 — Auto-queue + patterns | **done** (2026-08-11) |
 | 5 — Post-processing + `move` | **done** (2026-08-12) |
-| 6 — History page | **done, not yet committed** (2026-08-12) — see below |
-| 7 — Operations (logs, backup) | overnight run 2026-08-11 |
+| 6 — History page | **done** (2026-08-12) |
+| 7 — Operations (logs, backup, health) | **done, not yet committed** (2026-08-11) — see below |
 | 8 — Auth + hardening | overnight run 2026-08-11 |
 | 9 — Polish | overnight run 2026-08-11 |
 | `sync` mode | **not scheduled** — designed in §7, built only if it proves wanted |
@@ -317,10 +321,46 @@ this environment; only build/lint/type-check and the backend-level e2e were exer
 decision made unattended, including the no-live-updates call and the UTC-only date-filter
 limitation, is in `docs/decisions.md`'s phase 6 entry.
 
+**Phase 7, in one paragraph:** `core/backup.py` adds `VACUUM INTO`-based backups — never a
+file copy, per DESIGN.md §10.2's own WAL-safety reasoning — with settings (daily by default,
+keep 7, both configurable, stored in `setting` the same way `TransferSettings`/
+`PostprocessSettings` are), a `BackupScheduler` background loop (same `_task`/`start()`/
+`stop()` shape as `Engine`/`TransferQueue`), and retention that prunes oldest-first. **The
+pre-migration backup — the one DESIGN.md calls "the one that actually saves you" — is wired
+directly into `db.py.migrate()`**, unconditional and not gated by any settings toggle,
+firing exactly once before the first pending migration runs; a failed backup logs and lets
+the migration proceed rather than blocking startup, since the migration's own
+transaction-with-rollback (phase 1's finding) is still standing either way. The encryption
+secret (`core/crypto.py`) is proven absent from a backup byte-for-byte, not just assumed
+absent because `VACUUM INTO` "shouldn't" reach it. `core/logtail.py` bounds log tailing to a
+fixed byte budget read backwards from the end of the file, proven by an instrumented test
+against a 10+ MB fixture that the byte cap is actually honored, not merely correct on a small
+file; `api/logs.py` lists rotated files, tails only the live one with an optional level
+filter, and downloads any of them, with the credential redactor's existing coverage (it
+already runs on the way *in*, `logsetup.py`) verified end to end rather than duplicated as a
+second layer. `/api/health` (DESIGN.md §10.3) grows `host_reachable` (a tri-state: `null` =
+no host configured, `false` = configured but the pooled connection last failed, read from the
+engine's already-pooled connection rather than a fresh SSH call on every poll) and
+`scheduler_alive` (`TransferQueue`'s own admission-loop task) without touching the container
+`HEALTHCHECK`'s behavior, since it only checks the HTTP status code, never the body. Settings
+→ Logs and Settings → Backup (previously placeholders) are filled in. **The scheduled backup
+is the one deliberate exception to this run's "every new capability defaults off" rule** —
+shipped at DESIGN.md's own literal default (daily, keep 7) because it changes nothing about
+transfer behavior, only adds small bounded files, and an unattended install gets zero benefit
+from phase 7 if it's off until someone finds the settings page. Verified: 304 tests pass with
+the fake seedbox up (0 skipped), including the pre-migration backup exercised for real
+(database built at migration N, migration N+1 added, `migrate()` run again, backup opened
+with an independent connection and confirmed to hold the *prior* schema). Both lint gates
+clean, `npm run build`/`npm run lint` clean, all three compose files validate, fake-seedbox
+containers torn down afterward. **Not verified: the actual browser rendering** of the two new
+Settings pages — no browser is available in this environment. Every decision made unattended
+is in `docs/decisions.md`'s phase 7 entry.
+
 **Commits so far:** repo init + standard adoption, the design revisions, phase 1 (`b0109ae`),
 phase 2 (`de6d74b`), phase 3a (`36b9123`), phase 3b (`c814aa0`), phase 4 (`db89b63`), phase 5
-(`b0c9cb3`). All on `dev`. Phase 6's work is prepared on the working tree but **not yet
-committed** — see the phase 6 prompt's final report for the proposed commit message.
+(`b0c9cb3`), phase 6 (`d76a662`). All on `dev`. Phase 7's work is prepared on the working tree
+but **not yet committed** — see the phase 7 prompt's final report for the proposed commit
+message.
 
 ---
 

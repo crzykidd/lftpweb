@@ -6,6 +6,209 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-11 — Phase 7: operations (log viewer, database backup, health) — every decision
+## made unattended, recorded for review
+
+**Overnight run, no live confirmation possible.** Built `core/backup.py` (`VACUUM INTO`
+backups, settings, retention, the `BackupScheduler` loop), the pre-migration backup hook in
+`db.py.migrate()`, `core/logtail.py` (bounded reverse-read tailing), `api/backup.py` +
+`api/logs.py`, extended `/api/health` (DESIGN.md §10.3), and filled in the previously
+placeholder `Settings → Logs`/`Settings → Backup` pages. Full detail in the phase report;
+every non-obvious call is recorded here.
+
+**1. The scheduled backup (daily, keep 7) defaults ON — the one deliberate exception this
+overnight run makes to "every new capability ships defaulting to OFF."** `prompts/
+startnewsession.md`'s safety rule for the unattended phases 4-9 run is explicit that nothing
+landing overnight may change how the user's live deployment behaves. Chose to ship the
+schedule at DESIGN.md §10.2's own literal default ("daily by default, keep 7") rather than
+disabled, because (a) it changes nothing about *transfer* behavior — the thing every other
+phase's default-off rule is protecting — it only ever adds small, bounded files under
+`<config>/backups/`; (b) it is non-destructive and self-limiting (retention caps it at 7
+files, ~7x the live database's size at most); and (c) an install left running unattended is
+exactly the scenario this phase exists to protect, and shipping it off by default would mean
+phase 7 gives the sleeping user's live instance zero actual protection until they visit a
+Settings page they don't know exists yet. **Rejected: ship the schedule off by default, same
+as auto-queue/remote-deletion/auth.** Those defaults-off because they change what already
+happens to the user's data or transfers (auto-queue starts new downloads, `move` deletes
+remote files, auth locks them out) — a scheduled backup does not touch any of that, and
+DESIGN.md itself never describes the schedule as opt-in. The pre-migration backup (point 2)
+is stricter still: not merely defaulted on, but not configurable at all.
+
+**2. The pre-migration backup is unconditional and has no settings-driven toggle — it is not
+gated by `BackupSettings` or any "backups enabled" flag, because no such flag exists.**
+`db.py.migrate(conn, config_dir=None)` takes a backup itself, directly, before applying the
+first pending migration, whenever `config_dir` is provided (which `main.py` always does).
+This is deliberate: the prompt is explicit that this is "the one that actually saves you,"
+and a safety net a user (or a bug) can accidentally switch off before the one moment it
+matters is a worse design than no toggle at all. **Rejected: reuse `BackupSettings` and skip
+the pre-migration backup if the schedule is disabled.** Would let a user who turned off the
+*schedule* (say, to manage disk space) unknowingly also disable the migration safety net,
+which are two different risk profiles that don't belong behind the same switch.
+
+**3. A failed pre-migration backup logs an error and lets the migration proceed anyway,
+rather than aborting startup.** DESIGN.md doesn't say what happens if the backup itself
+fails (e.g. a full disk, a permissions problem in `<config>/backups/`). Chose non-blocking
+because the migration already has its own transaction-with-rollback safety net (phase 1's
+finding, `db.py`'s own module docstring: "the pre-migration backup hooks trivially into
+`migrate()`... the second net, not a replacement") — refusing to start the whole application
+over a failed *second* net is a worse failure mode than proceeding with only the first one
+still standing. **Rejected: abort startup if the pre-migration backup fails.** Safer-looking
+on paper, but it means a full `/config` disk (which will probably also make the migration
+itself fail, hitting the *first* net) turns into "the container won't start at all and the
+log has to be read to find out why," rather than "it started, and the log says the backup
+was skipped." `tests/test_db.py` doesn't cover the failure path directly (there is no clean
+way to force `VACUUM INTO` to fail without mocking, which the project's own testing bias
+{DESIGN.md §14} avoids) but the `try/except` and its log line are exercised by every passing
+migration test, since the mechanism runs unconditionally.
+
+**4. `RemoteConnectionPool.is_connected` (host reachability) reads the state of the
+*already-pooled* connection Engine's own periodic scans maintain, rather than opening a
+fresh SSH connection on every `/api/health` request.** DESIGN.md §10.3 just says "host
+reachability" without saying how fresh that reading must be. `/api/health` is one of the
+three paths `logsetup.py`'s `PollingNoiseFilter` specifically exists to quiet
+(`_POLLED_PATHS`) because the UI hits it continuously — making that same endpoint open a
+live SSH connection on every poll would turn a cheap status check into a slow, host-load-
+bearing one, and would make a seedbox with a strict connection-count ceiling (§4.5, §9.3)
+worse off for having an operations dashboard open. **Rejected: connect (or reuse
+`test_connection`) inline on every health request.** More "live," but wrong for a value read
+continuously — the whole point of `RemoteConnectionPool` (§5: "the same connection serves
+scanning, Test connection, and remote deletes") is one shared connection, and health
+reporting is a fourth consumer that should read its state, not add a fifth reason to open
+one.
+
+**5. `host_reachable` is a tri-state (`true`/`false`/`null`), not a plain boolean.**
+`null` means "no host configured yet" (a fresh install); `false` means "a host is configured
+but the pooled connection last failed or has never succeeded." DESIGN.md doesn't specify
+this distinction, but collapsing them into one boolean would either report a fresh,
+never-configured install as "unreachable" (alarming and wrong) or as "reachable" (false
+confidence). `tests/test_api.py` pins both cases: no host -> `null`; a host with a refused
+connection -> `false`.
+
+**6. Extending `HealthResponse` doesn't touch the HTTP status code the container
+`HEALTHCHECK` depends on.** `docker/Dockerfile`'s `HEALTHCHECK` is `curl -fsS ... || exit 1`
+— it only ever checks the HTTP status code, never the JSON body (confirmed by reading the
+Dockerfile directly, not assumed). This phase's `status: "degraded"` (set when the scheduler
+loop is dead, the DB is unreachable, or a configured host is currently unreachable) is
+therefore purely informational for the UI/an operator reading the endpoint by hand — it
+cannot cause a container restart on its own, which matters specifically because a transient
+seedbox blip flipping `host_reachable` to `false` must not restart the whole app. If this
+project ever wants the container to actually restart on a dead scheduler loop, that needs a
+deliberate, separate decision (e.g. a non-200 status code), not a side effect of this phase
+widening the response body.
+
+**7. Bounded log tailing lives in its own module, `core/logtail.py`, rather than inline in
+`api/logs.py`.** The phase 7 prompt names `api/logs.py` explicitly and says nothing about a
+separate core module, but every other phase in this codebase keeps the one pure, testable
+evaluator in `core/` and the HTTP glue thin (`core/patterns.py`, `core/mount_sentinel.py`,
+`core/verify.py`) — `docs/decisions.md`'s own repeated pattern. Bounded reverse-file-reading
+is exactly the kind of logic that benefits from being tested against a plain file object
+(see `tests/test_logtail.py`'s instrumented `BytesIO` proving the byte cap is actually
+honored) without needing a FastAPI `TestClient` around it.
+
+**8. A level filter (`?level=WARNING`) is applied only to whatever the bounded read already
+pulled in — it never triggers reading further back to find more matching lines.**
+`LogTailResponse.truncated` tells the caller when the byte cap, not "enough matching lines,"
+is what stopped the read. **Rejected: keep reading backwards until `max_lines` *matching*
+lines are found, filter included.** That reads more naturally ("give me the last 200 WARNING
+lines") but reintroduces an effectively unbounded read for exactly the case most likely to
+trigger it — a mostly-INFO file with sparse WARNING/ERROR lines, filtered on a large rotated
+log — which is the specific failure mode ("never stream the whole file into memory") this
+phase's prompt named by name. The UI surfaces `truncated` as a visible note rather than
+silently under-reporting.
+
+**9. The tail endpoint only ever reads the *current* `lftpweb.log`, never a rotated
+`.log.N` file.** DESIGN.md §10.1 says "tail the current one" in the same sentence as "list
+the rotated files" and "download" — read as three distinct verbs for three distinct
+targets, not "tail whichever file the caller names." A rotated file is closed and static, so
+tailing it would be equivalent to (and more confusing than) downloading it; download already
+covers that need for any listed file, including rotations.
+
+**10. No second redaction pass on the way out of `api/logs.py` — verified, not assumed, that
+`logsetup.CredentialRedactor` already covers what this endpoint can expose.** The prompt
+warned specifically against "bolt on a second layer and call it defence in depth" without
+first checking whether the existing one already covers the exposure surface.
+`CredentialRedactor` runs on every record before it reaches the file handler (`logsetup.py`'s
+own module docstring: "a secret that reaches disk has already leaked"), and the tail/download
+endpoints only ever read bytes already on disk — there is no code path in `api/logs.py` that
+constructs a log line itself or reads anything the redactor didn't already see.
+`tests/test_logs_api.py::test_credential_redaction_already_covers_what_the_endpoint_can_expose`
+proves this end to end through the real logging pipeline (a `sftp://user:pass@host` line
+logged, then read back through `/api/logs/tail`, with the password absent and the redacted
+form present) rather than trusting the argument alone.
+
+**11. `core/backup.py._list_backups_sync` sorts by real filesystem `mtime`, not the
+filename's own second-resolution timestamp.** Found while writing
+`tests/test_backup_api.py::test_backup_now_prunes_to_keep_count` (four rapid "Backup now"
+clicks with no delay): the on-disk naming (`lftpweb-YYYYMMDD-HHMMSS[-N].db`) only has
+second resolution, and the collision suffix (`-1`, `-2`, ...) does not sort after the bare
+filename lexicographically (`'-'` < `'.'` in ASCII), so two backups taken in the same wall-
+clock second could be pruned in the wrong order if sorted by filename text. `mtime` has
+practical sub-second resolution on every filesystem this app targets and reflects true
+creation order regardless of naming. The filename's own timestamp is still what's parsed
+into `BackupInfo.created_at` for display — only the *sort/prune* order changed.
+
+**12. No manual "delete a specific backup" endpoint.** The phase 7 prompt's "Done when" is
+"take, list, download, and schedule" — delete is implicit only through retention pruning.
+Added nothing beyond that scope. A future phase (or the user) can add one if wanted; nothing
+here forecloses it.
+
+**13. `BackupScheduler` checks hourly (`CHECK_INTERVAL_S = 3600`) rather than sleeping for
+the configured `interval_days` between checks**, the same shape `core/engine.py.Engine` and
+`core/queue.py.TransferQueue` already use for their own loops. A change to the schedule in
+Settings → Backup then takes effect within the hour instead of only after whatever the
+previous (possibly much longer) interval had already been slept.
+
+**14. `BackupSettings.interval_days` is a `float`, not an `int`**, so a sub-day interval
+(e.g. `0.5` = twice daily) is representable without a second unit field. DESIGN.md's own
+wording ("daily by default") doesn't require sub-day granularity, but nothing about the
+schema needs to forbid it either, and a float is a strictly larger domain than an int for
+free.
+
+**15. Neither Logs nor Backup auto-refreshes/polls — both are manual-refresh, the same call
+phase 6's History page made for its own filtered views** (docs/decisions.md's phase 6 entry,
+point 10). A tail or backup list a user is actively reading (or about to click "Download"
+on) resetting itself on a timer is a worse experience than a page that updates when asked.
+
+**16. `HealthResponse`'s new fields are reflected in `frontend/src/api/types.ts` for type
+correctness, but no new UI was built to surface `host_reachable`/`scheduler_alive`.** The
+phase 7 "Done when" names the Logs and Backup pages explicitly; extending `/api/health`'s
+shape is scoped to the API only, per DESIGN.md §10.3 and the phase prompt's item 3. A future
+"Polish" pass (phase 9) is the natural place for a dashboard/health-status UI element, not
+something added here as scope creep on an operations-plumbing phase.
+
+**Verified, not just asserted:** `tests/test_backup.py` (14 tests: `VACUUM INTO` produces an
+independently-openable database with real data in it, including one taken with writes still
+pending inside an open transaction; the encryption secret is provably absent from a backup
+byte-for-byte while its *ciphertext* is provably present, confirming the test isn't vacuous;
+retention prunes oldest-first to the keep count; settings default/round-trip; filename
+validation rejects path traversal; the scheduler's due/not-due logic and its
+start/stop/`is_alive` lifecycle). `tests/test_db.py` (2 new tests: the pre-migration backup
+exercised for real — a database built at migration 1, a migration 2 added, `migrate()` run
+again, and the resulting backup opened with an independent `sqlite3` connection to confirm
+it holds migration 1's schema, not migration 2's; and that calling `migrate(conn)` with no
+`config_dir`, as every pre-phase-7 call site does, takes no backup at all).
+`tests/test_logtail.py` (7 tests, including an instrumented `BytesIO` proving the byte cap
+is actually honored against a 10+ MB fixture, not merely correct on a small one).
+`tests/test_backup_api.py` / `tests/test_logs_api.py` (13 tests over the real HTTP surface:
+settings CRUD, backup now + list + download + retention-on-manual-click, 404s and
+path-traversal rejection on both download endpoints, level filtering, the redaction proof
+above). `tests/test_api.py` extended for both `host_reachable` cases. `uv run pytest`: 304
+passed, 0 skipped with the fake seedbox up; 294 passed, 10 skipped without it — no
+regressions in any earlier phase's tests. Both lint gates clean (`ruff check` and
+`ruff format --check`, `--config ruff.toml`, repo-wide — `format --check` again caught files
+`check` alone missed, the exact failure mode the prompt warned about a second time).
+`npm run build` and `npm run lint` (oxlint) clean. `docker compose config --quiet` clean on
+all three compose files. The fake-seedbox containers started to run the full suite were torn
+down and confirmed removed via `docker ps -a` afterward.
+
+**Not verified — stated plainly:** no browser is available in this environment. The Logs and
+Backup pages' actual rendering, the log-file table, the level/line-count selectors, and the
+backup schedule form were never exercised in an actual browser — only confirmed to build,
+type-check, and lint cleanly (`npm run build`, `npm run lint`), and their backend endpoints
+were verified directly over HTTP. This should be click-tested before being relied on.
+
+---
+
 ## 2026-08-12 — Phase 6: the History page — every decision made unattended, recorded for
 ## review
 
