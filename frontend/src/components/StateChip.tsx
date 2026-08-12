@@ -18,6 +18,16 @@ const STYLES: Record<string, string> = {
   // downloaded this and it's gone now, on purpose," not "never fetched."
   REMOVED_LOCAL: 'bg-fuchsia-100 text-fuchsia-800 dark:bg-fuchsia-900/40 dark:text-fuchsia-300',
   REMOVED_BOTH: 'bg-zinc-200 text-zinc-500 dark:bg-zinc-800 dark:text-zinc-500',
+  // Phase 5 (DESIGN.md §6): the post-processing pipeline's own states. VERIFYING/EXTRACTING
+  // reuse DOWNLOADING's blue (still in progress); VERIFIED/EXTRACTED reuse DOWNLOADED's
+  // green (a good outcome); CORRUPT/EXTRACT_FAILED get FAILED's red -- CORRUPT especially is
+  // the gate that withholds a move-mode delete, so it should read as alarming, not neutral.
+  VERIFYING: 'bg-blue-100 text-blue-800 dark:bg-blue-900/40 dark:text-blue-300',
+  VERIFIED: 'bg-emerald-100 text-emerald-800 dark:bg-emerald-900/40 dark:text-emerald-300',
+  CORRUPT: 'bg-red-100 text-red-800 dark:bg-red-900/40 dark:text-red-300',
+  EXTRACTING: 'bg-blue-100 text-blue-800 dark:bg-blue-900/40 dark:text-blue-300',
+  EXTRACTED: 'bg-emerald-100 text-emerald-800 dark:bg-emerald-900/40 dark:text-emerald-300',
+  EXTRACT_FAILED: 'bg-red-100 text-red-800 dark:bg-red-900/40 dark:text-red-300',
 }
 const FALLBACK_STYLE = 'bg-zinc-100 text-zinc-700 dark:bg-zinc-800 dark:text-zinc-300'
 

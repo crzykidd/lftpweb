@@ -32,6 +32,9 @@ interface FormState {
   sync_mode: SyncMode
   auto_queue_enabled: boolean
   auto_queue_patterns_only: boolean
+  auto_verify: boolean
+  auto_extract: boolean
+  auto_move: boolean
 }
 
 const EMPTY_FORM: FormState = {
@@ -43,6 +46,9 @@ const EMPTY_FORM: FormState = {
   sync_mode: 'copy',
   auto_queue_enabled: false,
   auto_queue_patterns_only: false,
+  auto_verify: false,
+  auto_extract: false,
+  auto_move: false,
 }
 
 /** DESIGN.md §9.2 Settings → Queues: add/edit/remove named path queues with their remote →
@@ -57,6 +63,11 @@ export function QueuesTab() {
   const [editingId, setEditingId] = useState<number | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [patternsQueueId, setPatternsQueueId] = useState<number | null>(null)
+  // DESIGN.md §7.1's misconfiguration warning: "switching a queue to move requires explicit
+  // confirmation." Re-armed (reset to false) on every edit start / cancel / mode change away
+  // from 'move', so saving a move queue always requires a fresh, deliberate acknowledgement
+  // in *this* editing session rather than a checkbox that silently stays checked.
+  const [moveConfirmed, setMoveConfirmed] = useState(false)
 
   const refresh = () => listQueues().then(setQueues)
 
@@ -64,11 +75,14 @@ export function QueuesTab() {
     refresh().finally(() => setLoading(false))
   }, [])
 
-  const update = <K extends keyof FormState>(key: K, value: FormState[K]) =>
+  const update = <K extends keyof FormState>(key: K, value: FormState[K]) => {
     setForm((prev) => ({ ...prev, [key]: value }))
+    if (key === 'sync_mode' && value !== 'move') setMoveConfirmed(false)
+  }
 
   const startEdit = (queue: PathQueueOut) => {
     setEditingId(queue.id)
+    setMoveConfirmed(false)
     setForm({
       name: queue.name,
       remote_path: queue.remote_path,
@@ -78,16 +92,33 @@ export function QueuesTab() {
       sync_mode: queue.sync_mode,
       auto_queue_enabled: queue.auto_queue_enabled,
       auto_queue_patterns_only: queue.auto_queue_patterns_only,
+      auto_verify: queue.auto_verify,
+      auto_extract: queue.auto_extract,
+      auto_move: queue.auto_move,
     })
   }
 
   const cancelEdit = () => {
     setEditingId(null)
+    setMoveConfirmed(false)
     setForm(EMPTY_FORM)
   }
 
+  // DESIGN.md §6: "auto_verify is forced on and cannot be turned off in the UI" for a move
+  // queue -- it is the sole gate on an irreversible remote delete (§7.3). The backend also
+  // forces this server-side (api/settings.py._effective_auto_verify) so a direct API call
+  // can't bypass it; this mirrors that in the form so the checkbox never lies about what
+  // will actually be saved.
+  const effectiveAutoVerify = form.auto_verify || form.sync_mode === 'move'
+
   const handleSubmit = async () => {
     setError(null)
+    if (form.sync_mode === 'move' && !moveConfirmed) {
+      setError(
+        'Confirm the hardlink-pickup-directory checkbox below before saving a move queue.',
+      )
+      return
+    }
     const body = {
       name: form.name,
       remote_path: form.remote_path,
@@ -97,6 +128,9 @@ export function QueuesTab() {
       sync_mode: form.sync_mode,
       auto_queue_enabled: form.auto_queue_enabled,
       auto_queue_patterns_only: form.auto_queue_patterns_only,
+      auto_verify: effectiveAutoVerify,
+      auto_extract: form.auto_extract,
+      auto_move: form.auto_move,
     }
     try {
       if (editingId != null) {
@@ -212,7 +246,14 @@ export function QueuesTab() {
           />
         </label>
         <label className="flex flex-col gap-1">
-          <span className={labelClasses}>Staging path (optional)</span>
+          <span className={labelClasses}>
+            Final destination (optional)
+            <span className="ml-2 font-normal text-zinc-500 dark:text-zinc-400">
+              — downloads always land in Local path above; the post-processing "Move to
+              staging path" step (DESIGN.md §6) relocates a finished item here, e.g. from an
+              NVMe download cache onto the array. Leave blank to keep items in Local path.
+            </span>
+          </span>
           <input
             className={inputClasses}
             value={form.staging_path}
@@ -235,10 +276,35 @@ export function QueuesTab() {
             onChange={(e) => update('sync_mode', e.target.value as SyncMode)}
           >
             <option value="copy">copy — download only, never touches the remote (default)</option>
-            <option value="move" disabled>move — not yet implemented (DESIGN.md §13 phase 5)</option>
+            <option value="move">
+              move — download, verify, then delete the remote copy (DESIGN.md §7)
+            </option>
             <option value="sync" disabled>sync — not scheduled (DESIGN.md §7)</option>
           </select>
         </label>
+        {form.sync_mode === 'move' && (
+          <div className="flex flex-col gap-2 rounded-md border border-amber-300 bg-amber-50 p-3 dark:border-amber-800 dark:bg-amber-900/20">
+            <p className="text-sm text-amber-900 dark:text-amber-200">
+              <strong>move</strong> deletes the remote copy of every item, once verified, the
+              moment it finishes downloading. This is irreversible. It is only safe when the
+              remote path above is a <strong>hardlink pickup directory</strong> your torrent
+              client populates on completion — never the torrent client's own seeding data
+              directory. Pointing this at a live seeding directory will destroy your seeds
+              (DESIGN.md §7.1).
+            </p>
+            <label className="flex items-center gap-2">
+              <input
+                type="checkbox"
+                checked={moveConfirmed}
+                onChange={(e) => setMoveConfirmed(e.target.checked)}
+              />
+              <span className="text-sm font-medium text-amber-900 dark:text-amber-200">
+                I confirm {form.remote_path || 'the remote path above'} is a hardlink pickup
+                directory, not live seeding data.
+              </span>
+            </label>
+          </div>
+        )}
         <label className="flex items-center gap-2">
           <input type="checkbox" checked={form.enabled} onChange={(e) => update('enabled', e.target.checked)} />
           <span className={labelClasses}>Enabled</span>
@@ -266,6 +332,51 @@ export function QueuesTab() {
             <span className="text-sm text-zinc-700 dark:text-zinc-300">
               Patterns-only (with no <code>select</code> pattern, match nothing instead of
               everything)
+            </span>
+          </label>
+        </div>
+
+        <div className="flex flex-col gap-2 rounded-md border border-zinc-200 p-3 dark:border-zinc-800">
+          <span className={labelClasses}>
+            Post-processing (DESIGN.md §6) — off by default; also gated by the site-wide
+            defaults in Settings → Post-processing
+          </span>
+          <label className="flex items-center gap-2">
+            <input
+              type="checkbox"
+              checked={effectiveAutoVerify}
+              onChange={(e) => update('auto_verify', e.target.checked)}
+              disabled={form.sync_mode === 'move'}
+            />
+            <span className="text-sm text-zinc-700 dark:text-zinc-300">
+              Verify (.sfv/.md5, or hash-on-disk if enabled site-wide)
+              {form.sync_mode === 'move' && (
+                <span className="ml-1 text-amber-600 dark:text-amber-400">
+                  — forced on for move (it gates the remote delete)
+                </span>
+              )}
+            </span>
+          </label>
+          <label className="flex items-center gap-2">
+            <input
+              type="checkbox"
+              checked={form.auto_extract}
+              onChange={(e) => update('auto_extract', e.target.checked)}
+            />
+            <span className="text-sm text-zinc-700 dark:text-zinc-300">
+              Extract archives (7zz — zip/7z/rar/rar5/tar/gz/bz2/xz)
+            </span>
+          </label>
+          <label className="flex items-center gap-2">
+            <input
+              type="checkbox"
+              checked={form.auto_move}
+              onChange={(e) => update('auto_move', e.target.checked)}
+              disabled={!form.staging_path}
+            />
+            <span className="text-sm text-zinc-700 dark:text-zinc-300">
+              Move to staging path once finished
+              {!form.staging_path && ' (set a staging path above first)'}
             </span>
           </label>
         </div>

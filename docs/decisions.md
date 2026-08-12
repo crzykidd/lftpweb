@@ -6,6 +6,259 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-11/12 — Phase 5: post-processing and `move` mode — this phase deletes data on a
+## machine the user doesn't own; every decision made unattended, recorded for review
+
+**Overnight run, no live confirmation possible, and the highest-consequence phase so far.**
+Built `core/verify.py` (sidecar + hash-on-disk verification), `core/extract.py` (7zz-only
+extraction), `core/postprocess.py` (the pipeline: verify → move-mode delete gate → extract →
+staging move, plus the cross-device-safe `move_tree`), `core/audit.py` (the `event`-table
+writer), and `RemoteConnectionPool.delete_path` in `core/remote.py` (the asyncssh delete
+mechanism, DESIGN.md §7.4). `move` is now in `api/settings.py`'s `IMPLEMENTED_SYNC_MODES`;
+`sync` still isn't. Verified end to end against the real fake seedbox — a `move` queue
+transferred a freshly-uploaded file, verified it (hash-on-disk fallback), deleted the remote
+copy over asyncssh, and a **second, independent** `RemoteConnectionPool.scan()` confirmed it
+gone — not just that `item.remote_deleted_at` got set. Full detail in the phase 5 report;
+every non-obvious call is recorded here.
+
+**0. THE USER'S LIVE QUEUE ROW IS NOW LIVE. Left alone on purpose — this is not a bug.** Their
+one queue has `sync_mode` stored as `'move'` in the database from before phase 4's guard
+existed (see the "mount sentinel" entry below and the 2026-08-11 overnight-plan note in
+`prompts/startnewsession.md`). Until this phase, that setting was inert — the API rejected
+`move` on every write, and nothing ever read `sync_mode` to decide whether to delete anything.
+As of this commit, `move` is implemented and the row was never touched, so **the very next
+time that queue completes a download and it verifies, this code will delete the remote copy**.
+This migration adds no data migration touching `path_queue` rows, and no code path in this
+phase resets or overrides `sync_mode` for an existing row — only `auto_verify` gets
+server-side-forced to `1` for a `move` queue, which for their row means verification will
+actually run (previously `auto_verify` was presumably `0`, since it never mattered). **Rejected
+alternative: silently reset their row's `sync_mode` back to `'copy'`, "for safety," until they
+confirm.** Rejected because it isn't ours to decide — DESIGN.md §7.1 exists specifically to
+explain why deletion is safe in the intended deployment shape (hardlink pickup directory), and
+whichever way they set it up, quietly overwriting a stored setting is exactly the kind of
+"helpfully" unrequested action the phase 5 prompt explicitly forbids twice. **Flagged here,
+in `prompts/startnewsession.md`, and at the top of the phase report** so it cannot be missed.
+
+**1. `local_path` stays exactly what phases 1–4 already built (the transfer target and the
+reconciler's scan root); `staging_path`, when set, is the post-processing Move step's
+*destination*, not the download target.** DESIGN.md §6 says "Move — staging → final
+destination... the 'download to NVMe, settle on the array' workflow," and §3.1 lists a
+nullable `staging_path` alongside the always-set `local_path`, but never says which field is
+which role, and the two readings are genuinely opposite (staging_path as where lftp writes
+first vs. staging_path as where a finished item ends up). Chose the reading that requires
+**zero changes** to the already-verified transfer engine, scanner, or reconciler: `local_path`
+is unconditionally where lftp writes and what `core/reconcile.py`/`core/engine.py` compare
+against remote (unchanged); the Move step, triggered only after an item is `DOWNLOADED` (i.e.
+already fully present at `local_path`), relocates `<local_path>/<rel_path>` to
+`<staging_path>/<rel_path>`. **Rejected: make transfers target `staging_path` when set,
+`local_path` the final tree.** That reading matches the *name* `staging_path` more naturally,
+but it means the reconciler would have to scan a different root during a transfer than after
+one completes — reaching back into phase 2/3's scan/reconcile/progress-sampling code for a
+phase whose brief is post-processing, and risking exactly the kind of subtle regression an
+unattended overnight run should avoid. The frontend's queue form now labels the field "Final
+destination" rather than "Staging path" to match actual behavior, without renaming the
+underlying column (a rename is a heavier migration for zero functional gain).
+
+**2. After a successful Move-to-final, `core/postprocess.py` does not set any new
+`item.state`.** DESIGN.md §3.2's `REMOVED_BOTH` is explicitly wrong for this (its own
+definition: "absent locally, remote deleted by us" — a `move`-mode item's *local* copy is
+exactly what Move relocates, it never becomes absent from lftpweb's tracked tree, just from
+`local_path`). No other existing state fits either. Rather than adding a new state (a CHECK
+constraint change means rebuilding the `item` table in a migration — real risk for a phase
+already deleting data), the smallest reasonable call: leave `item.state` as whatever the
+verify/extract steps last set it to (`VERIFIED` or `EXTRACTED`), and let the next scan
+discover `local_path` now empty for that `rel_path`. Since the item was `DOWNLOADED` before,
+phase 4's own `core/mount_sentinel.py.resolve_absence()` grace-period machinery already
+produces exactly the right outcome — `REMOVED_LOCAL` once the absence persists — because a
+post-processing-driven relocation and an `*arr` import moving the file out are, correctly,
+indistinguishable to the reconciler. **Rejected: a new `RELOCATED`/`ARCHIVED` state.** More
+precise, but it needs a schema migration this phase doesn't otherwise require, a new branch in
+every place that already handles the state vocabulary, and buys nothing `REMOVED_LOCAL`
+doesn't already give for free. The prompt's own text anticipated this ambiguity ("pick
+whatever is consistent and record the call") — this is that record.
+
+**3. Verification for a `move`-mode queue's item always runs, overriding both the global
+`verify_enabled` switch and the queue's own `auto_verify` value, rather than being subject to
+the same "both toggles must be on" rule every other step follows.** DESIGN.md §6 is explicit
+that `auto_verify` is "forced on and cannot be turned off in the UI" for `move`/`sync` — but
+doesn't say what happens if the *global* postprocessing switch for verification is off. Chose
+to force verification to run regardless of either toggle for a `move` queue specifically,
+because muting it via an unrelated site-wide default would silently turn `move` into
+"downloads, never deletes, never explains why" — the worst possible failure mode for a feature
+whose entire safety story rests on verification being the gate. **Rejected: AND-gate
+verification like extract/move (global × per-queue), and let a `move` queue with either
+switch off simply never delete anything.** Technically safe (no delete is always the safe
+outcome, per the prompt's own bias), but it fails silently from an operator's point of view —
+a `move` queue that never deletes because a global switch elsewhere is off looks identical to
+one working correctly with nothing yet eligible, and nothing in the UI would explain the gap
+without reading the event log closely. Forcing verification on is stricter, not laxer: it
+means *more* checking happens before a delete, never less.
+
+**4. `extract` and (the staging) `move` steps are AND-gated: a step only runs when *both* the
+site-wide `PostprocessSettings` flag and the queue's own `auto_extract`/`auto_move` column are
+true.** DESIGN.md §6 says "toggleable globally and per path queue" without specifying how two
+independent toggles combine. AND (both must opt in) was chosen over "queue overrides global"
+or "either one enables it" because it's the only combination where flipping *either* switch to
+off reliably turns the step off everywhere — the safest reading for a pipeline this phase
+explicitly wants defaulting to inert. A fresh install (`postprocess_settings` absent from
+`setting`, migration 003's `auto_extract`/`auto_move` at their `DEFAULT 0`) therefore runs
+zero post-processing even before anyone visits either Settings page, satisfying "every
+post-processing step defaults off" at both layers simultaneously, not just one.
+
+**5. Post-processing's trigger is `core/queue.py._reap_one`'s job-success path only — not also
+hooked into `core/engine.py._persist`'s scan-driven state computation.** DESIGN.md §6 says
+"triggered on transition to `DOWNLOADED`," which in principle includes an item that becomes
+`DOWNLOADED` purely because a rescan found matching bytes already on disk with no lftpweb job
+ever having run (e.g. files placed by hand). Given every *realistic* completion in this
+deployment goes through a job this app itself spawned, and given the overriding instruction to
+be conservative when this phase touches deletion, the smaller, better-tested surface won by
+only firing from the one code path that is exercised by every existing transfer test rather
+than also reaching into phase 2/3's reconcile/persist logic (already covered by its own
+extensive test suite) to add a second trigger site. **Consequence, stated plainly: a file that
+lands at `local_path` some other way (an operator's own `cp`, a restore) will never be
+verified, extracted, or have its remote counterpart deleted by `move` mode until *something*
+else re-touches that item** (e.g. a manual re-queue). Recorded as a known, deliberate scope
+reduction rather than a bug — flagged in the phase report — since the alternative (reaching
+into `_persist`) is unattended-session-risk for a corner case the prompt's own verification
+list never asked for.
+
+**6. Post-processing only ever triggers for a *top-level* item (no `/` in `rel_path`), the
+same eligibility shape `core/autoqueue.py` already uses.** `core/queue.py` only ever spawns a
+job against a top-level item (a whole release via `mirror`, or a loose top-level file via
+`pget` — DESIGN.md §4.7); the phase 2 decision to persist one `item` row per node (not just
+top-level ones, see that phase's own decisions.md entry) means a directory's *nested* file/
+subdirectory rows also transition to `DOWNLOADED` on the next scan after their parent's job
+succeeds, but verifying/extracting/deleting once per nested file inside an already-processed
+release would be redundant work and — for `move` — would attempt N remote deletes of paths
+already covered by the one delete issued for the release as a whole. The guard is defensive
+(nothing currently queues a nested item directly) but cheap and correctly scoped either way.
+
+**7. Deletion goes out as a shell `rm -rf --` over the same pooled asyncssh connection's
+`conn.run()`, not asyncssh's SFTP protocol layer.** `core/remote.py`'s existing scan paths
+(`_run_primary`, `_run_fallback`) already assume a POSIX shell is reachable this way; SFTP has
+no single "remove a possibly-non-empty directory tree" primitive, so a protocol-level
+implementation would mean hand-rolling recursive listing + delete in this codebase, more
+surface for a delete-path bug than reusing a mechanism already proven for scanning.
+`--` guards against a path that happens to start with `-`; a non-empty, non-root path check
+(`ValueError` on `""`, `"/"`, `"."`, `".."`) is defense in depth on top of the caller always
+constructing `<queue.remote_path>/<item.rel_path>` with a verified non-empty `rel_path` —
+never the primary safeguard, since the primary safeguard is verification gating whether
+`delete_path` is called at all.
+
+**8. "Hash-on-disk" verification (no `.sfv`/`.md5` sidecar, fallback enabled) means "every
+file under the item reads fully end to end with no I/O error" — not a hash compared against
+anything, since there is nothing to compare against.** DESIGN.md §6 names "hash-on-disk" as
+the fallback without defining what it hashes or checks when there's no reference value. Chose
+the weakest defensible reading — full-file readability, explicitly labeled in
+`VerifyResult.detail` as confirming "readability, not content correctness" — because a
+completed transfer already implies `local_size >= remote_size` (reconciler rule 2) and a clean
+lftp exit (`cmd:fail-exit true`, §4.3), so the only additional failure mode this fallback can
+actually catch beyond what already happened is a file that looks complete by size/mtime but
+errors on a full read (sparse-hole lies, disk corruption after the fact). **Rejected: compute
+and merely *store* a hash with nothing to compare it to, calling that "verified."** That would
+satisfy the letter of "hash-on-disk" while verifying nothing at all — a `move` queue would
+delete on the strength of a number nobody ever checks. The chosen reading is honest about its
+own weakness (`detail` says so explicitly) and is off by default (`verify_hash_on_disk`
+defaults `False`), per DESIGN.md §6's own words: "no usable verification evidence... must say
+so loudly," not be quietly promoted to sounding like a checksum match.
+
+**9. `core/extract.py`'s 7zz binary name is an overridable parameter (`binary=`) and env var
+(`LFTPWEB_7Z_BIN`), defaulting to `"7zz"` (the runtime image's Alpine `7zip` package binary),
+exactly `core/lftp.py.spawn`'s `lftp_bin` pattern.** Needed because this session's own dev
+host runs Ubuntu, whose `7zip` package (installed to verify extraction against a real binary
+rather than mocking one) names the identical upstream 7-Zip binary `7z`, not `7zz`. Tests pass
+`binary="7z"` (or set the env var) so "verify before reporting" could mean actually invoking a
+real 7-Zip process, not asserting against a mock — the same reasoning DESIGN.md §14 gives for
+the fake-seedbox-over-mocks approach generally.
+
+**10. A password-less 7zz extraction attempt omits `-p` entirely rather than passing an empty
+password, and every subprocess call sets `stdin=DEVNULL`.** 7-Zip's CLI has no "definitely
+don't prompt" flag; omitting `-p` is the normal case (target archive isn't encrypted), and
+`stdin=DEVNULL` is what actually prevents a hang if an archive turns out to be encrypted
+anyway — 7z fails fast on EOF instead of blocking forever waiting for a password that will
+never come. Compound-tar extraction (`.tar.gz`/`.tgz`, `.tar.bz2`/`.tbz2`, `.tar.xz`/`.txz`)
+needs two 7zz invocations, because 7-Zip only strips one layer of a chained format per call;
+the intermediate `.tar` lives in a throwaway subdirectory removed either way.
+
+**11. The extraction target directory (`extract_target_dir`) is a site-wide setting, not a
+per-queue column.** DESIGN.md §6 says "Target: in place, or a configured directory" without
+saying at what scope the configuration lives. Chose site-level, matching bandwidth/concurrency
+(§4.5, "a queue governs what and where, never how fast/how" — extended here to "or how
+processed") rather than adding another `path_queue` column and migration for a knob nothing in
+the prompt asked to be per-queue. Per-item placement underneath it (`extract_target_dir /
+item.rel_path`) still keeps different releases from colliding with each other.
+
+**12. `PostprocessPipeline.trigger()` schedules one `asyncio.create_task` per item and gates
+concurrent execution with a single `asyncio.Semaphore` sized from `PostprocessSettings.
+concurrency` (default 1), rather than a bounded worker-pool queue.** DESIGN.md §6: "executed
+in a thread pool, one item at a time by default (configurable)." A semaphore around
+per-item tasks gives the same effective concurrency bound with far less machinery than a
+persistent pool + queue, and matches this codebase's existing style (`TransferQueue`'s
+admission control is itself a bespoke scheduler, not a library pool). `wait_idle()` is exposed
+for tests and clean shutdown (`main.py`'s lifespan now awaits it between `queue.stop()` and
+`engine.stop()`, so an in-flight verify/extract/move isn't cut off mid-write against a
+database connection about to close).
+
+**13. Switching a queue's `sync_mode` to `move` in the UI requires a fresh, explicit checkbox
+confirmation ("I confirm ... is a hardlink pickup directory, not live seeding data") enforced
+**client-side only**, not as an API request field.** DESIGN.md §7.1's misconfiguration warning
+must appear "in the Settings UI next to the mode selector" and switching to `move` "requires
+explicit confirmation" — read as a UX requirement (a human using the form must acknowledge it
+before the button does anything), not a new wire-format contract. **Rejected: an API-level
+`confirm_move: bool` field on `PathQueueIn`/`PUT .../queues/{id}`.** DESIGN.md's own schema
+(§3.1) has no such field, and this project already treats a direct API call (curl, a script)
+as an equally valid client elsewhere with no equivalent extra-confirmation gate (e.g. deleting
+a queue outright needs no confirmation token either) — adding one only for this one field
+would be an inconsistent, unrequested API surface change for a phase whose job is the pipeline
+and the delete mechanism, not new API ceremony. `auto_verify`'s forced-on behavior *is*
+enforced server-side (decision above), because that one is a safety property the server must
+hold regardless of which client asked; the confirmation checkbox is a "did a human read the
+warning" gate, which only a human-facing form can meaningfully provide anyway.
+
+**14. `Settings → Post-processing` (`PostProcessingTab.tsx`) was filled in with a working
+global-settings form this phase, rather than staying the placeholder it was through phases
+3a–4** (`frontend/src/pages/settings/TransferTab.tsx` is still a placeholder despite phase 3a
+shipping a complete, tested `TransferSettings` API — a precedent for leaving site-level
+Settings UI for a later "polish" phase). Chose to build it anyway because the alternative —
+`PostprocessSettings` reachable only via `curl`/direct API calls — leaves no way for the user
+to see or change "every post-processing step defaults off" without reading source, for a
+feature phase whose entire framing is "the user must be able to tell what this is doing before
+it deletes something." `TransferTab` staying a placeholder is unaffected and not revisited
+here; it's a separate, lower-stakes gap for whichever phase (likely 9, Polish) picks it up.
+
+**15. `auto_verify`/`auto_extract` — DB columns that have existed since migration 001 but had
+no API field, no request/response model field, and no UI control through phases 1–4 — are
+wired up for the first time this phase, alongside the new `auto_move` (migration 003).** Not
+a phase 5 bug fix so much as this phase being the first one that needed those columns to mean
+anything; recorded because a future session grepping for "when was `auto_verify` first
+readable from the API" would otherwise have to dig through four phases' git history to learn
+it was always in the schema and simply unused until now.
+
+**Verified, not just asserted:** `tests/test_postprocess.py` (24 unit tests: `.sfv`/`.md5`/
+hash-on-disk verification including a corrupt-checksum case; zip and native `.7z` extraction
+via a real local 7-Zip binary, a password-protected archive, a deliberately corrupt archive
+that fails without raising, multi-part-rar volume name filtering; `move_tree`'s same-device
+fast path, a genuine EXDEV fallback that actually relocates a nested directory tree, and —
+the phase's own required test — an EXDEV fallback whose *copy* fails partway, proving no
+partial file is ever left at the destination and the source is untouched; the move-mode delete
+gate withholding on `SKIPPED` and on a real `CORRUPT` sidecar mismatch, and only ever calling
+the (stubbed) remote pool once verification actually returns `VERIFIED`; every default-off
+assertion). `tests/test_postprocess_e2e.py` (1 real end-to-end test against the fake seedbox:
+uploads a fresh file to a dedicated, uniquely-named remote subdirectory — deliberately *not*
+`docker/test-seedbox/seed_tree.sh`'s shared fixtures, which other tests in this suite still
+depend on and a `move` queue would otherwise delete out from under them — transfers it through
+the real `TransferQueue`/`PostprocessPipeline` wiring exactly as `main.py` constructs it,
+confirms `VERIFIED` + a `remote_delete` event, and **rescans the remote with a second,
+independent `RemoteConnectionPool` to confirm the file is actually gone**, not merely that
+`remote_deleted_at` got set). `uv run pytest`: 244 passed, 0 skipped (fake seedbox up), 0
+failed. Both lint gates clean (`ruff check` and `ruff format --check`, `--config ruff.toml`,
+repo-wide). `npm run build` and `npm run lint` clean. `docker compose config --quiet` clean on
+all three compose files. Fake-seedbox containers torn down and confirmed removed via
+`docker ps -a` after the run; the shared fixture tree (`seed_tree.sh`'s files) was never
+modified or deleted by this phase's own tests.
+
+---
+
 ## 2026-08-11 — Phase 4: auto-queue and patterns — every decision made unattended, recorded
 ## for the user to review in the morning
 

@@ -109,11 +109,37 @@ class PathQueueIn(BaseModel):
     # itself (this phase's non-negotiable, docs/decisions.md).
     auto_queue_enabled: bool = False
     auto_queue_patterns_only: bool = False
+    # DESIGN.md §6, phase 5. All three default off -- see docs/decisions.md's "every
+    # post-processing step defaults off" non-negotiable. `auto_verify`/`auto_extract` are
+    # existing DB columns (migration 001) that had no API/UI field until this phase;
+    # `auto_move` is new (migration 003). `api/settings.py` forces `auto_verify` to `True`
+    # whenever `sync_mode == 'move'` regardless of what's sent here (DESIGN.md §6: "forced on
+    # and cannot be turned off in the UI") -- it is the sole gate on an irreversible delete.
+    auto_verify: bool = False
+    auto_extract: bool = False
+    auto_move: bool = False
 
 
 class PathQueueOut(PathQueueIn):
     id: int
     host_id: int
+
+
+# --- Settings -> Post-processing (DESIGN.md §6, phase 5) --------------------------------
+
+
+class PostprocessSettingsOut(BaseModel):
+    verify_enabled: bool
+    verify_hash_on_disk: bool
+    extract_enabled: bool
+    extract_target_dir: str | None
+    extract_passwords: list[str]
+    move_enabled: bool
+    concurrency: int
+
+
+class PostprocessSettingsIn(PostprocessSettingsOut):
+    pass
 
 
 # --- Settings -> Queues -> Patterns (DESIGN.md §3.1 `pattern`, §4.7) --------------------

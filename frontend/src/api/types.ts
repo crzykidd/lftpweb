@@ -80,12 +80,32 @@ export interface PathQueueIn {
   // user action; omitting these on create must not auto-enable anything.
   auto_queue_enabled: boolean
   auto_queue_patterns_only: boolean
+  // Phase 5 (DESIGN.md §6). All three default off. The backend forces auto_verify to true
+  // whenever sync_mode is 'move' regardless of what's sent here -- the UI mirrors that by
+  // disabling (not hiding) the checkbox rather than relying on the server alone.
+  auto_verify: boolean
+  auto_extract: boolean
+  auto_move: boolean
 }
 
 export interface PathQueueOut extends PathQueueIn {
   id: number
   host_id: number
 }
+
+// --- Settings -> Post-processing (phase 5, DESIGN.md §6) -------------------------------
+
+export interface PostprocessSettingsOut {
+  verify_enabled: boolean
+  verify_hash_on_disk: boolean
+  extract_enabled: boolean
+  extract_target_dir: string | null
+  extract_passwords: string[]
+  move_enabled: boolean
+  concurrency: number
+}
+
+export type PostprocessSettingsIn = PostprocessSettingsOut
 
 // --- Settings -> Queues -> Patterns (phase 4, DESIGN.md §3.1 `pattern`, §4.7) -----------
 

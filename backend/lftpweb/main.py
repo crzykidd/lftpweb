@@ -21,6 +21,7 @@ from lftpweb.config import settings
 from lftpweb.core.autoqueue import AutoQueue
 from lftpweb.core.engine import Engine, load_host_config
 from lftpweb.core.events import EventBus
+from lftpweb.core.postprocess import PostprocessPipeline
 from lftpweb.core.queue import TransferQueue
 from lftpweb.db import connect, migrate
 from lftpweb.logsetup import setup_logging
@@ -61,6 +62,19 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         scan_interval_s=settings.scan_interval_s,
         autoqueue=autoqueue,
     )
+    # Phase 5 (DESIGN.md §6/§7.4): constructed after Engine, not TransferQueue, because it
+    # needs Engine.pool — the one pooled asyncssh connection scanning, Test connection, and
+    # now `move`-mode remote deletes all share (DESIGN.md §5: "exactly one code path"). Handed
+    # to TransferQueue as a plain attribute rather than a constructor argument for exactly
+    # this reason — see core/queue.py's own comment on `self.postprocess`.
+    app.state.postprocess = PostprocessPipeline(
+        db=app.state.db,
+        events=app.state.events,
+        remote_pool=app.state.engine.pool,
+        host_provider=_host_provider,
+    )
+    app.state.queue.postprocess = app.state.postprocess
+
     await app.state.engine.start()
     await app.state.queue.start()
 
@@ -69,6 +83,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         yield
     finally:
         await app.state.queue.stop()
+        # Let any in-flight postprocessing task (verify/extract/move, all still writing to
+        # app.state.db) finish before the connection underneath it closes, rather than
+        # cutting one off mid-write on shutdown.
+        await app.state.postprocess.wait_idle()
         await app.state.engine.stop()
         await app.state.db.close()
 

@@ -77,17 +77,24 @@ on `dev`, land via PR.
 
 ## Where we are
 
-**Status: phases 1–3 (including 3b) done.** `DESIGN.md` is settled and reviewed. The skeleton
-(phase 1), scanning + reconciliation + read-only Files view (phase 2), the transfer engine +
-scheduler (phase 3a), and the Transfers page / item drawer / Files actions / WebSocket delta fix
-(phase 3b) all exist and are verified — see
-`prompts/done/2026-08-11-phase1-skeleton-and-container.md`,
-`prompts/done/2026-08-11-phase2-scanning-and-model.md`,
-`prompts/done/2026-08-11-phase3a-transfer-engine.md`, and
-`prompts/done/2026-08-11-phase3b-transfers-ui.md` for the exact commands run. **lftp now
-actually moves bytes, and the UI shows it happening live** — queue from Files, watch progress on
-Transfers, open the drawer, stop it and see `STOPPED` with no page refresh, all verified end to
-end through the real API and a real WebSocket client against the fake seedbox.
+**Status: phases 1–5 done.** `DESIGN.md` is settled and reviewed. The skeleton (phase 1),
+scanning + reconciliation + read-only Files view (phase 2), the transfer engine + scheduler
+(phase 3a), the Transfers page / item drawer / Files actions / WebSocket delta fix (phase 3b),
+auto-queue + patterns + the mount sentinel (phase 4), and post-processing + `move` mode
+(phase 5) all exist and are verified — see `prompts/done/2026-08-11-phase1-skeleton-and-
+container.md`, `prompts/done/2026-08-11-phase2-scanning-and-model.md`,
+`prompts/done/2026-08-11-phase3a-transfer-engine.md`,
+`prompts/done/2026-08-11-phase3b-transfers-ui.md`,
+`prompts/done/2026-08-11-phase4-autoqueue-and-patterns.md`, and
+`prompts/done/2026-08-11-phase5-postprocessing-and-move.md` for the exact commands run.
+
+> **⚠ Phase 5 makes the user's live queue's `sync_mode = 'move'` row live.** It has been
+> stored that way in the database since before phase 4's guard existed, inert until now
+> because nothing implemented `move` or read `sync_mode` to act on it. As of this phase,
+> `move` **deletes the verified remote copy after every download that queue completes.** The
+> row was deliberately **not** touched or reset — see `docs/decisions.md`'s phase 5 entry,
+> point 0, and the phase 5 report. **Tell the user this first, before anything else, when
+> they're back.**
 
 | Phase (`DESIGN.md` §13) | State |
 |---|---|
@@ -95,8 +102,8 @@ end through the real API and a real WebSocket client against the fake seedbox.
 | 2 — Scanning + model | **done** (2026-08-11) |
 | 3a — Transfer engine + scheduler (backend) | **done** (2026-08-11) |
 | 3b — Transfers UI, item drawer, WebSocket delta fix | **done** (2026-08-11) |
-| 4 — Auto-queue + patterns | **prepared, not committed** (2026-08-11) — see below |
-| 5 — Post-processing + `move` | overnight run 2026-08-11 |
+| 4 — Auto-queue + patterns | **done** (2026-08-11) |
+| 5 — Post-processing + `move` | **done, not yet committed** (2026-08-12) — see below |
 | 6 — History page | overnight run 2026-08-11 |
 | 7 — Operations (logs, backup) | overnight run 2026-08-11 |
 | 8 — Auth + hardening | overnight run 2026-08-11 |
@@ -113,11 +120,15 @@ commit, push to `dev`, then start the next. Document every decision made without
 user's live instance may pull `:dev`. Nothing landing overnight may change how their running
 deployment behaves: auto-queue defaults disabled, remote deletion defaults off, auth defaults
 to the current `none`. A capability that turns itself on while they sleep is a bug, not a
-feature.
+feature. **Phase 5 is the one deliberate, flagged exception to "nothing changes behavior":**
+`move` mode itself was already stored as their live setting before any guard existed, so
+implementing it changes what their existing configuration does even though every *new* toggle
+this phase adds (global and per-queue post-processing switches, `auto_move`) still defaults
+off exactly like every other phase.
 
 **Their live config:** one queue, `sync_mode` stored as `move` in the database from before the
-guard existed — it behaves as `copy` (deletion is phase 5) and the API now rejects setting it.
-Worth mentioning to them; not worth silently rewriting their row.
+guard existed. As of phase 5 this is **no longer inert** — see the warning banner above. Not
+silently rewritten; it is the user's call and they need to see it first.
 
 ## What real hardware taught us that the fake seedbox could not
 
@@ -245,12 +256,38 @@ including two rejected alternatives worth a second look: whether `file_exclude` 
 path-aware (not just basename) matching, and whether the grace period belongs in the Settings
 UI now rather than later.
 
+**Phase 5, in one paragraph — the first phase that deletes data on a machine we don't own.**
+`core/verify.py` checks `.sfv`/`.md5` sidecars, falling back (opt-in, off by default) to a
+whole-file read as a weaker "readable end to end" guarantee when no sidecar exists.
+`core/extract.py` extracts every archive found under an item via `7zz` — the image's only
+archive tool, no `unrar` — including multi-part rar (first volume only) and compound tar
+formats (two passes: strip compression, then unpack). `core/postprocess.py` is the pipeline
+`core/queue.py._reap_one` triggers for a top-level item's job success: verify → (for a `move`
+queue) the delete gate → extract → move-to-final, each step off by default at **two**
+independent layers (a site-wide `PostprocessSettings` flag AND the queue's own `auto_verify`/
+`auto_extract`/`auto_move` column must both be on), except verification for `move`, which is
+forced on regardless of either toggle because it's the sole gate on an irreversible delete.
+`move_tree` is the cross-device-safe staging→final relocator: `os.rename` fast path,
+copy-to-a-same-filesystem-sibling-then-atomic-rename on `EXDEV` (the expected case — the
+user's downloads are on NFS), verified to leave no partial file at the destination when the
+copy itself fails partway. Deletion (`RemoteConnectionPool.delete_path`, `core/remote.py`)
+goes out as `rm -rf --` over the same pooled asyncssh connection scanning already uses, never
+lftp's `--Remove-source-files`; every delete and every delete withheld writes an `event` row
+(`core/audit.py`) naming the item, queue, mode, and gating condition. `api/settings.py` now
+accepts `move` in `IMPLEMENTED_SYNC_MODES` (`sync` still rejected) and force-sets `auto_verify`
+server-side whenever `sync_mode == 'move'`. UI: the Settings → Queues mode selector's `move`
+option is enabled with an inline misconfiguration warning and a required confirmation
+checkbox (DESIGN.md §7.1), per-queue verify/extract/move toggles, and a filled-in Settings →
+Post-processing page for the site-wide defaults. Verified end to end against the real fake
+seedbox (`tests/test_postprocess_e2e.py`): a `move` queue transferred a freshly-uploaded file,
+verified it, deleted the remote copy, and a **second, independent** remote scan confirmed it
+gone. Every decision made unattended is in `docs/decisions.md`'s phase 5 entry — read point 0
+first, it's about the live queue row above.
+
 **Commits so far:** repo init + standard adoption, the design revisions, phase 1 (`b0109ae`),
-phase 2 (`de6d74b`), phase 3a (`36b9123`). All on `dev`. Phase 3b's and phase 4's work are
-both prepared on the working tree but **not yet committed** — see the phase 3b and phase 4
-prompts' final reports for the proposed commits. (Separately, and unrelated to either phase: a
-concurrent session appears to have GitHub repo-bootstrap work in progress on this same working
-tree as of this note — see the "Note" under this file's title and `docs/decisions.md`.)
+phase 2 (`de6d74b`), phase 3a (`36b9123`), phase 3b (`c814aa0`), phase 4 (`db89b63`). All on
+`dev`. Phase 5's work is prepared on the working tree but **not yet committed** — see the
+phase 5 prompt's final report for the proposed commit message.
 
 ---
 
@@ -402,3 +439,29 @@ These are the places where the obvious implementation is wrong. Each is written 
   continues that convention on purpose rather than introducing the library mid-project — a
   future session should either correct DESIGN.md §9 or do the migration as its own scoped phase,
   not as a side effect of whichever phase next touches data-fetching.
+- **`path_queue.local_path` is still where lftp downloads to and what the reconciler scans —
+  `staging_path` is the phase 5 post-processing Move step's *destination*, not a download
+  target** (phase 5, resolved ambiguity — see docs/decisions.md). DESIGN.md names the field
+  `staging_path` and describes Move as "staging → final destination," which reads naturally as
+  "downloads land in staging first," but making that true would mean the reconciler comparing
+  remote vs. local at a *different* root during a transfer than after one completes — reaching
+  back into phase 2/3's already-verified scan/reconcile code for a phase whose brief is
+  post-processing. The chosen reading needs zero changes there; the frontend labels the field
+  "Final destination" to match, without renaming the column.
+- **A `move`-mode item's verification always runs, bypassing the "global setting AND per-queue
+  toggle" rule every other post-processing step follows** (phase 5). It is the sole gate on an
+  irreversible remote delete (DESIGN.md §7.3); muting it via an unrelated site-wide default
+  (`PostprocessSettings.verify_enabled`) would silently turn `move` into "downloads, never
+  deletes, never explains why." `core/postprocess.py.process_item`'s `verify_effective`
+  computation is the one step that ORs in `sync_mode == "move"` rather than ANDing two toggles.
+- **A `move`-mode delete sets `item.remote_deleted_at` but never changes `item.state`** (phase
+  5). DESIGN.md's `REMOVED_BOTH` is the wrong state for this — its own definition implies local
+  absence too, and `move` never removes the local copy. The item's state stays whatever verify/
+  extract last set (`VERIFIED`/`EXTRACTED`); if the item is *also* relocated by the Move step,
+  the resulting local absence is picked up by phase 4's existing `REMOVED_LOCAL` grace-period
+  machinery on the next scan, exactly as if a human or an `*arr` importer had moved it — no new
+  state, no new code path.
+- **The user's live queue's `sync_mode = 'move'` row went from inert to live the moment phase
+  5 shipped, and was deliberately left untouched** — see the warning near the top of this
+  file's "Where we are" and docs/decisions.md's phase 5 entry, point 0. The first thing to tell
+  the user when they're back.

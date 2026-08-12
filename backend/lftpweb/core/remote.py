@@ -89,6 +89,13 @@ class RemoteScanError(Exception):
     """
 
 
+class RemoteDeleteError(Exception):
+    """A remote delete (DESIGN.md §5, §7.4) could not be completed. Never silently swallowed
+    by the caller -- `core/postprocess.py` records it as an `event` row and leaves the
+    item's `remote_deleted_at` unset, exactly like a withheld delete.
+    """
+
+
 class DecryptionNeededError(Exception):
     """Raised when a host's password cannot be decrypted (DESIGN.md §8's "credentials need
     re-entry" state). Caught by the caller, not retried automatically.
@@ -535,6 +542,40 @@ class RemoteConnectionPool:
         if outcome.warning:
             logger.warning("scan of %s: %s", remote_path, outcome.warning)
         return outcome.raw, outcome.warning
+
+    async def delete_path(self, host: HostConfig, remote_path: str) -> None:
+        """Remove a remote file or directory tree (DESIGN.md §5, §7.4) over this same pooled
+        asyncssh connection -- **never** lftp's `mirror --Remove-source-files`. §7.4 gives the
+        full reasoning; the short version is that this is the one place deletion happens, so
+        it is the one place verification gates it and the one place an `event` row is
+        guaranteed.
+
+        Issued as a shell `rm -rf --` over `conn.run`, the identical mechanism
+        `_run_primary`/`_run_fallback` already use for scanning -- not asyncssh's SFTP
+        protocol layer, which has no single call for "remove a possibly-non-empty directory
+        tree" and would need this module to reimplement recursive removal by hand. `--` stops
+        a path that happens to start with `-` from being read as a flag. Idempotent: a path
+        that is already gone is not an error (`rm -rf` never fails on a missing target).
+
+        Deliberately refuses an empty or root-looking path rather than ever asking the remote
+        shell to `rm -rf` something that could expand to "everything" -- the caller
+        (`core/postprocess.py`) always passes `<queue.remote_path>/<item.rel_path>` with a
+        non-empty `rel_path`, so this is defense in depth, not the primary safeguard.
+        """
+        stripped = remote_path.strip()
+        if not stripped or stripped in ("/", ".", ".."):
+            raise ValueError(
+                f"refusing to delete an empty or root-looking remote path: {remote_path!r}"
+            )
+
+        conn = await self.get_connection(host)
+        result = await conn.run(f"rm -rf -- {shlex.quote(stripped)}", check=False, encoding=None)
+        if result.exit_status != 0:
+            stderr = result.stderr if isinstance(result.stderr, (bytes, bytearray)) else b""
+            raise RemoteDeleteError(
+                f"remote delete of {stripped!r} failed (exit {result.exit_status}): "
+                f"{stderr.decode('utf-8', errors='surrogateescape').strip()}"
+            )
 
     async def _run_fallback(self, conn: asyncssh.SSHClientConnection, remote_path: str) -> str:
         remote_tmp = f"/tmp/.lftpweb_scan_fs_{uuid4().hex}.py"

@@ -14,6 +14,11 @@ from fastapi import APIRouter, HTTPException, Request
 from lftpweb.core import patterns as patterns_core
 from lftpweb.core.crypto import DecryptionError, decrypt_secret, encrypt_secret
 from lftpweb.core.mount_sentinel import check as mount_ok_check
+from lftpweb.core.postprocess import (
+    PostprocessSettings,
+    load_postprocess_settings,
+    save_postprocess_settings,
+)
 from lftpweb.core.remote import HostConfig
 from lftpweb.models import (
     HostIn,
@@ -27,6 +32,8 @@ from lftpweb.models import (
     PatternPreviewItem,
     PatternPreviewRequest,
     PatternPreviewResponse,
+    PostprocessSettingsIn,
+    PostprocessSettingsOut,
     QueueAutoQueueStatus,
     TestConnectionResponse,
 )
@@ -196,7 +203,7 @@ async def test_host(
 
 _QUEUE_SELECT_COLUMNS = (
     "id, host_id, name, remote_path, local_path, staging_path, enabled, sync_mode, "
-    "auto_queue_enabled, auto_queue_patterns_only"
+    "auto_queue_enabled, auto_queue_patterns_only, auto_verify, auto_extract, auto_move"
 )
 
 
@@ -212,21 +219,32 @@ def _queue_out_from_row(row) -> PathQueueOut:
         sync_mode=row["sync_mode"],
         auto_queue_enabled=bool(row["auto_queue_enabled"]),
         auto_queue_patterns_only=bool(row["auto_queue_patterns_only"]),
+        auto_verify=bool(row["auto_verify"]),
+        auto_extract=bool(row["auto_extract"]),
+        auto_move=bool(row["auto_move"]),
     )
 
 
-# Only `copy` actually does anything today. `move` (delete the remote after a verified
-# transfer) is DESIGN.md §13 phase 5, and `sync` (propagate local deletes) is §7, unscheduled.
-# Both are valid values in the schema, and the column exists so those phases can drop in — but
-# accepting one now stores a setting that silently behaves as `copy`. On a seedbox that means
-# an operator believes their disk is being reclaimed while it quietly fills. Refusing with a
-# clear reason beats a switch that lies.
-IMPLEMENTED_SYNC_MODES = frozenset({"copy"})
+# `copy` and `move` are implemented (phase 5, DESIGN.md §13). `sync` (propagate *local*
+# deletes to the remote) stays rejected -- it is explicitly not scheduled (DESIGN.md §7) and
+# is not being built as a side effect of `move`. Accepting a mode that silently behaves as
+# `copy` is worse than one that isn't offered: on a seedbox that means an operator believes
+# their disk is being reclaimed while it quietly fills. Refusing with a clear reason beats a
+# switch that lies. See docs/decisions.md for why `move` is safe to enable now.
+IMPLEMENTED_SYNC_MODES = frozenset({"copy", "move"})
 
 _UNIMPLEMENTED_REASON = {
-    "move": "delete-after-download is build phase 5 (DESIGN.md §13); not implemented yet",
     "sync": "local-delete propagation is not scheduled (DESIGN.md §7)",
 }
+
+
+def _effective_auto_verify(body: PathQueueIn) -> bool:
+    """DESIGN.md §6: "For a queue in `move` or `sync` mode, `auto_verify` is forced on and
+    cannot be turned off in the UI." Enforced here too, not only in the frontend form —
+    verification is the sole gate on an irreversible remote delete (§7.3), so a direct API
+    call (curl, a script) must not be able to silently disable it for a `move` queue.
+    """
+    return body.auto_verify or body.sync_mode == "move"
 
 
 def _reject_unimplemented_sync_mode(mode: str) -> None:
@@ -257,8 +275,8 @@ async def create_queue(body: PathQueueIn, request: Request) -> PathQueueOut:
 
     cursor = await db.execute(
         "INSERT INTO path_queue (host_id, name, remote_path, local_path, staging_path, "
-        "enabled, sync_mode, auto_queue_enabled, auto_queue_patterns_only) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "enabled, sync_mode, auto_queue_enabled, auto_queue_patterns_only, "
+        "auto_verify, auto_extract, auto_move) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             host_row["id"],
             body.name,
@@ -269,6 +287,9 @@ async def create_queue(body: PathQueueIn, request: Request) -> PathQueueOut:
             body.sync_mode,
             1 if body.auto_queue_enabled else 0,
             1 if body.auto_queue_patterns_only else 0,
+            1 if _effective_auto_verify(body) else 0,
+            1 if body.auto_extract else 0,
+            1 if body.auto_move else 0,
         ),
     )
     await db.commit()
@@ -291,8 +312,8 @@ async def update_queue(queue_id: int, body: PathQueueIn, request: Request) -> Pa
     db = request.app.state.db
     cursor = await db.execute(
         "UPDATE path_queue SET name = ?, remote_path = ?, local_path = ?, staging_path = ?, "
-        "enabled = ?, sync_mode = ?, auto_queue_enabled = ?, auto_queue_patterns_only = ? "
-        "WHERE id = ?",
+        "enabled = ?, sync_mode = ?, auto_queue_enabled = ?, auto_queue_patterns_only = ?, "
+        "auto_verify = ?, auto_extract = ?, auto_move = ? WHERE id = ?",
         (
             body.name,
             body.remote_path,
@@ -302,6 +323,9 @@ async def update_queue(queue_id: int, body: PathQueueIn, request: Request) -> Pa
             body.sync_mode,
             1 if body.auto_queue_enabled else 0,
             1 if body.auto_queue_patterns_only else 0,
+            1 if _effective_auto_verify(body) else 0,
+            1 if body.auto_extract else 0,
+            1 if body.auto_move else 0,
             queue_id,
         ),
     )
@@ -484,3 +508,41 @@ async def pattern_preview(
             )
 
     return PatternPreviewResponse(items=items, sample_item=sample_item, sample_files=sample_files)
+
+
+# --- Post-processing (DESIGN.md §6, phase 5) ----------------------------------------------
+
+
+def _postprocess_out(s: PostprocessSettings) -> PostprocessSettingsOut:
+    return PostprocessSettingsOut(
+        verify_enabled=s.verify_enabled,
+        verify_hash_on_disk=s.verify_hash_on_disk,
+        extract_enabled=s.extract_enabled,
+        extract_target_dir=s.extract_target_dir,
+        extract_passwords=list(s.extract_passwords),
+        move_enabled=s.move_enabled,
+        concurrency=s.concurrency,
+    )
+
+
+@router.get("/postprocess", response_model=PostprocessSettingsOut)
+async def get_postprocess_settings(request: Request) -> PostprocessSettingsOut:
+    settings = await load_postprocess_settings(request.app.state.db)
+    return _postprocess_out(settings)
+
+
+@router.put("/postprocess", response_model=PostprocessSettingsOut)
+async def put_postprocess_settings(
+    body: PostprocessSettingsIn, request: Request
+) -> PostprocessSettingsOut:
+    settings = PostprocessSettings(
+        verify_enabled=body.verify_enabled,
+        verify_hash_on_disk=body.verify_hash_on_disk,
+        extract_enabled=body.extract_enabled,
+        extract_target_dir=body.extract_target_dir,
+        extract_passwords=tuple(body.extract_passwords),
+        move_enabled=body.move_enabled,
+        concurrency=max(1, body.concurrency),
+    )
+    await save_postprocess_settings(request.app.state.db, settings)
+    return _postprocess_out(settings)

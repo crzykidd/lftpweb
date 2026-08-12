@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import pytest
-
 from fastapi.testclient import TestClient
 
 from lftpweb.core.reconcile import ReconciledNode
@@ -155,26 +153,108 @@ def test_queue_crud(isolated_config):
         assert client.get("/api/settings/queues").json() == []
 
 
-@pytest.mark.parametrize("mode", ["move", "sync"])
-def test_unimplemented_sync_modes_are_rejected(isolated_config, mode):
+def test_unimplemented_sync_mode_sync_is_rejected(isolated_config):
     """A mode that silently behaves as `copy` is worse than one that isn't offered.
 
-    `sync_mode` accepts three values in the schema so phases 5 and beyond can drop in, but
-    only `copy` does anything today. Accepting `move` stored a setting an operator reasonably
-    reads as "my seedbox is being cleaned up" while the disk quietly filled instead. Found on
-    a real deployment.
+    `sync_mode` accepts three values in the schema so `sync` (unscheduled, DESIGN.md §7) can
+    drop in later without a migration, but it isn't implemented and must never be silently
+    accepted as if it were. `move` *is* implemented as of phase 5 -- see
+    `test_move_sync_mode_is_accepted` below -- so only `sync` is exercised here now.
     """
     body = {
         "name": "q",
         "remote_path": "/remote",
         "local_path": "/tmp/local",
         "enabled": True,
-        "sync_mode": mode,
+        "sync_mode": "sync",
     }
     with TestClient(app) as client:
         response = client.post("/api/settings/queues", json=body)
     assert response.status_code == 400
     assert "not available" in response.json()["detail"]
+
+
+# --- Phase 5: `move` mode is implemented; `auto_verify` is forced on for it (DESIGN.md §6) --
+
+
+def test_move_sync_mode_is_accepted(isolated_config):
+    with TestClient(app) as client:
+        queue = _make_host_and_queue(client, sync_mode="move")
+        assert queue["sync_mode"] == "move"
+
+
+def test_move_sync_mode_forces_auto_verify_on_even_if_not_requested(isolated_config):
+    """DESIGN.md §6: "For a queue in `move` or `sync` mode, `auto_verify` is forced on and
+    cannot be turned off in the UI." Enforced server-side (not just in the frontend form) so
+    a direct API call can't silently create a move queue that never verifies -- and therefore
+    never explains why it never deletes anything.
+    """
+    with TestClient(app) as client:
+        queue = _make_host_and_queue(client, sync_mode="move", auto_verify=False)
+        assert queue["auto_verify"] is True
+
+        resp = client.put(
+            f"/api/settings/queues/{queue['id']}",
+            json={
+                "name": queue["name"],
+                "remote_path": queue["remote_path"],
+                "local_path": queue["local_path"],
+                "sync_mode": "move",
+                "auto_verify": False,
+            },
+        )
+        assert resp.status_code == 200
+        assert resp.json()["auto_verify"] is True
+
+
+def test_copy_sync_mode_leaves_auto_verify_as_requested(isolated_config):
+    with TestClient(app) as client:
+        queue = _make_host_and_queue(client, sync_mode="copy", auto_verify=False)
+        assert queue["auto_verify"] is False
+
+
+def test_new_queue_defaults_postprocess_toggles_off(isolated_config):
+    """DESIGN.md §6 / this phase's non-negotiable: every post-processing step defaults off,
+    including for a queue created without specifying these fields at all.
+    """
+    with TestClient(app) as client:
+        queue = _make_host_and_queue(client)
+        assert queue["auto_verify"] is False
+        assert queue["auto_extract"] is False
+        assert queue["auto_move"] is False
+
+
+def test_postprocess_settings_round_trip_and_default_off(isolated_config):
+    with TestClient(app) as client:
+        resp = client.get("/api/settings/postprocess")
+        assert resp.status_code == 200
+        defaults = resp.json()
+        assert defaults["verify_enabled"] is False
+        assert defaults["extract_enabled"] is False
+        assert defaults["move_enabled"] is False
+        assert defaults["concurrency"] == 1
+
+        resp = client.put(
+            "/api/settings/postprocess",
+            json={
+                "verify_enabled": True,
+                "verify_hash_on_disk": True,
+                "extract_enabled": True,
+                "extract_target_dir": "/config/extracted",
+                "extract_passwords": ["hunter2", "letmein"],
+                "move_enabled": True,
+                "concurrency": 3,
+            },
+        )
+        assert resp.status_code == 200
+        saved = resp.json()
+        assert saved["verify_enabled"] is True
+        assert saved["extract_passwords"] == ["hunter2", "letmein"]
+        assert saved["concurrency"] == 3
+
+        # Persisted, not just echoed back.
+        resp = client.get("/api/settings/postprocess")
+        assert resp.json() == saved
 
 
 # --- Phase 4: queues carry auto-queue toggles, default off (DESIGN.md §4.7) ---------------

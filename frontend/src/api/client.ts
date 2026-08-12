@@ -12,6 +12,8 @@ import type {
   PatternOut,
   PatternPreviewRequest,
   PatternPreviewResponse,
+  PostprocessSettingsIn,
+  PostprocessSettingsOut,
   QueueAutoQueueStatus,
   StatsResponse,
   TestConnectionResponse,
@@ -114,6 +116,18 @@ export function previewPatterns(
     'POST',
     body,
   )
+}
+
+// --- Settings -> Post-processing (phase 5, DESIGN.md §6) --------------------------------
+
+export function getPostprocessSettings(): Promise<PostprocessSettingsOut> {
+  return getJson<PostprocessSettingsOut>('/api/settings/postprocess')
+}
+
+export function putPostprocessSettings(
+  body: PostprocessSettingsIn,
+): Promise<PostprocessSettingsOut> {
+  return sendJson<PostprocessSettingsOut>('/api/settings/postprocess', 'PUT', body)
 }
 
 // --- Files ---------------------------------------------------------------------------------

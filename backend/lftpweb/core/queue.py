@@ -181,6 +181,14 @@ class TransferQueue:
         # load_host_config so credential decryption has exactly one implementation. Injected
         # rather than imported directly to keep this module testable without the engine.
         self._host_provider = host_provider
+        # Phase 5 (DESIGN.md §6): set as a plain attribute after construction, not a
+        # constructor parameter — `main.py`'s lifespan builds `TransferQueue` before `Engine`
+        # (phase 4's ordering, needed so `AutoQueue` can use `enqueue_item`), and the
+        # postprocessing pipeline needs `Engine.pool` (the one pooled asyncssh connection,
+        # DESIGN.md §5/§7.4), which doesn't exist until `Engine` is constructed. `None` (every
+        # existing test's default) means postprocessing simply never triggers — not a crash,
+        # not a silent no-op that looks like a bug, just "this capability isn't wired up."
+        self.postprocess: Any = None
 
         self._running: dict[int, _RunningProcess] = {}  # job_id -> process
         self._backoff_until: dict[int, float] = {}  # item_id -> monotonic time
@@ -455,6 +463,13 @@ class TransferQueue:
             await self.db.commit()
             await self._publish_item_state(proc.item_id)
             proc.spawned.cleanup()
+            # Phase 5 (DESIGN.md §6): "triggered on transition to DOWNLOADED." Only for a
+            # top-level item — the same eligibility shape core/autoqueue.py uses — since a
+            # queued job is always for a top-level item (a whole release via `mirror`, or a
+            # loose top-level file via `pget`) and postprocessing operates on the release as
+            # a whole, not once per nested file/subdirectory item.
+            if self.postprocess is not None and "/" not in proc.rel_path:
+                self.postprocess.trigger(proc.item_id)
             return
 
         error_class = lftp.classify_output(tail)
