@@ -1,0 +1,34 @@
+lftpweb
+Copyright (C) 2026 crzykidd
+
+This program is free software: you can redistribute it and/or modify it under the
+terms of the GNU Affero General Public License as published by the Free Software
+Foundation, either version 3 of the License, or (at your option) any later version.
+See LICENSE for the full text.
+
+
+Third-party software distributed in the container image
+-------------------------------------------------------
+
+The lftpweb container image bundles unmodified third-party programs from the Alpine
+Linux package repositories. They are aggregated with lftpweb, not derived from it or
+linked into it — lftpweb invokes them as separate processes — so each remains under
+its own licence:
+
+  lftp             GPL-3.0-or-later   https://lftp.yar.ru/
+  openssh-client   BSD-style          https://www.openssh.com/
+  7zip (7zz)       LGPL-2.1-or-later, with the unRAR restriction applying to its
+                   RAR decoding code   https://www.7-zip.org/
+  su-exec          MIT                https://github.com/ncopa/su-exec
+  tini             MIT                https://github.com/krallin/tini
+
+Complete corresponding source for these packages is available from the Alpine Linux
+project at https://pkgs.alpinelinux.org/ — the image ships them unmodified, exactly as
+packaged there.
+
+Note on lftp: lftpweb runs lftp as a subprocess and communicates with it at arm's
+length. It does not link against lftp, and is not a derivative work of it.
+
+Note on 7zip's RAR support: 7-Zip's RAR decoder derives from the unRAR source, whose
+licence forbids using it to develop a RAR-compatible archiver. lftpweb only extracts
+archives; it never creates them.

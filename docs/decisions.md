@@ -6,6 +6,219 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-11 — Note: this session ran concurrently with another session bootstrapping the
+## GitHub repo — several unrelated files were dirty on disk throughout phase 3b
+
+> **Correction, added by the orchestrating session:** the concurrency was **deliberate, not
+> accidental.** The user asked for the repo-bootstrap work to run in parallel with phase 3b, and
+> the orchestrator ran both agents at once with an explicit file split — bootstrap owned
+> `.github/`, root docs, and `.claude/commands/`; 3b owned `frontend/`, `backend/`, `tests/`.
+> The genuine mistake was one-sided disclosure: **only the bootstrap agent was told another
+> agent was running.** Phase 3b discovered it from `git status` and reasonably concluded it was
+> uncoordinated. The lesson is not "avoid concurrency" but "tell *both* sides" — and the
+> skipped working-tree check below is why 3b found out late rather than up front. The merged
+> `prompts/startnewsession.md` was reviewed and is correct; both sessions' edits survive.
+
+**Not a phase 3b decision — a working-tree hazard worth recording so the merge is deliberate,
+not accidental.** Partway through building phase 3b, `git status --porcelain` turned up
+uncommitted changes to `CLAUDE.md`, `docker-compose.yml`, `standards.md`, and
+`prompts/startnewsession.md`, plus untracked `README.md`, `LICENSE`, `NOTICE`,
+`CHANGELOG.md`, `ruff.toml`, `docs/repo-setup.md`, `.github/workflows/`, `.claude/commands/`,
+and `prompts/done/2026-08-11-adopt-checkin-and-release-standards.md` — none of which this
+session touched or was asked to touch. Timestamps put every one of them inside this session's
+own working window, and their content (a GitHub repo URL, an AGPL-3.0 `LICENSE`, CI workflows,
+`code-checkin-and-pr`/`release-prep-and-cut` adoption) is a different, legitimate task: repo
+bootstrap. Another session was very likely running against the same working tree at the same
+time.
+
+**Why this matters here specifically:** `prompts/startnewsession.md` is a file both sessions
+needed to edit — the repo-bootstrap session had already added a "Repo, branches, and what has
+NOT been pushed" section and rewritten the Git-rules bullets by the time phase 3b's own update
+landed. This session's edit is additive on top of that content (new "Where we are" paragraph,
+phase table row, traps) rather than a rewrite, specifically to avoid clobbering it — but it was
+never coordinated with the other session, so a second concurrent save from either side after
+this one could still conflict. **Flagged for the user to review the merged diff on
+`prompts/startnewsession.md` deliberately**, rather than assuming either session's version is
+complete on its own. This session made no changes to any of the other-session files listed
+above.
+
+**Also: the phase 3b prompt's own "Working tree check" step (`git status --porcelain`, list
+uncommitted changes, ask first) was skipped at the start of this session** — it should have
+caught this before any code was written, not partway through. Recorded as a process gap, not
+just a one-off: a fresh session should run that check *before* reading DESIGN.md, not after.
+
+---
+
+## 2026-08-11 — Phase 3b: the WebSocket delta fix — `queue_snapshot` replaced by row-level
+## `queue_delta` / `item_delta`, proven proportional by test, not by inspection
+
+**The problem, stated precisely (docs/decisions.md's own phase 2 entry flagged this as
+scoped-down and warned phase 3 shouldn't inherit it by default — it did, until now).** Phase
+2's `core/engine.py.scan_queue` published one `queue_snapshot` — the complete node list —
+every time a queue finished scanning. Fine at a 30 s cadence over a few KB tree. Phase 3a
+added a ~1 Hz `ProgressSampler`; resending an entire queue's tree (which can run to thousands
+of file/directory rows on a real seedbox) to every connected browser every second would have
+made the WebSocket the bottleneck the whole no-PTY, no-`jobs -v`-parsing design was built to
+avoid elsewhere.
+
+**Fix, in two parts:**
+
+1. **`core/engine.py.diff_nodes`** — a pure function, `(old_nodes, new_nodes) ->
+   (changed, removed)`, using `ReconciledNode`'s existing frozen-dataclass equality. `scan_queue`
+   now diffs against `self.models[q.id]` before overwriting it, and publishes `queue_delta`
+   (`changed` + `removed` rel_paths) instead of the full tree. A full snapshot is sent exactly
+   once per connection, from `Engine.snapshot()` — unchanged in shape, just no longer also sent
+   on every scan.
+2. **`core/queue.py._publish_item_state`** — a one-row `item_delta`, published whenever a job
+   lifecycle transition changes an item's state outside a scan (queued, spawned, stopped,
+   failed, succeeded, requeued). Without this, the Files page only learned about a state change
+   on the *next* full engine scan (up to `scan_interval_s`, default 30 s) — far too slow for the
+   phase 3b prompt's own acceptance test ("stop it, and see it go STOPPED — all without a page
+   refresh"). `_sample_and_publish_progress` also now updates `item.local_size` and batches an
+   `item_delta` per queue for the currently-*running* items each tick — bounded by the active
+   set, never the tree, the same guarantee the pre-existing job-level `progress` message already
+   had.
+
+**Proven with a test, per the prompt's explicit instruction not to rely on inspection.**
+`tests/test_ws_deltas.py::test_scan_delta_payload_does_not_scale_with_tree_size` runs the
+identical 2-file mutation against a 20-item queue and a 5,000-item queue and asserts the
+*delta* payload grows by under 200 bytes while the *full snapshot* (what the old code sent
+every scan, and what a naive future change could regress to) grows over 100×. Measured live
+against the real fake seedbox during an actual transfer (throttled to 400 KB/s so there was
+time to observe several ticks): `progress` messages averaged **152 bytes** (121–156 byte
+range, n=11 ticks), `item_delta` messages averaged **188.5 bytes** (182–190 byte range, n=14),
+versus a **2,754-byte** full snapshot for the same 18-node fake-seedbox tree on connect — and
+that gap widens, not narrows, as the tree grows, per the unit test above.
+
+**Ambiguity resolved along the way, surfaced rather than silently decided:** DESIGN.md §2/§9
+never states whether the Files page's per-row live update (state chip, size) belongs on this
+same delta stream or is expected to wait for the next scan. Read literally, "one WebSocket
+delivering... deltas" doesn't specify granularity below "queue." Resolved toward the smallest
+useful unit (one item row) since anything coarser reintroduces exactly the scaling problem this
+fix exists to close.
+
+---
+
+## 2026-08-11 — Phase 3b: `core/queue.py.list_jobs()` broadened beyond `queued`/`running` —
+## DESIGN.md §9.2 requires the Transfers page to show terminal states it couldn't reach
+
+**Ambiguity found building the Transfers page, resolved with the smallest reasonable call.**
+Phase 3a's `list_jobs()` (`GET /api/jobs`) only ever selected `job.state IN ('queued',
+'running')` — deliberately, since that's what the *scheduler* needs to reason about. But
+DESIGN.md §9.2 states, in the same breath as describing this page, "**Failed rows show the
+error class and the captured lftp output tail**" — impossible under the old query, since the
+instant a job fails it's excluded from every future `list_jobs()` call, forever. The phase 3b
+prompt's own acceptance test has the same shape: "stop it, and see it go `STOPPED`... without a
+page refresh" — but a stopped job's state is `cancelled`, also excluded.
+
+**Fix:** `list_jobs()` now also includes a `failed`/`cancelled` job when it is that item's
+*most recent* job (`job.id = MAX(job.id) WHERE item_id = ...`). Self-healing by construction: a
+manual retry (`POST /api/items/{id}/retry`) inserts a fresh `queued` row for the same item,
+already covered by the first clause, which makes the old failed/cancelled row for that item no
+longer the most recent and it drops out of the query on its own — no separate "supersede" logic
+needed. `succeeded` jobs are deliberately **not** included; a freshly-completed item's row
+already reflects `DOWNLOADED` on the Files page via the WS delta fix above, and DESIGN.md
+positions History (the `job`/`event` audit trail) as the place a completed transfer's own job
+record lives, not the "job queue" page. Covered by `tests/test_transfers_list_jobs.py`.
+
+**Also added: `POST /api/items/{item_id}/stop`.** The Files page (unlike Transfers) only ever
+knows an *item*, never the job id currently servicing it — `GET /api/files` deliberately
+doesn't expose one (an item can outlive several job attempts). `TransferQueue.stop_item`
+resolves to the item's current active job, if any, and applies the same stop semantics as
+`stop_job`; returns `False` (not an error) when there's nothing to stop, matching `start_now`'s
+existing "no-op rather than pretend" shape. This is the one place the phase 3b prompt's claim
+that "the API you need already exists" didn't quite hold — every other action (Queue, Stop from
+Transfers, Retry, Move to top, Start now) mapped directly onto phase 3a's job-scoped API.
+
+---
+
+## 2026-08-11 — Phase 3b: the scan-abort bug (named out-of-scope by phase 3, DESIGN.md §5) —
+## fixed. One unreadable subtree now produces a warning, not a vanished tree
+
+**The bug, as phase 3 left it recorded:** `core/remote.py`'s primary scan path (`find
+<path> -mindepth 1 -printf ...`) treated *any* nonzero exit that wasn't the "-printf
+unsupported" signature as a hard failure, discarding the entire queue's tree. GNU `find` exits
+1 the moment it can't stat/read one subdirectory anywhere in the tree — even though it already
+printed every record it *could* reach to stdout, and kept scanning the rest. One
+permission-denied folder on the seedbox meant the whole Files page rendered empty (or reverted
+to its last-known state) with zero indication why.
+
+**Fix:** `interpret_primary_scan_result` (a pure function, unit-tested the same way
+`parse_find_records` is — no live SSH connection needed) classifies the exit: exit 0 is a clean
+success; the "-printf unsupported" signature still signals the busybox/BSD fallback path
+unchanged; a nonzero exit **with usable stdout** is a *partial* success — every record `find`
+did produce is kept, and a short human-readable warning (`_summarize_find_stderr`) is derived
+from stderr's `find: 'PATH': REASON` lines; a nonzero exit with **no** stdout at all (a
+genuinely bad path, or the root itself unreadable) still raises exactly as before — there's
+nothing to salvage. `RemoteConnectionPool.scan()` now returns `(entries, warning)`;
+`Engine.scan_queue` threads the warning through as a new `scan_warnings` map, surfaced on both
+`GET /api/files` (`QueueFiles.warning`) and the WebSocket (`queue_delta.warning`,
+`snapshot.queues[].warning`) — distinct from `scan_errors`/`error`, which still means the whole
+scan failed and the tree shown is stale.
+
+**Verified live against the real fake seedbox**, not just in unit tests:
+`docker/test-seedbox/seed_tree.sh` now seeds a `chmod 000 no-permission/secret/hidden.bin`
+subtree specifically for this. `tests/test_remote.py`'s live regression
+(`test_live_scan_skips_unreadable_subdirectory_instead_of_aborting`, skipped automatically
+without the fake seedbox up) confirms the rest of the tree scans normally, `no-permission`
+itself is visible (its own record is stat-able via its readable parent) but nothing beneath it
+is, and the warning names it. Reproduced again by hand through the running API during this
+phase's E2E verification: `GET /api/files` returned all 18 readable nodes plus `"warning": "1
+path skipped (could not be read): find: '/data/pickup/no-permission': Permission denied"`,
+`"error": null`.
+
+---
+
+## 2026-08-11 — Phase 3b: virtualization — `@tanstack/react-virtual`, deferred from phase 2
+## exactly as its own decision entry said it would be
+
+**Decision.** Phase 2 explicitly deferred adding a virtualization dependency "as a side effect
+of phase 2" rather than a deliberate choice (see this file's phase 2 entry, "the Files tree is
+not yet virtualized"). Phase 3b is where both the Files tree *and* the new item drawer need it
+(DESIGN.md §9.2 requires "smooth at 10k+ rows" for Files and calls the drawer "virtualized;
+a release can carry hundreds of files"), so the dependency decision is made once, here, for
+both.
+
+**Chosen: `@tanstack/react-virtual`.** Small (no runtime deps beyond React), headless (renders
+nothing itself — plain `<div>`s styled with Tailwind, matching the rest of the app rather than
+importing a component library's own row chrome), and actively maintained. `FileTree.tsx`
+flattens the collapsible tree into a visible-rows array respecting collapse state and
+virtualizes *that*, so collapsing a directory is just a shorter array, not a structural change
+to how virtualization works. `ItemDrawer.tsx` virtualizes its flat per-file list the same way.
+
+**Rejected: `react-window`.** Comparable size and maturity; `@tanstack/react-virtual` was
+preferred for API consistency with a `@tanstack/*` family already implicitly the closest match
+to what DESIGN.md's own §9 calls for elsewhere (see the next entry) — no strong technical
+reason either way.
+
+---
+
+## 2026-08-11 — Phase 3b: DESIGN.md §9's "TanStack Query for REST" was never adopted in
+## phases 1–3a, and phase 3b continues that deviation rather than introducing it mid-project
+
+**Deviation found, not created, by this session — surfaced because it was never recorded.**
+DESIGN.md §9 states plainly: "TanStack Query for REST; one WebSocket delivering a full model
+snapshot on connect and deltas thereafter." The WebSocket half was built faithfully starting in
+phase 2. The REST half was not: `frontend/src/api/client.ts` is a hand-rolled `fetch` wrapper,
+and data fetching uses a hand-rolled `usePoll` hook (`frontend/src/hooks/usePoll.ts`, dated to
+phase 1's `StatsHeader`) — no `@tanstack/react-query` dependency exists anywhere in
+`package.json` as of phase 3a's end, and nothing in `docs/decisions.md` recorded the
+substitution.
+
+**This phase's call: keep following the convention actually in the codebase.** `useJobs.ts`
+(new, phase 3b) is the same shape as `usePoll` — poll on an interval, expose the latest value —
+plus a `refresh()` escape hatch `usePoll` doesn't have, needed so an action (queue/stop/retry/
+move-to-top/start-now) can force an immediate refetch instead of waiting up to the poll
+interval for its own result to appear. Introducing TanStack Query now, mid-project, three
+phases after the convention diverged, would touch every existing data-fetching call site for a
+library swap unrelated to phase 3b's actual scope (the prompt's own conventions section:
+"don't restructure" the existing frontend structure). **Flagged here for a deliberate decision
+either way** — either DESIGN.md §9 should be corrected to describe what's actually built, or a
+future phase should do the TanStack Query migration as its own scoped piece of work, not as a
+side effect of whichever phase happens to touch data-fetching next.
+
+---
+
 ## 2026-08-11 — Phase 3: the live-retune experiment (§4.5) is **verified working**
 
 **Tested against a real running transfer, not left as a maybe.** Held `lftp`'s stdin open on a

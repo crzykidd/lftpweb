@@ -7,6 +7,13 @@ rules to honor, so a new session is productive even with no conversation memory.
 **Keep the "Where we are" section current.** Update it at the end of any phase or whenever a
 significant decision lands, in the same commit as the work.
 
+> **Note (2026-08-11):** phase 3b's session found this repo's working tree already dirty with
+> an *unrelated* concurrent session's repo-bootstrap edits (GitHub repo creation, `LICENSE`,
+> CI, `code-checkin-and-pr` adoption) mid-build, including to this very file. Phase 3b's own
+> edits below are additive on top of that content rather than a rewrite — see
+> `docs/decisions.md`'s "this session ran concurrently with another session" entry before
+> assuming either session's version of this file is the complete picture.
+
 ---
 
 ## What this project is
@@ -19,7 +26,9 @@ and optionally verifies / extracts / relocates finished items.
 - **Stack:** Python 3.13 / FastAPI / SQLite / asyncssh backend; React + TypeScript + Vite +
   Tailwind frontend; one Alpine container; lftp for transfers.
 - **First version:** `0.0.1`. Version lives in `backend/lftpweb/__init__.py`, bare (no `v`).
-- **Not yet on GitHub.** Local git only, no remote. Do not attempt to push.
+- **Licence: AGPL-3.0** (`LICENSE`). Bundled third-party programs in the image — lftp, OpenSSH,
+  7-Zip, su-exec, tini — are aggregated, not linked, and are recorded in `NOTICE`.
+- **Repo: https://github.com/crzykidd/lftpweb** — public, created 2026-08-11.
 
 ### The one idea everything hangs off
 
@@ -42,30 +51,66 @@ length — it is the single most important thing to read before touching the tra
 
 ---
 
+## Repo, branches, and what has NOT been pushed
+
+The GitHub repo exists and is **empty**. Nothing has been pushed yet — check before assuming.
+
+```
+* dev    all work lives here — every commit since repo init
+  main   still at the repo-init commit, 6+ commits behind
+```
+
+**The bootstrap ordering matters, and doing it out of order is annoying to undo:**
+
+1. Commit outstanding work on `dev`.
+2. **Fast-forward `main` to `dev` while no branch protection exists.**
+3. Push `main`, then `dev`.
+4. Enable CodeQL default setup; let CI run once so GitHub learns the check names.
+5. **Only then** apply branch protection with the required checks.
+
+Do step 5 first and the first action on the new repo is opening a PR to catch `main` up on the
+project's own history — which also can't merge until CI has run anyway. `docs/repo-setup.md`
+carries the full runbook.
+
+After protection is on, `code-checkin-and-pr`'s rules bind for real: never push to `main`, work
+on `dev`, land via PR.
+
 ## Where we are
 
-**Status: phases 1–3 done.** `DESIGN.md` is settled and reviewed. The skeleton (phase 1),
-scanning + reconciliation + read-only Files view (phase 2), and the transfer engine + scheduler
-(phase 3) all exist and are verified — see `prompts/done/2026-08-11-phase1-skeleton-and-container.md`,
-`prompts/done/2026-08-11-phase2-scanning-and-model.md`, and
-`prompts/done/2026-08-11-phase3a-transfer-engine.md` for the exact commands run. **lftp now
-actually moves bytes** — queue/stop/retry/move-to-top/start-now all work end to end through the
-real API against the fake seedbox, verified with checksums, a real mid-transfer stop, and a
-real resume from partial.
+**Status: phases 1–3 (including 3b) done.** `DESIGN.md` is settled and reviewed. The skeleton
+(phase 1), scanning + reconciliation + read-only Files view (phase 2), the transfer engine +
+scheduler (phase 3a), and the Transfers page / item drawer / Files actions / WebSocket delta fix
+(phase 3b) all exist and are verified — see
+`prompts/done/2026-08-11-phase1-skeleton-and-container.md`,
+`prompts/done/2026-08-11-phase2-scanning-and-model.md`,
+`prompts/done/2026-08-11-phase3a-transfer-engine.md`, and
+`prompts/done/2026-08-11-phase3b-transfers-ui.md` for the exact commands run. **lftp now
+actually moves bytes, and the UI shows it happening live** — queue from Files, watch progress on
+Transfers, open the drawer, stop it and see `STOPPED` with no page refresh, all verified end to
+end through the real API and a real WebSocket client against the fake seedbox.
 
 | Phase (`DESIGN.md` §13) | State |
 |---|---|
 | 1 — Skeleton + container | **done** (2026-08-11) |
 | 2 — Scanning + model | **done** (2026-08-11) |
-| 3 — Transfer engine + scheduler | **done** (2026-08-11) — backend only; Transfers UI + item drawer are 3b |
+| 3a — Transfer engine + scheduler (backend) | **done** (2026-08-11) |
+| 3b — Transfers UI, item drawer, WebSocket delta fix | **done** (2026-08-11) |
 | 4–9 | not started |
 | `sync` mode | **not scheduled** — designed in §7, built only if it proves wanted |
 
 **Current instruction:** build phases 1–3, one at a time — write the handoff prompt, execute it
 via a spawned agent, validate, surface any major design decisions found during the build, then
-stop after phase 3. **Phase 3 is done; the instruction's stopping point has been reached.**
-Next up, when resumed: either phase 3b (Transfers UI + item drawer, consuming the API phase 3a
-built) or phase 4 (auto-queue + patterns) — not decided yet, ask before proceeding.
+**stop after phase 3**. **Phase 3 (3a + 3b) is now fully done — this is the last phase being
+built for now, per that instruction.** Phases 4–9 remain (auto-queue + patterns, post-processing,
+sync mode design already exists but is unscheduled, auth, backup, polish) and **none of them are
+authorised yet — ask before starting phase 4 or any later phase.**
+
+**The most valuable next step is not a phase.** Everything so far is verified against the
+synthetic fake seedbox — two containers on localhost with a 26 MB tree. Run it against the
+user's real seedbox before building more: does `find -printf` exist there (§15.7 has always
+flagged this), how long does a full scan of a real tree take (the 30 s cadence is a guess), and
+does the connection ceiling hold (2 jobs × 4 parallel × 4 pget-n = 32 sessions, which many
+seedboxes refuse)? That could change what phase 4 should be.
 
 App ports are **8087** (API/SPA) and **5187** (Vite dev server) — not the more obvious
 8080/5173 — chosen to avoid collisions with other stacks on the shared build host. See
@@ -114,9 +159,34 @@ sampler-breaking 10s; and `GET /api/files` was serving a state that a stop/queue
 never actually reach until it was pointed at the database instead of the scan-only in-memory
 model.
 
+**Phase 3b, in one paragraph:** the WebSocket delta fix landed first, because it constrains
+everything else — `core/engine.py.diff_nodes` turns `scan_queue`'s full-tree publish into a
+`changed`/`removed` delta, and `core/queue.py._publish_item_state` pushes single-item deltas on
+every lifecycle transition plus a per-tick batch for the active set, so the Files page updates
+live without the WebSocket ever resending a whole queue's tree (proven by test across a 20-item
+and a 5,000-item tree, and measured live: ~152–189 bytes/message vs. a 2,754-byte full snapshot
+for the fake seedbox's 18-node tree). The Transfers page (`TransfersPage.tsx`) shows the
+three-word visible vocabulary from DESIGN.md §9.2 with `STOPPED`/`FAILED` surfacing where they
+apply, both allocated and current rate, and a one-time inline explanation for "Start now."
+`ItemDrawer.tsx` is the side drawer (not a modal), `FileTree.tsx` gained virtualization
+(`@tanstack/react-virtual`), multi-select with shift-range, and per-row/bulk Queue/Stop actions.
+Two backend gaps found wiring the UI to the phase 3a API: `list_jobs()` excluded every
+failed/cancelled job, which made DESIGN.md §9.2's own "failed rows show the error class" and the
+phase 3b prompt's "stop it and see it go STOPPED" both impossible — fixed by including an item's
+*most recent* terminal job; and the Files page had no way to stop an item at all (only
+job-scoped `POST /api/jobs/{id}/stop` existed) — fixed by adding `POST /api/items/{id}/stop`.
+Also fixed, out-of-scope-turned-in-scope per the phase 3b prompt: the phase-2 scan-abort bug
+(one permission-denied subdirectory used to discard an entire queue's tree) — now a partial
+scan plus a surfaced warning. Full detail, including two deliberately-flagged design deviations
+(TanStack Query never adopted; a new `@tanstack/react-virtual` dependency), in
+`docs/decisions.md`'s phase 3b entries.
+
 **Commits so far:** repo init + standard adoption, the design revisions, phase 1 (`b0109ae`),
-phase 2 (`de6d74b`). All on `dev`. Phase 3's work is prepared on the working tree but **not yet
-committed** — see the phase 3 prompt's final report for the proposed commit.
+phase 2 (`de6d74b`), phase 3a (`36b9123`). All on `dev`. Phase 3b's work is prepared on the
+working tree but **not yet committed** — see the phase 3b prompt's final report for the proposed
+commit. (Separately, and unrelated to phase 3b: a concurrent session appears to have GitHub
+repo-bootstrap work in progress on this same working tree as of this note — see the "Note"
+under this file's title and `docs/decisions.md`.)
 
 ---
 
@@ -137,9 +207,16 @@ committed** — see the phase 3 prompt's final report for the proposed commit.
   auto-commit, never push.
 
 **Git**
-- Day-to-day work is on `dev`. `main` exists but is left alone.
-- `code-checkin-and-pr` is **not adopted** (no remote yet), but its conventions are followed
-  voluntarily: `feat:` / `fix:` / `chore:` / `docs:` prefixes, no `Co-authored-by:` trailers.
+- Day-to-day work is on `dev`.
+- **Never a `Co-authored-by:` trailer** — explicitly reaffirmed by the user 2026-08-11, and true
+  of every commit in the history so far. Conventional-Commit prefixes required:
+  `feat:` / `fix:` / `chore:` / `docs:`.
+- `code-checkin-and-pr` and `release-prep-and-cut` were adopted 2026-08-11 alongside repo
+  creation; `standards.md` is the in-repo source of truth for what is actually wired. Until
+  branch protection is applied (see the bootstrap ordering above), treat `main` as
+  push-once-then-protected rather than already-protected.
+- `repo-sandbox-permissions` is **deliberately not adopted** — dedicated dev host, same call
+  the user made when de-adopting it from AmmoLedger. Don't "helpfully" add it.
 
 **Docs**
 - Non-obvious decisions go in `docs/decisions.md`, newest at top, with rejected alternatives.
@@ -219,3 +296,30 @@ These are the places where the obvious implementation is wrong. Each is written 
 - **A leading blank line in an lftp `-c`/`source`d script corrupts quote-stripping on the next
   `set key "value with spaces"` line** (found in phase 3, real lftp 4.9.2). Reproducible on
   demand; `core/lftp.py.build_rc_text` never emits one.
+- **Never publish a full node list except on WebSocket connect** (found/fixed in phase 3b, see
+  `docs/decisions.md`). Every update after the initial `snapshot` must be a `queue_delta`
+  (`core/engine.py.diff_nodes`, scan-driven) or an `item_delta` (`core/queue.py`, lifecycle- or
+  progress-tick-driven) — both proportional to what changed, never to tree size. A future change
+  that starts putting a full `nodes` array on anything but the connect-time `snapshot` message
+  is this same regression coming back.
+- **GNU `find -printf` exits nonzero the instant it can't read *one* subdirectory, but keeps
+  scanning everything else and still prints what it found** (named in phase 3, fixed in phase
+  3b — see `docs/decisions.md`). Any nonzero exit with usable stdout is a *partial* success
+  (`core/remote.py.interpret_primary_scan_result`), not a hard failure — only an exit with *no*
+  stdout at all means the scan genuinely failed.
+- **`core/queue.py.list_jobs()` is not "queued + running jobs" — it also includes an item's most
+  recent `failed`/`cancelled` job** (found in phase 3b). DESIGN.md §9.2 requires the Transfers
+  page to show failed rows' error class/output tail and a stopped row going `STOPPED`; the
+  phase 3a query structurally couldn't produce either, since a job vanishes from that query the
+  instant it stops being active. A manual retry's fresh `queued` row naturally supersedes the
+  old terminal one — no separate cleanup needed.
+- **The Files page needs `POST /api/items/{id}/stop`, not `POST /api/jobs/{id}/stop`** (added in
+  phase 3b). Unlike the Transfers page, the Files page only ever has an item id, never the job
+  id currently servicing it — `GET /api/files` deliberately doesn't expose one, since an item
+  can outlive several job attempts. `TransferQueue.stop_item` resolves item → active job.
+- **DESIGN.md §9's "TanStack Query for REST" was never actually adopted** (found in phase 3b,
+  flagged rather than silently followed or silently fixed). Phases 1–3a built a hand-rolled
+  `fetch` client + poll hook instead, with no record of the substitution. Phase 3b's `useJobs.ts`
+  continues that convention on purpose rather than introducing the library mid-project — a
+  future session should either correct DESIGN.md §9 or do the migration as its own scoped phase,
+  not as a side effect of whichever phase next touches data-fetching.
