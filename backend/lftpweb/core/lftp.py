@@ -61,6 +61,12 @@ DEFAULT_RUN_DIR = "/run/lftpweb"
 
 # ~4 KB tail kept on the `job` row (DESIGN.md §3.1/§4.3) — enough for a human to see *why*,
 # never the whole transcript (that would start drifting toward "parse this for progress").
+# Bounded so a connection that cannot succeed fails fast instead of retrying forever — see
+# the block in `build_rc_text` for what happened when these were left at lftp's defaults.
+DEFAULT_MAX_RETRIES = 3
+DEFAULT_NET_TIMEOUT_S = 30
+DEFAULT_RECONNECT_INTERVAL_BASE_S = 5
+
 OUTPUT_TAIL_BYTES = 4096
 
 JobKind = Literal["mirror", "pget"]
@@ -187,6 +193,9 @@ def build_rc_text(
     pget_n: int,
     save_status_interval_s: int,
     extra_settings: str,
+    max_retries: int = DEFAULT_MAX_RETRIES,
+    net_timeout_s: int = DEFAULT_NET_TIMEOUT_S,
+    reconnect_interval_base_s: int = DEFAULT_RECONNECT_INTERVAL_BASE_S,
 ) -> str:
     """The sourced rc file's content — credentials plus per-job tuning. Never starts with a
     blank line (see the module docstring's lftp-quirk note). Every line is a `set` or `open`
@@ -201,6 +210,21 @@ def build_rc_text(
         # sidecar simply didn't exist yet at the 1s/2s/3s marks under the default). This is the
         # one non-obvious tunable this module owns that DESIGN.md doesn't mention.
         f"set pget:save-status {save_status_interval_s}s;",
+        # Bounded retries and timeouts, always set — never left to lftp's defaults.
+        #
+        # Without these, a connection that cannot succeed (bad host key, refused auth, dead
+        # route) makes lftp retry *forever*: the process never exits, so the supervisor never
+        # sees a non-zero exit, `classify_output` never runs, and the job sits at
+        # "DOWNLOADING, 0 bytes" indefinitely with nothing in the log. Observed against a real
+        # seedbox — a 16-byte file "downloading" for minutes. A transfer that cannot start
+        # must fail loudly and quickly, so the error class reaches the UI (§4.3).
+        #
+        # DESIGN.md §9.3 lists these as host-level knobs; they were in the design's knob list
+        # but had never been written to the rc file.
+        f"set net:max-retries {max_retries};",
+        f"set net:timeout {net_timeout_s}s;",
+        f"set net:reconnect-interval-base {reconnect_interval_base_s}s;",
+        "set net:reconnect-interval-multiplier 1.5;",
         # DESIGN.md §4.4b: in-flight files carry a `.lftp` suffix so `core/local_scan.py`'s
         # temp-suffix handling has something to strip. lftp's own defaults are `no` / `.in.*`.
         "set xfer:use-temp-file yes;",

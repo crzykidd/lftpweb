@@ -299,3 +299,24 @@ def test_quoting_escapes_embedded_single_quotes():
         exclude_globs=(),
     )
     assert cmd == "pget -c -n 1 '/remote/it'\\''s a file.mkv' -o '/downloads/it'\\''s a file.mkv'"
+
+
+def test_rc_always_bounds_retries_and_timeouts():
+    """A connection that cannot succeed must fail fast, not retry forever.
+
+    lftp's defaults retry indefinitely, so a bad host key or refused auth produced a process
+    that never exited: the supervisor never saw a non-zero exit, `classify_output` never ran,
+    and the job sat at DOWNLOADING/0 bytes with nothing in the log. Observed against a real
+    seedbox. These settings are what turn that hang into a reportable failure.
+    """
+    creds = HostCreds(
+        address="h", port=22, username="u", auth_method="password", key_path=None,
+        password="p", known_hosts_policy="insecure", pinned_host_key=None,
+    )
+    rc = build_rc_text(
+        creds, None, rate_limit_bps=None, connection_limit=None, parallel=1, pget_n=1,
+        save_status_interval_s=1, extra_settings="",
+    )
+    assert "set net:max-retries 3;" in rc
+    assert "set net:timeout 30s;" in rc
+    assert "set net:reconnect-interval-base 5s;" in rc
