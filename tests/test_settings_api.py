@@ -4,6 +4,7 @@ import pytest
 
 from fastapi.testclient import TestClient
 
+from lftpweb.core.reconcile import ReconciledNode
 from lftpweb.main import app
 
 
@@ -174,3 +175,195 @@ def test_unimplemented_sync_modes_are_rejected(isolated_config, mode):
         response = client.post("/api/settings/queues", json=body)
     assert response.status_code == 400
     assert "not available" in response.json()["detail"]
+
+
+# --- Phase 4: queues carry auto-queue toggles, default off (DESIGN.md §4.7) ---------------
+
+
+def _make_host_and_queue(client, **queue_overrides):
+    client.put(
+        "/api/settings/host",
+        json={
+            "name": "seedbox",
+            "address": "example.invalid",
+            "username": "seeduser",
+            "auth_method": "password",
+            "password": "hunter2",
+        },
+    )
+    body = {"name": "TV", "remote_path": "/data/tv", "local_path": "/downloads/tv"}
+    body.update(queue_overrides)
+    resp = client.post("/api/settings/queues", json=body)
+    assert resp.status_code == 201
+    return resp.json()
+
+
+def test_new_queue_defaults_auto_queue_off(isolated_config):
+    with TestClient(app) as client:
+        queue = _make_host_and_queue(client)
+        assert queue["auto_queue_enabled"] is False
+        assert queue["auto_queue_patterns_only"] is False
+
+
+def test_auto_queue_toggle_is_an_explicit_opt_in(isolated_config):
+    with TestClient(app) as client:
+        queue = _make_host_and_queue(client)
+        resp = client.put(
+            f"/api/settings/queues/{queue['id']}",
+            json={
+                "name": queue["name"],
+                "remote_path": queue["remote_path"],
+                "local_path": queue["local_path"],
+                "auto_queue_enabled": True,
+                "auto_queue_patterns_only": True,
+            },
+        )
+        assert resp.status_code == 200
+        assert resp.json()["auto_queue_enabled"] is True
+        assert resp.json()["auto_queue_patterns_only"] is True
+
+
+# --- Phase 4: pattern CRUD, global and per-queue (DESIGN.md §3.1 `pattern`, §4.7) ---------
+
+
+def test_pattern_crud_and_global_vs_queue_scope(isolated_config):
+    with TestClient(app) as client:
+        queue = _make_host_and_queue(client)
+
+        resp = client.post(
+            "/api/settings/patterns",
+            json={"queue_id": queue["id"], "kind": "file_exclude", "expr": "*.nfo"},
+        )
+        assert resp.status_code == 201
+        pattern = resp.json()
+        assert pattern["kind"] == "file_exclude"
+
+        resp = client.post(
+            "/api/settings/patterns", json={"queue_id": None, "kind": "skip", "expr": "*SAMPLE*"}
+        )
+        assert resp.status_code == 201
+        global_pattern = resp.json()
+        assert global_pattern["queue_id"] is None
+
+        # Scoped listing returns both the queue's own and the global one.
+        resp = client.get(f"/api/settings/patterns?queue_id={queue['id']}")
+        assert {p["id"] for p in resp.json()} == {pattern["id"], global_pattern["id"]}
+
+        resp = client.put(
+            f"/api/settings/patterns/{pattern['id']}",
+            json={
+                "queue_id": queue["id"],
+                "kind": "file_exclude",
+                "expr": "*.sfv",
+                "enabled": False,
+            },
+        )
+        assert resp.status_code == 200
+        assert resp.json()["expr"] == "*.sfv"
+        assert resp.json()["enabled"] is False
+
+        resp = client.delete(f"/api/settings/patterns/{pattern['id']}")
+        assert resp.status_code == 204
+        resp = client.get(f"/api/settings/patterns?queue_id={queue['id']}")
+        assert {p["id"] for p in resp.json()} == {global_pattern["id"]}
+
+
+def test_pattern_not_found_returns_404(isolated_config):
+    with TestClient(app) as client:
+        assert (
+            client.put(
+                "/api/settings/patterns/9999", json={"kind": "select", "expr": "*"}
+            ).status_code
+            == 404
+        )
+        assert client.delete("/api/settings/patterns/9999").status_code == 404
+
+
+# --- Phase 4: the live pattern preview (DESIGN.md §4.7, §9.2) -----------------------------
+
+
+def test_pattern_preview_shows_selected_skipped_and_excluded_without_saving(isolated_config):
+    with TestClient(app) as client:
+        queue = _make_host_and_queue(client)
+
+        # Seed the engine's in-memory model directly -- what a real scan would populate --
+        # so the preview can run without a live seedbox connection.
+        app.state.engine.models[queue["id"]] = {
+            "Wanted.Release": ReconciledNode(
+                rel_path="Wanted.Release",
+                is_dir=True,
+                state="REMOTE_ONLY",
+                remote_size=1500,
+                local_size=None,
+                remote_mtime=None,
+            ),
+            "Wanted.Release/movie.mkv": ReconciledNode(
+                rel_path="Wanted.Release/movie.mkv",
+                is_dir=False,
+                state="REMOTE_ONLY",
+                remote_size=1000,
+                local_size=None,
+                remote_mtime=1.0,
+            ),
+            "Wanted.Release/notes.nfo": ReconciledNode(
+                rel_path="Wanted.Release/notes.nfo",
+                is_dir=False,
+                state="REMOTE_ONLY",
+                remote_size=5,
+                local_size=None,
+                remote_mtime=1.0,
+            ),
+            "Unwanted.Sample": ReconciledNode(
+                rel_path="Unwanted.Sample",
+                is_dir=True,
+                state="REMOTE_ONLY",
+                remote_size=10,
+                local_size=None,
+                remote_mtime=None,
+            ),
+        }
+
+        resp = client.post(
+            f"/api/settings/queues/{queue['id']}/pattern-preview",
+            json={
+                "patterns": [
+                    {"kind": "select", "expr": "Wanted*"},
+                    {"kind": "skip", "expr": "*Sample*"},
+                    {"kind": "file_exclude", "expr": "*.nfo"},
+                ],
+                "patterns_only": False,
+            },
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+
+        by_path = {item["rel_path"]: item["matched"] for item in body["items"]}
+        assert by_path["Wanted.Release"] is True
+        assert by_path["Unwanted.Sample"] is False  # skip beats select
+
+        assert body["sample_item"] == "Wanted.Release"
+        excluded_by_path = {f["rel_path"]: f["excluded"] for f in body["sample_files"]}
+        assert excluded_by_path["Wanted.Release/movie.mkv"] is False
+        assert excluded_by_path["Wanted.Release/notes.nfo"] is True
+
+
+def test_pattern_preview_unknown_queue_is_404(isolated_config):
+    with TestClient(app) as client:
+        resp = client.post("/api/settings/queues/9999/pattern-preview", json={"patterns": []})
+        assert resp.status_code == 404
+
+
+# --- Phase 4: the mount-gate status read (DESIGN.md §7.3) --------------------------------
+
+
+def test_autoqueue_status_reports_mount_not_ok_before_any_scan(isolated_config, tmp_path):
+    with TestClient(app) as client:
+        queue = _make_host_and_queue(client, local_path=str(tmp_path / "never-scanned"))
+        resp = client.get(f"/api/settings/queues/{queue['id']}/autoqueue-status")
+        assert resp.status_code == 200
+        assert resp.json()["mount_ok"] is False
+
+
+def test_autoqueue_status_unknown_queue_is_404(isolated_config):
+    with TestClient(app) as client:
+        assert client.get("/api/settings/queues/9999/autoqueue-status").status_code == 404

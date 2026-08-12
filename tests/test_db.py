@@ -37,7 +37,11 @@ async def test_migrate_is_idempotent(tmp_path):
 
         cursor = await conn.execute("SELECT COUNT(*) FROM schema_version")
         (count,) = await cursor.fetchone()
-        assert count == 1  # migration 001 recorded exactly once
+        # Every migration file recorded exactly once -- not hardcoded to "1", since that
+        # made this test fail the instant migration 002 (phase 4) was added even though
+        # idempotency itself was never in question. See db_module.MIGRATIONS_DIR.
+        expected = len(list(db_module.MIGRATIONS_DIR.glob("*.sql")))
+        assert count == expected
     finally:
         await conn.close()
 

@@ -95,7 +95,7 @@ end through the real API and a real WebSocket client against the fake seedbox.
 | 2 — Scanning + model | **done** (2026-08-11) |
 | 3a — Transfer engine + scheduler (backend) | **done** (2026-08-11) |
 | 3b — Transfers UI, item drawer, WebSocket delta fix | **done** (2026-08-11) |
-| 4 — Auto-queue + patterns | overnight run 2026-08-11 |
+| 4 — Auto-queue + patterns | **prepared, not committed** (2026-08-11) — see below |
 | 5 — Post-processing + `move` | overnight run 2026-08-11 |
 | 6 — History page | overnight run 2026-08-11 |
 | 7 — Operations (logs, backup) | overnight run 2026-08-11 |
@@ -215,12 +215,42 @@ scan plus a surfaced warning. Full detail, including two deliberately-flagged de
 (TanStack Query never adopted; a new `@tanstack/react-virtual` dependency), in
 `docs/decisions.md`'s phase 3b entries.
 
+**Phase 4, in one paragraph:** `core/patterns.py` is the one evaluator DESIGN.md §12 requires —
+`select`/`skip` (item-name, case-insensitive, glob-when-metacharacters-else-substring, skip
+beats select, empty-select matches everything unless *patterns-only*) and `file_exclude`
+(file basename, any depth, also applied to loose top-level file items). It feeds two
+consumers: `core/reconcile.py`'s `counts_predicate` seam (phase 2 left it; a matched file is
+now marked `EXCLUDED` — a real state, not an absence — and doesn't count toward its parent
+directory's completeness, so a `*.nfo` file_exclude leaves a release `DOWNLOADED` instead of
+permanently `PARTIAL`), and `core/queue.py._spawn_decision`'s `exclude_globs` for lftp's own
+`--exclude-glob`. `core/autoqueue.py` evaluates every eligible (`REMOTE_ONLY`/`PARTIAL`,
+unsuppressed) top-level item against the compiled patterns at the end of every scan pass —
+retroactive by construction, since it re-queries the whole known model rather than tracking
+"newly seen" itself — and skips anything `auto_queue_suppressed` or in `STOPPED`/`FAILED`/
+`REMOVED_LOCAL`/`REMOVED_BOTH`. **The mount sentinel and grace period landed here, not with
+`sync`**, per this file's own 2026-08-11 entry: `core/mount_sentinel.py` writes/checks
+`.lftpweb-mount-ok` at a queue's local root, `AutoQueue.on_scan()` refuses to act on
+*anything* for a queue whose gate fails, and `resolve_absence()` — a pure function wired into
+`core/engine.py._persist` — implements DESIGN.md §3.2 rule 3's `REMOVED_LOCAL` transition
+with the ~10 minute grace period, which this phase had to build from scratch since phases 2-3
+explicitly left it undone. Auto-queue and *patterns-only* both default off per queue
+(migration 002 adds the one new column, `DEFAULT 0`, changing nothing for any existing row).
+API: pattern CRUD, a live "what would this match" preview endpoint, and a queue-level
+mount-gate status read. UI: Settings → Queues gained the two toggles and a patterns editor
+with that live preview. Verified against the real fake seedbox
+(`tests/test_autoqueue_e2e.py`): a `file_exclude` of `*.nfo` drove `AutoQueue` to queue a real
+release, the `.mkv`/`.srt` arrived byte-exact, the `.nfo` never did, and the item reached
+`DOWNLOADED`. Every decision made unattended is in `docs/decisions.md`'s phase 4 entry,
+including two rejected alternatives worth a second look: whether `file_exclude` should support
+path-aware (not just basename) matching, and whether the grace period belongs in the Settings
+UI now rather than later.
+
 **Commits so far:** repo init + standard adoption, the design revisions, phase 1 (`b0109ae`),
-phase 2 (`de6d74b`), phase 3a (`36b9123`). All on `dev`. Phase 3b's work is prepared on the
-working tree but **not yet committed** — see the phase 3b prompt's final report for the proposed
-commit. (Separately, and unrelated to phase 3b: a concurrent session appears to have GitHub
-repo-bootstrap work in progress on this same working tree as of this note — see the "Note"
-under this file's title and `docs/decisions.md`.)
+phase 2 (`de6d74b`), phase 3a (`36b9123`). All on `dev`. Phase 3b's and phase 4's work are
+both prepared on the working tree but **not yet committed** — see the phase 3b and phase 4
+prompts' final reports for the proposed commits. (Separately, and unrelated to either phase: a
+concurrent session appears to have GitHub repo-bootstrap work in progress on this same working
+tree as of this note — see the "Note" under this file's title and `docs/decisions.md`.)
 
 ---
 
@@ -351,6 +381,21 @@ These are the places where the obvious implementation is wrong. Each is written 
   phase 3b). Unlike the Transfers page, the Files page only ever has an item id, never the job
   id currently servicing it — `GET /api/files` deliberately doesn't expose one, since an item
   can outlive several job attempts. `TransferQueue.stop_item` resolves item → active job.
+- **A `file_exclude` pattern must reach the reconciler, not just lftp's `--exclude-glob`**
+  (phase 4). `core/patterns.py.build_counts_predicate` marks the matched file `EXCLUDED` and
+  removes it from its parent directory's completeness accounting; skip this and every
+  filtered release sits `PARTIAL` forever. `core/reconcile.py` and `core/queue.py` both
+  consume the identical compiled pattern set for exactly this reason — see docs/decisions.md.
+- **`CompiledPatterns.compile()` iterating its input three times silently breaks on a
+  generator** (found building the pattern-preview endpoint, phase 4, before it ever shipped).
+  Fixed by materializing the iterable first. A reminder that "one evaluator, two consumers"
+  doesn't protect against a bug *inside* the evaluator itself.
+- **The mount gate blocks all auto-queue action for a queue, not just the `REMOVED_LOCAL`
+  transition** (phase 4). A blanket per-queue check (`AutoQueue.on_scan` returns immediately
+  if `core/mount_sentinel.py.check()` fails) is what also protects a **brand-new** queue
+  whose local root never mounted — every item would read `REMOTE_ONLY` from the very first
+  scan, with no history to compare against, so only a blanket gate stops auto-queue from
+  queueing transfers into a directory that isn't really there.
 - **DESIGN.md §9's "TanStack Query for REST" was never actually adopted** (found in phase 3b,
   flagged rather than silently followed or silently fixed). Phases 1–3a built a hand-rolled
   `fetch` client + poll hook instead, with no record of the substitution. Phase 3b's `useJobs.ts`

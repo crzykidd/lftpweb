@@ -3,8 +3,10 @@ from __future__ import annotations
 import pytest
 
 from lftpweb.core.local_scan import LocalEntry
+from lftpweb.core.patterns import CompiledPatterns, Pattern, build_counts_predicate
 from lftpweb.core.reconcile import (
     STATE_DOWNLOADED,
+    STATE_EXCLUDED,
     STATE_LOCAL_ONLY,
     STATE_PARTIAL,
     STATE_REMOTE_ONLY,
@@ -189,3 +191,100 @@ def test_counts_predicate_seam_excludes_a_file_from_completeness():
 
     with_predicate = reconcile(remote_tree, local_tree, counts_predicate=exclude_nfo)
     assert with_predicate["Release"].state == STATE_DOWNLOADED
+
+
+# --- Phase 4: core/patterns.py wired through the counts_predicate seam (DESIGN.md §4.7,
+# §3.2 rule 8) -- the single highest-value test in the phase, per its own prompt: a
+# `file_exclude` of `*.nfo` must leave its release DOWNLOADED, never permanently PARTIAL. ---
+
+
+def test_file_exclude_pattern_leaves_release_downloaded_not_partial():
+    remote_tree = _tree(
+        RemoteEntry("Release", True, 0, 1.0),
+        RemoteEntry("Release/movie.mkv", False, 1000, 1.0),
+        RemoteEntry("Release/notes.nfo", False, 5, 1.0),
+    )
+    local_tree = _local(
+        LocalEntry("Release", True),
+        LocalEntry("Release/movie.mkv", False, 1000),
+        # notes.nfo never arrives -- lftp was given --exclude-glob '*.nfo' for it.
+    )
+    compiled = CompiledPatterns.compile([Pattern(kind="file_exclude", expr="*.nfo")])
+    predicate = build_counts_predicate(compiled)
+
+    nodes = reconcile(remote_tree, local_tree, counts_predicate=predicate)
+
+    assert nodes["Release"].state == STATE_DOWNLOADED
+    assert nodes["Release/movie.mkv"].state == STATE_DOWNLOADED
+    # EXCLUDED, not REMOTE_ONLY -- a real state, not an absence (§3.2 rule 8).
+    assert nodes["Release/notes.nfo"].state == STATE_EXCLUDED
+
+
+def test_directory_whose_children_are_all_excluded_is_downloaded_without_a_local_directory():
+    # lftp does not create a directory it has nothing to put in, so the local directory may
+    # legitimately not exist at all -- completeness must not require it (§4.7, §3.2 rule 8).
+    remote_tree = _tree(
+        RemoteEntry("AllSamples", True, 0, 1.0),
+        RemoteEntry("AllSamples/a.sample.mkv", False, 100, 1.0),
+        RemoteEntry("AllSamples/b.sample.mkv", False, 200, 1.0),
+    )
+    local_tree: dict = {}  # nothing local at all -- not even the directory itself
+    compiled = CompiledPatterns.compile([Pattern(kind="file_exclude", expr="*sample*")])
+    predicate = build_counts_predicate(compiled)
+
+    nodes = reconcile(remote_tree, local_tree, counts_predicate=predicate)
+
+    assert nodes["AllSamples"].state == STATE_DOWNLOADED
+    assert nodes["AllSamples"].local_size is None  # never scanned locally -- never existed
+    assert nodes["AllSamples/a.sample.mkv"].state == STATE_EXCLUDED
+    assert nodes["AllSamples/b.sample.mkv"].state == STATE_EXCLUDED
+
+
+def test_a_loose_top_level_file_matching_file_exclude_is_also_excluded_not_remote_only():
+    remote_tree = _tree(RemoteEntry("notes.nfo", False, 5, 1.0))
+    local_tree: dict = {}
+    compiled = CompiledPatterns.compile([Pattern(kind="file_exclude", expr="*.nfo")])
+    predicate = build_counts_predicate(compiled)
+
+    nodes = reconcile(remote_tree, local_tree, counts_predicate=predicate)
+    assert nodes["notes.nfo"].state == STATE_EXCLUDED
+
+
+def test_changing_file_exclude_patterns_retroactively_changes_completeness_both_ways():
+    # DESIGN.md §4.7: "changing file_excludes retroactively changes completeness. Tightening
+    # them can make a DOWNLOADED item incomplete; loosening them can complete a PARTIAL one."
+    # Same fixture, same local disk contents throughout -- only the pattern set changes, and
+    # a file that was never fetched (because it used to be excluded) stays not-fetched.
+    remote_tree = _tree(
+        RemoteEntry("Release", True, 0, 1.0),
+        RemoteEntry("Release/movie.mkv", False, 1000, 1.0),
+        RemoteEntry("Release/notes.nfo", False, 5, 1.0),
+    )
+    local_tree = _local(
+        LocalEntry("Release", True),
+        LocalEntry("Release/movie.mkv", False, 1000),
+        # notes.nfo was never fetched -- it was excluded when this was downloaded.
+    )
+
+    no_patterns = build_counts_predicate(CompiledPatterns.compile([]))
+    with_nfo_excluded = build_counts_predicate(
+        CompiledPatterns.compile([Pattern(kind="file_exclude", expr="*.nfo")])
+    )
+
+    # Loosening (adding the exclude): a PARTIAL directory (nfo counts, is missing) becomes
+    # vacuously DOWNLOADED once nfo no longer counts at all.
+    assert reconcile(remote_tree, local_tree, counts_predicate=no_patterns)["Release"].state == (
+        STATE_PARTIAL
+    )
+    assert (
+        reconcile(remote_tree, local_tree, counts_predicate=with_nfo_excluded)["Release"].state
+        == STATE_DOWNLOADED
+    )
+
+    # Tightening (removing that exclude on the next scan, patterns changed back): the exact
+    # same on-disk contents now read PARTIAL again, because notes.nfo counts once more and
+    # was never actually fetched -- nothing miraculously appeared on disk just because a
+    # pattern changed.
+    assert reconcile(remote_tree, local_tree, counts_predicate=no_patterns)["Release"].state == (
+        STATE_PARTIAL
+    )

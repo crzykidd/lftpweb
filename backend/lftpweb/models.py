@@ -104,11 +104,73 @@ class PathQueueIn(BaseModel):
     staging_path: str | None = None
     enabled: bool = True
     sync_mode: SyncMode = "copy"
+    # DESIGN.md §4.7, phase 4. Both default off/false -- enabling auto-queue is an explicit
+    # user action; a queue created without specifying these fields must not auto-enable
+    # itself (this phase's non-negotiable, docs/decisions.md).
+    auto_queue_enabled: bool = False
+    auto_queue_patterns_only: bool = False
 
 
 class PathQueueOut(PathQueueIn):
     id: int
     host_id: int
+
+
+# --- Settings -> Queues -> Patterns (DESIGN.md §3.1 `pattern`, §4.7) --------------------
+
+PatternKind = Literal["select", "skip", "file_exclude"]
+
+
+class PatternIn(BaseModel):
+    queue_id: int | None = None  # None = global, applies to every queue (§4.7)
+    kind: PatternKind
+    expr: str
+    enabled: bool = True
+
+
+class PatternOut(PatternIn):
+    id: int
+
+
+class PatternPreviewRequest(BaseModel):
+    """The Settings → Queues live "what would this match" preview (DESIGN.md §4.7, §9.2) --
+    evaluates an *unsaved* pattern set against the queue's current remote tree, so a mistake
+    is visible before it's saved rather than discovered afterward.
+    """
+
+    patterns: list[PatternIn] = Field(default_factory=list)
+    patterns_only: bool = False
+
+
+class PatternPreviewItem(BaseModel):
+    rel_path: str
+    is_dir: bool
+    matched: bool  # would auto-queue pick this item up
+
+
+class PatternPreviewFile(BaseModel):
+    rel_path: str
+    excluded: bool
+
+
+class PatternPreviewResponse(BaseModel):
+    items: list[PatternPreviewItem]
+    # Per DESIGN.md §9.2: "within a sampled item, which files would be excluded." One
+    # top-level directory's files, chosen automatically -- `None` if the queue has no
+    # directory item to sample yet.
+    sample_item: str | None = None
+    sample_files: list[PatternPreviewFile] = Field(default_factory=list)
+
+
+class QueueAutoQueueStatus(BaseModel):
+    """Runtime status for the Settings → Queues pattern editor (DESIGN.md §7.3's mount gate,
+    required starting phase 4) -- distinct from the persisted `auto_queue_enabled` toggle,
+    which is just config. `mount_ok=False` means the gate is currently blocking every
+    auto-queue action for this queue, regardless of the toggle.
+    """
+
+    mount_ok: bool
+    gated_reason: str | None = None
 
 
 # --- Files (DESIGN.md §9.2) --------------------------------------------------------------
@@ -133,6 +195,10 @@ class QueueFiles(BaseModel):
     # remote subtrees (core/remote.py's scan-abort fix, phase 3b) rather than failing
     # outright. Distinct from `error`, which means the whole scan failed.
     warning: str | None = None
+    # DESIGN.md §7.3's mount sentinel, required starting phase 4 (docs/decisions.md).
+    # `None` before this queue has ever scanned; `False` means auto-queue (and, later,
+    # delete propagation) is currently gated off for this queue regardless of its toggles.
+    mount_ok: bool | None = None
     nodes: list[FileNode] = Field(default_factory=list)
 
 

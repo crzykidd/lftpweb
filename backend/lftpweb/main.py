@@ -18,6 +18,7 @@ from fastapi.staticfiles import StaticFiles
 from lftpweb import __version__
 from lftpweb.api import files, health, jobs, settings as settings_api, stats, ws
 from lftpweb.config import settings
+from lftpweb.core.autoqueue import AutoQueue
 from lftpweb.core.engine import Engine, load_host_config
 from lftpweb.core.events import EventBus
 from lftpweb.core.queue import TransferQueue
@@ -36,16 +37,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     await migrate(app.state.db)
 
     app.state.events = EventBus()
-    app.state.engine = Engine(
-        db=app.state.db,
-        config_dir=settings.config_dir,
-        events=app.state.events,
-        scan_interval_s=settings.scan_interval_s,
-    )
 
     async def _host_provider():
         return await load_host_config(app.state.db, settings.config_dir)
 
+    # TransferQueue is constructed before Engine, not after as in phases 1-3, because
+    # AutoQueue (phase 4, DESIGN.md §4.7) needs `TransferQueue.enqueue_item` -- the same
+    # "manual queue always wins, clears suppression" path a user action takes -- and Engine
+    # is the one that invokes AutoQueue.on_scan() at the end of every scan pass.
     app.state.queue = TransferQueue(
         db=app.state.db,
         config_dir=settings.config_dir,
@@ -53,6 +52,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         run_dir=settings.run_dir,
         tick_s=settings.transfer_tick_s,
         host_provider=_host_provider,
+    )
+    autoqueue = AutoQueue(db=app.state.db, enqueue_item=app.state.queue.enqueue_item)
+    app.state.engine = Engine(
+        db=app.state.db,
+        config_dir=settings.config_dir,
+        events=app.state.events,
+        scan_interval_s=settings.scan_interval_s,
+        autoqueue=autoqueue,
     )
     await app.state.engine.start()
     await app.state.queue.start()

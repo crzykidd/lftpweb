@@ -8,6 +8,11 @@ import type {
   JobsResponse,
   PathQueueIn,
   PathQueueOut,
+  PatternIn,
+  PatternOut,
+  PatternPreviewRequest,
+  PatternPreviewResponse,
+  QueueAutoQueueStatus,
   StatsResponse,
   TestConnectionResponse,
 } from './types'
@@ -72,6 +77,43 @@ export function updateQueue(id: number, body: PathQueueIn): Promise<PathQueueOut
 
 export function deleteQueue(id: number): Promise<void> {
   return sendJson<void>(`/api/settings/queues/${id}`, 'DELETE')
+}
+
+export function getAutoQueueStatus(queueId: number): Promise<QueueAutoQueueStatus> {
+  return getJson<QueueAutoQueueStatus>(`/api/settings/queues/${queueId}/autoqueue-status`)
+}
+
+// --- Settings -> Queues -> Patterns (phase 4, DESIGN.md §3.1 `pattern`, §4.7) -----------
+
+export function listPatterns(queueId?: number): Promise<PatternOut[]> {
+  const qs = queueId != null ? `?queue_id=${queueId}` : ''
+  return getJson<PatternOut[]>(`/api/settings/patterns${qs}`)
+}
+
+export function createPattern(body: PatternIn): Promise<PatternOut> {
+  return sendJson<PatternOut>('/api/settings/patterns', 'POST', body)
+}
+
+export function updatePattern(id: number, body: PatternIn): Promise<PatternOut> {
+  return sendJson<PatternOut>(`/api/settings/patterns/${id}`, 'PUT', body)
+}
+
+export function deletePattern(id: number): Promise<void> {
+  return sendJson<void>(`/api/settings/patterns/${id}`, 'DELETE')
+}
+
+/** The live "what would this match" preview (DESIGN.md §4.7, §9.2) -- evaluates an *unsaved*
+ * pattern set against the queue's current remote tree.
+ */
+export function previewPatterns(
+  queueId: number,
+  body: PatternPreviewRequest,
+): Promise<PatternPreviewResponse> {
+  return sendJson<PatternPreviewResponse>(
+    `/api/settings/queues/${queueId}/pattern-preview`,
+    'POST',
+    body,
+  )
 }
 
 // --- Files ---------------------------------------------------------------------------------

@@ -1,0 +1,167 @@
+"""Unit tests for `core/mount_sentinel.py` -- the mount gate and the local-absence grace
+period, required starting phase 4 rather than deferred with `sync` (DESIGN.md §7.3,
+docs/decisions.md).
+"""
+
+from __future__ import annotations
+
+from datetime import UTC, datetime, timedelta
+
+from lftpweb.core.mount_sentinel import (
+    DEFAULT_GRACE_S,
+    SENTINEL_NAME,
+    check,
+    resolve_absence,
+    write_if_needed,
+)
+
+
+# --- check() / write_if_needed() ---------------------------------------------------------
+
+
+def test_check_false_when_root_missing(tmp_path):
+    assert check(str(tmp_path / "does-not-exist")) is False
+
+
+def test_check_false_on_the_nastiest_case_empty_readable_root_no_sentinel(tmp_path):
+    # DESIGN.md §14 names this one explicitly: root exists, is readable, is empty, has no
+    # sentinel. Indistinguishable from an unmounted share by content alone.
+    root = tmp_path / "local"
+    root.mkdir()
+    assert check(str(root)) is False
+
+
+def test_write_then_check_round_trips(tmp_path):
+    root = tmp_path / "local"
+    root.mkdir()
+    write_if_needed(str(root))
+    assert (root / SENTINEL_NAME).is_file()
+    assert check(str(root)) is True
+
+
+def test_write_if_needed_does_not_create_the_root_itself(tmp_path):
+    # A not-yet-mounted root must never earn trust just because we tried to write into it.
+    missing_root = tmp_path / "not-mounted-yet"
+    write_if_needed(str(missing_root))
+    assert not missing_root.exists()
+
+
+def test_write_if_needed_is_idempotent(tmp_path):
+    root = tmp_path / "local"
+    root.mkdir()
+    write_if_needed(str(root))
+    first_contents = (root / SENTINEL_NAME).read_text()
+    write_if_needed(str(root))  # second call must not overwrite/touch it again
+    assert (root / SENTINEL_NAME).read_text() == first_contents
+
+
+# --- resolve_absence(): the grace period + mount gate, as a pure function ----------------
+
+
+def test_never_downloaded_item_is_left_to_the_structural_state():
+    assert (
+        resolve_absence(
+            prev_state="REMOTE_ONLY",
+            prev_first_missing_at=None,
+            structural_state="REMOTE_ONLY",
+            mount_ok=True,
+            now=datetime.now(UTC),
+        )
+        is None
+    )
+
+
+def test_first_observed_absence_starts_the_clock_but_keeps_downloaded():
+    state, first_missing_at = resolve_absence(
+        prev_state="DOWNLOADED",
+        prev_first_missing_at=None,
+        structural_state="REMOTE_ONLY",
+        mount_ok=True,
+        now=datetime.now(UTC),
+    )
+    assert state == "DOWNLOADED"
+    assert first_missing_at is not None
+
+
+def test_absence_within_the_grace_window_stays_downloaded():
+    now = datetime.now(UTC)
+    started = (now - timedelta(seconds=DEFAULT_GRACE_S / 2)).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    state, first_missing_at = resolve_absence(
+        prev_state="DOWNLOADED",
+        prev_first_missing_at=started,
+        structural_state="REMOTE_ONLY",
+        mount_ok=True,
+        now=now,
+    )
+    assert state == "DOWNLOADED"
+    assert first_missing_at == started
+
+
+def test_absence_past_the_grace_window_becomes_removed_local():
+    now = datetime.now(UTC)
+    started = (now - timedelta(seconds=DEFAULT_GRACE_S + 1)).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    state, first_missing_at = resolve_absence(
+        prev_state="DOWNLOADED",
+        prev_first_missing_at=started,
+        structural_state="REMOTE_ONLY",
+        mount_ok=True,
+        now=now,
+    )
+    assert state == "REMOVED_LOCAL"
+    assert first_missing_at == started
+
+
+def test_reappearance_clears_by_returning_none_for_the_caller_to_drop_first_missing_at():
+    # Once local presence is back, reconcile() itself reports PARTIAL/DOWNLOADED rather than
+    # REMOTE_ONLY -- resolve_absence has nothing to override, so the caller (core/engine.py)
+    # persists the fresh structural state and a fresh (cleared) first_missing_at.
+    assert (
+        resolve_absence(
+            prev_state="REMOVED_LOCAL",
+            prev_first_missing_at="2026-01-01T00:00:00.000000Z",
+            structural_state="DOWNLOADED",
+            mount_ok=True,
+            now=datetime.now(UTC),
+        )
+        is None
+    )
+
+
+def test_mount_gate_refuses_to_start_the_clock_when_mount_is_down():
+    state, first_missing_at = resolve_absence(
+        prev_state="DOWNLOADED",
+        prev_first_missing_at=None,
+        structural_state="REMOTE_ONLY",
+        mount_ok=False,
+        now=datetime.now(UTC),
+    )
+    assert state == "DOWNLOADED"
+    assert first_missing_at is None  # never started
+
+
+def test_mount_gate_freezes_an_already_running_clock_too():
+    now = datetime.now(UTC)
+    started = (now - timedelta(seconds=DEFAULT_GRACE_S + 1)).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    state, first_missing_at = resolve_absence(
+        prev_state="DOWNLOADED",
+        prev_first_missing_at=started,
+        structural_state="REMOTE_ONLY",
+        mount_ok=False,  # mount just dropped -- even though grace has technically elapsed
+        now=now,
+    )
+    assert state == "DOWNLOADED"  # never crosses into REMOVED_LOCAL while the mount is down
+    assert first_missing_at == started
+
+
+def test_removed_local_is_sticky_regardless_of_mount_state():
+    # Once correctly classified while the mount was healthy, a later mount drop must not
+    # undo it -- that's not the mount gate's job (it guards *new* transitions).
+    state, first_missing_at = resolve_absence(
+        prev_state="REMOVED_LOCAL",
+        prev_first_missing_at="2026-01-01T00:00:00.000000Z",
+        structural_state="REMOTE_ONLY",
+        mount_ok=False,
+        now=datetime.now(UTC),
+    )
+    assert state == "REMOVED_LOCAL"
+    assert first_missing_at == "2026-01-01T00:00:00.000000Z"

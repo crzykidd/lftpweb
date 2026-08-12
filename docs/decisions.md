@@ -6,6 +6,127 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-11 — Phase 4: auto-queue and patterns — every decision made unattended, recorded
+## for the user to review in the morning
+
+**Overnight run, no live confirmation possible.** Built `core/patterns.py` (the one
+evaluator, DESIGN.md §4.7/§12), wired its `counts_predicate` into `core/reconcile.py`
+(`EXCLUDED` state, DESIGN.md §3.2 rule 8), `core/autoqueue.py` (pattern-matching intake, the
+mount gate, suppression), and `core/mount_sentinel.py` (the `.lftpweb-mount-ok` gate plus the
+`REMOVED_LOCAL` grace period this phase requires per the 2026-08-11 entry below). Verified
+end to end against the real fake seedbox (`tests/test_autoqueue_e2e.py`), not just unit
+tests. Full detail in the phase 4 report; every non-obvious call is recorded here.
+
+**1. `REMOVED_LOCAL` detection + the grace period were built now, not left for a later
+phase.** DESIGN.md §3.2 rules 3/5/6/7 were explicitly *not* implemented by phases 2-3 (their
+own docstrings say so) — a previously-`DOWNLOADED` item whose local copy disappears simply
+reread as a fresh `REMOTE_ONLY` on the next scan. That's exactly the failure the phase 4
+prompt calls out by name: without it, auto-queue would re-download everything a user (or an
+*arr import) deliberately deleted, the moment the mount comes back healthy. **Rejected
+alternative:** rely solely on the blanket per-queue mount gate and skip `REMOVED_LOCAL`
+entirely. Rejected because the mount gate only protects against a *dropped* mount — it does
+nothing for the ordinary, expected case (§7.2's move-on-import workflow) where the mount is
+perfectly healthy and a file is genuinely, intentionally gone. `core/mount_sentinel.
+resolve_absence()` is a pure decision function (`(prev_state, prev_first_missing_at,
+structural_state, mount_ok, now) -> override|None`) so `core/engine.py._persist` is the only
+I/O around it — unit-tested without a filesystem or database
+(`tests/test_mount_sentinel.py`).
+
+**2. The mount gate blocks *all* auto-queue action for a queue, not just `REMOVED_LOCAL`
+transitions.** `AutoQueue.on_scan()` checks `mount_sentinel.check()` first and returns
+immediately if it fails — before even looking at eligible items. This is stricter than
+strictly necessary for the `REMOVED_LOCAL` failure direction (which `resolve_absence()`
+already handles on its own), but it's the only thing that also protects the *other* failure
+direction the prompt names: a **brand-new** queue whose local root never mounted would have
+every item read `REMOTE_ONLY` from the very first scan (nothing to compare against history),
+and only a blanket gate — not a per-item history check — stops auto-queue from happily
+queueing transfers into a directory that isn't really there.
+
+**3. `file_exclude` matches a file's own basename, at any depth, not the full relative
+path.** DESIGN.md §4.7 doesn't specify whether a pattern like `*.nfo` should be able to
+target a specific nested path (e.g. `Subs/*.nfo` vs. any `*.nfo` anywhere). Chose basename-
+only matching — the same convention lftp's own `--exclude-glob` uses by default, and what
+every DESIGN.md example (`*.nfo`, `*SAMPLE*`) already assumes. **Rejected:** matching the
+full `rel_path` when a pattern contains `/`, which would let a queue exclude, say, only
+`Subs/*.srt`. More expressive, but nothing in DESIGN.md or the phase 4 prompt asks for it,
+and it complicates `exclude_globs()`'s job of staying literally what lftp receives.
+
+**4. A plain-substring `file_exclude` pattern (no `*?[`) is wrapped `*pattern*` before being
+handed to lftp's `--exclude-glob`.** lftp has no substring-match mode of its own — passing
+`sample` verbatim would only match a file named exactly `sample`. Wrapping it in `core/
+patterns.py.CompiledPatterns.exclude_globs()` keeps the "no wildcards needed" convenience
+DESIGN.md §4.7 promises for `select`/`skip` consistent for `file_exclude` too, without lftp
+ever seeing anything but a real glob.
+
+**5. A file matched by `file_exclude` is marked `EXCLUDED` in the reconciler unconditionally
+— even if a local copy already exists** (e.g. downloaded before the pattern was added).
+**Rejected:** only mark `EXCLUDED` when there's no local copy, otherwise show the file's
+actual completeness state. Chose the unconditional rule because patterns are meant to
+reflect current intent — a file the operator no longer wants counted shouldn't keep
+contributing to completeness just because it happened to be fetched previously — and because
+the simpler rule is one branch instead of two, with no test in DESIGN.md's own list asking
+for the other behavior.
+
+**6. The pattern-preview endpoint samples a directory that *matches* the draft patterns,
+preferring it over the first directory alphabetically**, falling back to any directory if
+nothing matched. DESIGN.md §9.2 only says "within a sampled item" — doesn't say which one.
+Found while writing the endpoint's own test: sampling the first alphabetical item (which
+`test_pattern_preview_...` initially assumed) can easily be the *skipped* one, showing the
+user a file-exclude preview for an item that was never going to be selected in the first
+place — the least useful item to sample.
+
+**7. Pattern CRUD applies immediately** (`POST/PUT/DELETE /api/settings/patterns`) — there is
+no per-queue "save patterns" staging step in the UI. **Rejected:** batch pattern edits behind
+a save button, so a half-composed pattern set is never live. Rejected for phase 4's scope and
+because it keeps auto-queue's "retroactive" behavior (§4.7) simple: every persisted pattern
+is always the live, effective one, with no separate "has this been saved yet" state to track.
+The live preview endpoint (`POST .../pattern-preview`) covers the "see before you commit"
+need for a *single new* pattern being composed, which is the actual editing motion the UI
+supports (add one, see it take effect, add another).
+
+**8. `main.py`'s lifespan constructs `TransferQueue` before `Engine`, reversing phases 1-3's
+order.** `AutoQueue` needs `TransferQueue.enqueue_item` (the same "manual queue always wins"
+path a user action takes), and `Engine` is what invokes `AutoQueue.on_scan()` at the end of
+every scan pass — so `TransferQueue` has to exist first. Purely a wiring reorder; neither
+component's own behavior changed.
+
+**9. The `REMOVED_LOCAL` grace period is a hard-coded ~10 minute constant
+(`core/mount_sentinel.DEFAULT_GRACE_S`), not a Settings UI knob this phase.** DESIGN.md §7.3
+names ~10 minutes as its own default without requiring it be configurable. Deferred exposing
+it to keep this phase's UI surface smaller; `resolve_absence()` already takes `grace_s` as a
+parameter, so wiring a Settings field to it later is additive, not a signature change.
+
+**10. Migration 002 (`auto_queue_patterns_only`) is a bare `ALTER TABLE ... ADD COLUMN ...
+CHECK (...) DEFAULT 0`**, the same shape migration 001 already used for `auto_queue_enabled`.
+Verified against real SQLite via the full test suite (`ALTER TABLE ADD COLUMN` with an inline
+`CHECK` needs SQLite ≥ 3.25-ish semantics; not assumed, proven by `tests/test_db.py` and every
+queue-CRUD test passing against a freshly migrated database). `DEFAULT 0` is load-bearing:
+every existing queue picks up the column already off, so this migration cannot change
+behavior for any queue that already exists — the phase's own non-negotiable.
+
+**Bug caught before it shipped, not a design decision:** `core/patterns.py.CompiledPatterns.
+compile()` originally iterated its `patterns` argument three times (once per kind). Fine for
+a `list`, silently wrong for a one-shot generator — which is exactly what the pattern-preview
+endpoint passes. Fixed by materializing the iterable first, before any test exercised the
+generator path; recorded because it's the kind of bug this phase's "one evaluator, two
+consumers" design is specifically supposed to prevent from happening *twice*, and it very
+nearly happened once, quietly, inside the one module meant to prevent it.
+
+**Also touched, not a phase 4 decision but necessary fallout:** `tests/test_db.py::
+test_migrate_is_idempotent` hardcoded `schema_version` row count to `1`; adding migration 002
+broke it on contact. Fixed to derive the expected count from `MIGRATIONS_DIR` instead of a
+literal, so it doesn't break again at the next migration either.
+
+**What this phase deliberately does not do:** no UI beyond `StateChip`'s new
+`REMOVED_LOCAL`/`REMOVED_BOTH` colors and the Settings → Queues pattern editor — no dedicated
+"why did this get removed" panel (that's History, phase 6); no post-processing (verify/
+extract/move — phase 5); `mount_ok` is exposed on `GET /api/files` and a dedicated
+`/api/settings/queues/{id}/autoqueue-status` endpoint, deliberately **not** threaded through
+the WebSocket delta/snapshot messages, to avoid touching `core/engine.py`'s WS schema and
+every frontend WS type for a field that matters to Settings, not to the live Files view.
+
+---
+
 ## 2026-08-11 — The mount sentinel is needed before phase 4 (auto-queue), not before `sync`
 
 **Found while advising on a real NFS deployment, not by a build.** `DESIGN.md` §7.3 specifies

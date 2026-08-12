@@ -27,7 +27,8 @@ from typing import Any
 
 import aiosqlite
 
-from lftpweb.core import local_scan
+from lftpweb.core import local_scan, mount_sentinel, patterns
+from lftpweb.core.autoqueue import AutoQueue, QueueAutoConfig
 from lftpweb.core.crypto import DecryptionError, decrypt_secret
 from lftpweb.core.events import EventBus
 from lftpweb.core.reconcile import ReconciledNode, reconcile
@@ -52,6 +53,11 @@ class QueueConfig:
     staging_path: str | None
     enabled: bool
     sync_mode: str
+    # Phase 4 (DESIGN.md §4.7): per-queue, default off (migration 002 adds the column with
+    # DEFAULT 0; migration 001 already defaulted auto_queue_enabled to 0). A capability that
+    # turns itself on for an existing queue is a bug -- see docs/decisions.md.
+    auto_queue_enabled: bool = False
+    auto_queue_patterns_only: bool = False
 
 
 async def load_host_config(db: aiosqlite.Connection, config_dir: str) -> HostConfig | None:
@@ -94,8 +100,8 @@ async def load_host_config(db: aiosqlite.Connection, config_dir: str) -> HostCon
 
 async def load_queues(db: aiosqlite.Connection) -> list[QueueConfig]:
     cursor = await db.execute(
-        "SELECT id, host_id, name, remote_path, local_path, staging_path, enabled, sync_mode "
-        "FROM path_queue ORDER BY id"
+        "SELECT id, host_id, name, remote_path, local_path, staging_path, enabled, sync_mode, "
+        "auto_queue_enabled, auto_queue_patterns_only FROM path_queue ORDER BY id"
     )
     rows = await cursor.fetchall()
     return [
@@ -108,6 +114,8 @@ async def load_queues(db: aiosqlite.Connection) -> list[QueueConfig]:
             staging_path=row["staging_path"],
             enabled=bool(row["enabled"]),
             sync_mode=row["sync_mode"],
+            auto_queue_enabled=bool(row["auto_queue_enabled"]),
+            auto_queue_patterns_only=bool(row["auto_queue_patterns_only"]),
         )
         for row in rows
     ]
@@ -173,12 +181,20 @@ class Engine:
         config_dir: str,
         events: EventBus,
         scan_interval_s: float = DEFAULT_SCAN_INTERVAL_S,
+        autoqueue: AutoQueue | None = None,
     ) -> None:
         self.db = db
         self.config_dir = config_dir
         self.events = events
         self.scan_interval_s = scan_interval_s
         self.pool = RemoteConnectionPool(Path(config_dir))
+        # Phase 4 (DESIGN.md §4.7): injected rather than constructed here, the same shape
+        # `core/queue.py`'s `host_provider` uses — `AutoQueue` needs `TransferQueue.
+        # enqueue_item`, which doesn't exist yet when `Engine` is constructed in `main.py`'s
+        # lifespan. `None` (the default, and what every existing test still constructs)
+        # means auto-queue is simply never evaluated -- not a crash, not a silent no-op that
+        # looks like a bug, just "this capability isn't wired up."
+        self.autoqueue = autoqueue
 
         self.models: dict[int, dict[str, ReconciledNode]] = {}
         # rel_path -> item.id per queue; see `serialize_node` for why the WS needs it.
@@ -190,6 +206,10 @@ class Engine:
         # failing outright. Distinct from `scan_errors`, which means the whole scan failed.
         self.scan_warnings: dict[int, str | None] = {}
         self.last_scan_at: dict[int, str | None] = {}
+        # The mount sentinel gate's current reading per queue (DESIGN.md §7.3, required here
+        # per docs/decisions.md) -- exposed to the API/UI so "why isn't auto-queue doing
+        # anything" is answerable without reading a log.
+        self.mount_ok: dict[int, bool] = {}
 
         self._task: asyncio.Task | None = None
         self._wake = asyncio.Event()
@@ -243,7 +263,22 @@ class Engine:
                 raise RemoteScanError("no host configured")
             remote_tree, scan_warning = await self.pool.scan(host, q.remote_path)
             local_tree = local_scan.scan_local(q.local_path)
-            nodes = reconcile(remote_tree, local_tree)
+
+            # The mount sentinel (DESIGN.md §7.3, required starting this phase — see
+            # docs/decisions.md): written once the local root is confirmed present and
+            # writable, checked on every pass regardless. `self.mount_ok` is read by
+            # `AutoQueue.on_scan` below and exposed to the API/UI.
+            mount_sentinel.write_if_needed(q.local_path)
+            self.mount_ok[q.id] = mount_sentinel.check(q.local_path)
+
+            # DESIGN.md §4.7/§3.2 rule 8: the same compiled file_exclude set that will build
+            # lftp's --exclude-glob arguments (core/queue.py) also tells the reconciler what
+            # a directory is supposed to contain. Recompiled fresh every scan (cheap — see
+            # core/patterns.py's own docstring) so a pattern edit takes effect on the very
+            # next pass, not just for items scanned after it.
+            compiled = await patterns.compiled_for_queue(self.db, q.id)
+            counts_predicate = patterns.build_counts_predicate(compiled)
+            nodes = reconcile(remote_tree, local_tree, counts_predicate=counts_predicate)
 
             old_nodes = self.models.get(q.id, {})
             changed, removed = diff_nodes(old_nodes, nodes)
@@ -267,6 +302,16 @@ class Engine:
                     "warning": scan_warning,
                 }
             )
+
+            if self.autoqueue is not None:
+                await self.autoqueue.on_scan(
+                    QueueAutoConfig(
+                        id=q.id,
+                        local_path=q.local_path,
+                        auto_queue_enabled=q.auto_queue_enabled,
+                        patterns_only=q.auto_queue_patterns_only,
+                    )
+                )
         except Exception as exc:  # noqa: BLE001 - recorded per-queue, never propagated
             message = str(exc)
             self.scan_errors[q.id] = message
@@ -303,10 +348,23 @@ class Engine:
         rows = await cursor.fetchall()
         return {row["rel_path"] for row in rows}
 
+    async def _previous_states(self, queue_id: int) -> dict[str, tuple[str, str | None]]:
+        """`rel_path -> (state, first_missing_at)` as currently persisted, for the grace-period
+        decision below. One query per scan, same shape as `_protected_rel_paths`.
+        """
+        cursor = await self.db.execute(
+            "SELECT rel_path, state, first_missing_at FROM item WHERE queue_id = ?", (queue_id,)
+        )
+        rows = await cursor.fetchall()
+        return {row["rel_path"]: (row["state"], row["first_missing_at"]) for row in rows}
+
     async def _persist(self, queue_id: int, nodes: dict[str, ReconciledNode]) -> None:
         from lftpweb.core.util import to_safe_text
 
         protected = await self._protected_rel_paths(queue_id)
+        previous = await self._previous_states(queue_id)
+        mount_ok = self.mount_ok.get(queue_id, False)
+        now = datetime.now(UTC)
 
         for node in nodes.values():
             rel_path = to_safe_text(node.rel_path)
@@ -331,28 +389,48 @@ class Engine:
                         node.state,
                     ),
                 )
-            else:
-                await self.db.execute(
-                    """
-                    INSERT INTO item (queue_id, rel_path, is_dir, remote_size, local_size, remote_mtime, state)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT (queue_id, rel_path) DO UPDATE SET
-                        is_dir = excluded.is_dir,
-                        remote_size = excluded.remote_size,
-                        local_size = excluded.local_size,
-                        remote_mtime = excluded.remote_mtime,
-                        state = excluded.state
-                    """,
-                    (
-                        queue_id,
-                        rel_path,
-                        1 if node.is_dir else 0,
-                        node.remote_size,
-                        node.local_size,
-                        node.remote_mtime,
-                        node.state,
-                    ),
-                )
+                continue
+
+            # DESIGN.md §3.2 rule 3, §7.3's grace period, required starting this phase (see
+            # docs/decisions.md and core/mount_sentinel.py's module docstring): a fresh
+            # REMOTE_ONLY reading for something that used to be DOWNLOADED (or already
+            # REMOVED_LOCAL) doesn't get written verbatim -- it's resolved against history
+            # and the mount gate first. Every other node's freshly-computed state is trusted
+            # as-is, exactly like phase 2/3.
+            prev_state, prev_first_missing_at = previous.get(rel_path, (None, None))
+            override = mount_sentinel.resolve_absence(
+                prev_state=prev_state,
+                prev_first_missing_at=prev_first_missing_at,
+                structural_state=node.state,
+                mount_ok=mount_ok,
+                now=now,
+            )
+            state = override[0] if override is not None else node.state
+            first_missing_at = override[1] if override is not None else None
+
+            await self.db.execute(
+                """
+                INSERT INTO item (queue_id, rel_path, is_dir, remote_size, local_size, remote_mtime, state, first_missing_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT (queue_id, rel_path) DO UPDATE SET
+                    is_dir = excluded.is_dir,
+                    remote_size = excluded.remote_size,
+                    local_size = excluded.local_size,
+                    remote_mtime = excluded.remote_mtime,
+                    state = excluded.state,
+                    first_missing_at = excluded.first_missing_at
+                """,
+                (
+                    queue_id,
+                    rel_path,
+                    1 if node.is_dir else 0,
+                    node.remote_size,
+                    node.local_size,
+                    node.remote_mtime,
+                    state,
+                    first_missing_at,
+                ),
+            )
         await self.db.commit()
         await self._refresh_item_ids(queue_id)
 

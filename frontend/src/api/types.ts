@@ -76,11 +76,57 @@ export interface PathQueueIn {
   staging_path: string | null
   enabled: boolean
   sync_mode: SyncMode
+  // Phase 4 (DESIGN.md §4.7). Both default off/false -- enabling auto-queue is an explicit
+  // user action; omitting these on create must not auto-enable anything.
+  auto_queue_enabled: boolean
+  auto_queue_patterns_only: boolean
 }
 
 export interface PathQueueOut extends PathQueueIn {
   id: number
   host_id: number
+}
+
+// --- Settings -> Queues -> Patterns (phase 4, DESIGN.md §3.1 `pattern`, §4.7) -----------
+
+export type PatternKind = 'select' | 'skip' | 'file_exclude'
+
+export interface PatternIn {
+  queue_id: number | null // null = global, applies to every queue
+  kind: PatternKind
+  expr: string
+  enabled: boolean
+}
+
+export interface PatternOut extends PatternIn {
+  id: number
+}
+
+export interface PatternPreviewRequest {
+  patterns: PatternIn[]
+  patterns_only: boolean
+}
+
+export interface PatternPreviewItem {
+  rel_path: string
+  is_dir: boolean
+  matched: boolean
+}
+
+export interface PatternPreviewFile {
+  rel_path: string
+  excluded: boolean
+}
+
+export interface PatternPreviewResponse {
+  items: PatternPreviewItem[]
+  sample_item: string | null
+  sample_files: PatternPreviewFile[]
+}
+
+export interface QueueAutoQueueStatus {
+  mount_ok: boolean
+  gated_reason: string | null
 }
 
 // --- Files (phase 2, DESIGN.md §9.2) ----------------------------------------------------
@@ -105,6 +151,12 @@ export interface QueueFiles {
   // outright. Distinct from `error`, which means the whole scan failed and the tree shown
   // is stale.
   warning: string | null
+  // DESIGN.md §7.3's mount sentinel, required starting phase 4. `null`/absent before this
+  // queue has ever scanned or on the WebSocket's own queue shape (which doesn't carry this
+  // field -- see hooks/useLiveModel.ts); `false` means auto-queue is currently gated off for
+  // it regardless of its own toggle. Optional so the REST (`GET /api/files`) and WS-derived
+  // shapes can share this one interface without the WS side fabricating a value.
+  mount_ok?: boolean | null
   nodes: FileNode[]
 }
 

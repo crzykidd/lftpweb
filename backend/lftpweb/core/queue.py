@@ -25,7 +25,7 @@ from typing import Any
 
 import aiosqlite
 
-from lftpweb.core import lftp, scheduler
+from lftpweb.core import lftp, patterns, scheduler
 from lftpweb.core.events import EventBus
 from lftpweb.core.progress import ActiveJob, ProgressSampler
 from lftpweb.core.remote import HostConfig
@@ -690,6 +690,13 @@ class TransferQueue:
         )
         connection_limit = await self._connection_limit(host)
 
+        # DESIGN.md §4.7/§3.2 rule 8: the identical compiled file_exclude set the reconciler
+        # uses (core/engine.py.scan_queue) also builds lftp's --exclude-glob arguments here --
+        # one evaluator, two consumers, never two copies to drift apart (core/patterns.py).
+        # Only meaningful for `mirror` (lftp.build_transfer_command only emits --exclude-glob
+        # on that branch); harmless to compute unconditionally for `pget`.
+        compiled = await patterns.compiled_for_queue(self.db, item["queue_id"])
+
         spec = lftp.JobSpec(
             job_id=decision.job_id,
             kind=job_row["kind"],
@@ -702,6 +709,7 @@ class TransferQueue:
             pget_n=settings.mirror_use_pget_n
             if job_row["kind"] == "mirror"
             else settings.pget_default_n,
+            exclude_globs=compiled.exclude_globs(),
             extra_settings=settings.extra_lftp_settings,
             run_dir=self.run_dir,
         )

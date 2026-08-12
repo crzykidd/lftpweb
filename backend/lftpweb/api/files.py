@@ -42,6 +42,7 @@ async def get_files(request: Request) -> FilesResponse:
                 scanned_at=engine.last_scan_at.get(queue_id),
                 error=engine.scan_errors.get(queue_id),
                 warning=engine.scan_warnings.get(queue_id),
+                mount_ok=engine.mount_ok.get(queue_id),
                 nodes=[
                     FileNode(
                         id=row["id"],

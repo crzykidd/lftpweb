@@ -1,11 +1,17 @@
 """Merge a remote tree and a local tree into the unified model (DESIGN.md §3.2).
 
 Phase 2 implements rules 1, 2, and 4 — the ones that don't need a job engine or lifecycle
-history (rules 3, 5, 6, 7 need job/queue state; rule 8 needs the pattern evaluator). Both land
-in phase 3/4. **The seam is left here on purpose**: `counts_predicate` decides whether a given
-remote file counts toward its parent directory's completeness. Phase 2 always counts
-everything (`default_counts_predicate`); phase 4 swaps in a predicate that returns `False` for
-an `EXCLUDED` file, without this module changing shape.
+history (rules 3, 5, 6, 7 need job/queue state; rule 8 needs the pattern evaluator). Rule 8
+lands in phase 4 (below); rules 3, 5, 6, 7 need persisted lifecycle history and live partly
+in `core/engine.py._persist` (the "protected rows" and, from phase 4, the mount-gated
+`REMOVED_LOCAL` grace period — see `core/mount_sentinel.py`) rather than in this pure
+function. **The seam left here on purpose in phase 2**: `counts_predicate` decides whether a
+given remote file counts toward its parent directory's completeness. Phase 2 always counted
+everything (`default_counts_predicate`); phase 4 (`core/patterns.py.build_counts_predicate`)
+swaps in a predicate that returns `False` for a file matching a `file_exclude` pattern, and
+this module also now marks that file's own state `EXCLUDED` rather than `REMOTE_ONLY` — a
+real state, not an absence (DESIGN.md §3.2 rule 8, §4.7): the file was never going to arrive,
+on purpose, so it must not read as "missing."
 
 States produced this phase: `REMOTE_ONLY`, `LOCAL_ONLY`, `PARTIAL`, `DOWNLOADED` — the phase 2
 prompt's explicit scope, since `QUEUED`/`DOWNLOADING`/`STOPPED`/`FAILED` need a job engine that
@@ -32,6 +38,11 @@ STATE_REMOTE_ONLY = "REMOTE_ONLY"
 STATE_LOCAL_ONLY = "LOCAL_ONLY"
 STATE_PARTIAL = "PARTIAL"
 STATE_DOWNLOADED = "DOWNLOADED"
+# DESIGN.md §3.2 rule 8, §4.7: a file matched by a `file_exclude` pattern. Deliberately not
+# "REMOTE_ONLY" — that would look like something waiting to be downloaded, when it is in
+# fact never going to be, on purpose. Only ever produced for a non-directory node whose
+# `counts_predicate` returns `False`; see `core/patterns.py.build_counts_predicate`.
+STATE_EXCLUDED = "EXCLUDED"
 
 
 class _SizedEntry(Protocol):
@@ -175,7 +186,14 @@ def reconcile(
                 else:
                     state = STATE_PARTIAL
         else:
-            if remote_entry is not None and local_entry is not None:
+            if remote_entry is not None and not predicate(path, remote_entry):
+                # DESIGN.md §3.2 rule 8: excluded, not missing. Applies regardless of
+                # whatever local presence happens to exist (e.g. a file downloaded before an
+                # exclude pattern was added) — the pattern is the current source of truth for
+                # "does this file belong in the transfer," so the state reflects that rather
+                # than a leftover local copy's size.
+                state = STATE_EXCLUDED
+            elif remote_entry is not None and local_entry is not None:
                 # Rule 2: local_size < remote_size ⇒ PARTIAL, never DOWNLOADED, even with no
                 # active job to explain the gap.
                 state = STATE_DOWNLOADED if local_entry.size >= remote_entry.size else STATE_PARTIAL

@@ -13,6 +13,11 @@ const STYLES: Record<string, string> = {
   STOPPED: 'bg-orange-100 text-orange-800 dark:bg-orange-900/40 dark:text-orange-300',
   FAILED: 'bg-red-100 text-red-800 dark:bg-red-900/40 dark:text-red-300',
   EXCLUDED: 'bg-zinc-200 text-zinc-600 dark:bg-zinc-800 dark:text-zinc-400',
+  // Phase 4: DESIGN.md §3.2 rule 3 -- previously downloaded, now locally absent, remote
+  // still present. Deliberately its own color, distinct from REMOTE_ONLY -- this is "we
+  // downloaded this and it's gone now, on purpose," not "never fetched."
+  REMOVED_LOCAL: 'bg-fuchsia-100 text-fuchsia-800 dark:bg-fuchsia-900/40 dark:text-fuchsia-300',
+  REMOVED_BOTH: 'bg-zinc-200 text-zinc-500 dark:bg-zinc-800 dark:text-zinc-500',
 }
 const FALLBACK_STYLE = 'bg-zinc-100 text-zinc-700 dark:bg-zinc-800 dark:text-zinc-300'
 
