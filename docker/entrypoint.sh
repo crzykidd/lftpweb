@@ -72,6 +72,28 @@ if [ -d /config ]; then
     check_writable /config 1
 fi
 
+# The per-job rc directory (DESIGN.md §4.2): every transfer writes a mode-0600 file here
+# holding credentials and the known_hosts pin, then unlinks it on exit. It lives on the /run
+# tmpfs so secrets never touch a persistent volume.
+#
+# It must be created and chowned *here*, as root, before privileges are dropped. Docker
+# mounts the `tmpfs: - /run` from the compose file root-owned, so the app — correctly running
+# as PUID — cannot create a subdirectory in it. Missing this meant every transfer failed at
+# spawn with `PermissionError: '/run/lftpweb'` while scanning, browsing, and the whole UI
+# looked perfectly healthy.
+#
+# Fatal, not advisory: without this directory no transfer can ever start, so failing at
+# startup with one clear message beats failing per-job forever.
+RUN_DIR="${LFTPWEB_RUN_DIR:-/run/lftpweb}"
+if ! mkdir_err="$(mkdir -p "$RUN_DIR" 2>&1)"; then
+    echo "lftpweb: ERROR: could not create run dir '${RUN_DIR}': ${mkdir_err}" >&2
+    echo "lftpweb:        Transfers cannot start without it. Is /run mounted read-only?" >&2
+    exit 1
+fi
+chown "${PUID}:${PGID}" "$RUN_DIR" 2>/dev/null || true
+chmod 0700 "$RUN_DIR" 2>/dev/null || true
+check_writable "$RUN_DIR" 1
+
 # Data volumes: never chowned, ever (§11.2) — see above. Under the usual root_squash NFS
 # export, a root-owned entrypoint is squashed to `nobody` on the mount and a chown attempt
 # would simply fail there, which is how these containers end up crash-looping against a
