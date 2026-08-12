@@ -6,6 +6,36 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-11 — The mount sentinel is needed before phase 4 (auto-queue), not before `sync`
+
+**Found while advising on a real NFS deployment, not by a build.** `DESIGN.md` §7.3 specifies
+the `.lftpweb-mount-ok` sentinel and the grace period as rails on **delete propagation**, and
+§7 defers both along with `sync` mode — which is unscheduled. That placement is wrong by one
+phase.
+
+The sentinel's actual job is broader than deleting: it answers *"is this empty directory really
+empty, or is the mount gone?"* Auto-queue (phase 4) is the first feature that takes **action**
+on local absence, and a network mount that drops makes every tracked item look locally absent
+in the same scan.
+
+Both failure directions are bad, and which one you get depends only on how far the lifecycle
+has progressed:
+
+- Items read `REMOTE_ONLY` (today's behaviour — `scan_local()` returns `{}` when the root isn't
+  a directory) ⇒ auto-queue **re-downloads the entire library** off one blip.
+- Items read `REMOVED_LOCAL` (§3.2 rule 3, once phase 3/4 persist lifecycle history) ⇒
+  auto-queue **permanently skips** them, since that state means "deliberately removed."
+
+**Today this is harmless** — nothing consumes those states, so a dropout is cosmetic and
+self-heals when the mount returns. It stops being harmless the moment auto-queue exists.
+
+**Decision:** §13 phase 4 now requires the sentinel and grace period as part of that phase,
+independent of whether `sync` is ever built. Recorded here because the rails are written up in
+§7.3 under a deferred feature, which is exactly how a required safeguard gets skipped by someone
+reading the phase list top-down.
+
+---
+
 ## 2026-08-11 — Note: this session ran concurrently with another session bootstrapping the
 ## GitHub repo — several unrelated files were dirty on disk throughout phase 3b
 

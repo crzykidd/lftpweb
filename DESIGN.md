@@ -1272,6 +1272,12 @@ Each phase ends at something that can actually be looked at and judged.
    into both the lftp command line and the reconciler; retroactive re-evaluation on pattern
    change; per-queue enable; the live preview. *Done when:* a `file_exclude` of `*.nfo` leaves
    its release `DOWNLOADED`, not permanently `PARTIAL`.
+   **Also required here: the mount sentinel and grace period from §7.3.** They are written up
+   under `sync` mode because that is where they were first needed, but auto-queue is the point
+   at which local absence starts *driving action*, and a network mount that drops makes every
+   item look locally absent at once. Without the gate, one NFS hiccup either re-downloads the
+   entire library (items read `REMOTE_ONLY`) or permanently skips it (items read
+   `REMOVED_LOCAL`, §3.2 rule 3). Do not ship auto-queue without it.
 5. **Post-processing + `move` mode** — verify, extract, staging move; and remote deletion on
    verified completion via §7.4, with its audit trail. `move` ships here because it is
    verification plus one delete call, and the delete path it establishes is what `sync` later
