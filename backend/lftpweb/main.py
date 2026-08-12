@@ -16,10 +16,11 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from lftpweb import __version__
-from lftpweb.api import files, health, settings as settings_api, stats, ws
+from lftpweb.api import files, health, jobs, settings as settings_api, stats, ws
 from lftpweb.config import settings
-from lftpweb.core.engine import Engine
+from lftpweb.core.engine import Engine, load_host_config
 from lftpweb.core.events import EventBus
+from lftpweb.core.queue import TransferQueue
 from lftpweb.db import connect, migrate
 from lftpweb.logsetup import setup_logging
 
@@ -41,12 +42,26 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         events=app.state.events,
         scan_interval_s=settings.scan_interval_s,
     )
+
+    async def _host_provider():
+        return await load_host_config(app.state.db, settings.config_dir)
+
+    app.state.queue = TransferQueue(
+        db=app.state.db,
+        config_dir=settings.config_dir,
+        events=app.state.events,
+        run_dir=settings.run_dir,
+        tick_s=settings.transfer_tick_s,
+        host_provider=_host_provider,
+    )
     await app.state.engine.start()
+    await app.state.queue.start()
 
     logger.info("lftpweb %s started", __version__)
     try:
         yield
     finally:
+        await app.state.queue.stop()
         await app.state.engine.stop()
         await app.state.db.close()
 
@@ -58,6 +73,7 @@ def create_app() -> FastAPI:
     app.include_router(stats.router)
     app.include_router(settings_api.router)
     app.include_router(files.router)
+    app.include_router(jobs.router)
     app.include_router(ws.router)
 
     static_dir = Path(settings.static_dir)

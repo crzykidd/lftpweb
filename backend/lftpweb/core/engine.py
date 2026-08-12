@@ -221,31 +221,68 @@ class Engine:
             logger.warning("scan failed for queue %s (%s): %s", q.id, q.name, message)
             self.events.publish({"type": "scan_error", "queue_id": q.id, "queue_name": q.name, "message": message})
 
+    async def _protected_rel_paths(self, queue_id: int) -> set[str]:
+        """Items whose `state` this scan pass must **not** overwrite — DESIGN.md never says
+        who wins when a periodic rescan's structural state (REMOTE_ONLY/PARTIAL/DOWNLOADED,
+        computed fresh from remote-vs-local bytes on every pass, §3.2) disagrees with a
+        job-lifecycle state (QUEUED/DOWNLOADING/STOPPED/FAILED) `core/queue.py` set. Left
+        unresolved, the next 30s scan after a manual queue/stop silently reverts it — e.g. a
+        `STOPPED` item with a still-partial file reads as `PARTIAL` again on the very next
+        scan, which is indistinguishable from "not stopped" and defeats §4.6's suppression
+        rule the moment it matters.
+
+        Smallest reasonable call, surfaced rather than silently decided: `core/queue.py` owns
+        `state` for any item with a `queued`/`running` job, or with `auto_queue_suppressed`
+        set (STOPPED/FAILED) — this scan updates their size/mtime columns for display but
+        leaves `state` alone. Everything else still gets the structural state computed above;
+        in particular a job's own success path (`core/queue.py._reap_one`) clears
+        `auto_queue_suppressed` and sets `DOWNLOADED` itself, so this scan is free to confirm
+        it on the very next pass rather than fighting over it.
+        """
+        cursor = await self.db.execute(
+            "SELECT item.rel_path FROM item WHERE item.queue_id = ? AND ("
+            "  item.auto_queue_suppressed = 1"
+            "  OR EXISTS (SELECT 1 FROM job WHERE job.item_id = item.id AND job.state IN ('queued', 'running'))"
+            ")",
+            (queue_id,),
+        )
+        rows = await cursor.fetchall()
+        return {row["rel_path"] for row in rows}
+
     async def _persist(self, queue_id: int, nodes: dict[str, ReconciledNode]) -> None:
         from lftpweb.core.util import to_safe_text
 
+        protected = await self._protected_rel_paths(queue_id)
+
         for node in nodes.values():
-            await self.db.execute(
-                """
-                INSERT INTO item (queue_id, rel_path, is_dir, remote_size, local_size, remote_mtime, state)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT (queue_id, rel_path) DO UPDATE SET
-                    is_dir = excluded.is_dir,
-                    remote_size = excluded.remote_size,
-                    local_size = excluded.local_size,
-                    remote_mtime = excluded.remote_mtime,
-                    state = excluded.state
-                """,
-                (
-                    queue_id,
-                    to_safe_text(node.rel_path),
-                    1 if node.is_dir else 0,
-                    node.remote_size,
-                    node.local_size,
-                    node.remote_mtime,
-                    node.state,
-                ),
-            )
+            rel_path = to_safe_text(node.rel_path)
+            if rel_path in protected:
+                await self.db.execute(
+                    """
+                    INSERT INTO item (queue_id, rel_path, is_dir, remote_size, local_size, remote_mtime, state)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT (queue_id, rel_path) DO UPDATE SET
+                        is_dir = excluded.is_dir,
+                        remote_size = excluded.remote_size,
+                        local_size = excluded.local_size,
+                        remote_mtime = excluded.remote_mtime
+                    """,
+                    (queue_id, rel_path, 1 if node.is_dir else 0, node.remote_size, node.local_size, node.remote_mtime, node.state),
+                )
+            else:
+                await self.db.execute(
+                    """
+                    INSERT INTO item (queue_id, rel_path, is_dir, remote_size, local_size, remote_mtime, state)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT (queue_id, rel_path) DO UPDATE SET
+                        is_dir = excluded.is_dir,
+                        remote_size = excluded.remote_size,
+                        local_size = excluded.local_size,
+                        remote_mtime = excluded.remote_mtime,
+                        state = excluded.state
+                    """,
+                    (queue_id, rel_path, 1 if node.is_dir else 0, node.remote_size, node.local_size, node.remote_mtime, node.state),
+                )
         await self.db.commit()
 
     def snapshot(self) -> list[dict[str, Any]]:

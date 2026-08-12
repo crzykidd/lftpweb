@@ -3,6 +3,7 @@ from __future__ import annotations
 from lftpweb.core.local_scan import (
     LocalEntry,
     PgetStatus,
+    effective_file_size,
     effective_size,
     parse_pget_status,
     scan_local,
@@ -94,3 +95,39 @@ def test_scan_local_zero_byte_file(tmp_path):
     (tmp_path / "empty.bin").touch()
     entries = scan_local(tmp_path)
     assert entries["empty.bin"].size == 0
+
+
+# --- effective_file_size: core/progress.py's single-file (pget) sampling, no directory walk --
+
+
+def test_effective_file_size_plain_file(tmp_path):
+    path = tmp_path / "movie.mkv"
+    path.write_bytes(b"x" * 42)
+    assert effective_file_size(path) == 42
+
+
+def test_effective_file_size_missing_file_is_zero(tmp_path):
+    assert effective_file_size(tmp_path / "not-there.mkv") == 0
+
+
+def test_effective_file_size_uses_sidecar_over_sparse_st_size(tmp_path):
+    path = tmp_path / "movie.mkv"
+    with open(path, "wb") as f:
+        f.truncate(10_000_000)
+    (tmp_path / "movie.mkv.lftp-pget-status").write_text(
+        "size=10000000\n0.pos=0\n0.limit=6000000\n1.pos=8000000\n1.limit=10000000\n"
+    )
+    assert effective_file_size(path) == 2_000_000
+
+
+def test_effective_file_size_finds_temp_suffixed_file_by_final_name(tmp_path):
+    (tmp_path / "movie.mkv.lftp").write_bytes(b"y" * 777)
+    assert effective_file_size(tmp_path / "movie.mkv") == 777
+
+
+def test_effective_file_size_temp_suffixed_file_with_sidecar(tmp_path):
+    temp_path = tmp_path / "movie.mkv.lftp"
+    with open(temp_path, "wb") as f:
+        f.truncate(1_000)
+    (tmp_path / "movie.mkv.lftp.lftp-pget-status").write_text("size=1000\n0.pos=250\n0.limit=1000\n")
+    assert effective_file_size(tmp_path / "movie.mkv") == 250

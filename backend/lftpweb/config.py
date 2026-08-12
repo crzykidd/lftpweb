@@ -32,5 +32,14 @@ class Settings(BaseSettings):
     # local scanning rather than §5's separate 30s/10s cadences — see docs/decisions.md.
     scan_interval_s: float = 30.0
 
+    # DESIGN.md §4.2/§11.1: per-job rc files (credentials + settings) and their known_hosts
+    # pin, mode 0600, live on a tmpfs, unlinked when the job exits. `/run/lftpweb` in the
+    # container; overridable for local dev, where bare `/run` isn't writable by a non-root uid.
+    run_dir: str = "/run/lftpweb"
+
+    # DESIGN.md §4.5: the transfer engine's scheduling pass and progress sampler cadence.
+    # "~1 Hz" per §4.4.
+    transfer_tick_s: float = 1.0
+
 
 settings = Settings()

@@ -100,6 +100,35 @@ def _read_sidecar(path: Path) -> PgetStatus | None:
     return parse_pget_status(text)
 
 
+def effective_file_size(path: str | Path) -> int:
+    """The effective size of one file, applying §4.4a/b the same way `scan_local` does, but
+    without a directory walk — for `core/progress.py`'s single-file (`pget`) active-set
+    sampling, where stat-ing one known path beats walking its parent directory.
+
+    Checks, in order: a live `.lftp` temp file (if `path` itself doesn't exist yet), then that
+    file's own `.lftp-pget-status` sidecar (if present, its accounting wins over raw
+    `st_size`), then plain `st_size`. Returns 0 for a path that doesn't exist in any of these
+    forms — a file that hasn't started yet reads as 0 bytes done, not an error.
+    """
+    path = Path(path)
+    candidate = path
+    if not candidate.exists():
+        temp_candidate = path.with_name(path.name + TEMP_FILE_SUFFIX)
+        if temp_candidate.exists():
+            candidate = temp_candidate
+        else:
+            return 0
+
+    sidecar_path = candidate.with_name(candidate.name + PGET_STATUS_SUFFIX)
+    status = _read_sidecar(sidecar_path)
+    if status is not None:
+        return effective_size(status)
+    try:
+        return candidate.stat().st_size
+    except OSError:
+        return 0
+
+
 def scan_local(root: str | Path) -> dict[str, LocalEntry]:
     """Walk `root` and return every entry keyed by POSIX-style `rel_path`.
 

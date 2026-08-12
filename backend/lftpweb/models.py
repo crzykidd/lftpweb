@@ -115,6 +115,7 @@ class PathQueueOut(PathQueueIn):
 
 
 class FileNode(BaseModel):
+    id: int | None = None  # the persisted `item` row's id -- what POST /api/jobs takes (§4.7)
     rel_path: str
     is_dir: bool
     state: str
@@ -133,3 +134,60 @@ class QueueFiles(BaseModel):
 
 class FilesResponse(BaseModel):
     queues: list[QueueFiles]
+
+
+# --- Jobs / transfer engine (DESIGN.md §4, §9.2 Transfers) ------------------------------
+
+
+class QueueItemRequest(BaseModel):
+    item_id: int
+    start_now: bool = False  # "Start now at max bandwidth" (§4.5), applied at admission
+
+
+class JobOut(BaseModel):
+    id: int
+    item_id: int
+    queue_id: int
+    rel_path: str
+    is_dir: bool
+    kind: str
+    state: str
+    lane: str
+    rank: float
+    attempt: int
+    queued_at: str
+    started_at: str | None
+    finished_at: str | None
+    pid: int | None
+    rate_limit_bps: int | None
+    forced_full_rate: bool
+    bytes_start: int
+    bytes_done: int
+    bytes_total: int | None
+    speed_bps: float | None = None
+    eta_s: float | None = None
+    exit_code: int | None = None
+    error_class: str | None = None
+
+
+class JobsResponse(BaseModel):
+    jobs: list[JobOut]
+
+
+class TransferSettingsOut(BaseModel):
+    max_bandwidth_bps: int
+    max_concurrent_transfers: int
+    small_item_threshold_bytes: int
+    small_lane_concurrency: int
+    small_lane_reserve_bps: int | None
+    min_share_floor_bps: int
+    mirror_parallel_transfer_count: int
+    mirror_use_pget_n: int
+    pget_default_n: int
+    max_attempts: int
+    retry_backoff_base_s: float
+    extra_lftp_settings: str
+
+
+class TransferSettingsIn(TransferSettingsOut):
+    pass

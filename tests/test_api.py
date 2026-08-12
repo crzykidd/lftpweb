@@ -19,14 +19,17 @@ def test_health_returns_200_with_version_and_db_status(isolated_config):
 
 
 def test_stats_returns_documented_shape(isolated_config):
+    # Phase 1 stubbed every field at 0; phase 3 (core/queue.py, core/scheduler.py) fills them
+    # in for real — see tests/test_jobs_api.py for the queued/allocated/speed cases actually
+    # moving. With nothing queued and default transfer settings, only `ceiling_bps` (the
+    # configured max_bandwidth_bps default) is non-zero.
     with TestClient(app) as client:
         resp = client.get("/api/stats")
         assert resp.status_code == 200
-        assert resp.json() == {
-            "current_speed_bps": 0,
-            "allocated_bps": 0,
-            "ceiling_bps": 0,
-            "queued_count": 0,
-            "queued_bytes": 0,
-            "transferred_24h_bytes": 0,
-        }
+        body = resp.json()
+        assert body["current_speed_bps"] == 0
+        assert body["allocated_bps"] == 0
+        assert body["ceiling_bps"] > 0
+        assert body["queued_count"] == 0
+        assert body["queued_bytes"] == 0
+        assert body["transferred_24h_bytes"] == 0

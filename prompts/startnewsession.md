@@ -44,25 +44,28 @@ length — it is the single most important thing to read before touching the tra
 
 ## Where we are
 
-**Status: phases 1–2 done, phase 2 not yet committed.** `DESIGN.md` is settled and reviewed.
-The skeleton (phase 1) and scanning + reconciliation + read-only Files view (phase 2) both
-exist and are verified — see `prompts/done/2026-08-11-phase1-skeleton-and-container.md` and
-`prompts/done/2026-08-11-phase2-scanning-and-model.md` for the exact commands run. No transfer
-engine yet — lftp itself never runs until phase 3; nothing moves a byte before then.
+**Status: phases 1–3 done.** `DESIGN.md` is settled and reviewed. The skeleton (phase 1),
+scanning + reconciliation + read-only Files view (phase 2), and the transfer engine + scheduler
+(phase 3) all exist and are verified — see `prompts/done/2026-08-11-phase1-skeleton-and-container.md`,
+`prompts/done/2026-08-11-phase2-scanning-and-model.md`, and
+`prompts/done/2026-08-11-phase3a-transfer-engine.md` for the exact commands run. **lftp now
+actually moves bytes** — queue/stop/retry/move-to-top/start-now all work end to end through the
+real API against the fake seedbox, verified with checksums, a real mid-transfer stop, and a
+real resume from partial.
 
 | Phase (`DESIGN.md` §13) | State |
 |---|---|
 | 1 — Skeleton + container | **done** (2026-08-11) |
 | 2 — Scanning + model | **done** (2026-08-11) |
-| 3 — Transfer engine + scheduler | not started |
+| 3 — Transfer engine + scheduler | **done** (2026-08-11) — backend only; Transfers UI + item drawer are 3b |
 | 4–9 | not started |
 | `sync` mode | **not scheduled** — designed in §7, built only if it proves wanted |
 
 **Current instruction:** build phases 1–3, one at a time — write the handoff prompt, execute it
 via a spawned agent, validate, surface any major design decisions found during the build, then
-stop after phase 3. **Next up: write and execute the phase 3 handoff prompt** — the load-bearing
-one (§13): process supervision, the admission-control scheduler, FS-derived progress,
-queue/stop/retry, the Transfers view and item drawer.
+stop after phase 3. **Phase 3 is done; the instruction's stopping point has been reached.**
+Next up, when resumed: either phase 3b (Transfers UI + item drawer, consuming the API phase 3a
+built) or phase 4 (auto-queue + patterns) — not decided yet, ask before proceeding.
 
 App ports are **8087** (API/SPA) and **5187** (Vite dev server) — not the more obvious
 8080/5173 — chosen to avoid collisions with other stacks on the shared build host. See
@@ -87,11 +90,33 @@ full-tree scope disagree, resolved toward persisting one row per node.
 **Every credential encryption gap is closed as of phase 2**, moved up from build phase 8
 because phase 2 is where a seedbox password first exists (`core/crypto.py`; see
 `docs/decisions.md`). Phase 8 still owns the rest of §8: auth modes, sessions, API keys, rate
-limiting, and the full "hold all transfers for this host" behavior once phase 3 has transfers.
+limiting. Phase 3 landed the "hold transfers for a host with no usable credentials" half of that
+by construction — `TransferQueue._admit` just doesn't spawn anything when
+`core/engine.load_host_config` reports no host.
 
-**Commits so far:** repo init + standard adoption, the design revisions, then phase 1
-(`b0109ae`). All on `dev`. Phase 2's work is prepared on the working tree but **not yet
-committed** — see the phase 2 prompt's final report for the proposed commit.
+**Phase 3, in one paragraph:** `core/lftp.py` builds and spawns one lftp process per job
+(pipes, never a PTY; credentials + tuning in a per-job `/run` tmpfs rc file, never argv) and
+classifies non-zero exits. `core/scheduler.py` is a pure `(settings, running, queue) -> admit
+list` function pinned by a table test covering every §4.5 worked example, the floor loop, the
+fast lane, and start-now. `core/queue.py` ties it together — spawn/watch/reap, retry with
+backoff on transient classes only, SIGTERM-then-grace-then-SIGKILL stop semantics, and
+`auto_queue_suppressed` on every STOPPED/FAILED item even though phase 4's auto-queue doesn't
+exist yet to read it. `core/progress.py` samples the active set at ~1 Hz via
+`core/local_scan.py`'s sidecar math (reused, not reimplemented) and EMA-smooths speed/ETA.
+`api/jobs.py` exposes all of it, plus the site-level transfer settings. The **live-retune
+experiment is confirmed working** (holding lftp's stdin open + `set net:limit-total-rate` while
+a job runs) but is **not** wired into production — admission control stands alone, as required.
+Six non-obvious things were found running real lftp against the real fake seedbox — see
+`docs/decisions.md`'s phase 3 entries, especially: `mirror`'s target must be the item's *parent*
+directory (not the item's own directory, unlike `pget`); a bare `open sftp://user@host` makes
+lftp prompt for a password itself even under key auth; `pget:save-status` defaults to a
+sampler-breaking 10s; and `GET /api/files` was serving a state that a stop/queue action could
+never actually reach until it was pointed at the database instead of the scan-only in-memory
+model.
+
+**Commits so far:** repo init + standard adoption, the design revisions, phase 1 (`b0109ae`),
+phase 2 (`de6d74b`). All on `dev`. Phase 3's work is prepared on the working tree but **not yet
+committed** — see the phase 3 prompt's final report for the proposed commit.
 
 ---
 
@@ -165,3 +190,32 @@ These are the places where the obvious implementation is wrong. Each is written 
   splitting lines, which handles it in practice, but a path containing the *exact* bytes of a
   header immediately after a literal newline would still misparse — a property of the
   specified `find -printf` command, not fixed by deviating from it. See the phase 2 report.
+- **`mirror`'s local target is the item's *parent* directory, not the item's own directory**
+  (found in phase 3). `mirror -c 'REMOTE/item' 'LOCAL/'` creates `LOCAL/item/...` itself —
+  passing `LOCAL/item/`, the "obviously" symmetric choice with `pget`'s exact-file-path target,
+  produces a doubly-nested `LOCAL/item/item/...` tree. `core/lftp.py.build_transfer_command`'s
+  docstring has the full explanation; `core/queue.py` computes the two differently on purpose.
+- **A bare `open sftp://user@host` makes lftp prompt for a password itself, even under key
+  auth** (found in phase 3) — `GetPass() failed -- assume anonymous login` /
+  `Login failed: Password required`, despite the connect-program's ssh having already
+  authenticated successfully via the key. Always use `open -u user,password`, with an *empty*
+  password field for `key`/`agent` auth.
+- **`pget:save-status` defaults to 10s** (found in phase 3) — far too coarse for a ~1 Hz
+  progress sampler; a transfer inspected at the 1s/2s/3s marks under the default has no
+  `.lftp-pget-status` sidecar yet at all. Every job's rc file sets `pget:save-status 1s`.
+- **`GET /api/files` must read `item.state` from the database, not `core/engine.py`'s
+  in-memory scan model** (found live in phase 3, through the running API). The in-memory model
+  is `core/reconcile.py`'s pure structural output — it has no notion of QUEUED/DOWNLOADING/
+  STOPPED/FAILED, so serving it from an API a stop/queue action is supposed to affect silently
+  reverts the visible state on the very next read. `api/files.py` queries `item` directly.
+- **A periodic rescan can silently overwrite a job-lifecycle state back to a structural one**
+  (found in phase 3) — a `STOPPED` item with a still-partial file reads as `PARTIAL` again on
+  the next scan unless something stops it. `core/engine.py._persist` leaves `state` alone for
+  any item with a `queued`/`running` job or `auto_queue_suppressed` set; everything else still
+  gets recomputed every pass.
+- **`pget -o <path>` does not create its target's parent directory** (found in phase 3, unlike
+  `mirror`, which creates its own subtree). `core/queue.py._spawn_decision` `mkdir -p`s it
+  first — a no-op for a genuinely top-level item, load-bearing for anything nested.
+- **A leading blank line in an lftp `-c`/`source`d script corrupts quote-stripping on the next
+  `set key "value with spaces"` line** (found in phase 3, real lftp 4.9.2). Reproducible on
+  demand; `core/lftp.py.build_rc_text` never emits one.

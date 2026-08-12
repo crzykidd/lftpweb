@@ -6,6 +6,189 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-11 — Phase 3: the live-retune experiment (§4.5) is **verified working**
+
+**Tested against a real running transfer, not left as a maybe.** Held `lftp`'s stdin open on a
+read-write fd, fed it an initial script ending in `pget ... &` (backgrounding the transfer so
+the command loop stays live), then wrote `set net:limit-total-rate <n>` to that same fd while
+the job was running.
+
+**Result: it works.** Clean before/after measurement against the fake seedbox, using
+`.lftp-pget-status`'s own accounting (not a guess): capped at 200,000 B/s, a 3s window moved
+611,085 bytes (203,695 B/s — matches the cap to within 2%). Immediately after writing `set
+net:limit-total-rate 5000000` into the held-open stdin, the same job's throughput jumped
+sharply and it finished far faster than the original cap could have allowed. A second run
+retuning 300,000 → 3,000,000 mid-flight showed effective size accelerate from ~517 KB to ~8.15
+MB over the following 2s (≈3.8 MB/s) — well above the old cap, consistent with the new one.
+
+**Not adopted — admission control still stands alone**, exactly as the phase 3 prompt required.
+`core/queue.py` spawns every job with `stdin=DEVNULL`; the held-open-pipe technique was only
+exercised in a standalone script, never wired into production. This closes the "unverified"
+qualifier on DESIGN.md §4.5's experiment and on §15.2 — a future phase could build on it to
+reclaim the "half the pipe sits idle after a partner finishes" cost (§4.5's "residual
+inefficiency"), but nothing forces that decision now.
+
+---
+
+## 2026-08-11 — Phase 3: `GET /api/files` must read `item.state` from the database, not
+## `core/engine.py`'s in-memory scan model
+
+**Found live, through the running HTTP API — not by static review.** Stopping a job via `POST
+/api/jobs/{id}/stop` correctly wrote `item.state = 'STOPPED'` to the database (confirmed by
+direct SQL in `tests/test_queue.py`), but `GET /api/files` kept reporting `PARTIAL` for the same
+item immediately afterward. `api/files.py` was serving `core/engine.py`'s `engine.models` —
+`core/reconcile.py`'s pure structural output (REMOTE_ONLY/LOCAL_ONLY/PARTIAL/DOWNLOADED,
+recomputed from scratch on every scan), which has no notion of QUEUED/DOWNLOADING/STOPPED/FAILED
+at all. That was the correct thing to serve in phase 2 (nothing else existed), but phase 3 adds
+a second writer of `item.state` — `core/queue.py` — and the read path never learned to look at
+its output.
+
+**Fix:** `api/files.py.get_files()` now queries the `item` table directly for every field,
+including `state`, rather than reproducing the merge from `engine.models` in Python. The
+database is genuinely simpler here: `core/engine.py._persist` already knows how to merge
+scan-derived and job-derived state (see the next entry), so re-deriving that merge a second time
+at the API layer would only be a second place for the two to drift apart.
+
+**Also fixed in the same pass:** `GET /api/files` never exposed the persisted `item.id` at all —
+phase 2's read-only Files view never needed it, but `POST /api/jobs` (queue an item, §4.7) takes
+exactly that id, and there was no way for a client to obtain one. `FileNode` gained an `id`
+field.
+
+---
+
+## 2026-08-11 — Phase 3: a periodic rescan must not overwrite a job-lifecycle state back to a
+## purely structural one — DESIGN.md doesn't say who wins
+
+**Ambiguity found building the transfer engine, resolved with the smallest reasonable call.**
+`core/engine.py`'s scan loop persists `item.state` fresh on every pass (every `scan_interval_s`,
+default 30s, plus on-demand). `core/queue.py` also writes `item.state` — QUEUED on enqueue,
+DOWNLOADING on spawn, STOPPED/FAILED on stop or exhausted retries. Nothing in DESIGN.md's §3.2
+or §4 says which writer wins when both are live for the same item at once. Left unresolved, a
+`STOPPED` item with a still-partial file reads as `PARTIAL` again the moment the next scan runs
+— indistinguishable from "never stopped", which quietly defeats §4.6's auto-queue suppression
+rule (a state that reverts to non-STOPPED can't stay suppressed for the right reason).
+
+**Fix:** `core/engine.py._persist` now treats an item as "protected" — and leaves its `state`
+column alone, refreshing only size/mtime — whenever it currently has a `job` row in
+`queued`/`running`, or `auto_queue_suppressed` is set (STOPPED/FAILED). Everything else still
+gets the freshly computed structural state. `core/queue.py`'s own success path
+(`_reap_one`) clears `auto_queue_suppressed` and sets `DOWNLOADED` itself, so the next scan is
+free to confirm it rather than fight over it — the protection only ever applies while `queue.py`
+is actively using the row.
+
+---
+
+## 2026-08-11 — Phase 3: three real lftp behaviors found running it for real, none documented
+## anywhere in DESIGN.md or `lftp --help`
+
+All three were found by running actual commands against the fake seedbox while building
+`core/lftp.py` — see `tests/test_lftp.py` for the pinned regression coverage.
+
+**1. `mirror -c 'REMOTE/item' 'LOCAL/'` creates `LOCAL/item/...` itself — it appends the
+remote path's own basename onto the target.** The "obviously" symmetric choice with `pget`
+(`LOCAL/item/`, matching the item's own local directory) produces a doubly-nested
+`LOCAL/item/item/...` tree instead. `core/lftp.py.build_transfer_command` documents this
+explicitly; `core/queue.py` passes the item's *parent* directory as `local_path` for a `mirror`
+job, the item's own local directory for `pget`.
+
+**2. A bare `open sftp://user@host` makes lftp's own sftp backend try to prompt for a password
+itself — `GetPass() failed -- assume anonymous login` / `Login failed: Password required` —
+even when the connect-program's ssh has already authenticated successfully via a key.**
+`-u user,` with an *empty* password field suppresses lftp's own prompt and defers entirely to
+whatever the connect-program's ssh already established. `core/lftp.py.build_rc_text` always
+uses the `-u user,password` form now, with an empty password for `key`/`agent` auth.
+
+**3. `pget:save-status` defaults to `10s`.** Far too coarse for a ~1 Hz progress sampler — a
+transfer inspected at the 1s/2s/3s marks under the default had no `.lftp-pget-status` sidecar
+at all yet. Every job's rc file now sets `pget:save-status 1s`. This is a genuinely
+load-bearing tunable that DESIGN.md §4.4 never mentions, because §4.4 was written assuming the
+sidecar simply exists whenever there's progress to read.
+
+**Also found, cosmetic but worth recording:** a script passed to `lftp -c`/`source`d whose
+*first line is blank* corrupts quote-stripping on the very next `set key "value with spaces"`
+line — the literal quote characters end up in the stored value, and the shell that later execs
+that value treats the whole quoted string (spaces and all) as one unfindable program name.
+Reproducible on demand; not reproducible once the first line is real content.
+`core/lftp.py.build_rc_text` never emits a leading blank line for this reason.
+
+---
+
+## 2026-08-11 — Phase 3: host-key verification for the lftp-spawned ssh child — DESIGN.md §4.2
+## never says whether it should match the scanning connection's policy
+
+**Ambiguity found in DESIGN.md, resolved with the smallest reasonable call.** §5/§8 specify
+`known_hosts_policy` (accept-and-pin / strict / insecure) for the asyncssh connection
+`core/remote.py` uses to scan and test the connection. §4.1/§4.2 describe the *separate* ssh
+process `lftp` spawns via `sftp:connect-program` for an actual transfer, but never say whether
+it should honor the same policy, default to something else, or fall back to OpenSSH's own
+`~/.ssh/known_hosts`.
+
+**Decision:** reuse the exact pin `core/remote.py`'s `KnownHostsStore` already holds for the
+host — the same one the scanning connection trusted — written into a throwaway
+`known_hosts`-format file alongside the job's rc file (`/run` tmpfs, mode 0600, unlinked with
+it), with `-o StrictHostKeyChecking=yes`. `insecure` is passed straight through as
+`StrictHostKeyChecking=no` / `UserKnownHostsFile=/dev/null`, matching `core/remote.py`'s own
+"insecure means never verify, unconditionally" reading. **`strict`/`accept-and-pin` with no pin
+on file yet refuse to spawn the job at all** (`NoHostKeyPinError`) rather than trusting an
+unpinned key on the transfer path that the scan path hasn't already vouched for — a transfer job
+silently trusting-on-first-use independently of the scanning connection would make the whole
+policy decorative. In practice this can only happen if a job is queued before any scan has ever
+succeeded, which the engine's own scan loop makes rare but not impossible.
+
+---
+
+## 2026-08-11 — Phase 3: `pget -o <path>` does not create its target's parent directory
+
+**Found running a nested item through the real transfer queue, not anticipated.** `mirror`
+creates whatever directory structure it needs under its own target; `pget` does not — queuing
+an item whose local target directory didn't exist yet failed with lftp's own `No such file or
+directory`, for the *local* side, from inside the container running as the right uid with
+correct permissions. `core/queue.py._spawn_decision` now `mkdir -p`s the exact directory a
+`pget` job's file will land in (and a `mirror` job's own target-parent) before spawning. For a
+genuinely top-level item (DESIGN.md §4.7) this is a no-op — the parent is just the queue's
+`local_path`, which the operator already provisioned — but nothing in the schema restricts
+`item` rows (or manual queueing) to top-level entries (see the phase 2 decision on that), so it
+has to hold generally.
+
+---
+
+## 2026-08-11 — Phase 3: out-of-scope bug found incidentally — one permission-denied
+## subdirectory anywhere in a queue aborts that queue's *entire* scan
+
+**Found live while verifying phase 3 through the API, not something phase 3 was asked to fix.**
+`core/remote.py`'s primary scan path (`find <path> -mindepth 1 -printf ...`) treats any nonzero
+exit as a hard failure unless it matches the "unsupported `-printf`" fallback trigger. GNU
+`find` exits `1` the moment it can't `stat`/read one subdirectory's permissions — even though it
+still printed every record it *could* read to stdout first. The whole queue's scan is discarded
+and reported as failed, rather than the one inaccessible subtree being skipped. Not fixed here
+(it's `core/remote.py`, phase 2's module, and out of the phase 3 prompt's scope) — recorded so a
+future session doesn't have to rediscover it. Triggered by a test fixture (`chmod 000` on a
+seedbox directory) removed before phase 3's verification continued.
+
+---
+
+## 2026-08-11 — Phase 3: two admission-control edge cases DESIGN.md's §4.5 worked examples
+## don't cover, decided in code
+
+**"Start now at max bandwidth" bypasses both the main-lane slot count and headroom, not just
+headroom.** §4.5 says it "admits immediately with allocation = the full B, deliberately
+oversubscribing past the ceiling" and separately that normal admission freezes "while `Σ
+allocations > B − reserve`" — the bandwidth side is explicit, but whether it also ignores
+`max_concurrent_transfers` (N) is never stated. Decided: yes, unconditionally — it's framed
+throughout §4.5 as "the escape hatch", and a version that still queued behind a full N would be
+indistinguishable from Move to Top. `core/scheduler.py.admit()` admits every `forced_full_rate`
+queued item first, before computing `slots`/`ready` for anything else.
+
+**`UNKNOWN` error class never retries.** §4.3 names the transient classes (`HOST_UNREACHABLE`,
+`TLS_ERROR`, timeouts, resets) and the permanent ones (`AUTH_FAILED`, `PERMISSION_DENIED`,
+`REMOTE_GONE`, `DISK_FULL`) but never places `UNKNOWN` in either bucket. Decided: retry is a
+whitelist (`core/lftp.TRANSIENT_ERROR_CLASSES`), not "retry everything not explicitly
+permanent" — a failure our classifier didn't recognize is exactly the case where blindly
+hammering the seedbox on a timer is the wrong default; a human should see it once via `FAILED`
+rather than have it retry silently up to `max_attempts` first.
+
+---
+
 ## 2026-08-11 — Phase 2: `asyncssh.connect()` fails outright under DESIGN.md §11.2's own
 ## numeric-uid convention — `getpass.getuser()` raises `OSError` on Python 3.13
 
@@ -206,6 +389,59 @@ read as on-schedule rather than a phase 2 gap: the fake seedbox's tree (17 nodes
 realistic dev-scale queue are nowhere near where non-virtualized rendering degrades, and
 nothing about the read-only, collapsible, per-row-state-chip shape this phase built needs to
 change to add virtualization later — only the row-rendering internals of `FileTree.tsx` would.
+
+---
+
+## 2026-08-11 — Phase 3a review: a small bandwidth ceiling silently deadlocked the whole queue
+
+**Found reviewing phase 3a, by setting a 400 KB/s cap and watching a job sit in `queued`
+forever.** `DESIGN.md` §4.5 specified the fast-lane reserve as *"10% of B, min 1 MB/s"*. That
+floor is unconditional, so:
+
+| ceiling B | reserve | headroom = B − reserve | admits |
+|---|---|---|---|
+| 400 KB/s | 1 MB/s | **−600 KB/s** | 0 |
+| 1 MB/s | 1 MB/s | **0** | 0 |
+| 5 MB/s | 1 MB/s | 4 MB/s | 1 |
+
+Any ceiling at or below 1 MB/s produced `headroom <= 0`, so the main lane admitted **nothing,
+ever** — jobs accepted, queued, and never run, with no error, no failed state, and no log line.
+A user throttling lftpweb to be polite to their uplink would get a permanently dead queue and
+no way to tell why.
+
+The design error is worth naming precisely: the fast lane exists to stop small items being
+blocked by large ones, and the unclamped floor let it block *everything* instead — the exact
+failure it was introduced to prevent, inverted.
+
+**Fix, in both code and `DESIGN.md` §4.5:** the reserve is capped at `B/2`, so it can never
+consume the ceiling it is carved from. Explicit user-set reserves are clamped too, not just the
+derived default. Regression test `test_low_ceiling_still_admits_work` parametrises ceilings from
+100 KB/s upward and asserts work is still admitted.
+
+**Also fixed: the silence.** When the scheduler admits nothing while work is waiting, it now
+logs the arithmetic that produced that decision (ceiling, reserve, allocated, headroom, slots).
+Admitting nothing is usually correct, but it was previously indistinguishable from a wedged
+queue — which is how this hid.
+
+---
+
+## 2026-08-11 — Phase 3a review: a spawn failure left the job queued and the tick hot-looping
+
+**Found in the same session, accidentally**, by running the backend outside its container
+without setting `LFTPWEB_RUN_DIR`: `/run/lftpweb` isn't writable by a normal uid, so
+`lftp.spawn()` raised `PermissionError` inside `_spawn_decision`. (The misconfiguration was
+mine — `run_dir` is configurable and documented. The *failure mode* is the bug.)
+
+`_loop`'s blanket `except Exception` caught it, logged `transfer queue tick failed`, and
+continued — so the job stayed `queued`, the tick retried once a second forever, and the API
+reported a perfectly healthy job that simply never started. Every real deployment failure of
+this shape (read-only `/run`, missing `lftp` binary, wrong uid) would look identical.
+
+**Fix:** `_admit()` catches per-decision, marks that job `failed` with `error_class =
+SPAWN_FAILED` and the exception detail on the row, and suppresses the item like any other
+permanent error (§4.3, §4.6) — so it surfaces in the UI, doesn't spin, and doesn't take the
+other decisions in the same tick down with it. Covered by
+`test_spawn_failure_fails_the_job_instead_of_hot_looping`.
 
 ---
 

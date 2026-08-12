@@ -407,7 +407,7 @@ per-queue. A queue governs *what* and *where*, never *how fast*.
 | `max_concurrent_transfers` (N) | main-lane slots | — |
 | `small_item_threshold` | fast-lane cutoff, by item's total remote size | 10 MB |
 | `small_lane_concurrency` | fast-lane slots | 2 |
-| `small_lane_reserve` | bandwidth carved out for the fast lane | 10% of B, min 1 MB/s |
+| `small_lane_reserve` | bandwidth carved out for the fast lane | 10% of B, min 1 MB/s, **capped at B/2** |
 | `min_share_floor` | refuse to admit below this | ~500 KB/s |
 | `net:connection-limit` | hard cap on concurrent connections | — |
 
@@ -463,7 +463,15 @@ arriving while a 40 GB release holds the entire ceiling would otherwise sit thro
 headroom-is-zero to move a file it could have finished, alongside, in under a second.
 
 The reserve is carved off B rather than left unmetered, so the total stays bounded by B. The
-cost is that the slice sits idle when no small items are running. Letting the fast lane run
+cost is that the slice sits idle when no small items are running.
+
+**The `B/2` cap on the reserve is load-bearing, not defensive.** The "min 1 MB/s" floor is
+unconditional, so without the cap any ceiling at or below 1 MB/s yields a reserve ≥ B, hence
+`headroom ≤ 0`, hence the main lane admits nothing — **ever**. Jobs queue and sit there with no
+error and no log line. Found in build phase 3a by setting a 400 KB/s cap; the fast lane exists
+to stop small items being blocked, and must never be able to block everything else instead.
+When the scheduler admits nothing while work is waiting, it logs the arithmetic that produced
+that decision, so this class of fault is visible rather than silent. Letting the fast lane run
 unmetered was considered and rejected: queue 300 small files and it saturates the uplink at its
 concurrency cap, starving the rate-limited main lane and blowing past the ceiling exactly when
 the ceiling matters.
