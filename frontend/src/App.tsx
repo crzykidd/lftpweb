@@ -3,6 +3,7 @@ import { Layout } from './components/Layout'
 import { FilesPage } from './pages/FilesPage'
 import { TransfersPage } from './pages/TransfersPage'
 import { HistoryPage } from './pages/HistoryPage'
+import { LoginPage } from './pages/LoginPage'
 import { ConnectionTab } from './pages/settings/ConnectionTab'
 import { QueuesTab } from './pages/settings/QueuesTab'
 import { TransferTab } from './pages/settings/TransferTab'
@@ -10,8 +11,23 @@ import { PostProcessingTab } from './pages/settings/PostProcessingTab'
 import { LogsTab } from './pages/settings/LogsTab'
 import { BackupTab } from './pages/settings/BackupTab'
 import { AuthTab } from './pages/settings/AuthTab'
+import { useAuth } from './hooks/authContext'
 
 function App() {
+  const { session } = useAuth()
+
+  // `session === null` only while the very first `GET /api/auth/session` is in flight
+  // (`hooks/useAuth.tsx`) -- render nothing for that one tick rather than flashing the login
+  // form (or the real app) before we know which one is correct.
+  if (session === null) return null
+
+  // Gating the *entire* routed app behind one check, rather than a per-route guard, is
+  // deliberate for the same reason `middleware.py` is one gate instead of a per-router
+  // Depends() on the backend: it makes "did I forget to protect a page" impossible to get
+  // wrong, because there is no per-route decision to forget. `AUTH_MODE=none`/`proxy`-
+  // authenticated/`password`-with-a-valid-session all read `authenticated: true` here.
+  if (!session.authenticated) return <LoginPage />
+
   return (
     <Routes>
       <Route element={<Layout />}>

@@ -205,6 +205,12 @@ class TransferQueue:
         self._task: asyncio.Task | None = None
         self._wake = asyncio.Event()
 
+        # Phase 8 (DESIGN.md §8): "hold all transfers for a host whose credentials need
+        # re-entry, instead of spawning jobs that fail." `_admit` checks this every tick; the
+        # flag only exists so the WARNING log line fires once per transition into the held
+        # state instead of once per second for as long as it lasts (see `_admit` below).
+        self.credentials_need_reentry = False
+
     # --- lifecycle ---------------------------------------------------------------------
 
     async def start(self) -> None:
@@ -649,6 +655,25 @@ class TransferQueue:
         if host is None:
             logger.warning("scheduler admitted %d job(s) but no host is configured", len(decisions))
             return
+
+        # DESIGN.md §8: "hold all transfers for that host instead of spawning jobs that
+        # fail." Without this check, `_spawn_decision` would spawn lftp with
+        # `host.password is None`, and every one of those processes would fail
+        # `AUTH_FAILED` a few seconds later -- exactly the "wave of AUTH_FAILED jobs and no
+        # explanation" DESIGN.md §8 names as the failure mode to prevent. Checked here, not
+        # inside `_spawn_decision`, so it holds admission for *every* decision this tick, not
+        # just the first one to reach spawn.
+        if host.credentials_need_reentry:
+            if not self.credentials_need_reentry:
+                logger.warning(
+                    "holding %d job(s): host %s credentials need re-entry "
+                    "(Settings -> Connection)",
+                    len(decisions),
+                    host.id,
+                )
+            self.credentials_need_reentry = True
+            return
+        self.credentials_need_reentry = False
 
         for decision in decisions:
             try:

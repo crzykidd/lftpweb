@@ -356,3 +356,64 @@ export interface LogTailResponse {
 }
 
 export type LogLevel = 'DEBUG' | 'INFO' | 'WARNING' | 'ERROR' | 'CRITICAL'
+
+// --- Auth (phase 8, DESIGN.md §8) -------------------------------------------------------
+
+export type AuthMode = 'none' | 'password' | 'proxy'
+
+export interface AuthSettingsOut {
+  mode: AuthMode
+  proxy_header: string
+  proxy_trusted_cidrs: string[]
+  has_user: boolean
+  username: string | null
+}
+
+// Mirrors AuthSettingsIn — `username`/`new_password` are only consulted when `mode ===
+// 'password'`, and are required together the first time a user is created (the backend
+// refuses to store `mode: 'password'` with nobody able to log in — DESIGN.md §8).
+export interface AuthSettingsIn {
+  mode: AuthMode
+  proxy_header: string
+  proxy_trusted_cidrs: string[]
+  username?: string | null
+  new_password?: string | null
+}
+
+export interface ChangePasswordIn {
+  current_password: string
+  new_password: string
+}
+
+export interface LoginIn {
+  username: string
+  password: string
+}
+
+/** GET /api/auth/session — "whoami," always reachable unauthenticated so the SPA can decide
+ * whether to render the login form at all (see `hooks/useAuth.tsx`).
+ */
+export interface AuthSessionOut {
+  mode: AuthMode
+  authenticated: boolean
+  username: string | null
+  // Present only when authenticated via a password-mode session — attached as
+  // `X-CSRF-Token` on every mutating request afterwards.
+  csrf_token: string | null
+}
+
+export interface ApiKeyOut {
+  id: number
+  name: string
+  created_at: string
+  last_used_at: string | null
+}
+
+export interface ApiKeyIn {
+  name: string
+}
+
+// Plaintext `key` — present only in the create response, shown once, never again.
+export interface ApiKeyCreatedOut extends ApiKeyOut {
+  key: string
+}

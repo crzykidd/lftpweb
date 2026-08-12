@@ -41,5 +41,16 @@ class Settings(BaseSettings):
     # "~1 Hz" per §4.4.
     transfer_tick_s: float = 1.0
 
+    # DESIGN.md §8, phase 8. Day-to-day auth configuration (mode, proxy header, trusted
+    # CIDRs) lives in the `setting` table like every other *Settings dataclass and is edited
+    # from Settings -> Auth (core/auth.py.AuthSettings) -- NOT here. This env var is `None`
+    # (unset) by default and is deliberately the one piece of auth config that lives outside
+    # the database: it is the lockout-recovery lever. Setting `LFTPWEB_AUTH_MODE=none` (or
+    # any valid mode) and restarting the container overrides whatever is stored, with no
+    # database access required -- see README.md's "Locked out?" section and
+    # docs/decisions.md. Unset (the default) means "use whatever Settings -> Auth has
+    # stored," which itself defaults to `none` for a fresh install.
+    auth_mode: str | None = None
+
 
 settings = Settings()

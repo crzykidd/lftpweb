@@ -8,7 +8,7 @@ progress, auto-queue on patterns, and optionally verify, extract, and relocate f
 
 > ## ⚠ Pre-release — not ready to use
 >
-> **Version `0.0.1`. 3 of 9 build phases complete.** There is no release, no published image,
+> **Version `0.0.1`. 8 of 9 build phases complete.** There is no release, no published image,
 > and no upgrade path. Things will change without notice, including the database schema.
 >
 > Try it if you want to poke at it. Don't point it at anything you care about yet.
@@ -20,19 +20,46 @@ progress, auto-queue on patterns, and optionally verify, extract, and relocate f
 - Queue transfers manually, watch live progress, stop them, resume from the partial
 - Bandwidth ceiling and concurrency limits with an admission-control scheduler
 - Credentials encrypted at rest
+- **Authentication is optional and defaults off** (`AUTH_MODE=none`) — turn on a single-user
+  password login or trust a reverse proxy's identity header, both from Settings → Auth. See
+  "Locked out?" below before you flip it on.
 
 ## What doesn't yet
 
 | | Phase |
 |---|---|
-| Auto-queue and include/exclude patterns | 4 |
-| Archive extraction, checksum verification, staging → final move | 5 |
-| History view | 6 |
-| Log viewer, scheduled database backups | 7 |
-| Authentication (**the UI is currently unauthenticated**) | 8 |
+| Polish: bulk ops, filters, virtualization tuning | 9 |
+
+This table only tracked phases still pending. Phases 1–8 (skeleton, scanning, transfer engine,
+transfers UI, auto-queue/patterns, post-processing/`move`, history, operations, auth) are all
+built — see `prompts/startnewsession.md` for exactly what each phase shipped and how it was
+verified.
 
 Propagating local deletes back to the seedbox (`sync` mode) is designed but **not scheduled** —
 see `DESIGN.md` §7.
+
+## Locked out?
+
+`AUTH_MODE` defaults to `none` — a fresh pull of this image, or an existing install that has
+never visited Settings → Auth, behaves exactly as if auth didn't exist. If you turn on
+`password` mode and get locked out (forgot the password, or the container starts refusing you
+for any other reason), there are two independent ways back in — no browser needed for either:
+
+1. **Set `LFTPWEB_AUTH_MODE=none`** (or `password`/`proxy`, to force a specific mode) as a
+   container environment variable and restart. This overrides whatever is stored in the
+   database, unconditionally, until you unset it again. Fastest if you can edit your compose
+   file / restart the container.
+2. **Delete the local user row directly**, if you have shell/DB access but don't want to
+   restart:
+   ```bash
+   sqlite3 /config/lftpweb.db "DELETE FROM auth_user"
+   ```
+   With `password` mode on and no user configured, lftpweb treats that as open access rather
+   than rejecting every request forever — sign back in via Settings → Auth to create a fresh
+   user once you're in.
+
+Both routes are exercised by `tests/test_auth_api.py::test_lockout_recovery_env_var_override`
+and `::test_lockout_recovery_delete_user_row`, not just documented here.
 
 ## Running it
 

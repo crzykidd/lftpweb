@@ -77,27 +77,39 @@ on `dev`, land via PR.
 
 ## Where we are
 
-**Status: phases 1–7 done.** `DESIGN.md` is settled and reviewed. The skeleton (phase 1),
+**Status: phases 1–8 done.** `DESIGN.md` is settled and reviewed. The skeleton (phase 1),
 scanning + reconciliation + read-only Files view (phase 2), the transfer engine + scheduler
 (phase 3a), the Transfers page / item drawer / Files actions / WebSocket delta fix (phase 3b),
 auto-queue + patterns + the mount sentinel (phase 4), post-processing + `move` mode (phase 5),
-the History page (phase 6), and operations — log viewer + `VACUUM INTO` backups + extended
-health (phase 7) — all exist and are verified — see `prompts/done/2026-08-11-
-phase1-skeleton-and-container.md`, `prompts/done/2026-08-11-phase2-scanning-and-model.md`,
+the History page (phase 6), operations — log viewer + `VACUUM INTO` backups + extended
+health (phase 7), and auth + hardening — the three `AUTH_MODE`s, API keys, CSRF, rate
+limiting, and the finished credentials-need-re-entry behaviour (phase 8) — all exist and are
+verified — see `prompts/done/2026-08-11-phase1-skeleton-and-container.md`,
+`prompts/done/2026-08-11-phase2-scanning-and-model.md`,
 `prompts/done/2026-08-11-phase3a-transfer-engine.md`,
 `prompts/done/2026-08-11-phase3b-transfers-ui.md`,
 `prompts/done/2026-08-11-phase4-autoqueue-and-patterns.md`,
 `prompts/done/2026-08-11-phase5-postprocessing-and-move.md`,
-`prompts/done/2026-08-11-phase6-history-page.md`, and
-`prompts/done/2026-08-11-phase7-operations.md` for the exact commands run.
+`prompts/done/2026-08-11-phase6-history-page.md`,
+`prompts/done/2026-08-11-phase7-operations.md`, and
+`prompts/done/2026-08-11-phase8-auth-and-hardening.md` for the exact commands run.
+
+> **⚠ Phase 8's work is prepared on the working tree but NOT YET COMMITTED**, unlike every
+> earlier phase in this table. The task that ran phase 8 was explicitly instructed "do NOT
+> commit — prepare the tree and report back," overriding this file's normal unattended
+> commit-and-push-then-continue flow (below) for this one phase. `AUTH_MODE` still defaults
+> to `none` either way — nothing about being uncommitted changes that. See the phase 8
+> report (linked from its `prompts/done/` file) for the exact file list and the proposed
+> commit message.
 
 > **Note (2026-08-12):** phase 6's own build was never click-tested in a browser — no browser
 > is available in this environment. The History page type-checks, builds, and lints cleanly,
 > and its backend is verified end to end against the real fake seedbox, but the actual page
 > render, virtualized scroll, and filter controls have not been visually confirmed. Do this
-> before relying on the UI. **The same is true of phase 7's Settings → Logs and Settings →
-> Backup pages** — build/lint clean, every backend endpoint verified over real HTTP, but never
-> click-tested in a browser.
+> before relying on the UI. **The same is true of phase 7's Settings → Logs/Backup pages and
+> phase 8's login page, Settings → Auth, and the credentials-need-re-entry banner** —
+> build/lint clean, every backend endpoint verified over real HTTP, but never click-tested in
+> a browser.
 
 > **⚠ Phase 5 makes the user's live queue's `sync_mode = 'move'` row live.** It has been
 > stored that way in the database since before phase 4's guard existed, inert until now
@@ -116,8 +128,8 @@ phase1-skeleton-and-container.md`, `prompts/done/2026-08-11-phase2-scanning-and-
 | 4 — Auto-queue + patterns | **done** (2026-08-11) |
 | 5 — Post-processing + `move` | **done** (2026-08-12) |
 | 6 — History page | **done** (2026-08-12) |
-| 7 — Operations (logs, backup, health) | **done, not yet committed** (2026-08-11) — see below |
-| 8 — Auth + hardening | overnight run 2026-08-11 |
+| 7 — Operations (logs, backup, health) | **done** (2026-08-11, committed `c6dcc03`) |
+| 8 — Auth + hardening | **done, not yet committed** (2026-08-12) — see below |
 | 9 — Polish | overnight run 2026-08-11 |
 | `sync` mode | **not scheduled** — designed in §7, built only if it proves wanted |
 
@@ -190,10 +202,15 @@ full-tree scope disagree, resolved toward persisting one row per node.
 
 **Every credential encryption gap is closed as of phase 2**, moved up from build phase 8
 because phase 2 is where a seedbox password first exists (`core/crypto.py`; see
-`docs/decisions.md`). Phase 8 still owns the rest of §8: auth modes, sessions, API keys, rate
-limiting. Phase 3 landed the "hold transfers for a host with no usable credentials" half of that
-by construction — `TransferQueue._admit` just doesn't spawn anything when
-`core/engine.load_host_config` reports no host.
+`docs/decisions.md`). **Phase 8 (now done) built the rest of §8**: the three `AUTH_MODE`s,
+sessions, CSRF, API keys, rate limiting, and finished the credentials-need-re-entry behaviour
+for the restore-to-fresh-install case (`core/queue.py._admit` holds transfers,
+`core/engine.py.scan_queue` fails scanning cleanly, both keyed off a new
+`HostConfig.credentials_need_reentry` flag). Phase 3 had already landed the "hold transfers
+for a host with *no* host configured at all" half by construction —
+`TransferQueue._admit` just doesn't spawn anything when `core/engine.load_host_config`
+returns `None` — phase 8's addition is the narrower "a host *is* configured but its password
+won't decrypt" case, which is different code path (host is not `None`, `password` is).
 
 **Phase 3, in one paragraph:** `core/lftp.py` builds and spawns one lftp process per job
 (pipes, never a PTY; credentials + tuning in a per-job `/run` tmpfs rc file, never argv) and
@@ -356,11 +373,53 @@ containers torn down afterward. **Not verified: the actual browser rendering** o
 Settings pages — no browser is available in this environment. Every decision made unattended
 is in `docs/decisions.md`'s phase 7 entry.
 
+**Phase 8, in one paragraph:** `core/auth.py` holds the three `AUTH_MODE`s
+(`none`/`password`/`proxy`, stored in `setting` like every other `*Settings` dataclass,
+defaulting to `none` when absent), argon2id password hashing, session create/validate/purge
+(SHA-256-hashed token, the raw value only ever a cookie), API key create/validate/delete
+(SHA-256-hashed, same reasoning as sessions — high-entropy tokens don't need argon2's
+memory-hard slowness), trusted-CIDR matching off the ASGI socket's own peer address (never a
+spoofable header), and an in-memory per-IP login rate limiter.
+`middleware.py.AuthMiddleware` is one raw ASGI middleware (covers both HTTP and WebSocket
+scopes, unlike `BaseHTTPMiddleware`) gating everything under `/api/` except a four-entry
+public allowlist (`/api/health`, `/api/auth/login`, `/api/auth/session`, `/api/auth/logout`)
+— a default-*deny* shape chosen specifically because the alternative (`Depends()` per route)
+is default-*allow*, and "a route accidentally left open" is this phase's named failure mode.
+`api/auth.py` exposes `/api/auth/{login,logout,session}` and
+`/api/settings/auth/{,password,api-keys}`, refusing server-side to ever store `mode:
+"password"` with nobody able to log in, or `mode: "proxy"` without a trusted CIDR — both
+enforced regardless of what the frontend does. Migration `004_phase8_auth.sql` adds
+`auth_user`/`session`/`api_key`, inserting no rows (mode stays `none` for every existing
+install). The credentials-need-re-entry finish (§8, held over from phase 2): `HostConfig`
+gained `credentials_need_reentry`, and `core/queue.py._admit` / `core/engine.py.scan_queue`
+both check it — holding every scheduler decision and failing that queue's scan with one
+clean message, respectively, instead of spawning doomed lftp processes or retrying a
+connection that can only ever fail. Frontend: `hooks/useAuth.tsx` fetches `GET
+/api/auth/session` once on mount; `App.tsx` gates the *entire* routed app behind one
+`authenticated` check (mirroring the backend's one-gate philosophy) rather than a per-route
+guard; `LoginPage.tsx`, `CredentialsBanner.tsx` (polls host status, links to Settings →
+Connection), and a filled-in `AuthTab.tsx` (mode selector, user setup, password change, API
+key management) round it out. Two lockout-recovery routes, both *exercised* by tests, not
+just documented: `LFTPWEB_AUTH_MODE` (an env var override that wins over whatever is stored)
+and deleting the `auth_user` row (treated as open access rather than a permanent lock).
+Verified: 366 tests pass with the fake seedbox up (0 skipped; 357 passed / 10 skipped
+without it) — no regressions in any earlier phase's tests, including a 42-route enumeration
+proving every protected endpoint returns 401 unauthenticated in `password` mode, and a
+drift-check comparing that enumeration against the app's own registered routes. Both lint
+gates clean (`format --check` again caught files `check` alone missed — the third time this
+exact failure mode has bitten this project). `npm run build`/`npm run lint` clean, all three
+compose files validate, fake-seedbox containers torn down afterward. **Not verified: the
+actual browser rendering** of the login page, Settings → Auth, and the credentials banner —
+no browser is available in this environment. Every decision made unattended is in
+`docs/decisions.md`'s phase 8 entry — read points 1–2 first, they're the lockout-recovery
+design; **this phase's work is prepared but deliberately not committed**, per this task's
+explicit instruction (see the banner near the top of this file).
+
 **Commits so far:** repo init + standard adoption, the design revisions, phase 1 (`b0109ae`),
 phase 2 (`de6d74b`), phase 3a (`36b9123`), phase 3b (`c814aa0`), phase 4 (`db89b63`), phase 5
-(`b0c9cb3`), phase 6 (`d76a662`). All on `dev`. Phase 7's work is prepared on the working tree
-but **not yet committed** — see the phase 7 prompt's final report for the proposed commit
-message.
+(`b0c9cb3`), phase 6 (`d76a662`), phase 7 (`c6dcc03`). All on `dev`. Phase 8's work is
+prepared on the working tree but **not yet committed** — see the phase 8 prompt's final
+report for the proposed commit message.
 
 ---
 

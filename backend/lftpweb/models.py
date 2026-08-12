@@ -394,6 +394,73 @@ class BackupListResponse(BaseModel):
     backups: list[BackupInfoOut]
 
 
+# --- Auth (DESIGN.md §8, phase 8) --------------------------------------------------------
+
+AuthMode = Literal["none", "password", "proxy"]
+
+
+class AuthSettingsIn(BaseModel):
+    mode: AuthMode
+    proxy_header: str = "Remote-User"
+    proxy_trusted_cidrs: list[str] = Field(default_factory=list)
+    # Only meaningful when `mode == "password"`: creates the single local user (if none
+    # exists yet) or changes username/password atomically with the mode switch. This is what
+    # keeps "switch to password mode" from ever being separable from "someone can actually
+    # log in" -- a client can never store `mode: "password"` with nobody able to authenticate
+    # (see api/auth.py.put_auth_settings and core/auth.py's module docstring).
+    username: str | None = None
+    new_password: str | None = None
+
+
+class AuthSettingsOut(BaseModel):
+    mode: AuthMode
+    proxy_header: str
+    proxy_trusted_cidrs: list[str]
+    has_user: bool
+    username: str | None = None
+
+
+class ChangePasswordIn(BaseModel):
+    current_password: str
+    new_password: str
+
+
+class LoginIn(BaseModel):
+    username: str
+    password: str
+
+
+class AuthSessionOut(BaseModel):
+    """`GET /api/auth/session` -- "whoami," always reachable unauthenticated (it's the one
+    endpoint the login page itself needs before any session exists) so the frontend can
+    decide whether to render the login form at all.
+    """
+
+    mode: AuthMode
+    authenticated: bool
+    username: str | None = None
+    # Present only when `authenticated` via a password-mode session -- what the frontend
+    # attaches as `X-CSRF-Token` on every mutating request (DESIGN.md §8).
+    csrf_token: str | None = None
+
+
+class ApiKeyOut(BaseModel):
+    id: int
+    name: str
+    created_at: str
+    last_used_at: str | None
+
+
+class ApiKeyIn(BaseModel):
+    name: str
+
+
+class ApiKeyCreatedOut(ApiKeyOut):
+    # Plaintext -- shown exactly once, in the response to the create call, and never again
+    # (DESIGN.md §8: "show the plaintext once at creation and never again").
+    key: str
+
+
 # --- Settings -> Logs (DESIGN.md §10.1, phase 7) ----------------------------------------
 
 

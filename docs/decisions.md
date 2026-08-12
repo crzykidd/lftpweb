@@ -6,6 +6,309 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-12 — Phase 8: auth and hardening — every decision recorded for review
+
+Built the three `AUTH_MODE`s (`none`/`password`/`proxy`), an API key mechanism independent of
+mode, session cookies + CSRF, login rate limiting, and finished DESIGN.md §8's
+"credentials-need-re-entry" behaviour for the restore-to-fresh-install case (encryption
+itself shipped in phase 2). New: `core/auth.py` (settings, passwords, sessions, API keys,
+CIDR matching, rate limiter), `middleware.py` (one ASGI gate in front of everything under
+`/api/`), `api/auth.py` (`/api/auth/*` + `/api/settings/auth/*`), migration
+`004_phase8_auth.sql` (`auth_user`, `session`, `api_key`), the frontend's `AuthProvider`/
+`useAuth`/`LoginPage`/`CredentialsBanner`/`AuthTab`. Full detail in the phase report; every
+non-obvious call is recorded here.
+
+**1. `AUTH_MODE` is both a database-backed setting (`core/auth.py.AuthSettings`, in `setting`
+like every other `*Settings` dataclass, editable from Settings → Auth) AND an optional env
+var override (`LFTPWEB_AUTH_MODE`, `config.py`).** DESIGN.md §9.1's nav mockup lists "Auth"
+as a Settings tab alongside Connection/Queues/etc., all of which are DB-backed and
+UI-editable — so day-to-day mode configuration follows that precedent. The env var exists
+*only* as the lockout-recovery lever (decision 2): unset (`None`, the default) it changes
+nothing; set, it wins over whatever is stored, unconditionally, with no database access
+required. **Rejected: env-var-only, no DB row, no UI.** Matches the literal capitalization of
+"AUTH_MODE" in DESIGN.md §8 and the phase 8 prompt, and would be simpler, but it contradicts
+§9.1's own Auth tab (there would be nothing for that page to edit) and means turning on auth
+requires a container restart every time, which is a worse experience for the common case
+(configuring it once) to optimize for the rare one (recovering from a mistake) — the override
+handles the rare case fine on its own. **Rejected: DB-only, no env override.** Would remove
+one of the two lockout-recovery routes the prompt explicitly asks for, and — the more
+important reason — removes the *only* recovery route that doesn't require finding and
+deleting one specific database row (decision 2's route 2 is more surgical but requires
+knowing the schema; the env var is what a README-reading operator reaches for first).
+
+**2. Two independent, exercised lockout-recovery routes**, not one. Route 1:
+`LFTPWEB_AUTH_MODE` (decision 1). Route 2: **deleting the `auth_user` row treats `password`
+mode as open access rather than rejecting every request forever**
+(`core/auth.py.resolve_password_mode_gate`) — an operator with shell/DB access but no wish to
+restart the container runs `sqlite3 /config/lftpweb.db "DELETE FROM auth_user"` and is back
+in immediately, then creates a fresh user via Settings → Auth. **Rejected: refuse every
+request when `mode == "password"` and no user row exists ("fail closed").** Textbook-safer on
+paper, but it turns a five-second `DELETE` into a permanently bricked instance — the exact
+"worst possible outcome of this phase" the prompt names twice. An operator who can run that
+`DELETE` already has full read/write access to the database (including the encrypted
+credential blob's ciphertext, the session table, everything) — treating "no user configured"
+as open access gives that operator nothing they didn't already have. Both routes are
+*exercised*, not just asserted: `tests/test_auth_api.py::test_lockout_recovery_env_var_override`
+and `::test_lockout_recovery_delete_user_row` each lock a real running app out via a real
+HTTP 401, apply the recovery, and assert the very next request succeeds.
+
+**3. API keys are hashed with SHA-256, not argon2id — a deliberate, explicitly-flagged
+weakening relative to "argon2id," not an oversight.** DESIGN.md §8 says "argon2id" for the
+*password*; it says nothing about the API-key hash algorithm, and the phase 8 prompt asks
+that any weakening be stated explicitly rather than passed off as an implementation detail,
+so: an API key is 256 bits of `secrets.token_urlsafe` randomness, not a human-chosen
+low-entropy secret. Argon2's entire point is making *guessing* a weak secret expensive via
+memory-hard, deliberately slow hashing; a random 256-bit token cannot be brute-forced
+regardless of hash speed, so the slowness buys nothing here and would cost real latency on
+every API-key-authenticated request (this codebase's scripted/`*arr`-style integration path).
+Session tokens are hashed the same way, for the same reason. **Rejected: argon2id for
+everything uniformly, "for consistency."** Would be more defensible-sounding but is the wrong
+tool for a high-entropy secret and adds latency to a hot path for no real security gain —
+flagged here explicitly rather than silently done, per the prompt's own instruction.
+
+**4. Session cookie's `Secure` attribute is set dynamically (`request.url.scheme ==
+"https"`), not hardcoded `True` — a deliberate, flagged weakening for plain-HTTP LAN
+deployments.** DESIGN.md §8 says "HTTP-only SameSite=Lax session cookie" and doesn't mention
+`Secure` at all. This app is explicitly framed (§1.1) as something people run on a LAN,
+sometimes behind Authelia/Tailscale, sometimes with nothing in front of plain HTTP at all —
+a cookie marked `Secure` is silently *dropped by the browser* over plain HTTP, which would
+make login appear to succeed (200, a `Set-Cookie` header) and then immediately look
+logged-out on the very next request, which is a worse and more confusing failure mode than
+not setting `Secure` at all. **Rejected: hardcode `Secure=True` always.** The textbook-correct
+default for an internet-facing app, but it would silently break login for every user running
+this over plain HTTP on their LAN — the majority deployment shape this project targets — and
+"the cookie doesn't work but gives no error" is a worse outcome than the (accepted) risk of a
+LAN-local cookie being sent in the clear on a network the user already trusts enough to expose
+their seedbox credentials to.
+
+**5. CSRF uses a server-tracked token returned in the login/whoami response body
+(`session.csrf_token`), required as an `X-CSRF-Token` header on mutating requests — not a
+double-submit cookie.** DESIGN.md §8 says "CSRF token required on mutating requests" without
+specifying the mechanism. A second, non-`HttpOnly` cookie (the usual double-submit pattern)
+would need its own cookie-parsing/setting code for no real benefit here: this app has no
+subdomains and no shared-cookie-jar sibling apps, the two properties double-submit is
+designed to defend against when a plain shared-secret comparison wouldn't. Returning the
+token in the JSON body the frontend already reads (`AuthSessionOut.csrf_token`) is one fewer
+moving part. **Rejected: double-submit cookie.** More conventional, but adds a second cookie
+and its own parsing path for a threat model (cross-subdomain cookie injection) this
+single-origin, single-container app doesn't have.
+
+**6. `PUT /api/settings/auth` refuses to store `mode: "password"` unless a user already
+exists or `username`+`new_password` are supplied in the same request — atomically.**
+Otherwise a client could store `mode: "password"` with nobody able to log in, which is a
+lockout DESIGN.md §8 (and the phase 8 prompt, twice) name as the thing to prevent above all
+else. Enforced server-side (`api/auth.py.put_auth_settings`), not only in the frontend form —
+the same reasoning `api/settings.py._effective_auto_verify` already applies to a `move`
+queue's forced verification (a direct `curl`/script call must not be able to bypass a safety
+invariant the UI happens to enforce). Mirrors §8's identical requirement for `proxy` mode
+(refuse without a trusted CIDR) applied to the other mode capable of a total lockout.
+
+**7. `proxy` mode's trusted-CIDR check reads the ASGI scope's `client` (the direct TCP peer
+the server itself accepted the connection from), never `X-Forwarded-For` or any other
+client-supplied header.** DESIGN.md §8 is explicit that without the CIDR check, `proxy` mode
+is a bypass — trusting a header for the *address* half of that check would make the whole
+gate spoofable by anyone who can set an arbitrary header, which is exactly the attack the
+CIDR check exists to prevent. This does mean a request that traverses more than one hop
+before reaching lftpweb (e.g. a load balancer in front of the trusted reverse proxy) needs
+the *last* hop — the one lftpweb's own socket sees — to be the trusted one; documented as the
+expected topology (one reverse proxy directly in front of the container), not a general
+multi-hop `X-Forwarded-For` chain resolver, which DESIGN.md never asks for and which would
+reintroduce exactly the spoofing risk the CIDR check exists to close.
+
+**8. One raw ASGI middleware (`middleware.py.AuthMiddleware`) gates everything under `/api/`
+except a four-entry public allowlist, rather than a per-router `Depends(require_auth)`.**
+The phase 8 prompt's own framing — "a route accidentally left open is the entire failure mode
+of this phase" — is a default-*allow* problem: a per-route dependency is opt-in, so a new
+router or a route someone forgot to annotate is silently open. A single default-*deny*
+middleware inverts that: a new router is protected the moment it's mounted, and *allowing* a
+route is the one-line, reviewable thing that has to be deliberately added to
+`PUBLIC_API_PATHS`. **Rejected: `Depends()` per route.** More idiomatic FastAPI, and what
+most tutorials show, but it is structurally the shape most likely to produce exactly the bug
+this phase exists to prevent. `tests/test_auth_api.py::test_protected_route_enumeration_has_no_drift`
+additionally cross-checks the enumerated test list against `app.routes` itself, so a future
+router added without a corresponding test entry fails loudly rather than silently going
+untested.
+
+**9. Raw ASGI, not `BaseHTTPMiddleware`.** `BaseHTTPMiddleware` only ever sees the `"http"`
+ASGI scope; it cannot intercept a WebSocket handshake at all, and `/api/ws` (decision 10)
+needs gating like everything else. A plain `__init__(self, app)` / `async def
+__call__(self, scope, receive, send)` middleware handles `"http"` and `"websocket"` scopes
+uniformly and also sidesteps `BaseHTTPMiddleware`'s known interactions with streaming
+responses, relevant here because `/api/settings/backup/*/download` and `/api/logs/*/download`
+(phase 7) stream files.
+
+**10. `/api/ws` is gated exactly like every REST endpoint, even though DESIGN.md §8 only
+ever gives REST-shaped examples ("endpoint," "route").** The live WebSocket stream carries the
+same file/job/queue data the REST endpoints do — DESIGN.md §8's own framing ("everything
+else... requires auth") reads as a statement about *data exposed*, not about the specific
+transport, and leaving the socket open would mean password/proxy mode still exposes the
+entire tracked model to an unauthenticated client. Smallest reasonable call, recorded because
+DESIGN.md doesn't name it explicitly: a denied WebSocket handshake gets `websocket.close`
+before `websocket.accept` (`middleware.py._deny`), so the client sees a clean rejection at
+connect time rather than an accepted-then-immediately-dropped connection.
+
+**11. Login rate limiting is in-memory, per-client-IP, sliding window (5 failures / 5
+minutes), and resets on restart — no persistence.** DESIGN.md §8 just says "rate-limited
+login." This app is single-process (§2), so there is no cross-instance coordination problem
+a persisted table would solve, and a restart clearing every counter is an accepted trade
+(same reasoning phase 7 already applied elsewhere in this codebase to in-memory-only state).
+**Rejected: persist attempt timestamps in SQLite.** Would survive a restart, but adds a table
+and a write on every failed attempt for a homelab-scale threat model where "the attacker can
+restart the container" is already a much bigger problem than a reset rate limit.
+
+**12. A password change (`POST /api/settings/auth/password`, and `PUT /api/settings/auth`
+when it includes `new_password`) purges *every* session, including the one that just made the
+request.** Standard practice: a stolen-but-unused cookie from before the change must stop
+working immediately rather than riding out its own TTL, and "you'll need to sign in again
+after changing your password" is expected UX. The frontend (`AuthTab.tsx`) shows a notice
+saying so rather than silently leaving the user in a confusing half-logged-in state.
+
+**13. The login endpoint does not attempt to normalize timing between "unknown username" and
+"wrong password" — a deliberate, minor, explicitly-flagged simplification, not an oversight.**
+`api/auth.py.login` short-circuits on a username mismatch before ever calling
+`verify_password` (which runs argon2id and is measurably slower than a string comparison),
+which is in principle a timing side-channel revealing whether a given username is "the"
+username. For a single-user homelab app where the one valid username is typically visible
+elsewhere anyway (it's chosen by the same person who can read the source), and where the
+response is otherwise identical (`401`, `"invalid username or password"`) either way, this
+was judged not worth the complexity of hashing against a dummy value on every mismatched
+username to normalize timing. Both failure modes are still rate-limited identically
+(decision 11) and return an identical body either way — only wall-clock response time
+differs, and only measurably so under repeated automated probing this project's threat model
+doesn't particularly need to defend against. **Flagged explicitly per the prompt's
+instruction on weakening security for practicality**, rather than left to look like it was
+simply never considered.
+
+**14. `core/queue.py.TransferQueue._admit` holds *every* scheduler decision for a tick when
+`host.credentials_need_reentry` is true, rather than letting `_spawn_decision` attempt each
+one and fail.** This is the missing half of DESIGN.md §8's credentials-need-re-entry
+behaviour phase 2 didn't finish: without it, the scheduler would spawn lftp processes with
+`password=None`, each of which fails `AUTH_FAILED` a few seconds later — precisely the "wave
+of AUTH_FAILED jobs and no explanation" DESIGN.md §8 names as the failure mode to prevent.
+Checked once per `_admit` call (holding the whole batch of decisions for that tick), not
+inside `_spawn_decision` per job, so a single re-entry condition doesn't let some decisions
+through before the check catches up. `HostConfig` gained a new `credentials_need_reentry`
+field (`core/remote.py`), set by `core/engine.py.load_host_config` (already the one place
+that catches the phase-2 `DecryptionError`); nothing about the encryption scheme itself
+changed.
+
+**15. `core/engine.py.Engine.scan_queue` also short-circuits on
+`host.credentials_need_reentry`, raising a clean, stable `RemoteScanError` *before* calling
+`RemoteConnectionPool.scan` — rather than letting the scan attempt a doomed SSH connection
+every 30s and catching the resulting `DecryptionNeededError` two frames deeper.** DESIGN.md
+§8 says "mark the host credentials need re-entry... rather than crashing or retrying." The
+prior behaviour (before this phase) technically didn't crash, but it did retry — opening (and
+failing) a real connection attempt every scan cycle, with a message string that came from
+deep inside `core/remote.py._connect` rather than something written for this specific,
+well-understood condition. The observable end state (`scan_errors[q.id]`, a `scan_error` WS
+event) is the same shape as before; what changed is that the condition is now recognized
+*before* any I/O is attempted, not discovered by attempting and failing it.
+`tests/test_credentials_reentry.py::test_scan_queue_holds_cleanly_without_attempting_a_connection`
+asserts `engine.pool.is_connected is False` afterward to prove no connection was ever opened,
+not just that the error message looks right.
+
+**16. The frontend gates the *entire* routed app behind one check
+(`App.tsx`: `if (!session.authenticated) return <LoginPage />`), mirroring the backend's
+"one gate, not per-route" philosophy (decision 8) — no per-route guard component, no
+route-level `<ProtectedRoute>` wrapper.** The session is fetched once on mount
+(`hooks/useAuth.tsx`), not polled; a session going stale mid-visit surfaces the next time a
+mutating call gets a 401/403 from the backend (which the user sees as that action failing),
+rather than the frontend proactively detecting and bouncing to the login page on a timer.
+**Rejected: a global fetch interceptor that redirects to `/login` on any 401.** More
+"automatic," but adds a second, harder-to-reason-about auth-state transition path (a
+background redirect that can fire mid-interaction) for a homelab single-tab app where "the
+next action you take just fails and you can refresh" is an acceptable, much simpler fallback.
+Flagged as a simplification, not a completeness claim — see the "not verified" list in the
+report for what a browser would actually need to confirm.
+
+**17. Argon2-cffi was added as a new dependency (`pyproject.toml`, `uv.lock`) rather than
+hand-rolling PBKDF2/bcrypt via `hashlib`/`cryptography` (both already dependencies).**
+DESIGN.md §8 says "argon2id" specifically, and §11.1 had *already* anticipated this exact
+dependency in its own musllinux-wheel list ("cryptography, pydantic-core, argon2-cffi") —
+this isn't a new architectural decision so much as finishing what §11.1 already committed to.
+Confirmed (not assumed) that `argon2.PasswordHasher()`'s default `Type` is `Type.ID` and every
+hash it produces is prefixed `$argon2id$` before relying on it
+(`tests/test_auth.py::test_password_hash_is_argon2id_not_a_fallback`).
+
+**18. §11.1's compose hardening (`cap_drop: ALL` + `CHOWN`/`SETUID`/`SETGID` added back,
+`read_only: true`, `no-new-privileges: true`) needs zero changes for this phase, confirmed by
+review, not assumed.** Every piece of new state this phase adds (the `auth_user`/`session`/
+`api_key` tables, the in-memory rate limiter, the in-memory CSRF/session lookups) lives either
+in the existing SQLite database under `/config` (already the one non-tmpfs writable volume)
+or purely in process memory — no new binary, no new writable path, no new Linux capability.
+`argon2-cffi` ships as a prebuilt musllinux wheel (per §11.1's own anticipation, decision 17),
+so it adds no compiler requirement to the runtime image either. Nothing here "requires" the
+compose hardening to relax; recorded because the prompt asked this be checked explicitly, not
+assumed.
+
+**19. §10.1's credential redactor needed no changes, confirmed by review and by test, not
+assumed.** Grepped every `logger.*` call this phase adds (`core/auth.py`, `api/auth.py`,
+`middleware.py`) — none logs a password, session token, CSRF token, or API key, truncated or
+otherwise; the only two log lines this phase adds (`core/queue.py`'s
+"holding N job(s)... credentials need re-entry" and `middleware.py`'s "unrecognized auth
+mode") carry only a host id and a mode string, never a secret. Separately, credentials in
+this phase travel exclusively via JSON request bodies and the `Cookie`/`X-API-Key`/
+`X-CSRF-Token` headers, never a URL or query string, and uvicorn's own access-log line format
+is method+path+status only (no headers, no body) — so there is no code path by which a secret
+this phase introduces could reach a log line the existing `scheme://user:pass@host` URL
+redactor (`logsetup.CredentialRedactor`) would need to additionally cover.
+`tests/test_auth_api.py::test_login_never_writes_password_session_or_csrf_to_the_log_file`
+proves this end to end (a real login + API-key creation, then the actual log file on disk
+grepped for the password, the CSRF token, the API key, and the raw session cookie value)
+rather than trusting the review alone — the same "verified, not assumed" bar phase 7 set for
+its own redaction claim.
+
+**20. README.md's edits this phase are scoped to what phase 8 actually changed** (the
+pre-release banner's phase counter, the "Authentication" line moving from "doesn't yet" to
+"what works today," and a new "Locked out?" section) **— the stale phase 4–7 rows in the
+"doesn't yet" table were left alone rather than silently rewritten.** Those rows already
+describe work that shipped in earlier phases (auto-queue, post-processing, History, log
+viewer/backups) and are wrong, but fixing them is a documentation pass across four other
+phases' worth of scope, not something phase 8 was asked to do — flagged here and in the
+report as a one-line offer for the user rather than done unilaterally, per this project's own
+operating rule against scope creep during a named phase's work.
+
+**Verified, not just asserted:** `tests/test_auth.py` (31 unit tests: settings default/round-
+trip, the env-var override, argon2id hash format and verify success/failure, user create/
+update/delete, the password-mode gate, session create/validate/expire/delete/purge with the
+raw token never stored, API key create/validate/delete with the plaintext never stored, CIDR
+matching including the empty-list-never-trusts-anyone case, and the rate limiter's block/
+reset/window-expiry/per-key-independence behaviour). `tests/test_auth_api.py` (29 tests over
+the real HTTP app: the `AUTH_MODE=none` regression across every router, `/api/health`
+reachable unauthenticated in all three modes, the full protected-route enumeration — 42
+routes — asserting 401 unauthenticated in `password` mode, a drift-check comparing that
+enumeration against the app's own registered routes, the WebSocket handshake rejected/
+accepted in `password`/`none` mode respectively, login success setting an `HttpOnly`/
+`SameSite=Lax` cookie and returning a CSRF token, login failure, session-cookie access,
+logout invalidating the session, CSRF required/accepted on mutating requests and not required
+on GET, login rate limiting kicking in after 5 failures without blocking a subsequent correct
+attempt, API keys working in every mode independent of session state and never appearing in
+any response body, `proxy` mode's refuse-without-CIDR / reject-outside-CIDR / accept-inside-
+CIDR-with-header / reject-missing-header cases, the stored hash's `$argon2id$` prefix and its
+absence from every response, both lockout-recovery routes actually exercised end to end, and
+the log-file redaction proof). `tests/test_credentials_reentry.py` (3 tests, no fake seedbox
+needed: `load_host_config` flagging the restore-to-fresh-install case, `scan_queue` failing
+clean without opening a connection, and `_admit` holding every decision without ever spawning
+a job or marking one `AUTH_FAILED`). `uv run pytest`: 366 passed, 0 skipped with the fake
+seedbox up (357 passed, 10 skipped without it) — no regressions in any earlier phase's tests.
+Both lint gates clean (`ruff check` and `ruff format --check`, `--config ruff.toml`,
+repo-wide — `format --check` again caught 3 files `check` alone missed, the exact failure
+mode the prompt warned about a third time). `npm run build` and `npm run lint` (oxlint) clean.
+`docker compose config --quiet` clean on all three compose files. The fake-seedbox containers
+started to run the full suite were torn down and confirmed removed via `docker ps -a`
+afterward.
+
+**Not verified — stated plainly:** no browser is available in this environment. The login
+page's actual rendering, the Settings → Auth form (mode radio buttons, the CIDR textarea, the
+API-key creation flow, the "copy this now" one-time-reveal), the credentials-need-re-entry
+banner, and the sign-out control in the left nav were never exercised in an actual browser —
+only confirmed to build, type-check, and lint cleanly (`npm run build`, `npm run lint`), with
+every backend endpoint they call verified directly over real HTTP. This should be
+click-tested before being relied on, same caveat phases 6 and 7 already carry for their own
+UI.
+
+---
+
 ## 2026-08-11 — Phase 7: operations (log viewer, database backup, health) — every decision
 ## made unattended, recorded for review
 

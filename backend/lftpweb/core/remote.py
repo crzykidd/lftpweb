@@ -118,6 +118,14 @@ class HostConfig:
     password: str | None = None
     known_hosts_policy: str = "accept-and-pin"  # 'accept-and-pin' | 'strict' | 'insecure'
     connect_timeout: float = DEFAULT_CONNECT_TIMEOUT_S
+    # DESIGN.md §8, phase 8: set by `core/engine.py.load_host_config` when
+    # `auth_method == "password"` and the stored `password_enc` failed to decrypt with the
+    # current install secret (the restore-to-fresh-install case, §10.2). Distinct from
+    # `password is None`, which is also true for `key`/`agent` auth where no password is
+    # expected at all -- this flag is what `core/queue.py._admit` and `core/engine.py.
+    # scan_queue` check to hold transfers / skip scanning cleanly instead of retrying a
+    # connection that can only ever fail the same way.
+    credentials_need_reentry: bool = False
 
 
 @dataclass(frozen=True)

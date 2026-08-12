@@ -77,6 +77,7 @@ async def load_host_config(db: aiosqlite.Connection, config_dir: str) -> HostCon
         return None
 
     password: str | None = None
+    credentials_need_reentry = False
     if row["auth_method"] == "password" and row["password_enc"]:
         try:
             password = decrypt_secret(config_dir, row["password_enc"])
@@ -85,6 +86,7 @@ async def load_host_config(db: aiosqlite.Connection, config_dir: str) -> HostCon
                 "host %s: password does not decrypt (credentials need re-entry): %s", row["id"], exc
             )
             password = None
+            credentials_need_reentry = True
 
     return HostConfig(
         id=row["id"],
@@ -95,6 +97,7 @@ async def load_host_config(db: aiosqlite.Connection, config_dir: str) -> HostCon
         key_path=row["key_path"],
         password=password,
         known_hosts_policy=row["known_hosts_policy"],
+        credentials_need_reentry=credentials_need_reentry,
     )
 
 
@@ -261,6 +264,17 @@ class Engine:
         try:
             if host is None:
                 raise RemoteScanError("no host configured")
+            # DESIGN.md §8: "mark the host credentials need re-entry... rather than crashing
+            # or retrying." Raising here (instead of letting `self.pool.scan` attempt the
+            # connection) means this queue's scan fails with one clean, stable message every
+            # pass rather than actually opening a doomed SSH connection every 30s and getting
+            # a `DecryptionNeededError` two frames deeper each time -- same observable
+            # end state (the queue's `scan_errors` entry), but no retried connection attempt.
+            if host.credentials_need_reentry:
+                raise RemoteScanError(
+                    "credentials need re-entry -- update the seedbox password in "
+                    "Settings -> Connection"
+                )
             remote_tree, scan_warning = await self.pool.scan(host, q.remote_path)
             local_tree = local_scan.scan_local(q.local_path)
 

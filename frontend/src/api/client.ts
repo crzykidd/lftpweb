@@ -1,4 +1,11 @@
 import type {
+  ApiKeyCreatedOut,
+  ApiKeyIn,
+  ApiKeyOut,
+  AuthSessionOut,
+  AuthSettingsIn,
+  AuthSettingsOut,
+  ChangePasswordIn,
   BackupInfoOut,
   BackupListResponse,
   BackupSettingsIn,
@@ -15,6 +22,7 @@ import type {
   HostTestRequest,
   JobOut,
   JobsResponse,
+  LoginIn,
   LogFilesResponse,
   LogTailResponse,
   PathQueueIn,
@@ -30,6 +38,18 @@ import type {
   TestConnectionResponse,
 } from './types'
 
+// The CSRF token issued at login (DESIGN.md §8) — held in memory only, never localStorage
+// (nothing durable needs to survive a page reload; `hooks/useAuth.tsx` re-fetches it from
+// `GET /api/auth/session` on mount instead). `setCsrfToken` is called by that hook whenever
+// a login/session response carries one.
+let csrfToken: string | null = null
+
+export function setCsrfToken(token: string | null): void {
+  csrfToken = token
+}
+
+const MUTATING_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE'])
+
 async function getJson<T>(path: string): Promise<T> {
   const res = await fetch(path)
   if (!res.ok) {
@@ -39,9 +59,16 @@ async function getJson<T>(path: string): Promise<T> {
 }
 
 async function sendJson<T>(path: string, method: string, body?: unknown): Promise<T> {
+  const headers: Record<string, string> = {}
+  if (body !== undefined) headers['Content-Type'] = 'application/json'
+  // Attached whenever we have one, regardless of mode — a no-op in `none`/`proxy` mode (the
+  // backend only checks it for a password-mode session, middleware.py) and required for
+  // every mutating call once a password-mode session exists.
+  if (csrfToken && MUTATING_METHODS.has(method)) headers['X-CSRF-Token'] = csrfToken
+
   const res = await fetch(path, {
     method,
-    headers: body === undefined ? undefined : { 'Content-Type': 'application/json' },
+    headers: Object.keys(headers).length ? headers : undefined,
     body: body === undefined ? undefined : JSON.stringify(body),
   })
   if (!res.ok) {
@@ -258,4 +285,46 @@ export function backupNow(): Promise<BackupInfoOut> {
 
 export function backupDownloadUrl(filename: string): string {
   return `/api/settings/backup/${encodeURIComponent(filename)}/download`
+}
+
+// --- Auth (phase 8, DESIGN.md §8) ---------------------------------------------------------
+
+/** Always reachable with no credentials — see `middleware.py.PUBLIC_API_PATHS` — because a
+ * browser that isn't authenticated yet is exactly who needs to call this to find out.
+ */
+export function getAuthSession(): Promise<AuthSessionOut> {
+  return getJson<AuthSessionOut>('/api/auth/session')
+}
+
+export function login(body: LoginIn): Promise<AuthSessionOut> {
+  return sendJson<AuthSessionOut>('/api/auth/login', 'POST', body)
+}
+
+export function logout(): Promise<AuthSessionOut> {
+  return sendJson<AuthSessionOut>('/api/auth/logout', 'POST')
+}
+
+export function getAuthSettings(): Promise<AuthSettingsOut> {
+  return getJson<AuthSettingsOut>('/api/settings/auth')
+}
+
+export function putAuthSettings(body: AuthSettingsIn): Promise<AuthSettingsOut> {
+  return sendJson<AuthSettingsOut>('/api/settings/auth', 'PUT', body)
+}
+
+export function changePassword(body: ChangePasswordIn): Promise<void> {
+  return sendJson<void>('/api/settings/auth/password', 'POST', body)
+}
+
+export function listApiKeys(): Promise<ApiKeyOut[]> {
+  return getJson<ApiKeyOut[]>('/api/settings/auth/api-keys')
+}
+
+/** The plaintext `key` on the returned object is shown exactly once — DESIGN.md §8. */
+export function createApiKey(body: ApiKeyIn): Promise<ApiKeyCreatedOut> {
+  return sendJson<ApiKeyCreatedOut>('/api/settings/auth/api-keys', 'POST', body)
+}
+
+export function deleteApiKey(id: number): Promise<void> {
+  return sendJson<void>(`/api/settings/auth/api-keys/${id}`, 'DELETE')
 }
