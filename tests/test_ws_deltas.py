@@ -234,3 +234,35 @@ async def test_scan_delta_payload_does_not_scale_with_tree_size(tmp_path, monkey
 
     # And the delta is tiny next to even the *small* tree's own full snapshot.
     assert big_delta_bytes < small_snapshot_bytes
+
+
+async def test_ws_nodes_carry_item_id_so_the_ui_can_act_on_them(tmp_path, monkeypatch):
+    """Every node the WebSocket sends must carry its `item.id`.
+
+    The Files page renders purely from this stream — never from `GET /api/files` — and every
+    action it offers (Queue, Stop, bulk ops) addresses an item by id. When `serialize_node`
+    omitted it, every row arrived with `id == null` and the UI rendered no action button at
+    all, on every row: a REMOTE_ONLY file could be seen but never queued. Found against a
+    real deployment, because phase 3b verified the API and WS contract with curl and a raw
+    socket client but never clicked the button.
+    """
+    monkeypatch.setattr(engine_module.local_scan, "scan_local", lambda root: {})  # noqa: ARG005
+
+    tree = _release_tree(3)
+    engine, q, host, db = await _make_engine(tmp_path, [tree, tree])
+    try:
+        subscription = engine.events.subscribe()
+        await engine.scan_queue(q, host)
+        delta = await subscription.get()
+
+        assert delta["type"] == "queue_delta"
+        assert delta["changed"], "expected a first-scan delta carrying the whole tree"
+        for node in delta["changed"]:
+            assert node.get("id") is not None, f"delta node has no id: {node['rel_path']}"
+
+        for message in engine.snapshot():
+            assert message["nodes"], "expected nodes in the snapshot"
+            for node in message["nodes"]:
+                assert node.get("id") is not None, f"snapshot node has no id: {node['rel_path']}"
+    finally:
+        await db.close()

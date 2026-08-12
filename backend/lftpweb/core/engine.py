@@ -113,10 +113,21 @@ async def load_queues(db: aiosqlite.Connection) -> list[QueueConfig]:
     ]
 
 
-def serialize_node(node: ReconciledNode) -> dict[str, Any]:
+def serialize_node(node: ReconciledNode, item_id: int | None = None) -> dict[str, Any]:
+    """One node as the WebSocket sends it.
+
+    `id` matters more than it looks: every action the Files page offers (Queue, Stop, the
+    bulk operations) addresses an item by its `item.id`, and the page renders purely from
+    this stream — never from `GET /api/files`. Omitting it, as this did until it was caught
+    against a real deployment, means every row arrives with `id == null` and the UI silently
+    renders no action button at all, on every row, forever. `ReconciledNode` has no id of its
+    own (it is the pure reconciler output, produced before anything is persisted), so the id
+    is passed in by the caller from the map built in `_persist`.
+    """
     from lftpweb.core.util import to_safe_text
 
     return {
+        "id": item_id,
         "rel_path": to_safe_text(node.rel_path),
         "is_dir": node.is_dir,
         "state": node.state,
@@ -170,6 +181,8 @@ class Engine:
         self.pool = RemoteConnectionPool(Path(config_dir))
 
         self.models: dict[int, dict[str, ReconciledNode]] = {}
+        # rel_path -> item.id per queue; see `serialize_node` for why the WS needs it.
+        self.item_ids: dict[int, dict[str, int]] = {}
         self.queue_meta: dict[int, QueueConfig] = {}
         self.scan_errors: dict[int, str | None] = {}
         # A *soft* per-queue note (DESIGN.md §5) — set when a scan completed but skipped one
@@ -248,7 +261,7 @@ class Engine:
                     "type": "queue_delta",
                     "queue_id": q.id,
                     "queue_name": q.name,
-                    "changed": [serialize_node(n) for n in changed],
+                    "changed": [serialize_node(n, self._node_id(q.id, n)) for n in changed],
                     "removed": removed,
                     "scanned_at": self.last_scan_at[q.id],
                     "warning": scan_warning,
@@ -341,6 +354,22 @@ class Engine:
                     ),
                 )
         await self.db.commit()
+        await self._refresh_item_ids(queue_id)
+
+    async def _refresh_item_ids(self, queue_id: int) -> None:
+        """Cache `rel_path -> item.id` for this queue, so the WebSocket can carry the id the
+        Files page needs to act on a row (see `serialize_node`). One query per scan, run
+        after the upsert so freshly-inserted rows are included.
+        """
+        cursor = await self.db.execute(
+            "SELECT id, rel_path FROM item WHERE queue_id = ?", (queue_id,)
+        )
+        self.item_ids[queue_id] = {row["rel_path"]: row["id"] for row in await cursor.fetchall()}
+
+    def _node_id(self, queue_id: int, node: ReconciledNode) -> int | None:
+        from lftpweb.core.util import to_safe_text
+
+        return self.item_ids.get(queue_id, {}).get(to_safe_text(node.rel_path))
 
     def snapshot(self) -> list[dict[str, Any]]:
         """The full current model, one message per queue — what a freshly-connected
@@ -357,7 +386,9 @@ class Engine:
                     "type": "queue_snapshot",
                     "queue_id": queue_id,
                     "queue_name": meta.name if meta else "",
-                    "nodes": [serialize_node(n) for n in nodes.values()],
+                    "nodes": [
+                        serialize_node(n, self._node_id(queue_id, n)) for n in nodes.values()
+                    ],
                     "scanned_at": self.last_scan_at.get(queue_id),
                     "warning": self.scan_warnings.get(queue_id),
                 }
