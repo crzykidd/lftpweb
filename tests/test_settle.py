@@ -150,6 +150,68 @@ def test_none_record_is_never_settled():
     assert not settle.is_settled(None, now=_T0 + 1_000_000.0)
 
 
+# --- first_observed_at / last_changed_at (migration 013, 2026-08-13,
+# prompts/2026-08-13-settle-progress-visibility.md) -----------------------------------------
+
+
+def test_first_observed_at_and_last_changed_at_set_together_on_first_sighting():
+    record = settle.advance_settle(None, (1, 100, 1.0), partial_scan=False, now=_T0)
+    assert record.first_observed_at == _T0
+    assert record.last_changed_at == _T0
+
+
+def test_a_growing_fingerprint_keeps_matched_scans_at_one_and_updates_last_changed_at():
+    """The user's own report: a directory actively being copied onto the seedbox changes on
+    every scan, so `matched_scans` keeps resetting to 1 -- unchanged behavior, see
+    `docs/decisions.md` for why an earlier version of this task tried making it 0 instead and
+    reverted -- for as long as it keeps growing. What's new is `last_changed_at`, which moves
+    with every one of those changes even though `matched_scans` itself does not; that's the
+    signal the Files page actually uses to tell "still changing" apart from "confirmed once,"
+    both of which read `matched_scans == 1`. `first_observed_at` moves with neither.
+    """
+    first = settle.advance_settle(None, (1, 100, 1.0), partial_scan=False, now=_T0)
+    grown_once = settle.advance_settle(first, (1, 200, 2.0), partial_scan=False, now=_T0 + 30.0)
+    assert grown_once.matched_scans == 1
+    assert grown_once.last_changed_at == _T0 + 30.0
+    assert grown_once.first_observed_at == _T0  # unmoved
+
+    grown_again = settle.advance_settle(
+        grown_once, (1, 300, 3.0), partial_scan=False, now=_T0 + 60.0
+    )
+    assert grown_again.matched_scans == 1
+    assert grown_again.last_changed_at == _T0 + 60.0
+    assert grown_again.first_observed_at == _T0  # still unmoved
+
+
+def test_a_held_fingerprint_advances_the_counter_and_leaves_last_changed_at_alone():
+    first = settle.advance_settle(None, (1, 100, 1.0), partial_scan=False, now=_T0)
+    grown = settle.advance_settle(first, (1, 200, 2.0), partial_scan=False, now=_T0 + 30.0)
+    held = settle.advance_settle(grown, (1, 200, 2.0), partial_scan=False, now=_T0 + 60.0)
+    assert held.matched_scans == grown.matched_scans + 1 == 2
+    # The fingerprint held (matched grown's), so nothing "changed" on this scan -- both stay
+    # exactly where the previous change left them.
+    assert held.last_changed_at == _T0 + 30.0
+    assert held.first_observed_at == _T0
+
+
+def test_first_observed_at_is_set_once_and_never_moved_by_later_scans():
+    first = settle.advance_settle(None, (1, 100, 1.0), partial_scan=False, now=_T0)
+    held = settle.advance_settle(first, (1, 100, 1.0), partial_scan=False, now=_T0 + 30.0)
+    changed = settle.advance_settle(held, (2, 200, 2.0), partial_scan=False, now=_T0 + 90.0)
+    held_again = settle.advance_settle(changed, (2, 200, 2.0), partial_scan=False, now=_T0 + 120.0)
+    for record in (first, held, changed, held_again):
+        assert record.first_observed_at == _T0
+
+
+def test_partial_scan_holds_first_observed_at_and_last_changed_at_too():
+    first = settle.advance_settle(None, (1, 100, 1.0), partial_scan=False, now=_T0)
+    grown = settle.advance_settle(first, (1, 200, 2.0), partial_scan=False, now=_T0 + 30.0)
+    held = settle.advance_settle(grown, (9, 9, 9.0), partial_scan=True, now=_T0 + 500.0)
+    assert held == grown
+    assert held.first_observed_at == _T0
+    assert held.last_changed_at == _T0 + 30.0
+
+
 # --- persistence ----------------------------------------------------------------------------
 
 
@@ -202,6 +264,60 @@ async def test_settle_records_round_trip_through_the_database(db):
     assert not await settle.is_settled_in_db(db, queue_id, "Release", now=_T0 + 1.0)
     # Both met.
     assert await settle.is_settled_in_db(db, queue_id, "Release", now=_T0 + settle.SETTLE_MIN_AGE_S)
+
+
+async def test_first_observed_at_and_last_changed_at_round_trip_through_the_database(db):
+    """Migration 013's two new columns round-trip exactly, alongside the pre-existing ones."""
+    queue_id = await _make_queue(db)
+
+    records = {
+        "Release": settle.SettleRecord(
+            fingerprint=(2, 250, 5.0),
+            matched_scans=1,
+            first_matched_at=_T0,
+            first_observed_at=_T0 - 90.0,
+            last_changed_at=_T0,
+        )
+    }
+    await settle.save_settle_records(db, queue_id, records)
+    await db.commit()
+
+    loaded = await settle.load_settle_records(db, queue_id)
+    assert loaded == records
+    assert loaded["Release"].first_observed_at == _T0 - 90.0
+    assert loaded["Release"].last_changed_at == _T0
+
+
+async def test_null_first_observed_at_and_last_changed_at_round_trip_as_none(db):
+    """A pre-migration-013 `item_settle` row (or any row this module itself wrote with these
+    two columns left `NULL`) must come back as `None`, not raise and not fabricate an epoch --
+    the display layer (`core/itemview.py`, `frontend/src/lib/format.ts`) renders that as
+    "unknown," never as 1970 or a crash.
+    """
+    queue_id = await _make_queue(db)
+    await settle.save_settle_records(
+        db,
+        queue_id,
+        {
+            "Release": settle.SettleRecord(
+                fingerprint=(2, 250, 5.0), matched_scans=1, first_matched_at=_T0
+            )
+        },
+    )
+    await db.commit()
+
+    cursor = await db.execute(
+        "SELECT first_observed_at, last_changed_at FROM item_settle "
+        "WHERE queue_id = ? AND rel_path = 'Release'",
+        (queue_id,),
+    )
+    row = await cursor.fetchone()
+    assert row["first_observed_at"] is None
+    assert row["last_changed_at"] is None
+
+    loaded = await settle.load_settle_records(db, queue_id)
+    assert loaded["Release"].first_observed_at is None
+    assert loaded["Release"].last_changed_at is None
 
 
 async def test_is_settled_in_db_requires_the_age_floor_too(db):

@@ -258,8 +258,10 @@ async def test_scan_delta_is_small_and_exact_regardless_of_tree_size(tmp_path, m
     # prompts/2026-08-13-files-ux-pass.md item 3): every changed node now also carries
     # `settle_matched_scans`/`settle_first_matched_at`, `null` for these four rows (none of them
     # is `settling`) but still two more keys' worth of JSON per node -- another small, fixed
-    # per-node cost, not one that scales with `n`.
-    assert len(json.dumps(delta)) < 3200
+    # per-node cost, not one that scales with `n`. Bumped again, 3200->3500 (2026-08-13,
+    # prompts/2026-08-13-settle-progress-visibility.md): three more `null` keys per node
+    # (`settle_total_bytes`/`settle_first_observed_at`/`settle_last_changed_at`), same reasoning.
+    assert len(json.dumps(delta)) < 3500
 
 
 async def test_scan_delta_payload_does_not_scale_with_tree_size(tmp_path, monkeypatch):
@@ -450,8 +452,11 @@ async def test_published_state_is_the_persisted_state_not_the_structural_one(
         # The threshold was bumped from 2000 (2026-08-13, prompts/2026-08-13-files-detail-
         # inspector.md): every changed node now also carries `local_mtime` and `first_seen_at`
         # (`core/itemview.py`), two more fixed per-node fields that don't scale with tree size
-        # -- same reasoning as the 2000->3000 bump above this file's other threshold.
-        assert len(json.dumps(delta)) < 2400, "the delta must stay proportional to what changed"
+        # -- same reasoning as the 2000->3000 bump above this file's other threshold. Bumped
+        # again, 2400->2700 (2026-08-13, prompts/2026-08-13-settle-progress-visibility.md):
+        # three more `null` keys per node (`settle_total_bytes`/`settle_first_observed_at`/
+        # `settle_last_changed_at`), same reasoning as the other threshold's identical bump.
+        assert len(json.dumps(delta)) < 2700, "the delta must stay proportional to what changed"
 
         # ...and the connect-time snapshot -- the reload path, which is how this bug was
         # actually visible to a user -- agrees with the database for every node, not just the

@@ -267,3 +267,64 @@ export function settleWaitShortLabel(node: SettleProgressNode, settle: SettleCon
   )
   return `Waiting ${node.settle_matched_scans}/${settle.required_scans} · ${elapsedS}s`
 }
+
+// "Still arriving" -- the settle gate's other display state (2026-08-13,
+// prompts/2026-08-13-settle-progress-visibility.md). User report: copying a large directory
+// straight onto the seedbox, the countdown above sat at "1 of 2" for the whole copy and
+// conveyed nothing -- every scan found the fingerprint still growing, which resets
+// `settle_matched_scans` right back to 1 every time (`core/settle.py.advance_settle`'s counter
+// arithmetic is unchanged by this task -- see `docs/decisions.md` for why an earlier version of
+// this task tried starting it at 0 instead for this exact case and reverted: it silently added
+// a whole extra required scan to real settle timing, which is the growing-denominator problem
+// this task's own brief already ruled out, just relocated into the numerator).
+// `settle_matched_scans === 1` covers both a genuinely first-ever sighting and a fingerprint
+// that just changed from a previous one -- deliberately not split further: in *both* cases
+// nothing has been confirmed unchanged even once yet, so the ordinary "Waiting n of 2 scans"
+// countdown below has nothing meaningful to count. This is a different sentence for that
+// shared case, not a different phase of the same one: the byte count climbing
+// (`settle_total_bytes`, `item_settle.total_bytes`, already computed as part of the
+// fingerprint) *is* the progress signal while it applies, and `settle_last_changed_at`
+// (migration 013) says when it last actually moved -- "changed just now" for a first-ever
+// sighting (`last_changed_at` is set to the same instant as `first_observed_at` in that case),
+// a real elapsed reading for an item that has changed since. `isStillArriving` is the one place
+// that draws the line between the two displays, so `FileTree.tsx`'s `Row` never has to
+// duplicate the threshold.
+export function isStillArriving(node: { settle_matched_scans: number | null }): boolean {
+  return node.settle_matched_scans === 1
+}
+
+interface SettleArrivingNode {
+  settle_total_bytes: number | null
+  settle_first_observed_at: string | null
+  settle_last_changed_at: string | null
+}
+
+/** The full sentence, for the chip's `title` (hover) -- `settleWaitLabel`'s counterpart for
+ * this state. `settle_first_observed_at`/`settle_last_changed_at` are `null` on a row whose
+ * `item_settle` record predates migration 013 and hasn't changed again since
+ * (`core/settle.py.SettleRecord`'s own docstring) -- degrades by omitting that clause rather
+ * than fabricating a time, the same "never blocks the row from rendering" rule
+ * `settleWaitLabel` already follows.
+ */
+export function settleArrivingLabel(node: SettleArrivingNode): string {
+  const size = node.settle_total_bytes != null ? formatBytes(node.settle_total_bytes) : 'an unknown size so far'
+  const changed =
+    node.settle_last_changed_at != null
+      ? `, changed ${formatRelativeTimeIntl(node.settle_last_changed_at)}`
+      : ''
+  const watchedS =
+    node.settle_first_observed_at != null
+      ? Math.max(0, Math.floor((Date.now() - new Date(node.settle_first_observed_at).getTime()) / 1000))
+      : null
+  const watched = watchedS != null ? ` -- watching for ${formatEta(watchedS)}` : ''
+  return `Still arriving -- ${size}${changed}${watched}`
+}
+
+/** The Status chip's own in-cell text for this state -- `settleWaitShortLabel`'s counterpart,
+ * kept to the same short shape ("Waiting 1/2 · 35s") since it sits in the same fixed-width,
+ * already-once-trimmed column (`a4a626d`). The full sentence survives on hover via
+ * `settleArrivingLabel` above.
+ */
+export function settleArrivingShortLabel(node: { settle_total_bytes: number | null }): string {
+  return node.settle_total_bytes != null ? `Arriving · ${formatBytes(node.settle_total_bytes)}` : 'Arriving…'
+}

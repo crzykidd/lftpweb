@@ -6,6 +6,94 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-13 — The settle countdown's denominator stays fixed at `n/2`; a same-shaped fix to
+## the numerator was tried, caught by the e2e suite, and reverted in favor of a second field
+
+**Handoff prompt `prompts/2026-08-13-settle-progress-visibility.md`, executed end to end.** User
+report, copying a large directory onto the seedbox: "the scan validate process works as it keeps
+saying change so doesn't start. however the counter stays at 1/2 … that gives the user the
+ability to see how many scans we have done waiting for it to complete" — i.e. the countdown was
+pinned at "1 of 2" for the entire copy and conveyed nothing.
+
+**Rejected: a climbing denominator.** The user's own first instinct was "2/3", "3/4"… as the
+wait dragged on. Discussed and rejected together: the actual requirement is not growing, it is
+always exactly `REQUIRED_SETTLE_SCANS` (2) consecutive unchanged scans (§3.3) — a denominator
+that climbs would state something false about what the system is actually waiting for, trading
+one misleading number for a different misleading number rather than fixing the underlying
+problem. The fraction stays honest at `n/2`; what changes is whether that fraction is even the
+right thing to show.
+
+**Root cause: `matched_scans == 1` meant two different things.** `core/settle.py.advance_settle`
+reset the counter to 1 on *any* "not currently matching" outcome — both a genuinely first-ever
+sighting (nothing to compare against) and a fingerprint that differs from a previous, different
+one (something just changed). A directory being actively copied re-triggers the second case on
+every scan for as long as it keeps growing, and the display had no way to tell that apart from
+"confirmed unchanged once, one more scan to go" — both read "1 of 2".
+
+**First attempt, tried and reverted: split the reset branch itself.** The obvious-looking fix —
+start `matched_scans` at **0** instead of 1 specifically when `prev is not None` and the
+fingerprint differs (a real, detected change), leaving a genuinely first-ever sighting
+(`prev is None`) at 1 — was implemented first, and looked clean: `REQUIRED_SETTLE_SCANS` itself
+untouched at 2, only the *starting value* a changed fingerprint's reset carries. It is wrong.
+Traced through: before, changed→1, next match→2 (settled, age permitting) — 2 total
+observations of the same fingerprint, matching "2 consecutive unchanged scans" exactly. After
+the 0-start change, changed→0, match→1, match→2 — **3** total observations, one more than
+`REQUIRED_SETTLE_SCANS` actually requires, for *every* item that has ever changed once. That is
+the exact growing-denominator problem this task's own brief already ruled out — just relocated
+from the visible fraction into the invisible numerator, where nothing about the Files page would
+have shown it happening. `tests/test_settle_gate_e2e.py`'s real fake-seedbox reproductions
+(`test_growing_remote_file_is_not_queued_until_it_settles` and two siblings, which drive real
+scans against a real growing remote file/directory and assert settlement after exactly 2
+matching scans) failed against this change, which is exactly what they exist to catch — this is
+recorded here specifically so a future reader who reaches for the same "just start it at 0" fix
+finds out why it doesn't work before re-implementing it.
+
+**What shipped instead: a second, independent field carries the "just changed" signal, and
+`matched_scans` is untouched.** Migration 013's `last_changed_at` moves to `now` on exactly the
+two branches that reset `matched_scans` to 1 (a first sighting or a differing fingerprint) and
+holds on every scan that merely confirms the current value — so the Files page reads
+`matched_scans == 1` *together with* a fresh `last_changed_at` as "still arriving," and switches
+to the ordinary countdown the moment a confirming scan lands (`matched_scans >= 2`). This adds
+no new arithmetic to `advance_settle`'s counter at all — `is_settled`'s threshold, timing, and
+every existing caller (`core/autoqueue.py`, `core/queue.py._reap_one`) are byte-for-byte
+unchanged. The lesson generalizes: when a persisted counter is already load-bearing for a
+real state-machine decision, prefer adding an *orthogonal* observation to reusing that counter's
+own value space for a second, display-only meaning — the two attempts here cost the same amount
+of code and only one of them was safe to ship.
+
+**The "still arriving" display doesn't need `SettleConstants` at all.** `settleWaitLabel`/
+`settleWaitShortLabel` (`lib/format.ts`) take a `SettleConstants | null` because they render
+`required_scans`/`min_age_s` from the site setting fetched once by `FileTree.tsx`. The new
+`settleArrivingLabel`/`settleArrivingShortLabel` render only `item_settle.total_bytes` and the
+two migration-013 timestamps — no constant from settings enters the sentence — so they take a
+plain node shape and render correctly even before that one site-wide fetch resolves, rather than
+inheriting a `settle == null` guard clause that would never actually apply to them.
+
+**NULL timestamps on pre-migration rows are "unknown," not fabricated.** Migration 013 adds
+`first_observed_at`/`last_changed_at` to `item_settle` with no backfill — there is no history to
+invent for a row whose fingerprint held steady since before this migration ran and hasn't been
+rewritten since. `core/settle.py._parse_iso_opt`/`_format_iso_opt` round-trip `NULL`↔`None`
+explicitly; `SettleRecord`'s two new fields default to `None` (not required) so
+`tests/test_settle.py`'s and `tests/test_ws_deltas.py`'s existing direct constructions keep
+working unchanged. The frontend labels omit the clause entirely (no "changed …" / no "watching
+…") rather than rendering `Invalid Date` or a 1970 timestamp.
+
+**Migration 013**, not a repurposed column — checked `backend/lftpweb/migrations/` first;
+nothing had claimed it. Two `ALTER TABLE ... ADD COLUMN` statements, nullable, no backfill
+(same shape as 011's `local_mtime`).
+
+**The `substate == "settling"` gate widens, not weakens.** The regression this prompt's own
+brief called out by name: exposing settle fields unconditionally earlier this session made
+every top-level row compare as changed on every scan to `diff_nodes`'s whole-dict equality
+check, reintroducing full-tree WebSocket traffic — caught by `tests/test_ws_deltas.py` before
+it shipped. The three new fields (`settle_total_bytes`/`settle_first_observed_at`/
+`settle_last_changed_at`) are added to the *same* `if row["substate"] == "settling"` gate the
+first two fields already use in `core/itemview.py.item_view`, never a separate or looser one;
+`tests/test_ws_deltas.py`'s payload-size assertions were bumped for the extra JSON keys, not
+loosened.
+
+---
+
 ## 2026-08-13 — A portal-rendered hover card replaces the native tooltip, sharing its formatter
 ## with the item drawer rather than growing a second one
 

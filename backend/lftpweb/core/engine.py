@@ -1049,11 +1049,21 @@ class Engine:
         call. Called once per scan (`scan_interval_s`, default 30s) and once per new WebSocket
         connection (`snapshot()`) -- +3.4ms at either cadence is not worth avoiding at any queue
         size this project targets. docs/decisions.md records the method and numbers.
+
+        Three more columns joined from the same `settle` alias (2026-08-13,
+        `prompts/2026-08-13-settle-progress-visibility.md`, migration 013) -- `total_bytes`,
+        `first_observed_at`, `last_changed_at` -- for the "still arriving" display
+        (`core/itemview.py.item_view`). Same single indexed per-row lookup, no second join, no
+        re-measurement warranted for three more `INTEGER`/`TEXT` columns off a row already being
+        fetched.
         """
         cursor = await self.db.execute(
             f"SELECT {ITEM_VIEW_COLUMNS_QUALIFIED}, "  # noqa: S608 - a module constant, not user input
             "settle.matched_scans AS settle_matched_scans, "
-            "settle.updated_at AS settle_first_matched_at "
+            "settle.updated_at AS settle_first_matched_at, "
+            "settle.total_bytes AS settle_total_bytes, "
+            "settle.first_observed_at AS settle_first_observed_at, "
+            "settle.last_changed_at AS settle_last_changed_at "
             "FROM item "
             "LEFT JOIN item_settle AS settle "
             "ON settle.queue_id = item.queue_id AND settle.rel_path = item.rel_path "

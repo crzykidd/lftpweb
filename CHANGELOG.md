@@ -355,6 +355,33 @@ alongside this list: several entries below ship with deliberate, documented limi
   shared helper, `lib/format.ts.bothSidesRows`, now backs both this card and `ItemDrawer.tsx`'s
   own both-sides panel, so the two surfaces can never independently drift on what these numbers
   mean.
+- **The settle countdown now says something true while an item is still actively arriving, not
+  just once it's holding still** *(2026-08-13)*. User report: copying a large directory onto
+  the seedbox, the Status chip's "Waiting N of 2 scans" countdown sat pinned at "1 of 2" for the
+  whole copy — every scan found the fingerprint still growing, which reset the counter right
+  back to the value that also means "confirmed unchanged once." Fixed with a second, independent
+  signal rather than by touching the counter itself: migration 013 adds
+  `item_settle.first_observed_at`/`last_changed_at`, and `last_changed_at` now moves to "now" on
+  the same scan that resets the counter and holds on every scan that merely confirms it, so the
+  two previously-identical cases (a fresh sighting and a just-changed fingerprint, both reading
+  "1 of 2") are distinguishable without changing what the counter itself does or how long real
+  settlement takes. The Files page reads that split as two different sentences on the same amber
+  chip: **"Arriving · 3.4 GB"** (short) / **"Still arriving — 3.4 GB, changed 12s ago — watching
+  for 3m"** (on hover) while nothing has been confirmed unchanged yet — the byte count itself
+  (`item_settle.total_bytes`, already computed as part of the settle fingerprint) is the progress
+  signal while that's true — and the existing **"Waiting 1/2 · 35s"** countdown, completely
+  unchanged, from the first confirming scan onward. **The denominator was deliberately not made
+  to grow** ("2/3", "3/4"…, the user's own first suggestion) — the requirement genuinely is
+  always 2 consecutive unchanged scans, and a climbing denominator would say something false
+  about it; `docs/decisions.md` has the full reasoning, including a same-shaped fix at the
+  counter itself that was tried, would have silently required 3 observations instead of 2 for
+  any item that had ever changed once, was caught by `tests/test_settle_gate_e2e.py`'s real
+  fake-seedbox reproductions, and was reverted before shipping. Both new timestamp columns are
+  `NULL`, rendered as "unknown" rather than a fabricated time, on any row that predates this
+  migration and hasn't changed again since. The three new wire fields
+  (`settle_total_bytes`/`settle_first_observed_at`/`settle_last_changed_at`) are gated on
+  `substate == "settling"` exactly like the two that already existed — the same WebSocket-delta
+  regression `tests/test_ws_deltas.py` already guards against for those two now covers all five.
 
 ### Changed
 

@@ -9,7 +9,10 @@ import {
   formatBytes,
   formatPercent,
   hasBothSides,
+  isStillArriving,
   percentValue,
+  settleArrivingLabel,
+  settleArrivingShortLabel,
   settleWaitLabel,
   settleWaitShortLabel,
   stateAgeLabel,
@@ -905,6 +908,16 @@ function Row({
   // substitution over the chip, not a change to `entry.state` itself, which stays REMOTE_ONLY
   // server-side for the duration (`core/settle.py`).
   const isSettling = entry.state === 'REMOTE_ONLY' && entry.substate === 'settling'
+  // Two different sentences for the same `substate === 'settling'` row (2026-08-13,
+  // prompts/2026-08-13-settle-progress-visibility.md): `isStillArriving` picks out the case
+  // the countdown below has nothing useful to say about yet -- `settle_matched_scans === 1`,
+  // i.e. nothing has been confirmed unchanged even once (either a first-ever sighting, or the
+  // fingerprint changed on the most recent scan and reset the count -- `core/settle.py`'s
+  // counter doesn't distinguish the two, deliberately; see `lib/format.ts.isStillArriving`'s
+  // own comment). Only meaningful nested inside `isSettling`; `isStillArriving` itself doesn't
+  // check `substate` (the field is already `null` off it whenever `substate !== 'settling'`,
+  // per `core/itemview.py`'s gate).
+  const isStillArrivingRow = isSettling && isStillArriving(entry)
 
   // The hover card's anchor element (2026-08-13) -- `nameRef` is what `HoverCardContent`
   // positions itself against, never anything about this row's own place in the virtualized
@@ -999,12 +1012,32 @@ function Row({
             countdown ("1 of 2 scans, 35s of 60s"). Shortened to `settleWaitShortLabel` for the
             chip's own in-cell text (2026-08-13, prompts/2026-08-13-resizable-file-columns.md)
             -- the full sentence (`settleWaitLabel`) simply didn't fit this column and is no
-            longer lost, just moved to the chip's own `title` (hover). */}
+            longer lost, just moved to the chip's own `title` (hover).
+
+            **`isStillArrivingRow` picks a different sentence pair, same chip**
+            (2026-08-13, prompts/2026-08-13-settle-progress-visibility.md): the countdown above
+            reads as stuck at "1 of 2" for as long as an item's fingerprint keeps changing scan
+            to scan (a large directory still being copied onto the seedbox) -- while that's
+            true there is nothing confirmed yet for the countdown to count, so this shows the
+            byte count climbing instead (`settleArrivingShortLabel`/`settleArrivingLabel`). Both
+            pairs share `SETTLING`'s amber chip styling; only the words differ. */}
         <StateChip
           state={isRemoving ? 'REMOVING' : isSettling ? 'SETTLING' : entry.state}
           percent={isRemoving || isSettling ? null : stateProgressPercent(entry)}
-          label={isSettling ? settleWaitShortLabel(entry, settleSettings) : undefined}
-          title={isSettling ? settleWaitLabel(entry, settleSettings) : undefined}
+          label={
+            isStillArrivingRow
+              ? settleArrivingShortLabel(entry)
+              : isSettling
+                ? settleWaitShortLabel(entry, settleSettings)
+                : undefined
+          }
+          title={
+            isStillArrivingRow
+              ? settleArrivingLabel(entry)
+              : isSettling
+                ? settleWaitLabel(entry, settleSettings)
+                : undefined
+          }
         />
       </span>
       {/* Lifecycle icons (2026-08-13): R/L/V/E, one glyph per `entry.facets`

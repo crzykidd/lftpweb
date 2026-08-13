@@ -409,6 +409,22 @@ class FileNode(BaseModel):
     # has no row for one at all -- or before this item's first scan.
     settle_matched_scans: int | None = None
     settle_first_matched_at: str | None = None
+    # The settle gate's *other* display state (2026-08-13,
+    # prompts/2026-08-13-settle-progress-visibility.md, migration 013): a top-level item that
+    # hasn't been confirmed unchanged even once yet (`settle_matched_scans == 1` -- a
+    # first-ever sighting, or the fingerprint changed on the most recent scan and reset the
+    # count; the frontend's `lib/format.ts.isStillArriving` draws this line, deliberately not
+    # distinguishing the two) has nothing useful to say via the countdown above.
+    # `settle_total_bytes` (`item_settle.total_bytes`, already computed as part of the
+    # fingerprint) is what a "still arriving" reading watches climb; `settle_first_observed_at`/
+    # `settle_last_changed_at` answer "how long have we watched this" / "when did it last move."
+    # Gated on `substate == "settling"` exactly like the two fields above -- see
+    # `core/itemview.py.item_view`'s own docstring. `None` for the same reasons those two are,
+    # plus one more: a pre-migration-013 `item_settle` row that hasn't changed since carries
+    # `NULL` for these two timestamps specifically (`core/settle.py.SettleRecord`).
+    settle_total_bytes: int | None = None
+    settle_first_observed_at: str | None = None
+    settle_last_changed_at: str | None = None
     # Milestone/audit timestamps (2026-08-13, prompts/2026-08-13-lifecycle-icons.md) -- passed
     # through verbatim from the `item` row (`core/itemview.py.item_view`), the raw material a
     # lifecycle icon's tooltip is built from. `downloaded_at` already existed on the row before

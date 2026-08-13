@@ -225,9 +225,13 @@ item(
   UNIQUE(queue_id, rel_path))
 
 -- Settle-gate bookkeeping (§3.3): one row per top-level item being watched, so a restart
--- doesn't lose an in-progress verdict and so nothing has to publish a state it can't read back
+-- doesn't lose an in-progress verdict and so nothing has to publish a state it can't read back.
+-- first_observed_at/last_changed_at (migration 013) are NULL on any row that predates them and
+-- hasn't been rewritten since -- "how long have we watched this" / "when did it last move" are
+-- unknown for such a row, not fabricated as 1970 or "just now".
 item_settle(queue_id, rel_path, file_count, total_bytes, max_mtime NULL, matched_scans,
-            updated_at, PRIMARY KEY(queue_id, rel_path))
+            updated_at, first_observed_at NULL, last_changed_at NULL,
+            PRIMARY KEY(queue_id, rel_path))
 
 -- Archive files this codebase deleted after a successful extraction (§6). Read by the scan
 -- pass and folded into the same completeness predicate §4.7's file_exclude patterns feed, so
@@ -551,6 +555,30 @@ nonzero the moment one subdirectory is unreadable and still prints everything it
 (§5), so two consecutive partial scans can return an identical truncated subset — which would
 read as "settled" under a naive recount. Holding is the honest reading of "no evidence anything
 changed, only that this pass could not see all of it."
+
+**The countdown's denominator stays fixed at 2 scans, and so does the counter's own arithmetic
+— the display gets a second signal alongside it instead** (2026-08-13,
+`prompts/2026-08-13-settle-progress-visibility.md`). A live copy onto the seedbox pinned the
+Files page's countdown at "1 of 2" for the whole transfer, because every scan found the
+fingerprint still growing, which resets `matched_scans` back to 1 every time — indistinguishable
+from "already confirmed unchanged once," which also reads 1 for one scan. A climbing denominator
+("2 of 3", "3 of 4"…) was proposed and rejected: the requirement genuinely is not growing, it is
+always 2 consecutive unchanged scans, and a growing denominator would say something false about
+what's actually being waited for. A same-shaped fix — starting `matched_scans` at 0 instead of 1
+specifically when a fingerprint differs from a previous record, so the Files page could tell the
+two cases apart by the persisted counter alone — was tried and reverted: it silently required 3
+observations of the same fingerprint to settle instead of 2 for any item that had ever changed
+once, the identical false-denominator problem relocated into the numerator, and
+`tests/test_settle_gate_e2e.py`'s real fake-seedbox reproductions caught it. `matched_scans` is
+therefore untouched by this task. Two new persisted timestamps (migration 013,
+`item_settle.first_observed_at`/`last_changed_at`) carry the distinguishing signal instead:
+`last_changed_at` moves to "now" on the same scan a fresh sighting or a changed fingerprint
+resets the counter, and holds on every scan that merely confirms it — so the Files page reads
+`matched_scans == 1` **and** a `last_changed_at` from the fingerprint's own most recent write as
+"still arriving," and only switches to the ordinary countdown once a confirming scan has
+actually landed (§9.2). `REQUIRED_SETTLE_SCANS` and `is_settled`'s threshold are both completely
+unchanged — this task altered no settle *timing*, only what the Files page shows while a
+`matched_scans == 1` row is waiting for its first confirmation.
 
 The verdict is persisted (`item_settle`, §3.1) rather than counted in memory: it must survive a
 restart, and — decisively — `substate = 'settling'` goes out over the WebSocket, so it has to
@@ -1468,6 +1496,22 @@ state chip already reads (§2.2's one shared projection, never a second read of 
   this is a display override layered on top of the presence fact for exactly this one
   substate, never on L (the local side is legitimately empty during the wait, so amber there
   would imply activity that isn't happening).
+- **The Status chip's own `substate = 'settling'` text is one of two sentences, not always the
+  same one** (2026-08-13, §3.3). `matched_scans == 1` covers two cases the counter itself
+  doesn't distinguish — a genuinely first-ever sighting, or a fingerprint that just changed from
+  a previous one — and in both, the "Waiting N of 2 scans" countdown has nothing confirmed to
+  count yet; on an actively-growing directory this read as pinned at "1 of 2" for the whole
+  copy. While `matched_scans == 1`, the chip instead shows the byte count itself climbing
+  (`item_settle.total_bytes`, already computed as part of the fingerprint) plus how long it has
+  been watched and when it last moved (migration 013's `first_observed_at`/`last_changed_at`).
+  The moment a confirming scan lands (`matched_scans >= 2`), the display switches back to the
+  existing countdown, unchanged — `matched_scans`'s own arithmetic and `REQUIRED_SETTLE_SCANS`
+  are untouched by this split (§3.3 has the full reasoning, including a same-shaped fix that
+  was tried at the counter itself and reverted). Both are the same amber chip and the same
+  `substate`; only the words differ, gated the same way the rest of the settle fields are —
+  `substate == "settling"` only, never passed through otherwise (§2.2's projection invariant;
+  see `core/itemview.py.item_view`'s own docstring for the WebSocket-delta regression this
+  gate exists to prevent).
 - **Inline progress**, drawn as the state chip's own background growing under the label, for
   `PARTIAL`/`DOWNLOADING` rows only — including a directory's rolled-up percentage, so a 40 GB
   release shows real progress rather than the word "partial". No new backend data and no

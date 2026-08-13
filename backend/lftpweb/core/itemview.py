@@ -53,12 +53,13 @@ from typing import Any
 # `FileTree.tsx.rowAction` for where this is actually used.
 #
 # `settle_matched_scans`/`settle_first_matched_at` (2026-08-13, `prompts/2026-08-13-files-ux-
-# pass.md` item 3) are deliberately **not** in this list -- they live in `item_settle`, a
+# pass.md` item 3) -- and `settle_total_bytes`/`settle_first_observed_at`/
+# `settle_last_changed_at` (2026-08-13, `prompts/2026-08-13-settle-progress-visibility.md`,
+# migration 013) -- are deliberately **not** in this list -- they live in `item_settle`, a
 # different table, not a column `item` itself has. A caller that wants them adds its own
-# `LEFT JOIN item_settle ... AS settle_matched_scans, ... AS settle_first_matched_at` alongside
-# `{ITEM_VIEW_COLUMNS}` in its own SELECT (`core/engine.py._project`, `api/files.py.get_files`);
-# `item_view` reads them via `_optional` below rather than requiring them, so a query that
-# doesn't join still works.
+# `LEFT JOIN item_settle ...` alongside `{ITEM_VIEW_COLUMNS}` in its own SELECT
+# (`core/engine.py._project`, `api/files.py.get_files`); `item_view` reads them via `_optional`
+# below rather than requiring them, so a query that doesn't join still works.
 ITEM_VIEW_COLUMNS = (
     "id, rel_path, is_dir, remote_size, local_size, remote_mtime, local_mtime, state, substate, "
     "suppressed_reason, "
@@ -354,27 +355,44 @@ def item_view(row: Mapping[str, Any]) -> ItemView:
     every caller that doesn't, rather than requiring every reader of this table to carry a join
     only one page's one substate needs.
 
-    **Gated on `substate == "settling"`, not passed through whenever the join happens to have a
-    row.** `core/engine.py._persist` advances `item_settle` for *every* top-level item on *every*
-    scan for as long as its remote fingerprint keeps matching — including one that finished
-    downloading scans ago and will never be `settling` again — so an ungated read would make
-    `settle_matched_scans` climb forever on a row nothing else about is changing. `diff_nodes`
-    (this module's own docstring: "an `ItemView` is a plain dict of scalars, so 'changed' is
-    exactly the equality check") would then see *every* top-level item as changed on *every*
-    scan, forever — reintroducing the exact "delta scales with tree size" bug phase 3b fixed,
-    just from a new field instead of the old structural-vs-persisted disagreement
-    (`tests/test_ws_deltas.py` caught this in review before it shipped). Gating on `substate`
-    keeps the field's churn confined to the handful of rows actually mid-settle, which is also
-    the only case the frontend ever reads it for.
+    `settle_total_bytes`/`settle_first_observed_at`/`settle_last_changed_at` (2026-08-13,
+    `prompts/2026-08-13-settle-progress-visibility.md`, migration 013): the *other* settle
+    display, for the case the countdown above says nothing useful about — an item whose
+    fingerprint is still changing scan to scan (still being written onto the seedbox) rather
+    than holding steady while it waits out the age floor. `settle_total_bytes` is
+    `item_settle.total_bytes`, already computed as part of the fingerprint (`core/settle.py.
+    compute_fingerprints`) — the number that climbing is itself the evidence something is
+    still arriving. `settle_first_observed_at`/`settle_last_changed_at` are migration 013's two
+    new columns, joined and gated exactly like `settle_matched_scans` — see that migration and
+    `core/settle.py.SettleRecord`'s own docstring for what each answers ("how long have we been
+    watching" / "when did it last move") and why either can legitimately be `None` even on a
+    `"settling"` row (a pre-migration row that hasn't changed again since, `core/settle.py.
+    _parse_iso_opt`) — the frontend renders that as "unknown," never a fabricated time.
 
-    The DB column is `updated_at` (`core/settle.py.SettleRecord`'s own docstring explains why
-    that name, despite what it suggests, already holds exactly the value this field wants); the
-    two callers alias it to `settle_first_matched_at` in the SELECT itself, so this function
-    reads a name it doesn't have to translate. Passed through as the raw ISO string it already
-    is, verbatim, the same "raw material, not a pre-formatted sentence" convention as every
-    other timestamp on this row — a test can assert the value without needing `Date.now()`.
-    `None` whenever `substate != "settling"` (including a non-top-level row, which never has an
-    `item_settle` row at all, and a not-yet-first-scanned one) — the frontend must handle that.
+    **All five settle fields are gated on `substate == "settling"`, not passed through whenever
+    the join happens to have a row.** `core/engine.py._persist` advances `item_settle` for
+    *every* top-level item on *every* scan for as long as its remote fingerprint keeps matching
+    — including one that finished downloading scans ago and will never be `settling` again — so
+    an ungated read would make these fields climb/change forever on a row nothing else about is
+    changing. `diff_nodes` (this module's own docstring: "an `ItemView` is a plain dict of
+    scalars, so 'changed' is exactly the equality check") would then see *every* top-level item
+    as changed on *every* scan, forever — reintroducing the exact "delta scales with tree size"
+    bug phase 3b fixed, just from these fields instead of the old structural-vs-persisted
+    disagreement (`tests/test_ws_deltas.py` caught this in review before `settle_matched_scans`/
+    `settle_first_matched_at` shipped, and its assertions still hold with this task's three new
+    fields added the same way). Gating on `substate` keeps the churn confined to the handful of
+    rows actually mid-settle, which is also the only case the frontend ever reads any of them
+    for. **Do not widen this gate.**
+
+    The DB column behind `settle_first_matched_at` is `updated_at` (`core/settle.py.
+    SettleRecord`'s own docstring explains why that name, despite what it suggests, already
+    holds exactly the value this field wants); the two callers alias it in the SELECT itself, so
+    this function reads a name it doesn't have to translate. All five are passed through as the
+    raw values they already are, verbatim, the same "raw material, not a pre-formatted sentence"
+    convention as every other timestamp on this row — a test can assert the value without
+    needing `Date.now()`. `None` whenever `substate != "settling"` (including a non-top-level
+    row, which never has an `item_settle` row at all, and a not-yet-first-scanned one) — the
+    frontend must handle that, same as it already does for the first two.
 
     `facets` (`_lifecycle_facets`) is the one place R/L/V/E get computed, so `GET /api/files`,
     `queue_delta`, `item_delta`, and connect-time `snapshot()` cannot disagree about what a
@@ -398,6 +416,15 @@ def item_view(row: Mapping[str, Any]) -> ItemView:
         ),
         "settle_first_matched_at": (
             _optional(row, "settle_first_matched_at") if row["substate"] == "settling" else None
+        ),
+        "settle_total_bytes": (
+            _optional(row, "settle_total_bytes") if row["substate"] == "settling" else None
+        ),
+        "settle_first_observed_at": (
+            _optional(row, "settle_first_observed_at") if row["substate"] == "settling" else None
+        ),
+        "settle_last_changed_at": (
+            _optional(row, "settle_last_changed_at") if row["substate"] == "settling" else None
         ),
         "downloaded_at": row["downloaded_at"],
         "verified_at": row["verified_at"],

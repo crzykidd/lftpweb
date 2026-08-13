@@ -34,14 +34,18 @@ async def get_files(request: Request) -> FilesResponse:
     queues: list[QueueFiles] = []
 
     for queue_id, meta in engine.queue_meta.items():
-        # `LEFT JOIN item_settle` (2026-08-13, prompts/2026-08-13-files-ux-pass.md item 3): the
+        # `LEFT JOIN item_settle` (2026-08-13, prompts/2026-08-13-files-ux-pass.md item 3, widened
+        # 2026-08-13 by prompts/2026-08-13-settle-progress-visibility.md / migration 013): the
         # same join and reasoning as `core/engine.py._project`, which this endpoint otherwise
         # duplicates by design (this module's own docstring) -- both must agree on what a row's
-        # settle countdown looks like.
+        # settle display looks like, whether it's the countdown or the "still arriving" reading.
         cursor = await db.execute(
             f"SELECT {ITEM_VIEW_COLUMNS_QUALIFIED}, "  # noqa: S608 - a module constant, not user input
             "settle.matched_scans AS settle_matched_scans, "
-            "settle.updated_at AS settle_first_matched_at "
+            "settle.updated_at AS settle_first_matched_at, "
+            "settle.total_bytes AS settle_total_bytes, "
+            "settle.first_observed_at AS settle_first_observed_at, "
+            "settle.last_changed_at AS settle_last_changed_at "
             "FROM item "
             "LEFT JOIN item_settle AS settle "
             "ON settle.queue_id = item.queue_id AND settle.rel_path = item.rel_path "

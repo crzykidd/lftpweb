@@ -97,6 +97,28 @@ class SettleRecord:
     # `item_settle.updated_at` (see the persistence section below) -- that column predates this
     # meaning and is reused rather than renamed via a migration this task does not need.
     first_matched_at: float
+    # `first_observed_at`/`last_changed_at` (migration 013, 2026-08-13,
+    # prompts/2026-08-13-settle-progress-visibility.md): what `matched_scans`/`first_matched_at`
+    # alone can't answer -- how long this item has been watched at all, and when it last
+    # actually moved, as opposed to "since the current streak began" (which resets on every
+    # change and so can't tell a five-minute-old item apart from one that just started).
+    #
+    # `first_observed_at` is set once, the very first time this `(queue_id, rel_path)` is ever
+    # observed, and carried forward unchanged by every later call regardless of match, hold, or
+    # reset -- unlike `first_matched_at`, nothing ever moves it forward again.
+    #
+    # `last_changed_at` moves to `now` on the same calls that reset `matched_scans` (a fresh
+    # sighting or a changed fingerprint) and is held on every other call (a match or a
+    # partial-scan hold) -- see `advance_settle` below for exactly which branch does which.
+    #
+    # Both `None` for a `SettleRecord` built from a pre-migration-013 `item_settle` row that has
+    # not been written since (`load_settle_records` below) -- there is no history to invent, and
+    # the display renders `None` as "unknown" rather than a fabricated time. Also why both
+    # default to `None` here rather than being required: `tests/test_settle.py` and
+    # `tests/test_ws_deltas.py` construct `SettleRecord`s directly without them, and a record
+    # missing this information is a real, expected state, not a test-only convenience.
+    first_observed_at: float | None = None
+    last_changed_at: float | None = None
 
 
 def compute_fingerprints(remote_tree: Mapping[str, "RemoteEntry"]) -> dict[str, Fingerprint]:
@@ -155,7 +177,24 @@ def advance_settle(
     Otherwise: an unchanged fingerprint increments the counter and **carries `first_matched_at`
     forward unchanged** (the streak began when it began, not when it was last reconfirmed); a
     changed one resets the counter to 1 and starts a fresh streak at `now` -- a fresh sighting,
-    because something about the remote subtree just moved.
+    because something about the remote subtree just moved. **`matched_scans`'s own arithmetic is
+    untouched by 2026-08-13's `prompts/2026-08-13-settle-progress-visibility.md`** -- an earlier
+    version of that task tried starting it at `0` instead of `1` specifically for a change with a
+    `prev` to compare against (to give the Files page a value distinct from a first-ever
+    sighting), and `tests/test_settle_gate_e2e.py` caught why that was wrong before it shipped:
+    it silently turned "2 consecutive unchanged scans" into 3 for every item that had ever
+    changed once, which is exactly the growing-denominator problem this task's own brief already
+    ruled out, just moved into the numerator instead of the denominator. Reverted; see
+    `docs/decisions.md` for the full story. The Files page gets its "still changing" signal from
+    `last_changed_at` below instead, at zero cost to `is_settled`'s timing.
+
+    `first_observed_at` is carried forward from `prev` on every branch that has a `prev` at all
+    (matched, held, or changed) and set to `now` only on a genuinely first-ever sighting --
+    never moved once set. `last_changed_at` moves to `now` on exactly the two branches that
+    reset `matched_scans` to 1 (a first sighting, or a differing fingerprint) and is held
+    everywhere else (a match, or a partial-scan hold, both already returning early above) --
+    this is the field that actually distinguishes "just detected still changing" from
+    "confirmed unchanged once already," both of which read `matched_scans == 1`.
     """
     if partial_scan and prev is not None:
         return prev
@@ -164,8 +203,16 @@ def advance_settle(
             fingerprint=fingerprint,
             matched_scans=prev.matched_scans + 1,
             first_matched_at=prev.first_matched_at,
+            first_observed_at=prev.first_observed_at,
+            last_changed_at=prev.last_changed_at,
         )
-    return SettleRecord(fingerprint=fingerprint, matched_scans=1, first_matched_at=now)
+    return SettleRecord(
+        fingerprint=fingerprint,
+        matched_scans=1,
+        first_matched_at=now,
+        first_observed_at=prev.first_observed_at if prev is not None else now,
+        last_changed_at=now,
+    )
 
 
 def is_settled(record: SettleRecord | None, *, now: float | None = None) -> bool:
@@ -205,9 +252,23 @@ def _format_iso(value: float) -> str:
     return datetime.fromtimestamp(value, tz=UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
+def _parse_iso_opt(value: str | None) -> float | None:
+    """`_parse_iso`, but for `first_observed_at`/`last_changed_at` (migration 013), which are
+    `NULL` on any `item_settle` row that predates that migration and hasn't been written since
+    -- see `SettleRecord`'s own docstring for why `None` there is a real, expected state rather
+    than something to paper over.
+    """
+    return None if value is None else _parse_iso(value)
+
+
+def _format_iso_opt(value: float | None) -> str | None:
+    return None if value is None else _format_iso(value)
+
+
 async def load_settle_records(db: "aiosqlite.Connection", queue_id: int) -> dict[str, SettleRecord]:
     cursor = await db.execute(
-        "SELECT rel_path, file_count, total_bytes, max_mtime, matched_scans, updated_at "
+        "SELECT rel_path, file_count, total_bytes, max_mtime, matched_scans, updated_at, "
+        "first_observed_at, last_changed_at "
         "FROM item_settle WHERE queue_id = ?",
         (queue_id,),
     )
@@ -217,6 +278,8 @@ async def load_settle_records(db: "aiosqlite.Connection", queue_id: int) -> dict
             fingerprint=(row["file_count"], row["total_bytes"], row["max_mtime"]),
             matched_scans=row["matched_scans"],
             first_matched_at=_parse_iso(row["updated_at"]),
+            first_observed_at=_parse_iso_opt(row["first_observed_at"]),
+            last_changed_at=_parse_iso_opt(row["last_changed_at"]),
         )
         for row in rows
     }
@@ -227,20 +290,28 @@ async def save_settle_records(
 ) -> None:
     """Upsert this scan's records. Does **not** commit -- `core/engine.py._persist` issues one
     commit for the whole scan pass, matching every other write in that method.
+
+    `first_observed_at`/`last_changed_at` are written verbatim from the `SettleRecord`
+    `advance_settle` already computed -- that function is what decides whether each one moves
+    or holds for this call, so the upsert here has no arithmetic of its own to get wrong; it
+    just persists what it was given, same as every other column on this row.
     """
     for rel_path, record in records.items():
         file_count, total_bytes, max_mtime = record.fingerprint
         await db.execute(
             """
             INSERT INTO item_settle
-                (queue_id, rel_path, file_count, total_bytes, max_mtime, matched_scans, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+                (queue_id, rel_path, file_count, total_bytes, max_mtime, matched_scans, updated_at,
+                 first_observed_at, last_changed_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT (queue_id, rel_path) DO UPDATE SET
                 file_count = excluded.file_count,
                 total_bytes = excluded.total_bytes,
                 max_mtime = excluded.max_mtime,
                 matched_scans = excluded.matched_scans,
-                updated_at = excluded.updated_at
+                updated_at = excluded.updated_at,
+                first_observed_at = excluded.first_observed_at,
+                last_changed_at = excluded.last_changed_at
             """,
             (
                 queue_id,
@@ -250,6 +321,8 @@ async def save_settle_records(
                 max_mtime,
                 record.matched_scans,
                 _format_iso(record.first_matched_at),
+                _format_iso_opt(record.first_observed_at),
+                _format_iso_opt(record.last_changed_at),
             ),
         )
 

@@ -267,6 +267,21 @@ export interface FileNode {
   // which would defeat the WebSocket delta's "only publish what changed" property).
   settle_matched_scans: number | null
   settle_first_matched_at: string | null
+  // The settle gate's *other* display state (2026-08-13,
+  // prompts/2026-08-13-settle-progress-visibility.md, migration 013): a top-level item that
+  // hasn't been confirmed unchanged even once yet (settle_matched_scans === 1 -- a first-ever
+  // sighting, or the fingerprint changed on the most recent scan and reset the count; see
+  // lib/format.ts.isStillArriving) has nothing useful to say via the countdown above.
+  // settle_total_bytes (item_settle.total_bytes, already computed as part of the fingerprint)
+  // is what a "still arriving" reading watches climb; settle_first_observed_at/
+  // settle_last_changed_at answer "how long have we watched this" / "when did it last move."
+  // Gated on substate === 'settling' exactly like the two fields above, and null for the same
+  // reasons those two are, plus one more: a pre-migration item_settle row that hasn't changed
+  // since carries null for these two timestamps specifically (core/settle.py.SettleRecord) --
+  // render that as "unknown," never a fabricated time.
+  settle_total_bytes: number | null
+  settle_first_observed_at: string | null
+  settle_last_changed_at: string | null
   // Milestone/audit timestamps (2026-08-13) -- raw material for a lifecycle icon's tooltip.
   // `downloaded_at` already existed server-side (§7.3's retention key); the other four are new
   // to the wire only.
