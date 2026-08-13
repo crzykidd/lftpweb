@@ -27,7 +27,7 @@ from typing import Any
 
 import aiosqlite
 
-from lftpweb.core import local_scan, mount_sentinel, patterns, postprocess
+from lftpweb.core import local_scan, mount_sentinel, patterns, postprocess, settle
 from lftpweb.core.autoqueue import AutoQueue, QueueAutoConfig
 from lftpweb.core.crypto import DecryptionError, decrypt_secret
 from lftpweb.core.events import EventBus
@@ -287,13 +287,23 @@ class Engine:
             counts_predicate = patterns.build_counts_predicate(compiled)
             nodes = reconcile(remote_tree, local_tree, counts_predicate=counts_predicate)
 
+            # The settle gate (prompts/open-issues.md #2, `core/settle.py`): one fingerprint
+            # per top-level item, computed straight from this pass's own remote tree -- no
+            # extra I/O, the same tree `reconcile` above just consumed. `_persist` is what
+            # turns this into a settled/unsettled verdict and decides what (if anything) to
+            # override; this call only produces the raw per-item numbers.
+            fingerprints = settle.compute_fingerprints(remote_tree)
+
             # Persist first, then read back what was actually stored, then diff *that*
             # (DESIGN.md §2/§9; `core/itemview.py`). `_persist` is where an item's state is
             # really decided — job-lifecycle protection, §6's post-processing precedence,
-            # §7.3's grace period — so diffing `nodes` here, as this did until the two views
-            # were reconciled, published a state the database disagreed with. The order is
-            # the invariant: nothing goes on the wire that wasn't read back out of `item`.
-            written = await self._persist(q.id, nodes)
+            # §7.3's grace period, the settle gate above — so diffing `nodes` here, as this
+            # did until the two views were reconciled, published a state the database
+            # disagreed with. The order is the invariant: nothing goes on the wire that
+            # wasn't read back out of `item`.
+            written = await self._persist(
+                q.id, nodes, fingerprints=fingerprints, partial_scan=bool(scan_warning)
+            )
             published = await self._project(q.id, written)
 
             old_nodes = self.models.get(q.id, {})
@@ -435,10 +445,24 @@ class Engine:
         rows = await cursor.fetchall()
         return {row["rel_path"]: (row["state"], row["first_missing_at"]) for row in rows}
 
-    async def _persist(self, queue_id: int, nodes: dict[str, ReconciledNode]) -> set[str]:
+    async def _persist(
+        self,
+        queue_id: int,
+        nodes: dict[str, ReconciledNode],
+        *,
+        fingerprints: dict[str, settle.Fingerprint] | None = None,
+        partial_scan: bool = False,
+    ) -> set[str]:
         """Write this pass's arbitrated state for every reconciled node, and return the
         `rel_path`s it wrote (already `to_safe_text`-ed, i.e. keyed exactly as the `item`
         table stores them) so `_project` knows which rows this scan is entitled to publish.
+
+        `fingerprints`/`partial_scan` feed the settle gate (`core/settle.py`,
+        prompts/open-issues.md #2): `fingerprints` is keyed by the *un*-safe-texted top-level
+        `rel_path`, matching `node.rel_path` and the tree `settle.compute_fingerprints` was
+        built from; `None` (every existing caller/test before this task) disables the gate
+        entirely regardless of the site setting, the same "opt in explicitly or nothing
+        changes" shape every other gate in this method already has.
         """
         from lftpweb.core.util import to_safe_text
 
@@ -448,9 +472,30 @@ class Engine:
         now = datetime.now(UTC)
         written: set[str] = set()
 
+        settle_settings = await settle.load_settle_settings(self.db)
+        prev_settle = await settle.load_settle_records(self.db, queue_id) if fingerprints else {}
+        new_settle: dict[str, settle.SettleRecord] = {}
+
         for node in nodes.values():
             rel_path = to_safe_text(node.rel_path)
             written.add(rel_path)
+
+            # Settle-gate bookkeeping (`core/settle.py`): only top-level items are tracked --
+            # nested children inherit their root's verdict, per the agreed design -- and only
+            # when `fingerprints` was supplied at all. Computed *before* the protected check
+            # below so a queued/downloading item's settle progress keeps advancing off the
+            # remote tree even while its own `state` is left alone; whether it's actually
+            # settled only matters once it's unprotected again (or to `core/queue.py.
+            # _reap_one`'s completion gate, which reads this same table independently).
+            settle_record: settle.SettleRecord | None = None
+            if fingerprints is not None and "/" not in node.rel_path:
+                fp = fingerprints.get(node.rel_path)
+                if fp is not None:
+                    settle_record = settle.advance_settle(
+                        prev_settle.get(rel_path), fp, partial_scan=partial_scan
+                    )
+                    new_settle[rel_path] = settle_record
+
             if rel_path in protected:
                 await self.db.execute(
                     """
@@ -502,16 +547,39 @@ class Engine:
                 state = override[0] if override is not None else node.structural_state
                 first_missing_at = override[1] if override is not None else None
 
+            # The settle gate's completion half (prompts/open-issues.md #2): a top-level item
+            # that would otherwise publish DOWNLOADED is held at REMOTE_ONLY/substate=settling
+            # until its remote fingerprint has held for `settle.REQUIRED_SETTLE_SCANS`
+            # consecutive scans. This is what actually fixes the directory case -- byte
+            # comparison alone can't tell "3 of 8 files, all whole" from "done." Deliberately
+            # simple rather than precise: an item that is genuinely, permanently complete but
+            # merely hasn't had its second confirming scan yet is *also* shown REMOTE_ONLY for
+            # one scan interval -- the flat 2-scan rule DESIGN.md open-issues #2 settled on
+            # ("predictable beats clever"). Applied after the absence arbitration above, not
+            # instead of it -- this only ever downgrades a *presence* reading.
+            substate: str | None = None
+            if (
+                settle_settings.enabled
+                and settle_record is not None
+                and not settle.is_settled(settle_record)
+            ):
+                if state == "DOWNLOADED":
+                    state = "REMOTE_ONLY"
+                    first_missing_at = None
+                if state == "REMOTE_ONLY":
+                    substate = "settling"
+
             await self.db.execute(
                 """
-                INSERT INTO item (queue_id, rel_path, is_dir, remote_size, local_size, remote_mtime, state, first_missing_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO item (queue_id, rel_path, is_dir, remote_size, local_size, remote_mtime, state, substate, first_missing_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT (queue_id, rel_path) DO UPDATE SET
                     is_dir = excluded.is_dir,
                     remote_size = excluded.remote_size,
                     local_size = excluded.local_size,
                     remote_mtime = excluded.remote_mtime,
                     state = excluded.state,
+                    substate = excluded.substate,
                     first_missing_at = excluded.first_missing_at
                 """,
                 (
@@ -522,9 +590,12 @@ class Engine:
                     node.local_size,
                     node.remote_mtime,
                     state,
+                    substate,
                     first_missing_at,
                 ),
             )
+        if new_settle:
+            await settle.save_settle_records(self.db, queue_id, new_settle)
         await self.db.commit()
         return written
 

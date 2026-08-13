@@ -107,6 +107,43 @@ def test_verify_no_sidecar_hash_on_disk_fallback_reads_every_file(tmp_path):
     assert "fallback" in result.detail
 
 
+def test_verify_hash_on_disk_fallback_with_no_expected_size_is_unaffected(tmp_path):
+    """Backward compatible: `expected_total_bytes` defaults to `None`, which skips the new
+    size check entirely -- the same permissiveness the fallback always had.
+    """
+    item = tmp_path / "Release"
+    item.mkdir()
+    (item / "a.txt").write_bytes(b"hello world")
+
+    result = verify.verify_item(item, hash_on_disk_fallback=True, expected_total_bytes=None)
+    assert result.state == "VERIFIED"
+
+
+def test_verify_hash_on_disk_fallback_catches_truncation(tmp_path):
+    """prompts/open-issues.md #3: reading a short file to EOF raises nothing, so readability
+    alone previously proved nothing about completeness -- a partial file passed. Passing the
+    item's known remote size (as `core/postprocess.py._do_verify` now does) catches it.
+    """
+    item = tmp_path / "Release"
+    item.mkdir()
+    (item / "a.txt").write_bytes(b"hello world")  # 11 bytes on disk
+
+    result = verify.verify_item(item, hash_on_disk_fallback=True, expected_total_bytes=1000)
+    assert result.state == "CORRUPT"
+    assert "11 of 1000" in result.detail
+
+
+def test_verify_hash_on_disk_fallback_matching_size_is_verified(tmp_path):
+    item = tmp_path / "Release"
+    item.mkdir()
+    (item / "a.txt").write_bytes(b"hello world")  # 11 bytes
+    (item / "b.txt").write_bytes(b"!!")  # 2 bytes
+
+    result = verify.verify_item(item, hash_on_disk_fallback=True, expected_total_bytes=13)
+    assert result.state == "VERIFIED"
+    assert "13 bytes total" in result.detail
+
+
 def test_verify_single_loose_file_item(tmp_path):
     root = tmp_path / "root"
     root.mkdir()
@@ -886,14 +923,18 @@ async def test_move_mode_deletes_remote_only_after_verification(tmp_path):
         local_root = tmp_path / "local"
         local_root.mkdir()
         rel_path = "loose.txt"
-        (local_root / rel_path).write_bytes(b"downloaded and verifiable")
+        content = b"downloaded and verifiable"
+        (local_root / rel_path).write_bytes(content)
 
         _, queue_id = await _make_host_and_queue_rows(db, sync_mode="move")
         await db.execute(
             "UPDATE path_queue SET local_path = ? WHERE id = ?", (str(local_root), queue_id)
         )
         await db.commit()
-        item_id = await _make_item_row(db, queue_id, rel_path)
+        # remote_size must match what's actually on disk -- the hash-on-disk fallback now
+        # checks total bytes against it too (prompts/open-issues.md #3), same as a real scan
+        # would have recorded.
+        item_id = await _make_item_row(db, queue_id, rel_path, remote_size=len(content))
 
         pool = _FakeRemotePool()
         pipeline = postprocess.PostprocessPipeline(
@@ -1004,7 +1045,8 @@ async def test_pipeline_no_archives_never_stamps_extracted_and_preserves_verifie
         local_root = tmp_path / "local"
         local_root.mkdir()
         rel_path = "loose.txt"
-        (local_root / rel_path).write_bytes(b"just a normal, non-archive download")
+        content = b"just a normal, non-archive download"
+        (local_root / rel_path).write_bytes(content)
 
         _, queue_id = await _make_host_and_queue_rows(
             db, sync_mode="copy", auto_verify=1, auto_extract=1
@@ -1013,7 +1055,8 @@ async def test_pipeline_no_archives_never_stamps_extracted_and_preserves_verifie
             "UPDATE path_queue SET local_path = ? WHERE id = ?", (str(local_root), queue_id)
         )
         await db.commit()
-        item_id = await _make_item_row(db, queue_id, rel_path)
+        # remote_size must match what's actually on disk -- see the sibling test above.
+        item_id = await _make_item_row(db, queue_id, rel_path, remote_size=len(content))
 
         pipeline = postprocess.PostprocessPipeline(
             db=db, events=EventBus(), remote_pool=_FakeRemotePool(), host_provider=_async_host

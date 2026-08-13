@@ -165,6 +165,9 @@ export interface FileNode {
   rel_path: string
   is_dir: boolean
   state: string
+  // The settle gate (prompts/open-issues.md #2): 'settling' for a top-level REMOTE_ONLY item
+  // whose remote fingerprint hasn't held still for 2 consecutive scans yet, null otherwise.
+  substate: string | null
   remote_size: number | null
   local_size: number | null
   remote_mtime: number | null

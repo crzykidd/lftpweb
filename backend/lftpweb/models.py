@@ -160,6 +160,18 @@ class PostprocessSettingsIn(PostprocessSettingsOut):
     pass
 
 
+# --- Settings -> the settle gate (prompts/open-issues.md #2, `core/settle.py`) ----------
+
+
+class SettleSettingsOut(BaseModel):
+    # Defaults off -- see core/settle.py.SettleSettings's own docstring for the reasoning.
+    enabled: bool = False
+
+
+class SettleSettingsIn(SettleSettingsOut):
+    pass
+
+
 # --- Settings -> Queues -> Patterns (DESIGN.md §3.1 `pattern`, §4.7) --------------------
 
 PatternKind = Literal["select", "skip", "file_exclude"]
@@ -225,6 +237,11 @@ class FileNode(BaseModel):
     rel_path: str
     is_dir: bool
     state: str
+    # The settle gate (prompts/open-issues.md #2, `core/settle.py`, migration 007): `'settling'`
+    # for a top-level item held at REMOTE_ONLY while its remote fingerprint hasn't held still
+    # for 2 consecutive scans yet, `None` otherwise. Deliberately not a new `state` value --
+    # avoids touching the state CHECK constraint or DESIGN.md §9.2's three-word vocabulary.
+    substate: str | None = None
     remote_size: int | None
     local_size: int | None
     remote_mtime: float | None

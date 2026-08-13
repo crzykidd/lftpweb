@@ -28,7 +28,7 @@ from typing import Any
 # the query and the projection can't drift apart -- adding a field to the wire means adding it
 # in exactly one file. Callers that already hold a `SELECT *` row (`core/queue.py`,
 # `core/postprocess.py`) just pass it straight in.
-ITEM_VIEW_COLUMNS = "id, rel_path, is_dir, remote_size, local_size, remote_mtime, state"
+ITEM_VIEW_COLUMNS = "id, rel_path, is_dir, remote_size, local_size, remote_mtime, state, substate"
 
 # The published shape is a plain dict on purpose: it *is* the JSON that goes on the wire and
 # the kwargs `models.FileNode` takes, so there is no second representation to convert between
@@ -54,12 +54,17 @@ def item_view(row: Mapping[str, Any]) -> ItemView:
     `rel_path` needs no `core/util.py.to_safe_text` treatment here — a row can only have got
     into the table through `core/engine.py._persist`, which applies it on the way in (and a
     string carrying a lone surrogate could not be written to a TEXT column at all).
+
+    `substate` (migration 007, `core/settle.py`) is `'settling'` for a top-level item held at
+    `REMOTE_ONLY` by the settle gate, `None` otherwise — see that module's docstring. Passed
+    through verbatim; unlike `remote_mtime` it has no affinity mismatch to correct for.
     """
     return {
         "id": row["id"],
         "rel_path": row["rel_path"],
         "is_dir": bool(row["is_dir"]),
         "state": row["state"],
+        "substate": row["substate"],
         "remote_size": row["remote_size"],
         "local_size": row["local_size"],
         "remote_mtime": float(row["remote_mtime"]) if row["remote_mtime"] is not None else None,

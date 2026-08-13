@@ -6,6 +6,195 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-12 — The settle gate: a fingerprint-based hold on auto-queue and on reaching
+## `DOWNLOADED`, off by default; the hash-on-disk verify fallback now catches truncation
+
+**Handoff prompt `prompts/done/2026-08-12-settle-gate.md`, executed end to end** —
+`prompts/open-issues.md` bug #2 (the largest correctness gap the user found in the 2026-08-12
+real-use session) and bug #3, bundled because #3 is a small, closely related hardening of the
+same "don't act on an incomplete item" theme.
+
+**The bug, and why size comparison alone can't catch it.** A release directory uploads 8
+files; a scan catches 3, and each of those 3 happens to be fully arrived. `core/reconcile.py`'s
+rollup — remote bytes vs. local bytes, recomputed fresh every scan — reads the *directory* as
+`DOWNLOADED`. Not a race at a boundary: the normal outcome of uploading a multi-file release
+one file at a time. Nothing about those 3 files ever changes, so nothing about a byte
+comparison between two scans would ever catch it either — the defect isn't in comparing scan
+N to scan N-1, it's that scan N alone has no way to know 5 more files are coming. A single
+growing *file* self-heals (queued, lftp pulls a prefix, re-queued, resumes) — wasteful, not
+corrupting, confirmed live by the user. A directory does not: post-processing runs on the half
+release, `move` relocates it, an `*arr` imports 3 of 8 files, and the stragglers arrive to find
+the local copy gone (`REMOVED_LOCAL`, excluded from `ELIGIBLE_STATES` by open-issues #4 —
+never re-queued).
+
+**The fingerprint and its two rejected simpler forms.** Chosen:
+`(file_count, total_bytes, max_mtime)` over a top-level item's whole remote subtree, required
+to hold across `settle.REQUIRED_SETTLE_SCANS` (2) consecutive scans. Rejected:
+- **mtime alone.** `remote_mtime` was already captured (`find -printf '%T@'`), persisted, and
+  published — and read by nothing, so this looked like the free option. Rejected because
+  rsync/scp/torrent clients routinely preserve or preset source mtimes (a file can arrive with
+  a stale mtime the *instant* it lands), and a directory's own mtime only moves on entry
+  add/remove, never when an existing child merely grows in place mid-write.
+- **size alone.** This is exactly the bug above restated as a fix: a subset of files, each
+  individually complete, produces a total that doesn't change again once no more bytes are
+  pending for *those specific files* — indistinguishable from genuine completion by size.
+
+Combining all three closes each gap: a new file changes `file_count`, a growing file changes
+`total_bytes`, and the newest write landing changes `max_mtime` even when a file happens to
+arrive at exactly its final size on the first write.
+
+**Persisted, not in-memory — migration `007` (`item_settle`).** Two reasons, one merely
+practical (survives a restart; an item mid-upload when lftpweb restarts shouldn't lose its
+settle progress) and one decisive: nothing may publish a state it did not read back from a
+table (`core/itemview.py`'s own invariant, reinforced across the whole 2026-08-12 session). An
+in-memory counter could compute a verdict but could never be the source for
+`item.substate = 'settling'` going out over the WebSocket.
+
+**Both gates were required, and the completion half took the longer path.** The eligibility
+half (`core/autoqueue.py`, an extra `AND` clause reading `item_settle`) is the cheap fix and
+alone would have prevented most of the original bug — an unsettled top-level item is simply
+skipped for a later pass. But it does nothing for a manually-queued item, or for an item that
+becomes visible only after being auto-queued once already (a directory that settles, gets
+queued, and grows again before the job finishes). The completion half — an unsettled item must
+never reach `DOWNLOADED` — is what actually closes the gap for those cases, and it turned out
+to live in **two** places, not one:
+1. `core/engine.py._persist`: a top-level node whose structural read would publish `DOWNLOADED`
+   is downgraded to `REMOTE_ONLY`/`substate='settling'` when unsettled. Simple, but not
+   sufficient alone.
+2. `core/queue.py._reap_one`, the job-success path. A `mirror` job mirrors whatever is visible
+   on the remote *at the time it runs* — if the remote grew after admission but the job still
+   exits 0 (every file it was asked for arrived), `_reap_one` used to set `DOWNLOADED` and
+   call `postprocess.trigger()` unconditionally. This is the actual mechanism behind "the
+   directory case" when the item was queued manually (which deliberately bypasses the
+   eligibility check) or was auto-queued right as it settled and then kept growing. Skipping
+   this half — which the prompt named explicitly — would have left exactly that scenario open:
+   an item whose *job* succeeded but whose *item* wasn't actually done. `_reap_one` now checks
+   `item_settle` itself (`TransferQueue._item_is_settled`) before deciding: settled → the
+   original behavior unchanged; unsettled → held at `REMOTE_ONLY`/`settling`, suppression
+   cleared so a later auto-queue pass or a manual re-click resumes it, and
+   `postprocess.trigger()` is **not** called. An `audit` event (`settle_gate_held`) records
+   why, so a job that visibly "succeeded" but produced no completion isn't a silent mystery.
+
+**A deliberately *not*-built third path: scan-driven re-triggering of postprocess.** An item
+held at `REMOTE_ONLY`/`settling` by either gate re-enters the normal flow by being re-queued —
+either by `AutoQueue` (once eligible again) or by the user clicking Queue again — and lftp
+resumes rather than re-fetching what's already on disk. That re-queue's own eventual job
+success is what reaches `_reap_one` and (once genuinely settled) triggers post-processing
+normally. Considered and rejected: having `core/engine.py.scan_queue` trigger post-processing
+itself whenever a scan (not a job) moves an item into `DOWNLOADED`. This would handle the one
+case the re-queue path doesn't — an item that settles on a pass with no job running at all, if
+auto-queue is off and nobody manually re-clicks — but it works against the module's own
+stated design (`core/postprocess.py`'s docstring: "the only realistic way an item reaches
+`DOWNLOADED` is by lftpweb having just transferred it," on purpose, to avoid a second trigger
+path). Rejected for this task rather than half-solved: it's a real, narrow residual gap
+(recorded below), not a defect this task introduced, and closing it properly means either
+teaching the scan path to recognize "this DOWNLOADED came from a held-back job" (fragile) or
+accepting a general scan-driven trigger (a bigger, separately-reasoned change). Flagging it
+rather than silently working around it.
+
+**A manual Queue click overrides the eligibility gate, never the completion gate — enforced by
+which function each lives in, not by a flag.** `TransferQueue.enqueue_item` (what both
+`POST /api/jobs` and `AutoQueue._enqueue_item` ultimately call) never consults
+`item_settle` at all; only `AutoQueue.on_scan`'s own query does. So an explicit click always
+queues immediately — explicit user action beats a heuristic — but the very same
+`_reap_one` completion check applies regardless of *how* the job got queued. Worst case of
+clicking Queue on a settling item: a wasted partial transfer that resumes. Never a bad import,
+never a bad delete.
+
+**Default off**, per this project's standing rule (every new capability ships off unless
+there's an explicit, reasoned exception — `move`-mode delete-on-completion and the phase 7
+scheduled backup are the two exceptions on record, and neither reasoning applies here). The
+gate delays every transfer by up to `REQUIRED_SETTLE_SCANS * scan_interval_s` — today up to
+~60s at the 30s default — including the user's own atomic hardlink path, where nothing is
+actually still arriving and the delay buys nothing. That's a real, user-visible latency
+regression for every existing install if defaulted on, which is exactly the bar the "off
+unless reasoned" rule exists to catch. `core/settle.py.SettleSettings` (`setting` key
+`settle_settings`), reachable at `GET`/`PUT /api/settings/settle` — **no Settings-page UI
+built this task**, the same "backend exists, UI catches up later" gap this project already
+accepted for Settings → Transfer across several earlier phases; named here rather than
+silently left undiscoverable.
+
+**`substate = 'settling'`, not a new `state` value.** The `substate` column
+(`001_initial_schema.sql:86`) existed, was already migrated, and was read by nothing —
+free, and it sidesteps two things a new state value would have touched: the `item.state`
+`CHECK` constraint, and DESIGN.md §9.2's three-word visible state vocabulary. Added to
+`ITEM_VIEW_COLUMNS`/`item_view()` (the one projection everything publishes through) and to
+`FileNode`/the frontend `FileNode` type. Files-page treatment is a small quiet dot next to the
+state chip (`FileTree.tsx`), not a second chip — most items pass through this state on every
+first sighting (any first-ever scan of a genuinely atomic arrival is, by construction, only
+matched-scans=1 until its second confirming scan), so a loud treatment would read as "usually
+broken."
+
+**Rejected: resetting the settle counter on a partial-scan warning.** GNU `find` exits nonzero
+the instant it can't read one subdirectory anywhere in the tree and still prints everything it
+*did* reach (`core/remote.py.interpret_primary_scan_result`) — this is exactly how the phase 2
+scan-abort bug looked before it was fixed, and it recurs routinely on a seedbox with one
+permission-quirky subdirectory. Two consecutive partial scans returning the identical
+truncated subset would read as "settled" under a reset-then-recount scheme, or would simply
+take forever to progress under an ordinary "ignore this scan" scheme applied naively. Chosen
+instead: **hold** — `settle.advance_settle` returns the previous record completely unchanged
+when `partial_scan` is true and a previous record exists (a first sighting during a partial
+scan has nothing to hold, so it still starts at 1). This is the conservative reading of "no
+evidence anything changed, only that this pass couldn't see all of it."
+
+**`core/verify.py`'s hash-on-disk fallback (open-issues #3), bundled in because it's the same
+theme one layer later.** With no `.sfv`/`.md5` sidecar and the fallback enabled,
+`_verify_hash_on_disk` proved a file was *readable* end to end and returned `VERIFIED` — but
+reading a short/truncated file to EOF raises nothing; readability alone never proved
+completeness. `VERIFIED` is the sole gate on `move` mode's remote delete
+(`core/postprocess.py._maybe_delete_remote`), so this could authorize deleting the only
+remaining copy of a still-incomplete item. Fix: `verify_item`/`_verify_hash_on_disk` now take
+`expected_total_bytes` (the item's `remote_size`, passed by `core/postprocess.py._do_verify`)
+and compare total bytes actually read against it, returning `CORRUPT` on a shortfall.
+**Considered and rejected: demoting the whole fallback to `SKIPPED` for `move` queues**, on the
+theory that a check that can't detect bit-level corruption shouldn't be trusted to authorize a
+delete at all. Rejected because that bar is not the one the rest of this codebase holds
+itself to — `local_size >= remote_size` *is* how completeness is decided everywhere else in
+`core/reconcile.py`, with no stronger claim than "the bytes are there." Once the fallback also
+confirms total size, it offers exactly that same guarantee, no weaker than the rest of the
+system's risk model — the residual gap (an undetected in-place bit flip) is real but is not
+new, and is not specific to `move` mode. Downgrading only `move` queues to `SKIPPED` would also
+have meant `move` could never complete a delete without a sidecar, silently, which is its own
+kind of surprise for a queue configured for it. The size check is the fix that matches the bug
+actually found; a stronger content-correctness guarantee (real hashing without a sidecar to
+compare against isn't possible in principle) is out of scope.
+
+**`DESIGN.md` wording drafted, not applied** (three other wordings from earlier 2026-08-12
+tasks are already awaiting the user's approval; these join them):
+- **A new subsection near §5 (remote scanning) or §3.2 (state rules), "the settle gate":**
+  describing the `(file_count, total_bytes, max_mtime)` fingerprint, `REQUIRED_SETTLE_SCANS`,
+  the two gates (eligibility in §4.7's auto-queue evaluation, completion in the job-success
+  transition to `DOWNLOADED`), `substate = 'settling'`, and the default-off, switchable-via-
+  settings posture.
+- **§6's post-processing trigger paragraph** ("triggered on transition to `DOWNLOADED`") should
+  gain a clause: *"...specifically the job-success transition in `core/queue.py._reap_one` —
+  an item held back by the settle gate re-enters this path by being re-queued, not by a scan
+  alone reaching `DOWNLOADED`."* This documents the deliberately-not-built third path above as
+  a known, reasoned limitation rather than an oversight.
+- **§7.3's verification guarantees**: the hash-on-disk fallback's guarantee should read
+  "readable end to end and matches the known remote size," not just "readable end to end."
+
+**Reported but not fixed.** The scan-driven re-trigger gap above (no auto-queue, no manual
+click → a settled-but-held item can sit indefinitely without post-processing ever running).
+Also: `item_settle` rows are never deleted (same posture this codebase already holds for
+`item` rows themselves — bounded by top-level item count per queue, not tree size, so the
+accumulation is cheap, but it is accumulation).
+
+**Tests.** `tests/test_settle.py` (pure fingerprint/counter arithmetic and a DB round-trip, no
+seedbox). `tests/test_settle_gate_e2e.py` — the required reproduction — against the real fake
+seedbox: a single remote file written in chunks across real scans (both "not auto-queued while
+growing" and, separately, "does not read `DOWNLOADED` while growing even when local content
+keeps pace with it"), and a release directory gaining a second file between scans (the
+directory bug, reproduced and shown fixed end to end through a real `Engine.scan_queue` pass).
+`tests/test_autoqueue.py` gained default-off/on/settled/unsettled/missing-row eligibility
+cases. `core/verify.py`'s new truncation-catching behavior broke two existing
+`tests/test_postprocess.py` fixtures whose hardcoded `remote_size=100` no longer matched their
+actual fixture content length once the size check started running — fixed by making those
+fixtures' `remote_size` match reality, which is what a real scan would have recorded anyway,
+not by weakening the check.
+
+---
+
 ## 2026-08-12 — Per-file progress inside a mirroring directory is now published live, throttled
 ## to every 3rd tick; the parent item's WS row is read back from `item` instead of hardcoding
 ## `"state": "DOWNLOADING"`

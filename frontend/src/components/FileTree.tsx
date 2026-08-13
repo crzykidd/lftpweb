@@ -131,6 +131,15 @@ function Row({ entry, isCollapsed, isSelected, onToggleCollapse, onToggleSelect,
       </span>
       <span className="w-28 shrink-0 text-right">
         <StateChip state={entry.state} />
+        {/* The settle gate (prompts/open-issues.md #2): most REMOTE_ONLY items pass through
+            this on every first sighting, so it's deliberately quiet -- a small dot, not a
+            second chip -- rather than something that reads as a problem. */}
+        {entry.state === 'REMOTE_ONLY' && entry.substate === 'settling' && (
+          <span
+            className="ml-1 inline-block h-1.5 w-1.5 rounded-full bg-sky-400 align-middle dark:bg-sky-500"
+            title="Waiting for another scan to confirm this item has stopped changing before it's queued"
+          />
+        )}
       </span>
       <span className="w-16 shrink-0 text-right">
         {action && (

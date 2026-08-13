@@ -442,7 +442,15 @@ class PostprocessPipeline:
     async def _do_verify(self, item: Any, local_root: Path, settings: PostprocessSettings) -> str:
         await self._set_item_state(item["id"], "VERIFYING")
         result = await asyncio.to_thread(
-            verify.verify_item, local_root, hash_on_disk_fallback=settings.verify_hash_on_disk
+            verify.verify_item,
+            local_root,
+            hash_on_disk_fallback=settings.verify_hash_on_disk,
+            # prompts/open-issues.md #3: without this, the hash-on-disk fallback proves a file
+            # is readable, not that it's complete -- a truncated file reads to EOF cleanly.
+            # `item["remote_size"]` is the same total `core/reconcile.py` rolls up for
+            # completeness elsewhere; `None` if a scan never populated it, which disables the
+            # extra check rather than failing verification on missing information.
+            expected_total_bytes=item["remote_size"],
         )
         if result.state == "VERIFIED":
             await self.db.execute(

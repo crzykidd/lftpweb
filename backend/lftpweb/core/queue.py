@@ -25,7 +25,7 @@ from typing import Any
 
 import aiosqlite
 
-from lftpweb.core import lftp, patterns, scheduler
+from lftpweb.core import audit, lftp, patterns, scheduler, settle
 from lftpweb.core.events import EventBus
 from lftpweb.core.itemview import ITEM_VIEW_COLUMNS, ItemView, item_view
 from lftpweb.core.metrics import RunningJobBytes, ThroughputSampler
@@ -343,6 +343,14 @@ class TransferQueue:
     async def enqueue_item(self, item_id: int, *, forced_full_rate: bool = False) -> int:
         """Manual queue (DESIGN.md §4.7): always wins, clears suppression, resets `attempt`.
         Returns the new `job.id`.
+
+        **Deliberately does not consult the settle gate** (`core/settle.py`,
+        prompts/open-issues.md #2) -- that gate's *eligibility* half only lives in
+        `core/autoqueue.py`'s own query, which this method has no part of. An explicit user
+        click beats a heuristic; the gate's *completion* half (`_reap_one` below) still
+        applies regardless of how the job was queued, so the worst case of clicking Queue on
+        a settling item is a wasted partial transfer that resumes, never a bad import or a
+        bad delete.
         """
         item = await self._fetch_item(item_id)
         if item is None:
@@ -449,6 +457,23 @@ class TransferQueue:
         """
         return await self.enqueue_item(item_id)
 
+    async def _item_is_settled(self, queue_id: int, rel_path: str) -> bool:
+        """The completion half of the settle gate (prompts/open-issues.md #2,
+        `core/settle.py`), consulted from `_reap_one` on job success. Returns `True`
+        unconditionally when `settle.SettleSettings.enabled` is off -- this project's "every
+        new capability defaults off" rule, and this is the completion half, so the setting
+        being off must restore exactly the pre-gate behaviour rather than a softened version
+        of it.
+
+        Reflects the fingerprint as of the most recent scan (`core/engine.py._persist` is the
+        only writer of `item_settle`) -- a job can finish between two scan passes, so this is
+        the best information available, not a live recomputation.
+        """
+        settings = await settle.load_settle_settings(self.db)
+        if not settings.enabled:
+            return True
+        return await settle.is_settled_in_db(self.db, queue_id, rel_path)
+
     # --- one scheduling tick -------------------------------------------------------------
 
     async def tick(self) -> None:
@@ -509,25 +534,65 @@ class TransferQueue:
                 "finished_at = ? WHERE id = ?",
                 (finished_at, proc.job_id),
             )
-            # No inference (DESIGN.md §4.3): `cmd:fail-exit true` makes exit 0 mean the whole
-            # transfer succeeded, so the item is DOWNLOADED now, not "probably, pending the
-            # next scan." The engine's own reconcile pass will confirm sizes on its next
-            # cycle; this is what makes the UI update immediately instead of waiting for it.
-            await self.db.execute(
-                "UPDATE item SET state = 'DOWNLOADED', downloaded_at = ?, "
-                "auto_queue_suppressed = 0, suppressed_reason = NULL, error_class = NULL, error_detail = NULL "
-                "WHERE id = ?",
-                (finished_at, proc.item_id),
-            )
+
+            # The settle gate's completion half (prompts/open-issues.md #2, `core/settle.py`),
+            # for a top-level item only -- the same eligibility shape core/autoqueue.py uses,
+            # since a queued job is always for a top-level item. `_item_is_settled` reads
+            # `settle.SettleSettings` itself and returns `True` unconditionally when the gate
+            # is off, so this whole branch is a no-op change of behavior for every install that
+            # hasn't opted in.
+            top_level = "/" not in proc.rel_path
+            settled = (not top_level) or await self._item_is_settled(proc.queue_id, proc.rel_path)
+
+            if settled:
+                # No inference (DESIGN.md §4.3): `cmd:fail-exit true` makes exit 0 mean the
+                # whole transfer succeeded, so the item is DOWNLOADED now, not "probably,
+                # pending the next scan." The engine's own reconcile pass will confirm sizes on
+                # its next cycle; this is what makes the UI update immediately instead of
+                # waiting for it.
+                await self.db.execute(
+                    "UPDATE item SET state = 'DOWNLOADED', downloaded_at = ?, substate = NULL, "
+                    "auto_queue_suppressed = 0, suppressed_reason = NULL, error_class = NULL, error_detail = NULL "
+                    "WHERE id = ?",
+                    (finished_at, proc.item_id),
+                )
+            else:
+                # This job genuinely succeeded -- everything visible on the remote at
+                # admission time is now on disk -- but the remote subtree has not held still
+                # for `settle.REQUIRED_SETTLE_SCANS` consecutive scans, so this may not be the
+                # *whole* item (the directory-upload race the settle gate exists for: a
+                # release mid-upload, mirrored, exits 0 because every file it was asked for
+                # arrived). Held at REMOTE_ONLY/settling rather than DOWNLOADED so
+                # post-processing never runs on a partial release -- auto-queue or a manual
+                # Queue click can pick this item back up once it does settle, and lftp resumes
+                # rather than re-fetching what's already there. "A wasted partial transfer
+                # that resumes," never a bad import or a bad delete.
+                await self.db.execute(
+                    "UPDATE item SET state = 'REMOTE_ONLY', substate = 'settling', "
+                    "auto_queue_suppressed = 0, suppressed_reason = NULL, error_class = NULL, error_detail = NULL "
+                    "WHERE id = ?",
+                    (proc.item_id,),
+                )
+                await audit.record_event(
+                    self.db,
+                    level="info",
+                    item_id=proc.item_id,
+                    kind="settle_gate_held",
+                    message=(
+                        f"job {proc.job_id} for {proc.rel_path!r} succeeded but the item has "
+                        "not settled (prompts/open-issues.md #2) -- held at REMOTE_ONLY/"
+                        "settling instead of DOWNLOADED; post-processing was not triggered"
+                    ),
+                )
+
             await self.db.commit()
             await self._publish_item_state(proc.item_id)
             proc.spawned.cleanup()
-            # Phase 5 (DESIGN.md §6): "triggered on transition to DOWNLOADED." Only for a
-            # top-level item — the same eligibility shape core/autoqueue.py uses — since a
-            # queued job is always for a top-level item (a whole release via `mirror`, or a
-            # loose top-level file via `pget`) and postprocessing operates on the release as
-            # a whole, not once per nested file/subdirectory item.
-            if self.postprocess is not None and "/" not in proc.rel_path:
+            # Phase 5 (DESIGN.md §6): "triggered on transition to DOWNLOADED." Only when this
+            # job's item actually reached DOWNLOADED above -- an unsettled item held back by
+            # the branch above must not trigger post-processing (that's the whole point of the
+            # completion gate); it re-enters this same path via a fresh job once it settles.
+            if settled and self.postprocess is not None and top_level:
                 self.postprocess.trigger(proc.item_id)
             return
 

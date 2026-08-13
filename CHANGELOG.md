@@ -84,6 +84,26 @@ alongside this list: several entries below ship with deliberate, documented limi
   well below what the inputs accept.
 - **Expand all / Collapse all** on the Files tree, and the **queue name on each Transfers
   row** *(2026-08-12)*.
+- **The settle gate** *(2026-08-12, defaults **off**)*: a top-level item (a release directory
+  or a loose top-level file) is now fingerprinted every scan
+  (`file_count, total_bytes, max_mtime` over its whole remote subtree), and — when this new
+  toggle is on — must hold that fingerprint across 2 consecutive scans before auto-queue will
+  pick it up or before it's allowed to reach `DOWNLOADED` and trigger post-processing. Fixes a
+  real gap: a release still being uploaded, caught mid-upload, can look byte-complete for the
+  files that *have* fully arrived while more are still coming — a growing single file
+  self-heals (re-queued, resumes) but a growing *directory* previously did not, and could be
+  moved/extracted/deleted-from-remote with files still missing. A manual Queue click still
+  overrides the *queueing* half (explicit user action beats a heuristic); the *completion*
+  half — never publishing `DOWNLOADED` for an unsettled item — always applies regardless, so
+  the worst case is a wasted partial transfer that resumes, never a bad import or a bad
+  delete. Held items surface as `REMOTE_ONLY` with a new `substate: "settling"` (a small,
+  deliberately quiet dot next to the state chip on the Files page — most items pass through
+  it on every first sighting). **Off by default because it delays every transfer by up to
+  ~60 seconds** (two scan intervals at the current 30s default), including the atomic
+  hardlink path where it buys nothing; turn it on via `PUT /api/settings/settle` (no
+  Settings-page UI yet — a named gap, same as Settings → Transfer for several earlier
+  phases). See `docs/decisions.md` for the full reasoning and the DESIGN.md wording drafted,
+  not yet applied, alongside this entry.
 
 ### Changed
 
@@ -208,6 +228,12 @@ alongside this list: several entries below ship with deliberate, documented limi
   leaf file. In the same pass, the parent item's WS row stopped hardcoding `"state":
   "DOWNLOADING"` and is now read back from `item` like everything else `core/itemview.py`
   projects.
+- **The hash-on-disk verification fallback could bless a truncated file** *(2026-08-12)*: with
+  no `.sfv`/`.md5` sidecar and the fallback enabled, `verify_item` proved a file was
+  *readable* end to end, which a short/truncated file passes just as cleanly as a complete
+  one — and `VERIFIED` is the sole gate on a `move`-mode queue's irreversible remote delete.
+  The fallback now also compares total bytes read against the item's known remote size and
+  returns `CORRUPT` on a mismatch.
 
 ### Security
 

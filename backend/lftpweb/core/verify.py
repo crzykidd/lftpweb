@@ -6,9 +6,13 @@ off the event loop via `asyncio.to_thread`.
 the one and only gate on an irreversible remote delete. `VerifyResult.state` is one of:
 
 - `VERIFIED`   -- every referenced file's checksum matched (sidecar path), or every file was
-                  fully readable end to end with no sidecar to compare against (the weaker
-                  hash-on-disk fallback -- proves readability, not content correctness; see
-                  `detail`).
+                  fully readable end to end *and* the total bytes on disk match the item's
+                  known remote size, with no sidecar to compare against (the weaker
+                  hash-on-disk fallback -- proves readability and completeness, not per-byte
+                  content correctness; see `detail`). The size check (prompts/open-issues.md
+                  #3) is what stops a truncated file from passing: reading a short file to EOF
+                  raises nothing, so readability alone previously proved nothing about
+                  completeness.
 - `CORRUPT`     -- a checksum mismatch, a sidecar-referenced file that's missing, or a file
                   that could not be fully read.
 - `SKIPPED`     -- no sidecar found and hash-on-disk verification is disabled. Not a failure:
@@ -151,14 +155,24 @@ def _verify_against_sidecars(sidecars: list[Path]) -> VerifyResult:
     return VerifyResult(state="VERIFIED", detail=f"{checked} file(s) matched sidecar checksum")
 
 
-def _verify_hash_on_disk(root: Path) -> VerifyResult:
+def _verify_hash_on_disk(root: Path, expected_total_bytes: int | None) -> VerifyResult:
+    """The hash-on-disk fallback. `expected_total_bytes` -- the item's known remote size
+    (`item.remote_size`, passed in by `core/postprocess.py`) -- is the fix for the bug
+    recorded in `prompts/open-issues.md` #3: reading a file fully proves it's *readable*, not
+    that it's *complete*. A file truncated mid-transfer reads to EOF without error; only a
+    total-bytes comparison against what the remote side actually has catches that. `None`
+    (size not known to the caller) skips the check rather than failing closed on missing
+    information -- the same permissiveness this fallback already had before this fix, for the
+    one case where no better answer is available.
+    """
     files = _iter_files(root)
     unreadable: list[str] = []
+    total_read = 0
     for f in files:
         try:
             with f.open("rb") as fh:
-                while fh.read(_CHUNK_SIZE):
-                    pass
+                while chunk := fh.read(_CHUNK_SIZE):
+                    total_read += len(chunk)
         except OSError as exc:
             unreadable.append(f"{f.name}: {exc}")
     if unreadable:
@@ -166,19 +180,44 @@ def _verify_hash_on_disk(root: Path) -> VerifyResult:
         return VerifyResult(
             state="CORRUPT", detail=f"{len(unreadable)} file(s) could not be fully read: {shown}"
         )
+    if expected_total_bytes is not None and total_read < expected_total_bytes:
+        return VerifyResult(
+            state="CORRUPT",
+            detail=(
+                f"hash-on-disk fallback: only {total_read} of {expected_total_bytes} expected "
+                "bytes are present on disk -- truncated, still arriving, or the remote grew "
+                "after this item was last measured"
+            ),
+        )
     return VerifyResult(
         state="VERIFIED",
         detail=(
-            f"no .sfv/.md5 sidecar found; {len(files)} file(s) fully read on disk "
-            "(hash-on-disk fallback -- confirms readability, not content correctness)"
+            f"no .sfv/.md5 sidecar found; {len(files)} file(s) fully read on disk, "
+            f"{total_read} bytes total"
+            + (
+                f" (matches the {expected_total_bytes}-byte remote total)"
+                if expected_total_bytes is not None
+                else ""
+            )
+            + " (hash-on-disk fallback -- confirms readability and total size, not per-byte "
+            "content correctness)"
         ),
     )
 
 
-def verify_item(root: str | Path, *, hash_on_disk_fallback: bool = False) -> VerifyResult:
+def verify_item(
+    root: str | Path,
+    *,
+    hash_on_disk_fallback: bool = False,
+    expected_total_bytes: int | None = None,
+) -> VerifyResult:
     """Verify one item's local files. See the module docstring for the three possible
     results. `root` is the item's own local path (a directory for a release, a single file
     for a loose top-level file).
+
+    `expected_total_bytes` only matters for the hash-on-disk fallback (see
+    `_verify_hash_on_disk`) -- a `.sfv`/`.md5` sidecar's own per-file checksums are already a
+    strictly stronger completeness+correctness check and don't need it.
     """
     root = Path(root)
     sidecars = _find_sidecars(root)
@@ -191,4 +230,4 @@ def verify_item(root: str | Path, *, hash_on_disk_fallback: bool = False) -> Ver
             detail="no .sfv/.md5 sidecar found and hash-on-disk verification is disabled",
         )
 
-    return _verify_hash_on_disk(root)
+    return _verify_hash_on_disk(root, expected_total_bytes)

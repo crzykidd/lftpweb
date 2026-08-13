@@ -19,6 +19,14 @@ Three things this module must get right, in order of consequence:
    with (`STOPPED`, `FAILED`, `REMOVED_LOCAL`, `REMOVED_BOTH`), are excluded by construction:
    the eligibility query only ever selects `REMOTE_ONLY`/`PARTIAL` items with the flag clear.
    A `STOPPED` item whose pattern still matches must never be picked up here.
+4. **The settle gate (prompts/open-issues.md #2, `core/settle.py`).** Off by default like
+   everything else in this list; when `settle.SettleSettings.enabled` is on, a matched item is
+   still skipped -- left for a later pass -- until its remote fingerprint has held for
+   `settle.REQUIRED_SETTLE_SCANS` consecutive scans. This is the "cheap half" of the gate: it
+   stops auto-queue from spawning a transfer for an item that is still visibly arriving. A
+   *manual* Queue click bypasses this check entirely (`core/queue.py.enqueue_item` doesn't
+   consult it) -- an explicit user action beats a heuristic -- but still can't reach
+   `DOWNLOADED` early, because the gate's other half lives in `core/queue.py._reap_one`.
 
 **Retroactive by construction.** DESIGN.md §4.7: "adding a pattern re-evaluates the whole
 known model, not just future scans." This module re-queries every eligible top-level item in
@@ -36,7 +44,7 @@ from dataclasses import dataclass
 
 import aiosqlite
 
-from lftpweb.core import mount_sentinel, patterns
+from lftpweb.core import mount_sentinel, patterns, settle
 
 logger = logging.getLogger(__name__)
 
@@ -95,6 +103,8 @@ class AutoQueue:
             self.db, queue.id, patterns_only=queue.patterns_only
         )
 
+        settle_settings = await settle.load_settle_settings(self.db)
+
         cursor = await self.db.execute(
             "SELECT id, rel_path, is_dir FROM item WHERE queue_id = ? "
             "AND instr(rel_path, '/') = 0 AND auto_queue_suppressed = 0 "
@@ -106,6 +116,15 @@ class AutoQueue:
         queued = 0
         for row in rows:
             if not compiled.item_matches(row["rel_path"], is_file=not bool(row["is_dir"])):
+                continue
+            # The settle gate's eligibility half (prompts/open-issues.md #2): skip -- not
+            # suppress -- an item whose remote subtree hasn't held still yet. Left eligible
+            # for the *next* pass rather than marked `auto_queue_suppressed`, since nothing
+            # about the item itself is wrong; it just isn't done arriving. A no-op when the
+            # setting is off (`load_settle_settings` defaults to disabled).
+            if settle_settings.enabled and not await settle.is_settled_in_db(
+                self.db, queue.id, row["rel_path"]
+            ):
                 continue
             await self._enqueue_item(row["id"])
             queued += 1

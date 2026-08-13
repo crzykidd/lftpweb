@@ -223,3 +223,86 @@ async def test_global_pattern_queue_id_null_applies_to_every_queue(db, tmp_path)
     aq = AutoQueue(db, recorder)
 
     assert await aq.on_scan(_mounted_config(queue_id, tmp_path)) == 0
+
+
+# --- the settle gate's eligibility half (prompts/open-issues.md #2, `core/settle.py`) -----
+
+
+async def _set_settle_record(db, queue_id, rel_path, matched_scans: int) -> None:
+    await db.execute(
+        "INSERT INTO item_settle (queue_id, rel_path, file_count, total_bytes, max_mtime, matched_scans) "
+        "VALUES (?, ?, 1, 100, 1.0, ?)",
+        (queue_id, rel_path, matched_scans),
+    )
+    await db.commit()
+
+
+async def test_settle_gate_off_by_default_ignores_unsettled_items(db, tmp_path):
+    """No settle settings row at all -- `settle.load_settle_settings` defaults to disabled --
+    must reproduce the exact pre-gate behaviour: an item with no `item_settle` row (never
+    scanned by the settle-aware code path) is still queued.
+    """
+    from lftpweb.core.mount_sentinel import write_if_needed
+
+    write_if_needed(str(tmp_path))
+    queue_id = await _make_queue(db, tmp_path)
+    await _make_item(db, queue_id, "Release.One")
+    recorder = _Recorder()
+    aq = AutoQueue(db, recorder)
+
+    assert await aq.on_scan(_mounted_config(queue_id, tmp_path)) == 1
+    assert recorder.enqueued == [1]
+
+
+async def test_settle_gate_on_holds_back_an_unsettled_item(db, tmp_path):
+    from lftpweb.core.mount_sentinel import write_if_needed
+    from lftpweb.core.settle import SettleSettings, save_settle_settings
+
+    await save_settle_settings(db, SettleSettings(enabled=True))
+    write_if_needed(str(tmp_path))
+    queue_id = await _make_queue(db, tmp_path)
+    await _make_item(db, queue_id, "Release.One")
+    await _set_settle_record(db, queue_id, "Release.One", matched_scans=1)  # not yet settled
+    recorder = _Recorder()
+    aq = AutoQueue(db, recorder)
+
+    queued = await aq.on_scan(_mounted_config(queue_id, tmp_path))
+    assert queued == 0
+    assert recorder.enqueued == []
+
+
+async def test_settle_gate_on_queues_a_settled_item(db, tmp_path):
+    from lftpweb.core.mount_sentinel import write_if_needed
+    from lftpweb.core.settle import SettleSettings, save_settle_settings
+
+    await save_settle_settings(db, SettleSettings(enabled=True))
+    write_if_needed(str(tmp_path))
+    queue_id = await _make_queue(db, tmp_path)
+    await _make_item(db, queue_id, "Release.One")
+    await _set_settle_record(db, queue_id, "Release.One", matched_scans=2)  # settled
+    recorder = _Recorder()
+    aq = AutoQueue(db, recorder)
+
+    queued = await aq.on_scan(_mounted_config(queue_id, tmp_path))
+    assert queued == 1
+    assert recorder.enqueued == [1]
+
+
+async def test_settle_gate_on_with_no_settle_row_yet_is_conservative(db, tmp_path):
+    """A missing `item_settle` row means the settle-aware scan path hasn't run for this item
+    yet -- treated as *not* settled (never queued on the strength of an absence), rather than
+    optimistically queued.
+    """
+    from lftpweb.core.mount_sentinel import write_if_needed
+    from lftpweb.core.settle import SettleSettings, save_settle_settings
+
+    await save_settle_settings(db, SettleSettings(enabled=True))
+    write_if_needed(str(tmp_path))
+    queue_id = await _make_queue(db, tmp_path)
+    await _make_item(db, queue_id, "Release.One")
+    recorder = _Recorder()
+    aq = AutoQueue(db, recorder)
+
+    queued = await aq.on_scan(_mounted_config(queue_id, tmp_path))
+    assert queued == 0
+    assert recorder.enqueued == []

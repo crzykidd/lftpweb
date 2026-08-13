@@ -20,6 +20,7 @@ from lftpweb.core.postprocess import (
     save_postprocess_settings,
 )
 from lftpweb.core.remote import HostConfig, parse_connection_limit
+from lftpweb.core.settle import SettleSettings, load_settle_settings, save_settle_settings
 from lftpweb.models import (
     HostIn,
     HostOut,
@@ -35,6 +36,8 @@ from lftpweb.models import (
     PostprocessSettingsIn,
     PostprocessSettingsOut,
     QueueAutoQueueStatus,
+    SettleSettingsIn,
+    SettleSettingsOut,
     TestConnectionResponse,
 )
 
@@ -563,3 +566,25 @@ async def put_postprocess_settings(
     )
     await save_postprocess_settings(request.app.state.db, settings)
     return _postprocess_out(settings)
+
+
+# --- Settings -> the settle gate (prompts/open-issues.md #2, `core/settle.py`) -----------
+#
+# No frontend page yet -- this task's scope was the backend gate and its two consumers
+# (`core/autoqueue.py`, `core/queue.py._reap_one`); see the handoff report for the same
+# "backend first, UI catches up later" gap this project already accepted for Settings ->
+# Transfer across several earlier phases. Defaults off either way, so its absence from any
+# settings screen changes nothing about how an existing install behaves.
+
+
+@router.get("/settle", response_model=SettleSettingsOut)
+async def get_settle_settings(request: Request) -> SettleSettingsOut:
+    settings = await load_settle_settings(request.app.state.db)
+    return SettleSettingsOut(enabled=settings.enabled)
+
+
+@router.put("/settle", response_model=SettleSettingsOut)
+async def put_settle_settings(body: SettleSettingsIn, request: Request) -> SettleSettingsOut:
+    settings = SettleSettings(enabled=body.enabled)
+    await save_settle_settings(request.app.state.db, settings)
+    return SettleSettingsOut(enabled=settings.enabled)
