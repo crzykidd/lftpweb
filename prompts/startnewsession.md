@@ -70,6 +70,57 @@ side effect of shipping.
 
 ## Where we are
 
+> **Read `prompts/open-issues.md` first.** The 2026-08-12/13 overnight session closed sixteen
+> issues across nine commits, and that file carries the reasoning — including one fix that was
+> shipped and then deliberately reversed the same night. Several statements further down this
+> file predate it.
+
+### 2026-08-12/13 overnight session — sixteen issues, nine commits, all pushed and CI-green
+
+The user drove this one from a running instance: they used the app, reported what looked
+wrong, and each report became a handoff prompt executed by a spawned agent. **Tests went
+489 → 596.** Every commit is on `origin/dev` with all CI jobs green.
+
+| Commit | What |
+|---|---|
+| `209928d` | `VACUUM INTO` gets its own connection — scheduled backups were failing whenever any writer held a transaction |
+| `cd74f91` | `busy_timeout` on the shared connection; disabled-button reasons; a real `scan_complete` WS message replacing a fake 1s spinner |
+| `819b82c` | Extraction stops claiming `EXTRACTED` for no-ops, gains volume-set preconditions, bounds `_FAILED_` lifetime; live per-file progress inside a mirroring directory |
+| `9b11df6` | The settle gate; `verify_hash_on_disk` can no longer bless a truncated file |
+| `57f7ce9` | `item.state_changed_at`, trigger-enforced, shown on Files rows |
+| `dfb74c2` | Manual + retention local deletion |
+| `855e7a3` | **rar extraction fixed** — it had never worked; settle-gate follow-ups; the whole pending `DESIGN.md` wording backlog applied |
+| `6d3bd95` | Reverses `dfb74c2`'s `REMOVED_LOCAL` change into an opt-in setting, default off |
+| `c8d3e8b` | Per-queue scan interval (10/30/60/none), multi-cadence overrun-safe loop |
+
+**The two findings worth carrying forward:**
+
+1. **rar extraction had never worked, for any release.** Alpine's `7zip` ships without the RAR
+   codec. The Dockerfile comment claimed rar support, `DESIGN.md` §6 specified it, and
+   `core/extract.py`'s multi-volume machinery was dead code. It survived nine phases because
+   **no test ever built a real rar** — every fixture was fake bytes. Now fixed with `unrar`
+   built from source, and guarded by two hand-built real RAR4 fixtures cross-validated against
+   a desktop 7-Zip. Do not replace those with fake bytes.
+
+2. **A "bug" that was not one.** `REMOVED_LOCAL` being excluded from `ELIGIBLE_STATES` was
+   reported as a bug by the orchestrating session, fixed faithfully by an agent, and then
+   reversed hours later when it turned out to cause an infinite re-download loop on any
+   `copy` queue with auto-queue on. `prompts/open-issues.md` § "4" has the full account. The
+   lesson for a future session: an exclusion that looks like an oversight may be the entire
+   safety mechanism.
+
+**Behaviour changes an existing install will notice:** the settle gate is **on by default**
+(items hold at `REMOTE_ONLY`/`substate='settling'` until their remote fingerprint is unchanged
+for 2 scans *and* 60s wall-clock), and migrations 006–009 run at startup, with 008 rebuilding
+the `item` table to widen a `CHECK` constraint.
+
+**Still true and still the biggest risk: no browser has seen most of this.** New and unviewed:
+the delete confirmation panel and bulk delete, the `state_changed_at` column, the settling
+badge, the "scanned Xs ago" readout, Settings → Transfer's settle section, and Settings →
+Queues' scan-interval dropdown and re-download toggle.
+
+---
+
 **Status: all 9 phases done — v1 is complete — plus a post-phase-9 session on 2026-08-12 that
 first ran the app for real (its own section follows this one; read it, several of this
 section's phase-9-era statements are superseded there).** `DESIGN.md` is settled and reviewed (§13's
