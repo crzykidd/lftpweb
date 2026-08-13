@@ -1,6 +1,6 @@
 import { useVirtualizer } from '@tanstack/react-virtual'
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { getHistoryJobOutput, getHistoryJobs } from '../api/client'
+import { clearHistoryJob, clearHistoryJobs, getHistoryJobOutput, getHistoryJobs } from '../api/client'
 import type { HistoryJobOut, HistoryJobsFilter, PathQueueOut } from '../api/types'
 import { formatBytes, formatPercent } from '../lib/format'
 import { StateChip } from './StateChip'
@@ -59,7 +59,7 @@ function groupByQueue(jobs: HistoryJobOut[]): VirtualRow[] {
   return rows
 }
 
-function JobRow({ job }: { job: HistoryJobOut }) {
+function JobRow({ job, onClearRequest }: { job: HistoryJobOut; onClearRequest: (job: HistoryJobOut) => void }) {
   const [expanded, setExpanded] = useState(false)
   const [output, setOutput] = useState<{ error_class: string | null; output_tail: string | null } | null>(
     null,
@@ -120,6 +120,18 @@ function JobRow({ job }: { job: HistoryJobOut }) {
             {job.error_class ?? 'UNKNOWN'} {expanded ? '▲' : '▼'}
           </button>
         )}
+        {/* Clear (2026-08-13, prompts/2026-08-13-clear-history.md) -- deletes this row from
+         * History outright, unlike Dismiss above (which only hides it from Transfers). Every
+         * job in this list is already terminal (the endpoint's whole domain), so there's
+         * nothing to reject here -- the confirm panel this opens is what makes it deliberate. */}
+        <button
+          type="button"
+          onClick={() => onClearRequest(job)}
+          title="Clear this record from History -- cannot be undone"
+          className="shrink-0 rounded-md px-1.5 py-1 text-xs font-medium text-zinc-400 hover:bg-red-50 hover:text-red-700 dark:text-zinc-600 dark:hover:bg-red-950 dark:hover:text-red-300"
+        >
+          Clear
+        </button>
       </div>
       {expanded && job.state === 'failed' && (
         <div className="rounded-md border border-red-200 bg-red-50 p-2 text-xs text-red-800 dark:border-red-900 dark:bg-red-950/40 dark:text-red-300">
@@ -194,6 +206,43 @@ export function HistoryJobsSection({ queues }: HistoryJobsSectionProps) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [filter])
 
+  // --- Clearing (2026-08-13, prompts/2026-08-13-clear-history.md) -----------------------
+  //
+  // Irreversible, so every path goes through this confirm panel first -- one row or the
+  // whole filtered set, never a silent delete. Bulk clears run as a single server-side
+  // `DELETE` (api/history.py) against the *filter*, not the loaded page, so it also removes
+  // rows beyond what's currently fetched; a full reload afterward is what picks that up. A
+  // single-row clear only ever removes the one row already in hand, so it's applied locally
+  // instead of a full reload -- no unbounded refetch just to drop one item.
+  const hasActiveFilter = Boolean(queueId || state || errorClass || since || until)
+  const [pendingClear, setPendingClear] = useState<{ kind: 'row'; job: HistoryJobOut } | { kind: 'bulk' } | null>(
+    null,
+  )
+  const [clearing, setClearing] = useState(false)
+  const [clearError, setClearError] = useState<string | null>(null)
+
+  const confirmClear = async () => {
+    const pending = pendingClear
+    if (!pending) return
+    setClearing(true)
+    setClearError(null)
+    try {
+      if (pending.kind === 'row') {
+        await clearHistoryJob(pending.job.id)
+        setJobs((prev) => prev.filter((j) => j.id !== pending.job.id))
+        setTotal((t) => Math.max(0, t - 1))
+      } else {
+        await clearHistoryJobs(filter)
+        await load(0, true)
+      }
+      setPendingClear(null)
+    } catch (err) {
+      setClearError(err instanceof Error ? err.message : 'Clear failed')
+    } finally {
+      setClearing(false)
+    }
+  }
+
   const rows = useMemo(() => groupByQueue(jobs), [jobs])
 
   const virtualizer = useVirtualizer({
@@ -249,7 +298,62 @@ export function HistoryJobsSection({ queues }: HistoryJobsSectionProps) {
         >
           {loading ? 'Loading…' : 'Refresh'}
         </button>
+        <button
+          type="button"
+          disabled={total === 0}
+          onClick={() => setPendingClear({ kind: 'bulk' })}
+          className="ml-auto rounded-md border border-red-300 px-2.5 py-1.5 text-sm font-medium text-red-700 hover:bg-red-50 disabled:cursor-not-allowed disabled:opacity-50 dark:border-red-900 dark:text-red-300 dark:hover:bg-red-950"
+        >
+          {hasActiveFilter ? `Clear filtered (${total})` : `Clear all (${total})`}
+        </button>
       </div>
+
+      {/* Clearing is irreversible -- one confirm panel shared by the per-row "Clear" button
+       * and the toolbar's bulk clear above, distinguished only by its message and count. */}
+      {pendingClear && (
+        <div className="flex flex-col gap-2 rounded-md border border-red-300 bg-red-50 px-3 py-2 text-sm dark:border-red-900 dark:bg-red-950/40">
+          <p className="text-red-900 dark:text-red-200">
+            {pendingClear.kind === 'row' ? (
+              <>
+                Clear the History record for <strong>{itemName(pendingClear.job.rel_path)}</strong>? This
+                cannot be undone.
+              </>
+            ) : (
+              <>
+                Clear <strong>{total}</strong> job {total === 1 ? 'record' : 'records'}
+                {hasActiveFilter ? ' matching the current filters' : ''}? This cannot be undone.
+              </>
+            )}
+          </p>
+          <div className="flex gap-2">
+            <button
+              type="button"
+              onClick={confirmClear}
+              disabled={clearing}
+              className="rounded-md bg-red-700 px-2 py-1 text-xs font-medium text-white hover:bg-red-800 disabled:opacity-50 dark:bg-red-800 dark:hover:bg-red-700"
+            >
+              {clearing ? 'Clearing…' : 'Clear'}
+            </button>
+            <button
+              type="button"
+              onClick={() => setPendingClear(null)}
+              disabled={clearing}
+              className="rounded-md border border-zinc-300 px-2 py-1 text-xs font-medium text-zinc-700 hover:bg-zinc-50 disabled:opacity-50 dark:border-zinc-700 dark:text-zinc-200 dark:hover:bg-zinc-900"
+            >
+              Cancel
+            </button>
+          </div>
+        </div>
+      )}
+
+      {clearError && (
+        <div className="flex items-center justify-between gap-3 rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-900 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-200">
+          <span>{clearError}</span>
+          <button type="button" onClick={() => setClearError(null)} className="shrink-0 text-xs underline decoration-dotted">
+            Dismiss
+          </button>
+        </div>
+      )}
 
       {jobs.length === 0 && !loading && (
         <div className="flex h-32 items-center justify-center rounded-lg border border-dashed border-zinc-300 text-zinc-400 dark:border-zinc-700 dark:text-zinc-600">
@@ -283,7 +387,7 @@ export function HistoryJobsSection({ queues }: HistoryJobsSectionProps) {
                       {row.queueName}
                     </div>
                   ) : (
-                    <JobRow job={row.job} />
+                    <JobRow job={row.job} onClearRequest={(job) => setPendingClear({ kind: 'row', job })} />
                   )}
                 </div>
               )

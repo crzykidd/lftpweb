@@ -18,6 +18,37 @@ as the phase 6 prompt asks for.
 already-filtered/paginated page -- see docs/decisions.md. Both endpoints return `queue_id`/
 `queue_name` (jobs always; events when the underlying item still exists) precisely so the
 frontend can group without a second request.
+
+**`DELETE /api/history/jobs[/{id}]`, `DELETE /api/history/events[/{id}]`** (2026-08-13,
+prompts/2026-08-13-clear-history.md) -- clearing History. This is a *different* action from
+`api/jobs.py`'s `dismiss_job` (2026-08-13, prompts/done/2026-08-13-dismiss-terminal-jobs.md):
+dismiss only ever sets `job.dismissed_at` and hides a row from the *Transfers* page while
+leaving the row (and this page's view of it) completely intact; clear deletes the row from
+*History* outright, here, and is irreversible. The two are adjacent, not overlapping -- a
+dismissed job can still be cleared, and clearing never un-dismisses anything, because clearing
+either removes the row or it doesn't exist to have a `dismissed_at` at all.
+
+Bulk clearing (`DELETE` with no `{id}`) takes the exact same filter parameters as the matching
+`GET` -- built by the same `_jobs_where_clause`/`_events_where_clause` helpers below, so the
+two can never drift apart -- and deletes every row currently matching them in one SQL
+statement, server-side, rather than the client fetching ids and issuing N requests
+(`DESIGN.md`/phase-9's `Promise.allSettled` bulk pattern is for calls that can independently
+fail for different *reasons* per row, like a stop-then-delete race; a single `DELETE ... WHERE`
+either runs or it doesn't, so there is nothing per-row to partially fail). The jobs builder's
+base clause (`job.state IN (...)`) is never optional, so no filter combination -- including no
+filter at all, "clear all" -- can ever reach a `queued`/`running` job; the single-job `DELETE`
+checks the same thing explicitly (404/409) since it bypasses the builder's WHERE by going
+straight to a row id. Events have no such "active" concept, so every event -- including the
+delete-audit kinds (`remote_delete`/`remote_delete_withheld`/`local_delete`/`archive_cleanup`)
+-- clears the same way; see docs/decisions.md for why no category is protected.
+
+**What clearing never touches:** `item` rows, `item.auto_queue_suppressed`,
+`item.auto_queue_suppressed_reason`, or `metric_sample`/`metric_heartbeat` (the Dashboard's own
+tables, `core/metrics.py`). Deleting a `job` row nulls any surviving `event.job_id` that
+pointed at it (`ON DELETE SET NULL`, `001_initial_schema.sql:140`) -- the event still renders,
+just without the job link -- but nothing here ever deletes an `item`, and `item.id` is not a
+foreign key either table's `DELETE` touches. Logs (`core/logs.py`) and backups
+(`core/backup.py`) are separate, deliberately out of scope, and unaffected.
 """
 
 from __future__ import annotations
@@ -27,6 +58,7 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Request
 
 from lftpweb.models import (
+    HistoryClearResponse,
     HistoryEventOut,
     HistoryEventsResponse,
     HistoryJobOut,
@@ -46,6 +78,81 @@ MAX_LIMIT = 500
 
 def _clamp_paging(limit: int, offset: int) -> tuple[int, int]:
     return max(1, min(limit, MAX_LIMIT)), max(0, offset)
+
+
+# --- Shared WHERE builders (2026-08-13, prompts/2026-08-13-clear-history.md) ------------
+#
+# `list_history_jobs`/`list_history_events` and their new `DELETE` counterparts below filter
+# on exactly the same columns -- "clear what I am currently looking at" is the whole point, so
+# there is deliberately one filter vocabulary, not a GET one and a separate DELETE one that
+# could drift apart. Both builders always include a base clause (the terminal-state guard for
+# jobs; nothing extra for events), so a caller can never construct a filter that reaches a
+# `queued`/`running` job -- clearing history is bounded to history by construction, not by a
+# separate check the DELETE path has to remember to run.
+
+
+def _jobs_where_clause(
+    *,
+    item_id: int | None,
+    queue_id: int | None,
+    state: str | None,
+    error_class: str | None,
+    since: str | None,
+    until: str | None,
+) -> tuple[str, list[Any]]:
+    where = ["job.state IN ('succeeded','failed','cancelled')"]
+    params: list[Any] = []
+    if item_id is not None:
+        where.append("job.item_id = ?")
+        params.append(item_id)
+    if queue_id is not None:
+        where.append("item.queue_id = ?")
+        params.append(queue_id)
+    if state is not None:
+        where.append("job.state = ?")
+        params.append(state)
+    if error_class is not None:
+        where.append("job.error_class = ?")
+        params.append(error_class)
+    if since is not None:
+        where.append("COALESCE(job.finished_at, job.queued_at) >= ?")
+        params.append(since)
+    if until is not None:
+        where.append("COALESCE(job.finished_at, job.queued_at) <= ?")
+        params.append(until)
+    return " AND ".join(where), params
+
+
+def _events_where_clause(
+    *,
+    kind: str | None,
+    level: str | None,
+    item_id: int | None,
+    queue_id: int | None,
+    since: str | None,
+    until: str | None,
+) -> tuple[str, list[Any]]:
+    where: list[str] = []
+    params: list[Any] = []
+    if kind is not None:
+        where.append("event.kind = ?")
+        params.append(kind)
+    if level is not None:
+        where.append("event.level = ?")
+        params.append(level)
+    if item_id is not None:
+        where.append("event.item_id = ?")
+        params.append(item_id)
+    if queue_id is not None:
+        where.append("item.queue_id = ?")
+        params.append(queue_id)
+    if since is not None:
+        where.append("event.ts >= ?")
+        params.append(since)
+    if until is not None:
+        where.append("event.ts <= ?")
+        params.append(until)
+    return (" AND ".join(where) if where else "1 = 1"), params
 
 
 def _job_out(row: Any) -> HistoryJobOut:
@@ -101,27 +208,14 @@ async def list_history_jobs(
     limit, offset = _clamp_paging(limit, offset)
     db = request.app.state.db
 
-    where = ["job.state IN ('succeeded','failed','cancelled')"]
-    params: list[Any] = []
-    if item_id is not None:
-        where.append("job.item_id = ?")
-        params.append(item_id)
-    if queue_id is not None:
-        where.append("item.queue_id = ?")
-        params.append(queue_id)
-    if state is not None:
-        where.append("job.state = ?")
-        params.append(state)
-    if error_class is not None:
-        where.append("job.error_class = ?")
-        params.append(error_class)
-    if since is not None:
-        where.append("COALESCE(job.finished_at, job.queued_at) >= ?")
-        params.append(since)
-    if until is not None:
-        where.append("COALESCE(job.finished_at, job.queued_at) <= ?")
-        params.append(until)
-    where_sql = " AND ".join(where)
+    where_sql, params = _jobs_where_clause(
+        item_id=item_id,
+        queue_id=queue_id,
+        state=state,
+        error_class=error_class,
+        since=since,
+        until=until,
+    )
 
     count_cursor = await db.execute(
         f"SELECT COUNT(*) AS c FROM job JOIN item ON item.id = job.item_id WHERE {where_sql}",
@@ -165,6 +259,72 @@ async def get_job_output(job_id: int, request: Request) -> HistoryJobOutputOut:
     )
 
 
+@router.delete("/jobs/{job_id}", response_model=HistoryClearResponse)
+async def delete_history_job(job_id: int, request: Request) -> HistoryClearResponse:
+    """Clear one job record from History (module docstring). Unlike `dismiss_job`
+    (`api/jobs.py`), this deletes the row -- 404 if it never existed, 409 if it still does but
+    isn't terminal (`queued`/`running` is Transfers' domain, not history to clear), and only
+    otherwise a real `DELETE`. `item`/`auto_queue_suppressed` are never touched -- see the
+    module docstring.
+    """
+    db = request.app.state.db
+    cursor = await db.execute("SELECT state FROM job WHERE id = ?", (job_id,))
+    row = await cursor.fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="job not found")
+    if row["state"] not in _TERMINAL_JOB_STATES:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"job {job_id} is still {row['state']!r} -- an active transfer is not "
+                "history and cannot be cleared"
+            ),
+        )
+    cursor = await db.execute("DELETE FROM job WHERE id = ?", (job_id,))
+    await db.commit()
+    return HistoryClearResponse(deleted=cursor.rowcount)
+
+
+@router.delete("/jobs", response_model=HistoryClearResponse)
+async def clear_history_jobs(
+    request: Request,
+    item_id: int | None = None,
+    queue_id: int | None = None,
+    state: str | None = None,
+    error_class: str | None = None,
+    since: str | None = None,
+    until: str | None = None,
+) -> HistoryClearResponse:
+    """Clear every job matching the given filters -- the same ones `GET /jobs` accepts, built
+    by the same `_jobs_where_clause` (module docstring). No filters at all clears every
+    terminal job, i.e. "clear all"; `state='failed'` alone is "clear by outcome"; any
+    combination is "clear what I'm currently looking at". One `DELETE ... WHERE`, so this
+    either runs or it doesn't -- there's no partial-failure case to report per row.
+    """
+    if state is not None and state not in _TERMINAL_JOB_STATES:
+        raise HTTPException(
+            status_code=422,
+            detail=f"state must be one of {_TERMINAL_JOB_STATES}",
+        )
+    where_sql, params = _jobs_where_clause(
+        item_id=item_id,
+        queue_id=queue_id,
+        state=state,
+        error_class=error_class,
+        since=since,
+        until=until,
+    )
+    db = request.app.state.db
+    cursor = await db.execute(
+        "DELETE FROM job WHERE id IN ("
+        "SELECT job.id FROM job JOIN item ON item.id = job.item_id "
+        f"WHERE {where_sql})",
+        params,
+    )
+    await db.commit()
+    return HistoryClearResponse(deleted=cursor.rowcount)
+
+
 def _event_out(row: Any) -> HistoryEventOut:
     return HistoryEventOut(
         id=row["id"],
@@ -202,27 +362,9 @@ async def list_history_events(
     limit, offset = _clamp_paging(limit, offset)
     db = request.app.state.db
 
-    where: list[str] = []
-    params: list[Any] = []
-    if kind is not None:
-        where.append("event.kind = ?")
-        params.append(kind)
-    if level is not None:
-        where.append("event.level = ?")
-        params.append(level)
-    if item_id is not None:
-        where.append("event.item_id = ?")
-        params.append(item_id)
-    if queue_id is not None:
-        where.append("item.queue_id = ?")
-        params.append(queue_id)
-    if since is not None:
-        where.append("event.ts >= ?")
-        params.append(since)
-    if until is not None:
-        where.append("event.ts <= ?")
-        params.append(until)
-    where_sql = " AND ".join(where) if where else "1 = 1"
+    where_sql, params = _events_where_clause(
+        kind=kind, level=level, item_id=item_id, queue_id=queue_id, since=since, until=until
+    )
 
     count_cursor = await db.execute(
         "SELECT COUNT(*) AS c FROM event "
@@ -249,3 +391,48 @@ async def list_history_events(
     return HistoryEventsResponse(
         events=[_event_out(r) for r in rows], total=total, limit=limit, offset=offset
     )
+
+
+@router.delete("/events/{event_id}", response_model=HistoryClearResponse)
+async def delete_history_event(event_id: int, request: Request) -> HistoryClearResponse:
+    """Clear one event record from History (module docstring). Events have no `queued`/
+    `running` concept the way jobs do -- there's no active state to reject -- so this is a
+    plain `DELETE`, 404 if the id doesn't exist. No category (including the delete-audit
+    kinds) is protected -- see docs/decisions.md.
+    """
+    db = request.app.state.db
+    cursor = await db.execute("DELETE FROM event WHERE id = ?", (event_id,))
+    await db.commit()
+    if cursor.rowcount == 0:
+        raise HTTPException(status_code=404, detail="event not found")
+    return HistoryClearResponse(deleted=cursor.rowcount)
+
+
+@router.delete("/events", response_model=HistoryClearResponse)
+async def clear_history_events(
+    request: Request,
+    kind: str | None = None,
+    level: str | None = None,
+    item_id: int | None = None,
+    queue_id: int | None = None,
+    since: str | None = None,
+    until: str | None = None,
+) -> HistoryClearResponse:
+    """Clear every event matching the given filters -- the same ones `GET /events` accepts,
+    built by the same `_events_where_clause` (module docstring). No filters clears every event
+    in the table, delete-audit rows included by design (docs/decisions.md); `kind=
+    'remote_delete'` alone is "clear by outcome". Same single-`DELETE` shape as
+    `clear_history_jobs` above, for the same reason.
+    """
+    where_sql, params = _events_where_clause(
+        kind=kind, level=level, item_id=item_id, queue_id=queue_id, since=since, until=until
+    )
+    db = request.app.state.db
+    cursor = await db.execute(
+        "DELETE FROM event WHERE id IN ("
+        "SELECT event.id FROM event LEFT JOIN item ON item.id = event.item_id "
+        f"WHERE {where_sql})",
+        params,
+    )
+    await db.commit()
+    return HistoryClearResponse(deleted=cursor.rowcount)

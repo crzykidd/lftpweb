@@ -620,6 +620,17 @@ class HistoryEventsResponse(BaseModel):
     offset: int
 
 
+class HistoryClearResponse(BaseModel):
+    """The response for every `DELETE` under `/api/history/*` (2026-08-13,
+    prompts/2026-08-13-clear-history.md) -- one row, a filtered batch, or everything, all the
+    same shape. `deleted` is the actual row count the `DELETE` affected (`cursor.rowcount`),
+    which is the number to show the user, not the pre-delete `total` the confirmation prompt
+    used -- the two can differ if something else changed the underlying rows in between.
+    """
+
+    deleted: int
+
+
 # --- Settings -> Backup (DESIGN.md §10.2, phase 7) --------------------------------------
 
 

@@ -388,3 +388,343 @@ async def test_events_row_cap(db):
     resp = await history.list_history_events(_FakeRequest(db), limit=4)
     assert len(resp.events) == 4
     assert resp.total == 10
+
+
+# --- Clearing (2026-08-13, prompts/2026-08-13-clear-history.md) -------------------------
+#
+# "Dismiss" (`api/jobs.py.dismiss_job`, `prompts/done/2026-08-13-dismiss-terminal-jobs.md`)
+# only hides a row from Transfers and leaves it in History untouched -- that's covered by
+# `test_dismissed_job_still_appears_here_with_its_dismissed_at_set` above. These tests cover
+# the different, irreversible action: deleting the row from History outright.
+
+
+async def _job_row_exists(db, job_id: int) -> bool:
+    cursor = await db.execute("SELECT 1 FROM job WHERE id = ?", (job_id,))
+    return await cursor.fetchone() is not None
+
+
+async def _event_row_exists(db, event_id: int) -> bool:
+    cursor = await db.execute("SELECT 1 FROM event WHERE id = ?", (event_id,))
+    return await cursor.fetchone() is not None
+
+
+async def test_clear_single_job_deletes_the_row(db):
+    queue_id = await _make_queue(db)
+    item = await _make_item(db, queue_id, "done.txt")
+    job_id = await _make_job(db, item, state="succeeded")
+
+    resp = await history.delete_history_job(job_id, _FakeRequest(db))
+    assert resp.deleted == 1
+    assert not await _job_row_exists(db, job_id)
+
+
+async def test_clear_single_job_404_for_unknown_job(db):
+    from fastapi import HTTPException
+
+    with pytest.raises(HTTPException) as exc_info:
+        await history.delete_history_job(999999, _FakeRequest(db))
+    assert exc_info.value.status_code == 404
+
+
+async def test_clear_single_job_rejects_an_active_job(db):
+    """The important guard: an active (`queued`/`running`) job is not history and must not be
+    clearable, rejected server-side (409), not just hidden from a UI button.
+    """
+    from fastapi import HTTPException
+
+    queue_id = await _make_queue(db)
+    item = await _make_item(db, queue_id, "running.txt", state="DOWNLOADING")
+    job_id = await _make_job(db, item, state="running", finished_at=None)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await history.delete_history_job(job_id, _FakeRequest(db))
+    assert exc_info.value.status_code == 409
+    assert await _job_row_exists(db, job_id)
+
+    queued_item = await _make_item(db, queue_id, "queued.txt", state="QUEUED")
+    queued_job_id = await _make_job(db, queued_item, state="queued", finished_at=None)
+    with pytest.raises(HTTPException) as exc_info:
+        await history.delete_history_job(queued_job_id, _FakeRequest(db))
+    assert exc_info.value.status_code == 409
+    assert await _job_row_exists(db, queued_job_id)
+
+
+async def test_clear_all_jobs_leaves_the_active_job_alone(db):
+    """ "Clear all" is `DELETE /jobs` with no filters -- it must still never reach a
+    `queued`/`running` job, because the base WHERE clause (`job.state IN (...)`) is never
+    optional (module docstring).
+    """
+    queue_id = await _make_queue(db)
+    ok_item = await _make_item(db, queue_id, "ok.txt")
+    ok_job = await _make_job(db, ok_item, state="succeeded")
+    bad_item = await _make_item(db, queue_id, "bad.txt", state="FAILED")
+    bad_job = await _make_job(db, bad_item, state="failed", error_class="AUTH_FAILED")
+    running_item = await _make_item(db, queue_id, "running.txt", state="DOWNLOADING")
+    running_job = await _make_job(db, running_item, state="running", finished_at=None)
+
+    resp = await history.clear_history_jobs(_FakeRequest(db))
+    assert resp.deleted == 2
+    assert not await _job_row_exists(db, ok_job)
+    assert not await _job_row_exists(db, bad_job)
+    assert await _job_row_exists(db, running_job)
+
+
+async def test_clear_jobs_by_outcome_state(db):
+    queue_id = await _make_queue(db)
+    ok_item = await _make_item(db, queue_id, "ok.txt")
+    ok_job = await _make_job(db, ok_item, state="succeeded")
+    bad_item = await _make_item(db, queue_id, "bad.txt", state="FAILED")
+    bad_job = await _make_job(db, bad_item, state="failed", error_class="AUTH_FAILED")
+
+    resp = await history.clear_history_jobs(_FakeRequest(db), state="failed")
+    assert resp.deleted == 1
+    assert await _job_row_exists(db, ok_job)
+    assert not await _job_row_exists(db, bad_job)
+
+
+async def test_clear_jobs_rejects_non_terminal_state_filter(db):
+    from fastapi import HTTPException
+
+    with pytest.raises(HTTPException) as exc_info:
+        await history.clear_history_jobs(_FakeRequest(db), state="running")
+    assert exc_info.value.status_code == 422
+
+
+async def test_clear_jobs_filters_compose_leaving_everything_else_alone(db):
+    """Clearing "failed jobs in queue X" must leave failed jobs in other queues, and
+    succeeded jobs in queue X, alone.
+    """
+    q1 = await _make_queue(db, name="q1")
+    q2 = await _make_queue(db, name="q2")
+    q1_failed_item = await _make_item(db, q1, "q1-failed.txt", state="FAILED")
+    q1_failed = await _make_job(db, q1_failed_item, state="failed", error_class="AUTH_FAILED")
+    q1_ok_item = await _make_item(db, q1, "q1-ok.txt")
+    q1_ok = await _make_job(db, q1_ok_item, state="succeeded")
+    q2_failed_item = await _make_item(db, q2, "q2-failed.txt", state="FAILED")
+    q2_failed = await _make_job(db, q2_failed_item, state="failed", error_class="AUTH_FAILED")
+
+    resp = await history.clear_history_jobs(_FakeRequest(db), queue_id=q1, state="failed")
+    assert resp.deleted == 1
+    assert not await _job_row_exists(db, q1_failed)
+    assert await _job_row_exists(db, q1_ok)
+    assert await _job_row_exists(db, q2_failed)
+
+
+async def test_clearing_a_job_never_touches_the_item_row(db):
+    """The important one: clearing a job must not touch `item`, `auto_queue_suppressed`, or
+    `suppressed_reason` -- "I cleared my history and it re-downloaded everything" is the
+    failure this must design out.
+    """
+    queue_id = await _make_queue(db)
+    item_id = await _make_item(db, queue_id, "bad.txt", state="FAILED")
+    await db.execute(
+        "UPDATE item SET auto_queue_suppressed = 1, suppressed_reason = 'retries_exhausted' "
+        "WHERE id = ?",
+        (item_id,),
+    )
+    await db.commit()
+    job_id = await _make_job(db, item_id, state="failed", error_class="AUTH_FAILED")
+
+    await history.delete_history_job(job_id, _FakeRequest(db))
+
+    cursor = await db.execute(
+        "SELECT state, auto_queue_suppressed, suppressed_reason FROM item WHERE id = ?",
+        (item_id,),
+    )
+    row = await cursor.fetchone()
+    assert row is not None, "clearing a job must never delete the item row"
+    assert row["state"] == "FAILED"
+    assert row["auto_queue_suppressed"] == 1
+    assert row["suppressed_reason"] == "retries_exhausted"
+
+
+async def test_clearing_all_jobs_never_touches_any_item_row(db):
+    queue_id = await _make_queue(db)
+    item_id = await _make_item(db, queue_id, "bad.txt", state="FAILED")
+    await db.execute(
+        "UPDATE item SET auto_queue_suppressed = 1, suppressed_reason = 'permanent_error' "
+        "WHERE id = ?",
+        (item_id,),
+    )
+    await db.commit()
+    await _make_job(db, item_id, state="failed", error_class="AUTH_FAILED")
+
+    await history.clear_history_jobs(_FakeRequest(db))
+
+    cursor = await db.execute(
+        "SELECT auto_queue_suppressed, suppressed_reason FROM item WHERE id = ?", (item_id,)
+    )
+    row = await cursor.fetchone()
+    assert row is not None
+    assert row["auto_queue_suppressed"] == 1
+    assert row["suppressed_reason"] == "permanent_error"
+
+
+async def test_clearing_a_job_nulls_but_does_not_remove_the_surviving_event(db):
+    """`event.job_id` is `ON DELETE SET NULL` (001_initial_schema.sql:140) -- a cleared job's
+    surviving event must still render, just with `job_id` gone.
+    """
+    queue_id = await _make_queue(db)
+    item = await _make_item(db, queue_id, "bad.txt", state="FAILED")
+    job_id = await _make_job(db, item, state="failed", error_class="AUTH_FAILED")
+    await audit.record_event(
+        db, level="error", item_id=item, job_id=job_id, kind="remote_delete_failed", message="x"
+    )
+
+    await history.delete_history_job(job_id, _FakeRequest(db))
+
+    resp = await history.list_history_events(_FakeRequest(db))
+    assert len(resp.events) == 1
+    assert resp.events[0].job_id is None
+    assert resp.events[0].message == "x"
+
+
+async def test_clear_single_event_deletes_the_row(db):
+    queue_id = await _make_queue(db)
+    item = await _make_item(db, queue_id, "x.txt")
+    await audit.record_event(db, level="info", item_id=item, kind="verify", message="ok")
+    # `audit.record_event` returns `None` by design (its own docstring) -- fetch the id it
+    # just wrote instead of relying on a return value.
+    row = await (await db.execute("SELECT id FROM event WHERE message = 'ok'")).fetchone()
+    event_id = row["id"]
+
+    resp = await history.delete_history_event(event_id, _FakeRequest(db))
+    assert resp.deleted == 1
+    assert not await _event_row_exists(db, event_id)
+
+
+async def test_clear_single_event_404_for_unknown_event(db):
+    from fastapi import HTTPException
+
+    with pytest.raises(HTTPException) as exc_info:
+        await history.delete_history_event(999999, _FakeRequest(db))
+    assert exc_info.value.status_code == 404
+
+
+async def test_clear_all_events_has_no_protected_categories(db):
+    """The user's own decision (docs/decisions.md): delete-audit events are not protected --
+    `remote_delete`/`remote_delete_withheld`/`local_delete`/`archive_cleanup` clear the same
+    as any other event kind.
+    """
+    queue_id = await _make_queue(db)
+    item = await _make_item(db, queue_id, "x.txt")
+    await audit.record_event(db, level="info", item_id=item, kind="verify", message="ok")
+    await audit.record_event(
+        db, level="info", item_id=item, kind="remote_delete", message="deleted"
+    )
+    await audit.record_event(
+        db, level="warning", item_id=item, kind="remote_delete_withheld", message="withheld"
+    )
+    await audit.record_event(db, level="info", item_id=item, kind="local_delete", message="x")
+    await audit.record_event(db, level="info", item_id=item, kind="archive_cleanup", message="x")
+
+    resp = await history.clear_history_events(_FakeRequest(db))
+    assert resp.deleted == 5
+
+    remaining = await history.list_history_events(_FakeRequest(db))
+    assert remaining.total == 0
+
+
+async def test_clear_events_by_kind(db):
+    queue_id = await _make_queue(db)
+    item = await _make_item(db, queue_id, "x.txt")
+    await audit.record_event(db, level="info", item_id=item, kind="verify", message="ok")
+    await audit.record_event(
+        db, level="info", item_id=item, kind="remote_delete", message="deleted"
+    )
+
+    resp = await history.clear_history_events(_FakeRequest(db), kind="remote_delete")
+    assert resp.deleted == 1
+
+    remaining = await history.list_history_events(_FakeRequest(db))
+    assert [e.kind for e in remaining.events] == ["verify"]
+
+
+async def test_clear_events_by_level(db):
+    queue_id = await _make_queue(db)
+    item = await _make_item(db, queue_id, "x.txt")
+    await audit.record_event(db, level="info", item_id=item, kind="verify", message="ok")
+    await audit.record_event(
+        db, level="error", item_id=item, kind="remote_delete_failed", message="boom"
+    )
+
+    resp = await history.clear_history_events(_FakeRequest(db), level="error")
+    assert resp.deleted == 1
+
+    remaining = await history.list_history_events(_FakeRequest(db))
+    assert [e.kind for e in remaining.events] == ["verify"]
+
+
+async def test_clearing_events_never_touches_the_item_row(db):
+    queue_id = await _make_queue(db)
+    item_id = await _make_item(db, queue_id, "x.txt", state="VERIFIED")
+    await db.execute(
+        "UPDATE item SET auto_queue_suppressed = 1, suppressed_reason = 'user_stopped' "
+        "WHERE id = ?",
+        (item_id,),
+    )
+    await db.commit()
+    await audit.record_event(
+        db, level="info", item_id=item_id, kind="remote_delete", message="deleted"
+    )
+
+    await history.clear_history_events(_FakeRequest(db))
+
+    cursor = await db.execute(
+        "SELECT state, auto_queue_suppressed, suppressed_reason FROM item WHERE id = ?",
+        (item_id,),
+    )
+    row = await cursor.fetchone()
+    assert row is not None
+    assert row["state"] == "VERIFIED"
+    assert row["auto_queue_suppressed"] == 1
+    assert row["suppressed_reason"] == "user_stopped"
+
+
+async def test_clearing_history_does_not_change_dashboard_metrics(db):
+    """`metric_sample` (migration 005) holds only `queue_id`/`ts`/`bytes_delta` -- no job/item
+    reference -- and `core/metrics.py` never queries `job` or `event`. Clearing History must
+    leave the Dashboard's own data, and what its queries return, completely unchanged.
+    """
+    from lftpweb.core import metrics
+
+    queue_id = await _make_queue(db)
+    item = await _make_item(db, queue_id, "x.txt")
+    await _make_job(db, item, state="succeeded")
+    await audit.record_event(
+        db, level="info", item_id=item, kind="remote_delete", message="deleted"
+    )
+    await db.execute(
+        "INSERT INTO metric_sample (queue_id, ts, bytes_delta) VALUES (?, ?, ?)",
+        (queue_id, "2026-08-13T00:00:30.000000Z", 12345),
+    )
+    await db.execute("INSERT INTO metric_heartbeat (ts) VALUES ('2026-08-13T00:00:30.000000Z')")
+    await db.commit()
+
+    before = await metrics.queue_breakdown(
+        db,
+        start_ts="2026-08-13T00:00:00.000000Z",
+        end_ts="2026-08-13T00:01:00.000000Z",
+        bucket_seconds=60,
+    )
+
+    await history.clear_history_jobs(_FakeRequest(db))
+    await history.clear_history_events(_FakeRequest(db))
+
+    after = await metrics.queue_breakdown(
+        db,
+        start_ts="2026-08-13T00:00:00.000000Z",
+        end_ts="2026-08-13T00:01:00.000000Z",
+        bucket_seconds=60,
+    )
+    assert len(before) == 1
+    assert before[0][1] == queue_id
+    assert before[0][2] == 12345
+    assert before == after, "clearing job/event history changed a Dashboard query's result"
+
+    sample_count = await (await db.execute("SELECT COUNT(*) AS c FROM metric_sample")).fetchone()
+    heartbeat_count = await (
+        await db.execute("SELECT COUNT(*) AS c FROM metric_heartbeat")
+    ).fetchone()
+    assert sample_count["c"] == 1
+    assert heartbeat_count["c"] == 1

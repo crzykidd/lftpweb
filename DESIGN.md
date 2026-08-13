@@ -1710,6 +1710,20 @@ remove last night". A row a Transfers-page Dismiss removed from that page still 
 (same table, dismissal is display-only) with a quiet **dismissed** marker — worth surfacing,
 since it's the only page that can answer "why is this no longer on Transfers."
 
+**Clear** (2026-08-13) — the different, irreversible sibling of Dismiss: one row, everything
+matching the current filter ("by outcome" falls out of that for free — filter by `state` or
+`kind`/`level`, then clear), or everything, deleting the `job`/`event` rows outright rather than
+just hiding them. Confirmed before running (unlike Dismiss, which destroys nothing). No category
+is protected — the delete-audit events clear the same as anything else; see docs/decisions.md
+for why the obvious "protect the audit trail" alternative was considered and rejected. Bulk
+clears run as one server-side `DELETE ... WHERE`, built from the same filter the matching `GET`
+uses, rather than a client-side loop over ids. **Never touches `item`**, `auto_queue_suppressed`,
+or `suppressed_reason` — clearing is bookkeeping, not behavior, and cannot change what the next
+scan does — and has no effect on the Dashboard (§10.4's `metric_sample`/`metric_heartbeat` carry
+no `job`/`event` reference and are never touched). Logs and backups are separate and out of
+scope. An active (`queued`/`running`) job is not history and is rejected server-side, not just
+hidden from the button.
+
 **Dashboard** — throughput over time, from the sample store in §10.4: bytes moved per hour over
 the last 24 h, broken down by queue with a site total, and speed over a selectable 1 h / 12 h /
 24 h window for the site or one queue. Its own page rather than more chrome in the header —

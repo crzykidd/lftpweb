@@ -25,6 +25,19 @@ export function HistoryPage() {
 
   return (
     <div className="flex flex-col gap-6">
+      {/* Clearing scope note (2026-08-13, prompts/2026-08-13-clear-history.md) -- placed once,
+       * above both sections, since it's true of every clear control below. This is
+       * scope-setting, not a warning: a control that implies more than it does is worse than
+       * no control, so it says plainly what "Clear" does and does not reach, right next to the
+       * buttons that do it. */}
+      <p className="rounded-md border border-zinc-200 bg-zinc-50 px-3 py-2 text-xs text-zinc-600 dark:border-zinc-800 dark:bg-zinc-900/60 dark:text-zinc-400">
+        <strong className="font-medium text-zinc-700 dark:text-zinc-300">Clearing history</strong>{' '}
+        deletes these job and event records only. It never touches downloaded files, queue
+        settings, or auto-queue suppression -- nothing about what happens on the next scan
+        changes -- and it has no effect on the Dashboard, which tracks throughput in its own
+        table, independent of this page. Logs and backups (Settings) are separate and are not
+        covered by any control here.
+      </p>
       <HistoryJobsSection queues={queues} />
       <HistoryEventsSection queues={queues} />
     </div>

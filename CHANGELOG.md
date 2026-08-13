@@ -468,6 +468,25 @@ alongside this list: several entries below ship with deliberate, documented limi
   clears suppression on its own. A `queued`/`running` job can't be dismissed (409, not a
   silent no-op). **Clear all failed** dismisses every currently-failed row in one action,
   reporting partial failure honestly the same way the Files page's bulk actions do.
+- **The History page can now be cleared — one row, everything matching the current filter, or
+  everything** *(2026-08-13)*. User request, modelled on SABnzbd: a seedbox user doesn't
+  necessarily want a database that keeps two years of every transfer they've ever run. Clearing
+  is the different, irreversible sibling of the Dismiss action above — Dismiss only hides a row
+  from Transfers and leaves History alone; Clear deletes the `job`/`event` row from History
+  outright, always behind a confirmation that says how many records will go. **No category is
+  protected** — the delete-audit events (`remote_delete`/`remote_delete_withheld`/
+  `local_delete`/`archive_cleanup`) clear the same as anything else; this was discussed and the
+  "protect the audit trail" alternative was deliberately rejected (see `docs/decisions.md`).
+  Bulk clears run as one server-side `DELETE ... WHERE`, built from the exact same filter the
+  matching `GET /api/history/jobs`/`GET /api/history/events` already accepts (queue, state,
+  error class, kind, level, date range) — "clear what I'm currently looking at" is the natural
+  shape, not a second filtering vocabulary. **Never touches `item`,
+  `item.auto_queue_suppressed`, or `item.suppressed_reason`**, and has no effect on the
+  Dashboard, which reads its own `metric_sample`/`metric_heartbeat` tables that carry no `job`/
+  `event` reference at all — both stated plainly in the UI next to the clear controls, alongside
+  logs and backups being explicitly out of scope. An active (`queued`/`running`) job is not
+  history and is rejected server-side (409), not just hidden from the button. No migration
+  needed — this is a pure `DELETE`, not a schema change.
 
 ### Fixed
 

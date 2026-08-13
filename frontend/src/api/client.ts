@@ -15,6 +15,7 @@ import type {
   DeleteItemResponse,
   FilesResponse,
   HealthResponse,
+  HistoryClearResponse,
   HistoryEventsFilter,
   HistoryEventsResponse,
   HistoryJobOutputOut,
@@ -305,6 +306,51 @@ export function getHistoryJobOutput(jobId: number): Promise<HistoryJobOutputOut>
  */
 export function getHistoryEvents(filter: HistoryEventsFilter = {}): Promise<HistoryEventsResponse> {
   return getJson<HistoryEventsResponse>(`/api/history/events${queryString(filter)}`)
+}
+
+// --- History: clearing (2026-08-13, prompts/2026-08-13-clear-history.md) ------------------
+//
+// A *different* action from `dismissJob` above: dismiss only hides a row from Transfers and
+// leaves History untouched; these delete the row from History outright, and it's irreversible
+// -- every caller must confirm first (DESIGN.md's own instruction; see HistoryJobsSection /
+// HistoryEventsSection for the confirmation panel). Bulk clears run server-side as one
+// request (not a `Promise.allSettled` loop over ids) -- there's nothing per-row that can fail
+// independently the way a stop-then-delete race can, so one `DELETE ... WHERE` is simpler and
+// is what `api/history.py`'s own docstring documents as the choice made here.
+
+/** Clear one job record from History. Rejects (throws) for a `queued`/`running` job -- an
+ * active transfer is not history and the server enforces this itself (409), not just this
+ * button being hidden.
+ */
+export function clearHistoryJob(jobId: number): Promise<HistoryClearResponse> {
+  return sendJson<HistoryClearResponse>(`/api/history/jobs/${jobId}`, 'DELETE')
+}
+
+/** Clear every job matching `filter` -- the same filter shape `getHistoryJobs` takes. No
+ * filter at all clears every terminal job ("clear all"); `state` alone is "clear by outcome".
+ * Never reaches an active job regardless of filter -- see the server-side docstring.
+ */
+export function clearHistoryJobs(
+  filter: Omit<HistoryJobsFilter, 'limit' | 'offset'> = {},
+): Promise<HistoryClearResponse> {
+  return sendJson<HistoryClearResponse>(`/api/history/jobs${queryString(filter)}`, 'DELETE')
+}
+
+/** Clear one event record from History -- no "active" concept the way jobs have, so this
+ * always either deletes the row or 404s.
+ */
+export function clearHistoryEvent(eventId: number): Promise<HistoryClearResponse> {
+  return sendJson<HistoryClearResponse>(`/api/history/events/${eventId}`, 'DELETE')
+}
+
+/** Clear every event matching `filter` -- the same filter shape `getHistoryEvents` takes.
+ * No category is protected: the delete-audit kinds (`remote_delete` etc.) clear the same as
+ * any other event kind (docs/decisions.md).
+ */
+export function clearHistoryEvents(
+  filter: Omit<HistoryEventsFilter, 'limit' | 'offset'> = {},
+): Promise<HistoryClearResponse> {
+  return sendJson<HistoryClearResponse>(`/api/history/events${queryString(filter)}`, 'DELETE')
 }
 
 // --- Settings -> Logs (phase 7, DESIGN.md §10.1) -----------------------------------------

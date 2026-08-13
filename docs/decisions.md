@@ -6,6 +6,78 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-13 — Clearing History: no protected categories, server-side bulk delete, and never
+## touches `item`
+
+**Handoff prompt `prompts/2026-08-13-clear-history.md`, executed end to end.** User request,
+modelled on SABnzbd's history: a seedbox user accumulating two years of transfer records in the
+database is a liability, not something everyone wants kept forever, and they should be able to
+clear it — all, by outcome, or one row — the way SABnzbd's history lets you.
+
+**Decision: no protected categories, including the delete-audit events.** This was discussed
+explicitly before building anything. The counter-argument: `remote_delete`/
+`remote_delete_withheld`/`local_delete`/`archive_cleanup` events are the record of what happened
+to the user's files, and an audit trail that can be wiped removes the evidence you'd want in
+exactly the situation you'd go looking for it — "protect the delete-audit rows, let everything
+else clear." **The user overruled it, correctly**: for a seedbox user, an indefinite record of
+every transfer *is* the liability the whole feature exists to let them get rid of, and picking
+categories they're not allowed to delete — on data that's entirely theirs, about files that are
+entirely theirs — is paternalism dressed up as safety. So `DELETE /api/history/events` (and the
+single-row/`{id}` form) treats every `kind` identically; nothing in `api/history.py` special-cases
+the delete-audit kinds for retention. Logs (`core/logs.py`) and backups (`core/backup.py`) stay
+out of scope on purpose — those are things the operator already chose to keep, unlike a database
+that grows without anyone opting in.
+
+**Decision: server-side bulk delete, not a `Promise.allSettled` loop over ids.** Phase 9's bulk
+pattern (Queue/Stop/Delete on the Files page) exists because each of those calls can fail for a
+*different reason per row* — a stop-then-delete race, a withheld guard, a vanished item. Clearing
+History has no such per-row failure mode: a `DELETE FROM job WHERE id IN (SELECT ...)` against
+the same `WHERE` clause the matching `GET` uses either runs or it doesn't. So `clear_history_jobs`/
+`clear_history_events` do the whole filtered batch in one SQL statement and return the actual
+`cursor.rowcount`, and the frontend calls them once rather than fetching ids and issuing N
+requests. `_jobs_where_clause`/`_events_where_clause` are shared between the `GET` and `DELETE`
+routes for the same reason `list_history_jobs` and `clear_history_jobs` must never drift apart —
+"clear what I'm currently looking at" only holds if both sides build the identical filter.
+
+**Decision: the terminal-state guard lives in the WHERE builder, not as a separate check.**
+`_jobs_where_clause`'s base clause (`job.state IN ('succeeded','failed','cancelled')`) is
+unconditional — no filter combination, including no filter at all ("clear all"), can ever
+construct a `DELETE` that reaches a `queued`/`running` job. The single-row `DELETE
+/jobs/{job_id}` bypasses the builder (it deletes by id, not by WHERE), so it re-checks the same
+thing explicitly and returns 409 for an active job — "an active transfer is not history and
+cannot be cleared," server-side, matching the same trap `dismiss_job` closed below for a
+different action.
+
+**Decision: `item`/`auto_queue_suppressed`/`suppressed_reason` are structurally unreachable, not
+just untested.** Neither `DELETE` statement's `WHERE`/subquery ever names the `item` table as
+anything but a join target for filtering (`item.queue_id`), and no code path here executes `DELETE
+FROM item` or `UPDATE item`. "I cleared my history and it re-downloaded everything" — the failure
+this had to design out — would require a cleared job's `item` row to lose its suppression, and
+nothing in this feature touches that row at all. Covered explicitly in
+`tests/test_history_api.py` (`test_clearing_a_job_never_touches_the_item_row`,
+`test_clearing_all_jobs_never_touches_any_item_row`, `test_clearing_events_never_touches_the_item_row`)
+rather than left to infer from the SQL not mentioning it.
+
+**Decision: this is a different action from Dismiss (`prompts/done/2026-08-13-dismiss-terminal-jobs.md`),
+and the UI says so.** Dismiss (`b1eb8a4`) only sets `job.dismissed_at` and hides a row from
+*Transfers*; the row and its History view are untouched. Clear deletes the row from *History*
+outright and is irreversible. The two read as distinct everywhere they appear: `api/history.py`'s
+module docstring calls out the difference explicitly, and a dismissed job can still be cleared
+(clearing a row that happens to have `dismissed_at` set behaves exactly like clearing any other
+terminal job — there's nothing special about it).
+
+**Decision: the Dashboard-is-unaffected claim is verified, not assumed.** `metric_sample`
+(migration 005) holds only `queue_id`/`ts`/`bytes_delta` — no `item_id`/`job_id` column exists to
+be nulled or orphaned — and `core/metrics.py`/`api/metrics.py` never query `job` or `event`
+anywhere (confirmed by reading both files, not by trusting the handoff prompt's own claim).
+`test_clearing_history_does_not_change_dashboard_metrics` calls `core/metrics.py.queue_breakdown`
+before and after clearing all jobs and events and asserts identical results. Stated plainly in
+the UI (`HistoryPage.tsx`'s banner above both sections) rather than left implicit, along with
+logs/backups being out of scope — a control that implies more than it does is worse than no
+control.
+
+---
+
 ## 2026-08-13 — Dismissing a terminal job: display marker, not deletion, and never touches
 ## item suppression
 

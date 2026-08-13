@@ -502,6 +502,15 @@ export interface HistoryEventsFilter {
   offset?: number
 }
 
+/** The response shape for every `DELETE` under `/api/history/*` (2026-08-13,
+ * prompts/2026-08-13-clear-history.md) -- one row, a filtered batch, or everything. `deleted`
+ * is the actual row count the server removed, not the pre-delete `total` the confirmation
+ * prompt showed -- the two can differ if something else changed the rows in between.
+ */
+export interface HistoryClearResponse {
+  deleted: number
+}
+
 // --- Settings -> Backup (phase 7, DESIGN.md §10.2) --------------------------------------
 
 export interface BackupSettingsOut {
