@@ -270,6 +270,24 @@ class RetentionSettingsIn(RetentionSettingsOut):
     as `PostprocessSettingsIn`'s own docstring."""
 
 
+class OrphanTempCleanupSettingsOut(BaseModel):
+    """`core/local_delete.py.OrphanTempCleanupSettings` (2026-08-13,
+    prompts/2026-08-13-lftp-timestamped-temp-files.md). Defaults off -- same non-negotiable
+    reason `RetentionSettingsOut` above has: this deletes files from disk, even though what it
+    deletes is accidental byte waste with no diagnostic value.
+    """
+
+    enabled: bool = False
+    max_age_days: float = 2.0
+
+
+class OrphanTempCleanupSettingsIn(OrphanTempCleanupSettingsOut):
+    """`PUT /api/settings/orphan-temp-cleanup`'s body -- both fields default, so
+    `api/settings.py.put_orphan_temp_cleanup_settings` merges over the previously-stored
+    settings for any field genuinely absent from the request JSON, the same fix (and the same
+    reason) as `RetentionSettingsIn`'s own docstring."""
+
+
 class RetentionPreviewRequest(BaseModel):
     """Mirrors `PatternPreviewRequest`'s idiom: preview against a not-yet-saved value.
     `retention_days=None` previews the currently saved setting instead.

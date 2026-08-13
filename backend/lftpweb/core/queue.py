@@ -352,7 +352,30 @@ class TransferQueue:
 
     async def enqueue_item(self, item_id: int, *, forced_full_rate: bool = False) -> int:
         """Manual queue (DESIGN.md §4.7): always wins, clears suppression, resets `attempt`.
-        Returns the new `job.id`.
+        Returns the `job.id` -- a fresh one, or (see below) an existing active one.
+
+        **Idempotent, not rejecting** (2026-08-13,
+        prompts/2026-08-13-lftp-timestamped-temp-files.md's root cause). This used to insert a
+        new `job` row and set the item `QUEUED` unconditionally, with no check for a
+        `queued`/`running` job already on this item -- so a double-click, or clicking Queue on
+        an item auto-queue had just picked up, spawned a **second concurrent lftp process
+        against the same remote and local paths**. Observed for real: two duplicate jobs, four
+        lftp processes where there should have been two, and orphaned
+        `foo.mkv.lftp~<timestamp>~` temp files (lftp itself avoiding the first process's `.lftp`
+        file -- a symptom, not the disease; see docs/decisions.md for what reproducing that
+        against the fake seedbox actually showed). Returning the existing job's id rather than
+        raising is the kinder reading of a double-click or a race between two callers wanting
+        the same thing -- neither is a mistake worth surfacing as an error, and every existing
+        caller (`api/jobs.py`'s `POST /api/jobs`, `retry_item` below, `core/autoqueue.py`) is
+        already written to accept whatever id comes back without caring whether it's new.
+
+        This check alone is **not** the whole fix -- two `enqueue_item` calls racing each other
+        (interleaved across the `await`s between the check and the insert, which asyncio's
+        cooperative scheduling genuinely allows) could still both observe "no active job" before
+        either commits. `_admit` below is the second, independent layer: it refuses to let two
+        processes run concurrently against the same item regardless of how many `queued` job
+        rows exist for it, which is what actually closes that race -- this check just means the
+        common case (a human clicking twice) never creates the extra row in the first place.
 
         **Deliberately does not consult the settle gate** (`core/settle.py`,
         prompts/open-issues.md #2) -- that gate's *eligibility* half only lives in
@@ -365,6 +388,11 @@ class TransferQueue:
         item = await self._fetch_item(item_id)
         if item is None:
             raise ValueError(f"item {item_id} not found")
+
+        existing_job_id = await self._active_job_id(item_id)
+        if existing_job_id is not None:
+            return existing_job_id
+
         kind = "mirror" if item["is_dir"] else "pget"
         lane = await self._lane_for(item)
         job_id = await self._insert_job(
@@ -380,6 +408,21 @@ class TransferQueue:
         await self._publish_item_state(item_id)
         self.request_tick()
         return job_id
+
+    async def _active_job_id(self, item_id: int) -> int | None:
+        """The item's current `queued`/`running` job id, if any -- the same active-job presence
+        test `stop_item`/`delete_local`'s guard already use, reused here (2026-08-13) as
+        `enqueue_item`'s duplicate-prevention check. `ORDER BY id DESC LIMIT 1` matters only if
+        more than one such row somehow already exists (the exact scenario this task fixes);
+        the most recent one is the one actually worth returning.
+        """
+        cursor = await self.db.execute(
+            "SELECT id FROM job WHERE item_id = ? AND state IN ('queued', 'running') "
+            "ORDER BY id DESC LIMIT 1",
+            (item_id,),
+        )
+        row = await cursor.fetchone()
+        return row["id"] if row is not None else None
 
     async def stop_job(self, job_id: int) -> None:
         """Stop semantics (DESIGN.md §4.6) — exact, because this is the one section the phase
@@ -1016,11 +1059,27 @@ class TransferQueue:
         )
         rows = await cursor.fetchall()
         queue: list[scheduler.QueuedJob] = []
+        # 2026-08-13 (prompts/2026-08-13-lftp-timestamped-temp-files.md, this task's root
+        # cause): never hand the scheduler two queued jobs for the same item in one pass, and
+        # never admit a job for an item that already has a process running. This is what
+        # actually prevents two concurrent lftp processes against the same remote/local paths
+        # -- `enqueue_item`'s own check (above) only stops the *common* case (a double-click)
+        # from creating a second `queued` row in the first place; a race between two
+        # `enqueue_item` calls, or a row inserted directly (as a test does, or as some future
+        # caller might), still lands here as two `queued` rows for one `item_id`, and this is
+        # the layer that refuses to let both become processes regardless of how they got there.
+        # `rows` is already ordered `rank DESC, queued_at ASC`, so the row kept for admission is
+        # the one that would have been served first anyway; the other stays `queued` and is
+        # picked up on a later tick, once the running one is no longer active.
+        active_item_ids = {p.item_id for p in self._running.values()}
         for row in rows:
             if row["id"] in self._running:
                 continue
             if now < self._backoff_until.get(row["item_id"], 0.0):
                 continue
+            if row["item_id"] in active_item_ids:
+                continue
+            active_item_ids.add(row["item_id"])
             queue.append(
                 scheduler.QueuedJob(
                     id=row["id"],
@@ -1102,6 +1161,27 @@ class TransferQueue:
         item = await self._fetch_item(job_row["item_id"])
         if item is None:
             return
+
+        # Final guard, independent of `_admit`'s own dedup above (2026-08-13,
+        # prompts/2026-08-13-lftp-timestamped-temp-files.md): never actually exec a second lftp
+        # process for an item that already has one in `self._running`, regardless of how this
+        # decision came to exist. `_admit`'s per-tick dedup is what normally prevents the
+        # scheduler from ever producing such a decision in the first place, but a guard that
+        # lives only where the decision is *built* is one refactor of that method away from
+        # being no guard at all where the process actually gets exec'd -- this is the one place
+        # that can never be bypassed short of removing this check itself. Leaves the job
+        # `queued` (not failed): the moment the other job for this item finishes, this one is
+        # legitimately admissible again on a later tick.
+        if any(p.item_id == item["id"] for p in self._running.values()):
+            logger.warning(
+                "job %s: refusing to spawn a second process for item %s (%s) -- one is already "
+                "running",
+                decision.job_id,
+                item["id"],
+                item["rel_path"],
+            )
+            return
+
         queue_row = await self._fetch_queue(item["queue_id"])
         if queue_row is None:
             return

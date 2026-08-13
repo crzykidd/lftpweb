@@ -688,6 +688,22 @@ Effective size = `size − Σ(limit − pos)`. Small, stable, machine-oriented f
 `.lftp` suffix; strip it when matching a local file against its remote counterpart, and when
 the final name doesn't exist yet, look for `<name>.lftp`.
 
+**A variant of (b), found 2026-08-13 the hard way**
+(`prompts/2026-08-13-lftp-timestamped-temp-files.md`): if two lftp processes are ever allowed to
+target the same path at once (the bug this task fixed — see §4.7 below), the second one can end
+up on `<name>.lftp~<timestamp>~` instead of the plain name, e.g.
+`S06E21.mkv.lftp~20260813154311~`. Reproduced against the fake seedbox; the exact trigger inside
+lftp is a timing-dependent race with no controlling setting (`xfer:auto-rename`/`xfer:clobber`
+were tried and don't govern it), and the *other* observed failure mode from the same race —
+two processes silently writing into the identical plain `.lftp` file with no serialization — is
+arguably worse. Both forms mean the same thing, "not yet the real file," so both are matched by
+one regex (`core/local_scan.py.TEMP_FILE_RE`) everywhere `.lftp` is recognised, and a still-temp
+entry (`LocalEntry.is_temp`) can never satisfy §3.2 rule 2's completeness check regardless of its
+reported size — a temp file's size can lie (sparse `st_size` with no sidecar to correct it, or
+exactly this race) in a way a real, already-renamed file's cannot. The actual fix is the same as
+for the duplicate-job bug itself: never let a second process start against a path the first one
+already owns (§4.7).
+
 If lftp ever changed either format, progress degrades to "raw size, still monotonic" — it
 never crashes and never lies about completion, because completion is the exit code.
 
@@ -886,7 +902,14 @@ Two intake paths.
 
 **Manual.** Select one or more items in Files and queue them. Always available, always wins:
 it clears `auto_queue_suppressed` (§4.6) and ignores every pattern. An explicit user action is
-never second-guessed by a filter.
+never second-guessed by a filter. **"Always wins" means it beats suppression and the settle
+gate — it does not mean a second click spawns a second process** (found 2026-08-13,
+`prompts/2026-08-13-lftp-timestamped-temp-files.md`, from a user report of 4 lftp processes
+where there should have been 2): `enqueue_item` is idempotent against an item that already has
+an active job (returns the existing job's id rather than inserting a second row), and the
+scheduler's admission layer independently refuses to run two processes for the same item
+regardless of how many job rows exist for it — two lftp processes racing the same local/remote
+path is never safe (§4.4's temp-file note above has what was found trying).
 
 **Auto-queue.** Per path queue, off by default, evaluated against every eligible top-level
 remote item on each scan. Eligible means `REMOTE_ONLY` or `PARTIAL`, with `auto_queue_suppressed`

@@ -686,6 +686,37 @@ def test_retention_settings_put_omitting_a_field_preserves_its_previous_value(is
         assert resp.json() == saved
 
 
+def test_orphan_temp_cleanup_settings_default_off_and_round_trip(isolated_config):
+    """2026-08-13 (prompts/2026-08-13-lftp-timestamped-temp-files.md, `core/local_delete.py.
+    OrphanTempCleanupSettings`) -- same shape as retention above: default off, and `PUT` merges
+    over the previously-stored value for any field genuinely absent from the request body.
+    """
+    with TestClient(app) as client:
+        resp = client.get("/api/settings/orphan-temp-cleanup")
+        assert resp.status_code == 200
+        defaults = resp.json()
+        assert defaults["enabled"] is False
+        assert defaults["max_age_days"] == 2.0
+
+        resp = client.put(
+            "/api/settings/orphan-temp-cleanup", json={"enabled": True, "max_age_days": 5.0}
+        )
+        assert resp.status_code == 200
+        saved = resp.json()
+        assert saved["enabled"] is True
+        assert saved["max_age_days"] == 5.0
+
+        # Omit `max_age_days` entirely -- only `enabled` is in this request.
+        resp = client.put("/api/settings/orphan-temp-cleanup", json={"enabled": False})
+        assert resp.status_code == 200
+        saved = resp.json()
+        assert saved["enabled"] is False
+        assert saved["max_age_days"] == 5.0  # preserved, not reset to the 2.0 default
+
+        resp = client.get("/api/settings/orphan-temp-cleanup")
+        assert resp.json() == saved
+
+
 # --- The settle gate (prompts/open-issues.md #2, `core/settle.py`) -----------------------
 
 

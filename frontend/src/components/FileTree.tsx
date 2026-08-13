@@ -1465,7 +1465,22 @@ export function FileTree({
     }
   }
 
-  const bulkQueue = () => runAction('queue', selectedEntries)
+  /** 2026-08-13 (prompts/2026-08-13-lftp-timestamped-temp-files.md): "Queue selected" used to
+   * call `queueItem` for every selected row regardless of state, including rows already
+   * `QUEUED`/`DOWNLOADING` -- unlike the single-row action (`runRowAction`, which only ever
+   * fires `queueItem` when `rowAction` says `'queue'`/`'redownload'`), a multi-select could
+   * include an already-active row and this button would happily re-request it. The backend
+   * (`core/queue.py.enqueue_item`) is now idempotent against that -- it returns the existing
+   * job rather than spawning a second process -- so this was never a duplicate-process risk,
+   * but it's still a pointless request and a confusing "succeeded" outcome for a row that was
+   * never going to do anything. Filtered here to match `rowAction`'s own rule, the same way
+   * `deletableSelected` below already filters for Delete.
+   */
+  const queueableSelected = useMemo(
+    () => selectedEntries.filter((e) => rowAction(e) === 'queue' || rowAction(e) === 'redownload'),
+    [selectedEntries],
+  )
+  const bulkQueue = () => runAction('queue', queueableSelected)
   const bulkStop = () => runAction('stop', selectedEntries)
 
   const deletableSelected = useMemo(() => selectedEntries.filter(canDeleteLocal), [selectedEntries])
@@ -1590,11 +1605,16 @@ export function FileTree({
           <span className="font-medium text-sky-900 dark:text-sky-200">{selected.size} selected</span>
           <button
             type="button"
-            disabled={bulkBusy}
+            disabled={bulkBusy || queueableSelected.length === 0}
             onClick={bulkQueue}
-            className="rounded-md border border-sky-400 px-2 py-1 text-xs font-medium text-sky-900 hover:bg-sky-100 disabled:opacity-50 dark:border-sky-700 dark:text-sky-200 dark:hover:bg-sky-900"
+            title={
+              queueableSelected.length === 0
+                ? 'None of the selected rows can be queued (already transferring, or nothing to fetch)'
+                : undefined
+            }
+            className="rounded-md border border-sky-400 px-2 py-1 text-xs font-medium text-sky-900 hover:bg-sky-100 disabled:cursor-not-allowed disabled:opacity-50 dark:border-sky-700 dark:text-sky-200 dark:hover:bg-sky-900"
           >
-            Queue selected
+            Queue selected{queueableSelected.length > 0 && ` (${queueableSelected.length})`}
           </button>
           <button
             type="button"

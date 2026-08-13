@@ -6,6 +6,118 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-13 — Duplicate jobs spawn duplicate lftp processes; `~timestamp~` temp files are the
+## symptom, not the disease
+
+**Handoff prompt `prompts/2026-08-13-lftp-timestamped-temp-files.md`, executed end to end.**
+User report: 4 lftp processes where there should have been 2, and
+`S.W.A.T.S06E21....mkv.lftp~20260813154311~` files on disk.
+
+**Root cause: `core/queue.py.enqueue_item` had no guard against an existing active job.** A
+second Queue/Re-Download/Retry click (or a race between two callers) on an item already
+`queued`/`running` inserted a second `job` row unconditionally, and the scheduler admitted and
+spawned it as a second concurrent lftp process against the identical remote/local paths.
+`core/autoqueue.py`'s own docstring claimed "no active job" as an eligibility rule but its query
+never enforced it — it happened to hold only because nothing else produced a second job row.
+
+**Decision: `enqueue_item` is idempotent (returns the existing job's id), not rejecting.** A
+double-click is not a mistake worth surfacing as an error, and every existing caller (`POST
+/api/jobs`, `retry_item`, `core/autoqueue.py`) already treats whatever id comes back as "the
+job for this item" without caring whether it's new. **This check alone is not sufficient** — two
+`enqueue_item` calls can still race across the `await`s between the check and the insert (asyncio's
+cooperative scheduling genuinely allows this), so it only prevents the common case (an actual
+double-click) from creating the extra row.
+
+**Decision: the real fix is at the spawn layer, in two places.** `TransferQueue._admit` now
+deduplicates by `item_id` when building the tick's admission candidates — never hands the
+scheduler two `QueuedJob`s for the same item in one pass, and never admits a job for an item that
+already has a process running, regardless of how many `queued` rows exist for it. `_spawn_decision`
+additionally re-checks `self._running` for the same `item_id` immediately before calling
+`lftp.spawn`, as a second, independent guard that survives a future refactor of `_admit`'s own
+dedup. Both are exercised in `tests/test_queue_orphans.py` by inserting two `job` rows directly
+(bypassing `enqueue_item` entirely) and confirming only one ever reaches `running`; an end-to-end
+version against the real fake seedbox (`tests/test_queue.py::
+test_two_queued_jobs_for_one_item_never_produce_two_running_lftp_processes`) confirms only one
+real lftp pid exists at a time.
+
+**`core/autoqueue.py`'s eligibility query now says what its docstring already claimed**: a
+`NOT EXISTS (SELECT 1 FROM job WHERE job.item_id = item.id AND job.state IN ('queued','running'))`
+clause, so the exclusion is enforced by the query rather than an emergent property of state
+transitions elsewhere.
+
+**Empirical finding: resume works correctly for the sequential (non-concurrent) case — this was
+never broken.** Reproduced against the fake seedbox with `core/lftp.py.spawn` called directly
+(bypassing `TransferQueue`, for full control): started a `pget` of the seed tree's known 20 MB
+file, let ~775 KB accumulate, `SIGKILL`ed the process (not the graceful `SIGTERM` path — a harder
+case than any code path in this app produces), then started a **brand-new** job (fresh `job_id`,
+same target) with no other process alive. It resumed *into* the existing `<name>.mkv.lftp` file
+via `-c` (continue) — the byte count only ever grew (775,006 → 1,311,620 → 20,971,520 at
+completion) — and never created a `~timestamp~` variant. **Resume is not the bug here; measured
+by bytes, not inferred from filenames.**
+
+**Empirical finding: the exact trigger for the `~timestamp~` *rename* is a timing-dependent race
+inside lftp itself, not something this codebase controls, and it is not the only failure mode.**
+Running two lftp processes (both `pget` and `mirror`, tried separately) concurrently against the
+*identical* target repeatedly reproduced something worse than a clean rename: both processes wrote
+into the **same** plain `<name>.lftp` file with no serialization between them, and the loser's own
+attempt to rename its (shared, partially-written) temp file to the final name failed with
+`No such file or directory` (the winner had already renamed and removed it) — exit code 1. That
+losing exit's captured output ("no such file") would even be misclassified as `REMOTE_GONE` by
+`core/lftp.py.classify_output`'s substring match, a permanent error, on a file that plainly exists.
+Never reproduced the exact renamed-variant form the user saw in this environment, despite several
+attempts varying timing and `pget_n`; both observed failure modes (shared-write racing, and by the
+user's own report, a uniquified rename) are symptoms of the same disease — **two lftp processes
+must never be allowed to target the same path concurrently** — which is what the fix above
+actually prevents, independent of which specific symptom would have shown up.
+
+**No lftp setting prevents or controls this, and none was changed.** `lftp -c "set -a"` on the
+pinned 4.9.2 binary shows `xfer:auto-rename no` and `xfer:clobber no` as its own defaults —
+already what this project's rc file leaves them at (neither is set explicitly) — and the man page
+describes `xfer:auto-rename` as governing *server-suggested* filenames, not local temp-name
+collision avoidance. There is no documented (or found, by testing) setting that makes a second
+concurrent lftp process either refuse to start or safely share the first's temp file. The only
+correct fix is preventing the second process from ever being spawned, which the root-cause fix
+above does.
+
+**Decision: `core/local_scan.py.TEMP_FILE_RE` recognises both temp-file forms from one place**
+(`.lftp` and `.lftp~<timestamp>~`), imported by `core/local_delete.py` rather than each module
+inventing its own `~` handling. `LocalEntry` gained an `is_temp` flag; `core/reconcile.py` now
+refuses to call a still-temp-suffixed entry "complete" **regardless of its reported size** — this
+is the load-bearing part, not the display fix. Before this, an orphaned temp file whose size
+happened to reach or exceed the remote size (a missing/mismatched `.lftp-pget-status` sidecar
+falls back to a sparse `st_size` that already reads as the full allocation) could make a directory
+read `DOWNLOADED` purely structurally, with no job involved — and `core/engine.py._persist` does
+trigger post-processing off exactly that reconcile-driven transition. On a `move`-mode queue that
+is verify → **delete the remote copy** → extract, for a release that was never actually complete.
+Covered in `tests/test_reconcile.py` (`test_a_directory_with_only_an_orphaned_temp_file_never_
+reads_downloaded`).
+
+**Decision: orphan reaping is age-gated, not job-state-gated, mirroring `core/extract.py.
+sweep_failed_dirs`'s precedent for the identical shape of problem.** A live lftp process
+refreshes its temp file's mtime on every write, so an actually-alive (even slow) transfer can
+never look stale; `net:timeout`/`net:max-retries` already fail a genuinely stalled connection
+within minutes. `local_scan.sweep_orphan_temp_files` is a pure filesystem function (no DB access,
+consistent with the rest of that module) with a 2-day default threshold — shorter than
+`_FAILED_`'s 14 days, since a `_FAILED_` directory is kept as diagnostic evidence and an orphaned
+temp file has none. Wired into the existing hourly `RetentionScheduler` (rather than a new
+scheduler class) as an independently-toggled pass — `core/local_delete.OrphanTempCleanupSettings`,
+**default off**, this project's non-negotiable rule for anything that deletes, even though what
+this specific feature deletes is pure byte waste with no value once found. Has a `GET`/`PUT
+/api/settings/orphan-temp-cleanup` (merge-on-PUT, same fix `put_retention_settings` already
+needed) but **no frontend page yet** — the same accepted "backend first, UI catches up later" gap
+`retention`/the settle gate/Settings → Transfer already have.
+
+**Frontend: `FileTree.tsx`'s single-row Queue action was already safe** (`rowAction` returns
+`'stop'` for `QUEUED`/`DOWNLOADING`). **Bulk "Queue selected" was not** — it called `queueItem`
+for every selected row regardless of state, including already-active ones. Not a duplicate-process
+risk after the backend fix (the now-idempotent `enqueue_item` just returns the existing job), but
+still a pointless request and a confusing "succeeded" outcome for a row that was never going to do
+anything — filtered to match `rowAction`'s own rule (`queueableSelected`), same shape
+`deletableSelected` already used for the Delete button. Fixed regardless of the backend guard,
+per the task's own instruction: the UI not offering an action is not a guarantee.
+
+---
+
 ## 2026-08-13 — Clearing History: no protected categories, server-side bulk delete, and never
 ## touches `item`
 

@@ -708,6 +708,22 @@ alongside this list: several entries below ship with deliberate, documented limi
   (`prompts/open-issues.md`) that also made `AutoQueueSettings.re_download_externally_removed`
   capable of queuing a doomed transfer against a remote that no longer exists; closed in the same
   pass rather than left open, since it was the same underlying question asked twice.
+- **An item could be queued twice and run two concurrent lftp processes against the same paths**
+  *(2026-08-13, user report: 4 lftp processes where there should have been 2, and
+  `foo.mkv.lftp~20260813154311~` temp files on disk)*. `enqueue_item` had no guard against an
+  already-active job, so a double-click (or Queue on an item auto-queue had just picked up)
+  inserted a second job row and spawned a second process. Now idempotent (returns the existing
+  job) plus a hard guard at the scheduler's admission layer that refuses to run two processes for
+  one item regardless of how many job rows exist for it; `core/autoqueue.py`'s "no active job"
+  eligibility rule is now enforced by its query, not merely by its docstring. The `~timestamp~`
+  temp name (lftp avoiding a collision with the first process's own `.lftp` file) is now
+  recognised everywhere `.lftp` already is, so an orphaned one from before this fix no longer
+  shows as its own phantom row and — the dangerous part — can no longer make a directory read
+  `DOWNLOADED` while genuinely incomplete, which on a `move` queue was the path to deleting the
+  remote copy of a release that never finished. An optional, off-by-default cleanup pass
+  (`Settings` API only for now, no UI yet) reaps stale orphaned temp files past a configurable
+  age. Resume itself was verified working throughout (measured in bytes against the fake seedbox,
+  not inferred from filenames) — the bug was duplicate processes, not broken resume.
 
 ### Security
 

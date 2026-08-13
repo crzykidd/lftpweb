@@ -131,6 +131,36 @@ async def test_stopped_item_is_never_resurrected_even_though_its_pattern_matches
     assert recorder.enqueued == []
 
 
+async def test_active_job_excludes_an_otherwise_eligible_item_via_the_query_itself(db, tmp_path):
+    """2026-08-13 (prompts/2026-08-13-lftp-timestamped-temp-files.md): this module's docstring
+    has always claimed "only a top-level item with no active job ... is eligible", but nothing
+    in the `SELECT` enforced it -- it relied entirely on `state` never being `QUEUED`/
+    `DOWNLOADING` while a job is active, which happens to hold today but was never asserted by
+    the query. Proven here the way the task asks: an item left in an eligible *state*
+    (`REMOTE_ONLY`, not `QUEUED`) but carrying a `running` `job` row anyway -- exactly the shape
+    two concurrent job rows for one item could produce before `core/queue.py.enqueue_item`'s own
+    idempotency fix -- must still be excluded, and only the `NOT EXISTS (... job ...)` clause
+    can be doing that here, since the state alone says "eligible."
+    """
+    from lftpweb.core.mount_sentinel import write_if_needed
+
+    write_if_needed(str(tmp_path))
+    queue_id = await _make_queue(db, tmp_path)
+    item_id = await _make_item(db, queue_id, "Release.One")  # REMOTE_ONLY, unsuppressed
+    await db.execute(
+        "INSERT INTO job (item_id, kind, state, lane, rank, attempt, forced_full_rate) "
+        "VALUES (?, 'mirror', 'running', 'main', 0, 1, 0)",
+        (item_id,),
+    )
+    await db.commit()
+    recorder = _Recorder()
+    aq = AutoQueue(db, recorder)
+
+    queued = await aq.on_scan(_mounted_config(queue_id, tmp_path))
+    assert queued == 0
+    assert recorder.enqueued == []
+
+
 async def test_failed_and_removed_states_are_also_never_picked_up(db, tmp_path):
     """`REMOVED_LOCAL` is deliberately not in this list -- see the tests below. Unlike
     `FAILED`/`REMOVED_BOTH`/`QUEUED`/`DOWNLOADING`/`DOWNLOADED`, whether a `REMOVED_LOCAL` item

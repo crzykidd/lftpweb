@@ -17,7 +17,7 @@ import aiosqlite
 import pytest
 
 import lftpweb.core.engine as engine_module
-from lftpweb.core import local_delete
+from lftpweb.core import local_delete, local_scan
 from lftpweb.core.autoqueue import (
     AutoQueue,
     AutoQueueSettings,
@@ -229,6 +229,46 @@ async def test_loose_file_delete_removes_lftp_temp_leftover(tmp_path):
         assert item["state"] == "REMOVED_LOCAL"
         assert item["auto_queue_suppressed"] == 1
         assert item["suppressed_reason"] == "deleted_local"
+    finally:
+        await db.close()
+
+
+async def test_loose_file_delete_removes_timestamped_temp_variant_too(tmp_path):
+    """2026-08-13 (prompts/2026-08-13-lftp-timestamped-temp-files.md): the same shape as
+    `test_loose_file_delete_removes_lftp_temp_leftover` above, but for the `~<timestamp>~`
+    variant lftp falls back to when it finds the plain `.lftp` name already spoken for --
+    `local_scan.find_temp_variants` is what makes the delete find it at all, since its exact
+    name isn't predictable in advance.
+    """
+    local_root = tmp_path / "local"
+    local_root.mkdir()
+    temp = local_root / "Release.mkv.lftp~20260813154311~"
+    temp.write_bytes(b"x" * 30)
+    sidecar = local_root / "Release.mkv.lftp~20260813154311~.lftp-pget-status"
+    sidecar.write_text("size=100\n0.pos=0 0.limit=70\n")
+    write_if_needed(str(local_root))
+
+    db = await _make_db()
+    try:
+        queue_id = await _make_queue(db, local_root)
+        item_id = await _make_item(db, queue_id, "Release.mkv", local_size=30)
+
+        outcome = await local_delete.delete_local(
+            db,
+            item=await _item_row(db, item_id),
+            queue=await _queue_row(db, queue_id),
+            caller="manual",
+            require_nlink_guard=False,
+            in_flight_item_ids=frozenset(),
+        )
+
+        assert outcome.deleted is True
+        assert not temp.exists(), "the ~timestamp~ temp file must be removed too"
+        assert not sidecar.exists(), "its own .lftp-pget-status sidecar must go with it"
+        assert not (local_root / "Release.mkv").exists()
+
+        item = await _item_row(db, item_id)
+        assert item["state"] == "REMOVED_LOCAL"
     finally:
         await db.close()
 
@@ -1450,6 +1490,82 @@ async def test_retention_scheduler_is_a_no_op_while_disabled(tmp_path):
 
         assert result == local_delete.RetentionRunResult(considered=0, deleted=0, withheld=0)
         assert (local_root / "Old.Release").exists()
+    finally:
+        await db.close()
+
+
+# --- Orphan temp-file cleanup settings + scheduler integration (2026-08-13,
+# prompts/2026-08-13-lftp-timestamped-temp-files.md) -------------------------------------------
+
+
+async def test_orphan_temp_cleanup_settings_default_off():
+    db = await _make_db()
+    try:
+        settings = await local_delete.load_orphan_temp_cleanup_settings(db)
+        assert settings.enabled is False
+        assert settings.max_age_days == local_scan.ORPHAN_TEMP_FILE_DEFAULT_MAX_AGE_DAYS
+    finally:
+        await db.close()
+
+
+async def test_orphan_temp_cleanup_settings_round_trip():
+    db = await _make_db()
+    try:
+        saved = local_delete.OrphanTempCleanupSettings(enabled=True, max_age_days=5.0)
+        await local_delete.save_orphan_temp_cleanup_settings(db, saved)
+        loaded = await local_delete.load_orphan_temp_cleanup_settings(db)
+        assert loaded == saved
+    finally:
+        await db.close()
+
+
+async def test_retention_scheduler_sweeps_orphan_temp_files_when_enabled(tmp_path):
+    """Rides `RetentionScheduler`'s own hourly pass (`_sweep_orphan_temp_files`), gated by its
+    own independent setting -- enabling this must not require also enabling `RetentionSettings`
+    (asserted by leaving retention at its default-off below).
+    """
+    local_root = tmp_path / "local"
+    local_root.mkdir()
+    stale = local_root / "old.mkv.lftp~20260101000000~"
+    stale.write_bytes(b"x" * 10)
+    os.utime(stale, (0.0, 0.0))
+    write_if_needed(str(local_root))
+
+    db = await _make_db()
+    try:
+        await _make_queue(db, local_root)
+        await local_delete.save_orphan_temp_cleanup_settings(
+            db, local_delete.OrphanTempCleanupSettings(enabled=True, max_age_days=1.0)
+        )
+
+        scheduler = local_delete.RetentionScheduler(db, EventBus())
+        await scheduler.run_once()
+
+        assert not stale.exists()
+        events = await (
+            await db.execute("SELECT kind FROM event WHERE kind = 'orphan_temp_file_removed'")
+        ).fetchall()
+        assert len(events) == 1
+    finally:
+        await db.close()
+
+
+async def test_retention_scheduler_leaves_orphans_alone_while_disabled(tmp_path):
+    local_root = tmp_path / "local"
+    local_root.mkdir()
+    stale = local_root / "old.mkv.lftp~20260101000000~"
+    stale.write_bytes(b"x" * 10)
+    os.utime(stale, (0.0, 0.0))
+    write_if_needed(str(local_root))
+
+    db = await _make_db()
+    try:
+        await _make_queue(db, local_root)
+        # Settings never saved -- default is enabled=False.
+        scheduler = local_delete.RetentionScheduler(db, EventBus())
+        await scheduler.run_once()
+
+        assert stale.exists()
     finally:
         await db.close()
 

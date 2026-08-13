@@ -163,8 +163,26 @@ def reconcile(
         local_entry = local_tree.get(path)
         relevant_own[path] = 1
         local_present_own[path] = 1 if local_entry is not None else 0
+        # 2026-08-13 (prompts/2026-08-13-lftp-timestamped-temp-files.md): `not local_entry.
+        # is_temp` is load-bearing, not defensive. A local entry whose only on-disk form is
+        # still a temp-suffixed name (`.lftp` or `.lftp~<timestamp>~`) has not been through
+        # lftp's atomic rename yet, and its reported `size` can be wrong in ways a renamed
+        # file's cannot (a missing/mismatched `.lftp-pget-status` sidecar falls back to a
+        # sparse `st_size` that already reads as the full allocation; two processes racing the
+        # same target -- the bug this task's root cause fixes -- can leave one mid-write). Size
+        # alone used to be enough to call a file "complete" here; a large enough *orphaned* temp
+        # file (no active job explains the gap) could satisfy `size >= entry.size` while the
+        # real transfer was still incomplete, which on a `move`-mode queue is the path to
+        # deleting the remote copy of a release that never actually finished. See
+        # `core/local_scan.py.LocalEntry.is_temp`'s own docstring for the full reasoning.
         complete_own[path] = (
-            1 if (local_entry is not None and local_entry.size >= entry.size) else 0
+            1
+            if (
+                local_entry is not None
+                and not local_entry.is_temp
+                and local_entry.size >= entry.size
+            )
+            else 0
         )
 
     relevant_totals = _rollup(remote_tree, relevant_own)
@@ -241,8 +259,15 @@ def reconcile(
                 state = STATE_EXCLUDED
             elif remote_entry is not None and local_entry is not None:
                 # Rule 2: local_size < remote_size ⇒ PARTIAL, never DOWNLOADED, even with no
-                # active job to explain the gap.
-                state = STATE_DOWNLOADED if local_entry.size >= remote_entry.size else STATE_PARTIAL
+                # active job to explain the gap. `not local_entry.is_temp` (2026-08-13): a
+                # still-temp-suffixed file is never DOWNLOADED regardless of its reported size
+                # -- see `complete_own`'s comment above, and `LocalEntry.is_temp`'s own
+                # docstring, for why size alone can lie for an unrenamed file.
+                state = (
+                    STATE_DOWNLOADED
+                    if (local_entry.size >= remote_entry.size and not local_entry.is_temp)
+                    else STATE_PARTIAL
+                )
             elif remote_entry is not None:
                 state = STATE_REMOTE_ONLY
             else:

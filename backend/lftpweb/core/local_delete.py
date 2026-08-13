@@ -357,6 +357,13 @@ def _do_remove_from_disk(local_root: Path, resolved: Path) -> None:
     the failure mode `prompts/2026-08-13-delete-during-transfer.md` calls out by name. Both
     removals are `missing_ok=True`: the common case (a fully-finished file, or one that was
     never in flight at all) has neither, and that's not an error here.
+
+    **Every temp-file *variant*, not just the plain one** (2026-08-13,
+    `prompts/2026-08-13-lftp-timestamped-temp-files.md`): `core/local_scan.py.
+    find_temp_variants` also finds any `<final-name>.lftp~<timestamp>~` lftp fell back to when
+    a second process once raced this same target for the plain name -- see that function's own
+    docstring. Each variant's own sidecar (built on *its* name, not the plain one) is removed
+    alongside it.
     """
     if local_root.is_symlink():
         local_root.unlink()
@@ -367,12 +374,15 @@ def _do_remove_from_disk(local_root: Path, resolved: Path) -> None:
             resolved.unlink()
         # The sidecar's own name is built on top of the *temp* name, not the final one --
         # lftp's `pget:save-status` writes `<currently-in-use-name>.lftp-pget-status`, and the
-        # currently-in-use name is `<final-name>.lftp` for as long as `xfer:use-temp-file` (on,
-        # `core/lftp.py.build_rc_text`) hasn't yet renamed it. Matches the same two-suffix
-        # stacking `core/local_scan.py.scan_local`'s own sidecar lookup expects.
-        temp_path = resolved.with_name(resolved.name + local_scan.TEMP_FILE_SUFFIX)
-        temp_path.with_name(temp_path.name + local_scan.PGET_STATUS_SUFFIX).unlink(missing_ok=True)
-        temp_path.unlink(missing_ok=True)
+        # currently-in-use name is `<final-name>.lftp` (or its `~<timestamp>~` variant) for as
+        # long as `xfer:use-temp-file` (on, `core/lftp.py.build_rc_text`) hasn't yet renamed it.
+        # Matches the same two-suffix stacking `core/local_scan.py.scan_local`'s own sidecar
+        # lookup expects.
+        for temp_path in local_scan.find_temp_variants(resolved.parent, resolved.name):
+            temp_path.with_name(temp_path.name + local_scan.PGET_STATUS_SUFFIX).unlink(
+                missing_ok=True
+            )
+            temp_path.unlink(missing_ok=True)
 
 
 def _all_hardlinked(local_root: Path, resolved: Path) -> bool:
@@ -509,14 +519,14 @@ async def delete_local(
         )
 
     # A loose top-level file stopped mid-transfer (see this function's own docstring) can exist
-    # on disk *only* as `<name>.lftp` -- its own final name never got there. Checked
-    # unconditionally rather than gated on `item["is_dir"]`: a directory's own name never
-    # carries this suffix (mirror writes temp names to the *files inside* it, not to the
-    # directory itself), so this is safe to check for every item without needing to know its
-    # kind, and `RetentionScheduler`'s own `item` dict (`_select_expired`) doesn't carry
-    # `is_dir` at all.
-    temp_local_root = local_root.with_name(local_root.name + local_scan.TEMP_FILE_SUFFIX)
-    if not local_root.exists() and not local_root.is_symlink() and not temp_local_root.exists():
+    # on disk *only* as `<name>.lftp` or (2026-08-13) its `<name>.lftp~<timestamp>~` variant --
+    # its own final name never got there. Checked unconditionally rather than gated on
+    # `item["is_dir"]`: a directory's own name never carries this suffix (mirror writes temp
+    # names to the *files inside* it, not to the directory itself), so this is safe to check
+    # for every item without needing to know its kind, and `RetentionScheduler`'s own `item`
+    # dict (`_select_expired`) doesn't carry `is_dir` at all.
+    has_temp_variant = bool(local_scan.find_temp_variants(local_root.parent, local_root.name))
+    if not local_root.exists() and not local_root.is_symlink() and not has_temp_variant:
         return await withhold(f"{local_root} does not exist -- nothing to delete")
 
     # 5. The nlink guard -- caller's choice (module docstring).
@@ -746,6 +756,59 @@ async def preview_retention(
     return out
 
 
+# --- Orphaned temp-file cleanup (2026-08-13, prompts/2026-08-13-lftp-timestamped-temp-files.md) -
+
+ORPHAN_TEMP_CLEANUP_SETTING_KEY = "orphan_temp_cleanup_settings"
+
+
+@dataclass(frozen=True)
+class OrphanTempCleanupSettings:
+    """Site-level toggle for `local_scan.sweep_orphan_temp_files`. **Default off**, this
+    project's rule for anything that deletes (`RetentionSettings`'s own docstring), even though
+    the thing being removed here is accidental byte waste with no diagnostic value: an operator
+    who has never hit the duplicate-job bug this task fixes (`core/queue.py.enqueue_item`) has
+    no orphaned temp files to clean up, and the first time this runs should still be a decision,
+    not a surprise sweep of a directory someone is mid-transfer into with an unusually long
+    stall.
+    """
+
+    enabled: bool = False
+    max_age_days: float = local_scan.ORPHAN_TEMP_FILE_DEFAULT_MAX_AGE_DAYS
+
+
+async def load_orphan_temp_cleanup_settings(db: aiosqlite.Connection) -> OrphanTempCleanupSettings:
+    cursor = await db.execute(
+        "SELECT value FROM setting WHERE key = ?", (ORPHAN_TEMP_CLEANUP_SETTING_KEY,)
+    )
+    row = await cursor.fetchone()
+    if row is None:
+        return OrphanTempCleanupSettings()
+    try:
+        data = json.loads(row["value"])
+    except (ValueError, TypeError):
+        return OrphanTempCleanupSettings()
+    return OrphanTempCleanupSettings(
+        enabled=bool(data.get("enabled", False)),
+        max_age_days=float(
+            data.get("max_age_days", local_scan.ORPHAN_TEMP_FILE_DEFAULT_MAX_AGE_DAYS)
+        ),
+    )
+
+
+async def save_orphan_temp_cleanup_settings(
+    db: aiosqlite.Connection, settings: OrphanTempCleanupSettings
+) -> None:
+    await db.execute(
+        "INSERT INTO setting (key, value, updated_at) VALUES (?, ?, STRFTIME('%Y-%m-%dT%H:%M:%fZ','now')) "
+        "ON CONFLICT (key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+        (
+            ORPHAN_TEMP_CLEANUP_SETTING_KEY,
+            json.dumps({"enabled": settings.enabled, "max_age_days": settings.max_age_days}),
+        ),
+    )
+    await db.commit()
+
+
 @dataclass(frozen=True)
 class RetentionRunResult:
     considered: int
@@ -814,6 +877,12 @@ class RetentionScheduler:
             await asyncio.sleep(self.CHECK_INTERVAL_S)
 
     async def run_once(self) -> RetentionRunResult:
+        # 2026-08-13: orphan temp-file cleanup rides the same hourly pass but is gated by its
+        # own, independent setting -- an operator who wants one without the other (most will:
+        # this is disk hygiene from a bug, not a data-lifecycle policy) must not have to accept
+        # both or neither.
+        await self._sweep_orphan_temp_files()
+
         settings = await load_retention_settings(self.db)
         if not settings.enabled:
             return RetentionRunResult(considered=0, deleted=0, withheld=0)
@@ -843,6 +912,49 @@ class RetentionScheduler:
                 withheld,
             )
         return RetentionRunResult(considered=len(candidates), deleted=deleted, withheld=withheld)
+
+    async def _sweep_orphan_temp_files(self) -> None:
+        """Disk-hygiene half of prompts/2026-08-13-lftp-timestamped-temp-files.md's task 4 --
+        removes stale `.lftp`/`.lftp~<timestamp>~` leftovers (`local_scan.
+        sweep_orphan_temp_files`'s own docstring covers why age alone is a safe guard) across
+        every enabled queue, gated by `OrphanTempCleanupSettings.enabled` (default off, this
+        module's own rule for anything that deletes).
+
+        One queue at a time, off the event loop (`asyncio.to_thread`, matching
+        `postprocess.py._sweep_failed_dirs`'s reasoning for `extract.sweep_failed_dirs`: a
+        large tree walk must not block request handling or the WS delivery of anything else
+        happening at the same time). No `item_delta` publish here -- unlike `delete_local`,
+        an orphaned temp file was never its own visible node (`core/local_scan.py.scan_local`
+        already folds it into its final name's entry, dead or alive), so there is no row on the
+        Files page whose removal needs announcing; the `event` row is the whole audit trail.
+        """
+        settings = await load_orphan_temp_cleanup_settings(self.db)
+        if not settings.enabled:
+            return
+        cursor = await self.db.execute("SELECT id, local_path FROM path_queue WHERE enabled = 1")
+        queues = await cursor.fetchall()
+        for queue in queues:
+            removed = await asyncio.to_thread(
+                local_scan.sweep_orphan_temp_files,
+                Path(queue["local_path"].rstrip("/")),
+                max_age_days=settings.max_age_days,
+            )
+            for path, age_days in removed:
+                await audit.record_event(
+                    self.db,
+                    level="info",
+                    kind="orphan_temp_file_removed",
+                    message=(
+                        f"queue {queue['id']}: removed stale lftp temp file {path} "
+                        f"(age {age_days:.1f}d >= {settings.max_age_days}d)"
+                    ),
+                )
+            if removed:
+                logger.info(
+                    "orphan-temp-cleanup: removed %d stale temp file(s) in queue %d",
+                    len(removed),
+                    queue["id"],
+                )
 
 
 # --- Delete archives after extract (prompts/2026-08-13-delete-archives-after-extract.md) ------

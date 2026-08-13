@@ -7,8 +7,12 @@ from lftpweb.core.local_scan import (
     PgetStatus,
     effective_file_size,
     effective_size,
+    find_temp_variants,
+    is_temp_name,
     parse_pget_status,
     scan_local,
+    strip_temp_suffix,
+    sweep_orphan_temp_files,
 )
 from lftpweb.core.mount_sentinel import SENTINEL_NAME
 
@@ -258,6 +262,161 @@ def test_scan_local_temp_suffixed_file_reports_its_own_mtime(tmp_path):
     entries = scan_local(tmp_path)
 
     assert entries["show.mkv"].mtime == known_mtime
+
+
+# --- `~timestamp~` temp-file variant (2026-08-13,
+# prompts/2026-08-13-lftp-timestamped-temp-files.md) -------------------------------------------
+
+
+def test_strip_temp_suffix_recognises_both_forms():
+    assert strip_temp_suffix("movie.mkv.lftp") == "movie.mkv"
+    assert strip_temp_suffix("movie.mkv.lftp~20260813154311~") == "movie.mkv"
+    assert strip_temp_suffix("movie.mkv") == "movie.mkv"
+
+
+def test_is_temp_name_recognises_both_forms():
+    assert is_temp_name("movie.mkv.lftp") is True
+    assert is_temp_name("movie.mkv.lftp~20260813154311~") is True
+    assert is_temp_name("movie.mkv") is False
+
+
+def test_scan_local_recognises_the_timestamped_variant_as_a_temp_file(tmp_path):
+    """The user's own report, verbatim shape: a `~timestamp~` temp file must not appear as its
+    own node -- it must be attributed to the final name, exactly like plain `.lftp`.
+    """
+    (tmp_path / "S.W.A.T.S06E21.mkv.lftp~20260813154311~").write_bytes(b"x" * 900)
+
+    entries = scan_local(tmp_path)
+
+    assert "S.W.A.T.S06E21.mkv" in entries
+    assert "S.W.A.T.S06E21.mkv.lftp~20260813154311~" not in entries
+    assert entries["S.W.A.T.S06E21.mkv"].size == 900
+    assert entries["S.W.A.T.S06E21.mkv"].is_temp is True
+
+
+def test_scan_local_finished_file_is_not_marked_temp(tmp_path):
+    (tmp_path / "movie.mkv").write_bytes(b"z" * 10)
+    entries = scan_local(tmp_path)
+    assert entries["movie.mkv"].is_temp is False
+
+
+def test_scan_local_a_real_finished_file_wins_over_a_stray_temp_variant_regardless_of_size(
+    tmp_path,
+):
+    """A genuinely renamed final file is authoritative -- an orphaned temp variant of the same
+    name (even a larger one) must never be the entry that survives, since `core/reconcile.py`
+    trusts `is_temp is False` to mean "this is real."
+    """
+    (tmp_path / "movie.mkv").write_bytes(b"z" * 100)
+    (tmp_path / "movie.mkv.lftp~20260813154311~").write_bytes(b"x" * 999_999)
+
+    entries = scan_local(tmp_path)
+
+    assert entries["movie.mkv"].size == 100
+    assert entries["movie.mkv"].is_temp is False
+
+
+def test_scan_local_keeps_the_larger_of_two_temp_variants(tmp_path):
+    (tmp_path / "movie.mkv.lftp").write_bytes(b"a" * 100)
+    (tmp_path / "movie.mkv.lftp~20260813154311~").write_bytes(b"b" * 500)
+
+    entries = scan_local(tmp_path)
+
+    assert entries["movie.mkv"].size == 500
+    assert entries["movie.mkv"].is_temp is True
+
+
+def test_find_temp_variants_finds_plain_and_timestamped(tmp_path):
+    (tmp_path / "movie.mkv.lftp").write_bytes(b"a")
+    (tmp_path / "movie.mkv.lftp~20260813154311~").write_bytes(b"b")
+    (tmp_path / "movie.mkv.lftp~20260813160000~").write_bytes(b"c")
+    (tmp_path / "unrelated.mkv.lftp").write_bytes(b"d")
+
+    variants = find_temp_variants(tmp_path, "movie.mkv")
+
+    assert {p.name for p in variants} == {
+        "movie.mkv.lftp",
+        "movie.mkv.lftp~20260813154311~",
+        "movie.mkv.lftp~20260813160000~",
+    }
+
+
+def test_find_temp_variants_empty_when_nothing_matches(tmp_path):
+    assert find_temp_variants(tmp_path, "movie.mkv") == []
+
+
+def test_effective_file_size_finds_the_timestamped_variant_when_plain_lftp_is_absent(tmp_path):
+    (tmp_path / "movie.mkv.lftp~20260813154311~").write_bytes(b"y" * 321)
+    assert effective_file_size(tmp_path / "movie.mkv") == 321
+
+
+def test_effective_file_size_prefers_the_larger_temp_variant(tmp_path):
+    (tmp_path / "movie.mkv.lftp~20260813154311~").write_bytes(b"a" * 100)
+    (tmp_path / "movie.mkv.lftp~20260813160000~").write_bytes(b"b" * 700)
+    assert effective_file_size(tmp_path / "movie.mkv") == 700
+
+
+# --- sweep_orphan_temp_files -------------------------------------------------------------------
+
+
+def test_sweep_orphan_temp_files_removes_stale_ones_only(tmp_path):
+    import os
+
+    stale = tmp_path / "old.mkv.lftp~20260101000000~"
+    stale.write_bytes(b"x" * 10)
+    fresh = tmp_path / "fresh.mkv.lftp"
+    fresh.write_bytes(b"y" * 10)
+
+    now = 2_000_000.0
+    old_mtime = now - (5 * 86400)  # 5 days old
+    fresh_mtime = now - 10  # 10 seconds old -- a live transfer, still being written to
+    os.utime(stale, (old_mtime, old_mtime))
+    os.utime(fresh, (fresh_mtime, fresh_mtime))
+
+    removed = sweep_orphan_temp_files(tmp_path, max_age_days=2.0, now=now)
+
+    assert [p.name for p, _age in removed] == ["old.mkv.lftp~20260101000000~"]
+    assert not stale.exists()
+    assert (
+        fresh.exists()
+    ), "a temp file younger than the threshold must survive -- it may be a live transfer"
+
+
+def test_sweep_orphan_temp_files_removes_the_sidecar_too(tmp_path):
+    import os
+
+    temp = tmp_path / "movie.mkv.lftp"
+    temp.write_bytes(b"x" * 10)
+    sidecar = tmp_path / "movie.mkv.lftp.lftp-pget-status"
+    sidecar.write_text("size=10\n")
+    old_mtime = 0.0
+    os.utime(temp, (old_mtime, old_mtime))
+
+    removed = sweep_orphan_temp_files(tmp_path, max_age_days=2.0, now=1_000_000.0)
+
+    assert len(removed) == 1
+    assert not temp.exists()
+    assert not sidecar.exists()
+
+
+def test_sweep_orphan_temp_files_leaves_finished_files_and_other_bookkeeping_alone(tmp_path):
+    import os
+
+    finished = tmp_path / "done.mkv"
+    finished.write_bytes(b"x" * 10)
+    os.utime(finished, (0.0, 0.0))
+    (tmp_path / f"{UNPACK_PREFIX}Release").mkdir()
+    (tmp_path / f"{UNPACK_PREFIX}Release" / "part.mkv.lftp").write_bytes(b"y")
+    os.utime(tmp_path / f"{UNPACK_PREFIX}Release" / "part.mkv.lftp", (0.0, 0.0))
+
+    removed = sweep_orphan_temp_files(tmp_path, max_age_days=2.0, now=1_000_000.0)
+
+    assert removed == []
+    assert finished.exists()
+
+
+def test_sweep_orphan_temp_files_missing_root_is_a_noop(tmp_path):
+    assert sweep_orphan_temp_files(tmp_path / "nope", max_age_days=2.0) == []
 
 
 def test_scan_local_unpack_prefix_only_hides_directories_not_files(tmp_path):

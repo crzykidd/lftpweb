@@ -208,7 +208,15 @@ class AutoQueue:
         cursor = await self.db.execute(
             "SELECT id, rel_path, is_dir FROM item WHERE queue_id = ? "
             "AND instr(rel_path, '/') = 0 AND auto_queue_suppressed = 0 "
-            f"AND state IN ({','.join('?' for _ in eligible_states)})",
+            f"AND state IN ({','.join('?' for _ in eligible_states)}) "
+            # 2026-08-13 (prompts/2026-08-13-lftp-timestamped-temp-files.md): this module's own
+            # docstring has claimed "no active job" since it was written, but nothing in the
+            # query enforced it -- it relied entirely on `state` never being `QUEUED`/
+            # `DOWNLOADING` while a job is active, which holds today but was never asserted
+            # here. Made explicit so the claim is true by construction rather than by every
+            # other module continuing to agree with it forever.
+            "AND NOT EXISTS (SELECT 1 FROM job WHERE job.item_id = item.id "
+            "AND job.state IN ('queued', 'running'))",
             (queue.id, *eligible_states),
         )
         rows = await cursor.fetchall()

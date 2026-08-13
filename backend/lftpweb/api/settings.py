@@ -53,6 +53,8 @@ from lftpweb.models import (
     PatternPreviewItem,
     PatternPreviewRequest,
     PatternPreviewResponse,
+    OrphanTempCleanupSettingsIn,
+    OrphanTempCleanupSettingsOut,
     PostprocessSettingsIn,
     PostprocessSettingsOut,
     QueueAutoQueueStatus,
@@ -910,4 +912,42 @@ async def retention_preview(
     total_bytes = sum(c["local_size"] or 0 for c in candidates)
     return RetentionPreviewResponse(
         retention_days=retention_days, count=len(items), total_bytes=total_bytes, items=items
+    )
+
+
+# --- Settings -> orphan temp-file cleanup (2026-08-13,
+# prompts/2026-08-13-lftp-timestamped-temp-files.md, `core/local_delete.py`) -----------------
+#
+# No frontend page yet -- same accepted "backend first, UI catches up later" gap `retention`
+# above already has (its own comment). Defaults off either way, non-negotiably (this deletes
+# files from disk), so its absence from any settings screen changes nothing about how an
+# existing install behaves.
+
+
+@router.get("/orphan-temp-cleanup", response_model=OrphanTempCleanupSettingsOut)
+async def get_orphan_temp_cleanup_settings(request: Request) -> OrphanTempCleanupSettingsOut:
+    settings = await local_delete.load_orphan_temp_cleanup_settings(request.app.state.db)
+    return OrphanTempCleanupSettingsOut(
+        enabled=settings.enabled, max_age_days=settings.max_age_days
+    )
+
+
+@router.put("/orphan-temp-cleanup", response_model=OrphanTempCleanupSettingsOut)
+async def put_orphan_temp_cleanup_settings(
+    body: OrphanTempCleanupSettingsIn, request: Request
+) -> OrphanTempCleanupSettingsOut:
+    """Merges over the previously-stored settings, same shape and same reason as
+    `put_retention_settings` above -- both fields on `OrphanTempCleanupSettingsIn` default, so
+    an omitted body (or a partial one) must not silently reset the other field.
+    """
+    db = request.app.state.db
+    current = await local_delete.load_orphan_temp_cleanup_settings(db)
+    provided = body.model_fields_set
+    settings = local_delete.OrphanTempCleanupSettings(
+        enabled=body.enabled if "enabled" in provided else current.enabled,
+        max_age_days=body.max_age_days if "max_age_days" in provided else current.max_age_days,
+    )
+    await local_delete.save_orphan_temp_cleanup_settings(db, settings)
+    return OrphanTempCleanupSettingsOut(
+        enabled=settings.enabled, max_age_days=settings.max_age_days
     )

@@ -48,6 +48,60 @@ def test_file_local_only_when_absent_remotely():
     assert nodes["orphan.txt"].structural_state == STATE_LOCAL_ONLY
 
 
+# --- `is_temp` (2026-08-13, prompts/2026-08-13-lftp-timestamped-temp-files.md): a still-temp
+# entry can never satisfy completeness, no matter what its `size` claims -- this is what
+# protects a `move`-mode queue from deleting the remote copy of a release that never actually
+# finished, just because an orphaned `.lftp`/`.lftp~<timestamp>~` file's reported size (a
+# sparse `st_size` with no sidecar to correct it, or a race between two writers) happened to
+# reach or exceed the remote size. ------------------------------------------------------------
+
+
+def test_orphaned_temp_file_at_or_above_remote_size_reads_partial_not_downloaded():
+    remote_tree = {"f.bin": RemoteEntry(rel_path="f.bin", is_dir=False, size=100, mtime=1.0)}
+    local_tree = {
+        "f.bin": LocalEntry(rel_path="f.bin", is_dir=False, size=150, is_temp=True),
+    }
+    nodes = reconcile(remote_tree, local_tree)
+    assert nodes["f.bin"].structural_state == STATE_PARTIAL
+
+
+def test_a_directory_with_only_an_orphaned_temp_file_never_reads_downloaded():
+    """The exact danger this task's fix protects against: an abandoned temp file whose
+    reported size reaches the remote size must not make the *directory* read DOWNLOADED --
+    on a `move`-mode queue, that state is what triggers verify -> delete-remote -> extract for
+    a release that was never actually complete.
+    """
+    remote_tree = _tree(
+        RemoteEntry("Release", True, 0, 1.0),
+        RemoteEntry("Release/movie.mkv", False, 1000, 1.0),
+    )
+    local_tree = _local(
+        LocalEntry("Release", True),
+        LocalEntry("Release/movie.mkv", False, 1000, is_temp=True),
+    )
+    nodes = reconcile(remote_tree, local_tree)
+    assert nodes["Release/movie.mkv"].structural_state == STATE_PARTIAL
+    assert nodes["Release"].structural_state != STATE_DOWNLOADED
+
+
+def test_a_directory_reads_downloaded_once_the_temp_file_has_actually_been_renamed():
+    """Same bytes, `is_temp=False` this time (the real, post-rename final file) -- confirms the
+    fix is scoped to "still a temp file," not an unconditional regression that would make a
+    completed download permanently unable to reach DOWNLOADED.
+    """
+    remote_tree = _tree(
+        RemoteEntry("Release", True, 0, 1.0),
+        RemoteEntry("Release/movie.mkv", False, 1000, 1.0),
+    )
+    local_tree = _local(
+        LocalEntry("Release", True),
+        LocalEntry("Release/movie.mkv", False, 1000, is_temp=False),
+    )
+    nodes = reconcile(remote_tree, local_tree)
+    assert nodes["Release/movie.mkv"].structural_state == STATE_DOWNLOADED
+    assert nodes["Release"].structural_state == STATE_DOWNLOADED
+
+
 # --- Directory-level state (rule 1: every non-dir descendant with a remote size must be
 # complete, else PARTIAL; rule 4: remote size is never latched, recomputed each call) -----
 

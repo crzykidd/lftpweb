@@ -412,6 +412,76 @@ async def test_concurrency_two_at_half_third_waits_then_refills(db, tmp_path):
         await q.stop()
 
 
+# --- duplicate jobs never become duplicate processes (2026-08-13,
+# prompts/2026-08-13-lftp-timestamped-temp-files.md) -- real lftp, real fake seedbox ---------
+
+
+async def test_two_queued_jobs_for_one_item_never_produce_two_running_lftp_processes(db, tmp_path):
+    """End-to-end confirmation of this task's root-cause fix, against real lftp: two `job` rows
+    for the same item (inserted directly, the shape a race around `enqueue_item`'s own guard --
+    or a bug -- could still produce) must never both become a `running` job with a live pid.
+    The user's original report was exactly this: 4 lftp processes where there should have been
+    2, because an item got queued twice.
+    """
+    host_id = await _make_host_row(db)
+    local_dir = tmp_path / "local"
+    local_dir.mkdir()
+    queue_id = await _make_queue_row(db, host_id, local_dir)
+    item_id = await _make_item_row(
+        db, queue_id, "Some.Release.S01E01.720p.WEB", is_dir=True, remote_size=5_245_952
+    )
+
+    # Two `queued` rows for the same item, bypassing `enqueue_item` entirely -- the scenario
+    # `core/queue.py.TransferQueue._admit`'s own guard exists to catch regardless of how the
+    # duplicate rows came to exist.
+    await db.execute(
+        "INSERT INTO job (item_id, kind, state, lane, rank, attempt, forced_full_rate) "
+        "VALUES (?, 'mirror', 'queued', 'main', 0, 1, 0)",
+        (item_id,),
+    )
+    await db.execute(
+        "INSERT INTO job (item_id, kind, state, lane, rank, attempt, forced_full_rate) "
+        "VALUES (?, 'mirror', 'queued', 'main', 0, 1, 0)",
+        (item_id,),
+    )
+    await db.commit()
+
+    q = await _queue_for(db, tmp_path, max_bandwidth_bps=300_000, max_concurrent_transfers=2)
+    await q.start()
+    try:
+
+        async def one_running():
+            rows = await (
+                await db.execute("SELECT state, pid FROM job WHERE item_id = ?", (item_id,))
+            ).fetchall()
+            return sum(1 for r in rows if r["state"] == "running" and r["pid"] is not None) >= 1
+
+        assert await _wait_until(one_running, timeout_s=15)
+        # Give the scheduler several more ticks' worth of time to (wrongly) admit the second
+        # row too, if the guard weren't in place.
+        await asyncio.sleep(2.0)
+
+        rows = await (
+            await db.execute("SELECT id, state, pid FROM job WHERE item_id = ?", (item_id,))
+        ).fetchall()
+        running_rows = [r for r in rows if r["state"] == "running"]
+        assert (
+            len(running_rows) == 1
+        ), f"expected exactly one running job for this item, found {len(running_rows)}"
+
+        import os
+
+        pid = running_rows[0]["pid"]
+        assert pid is not None and os.path.exists(
+            f"/proc/{pid}"
+        ), "the one running job's lftp process must actually be alive"
+
+        queued_rows = [r for r in rows if r["state"] == "queued"]
+        assert len(queued_rows) == 1, "the duplicate job must stay queued, not vanish or also run"
+    finally:
+        await q.stop()
+
+
 async def test_spawn_failure_fails_the_job_instead_of_hot_looping(db, tmp_path, monkeypatch):
     """An unspawnable job must fail visibly, not sit `queued` while the tick loops forever.
 
