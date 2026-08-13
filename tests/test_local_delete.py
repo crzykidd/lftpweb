@@ -17,7 +17,13 @@ import aiosqlite
 
 import lftpweb.core.engine as engine_module
 from lftpweb.core import local_delete
-from lftpweb.core.autoqueue import AutoQueue, ELIGIBLE_STATES, QueueAutoConfig
+from lftpweb.core.autoqueue import (
+    AutoQueue,
+    AutoQueueSettings,
+    ELIGIBLE_STATES,
+    QueueAutoConfig,
+    save_autoqueue_settings,
+)
 from lftpweb.core.engine import Engine, QueueConfig
 from lftpweb.core.events import EventBus
 from lftpweb.core.local_scan import LocalEntry
@@ -56,13 +62,30 @@ async def _make_queue(db, local_path, *, enabled=1) -> int:
     return cursor.lastrowid
 
 
+# Sentinel default for `_make_item`'s `remote_size` -- "same as `local_size`" (a normal
+# already-downloaded `copy`-mode item, which is what most of this file's fixtures represent
+# and, after 2026-08-13's state fix, is exactly the case that must read `REMOVED_LOCAL` after a
+# delete). Pass `remote_size=None` explicitly for a `LOCAL_ONLY`-shaped item instead.
+_SAME_AS_LOCAL = object()
+
+
 async def _make_item(
-    db, queue_id, rel_path, *, is_dir=False, state="DOWNLOADED", local_size=100, downloaded_at=None
+    db,
+    queue_id,
+    rel_path,
+    *,
+    is_dir=False,
+    state="DOWNLOADED",
+    local_size=100,
+    remote_size=_SAME_AS_LOCAL,
+    downloaded_at=None,
 ):
+    if remote_size is _SAME_AS_LOCAL:
+        remote_size = local_size
     cursor = await db.execute(
         "INSERT INTO item (queue_id, rel_path, is_dir, remote_size, local_size, state, downloaded_at) "
         "VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (queue_id, rel_path, 1 if is_dir else 0, local_size, local_size, state, downloaded_at),
+        (queue_id, rel_path, 1 if is_dir else 0, remote_size, local_size, state, downloaded_at),
     )
     await db.commit()
     return cursor.lastrowid
@@ -340,7 +363,12 @@ async def test_nlink_guard_off_deletes_a_single_link_file(tmp_path):
 # --- A successful delete: state, suppression, audit trail ------------------------------------
 
 
-async def test_successful_delete_sets_removed_both_and_suppresses_the_item(tmp_path):
+async def test_successful_delete_sets_removed_local_when_remote_copy_exists(tmp_path):
+    """The normal `copy`-mode case (task: prompts/2026-08-13-delete-must-mark-the-whole-
+    subtree.md, item 0). `_make_item`'s default `remote_size` mirrors `local_size` -- an
+    already-downloaded item with a surviving remote copy -- so this must land on `REMOVED_LOCAL`,
+    not the unconditional `REMOVED_BOTH` this used to write.
+    """
     local_root = tmp_path / "local"
     local_root.mkdir()
     release = local_root / "Release"
@@ -368,10 +396,11 @@ async def test_successful_delete_sets_removed_both_and_suppresses_the_item(tmp_p
 
         assert outcome.deleted is True
         assert outcome.bytes_freed == 50
+        assert outcome.affected_rel_paths == ("Release",)
         assert not release.exists()
 
         item = await _item_row(db, item_id)
-        assert item["state"] == "REMOVED_BOTH"
+        assert item["state"] == "REMOVED_LOCAL"
         assert item["auto_queue_suppressed"] == 1
         assert item["suppressed_reason"] == "deleted_local"
 
@@ -381,6 +410,45 @@ async def test_successful_delete_sets_removed_both_and_suppresses_the_item(tmp_p
         published = subscriber.get_nowait()
         assert published["type"] == "item_delta"
         assert published["nodes"][0]["id"] == item_id
+        assert published["nodes"][0]["state"] == "REMOVED_LOCAL"
+    finally:
+        await db.close()
+
+
+async def test_successful_delete_sets_removed_both_when_no_remote_copy(tmp_path):
+    """A `LOCAL_ONLY` item (or a `move` queue whose remote copy is already gone) has
+    `remote_size IS NULL` -- both copies really are gone once this delete runs, so `REMOVED_BOTH`
+    is correct here, unlike the `REMOVED_LOCAL` case above.
+    """
+    local_root = tmp_path / "local"
+    local_root.mkdir()
+    target = local_root / "junk.txt"
+    target.write_bytes(b"x" * 30)
+    write_if_needed(str(local_root))
+
+    db = await _make_db()
+    try:
+        queue_id = await _make_queue(db, local_root)
+        item_id = await _make_item(
+            db, queue_id, "junk.txt", state="LOCAL_ONLY", local_size=30, remote_size=None
+        )
+
+        outcome = await local_delete.delete_local(
+            db,
+            item=await _item_row(db, item_id),
+            queue=await _queue_row(db, queue_id),
+            caller="manual",
+            require_nlink_guard=False,
+            in_flight_item_ids=frozenset(),
+        )
+
+        assert outcome.deleted is True
+        assert not target.exists()
+
+        item = await _item_row(db, item_id)
+        assert item["state"] == "REMOVED_BOTH"
+        assert item["auto_queue_suppressed"] == 1
+        assert item["suppressed_reason"] == "deleted_local"
     finally:
         await db.close()
 
@@ -414,6 +482,344 @@ async def test_delete_of_a_symlinked_item_removes_only_the_link(tmp_path):
         assert not link.is_symlink()
         assert inside_target.exists(), "only the link is removed, never its target's contents"
         assert (inside_target / "a.txt").exists()
+    finally:
+        await db.close()
+
+
+# --- Subtree marking (2026-08-13, prompts/2026-08-13-delete-must-mark-the-whole-subtree.md) --
+
+
+async def test_delete_marks_every_descendant_immediately_no_scan_needed(tmp_path):
+    """The bug this task fixes: `WHERE id = ?` only ever touched the clicked row, leaving every
+    descendant `item` row untouched until a scan's grace period (up to ten minutes) elapsed.
+    Every descendant must be suppressed with `deleted_local` the instant `delete_local` returns
+    -- no scan in between, no grace period elapsed.
+    """
+    local_root = tmp_path / "local"
+    local_root.mkdir()
+    release = local_root / "Release"
+    release.mkdir()
+    (release / "a.mkv").write_bytes(b"x" * 10)
+    (release / "b.mkv").write_bytes(b"x" * 15)
+    write_if_needed(str(local_root))
+
+    db = await _make_db()
+    try:
+        queue_id = await _make_queue(db, local_root)
+        top_id = await _make_item(db, queue_id, "Release", is_dir=True, local_size=25)
+        a_id = await _make_item(db, queue_id, "Release/a.mkv", local_size=10)
+        b_id = await _make_item(db, queue_id, "Release/b.mkv", local_size=15)
+
+        outcome = await local_delete.delete_local(
+            db,
+            item=await _item_row(db, top_id),
+            queue=await _queue_row(db, queue_id),
+            caller="manual",
+            require_nlink_guard=False,
+            in_flight_item_ids=frozenset(),
+        )
+
+        assert outcome.deleted is True
+        assert set(outcome.affected_rel_paths) == {"Release", "Release/a.mkv", "Release/b.mkv"}
+
+        for touched_id in (top_id, a_id, b_id):
+            item = await _item_row(db, touched_id)
+            assert item["state"] == "REMOVED_LOCAL"
+            assert item["auto_queue_suppressed"] == 1
+            assert item["suppressed_reason"] == "deleted_local"
+            assert item["first_missing_at"] is None, "no grace-period clock was ever started"
+    finally:
+        await db.close()
+
+
+async def test_delete_publishes_the_whole_subtree_in_one_ws_message(tmp_path):
+    """The WebSocket side of the same fix: a single-row `item_delta` left every descendant's
+    last-published node claiming `DOWNLOADED` until the next full scan resent the tree --
+    exactly the stale-subtree symptom item 6 of the task calls out. This asserts at the message
+    level (no browser here) that one `item_delta` carries every affected node, each already
+    showing its correct post-delete state.
+    """
+    local_root = tmp_path / "local"
+    local_root.mkdir()
+    release = local_root / "Release"
+    release.mkdir()
+    (release / "a.mkv").write_bytes(b"x" * 10)
+    (release / "b.mkv").write_bytes(b"x" * 15)
+    write_if_needed(str(local_root))
+
+    db = await _make_db()
+    try:
+        queue_id = await _make_queue(db, local_root)
+        top_id = await _make_item(db, queue_id, "Release", is_dir=True, local_size=25)
+        await _make_item(db, queue_id, "Release/a.mkv", local_size=10)
+        await _make_item(db, queue_id, "Release/b.mkv", local_size=15)
+
+        events_bus = EventBus()
+        subscriber = events_bus.subscribe()
+
+        outcome = await local_delete.delete_local(
+            db,
+            item=await _item_row(db, top_id),
+            queue=await _queue_row(db, queue_id),
+            caller="manual",
+            require_nlink_guard=False,
+            in_flight_item_ids=frozenset(),
+            events=events_bus,
+        )
+        assert outcome.deleted is True
+
+        published = subscriber.get_nowait()
+        assert published["type"] == "item_delta"
+        assert published["queue_id"] == queue_id
+        published_by_path = {n["rel_path"]: n for n in published["nodes"]}
+        assert set(published_by_path) == {"Release", "Release/a.mkv", "Release/b.mkv"}
+        for node in published_by_path.values():
+            assert node["state"] == "REMOVED_LOCAL"
+
+        # A directory delete is one coherent message, not one per row -- nothing else was
+        # published.
+        assert subscriber.empty()
+    finally:
+        await db.close()
+
+
+async def test_subtree_state_is_chosen_per_row_not_per_batch(tmp_path):
+    """A directory can hold a mix -- an `EXCLUDED` child that never had a remote counterpart
+    alongside siblings that did (task item 1's own example) -- so each row's state comes from
+    its own `remote_size`, never one verdict reused for the whole subtree.
+    """
+    local_root = tmp_path / "local"
+    local_root.mkdir()
+    release = local_root / "Release"
+    release.mkdir()
+    (release / "a.mkv").write_bytes(b"x" * 10)
+    (release / "local-only.nfo").write_bytes(b"x" * 5)
+    write_if_needed(str(local_root))
+
+    db = await _make_db()
+    try:
+        queue_id = await _make_queue(db, local_root)
+        top_id = await _make_item(db, queue_id, "Release", is_dir=True, local_size=15)
+        with_remote_id = await _make_item(db, queue_id, "Release/a.mkv", local_size=10)
+        local_only_id = await _make_item(
+            db,
+            queue_id,
+            "Release/local-only.nfo",
+            state="EXCLUDED",
+            local_size=5,
+            remote_size=None,
+        )
+
+        outcome = await local_delete.delete_local(
+            db,
+            item=await _item_row(db, top_id),
+            queue=await _queue_row(db, queue_id),
+            caller="manual",
+            require_nlink_guard=False,
+            in_flight_item_ids=frozenset(),
+        )
+        assert outcome.deleted is True
+
+        assert (await _item_row(db, top_id))["state"] == "REMOVED_LOCAL"
+        assert (await _item_row(db, with_remote_id))["state"] == "REMOVED_LOCAL"
+        assert (await _item_row(db, local_only_id))["state"] == "REMOVED_BOTH"
+
+        for touched_id in (top_id, with_remote_id, local_only_id):
+            item = await _item_row(db, touched_id)
+            assert item["auto_queue_suppressed"] == 1
+            assert item["suppressed_reason"] == "deleted_local"
+    finally:
+        await db.close()
+
+
+async def test_delete_does_not_touch_a_sibling_sharing_a_name_prefix(tmp_path):
+    """`LIKE 'target%'` would also match `target-extra` -- this module never uses `LIKE`
+    (`_subtree_rows`'s own docstring), so a sibling sharing a name prefix must survive intact.
+    """
+    local_root = tmp_path / "local"
+    local_root.mkdir()
+    target_dir = local_root / "Release"
+    target_dir.mkdir()
+    (target_dir / "a.mkv").write_bytes(b"x" * 10)
+    sibling_dir = local_root / "Release-Extra"
+    sibling_dir.mkdir()
+    (sibling_dir / "b.mkv").write_bytes(b"x" * 15)
+    write_if_needed(str(local_root))
+
+    db = await _make_db()
+    try:
+        queue_id = await _make_queue(db, local_root)
+        target_id = await _make_item(db, queue_id, "Release", is_dir=True, local_size=10)
+        child_id = await _make_item(db, queue_id, "Release/a.mkv", local_size=10)
+        sibling_id = await _make_item(db, queue_id, "Release-Extra", is_dir=True, local_size=15)
+        sibling_child_id = await _make_item(db, queue_id, "Release-Extra/b.mkv", local_size=15)
+
+        outcome = await local_delete.delete_local(
+            db,
+            item=await _item_row(db, target_id),
+            queue=await _queue_row(db, queue_id),
+            caller="manual",
+            require_nlink_guard=False,
+            in_flight_item_ids=frozenset(),
+        )
+
+        assert outcome.deleted is True
+        assert set(outcome.affected_rel_paths) == {"Release", "Release/a.mkv"}
+        assert not target_dir.exists()
+        assert sibling_dir.exists(), "a sibling sharing a name prefix must survive"
+
+        for touched_id in (target_id, child_id):
+            item = await _item_row(db, touched_id)
+            assert item["auto_queue_suppressed"] == 1
+
+        for untouched_id in (sibling_id, sibling_child_id):
+            item = await _item_row(db, untouched_id)
+            assert item["state"] == "DOWNLOADED"
+            assert item["auto_queue_suppressed"] == 0
+    finally:
+        await db.close()
+
+
+async def test_delete_handles_sql_like_metacharacters_in_rel_path(tmp_path):
+    """`_` and `%` are SQL `LIKE` wildcards and turn up constantly in real scene release names
+    (`_` especially). This module matches subtree membership in Python
+    (`_subtree_rows`), never SQL `LIKE`, so neither character can cause an unrelated sibling to
+    be swept in -- unlike a naive `LIKE 'target%'` pattern would (`_` substitutes for any single
+    character; a literal `%` in the target acts as its own wildcard).
+    """
+    local_root = tmp_path / "local"
+    local_root.mkdir()
+    target_dir = local_root / "My_Release%2024"
+    target_dir.mkdir()
+    (target_dir / "file_1.mkv").write_bytes(b"x" * 20)
+    write_if_needed(str(local_root))
+
+    db = await _make_db()
+    try:
+        queue_id = await _make_queue(db, local_root)
+        target_id = await _make_item(db, queue_id, "My_Release%2024", is_dir=True, local_size=20)
+        child_id = await _make_item(db, queue_id, "My_Release%2024/file_1.mkv", local_size=20)
+
+        # Would incorrectly match a naive `LIKE 'My_Release%2024%'` pattern: `_` wildcards to
+        # any single character, so "MyXRelease%2024" satisfies "My" + (any char) + "Release%2024".
+        underscore_trap_id = await _make_item(db, queue_id, "MyXRelease%2024", local_size=5)
+        # Would also incorrectly match: the literal `%` in the target acts as a `LIKE` wildcard
+        # for "anything", so "My_ReleaseABCD2024-unrelated" satisfies "My_Release" + (anything)
+        # + "2024" + (anything).
+        percent_trap_id = await _make_item(
+            db, queue_id, "My_ReleaseABCD2024-unrelated", local_size=5
+        )
+
+        outcome = await local_delete.delete_local(
+            db,
+            item=await _item_row(db, target_id),
+            queue=await _queue_row(db, queue_id),
+            caller="manual",
+            require_nlink_guard=False,
+            in_flight_item_ids=frozenset(),
+        )
+
+        assert outcome.deleted is True
+        assert set(outcome.affected_rel_paths) == {
+            "My_Release%2024",
+            "My_Release%2024/file_1.mkv",
+        }
+
+        for touched_id in (target_id, child_id):
+            item = await _item_row(db, touched_id)
+            assert item["auto_queue_suppressed"] == 1
+
+        for untouched_id in (underscore_trap_id, percent_trap_id):
+            item = await _item_row(db, untouched_id)
+            assert item["state"] == "DOWNLOADED"
+            assert item["auto_queue_suppressed"] == 0
+    finally:
+        await db.close()
+
+
+async def test_delete_does_not_touch_the_same_rel_path_in_a_different_queue(tmp_path):
+    """Two queues can hold the same `rel_path` -- `_subtree_rows` scopes to `queue_id`, so a
+    delete in one queue must never reach into another.
+    """
+    local_root_a = tmp_path / "local-a"
+    local_root_a.mkdir()
+    (local_root_a / "Release").mkdir()
+    (local_root_a / "Release" / "a.mkv").write_bytes(b"x" * 10)
+    local_root_b = tmp_path / "local-b"
+    local_root_b.mkdir()
+    (local_root_b / "Release").mkdir()
+    (local_root_b / "Release" / "a.mkv").write_bytes(b"x" * 10)
+    write_if_needed(str(local_root_a))
+    write_if_needed(str(local_root_b))
+
+    db = await _make_db()
+    try:
+        queue_a = await _make_queue(db, local_root_a)
+        queue_b = await _make_queue(db, local_root_b)
+        item_a = await _make_item(db, queue_a, "Release", is_dir=True, local_size=10)
+        await _make_item(db, queue_a, "Release/a.mkv", local_size=10)
+        item_b = await _make_item(db, queue_b, "Release", is_dir=True, local_size=10)
+        child_b = await _make_item(db, queue_b, "Release/a.mkv", local_size=10)
+
+        outcome = await local_delete.delete_local(
+            db,
+            item=await _item_row(db, item_a),
+            queue=await _queue_row(db, queue_a),
+            caller="manual",
+            require_nlink_guard=False,
+            in_flight_item_ids=frozenset(),
+        )
+        assert outcome.deleted is True
+
+        for untouched_id in (item_b, child_b):
+            item = await _item_row(db, untouched_id)
+            assert item["state"] == "DOWNLOADED"
+            assert item["auto_queue_suppressed"] == 0
+        assert (local_root_b / "Release" / "a.mkv").exists()
+    finally:
+        await db.close()
+
+
+async def test_dry_run_reports_the_same_subtree_a_real_run_marks(tmp_path):
+    local_root = tmp_path / "local"
+    local_root.mkdir()
+    release = local_root / "Release"
+    release.mkdir()
+    (release / "a.mkv").write_bytes(b"x" * 10)
+    (release / "b.mkv").write_bytes(b"x" * 15)
+    write_if_needed(str(local_root))
+
+    db = await _make_db()
+    try:
+        queue_id = await _make_queue(db, local_root)
+        item_id = await _make_item(db, queue_id, "Release", is_dir=True, local_size=25)
+        await _make_item(db, queue_id, "Release/a.mkv", local_size=10)
+        await _make_item(db, queue_id, "Release/b.mkv", local_size=15)
+
+        dry = await local_delete.delete_local(
+            db,
+            item=await _item_row(db, item_id),
+            queue=await _queue_row(db, queue_id),
+            caller="manual",
+            require_nlink_guard=False,
+            in_flight_item_ids=frozenset(),
+            dry_run=True,
+        )
+        assert dry.deleted is True
+        assert release.exists(), "a dry run must not touch the filesystem"
+
+        real = await local_delete.delete_local(
+            db,
+            item=await _item_row(db, item_id),
+            queue=await _queue_row(db, queue_id),
+            caller="manual",
+            require_nlink_guard=False,
+            in_flight_item_ids=frozenset(),
+        )
+        assert real.deleted is True
+
+        assert set(dry.affected_rel_paths) == set(real.affected_rel_paths)
+        assert set(dry.affected_rel_paths) == {"Release", "Release/a.mkv", "Release/b.mkv"}
     finally:
         await db.close()
 
@@ -617,6 +1023,124 @@ async def test_reconcile_only_completion_backfills_downloaded_at_for_retention(
         await db.close()
 
 
+# --- The Files list reflects disk, through a real Engine.scan_queue pass ---------------------
+
+
+async def test_delete_survives_a_scan_without_reverting_to_downloaded(tmp_path):
+    """The user-visible symptom that started this task: a directory row correctly showed
+    `REMOVED_BOTH`/`REMOVED_LOCAL`, but every file inside it kept reading `DOWNLOADED` because
+    only the clicked row was ever updated -- and once a scan ran, the descendants would have
+    entered §7.3's ten-minute grace period rather than reflecting the delete immediately. This
+    goes through a real `Engine.scan_queue` pass (the Files list's actual read path), not just
+    `delete_local` in isolation.
+    """
+    rel_path = "Release"
+    local_root = tmp_path / "local"
+    release = local_root / rel_path
+    release.mkdir(parents=True)
+    (release / "a.mkv").write_bytes(b"x" * 10)
+    (release / "b.mkv").write_bytes(b"x" * 15)
+
+    remote_tree = {
+        rel_path: RemoteEntry(rel_path=rel_path, is_dir=True),
+        f"{rel_path}/a.mkv": RemoteEntry(
+            rel_path=f"{rel_path}/a.mkv", is_dir=False, size=10, mtime=1.0
+        ),
+        f"{rel_path}/b.mkv": RemoteEntry(
+            rel_path=f"{rel_path}/b.mkv", is_dir=False, size=15, mtime=1.0
+        ),
+    }
+
+    db = await _make_db()
+    try:
+        cursor = await db.execute(
+            "INSERT INTO host (name, address, port, username, auth_method, known_hosts_policy) "
+            "VALUES ('h', '127.0.0.1', 22, 'u', 'key', 'strict')"
+        )
+        host_id = cursor.lastrowid
+        cursor = await db.execute(
+            "INSERT INTO path_queue (host_id, name, remote_path, local_path, enabled, sync_mode) "
+            "VALUES (?, 'q', '/remote', ?, 1, 'copy')",
+            (host_id, str(local_root)),
+        )
+        queue_id = cursor.lastrowid
+        await db.commit()
+
+        engine = Engine(db, str(tmp_path), EventBus())
+        engine.pool = _FakePool(remote_tree)
+        q = QueueConfig(
+            id=queue_id,
+            host_id=host_id,
+            name="q",
+            remote_path="/remote",
+            local_path=str(local_root),
+            staging_path=None,
+            enabled=True,
+            sync_mode="copy",
+        )
+        host = HostConfig(
+            id=host_id,
+            address="127.0.0.1",
+            port=22,
+            username="u",
+            auth_method="key",
+            key_path="/k",
+            known_hosts_policy="strict",
+        )
+
+        # A real first scan finds the pre-existing local files and reaches DOWNLOADED --
+        # everything is genuinely present, on both sides, exactly like an item lftpweb itself
+        # downloaded earlier.
+        await engine.scan_queue(q, host)
+
+        async def _state(path: str) -> str | None:
+            cursor = await db.execute(
+                "SELECT state FROM item WHERE queue_id = ? AND rel_path = ?", (queue_id, path)
+            )
+            row = await cursor.fetchone()
+            return row["state"] if row else None
+
+        assert await _state(rel_path) == "DOWNLOADED"
+        assert await _state(f"{rel_path}/a.mkv") == "DOWNLOADED"
+        assert await _state(f"{rel_path}/b.mkv") == "DOWNLOADED"
+
+        cursor = await db.execute(
+            "SELECT * FROM item WHERE queue_id = ? AND rel_path = ?", (queue_id, rel_path)
+        )
+        release_row = await cursor.fetchone()
+        cursor = await db.execute("SELECT * FROM path_queue WHERE id = ?", (queue_id,))
+        queue_row = await cursor.fetchone()
+
+        outcome = await local_delete.delete_local(
+            db,
+            item=release_row,
+            queue=queue_row,
+            caller="manual",
+            require_nlink_guard=False,
+            in_flight_item_ids=frozenset(),
+        )
+        assert outcome.deleted is True
+        assert not release.exists()
+
+        # Immediately -- no scan run yet -- every descendant already reflects the delete. The
+        # remote copy still exists (`remote_tree` above is unchanged), so REMOVED_LOCAL is the
+        # correct reading, not REMOVED_BOTH.
+        assert await _state(rel_path) == "REMOVED_LOCAL"
+        assert await _state(f"{rel_path}/a.mkv") == "REMOVED_LOCAL"
+        assert await _state(f"{rel_path}/b.mkv") == "REMOVED_LOCAL"
+
+        # A further scan pass -- remote unchanged, local genuinely empty now -- must not
+        # resurrect DOWNLOADED for any of them, nor start a fresh grace-period clock: they're
+        # `auto_queue_suppressed`, so `_protected_rel_paths` holds `state` untouched, never
+        # `resolve_absence`.
+        await engine.scan_queue(q, host)
+        assert await _state(rel_path) == "REMOVED_LOCAL"
+        assert await _state(f"{rel_path}/a.mkv") == "REMOVED_LOCAL"
+        assert await _state(f"{rel_path}/b.mkv") == "REMOVED_LOCAL"
+    finally:
+        await db.close()
+
+
 # --- An item deleted by retention is not re-queued on the next scan --------------------------
 
 
@@ -646,16 +1170,22 @@ async def test_retention_deleted_item_is_not_requeued_by_autoqueue(tmp_path):
         assert result.deleted == 1
 
         item = await _item_row(db, item_id)
-        assert item["state"] == "REMOVED_BOTH"
+        # The hardlink to `pickup` above proves a second copy exists, but the item's own
+        # `remote_size` (defaulted to `local_size` by `_make_item`) is what `delete_local`
+        # actually reads -- and it is set here, so this lands on `REMOVED_LOCAL`, not
+        # `REMOVED_BOTH` (fixed 2026-08-13,
+        # prompts/2026-08-13-delete-must-mark-the-whole-subtree.md; it used to be an
+        # unconditional `REMOVED_BOTH`).
+        assert item["state"] == "REMOVED_LOCAL"
         assert item["auto_queue_suppressed"] == 1
 
         # `REMOVED_LOCAL` is excluded from `ELIGIBLE_STATES` by default (reverted, 2026-08-12,
-        # docs/decisions.md), so this item would stay excluded by state name alone even without
-        # the assertion below -- but `delete_local` never writes bare `REMOVED_LOCAL` anyway
-        # (it goes straight to `REMOVED_BOTH`, already asserted above), so the real safety net
-        # this test is pinning is suppression, which holds regardless of the eligible-states
-        # tuple or the `re_download_externally_removed` setting -- lftpweb never re-fetches
-        # what it deleted itself.
+        # docs/decisions.md), so with the default (off) `re_download_externally_removed`
+        # setting this item is excluded by state name alone even before suppression is
+        # considered. `test_removed_local_after_delete_is_never_requeued_even_with_the_setting_on`
+        # below is the sharper test: with the setting *on*, `REMOVED_LOCAL` *does* become
+        # state-name-eligible, and suppression is the only thing left standing between this
+        # item and a re-fetch.
         assert "REMOVED_LOCAL" not in ELIGIBLE_STATES
 
         enqueued: list[int] = []
@@ -675,6 +1205,103 @@ async def test_retention_deleted_item_is_not_requeued_by_autoqueue(tmp_path):
         )
         assert queued == 0
         assert enqueued == []
+    finally:
+        await db.close()
+
+
+async def test_removed_local_after_delete_is_never_requeued_even_with_the_setting_on(tmp_path):
+    """The suppression flag, not the state name, is what actually stops the re-fetch. With
+    `re_download_externally_removed` **on**, `ELIGIBLE_STATES_WITH_EXTERNALLY_REMOVED` names
+    `REMOVED_LOCAL` explicitly -- so a delete-produced `REMOVED_LOCAL` row would be picked right
+    back up here if `auto_queue_suppressed` weren't also set in the same write. This is the
+    scenario `core/autoqueue.py`'s own module docstring names as the thing that must never
+    happen.
+    """
+    local_root = tmp_path / "local"
+    local_root.mkdir()
+    release = local_root / "Release.mkv"
+    release.write_bytes(b"x" * 10)
+    write_if_needed(str(local_root))
+
+    db = await _make_db()
+    try:
+        queue_id = await _make_queue(db, local_root)
+        item_id = await _make_item(db, queue_id, "Release.mkv", local_size=10)
+
+        outcome = await local_delete.delete_local(
+            db,
+            item=await _item_row(db, item_id),
+            queue=await _queue_row(db, queue_id),
+            caller="manual",
+            require_nlink_guard=False,
+            in_flight_item_ids=frozenset(),
+        )
+        assert outcome.deleted is True
+
+        item = await _item_row(db, item_id)
+        assert item["state"] == "REMOVED_LOCAL"
+        assert item["auto_queue_suppressed"] == 1
+
+        await save_autoqueue_settings(db, AutoQueueSettings(re_download_externally_removed=True))
+
+        enqueued: list[int] = []
+
+        async def _enqueue(item_id: int) -> int:
+            enqueued.append(item_id)
+            return item_id
+
+        aq = AutoQueue(db, _enqueue)
+        queued = await aq.on_scan(
+            QueueAutoConfig(
+                id=queue_id,
+                local_path=str(local_root),
+                auto_queue_enabled=True,
+                patterns_only=False,
+            )
+        )
+        assert queued == 0
+        assert enqueued == []
+    finally:
+        await db.close()
+
+
+async def test_retention_marks_the_deleted_items_subtree_too(tmp_path):
+    """Retention shares `delete_local()` with the manual endpoint, so it inherits the same
+    subtree-marking fix -- `_select_expired` only ever selects top-level items (DESIGN.md
+    §4.7), but a directory's descendant rows must still come out of a retention delete
+    suppressed and correctly stated.
+    """
+    local_root = tmp_path / "local"
+    local_root.mkdir()
+    pickup = tmp_path / "arr-library"
+    pickup.mkdir()
+    release = local_root / "Old.Release"
+    release.mkdir()
+    (release / "a.mkv").write_bytes(b"x" * 10)
+    os.link(release / "a.mkv", pickup / "old-a.mkv")
+    write_if_needed(str(local_root))
+
+    db = await _make_db()
+    try:
+        queue_id = await _make_queue(db, local_root)
+        old_ts = (datetime.now(UTC) - timedelta(days=60)).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+        top_id = await _make_item(
+            db, queue_id, "Old.Release", is_dir=True, local_size=10, downloaded_at=old_ts
+        )
+        child_id = await _make_item(db, queue_id, "Old.Release/a.mkv", local_size=10)
+
+        await local_delete.save_retention_settings(
+            db, local_delete.RetentionSettings(enabled=True, retention_days=30.0)
+        )
+        scheduler = local_delete.RetentionScheduler(db, EventBus())
+        result = await scheduler.run_once()
+        assert result.deleted == 1
+
+        for touched_id in (top_id, child_id):
+            item = await _item_row(db, touched_id)
+            assert item["state"] == "REMOVED_LOCAL"
+            assert item["auto_queue_suppressed"] == 1
+            assert item["suppressed_reason"] == "deleted_local"
     finally:
         await db.close()
 

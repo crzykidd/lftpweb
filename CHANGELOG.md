@@ -372,6 +372,20 @@ alongside this list: several entries below ship with deliberate, documented limi
   `docs/decisions.md` for the licence position (UnRAR's own licence permits redistributing the
   binary; it forbids only using its source to build a RAR-compatible compressor, which this
   project never needed).
+- **Deleting a directory from the Files page only updated the row that was clicked** *(found and
+  fixed the same day as the delete feature itself shipped, 2026-08-13)*: every file inside kept
+  reading `DOWNLOADED` after being deleted, and would have entered §7.3's ten-minute absence
+  grace period on the next scan rather than reflecting the delete — the exact mechanism that
+  grace period exists to *not* apply to a deletion this codebase performed and has a record of.
+  `delete_local` (the primitive both the manual delete button and scheduled retention share) now
+  marks the whole subtree — the target and every descendant `item` row in the same queue — in
+  the same transaction as the files' removal, each row suppressed from auto-queue individually.
+  In the same fix: a delete's `item.state` is now chosen per row from whether a remote copy
+  still exists (`REMOVED_LOCAL`) or not (`REMOVED_BOTH`), rather than always writing
+  `REMOVED_BOTH` — the unconditional `REMOVED_BOTH` the delete feature shipped with hours
+  earlier made the Files list stop reflecting what was actually on disk. Suppression, not the
+  state name, is what stops the re-fetch either way, so a deleted item can still be queued again
+  manually and downloads normally.
 
 ### Security
 

@@ -6,6 +6,69 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-13 — Delete must mark the whole subtree, and the state it marks each row with is
+## chosen per row, not hardcoded
+
+**Handoff prompt `prompts/2026-08-13-delete-must-mark-the-whole-subtree.md`, executed end to
+end.** Found by the user hours after the delete feature itself shipped (`dfb74c2`): deleting a
+directory correctly set the clicked row to `REMOVED_BOTH`, but every file inside it kept
+reading `DOWNLOADED` — `delete_local`'s own `UPDATE ... WHERE id = ?` only ever touched the one
+row a caller passed in. Left alone, the next scan would have run those descendants through
+§7.3's absence grace period (`core/mount_sentinel.py.resolve_absence`) — the mechanism that
+exists for *unexplained* absence (a flaky mount, an importer mid-move), applied here to a
+deletion this codebase performed itself and already has an `event` row for. Two defects
+followed: the visible one (ten minutes of `DOWNLOADED` on deleted files) and a consistency one
+(once the grace period elapsed, descendants would land at bare, unsuppressed `REMOVED_LOCAL`,
+contradicting their own suppressed parent).
+
+**Fix, in two parts, both in `core/local_delete.py`:**
+
+1. **`_subtree_rows`** matches subtree membership (`rel_path == target` or
+   `rel_path.startswith(target + "/")`) **in Python, not SQL `LIKE`** — deliberately.
+   `LIKE 'target%'` matches a sibling `target-extra`, and `_`/`%` are `LIKE` wildcards that
+   collide constantly with real scene release names (`My_Release%2024` is a completely
+   ordinary filename, not an edge case). Escaping them is a second thing to keep correct for no
+   benefit over an exact Python string comparison, so this doesn't use `LIKE` at all. Scoped to
+   `queue_id`, since two queues can hold the same `rel_path`.
+2. **`_mark_subtree_removed`** writes every row `_subtree_rows` finds, in the same transaction
+   as the filesystem delete — a crash between "files gone" and "rows updated" must not be a
+   state this module leaves reachable.
+
+**The state each row gets was also wrong, independent of the subtree bug.** `delete_local`
+wrote an unconditional `REMOVED_BOTH` — this module's own docstring called that "a deliberate,
+minor overload," but the user hit it as a real, visible bug: after deleting a `copy`-mode
+item whose remote copy is untouched, the Files list stopped reflecting what was actually on
+disk. `_removed_state_for` now reads `item.remote_size` (the same column
+`FileTree.tsx`'s delete dialog already reads for the identical "does a remote copy survive"
+question) and chooses `REMOVED_LOCAL` when one exists, `REMOVED_BOTH` only when both copies are
+genuinely gone (`LOCAL_ONLY`, or a `move` queue past its own remote-delete step). **This does
+not reopen `6d3bd95`** (prompts/open-issues.md "4," reverted the same night): that revert was
+about *unsuppressed* `REMOVED_LOCAL` from the grace period becoming auto-queue-eligible by
+state name alone. `delete_local` still sets `auto_queue_suppressed = 1` +
+`suppressed_reason = 'deleted_local'` on every row unconditionally, in the same write as the
+state — suppression is what stops the re-fetch, not the state name, and that separation is
+exactly what `6d3bd95` established. A new test
+(`test_removed_local_after_delete_is_never_requeued_even_with_the_setting_on`) pins this
+explicitly: even with `re_download_externally_removed` **on** — which puts bare `REMOVED_LOCAL`
+back in `core/autoqueue.py.ELIGIBLE_STATES_WITH_EXTERNALLY_REMOVED` — a delete-produced
+`REMOVED_LOCAL` row is still never re-queued, because suppression, not eligibility, is what's
+actually checked.
+
+**Rejected: leaving `REMOVED_BOTH` unconditional and fixing only the subtree bug.** The subtree
+fix alone would have made the *wrong* state consistent across an entire directory instead of
+just the top row — worse, not better, for the Files list actually reflecting disk. The user
+raised the state question directly, so both had to land together.
+
+**Retention needed no separate fix.** `RetentionScheduler`/`preview_retention` both call
+`delete_local()` — the shared primitive — so the subtree marking and the per-row state both
+apply to a retention delete automatically; a new test
+(`test_retention_marks_the_deleted_items_subtree_too`) confirms this rather than assuming it.
+
+Updated stale documentation that described the old, unconditional-`REMOVED_BOTH` behaviour as
+current: `core/local_delete.py`'s own module docstring, and the "two ways a local copy goes
+away" comment block in `core/autoqueue.py` above `ELIGIBLE_STATES` — both now describe
+suppression, not the state name, as the actual invariant.
+
 ## 2026-08-13 — Delete archives after extract: the `EXCLUDED` mechanism reused, not a second
 ## completeness rule, and why `move` mode and the relocate step needed no extra gate
 

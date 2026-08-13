@@ -64,10 +64,15 @@ logger = logging.getLogger(__name__)
 # goes away, and they need opposite treatment:**
 #
 #   1. lftpweb deleted it itself (`core/local_delete.py.delete_local` -- a manual delete from
-#      Files, or the retention sweep). That write always lands on `REMOVED_BOTH`, never bare
-#      `REMOVED_LOCAL`, *and* sets `auto_queue_suppressed = 1` in the same write. Already
-#      excluded by `ELIGIBLE_STATES` not naming `REMOVED_BOTH` at all -- unaffected by anything
-#      below, under either setting.
+#      Files, or the retention sweep). That write chooses `REMOVED_LOCAL` when a remote copy
+#      still exists and `REMOVED_BOTH` when it doesn't (fixed 2026-08-13,
+#      `prompts/2026-08-13-delete-must-mark-the-whole-subtree.md` -- it used to be an
+#      unconditional `REMOVED_BOTH`; see docs/decisions.md), *and* sets `auto_queue_suppressed
+#      = 1` in the same write, always. So a `delete_local` row genuinely can read bare
+#      `REMOVED_LOCAL` and still be excluded here -- by `auto_queue_suppressed = 0` in the
+#      query below, not by the state name. The state name is what tells the Files page the
+#      truth about disk; the suppression flag is what stops the re-fetch. Conflating the two
+#      is the exact bug this file's own history (case 2, `6d3bd95`) is about.
 #   2. Something *outside* lftpweb moved it -- an `*arr` importer picking up a finished
 #      release (DESIGN.md §7.2's ordinary, expected import), a human, a script. This is the
 #      only path that ever produces a bare `REMOVED_LOCAL` with `auto_queue_suppressed` clear
@@ -88,8 +93,10 @@ logger = logging.getLogger(__name__)
 # genuinely wants a copy-mode queue to re-fetch what something outside lftpweb removed. Named
 # and scoped by *who removed the file*, never by the state name alone -- "locally deleted" is
 # ambiguous about the agent of deletion, which is the exact confusion that produced this bug.
-# lftpweb's own deletions are excluded by `REMOVED_BOTH` not appearing in either tuple below,
-# under either setting value -- that is not something this toggle can ever switch on.
+# lftpweb's own deletions are excluded by `auto_queue_suppressed = 1`, under either setting
+# value and regardless of which of the two states the row landed on -- that is not something
+# this toggle can ever switch on, because the toggle only widens which *state names* are
+# eligible and never clears suppression.
 ELIGIBLE_STATES = ("REMOTE_ONLY", "PARTIAL")
 ELIGIBLE_STATES_WITH_EXTERNALLY_REMOVED = ELIGIBLE_STATES + ("REMOVED_LOCAL",)
 

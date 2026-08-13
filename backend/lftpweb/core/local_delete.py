@@ -25,18 +25,36 @@ parameter of the caller (`require_nlink_guard`), never baked into the primitive.
 **Row lifetime.** Deletion never removes the `item` row -- nothing in this codebase does
 (`core/engine.py._project`'s own docstring; row lifetime stays an explicitly open question,
 per `prompts/startnewsession.md` item 6, that this module must not answer by accident). A
-successful delete sets `state = 'REMOVED_BOTH'` and `auto_queue_suppressed = 1` with
-`suppressed_reason = 'deleted_local'` (migration 008) in the same write. That pairing is what
-keeps the row frozen there across every later rescan: `core/engine.py._persist`'s
-`_protected_rel_paths` already treats any `auto_queue_suppressed = 1` row as one whose `state`
-a scan pass must not touch -- the identical mechanism that already freezes `STOPPED`/`FAILED`
-rows -- so nothing new had to be taught to `resolve_absence`/`outcome_survives_rescan` for this
-to stick. `REMOVED_BOTH`'s documented meaning (DESIGN.md §3.2) is "remote deleted by us," which
-is not literally true for a `copy`-mode queue's local-only delete -- a deliberate, minor
-overload recorded in docs/decisions.md rather than left implicit, because it is the only
-terminal "we're done with this row" state already excluded from
-`core/autoqueue.py.ELIGIBLE_STATES` and it keeps History honest that *something* deliberate
-happened, which is the property this module actually needs.
+successful delete sets `auto_queue_suppressed = 1` with `suppressed_reason = 'deleted_local'`
+(migration 008) on every row it touches -- that pairing is what keeps the row frozen there
+across every later rescan: `core/engine.py._persist`'s `_protected_rel_paths` already treats
+any `auto_queue_suppressed = 1` row as one whose `state` a scan pass must not touch -- the
+identical mechanism that already freezes `STOPPED`/`FAILED` rows -- so nothing new had to be
+taught to `resolve_absence`/`outcome_survives_rescan` for this to stick.
+
+**The state written is chosen per row, not hardcoded** (fixed 2026-08-13,
+`prompts/2026-08-13-delete-must-mark-the-whole-subtree.md` --
+`prompts/done/2026-08-12-local-deletion-and-retention.md`, the feature that shipped hours
+earlier as `dfb74c2`, wrote an unconditional `REMOVED_BOTH` instead; see docs/decisions.md for
+why that was wrong). `REMOVED_BOTH`'s
+documented meaning (DESIGN.md §3.2) is "both copies are gone," which is only true when the item
+never had a remote copy (`LOCAL_ONLY`) or its remote copy is already gone (a `move` queue past
+the remote-delete step). A `copy`-mode delete's normal case leaves a remote copy behind --
+`REMOVED_LOCAL` is what's actually true there, and strictly more informative than `REMOTE_ONLY`
+("this was downloaded, and is now locally gone" vs. "this was never here"). `_removed_state_for`
+below makes the call from `item.remote_size` (`None` only for `LOCAL_ONLY` -- the same reading
+`FileTree.tsx`'s delete dialog already uses for the identical distinction), never a live scan.
+Suppression is what stops the re-fetch either way -- the state does not have to lie to achieve
+that, and never naming `REMOVED_LOCAL` in `core/autoqueue.py.ELIGIBLE_STATES` by default is a
+second, independent reason it wouldn't even if suppression were somehow cleared.
+
+**The whole subtree, not just the row that was clicked.** A directory delete removes every
+descendant's files too, so every `item` row in the same queue whose `rel_path` is the deleted
+path or lies beneath it (`_subtree_rows`) gets the same suppression -- and its own
+`_removed_state_for` verdict, since a directory can hold a mix (an `EXCLUDED` child that never
+had a remote counterpart alongside siblings that did). All of it lands in the one transaction
+that also removes the files, via `_mark_subtree_removed` below -- a crash between "files gone"
+and "rows updated" is not a state this module leaves reachable.
 
 **Explicitly out of scope: "delete remote."** The only remote deletion in this codebase is
 `move` mode's verification-gated pipeline (§7.4). A manual remote-delete button is a much
@@ -46,8 +64,9 @@ larger safety conversation and was deliberately left out of this task -- see
 **A third caller, added 2026-08-13, deletes *parts* of an item rather than the whole thing.**
 `delete_extracted_archives()` below removes a successfully-extracted release's spent `.rar`/
 `.r00`/... volumes, never the item itself -- so it is deliberately **not** a third code path
-built on `delete_local()`'s whole-item shape (which ends in `item.state = 'REMOVED_BOTH'`, wrong
-for "some files under this item are gone, the rest stays"). What it does reuse is the same
+built on `delete_local()`'s whole-item shape (which ends every affected row at `REMOVED_LOCAL`
+or `REMOVED_BOTH`, both wrong for "some files under this item are gone, the rest stays"). What
+it does reuse is the same
 guard vocabulary: `extract.resolve_within_root`'s containment check and the mount-sentinel gate.
 See its own docstring for the naive-implementation trap
 (`prompts/2026-08-13-delete-archives-after-extract.md`) this exists to avoid, and
@@ -87,11 +106,74 @@ class DeleteOutcome:
     """The result of one `delete_local()` call. `reason` is always populated -- "deleted" (or
     "would delete" for a dry run) on success, the withheld/failed precondition otherwise -- so
     a caller never has to re-derive why from a bare boolean.
+
+    `affected_rel_paths` (2026-08-13,
+    `prompts/2026-08-13-delete-must-mark-the-whole-subtree.md`) is the target's whole subtree --
+    itself plus every descendant row in the same queue -- computed identically whether or not
+    `dry_run` is set, so a preview can never claim a smaller (or larger) set than a real run
+    would actually mark. Empty on every withheld/failed outcome; a call that never got past the
+    guards affected nothing.
     """
 
     deleted: bool
     reason: str
     bytes_freed: int | None = None
+    affected_rel_paths: tuple[str, ...] = ()
+
+
+def _removed_state_for(remote_size: int | None) -> str:
+    """DESIGN.md §3.2's two "gone" states, chosen from what is actually true rather than
+    hardcoded (this was `REMOVED_BOTH` unconditionally for a few hours -- see docs/decisions.md
+    and this module's own docstring). `remote_size` is `None` only for `LOCAL_ONLY` (never
+    tracked remotely) or a `move` queue whose remote copy is already gone by the time a delete
+    reaches it -- the same reading `FileTree.tsx`'s delete dialog already uses for the identical
+    distinction (`hasRemoteCopy`), read from the persisted column rather than a live scan.
+    """
+    return "REMOVED_LOCAL" if remote_size is not None else "REMOVED_BOTH"
+
+
+async def _subtree_rows(
+    db: aiosqlite.Connection, *, queue_id: int, rel_path: str
+) -> list[aiosqlite.Row]:
+    """Every `item` row in `queue_id` that is `rel_path` itself or lies beneath it -- the
+    target's whole subtree, not just the row a caller clicked.
+
+    Matched in Python, deliberately not SQL `LIKE`: `LIKE 'target%'` also matches a sibling
+    named `target-extra`, and `_` is a `LIKE` wildcard (any single character) that shows up
+    constantly in scene release names, so an unescaped `LIKE` silently over-matches and an
+    escaped one is a second thing to get right for no benefit here. `rel_path == target` or
+    `rel_path.startswith(target + "/")` is the exact membership test a path-tree subtree
+    actually needs, and it is unambiguous by construction: the `"/"` separator can only start a
+    genuine child's own relative path, never a sibling's.
+
+    One query for the whole queue rather than one per candidate -- a queue's `item` table is a
+    release library, not something this scales badly against, and `queue_id` keeps two queues
+    that happen to share a `rel_path` from ever seeing each other's rows.
+    """
+    cursor = await db.execute(
+        "SELECT id, rel_path, remote_size FROM item WHERE queue_id = ?", (queue_id,)
+    )
+    rows = await cursor.fetchall()
+    prefix = rel_path + "/"
+    return [
+        row for row in rows if row["rel_path"] == rel_path or row["rel_path"].startswith(prefix)
+    ]
+
+
+async def _mark_subtree_removed(db: aiosqlite.Connection, subtree: Sequence[aiosqlite.Row]) -> None:
+    """Write every row in `subtree` (`_subtree_rows`'s output) to its own `_removed_state_for`
+    verdict, suppressed with `deleted_local` -- the whole batch, so a caller commits it as one
+    transaction alongside the filesystem change it follows. A directory can hold a mix (an
+    `EXCLUDED` child that never had a remote counterpart next to siblings that did), which is
+    exactly why this re-derives the state per row from that row's own `remote_size` rather than
+    reusing one verdict for the whole batch.
+    """
+    for row in subtree:
+        await db.execute(
+            "UPDATE item SET state = ?, auto_queue_suppressed = 1, "
+            "suppressed_reason = 'deleted_local' WHERE id = ?",
+            (_removed_state_for(row["remote_size"]), row["id"]),
+        )
 
 
 def _all_hardlinked(local_root: Path, resolved: Path) -> bool:
@@ -208,8 +290,19 @@ async def delete_local(
 
     bytes_freed = item["local_size"]
 
+    # The whole subtree this delete is about to affect -- computed once, identically for the
+    # dry-run and real-run paths below, so `preview_retention` can never claim a set a real run
+    # wouldn't also mark (`DeleteOutcome.affected_rel_paths`'s own docstring).
+    subtree = await _subtree_rows(db, queue_id=queue_id, rel_path=rel_path)
+    affected_rel_paths = tuple(row["rel_path"] for row in subtree)
+
     if dry_run:
-        return DeleteOutcome(deleted=True, reason="would delete", bytes_freed=bytes_freed)
+        return DeleteOutcome(
+            deleted=True,
+            reason="would delete",
+            bytes_freed=bytes_freed,
+            affected_rel_paths=affected_rel_paths,
+        )
 
     try:
         if local_root.is_symlink():
@@ -228,12 +321,14 @@ async def delete_local(
         )
         return DeleteOutcome(deleted=False, reason=f"delete failed: {exc}")
 
-    await db.execute(
-        "UPDATE item SET state = 'REMOVED_BOTH', auto_queue_suppressed = 1, "
-        "suppressed_reason = 'deleted_local' WHERE id = ?",
-        (item_id,),
-    )
+    # One transaction: the files are already gone on disk by this point, so every row the
+    # subtree touches is marked before the single `commit()` below -- a crash between "files
+    # gone" and "rows updated" must not be a state this module leaves reachable (task item 2).
+    await _mark_subtree_removed(db, subtree)
     await db.commit()
+    subtree_note = (
+        f", {len(subtree)} item(s) in its subtree marked removed" if len(subtree) > 1 else ""
+    )
     await audit.record_event(
         db,
         level="info",
@@ -241,16 +336,27 @@ async def delete_local(
         kind="local_delete",
         message=(
             f"{caller}: deleted local copy of {rel_path!r} (queue {queue_id} '{queue['name']}'), "
-            f"{bytes_freed if bytes_freed is not None else 'unknown'} bytes"
+            f"{bytes_freed if bytes_freed is not None else 'unknown'} bytes{subtree_note}"
         ),
     )
-    if events is not None:
-        row_cursor = await db.execute("SELECT * FROM item WHERE id = ?", (item_id,))
-        row = await row_cursor.fetchone()
-        if row is not None:
-            events.publish({"type": "item_delta", "queue_id": queue_id, "nodes": [item_view(row)]})
+    if events is not None and subtree:
+        placeholders = ",".join("?" for _ in subtree)
+        row_cursor = await db.execute(
+            f"SELECT * FROM item WHERE id IN ({placeholders})",  # noqa: S608 - placeholders only
+            tuple(row["id"] for row in subtree),
+        )
+        rows = await row_cursor.fetchall()
+        if rows:
+            events.publish(
+                {"type": "item_delta", "queue_id": queue_id, "nodes": [item_view(r) for r in rows]}
+            )
 
-    return DeleteOutcome(deleted=True, reason="deleted", bytes_freed=bytes_freed)
+    return DeleteOutcome(
+        deleted=True,
+        reason="deleted",
+        bytes_freed=bytes_freed,
+        affected_rel_paths=affected_rel_paths,
+    )
 
 
 # --- Retention (prompts/open-issues.md issue 7) -----------------------------------------------
