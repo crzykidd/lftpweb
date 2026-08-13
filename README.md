@@ -8,7 +8,8 @@ progress, auto-queue on patterns, and optionally verify, extract, and relocate f
 
 > ## ⚠ Pre-release — not ready to use
 >
-> **Version `0.0.1`. All 9 build phases are built and unit/integration tested.** There is no
+> **Version `0.0.1`. All 9 build phases are built and unit/integration tested**, plus two runs
+> of correctness fixes that only real use surfaced (2026-08-12 and 2026-08-13). There is no
 > release, no published image, and no upgrade path. Things will change without notice,
 > including the database schema. **No UI screen in this project has ever been opened in a
 > browser** — every page was built, verified against the real backend and the real fake
@@ -23,16 +24,36 @@ progress, auto-queue on patterns, and optionally verify, extract, and relocate f
 - Named **path queues** — one remote → local mapping each, with their own settings
 - Queue transfers manually, watch live progress, stop them, resume from the partial;
   multi-select with shift-range and bulk Queue/Stop/Delete-local that reports partial failure
-  honestly ("7 of 10 queued, these 3 failed because …"), plus text/state filters, on the Files
-  page. Deleting local files is guarded (path containment, no active job, mount sentinel) and
-  confirmed before it runs — irreversible, unlike Queue/Stop
+  honestly ("7 of 10 queued, these 3 failed because …"), plus text/state/"missing only" filters,
+  on the Files page. Deleting local files is guarded (path containment, no active job, mount
+  sentinel) and confirmed before it runs — irreversible, unlike Queue/Stop. A delete marks the
+  whole subtree, and picks each row's state from whether a remote copy actually survives
+- Files rows carry four lifecycle icons (**R**emote / **L**ocal / **V**erified / **E**xtracted —
+  presence facets may go dark, milestones stay lit), an inline progress bar inside the state
+  chip, when the row last changed state, and an info icon that opens a detail drawer with both
+  sides' size and modified date, the lifecycle chronology, and recent transfers and audit
+  events. The tree sorts by name / size / last change / percent complete, and remembers your
+  sort and your expand-or-collapse choice across reloads
 - Optional scheduled retention: delete local copies older than N days, off by default, with a
   dry-run preview endpoint (no Settings-page toggle yet — see "What doesn't yet")
-- Bandwidth ceiling and concurrency limits with an admission-control scheduler
+- Bandwidth ceiling and concurrency limits with an admission-control scheduler; per-queue scan
+  intervals (10s / 30s / 60s / on-demand-only), on an engine loop that scans only the queues
+  actually due and cannot stack a second scan of a queue over its own overrun
 - Auto-queue on select/skip/file-exclude patterns, with a live "what would this match" preview
-- Post-processing: verify (sidecar or hash-on-disk), extract (`7zz` for zip/7z/tar/gz/bz2/xz,
-  `unrar` for rar/rar5 — see `NOTICE`), and `move` mode's verification-gated remote delete, all
-  with an audited trail on the History page
+- **A settle gate, on by default**: a release still being uploaded to the seedbox is held until
+  its remote fingerprint (file count, total bytes, newest mtime) holds still across two
+  consecutive scans *and* at least 60 seconds of wall clock. Without it, a directory caught
+  mid-upload can read as byte-complete off whichever files arrived first — and then be
+  extracted, relocated, and (on a `move` queue) deleted from the remote with files still
+  missing. It costs up to about a minute per transfer; switch it off at Settings → Transfer if
+  your seedbox's landing path is atomic end to end
+- Post-processing: verify (sidecar or hash-on-disk, which now also checks total bytes so it
+  cannot bless a truncated file), extract (`7zz` for zip/7z/tar/gz/bz2/xz, `unrar` for rar/rar5
+  — see `NOTICE`), and `move` mode's verification-gated remote delete, all with an audited trail
+  on the History page. Extraction stages into `_UNPACK_` and merges into place only on full
+  success, is gated on cheap filesystem preconditions first (zero-length head volume, a gap in a
+  multi-volume rar set), and can optionally delete a release's spent archive volumes once they
+  have extracted — off by default
 - The History page: every completed/failed/cancelled transfer and every audit event
   (including remote deletes and deletes withheld), filterable and grouped by queue
 - Rotating log viewer, on-demand `VACUUM INTO` database backups (scheduled + manual), and a
@@ -65,12 +86,42 @@ reduction made during the build, recorded in full in `docs/decisions.md`:
   environment this project has been built in. Every page has been confirmed to build,
   type-check, and lint cleanly, and every backend endpoint it calls has been verified directly
   over real HTTP — but actual rendering, layout, and click-through behavior have never been
-  visually confirmed. Click-test before relying on any of it.
-- **Post-processing (verify/extract/move) triggers only when a job this app spawned succeeds**
-  — not when a routine rescan finds a file that arrived some other way (a manual `cp`, a
-  restore). A file placed by hand under a queue's `local_path` will sit there unverified,
-  unextracted, and — for a `move` queue — with its remote copy never deleted, until something
-  else re-touches that item (e.g. a manual re-queue). Phase 5's own deliberate call.
+  visually confirmed. Click-test before relying on any of it. This applies hardest to the
+  newest work: **almost none of the 2026-08-13 Files-page revamp** — the lifecycle icons, the
+  inline progress bars, sorting, the persisted collapse preference, the detail drawer, the
+  hover tooltip — **has been seen by a human, and none of it by any agent.**
+- **There is no frontend test runner in this project.** No vitest, no jest, no test script in
+  `frontend/package.json` — `tsc -b`, `vite build`, and `oxlint` are the entire frontend gate.
+  That was defensible while the frontend was thin glue over a well-tested backend; it is not
+  any more. Sorting (`sortValue`/`sortSiblingsRecursive`), the default-plus-exceptions collapse
+  preference, and the progress-fraction arithmetic are pure functions with real edge cases and
+  **zero automated coverage**. Naming this as a gap rather than leaving it implicit: the next
+  frontend bug of that shape will not be caught by anything currently in CI.
+- **Post-processing (verify/extract/move) triggers from two narrow places — a job this app
+  spawned succeeding, and the settle gate releasing its own hold on an item.** It does *not*
+  trigger when a routine rescan finds a file that arrived some other way (a manual `cp`, a
+  restore) with no gate hold behind it. Such a file will sit under a queue's `local_path`
+  unverified, unextracted, and — for a `move` queue — with its remote copy never deleted, until
+  something re-touches that item (e.g. a manual re-queue). Phase 5's own deliberate call; the
+  settle-gate half of it was closed on 2026-08-12, the placed-by-hand half was not.
+- **A completed `move`-mode item lands on `REMOVED_LOCAL`, not the `REMOVED_BOTH` the design
+  describes.** `core/mount_sentinel.py.resolve_absence` always writes `REMOVED_LOCAL` and takes
+  neither `sync_mode` nor `remote_deleted_at` as an input. At the default settings this is
+  harmless — the row is excluded from auto-queue either way — but it is excluded by its state
+  name rather than by `auto_queue_suppressed`, so turning on "re-download items removed outside
+  lftpweb" makes such a row eligible and produces a doomed job against a remote that is already
+  gone. Widening `resolve_absence` is a real design decision (it would also have to decide
+  whether that row should be suppressed like a self-delete), so it is documented in
+  `DESIGN.md` §3.2 rule 3 rather than quietly patched.
+- **Encrypted-rar password retry is implemented but has never been tested against a real
+  encrypted archive.** No RAR compressor exists anywhere in this project's toolchain — `unrar`
+  only extracts, and no Alpine package ships one — so there is no way to build the fixture. The
+  equivalent 7zz path *is* tested against a real encrypted zip; the rar path follows the same
+  shape and is assumed correct on that basis, which is weaker than every other claim here.
+- **Real-archive rar coverage is old-style multi-volume only.** The two committed fixtures are
+  hand-built RAR4 archives (a single file, and a genuine two-volume `.rar` + `.r00` split).
+  New-style `.partNN.rar` multi-volume extraction has no real-archive test — only the
+  fake-bytes precondition tests that exercise its naming and gap detection.
 - **The `REMOVED_LOCAL` grace period is unit-tested but has never been exercised live across a
   real multi-scan window.** The ~10-minute window between "locally absent" and "treated as
   deliberately removed" (`DESIGN.md` §3.2 rule 3) is pinned by `tests/test_mount_sentinel.py`,

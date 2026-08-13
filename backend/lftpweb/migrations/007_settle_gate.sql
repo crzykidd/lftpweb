@@ -1,5 +1,5 @@
--- The settle gate (prompts/open-issues.md "2 -- the settle gate"; DESIGN.md wording proposed
--- for this, not yet applied -- see docs/decisions.md). A seedbox may still be writing a
+-- The settle gate (DESIGN.md §3.3, written alongside this migration and applied to the
+-- document on 2026-08-12 -- see docs/decisions.md). A seedbox may still be writing a
 -- top-level item when a scan observes it. Comparing remote-vs-local bytes
 -- (core/reconcile.py) cannot tell a genuinely finished item from one still arriving one file
 -- at a time: a release directory holding 3 of an eventual 8 files, each of those 3 fully

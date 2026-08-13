@@ -49,8 +49,10 @@ alongside this list: several entries below ship with deliberate, documented limi
   mounted, and the `REMOVED_LOCAL` grace period lands with it. Auto-queue defaults **off**
   per queue.
 - **Phase 5 — post-processing + `move` mode.** Verify (`.sfv`/`.md5` sidecars, with an
-  opt-in whole-file-read fallback), extract (`7zz`, including multi-part rar and compound
-  tar), and relocate a finished item to its final destination. `move` mode deletes the
+  opt-in whole-file-read fallback), extract (zip / 7z / tar / gz / bz2 / xz and rar / rar5,
+  including multi-part sets and compound tar — see the rar entry under **Fixed** for which
+  binary handles what, and why that took nine phases to get right), and relocate a finished
+  item to its final destination. `move` mode deletes the
   remote copy **only** after verification passes — verification is forced on for `move`
   regardless of any other toggle, because it is the sole gate on an irreversible delete.
   Every delete and every delete *withheld* writes an audit event. All post-processing
@@ -94,26 +96,33 @@ alongside this list: several entries below ship with deliberate, documented limi
   (`extracted_at`/`verified_at`/`downloaded_at`/`first_seen_at`, an approximation); everything
   from this migration forward is exact. A single shared per-tree ticker drives the relative
   reading rather than a timer per row, since the Files tree can hold thousands of rows.
-- **The settle gate** *(2026-08-12, defaults **off**)*: a top-level item (a release directory
+- **The settle gate** *(2026-08-12, defaults **on**)*: a top-level item (a release directory
   or a loose top-level file) is now fingerprinted every scan
-  (`file_count, total_bytes, max_mtime` over its whole remote subtree), and — when this new
-  toggle is on — must hold that fingerprint across 2 consecutive scans before auto-queue will
-  pick it up or before it's allowed to reach `DOWNLOADED` and trigger post-processing. Fixes a
-  real gap: a release still being uploaded, caught mid-upload, can look byte-complete for the
-  files that *have* fully arrived while more are still coming — a growing single file
-  self-heals (re-queued, resumes) but a growing *directory* previously did not, and could be
-  moved/extracted/deleted-from-remote with files still missing. A manual Queue click still
-  overrides the *queueing* half (explicit user action beats a heuristic); the *completion*
-  half — never publishing `DOWNLOADED` for an unsettled item — always applies regardless, so
-  the worst case is a wasted partial transfer that resumes, never a bad import or a bad
-  delete. Held items surface as `REMOTE_ONLY` with a new `substate: "settling"` (a small,
-  deliberately quiet dot next to the state chip on the Files page — most items pass through
-  it on every first sighting). **Off by default because it delays every transfer by up to
-  ~60 seconds** (two scan intervals at the current 30s default), including the atomic
-  hardlink path where it buys nothing; turn it on via `PUT /api/settings/settle` (no
-  Settings-page UI yet — a named gap, same as Settings → Transfer for several earlier
-  phases). See `docs/decisions.md` for the full reasoning and the DESIGN.md wording drafted,
-  not yet applied, alongside this entry.
+  (`file_count, total_bytes, max_mtime` over its whole remote subtree), and must hold that
+  fingerprint across **2 consecutive scans *and* at least 60 seconds of wall-clock time**
+  before auto-queue will pick it up or before it's allowed to reach `DOWNLOADED` and trigger
+  post-processing. Both conditions are load-bearing: a scan count alone is only a proxy for
+  "quiet for a while" as long as every queue shares one scan interval, which stopped being true
+  the moment the per-queue interval below landed. Fixes a real gap: a release still being
+  uploaded, caught mid-upload, can look byte-complete for the files that *have* fully arrived
+  while more are still coming — a growing single file self-heals (re-queued, resumes) but a
+  growing *directory* previously did not, and could be moved/extracted/deleted-from-remote with
+  files still missing. A manual Queue click still overrides the *queueing* half (explicit user
+  action beats a heuristic); the *completion* half — never publishing `DOWNLOADED` for an
+  unsettled item — always applies regardless, so the worst case is a wasted partial transfer
+  that resumes, never a bad import or a bad delete. An item held after its own job already
+  succeeded self-heals: the next scan that finds the remote genuinely quiet reaches
+  `DOWNLOADED` and triggers post-processing on its own, with no new transfer and without
+  needing auto-queue or another click. Held items surface as `REMOTE_ONLY` with a new
+  `substate: "settling"` (a small, deliberately quiet dot next to the state chip on the Files
+  page — most items pass through it on every first sighting). **On by default, which costs up
+  to about a minute per transfer**, including on an atomic hardlink-pickup path where it buys
+  nothing — the third reasoned exception to this project's "every new capability ships off"
+  rule, made because it is the fix for a confirmed-live directory-corruption bug rather than a
+  latency preference. Switch it off at Settings → Transfer (or `PUT /api/settings/settle`) if
+  your seedbox's landing path is atomic end to end; that section also shows the required scan
+  count and the wall-clock floor, both read-only, since they are constants rather than
+  tunables.
 - **Delete local files — manually from the Files page, and on a retention schedule**
   *(2026-08-12)*. The Files tree now has a per-row and bulk "Delete" action (with a
   confirmation dialog showing the count and total bytes — this is irreversible, unlike
@@ -131,7 +140,16 @@ alongside this list: several entries below ship with deliberate, documented limi
   `LOCAL_ONLY` junk by hand (Files page) does not need that proof, since removing the one and
   only copy is the point. A dry-run preview endpoint (`POST /api/settings/retention/preview`)
   reports exactly what a real retention pass would delete, using the same guard chain rather
-  than a second approximation of it. Also adds a new `auto_queue_suppressed` reason,
+  than a second approximation of it. **Deleting a directory marks its whole subtree** — the
+  target and every descendant `item` row in the same queue, in the same transaction as the
+  files' removal — rather than only the row that was clicked, so deleted files don't keep
+  reading `DOWNLOADED` and then drift through the ten-minute absence grace period that exists
+  for *unexplained* absence, not for a deletion this codebase performed and has a record of.
+  **Each row's resulting state is chosen per row** from whether a remote copy actually survives:
+  `REMOVED_LOCAL` when one does, `REMOVED_BOTH` only when both copies are genuinely gone. Every
+  row is suppressed from auto-queue individually either way — suppression, not the state name,
+  is what stops the re-fetch, so a deleted item can still be queued again manually and
+  downloads normally. Also adds a new `auto_queue_suppressed` reason,
   `'deleted_local'` (migration 008), that distinguishes an item lftpweb deleted on purpose from
   one that merely left (moved out by an `*arr` importer, a human, or a script) — the mechanism
   the re-download setting below needs to stay safe. The Files-page delete confirmation also
@@ -140,7 +158,10 @@ alongside this list: several entries below ship with deliberate, documented limi
   **"Delete remote" is explicitly out of scope** — the only remote deletion in this app remains
   `move` mode's verification-gated pipeline; a manual remote-delete button is a materially
   larger safety conversation, deliberately deferred, not forgotten. No Settings-page UI for the
-  retention toggle yet — same named gap as the settle gate above and Settings → Transfer.
+  retention toggle yet — the manual Files-page delete has its UI, but turning the scheduled
+  sweep on still needs `PUT /api/settings/retention`. The last remaining instance of this
+  project's "backend first, settings screen catches up" gap; the settle gate's and Settings →
+  Transfer's both closed since.
 - **A setting to re-download items removed outside lftpweb** *(2026-08-12)*. There are two ways
   an item's local copy can go away: lftpweb deleted it itself (never re-queued, no matter what —
   see above), or something outside lftpweb removed it (an `*arr` importer picking up a finished
@@ -150,9 +171,13 @@ alongside this list: several entries below ship with deliberate, documented limi
   again; off (the default), it stays excluded, exactly as before this session. Off is the
   *correct* default, not merely the cautious one — on a `copy`-mode queue (remote copy never
   touched) with auto-queue on, an importer moving a release out would otherwise be re-fetched on
-  the very next scan, re-imported, and repeat forever. Only matters for `copy`-mode queues;
-  `move` deletes the remote copy on verified completion, so there is nothing left to re-fetch
-  either way.
+  the very next scan, re-imported, and repeat forever. It is meant to matter only for
+  `copy`-mode queues — `move` deletes the remote copy on verified completion, so there is
+  nothing left to re-fetch. In practice, turning it on affects `move` queues too, and not
+  usefully: a completed `move` item currently lands on `REMOVED_LOCAL` rather than the
+  `REMOVED_BOTH` the design describes, so it becomes eligible and produces a job that fails
+  against a remote that is already gone. Leaving the setting off (the default) avoids this
+  entirely; see `README.md`'s "Known gaps" and `DESIGN.md` §3.2 rule 3.
 - **The scan interval is now per-queue, not one global 30s for every queue** *(2026-08-12)*.
   `scan_interval_s` (`path_queue`, migration 009; `GET`/`PUT /api/settings/queues`, Settings →
   Queues) offers 10s / 30s / 60s / **None** — **default unset** (every existing queue keeps
@@ -181,10 +206,10 @@ alongside this list: several entries below ship with deliberate, documented limi
   removed on `EXTRACT_FAILED` or a precondition failure. Only ever acts on a directory item —
   a loose top-level archive file is left alone, since removing its own single file would be
   removing the whole item, `core/local_delete.py.delete_local`'s job, not this one's.
-  **The naive version of this feature is an infinite re-download loop**, the same shape as the
-  `REMOVED_LOCAL` bug shipped and reverted the same night in a prior session: deleting the
-  archives drops local bytes below remote, which reads `PARTIAL` on the next scan and would
-  outrank the `EXTRACTED` outcome. Avoided by reusing the exact mechanism `file_exclude`
+  **The naive version of this feature is an infinite re-download loop**: deleting the archives
+  drops local bytes below remote, which reads `PARTIAL` on the next scan and would outrank the
+  `EXTRACTED` outcome, so the item is re-fetched, re-extracted and re-deleted every scan
+  interval, forever. Avoided by reusing the exact mechanism `file_exclude`
   patterns already use for the identical problem — a new `deleted_archive` table (migration
   010) records every file this codebase removed after extraction, and the reconciler
   (`core/engine.py.build_scan_counts_predicate`) folds it into the same completeness seam
@@ -259,39 +284,24 @@ alongside this list: several entries below ship with deliberate, documented limi
   WebSocket, its connect-time snapshot, and `GET /api/files` all publish a projection read
   back from the database rather than the reconciler's structural reading, so the REST view and
   the live view can no longer disagree about the same item.
-- **`DESIGN.md` caught up with the code** *(2026-08-12, documentation only)*. The backlog of
-  replacement wordings that earlier sessions drafted into `docs/decisions.md` rather than
-  editing the doc was applied: three new sections (§2.2 the publish invariant, §3.3 the settle
-  gate, §10.4 throughput metrics), a new §3.2 rule 9 on which module wins when two of them
-  write `item.state`, and corrections to §3.1, §3.2, §4.6, §4.7, §5, §6, §7.3, §9, §11, §13,
-  and §14. No behavior changed; nothing was renumbered.
-- **The settle gate now defaults on, gained a wall-clock floor alongside its scan count, a
-  self-heal for a stuck item, and a Settings UI** *(2026-08-12)*, three follow-ups to the gate
-  added above:
-  1. **`SettleSettings.enabled` now defaults `True`.** The third reasoned exception to this
-     project's "every new capability ships off" rule, after `move`-mode verification and the
-     phase 7 scheduled backup. **Existing installs will see transfers complete up to about a
-     minute later than before this upgrade** — deliberate, not a regression: it is the fix for
-     a real, confirmed-live directory-corruption bug (a release caught mid-upload can read as
-     complete off whichever files happened to arrive first). Switch it back off at
-     Settings → Transfer if your seedbox's landing path is atomic end to end (e.g. hardlinked
-     torrent pickup) and you'd rather not pay the delay.
-  2. **Settling now requires *both* 2 consecutive matching scans *and* at least 60 seconds of
-     wall-clock time** since the fingerprint was first observed — a scan count alone is only a
-     reliable proxy for "quiet for a while" as long as every queue shares one scan interval,
-     which stops being true the moment a per-queue interval lands.
-  3. **An item stuck at `REMOTE_ONLY`/`settling` now self-heals.** Previously, if a job
-     finished while its item was still unsettled, the item was held back (correctly — see the
-     entry above) but then only ever reached `DOWNLOADED` by being re-queued; with auto-queue
-     off and nobody clicking Queue again, it could sit there forever with its bytes already
-     complete. The next scan that finds the remote genuinely quiet now reaches `DOWNLOADED` on
-     its own and triggers post-processing, with no new transfer. This is a second, narrower
-     entry point into post-processing (`core/engine.py._persist`, alongside the existing
-     job-success trigger in `core/queue.py._reap_one`) — DESIGN.md §6's trigger paragraph is
-     now stale and needs a follow-up correction; see `docs/decisions.md`.
-  4. **Settings → Transfer gained a "Settle gate" section**: the enable toggle, plus a
-     read-only readout of the required scan count and the wall-clock floor, with an
-     explanation of what the gate does.
+- **`DESIGN.md` caught up with the code** *(2026-08-12 and 2026-08-13, documentation only)*.
+  Earlier sessions drafted replacement wordings into `docs/decisions.md` rather than editing the
+  design doc; the whole backlog has now been applied. The first pass added three sections (§2.2
+  the publish invariant, §3.3 the settle gate, §10.4 throughput metrics) and a new §3.2 rule 9
+  on which module wins when two of them write `item.state`. The second added the `LOCAL_ONLY`
+  half of that rule, §7.3's "a path can leave both trees at once", §6's archive-cleanup
+  paragraph, and §9.2's Files-row revamp, and corrected three long-standing untruths: §9 never
+  used TanStack Query, §12's module list stopped at phase 4, and §3.2 rule 3 claimed a
+  `move`-mode item reaches `REMOVED_BOTH` when the code writes `REMOVED_LOCAL` (now documented
+  as the known gap it is, rather than silently fixed in the doc). No behavior changed; nothing
+  was renumbered, and every `§N.M` citation in the repo still resolves.
+- **Post-processing now has two entry points, not one** *(2026-08-12)*. It still fires when a
+  transfer job this app spawned exits successfully; it *also* fires when the settle gate
+  releases its own hold on an item, so an item whose job finished while the item was still
+  unsettled no longer needs auto-queue or a manual click to ever get verified and extracted.
+  Deliberately not a general scan-driven trigger — a file that appears under a queue's
+  `local_path` some other way, with no gate hold behind it, still triggers nothing (see
+  `README.md`'s "Known gaps").
 
 ### Fixed
 
@@ -420,20 +430,6 @@ alongside this list: several entries below ship with deliberate, documented limi
   `docs/decisions.md` for the licence position (UnRAR's own licence permits redistributing the
   binary; it forbids only using its source to build a RAR-compatible compressor, which this
   project never needed).
-- **Deleting a directory from the Files page only updated the row that was clicked** *(found and
-  fixed the same day as the delete feature itself shipped, 2026-08-13)*: every file inside kept
-  reading `DOWNLOADED` after being deleted, and would have entered §7.3's ten-minute absence
-  grace period on the next scan rather than reflecting the delete — the exact mechanism that
-  grace period exists to *not* apply to a deletion this codebase performed and has a record of.
-  `delete_local` (the primitive both the manual delete button and scheduled retention share) now
-  marks the whole subtree — the target and every descendant `item` row in the same queue — in
-  the same transaction as the files' removal, each row suppressed from auto-queue individually.
-  In the same fix: a delete's `item.state` is now chosen per row from whether a remote copy
-  still exists (`REMOVED_LOCAL`) or not (`REMOVED_BOTH`), rather than always writing
-  `REMOVED_BOTH` — the unconditional `REMOVED_BOTH` the delete feature shipped with hours
-  earlier made the Files list stop reflecting what was actually on disk. Suppression, not the
-  state name, is what stops the re-fetch either way, so a deleted item can still be queued again
-  manually and downloads normally.
 - **A `move`-mode item lost its verify/extract outcome within one scan of the remote delete**
   *(found by the user 2026-08-13, the first time `move` mode ran end to end against a real
   release)*: it downloaded, verified, deleted the remote, unrarred — and every item read

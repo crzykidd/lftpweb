@@ -5,7 +5,10 @@ lftp as the transfer engine.*
 
 Sections are numbered so feedback can be given by reference (e.g. "§4.3 — no, do it this way").
 
-**Status:** draft, pending review. Nothing implemented yet. First version will be **`0.0.1`**.
+**Status:** all nine build phases are built (§13), plus the post-phase-9 corrections real use
+surfaced. Still pre-release — nothing has been tagged, and the first version will be **`0.0.1`**.
+This line said "nothing implemented yet" until 2026-08-13; §13 is the authoritative record of
+what is actually built and what is still open.
 
 ---
 
@@ -193,6 +196,7 @@ path_queue(
   id, host_id, name, remote_path, local_path, staging_path NULL, enabled,
   sync_mode TEXT,                    -- 'copy' | 'move' | 'sync'   (default 'copy', §7)
   auto_queue_enabled, auto_extract, auto_verify,
+  scan_interval_s REAL NULL,         -- NULL = site default, 0 = on-demand only (§5)
   created_at)
 -- Note: no bandwidth / concurrency / parallelism columns. Those are site-level (§4.5) —
 -- a queue governs what and where, never how fast.
@@ -208,7 +212,7 @@ pattern(id, queue_id NULL, kind TEXT,
 -- One row per item we have ever cared about; the durable lifecycle record
 item(
   id, queue_id, rel_path, is_dir,
-  remote_size, local_size, remote_mtime,
+  remote_size, local_size, remote_mtime, local_mtime,   -- both mtimes files-only (§9.2)
   state TEXT, substate TEXT NULL,    -- substate carries 'settling' (§3.3); NULL otherwise
   first_seen_at, downloaded_at NULL, extracted_at NULL, verified_at NULL,
   state_changed_at NULL,             -- stamped by a trigger, not by each writer (§3.2 rule 9)
@@ -224,6 +228,11 @@ item(
 -- doesn't lose an in-progress verdict and so nothing has to publish a state it can't read back
 item_settle(queue_id, rel_path, file_count, total_bytes, max_mtime NULL, matched_scans,
             updated_at, PRIMARY KEY(queue_id, rel_path))
+
+-- Archive files this codebase deleted after a successful extraction (§6). Read by the scan
+-- pass and folded into the same completeness predicate §4.7's file_exclude patterns feed, so
+-- a removed volume reads EXCLUDED rather than missing. Never garbage-collected.
+deleted_archive(queue_id, rel_path, deleted_at, PRIMARY KEY(queue_id, rel_path))
 
 -- Throughput history (§10.4). Two tables, so "idle" and "down" stay distinguishable
 metric_sample(id, queue_id, ts, bytes_delta)   -- only when that queue moved bytes in a window
@@ -338,9 +347,31 @@ Nine rules that are easy to get wrong and that want review:
    AutoQueueSettings.re_download_externally_removed` (site-level, default `False`) is the
    opt-in for anyone who genuinely wants that case re-fetched; it governs only the
    externally-removed path; it can never make a self-delete (`REMOVED_BOTH`) eligible. This
-   only bites `copy` mode — in `move`, the remote copy is already gone by the time an item
-   could read bare `REMOVED_LOCAL` (it reaches `REMOVED_BOTH` instead), so the setting changes
-   nothing for a `move` queue either way.
+   is in practice a `copy`-mode concern — in `move` the remote copy is already gone by the time
+   an item could read bare `REMOVED_LOCAL`, so there is nothing left for the setting to
+   re-fetch. Read the gap below before relying on that last clause.
+
+   > **Known gap, stated rather than papered over (2026-08-13).** This rule used to end "(it
+   > reaches `REMOVED_BOTH` instead)". **That is not what the code does.**
+   > `core/mount_sentinel.py.resolve_absence` — the only thing that ever writes this transition
+   > — always writes the literal `REMOVED_LOCAL`, and takes neither the queue's `sync_mode` nor
+   > `remote_deleted_at` as an input. So a fully-completed `move`-mode item lands on bare,
+   > **unsuppressed** `REMOVED_LOCAL`, not on `REMOVED_BOTH`.
+   >
+   > This was latent until §7.3's leaves-both-trees sweep shipped, because before it such items
+   > never reached that function at all. Now that they do, the practical consequence is narrow
+   > but real: the row is still excluded from auto-queue at the default setting, exactly as
+   > intended — but it is excluded **by its state name**, not by `auto_queue_suppressed`, and
+   > `core/autoqueue.py`'s eligibility query never consults the current remote tree. So turning
+   > `re_download_externally_removed` **on** makes such a row eligible and produces a job doomed
+   > against a remote that is already gone. The setting is therefore not the no-op for `move`
+   > queues that the paragraph above claims.
+   >
+   > Widening `resolve_absence` to emit `REMOVED_BOTH` is a real design decision, not a two-line
+   > fix: it would also have to decide whether such a row is `auto_queue_suppressed` like a
+   > self-delete, which that function currently has no opinion about. Recorded here as the
+   > discrepancy between this rule and the implementation, with the implementation being what
+   > ships.
 4. **Remote size is a moving target** — a torrent may still be downloading on the seedbox.
    Never latch it; recompute completeness on every scan.
 5. **The same detection drives different actions by mode** (§7). `REMOVED_LOCAL` is one
@@ -384,6 +415,17 @@ Nine rules that are easy to get wrong and that want review:
    - **Content present and complete** (structural `DOWNLOADED`): the post-processing outcome
      wins. `VERIFIED`/`CORRUPT`/`EXTRACTED`/`EXTRACT_FAILED` are *refinements* of `DOWNLOADED`
      — each says something about an all-bytes-present item that the byte comparison cannot.
+   - **Content present, remote gone because we deleted it** (structural `LOCAL_ONLY`, *and*
+     `remote_deleted_at` set): the outcome wins here too. This is the same refinement argument
+     as the bullet above — the bytes are all here — reached from the other side: the scan after
+     a `move`-mode queue's verified remote delete sees "remote absent, local present", which
+     `core/reconcile.py` reads as `LOCAL_ONLY` with no way to know why. `remote_deleted_at` is
+     the column that tells "we removed the remote copy on purpose, after verifying" from a
+     genuinely untracked local file, and it is deliberately the *only* thing that opens this
+     branch: gating on `LOCAL_ONLY` alone would hand the protection to any local-only file that
+     happens to carry an outcome-shaped `state`. Found the first time `move` ran end to end
+     against a real release — it downloaded, verified, deleted the remote, extracted, and then
+     read `LOCAL_ONLY` within one scan interval, losing everything §6 had just recorded.
    - **Content partially present** (structural `PARTIAL`): the structural state wins and the
      outcome is dropped. Rule 2 is absolute, and an outcome is a stronger claim still; the item
      is genuinely re-queueable again.
@@ -392,6 +434,11 @@ Nine rules that are easy to get wrong and that want review:
      outcome for the whole window and then lands on `REMOVED_LOCAL`. This half is not
      politeness: without it a `VERIFIED` item whose importer moved it out would persist as a
      fresh `REMOTE_ONLY` and be downloaded all over again.
+   - **Content absent from *both* trees** — the path is in neither the remote scan nor the
+     local one, so the reconciler produces no node for it at all. §7.3 covers what happens
+     then; the short version is that it goes through the same grace period rather than being
+     skipped, because the scan loop only visits nodes and a row nothing visits is a row frozen
+     on its last outcome forever.
 
    `state_changed_at` is stamped by a database trigger on an actual change of value, not by
    each of the three writers remembering to. Cross-cutting discipline over three modules is
@@ -986,6 +1033,36 @@ that would overwrite existing content fails loudly rather than clobbering it.
 configurable age exists and, like every other new capability, ships off. Unattended deletion is
 the last place to grant an exception for "the containment check is solid."
 
+**Deleting the archives after a successful extraction is a separate, off-by-default option**
+(`PostprocessSettings.delete_archives_after_extract`). When on, every file belonging to each
+extracted archive — including a multi-volume rar's continuation volumes, not just the head — is
+removed once extraction reports `EXTRACTED`; nothing is removed on `EXTRACT_FAILED` or a
+precondition failure, and non-archive files (`.nfo`, `.sfv`/`.md5`, samples, subtitles) are
+never touched. It only ever acts on a **directory** item — a loose top-level archive file is
+left alone with a withheld-cleanup event, since removing its one file would be removing the
+whole item, which is the local-delete primitive's job and not this one's.
+
+The naive version of this feature is an infinite loop, and avoiding it is the whole design.
+Deleting the archives drops the item's local byte total below its remote total, which reads
+`PARTIAL` on the next scan (rule 2) and outranks the `EXTRACTED` outcome (rule 9) — so
+auto-queue re-fetches, re-extracts, and re-deletes it every scan interval, forever. The fix is
+to reuse §4.7's existing completeness seam rather than add a second completeness rule: every
+file removed this way is recorded, and the reconciler folds that record into the *same*
+predicate a `file_exclude` pattern already feeds. A deleted archive therefore reads `EXCLUDED`
+— a real state, deliberately absent — exactly like a pattern-excluded file, and rule 8's
+vacuously-`DOWNLOADED` reading applies to it with no new branch anywhere. `auto_queue_suppressed`
+was considered for this and rejected: suppression writes an item off *entirely* (§4.6), which
+would also block a legitimate future re-fetch, whereas the exclusion only ever affects
+completeness accounting for the specific bytes that were removed.
+
+On a `move` queue the remote copy is already gone by the time cleanup runs, so the archive
+volumes it removes are the last copy of those *compressed* bytes anywhere. That is accepted
+rather than gated further: a successful extraction has already decoded the payload onto disk as
+ordinary files, nothing re-extracts an item that already reads `EXTRACTED`, and so there is no
+future read of those bytes to protect. It does sharpen the ordering risk named below, though —
+the disk this frees is concentrated on exactly the items where getting extraction right the
+first time already matters most.
+
 **Extraction is gated on cheap, filesystem-only preconditions before any extractor is
 invoked** — a zero-length head volume, and a multi-part rar set with a gap in it (both the
 `.rNN` and `.partNN.rar` conventions, resolved through one shared volume map so the two cannot
@@ -1143,6 +1220,21 @@ them distinguishable, because a bind mount that didn't come up has no sentinel i
 - **Grace period.** Absence must persist across several consecutive scans — default ~10 minutes,
   tracked via `item.first_missing_at` — before it counts. An import in progress, a move across
   filesystems, or a momentarily-unreadable directory must not be able to trigger a delete.
+  **A `rel_path` can leave both trees at once, and that case runs through this same machinery.**
+  The reconciler's node set is `remote_tree ∪ local_tree`, so a path in neither produces no node
+  — and the persist pass only ever visits nodes. `move` mode manufactures exactly that shape
+  routinely: the remote copy is deleted on verified completion and the staging move then
+  relocates the local copy, leaving a tracked row for a path that no longer exists on either
+  side. Left to the node loop alone such a row is simply never written again, freezing on
+  whatever outcome it last held — `EXTRACTED` forever, never reaching `REMOVED_LOCAL`, defeating
+  §3.2 rule 3 for precisely the items `move` produces the most of. So the persist pass makes a
+  second, narrow sweep over every previously-tracked `rel_path` it did not write this pass and
+  resolves each one through the same grace-period function, with a synthetic `REMOTE_ONLY`
+  reading standing in for "there is nothing here to compare". It reuses that function's own
+  eligibility gate rather than re-implementing it, so a previous state the function has no
+  opinion about (`LOCAL_ONLY`, `REMOVED_BOTH`, a mid-flight `PARTIAL`) is left exactly as it was
+  rather than invented into something new, and a suppressed or actively-claimed row never
+  reaches the sweep at all.
 - **Verification gate.** `move` deletes only after the item verifies (§6). `sync` propagates only
   for items that reached a verified-complete state. Never deleted on a stale size rollup alone,
   and never on a `SKIPPED` verification — "no evidence" is not evidence.
@@ -1212,8 +1304,18 @@ explanation of why.
 
 ## 9. Frontend
 
-React + TypeScript + Vite + Tailwind. TanStack Query for REST; **one WebSocket** delivering a
-full model snapshot on connect and deltas thereafter.
+React + TypeScript + Vite + Tailwind. **One WebSocket** delivering a full model snapshot on
+connect and deltas thereafter; REST goes through a hand-rolled `fetch` client and a small poll
+hook.
+
+This document said "TanStack Query for REST" from its first draft, and **it has never been
+true**. Phase 1 built `api/client.ts` (a thin `fetch` wrapper) and a `usePoll` hook instead;
+phase 3b added `useJobs` in the same shape plus a `refresh()` escape hatch, and recorded the
+divergence rather than deepening it silently. The library is not a dependency of this project
+and never has been. Corrected here to describe what exists — **but adopting the library remains
+an open choice nobody has made.** It would touch every data-fetching call site, so it is its own
+scoped piece of work if it is ever wanted, never a side effect of whatever else happens to be
+editing the frontend.
 
 **Queues are the organizing axis.** Browsing, active transfers, and history are all filterable
 and groupable by the named path queue an item belongs to (§3.1), so "what's happening in TV"
@@ -1265,6 +1367,46 @@ bar, size, speed, ETA. Grouped by queue, collapsible per queue. Expand/collapse,
 with shift-range, bulk *Queue / Stop / Delete local / Delete remote*, text search and state
 filters.
 
+Four further row-level readings, all of them projections of the same persisted `item` row the
+state chip already reads (§2.2's one shared projection, never a second read of it):
+
+- **Lifecycle icons — Remote / Local / Verified / Extracted.** `item.state` was carrying at
+  least five orthogonal facts in one slot, and the state bugs this project actually hit were two
+  of those facts fighting over it. The icons split them apart at the display layer. **Remote and
+  Local are presence** — recomputed on every projection, and they may legitimately go dark: a
+  `move`-mode item's remote copy goes dark the instant it is deleted on purpose, and that is the
+  display being honest, so it renders dim, never red. **Verified and Extracted are milestones**
+  — read from `verified_at`/`extracted_at`, timestamp columns nothing ever clears, never from
+  `state` — so they stay correctly lit after a later rescan moves `state` on. That split is the
+  load-bearing part and must not be collapsed back: it is why the whole bug class stops being
+  visible here even where it is not yet fixed in the state layer.
+  Local completeness reuses the leaf byte rule only for states that have not resolved yet;
+  everything from `DOWNLOADED` onward reads complete from `state` instead, because two real
+  cases have real remote bytes and no local ones **by design** — a directory whose children were
+  all `EXCLUDED` (rule 8), and an `EXTRACTED` item whose spent archive volumes were deleted (§6).
+  The one case that genuinely is broken — a `DOWNLOADED` row still claiming bytes an importer
+  took — is told apart by `first_missing_at`, set only while §7.3's grace period is actually
+  running, which is also what makes a **Missing only** filter both correct and cheap.
+- **Inline progress**, drawn as the state chip's own background growing under the label, for
+  `PARTIAL`/`DOWNLOADING` rows only — including a directory's rolled-up percentage, so a 40 GB
+  release shows real progress rather than the word "partial". No new backend data and no
+  per-row timer.
+- **Sorting** by name, size, last state change, or percent complete, either direction, persisted
+  across reloads. It reorders **siblings within each parent**, never the flattened list the
+  virtualizer walks, so a sorted tree can never tear a child away from its actual parent.
+- **The Expand all / Collapse all choice persists** across reloads, stored as a default plus
+  per-row exceptions rather than a saved set of collapsed paths. The tree updates continuously
+  over the socket, and a directory that arrives *after* a saved set was written would not be in
+  it — so it would render expanded against a stated "start collapsed" preference. A default with
+  exceptions gives a newly-arrived directory the current default automatically.
+
+**Item detail.** A small info icon on each row — deliberately quieter than the lifecycle icons,
+because it is a control and not a status — opens the item drawer described below. Hovering a row
+shows a lightweight native tooltip with size / modified / percent-complete, composed from fields
+the row already holds; it fetches nothing. The icon exists because the row's own click already
+drives multi-select, which feeds bulk *Delete*, so overloading it would put an information
+affordance and an irreversible one on the same gesture.
+
 **Transfers** — the job queue. Rows stay deliberately plain:
 
 ```
@@ -1279,14 +1421,26 @@ Some.Release.S03E04.2160p    [downloading]   18 files   62%   4.1 MB/s   ETA 12m
   explained inline the first time it's used.
 - Failures show the error class plus the captured lftp output tail.
 
-**Item drawer.** Clicking a row opens a **side drawer** — not a modal, because file lists get
-long and the queue should stay visible — listing the files inside that item: name, size,
-transferred, per-file progress, status. Virtualized; a release can carry hundreds of files.
+**Item drawer.** A **side drawer** — not a modal, because file lists get long and the queue
+should stay visible — listing the files inside that item: name, size, transferred, per-file
+progress, status. Virtualized; a release can carry hundreds of files.
 
 This view is cheap for us specifically because of §1.3: per-file status is just the reconciler's
 local-vs-remote size comparison over the whole tree. `jobs -v` only ever names the handful of
 files lftp is actively touching, so a complete per-file breakdown isn't something the parsing
 approach could have offered at all.
+
+**It is one drawer, keyed on an item, opened from two places** — the Files row's info icon and a
+Transfers row — rather than two overlapping detail surfaces. It was originally keyed on a *job*
+and reachable only from Transfers, which meant it became unreachable the moment a transfer aged
+out of that page's list. Alongside the per-file breakdown it shows size and modified date for
+both sides where each exists (`local_mtime` is the local counterpart to `remote_mtime`; like
+`remote_mtime` it is files-only, since neither a directory inode's own mtime nor a recursive
+newest-child rollup answers a question the byte-comparison model asks), the lifecycle chronology
+from `first_seen_at` through `state_changed_at` rendered in the order it actually happened, and a
+bounded recent-history panel — the last handful of transfer attempts and audit events, including
+the delete trail. History is fetched **once, when the drawer opens**, never per row and never
+eagerly for a tree.
 
 **History** — **its own page**, not a panel: the `job` and `event` tables, **grouped by queue**,
 filterable by state, error class, date range, and event kind. This is where remote deletes are
@@ -1557,21 +1711,31 @@ docker-compose.dev.yml      development
 docker-compose.test.yml     the fake-seedbox integration harness (§14)
 backend/lftpweb/
   __init__.py                      # __version__ — the single source of truth, starts at 0.0.1
-  main.py config.py db.py models.py auth.py logsetup.py
-  api/{files,jobs,settings,auth,health,logs,backup}.py   api/ws.py
+  main.py config.py db.py models.py auth.py logsetup.py middleware.py
+  migrations/*.sql                 # hand-rolled, one file per step, run in order
+  api/{files,jobs,settings,auth,health,logs,backup,history,metrics,stats}.py   api/ws.py
   core/engine.py      core/remote.py     core/local_scan.py   core/lftp.py
   core/queue.py       core/scheduler.py  core/progress.py     core/reconcile.py
   core/patterns.py    core/autoqueue.py  core/postprocess.py  core/events.py
-  core/backup.py
-  core/sync.py                     # deferred (§7) — mount gate, grace period, delete policy
+  core/backup.py      core/crypto.py     core/auth.py         core/util.py
+  core/verify.py      core/extract.py    core/local_delete.py # the three §6 steps, plus
+                                                              #   deleting a local copy (§3.2)
+  core/itemview.py    core/settle.py     core/mount_sentinel.py
+  core/audit.py       core/metrics.py    core/logtail.py
   remote_agent/scan_fs.py          # stdlib-only fallback scanner
-frontend/   Vite app — routes Files / Transfers / History / Settings
+frontend/   Vite app — routes Files / Transfers / History / Dashboard / Settings
 tests/      unit + integration
 private_data/   gitignored — local scratch, test fixtures, sample trees, scratch compose (§12.1)
 ```
 
-Two of these are separate modules on purpose, and both for the same reason — the interesting
-logic is a pure function that deserves to be tested without a subprocess or a filesystem:
+`core/sync.py` was sketched here as the home for the mount gate, the grace period, and the
+delete policy. `sync` was deferred (§7), but the first two shipped in phase 4 regardless — they
+are what auto-queue needs, not what delete propagation needs (§13 phase 4) — so they live in
+`core/mount_sentinel.py` and there is no `core/sync.py`.
+
+Two of these were separate modules from the first draft, and both for the same reason — the
+interesting logic is a pure function that deserves to be tested without a subprocess or a
+filesystem:
 
 - **`core/scheduler.py`** vs `core/queue.py`. The queue owns job lifecycle and process
   supervision; the scheduler owns only the admission decision (§4.5) — `(N, B, running, queue)`
@@ -1581,6 +1745,23 @@ logic is a pure function that deserves to be tested without a subprocess or a fi
   compiled pattern set to be used in two places — building the lftp `--exclude-glob` arguments
   and telling the reconciler what an item is supposed to contain. Two copies of that logic
   drifting apart is precisely the bug that leaves every filtered release stuck in `PARTIAL`.
+
+Everything added after phase 4 followed the same rule, and five are worth naming because their
+boundaries are load-bearing rather than tidy:
+
+- **`core/itemview.py`** is the one projection of an `item` row that everything publishes
+  through — the WebSocket delta, the connect-time snapshot, and `GET /api/files` alike (§2.2).
+  Four hand-built copies of that dict existed before it, and the engine's copy is the one that
+  drifted. It is deliberately dependency-free so every other module can read back through it
+  without a cycle.
+- **`core/mount_sentinel.py`** holds the sentinel gate and the absence grace period as pure
+  decision functions, so the state machine is testable without a filesystem or a database.
+- **`core/settle.py`** holds the fingerprint arithmetic (§3.3) on the same terms.
+- **`core/audit.py`** writes the `event` rows an irreversible action must leave behind (§3.1),
+  and is distinct from `core/events.py`'s in-process `EventBus` despite the name overlap: one is
+  a durable table, the other is a fan-out to WebSocket clients.
+- **`core/logtail.py`** is the bounded backwards read behind Settings → Logs (§10.1), kept out
+  of `api/logs.py` so "read the last N lines of a possibly-5 MB file" is unit-testable.
 
 **Versioning.** `backend/lftpweb/__init__.py` holds `__version__` as a bare string (no `v`
 prefix) and is the only place the version is written. First release is **`0.0.1`**. The API
@@ -1677,7 +1858,18 @@ of `item.state` (§3.2 rule 9), the empty-remote-directory reading (§3.2 rule 1
 `REMOVED_LOCAL`/suppression correction (§3.2 rule 3), `_UNPACK_` extraction staging and the
 extraction preconditions (§6), the hash-on-disk fallback's size check (§7.3), local delete and
 retention (§3.2), throughput metrics and the Dashboard (§9.2, §10.4), and the Settings →
-Transfer tab (§9.3). `docs/decisions.md` carries the reasoning for each, newest first.
+Transfer tab (§9.3).
+
+**A second such run followed on 2026-08-13**, driven by the user running `move` mode end to end
+against a real release for the first time: rar extraction turned out never to have worked at all
+and now uses a real decoder (§11), the settle gate gained a wall-clock floor and defaults on
+(§3.3), the scan interval became per-queue (§5), archive cleanup after extraction landed (§6), a
+local delete now marks its whole subtree and picks each row's state per row (§3.2 rule 3), a
+`move`-mode outcome survives the `LOCAL_ONLY` reading that follows its own remote delete and a
+row that leaves both trees is resolved rather than frozen (§3.2 rule 9, §7.3), and the Files row
+gained lifecycle icons, inline progress, sorting, and the item detail drawer (§9.2).
+
+`docs/decisions.md` carries the reasoning for each, newest first.
 
 **Not scheduled.** `sync` mode — local-delete propagation with the mount sentinel gate, grace
 period, dry-run, and rate-based backstop (§7.3) — is a possible later feature, built only if it

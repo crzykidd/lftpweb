@@ -6,6 +6,102 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-13 — Closing documentation sweep: the second wordings backlog applied, three
+## long-standing untruths in DESIGN.md corrected, and the `resolve_absence` gap documented
+## rather than fixed
+
+**Handoff prompt `prompts/2026-08-13-docs-sweep.md`, executed end to end.** Documentation only,
+plus four stale code *comments*; `uv run pytest` was run at the end to prove no behaviour moved.
+Same shape as the 2026-08-12 sweep below: agents that found `DESIGN.md` wrong or silent drafted
+replacement wording into this file and deliberately left the doc untouched, and the user
+approved applying the lot. Each source entry now carries its own "**Applied to DESIGN.md
+2026-08-13**" line, so settled and pending stay distinguishable without re-reading the file.
+
+**What landed where.** §3.1 (`local_mtime`, `path_queue.scan_interval_s`, the `deleted_archive`
+table), §3.2 rule 3 (the `REMOVED_BOTH` correction, below), §3.2 rule 9 (the `LOCAL_ONLY`
+refinement and a pointer to §7.3), §6 (archive cleanup after extraction, three paragraphs), §7.3
+(a `rel_path` can leave both trees, and the second sweep that resolves it), §9 (the TanStack
+Query correction), §9.2 (the Files row revamp and the generalised item drawer), §12 (the module
+list, current for the first time since phase 4), §13 (a second post-phase-9 index for the
+2026-08-13 run), and the status line at the top of the document, which still said "nothing
+implemented yet."
+
+**Nothing was renumbered, again, and it was verified rather than assumed.** Every addition is
+appended within an existing section. Afterwards, every `§N.M` reference in the repo was
+extracted and resolved against the headings that now exist: the only unresolved ones are `§8.1`
+and `§8.4`, both pre-existing citations inside historical documents (this file and a completed
+prompt) to sections that never existed in the shipped numbering. Untouched deliberately —
+rewriting history to match a heading is worse than a dangling reference in an archive.
+
+**Where a draft disagreed with the code, the code won — once, and it is the important one.** The
+`move`-mode entry below carries the sentence "DESIGN.md rule 3's `re_download_externally_removed`
+opt-in is explicitly documented as a no-op for `move` either way." Reading
+`core/autoqueue.py.on_scan` against that claim while writing the correction shows it is true of
+the *intent* and false of the code: the eligibility query selects on `state` and
+`auto_queue_suppressed` and never consults the current remote tree, so a `move`-mode row sitting
+at bare, unsuppressed `REMOVED_LOCAL` becomes eligible the moment that setting is turned on, and
+produces a job doomed against a remote that is already gone. Harmless at the default. Written
+into §3.2 rule 3, `README.md`'s "Known gaps", and the changelog entry for that setting, all three
+saying the same thing.
+
+**The gap is documented, not fixed, per the prompt.** `core/mount_sentinel.py.resolve_absence`
+still always writes the literal `REMOVED_LOCAL` and still takes neither `sync_mode` nor
+`remote_deleted_at`. Widening it is a real design decision — it would also have to decide whether
+such a row is `auto_queue_suppressed` like a self-delete — and this was a documentation task.
+Rule 3's old parenthetical claiming `REMOVED_BOTH` was *removed*, not footnoted: leaving a false
+sentence in place with a correction attached below it means the next reader has to read both to
+know which one is true.
+
+**Three long-standing untruths corrected, none of which had a drafted wording waiting.**
+§9's "TanStack Query for REST" has been false since phase 1 and was flagged in phase 3b; it now
+describes the hand-rolled `fetch` client and poll hook, and says explicitly that **adopting the
+library remains an open choice nobody has made** — the correction records what exists without
+quietly closing the decision. §12's file list stopped at phase 4 and is now current, with short
+notes on why `itemview`, `mount_sentinel`, `settle`, `audit` and `logtail` have the boundaries
+they do, in the voice of the two module-boundary notes already there, plus a line recording that
+`core/sync.py` was sketched and never existed. And the document's own status line said "draft,
+pending review. Nothing implemented yet."
+
+**Four code comments corrected — comments only, no logic.** `core/settle.py`,
+`core/metrics.py`, `migrations/005_throughput_metrics.sql` and `migrations/007_settle_gate.sql`
+each claimed DESIGN.md wording was "proposed, not applied" / "not yet applied." All four
+wordings landed in the 2026-08-12 sweep; the comments now cite the section that exists (§3.3,
+§10.4). The prompt named the first three; the fourth is the same claim in the same shape and was
+corrected with them.
+
+**`CHANGELOG.md` read for coherence, not just completeness**, following `6d3bd95`'s precedent
+that an unreleased change made and then superseded the same day is described by its **net
+result**:
+
+- **The settle gate appeared twice and contradicted itself** — an `### Added` entry saying
+  "defaults **off**" and an `### Changed` entry flipping it on. Collapsed into one `### Added`
+  entry describing what actually ships: on by default, both the scan count and the wall-clock
+  floor, the self-heal, and the Settings → Transfer section. What survived into `### Changed` is
+  the one genuinely separate fact — post-processing now has two entry points instead of one.
+- **Phase 5's entry still said extraction was `7zz`, "including multi-part rar"**, directly
+  contradicting the `### Fixed` entry two hundred lines later that says rar never worked at all.
+  Made tool-agnostic, pointing at the rar entry.
+- **The same-day subtree/per-row-state delete fix was a `### Fixed` entry for a bug that never
+  shipped.** Folded into the local-deletion `### Added` entry as the net result. The `move`-mode
+  outcome fix was *kept* as `### Fixed` — it corrects phase-5-era behaviour, not a feature added
+  hours earlier, so the journey framing is the honest one there.
+- Three now-stale pointers to "DESIGN.md wording drafted, not yet applied" removed, and the
+  "`DESIGN.md` caught up with the code" entry extended to cover both sweeps rather than gaining
+  a second, near-duplicate sibling.
+
+**`README.md`: three new gaps named, one narrowed.** The frontend has **no test runner at all** —
+no vitest, no jest, nothing in `frontend/package.json` beyond `tsc -b`/`vite build`/`oxlint` —
+and the 2026-08-13 work added sorting, the collapse preference, and progress arithmetic as pure
+functions with zero coverage; that was defensible while the frontend was thin glue and is not
+any more. Almost none of that UI has been seen by a human and none of it by any agent.
+Encrypted-rar password retry is implemented and untestable (no compressor exists anywhere in
+this toolchain to build the fixture), and real-archive rar coverage is old-style `.r00`
+multi-volume only, not `.partNN`. Narrowed: the "post-processing only triggers on job success"
+gap now says two entry points, since the settle-gate half was closed on 2026-08-12 and only the
+placed-by-hand half remains.
+
+---
+
 ## 2026-08-13 — One detail surface, not two: generalising the item drawer instead of building
 ## an inline expansion
 
@@ -80,6 +176,15 @@ draft wording (see the 2026-08-12 "settle gate"/"`state_changed_at`" entries and
 > audit events. The same drawer opens from a Transfers-page row. Hovering a row (no click)
 > shows a lightweight native tooltip with size / modified / percent-complete — cheap, and it
 > never fetches anything.
+
+**Applied to DESIGN.md 2026-08-13.** §9.2's **Item drawer** paragraph was rewritten rather than
+appended to: it described a job-keyed drawer opened by clicking a Transfers row, which is the
+thing this task generalised away, so it now says "one drawer, keyed on an item, opened from two
+places" and carries the chronology, the bounded history panel, the fetch-once-on-open rule, and
+`local_mtime`'s files-only convention. The info icon and the hover tooltip landed in the new
+**Item detail** paragraph at the end of the Files section, next to the row-level readings they
+belong with, including *why* the icon exists at all (row click already drives multi-select,
+which feeds bulk Delete). §3.1's `item` block now lists `local_mtime`.
 
 ---
 
@@ -180,6 +285,17 @@ addition, pending a nod:
 Not applied to `DESIGN.md` itself per this repo's own convention for draft wording (see the
 2026-08-12 "settle gate" and "`state_changed_at`" entries below, same pattern).
 
+**Applied to DESIGN.md 2026-08-13**, expanded well past the draft because the draft compressed
+five decisions into two sentences and §9.2 is where a future reader will look for them. §9.2's
+Files section gained four bullets under the existing row description — lifecycle icons, inline
+progress, sorting, the persisted collapse preference — with the presence-vs-milestone split
+stated as the load-bearing idea and marked as the thing not to collapse back, the two
+legitimately-zero-local-bytes cases (all-`EXCLUDED`, and `EXTRACTED`-with-archives-deleted)
+named as why completeness reads from `state` past `DOWNLOADED`, and `first_missing_at` named as
+what makes the **Missing only** filter correct. Sorting's siblings-only rule and the
+default-plus-exceptions collapse preference each kept their reasoning rather than just their
+behaviour.
+
 ---
 
 ## 2026-08-13 — A `move`-mode outcome must survive `LOCAL_ONLY`, and a rel_path that leaves
@@ -239,6 +355,31 @@ should be `auto_queue_suppressed` like a self-delete, which `resolve_absence` cu
 opinion about either — not a two-line addition to this bug fix. Left as a follow-up; DESIGN.md's
 own text already documents the *intended* end state, so the gap is between the design and
 `resolve_absence`'s implementation, not an undocumented ambiguity.
+
+**Applied to DESIGN.md 2026-08-13**, in three places, and the gap above is now written into the
+document rather than left as an unremarked disagreement between the doc and the code:
+
+- **§3.2 rule 9** gained a fifth bullet, "Content present, remote gone because we deleted it"
+  (structural `LOCAL_ONLY` *and* `remote_deleted_at` set) — the same refinement argument as the
+  existing `DOWNLOADED` bullet, reached from the other side, with `remote_deleted_at` named as
+  the only thing that opens the branch and why gating on `LOCAL_ONLY` alone would be wrong. A
+  sixth bullet points at §7.3 for the leaves-both-trees case.
+- **§7.3's grace-period rail** now carries the second sweep: the reconciler's node set is
+  `remote_tree ∪ local_tree`, the persist pass only visits nodes, `move` mode manufactures paths
+  in neither tree routinely, and the sweep reuses `resolve_absence`'s own eligibility gate so a
+  `prev_state` it has no opinion about is left alone rather than invented.
+- **§3.2 rule 3's parenthetical** — "(it reaches `REMOVED_BOTH` instead)" — was **not** left in
+  place with a footnote. It was removed outright and replaced with a block quote saying plainly
+  that this is not what the code does. **One consequence this entry did not trace through, found
+  while writing that quote:** the claim above that the opt-in is "documented as a no-op for
+  `move` either way" is true of the *intent* and false of the code.
+  `core/autoqueue.py`'s eligibility query selects on `state` and `auto_queue_suppressed` alone
+  and never consults the current remote tree — so a `move`-mode row sitting at bare, unsuppressed
+  `REMOVED_LOCAL` is excluded by its **state name**, and turning
+  `re_download_externally_removed` on makes it eligible again and produces a job that fails
+  against a remote that is already gone. Harmless at the default; not a no-op. `README.md`'s
+  "Known gaps" and `CHANGELOG.md`'s entry for that setting both say so now. **Still not
+  implemented, on purpose** — for exactly the reason this entry already gives.
 
 ---
 
@@ -462,6 +603,18 @@ off to the side..." paragraph, once the user says so:
 > re-fetch/re-extract/re-delete loop; this is avoided by recording every deleted file
 > (`deleted_archive` table) and folding it into the same completeness seam §4.7's
 > `file_exclude` already feeds — a deleted archive reads `EXCLUDED`, not absent.
+
+**Applied to DESIGN.md 2026-08-13**, split across three paragraphs at the end of §6 rather than
+pasted as the single block above, because the draft packed a feature description, a trap, and a
+mode interaction into one paragraph and §6 already separates those concerns. First paragraph:
+what the option does and what it never touches, including the directory-only rule. Second: the
+infinite-loop trap and why it is solved by feeding §4.7's existing completeness seam rather than
+adding a second completeness rule — with `auto_queue_suppressed` named as the rejected tool and
+*why* (suppression writes an item off entirely; the exclusion only affects accounting for the
+bytes that were removed). Third: `move` mode, where the volumes removed are the last copy of
+those compressed bytes anywhere, why that is accepted rather than gated, and the note that it
+sharpens §6's already-recorded unreasoned ordering risk. §3.1 gained the `deleted_archive`
+table, which the second paragraph depends on.
 
 ---
 
@@ -1141,6 +1294,15 @@ exists — flagged in phase 3b and still undecided); §12's file list omits ever
 since phase 4; local retention and the manual delete endpoint have no section of their own
 (only the state-level consequences are documented, in §3.2); and the per-file live child
 progress work has no §9.2 wording. Filling any of those is a decision, not a transcription.
+
+**Two of those four were filled on 2026-08-13** (see this file's newest entry). §9 now describes
+the hand-rolled client and says outright that the document was wrong from its first draft —
+while recording that *adopting* the library remains an open choice nobody has made, since that
+is the decision this paragraph correctly declined to make on its own. §12's file list is current
+and gained short notes on why five of the post-phase-4 modules have the boundaries they do, plus
+a line about `core/sync.py` never existing. The other two remain open: local delete and
+retention still have no section of their own, and per-file live child progress still has no
+§9.2 wording.
 
 ---
 

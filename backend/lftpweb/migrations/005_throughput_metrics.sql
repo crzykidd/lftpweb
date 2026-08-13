@@ -1,6 +1,6 @@
--- Throughput metrics (DESIGN.md — new section proposed alongside this migration; see
--- docs/decisions.md for the exact wording proposed, not applied here per this task's
--- working-tree constraint). Backs the Dashboard page's two charts (api/metrics.py):
+-- Throughput metrics (DESIGN.md §10.4, written alongside this migration and applied to the
+-- document on 2026-08-12; docs/decisions.md carries the reasoning and the rejected
+-- alternatives). Backs the Dashboard page's two charts (api/metrics.py):
 -- bytes-per-hour over the last 24h, and speed over a selectable 1h/12h/24h window.
 --
 -- Two tables, deliberately not one:

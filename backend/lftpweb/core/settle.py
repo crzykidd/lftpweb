@@ -1,9 +1,12 @@
-"""The settle gate (`prompts/open-issues.md` "2 -- the settle gate"). DESIGN.md wording has
-been drafted for this across two tasks -- the original build and
-`prompts/2026-08-12-settle-gate-followups.md` (the stuck-item fix, the wall-clock floor below,
-and defaulting this on) -- see `docs/decisions.md` for both; the doc gets corrected explicitly,
-not quietly diverged from, and the second task's entry supersedes part of the first's already-
-applied §6 wording (the post-processing trigger paragraph).
+"""The settle gate -- DESIGN.md §3.3, with the eligibility half in §4.7 and the completion half
+in §6's trigger paragraph.
+
+Built across two tasks (the original build, then `prompts/done/2026-08-12-settle-gate-
+followups.md` for the stuck-item self-heal, the wall-clock floor below, and defaulting this on);
+both tasks drafted DESIGN.md wording rather than applying it, and **both wordings have since
+been applied** -- §3.3 is the settle gate's own section, and §6 now names the two
+post-processing call sites rather than only the job-success one. `docs/decisions.md` carries the
+reasoning and the rejected alternatives for each.
 
 **The problem this exists to catch.** A seedbox may still be writing a top-level item
 (DESIGN.md §4.7's granularity) when a scan observes it. `core/reconcile.py` decides

@@ -1,7 +1,7 @@
-"""Throughput sample store (DESIGN.md — new section proposed alongside this task; see
-docs/decisions.md for the exact wording proposed, not applied to DESIGN.md itself here). Feeds
-the Dashboard page's two charts (`api/metrics.py`) from the *same* byte accounting
-`core/progress.py`/`core/queue.py` already derive from the filesystem (DESIGN.md §1.3/§4.4) --
+"""Throughput sample store (DESIGN.md §10.4, written alongside this module and applied to the
+document on 2026-08-12; `docs/decisions.md` carries the reasoning and the rejected
+alternatives). Feeds the Dashboard page's two charts (`api/metrics.py`) from the *same* byte
+accounting `core/progress.py`/`core/queue.py` already derive from the filesystem (§1.3/§4.4) --
 nothing here parses lftp's stdout, and nothing here re-measures anything; it only persists a
 delta of numbers `TransferQueue.tick()`'s existing ~1 Hz progress sample already computed for
 the live WebSocket feed.
