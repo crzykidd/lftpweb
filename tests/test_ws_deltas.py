@@ -45,6 +45,7 @@ def _node(rel_path: str, size: int) -> ItemView:
             "remote_size": size,
             "local_size": None,
             "remote_mtime": 1.0,
+            "state_changed_at": None,
         }
     )
 

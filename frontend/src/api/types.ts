@@ -171,6 +171,12 @@ export interface FileNode {
   remote_size: number | null
   local_size: number | null
   remote_mtime: number | null
+  // When `state` last actually changed value (migration 006), stamped by that migration's own
+  // triggers. null only for a row the migration's backfill genuinely couldn't date -- render
+  // gracefully rather than assuming a value. Not the same question as "when did it complete"
+  // (downloaded_at, the planned local-retention feature's key) -- a DOWNLOADED item that dips
+  // to PARTIAL and back moves this without earning a fresh retention lease.
+  state_changed_at: string | null
 }
 
 export interface QueueFiles {

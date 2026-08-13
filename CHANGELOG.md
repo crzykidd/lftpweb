@@ -84,6 +84,16 @@ alongside this list: several entries below ship with deliberate, documented limi
   well below what the inputs accept.
 - **Expand all / Collapse all** on the Files tree, and the **queue name on each Transfers
   row** *(2026-08-12)*.
+- **The Files tree now shows when each row last changed state** *(2026-08-12)*: "Downloaded
+  3 min ago" / "Remote 2 hr ago", relative time via the built-in `Intl.RelativeTimeFormat`
+  (no new dependency), with the absolute local time on hover. Backed by a new
+  `item.state_changed_at` column (migration 006), stamped by two triggers rather than writer
+  discipline — `item.state` is written from three separate modules, and a timestamp every
+  writer has to remember to also set is a timestamp that eventually goes silently wrong.
+  Existing rows are backfilled from the closest thing already on hand
+  (`extracted_at`/`verified_at`/`downloaded_at`/`first_seen_at`, an approximation); everything
+  from this migration forward is exact. A single shared per-tree ticker drives the relative
+  reading rather than a timer per row, since the Files tree can hold thousands of rows.
 - **The settle gate** *(2026-08-12, defaults **off**)*: a top-level item (a release directory
   or a loose top-level file) is now fingerprinted every scan
   (`file_count, total_bytes, max_mtime` over its whole remote subtree), and — when this new

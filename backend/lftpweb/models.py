@@ -245,6 +245,12 @@ class FileNode(BaseModel):
     remote_size: int | None
     local_size: int | None
     remote_mtime: float | None
+    # When `state` last actually changed value (migration 006), stamped by that migration's
+    # own triggers -- not writer discipline (see `core/itemview.py.item_view`). `None` only
+    # for a row the migration's backfill genuinely couldn't date. Deliberately NOT the key for
+    # the planned local-retention feature, which must use `downloaded_at` instead: "when did
+    # it complete" and "when did it last move" are different questions.
+    state_changed_at: str | None = None
 
 
 class QueueFiles(BaseModel):

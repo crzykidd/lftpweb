@@ -1,9 +1,16 @@
 import { useVirtualizer } from '@tanstack/react-virtual'
-import { useMemo, useRef, useState } from 'react'
+import { useEffect, useMemo, useReducer, useRef, useState } from 'react'
 import { queueItem, stopItem } from '../api/client'
 import type { FileNode } from '../api/types'
-import { formatBytes } from '../lib/format'
+import { formatBytes, stateAgeLabel } from '../lib/format'
 import { StateChip } from './StateChip'
+
+// One shared ticker per tree, not a `setInterval` per row (migration 006's `state_changed_at`
+// column, DESIGN.md §9.2). This page can hold thousands of rows; a per-row timer would mean
+// thousands of live intervals for a reading that only needs to refresh every few seconds. A
+// single bumped counter here forces a re-render of whatever rows are currently mounted --
+// cheap, because the virtualizer only ever mounts the visible slice.
+const AGE_TICK_INTERVAL_MS = 15_000
 
 const ROW_HEIGHT_PX = 32
 
@@ -141,6 +148,16 @@ function Row({ entry, isCollapsed, isSelected, onToggleCollapse, onToggleSelect,
           />
         )}
       </span>
+      {/* migration 006's `state_changed_at`: "when did this row last move," labeled by the
+          state it's already showing rather than a second, redundant chip. Absolute time in
+          local time on hover -- History's date filters are UTC-only (a documented phase 6
+          limitation), and this sidesteps that question rather than inheriting it. */}
+      <span
+        className="w-32 shrink-0 truncate text-right text-xs text-zinc-500 dark:text-zinc-400"
+        title={entry.state_changed_at ? new Date(entry.state_changed_at).toLocaleString() : undefined}
+      >
+        {stateAgeLabel(entry.state, entry.state_changed_at)}
+      </span>
       <span className="w-16 shrink-0 text-right">
         {action && (
           <button
@@ -192,6 +209,15 @@ function errorMessage(reason: unknown): string {
  * failure reporting for bulk Queue/Stop.
  */
 export function FileTree({ nodes }: { nodes: FileNode[] }) {
+  // The shared age ticker (module docstring above): bumping this forces a re-render of
+  // whatever rows are currently mounted, which is all `stateAgeLabel` needs to catch up --
+  // it's computed fresh from `Date.now()` on every render, not memoized against this value.
+  const [, bumpAgeTick] = useReducer((c: number) => c + 1, 0)
+  useEffect(() => {
+    const id = setInterval(() => bumpAgeTick(), AGE_TICK_INTERVAL_MS)
+    return () => clearInterval(id)
+  }, [])
+
   const tree = useMemo(() => buildTree(nodes), [nodes])
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set())
   const [selected, setSelected] = useState<Set<string>>(new Set())

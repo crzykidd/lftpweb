@@ -6,6 +6,73 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-12 — `item.state_changed_at`: two triggers instead of writer discipline, and why
+## the column has no `DEFAULT`
+
+**Handoff prompt `prompts/done/2026-08-12-state-changed-at.md`, executed end to end** — the
+Files page's "when did this row last change" readout, migration 006.
+
+**Trigger, not writer discipline — restated from the prompt because it's the whole point of
+the design.** `item.state` is written from three separate modules: `core/engine.py._persist`
+(two `INSERT ... ON CONFLICT DO UPDATE` statements), `core/queue.py` (plain `UPDATE`s for
+QUEUED/DOWNLOADING/DOWNLOADED/STOPPED/FAILED, plus a per-child `CASE` statement that assigns
+`state` on every tick whether or not the computed value actually changed), and
+`core/postprocess.py` (`_set_item_state` plus the verify/extract branches). Requiring all
+three to also stamp a timestamp on every write is exactly the kind of cross-cutting discipline
+that gets missed once, silently, and a wrong timestamp is worse than no timestamp — nothing
+downstream can tell the two apart. Schema-level enforcement means there is exactly one place
+this can ever be wrong: the migration file itself.
+
+**Two triggers, not one.** `AFTER UPDATE OF state ON item WHEN NEW.state IS NOT OLD.state`
+covers every write above — the `WHEN` guard is what makes the queue's per-child `CASE`
+statement safe (it assigns `state` unconditionally, so `UPDATE OF state` alone would fire on
+every tick regardless of whether the value moved; only the value-comparison guard stops that).
+A second `AFTER INSERT ... WHEN NEW.state_changed_at IS NULL` trigger stamps a brand new row —
+see the `DEFAULT` question below for why this is a trigger and not a column default.
+Re-entrancy is structural, not timing-dependent: the update trigger's own `UPDATE` touches only
+`state_changed_at`, never `state`, so `AFTER UPDATE OF state` cannot re-fire itself regardless
+of the `recursive_triggers` pragma (SQLite's own default is OFF; the test suite forces it ON
+and asserts the write still completes, rather than trusting the default to be masking a latent
+bug).
+
+**The `ALTER TABLE ... DEFAULT` restriction, confirmed rather than assumed.** The obvious first
+draft — `ALTER TABLE item ADD COLUMN state_changed_at TEXT DEFAULT (STRFTIME(...))` — was
+tried directly against a populated in-memory table before writing the migration, and SQLite
+refuses it outright: `Cannot add a column with non-constant default`. This restriction only
+bites once the table already has rows, which is every real lftpweb database this migration
+will ever run against (a fresh install has no `item` rows to migrate in the first place, so the
+restriction would never surface in that case — but it always does in practice). Two ways
+around it were on the table:
+
+- **Rebuild the `item` table** (`CREATE TABLE item_new (... DEFAULT (STRFTIME...) ...)`, copy
+  every row across, drop the old table, rename). A `CREATE TABLE` with a non-constant `DEFAULT`
+  has no such restriction — only `ALTER TABLE ADD COLUMN` does. Rejected: a full rebuild has to
+  faithfully reproduce every `CHECK`, `UNIQUE`, and foreign key on a table five other migrations
+  have already touched, for a blast radius (every row physically rewritten, indexes rebuilt)
+  wildly out of proportion to "one nullable column."
+- **Plain `ALTER TABLE ADD COLUMN` with no default, plus an `AFTER INSERT` trigger** —
+  what shipped. The column starts `NULL` for every existing row (fixed immediately after by the
+  backfill `UPDATE` in the same migration), and the insert trigger stamps every row from that
+  point forward, in the same transaction, with no risk to a single existing row. Four lines
+  versus a table rebuild, for the identical externally-visible outcome: a first-sighted item
+  gets `state_changed_at` set the moment it exists.
+
+**Backfill is an explicit approximation, not a reconstruction.** `COALESCE(extracted_at,
+verified_at, downloaded_at, first_seen_at)` picks the closest thing already on a pre-existing
+row to "when did the current state begin," most-specific first — it is not, and cannot be, the
+actual moment the row's `state` last changed, because that information was never recorded
+before this migration. The migration file and `core/itemview.py`'s docstring both say so, so a
+future reader doesn't mistake a backfilled row for an exact one.
+
+**Explicitly not wired to the planned local-retention feature.** That feature must key on
+`downloaded_at`, not `state_changed_at`: "when did it complete" and "when did it last move" are
+different questions, and a `DOWNLOADED` item that dips to `PARTIAL` (a stopped/resumed
+transfer, a partial rescan) and back would otherwise earn a fresh retention lease it never
+actually earned. Left as a column comment in the migration and a docstring note in
+`models.py`/`types.ts` so the next person doesn't wire it up wrongly.
+
+---
+
 ## 2026-08-12 — The settle gate: a fingerprint-based hold on auto-queue and on reaching
 ## `DOWNLOADED`, off by default; the hash-on-disk verify fallback now catches truncation
 
