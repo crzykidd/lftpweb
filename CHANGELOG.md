@@ -446,6 +446,41 @@ alongside this list: several entries below ship with deliberate, documented limi
   tracked `rel_path` that vanished from both trees this pass through the same grace-period
   machinery, so a relocated (or externally moved) `move`-mode item still reaches `REMOVED_LOCAL`
   rather than freezing on its outcome.
+- **Four defects found by the user within hours of the local-deletion feature shipping**
+  *(2026-08-13)*, all variations of one theme: a row that nothing will ever revisit, so it
+  stays wrong forever.
+  - A large delete gave no feedback while it ran, and the actual removal blocked the whole
+    process (not just the request that started it) for its whole duration. `item.substate =
+    'removing'` is now written and published *before* the filesystem work starts, and the
+    work itself now runs off the event loop so that message — and everything else — can
+    actually get through while a large directory delete is in progress. Protected from a
+    racing scan (and a second concurrent delete of the same item) by a new in-memory
+    `DeleteInFlight` tracker, the same shape and crash-safety guarantee as
+    `PostprocessPipeline.in_flight_item_ids()` — a killed process cannot leave a row stuck
+    reading "Removing" forever.
+  - A row this codebase deleted itself (`REMOVED_LOCAL`/`REMOVED_BOTH`, suppressed) never
+    noticed content coming back on either side — a re-uploaded release still read "Removed
+    Both" with no indication the remote copy was back, and a child file a fresh extraction
+    recreated locally stayed frozen at "Removed Both" even though the bytes were on disk
+    again. Both now correct (`REMOVED_LOCAL` if only remote returned, `LOCAL_ONLY` if only
+    local did) while staying exactly as ineligible for auto-queue as before — suppression and
+    state text are separate questions, and only the text was ever wrong. The Files page also
+    now labels the action "Re-Download" rather than "Queue" for exactly this row shape, named
+    by the user directly.
+  - **The most serious of the four**: a small file's row could get stuck at `PARTIAL` forever
+    on a `move` queue, with no rescan able to fix it — reported by the user as "the last file
+    downloaded was a Sample file and it ended at Partial but the file is there and there are
+    no active transfers." Root cause: the throttled per-child progress writer can leave a
+    stale mid-transfer reading behind right as a job finishes, and post-processing can relocate
+    the whole release out of both trees before any scan gets the chance to correct it — once
+    that happens, there is no fresh structural reading left to fix the row with. Fixed at the
+    source (`core/queue.py._reap_one` now flushes one final, accurate, unthrottled reading of
+    every child the instant its job reaps) and with a safety net for whenever a stale reading
+    forms anyway (`core/mount_sentinel.resolve_vanished`, a narrow fallback for a `PARTIAL`/
+    `LOCAL_ONLY` row that leaves both trees with no other opinion available).
+  - A completed directory showed no size at all on a `move` queue, while every file inside it
+    still did — files already fell back from a cleared `remote_size` to `local_size`;
+    directories now do too.
 
 ### Security
 

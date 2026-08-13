@@ -403,6 +403,196 @@ async def test_move_mode_item_survives_the_next_scan_as_verified_not_local_only(
         await scan_pool.close()
 
 
+async def test_move_mode_multi_file_release_leaves_no_child_stuck_at_partial(db, tmp_path):
+    """The user's own reproduction (`prompts/2026-08-13-delete-state-truthfulness.md`, defect
+    3), against the real fake seedbox: "the last file downloaded was a Sample file and it ended
+    at Partial but the file is there and there are no active transfers. a rescan doesn't seem to
+    fix that." A `move` queue with `auto_move` on, a multi-file release including a small file,
+    end to end -- transfer, the throttled per-child sampler (`core/queue.py.
+    _publish_child_progress`), the job's own reap (`_reap_one`, now flushing a final accurate
+    child reading -- `_flush_child_progress_final`), verification, the remote delete, and the
+    staging move that relocates the release out of both trees entirely.
+
+    Asserts no row -- top-level or any child -- is left at `PARTIAL` once the dust settles, both
+    the instant the move completes and after a further real scan (which is what exercises
+    `core/mount_sentinel.py.resolve_vanished`'s fallback for anything the reap-time flush alone
+    didn't catch).
+    """
+    remote_subdir = f"phase5-move-partial-e2e-{uuid4().hex[:12]}"
+    rel_path = "Release"
+    sample_content = b"tiny sample file -- the one that reproduced the bug\n"
+    big_content = os.urandom(64_000)
+
+    scan_pool = RemoteConnectionPool(tmp_path / "known_hosts_scan")
+    host = _host_config()
+    try:
+        conn = await scan_pool.get_connection(host)
+        async with conn.start_sftp_client() as sftp:
+            await sftp.makedirs(f"/data/pickup/{remote_subdir}/{rel_path}", exist_ok=True)
+            async with sftp.open(f"/data/pickup/{remote_subdir}/{rel_path}/sample.txt", "wb") as f:
+                await f.write(sample_content)
+            async with sftp.open(f"/data/pickup/{remote_subdir}/{rel_path}/release.mkv", "wb") as f:
+                await f.write(big_content)
+
+        local_dir = tmp_path / "local"
+        local_dir.mkdir()
+        staging_dir = tmp_path / "staging"
+        staging_dir.mkdir()
+        cursor = await db.execute(
+            "INSERT INTO host (name, address, port, username, auth_method, password_enc, "
+            "known_hosts_policy) VALUES ('seedbox', ?, ?, ?, 'password', NULL, 'insecure')",
+            (SEEDBOX_HOST, SEEDBOX_PORT, SEEDBOX_USER),
+        )
+        host_id = cursor.lastrowid
+        cursor = await db.execute(
+            "INSERT INTO path_queue (host_id, name, remote_path, local_path, staging_path, "
+            "enabled, sync_mode, auto_move) VALUES "
+            "(?, 'e2e-move-partial', ?, ?, ?, 1, 'move', 1)",
+            (
+                host_id,
+                f"/data/pickup/{remote_subdir}",
+                str(local_dir),
+                str(staging_dir),
+            ),
+        )
+        queue_id = cursor.lastrowid
+        await db.commit()
+
+        await save_transfer_settings(
+            db,
+            TransferSettings(
+                max_bandwidth_bps=10_000_000,
+                max_concurrent_transfers=2,
+                small_item_threshold_bytes=0,
+                small_lane_reserve_bps=0,
+                min_share_floor_bps=0,
+                mirror_parallel_transfer_count=2,
+                mirror_use_pget_n=2,
+                pget_default_n=2,
+            ),
+        )
+        await save_settle_settings(db, SettleSettings(enabled=False))
+
+        async def host_provider():
+            return host
+
+        events = EventBus()
+        pipeline_pool = RemoteConnectionPool(tmp_path / "known_hosts_pipeline")
+        # No .sfv/.md5 sidecar -- the hash-on-disk fallback is what lets verification (forced
+        # on for `move` regardless of this setting) actually reach VERIFIED.
+        await save_postprocess_settings(
+            db, PostprocessSettings(verify_hash_on_disk=True, move_enabled=True)
+        )
+        pipeline = PostprocessPipeline(
+            db=db, events=events, remote_pool=pipeline_pool, host_provider=host_provider
+        )
+
+        # A real scan first, exactly like production: this is what actually creates the child
+        # `item` rows (`Release/sample.txt`, `Release/release.mkv`) that `_publish_child_progress`
+        # and `_flush_child_progress_final` update during and after the transfer -- neither
+        # invents a row that a scan didn't already persist.
+        engine = Engine(db, str(tmp_path), events)
+        q = QueueConfig(
+            id=queue_id,
+            host_id=host_id,
+            name="e2e-move-partial",
+            remote_path=f"/data/pickup/{remote_subdir}",
+            local_path=str(local_dir),
+            staging_path=str(staging_dir),
+            enabled=True,
+            sync_mode="move",
+        )
+        try:
+            await engine.scan_queue(q, host)
+
+            cursor = await db.execute(
+                "SELECT id, rel_path FROM item WHERE queue_id = ? ORDER BY rel_path", (queue_id,)
+            )
+            rows = await cursor.fetchall()
+            by_path = {r["rel_path"]: r["id"] for r in rows}
+            assert set(by_path) == {rel_path, f"{rel_path}/sample.txt", f"{rel_path}/release.mkv"}
+            top_id = by_path[rel_path]
+
+            q_transfer = TransferQueue(
+                db=db,
+                config_dir=str(tmp_path),
+                events=events,
+                run_dir=str(tmp_path / "run"),
+                tick_s=0.2,
+                host_provider=host_provider,
+            )
+            q_transfer.postprocess = pipeline
+
+            await q_transfer.start()
+            try:
+                await q_transfer.enqueue_item(top_id)
+
+                async def job_succeeded():
+                    row = await (
+                        await db.execute(
+                            "SELECT state FROM job WHERE item_id = ? ORDER BY id DESC LIMIT 1",
+                            (top_id,),
+                        )
+                    ).fetchone()
+                    return row is not None and row["state"] == "succeeded"
+
+                assert await _wait_until(
+                    job_succeeded, timeout_s=30
+                ), "transfer job never succeeded"
+                # Not "and the release directory still exists locally right here" -- postprocessing
+                # is triggered fire-and-forget the instant the job succeeds (`_reap_one`) and can
+                # race ahead of this poll loop's very next iteration, same as the other e2e tests
+                # in this file already note. The job row itself is the proof the transfer happened.
+
+                # The proof of the staging move having actually happened: an event row naming
+                # it (`core/postprocess.py._do_move`'s own audit trail), not just "the directory
+                # is gone" -- which a slow verify/delete step still in flight could satisfy
+                # vacuously if checked too early relative to the move step that follows it.
+                async def moved() -> bool:
+                    row = await (
+                        await db.execute(
+                            "SELECT 1 FROM event WHERE item_id = ? AND kind = 'move' LIMIT 1",
+                            (top_id,),
+                        )
+                    ).fetchone()
+                    return row is not None
+
+                assert await _wait_until(
+                    moved, timeout_s=30
+                ), "move-mode postprocessing never relocated the release to staging_path"
+            finally:
+                await q_transfer.stop()
+
+            assert (staging_dir / rel_path / "sample.txt").read_bytes() == sample_content
+            assert (staging_dir / rel_path / "release.mkv").read_bytes() == big_content
+
+            # The actual assertion this test exists for: immediately after the move, before any
+            # further scan, no row -- top-level or child -- is stuck at PARTIAL.
+            cursor = await db.execute(
+                "SELECT rel_path, state FROM item WHERE queue_id = ? ORDER BY rel_path", (queue_id,)
+            )
+            states_before_scan = {r["rel_path"]: r["state"] for r in await cursor.fetchall()}
+            assert "PARTIAL" not in states_before_scan.values(), states_before_scan
+
+            # And it stays that way through a real further scan -- the second half of the fix
+            # (`core/mount_sentinel.py.resolve_vanished`) for anything the reap-time flush alone
+            # didn't already correct, since both files have now left both trees entirely.
+            await engine.scan_queue(q, host)
+            cursor = await db.execute(
+                "SELECT rel_path, state FROM item WHERE queue_id = ? ORDER BY rel_path", (queue_id,)
+            )
+            states_after_scan = {r["rel_path"]: r["state"] for r in await cursor.fetchall()}
+            assert "PARTIAL" not in states_after_scan.values(), states_after_scan
+        finally:
+            await engine.pool.close()
+    finally:
+        try:
+            await scan_pool.delete_path(host, f"/data/pickup/{remote_subdir}")
+        except Exception:  # noqa: BLE001 - cleanup only
+            pass
+        await scan_pool.close()
+
+
 _SEVEN_ZIP_BIN = os.environ.get("LFTPWEB_7Z_BIN") or next(
     (b for b in ("7zz", "7z") if shutil.which(b)), None
 )

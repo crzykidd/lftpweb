@@ -24,7 +24,7 @@ from lftpweb.config import settings
 from lftpweb.core import auth
 from lftpweb.core.autoqueue import AutoQueue
 from lftpweb.core.backup import BackupScheduler
-from lftpweb.core.local_delete import RetentionScheduler
+from lftpweb.core.local_delete import DeleteInFlight, RetentionScheduler
 from lftpweb.core.metrics import MetricsRetentionScheduler
 from lftpweb.core.engine import Engine, load_host_config
 from lftpweb.core.events import EventBus
@@ -94,6 +94,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # (Engine._protected_rel_paths). Same plain-attribute wiring, same reason as above.
     app.state.engine.postprocess = app.state.postprocess
 
+    # 2026-08-13 (`prompts/2026-08-13-delete-state-truthfulness.md`): the live, in-memory
+    # record of which items a `delete_local()` call is currently removing from disk -- the
+    # identical "one instance, shared by every writer and reader, plain-attribute wiring"
+    # shape `postprocess` above uses, for the identical reason (`DeleteInFlight`'s own
+    # docstring). `Engine` needs it for the same read `postprocess.in_flight_item_ids()`
+    # already gets: `_protected_rel_paths` shielding a row's state from a racing scan while
+    # its files are still disappearing.
+    app.state.delete_in_flight = DeleteInFlight()
+    app.state.engine.delete_in_flight = app.state.delete_in_flight
+
     # Phase 7 (DESIGN.md §10.2): the scheduled backup loop, independent of the pre-migration
     # backup above (which fires from db.py.migrate() regardless of this loop ever starting).
     app.state.backup_scheduler = BackupScheduler(db=app.state.db, config_dir=settings.config_dir)
@@ -113,6 +123,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         db=app.state.db,
         events=app.state.events,
         in_flight_provider=lambda: app.state.postprocess.in_flight_item_ids(),
+        delete_in_flight=app.state.delete_in_flight,
     )
 
     await app.state.engine.start()

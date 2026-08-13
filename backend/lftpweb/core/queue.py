@@ -25,7 +25,7 @@ from typing import Any
 
 import aiosqlite
 
-from lftpweb.core import audit, lftp, patterns, scheduler, settle
+from lftpweb.core import audit, lftp, local_scan, patterns, scheduler, settle
 from lftpweb.core.events import EventBus
 from lftpweb.core.itemview import ITEM_VIEW_COLUMNS, ItemView, item_view
 from lftpweb.core.metrics import RunningJobBytes, ThroughputSampler
@@ -535,6 +535,15 @@ class TransferQueue:
                 (finished_at, proc.job_id),
             )
 
+            # 2026-08-13 (prompts/2026-08-13-delete-state-truthfulness.md, defect 3's "real
+            # fix"): a final, accurate, un-throttled reading of every child row before anything
+            # downstream (post-processing's verify/delete/extract/move) can touch this job's
+            # files -- see `_flush_child_progress_final`'s own docstring for the bug this
+            # closes. A no-op for a `pget` job (single file, no children) and cheap for a
+            # `mirror` job either way (bounded by the release's own file count, the same walk
+            # `_publish_child_progress` already does every throttled tick).
+            await self._flush_child_progress_final(proc)
+
             # The settle gate's completion half (prompts/open-issues.md #2, `core/settle.py`),
             # for a top-level item only -- the same eligibility shape core/autoqueue.py uses,
             # since a queued job is always for a top-level item. `_item_is_settled` reads
@@ -638,6 +647,75 @@ class TransferQueue:
 
         await self._publish_item_state(proc.item_id)
         proc.spawned.cleanup()
+
+    async def _flush_child_progress_final(self, proc: _RunningProcess) -> None:
+        """A final, accurate, un-throttled reading of a `mirror` job's per-child rows, run once
+        at reap time on job success -- the "real fix" half of
+        `prompts/2026-08-13-delete-state-truthfulness.md`'s defect 3 (`core/mount_sentinel.py.
+        resolve_vanished` is the safety net for whenever this doesn't run, or a stale reading
+        forms anyway).
+
+        **The bug.** `_publish_child_progress` persists a child's `local_size`/`state` only
+        every `CHILD_PROGRESS_THROTTLE_TICKS`-th tick, and only for files whose size changed
+        since the *previous* throttled tick -- deliberately, so a 50-file release doesn't mean
+        50 writes a second (that module's own docstring). But a job can finish *between* two
+        throttled ticks, and once it does, nothing ever samples that job's children again --
+        `_reap_one` only ever wrote the *parent* item's row. So the last thing a small file's
+        row says can be a mid-transfer `PARTIAL`, true for a fraction of a second, frozen there
+        indefinitely. On a `copy`-mode queue a later engine scan corrects it (the file is still
+        sitting in both trees). On a `move` queue, post-processing can relocate the whole
+        release out of both trees -- remote deleted after verify, local moved to
+        `staging_path` -- before any scan gets the chance, and the stale `PARTIAL` becomes
+        permanent (`resolve_vanished`'s own docstring has the full mechanics).
+
+        **The fix.** The job has just exited 0 -- `cmd:fail-exit true` guarantees every file it
+        was asked to transfer is now on disk under its final name, no more `.lftp` temp
+        suffixes in flight (DESIGN.md §4.3) -- so one more walk of `proc.local_root` at this
+        exact moment, right here, gives the true final state, and this runs it unthrottled and
+        unconditionally rather than waiting for a tick that might not come. Same walk
+        `core/progress.py._bytes_done_for` already does for a live `mirror` job
+        (`local_scan.scan_local`), same per-child state rule `_publish_child_progress` already
+        uses (`local >= remote_size -> DOWNLOADED, else PARTIAL`, left alone when `remote_size`
+        is `NULL`) -- not reimplemented, just run one more time, synchronously, not wrapped in
+        `asyncio.to_thread`: bounded by one release's own file count (the same bound that
+        module's docstring already argues from), and `core/engine.py.scan_queue` already calls
+        `local_scan.scan_local` this same way for its own (much larger) tree walk.
+
+        A no-op for a `pget` job (single file, `item.id == proc.item_id` already got the
+        parent's own final write above; there are no children to flush) and for any job whose
+        `local_root` no longer exists by the time this runs (`scan_local` returns `{}` for a
+        missing root -- nothing to flush, nothing to crash on).
+        """
+        if proc.kind != "mirror":
+            return
+        entries = local_scan.scan_local(proc.local_root)
+        full_paths: list[str] = []
+        for rel, entry in entries.items():
+            if entry.is_dir:
+                continue
+            full_path = f"{proc.rel_path}/{rel}"
+            await self.db.execute(
+                "UPDATE item SET local_size = ?, state = CASE "
+                "WHEN remote_size IS NULL THEN state "
+                "WHEN ? >= remote_size THEN 'DOWNLOADED' "
+                "ELSE 'PARTIAL' END "
+                "WHERE queue_id = ? AND rel_path = ?",
+                (entry.size, entry.size, proc.queue_id, full_path),
+            )
+            full_paths.append(full_path)
+        if not full_paths:
+            return
+        await self.db.commit()
+        placeholders = ",".join("?" * len(full_paths))
+        cursor = await self.db.execute(
+            # ITEM_VIEW_COLUMNS is a module constant and `placeholders` is just `?` repeated
+            # once per path; the only bound values are `queue_id`/`full_paths`.
+            f"SELECT {ITEM_VIEW_COLUMNS} FROM item WHERE queue_id = ? AND rel_path IN ({placeholders})",  # noqa: S608
+            (proc.queue_id, *full_paths),
+        )
+        nodes = [item_view(row) for row in await cursor.fetchall()]
+        if nodes:
+            self.events.publish({"type": "item_delta", "queue_id": proc.queue_id, "nodes": nodes})
 
     async def _sample_and_publish_progress(self) -> None:
         """The ~1 Hz tick the WS delta fix (DESIGN.md §2/§9) exists for. Two messages come

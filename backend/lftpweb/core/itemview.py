@@ -43,8 +43,17 @@ from typing import Any
 # 001) already existed on every row but had never reached the wire before this task -- it is the
 # first entry in the lifecycle chronology the drawer renders ("when did lftpweb first notice
 # this"), and there was simply no reader for it until now.
+#
+# `suppressed_reason` (2026-08-13, prompts/2026-08-13-delete-state-truthfulness.md, defect 2):
+# the Files page's "Re-Download" label needs to tell "this row is suppressed because *we*
+# deleted it" (`'deleted_local'`) apart from every other suppression reason
+# (`'user_stopped'`/`'retries_exhausted'`/`'permanent_error'`) and from not-suppressed-at-all,
+# which the state string alone cannot -- `REMOVED_LOCAL`/`REMOVED_BOTH` can also be produced by
+# `core/mount_sentinel.py.resolve_vanished` with no suppression at all (defect 3). See
+# `FileTree.tsx.rowAction` for where this is actually used.
 ITEM_VIEW_COLUMNS = (
     "id, rel_path, is_dir, remote_size, local_size, remote_mtime, local_mtime, state, substate, "
+    "suppressed_reason, "
     "state_changed_at, first_seen_at, downloaded_at, verified_at, extracted_at, "
     "first_missing_at, remote_deleted_at"
 )
@@ -274,8 +283,13 @@ def item_view(row: Mapping[str, Any]) -> ItemView:
     string carrying a lone surrogate could not be written to a TEXT column at all).
 
     `substate` (migration 007, `core/settle.py`) is `'settling'` for a top-level item held at
-    `REMOTE_ONLY` by the settle gate, `None` otherwise — see that module's docstring. Passed
-    through verbatim; unlike `remote_mtime` it has no affinity mismatch to correct for.
+    `REMOTE_ONLY` by the settle gate, `'removing'` for the whole subtree of a
+    `core/local_delete.py.delete_local()` call currently mid-removal (2026-08-13), `None`
+    otherwise — see those modules' docstrings. `suppressed_reason` (2026-08-13, new to the wire
+    with the same task) is the raw `item.suppressed_reason` column, `None` unless
+    `auto_queue_suppressed` is set — see `ITEM_VIEW_COLUMNS`'s own comment for why the Files
+    page needs it. Both passed through verbatim; unlike `remote_mtime` neither has an affinity
+    mismatch to correct for.
 
     `state_changed_at` (migration 006) is when `state` last actually changed value, stamped by
     that migration's own triggers — nothing in this codebase writes it directly. `None` only
@@ -304,6 +318,7 @@ def item_view(row: Mapping[str, Any]) -> ItemView:
         "is_dir": bool(row["is_dir"]),
         "state": row["state"],
         "substate": row["substate"],
+        "suppressed_reason": row["suppressed_reason"],
         "remote_size": row["remote_size"],
         "local_size": row["local_size"],
         "remote_mtime": float(row["remote_mtime"]) if row["remote_mtime"] is not None else None,

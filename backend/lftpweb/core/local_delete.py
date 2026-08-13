@@ -132,6 +132,116 @@ def _removed_state_for(remote_size: int | None) -> str:
     return "REMOVED_LOCAL" if remote_size is not None else "REMOVED_BOTH"
 
 
+def reconsider_removed_state(
+    prev_state: str,
+    *,
+    remote_present: bool,
+    local_present: bool,
+    structural_state: str,
+) -> str | None:
+    """Whether a row this codebase already marked `REMOVED_LOCAL`/`REMOVED_BOTH` (and
+    suppressed, `suppressed_reason = 'deleted_local'` -- the only writer of either state) should
+    be *corrected* on a later scan because content has demonstrably come back on one side or the
+    other. `auto_queue_suppressed` is never touched here or by any caller of this function --
+    that flag alone is what keeps the row out of auto-queue (DESIGN.md §3.2 rule 3); `state`
+    should still describe what is actually on disk and on the seedbox, because a state that is
+    wrong is worse than an ugly one.
+
+    2026-08-13 (`prompts/2026-08-13-delete-state-truthfulness.md`, defect 2), found two ways:
+    a deleted release re-uploaded to the seedbox (remote came back, local still absent -- the
+    row kept reading `REMOVED_BOTH`, asserting "both gone," while `R` had already gone green a
+    scan earlier because `core/engine.py._persist`'s protected branch always refreshes
+    `remote_size`, just never `state`); and a deleted release's child file recreated by a fresh
+    extraction after a manual re-download of the parent (local came back, remote still absent on
+    a `move` queue -- same stale `REMOVED_BOTH`, this time on a row whose parent had already
+    moved on to `EXTRACTED`).
+
+    `None` means "no correction due" -- the row is left exactly as `core/engine.py._persist`'s
+    protected branch has always left a suppressed row's `state`, unwidened. This fires only for
+    `prev_state` in `{"REMOVED_LOCAL", "REMOVED_BOTH"}` -- **never** for `STOPPED`/`FAILED`,
+    which are suppressed for entirely different reasons (a retry policy exhausted, a user
+    choice) and must stay untouched regardless of what a fresh scan sees, or this would
+    reintroduce the exact bug `_protected_rel_paths` exists to prevent (a periodic rescan
+    silently reverting a job-lifecycle state).
+
+    - Neither side present: nothing has changed: still `None`.
+    - Remote present, local absent: `REMOVED_LOCAL` -- "was downloaded [historically true of
+      every row this function fires for], now absent locally, remote still present," exactly
+      DESIGN.md §3.2 rule 3's own wording.
+    - Local present, remote absent: `LOCAL_ONLY` -- there is no remote copy to compare against
+      (the same reading `core/reconcile.py` gives any never/no-longer-remotely-tracked file
+      with local content), and it is the honest reading for a `move`-mode child whose remote
+      copy is gone for good but whose bytes are back on disk.
+    - Both present: the removal claim is false on both fronts at once, so the honest answer is
+      simply this pass's own byte comparison -- `structural_state`, the identical reading any
+      ordinary (non-suppressed) node with the same remote/local sizes would get. This is not
+      "suppressed rows get recomputed generally" (`auto_queue_suppressed` stays set, and the
+      caller only ever reaches this function for a row already carrying a delete-produced
+      state) -- it is this one row's own removal assertion being corrected once, in place.
+
+    Deliberately narrow in one further way: a `REMOVED_LOCAL` row whose surviving remote copy
+    *later* disappears too (remote_present flips to `False` while local stays absent) is left
+    exactly as `REMOVED_LOCAL`, not promoted to `REMOVED_BOTH` -- this function only ever
+    corrects a removal claim when content *returns*, matching the delete-state-truthfulness
+    prompt's own scope (`content returning on either side`) rather than the (also real, but
+    unasked-for) opposite direction.
+    """
+    if prev_state not in ("REMOVED_LOCAL", "REMOVED_BOTH"):
+        return None
+    if not remote_present and not local_present:
+        return None
+    if remote_present and not local_present:
+        return "REMOVED_LOCAL"
+    if local_present and not remote_present:
+        return "LOCAL_ONLY"
+    return structural_state
+
+
+class DeleteInFlight:
+    """In-memory record of `item.id`s a `delete_local()` call is currently, actually removing
+    from disk -- the identical shape and purpose `core/postprocess.py.PostprocessPipeline.
+    in_flight_item_ids()` has, and for the same reason (this project's rule, restated in
+    `prompts/startnewsession.md`: "a state that is merely protected is a state that can never
+    be un-stuck"). Two consumers:
+
+    - `core/engine.py._protected_rel_paths` folds this in alongside the postprocess set, so a
+      periodic scan cannot recompute a row's structural state (or its `substate = 'removing'`
+      marker, see `delete_local`) while its files are still actually disappearing from under
+      it -- without this, a large delete racing a 30s scan could read `PARTIAL`/`REMOTE_ONLY`
+      mid-removal and hand auto-queue a target it should never have seen.
+    - `delete_local()` itself folds this into the same in-flight check a live postprocess
+      worker already gates on (guard 3), so a second delete request for an item already being
+      removed is withheld rather than starting a second concurrent `rmtree` of the same tree.
+
+    **Deliberately in-memory, and that is the whole recovery mechanism**, exactly like
+    `PostprocessPipeline`'s own set: a crashed or killed process forgets every mark it ever
+    made, so a restart's very next scan finds nothing protected and recomputes every affected
+    row structurally -- there is no durable "removing" flag anywhere for a crash to strand. A
+    counting `dict`, not a `set`, for the same reason `PostprocessPipeline._in_flight` is one:
+    a manual delete and a scheduled retention pass could (in principle) both be told to remove
+    overlapping subtree rows, and the first to finish must not un-protect an item the second is
+    still working on.
+    """
+
+    def __init__(self) -> None:
+        self._counts: dict[int, int] = {}
+
+    def mark(self, item_ids: Iterable[int]) -> None:
+        for item_id in item_ids:
+            self._counts[item_id] = self._counts.get(item_id, 0) + 1
+
+    def unmark(self, item_ids: Iterable[int]) -> None:
+        for item_id in item_ids:
+            remaining = self._counts.get(item_id, 1) - 1
+            if remaining > 0:
+                self._counts[item_id] = remaining
+            else:
+                self._counts.pop(item_id, None)
+
+    def in_flight_item_ids(self) -> frozenset[int]:
+        return frozenset(self._counts)
+
+
 async def _subtree_rows(
     db: aiosqlite.Connection, *, queue_id: int, rel_path: str
 ) -> list[aiosqlite.Row]:
@@ -167,13 +277,65 @@ async def _mark_subtree_removed(db: aiosqlite.Connection, subtree: Sequence[aios
     `EXCLUDED` child that never had a remote counterpart next to siblings that did), which is
     exactly why this re-derives the state per row from that row's own `remote_size` rather than
     reusing one verdict for the whole batch.
+
+    `substate = NULL` in the same write (2026-08-13,
+    `prompts/2026-08-13-delete-state-truthfulness.md`): this is the one place the transient
+    `substate = 'removing'` `delete_local` writes before doing the actual filesystem work gets
+    cleared on success -- see that function for the full lifecycle.
     """
     for row in subtree:
         await db.execute(
-            "UPDATE item SET state = ?, auto_queue_suppressed = 1, "
+            "UPDATE item SET state = ?, substate = NULL, auto_queue_suppressed = 1, "
             "suppressed_reason = 'deleted_local' WHERE id = ?",
             (_removed_state_for(row["remote_size"]), row["id"]),
         )
+
+
+async def _mark_subtree_removing(db: aiosqlite.Connection, item_ids: Sequence[int]) -> None:
+    """The transient half of `delete_local`'s two-phase write: `substate = 'removing'` for
+    every row in the subtree, `state` left untouched. Issued, committed, and published *before*
+    the actual filesystem work starts -- see `delete_local`'s own docstring for why this has to
+    happen before the (potentially long) `rmtree`, not after it.
+    """
+    for item_id in item_ids:
+        await db.execute("UPDATE item SET substate = 'removing' WHERE id = ?", (item_id,))
+
+
+async def _publish_rows(
+    db: aiosqlite.Connection, events: EventBus | None, queue_id: int, item_ids: Sequence[int]
+) -> None:
+    """Read `item_ids` back and publish one `item_delta` for the batch -- the same
+    persist-then-read-back-then-publish invariant every other writer in this codebase follows
+    (`core/engine.py.scan_queue`'s own comment). Shared by both of `delete_local`'s publishes
+    (the transient `substate = 'removing'` write and the final removed-state write) so there is
+    exactly one place that turns a set of ids into a WS message.
+    """
+    if events is None or not item_ids:
+        return
+    placeholders = ",".join("?" for _ in item_ids)
+    cursor = await db.execute(
+        f"SELECT * FROM item WHERE id IN ({placeholders})",  # noqa: S608 - placeholders only
+        tuple(item_ids),
+    )
+    rows = await cursor.fetchall()
+    if rows:
+        events.publish(
+            {"type": "item_delta", "queue_id": queue_id, "nodes": [item_view(r) for r in rows]}
+        )
+
+
+def _do_remove_from_disk(local_root: Path, resolved: Path) -> None:
+    """The actual, potentially slow, filesystem work -- split out so `delete_local` can run it
+    via `asyncio.to_thread` (see that function's docstring for why that matters: a large
+    `shutil.rmtree` run inline would block the *entire* event loop, including the WS delivery
+    of the transient state this same change adds, for as long as the delete takes).
+    """
+    if local_root.is_symlink():
+        local_root.unlink()
+    elif resolved.is_dir():
+        shutil.rmtree(resolved)
+    else:
+        resolved.unlink()
 
 
 def _all_hardlinked(local_root: Path, resolved: Path) -> bool:
@@ -212,6 +374,7 @@ async def delete_local(
     in_flight_item_ids: frozenset[int],
     events: EventBus | None = None,
     dry_run: bool = False,
+    delete_in_flight: DeleteInFlight | None = None,
 ) -> DeleteOutcome:
     """Delete one item's local copy, or explain why it was withheld. `item` is a `SELECT *`
     (or equivalent) row from `item`; `queue` needs at least `id`, `name`, `local_path`.
@@ -222,6 +385,32 @@ async def delete_local(
     filesystem, the `item` row, or the audit trail (`RetentionScheduler`'s preview endpoint
     uses this so "here is exactly what would be deleted" can never drift from what a real run
     actually does -- there is no second implementation of the guard chain to keep in sync).
+
+    **Feedback for a slow delete** (2026-08-13, `prompts/2026-08-13-delete-state-truthfulness.md`,
+    defect 1). A directory delete's actual filesystem work (`shutil.rmtree`) can take a while,
+    and this function used to run it inline on the event loop, then write the final removed
+    state in the same breath -- so a large delete both froze the whole process for its duration
+    (no other request, no scan, no WS traffic could get through) *and* gave the row nothing
+    honest to say while it happened. Fixed two ways together, because either alone is
+    incomplete: (1) `item.substate = 'removing'` is written, committed, and published for the
+    whole subtree *before* the filesystem work starts (the same vehicle `core/settle.py` uses
+    for `'settling'` -- no `state` CHECK-constraint migration, no new §9.2 vocabulary word), and
+    (2) the actual removal runs via `asyncio.to_thread`, so the event loop stays free to
+    actually deliver that WS message (and everything else) while a large `rmtree` runs in a
+    worker thread. `delete_in_flight` (a `DeleteInFlight`, `None` by default so every existing
+    caller/test is unaffected) is marked for the whole subtree around that window and read by
+    `core/engine.py._protected_rel_paths`, so a scan racing a large delete can't recompute
+    (and republish) a row's structural state out from under files that are still disappearing.
+
+    **Impossible to wedge, the same way `PostprocessPipeline.in_flight_item_ids()` is**: the
+    `'removing'` marker is protected only by `delete_in_flight`'s live, in-memory entry, never
+    by the substate string itself. A crashed or killed process forgets the mark instantly (see
+    `DeleteInFlight`'s own docstring), and `substate` is a column the *general* (unprotected)
+    write path in `core/engine.py._persist` always writes an explicit value for on every scan
+    -- so the very next scan after a crash, restart, or any raised exception here corrects both
+    `state` and `substate` from a fresh structural reading, within one scan interval at worst.
+    The `finally` block below additionally clears both eagerly on any outcome (success or a
+    caught `OSError`), so the common case never even waits that long.
     """
     item_id = item["id"]
     queue_id = queue["id"]
@@ -266,10 +455,14 @@ async def delete_local(
     if await cursor.fetchone() is not None:
         return await withhold("an active job exists for this item")
 
-    # 3. Not in the live-worker check -- never the state string
-    # (`PostprocessPipeline.in_flight_item_ids()`).
+    # 3. Not in a live-worker check -- never the state string
+    # (`PostprocessPipeline.in_flight_item_ids()`, and -- 2026-08-13 -- this same item's own
+    # `DeleteInFlight`, so a second delete request for an item already mid-removal is withheld
+    # instead of racing a second `rmtree` of the same tree).
     if item_id in in_flight_item_ids:
         return await withhold("a post-processing worker is currently running for this item")
+    if delete_in_flight is not None and item_id in delete_in_flight.in_flight_item_ids():
+        return await withhold("a delete is already in progress for this item")
 
     # 4. Mount-sentinel gated, like auto-queue (`core/autoqueue.py.on_scan`).
     if not mount_sentinel.check(local_path):
@@ -304,28 +497,53 @@ async def delete_local(
             affected_rel_paths=affected_rel_paths,
         )
 
-    try:
-        if local_root.is_symlink():
-            local_root.unlink()
-        elif resolved.is_dir():
-            shutil.rmtree(resolved)
-        else:
-            resolved.unlink()
-    except OSError as exc:
-        await audit.record_event(
-            db,
-            level="error",
-            item_id=item_id,
-            kind="local_delete_failed",
-            message=f"{caller}: delete of {local_root} failed: {exc}",
-        )
-        return DeleteOutcome(deleted=False, reason=f"delete failed: {exc}")
+    subtree_ids = [row["id"] for row in subtree]
 
-    # One transaction: the files are already gone on disk by this point, so every row the
-    # subtree touches is marked before the single `commit()` below -- a crash between "files
-    # gone" and "rows updated" must not be a state this module leaves reachable (task item 2).
-    await _mark_subtree_removed(db, subtree)
-    await db.commit()
+    # The transient half (module/function docstring): mark the whole subtree in-flight *before*
+    # touching the filesystem, so `core/engine.py._protected_rel_paths` shields it from a
+    # racing scan for the whole window below, then write/commit/publish `substate = 'removing'`
+    # while `state` is left exactly as it was -- a row says something honest about what is
+    # happening to it before the (possibly long) removal even starts.
+    if delete_in_flight is not None:
+        delete_in_flight.mark(subtree_ids)
+    try:
+        await _mark_subtree_removing(db, subtree_ids)
+        await db.commit()
+        await _publish_rows(db, events, queue_id, subtree_ids)
+
+        try:
+            # Off the event loop (2026-08-13, this function's own docstring): a large
+            # `shutil.rmtree` run inline would block every other request, scan, and WS message
+            # -- including the one this function just sent -- for as long as the delete takes.
+            await asyncio.to_thread(_do_remove_from_disk, local_root, resolved)
+        except OSError as exc:
+            # Clear the transient marker eagerly rather than waiting for the next scan to
+            # notice this item is no longer in-flight -- see the function docstring's
+            # "impossible to wedge" paragraph.
+            for row in subtree:
+                await db.execute("UPDATE item SET substate = NULL WHERE id = ?", (row["id"],))
+            await db.commit()
+            await _publish_rows(db, events, queue_id, subtree_ids)
+            await audit.record_event(
+                db,
+                level="error",
+                item_id=item_id,
+                kind="local_delete_failed",
+                message=f"{caller}: delete of {local_root} failed: {exc}",
+            )
+            return DeleteOutcome(deleted=False, reason=f"delete failed: {exc}")
+
+        # One transaction: the files are already gone on disk by this point, so every row the
+        # subtree touches is marked before the single `commit()` below -- a crash between
+        # "files gone" and "rows updated" must not be a state this module leaves reachable
+        # (task item 2). This is also what clears `substate = 'removing'` back to `NULL` --
+        # see `_mark_subtree_removed`'s own docstring.
+        await _mark_subtree_removed(db, subtree)
+        await db.commit()
+    finally:
+        if delete_in_flight is not None:
+            delete_in_flight.unmark(subtree_ids)
+
     subtree_note = (
         f", {len(subtree)} item(s) in its subtree marked removed" if len(subtree) > 1 else ""
     )
@@ -339,17 +557,7 @@ async def delete_local(
             f"{bytes_freed if bytes_freed is not None else 'unknown'} bytes{subtree_note}"
         ),
     )
-    if events is not None and subtree:
-        placeholders = ",".join("?" for _ in subtree)
-        row_cursor = await db.execute(
-            f"SELECT * FROM item WHERE id IN ({placeholders})",  # noqa: S608 - placeholders only
-            tuple(row["id"] for row in subtree),
-        )
-        rows = await row_cursor.fetchall()
-        if rows:
-            events.publish(
-                {"type": "item_delta", "queue_id": queue_id, "nodes": [item_view(r) for r in rows]}
-            )
+    await _publish_rows(db, events, queue_id, subtree_ids)
 
     return DeleteOutcome(
         deleted=True,
@@ -520,10 +728,17 @@ class RetentionScheduler:
         events: EventBus,
         *,
         in_flight_provider: Callable[[], frozenset[int]] | None = None,
+        delete_in_flight: DeleteInFlight | None = None,
     ) -> None:
         self.db = db
         self.events = events
         self._in_flight_provider = in_flight_provider or (lambda: frozenset())
+        # 2026-08-13: the same `DeleteInFlight` instance the manual delete endpoint uses
+        # (`api/jobs.py`), threaded through so a scheduled retention delete gets the identical
+        # transient-state/scan-protection treatment as a manual one -- see `delete_local`'s own
+        # docstring. `None` (every existing caller/test) simply means retention deletes get no
+        # extra protection, exactly the pre-existing behavior.
+        self._delete_in_flight = delete_in_flight
         self._task: asyncio.Task | None = None
 
     async def start(self) -> None:
@@ -569,6 +784,7 @@ class RetentionScheduler:
                 require_nlink_guard=True,
                 in_flight_item_ids=self._in_flight_provider(),
                 events=self.events,
+                delete_in_flight=self._delete_in_flight,
             )
             if outcome.deleted:
                 deleted += 1

@@ -28,6 +28,13 @@ const STYLES: Record<string, string> = {
   EXTRACTING: 'bg-blue-100 text-blue-800 dark:bg-blue-900/40 dark:text-blue-300',
   EXTRACTED: 'bg-emerald-100 text-emerald-800 dark:bg-emerald-900/40 dark:text-emerald-300',
   EXTRACT_FAILED: 'bg-red-100 text-red-800 dark:bg-red-900/40 dark:text-red-300',
+  // Not a real `item.state` -- `FileTree.tsx`'s `Row` substitutes this synthetic label whenever
+  // `substate === 'removing'` (2026-08-13, prompts/2026-08-13-delete-state-truthfulness.md), so
+  // a row says something honest while `core/local_delete.py.delete_local()` is actually still
+  // removing its files, rather than showing its last state (which could be a completed-looking
+  // `DOWNLOADED`/`EXTRACTED`) with no indication anything is happening. Red, like FAILED/
+  // CORRUPT -- this is destructive and irreversible, unlike the blue "still arriving" states.
+  REMOVING: 'bg-red-100 text-red-800 dark:bg-red-900/40 dark:text-red-300',
 }
 const FALLBACK_STYLE = 'bg-zinc-100 text-zinc-700 dark:bg-zinc-800 dark:text-zinc-300'
 

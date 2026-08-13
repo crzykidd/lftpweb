@@ -272,6 +272,14 @@ class Engine:
         # no item is ever reported as mid-postprocessing, which is exactly right for an
         # engine running without a pipeline attached.
         self.postprocess: Any = None
+        # 2026-08-13 (`prompts/2026-08-13-delete-state-truthfulness.md`): the identical seam
+        # for `core/local_delete.py.DeleteInFlight` -- a `main.py`-can't-construct-it-yet plain
+        # attribute, read the same single way (`in_flight_item_ids()`) in
+        # `_protected_rel_paths` below, so a scan pass can't recompute a row's structural state
+        # while `delete_local()` is still actually removing its files. `None` (every existing
+        # test's default) means no item is ever reported as mid-delete, unchanged from before
+        # this task.
+        self.delete_in_flight: Any = None
 
         # rel_path -> the projection of that item's persisted row, per queue (DESIGN.md §2).
         # A *cache of the `item` table*, refreshed from it after every persist — never the
@@ -592,10 +600,22 @@ class Engine:
           present, which is a decision about *both* states and so lives in `_persist` below
           (`core/postprocess.py.outcome_survives_rescan`) alongside the absence half
           (`core/mount_sentinel.py.resolve_absence`).
+
+        **A third live-worker source, added 2026-08-13** (`prompts/2026-08-13-delete-state-
+        truthfulness.md`): `self.delete_in_flight` — `core/local_delete.py.delete_local()`'s
+        own in-flight tracker, folded into the identical `in_flight` list below rather than a
+        second clause, because it means exactly the same thing to this query as postprocess's
+        own set does — "a live worker outside this scan pass is actively changing this item's
+        files right now, so this scan must not race it." Without this, a large delete's
+        `substate = 'removing'` marker (and the row's `state`, whatever it is mid-removal)
+        could be overwritten by a scan that lands while `shutil.rmtree` is still running.
         """
         # `frozenset` -> sorted list purely so the SQL parameters are deterministic (log/test
         # readability); membership is what matters, not order.
-        in_flight = sorted(self.postprocess.in_flight_item_ids()) if self.postprocess else []
+        in_flight = set(self.postprocess.in_flight_item_ids()) if self.postprocess else set()
+        if self.delete_in_flight is not None:
+            in_flight |= set(self.delete_in_flight.in_flight_item_ids())
+        in_flight = sorted(in_flight)
         in_flight_clause = (
             f" OR item.id IN ({','.join('?' for _ in in_flight)})" if in_flight else ""
         )
@@ -696,6 +716,29 @@ class Engine:
                     new_settle[rel_path] = settle_record
 
             if rel_path in protected:
+                # 2026-08-13 (prompts/2026-08-13-delete-state-truthfulness.md, defect 2): a
+                # narrow exception to "protected rows never have `state` touched," for exactly
+                # one shape -- a row this codebase's own `delete_local()` already left at
+                # `REMOVED_LOCAL`/`REMOVED_BOTH` (and suppressed, `deleted_local`) whose fresh
+                # structural reading this pass now contradicts, because content came back on
+                # one side or the other. `reconsider_removed_state` is the only thing that can
+                # produce a non-`None` correction here -- every other suppressed reason
+                # (`user_stopped`, `retries_exhausted`, `permanent_error`) and every other
+                # `prev_state` leave this `None`, so a `STOPPED`/`FAILED` row's protection stays
+                # exactly as absolute as it always was. `auto_queue_suppressed` itself is never
+                # touched by this branch -- see that function's own docstring for why the
+                # eligibility flag and the state text are deliberately two separate questions.
+                prev_state, _, _, _ = previous.get(rel_path, (None, None, None, None))
+                corrected_state = (
+                    local_delete.reconsider_removed_state(
+                        prev_state,
+                        remote_present=node.remote_size is not None,
+                        local_present=node.local_size is not None,
+                        structural_state=node.structural_state,
+                    )
+                    if prev_state is not None
+                    else None
+                )
                 await self.db.execute(
                     """
                     INSERT INTO item (queue_id, rel_path, is_dir, remote_size, local_size, remote_mtime, local_mtime, state)
@@ -705,7 +748,8 @@ class Engine:
                         remote_size = excluded.remote_size,
                         local_size = excluded.local_size,
                         remote_mtime = excluded.remote_mtime,
-                        local_mtime = excluded.local_mtime
+                        local_mtime = excluded.local_mtime,
+                        state = COALESCE(?, state)
                     """,
                     (
                         queue_id,
@@ -716,6 +760,7 @@ class Engine:
                         node.remote_mtime,
                         node.local_mtime,
                         node.structural_state,
+                        corrected_state,
                     ),
                 )
                 continue
@@ -878,9 +923,18 @@ class Engine:
                 mount_ok=mount_ok,
                 now=now,
             )
-            if override is None:
-                continue
-            vanished_state, vanished_first_missing_at = override
+            if override is not None:
+                vanished_state, vanished_first_missing_at = override
+            else:
+                # 2026-08-13 (prompts/2026-08-13-delete-state-truthfulness.md, defect 3):
+                # `resolve_absence` has no opinion about this `prev_state` (PARTIAL, LOCAL_ONLY,
+                # EXCLUDED, or REMOVED_BOTH already resting here) -- without a fallback such a
+                # row is simply never written again, frozen forever on a reading nothing will
+                # ever revisit (see `resolve_vanished`'s own docstring for the bug this closes).
+                fallback_state = mount_sentinel.resolve_vanished(prev_state)
+                if fallback_state is None:
+                    continue
+                vanished_state, vanished_first_missing_at = fallback_state, None
             written.add(rel_path)
             await self.db.execute(
                 "UPDATE item SET remote_size = NULL, local_size = NULL, local_mtime = NULL, "

@@ -219,6 +219,7 @@ def _row(**overrides):
         "is_dir": 0,
         "state": "DOWNLOADED",
         "substate": None,
+        "suppressed_reason": None,
         "remote_size": 1000,
         "local_size": 1000,
         "remote_mtime": None,

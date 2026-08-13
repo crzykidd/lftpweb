@@ -165,3 +165,69 @@ def resolve_absence(
     if elapsed >= grace_s:
         return ("REMOVED_LOCAL", prev_first_missing_at)
     return (prev_state, prev_first_missing_at)
+
+
+# `resolve_vanished`'s own eligible set, deliberately narrower than "every prev_state
+# `resolve_absence` has no opinion about". `PARTIAL` (content partway arrived) and `LOCAL_ONLY`
+# (content fully arrived, just never remotely tracked) both assert *some* concrete content was
+# actually here -- the shape "removed" is meant for. `REMOTE_ONLY` (nothing was ever here) and
+# `EXCLUDED` (never going to be here, on purpose, §3.2 rule 8) assert the opposite, and treating
+# their disappearance as a removal would be new, much broader behavior no defect asked for: a
+# `REMOTE_ONLY` item is the single most common row in this system (every remote file lftpweb
+# hasn't fetched yet), and letting it silently rest at `REMOVED_BOTH` the moment it drops off an
+# unrelated remote scan (renamed, expired, pattern changed) would be a real regression, not a
+# fix -- see `tests/test_ws_deltas.py`'s scan-delta tests, which depend on a vanished
+# never-downloaded item being dropped from the published tree, not relabeled.
+_VANISHED_FALLBACK_PREV_STATES = frozenset({"PARTIAL", "LOCAL_ONLY"})
+
+
+def resolve_vanished(prev_state: str) -> str | None:
+    """The resting state for a `rel_path` that has left *both* trees entirely -- absent from
+    this pass's `remote_tree` and `local_tree` alike -- for the narrow set of `prev_state`s
+    above. Every other `prev_state` `resolve_absence` has no opinion about (`REMOTE_ONLY`,
+    `EXCLUDED`, `QUEUED`/`DOWNLOADING`/`STOPPED`/`FAILED` if they ever reached here at all, or
+    `REMOVED_BOTH` already resting here from an earlier pass) returns `None` here too, same as
+    it always has -- such a row is simply left out of this pass's `written` set, exactly the
+    pre-existing "silently drops from the published tree" behavior.
+
+    **Found 2026-08-13** (`prompts/2026-08-13-delete-state-truthfulness.md`), on a `move` queue:
+    `core/queue.py._publish_child_progress` throttles per-child writes
+    (`CHILD_PROGRESS_THROTTLE_TICKS`), so the last write before a small file's job reaps is
+    frequently a mid-transfer `PARTIAL`, not the final `DOWNLOADED` -- and post-processing can
+    relocate the whole release out of both trees (remote deleted after verify, local moved to
+    `staging_path`) before a fresh scan ever gets a chance to correct it. Without this, such a
+    row is simply never written again (`core/engine.py._persist`'s vanished sweep only calls
+    `resolve_absence`, which has nothing to say about a `PARTIAL` `prev_state`) -- frozen on a
+    reading that was only ever true for a fraction of a second, forever: not the sweep (no
+    fresh structural reading exists for a path in neither tree), not a rescan (the row is in
+    neither tree to rescan), not auto-queue (nothing to match against).
+    (`core/queue.py._reap_one`'s own final flush is the fix for the common case -- this is the
+    safety net for whenever a stale reading forms anyway, e.g. a crash between a throttled
+    write and the next one.)
+
+    **Not `REMOVED_LOCAL`** -- that state asserts the remote copy is still present, which this
+    function already knows is false (a `prev_state` in `_STICKY_PREV_STATES` never reaches
+    here; `resolve_absence` handles those itself). **`REMOVED_BOTH`, deliberately, but not the
+    self-delete flavor** -- this codebase did not delete anything here (`local_delete.py` is
+    the only writer that pairs `REMOVED_BOTH` with `auto_queue_suppressed`/`suppressed_reason`,
+    and neither is touched by this function or its caller), so nothing is asserted beyond "not
+    visible on either side right now." `REMOVED_BOTH` is reused rather than a new `state` value
+    invented for this because it is already this project's one "nothing here to compare, don't
+    make up a story" bucket (DESIGN.md §3.2: "deliberately broader than its name") and adding a
+    fourth CHECK-constrained state for a narrow safety-net case is a worse trade than a third,
+    documented reading of one that already exists. Left unsuppressed on purpose (§3.2 rule 6:
+    "if the same rel_path reappears... it is a genuinely new item") -- if remote or local
+    content for this exact path shows up again on a later scan, this row simply re-enters the
+    ordinary per-node path next time, the same as any other absent-then-present transition,
+    with no leftover suppression to clear first.
+
+    Known imprecision, recorded rather than silently taken: `core/itemview.py`'s `REMOVED_BOTH`
+    reading (`_local_facet`/`_remote_facet`) says "removed_by_us"/"deleted_by_us" for *every*
+    `REMOVED_BOTH` row, which is not literally true for one this function produced -- the
+    common real-world cause is a *successful* `move`-mode relocation, not a deletion. Giving
+    this its own reason code would mean threading a new signal through `item_view` for a rare
+    safety-net path; not done here. See docs/decisions.md.
+    """
+    if prev_state not in _VANISHED_FALLBACK_PREV_STATES:
+        return None
+    return "REMOVED_BOTH"

@@ -14,6 +14,7 @@ import os
 from datetime import UTC, datetime, timedelta
 
 import aiosqlite
+import pytest
 
 import lftpweb.core.engine as engine_module
 from lftpweb.core import local_delete
@@ -407,10 +408,22 @@ async def test_successful_delete_sets_removed_local_when_remote_copy_exists(tmp_
         events = await _events_for(db, item_id)
         assert [e["kind"] for e in events] == ["local_delete"]
 
+        # Two publishes now (2026-08-13, prompts/2026-08-13-delete-state-truthfulness.md
+        # defect 1): the transient `substate = 'removing'` marker before the filesystem work,
+        # then the final removed state after. `state` stays whatever it was (DOWNLOADED here,
+        # `_make_item`'s default) for the first one -- only `substate` says anything changed.
+        removing = subscriber.get_nowait()
+        assert removing["type"] == "item_delta"
+        assert removing["nodes"][0]["id"] == item_id
+        assert removing["nodes"][0]["state"] == "DOWNLOADED"
+        assert removing["nodes"][0]["substate"] == "removing"
+
         published = subscriber.get_nowait()
         assert published["type"] == "item_delta"
         assert published["nodes"][0]["id"] == item_id
         assert published["nodes"][0]["state"] == "REMOVED_LOCAL"
+        assert published["nodes"][0]["substate"] is None
+        assert subscriber.empty()
     finally:
         await db.close()
 
@@ -538,6 +551,10 @@ async def test_delete_publishes_the_whole_subtree_in_one_ws_message(tmp_path):
     exactly the stale-subtree symptom item 6 of the task calls out. This asserts at the message
     level (no browser here) that one `item_delta` carries every affected node, each already
     showing its correct post-delete state.
+
+    2026-08-13 (`prompts/2026-08-13-delete-state-truthfulness.md` defect 1): there are now two
+    coherent batch messages, not one -- the transient `substate = 'removing'` marker, then the
+    final removed state -- each still one message per phase, not one per row.
     """
     local_root = tmp_path / "local"
     local_root.mkdir()
@@ -567,6 +584,14 @@ async def test_delete_publishes_the_whole_subtree_in_one_ws_message(tmp_path):
             events=events_bus,
         )
         assert outcome.deleted is True
+
+        removing = subscriber.get_nowait()
+        assert removing["type"] == "item_delta"
+        assert removing["queue_id"] == queue_id
+        removing_by_path = {n["rel_path"]: n for n in removing["nodes"]}
+        assert set(removing_by_path) == {"Release", "Release/a.mkv", "Release/b.mkv"}
+        for node in removing_by_path.values():
+            assert node["substate"] == "removing"
 
         published = subscriber.get_nowait()
         assert published["type"] == "item_delta"
@@ -1348,5 +1373,622 @@ async def test_retention_scheduler_is_a_no_op_while_disabled(tmp_path):
 
         assert result == local_delete.RetentionRunResult(considered=0, deleted=0, withheld=0)
         assert (local_root / "Old.Release").exists()
+    finally:
+        await db.close()
+
+
+# --- Defect 1 (2026-08-13, prompts/2026-08-13-delete-state-truthfulness.md): the transient
+# `substate = 'removing'` marker, `DeleteInFlight`, and the "impossible to wedge" guarantee ----
+
+
+async def test_a_second_delete_request_for_an_item_already_being_removed_is_withheld(tmp_path):
+    local_root = tmp_path / "local"
+    local_root.mkdir()
+    (local_root / "Release").mkdir()
+    write_if_needed(str(local_root))
+
+    db = await _make_db()
+    try:
+        queue_id = await _make_queue(db, local_root)
+        item_id = await _make_item(db, queue_id, "Release", is_dir=True)
+
+        tracker = local_delete.DeleteInFlight()
+        tracker.mark([item_id])  # simulates a delete already mid-removal for this item
+
+        outcome = await local_delete.delete_local(
+            db,
+            item=await _item_row(db, item_id),
+            queue=await _queue_row(db, queue_id),
+            caller="manual",
+            require_nlink_guard=False,
+            in_flight_item_ids=frozenset(),
+            delete_in_flight=tracker,
+        )
+
+        assert outcome.deleted is False
+        assert "already in progress" in outcome.reason
+        assert (local_root / "Release").exists()
+    finally:
+        await db.close()
+
+
+async def test_delete_marks_and_unmarks_delete_in_flight_around_the_filesystem_work(
+    tmp_path, monkeypatch
+):
+    """`DeleteInFlight` must be non-empty *while* the removal is actually happening (so a
+    racing scan is shielded -- see the engine-level test below) and empty again once
+    `delete_local` returns, success or failure.
+    """
+    local_root = tmp_path / "local"
+    local_root.mkdir()
+    release = local_root / "Release"
+    release.mkdir()
+    (release / "a.mkv").write_bytes(b"x" * 10)
+    write_if_needed(str(local_root))
+
+    db = await _make_db()
+    try:
+        queue_id = await _make_queue(db, local_root)
+        item_id = await _make_item(db, queue_id, "Release", is_dir=True, local_size=10)
+
+        tracker = local_delete.DeleteInFlight()
+        seen_in_flight_during_removal: list[frozenset[int]] = []
+        real_remove = local_delete._do_remove_from_disk
+
+        def _spying_remove(local_root_arg, resolved_arg):
+            seen_in_flight_during_removal.append(tracker.in_flight_item_ids())
+            real_remove(local_root_arg, resolved_arg)
+
+        monkeypatch.setattr(local_delete, "_do_remove_from_disk", _spying_remove)
+
+        outcome = await local_delete.delete_local(
+            db,
+            item=await _item_row(db, item_id),
+            queue=await _queue_row(db, queue_id),
+            caller="manual",
+            require_nlink_guard=False,
+            in_flight_item_ids=frozenset(),
+            delete_in_flight=tracker,
+        )
+
+        assert outcome.deleted is True
+        assert seen_in_flight_during_removal == [
+            frozenset({item_id})
+        ], "the item must be marked in-flight for the whole duration of the filesystem work"
+        assert (
+            tracker.in_flight_item_ids() == frozenset()
+        ), "and unmarked again once delete_local returns"
+    finally:
+        await db.close()
+
+
+async def test_delete_in_flight_and_substate_are_cleared_even_when_the_filesystem_work_raises(
+    tmp_path, monkeypatch
+):
+    """The important one: a failure partway through must not leave `DeleteInFlight` (or the
+    transient `substate`) stuck. This is the closest an in-process test can get to "the worker
+    was killed" -- the recovery path (clear eagerly on any exception) is identical either way;
+    see `delete_local`'s own docstring for why a real process kill is additionally covered by
+    `DeleteInFlight` simply being in-memory (proven separately below).
+    """
+    local_root = tmp_path / "local"
+    local_root.mkdir()
+    release = local_root / "Release"
+    release.mkdir()
+    (release / "a.mkv").write_bytes(b"x" * 10)
+    write_if_needed(str(local_root))
+
+    db = await _make_db()
+    try:
+        queue_id = await _make_queue(db, local_root)
+        item_id = await _make_item(db, queue_id, "Release", is_dir=True, local_size=10)
+
+        tracker = local_delete.DeleteInFlight()
+        events_bus = EventBus()
+        subscriber = events_bus.subscribe()
+
+        def _raising_remove(*_args, **_kwargs):
+            raise OSError("simulated failure mid-removal")
+
+        monkeypatch.setattr(local_delete, "_do_remove_from_disk", _raising_remove)
+
+        outcome = await local_delete.delete_local(
+            db,
+            item=await _item_row(db, item_id),
+            queue=await _queue_row(db, queue_id),
+            caller="manual",
+            require_nlink_guard=False,
+            in_flight_item_ids=frozenset(),
+            delete_in_flight=tracker,
+            events=events_bus,
+        )
+
+        assert outcome.deleted is False
+        assert "delete failed" in outcome.reason
+        assert release.exists(), "a failed removal must not be reported as having happened"
+
+        assert tracker.in_flight_item_ids() == frozenset(), "must not stay marked after a failure"
+
+        item = await _item_row(db, item_id)
+        assert item["state"] == "DOWNLOADED", "the pre-delete state survives a failed delete"
+        assert item["substate"] is None, "the transient marker must not survive a failed delete"
+
+        removing = subscriber.get_nowait()
+        assert removing["nodes"][0]["substate"] == "removing"
+        cleared = subscriber.get_nowait()
+        assert cleared["nodes"][0]["substate"] is None
+
+        events = await _events_for(db, item_id)
+        assert [e["kind"] for e in events] == ["local_delete_failed"]
+    finally:
+        await db.close()
+
+
+async def test_a_crashed_delete_does_not_leave_the_row_stuck_in_removing(tmp_path):
+    """The important one, restated at the level the task cares about: a process that dies
+    mid-delete leaves nothing durable behind to protect the transient state, so the very next
+    scan -- with a *fresh* `DeleteInFlight` (a restart's own, exactly as empty as one is at
+    process start) -- must recompute the row from scratch rather than trusting a leftover
+    `substate = 'removing'` string. Fabricated directly (module-level helpers, not the full
+    `delete_local` call) to simulate exactly the crash window: the transient marker was written
+    and committed, but the process died before the filesystem work (or the final write) ever
+    got a chance to run -- `delete_local`'s own `finally` never executes in a real crash either.
+    """
+    rel_path = "Release"
+    local_root = tmp_path / "local"
+    release = local_root / rel_path
+    release.mkdir(parents=True)
+    (release / "a.mkv").write_bytes(b"x" * 10)
+
+    remote_tree = {
+        rel_path: RemoteEntry(rel_path=rel_path, is_dir=True),
+        f"{rel_path}/a.mkv": RemoteEntry(
+            rel_path=f"{rel_path}/a.mkv", is_dir=False, size=10, mtime=1.0
+        ),
+    }
+
+    db = await _make_db()
+    try:
+        cursor = await db.execute(
+            "INSERT INTO host (name, address, port, username, auth_method, known_hosts_policy) "
+            "VALUES ('h', '127.0.0.1', 22, 'u', 'key', 'strict')"
+        )
+        host_id = cursor.lastrowid
+        cursor = await db.execute(
+            "INSERT INTO path_queue (host_id, name, remote_path, local_path, enabled, sync_mode) "
+            "VALUES (?, 'q', '/remote', ?, 1, 'copy')",
+            (host_id, str(local_root)),
+        )
+        queue_id = cursor.lastrowid
+        item_id = await _make_item(db, queue_id, rel_path, is_dir=True, local_size=10)
+
+        # The crash window: `delete_local`'s own subtree-marking helper, called directly, the
+        # same write `delete_local` issues *before* the (never-finished, in this simulation)
+        # filesystem work.
+        await local_delete._mark_subtree_removing(db, [item_id])
+        await db.commit()
+        row = await _item_row(db, item_id)
+        assert row["substate"] == "removing", "the crash-window fixture itself must be honest"
+
+        # "Restart": a brand new Engine and a brand new, empty DeleteInFlight -- nothing in
+        # memory remembers the delete that never finished.
+        engine = Engine(db, str(tmp_path), EventBus())
+        engine.pool = _FakePool(remote_tree)
+        engine.delete_in_flight = local_delete.DeleteInFlight()
+        q = QueueConfig(
+            id=queue_id,
+            host_id=host_id,
+            name="q",
+            remote_path="/remote",
+            local_path=str(local_root),
+            staging_path=None,
+            enabled=True,
+            sync_mode="copy",
+        )
+        host = HostConfig(
+            id=host_id,
+            address="127.0.0.1",
+            port=22,
+            username="u",
+            auth_method="key",
+            key_path="/k",
+            known_hosts_policy="strict",
+        )
+        await engine.scan_queue(q, host)
+
+        row = await _item_row(db, item_id)
+        assert row["substate"] is None, "the very next scan must clear the stale marker"
+        assert row["state"] == "DOWNLOADED", "recomputed fresh -- the file is genuinely all here"
+    finally:
+        await db.close()
+
+
+async def test_engine_shields_a_delete_in_flight_row_from_a_racing_scan(tmp_path):
+    """The other half: while a delete really is in progress (`DeleteInFlight` marked, a live
+    worker), a scan landing in the middle of it must leave the row's `state`/`substate` alone --
+    `core/engine.py._protected_rel_paths` is the mechanism, `delete_in_flight` the seam this
+    task adds to it.
+    """
+    rel_path = "Release"
+    local_root = tmp_path / "local"
+    release = local_root / rel_path
+    release.mkdir(parents=True)
+    # Only half the bytes are actually on disk right now -- what a scan landing mid-`rmtree`
+    # would plausibly see.
+    (release / "a.mkv").write_bytes(b"x" * 5)
+
+    remote_tree = {
+        rel_path: RemoteEntry(rel_path=rel_path, is_dir=True),
+        f"{rel_path}/a.mkv": RemoteEntry(
+            rel_path=f"{rel_path}/a.mkv", is_dir=False, size=10, mtime=1.0
+        ),
+    }
+
+    db = await _make_db()
+    try:
+        cursor = await db.execute(
+            "INSERT INTO host (name, address, port, username, auth_method, known_hosts_policy) "
+            "VALUES ('h', '127.0.0.1', 22, 'u', 'key', 'strict')"
+        )
+        host_id = cursor.lastrowid
+        cursor = await db.execute(
+            "INSERT INTO path_queue (host_id, name, remote_path, local_path, enabled, sync_mode) "
+            "VALUES (?, 'q', '/remote', ?, 1, 'copy')",
+            (host_id, str(local_root)),
+        )
+        queue_id = cursor.lastrowid
+        item_id = await _make_item(db, queue_id, rel_path, is_dir=True, local_size=10)
+
+        tracker = local_delete.DeleteInFlight()
+        tracker.mark([item_id])  # a delete is genuinely still running for this item
+        await local_delete._mark_subtree_removing(db, [item_id])
+        await db.commit()
+
+        engine = Engine(db, str(tmp_path), EventBus())
+        engine.pool = _FakePool(remote_tree)
+        engine.delete_in_flight = tracker
+        q = QueueConfig(
+            id=queue_id,
+            host_id=host_id,
+            name="q",
+            remote_path="/remote",
+            local_path=str(local_root),
+            staging_path=None,
+            enabled=True,
+            sync_mode="copy",
+        )
+        host = HostConfig(
+            id=host_id,
+            address="127.0.0.1",
+            port=22,
+            username="u",
+            auth_method="key",
+            key_path="/k",
+            known_hosts_policy="strict",
+        )
+        await engine.scan_queue(q, host)
+
+        row = await _item_row(db, item_id)
+        assert row["substate"] == "removing", "a racing scan must not clobber the transient state"
+        assert row["state"] == "DOWNLOADED", "state, too, must be left exactly as it was"
+    finally:
+        await db.close()
+
+
+# --- Defect 2 (2026-08-13, prompts/2026-08-13-delete-state-truthfulness.md): a suppressed
+# removed-state row corrects itself when content genuinely returns, on either side ------------
+
+
+def test_reconsider_removed_state_neither_side_present_is_no_change():
+    assert (
+        local_delete.reconsider_removed_state(
+            "REMOVED_BOTH", remote_present=False, local_present=False, structural_state="X"
+        )
+        is None
+    )
+    assert (
+        local_delete.reconsider_removed_state(
+            "REMOVED_LOCAL", remote_present=False, local_present=False, structural_state="X"
+        )
+        is None
+    )
+
+
+def test_reconsider_removed_state_remote_returns_alone_is_removed_local():
+    assert (
+        local_delete.reconsider_removed_state(
+            "REMOVED_BOTH", remote_present=True, local_present=False, structural_state="X"
+        )
+        == "REMOVED_LOCAL"
+    )
+
+
+def test_reconsider_removed_state_local_returns_alone_is_local_only():
+    assert (
+        local_delete.reconsider_removed_state(
+            "REMOVED_BOTH", remote_present=False, local_present=True, structural_state="X"
+        )
+        == "LOCAL_ONLY"
+    )
+
+
+def test_reconsider_removed_state_both_return_defers_to_the_structural_reading():
+    assert (
+        local_delete.reconsider_removed_state(
+            "REMOVED_LOCAL", remote_present=True, local_present=True, structural_state="PARTIAL"
+        )
+        == "PARTIAL"
+    )
+
+
+@pytest.mark.parametrize("prev_state", ["STOPPED", "FAILED", "DOWNLOADED", "QUEUED"])
+def test_reconsider_removed_state_never_fires_for_a_non_removed_prev_state(prev_state):
+    # This is the "must not widen" guarantee at the unit level -- a STOPPED/FAILED row's
+    # suppression is for an entirely different reason and must never be second-guessed here.
+    assert (
+        local_delete.reconsider_removed_state(
+            prev_state, remote_present=True, local_present=True, structural_state="DOWNLOADED"
+        )
+        is None
+    )
+
+
+async def test_remote_reappearing_after_a_self_delete_corrects_to_removed_local(tmp_path):
+    """Defect 2's first symptom: "if I copy the same folder I already deleted on seedbox
+    again. Status is Removed Both." -- a `LOCAL_ONLY`-at-delete-time item (remote already gone)
+    reads `REMOVED_BOTH`, then the same path reappears on the seedbox. The row must correct to
+    `REMOVED_LOCAL` (R lights -- `remote_size` is non-null again) and stay suppressed.
+    """
+    rel_path = "Release"
+    local_root = tmp_path / "local"
+    release = local_root / rel_path
+    release.mkdir(parents=True)
+    (release / "a.mkv").write_bytes(b"x" * 10)
+
+    db = await _make_db()
+    try:
+        cursor = await db.execute(
+            "INSERT INTO host (name, address, port, username, auth_method, known_hosts_policy) "
+            "VALUES ('h', '127.0.0.1', 22, 'u', 'key', 'strict')"
+        )
+        host_id = cursor.lastrowid
+        cursor = await db.execute(
+            "INSERT INTO path_queue (host_id, name, remote_path, local_path, enabled, sync_mode) "
+            "VALUES (?, 'q', '/remote', ?, 1, 'copy')",
+            (host_id, str(local_root)),
+        )
+        queue_id = cursor.lastrowid
+        host = HostConfig(
+            id=host_id,
+            address="127.0.0.1",
+            port=22,
+            username="u",
+            auth_method="key",
+            key_path="/k",
+            known_hosts_policy="strict",
+        )
+
+        # First scan: nothing remote yet -- LOCAL_ONLY.
+        engine = Engine(db, str(tmp_path), EventBus())
+        engine.pool = _FakePool({})
+        q = QueueConfig(
+            id=queue_id,
+            host_id=host_id,
+            name="q",
+            remote_path="/remote",
+            local_path=str(local_root),
+            staging_path=None,
+            enabled=True,
+            sync_mode="copy",
+        )
+        await engine.scan_queue(q, host)
+        cursor = await db.execute(
+            "SELECT id, state FROM item WHERE queue_id = ? AND rel_path = ?", (queue_id, rel_path)
+        )
+        row = await cursor.fetchone()
+        assert row["state"] == "LOCAL_ONLY"
+        item_id = row["id"]
+
+        write_if_needed(str(local_root))
+        outcome = await local_delete.delete_local(
+            db,
+            item=await _item_row(db, item_id),
+            queue=await _queue_row(db, queue_id),
+            caller="manual",
+            require_nlink_guard=False,
+            in_flight_item_ids=frozenset(),
+        )
+        assert outcome.deleted is True
+        item = await _item_row(db, item_id)
+        assert item["state"] == "REMOVED_BOTH", "no remote copy at delete time -- both gone"
+        assert item["auto_queue_suppressed"] == 1
+        assert item["suppressed_reason"] == "deleted_local"
+
+        # The re-upload: the same path reappears on the seedbox.
+        engine.pool = _FakePool(
+            {
+                rel_path: RemoteEntry(rel_path=rel_path, is_dir=True),
+                f"{rel_path}/a.mkv": RemoteEntry(
+                    rel_path=f"{rel_path}/a.mkv", is_dir=False, size=10, mtime=1.0
+                ),
+            }
+        )
+        await engine.scan_queue(q, host)
+
+        item = await _item_row(db, item_id)
+        assert (
+            item["state"] == "REMOVED_LOCAL"
+        ), "the removal claim is now half false -- must correct"
+        assert item["remote_size"] == 10, "R must light: remote_size refreshed regardless"
+        assert (
+            item["auto_queue_suppressed"] == 1
+        ), "still suppressed -- this was still a self-delete"
+        assert item["suppressed_reason"] == "deleted_local"
+
+        # Not picked up by auto-queue, either setting.
+        for setting in (False, True):
+            await save_autoqueue_settings(
+                db, AutoQueueSettings(re_download_externally_removed=setting)
+            )
+            enqueued: list[int] = []
+
+            async def _enqueue(item_id: int) -> int:
+                enqueued.append(item_id)
+                return item_id
+
+            aq = AutoQueue(db, _enqueue)
+            queued = await aq.on_scan(
+                QueueAutoConfig(
+                    id=queue_id,
+                    local_path=str(local_root),
+                    auto_queue_enabled=True,
+                    patterns_only=False,
+                )
+            )
+            assert queued == 0
+            assert enqueued == []
+    finally:
+        await db.close()
+
+
+async def test_local_reappearing_after_a_self_delete_corrects_to_local_only(tmp_path):
+    """Defect 2's second symptom: a `move`-mode child fossilised at `REMOVED_BOTH` by the whole-
+    subtree delete, whose content a fresh extraction later recreates locally while the remote
+    stays gone for good. Must correct to `LOCAL_ONLY` and stay suppressed -- never `REMOVED_LOCAL`
+    (that would assert a remote copy that does not exist).
+    """
+    rel_path = "Release/movie.mkv"
+    local_root = tmp_path / "local"
+    (local_root / "Release").mkdir(parents=True)
+
+    db = await _make_db()
+    try:
+        cursor = await db.execute(
+            "INSERT INTO host (name, address, port, username, auth_method, known_hosts_policy) "
+            "VALUES ('h', '127.0.0.1', 22, 'u', 'key', 'strict')"
+        )
+        host_id = cursor.lastrowid
+        cursor = await db.execute(
+            "INSERT INTO path_queue (host_id, name, remote_path, local_path, enabled, sync_mode) "
+            "VALUES (?, 'q', '/remote', ?, 1, 'move')",
+            (host_id, str(local_root)),
+        )
+        queue_id = cursor.lastrowid
+        item_id = await _make_item(
+            db, queue_id, rel_path, local_size=None, remote_size=None, state="REMOVED_BOTH"
+        )
+        await db.execute(
+            "UPDATE item SET auto_queue_suppressed = 1, suppressed_reason = 'deleted_local' "
+            "WHERE id = ?",
+            (item_id,),
+        )
+        await db.commit()
+
+        # The fresh extraction recreates the file locally; the remote never comes back (move
+        # mode already deleted it for good).
+        (local_root / rel_path).write_bytes(b"x" * 20)
+
+        host = HostConfig(
+            id=host_id,
+            address="127.0.0.1",
+            port=22,
+            username="u",
+            auth_method="key",
+            key_path="/k",
+            known_hosts_policy="strict",
+        )
+        engine = Engine(db, str(tmp_path), EventBus())
+        engine.pool = _FakePool({})
+        q = QueueConfig(
+            id=queue_id,
+            host_id=host_id,
+            name="q",
+            remote_path="/remote",
+            local_path=str(local_root),
+            staging_path=None,
+            enabled=True,
+            sync_mode="move",
+        )
+        await engine.scan_queue(q, host)
+
+        item = await _item_row(db, item_id)
+        assert item["state"] == "LOCAL_ONLY"
+        assert item["auto_queue_suppressed"] == 1
+        assert item["suppressed_reason"] == "deleted_local"
+    finally:
+        await db.close()
+
+
+async def test_a_suppressed_stopped_item_is_still_fully_protected_from_recomputation(tmp_path):
+    """The narrowing must not widen: a `STOPPED` item's suppression is for a completely
+    different reason (a retry policy, a user choice) and must stay absolute -- `state` left
+    exactly alone -- even when a fresh scan would otherwise compute something entirely
+    different (here, a fully-matching DOWNLOADED).
+    """
+    rel_path = "Release"
+    local_root = tmp_path / "local"
+    release = local_root / rel_path
+    release.mkdir(parents=True)
+    (release / "a.mkv").write_bytes(b"x" * 10)
+
+    remote_tree = {
+        rel_path: RemoteEntry(rel_path=rel_path, is_dir=True),
+        f"{rel_path}/a.mkv": RemoteEntry(
+            rel_path=f"{rel_path}/a.mkv", is_dir=False, size=10, mtime=1.0
+        ),
+    }
+
+    db = await _make_db()
+    try:
+        cursor = await db.execute(
+            "INSERT INTO host (name, address, port, username, auth_method, known_hosts_policy) "
+            "VALUES ('h', '127.0.0.1', 22, 'u', 'key', 'strict')"
+        )
+        host_id = cursor.lastrowid
+        cursor = await db.execute(
+            "INSERT INTO path_queue (host_id, name, remote_path, local_path, enabled, sync_mode) "
+            "VALUES (?, 'q', '/remote', ?, 1, 'copy')",
+            (host_id, str(local_root)),
+        )
+        queue_id = cursor.lastrowid
+        item_id = await _make_item(
+            db, queue_id, rel_path, is_dir=True, state="STOPPED", local_size=5
+        )
+        await db.execute(
+            "UPDATE item SET auto_queue_suppressed = 1, suppressed_reason = 'user_stopped' "
+            "WHERE id = ?",
+            (item_id,),
+        )
+        await db.commit()
+
+        engine = Engine(db, str(tmp_path), EventBus())
+        engine.pool = _FakePool(remote_tree)
+        q = QueueConfig(
+            id=queue_id,
+            host_id=host_id,
+            name="q",
+            remote_path="/remote",
+            local_path=str(local_root),
+            staging_path=None,
+            enabled=True,
+            sync_mode="copy",
+        )
+        host = HostConfig(
+            id=host_id,
+            address="127.0.0.1",
+            port=22,
+            username="u",
+            auth_method="key",
+            key_path="/k",
+            known_hosts_policy="strict",
+        )
+        await engine.scan_queue(q, host)
+
+        item = await _item_row(db, item_id)
+        assert (
+            item["state"] == "STOPPED"
+        ), "protection must stay absolute for a non-delete suppression"
+        assert item["auto_queue_suppressed"] == 1
+        assert item["suppressed_reason"] == "user_stopped"
     finally:
         await db.close()

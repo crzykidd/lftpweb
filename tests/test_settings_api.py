@@ -23,6 +23,7 @@ def _view(
             "is_dir": 1 if is_dir else 0,
             "state": "REMOTE_ONLY",
             "substate": None,
+            "suppressed_reason": None,
             "remote_size": remote_size,
             "local_size": None,
             "remote_mtime": remote_mtime,

@@ -6,6 +6,89 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-13 — Delete-state truthfulness: four defects found within hours of shipping deletion
+
+**Handoff prompt `prompts/2026-08-13-delete-state-truthfulness.md`, executed end to end.** The
+user found four defects testing the delete work that shipped hours earlier (`b39158e`), on a
+real `move`-mode queue. All four are the same shape: a row that nothing will ever revisit, so
+it stays wrong forever. Defect 3 (a `PARTIAL` row a rescan cannot fix) was the most serious.
+
+**Defect 1 — no feedback during a slow delete.** Diagnosed as the second of the prompt's two
+named possibilities: `core/local_delete.py.delete_local()` already writes the final removed
+state *after* the filesystem work (not before), so the report's specific case was a `move`
+queue whose remote was already gone — `REMOVED_BOTH` was correct, just silent for however long
+`shutil.rmtree` took. That rmtree also ran inline on the event loop, blocking the entire
+process (WS delivery included) for the duration — not what the user reported, but a real bug
+found while fixing the reported one. Fixed together: `item.substate = 'removing'` is written,
+committed, and published for the whole subtree *before* the filesystem work starts, and the
+work itself now runs via `asyncio.to_thread` so that publish can actually reach clients while a
+large delete is still running. Protection against a racing scan (and a second concurrent delete
+of the same item) is a new `core/local_delete.DeleteInFlight` — a plain in-memory counting
+dict, the identical shape and rationale as `PostprocessPipeline.in_flight_item_ids()` — folded
+into `core/engine.py.Engine._protected_rel_paths` and `delete_local`'s own in-flight guard.
+Because it is in-memory, a crash forgets it instantly; the next scan (or `delete_local`'s own
+`finally`, for a caught exception) recomputes the row from scratch. No wedge.
+
+**Defect 2 — a suppressed `REMOVED_LOCAL`/`REMOVED_BOTH` row doesn't notice content returning.**
+`core/engine.py._persist`'s protected branch never touched `state` for a suppressed row, by
+design (rule 9) — but that blanket rule doesn't distinguish "this row is suppressed because we
+deleted it, and the removal claim just became half-false" from "this row is suppressed for an
+unrelated reason (STOPPED/FAILED) and must never be second-guessed." `core/local_delete.
+reconsider_removed_state(prev_state, *, remote_present, local_present, structural_state)` is
+the narrow rule: fires only for `prev_state in {REMOVED_LOCAL, REMOVED_BOTH}`, and only
+produces a non-`None` correction when content is provably back on one side (`REMOVED_LOCAL` if
+remote alone returned, `LOCAL_ONLY` if local alone did, the plain `structural_state` if both
+did — see the function's own docstring for why the last one is still narrow, not a blanket
+recompute). `auto_queue_suppressed` is never touched by this branch, so eligibility is
+unaffected either way — exactly the split the prompt asked for. Considered and rejected:
+correcting `REMOVED_LOCAL` back toward `REMOVED_BOTH` if the surviving remote copy *later* also
+disappears — that's "removal getting more true," not "content returning," and the prompt's own
+scope was the latter; left as a known, documented imprecision rather than silently taken
+further than asked.
+
+**Defect 3 — a `PARTIAL` row that leaves both trees is stuck forever, and a rescan can't fix
+it.** Confirmed both halves of the prompt's diagnosis against the code before touching
+anything. Fixed both, since both were sound: (1) `core/queue.py._reap_one` now calls a new
+`_flush_child_progress_final(proc)` the instant a `mirror` job reaps successfully — one more,
+un-throttled, unconditional walk of the job's own directory (the same `local_scan.scan_local`
+`core/progress.py._bytes_done_for` already uses), so a child's row reflects its true final size
+before post-processing ever gets a chance to relocate it out of both trees. This is "arguably
+the real fix," per the prompt's own framing — it stops the stale reading from forming at all.
+(2) `core/mount_sentinel.resolve_vanished(prev_state)` is the safety net for whenever a stale
+reading forms anyway (a crash between two throttled writes, say): a **new, deliberately narrow**
+fallback in `core/engine.py._persist`'s vanished-from-both-trees sweep, consulted only when
+`resolve_absence` itself has no opinion. Rejected the obvious move (widening
+`_COMPLETE_PREV_STATES` to include `PARTIAL`) for the reason the prompt named directly — that
+set means "asserted all its bytes were here," which is exactly what `PARTIAL` doesn't assert.
+Also rejected the first draft of `resolve_vanished` itself: firing for *every* "no opinion"
+`prev_state` (including plain `REMOTE_ONLY` and `EXCLUDED`) broke `tests/test_ws_deltas.py`'s
+existing, correct assumption that a never-downloaded item quietly dropping off a remote scan
+disappears from the published tree rather than being relabeled `REMOVED_BOTH` — a real
+regression caught by the existing test suite, not a hypothetical one. Narrowed to fire only for
+`PARTIAL`/`LOCAL_ONLY` (states that assert *some* concrete content was actually here); `REMOTE_
+ONLY`/`EXCLUDED` keep the old "silently drops from the published tree" behavior. Two existing
+tests (`tests/test_state_persistence.py`, `tests/test_ws_deltas.py`) encoded the old, now-wrong
+assumption that any vanished-with-no-opinion row is simply left alone forever; updated to match
+the new, narrower, intentional behavior rather than left to rot as a stale regression guard.
+
+**Defect 4 — a completed directory shows no size on a `move` queue.** `FileTree.tsx.
+nodeDisplaySize` gave files a `local_size` fallback but not directories; added the equivalent
+fallback (`remote_size ?? local_size`, directories only — files keep their existing `local_size
+?? remote_size` order, which is deliberately the opposite priority: a file's cell is meant to
+read as live download progress, a directory's as the release's total size). Both the sort
+comparator and the hover tooltip already read this same function, so no separate fix was needed
+there — confirmed by inspection rather than assumed, since the prompt suggested checking.
+
+**A ripple this task caused and had to clean up.** `item_view()` gained a `suppressed_reason`
+field (needed by `FileTree.tsx`'s new "Re-Download" label). Every hand-built `ItemView`/row
+dict fixture across the test suite that doesn't go through a real `SELECT * FROM item` needed
+the new key added by hand (`tests/test_ws_deltas.py`, `tests/test_itemview.py`,
+`tests/test_settings_api.py`) — a `KeyError` at test time, not a silent gap, but worth recording
+as the shape of cost a wire-projection field addition has in this codebase: one field, N
+hand-built fixtures to touch.
+
+---
+
 ## 2026-08-13 — Closing documentation sweep: the second wordings backlog applied, three
 ## long-standing untruths in DESIGN.md corrected, and the `resolve_absence` gap documented
 ## rather than fixed

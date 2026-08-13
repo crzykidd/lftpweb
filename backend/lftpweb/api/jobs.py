@@ -119,6 +119,7 @@ async def delete_item(item_id: int, request: Request) -> DeleteItemResponse:
 
     postprocess = getattr(request.app.state, "postprocess", None)
     in_flight = postprocess.in_flight_item_ids() if postprocess is not None else frozenset()
+    delete_in_flight = getattr(request.app.state, "delete_in_flight", None)
 
     outcome = await local_delete.delete_local(
         db,
@@ -128,6 +129,7 @@ async def delete_item(item_id: int, request: Request) -> DeleteItemResponse:
         require_nlink_guard=False,
         in_flight_item_ids=in_flight,
         events=request.app.state.events,
+        delete_in_flight=delete_in_flight,
     )
     if not outcome.deleted:
         raise HTTPException(status_code=409, detail=outcome.reason)

@@ -568,19 +568,42 @@ async def test_move_mode_item_that_leaves_both_trees_still_reaches_removed_local
         await db.close()
 
 
-async def test_a_vanished_row_resolve_absence_has_no_opinion_about_is_left_alone(
+async def test_a_vanished_local_only_row_rests_at_removed_both_not_left_alone(
     tmp_path, monkeypatch
 ):
-    """The "vanished from both trees" loop is deliberately narrow: a `rel_path` absent from
-    this scan's `nodes` whose previous state `resolve_absence` doesn't recognize (`LOCAL_ONLY`
-    is not in `_STICKY_PREV_STATES` -- it was never content the grace period tracks) must be
-    left exactly as it was, never invented into `REMOTE_ONLY` or `REMOVED_LOCAL`.
+    """The "vanished from both trees" loop consults `resolve_absence` first (which has no
+    opinion about `LOCAL_ONLY` -- it is not in `_STICKY_PREV_STATES`, never content the grace
+    period tracks) and then, since 2026-08-13
+    (`prompts/2026-08-13-delete-state-truthfulness.md`, defect 3),
+    `core/mount_sentinel.py.resolve_vanished` as the fallback: `LOCAL_ONLY` asserted concrete
+    content was actually here, so a row that leaves both trees with that history must not be
+    frozen on it forever (`REMOTE_ONLY`, "nothing was ever here", correctly stays frozen --
+    see `test_a_vanished_remote_only_row_is_still_left_alone` below). Never `REMOVED_LOCAL`
+    (that would assert a remote copy that is not there).
     """
     engine, q, host, db, item_id = await _make_move_engine(
         tmp_path, monkeypatch, local_size=None, state="LOCAL_ONLY", remote_deleted_at=None
     )
     try:
         await engine.scan_queue(q, host)
-        assert (await _state_of(db, item_id))[0] == "LOCAL_ONLY"
+        assert (await _state_of(db, item_id))[0] == "REMOVED_BOTH"
+    finally:
+        await db.close()
+
+
+async def test_a_vanished_remote_only_row_is_still_left_alone(tmp_path, monkeypatch):
+    """The narrowing's other half: `REMOTE_ONLY` -- nothing was ever fetched, so there is no
+    "removed" story to tell -- must keep the pre-`resolve_vanished` behavior of simply being
+    left out of the published tree, not relabeled `REMOVED_BOTH`. This is the common case (a
+    remote file that dropped off an unrelated scan), and `tests/test_ws_deltas.py`'s scan-delta
+    tests already depend on it at the WebSocket-payload level; this is the same guarantee
+    checked directly against the persisted row.
+    """
+    engine, q, host, db, item_id = await _make_move_engine(
+        tmp_path, monkeypatch, local_size=None, state="REMOTE_ONLY", remote_deleted_at=None
+    )
+    try:
+        await engine.scan_queue(q, host)
+        assert (await _state_of(db, item_id))[0] == "REMOTE_ONLY"
     finally:
         await db.close()

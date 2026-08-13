@@ -14,6 +14,7 @@ from lftpweb.core.mount_sentinel import (
     SENTINEL_NAME,
     check,
     resolve_absence,
+    resolve_vanished,
     write_if_needed,
 )
 
@@ -243,4 +244,54 @@ def test_presence_is_not_this_functions_decision(prev_state, structural_state):
             now=datetime.now(UTC),
         )
         is None
+    )
+
+
+# --- resolve_vanished(): the "no opinion" fallback for a path in neither tree at all --------
+#
+# 2026-08-13 (prompts/2026-08-13-delete-state-truthfulness.md, defect 3): `resolve_absence`
+# returns None for a `prev_state` outside `_STICKY_PREV_STATES` -- correct for that function's
+# own job, but `core/engine.py._persist`'s vanished-from-both-trees sweep has nothing else to
+# fall back to, and without one, such a row is simply never written again. Deliberately narrow:
+# only `PARTIAL`/`LOCAL_ONLY` (content that was actually, concretely here) get a resting state;
+# `REMOTE_ONLY`/`EXCLUDED` (nothing was ever here, or never going to be, on purpose) keep the
+# pre-existing "silently drops from the published tree" behavior -- see the module-level
+# comment on `_VANISHED_FALLBACK_PREV_STATES` for why widening further would be a regression,
+# not a fix (`tests/test_ws_deltas.py`'s scan-delta tests depend on the `REMOTE_ONLY` case).
+
+
+@pytest.mark.parametrize("prev_state", ["PARTIAL", "LOCAL_ONLY"])
+def test_resolve_vanished_rests_a_no_opinion_prev_state_at_removed_both(prev_state):
+    assert resolve_vanished(prev_state) == "REMOVED_BOTH"
+
+
+@pytest.mark.parametrize(
+    "prev_state", ["REMOTE_ONLY", "EXCLUDED", "QUEUED", "STOPPED", "REMOVED_BOTH"]
+)
+def test_resolve_vanished_leaves_every_other_prev_state_alone(prev_state):
+    # REMOTE_ONLY/EXCLUDED never asserted concrete content; QUEUED/STOPPED would never reach
+    # this function in practice (protected rows never enter the vanished sweep) but are checked
+    # anyway as documentation; REMOVED_BOTH is the idempotent already-resting-here case -- the
+    # vanished sweep runs every scan a row stays gone, and a REMOVED_BOTH this function itself
+    # produced last pass must not be treated as a fresh "no opinion" case on the next one.
+    assert resolve_vanished(prev_state) is None
+
+
+@pytest.mark.parametrize(
+    "prev_state",
+    ["DOWNLOADED", "VERIFIED", "EXTRACTED", "REMOVED_LOCAL"],
+)
+def test_resolve_vanished_is_never_consulted_for_a_sticky_prev_state(prev_state):
+    # Not a claim this function makes itself (its caller only ever reaches it when
+    # resolve_absence already returned None) -- asserted here anyway as documentation: every
+    # sticky state has its own opinion and would never legitimately reach resolve_vanished.
+    assert (
+        resolve_absence(
+            prev_state=prev_state,
+            prev_first_missing_at=None,
+            structural_state="REMOTE_ONLY",
+            mount_ok=True,
+            now=datetime.now(UTC),
+        )
+        is not None
     )

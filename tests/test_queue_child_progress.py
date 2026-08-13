@@ -246,3 +246,85 @@ async def test_parent_aggregate_progress_still_updates_every_tick_not_just_throt
     parent_row = await _item_row(db, ids["parent"])
     assert parent_row["local_size"] == 150
     assert parent_row["state"] == "DOWNLOADING"  # read back from `item`, not hardcoded
+
+
+# --- _flush_child_progress_final: the reap-time correction for a stale throttled reading -----
+#
+# 2026-08-13 (prompts/2026-08-13-delete-state-truthfulness.md, defect 3). The throttled sampler
+# above only persists a child on a tick that's a multiple of CHILD_PROGRESS_THROTTLE_TICKS, and
+# only for files whose size changed since the *previous* throttled tick -- so a job that
+# finishes between two throttled ticks can leave a child's row reading a stale PARTIAL forever
+# if nothing else ever revisits it (the exact shape a `move` queue produces: post-processing
+# relocates the release out of both trees before any further engine scan gets the chance).
+# `_flush_child_progress_final` is `_reap_one`'s fix -- one more, unthrottled, unconditional
+# walk of the job's own directory the moment it reaps successfully.
+
+
+async def test_flush_child_progress_final_corrects_a_stale_partial_left_by_the_throttle(
+    db, tmp_path
+):
+    q, release_dir, _queue_id, ids = await _setup(db, tmp_path)
+    # A throttled tick catches a.rar mid-transfer and persists PARTIAL -- exactly the reading
+    # the bug leaves behind if nothing else ever runs again for this job.
+    (release_dir / "a.rar").write_bytes(b"a" * 400)
+    (release_dir / "b.rar").write_bytes(b"b" * 500)
+    await _tick_through_throttle(q)
+    assert (await _item_row(db, ids["a"]))["state"] == "PARTIAL"
+
+    # The job finishes for real between throttled ticks -- a.rar reaches its full size on disk,
+    # but nothing has sampled it since the PARTIAL write above.
+    (release_dir / "a.rar").write_bytes(b"a" * 1000)
+
+    proc = q._running[1]
+    events_queue = q.events.subscribe()
+    await q._flush_child_progress_final(proc)
+    messages = await _drain(q.events, events_queue)
+
+    a_row = await _item_row(db, ids["a"])
+    assert a_row["state"] == "DOWNLOADED", "the stale PARTIAL must not survive the final flush"
+    assert a_row["local_size"] == 1000
+    b_row = await _item_row(db, ids["b"])
+    assert b_row["state"] == "DOWNLOADED"
+    assert b_row["local_size"] == 500
+
+    deltas = _item_deltas(messages)
+    published_by_id = {node["id"]: node for d in deltas for node in d["nodes"]}
+    assert published_by_id[ids["a"]]["state"] == "DOWNLOADED"
+
+
+async def test_flush_child_progress_final_is_a_no_op_for_a_pget_job(db, tmp_path):
+    """A `pget` job is a single file with no children -- there is nothing for this to walk, and
+    it must not raise trying.
+    """
+    q, _release_dir, queue_id, _ids = await _setup(db, tmp_path)
+    single_id = await _make_item_row(db, queue_id, "loose.txt", is_dir=False, remote_size=10)
+    await db.commit()
+    proc = _RunningProcess(
+        job_id=2,
+        item_id=single_id,
+        queue_id=queue_id,
+        rel_path="loose.txt",
+        is_dir=False,
+        kind="pget",
+        lane="main",
+        rate_limit_bps=0,
+        forced_full_rate=False,
+        local_root=str(tmp_path / "local" / "loose.txt"),
+        bytes_total=10,
+        remote_mtime=None,
+        spawned=None,
+        wait_task=None,
+    )
+    await q._flush_child_progress_final(proc)  # must not raise
+
+
+async def test_flush_child_progress_final_is_a_no_op_when_local_root_no_longer_exists(db, tmp_path):
+    """A job whose directory has already been relocated (or never existed) by the time this
+    runs must not crash -- `local_scan.scan_local` already returns `{}` for a missing root.
+    """
+    q, release_dir, _queue_id, _ids = await _setup(db, tmp_path)
+    import shutil
+
+    shutil.rmtree(release_dir)
+    proc = q._running[1]
+    await q._flush_child_progress_final(proc)  # must not raise

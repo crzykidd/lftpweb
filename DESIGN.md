@@ -313,6 +313,18 @@ and a new branch everywhere the vocabulary is handled. What actually distinguish
 cases is `remote_deleted_at` (set only when we removed the remote copy) and the `event` row
 that records every delete.
 
+**A third reading, narrower still, added 2026-08-13.** `core/mount_sentinel.py.
+resolve_vanished` also writes `REMOVED_BOTH` for a `PARTIAL`/`LOCAL_ONLY` row that leaves both
+trees with no scan ever getting the chance to say anything else about it (rule 9's last bullet,
+§7.3) — the safety net for a stale reading the throttled child-progress writer can otherwise
+leave behind on a `move` queue. Unlike the two readings above, this one is **not** a delete
+this codebase performed: `auto_queue_suppressed` is left clear and no `event` row is written,
+because there was nothing to audit. The state text is the same "nothing here to compare, don't
+invent a story" signal either way; only the suppression (and therefore auto-queue eligibility)
+differs, which is exactly why `core/local_delete.py.reconsider_removed_state` treats a
+`resolve_vanished`-produced `REMOVED_BOTH` no differently from a self-delete one when content
+later returns — see that function's own docstring.
+
 Nine rules that are easy to get wrong and that want review:
 
 1. A **directory** is `DOWNLOADED` only when every non-directory descendant that has a remote
@@ -406,12 +418,20 @@ Nine rules that are easy to get wrong and that want review:
    **precedence with an explicit domain, never blanket stickiness** — a state that can only
    ever be protected is a state that can never be un-stuck:
 
-   - **An item with a live claim on it is not recomputed at all.** A `queued`/`running` job, an
-     item a post-processing worker is *currently inside*, or a suppressed row (`STOPPED`,
-     `FAILED`, a row we deleted ourselves — rule 3) keeps its state; only sizes and mtimes are
-     refreshed. Note what the second of those keys on: the **live worker's existence**, never
-     the string `VERIFYING`/`EXTRACTING`. A worker killed mid-extract leaves that string behind
-     with nothing running, and a protection keyed on the string could never let go of it.
+   - **An item with a live claim on it is not recomputed at all — with one narrow exception.**
+     A `queued`/`running` job, an item a post-processing worker (or, since 2026-08-13, a
+     `core/local_delete.py.delete_local()` call — see §7.4) is *currently inside*, or a
+     suppressed row (`STOPPED`, `FAILED`, a row we deleted ourselves — rule 3) keeps its state;
+     only sizes and mtimes are refreshed. Note what the live-worker cases key on: the **live
+     worker's existence**, never a string like `VERIFYING`/`EXTRACTING`/`substate = 'removing'`.
+     A worker killed mid-extract (or mid-delete) leaves that string behind with nothing running,
+     and a protection keyed on the string could never let go of it. The exception: a row this
+     codebase itself marked `REMOVED_LOCAL`/`REMOVED_BOTH` (`suppressed_reason = 'deleted_local'`)
+     may still have its `state` text corrected — never its suppression — when a fresh scan
+     proves the removal claim half-false (content came back on one side; `core/local_delete.py.
+     reconsider_removed_state` is the rule). This is not a second recomputation path: it fires
+     only for those two states, so a `STOPPED`/`FAILED` row's protection stays exactly as
+     absolute as before.
    - **Content present and complete** (structural `DOWNLOADED`): the post-processing outcome
      wins. `VERIFIED`/`CORRUPT`/`EXTRACTED`/`EXTRACT_FAILED` are *refinements* of `DOWNLOADED`
      — each says something about an all-bytes-present item that the byte comparison cannot.
@@ -436,9 +456,29 @@ Nine rules that are easy to get wrong and that want review:
      fresh `REMOTE_ONLY` and be downloaded all over again.
    - **Content absent from *both* trees** — the path is in neither the remote scan nor the
      local one, so the reconciler produces no node for it at all. §7.3 covers what happens
-     then; the short version is that it goes through the same grace period rather than being
-     skipped, because the scan loop only visits nodes and a row nothing visits is a row frozen
-     on its last outcome forever.
+     then. Every `prev_state` §7.3's grace-period function (`resolve_absence`) has an opinion
+     about goes through the same grace period as if it were freshly absent — the point of
+     that half. **A second, narrower fallback exists for two `prev_state`s it does not**
+     (2026-08-13, a real bug — see below): `PARTIAL` and `LOCAL_ONLY` both assert *some*
+     concrete content was actually here, so a row that leaves both trees carrying either one
+     rests at `REMOVED_BOTH` rather than being frozen forever, because the scan loop only
+     visits nodes and a row nothing ever visits again is a row frozen on its last reading
+     forever. `REMOTE_ONLY` (nothing was ever fetched) and `EXCLUDED` (never going to be, on
+     purpose) are deliberately left out of that fallback and keep the older "simply drops from
+     the published tree" behavior — see `core/mount_sentinel.py.resolve_vanished`'s own
+     docstring for why widening it to cover them too would be a regression, not a fix.
+
+     **Found 2026-08-13** (`prompts/2026-08-13-delete-state-truthfulness.md`): a `move` queue's
+     throttled per-child progress writer (`core/queue.py._publish_child_progress`) can leave a
+     small file's row reading a mid-transfer `PARTIAL` — true for a fraction of a second — right
+     as its job reaps, and post-processing can relocate the whole release out of both trees
+     before any scan gets a chance to correct it. Before the fallback above existed, such a row
+     was frozen at `PARTIAL` forever, and a rescan could not fix it: no fresh structural reading
+     exists for a path in neither tree to overwrite it with. `core/queue.py._reap_one` also now
+     flushes a final, un-throttled, accurate child reading the instant a job reaps successfully
+     — the fix that stops the stale reading from forming in the first place; the fallback above
+     is the safety net for whenever one forms anyway (a crash between two throttled writes,
+     say).
 
    `state_changed_at` is stamped by a database trigger on an actual change of value, not by
    each of the three writers remembering to. Cross-cutting discipline over three modules is
@@ -1232,9 +1272,16 @@ them distinguishable, because a bind mount that didn't come up has no sentinel i
   resolves each one through the same grace-period function, with a synthetic `REMOTE_ONLY`
   reading standing in for "there is nothing here to compare". It reuses that function's own
   eligibility gate rather than re-implementing it, so a previous state the function has no
-  opinion about (`LOCAL_ONLY`, `REMOVED_BOTH`, a mid-flight `PARTIAL`) is left exactly as it was
-  rather than invented into something new, and a suppressed or actively-claimed row never
-  reaches the sweep at all.
+  opinion about is handed to a second, even narrower fallback (`core/mount_sentinel.py.
+  resolve_vanished`, 2026-08-13) before being left alone: `PARTIAL` and `LOCAL_ONLY` — states
+  that assert *some* concrete content was actually here — rest at `REMOVED_BOTH` rather than
+  freezing forever (this closed a real bug: a `move` queue's throttled per-child progress
+  writer can leave a small file's row reading a fraction-of-a-second-true `PARTIAL` right as
+  its job reaps, and post-processing can relocate the release out of both trees before any
+  scan gets the chance to correct it — no rescan can fix it once that happens, because there is
+  no fresh structural reading for a path in neither tree). `REMOTE_ONLY` and `EXCLUDED` — which
+  assert the opposite, that no real content was ever here — are still left exactly as they were,
+  and a suppressed or actively-claimed row never reaches either sweep at all.
 - **Verification gate.** `move` deletes only after the item verifies (§6). `sync` propagates only
   for items that reached a verified-complete state. Never deleted on a stale size rollup alone,
   and never on a `SKIPPED` verification — "no evidence" is not evidence.
@@ -1399,6 +1446,21 @@ state chip already reads (§2.2's one shared projection, never a second read of 
   over the socket, and a directory that arrives *after* a saved set was written would not be in
   it — so it would render expanded against a stated "start collapsed" preference. A default with
   exceptions gives a newly-arrived directory the current default automatically.
+- **A delete in progress reads honestly, not as whatever it happened to be beforehand**
+  (2026-08-13). `item.substate = 'removing'`, the same vehicle the settle gate's `'settling'`
+  uses, overlays the state chip (`REMOVING`, styled like a failure — it is destructive and
+  irreversible) for the whole subtree of a `core/local_delete.py.delete_local()` call, written
+  and published *before* the filesystem work starts so a large directory delete has visible
+  feedback for the whole time it takes, not silence followed by a sudden final state. Protected
+  from a racing scan by the same live-worker mechanism as `VERIFYING`/`EXTRACTING` (§3.2 rule 9)
+  — a crashed or killed process cannot leave a row stuck reading "Removing" forever.
+- **A row whose content came back reads "Re-Download", not "Queue"** (2026-08-13). A
+  `REMOVED_LOCAL`/`REMOVED_BOTH` row this codebase deleted itself
+  (`suppressed_reason = 'deleted_local'`) whose remote copy has since reappeared still won't be
+  auto-fetched (rule 3), but the manual action button says so by name rather than reading like a
+  brand-new item — derived from the suppression reason plus current remote presence, never from
+  the state string alone, since an *unsuppressed* `REMOVED_LOCAL`/`REMOVED_BOTH`
+  (`core/mount_sentinel.py.resolve_vanished`, rule 9) is a plain "Queue".
 
 **Item detail.** A small info icon on each row — deliberately quieter than the lifecycle icons,
 because it is a control and not a status — opens the item drawer described below. Hovering a row

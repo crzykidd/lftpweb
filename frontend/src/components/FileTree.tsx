@@ -26,13 +26,25 @@ interface TreeEntry extends FileNode {
   children: TreeEntry[]
 }
 
-/** What a row's own size column shows -- a directory's `remote_size` (already a rollup,
- * `core/reconcile.py`), a file's `local_size` falling back to `remote_size` (a not-yet-touched
- * file has no local bytes to show at all). Named and shared so `Row` and the `size` sort key
- * (below) can never quietly disagree about what "size" means for a node.
+/** What a row's own size column shows. A **file** prefers `local_size` (falling back to
+ * `remote_size` only when local is unknown) so an in-progress download's cell reads as live
+ * progress, not the eventual total. A **directory** is the opposite: `remote_size` first --
+ * it's the rollup total for the whole subtree while anything is still incomplete, which is the
+ * more useful "how big is this" reading -- falling back to `local_size` only when
+ * `remote_size` is unknown. That fallback used to not exist at all (2026-08-13,
+ * `prompts/2026-08-13-delete-state-truthfulness.md` defect 4): a completed directory on a
+ * `move` queue has `remote_size` go `NULL` the moment its verified remote copy is deleted
+ * (DESIGN.md §6/§7.4), so every file inside it kept showing a size (their own fallback already
+ * covered that) while the directory row wrapping them went blank. Both sizes are already
+ * rollups from `core/reconcile.py`, so there's nothing new to compute, just the same shape of
+ * fallback files already had. Named and shared so `Row`, the hover tooltip, and the `size`
+ * sort key (`sortValue` below) all read this one function and can never quietly disagree about
+ * what "size" means for a node.
  */
 function nodeDisplaySize(entry: TreeEntry): number | null {
-  return entry.is_dir ? entry.remote_size : (entry.local_size ?? entry.remote_size)
+  return entry.is_dir
+    ? (entry.remote_size ?? entry.local_size)
+    : (entry.local_size ?? entry.remote_size)
 }
 
 function buildTree(nodes: FileNode[]): TreeEntry[] {
@@ -201,11 +213,23 @@ function isSortPreference(value: unknown): value is SortPreference {
  * queueing always wins over auto-queue suppression and is never filtered by the UI based on
  * state (STOPPED/FAILED included) -- the one exception is a node with nothing remote to
  * fetch at all (`LOCAL_ONLY`), where there is nothing a "Queue" action could mean.
+ *
+ * `'redownload'` (2026-08-13, `prompts/2026-08-13-delete-state-truthfulness.md` defect 2) is
+ * the same click as `'queue'` -- `Row` below dispatches both through the identical `onAction`
+ * handler -- just a different label for one specific case: a row *we* deleted
+ * (`suppressed_reason === 'deleted_local'`) whose remote copy has since come back
+ * (`hasRemoteCopy`, defined below). Derived from the suppression reason plus remote presence,
+ * never from the state string alone, because `REMOVED_LOCAL`/`REMOVED_BOTH` can also be
+ * produced with no suppression at all (`core/mount_sentinel.py.resolve_vanished`, defect 3) --
+ * that row is a plain "Queue", not a "Re-Download". "Queue" reads like a brand-new item;
+ * "Re-Download" tells the user this is the release they already had, back again, and nothing
+ * fetches it automatically.
  */
-function rowAction(node: FileNode): 'queue' | 'stop' | null {
+function rowAction(node: FileNode): 'queue' | 'stop' | 'redownload' | null {
   if (node.id == null) return null
   if (node.state === 'QUEUED' || node.state === 'DOWNLOADING') return 'stop'
   if (node.state === 'LOCAL_ONLY') return null
+  if (node.suppressed_reason === 'deleted_local' && hasRemoteCopy(node)) return 'redownload'
   return 'queue'
 }
 
@@ -231,11 +255,13 @@ function localBytes(node: FileNode): number {
 
 /** Whether this node still has a remote copy -- `remote_size` is `null` only for `LOCAL_ONLY`
  * (never tracked remotely; everything else was seen on a scan). Drives the delete
- * confirmation's "what happens to this after I delete it" wording: a remote copy surviving
- * means lftpweb will never re-fetch it on its own (`core/local_delete.py.delete_local` always
- * writes `REMOVED_BOTH` + `auto_queue_suppressed`, which auto-queue excludes unconditionally,
- * regardless of the `re_download_externally_removed` setting -- that setting only ever governs
- * an item *something else* removed, never one this app just deleted).
+ * confirmation's "what happens to this after I delete it" wording (a remote copy surviving
+ * means `delete_local` writes `REMOVED_LOCAL`, not `REMOVED_BOTH` -- `core/local_delete.py.
+ * _removed_state_for`) and, since 2026-08-13, `rowAction`'s "Re-Download" label above. Either
+ * way lftpweb will never re-fetch what it deleted itself on its own: `delete_local` always sets
+ * `auto_queue_suppressed`, which auto-queue excludes unconditionally regardless of the
+ * `re_download_externally_removed` setting -- that setting only ever governs an item
+ * *something else* removed, never one this app just deleted.
  */
 function hasRemoteCopy(node: FileNode): boolean {
   return node.remote_size != null
@@ -325,6 +351,14 @@ function Row({
   const size = nodeDisplaySize(entry)
   const action = rowAction(entry)
   const deletable = canDeleteLocal(entry)
+  // 2026-08-13 (prompts/2026-08-13-delete-state-truthfulness.md defect 1): `substate ===
+  // 'removing'` overlays the chip regardless of `state` -- the row's real `state` is left
+  // untouched server-side for the duration (`core/local_delete.py.delete_local`'s own
+  // docstring), so this is purely a display substitution, not a claim that `state` itself
+  // changed. The delete button is also hidden while this is true: a second delete request
+  // for the same item is already withheld server-side (`DeleteInFlight`), but there's no
+  // reason to invite the click.
+  const isRemoving = entry.substate === 'removing'
 
   return (
     <div
@@ -370,7 +404,10 @@ function Row({
         {size != null ? formatBytes(size) : '—'}
       </span>
       <span className="w-28 shrink-0 text-right">
-        <StateChip state={entry.state} percent={stateProgressPercent(entry)} />
+        <StateChip
+          state={isRemoving ? 'REMOVING' : entry.state}
+          percent={isRemoving ? null : stateProgressPercent(entry)}
+        />
         {/* The settle gate (prompts/open-issues.md #2): most REMOTE_ONLY items pass through
             this on every first sighting, so it's deliberately quiet -- a small dot, not a
             second chip -- rather than something that reads as a problem. */}
@@ -409,10 +446,10 @@ function Row({
                 : 'border border-zinc-300 text-zinc-700 hover:bg-zinc-50 dark:border-zinc-700 dark:text-zinc-200 dark:hover:bg-zinc-900'
             }`}
           >
-            {action === 'stop' ? 'Stop' : 'Queue'}
+            {action === 'stop' ? 'Stop' : action === 'redownload' ? 'Re-Download' : 'Queue'}
           </button>
         )}
-        {deletable && (
+        {deletable && !isRemoving && (
           <button
             type="button"
             disabled={actionBusy}
@@ -655,7 +692,7 @@ export function FileTree({ nodes }: { nodes: FileNode[] }) {
     setRowBusy((prev) => new Set(prev).add(entry.rel_path))
     try {
       const action = rowAction(entry)
-      if (action === 'queue') await queueItem(entry.id)
+      if (action === 'queue' || action === 'redownload') await queueItem(entry.id)
       else if (action === 'stop') await stopItem(entry.id)
     } finally {
       setRowBusy((prev) => {

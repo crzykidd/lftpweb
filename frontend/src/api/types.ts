@@ -226,8 +226,15 @@ export interface FileNode {
   is_dir: boolean
   state: string
   // The settle gate (prompts/open-issues.md #2): 'settling' for a top-level REMOTE_ONLY item
-  // whose remote fingerprint hasn't held still for 2 consecutive scans yet, null otherwise.
+  // whose remote fingerprint hasn't held still for 2 consecutive scans yet. 'removing'
+  // (2026-08-13, prompts/2026-08-13-delete-state-truthfulness.md) for the whole subtree of an
+  // in-progress delete (core/local_delete.py.delete_local). null otherwise.
   substate: string | null
+  // item.suppressed_reason (2026-08-13, prompts/2026-08-13-delete-state-truthfulness.md), null
+  // unless auto_queue_suppressed is set server-side. Drives the "Re-Download" action label
+  // below -- a self-delete ('deleted_local') reads differently from every other suppression
+  // reason and from an unsuppressed REMOVED_LOCAL/REMOVED_BOTH row.
+  suppressed_reason: string | null
   remote_size: number | null
   local_size: number | null
   remote_mtime: number | null

@@ -351,9 +351,18 @@ class FileNode(BaseModel):
     state: str
     # The settle gate (prompts/open-issues.md #2, `core/settle.py`, migration 007): `'settling'`
     # for a top-level item held at REMOTE_ONLY while its remote fingerprint hasn't held still
-    # for 2 consecutive scans yet, `None` otherwise. Deliberately not a new `state` value --
-    # avoids touching the state CHECK constraint or DESIGN.md §9.2's three-word vocabulary.
+    # for 2 consecutive scans yet. `'removing'` (2026-08-13,
+    # prompts/2026-08-13-delete-state-truthfulness.md) for the whole subtree of an in-progress
+    # `core/local_delete.py.delete_local()` call. `None` otherwise. Deliberately not a new
+    # `state` value -- avoids touching the state CHECK constraint or DESIGN.md §9.2's
+    # three-word vocabulary.
     substate: str | None = None
+    # `item.suppressed_reason` (2026-08-13, prompts/2026-08-13-delete-state-truthfulness.md),
+    # `None` unless `auto_queue_suppressed` is set. `FileTree.tsx`'s "Re-Download" action label
+    # needs this to tell a self-delete (`'deleted_local'`) apart from every other suppression
+    # reason and from a `REMOVED_LOCAL`/`REMOVED_BOTH` row that isn't suppressed at all (the
+    # latter reachable via `core/mount_sentinel.py.resolve_vanished`, which never suppresses).
+    suppressed_reason: str | None = None
     remote_size: int | None
     local_size: int | None
     remote_mtime: float | None
