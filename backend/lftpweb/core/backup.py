@@ -39,6 +39,8 @@ from pathlib import Path
 
 import aiosqlite
 
+from lftpweb.db import db_path
+
 logger = logging.getLogger(__name__)
 
 BACKUP_DIRNAME = "backups"
@@ -150,6 +152,23 @@ def backup_file_path(config_dir: str, filename: str) -> Path:
     return backup_dir(config_dir) / filename
 
 
+async def _source_db_path(db: aiosqlite.Connection, config_dir: str) -> str:
+    """The file `db` is actually attached to, for the dedicated VACUUM connection below to
+    open. `PRAGMA database_list` is a metadata read -- safe inside any transaction state,
+    unlike almost everything else you could ask a connection -- so this asks `db` directly
+    instead of assuming `db_path(config_dir)` names the same file. That keeps "back up *this*
+    connection's database" exact even if some future caller's `db` and `config_dir` ever
+    drifted apart, at the cost of one extra query. Every call site today does pass a matching
+    pair (`db.py.connect(config_dir)` is the only place a connection is opened), so the
+    fallback below is defensive, not load-bearing.
+    """
+    cursor = await db.execute("PRAGMA database_list")
+    for row in await cursor.fetchall():
+        if row["name"] == "main" and row["file"]:
+            return row["file"]
+    return str(db_path(config_dir))  # pragma: no cover - defensive; see docstring above
+
+
 async def create_backup(
     db: aiosqlite.Connection, config_dir: str, *, reason: str = "manual"
 ) -> BackupInfo:
@@ -167,9 +186,34 @@ async def create_backup(
         path = d / f"lftpweb-{timestamp}-{suffix}.db"
         suffix += 1
 
-    # VACUUM INTO takes its target as a bound parameter like any other SQL expression --
-    # verified against real sqlite3 (>= 3.27) before relying on it here, not assumed.
-    await db.execute("VACUUM INTO ?", (str(path),))
+    # VACUUM cannot run on `db` -- it's the shared application connection, and SQLite refuses
+    # VACUUM inside a transaction. Every writer holds one between its own `execute` and
+    # `commit`, and since the 2026-08-12 metrics heartbeat fires every 30s unconditionally,
+    # `db` is in a transaction often enough that this used to fail routinely
+    # (docs/decisions.md). Committing `db` first and then running VACUUM on it right after is
+    # NOT a fix -- another coroutine can open its own transaction on `db` in the gap between
+    # that commit and this statement actually running, since asyncio can interleave awaits
+    # arbitrarily. The only real fix is a connection nobody else can put into a transaction,
+    # so open a second, short-lived one just for this. WAL mode (set by `db.py.connect()`)
+    # makes a concurrent connection safe; a busy_timeout gives a concurrent WAL checkpoint or
+    # writer something to wait out instead of an instant SQLITE_BUSY (db.py.connect() sets no
+    # busy_timeout on the shared connection today, so this one is deliberately more cautious
+    # than that baseline rather than merely matching it).
+    source_path = await _source_db_path(db, config_dir)
+    vacuum_conn = await aiosqlite.connect(source_path)
+    try:
+        # The cursor from this PRAGMA must be closed before VACUUM runs, not just left to be
+        # garbage-collected eventually -- an un-finalized statement on the *same* connection
+        # (even a no-op PRAGMA whose single result row was never fetched) makes SQLite refuse
+        # VACUUM with "cannot VACUUM - SQL statements in progress", a second and unrelated way
+        # to hit basically the same class of error this function exists to avoid.
+        pragma_cursor = await vacuum_conn.execute("PRAGMA busy_timeout = 30000")
+        await pragma_cursor.close()
+        # VACUUM INTO takes its target as a bound parameter like any other SQL expression --
+        # verified against real sqlite3 (>= 3.27) before relying on it here, not assumed.
+        await vacuum_conn.execute("VACUUM INTO ?", (str(path),))
+    finally:
+        await vacuum_conn.close()
 
     size = (await asyncio.to_thread(path.stat)).st_size
     logger.info("database backup created (%s): %s (%d bytes)", reason, path.name, size)

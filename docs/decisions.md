@@ -6,6 +6,63 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-12 — `create_backup` runs `VACUUM INTO` on a dedicated connection, not the shared
+## application connection, and asks the connection for its own database file via `PRAGMA
+## database_list` rather than trusting `db_path(config_dir)` alone
+
+**Handoff prompt `prompts/done/2026-08-12-fix-backup-vacuum-race.md`, executed end to end.**
+`core/backup.py.create_backup` ran `VACUUM INTO` on the connection it was handed — the same
+one every other writer in the app uses. SQLite refuses `VACUUM` inside a transaction, and every
+writer holds one between its own `execute` and `commit`, so a backup landing in that window
+died with `sqlite3.OperationalError: cannot VACUUM from within a transaction`. Rare while
+writes were event-driven; routine once the 2026-08-12 metrics heartbeat started writing a row
+every 30 seconds unconditionally. CI caught it on `fe80aaf`
+(`tests/test_backup_api.py::test_backup_now_creates_and_lists_and_downloads`); it passed
+locally because the failure is timing-dependent.
+
+**1. The fix is connection isolation, not statement ordering.** `create_backup` now opens a
+second, short-lived `aiosqlite` connection just for the `VACUUM INTO`, with `PRAGMA
+busy_timeout = 30000` set on it so a concurrent WAL checkpoint or writer produces a wait rather
+than an instant `SQLITE_BUSY`. **Rejected: commit the shared connection first, then `VACUUM`
+on it right after.** This was the prompt's explicit non-fix and is worth naming why it fails —
+`asyncio` can interleave awaits arbitrarily, so another coroutine can open its own transaction
+on the shared connection in the gap between that commit and the `VACUUM` statement actually
+running. Only a connection nobody else can reach is airtight. WAL mode (already set by
+`db.py.connect()`) makes the second connection safe to open concurrently.
+
+**2. The regression test hit a second, related trap while proving the fix.** The first working
+version of the new connection ran `PRAGMA busy_timeout = 30000` and then `VACUUM INTO` right
+after, and failed with a *different* error: `cannot VACUUM - SQL statements in progress`. The
+`PRAGMA`'s own cursor (its one result row never fetched) counted as an unfinalized statement on
+that connection, and SQLite refuses `VACUUM` in that state too — a second, unrelated way to hit
+basically the same class of failure this task exists to fix. Fixed by explicitly closing the
+`PRAGMA` cursor before issuing `VACUUM INTO`. Worth remembering generally: any statement
+executed on a connection that is about to run `VACUUM` must be fully drained or closed first,
+not just left for eventual garbage collection.
+
+**3. `create_backup`'s signature is unchanged** (`db`, `config_dir`, `reason`) — no call site
+needed touching. Rather than trusting that `db_path(config_dir)` names the same file `db` is
+attached to (true at all four call sites today, verified: `main.py` always constructs `db` via
+`connect(config_dir)` with the same `config_dir` it hands to every backup caller), the new
+`_source_db_path()` helper asks `db` directly via `PRAGMA database_list` — a metadata read,
+safe inside any transaction state — and falls back to `db_path(config_dir)` only if that comes
+back empty. This keeps the "back up *this* connection's database" contract exact even if a
+future caller's `db` and `config_dir` ever drifted apart, at the cost of one extra query per
+backup. The alternative the prompt offered (rely on `db_path(config_dir)` alone, drop `db` from
+the signature since it would then be unused) was rejected as more churn for a guarantee that
+`PRAGMA database_list` gives for free without trusting an assumption.
+
+**4. The pre-migration backup in `db.py.migrate()` was verified safe, not assumed.** It fires
+after the `schema_version` bookkeeping table's own `commit()` and before the pending
+migration's `BEGIN`/`executescript`/`COMMIT` block starts — so at the moment `create_backup`
+opens its second connection, `conn` is not mid-transaction and no migration write lock is held
+yet. The new connection opens, runs `VACUUM INTO`, and closes entirely before the migration
+that actually mutates the schema begins. `tests/test_db.py::
+test_migrate_takes_a_pre_migration_backup_containing_the_prior_schema` exercises this for real
+(not mocked) and passes.
+
+---
+
 ## 2026-08-12 — The `item` table is the single authority for item state: the WebSocket now
 ## publishes a projection of the database, `ReconciledNode.state` became `structural_state`,
 ## and all four item-view implementations collapsed into one

@@ -59,6 +59,42 @@ async def test_create_backup_produces_a_valid_openable_database(tmp_path):
     await conn.close()
 
 
+async def test_create_backup_survives_a_writer_holding_an_open_transaction(tmp_path):
+    """Regression test for the race that shipped broken in `:dev` from `fe80aaf`
+    (docs/decisions.md, DESIGN.md §10.2): `VACUUM` cannot run on a connection anyone else has
+    a transaction open on, and every writer holds one between its own `execute` and `commit`
+    -- so a backup landing in that window died with `sqlite3.OperationalError: cannot VACUUM
+    from within a transaction`. CI caught it because it's timing-dependent in practice; this
+    reproduces it deterministically by holding the transaction open on purpose instead of
+    hoping a background writer collides with a backup mid-run.
+    """
+    config_dir = str(tmp_path)
+    conn = await _fresh_db(config_dir)
+    await conn.execute(
+        "INSERT INTO host (name, address, username, auth_method) VALUES (?, ?, ?, ?)",
+        ("seedbox", "1.2.3.4", "user", "key"),
+    )
+    assert conn.in_transaction is True  # the condition that makes VACUUM raise on `conn`
+
+    info = await create_backup(conn, config_dir, reason="test")
+    backup_path = backup_dir(config_dir) / info.filename
+    assert backup_path.is_file()
+
+    # The backup must reflect this connection's committed state, not the uncommitted INSERT
+    # above -- proving the fix is real isolation (a dedicated connection) rather than some
+    # workaround that happens to let VACUUM run without actually respecting transaction
+    # boundaries.
+    raw_conn = sqlite3.connect(str(backup_path))
+    try:
+        rows = raw_conn.execute("SELECT name FROM host").fetchall()
+        assert rows == []  # the INSERT above was never committed
+    finally:
+        raw_conn.close()
+
+    await conn.commit()
+    await conn.close()
+
+
 async def test_backup_taken_during_wal_writes_is_still_consistent(tmp_path):
     """The whole reason DESIGN.md specifies VACUUM INTO over a file copy: WAL-safe. Write
     inside an open transaction's worth of pending WAL frames, then back up without an

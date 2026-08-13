@@ -201,37 +201,19 @@ call site. `snapshot()` re-reads the database (and became `async`) because write
 Before this, a `REMOVED_LOCAL` item was published as `REMOTE_ONLY` — Queue button and all —
 since phase 4, and REST and the socket could disagree about the same item.
 
-### 🔴 KNOWN BUG, unfixed, shipped in `:dev` — fix this first
+### ✅ Backup/VACUUM race — fixed 2026-08-12
 
-**Scheduled backups are broken by a race that CI caught on `fe80aaf`.**
-`tests/test_backup_api.py::test_backup_now_creates_and_lists_and_downloads` fails in CI with
-`sqlite3.OperationalError: cannot VACUUM from within a transaction`. It passes locally — this
-is timing-dependent, so **a green local run proves nothing here.**
+The race where `core/backup.py.create_backup` ran `VACUUM INTO` on the shared application
+connection (raising `sqlite3.OperationalError: cannot VACUUM from within a transaction`
+whenever another coroutine held an open transaction — routine once the metrics heartbeat
+started writing every 30s) was fixed via `prompts/done/2026-08-12-fix-backup-vacuum-race.md`.
+`create_backup` now opens a dedicated `aiosqlite` connection (with a 30s `busy_timeout`) just
+for the `VACUUM INTO`, so it can never inherit another coroutine's transaction state. See
+`docs/decisions.md` for the full writeup, including why commit-then-vacuum on the shared
+connection was rejected.
 
-**Mechanism** (reproduced deterministically, not theorised): `core/backup.py.create_backup`
-runs `VACUUM INTO` on the **shared application connection**, and `VACUUM` cannot run inside a
-transaction. Every writer holds one between its `execute` and its `commit`. Reproduction —
-insert a row without committing, then call `create_backup`, and it raises every time:
-
-```
-in_transaction: True
-BACKUP FAILED: OperationalError cannot VACUUM from within a transaction
-```
-
-**The race has existed since phase 7**, but writes used to be event-driven (scans, transfers)
-so the window was narrow and nobody hit it. The 2026-08-12 metrics sampler writes a heartbeat
-**every 30 seconds unconditionally, including when completely idle**, which turned it from
-rare into routine. **Scheduled backups default ON (daily, keep 7)**, so a real instance starts
-silently failing its nightly backup. The pre-migration backup in `db.py.migrate()` runs before
-the background loops start, so it is *probably* safe — verify rather than assume.
-
-**The fix** (agreed direction, not yet written): give `VACUUM INTO` its own connection, so it
-cannot inherit anyone else's transaction state. `db.py.db_path(config_dir)` gives the path;
-WAL mode makes a second connection safe. Committing first and then vacuuming is **not**
-sufficient — another coroutine can open a transaction between the commit and the `VACUUM`.
-Add the reproduction above as a regression test.
-
-`:dev` images were published from `fe80aaf`, so the currently-pulled `:dev` contains this bug.
+**`:dev` images built before this fix (published from `fe80aaf`) still carry the bug** —
+pull a fresh image to pick up the fix.
 
 ### ⚠ Open items awaiting the user — updated 2026-08-12 (post-phase-9 session)
 
@@ -727,6 +709,9 @@ most likely to be re-broken:**
 - **`root.setLevel()` sets the level for every library in the process.** `logsetup.py` applies
   per-logger floors for exactly this reason; `LFTPWEB_DEBUG_LIBS` lifts them when you actually
   need transport-level output.
+- **`VACUUM` cannot run on a connection anyone else might have a transaction open on.**
+  `core/backup.py.create_backup` learned this the hard way (fixed 2026-08-12, above) — it now
+  opens its own connection just for the `VACUUM INTO` rather than reusing the caller's.
 
 - **Excluded files break completeness** (§4.7, §3.2 rule 8). A `file_exclude` of `*.nfo` means
   those files never arrive — so if the reconciler counts them as missing, every filtered

@@ -143,16 +143,15 @@ alongside this list: several entries below ship with deliberate, documented limi
   lines against 1 from lftpweb itself, on a rotating handler whose fixed budget meant that
   chatter evicted anything an incident would need. Third-party loggers now have floors, lifted
   per-library with `LFTPWEB_DEBUG_LIBS`.
-
-### Known issues
-
-- **Scheduled backups are broken** *(found 2026-08-12, unfixed)*. `VACUUM INTO` runs on the
-  shared application connection and cannot execute inside a transaction, so a backup taken
-  while any other write sits between its statement and its commit fails with
-  `cannot VACUUM from within a transaction`. The race dates from phase 7 but became routine
-  when the metrics sampler began writing a heartbeat every 30 seconds. Backups default on, so
-  an unattended instance fails its nightly backup silently. Reproduction and the agreed fix
-  are in `prompts/startnewsession.md`.
+- **Scheduled backups failed under an unrelated write** *(found and fixed 2026-08-12)*.
+  `create_backup` ran `VACUUM INTO` on the shared application connection, and `VACUUM` cannot
+  execute inside a transaction — any other writer with a commit pending at the same moment made
+  the backup fail with `cannot VACUUM from within a transaction`. The race dates from phase 7
+  but became routine once the metrics sampler began writing a heartbeat every 30 seconds, and
+  scheduled backups default on, so an unattended instance was silently failing its nightly
+  backup. `create_backup` now takes its `VACUUM INTO` on a dedicated connection that no other
+  coroutine's transaction can reach. `:dev` images built before this fix (published from
+  `fe80aaf`) still carry the bug.
 
 ### Security
 
