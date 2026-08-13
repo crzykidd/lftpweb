@@ -96,7 +96,7 @@ export function FilesPage() {
               </span>
             )}
           </div>
-          <FileTree nodes={queue.nodes} />
+          <FileTree nodes={queue.nodes} connected={state === 'open'} />
         </section>
       ))}
     </div>

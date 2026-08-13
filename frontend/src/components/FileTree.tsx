@@ -826,7 +826,17 @@ function errorMessage(reason: unknown): string {
  * History's server-paginated model, so there is no endpoint to add) and honest partial-
  * failure reporting for bulk Queue/Stop.
  */
-export function FileTree({ nodes }: { nodes: FileNode[] }) {
+export function FileTree({
+  nodes,
+  connected = true,
+}: {
+  nodes: FileNode[]
+  /** Whether the WebSocket is open, i.e. whether the connect-time `snapshot` has arrived.
+   * Only used to word the empty state: with the socket open the snapshot is authoritative, so
+   * an empty tree really does mean "there is nothing on either side" -- not "we haven't looked
+   * yet", which is what this used to claim regardless (found 2026-08-13). */
+  connected?: boolean
+}) {
   // The shared age ticker (module docstring above): bumping this forces a re-render of
   // whatever rows are currently mounted, which is all `stateAgeLabel` needs to catch up --
   // it's computed fresh from `Date.now()` on every render, not memoized against this value.
@@ -1164,7 +1174,13 @@ export function FileTree({ nodes }: { nodes: FileNode[] }) {
   )
 
   if (tree.length === 0) {
-    return <p className="p-3 text-sm text-zinc-500 dark:text-zinc-400">Nothing scanned yet.</p>
+    return (
+      <p className="p-3 text-sm text-zinc-500 dark:text-zinc-400">
+        {connected
+          ? 'No files — nothing found on the remote or the local side for this queue.'
+          : 'Connecting…'}
+      </p>
+    )
   }
 
   return (

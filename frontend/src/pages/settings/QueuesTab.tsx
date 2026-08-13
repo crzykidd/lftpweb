@@ -902,7 +902,11 @@ function PatternsEditor({ queue, onClose }: { queue: PathQueueOut | null; onClos
                     {item.is_dir ? '/' : ''}
                   </li>
                 ))}
-                {preview.items.length === 0 && <li className="text-zinc-400">Nothing scanned yet.</li>}
+                {preview.items.length === 0 && (
+                  <li className="text-zinc-400">
+                    No items to preview — this queue has nothing on the remote or local side yet.
+                  </li>
+                )}
               </ul>
             </div>
             {preview.sample_item && (
