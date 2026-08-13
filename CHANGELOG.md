@@ -386,6 +386,22 @@ alongside this list: several entries below ship with deliberate, documented limi
   earlier made the Files list stop reflecting what was actually on disk. Suppression, not the
   state name, is what stops the re-fetch either way, so a deleted item can still be queued again
   manually and downloads normally.
+- **A `move`-mode item lost its verify/extract outcome within one scan of the remote delete**
+  *(found by the user 2026-08-13, the first time `move` mode ran end to end against a real
+  release)*: it downloaded, verified, deleted the remote, unrarred — and every item read
+  `LOCAL_ONLY` again moments later. `core/reconcile.py` reads "remote absent, local present" as
+  `LOCAL_ONLY` regardless of *why* the remote is absent, and `outcome_survives_rescan` (fixed for
+  the `DOWNLOADED` case the day before, in the entry above) only ever protected a structural
+  `DOWNLOADED`, never `LOCAL_ONLY`. It now also wins over `LOCAL_ONLY`, but only when
+  `item.remote_deleted_at` is set — the signal that *this codebase* deleted the remote copy on
+  purpose, as opposed to a genuinely untracked local file. Fixing that alone would have traded
+  one bug for a worse one: once `auto_move` relocates the local copy too, the item's `rel_path`
+  leaves both trees entirely and `core/reconcile.py` produces no node for it at all, so nothing
+  would ever revisit the row again — `EXTRACTED` forever instead of reaching `REMOVED_LOCAL`
+  through §7.3's grace period. `core/engine.py._persist` now also resolves every previously
+  tracked `rel_path` that vanished from both trees this pass through the same grace-period
+  machinery, so a relocated (or externally moved) `move`-mode item still reaches `REMOVED_LOCAL`
+  rather than freezing on its outcome.
 
 ### Security
 

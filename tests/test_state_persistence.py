@@ -356,3 +356,231 @@ async def test_job_lifecycle_states_are_still_protected(tmp_path, monkeypatch):
         assert (await _state_of(db, item_id))[0] == "DOWNLOADING"
     finally:
         await db.close()
+
+
+# --- 4. move mode: the remote copy is already gone (prompts/2026-08-13-move-mode-outcome- ----
+# --- survives-local-only.md) -------------------------------------------------------------------
+#
+# The reproduction: the first time `move` mode ran end to end against a real release, it
+# downloaded, verified, deleted the remote, unrarred -- and every item read `LOCAL_ONLY` within
+# one scan interval, losing the outcome §6 had just recorded. `core/reconcile.py` reads "remote
+# absent, local present" as `LOCAL_ONLY` regardless of *why* the remote is absent -- correct for
+# a file that was genuinely never tracked remotely, indistinguishable from a move-mode item's
+# own remote copy the scan after `core/postprocess.py._maybe_delete_remote` deletes it on
+# purpose. `remote_deleted_at` is what tells the two apart.
+
+
+async def _make_move_engine(
+    tmp_path,
+    monkeypatch,
+    *,
+    local_size: int | None,
+    state: str,
+    remote_deleted_at: str | None,
+):
+    """Same shape as `_make_engine`, but for a `move`-mode queue whose remote copy is already
+    gone (`_FakePool({})` -- the delete `core/postprocess.py._maybe_delete_remote` already
+    performed) and whose row carries `remote_deleted_at` the way that delete leaves it.
+    """
+    db = await aiosqlite.connect(":memory:")
+    db.row_factory = aiosqlite.Row
+    await db.execute("PRAGMA foreign_keys = ON")
+    await migrate(db)
+
+    cursor = await db.execute(
+        "INSERT INTO host (name, address, port, username, auth_method, known_hosts_policy) "
+        "VALUES ('h', '127.0.0.1', 22, 'u', 'key', 'strict')"
+    )
+    host_id = cursor.lastrowid
+    cursor = await db.execute(
+        "INSERT INTO path_queue (host_id, name, remote_path, local_path, enabled, sync_mode) "
+        "VALUES (?, 'q', '/remote', ?, 1, 'move')",
+        (host_id, str(tmp_path)),
+    )
+    queue_id = cursor.lastrowid
+    cursor = await db.execute(
+        "INSERT INTO item (queue_id, rel_path, is_dir, remote_size, local_size, state, remote_deleted_at) "
+        "VALUES (?, ?, 0, ?, ?, ?, ?)",
+        (queue_id, REL_PATH, SIZE, local_size, state, remote_deleted_at),
+    )
+    item_id = cursor.lastrowid
+    await db.commit()
+
+    await save_settle_settings(db, SettleSettings(enabled=False))
+
+    monkeypatch.setattr(
+        engine_module.local_scan,
+        "scan_local",
+        lambda root: _local_tree(local_size),  # noqa: ARG005
+    )
+
+    engine = Engine(db, str(tmp_path), EventBus())
+    engine.pool = _FakePool({})  # the remote copy is already gone
+    q = QueueConfig(
+        id=queue_id,
+        host_id=host_id,
+        name="q",
+        remote_path="/remote",
+        local_path=str(tmp_path),
+        staging_path=None,
+        enabled=True,
+        sync_mode="move",
+    )
+    host = HostConfig(
+        id=host_id,
+        address="127.0.0.1",
+        port=22,
+        username="u",
+        auth_method="key",
+        key_path="/k",
+        known_hosts_policy="strict",
+    )
+    return engine, q, host, db, item_id
+
+
+@pytest.mark.parametrize("persisted_state", ["VERIFIED", "CORRUPT", "EXTRACTED", "EXTRACT_FAILED"])
+async def test_move_mode_outcome_survives_when_remote_already_deleted(
+    tmp_path, monkeypatch, persisted_state
+):
+    """The reproduction, at the engine level: verify -> delete the remote -> (optionally)
+    extract already happened; the very next scan must not overwrite the outcome with
+    `LOCAL_ONLY`. Covers `VERIFIED` (extraction disabled) and `EXTRACTED`/`CORRUPT`/
+    `EXTRACT_FAILED` (extraction enabled or failed) alike -- the fix is keyed on `TERMINAL_
+    STATES`, not on any one of them.
+    """
+    engine, q, host, db, item_id = await _make_move_engine(
+        tmp_path,
+        monkeypatch,
+        local_size=SIZE,
+        state=persisted_state,
+        remote_deleted_at="2026-08-13T00:00:00.000000Z",
+    )
+    try:
+        await engine.scan_queue(q, host)
+        state, first_missing_at = await _state_of(db, item_id)
+        assert state == persisted_state, "must not be overwritten with LOCAL_ONLY"
+        assert first_missing_at is None, "content is present; nothing should start the clock"
+
+        # Not just one pass.
+        for _ in range(3):
+            await engine.scan_queue(q, host)
+        assert (await _state_of(db, item_id))[0] == persisted_state
+    finally:
+        await db.close()
+
+
+async def test_a_genuine_local_only_item_is_unaffected(tmp_path, monkeypatch):
+    """The gate is `remote_deleted_at`, not `LOCAL_ONLY` alone: an item that reads LOCAL_ONLY
+    for any other reason -- nothing in this codebase ever deleted its remote copy -- must not
+    be mistaken for a move-mode item's own post-delete reading.
+    """
+    engine, q, host, db, item_id = await _make_move_engine(
+        tmp_path, monkeypatch, local_size=SIZE, state="EXTRACTED", remote_deleted_at=None
+    )
+    try:
+        await engine.scan_queue(q, host)
+        assert (await _state_of(db, item_id))[0] == "LOCAL_ONLY"
+    finally:
+        await db.close()
+
+
+async def test_partial_wins_over_the_outcome_even_with_remote_deleted(tmp_path, monkeypatch):
+    """Rule 2 is absolute regardless of *why* `remote_deleted_at` happens to be set: with the
+    remote copy genuinely still present (so `core/reconcile.py` can actually produce
+    `PARTIAL`) and local short of it, the structural reading must still win over the outcome.
+    `remote_deleted_at` only ever refines a `LOCAL_ONLY` reading -- see
+    `test_outcome_survives_rescan_local_only_with_remote_deleted` in tests/test_postprocess.py
+    for the direct pure-function version of this same case; this is the engine-level twin.
+    """
+    engine, q, host, db, item_id = await _make_engine(
+        tmp_path, monkeypatch, local_size=SIZE // 2, state="EXTRACTED"
+    )
+    await db.execute(
+        "UPDATE item SET remote_deleted_at = ? WHERE id = ?",
+        ("2026-08-13T00:00:00.000000Z", item_id),
+    )
+    await db.commit()
+    try:
+        await engine.scan_queue(q, host)
+        assert (await _state_of(db, item_id))[0] == "PARTIAL"
+    finally:
+        await db.close()
+
+
+async def test_move_mode_item_that_leaves_both_trees_still_reaches_removed_local(
+    tmp_path, monkeypatch
+):
+    """The other half of the reproduction. Once `_do_move` (auto_move) relocates the local
+    copy too -- or an importer takes it -- the rel_path is in *neither* tree, so
+    `core/reconcile.py` produces no node for it at all and the LOCAL_ONLY fix above is never
+    even asked. Without `core/engine.py._persist`'s own "vanished from both trees" handling,
+    this row would simply never be written again: `EXTRACTED` forever, freezing the item on
+    its outcome instead of letting §7.3's grace period carry it to `REMOVED_LOCAL` the way an
+    ordinary importer-moved-it-out item already does. This proves the fix does not introduce
+    that freeze.
+    """
+    local_present = {"value": True}
+
+    engine, q, host, db, item_id = await _make_move_engine(
+        tmp_path,
+        monkeypatch,
+        local_size=SIZE,
+        state="EXTRACTED",
+        remote_deleted_at="2026-08-13T00:00:00.000000Z",
+    )
+    # Override the fixture's fixed local-scan stub with one this test can flip mid-run.
+    monkeypatch.setattr(
+        engine_module.local_scan,
+        "scan_local",
+        lambda root: (_local_tree(SIZE) if local_present["value"] else {}),  # noqa: ARG005
+    )
+    try:
+        # 1. Remote already gone, local still here -- LOCAL_ONLY structurally, must hold (the
+        # first half of the reproduction, proven again here for continuity with what follows).
+        await engine.scan_queue(q, host)
+        state, first_missing_at = await _state_of(db, item_id)
+        assert state == "EXTRACTED"
+        assert first_missing_at is None
+
+        # 2. `_do_move` relocates the local copy out of local_path too. The rel_path now
+        # exists in neither tree.
+        local_present["value"] = False
+        await engine.scan_queue(q, host)
+        state, first_missing_at = await _state_of(db, item_id)
+        assert state == "EXTRACTED", "the outcome must not be downgraded while grace runs"
+        assert first_missing_at is not None, "the grace clock should have started"
+
+        # 3. A second pass inside the window changes nothing -- and does not restart the clock.
+        await engine.scan_queue(q, host)
+        assert (await _state_of(db, item_id)) == ("EXTRACTED", first_missing_at)
+
+        # 4. Backdate the clock past the grace window rather than sleeping ten minutes.
+        await db.execute(
+            "UPDATE item SET first_missing_at = STRFTIME('%Y-%m-%dT%H:%M:%fZ', 'now', ?) "
+            "WHERE id = ?",
+            (f"-{int(DEFAULT_GRACE_S) + 60} seconds", item_id),
+        )
+        await db.commit()
+
+        await engine.scan_queue(q, host)
+        assert (await _state_of(db, item_id))[0] == "REMOVED_LOCAL"
+    finally:
+        await db.close()
+
+
+async def test_a_vanished_row_resolve_absence_has_no_opinion_about_is_left_alone(
+    tmp_path, monkeypatch
+):
+    """The "vanished from both trees" loop is deliberately narrow: a `rel_path` absent from
+    this scan's `nodes` whose previous state `resolve_absence` doesn't recognize (`LOCAL_ONLY`
+    is not in `_STICKY_PREV_STATES` -- it was never content the grace period tracks) must be
+    left exactly as it was, never invented into `REMOTE_ONLY` or `REMOVED_LOCAL`.
+    """
+    engine, q, host, db, item_id = await _make_move_engine(
+        tmp_path, monkeypatch, local_size=None, state="LOCAL_ONLY", remote_deleted_at=None
+    )
+    try:
+        await engine.scan_queue(q, host)
+        assert (await _state_of(db, item_id))[0] == "LOCAL_ONLY"
+    finally:
+        await db.close()

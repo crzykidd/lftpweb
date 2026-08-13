@@ -6,6 +6,66 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-13 — A `move`-mode outcome must survive `LOCAL_ONLY`, and a rel_path that leaves
+## both trees must not freeze on it forever
+
+**Handoff prompt `prompts/2026-08-13-move-mode-outcome-survives-local-only.md`, executed end to
+end.** Found by the user the first time `move` mode ran end to end against a real release: it
+downloaded, verified, deleted the remote, unrarred — and every item read `LOCAL_ONLY` within one
+scan interval, losing the outcome §6 had just recorded. The 2026-08-12 fix for "post-processing
+states erased for four phases" (the entry below) only covered a fresh structural `DOWNLOADED`,
+because nobody had exercised `move` yet: `core/reconcile.py` reads "remote absent, local present"
+as `LOCAL_ONLY`, which is exactly what a `move`-mode item's own remote copy looks like the scan
+after `core/postprocess.py._maybe_delete_remote` deletes it on purpose.
+
+**Fix 1 — `core/postprocess.py.outcome_survives_rescan`** gained a keyword-only
+`remote_deleted_at` parameter and now also wins over a structural `LOCAL_ONLY`, but *only* when
+it is set. That column is the one signal that actually distinguishes "this codebase deleted the
+remote copy after verifying" from a genuinely untracked local file — gating on `LOCAL_ONLY`
+alone would have let a plain local-only file that happens to share a stale outcome-shaped
+`item.state` (a queue reconfigured out from under it, say) ride the protection it was never
+entitled to. `core/engine.py._previous_states` now reads `remote_deleted_at` alongside
+`state`/`substate`/`first_missing_at` so `_persist` can pass it through.
+
+**Fix 2, found while testing fix 1, not initially scoped by the prompt but required by its own
+"must not freeze forever" instruction.** Once `auto_move` is on, `_do_move` relocates the local
+copy too — and at that point the item's `rel_path` is in *neither* `remote_tree` nor
+`local_tree`. `core/reconcile.py`'s node set is `set(remote_tree) | set(local_tree)`, so it
+produces **no node at all** for such a path, and `core/engine.py._persist`'s main loop only ever
+visits `nodes.values()`. Without a second pass, a row in this state is simply never written
+again — `EXTRACTED` forever, never reaching `REMOVED_LOCAL`, defeating §3.2 rule 3 for exactly
+the items `move` mode produces the most of. `_persist` now also walks every previously tracked
+`rel_path` absent from this pass's `written` set (and not otherwise protected) through
+`core/mount_sentinel.py.resolve_absence` with a synthetic `structural_state="REMOTE_ONLY"` —
+reusing that function's own `prev_state in _STICKY_PREV_STATES` gate rather than
+re-implementing it, so a `prev_state` it has no opinion about (`LOCAL_ONLY`, `REMOVED_BOTH`, a
+mid-flight `PARTIAL`) is left exactly as it was rather than invented into something new.
+
+**Found, not fixed: `REMOVED_BOTH` is the state DESIGN.md and `core/autoqueue.py`'s own comments
+say a `move`-mode item should settle on once both copies are gone ("in `move`, the remote copy is
+already gone by the time an item could read bare `REMOVED_LOCAL` — it reaches `REMOVED_BOTH`
+instead"), but nothing in the actual grace-period machinery does that.**
+`core/mount_sentinel.py.resolve_absence` always writes the literal `"REMOVED_LOCAL"` string,
+regardless of `remote_deleted_at` or the queue's `sync_mode` — it doesn't take either as an
+input. Before this task, `move`-mode items never reached that function at all for this purpose
+(the LOCAL_ONLY bug above meant the row never made it past `LOCAL_ONLY`, and the "vanished from
+both trees" gap meant it never made it there either), so the discrepancy was latent rather than
+visibly wrong. Now that both fixes let a `move`-mode item actually complete the journey, it lands
+on bare `REMOVED_LOCAL` — correct in that it is `auto_queue`-excluded by default the same as
+`REMOVED_BOTH` (DESIGN.md rule 3's `re_download_externally_removed` opt-in is explicitly
+documented as a no-op for `move` either way), but not literally the state the design docs
+describe, and not suppressed (`auto_queue_suppressed`) the way a self-delete through
+`core/local_delete.py` is. This task's own reproduction test explicitly asserts `REMOVED_LOCAL`
+(matching what `resolve_absence` actually does, not the aspirational `REMOVED_BOTH`), on the
+reasoning that widening `resolve_absence` to accept a mode/`remote_deleted_at` signal and emit
+`REMOVED_BOTH` instead is a real design change — it would also need to decide whether such a row
+should be `auto_queue_suppressed` like a self-delete, which `resolve_absence` currently has no
+opinion about either — not a two-line addition to this bug fix. Left as a follow-up; DESIGN.md's
+own text already documents the *intended* end state, so the gap is between the design and
+`resolve_absence`'s implementation, not an undocumented ambiguity.
+
+---
+
 ## 2026-08-13 — Delete must mark the whole subtree, and the state it marks each row with is
 ## chosen per row, not hardcoded
 

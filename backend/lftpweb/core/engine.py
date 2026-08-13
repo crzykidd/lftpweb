@@ -612,18 +612,28 @@ class Engine:
 
     async def _previous_states(
         self, queue_id: int
-    ) -> dict[str, tuple[str, str | None, str | None]]:
-        """`rel_path -> (state, substate, first_missing_at)` as currently persisted, for the
-        grace-period decision below and (prompts/open-issues.md #2's stuck-item follow-up) the
-        settle-gate release check. One query per scan, same shape as `_protected_rel_paths`.
+    ) -> dict[str, tuple[str, str | None, str | None, str | None]]:
+        """`rel_path -> (state, substate, first_missing_at, remote_deleted_at)` as currently
+        persisted, for the grace-period decision below, (prompts/open-issues.md #2's stuck-item
+        follow-up) the settle-gate release check, and (2026-08-13,
+        `prompts/2026-08-13-move-mode-outcome-survives-local-only.md`)
+        `postprocess.outcome_survives_rescan`'s `LOCAL_ONLY` refinement, which needs to tell "a
+        never-tracked local file" from "the remote copy this codebase deleted on purpose" apart.
+        One query per scan, same shape as `_protected_rel_paths`.
         """
         cursor = await self.db.execute(
-            "SELECT rel_path, state, substate, first_missing_at FROM item WHERE queue_id = ?",
+            "SELECT rel_path, state, substate, first_missing_at, remote_deleted_at "
+            "FROM item WHERE queue_id = ?",
             (queue_id,),
         )
         rows = await cursor.fetchall()
         return {
-            row["rel_path"]: (row["state"], row["substate"], row["first_missing_at"])
+            row["rel_path"]: (
+                row["state"],
+                row["substate"],
+                row["first_missing_at"],
+                row["remote_deleted_at"],
+            )
             for row in rows
         }
 
@@ -715,10 +725,12 @@ class Engine:
             # history and the mount gate first. The branch above it is the same arbitration
             # for the opposite reading, presence rather than absence. Every other node's
             # freshly-computed state is trusted as-is, exactly like phase 2/3.
-            prev_state, prev_substate, prev_first_missing_at = previous.get(
-                rel_path, (None, None, None)
+            prev_state, prev_substate, prev_first_missing_at, prev_remote_deleted_at = previous.get(
+                rel_path, (None, None, None, None)
             )
-            if postprocess.outcome_survives_rescan(prev_state, node.structural_state):
+            if postprocess.outcome_survives_rescan(
+                prev_state, node.structural_state, remote_deleted_at=prev_remote_deleted_at
+            ):
                 # DESIGN.md §3.2/§6: the content is all still here, and a post-processing
                 # outcome says something about it this scan's byte comparison cannot --
                 # `core/postprocess.py` owns `state` for as long as that holds. Without this,
@@ -827,6 +839,51 @@ class Engine:
                     downloaded_stamp,
                 ),
             )
+
+        # 2026-08-13 (prompts/2026-08-13-move-mode-outcome-survives-local-only.md): a rel_path
+        # that has left *both* trees entirely -- a `move`-mode item whose remote copy this
+        # codebase already deleted and whose local copy `_do_move` then relocated to
+        # `staging_path` (or an importer took, same shape) -- has no entry in `nodes` at all
+        # (`core/reconcile.py`'s `all_paths` is `set(remote_tree) | set(local_tree)`, and this
+        # path is in neither). The loop above only ever visits `nodes.values()`, so without
+        # this, such a row is simply never written again: whatever outcome it last held
+        # (`EXTRACTED`, say) would freeze forever instead of reaching `REMOVED_LOCAL` through
+        # §7.3's grace period the way an ordinary importer-moved-it-out item does -- defeating
+        # rule 3 for exactly the items `move` mode produces the most of.
+        #
+        # Deliberately narrow, reusing `resolve_absence`'s own gate rather than re-implementing
+        # it: `structural_state="REMOTE_ONLY"` is the closest existing reading for "there is
+        # nothing here to compare" (the function only cares that local presence is in
+        # question), and `resolve_absence` itself already returns `None` -- "trust the fresh
+        # reading as-is" -- for any `prev_state` outside `_STICKY_PREV_STATES`. `None` here
+        # means *skip*, not *trust*: there is no fresh structural reading for a path in neither
+        # tree, so a `prev_state` this function has no opinion about (`LOCAL_ONLY`,
+        # `REMOVED_BOTH`, a mid-flight `PARTIAL`/`QUEUED`) is left exactly as it was rather than
+        # invented. `protected` is already excluded from `written`'s complement, so a
+        # suppressed row (`STOPPED`/`FAILED`/a self-delete's `REMOVED_BOTH`) never reaches this
+        # loop either -- consistent with rule 6's "never rescanned".
+        vanished = set(previous) - written - protected
+        for rel_path in sorted(vanished):
+            prev_state, _prev_substate, prev_first_missing_at, _prev_remote_deleted_at = previous[
+                rel_path
+            ]
+            override = mount_sentinel.resolve_absence(
+                prev_state=prev_state,
+                prev_first_missing_at=prev_first_missing_at,
+                structural_state="REMOTE_ONLY",
+                mount_ok=mount_ok,
+                now=now,
+            )
+            if override is None:
+                continue
+            vanished_state, vanished_first_missing_at = override
+            written.add(rel_path)
+            await self.db.execute(
+                "UPDATE item SET remote_size = NULL, local_size = NULL, state = ?, "
+                "first_missing_at = ? WHERE queue_id = ? AND rel_path = ?",
+                (vanished_state, vanished_first_missing_at, queue_id, rel_path),
+            )
+
         if new_settle:
             await settle.save_settle_records(self.db, queue_id, new_settle)
         await self.db.commit()

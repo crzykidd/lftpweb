@@ -1398,10 +1398,50 @@ async def test_pipeline_failed_retention_sweep_leaves_recent_dirs_alone(tmp_path
         ("STOPPED", "DOWNLOADED", False),
         ("REMOVED_LOCAL", "DOWNLOADED", False),
         (None, "DOWNLOADED", False),
+        # Without `remote_deleted_at`, LOCAL_ONLY is not covered at all -- a genuinely
+        # never-tracked local file must not be mistaken for a move-mode item whose remote copy
+        # this codebase deleted on purpose.
+        ("VERIFIED", "LOCAL_ONLY", False),
+        ("EXTRACTED", "LOCAL_ONLY", False),
     ],
 )
 def test_outcome_survives_rescan(prev_state, structural_state, expected):
     assert postprocess.outcome_survives_rescan(prev_state, structural_state) is expected
+
+
+@pytest.mark.parametrize(
+    ("prev_state", "structural_state", "expected"),
+    [
+        # 2026-08-13 (prompts/2026-08-13-move-mode-outcome-survives-local-only.md): a
+        # move-mode item's own remote copy, once this codebase deletes it, reads exactly like a
+        # never-tracked local file to core/reconcile.py -- REMOTE_ONLY. `remote_deleted_at` is
+        # what tells the two apart, and only while the bytes are still all here (LOCAL_ONLY).
+        ("VERIFIED", "LOCAL_ONLY", True),
+        ("CORRUPT", "LOCAL_ONLY", True),
+        ("EXTRACTED", "LOCAL_ONLY", True),
+        ("EXTRACT_FAILED", "LOCAL_ONLY", True),
+        # PARTIAL still beats the outcome even with the remote copy gone -- rule 2 is absolute
+        # regardless of *why* the byte comparison fell short.
+        ("VERIFIED", "PARTIAL", False),
+        ("EXTRACTED", "PARTIAL", False),
+        # DOWNLOADED already wins unconditionally; a real DOWNLOADED reading with
+        # remote_deleted_at set is not this codebase's normal shape (the delete only fires once
+        # the item already left DOWNLOADED for an outcome) but must not regress either way.
+        ("VERIFIED", "DOWNLOADED", True),
+        # A state this module doesn't own is still none of its business.
+        ("DOWNLOADED", "LOCAL_ONLY", False),
+        (None, "LOCAL_ONLY", False),
+    ],
+)
+def test_outcome_survives_rescan_local_only_with_remote_deleted(
+    prev_state, structural_state, expected
+):
+    assert (
+        postprocess.outcome_survives_rescan(
+            prev_state, structural_state, remote_deleted_at="2026-08-13T00:00:00.000000Z"
+        )
+        is expected
+    )
 
 
 def test_owned_states_cover_exactly_the_six_states_design_3_2_names():

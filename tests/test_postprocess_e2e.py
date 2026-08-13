@@ -34,6 +34,7 @@ import aiosqlite
 import pytest
 
 from lftpweb.core import extract
+from lftpweb.core.engine import Engine, QueueConfig
 from lftpweb.core.events import EventBus
 from lftpweb.core.postprocess import (
     PostprocessPipeline,
@@ -261,6 +262,140 @@ async def test_move_mode_transfers_verifies_and_deletes_the_remote_copy(db, tmp_
     finally:
         # Best-effort cleanup of the throwaway remote subdirectory (harmless if the delete
         # above already removed it).
+        try:
+            await scan_pool.delete_path(host, f"/data/pickup/{remote_subdir}")
+        except Exception:  # noqa: BLE001 - cleanup only
+            pass
+        await scan_pool.close()
+
+
+async def test_move_mode_item_survives_the_next_scan_as_verified_not_local_only(db, tmp_path):
+    """The reproduction (prompts/2026-08-13-move-mode-outcome-survives-local-only.md), against
+    the real fake seedbox rather than only a unit test on the pure function -- this bug existed
+    precisely because the unit-level rule (`outcome_survives_rescan`) looked right on its own.
+
+    Same sequence as the test above -- transfer, verify, delete -- through the real pipeline,
+    then a real `core/engine.py.Engine.scan_queue` against the seedbox: a genuine SSH `find`
+    that finds nothing left at this path (the delete above really happened), and a genuine
+    `core/local_scan.py` walk that finds the file still on disk. Before the fix this reads
+    `LOCAL_ONLY` within one scan; the whole point of this task is that it must not.
+    """
+    remote_subdir = f"phase5-move-scan-e2e-{uuid4().hex[:12]}"
+    rel_path = "target.txt"
+    remote_full = f"/data/pickup/{remote_subdir}/{rel_path}"
+
+    scan_pool = RemoteConnectionPool(tmp_path / "known_hosts_scan")
+    host = _host_config()
+    try:
+        conn = await scan_pool.get_connection(host)
+        async with conn.start_sftp_client() as sftp:
+            await sftp.makedirs(f"/data/pickup/{remote_subdir}", exist_ok=True)
+            async with sftp.open(remote_full, "wb") as f:
+                await f.write(_CONTENT)
+
+        local_dir = tmp_path / "local"
+        local_dir.mkdir()
+        cursor = await db.execute(
+            "INSERT INTO host (name, address, port, username, auth_method, password_enc, "
+            "known_hosts_policy) VALUES ('seedbox', ?, ?, ?, 'password', NULL, 'insecure')",
+            (SEEDBOX_HOST, SEEDBOX_PORT, SEEDBOX_USER),
+        )
+        host_id = cursor.lastrowid
+        cursor = await db.execute(
+            "INSERT INTO path_queue (host_id, name, remote_path, local_path, enabled, "
+            "sync_mode, auto_verify) VALUES (?, 'e2e-move-scan', ?, ?, 1, 'move', 1)",
+            (host_id, f"/data/pickup/{remote_subdir}", str(local_dir)),
+        )
+        queue_id = cursor.lastrowid
+        cursor = await db.execute(
+            "INSERT INTO item (queue_id, rel_path, is_dir, remote_size, local_size, state) "
+            "VALUES (?, ?, 0, ?, 0, 'REMOTE_ONLY')",
+            (queue_id, rel_path, len(_CONTENT)),
+        )
+        item_id = cursor.lastrowid
+        await db.commit()
+
+        await save_transfer_settings(
+            db,
+            TransferSettings(
+                max_bandwidth_bps=10_000_000,
+                max_concurrent_transfers=2,
+                small_item_threshold_bytes=0,
+                small_lane_reserve_bps=0,
+                min_share_floor_bps=0,
+                mirror_parallel_transfer_count=2,
+                mirror_use_pget_n=2,
+                pget_default_n=2,
+            ),
+        )
+
+        async def host_provider():
+            return host
+
+        events = EventBus()
+        pipeline_pool = RemoteConnectionPool(tmp_path / "known_hosts_pipeline")
+        await save_postprocess_settings(db, PostprocessSettings(verify_hash_on_disk=True))
+        pipeline = PostprocessPipeline(
+            db=db, events=events, remote_pool=pipeline_pool, host_provider=host_provider
+        )
+
+        q_transfer = TransferQueue(
+            db=db,
+            config_dir=str(tmp_path),
+            events=events,
+            run_dir=str(tmp_path / "run"),
+            tick_s=0.2,
+            host_provider=host_provider,
+        )
+        q_transfer.postprocess = pipeline
+
+        await q_transfer.start()
+        try:
+            await q_transfer.enqueue_item(item_id)
+
+            async def remote_delete_recorded():
+                row = await (
+                    await db.execute("SELECT remote_deleted_at FROM item WHERE id = ?", (item_id,))
+                ).fetchone()
+                return row is not None and row["remote_deleted_at"] is not None
+
+            assert await _wait_until(
+                remote_delete_recorded, timeout_s=30
+            ), "move-mode postprocessing never recorded a remote delete"
+        finally:
+            await q_transfer.stop()
+
+        item_row = await (
+            await db.execute("SELECT state, remote_deleted_at FROM item WHERE id = ?", (item_id,))
+        ).fetchone()
+        assert item_row["state"] == "VERIFIED", "setup did not actually verify -- test is void"
+        assert item_row["remote_deleted_at"] is not None, "setup did not actually delete"
+
+        # --- The reproduction: a real scan must not overwrite VERIFIED with LOCAL_ONLY -------
+        engine = Engine(db, str(tmp_path), events)
+        q = QueueConfig(
+            id=queue_id,
+            host_id=host_id,
+            name="e2e-move-scan",
+            remote_path=f"/data/pickup/{remote_subdir}",
+            local_path=str(local_dir),
+            staging_path=None,
+            enabled=True,
+            sync_mode="move",
+        )
+        try:
+            for _ in range(3):
+                await engine.scan_queue(q, host)
+                row = await (
+                    await db.execute(
+                        "SELECT state, first_missing_at FROM item WHERE id = ?", (item_id,)
+                    )
+                ).fetchone()
+                assert row["state"] == "VERIFIED", "must not read LOCAL_ONLY"
+                assert row["first_missing_at"] is None, "content is present; nothing is missing"
+        finally:
+            await engine.pool.close()
+    finally:
         try:
             await scan_pool.delete_path(host, f"/data/pickup/{remote_subdir}")
         except Exception:  # noqa: BLE001 - cleanup only

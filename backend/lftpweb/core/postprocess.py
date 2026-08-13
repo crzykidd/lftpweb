@@ -95,7 +95,12 @@ TERMINAL_STATES = frozenset({"VERIFIED", "CORRUPT", "EXTRACTED", "EXTRACT_FAILED
 OWNED_STATES = TRANSIENT_STATES | TERMINAL_STATES
 
 
-def outcome_survives_rescan(prev_state: str | None, structural_state: str) -> bool:
+def outcome_survives_rescan(
+    prev_state: str | None,
+    structural_state: str,
+    *,
+    remote_deleted_at: str | None = None,
+) -> bool:
     """Whether a persisted post-processing *outcome* must win over the structural state
     `core/reconcile.py` just recomputed -- the "content is still present" half of the
     precedence rule (`core/engine.py._persist` is the only caller; the "content has gone
@@ -103,8 +108,7 @@ def outcome_survives_rescan(prev_state: str | None, structural_state: str) -> bo
 
     `VERIFIED`/`CORRUPT`/`EXTRACTED`/`EXTRACT_FAILED` are **refinements of `DOWNLOADED`**:
     each one says something about an item whose bytes are all here that the byte comparison
-    itself cannot say. So an outcome wins over a fresh `DOWNLOADED` -- and only over
-    `DOWNLOADED`:
+    itself cannot say. So an outcome wins over a fresh `DOWNLOADED` --
 
     - `PARTIAL` (§3.2 rule 2) wins over the outcome instead. Local is short of remote again --
       the remote grew (rule 4), or something took files away -- so the item is genuinely
@@ -117,8 +121,35 @@ def outcome_survives_rescan(prev_state: str | None, structural_state: str) -> bo
     Transient states deliberately don't survive on this path. Protecting them is the job of
     `in_flight_item_ids()`, which is true only while a worker really is running -- so a state
     left behind by a crashed one is recomputed away on the next scan instead of wedging.
+
+    **...and, narrowly, over `LOCAL_ONLY` too -- but only when `remote_deleted_at` is set**
+    (fix, 2026-08-13, `prompts/2026-08-13-move-mode-outcome-survives-local-only.md`, found the
+    first time `move` mode ran end to end: verify -> delete the remote -> extract all
+    succeeded, and every item read `LOCAL_ONLY` within one scan interval anyway).
+    `core/reconcile.py` reads "remote absent, local present" as `LOCAL_ONLY` -- correct for a
+    file that was genuinely never tracked remotely, but exactly what a `move`-mode item's own
+    remote copy looks like the scan *after* this module deleted it on purpose
+    (`_maybe_delete_remote`). `remote_deleted_at` is the signal that tells the two apart: it is
+    set only when *this codebase* removed the remote copy, after verification, so a
+    `LOCAL_ONLY` reading alongside it means "the bytes are all here and the remote is gone
+    because we deleted it" -- a refinement of the outcome in exactly the sense `DOWNLOADED` is,
+    not a fresh, never-tracked local file. An item that is genuinely `LOCAL_ONLY` for any other
+    reason has `remote_deleted_at IS NULL` and this branch never fires for it.
+
+    Deliberately **not** a blanket "any outcome survives while `remote_deleted_at` is set,
+    forever": this only fires while `structural_state == "LOCAL_ONLY"`, i.e. while local
+    content is still actually present. Once that content is *also* gone -- `_do_move`
+    relocated it, or something else took it -- the path leaves both trees entirely and this
+    function is never even reached for it; `core/engine.py._persist`'s own "vanished from both
+    trees" handling is what lets §7.3's grace period still carry it to `REMOVED_LOCAL` rather
+    than freezing it on its outcome forever (see that method for why one isn't a substitute for
+    the other).
     """
-    return prev_state in TERMINAL_STATES and structural_state == "DOWNLOADED"
+    if prev_state not in TERMINAL_STATES:
+        return False
+    if structural_state == "DOWNLOADED":
+        return True
+    return structural_state == "LOCAL_ONLY" and remote_deleted_at is not None
 
 
 # --- Settings (JSON in `setting`, the same pattern core/queue.py.TransferSettings uses) -----
