@@ -170,6 +170,32 @@ alongside this list: several entries below ship with deliberate, documented limi
   floor (`SETTLE_MIN_AGE_S`, shipped the same day specifically anticipating this feature) is
   unaffected: a fast per-queue interval cannot shrink the ~60s settle window below what a 30s
   queue already gets.
+- **An option to delete a release's archive volumes once they've extracted successfully**
+  *(2026-08-13)*. `PostprocessSettings.delete_archives_after_extract`
+  (`GET`/`PUT /api/settings/postprocess`, Settings → Post-processing → Extract), **default
+  off**, non-negotiably, like every other capability in this project that deletes something.
+  On, once an item's archives (every volume of a multi-part `.rar` set — the `.r00`/`.r01`/...
+  or `.partNN.rar` continuation volumes too, not just the head `find_archives` returns — or a
+  single-file `.zip`/`.7z`/`.tar`/etc.) have extracted in full, they are removed from disk;
+  `.nfo`/`.sfv`/`.md5` sidecars, samples, and subtitles are never touched, and nothing is
+  removed on `EXTRACT_FAILED` or a precondition failure. Only ever acts on a directory item —
+  a loose top-level archive file is left alone, since removing its own single file would be
+  removing the whole item, `core/local_delete.py.delete_local`'s job, not this one's.
+  **The naive version of this feature is an infinite re-download loop**, the same shape as the
+  `REMOVED_LOCAL` bug shipped and reverted the same night in a prior session: deleting the
+  archives drops local bytes below remote, which reads `PARTIAL` on the next scan and would
+  outrank the `EXTRACTED` outcome. Avoided by reusing the exact mechanism `file_exclude`
+  patterns already use for the identical problem — a new `deleted_archive` table (migration
+  010) records every file this codebase removed after extraction, and the reconciler
+  (`core/engine.py.build_scan_counts_predicate`) folds it into the same completeness seam
+  `core/patterns.py.build_counts_predicate` already feeds, so a deleted archive reads
+  `EXCLUDED` — a real state, not an absence — exactly like a pattern-excluded file, rather
+  than a second completeness rule. Composes with `move` mode (cleanup runs regardless of the
+  remote copy already being gone by the time extraction runs — see `docs/decisions.md` for why
+  that's the right call, not a gap) and with the relocate step (`_do_move` always runs after
+  cleanup, per the pipeline's fixed step order, so there is nothing to reconcile between the
+  two). No Settings-page UI gap this time — the toggle lives in Settings → Post-processing
+  alongside the other extraction options.
 
 ### Changed
 

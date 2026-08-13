@@ -161,6 +161,11 @@ class PostprocessSettingsOut(BaseModel):
     # existed keeps defaulting off rather than 422ing on a field it doesn't know about.
     failed_retention_enabled: bool = False
     failed_retention_days: float = 14.0
+    # Delete an item's spent archive volumes after a successful extraction (2026-08-13,
+    # docs/decisions.md). Off by default -- see core/postprocess.py.PostprocessSettings. Same
+    # "field defaults so an old PUT body doesn't 422" reasoning as failed_retention_enabled
+    # above.
+    delete_archives_after_extract: bool = False
     move_enabled: bool
     concurrency: int
 

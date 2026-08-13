@@ -12,6 +12,7 @@ const EMPTY: PostprocessSettingsOut = {
   extract_enabled: false,
   extract_target_dir: null,
   extract_passwords: [],
+  delete_archives_after_extract: false,
   move_enabled: false,
   concurrency: 1,
 }
@@ -135,6 +136,22 @@ export function PostProcessingTab() {
             onChange={(e) => setPasswordsText(e.target.value)}
           />
         </label>
+        <label className="flex items-center gap-2">
+          <input
+            type="checkbox"
+            checked={settings.delete_archives_after_extract}
+            onChange={(e) => update('delete_archives_after_extract', e.target.checked)}
+          />
+          <span className="text-sm text-zinc-700 dark:text-zinc-300">
+            Delete archive volumes (.rar/.r00/.7z/.zip/...) once they've extracted successfully
+          </span>
+        </label>
+        <p className="text-xs text-zinc-500 dark:text-zinc-400">
+          Only ever deletes files extraction actually used, and only on a full success — never
+          on a failed or incomplete extraction. Sidecars (.sfv/.md5), .nfo files, and samples
+          are never touched. Off by default, like every other capability in this project that
+          deletes something.
+        </p>
       </div>
 
       <div className="flex flex-col gap-2 rounded-md border border-zinc-200 p-4 dark:border-zinc-800">

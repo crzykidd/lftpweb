@@ -6,6 +6,166 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-13 — Delete archives after extract: the `EXCLUDED` mechanism reused, not a second
+## completeness rule, and why `move` mode and the relocate step needed no extra gate
+
+**Handoff prompt `prompts/2026-08-13-delete-archives-after-extract.md`, executed end to end**,
+migration 010. Once a release's archives have extracted successfully, the `.rar`/`.r00`/...
+volumes are dead weight on local disk; this adds an option to remove them.
+
+**The trap, and the fix.** Deleting the archives drops the item's local byte total below its
+remote total. The next scan (`core/reconcile.py`) reads that as `local < remote` -> `PARTIAL`
+(DESIGN.md §3.2 rule 2), and rule 9 / `core/postprocess.py.outcome_survives_rescan` says
+`PARTIAL` beats any post-processing outcome — so `EXTRACTED` would not protect the item and
+auto-queue would re-fetch, re-extract, and re-delete it every scan interval, forever. This is
+the identical shape to the `REMOVED_LOCAL` bug shipped and reverted the same night in `6d3bd95`
+(`prompts/open-issues.md` "4") — the prompt named that entry by name and required reading it
+first, specifically so this task didn't repeat it. The fix reuses the mechanism
+`core/patterns.py.build_counts_predicate` already built for the identical problem with a
+different cause: a `file_exclude`-matched file is marked `EXCLUDED`, a real state, and stops
+counting toward its parent directory's completeness (DESIGN.md §3.2 rule 8). A new
+`deleted_archive` table (migration 010, one row per `(queue_id, rel_path)` this codebase
+actually removed) persists the analogous "gone on purpose" fact for a deletion instead of a
+pattern match, and `core/engine.py.build_scan_counts_predicate` — a new, free-standing,
+unit-testable function, not an inline closure — composes it with the existing pattern predicate
+before handing the result to `reconcile()`. **Deliberately not a second completeness rule**:
+both sources feed the one seam, so `reconcile.py`'s directory-level vacuous-`DOWNLOADED`
+branch (§3.2 rule 8's "every child excluded, still `DOWNLOADED`, and the load-bearing
+distinction from a genuinely empty remote directory via `remote_file_totals`") applies to a
+deleted archive exactly as it already does to a pattern-excluded file, with no new branch in
+`reconcile.py` itself.
+
+**Rejected: `auto_queue_suppressed`.** The prompt named this explicitly as the wrong tool, and
+tracing it through confirms why: suppression (DESIGN.md §4.6) is for user decisions and
+permanent-error states, and it stops an item being re-fetched *at all* — using it here would
+also block a legitimate future re-fetch (the user deletes the queue's local copy by hand, say,
+and genuinely wants it back). The `EXCLUDED`-via-predicate approach only ever affects
+completeness accounting for the specific bytes that were removed; the item stays fully eligible
+for everything else.
+
+**Rejected: reusing `delete_local()` directly, or writing a fully separate deletion module.**
+The prompt asked for exactly one non-obvious call: reuse `core/local_delete.py`'s primitive
+without adding a third, disconnected deletion code path. `delete_local()`'s whole shape —
+containment check, guard chain, physical delete, `item.state = 'REMOVED_BOTH'` in one write —
+answers "the item is gone," which is the wrong claim for "some files under this item are gone,
+the rest (`.nfo`/`.sfv`/samples/subtitles) stays." So `delete_extracted_archives()` is a new,
+third function in the *same module*, reusing `extract.resolve_within_root`'s containment check
+and the mount-sentinel gate `delete_local` already established, rather than either (a) forcing
+archive cleanup through `delete_local`'s whole-item shape or (b) inventing an unrelated fourth
+module for "things that unlink real files with a guard chain."
+
+**Rejected: an nlink guard**, unlike `delete_local`'s retention path. That guard proves an
+`*arr`'s hardlink-out-of-the-download-directory pickup already holds a second copy of content
+about to be removed. Nothing hardlinks a compressed archive volume itself — an importer picks
+up the *extracted* output, which this feature never touches — so there is no second copy to
+prove and the guard would only ever produce a permanent, meaningless withhold.
+
+**`move` mode: no additional gate, deliberately.** On a `move` queue the remote copy is already
+deleted by the time extraction runs (`process_item`'s fixed verify -> delete-remote -> extract
+-> relocate order, unchanged by this task — see below). By the time cleanup runs, the archive
+volumes it is about to remove are the last copy of those *compressed* bytes anywhere. Decided
+this is acceptable and did not gate it further: a successful extraction has already decoded the
+payload onto disk as ordinary files, so the archive volumes are a spent intermediate — nothing
+in this codebase re-extracts a directory that already reads `EXTRACTED`, so there is no future
+read of those bytes to protect against losing. Verified with a dedicated test
+(`test_move_mode_cleanup_runs_even_though_the_remote_copy_is_already_gone`) rather than assumed.
+
+**Flagged, not fixed: the pre-existing `move`-mode ordering risk this feature makes marginally
+more relevant.** DESIGN.md §6 already names, as a known-not-decided ordering, that a `move`-mode
+item whose extraction later *fails* has already lost its remote copy — nothing left to retry
+from. This task's prompt explicitly forbade changing that order, and it wasn't changed. Worth
+naming anyway: this feature only ever deletes archives after a *successful* extraction, so it
+does not make that specific failure mode worse — but it does mean the disk space this feature
+frees is concentrated on exactly the `move`-mode items where getting extraction right the first
+time already matters most.
+
+**The relocate step (`_do_move`) needed no interaction logic at all**, because `_process_item`'s
+step order already guarantees one: `_do_extract` (which now includes cleanup, at its very end,
+gated on `result.state == 'EXTRACTED'`) runs before `_do_move`. Cleanup always completes before
+relocation ever starts; there is no "compose in either order" question to answer, only a
+regression test to prove the fixed order actually behaves
+(`test_cleanup_composes_with_the_relocate_step_leaving_no_orphans`): the relocated directory
+holds the extracted content and the sidecar, never the archives, and the original location is
+left empty (fully moved away), not partially cleaned up and then abandoned.
+
+**Directories only — a loose top-level archive file is withheld, not deleted.** DESIGN.md
+§4.7's "loose top-level file" item (no containing directory) is skipped outright by
+`delete_extracted_archives`, with an `archive_cleanup_withheld` event. Two reasons, not one:
+removing the item's own single file *is* removing the whole item (`delete_local`'s job, never
+this one's), and the sharper reason — `core/reconcile.py`'s vacuous-`DOWNLOADED`-when-
+everything-excluded branch (the one this whole feature leans on) is computed per-*directory*
+(`relevant_totals`/`remote_file_totals`, rolled up over a subtree); a loose file's own node has
+no such branch, so excluding it reads plain `EXCLUDED` instead, which does not satisfy
+`outcome_survives_rescan`'s `structural_state == 'DOWNLOADED'` requirement and would silently
+drop the very `EXTRACTED` outcome this feature exists to protect. Proven with a dedicated real-
+`unrar` test rather than reasoned about only in a comment.
+
+**Sidecars survive, without any special-casing.** `.sfv`/`.md5` files are never returned by
+`find_archives`, so they were never candidates for `delete_extracted_archives` in the first
+place — no filter had to be added, only a test proving it
+(`test_pipeline_deletes_every_archive_volume_after_success_and_preserves_sidecar`). Decided
+they should survive because `core/verify.py` is their consumer and a future re-verify (a
+manual "Rescan now," or a settings change that turns verification on later) still wants them.
+
+**Event granularity: one row per cleanup attempt, not one per file.** Mirrors `_do_extract`'s
+own single `extract` event (which already summarizes every archive in an item, not one event
+per archive) rather than `delete_local`'s per-item shape (where the item *is* the one thing
+being deleted). A withheld batch writes one `archive_cleanup_withheld` row naming the whole-
+batch reason (a directory-only guard, a missing mount sentinel, a containment failure); a
+completed batch writes one `archive_cleanup` row naming every file removed and the total bytes
+freed. A per-file `OSError` (e.g. a permissions problem on one volume of a large set) withholds
+only that file — appended to the same success event's message — rather than failing the whole
+batch; only the files that actually deleted are persisted to `deleted_archive`, so a file that
+failed to delete correctly keeps counting toward completeness on the next scan.
+
+**Setting is site-level only, no per-queue column, no migration for the setting itself.**
+`PostprocessSettings.delete_archives_after_extract` (JSON key in the existing
+`postprocess_settings` row) — the natural home the prompt suggested, alongside
+`extract_enabled`/`failed_retention_enabled`. A per-queue override (matching `auto_extract`'s
+own per-queue toggle) is a real, plausible want this doesn't serve, same scope-narrowing choice
+the local-deletion session made for retention windows — the one migration this task actually
+needed is `deleted_archive` (the bookkeeping table `build_scan_counts_predicate` reads), not a
+`path_queue` schema change.
+
+**Migration 010 is a plain `CREATE TABLE`, not an `item`-table rebuild.** `'EXCLUDED'` was
+already in `item.state`'s `CHECK` (added migration 007, for `file_exclude`), so nothing about
+the state vocabulary needed widening — the only new persistence this feature needs is the
+`deleted_archive` table itself, one row per removed file, `queue_id`+`rel_path` primary key,
+`ON DELETE CASCADE` on the queue. `to_safe_text` is applied on the way in (required — SQLite
+TEXT and a lone surrogate from a non-UTF-8 filename don't mix, same reasoning `core/util.py`
+documents for `item.rel_path`) and deliberately *not* undone on the way back out in
+`load_deleted_archive_paths`, since the comparison happens in the raw scanning/matching domain
+(`core/reconcile.py`'s trees) — the same known, accepted edge case
+`core/postprocess.py._find_item_id_for_failed_dir` already has for a lone-surrogate filename,
+not solved twice.
+
+**Known, accepted limitation: no garbage collection of `deleted_archive` rows.** If a
+`rel_path` this codebase deleted later reappears as a genuinely different remote file of the
+same name (a repost, say), the stale row would still exclude it from completeness. Nothing in
+this codebase retroactively clears bookkeeping when a path's remote identity changes without
+its own `rel_path` changing — `item_settle` and `REMOVED_BOTH` rows already carry the identical
+limitation — so this is treated as consistent with existing behavior, not a new gap.
+
+**DESIGN.md wording is proposed, not applied** — same pattern every other session this cycle
+used. §6 currently ends its extraction paragraph without mentioning archive cleanup at all.
+Drafted addition, to land as a new paragraph immediately after the existing "Extraction stages
+off to the side..." paragraph, once the user says so:
+
+> **Deleting archives after a successful extraction is a separate, off-by-default option**
+> (`PostprocessSettings.delete_archives_after_extract`). When on, every file belonging to each
+> extracted archive — including a multi-volume rar's continuation volumes, not just the head —
+> is removed once extraction reports `EXTRACTED`; nothing is removed on `EXTRACT_FAILED` or a
+> precondition failure, and non-archive files (`.nfo`, `.sfv`/`.md5`, samples, subtitles) are
+> never touched. Only ever acts on a directory item — a loose top-level archive file is left
+> alone, since removing it would be removing the whole item. Deleting the archives would
+> otherwise drop the item's local bytes below its remote total and read `PARTIAL` on the next
+> scan (rule 2), outranking the `EXTRACTED` outcome (rule 9) and triggering an infinite
+> re-fetch/re-extract/re-delete loop; this is avoided by recording every deleted file
+> (`deleted_archive` table) and folding it into the same completeness seam §4.7's
+> `file_exclude` already feeds — a deleted archive reads `EXCLUDED`, not absent.
+
+---
+
 ## 2026-08-12 — Per-queue scan interval (migration 009): `NULL` means the site default, `0`
 ## means on-demand only, and the engine loop became multi-cadence rather than one shared timer
 

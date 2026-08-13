@@ -219,6 +219,36 @@ def check_rar_volume_set(head: Path) -> str | None:
     )
 
 
+def archive_volume_paths(head: Path) -> list[Path]:
+    """Every file on disk that makes up `head`'s archive -- just `head` itself for every format
+    `find_archives` hands to 7zz directly, but the **full** multi-volume set for a rar head:
+    `find_archives` deliberately returns only the first volume (`unrar` follows the rest once
+    given that one -- see that function's docstring), so a caller that needs to account for
+    every byte on disk belonging to one archive (2026-08-13,
+    `prompts/2026-08-13-delete-archives-after-extract.md`: deleting only the head after a
+    successful extraction would leave every `.r00`/`.r01`/...`.partNN.rar` continuation volume
+    behind) cannot use `find_archives`'s own output for that.
+
+    Reuses `_rar_volume_number`'s sibling-scanning walk -- the same one `check_rar_volume_set`
+    already does -- so this and the completeness precondition can never disagree about which
+    files belong to one set. Unlike `check_rar_volume_set`, this does not fail on a gap or a
+    zero-length volume; a caller here is walking a set that has *already* extracted
+    successfully (the precondition already ran, earlier, before that happened), so every
+    present, numbered sibling is returned as-is.
+    """
+    if not head.name.lower().endswith(".rar"):
+        return [head]
+    head_name_lower = head.name.lower()
+    volumes: dict[int, Path] = {1: head}
+    for sibling in head.parent.iterdir():
+        if sibling == head or not sibling.is_file():
+            continue
+        n = _rar_volume_number(sibling.name.lower(), head_name_lower)
+        if n is not None:
+            volumes[n] = sibling
+    return [volumes[n] for n in sorted(volumes)]
+
+
 def check_extract_preconditions(archive: Path) -> str | None:
     """Cheap, filesystem-only gates run before an archive is ever handed to a decoder (7zz or
     `unrar`, DESIGN.md §6; the 2026-08-12 production failure and gating gap -- see

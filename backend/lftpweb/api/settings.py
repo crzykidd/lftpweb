@@ -580,6 +580,7 @@ def _postprocess_out(s: PostprocessSettings) -> PostprocessSettingsOut:
         extract_passwords=list(s.extract_passwords),
         failed_retention_enabled=s.failed_retention_enabled,
         failed_retention_days=s.failed_retention_days,
+        delete_archives_after_extract=s.delete_archives_after_extract,
         move_enabled=s.move_enabled,
         concurrency=s.concurrency,
     )
@@ -603,6 +604,7 @@ async def put_postprocess_settings(
         extract_passwords=tuple(body.extract_passwords),
         failed_retention_enabled=body.failed_retention_enabled,
         failed_retention_days=body.failed_retention_days,
+        delete_archives_after_extract=body.delete_archives_after_extract,
         move_enabled=body.move_enabled,
         concurrency=max(1, body.concurrency),
     )

@@ -116,6 +116,9 @@ export interface PostprocessSettingsOut {
   extract_enabled: boolean
   extract_target_dir: string | null
   extract_passwords: string[]
+  // Off by default -- deletes an item's spent archive volumes once they've extracted
+  // successfully (2026-08-13). See core/local_delete.py.delete_extracted_archives.
+  delete_archives_after_extract: boolean
   move_enabled: boolean
   concurrency: number
 }

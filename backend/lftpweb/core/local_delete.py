@@ -42,6 +42,17 @@ happened, which is the property this module actually needs.
 `move` mode's verification-gated pipeline (§7.4). A manual remote-delete button is a much
 larger safety conversation and was deliberately left out of this task -- see
 `prompts/2026-08-12-local-deletion-and-retention.md`.
+
+**A third caller, added 2026-08-13, deletes *parts* of an item rather than the whole thing.**
+`delete_extracted_archives()` below removes a successfully-extracted release's spent `.rar`/
+`.r00`/... volumes, never the item itself -- so it is deliberately **not** a third code path
+built on `delete_local()`'s whole-item shape (which ends in `item.state = 'REMOVED_BOTH'`, wrong
+for "some files under this item are gone, the rest stays"). What it does reuse is the same
+guard vocabulary: `extract.resolve_within_root`'s containment check and the mount-sentinel gate.
+See its own docstring for the naive-implementation trap
+(`prompts/2026-08-13-delete-archives-after-extract.md`) this exists to avoid, and
+`load_deleted_archive_paths`/`save_deleted_archive_paths` for how the reconciler is told these
+files are gone on purpose rather than missing.
 """
 
 from __future__ import annotations
@@ -51,7 +62,7 @@ import json
 import logging
 import os
 import shutil
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -62,6 +73,7 @@ import aiosqlite
 from lftpweb.core import audit, extract, mount_sentinel
 from lftpweb.core.events import EventBus
 from lftpweb.core.itemview import item_view
+from lftpweb.core.util import to_safe_text
 
 logger = logging.getLogger(__name__)
 
@@ -464,3 +476,222 @@ class RetentionScheduler:
                 withheld,
             )
         return RetentionRunResult(considered=len(candidates), deleted=deleted, withheld=withheld)
+
+
+# --- Delete archives after extract (prompts/2026-08-13-delete-archives-after-extract.md) ------
+#
+# **The trap this section exists to avoid.** Deleting a release's archive volumes after a
+# successful extraction drops the item's local byte total below its remote total. The next scan
+# (`core/reconcile.py`) would read that as `local < remote` -> `PARTIAL` (DESIGN.md §3.2 rule
+# 2), and rule 9/`core/postprocess.py.outcome_survives_rescan` says `PARTIAL` beats any
+# post-processing outcome -- so the `EXTRACTED` state this codebase just wrote would not
+# protect the item, and auto-queue would re-fetch the archives, extract them again, delete them
+# again, every scan interval, forever. This is the same shape as the `REMOVED_LOCAL` bug shipped
+# and reverted the same night in `6d3bd95` (prompts/open-issues.md "4").
+#
+# The fix is **not** a new completeness rule and **not** `auto_queue_suppressed` (that flag is
+# for user decisions and permanent errors, DESIGN.md §4.6, and suppressing an item here would
+# also stop it being legitimately re-fetched if the user ever wanted it again). It reuses the
+# mechanism `core/patterns.py.build_counts_predicate` already built for the identical problem
+# with a different cause (a `file_exclude` pattern instead of a deletion this codebase
+# performed): a file the counts_predicate rejects is marked `EXCLUDED` -- a real state, not an
+# absence -- and stops counting toward its parent directory's completeness (DESIGN.md §3.2 rule
+# 8). `load_deleted_archive_paths`/`save_deleted_archive_paths` below persist exactly the set
+# `core/engine.py.scan_queue` needs to fold into that same seam; see that function for how the
+# two sources (patterns, deletions) combine into one predicate.
+
+
+# No site setting lives in this module for this feature -- see
+# `core/postprocess.py.PostprocessSettings.delete_archives_after_extract`, alongside the other
+# post-processing toggles. This module only holds the deletion primitive and its bookkeeping
+# table, the same split `retention_settings` above doesn't need because retention's own toggle
+# has no other natural home.
+
+
+@dataclass(frozen=True)
+class ArchiveCleanupResult:
+    """One `delete_extracted_archives()` call's outcome. `deleted_rel_paths` is exactly what
+    got persisted to the `deleted_archive` table -- what `core/engine.py` needs to have
+    happened for the reconciler to stop counting these files, not just what was attempted.
+    """
+
+    deleted_rel_paths: tuple[str, ...]
+    bytes_freed: int
+    withheld_reason: str | None = None
+
+
+async def load_deleted_archive_paths(db: aiosqlite.Connection, queue_id: int) -> frozenset[str]:
+    """Every `rel_path` (queue-root-relative, the same raw scanning-domain string
+    `core/reconcile.py`'s trees are keyed by) this codebase has deleted as a spent archive
+    volume for this queue -- read by `core/engine.py.scan_queue` on every pass and folded into
+    the counts_predicate it hands to `reconcile()`.
+
+    **Not re-encoded through `to_safe_text` on the way out**, deliberately: that boundary
+    conversion exists for SQLite/JSON storage, never for the scanning/matching path
+    (`core/util.py`'s own docstring), and this frozenset is compared directly against raw
+    `remote_tree`/`local_tree` keys inside `reconcile()`. For the overwhelming common case
+    (any filename that round-trips through UTF-8 cleanly) the stored and raw forms are
+    identical anyway; a filename containing a genuine lone surrogate is the same known,
+    accepted edge case `core/postprocess.py._find_item_id_for_failed_dir` already has -- see
+    docs/decisions.md.
+    """
+    cursor = await db.execute(
+        "SELECT rel_path FROM deleted_archive WHERE queue_id = ?", (queue_id,)
+    )
+    rows = await cursor.fetchall()
+    return frozenset(row["rel_path"] for row in rows)
+
+
+async def save_deleted_archive_paths(
+    db: aiosqlite.Connection, queue_id: int, rel_paths: Iterable[str]
+) -> None:
+    """Persist `rel_paths` (already resolved, queue-root-relative) as deleted for `queue_id`.
+    `to_safe_text` is applied here, at the storage boundary -- see `load_deleted_archive_paths`
+    for why it is deliberately *not* undone on the way back out. `INSERT OR IGNORE`: a path
+    already recorded (a second extraction of files that reappeared, or a re-run after a partial
+    failure) is not an error, just a no-op for that row.
+    """
+    if not rel_paths:
+        return
+    await db.executemany(
+        "INSERT INTO deleted_archive (queue_id, rel_path) VALUES (?, ?) "
+        "ON CONFLICT (queue_id, rel_path) DO NOTHING",
+        [(queue_id, to_safe_text(p)) for p in rel_paths],
+    )
+    await db.commit()
+
+
+async def delete_extracted_archives(
+    db: aiosqlite.Connection,
+    *,
+    item: Mapping[str, Any],
+    queue: Mapping[str, Any],
+    archive_heads: Sequence[Path],
+) -> ArchiveCleanupResult:
+    """Remove every file belonging to a set of archives that just extracted successfully
+    (`core/postprocess.py._do_extract`, gated on `PostprocessSettings.
+    delete_archives_after_extract`, default off, and only ever called with `result.state ==
+    'EXTRACTED'` -- never on `EXTRACT_FAILED`, never on a precondition failure, both of which
+    leave `archive_heads` moot because the caller never reaches this function for them).
+
+    `archive_heads` is `core/extract.py.find_archives`'s own output for the item that was just
+    extracted -- the *first* volume of each archive only. This function expands every head to
+    its full volume set (`extract.archive_volume_paths`) before touching anything, so a
+    multi-volume rar's `.r00`/`.r01`/...`.partNN.rar` continuation volumes are removed too, not
+    just the head left holding the whole set's apparent size. Nothing outside that expanded set
+    is ever a candidate -- a release directory's `.nfo`/`.sfv`/samples/subtitles are not
+    archives and `find_archives` never returned them in the first place, so they are never
+    touched here either; sidecars (`.sfv`/`.md5`) survive deliberately, since a future re-verify
+    (`core/verify.py`) still wants them.
+
+    **Directories only.** An item that is itself a loose top-level archive file (DESIGN.md §4.7
+    -- no containing directory) is withheld outright: deleting its own single file *is*
+    deleting the whole item, `delete_local()`'s job, never this one's -- and the sharper reason,
+    `core/reconcile.py`'s vacuous-`DOWNLOADED` branch for "every child excluded" only exists at
+    the *directory* level (`relevant == 0` is computed per-directory); excluding a loose file's
+    own node instead reads `EXCLUDED`, which does not satisfy `outcome_survives_rescan`'s
+    `structural_state == 'DOWNLOADED'` requirement and would drop the very `EXTRACTED` state
+    this feature exists to protect.
+
+    **No nlink guard**, unlike `delete_local()`'s retention path. That guard proves an `*arr`'s
+    hardlink-out-of-the-download-directory pickup already holds a second copy of content this
+    call is about to remove -- but nothing hardlinks a compressed archive volume itself; an
+    importer picks up the *extracted* output, which this function never touches. There is no
+    second copy to prove because the raw archive bytes were never the artifact anything
+    downstream wanted, in `copy`, `move`, or `sync` mode alike (see docs/decisions.md for why
+    `move` mode -- where the remote copy is already gone by the time extraction runs -- is not
+    additionally gated here either).
+
+    Every outcome writes an `event` row before returning -- a withheld batch (one row, the
+    whole batch shares one reason), or a completed one (one row naming every file removed and
+    the bytes freed). A per-file `OSError` withholds only that file, appended to the same
+    success event's message rather than failing the batch -- an unrelated permissions problem
+    on volume 5 of 12 must not leave the other 11 behind.
+    """
+    item_id = item["id"]
+    queue_id = queue["id"]
+    rel_path = item["rel_path"]
+
+    async def withhold(reason: str) -> ArchiveCleanupResult:
+        await audit.record_event(
+            db,
+            level="warning",
+            item_id=item_id,
+            kind="archive_cleanup_withheld",
+            message=(
+                f"delete-archives-after-extract: cleanup of {rel_path!r} (queue {queue_id} "
+                f"'{queue['name']}') withheld -- {reason}"
+            ),
+        )
+        return ArchiveCleanupResult(deleted_rel_paths=(), bytes_freed=0, withheld_reason=reason)
+
+    if not archive_heads:
+        return ArchiveCleanupResult(deleted_rel_paths=(), bytes_freed=0)
+
+    if not item["is_dir"]:
+        return await withhold(
+            "item is a loose top-level file, not a directory -- removing its own archive "
+            "would remove the whole item"
+        )
+
+    local_path = queue["local_path"].rstrip("/")
+    root = Path(local_path)
+
+    if not mount_sentinel.check(local_path):
+        return await withhold(
+            f"local root {local_path!r} is missing, unreadable, or has not yet completed a "
+            "scan with the mount sentinel present"
+        )
+
+    candidates: list[Path] = []
+    for head in archive_heads:
+        candidates.extend(extract.archive_volume_paths(head))
+
+    resolved: list[tuple[Path, Path]] = []
+    for candidate in candidates:
+        one_resolved = extract.resolve_within_root(candidate, root)
+        if one_resolved is None:
+            return await withhold(
+                f"{candidate} resolves outside the queue's local root {root} -- refusing the "
+                "whole batch (symlink escape or similar)"
+            )
+        resolved.append((candidate, one_resolved))
+
+    deleted: list[str] = []
+    failed: list[str] = []
+    bytes_freed = 0
+    for candidate, target in resolved:
+        try:
+            size = target.stat().st_size
+            target.unlink()
+        except OSError as exc:
+            failed.append(f"{candidate.name} ({exc})")
+            continue
+        deleted.append(candidate.relative_to(root).as_posix())
+        bytes_freed += size
+
+    if not deleted:
+        reason = (
+            "every candidate archive file failed to delete: " + "; ".join(failed)
+            if failed
+            else "no archive files were found on disk to delete"
+        )
+        return await withhold(reason)
+
+    await save_deleted_archive_paths(db, queue_id, deleted)
+
+    message = (
+        f"delete-archives-after-extract: removed {len(deleted)} archive file(s) for "
+        f"{rel_path!r} (queue {queue_id} '{queue['name']}'), {bytes_freed} bytes freed: "
+        + ", ".join(deleted)
+    )
+    if failed:
+        message += f" -- {len(failed)} file(s) could not be removed: " + "; ".join(failed)
+    await audit.record_event(
+        db,
+        level="info",
+        item_id=item_id,
+        kind="archive_cleanup",
+        message=message,
+    )
+    return ArchiveCleanupResult(deleted_rel_paths=tuple(deleted), bytes_freed=bytes_freed)

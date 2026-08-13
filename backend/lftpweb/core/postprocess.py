@@ -154,6 +154,14 @@ class PostprocessSettings:
     # queue's `local_path` whose name starts with `_FAILED_` is ever a candidate.
     failed_retention_enabled: bool = False
     failed_retention_days: float = extract.FAILED_RETENTION_DEFAULT_DAYS
+    # Delete an item's spent archive volumes once they've extracted successfully (2026-08-13,
+    # `prompts/2026-08-13-delete-archives-after-extract.md`). Off by default -- this project's
+    # rule for anything that deletes, same as `failed_retention_enabled` above and
+    # `local_delete.RetentionSettings` -- even though the naive infinite-re-download trap this
+    # guards against (see `core/local_delete.py.delete_extracted_archives`'s module-level
+    # comment) is already closed regardless of this flag; the flag exists because deleting the
+    # user's own files is not a decision this project makes for them.
+    delete_archives_after_extract: bool = False
     move_enabled: bool = False
     # DESIGN.md §6: "executed in a thread pool, one item at a time by default (configurable)."
     concurrency: int = 1
@@ -167,6 +175,7 @@ class PostprocessSettings:
             "extract_passwords": list(self.extract_passwords),
             "failed_retention_enabled": self.failed_retention_enabled,
             "failed_retention_days": self.failed_retention_days,
+            "delete_archives_after_extract": self.delete_archives_after_extract,
             "move_enabled": self.move_enabled,
             "concurrency": self.concurrency,
         }
@@ -192,6 +201,7 @@ async def load_postprocess_settings(db: aiosqlite.Connection) -> PostprocessSett
         failed_retention_days=float(
             data.get("failed_retention_days", extract.FAILED_RETENTION_DEFAULT_DAYS)
         ),
+        delete_archives_after_extract=bool(data.get("delete_archives_after_extract", False)),
         move_enabled=bool(data.get("move_enabled", False)),
         concurrency=max(1, int(data.get("concurrency", 1))),
     )
@@ -624,6 +634,24 @@ class PostprocessPipeline:
             message=result.detail,
         )
         await self._publish(item["id"])
+
+        # 2026-08-13 (prompts/2026-08-13-delete-archives-after-extract.md): only on a *full*
+        # success -- never EXTRACT_FAILED, never a precondition failure (which also reports as
+        # EXTRACT_FAILED, caught by this same check), never SKIPPED (nothing was extracted, so
+        # `archives` is never even reached; the guard above already returned). `archives` is
+        # `find_archives`'s pre-extraction listing (first volume of each set only) -- untouched
+        # by `extract_item`, which only ever writes to its own staging directory and merges into
+        # `local_root`, so it is still exactly what to expand and remove.
+        if result.state == "EXTRACTED" and settings.delete_archives_after_extract:
+            # Imported locally: `core/local_delete.py` imports `core/mount_sentinel.py`, which
+            # imports this module for `OWNED_STATES` -- a top-level import here would be
+            # circular (the same reason `core/extract.py.extract_item` imports `move_tree`
+            # locally).
+            from lftpweb.core import local_delete
+
+            await local_delete.delete_extracted_archives(
+                self.db, item=item, queue=queue, archive_heads=archives
+            )
 
     async def _sweep_failed_dirs(self, queue: Any, settings: PostprocessSettings) -> None:
         """Fix, 2026-08-12 (docs/decisions.md): `_FAILED_` staging directories

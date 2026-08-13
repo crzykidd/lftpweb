@@ -43,13 +43,13 @@ from typing import Any
 
 import aiosqlite
 
-from lftpweb.core import local_scan, mount_sentinel, patterns, postprocess, settle
+from lftpweb.core import local_delete, local_scan, mount_sentinel, patterns, postprocess, settle
 from lftpweb.core.autoqueue import AutoQueue, QueueAutoConfig
 from lftpweb.core.crypto import DecryptionError, decrypt_secret
 from lftpweb.core.events import EventBus
 from lftpweb.core.itemview import ITEM_VIEW_COLUMNS, ItemView, item_view
 from lftpweb.core.reconcile import ReconciledNode, reconcile
-from lftpweb.core.remote import HostConfig, RemoteConnectionPool, RemoteScanError
+from lftpweb.core.remote import HostConfig, RemoteConnectionPool, RemoteEntry, RemoteScanError
 
 logger = logging.getLogger(__name__)
 
@@ -200,6 +200,43 @@ def diff_nodes(
     changed = [node for rel_path, node in new.items() if old.get(rel_path) != node]
     removed = [rel_path for rel_path in old if rel_path not in new]
     return changed, removed
+
+
+def build_scan_counts_predicate(
+    pattern_predicate: patterns.CountsPredicate, deleted_archive_paths: frozenset[str]
+) -> patterns.CountsPredicate:
+    """One queue's real `counts_predicate` for `reconcile()` -- everything `scan_queue` hands
+    it, composed. Two sources feed the identical seam
+    (`core/reconcile.py`'s `CountsPredicate` -- a remote file counts toward completeness unless
+    something says otherwise) for two different reasons a file shouldn't count:
+
+    - `pattern_predicate` (`core/patterns.py.build_counts_predicate`): a `file_exclude` pattern
+      matched it (DESIGN.md §3.2 rule 8, §4.7).
+    - `deleted_archive_paths` (2026-08-13,
+      `prompts/2026-08-13-delete-archives-after-extract.md`): this codebase deleted it itself,
+      after a successful extraction (`core/local_delete.py.delete_extracted_archives`). Without
+      this, an item whose spent `.rar`/`.r00`/... volumes were removed reads `local < remote` on
+      the very next scan -> `PARTIAL` (§3.2 rule 2), which beats any post-processing outcome
+      (rule 9) and would re-fetch/re-extract/re-delete it every scan interval, forever -- the
+      same shape as the `REMOVED_LOCAL` bug shipped and reverted the same night in `6d3bd95`.
+
+    Deliberately **one predicate, not a second completeness rule**: both a `rel_path` matched
+    by a pattern and one this codebase deleted end up marked `EXCLUDED` by `reconcile()`
+    through the exact same branch, so a directory's vacuous-`DOWNLOADED`-when-everything-
+    excluded handling (§3.2 rule 8, `core/reconcile.py`'s `remote_file_totals` split) applies
+    identically to both causes without `reconcile.py` itself needing to know there are two.
+
+    A free-standing function (not inlined in `scan_queue`) so the composition itself --
+    "either source excludes it, in either order, and only membership matters" -- is
+    unit-testable without a database, a filesystem, or a running `Engine`.
+    """
+
+    def predicate(rel_path: str, entry: RemoteEntry) -> bool:
+        if rel_path in deleted_archive_paths:
+            return False
+        return pattern_predicate(rel_path, entry)
+
+    return predicate
 
 
 class Engine:
@@ -418,7 +455,11 @@ class Engine:
             # core/patterns.py's own docstring) so a pattern edit takes effect on the very
             # next pass, not just for items scanned after it.
             compiled = await patterns.compiled_for_queue(self.db, q.id)
-            counts_predicate = patterns.build_counts_predicate(compiled)
+            pattern_predicate = patterns.build_counts_predicate(compiled)
+            # 2026-08-13 (prompts/2026-08-13-delete-archives-after-extract.md): the second
+            # source `build_scan_counts_predicate` folds in -- see that function's docstring.
+            deleted_archive_paths = await local_delete.load_deleted_archive_paths(self.db, q.id)
+            counts_predicate = build_scan_counts_predicate(pattern_predicate, deleted_archive_paths)
             nodes = reconcile(remote_tree, local_tree, counts_predicate=counts_predicate)
 
             # The settle gate (prompts/open-issues.md #2, `core/settle.py`): one fingerprint

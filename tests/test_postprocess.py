@@ -30,9 +30,12 @@ from pathlib import Path
 import aiosqlite
 import pytest
 
-from lftpweb.core import extract, postprocess, verify
+from lftpweb.core import extract, local_delete, postprocess, verify
+from lftpweb.core.autoqueue import ELIGIBLE_STATES
+from lftpweb.core.engine import Engine, QueueConfig, build_scan_counts_predicate
 from lftpweb.core.events import EventBus
-from lftpweb.core.remote import HostConfig
+from lftpweb.core.mount_sentinel import write_if_needed
+from lftpweb.core.remote import HostConfig, RemoteEntry
 from lftpweb.db import migrate
 
 _SEVEN_ZIP_BIN = os.environ.get("LFTPWEB_7Z_BIN") or next(
@@ -1485,3 +1488,606 @@ async def test_overlapping_runs_for_one_item_release_only_once_both_are_done(mon
     release.set()
     await slow
     assert pipeline.in_flight_item_ids() == frozenset()
+
+
+# --- Delete archives after extract (2026-08-13,
+# prompts/2026-08-13-delete-archives-after-extract.md) -----------------------------------------
+#
+# **The trap this whole feature exists to avoid**, restated because it is the point of every
+# test below: deleting a release's archive volumes after extraction drops its local byte total
+# below remote. The very next scan (`core/reconcile.py`) would read `local < remote` -> `PARTIAL`
+# (DESIGN.md §3.2 rule 2), and rule 9 / `outcome_survives_rescan` says `PARTIAL` beats any
+# post-processing outcome -- so `EXTRACTED` would not protect the item and auto-queue would
+# re-fetch, re-extract, and re-delete it every scan interval, forever. This is the same shape as
+# the `REMOVED_LOCAL` bug shipped and reverted the same night in `6d3bd95`
+# (`prompts/open-issues.md` "4"). `test_archive_cleanup_does_not_cause_a_partial_re_download_loop`
+# below is the regression guard for exactly that; everything above it is unit-level scaffolding
+# building up to it, using the same real RAR fixtures (`_RAR_SINGLE`, `_RAR_MULTIVOL_VOL1/2`)
+# defined earlier in this file, never fake bytes -- fake fixtures are why a nine-phase bug
+# (rar extraction never working at all) went unnoticed.
+
+
+def _sfv_bytes() -> bytes:
+    """Sidecar content is never read by these tests (verify is off except in the move-mode
+    test, which uses the hash-on-disk fallback instead) -- only that the file survives
+    cleanup untouched.
+    """
+    return b"multi.txt 00000000\n"
+
+
+async def _make_multivolume_rar_release(local_root: Path, rel_path: str = "Release") -> Path:
+    """A directory item holding a real two-volume old-style rar set (`_RAR_MULTIVOL_VOL1` /
+    `_RAR_MULTIVOL_VOL2`, defined earlier in this file) plus a `.sfv` sidecar -- the shape
+    `delete_extracted_archives` must handle: remove both volumes, leave the sidecar alone.
+    """
+    item_dir = local_root / rel_path
+    item_dir.mkdir(parents=True)
+    (item_dir / "release.rar").write_bytes(_RAR_MULTIVOL_VOL1)
+    (item_dir / "release.r00").write_bytes(_RAR_MULTIVOL_VOL2)
+    (item_dir / "checksums.sfv").write_bytes(_sfv_bytes())
+    return item_dir
+
+
+# --- core/extract.py.archive_volume_paths ------------------------------------------------------
+
+
+@pytestmark_7z
+def test_archive_volume_paths_non_rar_format_is_just_the_head(tmp_path):
+    archive = tmp_path / "payload.zip"
+    with zipfile.ZipFile(archive, "w") as zf:
+        zf.writestr("inner.txt", "contents")
+    assert extract.archive_volume_paths(archive) == [archive]
+
+
+def test_archive_volume_paths_expands_old_style_multivolume_rar(tmp_path):
+    head = tmp_path / "release.rar"
+    head.write_bytes(_RAR_MULTIVOL_VOL1)
+    vol2 = tmp_path / "release.r00"
+    vol2.write_bytes(_RAR_MULTIVOL_VOL2)
+    (tmp_path / "checksums.sfv").write_bytes(_sfv_bytes())  # must never be picked up
+
+    assert extract.archive_volume_paths(head) == [head, vol2]
+
+
+def test_archive_volume_paths_expands_new_style_partn_rar(tmp_path):
+    head = tmp_path / "release.part1.rar"
+    head.write_bytes(b"volume 1")
+    part2 = tmp_path / "release.part2.rar"
+    part2.write_bytes(b"volume 2")
+    part3 = tmp_path / "release.part3.rar"
+    part3.write_bytes(b"volume 3")
+
+    assert extract.archive_volume_paths(head) == [head, part2, part3]
+
+
+def test_archive_volume_paths_single_volume_rar_is_just_the_head(tmp_path):
+    head = tmp_path / "release.rar"
+    head.write_bytes(_RAR_SINGLE)
+    assert extract.archive_volume_paths(head) == [head]
+
+
+# --- core/engine.py.build_scan_counts_predicate -- pure composition, no DB/filesystem ----------
+
+
+def test_build_scan_counts_predicate_excludes_a_deleted_archive_path():
+    entry = RemoteEntry(rel_path="Release/release.rar", is_dir=False, size=78, mtime=1.0)
+    predicate = build_scan_counts_predicate(
+        lambda rel_path, e: True, frozenset({"Release/release.rar"})
+    )  # noqa: E501
+    assert predicate("Release/release.rar", entry) is False
+
+
+def test_build_scan_counts_predicate_still_defers_to_the_pattern_predicate():
+    entry = RemoteEntry(rel_path="Release/notes.nfo", is_dir=False, size=5, mtime=1.0)
+    predicate = build_scan_counts_predicate(lambda rel_path, e: False, frozenset())
+    assert predicate("Release/notes.nfo", entry) is False
+
+
+def test_build_scan_counts_predicate_true_only_when_both_sources_say_so():
+    entry = RemoteEntry(rel_path="Release/movie.mkv", is_dir=False, size=1000, mtime=1.0)
+    predicate = build_scan_counts_predicate(lambda rel_path, e: True, frozenset())
+    assert predicate("Release/movie.mkv", entry) is True
+
+
+# --- core/local_delete.py.delete_extracted_archives, through the real pipeline -----------------
+
+
+@pytestmark_unrar
+async def test_pipeline_deletes_every_archive_volume_after_success_and_preserves_sidecar(tmp_path):
+    """The feature's own success path: a full multi-volume set -- head *and* the `.r00`
+    continuation volume `find_archives` never returns -- through the real pipeline with a real
+    `unrar`, not just `core/extract.py` in isolation.
+    """
+    db = await _make_db()
+    try:
+        local_root = tmp_path / "local"
+        local_root.mkdir()
+        write_if_needed(str(local_root))
+        item_dir = await _make_multivolume_rar_release(local_root)
+
+        _, queue_id = await _make_host_and_queue_rows(db, sync_mode="copy", auto_extract=1)
+        await db.execute(
+            "UPDATE path_queue SET local_path = ? WHERE id = ?", (str(local_root), queue_id)
+        )
+        await db.commit()
+        item_id = await _make_item_row(db, queue_id, "Release", state="DOWNLOADED")
+        await db.execute("UPDATE item SET is_dir = 1 WHERE id = ?", (item_id,))
+        await db.commit()
+
+        pipeline = postprocess.PostprocessPipeline(
+            db=db, events=EventBus(), remote_pool=_FakeRemotePool(), host_provider=_async_host
+        )
+        settings = postprocess.PostprocessSettings(
+            extract_enabled=True, delete_archives_after_extract=True
+        )
+        await pipeline.process_item(item_id, settings)
+
+        item = await (await db.execute("SELECT * FROM item WHERE id = ?", (item_id,))).fetchone()
+        assert item["state"] == "EXTRACTED", item["error_detail"]
+
+        assert not (item_dir / "release.rar").exists()
+        assert not (item_dir / "release.r00").exists()
+        assert (item_dir / "checksums.sfv").exists(), "sidecars must survive cleanup"
+        assert (item_dir / "multi.txt").read_text() == "0123456789abcdefghij"
+
+        deleted = await local_delete.load_deleted_archive_paths(db, queue_id)
+        assert deleted == {"Release/release.rar", "Release/release.r00"}
+
+        events = await (
+            await db.execute("SELECT kind, message FROM event WHERE item_id = ?", (item_id,))
+        ).fetchall()
+        kinds = [e["kind"] for e in events]
+        cleanup_events = [e for e in events if e["kind"] == "archive_cleanup"]
+        assert len(cleanup_events) == 1
+        assert "release.rar" in cleanup_events[0]["message"]
+        assert "release.r00" in cleanup_events[0]["message"]
+        assert "archive_cleanup_withheld" not in kinds
+    finally:
+        await db.close()
+
+
+@pytestmark_unrar
+async def test_pipeline_default_off_leaves_archives_on_disk(tmp_path):
+    """Default off, non-negotiable (this project's own rule for anything that deletes) --
+    extraction succeeds but nothing about the archives changes when the setting is left at its
+    default.
+    """
+    db = await _make_db()
+    try:
+        local_root = tmp_path / "local"
+        local_root.mkdir()
+        write_if_needed(str(local_root))
+        item_dir = await _make_multivolume_rar_release(local_root)
+
+        _, queue_id = await _make_host_and_queue_rows(db, sync_mode="copy", auto_extract=1)
+        await db.execute(
+            "UPDATE path_queue SET local_path = ? WHERE id = ?", (str(local_root), queue_id)
+        )
+        await db.commit()
+        item_id = await _make_item_row(db, queue_id, "Release", state="DOWNLOADED")
+        await db.execute("UPDATE item SET is_dir = 1 WHERE id = ?", (item_id,))
+        await db.commit()
+
+        pipeline = postprocess.PostprocessPipeline(
+            db=db, events=EventBus(), remote_pool=_FakeRemotePool(), host_provider=_async_host
+        )
+        # delete_archives_after_extract left at its default (False).
+        await pipeline.process_item(item_id, postprocess.PostprocessSettings(extract_enabled=True))
+
+        item = await (await db.execute("SELECT * FROM item WHERE id = ?", (item_id,))).fetchone()
+        assert item["state"] == "EXTRACTED"
+        assert (item_dir / "release.rar").exists()
+        assert (item_dir / "release.r00").exists()
+
+        deleted = await local_delete.load_deleted_archive_paths(db, queue_id)
+        assert deleted == frozenset()
+
+        events = await (await db.execute("SELECT kind FROM event")).fetchall()
+        assert "archive_cleanup" not in [e["kind"] for e in events]
+    finally:
+        await db.close()
+
+
+async def test_pipeline_never_deletes_archives_on_extract_failed(tmp_path):
+    """Never on a precondition failure (a gap in the volume set, here) -- the cleanup call is
+    never even reached, because `_do_extract` only calls it when `result.state == 'EXTRACTED'`.
+    """
+    db = await _make_db()
+    try:
+        local_root = tmp_path / "local"
+        local_root.mkdir()
+        write_if_needed(str(local_root))
+        item_dir = local_root / "Release"
+        item_dir.mkdir()
+        (item_dir / "Release.rar").write_bytes(b"volume 1")
+        (item_dir / "Release.r00").write_bytes(b"volume 2")
+        # Release.r01 (volume 3) missing -- an incomplete set, same fixture shape as the
+        # existing precondition-failure test above.
+        (item_dir / "Release.r02").write_bytes(b"volume 4")
+
+        _, queue_id = await _make_host_and_queue_rows(db, sync_mode="copy", auto_extract=1)
+        await db.execute(
+            "UPDATE path_queue SET local_path = ? WHERE id = ?", (str(local_root), queue_id)
+        )
+        await db.commit()
+        item_id = await _make_item_row(db, queue_id, "Release")
+        await db.execute("UPDATE item SET is_dir = 1 WHERE id = ?", (item_id,))
+        await db.commit()
+
+        pipeline = postprocess.PostprocessPipeline(
+            db=db, events=EventBus(), remote_pool=_FakeRemotePool(), host_provider=_async_host
+        )
+        settings = postprocess.PostprocessSettings(
+            extract_enabled=True, delete_archives_after_extract=True
+        )
+        await pipeline.process_item(item_id, settings)
+
+        item = await (await db.execute("SELECT * FROM item WHERE id = ?", (item_id,))).fetchone()
+        assert item["state"] == "EXTRACT_FAILED"
+        assert (item_dir / "Release.rar").exists()
+        assert (item_dir / "Release.r00").exists()
+        assert (item_dir / "Release.r02").exists()
+
+        deleted = await local_delete.load_deleted_archive_paths(db, queue_id)
+        assert deleted == frozenset()
+
+        events = await (await db.execute("SELECT kind FROM event")).fetchall()
+        kinds = [e["kind"] for e in events]
+        assert "archive_cleanup" not in kinds
+        assert "archive_cleanup_withheld" not in kinds
+    finally:
+        await db.close()
+
+
+@pytestmark_unrar
+async def test_pipeline_never_deletes_a_loose_top_level_archive_file(tmp_path):
+    """DESIGN.md §4.7's loose top-level file case, and the reason `delete_extracted_archives`
+    withholds it outright rather than deleting: removing the item's own single file *is*
+    removing the whole item (`core/local_delete.py.delete_local`'s job, not this one's), and the
+    directory-only vacuous-`DOWNLOADED` branch this feature otherwise relies on
+    (`core/reconcile.py`'s `relevant == 0` split) does not exist at the file level -- excluding
+    it would read `EXCLUDED`, not the outcome-preserving `DOWNLOADED`, and drop `EXTRACTED`.
+    """
+    db = await _make_db()
+    try:
+        local_root = tmp_path / "local"
+        local_root.mkdir()
+        write_if_needed(str(local_root))
+        (local_root / "release.rar").write_bytes(_RAR_SINGLE)
+
+        _, queue_id = await _make_host_and_queue_rows(db, sync_mode="copy", auto_extract=1)
+        await db.execute(
+            "UPDATE path_queue SET local_path = ? WHERE id = ?", (str(local_root), queue_id)
+        )
+        await db.commit()
+        # is_dir defaults to 0 in _make_item_row -- exactly the loose-file case.
+        item_id = await _make_item_row(db, queue_id, "release.rar")
+
+        pipeline = postprocess.PostprocessPipeline(
+            db=db, events=EventBus(), remote_pool=_FakeRemotePool(), host_provider=_async_host
+        )
+        settings = postprocess.PostprocessSettings(
+            extract_enabled=True, delete_archives_after_extract=True
+        )
+        await pipeline.process_item(item_id, settings)
+
+        item = await (await db.execute("SELECT * FROM item WHERE id = ?", (item_id,))).fetchone()
+        assert item["state"] == "EXTRACTED"
+        assert (local_root / "release.rar").exists(), "the item's own archive must survive"
+        assert (local_root / "hello.txt").read_text() == "hello world\n"
+
+        deleted = await local_delete.load_deleted_archive_paths(db, queue_id)
+        assert deleted == frozenset()
+
+        events = await (
+            await db.execute("SELECT kind, message FROM event WHERE item_id = ?", (item_id,))
+        ).fetchall()
+        withheld = [e for e in events if e["kind"] == "archive_cleanup_withheld"]
+        assert len(withheld) == 1
+        assert "loose top-level file" in withheld[0]["message"]
+    finally:
+        await db.close()
+
+
+@pytestmark_unrar
+async def test_move_mode_cleanup_runs_even_though_the_remote_copy_is_already_gone(tmp_path):
+    """§5's own required check: on a `move` queue the remote copy is deleted *before*
+    extraction runs (`_process_item`'s fixed verify -> delete-remote -> extract -> move order,
+    unchanged by this task). By the time cleanup runs, the compressed archive bytes it is about
+    to remove are already the last copy anywhere -- deliberately not gated further (see
+    docs/decisions.md): a successful extraction has already decoded the payload onto disk as
+    ordinary files, so the archive volumes are a spent intermediate nobody re-reads, not the
+    release itself.
+    """
+    db = await _make_db()
+    try:
+        import zlib
+
+        local_root = tmp_path / "local"
+        local_root.mkdir()
+        write_if_needed(str(local_root))
+        item_dir = local_root / "Release"
+        item_dir.mkdir()
+        (item_dir / "release.rar").write_bytes(_RAR_MULTIVOL_VOL1)
+        (item_dir / "release.r00").write_bytes(_RAR_MULTIVOL_VOL2)
+        # A *real* sfv, checksumming the two archive volumes that actually exist at verify
+        # time (verify runs before extraction) -- not `_sfv_bytes()`'s placeholder, which
+        # references "multi.txt" (the file the rar contains, not yet extracted) and would read
+        # CORRUPT ("missing") if used here.
+        rar_crc = zlib.crc32(_RAR_MULTIVOL_VOL1) & 0xFFFFFFFF
+        r00_crc = zlib.crc32(_RAR_MULTIVOL_VOL2) & 0xFFFFFFFF
+        sfv_content = f"release.rar {rar_crc:08x}\nrelease.r00 {r00_crc:08x}\n".encode()
+        (item_dir / "checksums.sfv").write_bytes(sfv_content)
+        total_bytes = len(_RAR_MULTIVOL_VOL1) + len(_RAR_MULTIVOL_VOL2) + len(sfv_content)
+
+        _, queue_id = await _make_host_and_queue_rows(db, sync_mode="move", auto_extract=1)
+        await db.execute(
+            "UPDATE path_queue SET local_path = ? WHERE id = ?", (str(local_root), queue_id)
+        )
+        await db.commit()
+        item_id = await _make_item_row(
+            db, queue_id, "Release", state="DOWNLOADED", remote_size=total_bytes
+        )
+        await db.execute("UPDATE item SET is_dir = 1 WHERE id = ?", (item_id,))
+        await db.commit()
+
+        pool = _FakeRemotePool()
+        pipeline = postprocess.PostprocessPipeline(
+            db=db, events=EventBus(), remote_pool=pool, host_provider=lambda: _async_host()
+        )
+        settings = postprocess.PostprocessSettings(
+            extract_enabled=True, delete_archives_after_extract=True
+        )
+        await pipeline.process_item(item_id, settings)
+
+        # The remote delete happened (move mode's own gate, unrelated to this feature)...
+        assert len(pool.calls) == 1
+        item = await (await db.execute("SELECT * FROM item WHERE id = ?", (item_id,))).fetchone()
+        assert item["remote_deleted_at"] is not None
+        # ...and cleanup still ran on top of that, unimpeded.
+        assert item["state"] == "EXTRACTED"
+        assert not (item_dir / "release.rar").exists()
+        assert not (item_dir / "release.r00").exists()
+        assert (item_dir / "checksums.sfv").exists()
+
+        deleted = await local_delete.load_deleted_archive_paths(db, queue_id)
+        assert deleted == {"Release/release.rar", "Release/release.r00"}
+    finally:
+        await db.close()
+
+
+@pytestmark_unrar
+async def test_cleanup_composes_with_the_relocate_step_leaving_no_orphans(tmp_path):
+    """§6's own required check: `_do_move` relocates the item to `staging_path` *after*
+    `_do_extract` (which now includes cleanup) runs -- `_process_item`'s fixed order means
+    cleanup always happens before relocation, never the reverse, so there is no ordering to
+    reconcile. Prove the composition: the relocated directory holds the extracted content and
+    the sidecar, never the archives, and the original location is empty.
+    """
+    db = await _make_db()
+    try:
+        local_root = tmp_path / "local"
+        local_root.mkdir()
+        write_if_needed(str(local_root))
+        item_dir = await _make_multivolume_rar_release(local_root)
+
+        staging_root = tmp_path / "staging"
+        staging_root.mkdir()
+
+        _, queue_id = await _make_host_and_queue_rows(
+            db,
+            sync_mode="copy",
+            auto_extract=1,
+            auto_move=1,
+            staging_path=str(staging_root),
+        )
+        await db.execute(
+            "UPDATE path_queue SET local_path = ? WHERE id = ?", (str(local_root), queue_id)
+        )
+        await db.commit()
+        item_id = await _make_item_row(db, queue_id, "Release", state="DOWNLOADED")
+        await db.execute("UPDATE item SET is_dir = 1 WHERE id = ?", (item_id,))
+        await db.commit()
+
+        pipeline = postprocess.PostprocessPipeline(
+            db=db, events=EventBus(), remote_pool=_FakeRemotePool(), host_provider=_async_host
+        )
+        settings = postprocess.PostprocessSettings(
+            extract_enabled=True, delete_archives_after_extract=True, move_enabled=True
+        )
+        await pipeline.process_item(item_id, settings)
+
+        item = await (await db.execute("SELECT * FROM item WHERE id = ?", (item_id,))).fetchone()
+        assert item["state"] == "EXTRACTED"
+
+        assert not item_dir.exists(), "the whole item should have relocated to staging"
+        dest = staging_root / "Release"
+        assert (dest / "multi.txt").read_text() == "0123456789abcdefghij"
+        assert (dest / "checksums.sfv").exists()
+        assert not (dest / "release.rar").exists()
+        assert not (dest / "release.r00").exists()
+
+        deleted = await local_delete.load_deleted_archive_paths(db, queue_id)
+        assert deleted == {"Release/release.rar", "Release/release.r00"}
+
+        events = await (
+            await db.execute("SELECT kind FROM event WHERE item_id = ?", (item_id,))
+        ).fetchall()
+        assert "move" in [e["kind"] for e in events]
+    finally:
+        await db.close()
+
+
+# --- The regression guard: a real scan must never read PARTIAL, and must survive a restart -----
+
+
+class _FakeScanPool:
+    """A fixed remote tree, handed back on every scan -- the same shape
+    `tests/test_state_persistence.py._FakePool` uses, so `core/engine.py.scan_queue` runs for
+    real (real `local_scan.scan_local` against the actual, post-cleanup filesystem; real
+    `core/engine.py._persist` arbitration) without a live SSH connection.
+    """
+
+    def __init__(self, tree: dict[str, RemoteEntry]) -> None:
+        self._tree = tree
+
+    async def scan(self, host, remote_path):  # noqa: ARG002
+        return self._tree, None
+
+
+async def _setup_extracted_and_cleaned_release(tmp_path):
+    """Runs the real pipeline (real `unrar`) to produce an `EXTRACTED` item whose archive
+    volumes have already been deleted from disk -- the starting point every test below needs.
+    Returns `(db, host_id, queue_id, item_id, local_root, remote_tree)` so a caller can drive
+    `Engine.scan_queue` against exactly the database and filesystem state a real run leaves
+    behind, with `remote_tree` describing what a `copy`-mode queue's seedbox still has (nothing
+    ever deletes remote content in `copy` mode, so the archive volumes are still there).
+    """
+    db = await _make_db()
+    local_root = tmp_path / "local"
+    local_root.mkdir()
+    write_if_needed(str(local_root))
+    await _make_multivolume_rar_release(local_root)
+    sfv_size = len(_sfv_bytes())
+
+    host_id, queue_id = await _make_host_and_queue_rows(db, sync_mode="copy", auto_extract=1)
+    await db.execute(
+        "UPDATE path_queue SET local_path = ? WHERE id = ?", (str(local_root), queue_id)
+    )
+    await db.commit()
+    total = len(_RAR_MULTIVOL_VOL1) + len(_RAR_MULTIVOL_VOL2) + sfv_size
+    item_id = await _make_item_row(db, queue_id, "Release", state="DOWNLOADED", remote_size=total)
+    await db.execute("UPDATE item SET is_dir = 1 WHERE id = ?", (item_id,))
+    await db.commit()
+
+    pipeline = postprocess.PostprocessPipeline(
+        db=db, events=EventBus(), remote_pool=_FakeRemotePool(), host_provider=_async_host
+    )
+    settings = postprocess.PostprocessSettings(
+        extract_enabled=True, delete_archives_after_extract=True
+    )
+    await pipeline.process_item(item_id, settings)
+
+    remote_tree = {
+        "Release": RemoteEntry(rel_path="Release", is_dir=True, size=0, mtime=1.0),
+        "Release/release.rar": RemoteEntry(
+            rel_path="Release/release.rar", is_dir=False, size=len(_RAR_MULTIVOL_VOL1), mtime=1.0
+        ),
+        "Release/release.r00": RemoteEntry(
+            rel_path="Release/release.r00", is_dir=False, size=len(_RAR_MULTIVOL_VOL2), mtime=1.0
+        ),
+        "Release/checksums.sfv": RemoteEntry(
+            rel_path="Release/checksums.sfv", is_dir=False, size=sfv_size, mtime=1.0
+        ),
+    }
+    return db, host_id, queue_id, item_id, local_root, remote_tree
+
+
+def _queue_and_host(
+    host_id: int, queue_id: int, local_root: Path
+) -> tuple[QueueConfig, HostConfig]:
+    q = QueueConfig(
+        id=queue_id,
+        host_id=host_id,
+        name="q",
+        remote_path="/data/pickup",
+        local_path=str(local_root),
+        staging_path=None,
+        enabled=True,
+        sync_mode="copy",
+    )
+    host = HostConfig(
+        id=host_id,
+        address="seedbox.invalid",
+        port=22,
+        username="u",
+        auth_method="key",
+        key_path="/k",
+        known_hosts_policy="strict",
+    )
+    return q, host
+
+
+@pytestmark_unrar
+async def test_archive_cleanup_does_not_cause_a_partial_re_download_loop(tmp_path):
+    """**The regression test that is the point of this whole feature.** Without the
+    `deleted_archive` bookkeeping and `core/engine.py.build_scan_counts_predicate` fix, this
+    item would read `PARTIAL` on the very first real scan after cleanup (local now short of
+    remote by the two deleted rar volumes), `EXTRACTED` would not survive
+    (`outcome_survives_rescan` only protects a structural `DOWNLOADED`), and the item would
+    become eligible for auto-queue again (`REMOTE_ONLY`/`PARTIAL` are the only
+    `ELIGIBLE_STATES`) -- re-fetching, re-extracting, and re-deleting the same archives forever.
+    """
+    (
+        db,
+        host_id,
+        queue_id,
+        item_id,
+        local_root,
+        remote_tree,
+    ) = await _setup_extracted_and_cleaned_release(tmp_path)
+    try:
+        item = await (await db.execute("SELECT * FROM item WHERE id = ?", (item_id,))).fetchone()
+        assert item["state"] == "EXTRACTED", "setup did not actually extract -- test is void"
+
+        engine = Engine(db, str(tmp_path), EventBus())
+        engine.pool = _FakeScanPool(remote_tree)
+        q, host = _queue_and_host(host_id, queue_id, local_root)
+
+        # Not just one pass -- the failure mode is a *periodic* re-computation, so several
+        # scans in a row must all agree (same discipline as
+        # tests/test_state_persistence.py::test_an_outcome_survives_repeated_scans_not_just_the_first).
+        for _ in range(3):
+            await engine.scan_queue(q, host)
+            row = await (
+                await db.execute(
+                    "SELECT state, first_missing_at FROM item WHERE id = ?", (item_id,)
+                )
+            ).fetchone()
+            assert row["state"] == "EXTRACTED", "the archive-delete trap: must never read PARTIAL"
+            assert row["state"] not in ELIGIBLE_STATES, "must never become auto-queue eligible"
+            assert row["first_missing_at"] is None, "content is not absent, nothing should start"
+
+        # The two archive-volume nodes are EXCLUDED, not REMOTE_ONLY -- a real state, not an
+        # absence (DESIGN.md §3.2 rule 8), the same mechanism `file_exclude` already uses for a
+        # different cause.
+        for rel_path in ("Release/release.rar", "Release/release.r00"):
+            row = await (
+                await db.execute(
+                    "SELECT state FROM item WHERE queue_id = ? AND rel_path = ?",
+                    (queue_id, rel_path),
+                )
+            ).fetchone()
+            assert row["state"] == "EXCLUDED", rel_path
+    finally:
+        await db.close()
+
+
+@pytestmark_unrar
+async def test_archive_cleanup_reaches_the_same_conclusion_after_a_simulated_restart(tmp_path):
+    """Cold start: the reconciler must reach the same conclusion from only the database and the
+    filesystem, not from anything the `PostprocessPipeline` run happened to hold in memory (it
+    holds nothing relevant -- `deleted_archive` is the only thing that has to survive, and it is
+    a table, not a Python object). A brand-new `Engine` -- nothing carried over, the same shape
+    a process restart would produce with this same on-disk database -- must land on `EXTRACTED`
+    on its very first scan, not need a warm-up pass.
+    """
+    (
+        db,
+        host_id,
+        queue_id,
+        item_id,
+        local_root,
+        remote_tree,
+    ) = await _setup_extracted_and_cleaned_release(tmp_path)
+    try:
+        fresh_engine = Engine(db, str(tmp_path), EventBus())
+        fresh_engine.pool = _FakeScanPool(remote_tree)
+        q, host = _queue_and_host(host_id, queue_id, local_root)
+
+        await fresh_engine.scan_queue(q, host)
+
+        row = await (await db.execute("SELECT state FROM item WHERE id = ?", (item_id,))).fetchone()
+        assert row["state"] == "EXTRACTED"
+    finally:
+        await db.close()
