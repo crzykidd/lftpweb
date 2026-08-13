@@ -439,6 +439,10 @@ export interface HistoryJobOut {
   exit_code: number | null
   error_class: string | null
   has_output_tail: boolean
+  // Migration 016 (2026-08-13) -- when this job was dismissed from the Transfers page, or
+  // `null` if it never was. History shows every terminal job either way (dismissal only ever
+  // hides a Transfers row); this just answers "did I dismiss this."
+  dismissed_at: string | null
 }
 
 export interface HistoryJobsResponse {

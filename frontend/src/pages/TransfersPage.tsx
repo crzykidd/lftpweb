@@ -1,5 +1,5 @@
 import { useMemo, useState } from 'react'
-import { moveJobToTop, retryItem, startJobNow, stopJob } from '../api/client'
+import { dismissJob, moveJobToTop, retryItem, startJobNow, stopJob } from '../api/client'
 import type { FileNode, JobOut } from '../api/types'
 import { ItemDrawer } from '../components/ItemDrawer'
 import { StateChip } from '../components/StateChip'
@@ -43,6 +43,27 @@ function itemName(relPath: string): string {
   return lastSlash === -1 ? relPath : relPath.slice(lastSlash + 1)
 }
 
+function errorMessage(reason: unknown): string {
+  return reason instanceof Error ? reason.message : String(reason)
+}
+
+/** "Clear all failed" (2026-08-13, prompts/done/2026-08-13-dismiss-terminal-jobs.md) --
+ * `Promise.allSettled`, not `Promise.all`, same reasoning `FileTree.tsx`'s bulk actions
+ * already use: one job's dismiss failing (e.g. it started running between page load and the
+ * click) must not hide whether the other N-1 succeeded.
+ */
+interface DismissFailure {
+  rel_path: string
+  name: string
+  error: string
+}
+
+interface DismissOutcome {
+  total: number
+  succeeded: number
+  failures: DismissFailure[]
+}
+
 interface RowProps {
   job: JobOut
   nodes: FileNode[]
@@ -58,6 +79,7 @@ interface RowProps {
   onStartNow: (job: JobOut) => void
   onStop: (job: JobOut) => void
   onRetry: (job: JobOut) => void
+  onDismiss: (job: JobOut) => void
   busy: boolean
 }
 
@@ -71,6 +93,7 @@ function Row({
   onStartNow,
   onStop,
   onRetry,
+  onDismiss,
   busy,
 }: RowProps) {
   const running = job.state === 'running'
@@ -177,6 +200,23 @@ function Row({
             Retry
           </button>
         )}
+        {/* Dismiss (2026-08-13): terminal rows only -- a failed job whose remote is actually
+         * gone (REMOTE_GONE, permanently suppressed) had no action but Retry, which is
+         * precisely wrong for it. Purely a display action on this job row -- see
+         * `core/queue.py.dismiss_job`'s docstring for why it never touches the item's own
+         * state or suppression. No confirmation dialog: nothing is destroyed, the record
+         * stays on the History page. */}
+        {(job.state === 'failed' || job.state === 'cancelled') && (
+          <button
+            type="button"
+            disabled={busy}
+            onClick={() => onDismiss(job)}
+            className="rounded-md border border-zinc-300 px-2 py-1 text-xs font-medium text-zinc-500 hover:bg-zinc-50 disabled:opacity-50 dark:border-zinc-700 dark:text-zinc-400 dark:hover:bg-zinc-900"
+            title="Remove this row from Transfers -- it stays visible on the History page"
+          >
+            Dismiss
+          </button>
+        )}
       </div>
 
       {job.state === 'failed' && (
@@ -203,6 +243,8 @@ export function TransfersPage() {
   const [busyIds, setBusyIds] = useState<Set<number>>(new Set())
   const [drawerJob, setDrawerJob] = useState<JobOut | null>(null)
   const [startNowNotice, setStartNowNotice] = useState(false)
+  const [clearingAll, setClearingAll] = useState(false)
+  const [dismissOutcome, setDismissOutcome] = useState<DismissOutcome | null>(null)
 
   const nodesByQueue = useMemo(() => {
     const map = new Map<number, FileNode[]>()
@@ -243,12 +285,45 @@ export function TransfersPage() {
   const handleMoveToTop = (job: JobOut) => withBusy(job.id, () => moveJobToTop(job.id))
   const handleStop = (job: JobOut) => withBusy(job.id, () => stopJob(job.id))
   const handleRetry = (job: JobOut) => withBusy(job.id, () => retryItem(job.item_id))
+  const handleDismiss = (job: JobOut) => withBusy(job.id, () => dismissJob(job.id))
   const handleStartNow = (job: JobOut) => {
     if (localStorage.getItem(START_NOW_EXPLAINED_KEY) !== '1') {
       setStartNowNotice(true)
       localStorage.setItem(START_NOW_EXPLAINED_KEY, '1')
     }
     return withBusy(job.id, () => startJobNow(job.id))
+  }
+
+  const failedJobs = useMemo(() => jobs.filter((j) => j.state === 'failed'), [jobs])
+
+  /** "Clear all failed" (2026-08-13) -- the bulk counterpart to the per-row Dismiss button,
+   * for the "I should have a clear or delete button" half of the user's report: one-at-a-time
+   * dismissal of a stack of dead rows is its own annoyance. Scoped to `failed` only, not
+   * `cancelled` too -- a stopped job is the result of a deliberate Stop click, not the kind of
+   * unattended pile-up `failed` rows (auto-retries exhausted, or a permanent class like
+   * REMOTE_GONE) can become; a cancelled row is still one Dismiss click away individually.
+   * `Promise.allSettled` (not `Promise.all`) so one job racing to `running` between page load
+   * and the click doesn't hide whether the rest actually cleared.
+   */
+  const handleClearAllFailed = async () => {
+    const targets = failedJobs
+    if (targets.length === 0) return
+    setClearingAll(true)
+    setDismissOutcome(null)
+    try {
+      const results = await Promise.allSettled(targets.map((job) => dismissJob(job.id)))
+      const failures: DismissFailure[] = []
+      let succeeded = 0
+      results.forEach((result, i) => {
+        const job = targets[i]
+        if (result.status === 'fulfilled') succeeded += 1
+        else failures.push({ rel_path: job.rel_path, name: itemName(job.rel_path), error: errorMessage(result.reason) })
+      })
+      setDismissOutcome({ total: targets.length, succeeded, failures })
+      refresh()
+    } finally {
+      setClearingAll(false)
+    }
   }
 
   const drawerNodes = drawerJob ? (nodesByQueue.get(drawerJob.queue_id) ?? []) : []
@@ -292,6 +367,58 @@ export function TransfersPage() {
         </p>
       )}
 
+      {/* "Clear all failed" (2026-08-13) -- the bulk counterpart to each row's own Dismiss
+       * button; see `handleClearAllFailed`'s docstring for why this is scoped to `failed`
+       * only. Only shown once there's something to clear. */}
+      {failedJobs.length > 0 && (
+        <div className="flex items-center justify-between gap-2">
+          <span className="text-xs text-zinc-500 dark:text-zinc-400">
+            {failedJobs.length} failed job{failedJobs.length === 1 ? '' : 's'}
+          </span>
+          <button
+            type="button"
+            disabled={clearingAll}
+            onClick={handleClearAllFailed}
+            className="rounded-md border border-zinc-300 px-2.5 py-1.5 text-xs font-medium text-zinc-700 hover:bg-zinc-50 disabled:opacity-50 dark:border-zinc-700 dark:text-zinc-200 dark:hover:bg-zinc-900"
+          >
+            {clearingAll ? 'Clearing…' : 'Clear all failed'}
+          </button>
+        </div>
+      )}
+
+      {dismissOutcome && (
+        <div
+          className={`rounded-md border px-3 py-2 text-sm ${
+            dismissOutcome.failures.length === 0
+              ? 'border-emerald-300 bg-emerald-50 text-emerald-900 dark:border-emerald-900 dark:bg-emerald-950/40 dark:text-emerald-200'
+              : 'border-amber-300 bg-amber-50 text-amber-900 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-200'
+          }`}
+        >
+          <div className="flex items-center justify-between gap-3">
+            <span className="font-medium">
+              Cleared {dismissOutcome.succeeded} of {dismissOutcome.total}
+              {dismissOutcome.failures.length > 0 && `, ${dismissOutcome.failures.length} failed`}
+            </span>
+            <button
+              type="button"
+              onClick={() => setDismissOutcome(null)}
+              className="shrink-0 text-xs underline decoration-dotted"
+            >
+              Dismiss
+            </button>
+          </div>
+          {dismissOutcome.failures.length > 0 && (
+            <ul className="mt-1.5 list-disc space-y-0.5 pl-5 text-xs">
+              {dismissOutcome.failures.map((f) => (
+                <li key={f.rel_path}>
+                  <span className="font-mono">{f.name}</span> — {f.error}
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      )}
+
       {jobs.length > 0 && (
         <div className="overflow-hidden rounded-md border border-zinc-200 dark:border-zinc-800">
           {jobs.map((job) => (
@@ -306,6 +433,7 @@ export function TransfersPage() {
               onStartNow={handleStartNow}
               onStop={handleStop}
               onRetry={handleRetry}
+              onDismiss={handleDismiss}
               busy={busyIds.has(job.id)}
             />
           ))}

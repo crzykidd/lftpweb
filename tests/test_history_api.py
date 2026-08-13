@@ -121,6 +121,29 @@ async def test_succeeded_jobs_are_included_here_unlike_the_transfers_page(db):
     assert resp.jobs[0].bytes_total == 1000
 
 
+async def test_dismissed_job_still_appears_here_with_its_dismissed_at_set(db):
+    """2026-08-13, prompts/done/2026-08-13-dismiss-terminal-jobs.md: dismissing a job on the
+    Transfers page (`core/queue.py.dismiss_job`) only ever sets `job.dismissed_at` -- the row
+    itself, and this endpoint's view of it, must be completely unaffected. `dismissed_at` is
+    surfaced (not just absent-from-Transfers) so History can say *why* a job isn't there.
+    """
+    queue_id = await _make_queue(db)
+    item = await _make_item(db, queue_id, "gone.txt", state="FAILED")
+    job_id = await _make_job(db, item, state="failed", error_class="REMOTE_GONE")
+
+    resp = await history.list_history_jobs(_FakeRequest(db))
+    assert resp.jobs[0].dismissed_at is None
+
+    await db.execute(
+        "UPDATE job SET dismissed_at = '2026-08-13T12:00:00.000000Z' WHERE id = ?", (job_id,)
+    )
+    await db.commit()
+
+    resp = await history.list_history_jobs(_FakeRequest(db))
+    assert len(resp.jobs) == 1
+    assert resp.jobs[0].dismissed_at == "2026-08-13T12:00:00.000000Z"
+
+
 async def test_output_tail_never_appears_in_the_list_payload(db):
     queue_id = await _make_queue(db)
     item = await _make_item(db, queue_id, "bad.txt", state="FAILED")

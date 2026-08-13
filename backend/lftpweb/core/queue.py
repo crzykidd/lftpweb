@@ -45,6 +45,16 @@ PERMANENT_ERROR_CLASSES = frozenset(
     {"AUTH_FAILED", "PERMISSION_DENIED", "REMOTE_GONE", "DISK_FULL"}
 )
 
+
+class JobNotDismissableError(Exception):
+    """Raised by `TransferQueue.dismiss_job` for a `queued`/`running` job (§4.6's active
+    states) -- dismiss is a Transfers-page display action for a job that's already done,
+    never a way to hide an active transfer. The UI never offers the button for these states
+    (`dismiss_job`'s own docstring), but that's a courtesy, not the guard -- rejecting it here
+    too is what makes it impossible, not merely unusual, matching the task's own instruction.
+    """
+
+
 # Live per-file progress inside a mirroring directory (see `_publish_child_progress`), tuned
 # separately from the ~1 Hz `tick_s` cadence everything else in this module runs at:
 #
@@ -456,6 +466,43 @@ class TransferQueue:
         from the *automatic* retry in `_reap_one`, which increments `attempt` instead.
         """
         return await self.enqueue_item(item_id)
+
+    async def dismiss_job(self, job_id: int) -> None:
+        """Dismiss a terminal job from the Transfers page (2026-08-13,
+        prompts/done/2026-08-13-dismiss-terminal-jobs.md) — user report: they deleted files on
+        the seedbox mid-transfer, the job failed `REMOTE_GONE`, and Retry was the *only*
+        available action, which is exactly wrong when the remote files are genuinely gone.
+
+        **Dismiss, not delete.** This only ever sets `job.dismissed_at`, which `list_jobs()`
+        checks — the row itself is untouched, so `api/history.py` (reading the same table)
+        keeps showing it. Deleting the row would erase the record of what happened, the
+        opposite of what History exists for.
+
+        **Only a terminal job** (`failed`/`cancelled`) can be dismissed — `queued`/`running`
+        raises `JobNotDismissableError` rather than silently no-opping, so a client that races
+        a dismiss against a job starting gets a real error instead of an inconsistent-looking
+        success. The Transfers page only ever offers the button on a terminal row, but that's
+        a courtesy; this is the guard.
+
+        **Deliberately does not touch `item.state` or `item.auto_queue_suppressed`/
+        `suppressed_reason`.** This is a display action about the *job* row, not a decision
+        about the *item* — the item's suppression (§4.6) is correct and load-bearing exactly
+        as it stands: a `REMOTE_GONE` item is suppressed with `suppressed_reason =
+        'permanent_error'` precisely so auto-queue never picks it back up, and dismissing the
+        dead job from view must not silently undo that. The obvious next "improvement" is to
+        have dismiss also clear suppression — don't; that path already exists and is called
+        Retry (`retry_item` above, "always wins, clears suppression, resets `attempt`"), which
+        is the deliberate, visible way to say "actually, try again."
+        """
+        row = await self._fetch_job(job_id)
+        if row is None:
+            raise ValueError(f"job {job_id} not found")
+        if row["state"] not in ("failed", "cancelled"):
+            raise JobNotDismissableError(
+                f"job {job_id} is {row['state']!r}; only a failed or cancelled job can be dismissed"
+            )
+        await self.db.execute("UPDATE job SET dismissed_at = ? WHERE id = ?", (_now_iso(), job_id))
+        await self.db.commit()
 
     async def _item_is_settled(self, queue_id: int, rel_path: str) -> bool:
         """The completion half of the settle gate (prompts/open-issues.md #2,
@@ -1296,6 +1343,12 @@ class TransferQueue:
         which is already covered by the first clause and makes the old failed/cancelled row
         irrelevant (superseded), so this doesn't need to filter it out separately.
 
+        A terminal job whose `dismissed_at` is set (2026-08-13, `dismiss_job` above) is
+        excluded here too — dismissal is exactly "stop counting this as the item's visible
+        row," the same effect a fresh retry already has, just without creating one. Nothing
+        else reads `dismissed_at`: `api/history.py` has no such filter, by design, so a
+        dismissed job stays visible there.
+
         Also joins `path_queue` for `queue_name` (DESIGN.md §9.2: with multiple active
         queues, a Transfers-page row has to say which one it's from). This row set is
         bounded by construction (the docstring above), unlike `api/history.py`'s unbounded,
@@ -1310,6 +1363,7 @@ class TransferQueue:
             "JOIN path_queue ON path_queue.id = item.queue_id "
             "WHERE job.state IN ('queued','running') "
             "   OR (job.state IN ('failed','cancelled') "
+            "       AND job.dismissed_at IS NULL "
             "       AND job.id = (SELECT MAX(j2.id) FROM job j2 WHERE j2.item_id = job.item_id)) "
             "ORDER BY job.rank DESC, job.queued_at ASC"
         )

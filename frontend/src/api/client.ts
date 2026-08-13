@@ -230,6 +230,15 @@ export function moveJobToTop(jobId: number): Promise<void> {
   return sendJson<void>(`/api/jobs/${jobId}/move-to-top`, 'POST')
 }
 
+/** Dismiss a terminal (`failed`/`cancelled`) job from the Transfers page (2026-08-13,
+ * prompts/done/2026-08-13-dismiss-terminal-jobs.md) -- the row's own record stays in History;
+ * this only stops it showing here. Rejects (non-2xx, `sendJson` throws) for a `queued`/
+ * `running` job -- see `core/queue.py.dismiss_job`.
+ */
+export function dismissJob(jobId: number): Promise<void> {
+  return sendJson<void>(`/api/jobs/${jobId}/dismiss`, 'POST')
+}
+
 export function startJobNow(jobId: number): Promise<{ applied: boolean }> {
   return sendJson<{ applied: boolean }>(`/api/jobs/${jobId}/start-now`, 'POST')
 }

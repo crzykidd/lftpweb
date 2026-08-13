@@ -90,6 +90,18 @@ function JobRow({ job }: { job: HistoryJobOut }) {
         {job.attempt > 1 && (
           <span className="shrink-0 text-xs text-zinc-500 dark:text-zinc-400">attempt {job.attempt}</span>
         )}
+        {/* Dismissed from Transfers (2026-08-13, prompts/done/2026-08-13-dismiss-terminal-jobs.md)
+         * -- this row is still here (dismissal never touches this table), it just no longer
+         * shows on the Transfers page. Worth a quiet marker: without it, "why did this
+         * disappear from Transfers" has no answer on the one page that could give it one. */}
+        {job.dismissed_at && (
+          <span
+            className="shrink-0 rounded bg-zinc-100 px-1.5 py-0.5 text-[11px] font-medium text-zinc-500 dark:bg-zinc-800 dark:text-zinc-400"
+            title={`Dismissed from Transfers ${formatTs(job.dismissed_at)}`}
+          >
+            dismissed
+          </span>
+        )}
         <span className="w-20 shrink-0 text-right text-zinc-500 dark:text-zinc-400">
           {job.bytes_total != null ? formatBytes(job.bytes_total) : '—'}
         </span>

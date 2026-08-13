@@ -19,7 +19,7 @@ import aiosqlite
 import pytest
 
 from lftpweb.core.events import EventBus
-from lftpweb.core.queue import TransferQueue
+from lftpweb.core.queue import JobNotDismissableError, TransferQueue
 from lftpweb.db import migrate
 
 
@@ -188,3 +188,113 @@ async def test_publish_item_state_missing_item_is_a_no_op(db):
     subscription = q.events.subscribe()
     await q._publish_item_state(999999)  # noqa: SLF001
     assert subscription.empty()
+
+
+# --- dismiss_job: display-only, terminal-only (2026-08-13,
+# prompts/done/2026-08-13-dismiss-terminal-jobs.md) -------------------------------------------
+
+
+async def test_dismiss_job_removes_a_failed_row_from_list_jobs(db):
+    queue_id = await _make_queue(db)
+    item = await _make_item(db, queue_id, "gone.txt", state="FAILED")
+    job_id = await _make_job(db, item, state="failed")
+
+    q = _queue(db)
+    await q.dismiss_job(job_id)
+
+    assert await q.list_jobs() == []
+
+
+async def test_dismiss_job_removes_a_cancelled_row_from_list_jobs(db):
+    queue_id = await _make_queue(db)
+    item = await _make_item(db, queue_id, "stopped.txt", state="STOPPED")
+    job_id = await _make_job(db, item, state="cancelled")
+
+    q = _queue(db)
+    await q.dismiss_job(job_id)
+
+    assert await q.list_jobs() == []
+
+
+async def test_dismiss_job_rejects_a_queued_job(db):
+    queue_id = await _make_queue(db)
+    item = await _make_item(db, queue_id, "a.txt")
+    job_id = await _make_job(db, item, state="queued")
+
+    q = _queue(db)
+    with pytest.raises(JobNotDismissableError):
+        await q.dismiss_job(job_id)
+    # Rejected, not silently ignored -- still visible afterward.
+    assert len(await q.list_jobs()) == 1
+
+
+async def test_dismiss_job_rejects_a_running_job(db):
+    queue_id = await _make_queue(db)
+    item = await _make_item(db, queue_id, "a.txt", state="DOWNLOADING")
+    job_id = await _make_job(db, item, state="running")
+
+    q = _queue(db)
+    with pytest.raises(JobNotDismissableError):
+        await q.dismiss_job(job_id)
+    assert len(await q.list_jobs()) == 1
+
+
+async def test_dismiss_job_unknown_id_raises_value_error(db):
+    with pytest.raises(ValueError, match="not found"):
+        await _queue(db).dismiss_job(999999)
+
+
+async def test_dismiss_job_does_not_touch_item_state_or_suppression(db):
+    """The load-bearing guarantee (task's own wording): dismiss is a display action about the
+    job row, never a decision about the item. A REMOTE_GONE item's suppression must survive a
+    dismiss untouched -- undoing it here would silently re-enable auto-queue for an item whose
+    remote is actually gone.
+    """
+    queue_id = await _make_queue(db)
+    item = await _make_item(db, queue_id, "remote-gone.txt", state="FAILED")
+    job_id = await _make_job(db, item, state="failed")
+    await db.execute(
+        "UPDATE item SET auto_queue_suppressed = 1, suppressed_reason = 'permanent_error', "
+        "error_class = 'REMOTE_GONE' WHERE id = ?",
+        (item,),
+    )
+    await db.commit()
+
+    await _queue(db).dismiss_job(job_id)
+
+    row = await (
+        await db.execute(
+            "SELECT state, auto_queue_suppressed, suppressed_reason, error_class FROM item WHERE id = ?",
+            (item,),
+        )
+    ).fetchone()
+    assert row["state"] == "FAILED"
+    assert row["auto_queue_suppressed"] == 1
+    assert row["suppressed_reason"] == "permanent_error"
+    assert row["error_class"] == "REMOTE_GONE"
+
+
+async def test_retry_after_dismiss_produces_a_fresh_job_visible_again(db):
+    queue_id = await _make_queue(db)
+    item = await _make_item(db, queue_id, "retry-me.txt", state="FAILED")
+    job_id = await _make_job(db, item, state="failed")
+
+    q = _queue(db)
+    await q.dismiss_job(job_id)
+    assert await q.list_jobs() == []
+
+    new_job_id = await q.retry_item(item)
+
+    jobs = await q.list_jobs()
+    assert len(jobs) == 1
+    assert jobs[0]["id"] == new_job_id
+    assert jobs[0]["state"] == "queued"
+    # Retry clears suppression regardless of the dismiss that preceded it (unchanged
+    # behaviour -- enqueue_item's own contract) -- this is the "actually, try again" path.
+    item_row = await (
+        await db.execute(
+            "SELECT auto_queue_suppressed, suppressed_reason FROM item WHERE id = ?", (item,)
+        )
+    ).fetchone()
+    assert item_row["auto_queue_suppressed"] == 0
+    assert item_row["suppressed_reason"] is None

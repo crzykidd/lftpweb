@@ -62,6 +62,7 @@ PROTECTED_ROUTE_TEMPLATES: list[tuple[str, str]] = [
     ("GET", "/api/jobs"),
     ("POST", "/api/jobs"),
     ("POST", "/api/jobs/{job_id}/stop"),
+    ("POST", "/api/jobs/{job_id}/dismiss"),
     ("POST", "/api/jobs/{job_id}/move-to-top"),
     ("POST", "/api/jobs/{job_id}/start-now"),
     ("POST", "/api/items/{item_id}/stop"),

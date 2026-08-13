@@ -569,6 +569,12 @@ class HistoryJobOut(BaseModel):
     exit_code: int | None
     error_class: str | None
     has_output_tail: bool
+    # Migration 016 (2026-08-13, prompts/done/2026-08-13-dismiss-terminal-jobs.md): when this
+    # job was dismissed from the Transfers page, or `None` if it never was / is still active.
+    # History shows every terminal job regardless -- dismissal only ever hides a row from
+    # Transfers -- but surfacing it here answers "did I dismiss this, or did it just age off
+    # the other page" without making the row set itself conditional on the answer.
+    dismissed_at: str | None
 
 
 class HistoryJobsResponse(BaseModel):

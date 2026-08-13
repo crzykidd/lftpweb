@@ -455,6 +455,19 @@ alongside this list: several entries below ship with deliberate, documented limi
   **not** preserve any queue's pre-upgrade *effective* value — every existing queue's four
   toggles are simply set to inherit — since nothing has shipped yet and there is exactly one
   install to consider (see `docs/decisions.md`).
+- **A failed or stopped job on the Transfers page can now be dismissed instead of only
+  retried** *(2026-08-13)*. User report: they deleted files on the seedbox mid-transfer, the
+  job failed `REMOTE_GONE`, and Retry was the only button — exactly the wrong action once the
+  remote files are genuinely gone. Migration 016 adds `job.dismissed_at`; `list_jobs()` (the
+  Transfers-page row set) excludes a terminal job once it's set, while `GET /api/history/jobs`
+  keeps showing it, with the timestamp, since dismissal never touches the row itself — deleting
+  it would have erased the record of what happened, the opposite of what History exists for.
+  Deliberately does **not** touch the item's own state or `auto_queue_suppressed`/
+  `suppressed_reason` — a `REMOTE_GONE` item's permanent-error suppression is correct and must
+  survive a dismiss untouched; the "actually, try again" path is still Retry, which already
+  clears suppression on its own. A `queued`/`running` job can't be dismissed (409, not a
+  silent no-op). **Clear all failed** dismisses every currently-failed row in one action,
+  reporting partial failure honestly the same way the Files page's bulk actions do.
 
 ### Fixed
 

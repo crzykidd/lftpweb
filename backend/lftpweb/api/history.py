@@ -67,6 +67,7 @@ def _job_out(row: Any) -> HistoryJobOut:
         exit_code=row["exit_code"],
         error_class=row["error_class"],
         has_output_tail=row["output_tail"] is not None,
+        dismissed_at=row["dismissed_at"],
     )
 
 
@@ -133,7 +134,7 @@ async def list_history_jobs(
         "SELECT job.id, job.item_id, item.queue_id, path_queue.name AS queue_name, "
         "item.rel_path, item.is_dir, job.kind, job.state, job.attempt, job.queued_at, "
         "job.started_at, job.finished_at, item.remote_size AS bytes_total, job.bytes_done, "
-        "job.exit_code, job.error_class, job.output_tail "
+        "job.exit_code, job.error_class, job.output_tail, job.dismissed_at "
         "FROM job "
         "JOIN item ON item.id = job.item_id "
         "JOIN path_queue ON path_queue.id = item.queue_id "

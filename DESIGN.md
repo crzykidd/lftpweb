@@ -1669,6 +1669,17 @@ Some.Release.S03E04.2160p    [downloading]   18 files   62%   4.1 MB/s   ETA 12m
 - **Start now at max bandwidth** as a per-row action, with its oversubscription behavior
   explained inline the first time it's used.
 - Failures show the error class plus the captured lftp output tail.
+- **Dismiss**, on a `failed`/`cancelled` row (2026-08-13) — a display-only action that stops
+  the row showing on this page (`job.dismissed_at`) without deleting the `job` row or touching
+  the item's own state/suppression. Added after a user hit a `REMOTE_GONE` failure — the
+  remote files were genuinely gone, and Retry was the only action this page offered, which is
+  exactly wrong for that case. History (below) keeps showing a dismissed job regardless — it
+  reads the same table and dismissal was never meant to erase what happened, only to declutter
+  this page. **Clear all failed** dismisses every currently-`failed` row in one action
+  (`Promise.allSettled`, honest about partial failure the same way the Files page's bulk
+  actions already are) — scoped to `failed` only, not `cancelled`, since a stopped job is a
+  deliberate Stop click, not the kind of unattended pile-up a permanent-error class like
+  `REMOTE_GONE` can become. No confirmation dialog on either: nothing is destroyed.
 
 **Item drawer.** A **side drawer** — not a modal, because file lists get long and the queue
 should stay visible — listing the files inside that item: name, size, transferred, per-file
@@ -1695,7 +1706,9 @@ eagerly for a tree.
 filterable by state, error class, date range, and event kind. This is where remote deletes are
 reviewed, so it must render the delete audit trail (§7.3) legibly — what was deleted, from
 which queue, under which mode, and what gated it. The only view that answers "what did it
-remove last night".
+remove last night". A row a Transfers-page Dismiss removed from that page still shows here
+(same table, dismissal is display-only) with a quiet **dismissed** marker — worth surfacing,
+since it's the only page that can answer "why is this no longer on Transfers."
 
 **Dashboard** — throughput over time, from the sample store in §10.4: bytes moved per hour over
 the last 24 h, broken down by queue with a site total, and speed over a selectable 1 h / 12 h /

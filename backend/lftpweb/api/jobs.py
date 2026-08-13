@@ -14,7 +14,12 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Request
 
 from lftpweb.core import audit, local_delete
-from lftpweb.core.queue import TransferSettings, load_transfer_settings, save_transfer_settings
+from lftpweb.core.queue import (
+    JobNotDismissableError,
+    TransferSettings,
+    load_transfer_settings,
+    save_transfer_settings,
+)
 from lftpweb.models import (
     DeleteItemResponse,
     JobOut,
@@ -124,6 +129,27 @@ async def stop_job(job_id: int, request: Request) -> None:
         await request.app.state.queue.stop_job(job_id)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.post("/api/jobs/{job_id}/dismiss", status_code=204)
+async def dismiss_job(job_id: int, request: Request) -> None:
+    """Dismiss a terminal (`failed`/`cancelled`) job from the Transfers page (2026-08-13,
+    prompts/done/2026-08-13-dismiss-terminal-jobs.md) — the user's own report: a `REMOTE_GONE`
+    failure had Retry as its only action, which is exactly the wrong one once the remote files
+    are actually gone. See `core/queue.py.dismiss_job`'s own docstring for what this does and
+    deliberately does not touch (the job row's `dismissed_at`, never `item.state` or its
+    suppression).
+
+    A `queued`/`running` job is a 409, not a 404 — the job exists, the request just isn't
+    valid for its current state, same distinction `delete_item`'s withheld-guard 409 draws
+    above.
+    """
+    try:
+        await request.app.state.queue.dismiss_job(job_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except JobNotDismissableError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @router.post("/api/jobs/{job_id}/move-to-top", status_code=204)

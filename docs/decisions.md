@@ -6,6 +6,63 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-13 — Dismissing a terminal job: display marker, not deletion, and never touches
+## item suppression
+
+**Handoff prompt `prompts/done/2026-08-13-dismiss-terminal-jobs.md`, executed end to end.**
+User report from live testing: they deleted a set of files on the seedbox mid-transfer, the job
+failed `REMOTE_GONE`, and the only action the Transfers page offered was Retry — exactly the
+wrong one, since the remote files really are gone.
+
+**Decision: dismiss, don't delete.** `api/history.py` reads the same `job` table `core/queue.py.
+list_jobs()` does — deleting the row to make it stop showing on Transfers would have erased the
+one place a completed/failed/cancelled transfer's record is meant to live. Instead, migration
+016 adds a nullable `job.dismissed_at` (a plain `ADD COLUMN`, no table rebuild — see below);
+`list_jobs()` excludes a terminal job once it's set, `list_history_jobs()` doesn't filter on it
+at all, so a dismissed job stays fully visible there, now with the timestamp of when it was
+dismissed.
+
+**Decision: History *does* indicate dismissal.** Considered leaving `dismissed_at` off the
+`HistoryJobOut` wire shape entirely — arguably noise, since History's whole domain is terminal
+jobs and "dismissed" adds a state nobody filters by. Decided against: without it, "why is this
+job gone from Transfers" has no answer anywhere in the app once it's happened — the row just
+looks like it aged off, no different from any other Transfers-page churn. A quiet `dismissed`
+tag next to the state chip (`HistoryJobsSection.tsx`) costs one column and answers a real
+question without adding a new filter, sort key, or state machine.
+
+**Decision: dismissal must never touch `item.state` or `auto_queue_suppressed`/
+`suppressed_reason`.** This was the task's own load-bearing instruction, restated here because
+it's the trap: a `REMOTE_GONE` item is suppressed with `suppressed_reason = 'permanent_error'`
+specifically so auto-queue never re-fetches it, and the obvious next "improvement" to dismiss is
+to have it also clear suppression (since the row is going away from view, doesn't it make sense
+to also stop nagging about it?). It doesn't — that path already exists and is called Retry
+(`enqueue_item`: "always wins, clears suppression, resets `attempt`"), and folding it into
+Dismiss would silently re-enable auto-queue for an item whose remote copy is actually gone, with
+no separate user action to blame it on. `core/queue.py.dismiss_job` and its migration both carry
+this as an explicit code comment for exactly this reason.
+
+**Decision: reject, not no-op, for a `queued`/`running` job.** `dismiss_job` raises a dedicated
+`JobNotDismissableError` (409 at the API layer) rather than silently doing nothing — the task's
+own instruction was "impossible, not merely unusual." The Transfers page never offers the button
+outside `failed`/`cancelled` rows, but that's a courtesy; the guard is server-side so a raced
+request (job starts between page load and the click) gets a real error instead of a
+misleadingly-successful-looking response.
+
+**Decision: "Clear all failed" is scoped to `failed`, not `cancelled` too**, even though the
+per-row Dismiss button covers both terminal states. A `cancelled` job is the result of a
+deliberate Stop click — not the kind of unattended pile-up a permanent-error class like
+`REMOTE_GONE` becomes, which is what the user's report was actually about. Individually
+dismissible either way; just not swept in bulk.
+
+**Migration 016 is a plain `ADD COLUMN`, not a rebuild.** `3500b3f` (the previous session) found
+a real bug where a table rebuild with `PRAGMA foreign_keys = ON` cascade-deletes its children,
+and `db.py.migrate()` now disables FKs for the whole pending migration batch as a result. A
+nullable `job.dismissed_at` needs no `NOT NULL`/`CHECK` widening and no FK change, so it follows
+migration 009's precedent instead (per-queue `scan_interval_s`) and never raises the question the
+015/`3500b3f` fix exists to answer.
+
+---
+
 ## 2026-08-13 — Post-processing toggles: inherit-or-override replaces the AND, a simpler
 ## (not behaviour-preserving) migration, and a latent table-rebuild cascade-delete bug found
 ## and fixed along the way
