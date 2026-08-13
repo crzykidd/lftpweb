@@ -70,12 +70,41 @@ side effect of shipping.
 
 ## Where we are
 
-> **Read `prompts/open-issues.md` first.** The 2026-08-12/13 overnight session closed sixteen
-> issues across nine commits, and that file carries the reasoning — including one fix that was
-> shipped and then deliberately reversed the same night. Several statements further down this
-> file predate it.
+> **Read `prompts/open-issues.md` first.** The 2026-08-12/13 session closed every issue raised
+> across **sixteen commits**, and that file carries the reasoning — including one fix that was
+> shipped and then deliberately reversed the same night, and one thing the orchestrating
+> session asserted that turned out to be false. Several statements further down this file
+> predate it.
 
-### 2026-08-12/13 overnight session — sixteen issues, nine commits, all pushed and CI-green
+### The four commits after the first push (2026-08-13, unpushed as of session end)
+
+`4533617` … `cad5891` continued past the nine below and are **committed on `dev` but NOT
+pushed** — the user asked for local-only commits overnight. `git log origin/dev..dev` shows
+exactly what is waiting. CI has not seen them.
+
+| Commit | What |
+|---|---|
+| `4533617` | Archive volumes optionally deleted after extraction (default off) without breaking completeness — reuses §4.7's `EXCLUDED` seam via a `deleted_archive` table, so the naive infinite-re-download trap is avoided |
+| `b39158e` | A local delete marks its **whole subtree**, and picks `REMOVED_LOCAL` vs `REMOVED_BOTH` **per row** from whether a remote copy survives |
+| `56ec523` | A `move`-mode outcome survives the rescan that finds it `LOCAL_ONLY`; also fixes items that leave **both** trees freezing forever |
+| `8a54475` | Files row revamp — R/L/V/E lifecycle icons, inline progress bars, sorting, persisted collapse preference, "Missing only" filter |
+| `de85753` | Item detail drawer reachable from Files — `local_mtime` (migration 011), lifecycle chronology, bounded per-item history |
+| `cad5891` | The `DESIGN.md` wording backlog applied, plus three long-standing untruths corrected |
+
+**Tests 489 → 701.** Migrations now run to **011**. Both lint gates, `npm run build`, and all
+three compose files clean at session end.
+
+**Three things a fresh session must not undo:**
+
+1. **The real RAR fixtures in `tests/test_postprocess.py` are hand-built valid archives**,
+   cross-validated against a desktop 7-Zip. Fake fixtures are exactly why rar extraction was
+   broken for nine phases. Do not "simplify" them.
+2. **Presence icons read the world; milestone icons read timestamps.** `core/itemview.py`'s
+   facets depend on that split. Collapsing it back into one notion reinstates the bug class.
+3. **`REMOVED_LOCAL` is excluded from `ELIGIBLE_STATES` on purpose.** It looks like an
+   oversight. It is the safety mechanism. See `prompts/open-issues.md`.
+
+### 2026-08-12/13 overnight session — sixteen issues, all pushed and CI-green through `a6741ba`
 
 The user drove this one from a running instance: they used the app, reported what looked
 wrong, and each report became a handoff prompt executed by a spawned agent. **Tests went
