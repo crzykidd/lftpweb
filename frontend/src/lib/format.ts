@@ -42,6 +42,71 @@ export function formatPercent(done: number | null, total: number | null): string
   return value == null ? '—' : `${value}%`
 }
 
+// Both-sides panels (2026-08-13, prompts/2026-08-13-both-sides-hover-card.md): `ItemDrawer.tsx`'s
+// `SideBySideDetails` grid and `FileTree.tsx`'s row hover card both need "size / modified,
+// remote vs. local" as label/value triples for the same item. This project has been bitten
+// three separate times by exactly this shape of duplication (column widths declared twice in
+// `FileTree.tsx` before `2026-08-13-resizable-file-columns.md`'s fix, an item projection
+// hand-copied into four publishers, `_LOCAL_CONTENT_ASSERTED_STATES` forked from
+// `mount_sentinel.COMPLETE_STATES`) -- a tooltip and a drawer independently formatting the same
+// numbers would disagree eventually. One function, shared by both.
+
+interface BothSidesFields {
+  is_dir: boolean
+  remote_size: number | null
+  local_size: number | null
+  remote_mtime: number | null
+  local_mtime: number | null
+}
+
+export interface BothSidesRow {
+  label: string
+  remote: string
+  local: string
+}
+
+function formatMtimeSide(epochSeconds: number | null): string {
+  return epochSeconds != null ? new Date(epochSeconds * 1000).toLocaleString() : '—'
+}
+
+/** Label/remote/local triples: Size always, Modified only for a file. **A directory gets no
+ * Modified row at all** -- not one reading `—` -- because `remote_mtime`/`local_mtime` are
+ * files-only by deliberate convention (`core/reconcile.py`; `de85753`'s decision entry weighed
+ * and rejected both a directory-inode mtime and a recursive newest-child rollup as answers to a
+ * question the byte-comparison model doesn't ask). A directory never had a Modified value to
+ * report, which is a different fact from "unknown," so the row itself is absent rather than
+ * blank.
+ */
+export function bothSidesRows(entry: BothSidesFields): BothSidesRow[] {
+  const rows: BothSidesRow[] = [
+    {
+      label: 'Size',
+      remote: entry.remote_size != null ? formatBytes(entry.remote_size) : '—',
+      local: entry.local_size != null ? formatBytes(entry.local_size) : '—',
+    },
+  ]
+  if (!entry.is_dir) {
+    rows.push({
+      label: 'Modified',
+      remote: formatMtimeSide(entry.remote_mtime),
+      local: formatMtimeSide(entry.local_mtime),
+    })
+  }
+  return rows
+}
+
+/** Whether both sides have anything to show at all -- `remote_size`/`local_size` null means that
+ * side was never tracked (no remote copy at all, or nothing downloaded yet), not merely an
+ * unknown reading inside an otherwise-populated row. Drives whether `FileTree.tsx`'s hover card
+ * renders two columns or degrades to one labelled column -- a two-column layout with an empty
+ * half reads worse than a single column, per that task's own bar. `ItemDrawer.tsx`'s own grid
+ * keeps rendering two columns unconditionally regardless of this (unchanged): a drawer has the
+ * room for an explicit `—`, a small hover card does not.
+ */
+export function hasBothSides(entry: { remote_size: number | null; local_size: number | null }): boolean {
+  return entry.remote_size != null && entry.local_size != null
+}
+
 // DESIGN.md §4.5/§9.3's Settings -> Transfer fields are stored on the wire as bytes(/s) --
 // nobody should have to type `10000000`. Decimal MB (1,000,000 B), not binary MiB: it's what
 // makes `core/queue.py.TransferSettings`'s own round defaults (10_000_000 bps, 1_000_000 B

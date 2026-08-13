@@ -1,8 +1,8 @@
 import { useVirtualizer } from '@tanstack/react-virtual'
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { Fragment, useEffect, useMemo, useRef, useState } from 'react'
 import { getHistoryEvents, getHistoryJobs } from '../api/client'
 import type { FileNode, HistoryEventOut, HistoryJobOut } from '../api/types'
-import { formatBytes, formatPercent, formatRelativeTimeIntl } from '../lib/format'
+import { bothSidesRows, formatBytes, formatPercent, formatRelativeTimeIntl } from '../lib/format'
 import { StateChip } from './StateChip'
 
 const ROW_HEIGHT_PX = 40
@@ -37,23 +37,18 @@ function filesUnder(nodes: FileNode[], rootRelPath: string): FileNode[] {
     .sort((a, b) => a.rel_path.localeCompare(b.rel_path))
 }
 
-/** "modified," epoch seconds -> a local-time reading, or `—` when this side has none. Both
- * `remote_mtime`/`local_mtime` are files-only (`core/reconcile.py`) -- a directory's own row
- * never carries one, which this renders exactly like any other absent value rather than a
- * special case.
- */
-function formatMtime(epochSeconds: number | null): string {
-  return epochSeconds != null ? new Date(epochSeconds * 1000).toLocaleString() : '—'
-}
-
 /** Both sides, side by side -- the core of the user's own request ("Size, modified date etc.
- * ... for both sides if it exists on both sides"). A local file short of its remote size is
- * called out explicitly (mid-transfer or truncated, per the task's own wording) rather than
- * left for the reader to notice by comparing two numbers themselves.
+ * ... for both sides if it exists on both sides"). Rows come from `lib/format.ts.bothSidesRows`,
+ * shared with `FileTree.tsx`'s row hover card (2026-08-13,
+ * prompts/2026-08-13-both-sides-hover-card.md) so the two surfaces can never quietly disagree
+ * about what these numbers are. A local file short of its remote size is called out explicitly
+ * (mid-transfer or truncated, per the task's own wording) rather than left for the reader to
+ * notice by comparing two numbers themselves.
  */
 function SideBySideDetails({ node }: { node: FileNode }) {
   const { remote_size: remoteSize, local_size: localSize } = node
   const shortfall = remoteSize != null && localSize != null && localSize < remoteSize ? remoteSize - localSize : null
+  const rows = bothSidesRows(node)
 
   return (
     <div className="border-b border-zinc-200 px-4 py-3 text-sm dark:border-zinc-800">
@@ -65,12 +60,13 @@ function SideBySideDetails({ node }: { node: FileNode }) {
         <span className="text-[10px] font-medium tracking-wide text-zinc-500 uppercase dark:text-zinc-400">
           Local
         </span>
-        <span className="text-xs text-zinc-500 dark:text-zinc-400">Size</span>
-        <span>{remoteSize != null ? formatBytes(remoteSize) : '—'}</span>
-        <span>{localSize != null ? formatBytes(localSize) : '—'}</span>
-        <span className="text-xs text-zinc-500 dark:text-zinc-400">Modified</span>
-        <span>{formatMtime(node.remote_mtime)}</span>
-        <span>{formatMtime(node.local_mtime)}</span>
+        {rows.map((row) => (
+          <Fragment key={row.label}>
+            <span className="text-xs text-zinc-500 dark:text-zinc-400">{row.label}</span>
+            <span>{row.remote}</span>
+            <span>{row.local}</span>
+          </Fragment>
+        ))}
       </div>
       {shortfall != null && shortfall > 0 && (
         <p className="mt-2 text-xs text-amber-700 dark:text-amber-400">

@@ -1543,11 +1543,21 @@ state chip already reads (§2.2's one shared projection, never a second read of 
   leaves behind exactly the bytes it was asked to remove under a different name.
 
 **Item detail.** A small info icon on each row — deliberately quieter than the lifecycle icons,
-because it is a control and not a status — opens the item drawer described below. Hovering a row
-shows a lightweight native tooltip with size / modified / percent-complete, composed from fields
-the row already holds; it fetches nothing. The icon exists because the row's own click already
-drives multi-select, which feeds bulk *Delete*, so overloading it would put an information
-affordance and an irreversible one on the same gesture.
+because it is a control and not a status — opens the item drawer described below. The icon exists
+because the row's own click already drives multi-select, which feeds bulk *Delete*, so overloading
+it would put an information affordance and an irreversible one on the same gesture.
+
+Hovering a row's name (or giving it keyboard focus, for anyone not using a pointer) shows a
+lightweight hover card with size and modified date, remote and local side by side — the row's
+name as the header, two columns only when the item actually exists on both sides (a
+`LOCAL_ONLY`/`REMOTE_ONLY`/deleted row degrades to one labelled column rather than showing a
+permanently empty half), and no "Modified" row at all for a directory, since `local_mtime`/
+`remote_mtime` are files-only. It fetches nothing — every field comes from what the row already
+holds — and shares its label/value formatting with the item drawer's own both-sides panel below
+(`lib/format.ts.bothSidesRows`) so the two surfaces can never disagree about what these numbers
+mean. The card is portal-rendered, not a child of the row (the row can scroll out of the
+virtualized list, or unmount, while it's showing), hides on any scroll, and never intercepts a
+click meant for the row, a sort header, or a column resize handle.
 
 **Transfers** — the job queue. Rows stay deliberately plain:
 

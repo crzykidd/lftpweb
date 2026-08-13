@@ -6,6 +6,101 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-13 — A portal-rendered hover card replaces the native tooltip, sharing its formatter
+## with the item drawer rather than growing a second one
+
+**Handoff prompt `prompts/2026-08-13-both-sides-hover-card.md`, executed end to end.** The
+user's own words: "on the tool tip for a file or directory I like.. but if the file or dir
+exists on both sides remote and local... the popup should have the file name and then 2 columns
+remote and local showing the details." A native `title` attribute can't do columns, styling, or
+its own timing — `FileTree.tsx.Row`'s name span now anchors a real component instead.
+
+**One formatter, not two.** `lib/format.ts.bothSidesRows(entry)` returns label/remote/local
+triples (Size always; Modified only for a file — see below) and now backs both the new hover
+card and `ItemDrawer.tsx`'s pre-existing `SideBySideDetails` panel (`de85753`), which previously
+built its own inline grid from `remote_size`/`local_size`/`remote_mtime`/`local_mtime` directly.
+This project has been bitten by exactly this duplication shape three separate times already
+(`FileTree.tsx` column widths declared in both the header and the row before
+`2026-08-13-resizable-file-columns.md`'s fix; an item projection hand-copied into four
+publishers; `_LOCAL_CONTENT_ASSERTED_STATES` forked from `mount_sentinel.COMPLETE_STATES`) — a
+tooltip and a drawer independently formatting the same numbers would disagree eventually, not
+immediately, which is the worse failure mode. A second function, `hasBothSides`, decides
+whether a caller has anything to show on both sides at all; only the hover card uses it
+(`ItemDrawer.tsx`'s grid keeps its own unconditional two columns, unchanged — a drawer has room
+for an explicit `—`, a small hover card does not).
+
+**Two columns only when both sides exist; a directory never gets a Modified row.** Gated on
+`remote_size`/`local_size` both being non-null, mirroring the existing `hasRemoteCopy` reading
+elsewhere in `FileTree.tsx` rather than reaching for `facets` — the concern here is "would a
+column be permanently empty," which is exactly what a null size answers, and `LOCAL_ONLY`/
+`REMOTE_ONLY`/a deleted item all read correctly off it with no special-casing. `bothSidesRows`
+omits the Modified row outright for `is_dir`, not a `—` one — `remote_mtime`/`local_mtime` stay
+files-only by the convention `de85753` already established and reasoned through (a directory
+inode's own mtime and a recursive newest-child rollup were both considered and rejected there);
+this task invents nothing new on that question, just reuses the existing rule at a second call
+site.
+
+**Native `title` removed outright, not kept alongside the card.** Both are individually
+defensible — `title` is the only tooltip that works before hydration and reaches contexts a
+portal can't — but leaving both wired to the same element means a long-enough hover shows the
+browser's own delayed tooltip *and* this card at once, which the task's own bar ruled out
+explicitly ("what is not defensible is both firing at once"). This is a hydrated SPA with no
+meaningful pre-JS content to begin with, so the fallback `title` would have bought was thin;
+`ItemDrawer.tsx`'s info-icon route (a real, always-present button) remains the actual
+pre-hydration/no-JS/touch-safe path, unchanged.
+
+**The card is driven by an imperative ref, not by state lifted into `FileTree`.** A `useState`
+living in `FileTree` (or passed down as a changing prop) would re-render every currently-mounted
+row on every show/hide — exactly the "re-render the tree to show it" the task's own bar ruled
+out, and expensive at the row counts this page can hit. Instead, `HoverCardHost` — mounted once,
+as a sibling of the virtualized row list, not inside it — owns the only piece of state (`open`)
+and hands out a stable `HoverCardHandle` (`requestShow`/`requestHide`/`cancelIfAnchor`) through a
+`useRef` that every `Row` reads. A show/hide only ever re-renders `HoverCardHost` itself and the
+portal it draws into `document.body`; `FileTree` and every other row are untouched. Show has a
+400ms delay (skipped for keyboard focus, an explicit request); hide has a 150ms delay so a
+pointer passing briefly off the row into the small gap before the card itself doesn't flicker it
+shut, except where it must be immediate (keyboard blur, any scroll, the anchor row unmounting).
+
+**`cancelIfAnchor`, called from every row's own unmount cleanup, is what keeps a stale card from
+surviving its anchor.** The virtualizer unmounts rows constantly as they scroll past the
+overscan window — a hovering pointer does not stop that. Every `Row`'s cleanup calls it
+unconditionally regardless of whether that row was ever actually the open card's anchor (a cheap
+no-op otherwise), which is the one place guaranteed to run before a recycled DOM slot could show
+a card that no longer belongs to what's now rendered there. A capturing `scroll` listener on
+`window` (scroll events don't bubble, but a capture-phase listener still sees them on the way
+down to the target) closes the card immediately on any scroll — the row list's own container or
+otherwise — as a second, independent guard against the same class of problem.
+
+**Positioning is a two-pass measure-then-place, not a guess.** `HoverCardContent` paints first
+at `opacity: 0` so `useLayoutEffect` can read its real rendered size off `cardRef`, then places
+it against `anchorEl.getBoundingClientRect()` — flipping above the row when there isn't room
+below, and clamping both axes into the viewport with an 8px margin — before revealing it. This
+avoids a visible jump from a guessed position to the real one, at the cost of one extra layout
+pass; not measured against a real browser (no UI access in this environment — see the closing
+note below).
+
+**The card is `pointer-events: none`.** It shows read-only text with nothing to click, so making
+it inert is a stronger guarantee against swallowing a click meant for the row, a sort header, or
+a column resize handle (`a4a626d`) than relying on z-index or bounds-checking to keep it out of
+the way — the task's own bar called this out explicitly as something to get right.
+
+**`DESIGN.md` §9.2's "Item detail" paragraph was rewritten**, not appended to: it described the
+native-tooltip behaviour this task replaces, so it now describes the card directly (two-column
+gating, the directory Modified omission, the shared formatter, and the portal/scroll/unmount
+mechanics) rather than carrying stale wording alongside new.
+
+**No new frontend dependency** — `createPortal` comes from `react-dom`, already a direct
+dependency; the positioning, timers, and anchor-tracking are hand-rolled, consistent with this
+project having added exactly one frontend dependency since phase 1.
+
+**Not verified against a real browser.** This environment has no UI access, so the show/hide
+delays, the flip/clamp positioning, and whether two columns genuinely read better than the
+tooltip's previous three lines are all reasoned defaults, not confirmed outcomes — flagged here
+per the task's own instruction to say so plainly rather than imply visual confidence that
+doesn't exist.
+
+---
+
 ## 2026-08-13 — Deleting mid-transfer: the active-job guard became an ordering requirement, not a removal
 
 **Handoff prompt `prompts/2026-08-13-delete-during-transfer.md`, executed end to end.** The

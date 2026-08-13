@@ -339,6 +339,22 @@ alongside this list: several entries below ship with deliberate, documented limi
   The resulting row always reads `suppressed_reason = 'deleted_local'`, never the stop path's
   own `user_stopped`, and — like every delete this codebase performs — is never re-queued by
   auto-queue, regardless of the `re_download_externally_removed` setting.
+- **The Files-tree row hover now shows size and modified date side by side, remote and local,
+  instead of a plain-text tooltip** *(2026-08-13)*. The previous hover was a native `title`
+  attribute — one line of text, no columns, no styling. It is now a small portal-rendered card
+  anchored to the row's name, positioned in the viewport (flipping above/below and clamped
+  horizontally so it can never run off-screen), shown after a brief hover delay or immediately
+  on keyboard focus of the row's name, and hidden immediately on any scroll or the instant the
+  underlying row scrolls out of the virtualized list. Two columns only when the item exists on
+  both sides; a `LOCAL_ONLY`/`REMOTE_ONLY`/deleted row degrades to one labelled column rather
+  than showing a permanently empty half. A directory shows no "Modified" row at all —
+  `local_mtime`/`remote_mtime` are files-only by existing convention (`de85753`), not something
+  to invent for a directory. The card is `pointer-events: none` and never intercepts a click
+  meant for the row, a sort header, or a column resize handle. The native `title` is removed
+  outright rather than kept alongside the card, so the two can never fire on the same hover. New
+  shared helper, `lib/format.ts.bothSidesRows`, now backs both this card and `ItemDrawer.tsx`'s
+  own both-sides panel, so the two surfaces can never independently drift on what these numbers
+  mean.
 
 ### Changed
 

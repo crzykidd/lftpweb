@@ -1,11 +1,14 @@
 import { useVirtualizer } from '@tanstack/react-virtual'
 import type { CSSProperties, KeyboardEvent as ReactKeyboardEvent, PointerEvent as ReactPointerEvent, RefObject } from 'react'
-import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react'
+import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useReducer, useRef, useState } from 'react'
+import { createPortal } from 'react-dom'
 import { deleteItem, getSettleSettings, queueItem, stopItem } from '../api/client'
 import type { FileNode, SettleSettingsOut } from '../api/types'
 import {
+  bothSidesRows,
   formatBytes,
   formatPercent,
+  hasBothSides,
   percentValue,
   settleWaitLabel,
   settleWaitShortLabel,
@@ -396,26 +399,210 @@ function stateProgressPercent(node: FileNode): number | null {
   return percentValue(node.local_size, node.remote_size)
 }
 
-/** The row's hover tooltip (2026-08-13, prompts/2026-08-13-files-detail-inspector.md's
- * "secondary, cheap" half of the detail request -- size / modified / percent). A native
- * `title` attribute, deliberately: zero fetch, zero re-render of the virtualized list, no
- * layout shift -- the browser owns showing and hiding it. The *primary* affordance is
- * `DetailButton` below, which opens the full drawer; this is the free hint you get without
- * clicking anything. `local_mtime` wins over `remote_mtime` when both exist -- "modified"
- * reads most naturally as the copy actually sitting in front of the user.
+// --- Row hover card (2026-08-13, prompts/2026-08-13-both-sides-hover-card.md) -----------------
+// Replaces the previous native `title` tooltip (a plain `\n`-joined string -- no columns, no
+// styling, no control over timing or position) with a real, portal-rendered card showing size
+// and modified date **remote and local side by side**, per the user's own request. The native
+// `title` on the name span is removed outright rather than kept alongside this: both are
+// defensible in isolation, but a `title` hovering the same element would start its own ~1s
+// browser-native timer independent of this card's, so a long-enough hover would show *both* at
+// once -- not defensible. `ItemDrawer.tsx`'s info-icon route remains the pre-hydration/no-JS/
+// touch fallback (the drawer's own click target, `DetailButton`, is a real button, not a hover
+// affordance) -- see that component's docstring.
+
+/** The hover card's imperative controller. `Row` -- a virtualized, frequently mounting and
+ * unmounting child -- drives this through a stable ref rather than through lifted React state,
+ * so a show/hide only ever re-renders `HoverCardHost` (and the portal it draws into), never
+ * `FileTree` or any other row. "Do not re-render the tree to show it; the card is one element,
+ * not per-row state" is the task's own bar.
  */
-function hoverTooltip(entry: TreeEntry): string {
-  const size = nodeDisplaySize(entry)
-  // `local_mtime`/`remote_mtime` are files-only (`core/reconcile.py`) -- a directory's row
-  // never carries either, so there is nothing to fall back to for one.
-  const mtime = entry.is_dir ? null : (entry.local_mtime ?? entry.remote_mtime)
-  const lines = [
-    entry.rel_path,
-    `Size: ${size != null ? formatBytes(size) : '—'}`,
-    `Complete: ${formatPercent(entry.local_size, entry.remote_size)}`,
-  ]
-  if (mtime != null) lines.push(`Modified: ${new Date(mtime * 1000).toLocaleString()}`)
-  return lines.join('\n')
+interface HoverCardHandle {
+  /** Schedules the card open over `anchorEl` for `entry`, after a delay. `immediate` skips the
+   * delay -- used for keyboard focus, where the user already made an explicit request and a
+   * 400ms pause would just read as lag.
+   */
+  requestShow: (entry: TreeEntry, anchorEl: HTMLElement, immediate?: boolean) => void
+  /** Schedules the card closed, after a short delay so a pointer passing briefly off the row
+   * doesn't flicker it shut. `immediate` skips the delay -- keyboard blur, a list scroll, and
+   * the anchor row's own unmount cleanup all need it closed *now*, not 150ms from now.
+   */
+  requestHide: (immediate?: boolean) => void
+  /** Closes the card immediately, but only if it is currently anchored to `path` -- called from
+   * every row's own unmount cleanup. The virtualizer unmounts rows constantly as they scroll out
+   * of view (only ~16 rows of overscan); a card left floating over whatever row now occupies
+   * that slot in the DOM would be worse than no card at all, so every row guarantees this on its
+   * way out regardless of whether it was ever actually the anchor.
+   */
+  cancelIfAnchor: (path: string) => void
+}
+
+const HOVER_SHOW_DELAY_MS = 400
+const HOVER_HIDE_DELAY_MS = 150
+const HOVER_CARD_EDGE_MARGIN_PX = 8
+
+/** The card's contents -- built entirely from `lib/format.ts.bothSidesRows`/`hasBothSides`, the
+ * same functions `ItemDrawer.tsx`'s `SideBySideDetails` reads, so the two surfaces can never
+ * quietly disagree about what these numbers are. Two columns only when both sides actually have
+ * something to show (`hasBothSides`); otherwise one labelled column -- a two-column layout with
+ * a permanently empty half (`LOCAL_ONLY`, `REMOTE_ONLY`, a deleted item) reads worse than a
+ * single column, per the task's own bar.
+ */
+function HoverCardBody({ entry }: { entry: TreeEntry }) {
+  const rows = bothSidesRows(entry)
+  const both = hasBothSides(entry)
+  const remotePresent = entry.remote_size != null
+  const singleSideLabel = remotePresent
+    ? 'Remote only'
+    : entry.local_size != null
+      ? 'Local only'
+      : 'No copy on either side'
+
+  return (
+    <div className="flex flex-col gap-1.5">
+      <p className="max-w-[22rem] font-medium break-words text-zinc-900 dark:text-zinc-100">{entry.rel_path}</p>
+      {both ? (
+        <div className="grid grid-cols-[auto_1fr_1fr] items-baseline gap-x-3 gap-y-0.5">
+          <span />
+          <span className="text-[10px] font-medium tracking-wide text-zinc-500 uppercase dark:text-zinc-400">
+            Remote
+          </span>
+          <span className="text-[10px] font-medium tracking-wide text-zinc-500 uppercase dark:text-zinc-400">
+            Local
+          </span>
+          {rows.map((row) => (
+            <Fragment key={row.label}>
+              <span className="text-zinc-500 dark:text-zinc-400">{row.label}</span>
+              <span>{row.remote}</span>
+              <span>{row.local}</span>
+            </Fragment>
+          ))}
+        </div>
+      ) : (
+        <div className="flex flex-col gap-0.5">
+          <span className="text-[10px] font-medium tracking-wide text-zinc-500 uppercase dark:text-zinc-400">
+            {singleSideLabel}
+          </span>
+          {rows.map((row) => (
+            <div key={row.label} className="flex items-baseline justify-between gap-3">
+              <span className="text-zinc-500 dark:text-zinc-400">{row.label}</span>
+              <span>{remotePresent ? row.remote : row.local}</span>
+            </div>
+          ))}
+        </div>
+      )}
+      {/* Percent is only meaningful once both sides exist -- a lone REMOTE_ONLY/LOCAL_ONLY
+          reading has no "of what" to be a percentage of. `percentValue`/`formatPercent` already
+          guard the divide-by-zero/NaN cases, but this is about not cluttering a one-sided card
+          with a line that could only ever read as absent. */}
+      {both && (
+        <p className="text-zinc-500 dark:text-zinc-400">Complete: {formatPercent(entry.local_size, entry.remote_size)}</p>
+      )}
+    </div>
+  )
+}
+
+/** The portal-rendered card -- positioned in the viewport from `anchorEl`'s own
+ * `getBoundingClientRect()`, never from anything in the virtualized list's own layout, because
+ * the anchor row can scroll (or unmount) out from under it at any moment. Painted first at
+ * `opacity: 0` so its real rendered size can be measured (`cardRef`), then placed and revealed
+ * in one `useLayoutEffect` -- avoids a visible jump from a guessed position to the real one.
+ * Flips above the anchor when there isn't room below, and clamps both axes into the viewport
+ * with `HOVER_CARD_EDGE_MARGIN_PX` of breathing room rather than ever overflowing off-screen.
+ */
+function HoverCardContent({ entry, anchorEl }: { entry: TreeEntry; anchorEl: HTMLElement }) {
+  const cardRef = useRef<HTMLDivElement>(null)
+  const [style, setStyle] = useState<CSSProperties>({ position: 'fixed', top: 0, left: 0, opacity: 0 })
+
+  useLayoutEffect(() => {
+    const card = cardRef.current
+    if (card == null) return
+    const anchorRect = anchorEl.getBoundingClientRect()
+    const cardRect = card.getBoundingClientRect()
+    const margin = HOVER_CARD_EDGE_MARGIN_PX
+
+    let top = anchorRect.bottom + margin
+    if (top + cardRect.height > window.innerHeight - margin) top = anchorRect.top - cardRect.height - margin
+    top = Math.max(margin, Math.min(top, window.innerHeight - cardRect.height - margin))
+
+    let left = anchorRect.left
+    if (left + cardRect.width > window.innerWidth - margin) left = window.innerWidth - cardRect.width - margin
+    left = Math.max(margin, left)
+
+    setStyle({ position: 'fixed', top, left, opacity: 1 })
+  }, [entry, anchorEl])
+
+  return (
+    // `pointer-events-none` (task's own bar): this card must never swallow a click meant for
+    // the row underneath it, a sort header, or a column resize handle (`a4a626d`) -- it shows
+    // read-only text, so nothing inside it ever needed to be clickable.
+    <div
+      ref={cardRef}
+      role="tooltip"
+      className="pointer-events-none fixed z-50 max-w-[min(24rem,calc(100vw-16px))] rounded-md border border-zinc-200 bg-white px-3 py-2 text-xs text-zinc-700 shadow-lg dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-200"
+      style={style}
+    >
+      <HoverCardBody entry={entry} />
+    </div>
+  )
+}
+
+/** Owns the hover card's only piece of state (`open`) and renders it into `document.body` via a
+ * portal -- mounted once by `FileTree`, outside the virtualized row list, so a show/hide only
+ * ever re-renders this one component, never the rows. `Row` drives it entirely through the
+ * imperative `controllerRef` handle (assigned in the effect below), never through props or
+ * context that would force `FileTree` itself to re-render on every hover.
+ */
+function HoverCardHost({ controllerRef }: { controllerRef: RefObject<HoverCardHandle | null> }) {
+  const [open, setOpen] = useState<{ entry: TreeEntry; anchorEl: HTMLElement } | null>(null)
+  const showTimer = useRef<number | null>(null)
+  const hideTimer = useRef<number | null>(null)
+
+  useEffect(() => {
+    const clearTimers = () => {
+      if (showTimer.current != null) window.clearTimeout(showTimer.current)
+      if (hideTimer.current != null) window.clearTimeout(hideTimer.current)
+      showTimer.current = null
+      hideTimer.current = null
+    }
+
+    controllerRef.current = {
+      requestShow(entry, anchorEl, immediate = false) {
+        clearTimers()
+        if (immediate) {
+          setOpen({ entry, anchorEl })
+          return
+        }
+        showTimer.current = window.setTimeout(() => {
+          showTimer.current = null
+          setOpen({ entry, anchorEl })
+        }, HOVER_SHOW_DELAY_MS)
+      },
+      requestHide(immediate = false) {
+        clearTimers()
+        if (immediate) {
+          setOpen(null)
+          return
+        }
+        hideTimer.current = window.setTimeout(() => {
+          hideTimer.current = null
+          setOpen(null)
+        }, HOVER_HIDE_DELAY_MS)
+      },
+      cancelIfAnchor(path) {
+        clearTimers()
+        setOpen((prev) => (prev != null && prev.entry.rel_path === path ? null : prev))
+      },
+    }
+    return () => {
+      clearTimers()
+      controllerRef.current = null
+    }
+    // `controllerRef` is a plain ref object, stable across renders -- included for
+    // exhaustive-deps correctness, not because it ever actually changes.
+  }, [controllerRef])
+
+  if (open == null) return null
+  return createPortal(<HoverCardContent entry={open.entry} anchorEl={open.anchorEl} />, document.body)
 }
 
 // --- Facet filter (2026-08-13, prompts/2026-08-13-files-ux-pass.md item 2): replaces the
@@ -685,6 +872,9 @@ interface RowProps {
   // threaded down rather than re-fetched per row. See that fetch's own comment for the `null`
   // cases.
   settleSettings: SettleSettingsOut | null
+  // The hover card's imperative controller (2026-08-13) -- a stable ref, not state, so wiring it
+  // to every row never itself causes a re-render. See `HoverCardHandle`'s own docstring.
+  hoverCardRef: RefObject<HoverCardHandle | null>
 }
 
 function Row({
@@ -698,6 +888,7 @@ function Row({
   onOpenDrawer,
   actionBusy,
   settleSettings,
+  hoverCardRef,
 }: RowProps) {
   const size = nodeDisplaySize(entry)
   const action = rowAction(entry)
@@ -714,6 +905,24 @@ function Row({
   // substitution over the chip, not a change to `entry.state` itself, which stays REMOTE_ONLY
   // server-side for the duration (`core/settle.py`).
   const isSettling = entry.state === 'REMOTE_ONLY' && entry.substate === 'settling'
+
+  // The hover card's anchor element (2026-08-13) -- `nameRef` is what `HoverCardContent`
+  // positions itself against, never anything about this row's own place in the virtualized
+  // list. Cleanup runs on every unmount unconditionally, whether or not this row was ever
+  // actually the open card's anchor -- `cancelIfAnchor` is a cheap no-op otherwise, and the
+  // virtualizer unmounts rows constantly as they scroll out of view, so this is the one place
+  // guaranteed to run before a recycled slot could show a stale card (see `HoverCardHandle`'s
+  // own docstring).
+  const nameRef = useRef<HTMLSpanElement>(null)
+  useEffect(() => {
+    // Reading `hoverCardRef.current` inside the cleanup itself, not a variable captured at
+    // effect-setup time, is deliberate here -- the lint rule's usual worry is a DOM ref React
+    // has already nulled out by the time cleanup runs, which doesn't apply: `hoverCardRef` is
+    // our own imperative controller, assigned once by `HoverCardHost` and stable for the whole
+    // list's lifetime, so the freshest reading is the correct one to act on at unmount.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    return () => hoverCardRef.current?.cancelIfAnchor(entry.rel_path)
+  }, [entry.rel_path, hoverCardRef])
 
   return (
     <div
@@ -751,7 +960,29 @@ function Row({
           (`DetailButton`'s own styling). Disabled for a row with no `id` -- there is no item
           to fetch history for yet (see `ItemDrawer`'s own itemId handling). */}
       <DetailButton label={entry.name} onOpen={() => onOpenDrawer(entry)} />
-      <span className="flex-1 truncate" style={{ minWidth: NAME_MIN_WIDTH_PX }} title={hoverTooltip(entry)}>
+      {/* The hover card's anchor (2026-08-13) -- no native `title` here (see the module comment
+          above `HoverCardHandle`: showing both would double up on a long hover). `tabIndex={0}`
+          makes the card reachable by keyboard, not just a mouse -- `onFocus` opens it
+          immediately (no delay: the user already made an explicit request), `onBlur` closes it
+          immediately. `onPointerEnter`/`onPointerLeave` ignore touch (`pointerType`) --
+          `DetailButton`'s drawer is the touch route, not this card, per the task's own
+          instruction not to make hover serve touch too. */}
+      <span
+        ref={nameRef}
+        tabIndex={0}
+        className="flex-1 truncate outline-none focus-visible:ring-2 focus-visible:ring-sky-500 focus-visible:ring-inset"
+        style={{ minWidth: NAME_MIN_WIDTH_PX }}
+        onPointerEnter={(e) => {
+          if (e.pointerType === 'touch' || nameRef.current == null) return
+          hoverCardRef.current?.requestShow(entry, nameRef.current)
+        }}
+        onPointerLeave={() => hoverCardRef.current?.requestHide()}
+        onFocus={() => {
+          if (nameRef.current == null) return
+          hoverCardRef.current?.requestShow(entry, nameRef.current, true)
+        }}
+        onBlur={() => hoverCardRef.current?.requestHide(true)}
+      >
         {entry.name}
         {entry.is_dir && '/'}
       </span>
@@ -961,6 +1192,21 @@ export function FileTree({
   // = closed. Holding the whole `TreeEntry` rather than just a path means the drawer's title
   // survives even if this exact row scrolls out of the virtualizer's mounted window while open.
   const [drawerEntry, setDrawerEntry] = useState<TreeEntry | null>(null)
+
+  // The hover card's controller (2026-08-13, prompts/2026-08-13-both-sides-hover-card.md) -- a
+  // plain ref, not state (see `HoverCardHandle`'s own docstring for why). Every row is handed
+  // this same stable ref rather than getting its own piece of state.
+  const hoverCardRef = useRef<HoverCardHandle | null>(null)
+  // The card hides on any scroll, not just the row list's own -- a capturing listener on
+  // `window` catches scroll events fired anywhere in the tree, including `scrollRef`'s own
+  // container below: scroll events don't bubble, but a capture-phase listener still sees them on
+  // the way down to their target regardless. `immediate`: a stale card hanging in place while
+  // the list scrolls under it is wrong right away, not 150ms from now.
+  useEffect(() => {
+    const onScroll = () => hoverCardRef.current?.requestHide(true)
+    window.addEventListener('scroll', onScroll, { capture: true, passive: true })
+    return () => window.removeEventListener('scroll', onScroll, true)
+  }, [])
 
   // Every entry regardless of collapse state -- selection and the state-filter dropdown's
   // own option list must survive a directory being collapsed, and a text/state match inside
@@ -1508,6 +1754,7 @@ export function FileTree({
                     onOpenDrawer={setDrawerEntry}
                     actionBusy={rowBusy.has(entry.rel_path)}
                     settleSettings={settleSettings}
+                    hoverCardRef={hoverCardRef}
                   />
                 </div>
               )
@@ -1530,6 +1777,11 @@ export function FileTree({
           onClose={() => setDrawerEntry(null)}
         />
       )}
+
+      {/* The hover card (2026-08-13) -- mounted once, outside the virtualized row list, so its
+          own open/close state never touches `FileTree`'s render or any row's. See
+          `HoverCardHost`'s own docstring. */}
+      <HoverCardHost controllerRef={hoverCardRef} />
     </div>
   )
 }
