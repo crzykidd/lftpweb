@@ -30,13 +30,35 @@ def db_path(config_dir: str) -> Path:
 
 
 async def connect(config_dir: str) -> aiosqlite.Connection:
-    """Open the database with the pragmas this app requires on every connection."""
+    """Open the database with the pragmas this app requires on every connection.
+
+    `busy_timeout` matters as much as `journal_mode`/`foreign_keys` now: this connection is
+    shared by the engine's scan persist, the transfer queue's ~1 Hz tick, the metrics
+    sampler's 30s heartbeat, and the post-processing pipeline, all writing concurrently. At
+    SQLite's default `busy_timeout` of 0, any lock contention between them fails instantly
+    with `SQLITE_BUSY` instead of waiting a bounded time for the other writer to finish. Set
+    to 30000ms to match `core/backup.py.create_backup`'s dedicated VACUUM connection --
+    one number, not two conventions.
+
+    Every pragma cursor is closed explicitly rather than left for GC, per
+    `core/backup.py`'s own documented trap: a PRAGMA returning a row whose cursor is never
+    finalized leaves an unfinalized statement on the connection, which is enough to make
+    `VACUUM` refuse with "cannot VACUUM - SQL statements in progress" -- and the
+    pre-migration backup (`migrate()` below) runs against this very connection's database
+    file from a second connection, so a lingering statement here is exactly the kind of bug
+    that would only show up the next time someone adds a migration.
+    """
     path = db_path(config_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = await aiosqlite.connect(path)
     conn.row_factory = aiosqlite.Row
-    await conn.execute("PRAGMA journal_mode = WAL")
-    await conn.execute("PRAGMA foreign_keys = ON")
+    for pragma in (
+        "PRAGMA journal_mode = WAL",
+        "PRAGMA foreign_keys = ON",
+        "PRAGMA busy_timeout = 30000",
+    ):
+        cursor = await conn.execute(pragma)
+        await cursor.close()
     await conn.commit()
     return conn
 

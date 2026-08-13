@@ -6,6 +6,75 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-12 — `scan_complete` is a new, dedicated WebSocket message rather than a blocking
+## `/api/files/rescan`; the busy-button clears on the message, not a request id
+
+**Handoff prompt `prompts/done/2026-08-12-small-fixes-and-scan-visibility.md`, executed end to
+end** — three small, unrelated defects grouped into one prompt because each was small and they
+touched disjoint files. Two (no `busy_timeout` on the shared connection; Expand/Collapse all
+giving no reason when disabled for having no directories) were plain bugs, each a few lines.
+The third — "Rescan now" reporting completion via a bare 1-second `setTimeout` regardless of
+how long the scan actually took, or whether it failed outright — needed the backend to say
+when a scan pass is actually over, which is the substantive decision here.
+
+**1. A new `scan_complete` WebSocket message, not a blocking rescan endpoint.** `POST
+/api/files/rescan` (`api/files.py`) only sets the engine's wake event and returns 202
+immediately, deliberately — it's fire-and-forget so a request never sits open for the length
+of an SSH tree walk. Making it block until the triggered scan finished was rejected for
+exactly that reason: it would tie up an HTTP request (and a client's expectation of a fast
+response) for however long the remote happens to take, and every other piece of live state on
+this page already flows over the one WebSocket (DESIGN.md §2/§9) rather than a second channel.
+`core/engine.py.scan_queue` now publishes `{"type": "scan_complete", "queue_id", "finished_at",
+"ok", "warning"}` at the end of *every* pass, success or failure — four scalars, fixed-size
+regardless of tree size, honoring the same delta rule as `queue_delta`/`item_delta`.
+
+**2. Published on the failure path too, deliberately.** `queue_delta` only fires on success (a
+failed pass has no fresh tree to report), which is exactly why it can't be reused for this: a
+button waiting on "the next update" after a scan that errors out would spin forever. The
+`except` branch in `scan_queue` now publishes `scan_complete` right alongside its existing
+`scan_error`, with `ok: False` and `warning: None` — the failure never got far enough to know
+whether it would also have carried a partial-scan warning, and `scan_error`'s own `message`
+already carries the failure detail, so nothing is duplicated.
+
+**3. The button clears on the first `scan_complete` after its own request, not per-queue and
+not by request id.** The wire protocol has no request id to correlate a specific "Rescan now"
+click to a specific completion, and `request_rescan()` wakes every enabled queue's scan in one
+pass (`scan_all`), not just one. `useLiveModel.ts` exposes a `scanCompleteSeq` counter bumped
+on every `scan_complete` for any queue; `FilesPage.tsx` captures its value before the request
+and clears the busy state the moment it moves. **Rejected: wait for every enabled queue to
+report before clearing.** That needs a per-request queue-id set the client would have to
+maintain with no server-side concept of "this rescan" to key it on, for a benefit that doesn't
+matter on the only install that exists today (one queue) and is a strictly separate, larger
+feature (a real request/response correlation id) if it ever does.
+
+**4. "Last scanned" is a relative reading sourced from the same message, not from
+`queue_delta`'s pre-existing (and now redundant) copies of `scanned_at`/`warning`.** Both
+fields already existed on `queue_delta` since phase 2, updated on every successful pass — but
+that's exactly the coverage gap `scan_complete` exists to close (failure isn't a `queue_delta`
+at all), so `useLiveModel.ts`'s `queue_delta` handler now carries these two fields forward
+unchanged instead of re-setting them, and only the new `scan_complete` handler updates them
+(and only when `ok` is true — a failed attempt has nothing new to report, and must not
+overwrite the last time the queue actually finished with "just now"). `lib/format.ts` gained
+`formatRelativeTime`, deliberately **not** backed by a client-side ticking interval — the Files
+page is WebSocket-driven precisely to avoid a poll to tune, and a `setInterval` re-rendering
+the same already-held timestamp on a clock would be exactly that in spirit even without
+touching the network. Each queue already re-renders at least every `scan_interval_s` (default
+30s) as its own `scan_complete` arrives, which is fresh enough for a "12s ago" / "2m ago"
+reading; the exact `Date` is still one hover away via `title`.
+
+**5. `tests/test_ws_deltas.py`'s existing `subscription.get()` call sites needed updating, not
+just new tests appended.** `scan_queue` now publishes two messages per successful pass
+(`queue_delta` then `scan_complete`) instead of one, and several existing tests drain-then-
+consume in lockstep (`await scan_queue(); await subscription.get()  # drain the baseline` then
+a second `scan_queue()`/`get()` pair to inspect the *next* delta). Left unpatched, the second
+`get()` would return the *previous* pass's trailing `scan_complete` instead of the new
+`queue_delta`, silently breaking every payload-size and wire-matches-db assertion in the file.
+Added a small `_next_message(subscription, expected_type)` helper that discards `scan_complete`
+messages while waiting for the type a test actually wants, used at every call site that spans
+more than one `scan_queue()` call.
+
+---
+
 ## 2026-08-12 — `create_backup` runs `VACUUM INTO` on a dedicated connection, not the shared
 ## application connection, and asks the connection for its own database file via `PRAGMA
 ## database_list` rather than trusting `db_path(config_dir)` alone

@@ -210,6 +210,17 @@ export function FileTree({ nodes }: { nodes: FileNode[] }) {
   // click that silently does nothing.
   const hasDirectories = useMemo(() => fullFlat.some((e) => e.is_dir), [fullFlat])
 
+  // Both buttons disable for two unrelated reasons (no directories at all, or an active
+  // filter) and used to share one `title` that only explained the filter case -- a queue
+  // with no directories rendered greyed out with no explanation and read as a broken
+  // feature (the user hit exactly this). `undefined` when enabled, since a `title` on an
+  // enabled button is just clutter.
+  const disabledReason = (verb: 'expand' | 'collapse'): string | undefined => {
+    if (!hasDirectories) return `Nothing to ${verb} -- this queue has no directories`
+    if (filtersActive) return 'Clear filters to change collapse state'
+    return undefined
+  }
+
   // A match plus every one of its ancestor directories (so the tree stays navigable down to
   // the hit) -- computed over the *full*, uncollapsed set, then substituted for the normal
   // collapse-respecting flatten below. Filtering while a directory happens to be collapsed
@@ -381,7 +392,7 @@ export function FileTree({ nodes }: { nodes: FileNode[] }) {
           type="button"
           disabled={!hasDirectories || filtersActive}
           onClick={expandAll}
-          title={filtersActive ? 'Clear filters to change collapse state' : undefined}
+          title={disabledReason('expand')}
           className="rounded-md border border-zinc-300 px-2 py-1 text-xs font-medium text-zinc-700 hover:bg-zinc-50 disabled:cursor-not-allowed disabled:opacity-50 dark:border-zinc-700 dark:text-zinc-200 dark:hover:bg-zinc-900"
         >
           Expand all
@@ -390,7 +401,7 @@ export function FileTree({ nodes }: { nodes: FileNode[] }) {
           type="button"
           disabled={!hasDirectories || filtersActive}
           onClick={collapseAll}
-          title={filtersActive ? 'Clear filters to change collapse state' : undefined}
+          title={disabledReason('collapse')}
           className="rounded-md border border-zinc-300 px-2 py-1 text-xs font-medium text-zinc-700 hover:bg-zinc-50 disabled:cursor-not-allowed disabled:opacity-50 dark:border-zinc-700 dark:text-zinc-200 dark:hover:bg-zinc-900"
         >
           Collapse all

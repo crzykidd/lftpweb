@@ -152,6 +152,23 @@ alongside this list: several entries below ship with deliberate, documented limi
   backup. `create_backup` now takes its `VACUUM INTO` on a dedicated connection that no other
   coroutine's transaction can reach. `:dev` images built before this fix (published from
   `fe80aaf`) still carry the bug.
+- **The shared application connection had no `busy_timeout`** *(2026-08-12)*, so any lock
+  contention between the engine's scan persist, the transfer queue's ~1 Hz tick, the metrics
+  heartbeat, and post-processing failed instantly with `SQLITE_BUSY` instead of waiting.
+  `db.py.connect()` now sets 30000ms, matching `core/backup.py`'s dedicated `VACUUM INTO`
+  connection.
+- **Files' Expand all / Collapse all gave no reason when disabled for having no directories**
+  *(2026-08-12)* — the `title` only ever explained the filter-active case, so a queue with a
+  flat tree rendered both buttons greyed out with no explanation and read as broken.
+- **"Rescan now" reported completion it knew nothing about** *(2026-08-12)*: `POST
+  /api/files/rescan` only wakes the engine and returns immediately, so the button faked
+  completion with a bare 1-second timer regardless of how long the scan actually took, and
+  stayed "Rescanning…" for exactly that second even when the scan failed outright. The engine
+  now publishes a `scan_complete` WebSocket message at the end of every scan pass — success or
+  failure — and the button clears on the first one after its own request. The Files page also
+  now shows each queue's last-scanned time relative to now (absolute on hover), driven by the
+  same message, with a partial-scan warning folded into the same readout instead of only a log
+  line.
 
 ### Security
 

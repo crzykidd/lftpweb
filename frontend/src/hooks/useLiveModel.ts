@@ -50,10 +50,17 @@ export function useLiveModel(): {
   queues: QueueFiles[]
   progressByJobId: Record<number, ProgressJob>
   state: SocketState
+  /** Bumped by one on every `scan_complete` message, for any queue. Purely a change signal --
+   * a caller (`FilesPage.tsx`'s "Rescan now") that captures this value before triggering a
+   * rescan and then watches for it to move knows a real scan pass finished, without either
+   * side needing to correlate a request id it was never given. See docs/decisions.md for why
+   * a WS message rather than a blocking rescan endpoint. */
+  scanCompleteSeq: number
 } {
   const [queuesById, setQueuesById] = useState<Record<number, QueueState>>({})
   const [progressByJobId, setProgressByJobId] = useState<Record<number, ProgressJob>>({})
   const [state, setState] = useState<SocketState>('connecting')
+  const [scanCompleteSeq, setScanCompleteSeq] = useState(0)
 
   useEffect(() => {
     let cancelled = false
@@ -106,13 +113,35 @@ export function useLiveModel(): {
               [msg.queue_id]: {
                 queue_id: msg.queue_id,
                 queue_name: msg.queue_name,
-                scanned_at: msg.scanned_at,
+                // `scan_complete` (below) is the one source for these two now -- carried
+                // forward rather than duplicated from this message's own copies (which are
+                // always identical on a successful pass; `core/engine.py.scan_queue`
+                // publishes both from the same `self.last_scan_at[q.id]`), so "last scanned"
+                // has exactly one place it comes from, including the failed-pass case
+                // `queue_delta` never fires for at all.
+                scanned_at: existing?.scanned_at ?? null,
                 error: null,
-                warning: msg.warning,
+                warning: existing?.warning ?? null,
                 nodesByPath,
               },
             }
           })
+        } else if (msg.type === 'scan_complete') {
+          setScanCompleteSeq((n) => n + 1)
+          // Only a successful pass updates the displayed "last scanned" reading -- a failed
+          // attempt has nothing new to report (`scan_error`, handled separately, already
+          // carries the failure message) and must not overwrite the last time this queue
+          // actually finished scanning with "just now".
+          if (msg.ok) {
+            setQueuesById((prev) => {
+              const existing = prev[msg.queue_id]
+              if (!existing) return prev
+              return {
+                ...prev,
+                [msg.queue_id]: { ...existing, scanned_at: msg.finished_at, warning: msg.warning },
+              }
+            })
+          }
         } else if (msg.type === 'item_delta') {
           setQueuesById((prev) => {
             const existing = prev[msg.queue_id]
@@ -169,5 +198,5 @@ export function useLiveModel(): {
     .map(toQueueFiles)
     .sort((a, b) => a.queue_id - b.queue_id)
 
-  return { queues, progressByJobId, state }
+  return { queues, progressByJobId, state, scanCompleteSeq }
 }

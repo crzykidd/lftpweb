@@ -11,6 +11,7 @@ emitted payload contains only those and does not grow with total tree size.
 
 from __future__ import annotations
 
+import asyncio
 import json
 
 import aiosqlite
@@ -22,7 +23,7 @@ from lftpweb.core.events import EventBus
 from lftpweb.core.itemview import ItemView, item_view
 from lftpweb.core.local_scan import LocalEntry
 from lftpweb.core.mount_sentinel import DEFAULT_GRACE_S
-from lftpweb.core.remote import HostConfig, RemoteEntry
+from lftpweb.core.remote import HostConfig, RemoteEntry, RemoteScanError
 from lftpweb.db import migrate
 
 # --- diff_nodes: the pure function, tested directly ----------------------------------------
@@ -86,6 +87,26 @@ def test_diff_nodes_first_scan_reports_everything_as_changed():
     changed, removed = diff_nodes({}, new)
     assert len(changed) == 25
     assert removed == []
+
+
+async def _next_message(subscription: asyncio.Queue, expected_type: str) -> dict:
+    """Pop from the subscription until a message of `expected_type` arrives, discarding any
+    `scan_complete` messages along the way.
+
+    `scan_queue` now publishes a `scan_complete` after every pass (success or failure) as a
+    dedicated completion signal for "Rescan now" (docs/decisions.md) -- interleaved on the
+    same `EventBus` subscription as the `queue_delta`/`scan_error` this suite already asserts
+    on in lockstep with each `scan_queue` call. Without this, a bare `subscription.get()`
+    would sometimes hand a test the *previous* scan's trailing `scan_complete` instead of the
+    `queue_delta` it actually wants.
+    """
+    while True:
+        message = await subscription.get()
+        if message["type"] == expected_type:
+            return message
+        assert (
+            message["type"] == "scan_complete"
+        ), f"unexpected message while waiting for {expected_type!r}: {message['type']!r}"
 
 
 # --- Engine.scan_queue: the real code path, not just the pure helper -----------------------
@@ -185,10 +206,10 @@ async def _mutated_delta_payload(tmp_path, monkeypatch, n: int) -> tuple[dict, d
         subscription = engine.events.subscribe()
 
         await engine.scan_queue(q, host)  # baseline scan: populates engine.models
-        await subscription.get()  # drain the first-scan delta (legitimately the whole tree)
+        await _next_message(subscription, "queue_delta")  # drain the first-scan delta
 
         await engine.scan_queue(q, host)  # the mutation
-        delta = await subscription.get()
+        delta = await _next_message(subscription, "queue_delta")
         full_snapshot = (await engine.snapshot())[0]
         return delta, full_snapshot
     finally:
@@ -352,7 +373,7 @@ async def test_published_state_is_the_persisted_state_not_the_structural_one(
     try:
         subscription = engine.events.subscribe()
         await engine.scan_queue(q, host)  # baseline: creates the `item` rows
-        await subscription.get()
+        await _next_message(subscription, "queue_delta")
 
         # Seed the three overrides the way their real owners would, then rescan. The
         # structural reading for all three is unchanged from the baseline scan, which is
@@ -385,7 +406,7 @@ async def test_published_state_is_the_persisted_state_not_the_structural_one(
         await db.commit()
 
         await engine.scan_queue(q, host)
-        delta = await subscription.get()
+        delta = await _next_message(subscription, "queue_delta")
         persisted = await _persisted_states(db, q.id)
 
         assert persisted["postprocessed.mkv"] == "EXTRACTED"
@@ -442,5 +463,73 @@ async def test_snapshot_reflects_a_lifecycle_write_made_since_the_last_scan(tmp_
         states = {node["rel_path"]: node["state"] for node in snapshot["nodes"]}
         assert states["plain.mkv"] == "QUEUED"
         _assert_wire_matches_db(snapshot["nodes"], await _persisted_states(db, q.id))
+    finally:
+        await db.close()
+
+
+# --- scan_complete: the completion signal "Rescan now" actually waits on -------------------
+
+
+class _FailingPool:
+    """Every `.scan()` raises -- exercises `scan_queue`'s `except` branch, the one that used
+    to leave a client with no signal at all that the pass was over.
+    """
+
+    async def scan(self, host, remote_path):  # noqa: ARG002 - matches RemoteConnectionPool.scan
+        raise RemoteScanError("seedbox unreachable")
+
+
+async def test_scan_complete_published_on_a_successful_pass(tmp_path, monkeypatch):
+    """The completion signal a client can actually wait on (docs/decisions.md) -- fired after
+    `queue_delta`, carrying the same `queue_id`/timestamp plus whether this pass carried a
+    partial-scan warning, and small and fixed-size regardless of tree size (DESIGN.md §2/§9's
+    delta rule: never proportional to the tree).
+    """
+    monkeypatch.setattr(engine_module.local_scan, "scan_local", lambda root: {})  # noqa: ARG005
+
+    tree = _release_tree(500)
+    engine, q, host, db = await _make_engine(tmp_path, [tree])
+    try:
+        subscription = engine.events.subscribe()
+        await engine.scan_queue(q, host)
+
+        delta = await subscription.get()
+        assert delta["type"] == "queue_delta"
+
+        complete = await subscription.get()
+        assert complete == {
+            "type": "scan_complete",
+            "queue_id": q.id,
+            "finished_at": engine.last_scan_at[q.id],
+            "ok": True,
+            "warning": None,
+        }
+        # Fixed-size regardless of the 500-item tree scanned above -- four scalars, no nodes.
+        assert len(json.dumps(complete)) < 200
+    finally:
+        await db.close()
+
+
+async def test_scan_complete_published_on_a_failed_pass_too(tmp_path):
+    """A scan that errors out must still tell a waiting "Rescan now" button the pass is over
+    -- `queue_delta` never fires on this path (there's nothing to publish), so without this
+    the button would spin forever on any transient seedbox failure.
+    """
+    engine, q, host, db = await _make_engine(tmp_path, [])
+    engine.pool = _FailingPool()
+    try:
+        subscription = engine.events.subscribe()
+        await engine.scan_queue(q, host)
+
+        error = await subscription.get()
+        assert error["type"] == "scan_error"
+        assert error["queue_id"] == q.id
+
+        complete = await subscription.get()
+        assert complete["type"] == "scan_complete"
+        assert complete["queue_id"] == q.id
+        assert complete["ok"] is False
+        assert complete["warning"] is None
+        assert complete["finished_at"]  # a real timestamp, not empty/None
     finally:
         await db.close()

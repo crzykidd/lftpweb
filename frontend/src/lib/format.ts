@@ -41,3 +41,23 @@ export function bytesToMB(bytes: number): number {
 export function mbToBytes(mb: number): number {
   return Math.round(mb * MB_BYTES)
 }
+
+/** "scanned 12s ago" style reading for a `scan_complete`/snapshot timestamp (Files page,
+ * DESIGN.md §9.2). Deliberately recomputed only on render, never on a ticking timer -- the
+ * Files page is WebSocket-driven (DESIGN.md §9), and a client-side interval here would be
+ * exactly the kind of client-side refresh loop that page is built to avoid; each queue
+ * already re-renders at least every `scan_interval_s` (default 30s) as its own `scan_complete`
+ * arrives, which is fresh enough for a relative reading measured in seconds-to-minutes.
+ */
+export function formatRelativeTime(iso: string): string {
+  const deltaMs = Date.now() - new Date(iso).getTime()
+  const deltaS = Math.max(Math.round(deltaMs / 1000), 0)
+  if (deltaS < 5) return 'just now'
+  if (deltaS < 60) return `${deltaS}s ago`
+  const deltaM = Math.round(deltaS / 60)
+  if (deltaM < 60) return `${deltaM}m ago`
+  const deltaH = Math.round(deltaM / 60)
+  if (deltaH < 24) return `${deltaH}h ago`
+  const deltaD = Math.round(deltaH / 24)
+  return `${deltaD}d ago`
+}

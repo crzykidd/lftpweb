@@ -172,3 +172,18 @@ async def test_wal_and_foreign_keys_enabled(tmp_path):
         assert fk == 1
     finally:
         await conn.close()
+
+
+async def test_busy_timeout_set_on_shared_connection(tmp_path):
+    """`connect()` must actually set `busy_timeout` on the connection it hands back -- not
+    merely execute the pragma line and lose it. 30000ms, matching
+    `core/backup.py.create_backup`'s dedicated VACUUM connection (docs/decisions.md).
+    """
+    conn = await connect(str(tmp_path))
+    try:
+        cursor = await conn.execute("PRAGMA busy_timeout")
+        (timeout_ms,) = await cursor.fetchone()
+        await cursor.close()
+        assert timeout_ms == 30000
+    finally:
+        await conn.close()

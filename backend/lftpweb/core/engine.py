@@ -317,6 +317,25 @@ class Engine:
                     "warning": scan_warning,
                 }
             )
+            # The completion signal a client can actually wait on (DESIGN.md §2/§9; see
+            # docs/decisions.md): "Rescan now" used to fake completion with a bare 1s
+            # `setTimeout`, which was simply wrong on any tree big enough to take longer than
+            # that. `queue_delta` above isn't a substitute -- it's published on every pass
+            # regardless of outcome *except* this one never fires on a failed pass, which is
+            # exactly the case a spinning button most needs a signal for. Deliberately its own
+            # message rather than a field bolted onto `queue_delta`, so a listener doesn't have
+            # to infer "this pass is over" from a message shape meant for tree deltas. Same
+            # fixed-size shape regardless of the outcome or tree size: four scalars, never a
+            # node list.
+            self.events.publish(
+                {
+                    "type": "scan_complete",
+                    "queue_id": q.id,
+                    "finished_at": self.last_scan_at[q.id],
+                    "ok": True,
+                    "warning": scan_warning,
+                }
+            )
 
             if self.autoqueue is not None:
                 await self.autoqueue.on_scan(
@@ -333,6 +352,21 @@ class Engine:
             logger.warning("scan failed for queue %s (%s): %s", q.id, q.name, message)
             self.events.publish(
                 {"type": "scan_error", "queue_id": q.id, "queue_name": q.name, "message": message}
+            )
+            # Published on the failure path too, not just success (see the success-path
+            # comment above) -- a scan that errors out must still tell a waiting "Rescan now"
+            # button the pass is over, or it spins forever. `ok: False` and no `warning`: a
+            # pass that failed outright never got far enough to know whether it would also
+            # have carried a partial-scan warning, and `scan_error`'s own `message` already
+            # carries the failure detail.
+            self.events.publish(
+                {
+                    "type": "scan_complete",
+                    "queue_id": q.id,
+                    "finished_at": _now_iso(),
+                    "ok": False,
+                    "warning": None,
+                }
             )
 
     async def _protected_rel_paths(self, queue_id: int) -> set[str]:

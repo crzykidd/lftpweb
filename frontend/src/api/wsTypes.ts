@@ -51,6 +51,23 @@ export interface ScanErrorMessage {
   message: string
 }
 
+/** Published by `core/engine.py.scan_queue` at the end of *every* pass -- success or
+ * failure, unlike `QueueDeltaMessage` which only fires on success. This is the one signal
+ * a client can actually wait on for "this queue's scan attempt is over", rather than
+ * guessing from a fixed timer (`pages/FilesPage.tsx`'s old 1s `setTimeout`) or inferring it
+ * from a message shape meant for tree deltas. Fixed-size regardless of tree size: four
+ * scalars, never a node list -- same delta-rule shape as every other message here.
+ */
+export interface ScanCompleteMessage {
+  type: 'scan_complete'
+  queue_id: number
+  finished_at: string
+  ok: boolean
+  /** The partial-scan warning text carried by this pass, if any. Only ever set when `ok` is
+   * true -- a pass that failed outright never got far enough to know. */
+  warning: string | null
+}
+
 export interface ProgressJob {
   job_id: number
   item_id: number
@@ -73,4 +90,5 @@ export type WsMessage =
   | QueueDeltaMessage
   | ItemDeltaMessage
   | ScanErrorMessage
+  | ScanCompleteMessage
   | ProgressMessage
