@@ -2,9 +2,10 @@ import { useVirtualizer } from '@tanstack/react-virtual'
 import { useEffect, useMemo, useReducer, useRef, useState } from 'react'
 import { deleteItem, queueItem, stopItem } from '../api/client'
 import type { FileNode } from '../api/types'
-import { formatBytes, percentValue, stateAgeLabel } from '../lib/format'
+import { formatBytes, formatPercent, percentValue, stateAgeLabel } from '../lib/format'
 import { readLocalStorage, writeLocalStorage } from '../lib/storage'
-import { LifecycleIcons } from './LifecycleIcons'
+import { DetailButton, LifecycleIcons } from './LifecycleIcons'
+import { ItemDrawer } from './ItemDrawer'
 import { StateChip } from './StateChip'
 
 // One shared ticker per tree, not a `setInterval` per row (migration 006's `state_changed_at`
@@ -276,6 +277,28 @@ function stateProgressPercent(node: FileNode): number | null {
   return percentValue(node.local_size, node.remote_size)
 }
 
+/** The row's hover tooltip (2026-08-13, prompts/2026-08-13-files-detail-inspector.md's
+ * "secondary, cheap" half of the detail request -- size / modified / percent). A native
+ * `title` attribute, deliberately: zero fetch, zero re-render of the virtualized list, no
+ * layout shift -- the browser owns showing and hiding it. The *primary* affordance is
+ * `DetailButton` below, which opens the full drawer; this is the free hint you get without
+ * clicking anything. `local_mtime` wins over `remote_mtime` when both exist -- "modified"
+ * reads most naturally as the copy actually sitting in front of the user.
+ */
+function hoverTooltip(entry: TreeEntry): string {
+  const size = nodeDisplaySize(entry)
+  // `local_mtime`/`remote_mtime` are files-only (`core/reconcile.py`) -- a directory's row
+  // never carries either, so there is nothing to fall back to for one.
+  const mtime = entry.is_dir ? null : (entry.local_mtime ?? entry.remote_mtime)
+  const lines = [
+    entry.rel_path,
+    `Size: ${size != null ? formatBytes(size) : '—'}`,
+    `Complete: ${formatPercent(entry.local_size, entry.remote_size)}`,
+  ]
+  if (mtime != null) lines.push(`Modified: ${new Date(mtime * 1000).toLocaleString()}`)
+  return lines.join('\n')
+}
+
 interface RowProps {
   entry: TreeEntry
   isCollapsed: boolean
@@ -284,6 +307,7 @@ interface RowProps {
   onToggleSelect: (entry: TreeEntry, shiftKey: boolean) => void
   onAction: (entry: TreeEntry) => void
   onDeleteRequest: (entry: TreeEntry) => void
+  onOpenDrawer: (entry: TreeEntry) => void
   actionBusy: boolean
 }
 
@@ -295,6 +319,7 @@ function Row({
   onToggleSelect,
   onAction,
   onDeleteRequest,
+  onOpenDrawer,
   actionBusy,
 }: RowProps) {
   const size = nodeDisplaySize(entry)
@@ -332,7 +357,12 @@ function Row({
       ) : (
         <span className="w-4 shrink-0" />
       )}
-      <span className="min-w-0 flex-1 truncate" title={entry.rel_path}>
+      {/* The primary detail-drawer affordance (2026-08-13) -- a control, not a status, so it
+          sits here rather than among the lifecycle icons and reads visibly quieter than them
+          (`DetailButton`'s own styling). Disabled for a row with no `id` -- there is no item
+          to fetch history for yet (see `ItemDrawer`'s own itemId handling). */}
+      <DetailButton label={entry.name} onOpen={() => onOpenDrawer(entry)} />
+      <span className="min-w-0 flex-1 truncate" title={hoverTooltip(entry)}>
         {entry.name}
         {entry.is_dir && '/'}
       </span>
@@ -493,6 +523,12 @@ export function FileTree({ nodes }: { nodes: FileNode[] }) {
   // action. `null` = no pending confirmation; otherwise the exact entries about to be deleted,
   // so the dialog's count/byte total is read from the same list the delete itself will use.
   const [pendingDelete, setPendingDelete] = useState<TreeEntry[] | null>(null)
+
+  // The item drawer (2026-08-13, prompts/2026-08-13-files-detail-inspector.md) -- opened by a
+  // row's `DetailButton`, never by the row click itself (that drives selection, above). `null`
+  // = closed. Holding the whole `TreeEntry` rather than just a path means the drawer's title
+  // survives even if this exact row scrolls out of the virtualizer's mounted window while open.
+  const [drawerEntry, setDrawerEntry] = useState<TreeEntry | null>(null)
 
   // Every entry regardless of collapse state -- selection and the state-filter dropdown's
   // own option list must survive a directory being collapsed, and a text/state match inside
@@ -924,6 +960,7 @@ export function FileTree({ nodes }: { nodes: FileNode[] }) {
           <div className="sticky top-0 z-10 flex items-center gap-2 border-b border-zinc-200 bg-zinc-50 px-2 py-1 text-[10px] font-medium tracking-wide text-zinc-500 uppercase dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-400">
             <span className="w-4 shrink-0" />
             <span className="w-4 shrink-0" />
+            <span className="w-4 shrink-0" />
             <span className="min-w-0 flex-1">Name</span>
             <span className="w-24 shrink-0 text-right">Size</span>
             <span className="w-28 shrink-0 text-right">Status</span>
@@ -954,6 +991,7 @@ export function FileTree({ nodes }: { nodes: FileNode[] }) {
                     onToggleSelect={toggleSelect}
                     onAction={runRowAction}
                     onDeleteRequest={requestDeleteRow}
+                    onOpenDrawer={setDrawerEntry}
                     actionBusy={rowBusy.has(entry.rel_path)}
                   />
                 </div>
@@ -961,6 +999,21 @@ export function FileTree({ nodes }: { nodes: FileNode[] }) {
             })}
           </div>
         </div>
+      )}
+
+      {/* The item drawer (2026-08-13, prompts/2026-08-13-files-detail-inspector.md) --
+          `nodes` is already this queue's whole tree (this component's own prop), exactly what
+          `ItemDrawer` needs; no second fetch. `itemId` comes straight off the clicked row --
+          `TransfersPage.tsx` supplies the same prop from `job.item_id` for its own entry
+          point, which this generalises rather than replaces. */}
+      {drawerEntry && (
+        <ItemDrawer
+          title={drawerEntry.name}
+          rootRelPath={drawerEntry.rel_path}
+          itemId={drawerEntry.id}
+          nodes={nodes}
+          onClose={() => setDrawerEntry(null)}
+        />
       )}
     </div>
   )

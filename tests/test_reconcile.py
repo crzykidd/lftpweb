@@ -213,6 +213,48 @@ def test_directory_size_rollup_sums_children_not_own_reported_size():
     assert nodes["Release"].remote_size == 350
 
 
+# --- local_mtime (2026-08-13, prompts/2026-08-13-files-detail-inspector.md): the local-side --
+# --- counterpart to `remote_mtime` -- same files-only convention, deliberately -----------------
+
+
+def test_local_mtime_carried_through_for_a_file():
+    remote_tree = _tree(RemoteEntry("f.bin", False, 100, 1.0))
+    local_tree = _local(LocalEntry("f.bin", False, 100, 1_700_000_000.0))
+    nodes = reconcile(remote_tree, local_tree)
+    assert nodes["f.bin"].local_mtime == 1_700_000_000.0
+
+
+def test_local_mtime_none_when_no_local_copy():
+    remote_tree = _tree(RemoteEntry("f.bin", False, 100, 1.0))
+    local_tree: dict = {}
+    nodes = reconcile(remote_tree, local_tree)
+    assert nodes["f.bin"].local_mtime is None
+
+
+def test_local_mtime_none_for_a_directory_even_though_it_has_local_children():
+    # Files only, mirroring `remote_mtime`'s own convention (`reconcile`'s own docstring on
+    # `ReconciledNode.local_mtime`) -- a directory's row never carries a `local_mtime`,
+    # regardless of what its children report.
+    remote_tree = _tree(
+        RemoteEntry("Release", True, 0, 1.0),
+        RemoteEntry("Release/a.txt", False, 100, 1.0),
+    )
+    local_tree = _local(
+        LocalEntry("Release", True),
+        LocalEntry("Release/a.txt", False, 100, 1_700_000_000.0),
+    )
+    nodes = reconcile(remote_tree, local_tree)
+    assert nodes["Release"].local_mtime is None
+    assert nodes["Release/a.txt"].local_mtime == 1_700_000_000.0
+
+
+def test_local_mtime_none_for_a_local_only_directory():
+    remote_tree: dict = {}
+    local_tree = _local(LocalEntry("MyStuff", True, 0, 1_700_000_000.0))
+    nodes = reconcile(remote_tree, local_tree)
+    assert nodes["MyStuff"].local_mtime is None
+
+
 def test_remote_size_never_latched_recomputed_each_call():
     # DESIGN.md §3.2 rule 4: a torrent may still be growing on the seedbox. Two separate
     # reconcile() calls over different remote sizes must each reflect the size passed in,

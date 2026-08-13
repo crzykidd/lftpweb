@@ -46,7 +46,9 @@ def _node(rel_path: str, size: int) -> ItemView:
             "remote_size": size,
             "local_size": None,
             "remote_mtime": 1.0,
+            "local_mtime": None,
             "state_changed_at": None,
+            "first_seen_at": None,
             "downloaded_at": None,
             "verified_at": None,
             "extracted_at": None,
@@ -440,7 +442,11 @@ async def test_published_state_is_the_persisted_state_not_the_structural_one(
             "lifecycle.mkv",
             "removed.mkv",
         }, "only the rows whose persisted state changed belong in the delta"
-        assert len(json.dumps(delta)) < 2000, "the delta must stay proportional to what changed"
+        # The threshold was bumped from 2000 (2026-08-13, prompts/2026-08-13-files-detail-
+        # inspector.md): every changed node now also carries `local_mtime` and `first_seen_at`
+        # (`core/itemview.py`), two more fixed per-node fields that don't scale with tree size
+        # -- same reasoning as the 2000->3000 bump above this file's other threshold.
+        assert len(json.dumps(delta)) < 2400, "the delta must stay proportional to what changed"
 
         # ...and the connect-time snapshot -- the reload path, which is how this bug was
         # actually visible to a user -- agrees with the database for every node, not just the

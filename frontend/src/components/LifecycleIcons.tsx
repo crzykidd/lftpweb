@@ -89,6 +89,49 @@ function PackageIcon(props: IconProps) {
   )
 }
 
+/** The per-row detail-drawer affordance (2026-08-13, prompts/2026-08-13-files-detail-
+ * inspector.md), not a lifecycle facet -- it is a *control* ("open the drawer"), not a
+ * *state*, and `FileTree.tsx`'s row renders it with a plainer, quieter treatment than the four
+ * status icons above for exactly that reason (`text-zinc-400`, never one of
+ * `FACET_LEVEL_CLASSES`'s semantic colours). Lucide `info` -- unlike the four icons above, this
+ * one *is* one of the handful of Lucide icons derived from the Feather project, so it carries
+ * the additional Feather MIT notice in NOTICE alongside the ISC one.
+ */
+function InfoIcon(props: IconProps) {
+  return (
+    <IconBase {...props}>
+      <circle cx="12" cy="12" r="10" />
+      <path d="M12 16v-4" />
+      <path d="M12 8h.01" />
+    </IconBase>
+  )
+}
+
+/** A row's "view details" button -- explicit and touch-safe (DESIGN.md §9.2's affordance
+ * conflict this task resolves: row click already drives multi-select, which feeds bulk
+ * Queue/Stop/**Delete**, so opening a drawer on the same click would sit behind a destructive
+ * action). `stopPropagation` lives here, not on the caller -- every row that renders this
+ * button gets the guarantee for free, the same way the row's own selection checkbox already
+ * stops its own click from reaching a (currently nonexistent, but not guaranteed to stay that
+ * way) row-level handler.
+ */
+export function DetailButton({ label, onOpen }: { label: string; onOpen: () => void }) {
+  return (
+    <button
+      type="button"
+      onClick={(e) => {
+        e.stopPropagation()
+        onOpen()
+      }}
+      title={`View details for ${label}`}
+      aria-label={`View details for ${label}`}
+      className="flex shrink-0 items-center text-zinc-400 hover:text-zinc-700 dark:text-zinc-600 dark:hover:text-zinc-300"
+    >
+      <InfoIcon title={`View details for ${label}`} />
+    </button>
+  )
+}
+
 // Four colour treatments, not three (the task's own correction to the user's green/amber/red
 // framing): green = done and good, amber = in progress, red = failed, dim = not applicable or
 // *intentionally* gone -- a move-mode item's deleted-on-purpose remote copy is this last one,

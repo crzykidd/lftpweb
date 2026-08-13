@@ -231,12 +231,21 @@ export interface FileNode {
   remote_size: number | null
   local_size: number | null
   remote_mtime: number | null
+  // The local-side counterpart to `remote_mtime` (migration 011, 2026-08-13,
+  // prompts/2026-08-13-files-detail-inspector.md) -- the item drawer's "modified date, both
+  // sides" reading. Files only, null for a directory, mirroring `remote_mtime`'s own convention
+  // (core/reconcile.py -- see that module for why the local side deliberately stays consistent
+  // rather than inventing a directory rule of its own).
+  local_mtime: number | null
   // When `state` last actually changed value (migration 006), stamped by that migration's own
   // triggers. null only for a row the migration's backfill genuinely couldn't date -- render
   // gracefully rather than assuming a value. Not the same question as "when did it complete"
   // (downloaded_at, the planned local-retention feature's key) -- a DOWNLOADED item that dips
   // to PARTIAL and back moves this without earning a fresh retention lease.
   state_changed_at: string | null
+  // When this row was first ever seen (migration 001) -- the first entry in the item drawer's
+  // lifecycle chronology (2026-08-13). Existed server-side since phase 2; new to the wire only.
+  first_seen_at: string | null
   // Milestone/audit timestamps (2026-08-13) -- raw material for a lifecycle icon's tooltip.
   // `downloaded_at` already existed server-side (§7.3's retention key); the other four are new
   // to the wire only.
@@ -414,6 +423,9 @@ export interface HistoryEventsResponse {
 }
 
 export interface HistoryJobsFilter {
+  // One item's own transfer history (2026-08-13, prompts/2026-08-13-files-detail-inspector.md)
+  // -- the item drawer's bounded "load on open" fetch. Mirrors `HistoryEventsFilter.item_id`.
+  item_id?: number
   queue_id?: number
   state?: 'succeeded' | 'failed' | 'cancelled'
   error_class?: string

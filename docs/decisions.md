@@ -6,6 +6,83 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-13 — One detail surface, not two: generalising the item drawer instead of building
+## an inline expansion
+
+**Handoff prompt `prompts/2026-08-13-files-detail-inspector.md`, executed end to end.** User
+request: mouse over or click a row and see "Size, modified date etc." for both sides, plus a
+little history. The user's own refinement (after being shown the affordance conflict — row
+click already drives multi-select, which feeds bulk **Delete**) settled on a small per-row info
+icon as the primary entry point, with a hover tooltip as a cheap secondary.
+
+**Reused `ItemDrawer.tsx` rather than building the inline expand-underneath the request
+originally floated.** It already existed (phase 3b) and already showed a per-file breakdown;
+it was job-keyed and reachable from exactly one place (`TransfersPage.tsx`), so it could never
+be opened once a transfer aged out of that page's list, and the user had directly hit this
+("How do I get to the drawer?"). Its props were already item-agnostic apart from that one
+job-keying, so generalising it to a plain `{ itemId, rootRelPath, nodes }` and wiring a second
+caller from `FileTree.tsx` was the smaller, single-surface change; building a second display of
+overlapping information would have started the two drifting apart the first time only one of
+them was updated. `TransfersPage.tsx` keeps its own entry point working unchanged, now passing
+`job.item_id` for the prop that used to be implicit.
+
+**The info icon lives in `LifecycleIcons.tsx`, not a new file** — same inline-SVG-from-Lucide
+convention the row-revamp task established, but *visually quieter* than the four status icons
+(plain `text-zinc-400`, none of `FACET_LEVEL_CLASSES`'s semantic colours) because it is a
+control ("open the drawer"), not a state. Lucide's `info` glyph, unlike the four status icons,
+*is* one of the handful derived from the Feather project, so it carries an additional Feather
+MIT notice in `NOTICE` alongside the existing Lucide ISC one — checked directly against
+Lucide's own `LICENSE` file rather than assumed. `stopPropagation` lives inside the button
+component itself (`DetailButton`), not pushed onto each caller, so every future caller gets the
+"never toggles selection" guarantee for free rather than having to remember it.
+
+**`local_mtime` (migration 011) is files-only, mirroring `remote_mtime` exactly — no
+directory rule invented.** The request asked for "modified date … for both sides," but
+`remote_mtime` (migration 001) had never had a directory reading either — `core/reconcile.py`
+only ever sets it for a file. Two directory conventions were considered and rejected: the
+directory inode's own mtime (moves only on entry add/remove, says nothing about the content
+inside — a subtitle file changing three levels down wouldn't move it) and "newest child,
+recursively" (a second rollup, computed differently from every other per-directory value this
+codebase already rolls up by summing, for a question the byte-comparison model doesn't actually
+need answered). Staying consistent with the existing, already-shipped convention was the
+deliberate call, not an oversight — `core/local_scan.py.LocalEntry.mtime` defaults to `0.0` and
+`core/reconcile.py.reconcile` discards it for any `is_dir` node exactly the way it already
+discarded `remote_entry.mtime`.
+
+**No backfill for the new column — a real gap in existing rows, left as `NULL` on purpose.**
+Unlike `state_changed_at` (migration 006), there is nothing already on the `item` row that
+`local_mtime` could be approximated from; fabricating one from, say, `first_seen_at` would claim
+a precision this codebase never measured. Every pre-existing row reads `NULL` until its next
+scan, identically to a brand-new item that hasn't been scanned yet.
+
+**`GET /api/history/jobs` gained an `item_id` filter.** It already had `queue_id`; the mirror
+`GET /api/history/events` filter already existed. The drawer's "a little history" needs one
+item's own jobs, not a whole queue's filtered client-side — adding the filter server-side
+avoids exactly the over-fetch `api/history.py`'s own module docstring already argues against
+for `output_tail` (docs/decisions.md's phase 6 entry, the row-cap reasoning). Both history
+calls fire exactly once, when the drawer mounts (or when `itemId` itself changes), via a
+`useEffect` inside the drawer — never per row, never eagerly for a whole tree; a cancellation
+flag guards against a stale response landing after the drawer has moved on to a different item.
+
+**The hover tooltip is a native `title` attribute, not a second component.** Zero fetch, zero
+re-render of the virtualized list, no layout shift — the browser owns showing and hiding it.
+It shows size / modified / percent-complete, composed from fields the row already has in hand;
+the drawer (opened via the info icon) is the only thing that ever triggers a network request.
+
+**DESIGN.md §9.2 — draft wording only, not applied**, per this repo's own convention for
+draft wording (see the 2026-08-12 "settle gate"/"`state_changed_at`" entries and the
+2026-08-13 lifecycle-icons entry below, same pattern). Proposed addition, pending a nod:
+
+> A small info icon on each row (quieter than the lifecycle icons — a control, not a status)
+> opens a side drawer with that item's full detail: size and modified date for both remote and
+> local where each exists, the lifecycle chronology (`first_seen_at` through
+> `state_changed_at`, in the order it happened), and up to ten recent transfer attempts and
+> audit events. The same drawer opens from a Transfers-page row. Hovering a row (no click)
+> shows a lightweight native tooltip with size / modified / percent-complete — cheap, and it
+> never fetches anything.
+
+---
+
 ## 2026-08-13 — Lifecycle icons: presence vs. milestone, and why `item.state` stays untouched
 
 **Handoff prompt `prompts/2026-08-13-lifecycle-icons.md`, executed end to end.** User design

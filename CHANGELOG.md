@@ -228,6 +228,22 @@ alongside this list: several entries below ship with deliberate, documented limi
   saved set of collapsed paths — a directory that arrives later over the WebSocket inherits
   the current default automatically rather than defaulting to expanded regardless of what
   was last chosen.
+- **The Files tree now has an item detail drawer, reachable from every row** *(2026-08-13)*.
+  A small, deliberately quieter info icon per row opens a side drawer with both sides' size
+  and modified date (a local file short of its remote size is called out explicitly as
+  mid-transfer or truncated), the full lifecycle chronology (`first_seen_at` through
+  `state_changed_at`, rendered in the order it actually happened, not an unordered field
+  dump), and a bounded "recent history" panel (last 10 transfer attempts, last 10 audit
+  events — including the delete-audit trail — fetched once when the drawer opens, never per
+  row). This is the same drawer the Transfers page has used since phase 3b, generalised
+  rather than duplicated: it previously took a job and was unreachable once a transfer aged
+  out of that page's list; it now takes a plain item id and path, so Files can open it too.
+  New: `local_mtime` (migration 011) — the local-side counterpart to `remote_mtime` that
+  never existed before this task, so "modified date" could not be answered for the local
+  side at all — and `first_seen_at` (already persisted since phase 2) reaching the wire for
+  the first time. `GET /api/history/jobs` gained an `item_id` filter to match
+  `GET /api/history/events`'s existing one, so the drawer's history fetch doesn't have to
+  pull a whole queue's jobs client-side.
 
 ### Changed
 

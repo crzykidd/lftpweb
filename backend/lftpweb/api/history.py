@@ -73,6 +73,7 @@ def _job_out(row: Any) -> HistoryJobOut:
 @router.get("/jobs", response_model=HistoryJobsResponse)
 async def list_history_jobs(
     request: Request,
+    item_id: int | None = None,
     queue_id: int | None = None,
     state: str | None = None,
     error_class: str | None = None,
@@ -86,6 +87,10 @@ async def list_history_jobs(
     lexicographically comparable) so a cancelled-before-start job -- which has no
     `started_at` and may have no `finished_at` either in edge cases -- still sorts and
     filters sensibly.
+
+    `item_id` (2026-08-13, prompts/2026-08-13-files-detail-inspector.md): one item's own
+    transfer history, for the item drawer's bounded "load on open" fetch -- the mirror of
+    `list_history_events`'s existing `item_id` filter below, which this endpoint lacked.
     """
     if state is not None and state not in _TERMINAL_JOB_STATES:
         raise HTTPException(
@@ -97,6 +102,9 @@ async def list_history_jobs(
 
     where = ["job.state IN ('succeeded','failed','cancelled')"]
     params: list[Any] = []
+    if item_id is not None:
+        where.append("job.item_id = ?")
+        params.append(item_id)
     if queue_id is not None:
         where.append("item.queue_id = ?")
         params.append(queue_id)

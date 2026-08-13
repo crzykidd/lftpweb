@@ -36,10 +36,17 @@ from typing import Any
 # timestamp into relative text is a presentation concern the frontend already owns for
 # `state_changed_at` (`lib/format.ts`), and duplicating that here would be a second place doing
 # the same job.
+#
+# `local_mtime`/`first_seen_at` (2026-08-13, prompts/2026-08-13-files-detail-inspector.md): the
+# item drawer's detail panel. `local_mtime` is migration 011's new column (the local-side
+# counterpart to `remote_mtime`, files only -- see that migration). `first_seen_at` (migration
+# 001) already existed on every row but had never reached the wire before this task -- it is the
+# first entry in the lifecycle chronology the drawer renders ("when did lftpweb first notice
+# this"), and there was simply no reader for it until now.
 ITEM_VIEW_COLUMNS = (
-    "id, rel_path, is_dir, remote_size, local_size, remote_mtime, state, substate, "
-    "state_changed_at, downloaded_at, verified_at, extracted_at, first_missing_at, "
-    "remote_deleted_at"
+    "id, rel_path, is_dir, remote_size, local_size, remote_mtime, local_mtime, state, substate, "
+    "state_changed_at, first_seen_at, downloaded_at, verified_at, extracted_at, "
+    "first_missing_at, remote_deleted_at"
 )
 
 # The published shape is a plain dict on purpose: it *is* the JSON that goes on the wire and
@@ -282,6 +289,11 @@ def item_view(row: Mapping[str, Any]) -> ItemView:
     `facets` below is derived from them, so a test can assert the derivation without a
     database.
 
+    `local_mtime` (migration 011, prompts/2026-08-13-files-detail-inspector.md) has the same
+    affinity mismatch as `remote_mtime` and is corrected the same way. `first_seen_at`
+    (migration 001) is plain ISO-8601 text like `state_changed_at`, passed through verbatim —
+    both are new to the wire with this task, not new to the database.
+
     `facets` (`_lifecycle_facets`) is the one place R/L/V/E get computed, so `GET /api/files`,
     `queue_delta`, `item_delta`, and connect-time `snapshot()` cannot disagree about what a
     row's icons should show — they are all this same function.
@@ -295,7 +307,9 @@ def item_view(row: Mapping[str, Any]) -> ItemView:
         "remote_size": row["remote_size"],
         "local_size": row["local_size"],
         "remote_mtime": float(row["remote_mtime"]) if row["remote_mtime"] is not None else None,
+        "local_mtime": float(row["local_mtime"]) if row["local_mtime"] is not None else None,
         "state_changed_at": row["state_changed_at"],
+        "first_seen_at": row["first_seen_at"],
         "downloaded_at": row["downloaded_at"],
         "verified_at": row["verified_at"],
         "extracted_at": row["extracted_at"],

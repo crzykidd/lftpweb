@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import os
+
 from lftpweb.core.extract import FAILED_PREFIX, UNPACK_PREFIX
 from lftpweb.core.local_scan import (
-    LocalEntry,
     PgetStatus,
     effective_file_size,
     effective_size,
@@ -73,7 +74,12 @@ def test_scan_local_temp_suffix_matched_to_final_name(tmp_path):
 def test_scan_local_finished_file_has_no_suffix(tmp_path):
     (tmp_path / "done.mkv").write_bytes(b"y" * 42)
     entries = scan_local(tmp_path)
-    assert entries["done.mkv"] == LocalEntry(rel_path="done.mkv", is_dir=False, size=42)
+    # Not a full `LocalEntry(...) ==` comparison -- `mtime` (below) is the real filesystem
+    # timestamp, which this test doesn't control, so it's checked separately rather than
+    # baked into an equality the real value would never satisfy.
+    assert entries["done.mkv"].rel_path == "done.mkv"
+    assert entries["done.mkv"].is_dir is False
+    assert entries["done.mkv"].size == 42
 
 
 def test_scan_local_nested_directories_and_files(tmp_path):
@@ -213,6 +219,45 @@ def test_scan_local_skips_unpack_and_failed_dirs_at_any_depth(tmp_path):
     assert f"Show/Season 01/{UNPACK_PREFIX}Episode.01" not in entries
     assert f"Show/Season 01/{FAILED_PREFIX}Episode.02" not in entries
     assert "Show/Season 01/Episode.03.mkv" in entries
+
+
+# --- `mtime` (2026-08-13, prompts/2026-08-13-files-detail-inspector.md): the local-side --------
+# --- counterpart to `core/remote.py.RemoteEntry.mtime` --------------------------------------
+
+
+def test_scan_local_captures_file_mtime(tmp_path):
+    path = tmp_path / "movie.mkv"
+    path.write_bytes(b"x" * 10)
+    known_mtime = 1_700_000_000  # a fixed epoch second, not "whenever this test happened to run"
+    os.utime(path, (known_mtime, known_mtime))
+
+    entries = scan_local(tmp_path)
+
+    assert entries["movie.mkv"].mtime == known_mtime
+
+
+def test_scan_local_directory_mtime_is_always_zero_not_the_inode_mtime(tmp_path):
+    # Files only -- the same convention `core/remote.py.RemoteEntry.mtime` already has, and
+    # `core/reconcile.py.reconcile` never reads a directory's own `mtime` off either side.
+    # `os.scandir` never even statted the directory itself for this, so this is the dataclass
+    # default, not a captured-and-discarded reading.
+    (tmp_path / "Release").mkdir()
+    entries = scan_local(tmp_path)
+    assert entries["Release"].mtime == 0.0
+
+
+def test_scan_local_temp_suffixed_file_reports_its_own_mtime(tmp_path):
+    # A `.lftp` in-progress temp file's mtime is what actually matters (last write, not the
+    # nonexistent final-name file) -- the rename at completion time is what makes the two
+    # converge, but mid-transfer only the temp file's own timestamp exists at all.
+    path = tmp_path / "show.mkv.lftp"
+    path.write_bytes(b"x" * 5)
+    known_mtime = 1_700_000_500
+    os.utime(path, (known_mtime, known_mtime))
+
+    entries = scan_local(tmp_path)
+
+    assert entries["show.mkv"].mtime == known_mtime
 
 
 def test_scan_local_unpack_prefix_only_hides_directories_not_files(tmp_path):

@@ -257,6 +257,7 @@ export function TransfersPage() {
         <ItemDrawer
           title={itemName(drawerJob.rel_path)}
           rootRelPath={drawerJob.rel_path}
+          itemId={drawerJob.item_id}
           nodes={drawerNodes}
           onClose={() => setDrawerJob(null)}
         />

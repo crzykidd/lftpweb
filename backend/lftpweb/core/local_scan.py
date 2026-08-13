@@ -29,11 +29,20 @@ class LocalEntry:
     root). `size` is the *effective* size for files (§4.4a/b already applied) and is always
     0 for directories — the reconciler computes directory totals by summing children, the
     same way it does for the remote tree, so the two are computed identically.
+
+    `mtime` (2026-08-13, prompts/2026-08-13-files-detail-inspector.md) is the file's own
+    `st_mtime`, epoch seconds — the local-side counterpart to `core/remote.py.RemoteEntry.mtime`
+    that never existed before this task (the gap the item drawer's "modified date, both sides"
+    request exposed directly). Always `0.0` for a directory, mirroring `RemoteEntry` exactly:
+    `core/reconcile.py` only ever reads a file's own mtime, never a directory's, on either side
+    — see that module for why staying consistent with the existing (files-only) convention was
+    the deliberate choice here rather than inventing a directory rule from scratch.
     """
 
     rel_path: str
     is_dir: bool
     size: int = 0
+    mtime: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -202,14 +211,21 @@ def scan_local(root: str | Path) -> dict[str, LocalEntry]:
                 f"{rel_prefix}{final_name}" if rel_prefix == "" else f"{rel_prefix}/{final_name}"
             )
 
+            # One `stat()`, used for both `mtime` (always wanted -- a sidecar has no opinion
+            # on it) and `size` (only when there's no sidecar to prefer instead). Missing
+            # entirely on a race (deleted between `scandir` and `stat`) reads as `mtime=0.0`,
+            # the same "nothing better available" fallback `size` already had.
+            try:
+                stat_result = entry.stat(follow_symlinks=False)
+            except OSError:
+                stat_result = None
+            mtime = stat_result.st_mtime if stat_result is not None else 0.0
+
             status = sidecars.get(name)
             if status is not None:
                 size = effective_size(status)
             else:
-                try:
-                    size = entry.stat(follow_symlinks=False).st_size
-                except OSError:
-                    size = 0
+                size = stat_result.st_size if stat_result is not None else 0
 
             existing = entries.get(final_rel_path)
             if existing is not None and existing.size >= size:
@@ -217,7 +233,9 @@ def scan_local(root: str | Path) -> dict[str, LocalEntry]:
                 # should not both occur, but if they do, keep whichever reports more data
                 # rather than letting scan order decide.
                 continue
-            entries[final_rel_path] = LocalEntry(rel_path=final_rel_path, is_dir=False, size=size)
+            entries[final_rel_path] = LocalEntry(
+                rel_path=final_rel_path, is_dir=False, size=size, mtime=mtime
+            )
 
     walk(root, "")
     return entries

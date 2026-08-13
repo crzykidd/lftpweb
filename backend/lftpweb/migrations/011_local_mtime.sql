@@ -1,0 +1,26 @@
+-- local_mtime (prompts/2026-08-13-files-detail-inspector.md): the item drawer's "modified
+-- date -- for both sides" request cannot be answered without a local-side counterpart to
+-- `remote_mtime` (migration 001) -- there simply wasn't one. A plain `ADD COLUMN`, migration
+-- 006's own precedent for a nullable TEXT column with no CHECK to widen: no table rebuild
+-- needed (contrast migration 010, which had to rebuild `item` because it was widening a CHECK).
+--
+-- Same storage convention as `remote_mtime`: a `float` (epoch seconds) written into a
+-- TEXT-affinity column, converted back with `float(row["local_mtime"])` in
+-- `core/itemview.py.item_view` -- see that function's docstring for why (SQLite TEXT affinity
+-- stores an inserted REAL as its text form).
+--
+-- No backfill. Unlike `state_changed_at` (migration 006), there is no already-persisted value
+-- anywhere on the row this could be approximated from -- `local_mtime` was never captured
+-- before this task, by scan or otherwise, so fabricating one (e.g. from `first_seen_at`) would
+-- claim a precision this codebase never actually measured. Every pre-existing row gets NULL,
+-- exactly like a freshly-inserted item that hasn't been scanned yet; the very next scan pass
+-- (`core/local_scan.py` -> `core/reconcile.py` -> `core/engine.py._persist`) fills it in for
+-- real, the same way `remote_mtime` fills in on a queue's first scan.
+--
+-- Files only, `NULL` for a directory -- `remote_mtime` never had a directory reading either
+-- (`core/reconcile.py.reconcile` only ever sets it `remote_entry.mtime if not is_dir else
+-- None`), and the local side stays consistent with that rather than inventing a different
+-- convention (newest child? the directory inode's own mtime, which only moves on entry
+-- add/remove and says nothing about the content inside) -- see `core/local_scan.py.LocalEntry`
+-- and `core/reconcile.py.ReconciledNode` for where this is enforced.
+ALTER TABLE item ADD COLUMN local_mtime TEXT;

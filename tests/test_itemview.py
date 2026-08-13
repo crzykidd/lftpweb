@@ -222,7 +222,9 @@ def _row(**overrides):
         "remote_size": 1000,
         "local_size": 1000,
         "remote_mtime": None,
+        "local_mtime": None,
         "state_changed_at": None,
+        "first_seen_at": "2026-08-12T23:00:00Z",
         "downloaded_at": "2026-08-13T00:00:00Z",
         "verified_at": None,
         "extracted_at": None,
@@ -251,6 +253,25 @@ def test_item_view_carries_facets_and_the_raw_timestamps_verbatim():
     assert view["downloaded_at"] == "2026-08-13T00:00:00Z"
     assert view["first_missing_at"] is None
     assert view["remote_deleted_at"] is None
+
+
+# --- local_mtime / first_seen_at (2026-08-13, prompts/2026-08-13-files-detail-inspector.md) --
+
+
+def test_item_view_converts_local_mtime_like_remote_mtime():
+    # Same TEXT-affinity round-trip as `remote_mtime` (a REAL bound value comes back out of a
+    # TEXT column as a string) -- `item_view` must apply the same `float(...)` correction.
+    row = _row(local_mtime="1700000000.0")
+    assert item_view(row)["local_mtime"] == 1700000000.0
+
+
+def test_item_view_local_mtime_none_when_column_is_null():
+    assert item_view(_row(local_mtime=None))["local_mtime"] is None
+
+
+def test_item_view_passes_first_seen_at_through_verbatim():
+    row = _row(first_seen_at="2026-08-12T23:00:00Z")
+    assert item_view(row)["first_seen_at"] == "2026-08-12T23:00:00Z"
 
 
 # --- The headline test: a completed move-mode item, through the real Engine pipeline ---------

@@ -169,6 +169,36 @@ async def test_filter_by_queue_id(db):
     assert resp.jobs[0].queue_name == "tv"
 
 
+async def test_filter_by_item_id(db):
+    """2026-08-13, prompts/2026-08-13-files-detail-inspector.md: the item drawer's bounded
+    "load on open" history fetch needs one item's own jobs, not a whole queue's -- mirrors
+    `list_history_events`'s pre-existing `item_id` filter, which this endpoint lacked.
+    """
+    queue_id = await _make_queue(db)
+    item1 = await _make_item(db, queue_id, "show.mkv")
+    await _make_job(db, item1, state="succeeded")
+    item2 = await _make_item(db, queue_id, "film.mkv")
+    await _make_job(db, item2, state="succeeded")
+
+    resp = await history.list_history_jobs(_FakeRequest(db), item_id=item1)
+    assert len(resp.jobs) == 1
+    assert resp.jobs[0].item_id == item1
+    assert resp.jobs[0].rel_path == "show.mkv"
+
+
+async def test_filter_by_item_id_returns_every_attempt_for_that_item(db):
+    queue_id = await _make_queue(db)
+    item = await _make_item(db, queue_id, "retry.mkv", state="FAILED")
+    await _make_job(db, item, state="failed", finished_at="2026-08-11T00:00:00.000000Z")
+    await _make_job(db, item, state="succeeded", finished_at="2026-08-11T01:00:00.000000Z")
+    other_item = await _make_item(db, queue_id, "other.mkv")
+    await _make_job(db, other_item, state="succeeded")
+
+    resp = await history.list_history_jobs(_FakeRequest(db), item_id=item)
+    assert len(resp.jobs) == 2
+    assert {j.state for j in resp.jobs} == {"failed", "succeeded"}
+
+
 async def test_filter_by_state(db):
     queue_id = await _make_queue(db)
     ok_item = await _make_item(db, queue_id, "ok.txt")

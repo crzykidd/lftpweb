@@ -698,13 +698,14 @@ class Engine:
             if rel_path in protected:
                 await self.db.execute(
                     """
-                    INSERT INTO item (queue_id, rel_path, is_dir, remote_size, local_size, remote_mtime, state)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO item (queue_id, rel_path, is_dir, remote_size, local_size, remote_mtime, local_mtime, state)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT (queue_id, rel_path) DO UPDATE SET
                         is_dir = excluded.is_dir,
                         remote_size = excluded.remote_size,
                         local_size = excluded.local_size,
-                        remote_mtime = excluded.remote_mtime
+                        remote_mtime = excluded.remote_mtime,
+                        local_mtime = excluded.local_mtime
                     """,
                     (
                         queue_id,
@@ -713,6 +714,7 @@ class Engine:
                         node.remote_size,
                         node.local_size,
                         node.remote_mtime,
+                        node.local_mtime,
                         node.structural_state,
                     ),
                 )
@@ -814,13 +816,14 @@ class Engine:
 
             await self.db.execute(
                 """
-                INSERT INTO item (queue_id, rel_path, is_dir, remote_size, local_size, remote_mtime, state, substate, first_missing_at, downloaded_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO item (queue_id, rel_path, is_dir, remote_size, local_size, remote_mtime, local_mtime, state, substate, first_missing_at, downloaded_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT (queue_id, rel_path) DO UPDATE SET
                     is_dir = excluded.is_dir,
                     remote_size = excluded.remote_size,
                     local_size = excluded.local_size,
                     remote_mtime = excluded.remote_mtime,
+                    local_mtime = excluded.local_mtime,
                     state = excluded.state,
                     substate = excluded.substate,
                     first_missing_at = excluded.first_missing_at,
@@ -833,6 +836,7 @@ class Engine:
                     node.remote_size,
                     node.local_size,
                     node.remote_mtime,
+                    node.local_mtime,
                     state,
                     substate,
                     first_missing_at,
@@ -879,8 +883,8 @@ class Engine:
             vanished_state, vanished_first_missing_at = override
             written.add(rel_path)
             await self.db.execute(
-                "UPDATE item SET remote_size = NULL, local_size = NULL, state = ?, "
-                "first_missing_at = ? WHERE queue_id = ? AND rel_path = ?",
+                "UPDATE item SET remote_size = NULL, local_size = NULL, local_mtime = NULL, "
+                "state = ?, first_missing_at = ? WHERE queue_id = ? AND rel_path = ?",
                 (vanished_state, vanished_first_missing_at, queue_id, rel_path),
             )
 

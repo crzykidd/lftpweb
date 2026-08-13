@@ -83,6 +83,13 @@ class ReconciledNode:
     remote_size: int | None
     local_size: int | None
     remote_mtime: float | None
+    # The local-side counterpart to `remote_mtime` (2026-08-13,
+    # prompts/2026-08-13-files-detail-inspector.md). Same convention, deliberately: files only,
+    # `None` for a directory -- `remote_mtime` never had a directory reading either (see that
+    # field's own line below), and inventing a different rule for the local side (newest child?
+    # the directory inode's own mtime, which only moves on entry add/remove and says nothing
+    # about *content*) would make the two sides answer different questions for no real gain.
+    local_mtime: float | None
 
 
 def _parent(rel_path: str) -> str | None:
@@ -248,6 +255,7 @@ def reconcile(
             remote_size=remote_size_totals.get(path) if remote_entry is not None else None,
             local_size=local_size_totals.get(path) if local_entry is not None else None,
             remote_mtime=remote_entry.mtime if (remote_entry is not None and not is_dir) else None,
+            local_mtime=local_entry.mtime if (local_entry is not None and not is_dir) else None,
         )
 
     return nodes

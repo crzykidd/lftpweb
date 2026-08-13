@@ -357,12 +357,21 @@ class FileNode(BaseModel):
     remote_size: int | None
     local_size: int | None
     remote_mtime: float | None
+    # The local-side counterpart to `remote_mtime` (migration 011, 2026-08-13,
+    # prompts/2026-08-13-files-detail-inspector.md) -- the item drawer's "modified date, both
+    # sides" reading. Files only, `None` for a directory, mirroring `remote_mtime`'s own
+    # convention (`core/reconcile.py`).
+    local_mtime: float | None
     # When `state` last actually changed value (migration 006), stamped by that migration's
     # own triggers -- not writer discipline (see `core/itemview.py.item_view`). `None` only
     # for a row the migration's backfill genuinely couldn't date. Deliberately NOT the key for
     # the planned local-retention feature, which must use `downloaded_at` instead: "when did
     # it complete" and "when did it last move" are different questions.
     state_changed_at: str | None = None
+    # When this row was first ever seen (migration 001) -- the first entry in the item drawer's
+    # lifecycle chronology (2026-08-13, prompts/2026-08-13-files-detail-inspector.md). Existed
+    # on the row since phase 2; new to the wire only with this task.
+    first_seen_at: str | None = None
     # Milestone/audit timestamps (2026-08-13, prompts/2026-08-13-lifecycle-icons.md) -- passed
     # through verbatim from the `item` row (`core/itemview.py.item_view`), the raw material a
     # lifecycle icon's tooltip is built from. `downloaded_at` already existed on the row before
