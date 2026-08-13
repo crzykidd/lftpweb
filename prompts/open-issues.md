@@ -13,41 +13,6 @@ and it held all night.
 
 ---
 
-## Awaiting a decision from the user
-
-### Post-processing settings: site-wide *and* per-queue, for four toggles
-
-Raised by the user 2026-08-13: *"if we have these settings per queue then why have some of them
-here?"* Scanned and written up; **not built — this changes behaviour and is the user's call.**
-
-Only **four** settings are duplicated, and they are ANDed
-(`core/postprocess.py.process_item`): `verify_enabled`/`auto_verify`,
-`extract_enabled`/`auto_extract`, `move_enabled`/`auto_move`,
-`delete_archives_after_extract`/`auto_delete_archives`.
-
-Everything else site-wide is genuine *configuration* with no per-queue twin —
-`verify_hash_on_disk`, `extract_target_dir`, `extract_passwords`, `concurrency`,
-`failed_retention_enabled`/`_days`. Nobody is confused by those and they should stay put.
-
-Three options:
-
-1. **Status quo** — keep the AND, rely on the "System setting: off" readout added in `0781352`.
-   No work, but it papers over the confusion instead of removing it.
-2. **Site toggle becomes the default for new queues, not an AND gate.** The queue owns the
-   decision; the site value is the template applied at creation. "Toggle on but nothing
-   happens" becomes structurally impossible. **The migration can preserve behaviour exactly** —
-   set each queue's toggle to `(site AND queue)` as it currently resolves, then stop ANDing, so
-   no existing install changes.
-3. **Drop the site toggles entirely.** Simplest model; costs a global kill switch.
-
-**Recommendation: 2.** Keeps set-policy-once convenience, makes a queue's behaviour readable
-from one screen, migration is behaviour-preserving. The only loss is a global off switch, which
-is better expressed as one explicit "pause post-processing" control than as four ANDs that each
-fail silently — the user has been bitten by exactly that twice.
-
-Under all three, `sync_mode == 'move'` still forces verification on regardless of both layers,
-because it gates an irreversible remote delete.
-
 ## Still open — read these first
 
 ### No frontend test runner exists — at all
@@ -156,6 +121,7 @@ Plus the backup `VACUUM INTO` race (`209928d`) and the pending `DESIGN.md` wordi
 
 | Summary | Commit |
 |---|---|
+| The four post-processing toggles' site-wide/per-queue AND (raised as "Awaiting a decision from the user," now resolved and removed from this file) replaced with inherit-or-override; migration 015, and `db.py.migrate()` now disables `PRAGMA foreign_keys` for the whole batch of pending migrations after the table-rebuild this needed turned out to cascade-delete `item`/`pattern` — see `docs/decisions.md` | `prompts/done/2026-08-13-postprocess-inherit-or-override.md` |
 | `re_download_externally_removed` could queue doomed jobs on a `move` queue, and `resolve_absence` never wrote `REMOVED_BOTH` — the same underlying question, closed together; see `docs/decisions.md` and `DESIGN.md` §3.2 rule 3 | `prompts/2026-08-13-vanished-rows-should-leave-the-tree.md` |
 | A vanished-both row (`56ec523`'s own fix) stayed *published* in the Files tree forever once it reached a terminal removed state, instead of leaving it once `_project` stopped being handed it — the sweep must keep *writing* the row (unchanged) but stop *publishing* it once terminal | `prompts/2026-08-13-vanished-rows-should-leave-the-tree.md` |
 | Archive volumes optionally deleted after extraction, without breaking completeness | `4533617` |

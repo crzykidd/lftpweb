@@ -136,21 +136,28 @@ class PathQueueIn(BaseModel):
     # itself (this phase's non-negotiable, docs/decisions.md).
     auto_queue_enabled: bool = False
     auto_queue_patterns_only: bool = False
-    # DESIGN.md §6, phase 5. All three default off -- see docs/decisions.md's "every
-    # post-processing step defaults off" non-negotiable. `auto_verify`/`auto_extract` are
-    # existing DB columns (migration 001) that had no API/UI field until this phase;
-    # `auto_move` is new (migration 003). `api/settings.py` forces `auto_verify` to `True`
+    # DESIGN.md §6, phase 5; nullable-for-inherit as of 2026-08-13
+    # (`prompts/2026-08-13-postprocess-inherit-or-override.md`). `None` (the default, and what
+    # a freshly-created queue gets, same as migration 015 sets for every existing queue) means
+    # "inherit the matching `PostprocessSettings` site-wide flag" -- `core/postprocess.py`'s
+    # `_effective()`. An explicit `True`/`False` is a per-queue override, independent of the
+    # site-wide flag in either direction; it is no longer ANDed with it, which could only ever
+    # narrow "on" toward "off." `auto_verify`/`auto_extract` are existing DB columns (migration
+    # 001) that had no API/UI field until phase 5; `auto_move` is new there (migration 003).
+    # `api/settings.py._effective_auto_verify` forces `auto_verify` to an explicit `True`
     # whenever `sync_mode == 'move'` regardless of what's sent here (DESIGN.md §6: "forced on
-    # and cannot be turned off in the UI") -- it is the sole gate on an irreversible delete.
-    auto_verify: bool = False
-    auto_extract: bool = False
-    auto_move: bool = False
-    # Migration 012 (prompts/2026-08-13-per-queue-archive-cleanup.md). Default off, same as the
-    # three above -- `PostprocessSettings.delete_archives_after_extract` shipped site-only
-    # (migration 010) and was the odd one out; this brings it in line with the other three's
-    # "toggleable globally and per path queue" shape (DESIGN.md §6). ANDed with the site-wide
-    # flag in `core/postprocess.py.process_item`, never a tri-state.
-    auto_delete_archives: bool = False
+    # and cannot be turned off in the UI") -- it is the sole gate on an irreversible delete, and
+    # forcing an explicit override (not leaving it on inherit) means a later site-wide change
+    # can never silently turn it off for a `move` queue.
+    auto_verify: bool | None = None
+    auto_extract: bool | None = None
+    auto_move: bool | None = None
+    # Migration 012 (prompts/2026-08-13-per-queue-archive-cleanup.md); nullable-for-inherit
+    # alongside the three above as of the 2026-08-13 task cited above.
+    # `PostprocessSettings.delete_archives_after_extract` shipped site-only (migration 010) and
+    # was the odd one out; this brings it in line with the other three's "toggleable globally
+    # and per path queue" shape (DESIGN.md §6).
+    auto_delete_archives: bool | None = None
     # Migration 009 (prompts/done/2026-08-12-per-queue-scan-interval.md). `None` (the default,
     # and what an existing queue's row already has -- `ADD COLUMN` with no `DEFAULT` leaves it
     # NULL) means "use the site-wide `scan_interval_s` default (`config.py`, currently 30s)" --

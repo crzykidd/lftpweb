@@ -100,16 +100,21 @@ export interface PathQueueIn {
   // user action; omitting these on create must not auto-enable anything.
   auto_queue_enabled: boolean
   auto_queue_patterns_only: boolean
-  // Phase 5 (DESIGN.md §6). All three default off. The backend forces auto_verify to true
+  // Phase 5 (DESIGN.md §6); nullable-for-inherit as of 2026-08-13
+  // (prompts/2026-08-13-postprocess-inherit-or-override.md). `null` means "inherit the
+  // matching Settings -> Post-processing site-wide flag" -- the default, and what every
+  // existing queue's row was set to by migration 015. `true`/`false` is an explicit per-queue
+  // override, independent of the site-wide flag in either direction; the backend no longer
+  // ANDs it with the site-wide flag. The backend forces auto_verify to an explicit `true`
   // whenever sync_mode is 'move' regardless of what's sent here -- the UI mirrors that by
   // disabling (not hiding) the checkbox rather than relying on the server alone.
-  auto_verify: boolean
-  auto_extract: boolean
-  auto_move: boolean
-  // Migration 012 (2026-08-13). Default off, same shape as the three above -- archive cleanup
-  // (Settings -> Post-processing -> Extract) shipped site-only and was the odd one out; this
-  // is its per-queue half, ANDed with the site-wide flag on the backend.
-  auto_delete_archives: boolean
+  auto_verify: boolean | null
+  auto_extract: boolean | null
+  auto_move: boolean | null
+  // Migration 012 (2026-08-13); nullable-for-inherit alongside the three above as of the task
+  // cited above. Archive cleanup (Settings -> Post-processing -> Extract) shipped site-only
+  // and was the odd one out; this is its per-queue half.
+  auto_delete_archives: boolean | null
   // Migration 009 (prompts/done/2026-08-12-per-queue-scan-interval.md). `null` -- the default,
   // and what an existing queue already has -- means "use the site-wide default (30s)"; `0`
   // means on-demand only (no timer; "Rescan now" and auto-queue-driving passes still work when

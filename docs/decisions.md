@@ -6,6 +6,116 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-13 — Post-processing toggles: inherit-or-override replaces the AND, a simpler
+## (not behaviour-preserving) migration, and a latent table-rebuild cascade-delete bug found
+## and fixed along the way
+
+**Handoff prompt `prompts/done/2026-08-13-postprocess-inherit-or-override.md`, executed end to
+end.** `prompts/open-issues.md` had this flagged as "Awaiting a decision from the user" — raised
+by the user: *"if we have these settings per queue then why have some of them here?"* The four
+`path_queue` post-processing columns (`auto_verify`/`auto_extract`/`auto_move`/
+`auto_delete_archives`) were `NOT NULL DEFAULT 0` and ANDed against the matching
+`PostprocessSettings` site-wide flag in `core/postprocess.py.process_item`. The AND was standing
+in for "no override," badly: it can only ever narrow "on" toward "off," so a queue's own toggle
+reading on while the site-wide flag was off did nothing, silently — the user hit this twice on
+2026-08-13 alone, and `0781352` had already tried to paper over it with a "System setting: off —
+this toggle has no effect" readout rather than removing the cause.
+
+**Decision: `NULL` = inherit the site-wide value; `0`/`1` = an explicit override, independent of
+the site-wide value in either direction.** `effective = queue_value if queue_value is not None
+else site_value` (`core/postprocess.py._effective`), no AND anywhere. Three options were on the
+table in `open-issues.md` before this task started:
+
+1. **Status quo** (keep the AND, rely on the readout) — rejected; it doesn't remove the
+   confusion, only explains it after the fact, and the user had already been bitten twice.
+2. **Site value becomes the *creation-time default* for a new queue, not a live gate** — the
+   queue would own its own copy from the moment it's created, diverging from the site value
+   immediately and forever after. Rejected: this is not actually inheritance — changing the
+   site-wide default afterward would do nothing for any queue that already exists, which is
+   most of them most of the time, defeating "site is a convenience default" (the user's own
+   framing, see below).
+3. **Drop the site-level toggles entirely, per-queue only** — rejected; loses the "set policy
+   once, most queues don't need to differ" convenience the user explicitly wanted to keep.
+
+The user resolved it directly, mid-`open-issues.md`-write-up, with the shape actually built:
+*"if we have a global setting, on each setting for a queue we need to have an 'override global'
+and set it locally option. So by default the queue UI shows the global setting unchangeable, and
+if you click override then we store the local setting changes... Global is a convenience
+setting and most of the time it would be the same for all queues, but you might have a specific
+workflow that you need to tweak for 1 queue."* This is a fourth option none of the three above
+actually was: *live* inheritance (a later site-wide change takes effect immediately for every
+queue that hasn't overridden it) plus an explicit, visible override control — not a one-time
+copy (option 2) and not the toggle's total removal (option 3).
+
+**Migration 015 does *not* preserve pre-upgrade effective behaviour, and that was a deliberate,
+explicit mid-task scope change, not an oversight.** The first draft of this migration computed
+each existing row's new value from the site settings read out of `setting.value` (JSON1
+`json_extract`) so that no install's *effective* post-processing behaviour would change on
+upgrade — genuinely behaviour-preserving under the table `site=1,queue=0 -> explicit 0; every
+other combination -> NULL` (verified: `site=0,queue=1` reads 0 under both the old AND and new
+inherit; `site=1,queue=0` needs the explicit override precisely because inherit would flip it to
+1 the moment the site value is read). The user overrode this mid-task: *"for existing setup I
+don't care how it happens. I am the only user running and I am only in a test environment
+today... we don't need to preserve settings."* Nothing has shipped yet — there is exactly one
+install, the developer's own — so behaviour preservation had no one left to protect. Migration
+015 was simplified to set every existing queue's four columns to `NULL` unconditionally: every
+queue starts out inheriting on upgrade, full stop. Kept, deliberately, because it still matters
+for any future *actual* release: the resolution rule itself (`_effective`), the nullable
+columns, and the override UI. Only the migration's *data transform* was simplified, and only
+because pre-release status made that safe.
+
+**A latent, pre-existing cascade-delete bug was found and fixed while building this migration's
+own table rebuild, and it would have mattered a great deal more than the changes above.** SQLite
+has no `ALTER TABLE ... ALTER COLUMN`; dropping `NOT NULL` means the same rebuild migration 008
+already used for `item` (create the new shape, copy every row, `DROP TABLE` the old one, rename).
+Migration 008's own comment claims this was *"confirmed empirically... `DROP TABLE` does not run
+`ON DELETE` actions, and the FK simply re-resolves by name once `item_new` is renamed back to
+`item`."* That claim does not hold up: reproduced directly (a `job` row referencing an `item` row
+via `ON DELETE CASCADE`, rebuilt exactly as migration 008 does, with `foreign_keys = ON` — the
+`job` row was gone afterward, every time) and confirmed via the SQLite documentation for `DROP
+TABLE`: with foreign keys enabled, it performs an implicit `DELETE FROM` of every row *first*,
+which fires `ON DELETE CASCADE` on any child table exactly as if each row had been deleted by
+hand. `path_queue` (this migration's own table) is the parent of `item` and `pattern` — rebuilding
+it under migration 008's stated-safe approach would have silently wiped every item and pattern in
+the database the moment `DROP TABLE path_queue` ran (reproduced against the actual dev database,
+which has 27 real `item` rows; confirmed they were being deleted before the fix, and survive the
+migration after it).
+
+The reason 008's claim went untested for eight migrations: every migration in this project's own
+test suite runs against a *freshly created* database (`migrate()` from empty), so the child table
+being cascaded away is always empty at the point the parent gets rebuilt — there was never any
+data present to notice going missing. It would only bite a real upgrade of an install with actual
+history in `item`/`job`/`event`, which — per this project's own pre-release status — had simply
+never happened yet either.
+
+**The fix belongs in `db.py.migrate()`, not in each migration file.** `PRAGMA foreign_keys` is
+documented as a no-op once a transaction is open, and every migration already runs inside one
+(`migrate()`'s own `BEGIN ... COMMIT` wrapper) — so a migration file cannot toggle it off for
+itself no matter what it tries. `migrate()` now sets `PRAGMA foreign_keys = OFF` once, before the
+loop over pending migrations opens any transaction, and restores it to `ON` in a `finally` once
+the batch has applied (or failed) — verified this actually works (the pragma takes effect when
+issued standalone, outside any transaction) and that it's the only place it can be issued for
+this to matter. `connect()`'s own invariant (foreign keys are on for the life of the connection)
+still holds from the caller's point of view; it is only genuinely off for the narrow window where
+pending migrations are actually being applied. Migration 008's comment was left as-is (a
+historical artifact of what was believed true when it shipped) rather than rewritten after the
+fact; this entry, and `db.py.migrate()`'s own updated comment, are the correction.
+
+**The API subtlety: `PUT /api/settings/queues/{id}` is a full replace for every field except the
+four toggles, and that split is deliberate, not an accident of two different code paths meeting.**
+`null` and "field absent from the request" are different for these four now (`null` = inherit, a
+real value this endpoint must be able to write; absent has to mean "leave whatever this queue
+already has," the same class of problem `put_postprocess_settings`/`put_retention_settings`
+already solved via `model_fields_set`). Every other field on this endpoint (`name`, `sync_mode`,
+`scan_interval_s`, …) stays a plain full replace, unchanged — Settings → Queues' edit form always
+submits the complete form state, so nothing forced that decision either way; it stays a full
+replace because there was no reason to change it, not because it was reconsidered and kept.
+`create_queue` needed no such change: a freshly created row has no prior value to accidentally
+clear, so an absent toggle field there just takes the model default (`None`, inherit) whether it
+was omitted or sent as `null` — both parse to the identical `None`.
+
+---
+
 ## 2026-08-13 — Pasted SSH key: DB ciphertext over a separate file, and per-job materialisation
 ## over per-process
 

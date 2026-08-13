@@ -443,6 +443,18 @@ alongside this list: several entries below ship with deliberate, documented limi
   Deliberately not a general scan-driven trigger — a file that appears under a queue's
   `local_path` some other way, with no gate hold behind it, still triggers nothing (see
   `README.md`'s "Known gaps").
+- **A queue's four post-processing toggles now inherit the site-wide default instead of being
+  ANDed with it** *(2026-08-13)*. `auto_verify`/`auto_extract`/`auto_move`/`auto_delete_archives`
+  were `NOT NULL DEFAULT 0`, so a queue's own checkbox could only ever narrow the site-wide flag
+  toward "off" — turning a queue's toggle on while the matching Settings → Post-processing flag
+  was off did nothing, silently. Migration 015 makes all four columns nullable: `NULL` means
+  "inherit," and only an explicit per-queue override diverges from the site-wide value, in
+  either direction. Settings → Queues shows each toggle as locked to the resolved site-wide
+  value until "Override for this queue" is clicked; the old "System setting: off — this toggle
+  has no effect" readout is gone, since it described the AND this removes. The migration does
+  **not** preserve any queue's pre-upgrade *effective* value — every existing queue's four
+  toggles are simply set to inherit — since nothing has shipped yet and there is exactly one
+  install to consider (see `docs/decisions.md`).
 
 ### Fixed
 

@@ -1067,9 +1067,15 @@ from it". §7.4 gives the reasoning for keeping deletion out of lftp.
 
 `core/postprocess.py`, triggered on transition to `DOWNLOADED`, executed in a thread pool,
 one item at a time by default (configurable). Each step is independently toggleable globally
-and per path queue, and a step runs for an item only when **both** toggles are on — so
-flipping either one off reliably turns the step off everywhere, and a fresh install
-post-processes nothing before anyone has visited a settings page.
+and per path queue. As of 2026-08-13
+(`prompts/2026-08-13-postprocess-inherit-or-override.md`) the per-queue half is
+**inherit-or-override**, not an AND: a queue's own toggle is `NULL` by default, meaning
+"whatever the site-wide setting says," and only an explicit `on`/`off` from that queue makes it
+diverge. The AND it replaced could only ever narrow "on" toward "off" — flipping a queue's
+checkbox on while the site-wide flag was off did nothing, silently, with no way for that one
+queue to actually mean it. A fresh install still post-processes nothing before anyone has
+visited a settings page, because every site-wide flag itself still defaults off and every
+queue starts out inheriting it.
 
 1. **Verify** — use `.sfv` / `.md5` sidecars when present; otherwise the optional hash-on-disk
    fallback. Result: `VERIFIED`, `CORRUPT`, or `SKIPPED` — "no evidence either way" is a third
@@ -1119,20 +1125,21 @@ configurable age exists and, like every other new capability, ships off. Unatten
 the last place to grant an exception for "the containment check is solid."
 
 **Deleting the archives after a successful extraction is a separate, off-by-default option**
-(`PostprocessSettings.delete_archives_after_extract`, ANDed with a queue's own
-`auto_delete_archives` column — migration 012, 2026-08-13 — the same two-layer shape as
-verify/extract/move above; it shipped site-only in migration 010 and was the odd one out until
-this fix). When on at both layers, every file belonging to each extracted archive — including a
-multi-volume rar's continuation volumes, not just the head — is removed once extraction reports
-`EXTRACTED`; nothing is removed on `EXTRACT_FAILED` or a precondition failure, and non-archive
-files (`.nfo`, `.sfv`/`.md5`, samples, subtitles) are never touched. It only ever acts on a
+(`PostprocessSettings.delete_archives_after_extract`, resolved against a queue's own
+`auto_delete_archives` column via the inherit-or-override rule above — migration 012,
+2026-08-13 — the same two-layer shape as verify/extract/move above; it shipped site-only in
+migration 010 and was the odd one out until that fix). When the resolved value is on at both
+layers, every file belonging to each extracted archive — including a multi-volume rar's
+continuation volumes, not just the head — is removed once extraction reports `EXTRACTED`;
+nothing is removed on `EXTRACT_FAILED` or a precondition failure, and non-archive files
+(`.nfo`, `.sfv`/`.md5`, samples, subtitles) are never touched. It only ever acts on a
 **directory** item — a loose top-level archive file is left alone with a withheld-cleanup event,
 since removing its one file would be removing the whole item, which is the local-delete
 primitive's job and not this one's. Settings → Queues shows, next to every per-queue
-post-processing toggle (not only this one), what the matching site-wide flag currently resolves
-to — a per-queue toggle being on while the site-wide flag is off is otherwise invisible on that
-page, and archive cleanup is the most destructive of the four to get wrong silently (§7 below:
-on a `move` queue it can be the last copy of an archive's compressed bytes anywhere).
+post-processing toggle (not only this one), whether it is currently inheriting the site-wide
+value or has been explicitly overridden for that queue, and what either resolves to — archive
+cleanup is the most destructive of the four to get wrong silently (§7 below: on a `move` queue
+it can be the last copy of an archive's compressed bytes anywhere).
 
 The naive version of this feature is an infinite loop, and avoiding it is the whole design.
 Deleting the archives drops the item's local byte total below its remote total, which reads
@@ -1182,7 +1189,9 @@ on an irreversible remote delete: verification is the only thing standing betwee
 download and permanently losing the only good copy. Consequences:
 
 - For a queue in `move` or `sync` mode, `auto_verify` is forced on and cannot be turned off in
-  the UI. It is not a per-queue preference in those modes; it is part of the mode.
+  the UI. It is not a per-queue preference in those modes; it is part of the mode — stored as
+  an explicit per-queue override (never left on "inherit"), so a later change to the site-wide
+  verify flag can't silently turn it back off for that queue.
 - A queue in `move` or `sync` whose items carry no usable verification evidence — no `.sfv` or
   `.md5` sidecar and hash-on-disk disabled — must say so loudly in Settings, because "verified"
   would otherwise silently mean "we compared the size and hoped".

@@ -306,6 +306,16 @@ _QUEUE_SELECT_COLUMNS = (
 )
 
 
+def _nullable_bool(value: int | None) -> bool | None:
+    """`aiosqlite.Row` for a nullable `INTEGER ... CHECK (col IN (0, 1))` column (migration
+    015): `None` really is `NULL` (inherit), never a value this function invents by defaulting
+    a falsy int -- `bool(0)` and "column is NULL" must stay distinguishable all the way out to
+    the API response, the same way `_effective` in `core/postprocess.py` needs them
+    distinguishable coming in.
+    """
+    return None if value is None else bool(value)
+
+
 def _queue_out_from_row(row) -> PathQueueOut:
     return PathQueueOut(
         id=row["id"],
@@ -318,10 +328,10 @@ def _queue_out_from_row(row) -> PathQueueOut:
         sync_mode=row["sync_mode"],
         auto_queue_enabled=bool(row["auto_queue_enabled"]),
         auto_queue_patterns_only=bool(row["auto_queue_patterns_only"]),
-        auto_verify=bool(row["auto_verify"]),
-        auto_extract=bool(row["auto_extract"]),
-        auto_move=bool(row["auto_move"]),
-        auto_delete_archives=bool(row["auto_delete_archives"]),
+        auto_verify=_nullable_bool(row["auto_verify"]),
+        auto_extract=_nullable_bool(row["auto_extract"]),
+        auto_move=_nullable_bool(row["auto_move"]),
+        auto_delete_archives=_nullable_bool(row["auto_delete_archives"]),
         scan_interval_s=row["scan_interval_s"],
     )
 
@@ -339,13 +349,27 @@ _UNIMPLEMENTED_REASON = {
 }
 
 
-def _effective_auto_verify(body: PathQueueIn) -> bool:
-    """DESIGN.md §6: "For a queue in `move` or `sync` mode, `auto_verify` is forced on and
-    cannot be turned off in the UI." Enforced here too, not only in the frontend form —
-    verification is the sole gate on an irreversible remote delete (§7.3), so a direct API
-    call (curl, a script) must not be able to silently disable it for a `move` queue.
+def _sql_bool(value: bool | None) -> int | None:
+    """`PathQueueIn`'s four post-processing fields are `bool | None` (migration 015: `None` =
+    inherit); this is the reverse of `_nullable_bool` above, for writing one back to its
+    `INTEGER` column. Never collapses `None` to `0` -- that would silently turn "inherit" into
+    an explicit override the instant a queue is saved.
     """
-    return body.auto_verify or body.sync_mode == "move"
+    return None if value is None else (1 if value else 0)
+
+
+def _effective_auto_verify(body: PathQueueIn) -> bool | None:
+    """DESIGN.md §6: "For a queue in `move` or `sync` mode, `auto_verify` is forced on and
+    cannot be turned off in the UI." For `move`/`sync` this returns an explicit `True`, never
+    `None` (inherit) -- inheriting would let a later site-wide change silently turn off the
+    sole gate on this mode's irreversible remote delete, exactly the failure mode inheritance
+    exists to avoid everywhere else. Enforced here too, not only in the frontend form —
+    a direct API call (curl, a script) must not be able to silently disable it for a `move`
+    queue by omitting the field or sending `null`.
+    """
+    if body.sync_mode == "move":
+        return True
+    return body.auto_verify
 
 
 def _reject_unimplemented_sync_mode(mode: str) -> None:
@@ -406,10 +430,10 @@ async def create_queue(body: PathQueueIn, request: Request) -> PathQueueOut:
             body.sync_mode,
             1 if body.auto_queue_enabled else 0,
             1 if body.auto_queue_patterns_only else 0,
-            1 if _effective_auto_verify(body) else 0,
-            1 if body.auto_extract else 0,
-            1 if body.auto_move else 0,
-            1 if body.auto_delete_archives else 0,
+            _sql_bool(_effective_auto_verify(body)),
+            _sql_bool(body.auto_extract),
+            _sql_bool(body.auto_move),
+            _sql_bool(body.auto_delete_archives),
             body.scan_interval_s,
         ),
     )
@@ -427,12 +451,66 @@ async def create_queue(body: PathQueueIn, request: Request) -> PathQueueOut:
     return _queue_out_from_row(row)
 
 
+def _merged_toggle(
+    body: PathQueueIn, provided: set[str], field_name: str, current_stored: int | None
+) -> int | None:
+    """Merge one of the four post-processing toggle fields into `update_queue`: the field
+    genuinely **absent** from the request body leaves the stored value (override *or*
+    inherit) untouched; **explicitly sent** -- including `null` -- always overwrites, `null`
+    clearing an existing override back to inherit. This is the one place on this endpoint
+    that merges rather than replaces -- see `update_queue`'s own docstring for why -- and it
+    is the same fix, for the same reason, as `put_postprocess_settings`/
+    `put_retention_settings`'s own `model_fields_set` handling: getting this backwards means
+    a queue form that doesn't happen to touch a toggle field silently clears whatever override
+    was already saved for it.
+    """
+    if field_name not in provided:
+        return current_stored
+    return _sql_bool(getattr(body, field_name))
+
+
 @router.put("/queues/{queue_id}", response_model=PathQueueOut)
 async def update_queue(queue_id: int, body: PathQueueIn, request: Request) -> PathQueueOut:
+    """Every field **except** the four post-processing toggles is a full replace, same as this
+    endpoint has always been -- `name`/`remote_path`/`sync_mode`/etc. are written from `body`
+    unconditionally, and a caller that wants to change one field must still resend the rest
+    (Settings -> Queues' edit form always submits the complete form state, so this has never
+    been a real constraint for it).
+
+    The four toggles (`auto_verify`/`auto_extract`/`auto_move`/`auto_delete_archives`) are the
+    one deliberate exception, via `_merged_toggle` above: `null` and "field not sent" are now
+    genuinely different for them (migration 015) -- `null` means inherit, a real value this
+    endpoint must be able to write, while an *absent* field has to mean "leave whatever this
+    queue already has," exactly like `put_postprocess_settings`'s own fields. A plain full
+    replace can't tell those apart: `body.auto_verify` reads as Python `None` either way, so
+    writing it unconditionally would silently reset an override to inherit any time a caller
+    (a script, an older client, a future partial-update form) posts a body that just doesn't
+    mention one of these four fields.
+    """
     _reject_unimplemented_sync_mode(body.sync_mode)
     _reject_invalid_scan_interval(body.scan_interval_s)
     db = request.app.state.db
+
     cursor = await db.execute(
+        "SELECT auto_verify, auto_extract, auto_move, auto_delete_archives "
+        "FROM path_queue WHERE id = ?",
+        (queue_id,),
+    )
+    existing = await cursor.fetchone()
+    if existing is None:
+        raise HTTPException(status_code=404, detail="queue not found")
+
+    provided = body.model_fields_set
+    # `move`/`sync` forces verification on regardless of whether `auto_verify` was even sent
+    # (DESIGN.md §6) -- checked before the merge, not folded into `_merged_toggle`, since this
+    # override wins even over "leave it as it was."
+    auto_verify_value = (
+        1
+        if body.sync_mode == "move"
+        else _merged_toggle(body, provided, "auto_verify", existing["auto_verify"])
+    )
+
+    await db.execute(
         "UPDATE path_queue SET name = ?, remote_path = ?, local_path = ?, staging_path = ?, "
         "enabled = ?, sync_mode = ?, auto_queue_enabled = ?, auto_queue_patterns_only = ?, "
         "auto_verify = ?, auto_extract = ?, auto_move = ?, auto_delete_archives = ?, "
@@ -446,16 +524,16 @@ async def update_queue(queue_id: int, body: PathQueueIn, request: Request) -> Pa
             body.sync_mode,
             1 if body.auto_queue_enabled else 0,
             1 if body.auto_queue_patterns_only else 0,
-            1 if _effective_auto_verify(body) else 0,
-            1 if body.auto_extract else 0,
-            1 if body.auto_move else 0,
-            1 if body.auto_delete_archives else 0,
+            auto_verify_value,
+            _merged_toggle(body, provided, "auto_extract", existing["auto_extract"]),
+            _merged_toggle(body, provided, "auto_move", existing["auto_move"]),
+            _merged_toggle(
+                body, provided, "auto_delete_archives", existing["auto_delete_archives"]
+            ),
             body.scan_interval_s,
             queue_id,
         ),
     )
-    if cursor.rowcount == 0:
-        raise HTTPException(status_code=404, detail="queue not found")
     await db.commit()
 
     engine = getattr(request.app.state, "engine", None)

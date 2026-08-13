@@ -1,3 +1,4 @@
+import type { ReactNode } from 'react'
 import { useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
 import {
@@ -39,10 +40,12 @@ interface FormState {
   sync_mode: SyncMode
   auto_queue_enabled: boolean
   auto_queue_patterns_only: boolean
-  auto_verify: boolean
-  auto_extract: boolean
-  auto_move: boolean
-  auto_delete_archives: boolean
+  // `null` = inherit the site-wide Settings -> Post-processing flag (the default -- see
+  // `InheritableToggle` below); `true`/`false` = an explicit per-queue override.
+  auto_verify: boolean | null
+  auto_extract: boolean | null
+  auto_move: boolean | null
+  auto_delete_archives: boolean | null
   scan_interval_s: number | null
 }
 
@@ -55,10 +58,10 @@ const EMPTY_FORM: FormState = {
   sync_mode: 'copy',
   auto_queue_enabled: false,
   auto_queue_patterns_only: false,
-  auto_verify: false,
-  auto_extract: false,
-  auto_move: false,
-  auto_delete_archives: false,
+  auto_verify: null,
+  auto_extract: null,
+  auto_move: null,
+  auto_delete_archives: null,
   scan_interval_s: null,
 }
 
@@ -79,52 +82,102 @@ function usePostprocessSiteSettings(): PostprocessSettingsOut | null {
   return settings
 }
 
-/** One per-queue post-processing toggle's readout: what the site-wide half currently resolves
- * to, and therefore whether the queue's own toggle above actually does anything right now.
- * `forcedOn` is `move`-mode verification's own case -- DESIGN.md §6/§7.3: it runs regardless of
- * *either* toggle, so the readout must say "always on," never "system setting: off" (which
- * would be a lie for exactly that queue).
+/** One per-queue post-processing toggle, inherit-or-override (2026-08-13,
+ * `prompts/2026-08-13-postprocess-inherit-or-override.md`). `value === null` means this queue
+ * inherits the site-wide Settings → Post-processing flag -- the checkbox shows that resolved
+ * value but is locked, and an "Override for this queue" button unlocks it, seeded at the
+ * currently-resolved value so clicking it alone never changes what actually runs. Once
+ * overridden, a "Revert to inherit" button flips back to `null` -- and says up front what that
+ * will resolve to, since reverting to an invisible value is the same discoverability problem
+ * in reverse (this component replaces `PostprocessStepReadout`'s old "System setting: off —
+ * this toggle has no effect" readout, which described the AND this task removed).
+ *
+ * `forcedOn` is `move`-mode verification's own case -- DESIGN.md §6/§7.3: it runs regardless
+ * of either level, so the checkbox is shown checked and locked with its own explanation,
+ * never folded into ordinary inherit/override.
  */
-function PostprocessStepReadout({
-  site,
-  queueEnabled,
-  forcedOn = false,
-}: {
+function InheritableToggle({
+  label,
+  value,
+  onChange,
   // `null` covers two cases the same way: the site-wide fetch hasn't resolved yet, or it
-  // failed -- both render the same "loading" line rather than guessing a value that could be
-  // wrong in either direction.
-  site: boolean | null
-  queueEnabled: boolean
+  // failed -- both read as "resolves to off" for display purposes until it's known, rather
+  // than guessing a value that could be wrong in either direction.
+  siteValue,
+  forcedOn = false,
+  forcedOnMessage,
+  disabled = false,
+  disabledMessage,
+}: {
+  label: ReactNode
+  value: boolean | null
+  onChange: (next: boolean | null) => void
+  siteValue: boolean | null
   forcedOn?: boolean
+  forcedOnMessage?: ReactNode
+  disabled?: boolean
+  disabledMessage?: ReactNode
 }) {
   if (forcedOn) {
     return (
-      <p className={hintClasses}>
-        Always runs for this <code>move</code> queue, regardless of the site-wide setting or
-        this toggle — verification is the sole gate on the irreversible remote delete
-        (DESIGN.md §6/§7.3).
-      </p>
+      <div className="flex flex-col gap-1">
+        <label className="flex items-center gap-2">
+          <input type="checkbox" checked readOnly disabled />
+          <span className="text-sm text-zinc-700 dark:text-zinc-300">{label}</span>
+        </label>
+        <p className={hintClasses}>{forcedOnMessage}</p>
+      </div>
     )
   }
-  if (site == null) {
-    return <p className={hintClasses}>Loading the site-wide setting…</p>
-  }
-  if (!site) {
-    return (
-      <p className="text-xs text-amber-600 dark:text-amber-400">
-        System setting: off — this queue's toggle has no effect until it's also turned on in{' '}
-        <Link to="/settings/post-processing" className="underline">
-          Settings → Post-processing
-        </Link>
-        .
-      </p>
-    )
-  }
+
+  const siteLabel = siteValue == null ? 'loading…' : siteValue ? 'on' : 'off'
+  const overridden = value !== null
+  const effective = overridden ? value : !!siteValue
+
   return (
-    <p className={hintClasses}>
-      System setting: on —{' '}
-      {queueEnabled ? 'active for this queue.' : "this queue's toggle above is off, so nothing runs yet."}
-    </p>
+    <div className="flex flex-col gap-1">
+      <label className="flex items-center gap-2">
+        <input
+          type="checkbox"
+          checked={effective}
+          disabled={disabled || !overridden}
+          onChange={(e) => onChange(e.target.checked)}
+        />
+        <span className="text-sm text-zinc-700 dark:text-zinc-300">{label}</span>
+      </label>
+      {!overridden && (
+        <p className={hintClasses}>
+          Inherits{' '}
+          <Link to="/settings/post-processing" className="underline">
+            Settings → Post-processing
+          </Link>
+          's site-wide value (currently <strong>{siteLabel}</strong>).{' '}
+          <button
+            type="button"
+            disabled={disabled}
+            onClick={() => onChange(!!siteValue)}
+            className="text-zinc-600 underline hover:no-underline disabled:opacity-50 dark:text-zinc-300"
+          >
+            Override for this queue
+          </button>
+        </p>
+      )}
+      {overridden && (
+        <p className={hintClasses}>
+          Overridden for this queue.{' '}
+          <button
+            type="button"
+            onClick={() => onChange(null)}
+            className="text-zinc-600 underline hover:no-underline dark:text-zinc-300"
+          >
+            Revert to inherit (currently resolves to {siteLabel})
+          </button>
+        </p>
+      )}
+      {disabled && disabledMessage && (
+        <p className="text-xs text-amber-600 dark:text-amber-400">{disabledMessage}</p>
+      )}
+    </div>
   )
 }
 
@@ -296,11 +349,19 @@ export function QueuesTab() {
   }
 
   // DESIGN.md §6: "auto_verify is forced on and cannot be turned off in the UI" for a move
-  // queue -- it is the sole gate on an irreversible remote delete (§7.3). The backend also
+  // queue -- it is the sole gate on an irreversible remote delete (§7.3). Forced to an
+  // explicit `true`, never left on inherit (`null`) -- inheriting would let a later change to
+  // the site-wide verify flag silently turn it back off for this queue. The backend also
   // forces this server-side (api/settings.py._effective_auto_verify) so a direct API call
   // can't bypass it; this mirrors that in the form so the checkbox never lies about what
   // will actually be saved.
-  const effectiveAutoVerify = form.auto_verify || form.sync_mode === 'move'
+  const submitAutoVerify = form.sync_mode === 'move' ? true : form.auto_verify
+
+  // What "Extract" actually resolves to right now (inherit or override) -- used only to gate
+  // "Delete archive volumes," which is meaningless while nothing extracts. Checking the raw
+  // `form.auto_extract` value instead would wrongly disable this whenever Extract is on
+  // inherit, even on a site where the site-wide Extract flag is on.
+  const effectiveAutoExtract = form.auto_extract ?? !!(postprocessSite && postprocessSite.extract_enabled)
 
   const handleSubmit = async () => {
     setError(null)
@@ -319,7 +380,7 @@ export function QueuesTab() {
       sync_mode: form.sync_mode,
       auto_queue_enabled: form.auto_queue_enabled,
       auto_queue_patterns_only: form.auto_queue_patterns_only,
-      auto_verify: effectiveAutoVerify,
+      auto_verify: submitAutoVerify,
       auto_extract: form.auto_extract,
       auto_move: form.auto_move,
       auto_delete_archives: form.auto_delete_archives,
@@ -573,86 +634,44 @@ export function QueuesTab() {
           </label>
         </div>
 
-        <div className="flex flex-col gap-2 rounded-md border border-zinc-200 p-3 dark:border-zinc-800">
+        <div className="flex flex-col gap-3 rounded-md border border-zinc-200 p-3 dark:border-zinc-800">
           <span className={labelClasses}>
-            Post-processing (DESIGN.md §6) — off by default; also gated by the site-wide
-            defaults in Settings → Post-processing
+            Post-processing (DESIGN.md §6) — each step inherits its site-wide default from{' '}
+            <Link to="/settings/post-processing" className="underline">
+              Settings → Post-processing
+            </Link>{' '}
+            unless explicitly overridden below.
           </span>
-          <div className="flex flex-col gap-1">
-            <label className="flex items-center gap-2">
-              <input
-                type="checkbox"
-                checked={effectiveAutoVerify}
-                onChange={(e) => update('auto_verify', e.target.checked)}
-                disabled={form.sync_mode === 'move'}
-              />
-              <span className="text-sm text-zinc-700 dark:text-zinc-300">
-                Verify (.sfv/.md5, or hash-on-disk if enabled site-wide)
-                {form.sync_mode === 'move' && (
-                  <span className="ml-1 text-amber-600 dark:text-amber-400">
-                    — forced on for move (it gates the remote delete)
-                  </span>
-                )}
-              </span>
-            </label>
-            <PostprocessStepReadout
-              site={postprocessSite && postprocessSite.verify_enabled}
-              queueEnabled={form.auto_verify}
-              forcedOn={form.sync_mode === 'move'}
-            />
-          </div>
-          <div className="flex flex-col gap-1">
-            <label className="flex items-center gap-2">
-              <input
-                type="checkbox"
-                checked={form.auto_extract}
-                onChange={(e) => update('auto_extract', e.target.checked)}
-              />
-              <span className="text-sm text-zinc-700 dark:text-zinc-300">
-                Extract archives (7zz — zip/7z/rar/rar5/tar/gz/bz2/xz)
-              </span>
-            </label>
-            <PostprocessStepReadout
-              site={postprocessSite && postprocessSite.extract_enabled}
-              queueEnabled={form.auto_extract}
-            />
-          </div>
-          <div className="flex flex-col gap-1">
-            <label className="flex items-center gap-2">
-              <input
-                type="checkbox"
-                checked={form.auto_delete_archives}
-                onChange={(e) => update('auto_delete_archives', e.target.checked)}
-                disabled={!form.auto_extract}
-              />
-              <span className="text-sm text-zinc-700 dark:text-zinc-300">
-                Delete archive volumes once they've extracted successfully
-                {!form.auto_extract && ' (turn on Extract above first)'}
-              </span>
-            </label>
-            <PostprocessStepReadout
-              site={postprocessSite && postprocessSite.delete_archives_after_extract}
-              queueEnabled={form.auto_delete_archives}
-            />
-          </div>
-          <div className="flex flex-col gap-1">
-            <label className="flex items-center gap-2">
-              <input
-                type="checkbox"
-                checked={form.auto_move}
-                onChange={(e) => update('auto_move', e.target.checked)}
-                disabled={!form.staging_path}
-              />
-              <span className="text-sm text-zinc-700 dark:text-zinc-300">
-                Move to staging path once finished
-                {!form.staging_path && ' (set a staging path above first)'}
-              </span>
-            </label>
-            <PostprocessStepReadout
-              site={postprocessSite && postprocessSite.move_enabled}
-              queueEnabled={form.auto_move}
-            />
-          </div>
+          <InheritableToggle
+            label="Verify (.sfv/.md5, or hash-on-disk if enabled site-wide)"
+            value={form.auto_verify}
+            onChange={(v) => update('auto_verify', v)}
+            siteValue={postprocessSite ? postprocessSite.verify_enabled : null}
+            forcedOn={form.sync_mode === 'move'}
+            forcedOnMessage="Always runs for this move queue, regardless of the site-wide setting or any per-queue override — verification is the sole gate on the irreversible remote delete (DESIGN.md §6/§7.3)."
+          />
+          <InheritableToggle
+            label="Extract archives (7zz — zip/7z/rar/rar5/tar/gz/bz2/xz)"
+            value={form.auto_extract}
+            onChange={(v) => update('auto_extract', v)}
+            siteValue={postprocessSite ? postprocessSite.extract_enabled : null}
+          />
+          <InheritableToggle
+            label="Delete archive volumes once they've extracted successfully"
+            value={form.auto_delete_archives}
+            onChange={(v) => update('auto_delete_archives', v)}
+            siteValue={postprocessSite ? postprocessSite.delete_archives_after_extract : null}
+            disabled={!effectiveAutoExtract}
+            disabledMessage="Extract (above) doesn't currently run for this queue — turn it on, or its own inherited value, first."
+          />
+          <InheritableToggle
+            label="Move to staging path once finished"
+            value={form.auto_move}
+            onChange={(v) => update('auto_move', v)}
+            siteValue={postprocessSite ? postprocessSite.move_enabled : null}
+            disabled={!form.staging_path}
+            disabledMessage="Set a staging path above first."
+          />
         </div>
 
         {error && <p className="text-sm text-red-600 dark:text-red-400">{error}</p>}

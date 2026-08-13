@@ -22,17 +22,22 @@ second path was rejected once already and is now built anyway.
 calls into `core/verify.py` / `core/extract.py` / `move_tree` via `asyncio.to_thread`.
 
 **Every step defaults off, at two independent layers** (DESIGN.md §6: "toggleable globally
-and per path queue"). A step runs for an item only when *both* `PostprocessSettings`'s own
-flag and the queue's `auto_verify`/`auto_extract`/`auto_move`/`auto_delete_archives` column
-are true -- except verification for a `move`-mode queue, which always runs regardless of
-either toggle, because it is the sole gate on an irreversible remote delete (see the decision
-recorded in `docs/decisions.md`: muting it via an unrelated global switch would silently turn
-`move` into "downloads, never deletes, never says why"). `auto_delete_archives` (migration 012,
-2026-08-13) is the youngest of the four -- archive cleanup originally shipped site-only
-(migration 010) and was the one step that didn't follow this shape; brought in line by
-`prompts/2026-08-13-per-queue-archive-cleanup.md` because it is also the most destructive of
-the four (it can be the last copy of an archive's compressed bytes anywhere, on a `move`
-queue -- see `_do_extract` below).
+and per path queue"). Each layer's flag used to be ANDed together; as of 2026-08-13
+(`prompts/2026-08-13-postprocess-inherit-or-override.md`) it is inheritance instead: a queue's
+own `auto_verify`/`auto_extract`/`auto_move`/`auto_delete_archives` column is now nullable, and
+`_effective` below resolves `NULL` to the matching `PostprocessSettings` flag rather than
+treating it as "off." The AND was standing in for "no override" and did it badly -- flipping a
+queue's checkbox on with the site-wide flag off did nothing, silently, with no per-queue way to
+actually mean "just this queue." An explicit `0`/`1` on the column is a real override,
+independent of the site-wide flag in either direction -- except verification for a `move`-mode
+queue, which always runs regardless of either layer, because it is the sole gate on an
+irreversible remote delete (see the decision recorded in `docs/decisions.md`: muting it via an
+unrelated global switch would silently turn `move` into "downloads, never deletes, never says
+why"). `auto_delete_archives` (migration 012, 2026-08-13) is the youngest of the four -- archive
+cleanup originally shipped site-only (migration 010) and was the one step that didn't follow
+this shape; brought in line by `prompts/2026-08-13-per-queue-archive-cleanup.md` because it is
+also the most destructive of the four (it can be the last copy of an archive's compressed bytes
+anywhere, on a `move` queue -- see `_do_extract` below).
 
 **Deletion (§7.4).** `move` deletes the remote copy only after verification returns
 `VERIFIED` -- never `CORRUPT`, never `SKIPPED` (no evidence). Every delete and every withheld
@@ -241,6 +246,17 @@ async def load_postprocess_settings(db: aiosqlite.Connection) -> PostprocessSett
         move_enabled=bool(data.get("move_enabled", False)),
         concurrency=max(1, int(data.get("concurrency", 1))),
     )
+
+
+def _effective(queue_value: int | None, site_value: bool) -> bool:
+    """The inherit-or-override resolution rule (2026-08-13,
+    `prompts/2026-08-13-postprocess-inherit-or-override.md`): a `path_queue` toggle column is
+    `NULL` (inherit the site-wide default), `0`, or `1` (an explicit override, either
+    direction) -- never AND with the site flag, which could only ever narrow it. `queue_value`
+    comes straight off an `aiosqlite.Row`, so `None` is genuinely "column is NULL," not a
+    default this function invents.
+    """
+    return bool(queue_value) if queue_value is not None else site_value
 
 
 async def save_postprocess_settings(
@@ -469,14 +485,14 @@ class PostprocessPipeline:
         local_root = Path(queue["local_path"].rstrip("/")) / item["rel_path"]
         sync_mode = queue["sync_mode"]
 
-        # DESIGN.md §6: verification is forced on for `move` regardless of either toggle --
+        # DESIGN.md §6: verification is forced on for `move` regardless of either layer --
         # see the module docstring and docs/decisions.md.
         verify_effective = (
-            settings.verify_enabled and bool(queue["auto_verify"])
+            _effective(queue["auto_verify"], settings.verify_enabled)
         ) or sync_mode == "move"
-        extract_effective = settings.extract_enabled and bool(queue["auto_extract"])
-        move_effective = (
-            settings.move_enabled and bool(queue["auto_move"]) and bool(queue["staging_path"])
+        extract_effective = _effective(queue["auto_extract"], settings.extract_enabled)
+        move_effective = _effective(queue["auto_move"], settings.move_enabled) and bool(
+            queue["staging_path"]
         )
 
         verify_state: str | None = None
@@ -679,12 +695,13 @@ class PostprocessPipeline:
         # by `extract_item`, which only ever writes to its own staging directory and merges into
         # `local_root`, so it is still exactly what to expand and remove.
         #
-        # Two-layer gating (migration 012, 2026-08-13,
-        # prompts/2026-08-13-per-queue-archive-cleanup.md), the same shape as
+        # Two-layer resolution (migration 012, 2026-08-13,
+        # prompts/2026-08-13-per-queue-archive-cleanup.md; inherit-or-override, 2026-08-13,
+        # prompts/2026-08-13-postprocess-inherit-or-override.md), the same shape as
         # verify_effective/extract_effective/move_effective in `_process_item` above -- archive
         # cleanup shipped site-only (migration 010) and was the odd one out.
-        delete_archives_effective = settings.delete_archives_after_extract and bool(
-            queue["auto_delete_archives"]
+        delete_archives_effective = _effective(
+            queue["auto_delete_archives"], settings.delete_archives_after_extract
         )
         if result.state == "EXTRACTED" and delete_archives_effective:
             # Imported locally: `core/local_delete.py` imports `core/mount_sentinel.py`, which

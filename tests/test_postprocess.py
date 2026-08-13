@@ -1706,29 +1706,35 @@ async def test_pipeline_deletes_every_archive_volume_after_success_and_preserves
 
 
 @pytestmark_unrar
-async def test_pipeline_and_gating_all_four_combinations(tmp_path):
-    """Item 1's own required test: archive cleanup (migration 012, 2026-08-13) is ANDed across
-    the site-wide flag and the queue's own `auto_delete_archives`, the identical shape
-    `verify`/`extract`/`move` already use -- runs only when *both* are on, exactly the same as
-    `test_pipeline_deletes_every_archive_volume_after_success_and_preserves_sidecar` (both on)
-    and `test_pipeline_default_off_leaves_archives_on_disk` (both off) already cover, plus the
-    two mixed combinations neither of those exercises.
+async def test_pipeline_and_gating_all_six_inherit_and_override_combinations(tmp_path):
+    """Item 1's own required test, updated for inherit-or-override (2026-08-13,
+    `prompts/2026-08-13-postprocess-inherit-or-override.md`): archive cleanup (migration 012)
+    used to be ANDed across the site-wide flag and the queue's own `auto_delete_archives` --
+    this asserted only that shape. The AND is gone: `auto_delete_archives=None` now inherits
+    the site-wide flag wherever it moves, and an explicit override (`True`/`False`) wins
+    regardless of the site-wide flag in *either* direction -- including the one combination the
+    old AND could never produce, `site=False, queue=True` (an explicit per-queue "yes, this one
+    anyway" now actually deletes, where the AND silently withheld it). Six combinations, not
+    four: site on/off crossed with queue inherit/override-on/override-off.
     """
-    for site_on, queue_on, expect_deleted in (
-        (True, True, True),
-        (True, False, False),
-        (False, True, False),
-        (False, False, False),
+    for site_on, queue_value, expect_deleted in (
+        (True, True, True),  # override on, site on -> on
+        (True, False, False),  # override off, site on -> off (override wins)
+        (True, None, True),  # inherit, site on -> on
+        (False, True, True),  # override on, site off -> on (override wins, unlike the old AND)
+        (False, False, False),  # override off, site off -> off
+        (False, None, False),  # inherit, site off -> off
     ):
         db = await _make_db()
         try:
-            local_root = tmp_path / f"local-{site_on}-{queue_on}"
+            local_root = tmp_path / f"local-{site_on}-{queue_value}"
             local_root.mkdir()
             write_if_needed(str(local_root))
             item_dir = await _make_multivolume_rar_release(local_root)
 
+            queue_column_value = None if queue_value is None else int(queue_value)
             _, queue_id = await _make_host_and_queue_rows(
-                db, sync_mode="copy", auto_extract=1, auto_delete_archives=int(queue_on)
+                db, sync_mode="copy", auto_extract=1, auto_delete_archives=queue_column_value
             )
             await db.execute(
                 "UPDATE path_queue SET local_path = ? WHERE id = ?", (str(local_root), queue_id)
@@ -1749,15 +1755,26 @@ async def test_pipeline_and_gating_all_four_combinations(tmp_path):
             item = await (
                 await db.execute("SELECT * FROM item WHERE id = ?", (item_id,))
             ).fetchone()
-            assert item["state"] == "EXTRACTED", (site_on, queue_on, item["error_detail"])
+            assert item["state"] == "EXTRACTED", (site_on, queue_value, item["error_detail"])
 
             still_there = (item_dir / "release.rar").exists()
-            assert still_there == (not expect_deleted), (site_on, queue_on)
+            assert still_there == (not expect_deleted), (site_on, queue_value)
 
             deleted = await local_delete.load_deleted_archive_paths(db, queue_id)
-            assert bool(deleted) == expect_deleted, (site_on, queue_on)
+            assert bool(deleted) == expect_deleted, (site_on, queue_value)
         finally:
             await db.close()
+
+
+def test_effective_resolves_inherit_from_site_and_ignores_override_for_explicit_values():
+    """`core/postprocess.py._effective`'s own contract (2026-08-13,
+    `prompts/2026-08-13-postprocess-inherit-or-override.md`): a `None` queue value tracks the
+    site-wide value wherever it moves; an explicit `0`/`1` never does, in either direction.
+    """
+    assert postprocess._effective(None, True) is True
+    assert postprocess._effective(None, False) is False
+    assert postprocess._effective(1, False) is True  # override wins over an off site
+    assert postprocess._effective(0, True) is False  # override wins over an on site
 
 
 @pytestmark_unrar

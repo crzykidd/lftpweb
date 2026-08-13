@@ -17,13 +17,15 @@ const EMPTY: PostprocessSettingsOut = {
   concurrency: 1,
 }
 
-/** Settings → Post-processing (DESIGN.md §6, phase 5): the *site-wide* defaults for
- * verify/extract/move. A step only actually runs for a given queue's items when both this
- * global flag AND that queue's own auto_verify/auto_extract/auto_move/auto_delete_archives
- * toggle (Settings → Queues, which also shows what this site-wide half currently resolves to
- * for each one) are on -- see docs/decisions.md for why the two layers are ANDed rather than
- * one overriding the other. Every field here defaults off; a fresh install runs no
- * post-processing at all even before anyone visits this page.
+/** Settings → Post-processing (DESIGN.md §6, phase 5): the *site-wide* default for each of
+ * verify/extract/move/delete-archives. As of 2026-08-13
+ * (`prompts/2026-08-13-postprocess-inherit-or-override.md`) a queue's own toggle (Settings →
+ * Queues) inherits this value unless explicitly overridden for that queue -- changing a value
+ * here now takes effect immediately for every queue that hasn't overridden it, rather than
+ * being ANDed against a per-queue flag that could only narrow it toward "off" (see
+ * docs/decisions.md for that history). Every field here defaults off; a fresh install runs no
+ * post-processing at all even before anyone visits this page, and every queue starts out
+ * inheriting that off default.
  *
  * `_FAILED_` staging-directory retention (`failed_retention_enabled`/`failed_retention_days`)
  * has no field on this page or on `PostprocessSettingsOut` above -- a pre-existing "backend

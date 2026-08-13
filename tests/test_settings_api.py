@@ -404,18 +404,108 @@ def test_copy_sync_mode_leaves_auto_verify_as_requested(isolated_config):
 
 
 def test_new_queue_defaults_postprocess_toggles_off(isolated_config):
-    """DESIGN.md §6 / this phase's non-negotiable: every post-processing step defaults off,
-    including for a queue created without specifying these fields at all.
+    """Migration 015 (2026-08-13, `prompts/2026-08-13-postprocess-inherit-or-override.md`):
+    every post-processing toggle defaults to inherit (`None`) now, including for a queue
+    created without specifying these fields at all -- not `False`, since the AND that made
+    `False` and "off" indistinguishable is gone. `PostprocessSettings` itself still defaults
+    every flag off, so the *effective* value for a fresh install's queue is still off end to
+    end (`core/postprocess.py._effective`, and its own unit test) -- this test only pins down
+    what is actually stored.
     """
     with TestClient(app) as client:
         queue = _make_host_and_queue(client)
-        assert queue["auto_verify"] is False
-        assert queue["auto_extract"] is False
-        assert queue["auto_move"] is False
+        assert queue["auto_verify"] is None
+        assert queue["auto_extract"] is None
+        assert queue["auto_move"] is None
         # Migration 012, 2026-08-13: archive cleanup's per-queue half. Shipped site-only
-        # originally (migration 010) -- this closes that gap, so it must default off exactly
-        # like its three siblings above for an existing/newly-created queue alike.
-        assert queue["auto_delete_archives"] is False
+        # originally (migration 010) -- this closes that gap, so it follows the same
+        # inherit-by-default shape as its three siblings above for an existing/newly-created
+        # queue alike.
+        assert queue["auto_delete_archives"] is None
+
+
+_TOGGLE_FIELDS = ("auto_verify", "auto_extract", "auto_move", "auto_delete_archives")
+
+
+def test_queue_toggle_omitted_on_update_preserves_existing_override(isolated_config):
+    """The API subtlety worth getting right
+    (`prompts/2026-08-13-postprocess-inherit-or-override.md`): `null` and "field not sent" are
+    different for the four post-processing toggles now that migration 015 makes them
+    nullable-for-inherit. A PUT that omits one entirely must leave whatever was already stored
+    (override or inherit) untouched -- `api/settings.py._merged_toggle` -- the same class of
+    fix `put_postprocess_settings` already made for its own fields via `model_fields_set`.
+    Covers all four columns in one pass, since they are separate and it is easy to wire three
+    correctly and miss one.
+    """
+    with TestClient(app) as client:
+        queue = _make_host_and_queue(
+            client,
+            auto_verify=True,
+            auto_extract=True,
+            auto_move=True,
+            auto_delete_archives=True,
+        )
+        for field in _TOGGLE_FIELDS:
+            assert queue[field] is True, field
+
+        # A PUT that only touches `name` -- the four toggle fields are absent entirely, not
+        # sent as `null`.
+        resp = client.put(
+            f"/api/settings/queues/{queue['id']}",
+            json={
+                "name": "renamed",
+                "remote_path": queue["remote_path"],
+                "local_path": queue["local_path"],
+            },
+        )
+        assert resp.status_code == 200
+        saved = resp.json()
+        assert saved["name"] == "renamed"
+        for field in _TOGGLE_FIELDS:
+            assert saved[field] is True, field
+
+        # Persisted, not just echoed back.
+        fetched = client.get("/api/settings/queues").json()[0]
+        for field in _TOGGLE_FIELDS:
+            assert fetched[field] is True, field
+
+
+def test_queue_toggle_explicit_null_clears_override_to_inherit(isolated_config):
+    """The other half of the same fix: sending an explicit `null` for a toggle field DOES
+    clear a stored override back to inherit -- unlike simply omitting it
+    (`test_queue_toggle_omitted_on_update_preserves_existing_override` above). If
+    `_merged_toggle` collapsed "omitted" and "sent null" into the same case, one of these two
+    tests would fail.
+    """
+    with TestClient(app) as client:
+        queue = _make_host_and_queue(
+            client,
+            auto_verify=True,
+            auto_extract=True,
+            auto_move=True,
+            auto_delete_archives=True,
+        )
+
+        resp = client.put(
+            f"/api/settings/queues/{queue['id']}",
+            json={
+                "name": queue["name"],
+                "remote_path": queue["remote_path"],
+                "local_path": queue["local_path"],
+                "auto_verify": None,
+                "auto_extract": None,
+                "auto_move": None,
+                "auto_delete_archives": None,
+            },
+        )
+        assert resp.status_code == 200
+        saved = resp.json()
+        for field in _TOGGLE_FIELDS:
+            assert saved[field] is None, field
+
+        fetched = client.get("/api/settings/queues").json()[0]
+        for field in _TOGGLE_FIELDS:
+            assert fetched[field] is None, field
 
 
 def test_queue_round_trips_auto_delete_archives(isolated_config):
