@@ -67,6 +67,40 @@ The specific thing to look at first: **progress-bar text contrast at around 50% 
 the label straddles filled and unfilled background. That is the case that looks fine in a
 mockup and reads badly in practice.
 
+### A cleaned-up archive rests in a different state depending on sync mode
+
+After archive cleanup deletes the volumes:
+
+- **`copy` queue** — the remote rars still exist, so the node stays in the tree and the counts
+  predicate marks it **`EXCLUDED`**. Correct.
+- **`move` queue** — both copies are gone, so the row goes through §7.3's grace period and
+  lands at **`REMOVED_LOCAL`** after ~10 minutes. Semantically wrong: nothing went *missing*,
+  we deleted them deliberately as part of extraction.
+
+Functionally harmless today (archive volumes are children, and auto-queue only considers
+top-level items), but it means the same event produces two different readings. A cleaned-up
+archive should rest at `EXCLUDED` in both modes.
+
+**Blocks a UI decision.** The user floated collapsing archive volumes into one summary row —
+*"14 archive volumes · removed after extraction"*, expandable, so the screen stays clean but
+the provenance of the `.mkv` is still visible. Worth doing, but not until there is one
+consistent resting state to summarise. Their own note: *"Not sure on this."*
+
+### `AuthSettingsIn` has the silent-reset shape, with security stakes
+
+The 2026-08-13 settings audit fixed the replace-on-PUT bug for `PostprocessSettings` and
+`RetentionSettings` by merging on `model_fields_set`. It found `AuthSettingsIn.proxy_header`
+and `proxy_trusted_cidrs` have **the same defaulted-field shape** and left them alone as out of
+scope.
+
+That one matters more than the others: silently resetting a trusted-CIDR list is a security
+control quietly turning itself off. Not known to be reachable — nobody has checked whether the
+Auth tab omits those fields on save — but it is the same pattern that *was* reachable twice.
+
+`SettleSettingsIn`/`AutoQueueSettingsIn` are single-field so cannot partially omit;
+`BackupSettingsIn`/`TransferSettingsIn`/`MetricsSettingsIn` have no defaults and are not
+vulnerable.
+
 ### Smaller, and genuinely optional
 
 - **Row lifetime** — nothing deletes `item` rows. [Issue #1](https://github.com/crzykidd/lftpweb/issues/1).
@@ -121,6 +155,15 @@ Plus the backup `VACUUM INTO` race (`209928d`) and the pending `DESIGN.md` wordi
 | Files row revamp — lifecycle icons, inline progress, sorting, persisted collapse | `8a54475` |
 | Item detail drawer, reachable from Files — `local_mtime`, lifecycle chronology, bounded history | `de85753` |
 | DESIGN.md backlog applied; three long-standing untruths corrected | `cad5891` |
+| Delete/removal state honest under a slow delete, a returning release, and a stuck `PARTIAL` child | `7dc045f` |
+| Per-queue archive cleanup, site-setting readout, settings-merge fix for silent resets | `0781352` |
+| Header sorting, facet filter, settle countdown, queue position, dashboard timeframe | `38efaaa` |
+
+Three of those came from a second round of live testing after the first push, and two found
+bugs nobody was looking for: `shutil.rmtree` was blocking the event loop for the whole duration
+of a large delete, and **every save from Settings → Post-processing had always silently reset
+`failed_retention_enabled`/`failed_retention_days`**, because those fields have no frontend
+form entry at all and the PUT replaced rather than merged.
 
 ---
 
