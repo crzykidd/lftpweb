@@ -53,8 +53,10 @@ re-run. As of phase 9 (verified live via `gh api repos/crzykidd/lftpweb/branches
 protection`, not assumed from an old note): **`main` is branch-protected** — 8 required status
 checks (Backend lint, Frontend lint + typecheck, Config validation, Compose validation, Image
 build, Test suite, and CodeQL for both languages), PR required, force-push and deletion both
-blocked. `dev` and `main` are both fully pushed and in sync with `origin` (`git rev-list
---left-right --count origin/<branch>...<branch>` reads `0 0` for both). `dev` sits ahead of
+blocked. **As of the 2026-08-12 post-phase-9 session `dev` is 2 commits AHEAD of `origin/dev`
+and deliberately unpushed** — the user asked to work locally without pushing; check
+`git rev-list --left-right --count origin/dev...dev` rather than assuming, and ask before
+pushing. `dev` sits ahead of
 `main` by design — protection means `main` only advances via a green PR, so `dev` naturally
 runs ahead between release-prep passes; check the actual commit count
 (`git rev-list --left-right --count main...dev`) rather than trusting a specific number here,
@@ -68,7 +70,9 @@ side effect of shipping.
 
 ## Where we are
 
-**Status: all 9 phases done — v1 is complete.** `DESIGN.md` is settled and reviewed (§13's
+**Status: all 9 phases done — v1 is complete — plus a post-phase-9 session on 2026-08-12 that
+first ran the app for real (its own section follows this one; read it, several of this
+section's phase-9-era statements are superseded there).** `DESIGN.md` is settled and reviewed (§13's
 build order is annotated with what shipped; §15's risk table was re-reviewed at phase 9). The
 skeleton (phase 1), scanning + reconciliation + read-only Files view (phase 2), the transfer
 engine + scheduler (phase 3a), the Transfers page / item drawer / Files actions / WebSocket
@@ -91,22 +95,161 @@ CSRF, rate limiting, and the finished credentials-need-re-entry behaviour (phase
 
 **Real, permanent gaps remain even though all 9 phases shipped — see `README.md`'s "What
 doesn't yet" and "Known gaps" sections for the consolidated, canonical list** (this file
-doesn't duplicate it). The headline items: **no UI screen in this project has ever been opened
-in a browser** (none exists in any environment this project has been built in — every page is
-confirmed to build/type-check/lint cleanly and every endpoint it calls is verified over real
-HTTP, but actual rendering and click-through behavior have never been visually confirmed);
-Settings → Transfer has no UI despite a complete backend API since phase 3; and Files has no
-bulk "Delete local"/"Delete remote" (Queue/Stop only, per phase 9's own scope). Click-test the
-UI before relying on any of it.
+doesn't duplicate it). Two headline items from phase 9 are now **closed** by the 2026-08-12
+post-phase-9 session below — Settings → Transfer has a UI, and the app has been run in a real
+browser — but Files still has no bulk "Delete local"/"Delete remote" (Queue/Stop only, per
+phase 9's own scope), and no manual delete endpoint exists anywhere in the API.
 
-> **⚠ Phase 5 makes the user's live queue's `sync_mode = 'move'` row live.** It has been
-> stored that way in the database since before phase 4's guard existed, inert until now
-> because nothing implemented `move` or read `sync_mode` to act on it. As of phase 5, `move`
-> **deletes the verified remote copy after every download that queue completes.** The row was
-> deliberately **not** touched or reset — see `docs/decisions.md`'s phase 5 entry, point 0, and
-> the phase 5 report. **Tell the user this first, before anything else, when they're back** —
-> this note stays here until they've confirmed they've seen it, not just until the phase that
-> introduced it shipped.
+## 2026-08-12, post-phase-9 session — the dev environment became real, and the UI was opened
+
+**This is the first session in which the application was actually run and looked at.** That
+single fact is why this session found more real bugs than any phase since the first live
+deployment, and it is the thing to remember when planning work: build/lint/type-check and
+endpoint-level HTTP checks had all been green for nine phases *while five distinct bugs sat in
+plain sight on the first screen a human opened*.
+
+**A coding agent still cannot see the UI** — no browser exists in the environment agents run
+in. Every UI claim in this file and in `docs/decisions.md` means "builds, type-checks, lints,
+and the endpoints it calls were verified over real HTTP", never "renders correctly". The user
+is the only one who has seen a screen. Say so plainly rather than implying otherwise.
+
+### The dev environment now runs — and four things had to be fixed before it could
+
+`docker-compose.dev.yml` + `docker-compose.test.yml` bring up a working stack:
+`http://localhost:5187` (Vite, hot reload, proxies `/api`), `http://localhost:8087` (API), and
+two fake seedboxes on `localhost:2222` (GNU) / `2223` (busybox). From *inside* the backend
+container the seedboxes are reachable as `seedbox-gnu` / `seedbox-busybox` on port 22 —
+**use the service name, not `localhost:2222`**, which is a host-side port. Credentials
+`seeduser` / `testpass123`, remote path `/data/pickup`. `private_data/seedbox-dropbox/` on the
+host is bind-mounted at **`/data/dropbox`** on both seedboxes for hand-testing — deliberately
+*not* over `/data/pickup`, since a mount there would shadow the seeded fixture tree several
+integration tests assert on. `private_data/dev-config/` holds the dev database and survives
+every rebuild (it is a bind mount; `down`, `up --build`, even `down -v` all leave it).
+
+The four dev-only breakages fixed (all in `1235293`; production was already correct in each
+case, which is exactly why they had gone unnoticed):
+
+- **The dev image had no `lftp`, no `ssh`, no `7zz`.** Only the runtime stage installed them.
+  Scanning worked (asyncssh is pure Python), so everything looked healthy until the first
+  Queue click died `SPAWN_FAILED: FileNotFoundError`.
+- **The dev image had no `/etc/passwd` entry for the running uid**, so OpenSSH would have
+  fatalled `No user exists for uid N` on every transfer even once lftp existed — asyncssh has
+  an env fallback (`core/remote.py` sets `LOGNAME`), OpenSSH has none. The dev stage now creates
+  the user at build time from `DEV_UID`/`DEV_GID`; the runtime stage solves it differently
+  (symlink `/etc/passwd` into the `/run` tmpfs, write it in the entrypoint) because there the
+  uid is a runtime PUID/PGID and the root filesystem is read-only.
+- **`/run/lftpweb` was root-owned and unwritable**, since the dev stage has no entrypoint to
+  create and chown it before dropping privileges. Now a uid-owned `tmpfs` mount at the same
+  path — *not* an `LFTPWEB_RUN_DIR` override onto the writable layer, which would put per-job
+  rc files (seedbox password, known_hosts pin, mode 0600) on real disk and quietly drop the
+  property §4.2/§11.1 exists to guarantee.
+- **Vite refused the host and never proxied the WebSocket.** `allowedHosts` now defaults open
+  (dev server only — production serves the built SPA same-origin from FastAPI, so this reaches
+  no deployed user), narrowable via `LFTPWEB_DEV_ALLOWED_HOSTS`. And the `/api` proxy gained
+  **`ws: true`**, which was load-bearing: `useLiveModel.ts` opens the one WebSocket at
+  `window.location.host`, which in dev is *Vite*, not the backend. Without it the Files page
+  connects to nothing and renders empty while every REST call works — verified by removing the
+  line and watching the upgrade hang with zero bytes.
+
+**Logs are readable now.** `LFTPWEB_LOG_LEVEL=DEBUG` set the *root* logger, so `aiosqlite`
+logged every statement twice: measured 37,388 library lines against **1** line from lftpweb
+itself, on a rotating handler with a fixed 25 MB budget — library chatter was actively evicting
+anything an incident would need. `logsetup.py` now applies per-logger floors (`aiosqlite`,
+`asyncssh`, `websockets` → WARNING), with `LFTPWEB_DEBUG_LIBS=asyncssh` as the escape hatch.
+That hatch matters: asyncssh's own output is how connection behaviour gets diagnosed. Result:
+~2,500 lines/minute → ~10.
+
+### What shipped this session (committed `16a1a2f`, one `feat:` commit)
+
+Seven agent-executed tasks, each with a `docs/decisions.md` entry and a prompt in
+`prompts/done/2026-08-12-*.md`. Tests went **367 → 489**; both lint gates and `npm run build`
+clean throughout.
+
+- **`_UNPACK_` extraction staging** — extraction was the one step writing files under their
+  *final* names, incomplete, where Sonarr/Radarr could import them. (Downloads were already
+  safe: `xfer:use-temp-file yes` with `*.lftp`.) Now extraction stages into a `_UNPACK_<name>`
+  **sibling** and merges into position only on full success via `move_tree(merge=True)`;
+  failure leaves `_FAILED_<name>` as evidence. Both prefixes are hidden from `scan_local`.
+- **Settings → Transfer built** (the phase-3a backend had no UI since phase 3), with §9.3's
+  required live connection-count readout, and **`queue_name` added to `JobOut`** so the
+  Transfers page shows which queue a row belongs to.
+- **Post-processing states survive the rescan.** They never had: every outcome was overwritten
+  within ~30s, so `CORRUPT` and `EXTRACT_FAILED` erased themselves before a human could see
+  them. Fixed as a precedence rule with a bounded domain (outcomes beat a fresh `DOWNLOADED`,
+  `PARTIAL` beats them, absence goes to §7.3's grace period), with transient states protected
+  by the **live worker's existence**, never by the state string — so a crashed worker cannot
+  wedge an item.
+- **An empty remote directory reads `REMOTE_ONLY`, not vacuously `DOWNLOADED`.**
+- **Throughput metrics + a Dashboard page** — `metric_sample` + `metric_heartbeat`
+  (migration 005), 30s sampling, per-queue, 7-day retention (configurable to 30), two
+  hand-rolled SVG charts, no new dependency.
+- **Files tree Expand all / Collapse all.**
+- **The WebSocket now publishes the persisted state, not the structural one** (below).
+
+### The one architectural change worth reading before touching `core/engine.py`
+
+**The `item` table is the single authority for item state; everything published is a projection
+of it.** `scan_queue`'s order is now the invariant: **reconcile → persist → read back → diff →
+publish**. `core/itemview.py` owns the one projection (`ITEM_VIEW_COLUMNS` + `item_view()`),
+and `GET /api/files`, the `queue_delta`, the connect-time `snapshot()`, `TransferQueue.
+_publish_item_state` and `PostprocessPipeline._publish` all go through it — **four hand-written
+copies of the same dict collapsed into one**. `ReconciledNode.state` was renamed
+**`structural_state`** so a *candidate* reading can no longer be mistaken for the real one at a
+call site. `snapshot()` re-reads the database (and became `async`) because writers change
+`item.state` between scans, and the reload path is how the old bug was actually visible.
+
+Before this, a `REMOVED_LOCAL` item was published as `REMOTE_ONLY` — Queue button and all —
+since phase 4, and REST and the socket could disagree about the same item.
+
+### ⚠ Open items awaiting the user — updated 2026-08-12 (post-phase-9 session)
+
+They stay in this file until the user resolves them, not until the phase that raised them
+shipped. **Do not action any of them unilaterally.**
+
+1. **The user's live queue still has `sync_mode = 'move'` stored, and `move` works.** The row
+   has been in the database since before phase 4's guard existed, inert the whole time because
+   nothing implemented `move` or read `sync_mode` to act on it. As of phase 5 it **deletes the
+   verified remote copy after every download that queue completes.** Deliberately **not**
+   touched or reset — see `docs/decisions.md`'s phase 5 entry, point 0. The user needs to either
+   switch it to `copy` or confirm that `/home/crzykidd/downloads/complete/testlftp` is a genuine
+   hardlink pickup directory rather than live torrent data (§7.1 — deleting from a live torrent
+   data directory destroys the seed). Nothing has been pulled on that queue since, so nothing
+   has been deleted yet. **Note (2026-08-12):** the user intends to purge and rebuild the
+   dev *and* production-test databases, which would delete this row — resolving it by deletion
+   rather than by decision. If they rebuild the queue, the mode they pick is a fresh choice.
+2. **Scheduled DB backups default ON** (daily, keep 7) — the one deliberate exception to the
+   overnight run's "every new capability defaults off" rule, reasoned in `docs/decisions.md`'s
+   phase 7 entry. The user's call whether to reverse it.
+3. ~~No UI screen has ever been opened in a browser.~~ **Resolved 2026-08-12** — the app now
+   runs and the user has used it (see the session section above). Still true and still worth
+   repeating: **a coding agent cannot see it**, and most screens remain unviewed by anyone.
+4. **`DESIGN.md` has three proposed wordings pending the user's approval**, all drafted by the
+   tasks that found the gaps, none applied — a build that reveals `DESIGN.md` is wrong gets the
+   doc corrected, it is not quietly diverged from. They are: **§3.2 rule 9** (who wins between
+   the three modules that write `item.state` — its absence is why post-processing states were
+   erased for four phases); **an empty-remote-directory clause** near rule 1/8; and **§2/§9's
+   publish invariant** (what is published is the persisted state, never the structural one).
+   Full text is in `docs/decisions.md`'s 2026-08-12 entries and the matching `prompts/done/`
+   reports.
+5. **`net:connection-limit` is not settable from any UI.** §4.5 calls it "a first-class setting,
+   host-level, not an advanced afterthought", but it lives only inside the `host`.
+   `connection_overrides` JSON blob, with no write path anywhere. Settings → Transfer's live
+   connection-count readout therefore computes the worst case correctly but **can never fire its
+   "⚠ over the limit" warning** on any current install. Surfaced read-only rather than promoted
+   to a real column (that needs a migration). Recorded in `README.md`'s "Known gaps".
+6. **Nothing deletes `item` rows, ever.** Found live: `GET /api/files` returned 27 rows while
+   the WebSocket published 6, the difference being paths that had left both trees during
+   testing. Row *lifetime* is an unanswered design question distinct from state ownership —
+   when, if ever, may a row be deleted, and what does History/audit need to keep?
+7. **Per-queue rescan interval** was requested and is not built. `scan_interval_s` is a single
+   global (30s, env-overridable); phase 2 collapsed §5's separate 30s remote / 10s local
+   cadences into it. Needs a migration, a per-queue next-due in the engine loop, and a field in
+   Settings → Queues.
+
+Also open, but not a decision so much as a next step: **`dev` is ahead of `main` by every
+phase 4–9 commit plus the two 2026-08-12 commits, and no PR has been opened.** `main` is
+protected; merging is a `dev` → `main` PR with all 8 required checks green, whenever the user
+is ready. No release has been cut.
 
 | Phase (`DESIGN.md` §13) | State |
 |---|---|
@@ -119,14 +262,9 @@ UI before relying on any of it.
 | 6 — History page | **done** (2026-08-12) |
 | 7 — Operations (logs, backup, health) | **done** (2026-08-11, committed `c6dcc03`) |
 | 8 — Auth + hardening | **done, committed** (2026-08-12, `b936576`) |
-| 9 — Polish + docs reconciliation | **done, not yet committed** (2026-08-12) — see below |
+| 9 — Polish + docs reconciliation | **done, committed** (2026-08-12, `9272f36`) |
+| post-phase-9 session | **done, committed** (2026-08-12, `1235293` + `16a1a2f`) — see above |
 | `sync` mode | **not scheduled** — designed in §7, built only if it proves wanted |
-
-> **⚠ Phase 9's work is prepared on the working tree but NOT YET COMMITTED**, per that task's
-> explicit "do NOT commit — prepare the tree and report back" instruction (the same
-> instruction phase 8 was given; phase 8 has since been committed — see the table above and
-> "Commits so far" below). See the phase 9 report (linked from its `prompts/done/` file, once
-> moved there) for the exact file list and the proposed commit message.
 
 **Current instruction (2026-08-11, overnight run) — closed out as of phase 9.** Phases 1–3
 were proven against **the user's real seedbox** — a 1.29 GB mkv transferred byte-exact, nested
@@ -149,8 +287,9 @@ off exactly like every other phase. Phase 7's scheduled backup was a second, sma
 reasoned exception (see its own `docs/decisions.md` entry) — everything else held the rule.
 
 **Their live config:** one queue, `sync_mode` stored as `move` in the database from before the
-guard existed. As of phase 5 this is **no longer inert** — see the warning banner above. Not
-silently rewritten; it is the user's call and they need to see it first.
+guard existed. As of phase 5 this is **no longer inert** — see item 1 of the decisions-awaited
+list above. Not silently rewritten; it is the user's call, they have been told, and as of the
+last session they had not yet answered.
 
 ## What real hardware taught us that the fake seedbox could not
 
@@ -436,24 +575,36 @@ report was written) along with a stale "phases 1–3 of 9" status line that had 
 updated in `CLAUDE.md`. `README.md` gained a "Known gaps" section consolidating seven
 deliberate scope reductions collected from `docs/decisions.md` across all eight prior phases,
 plus two more found while reconciling this phase (Settings → Transfer has no UI despite a
-complete backend since phase 3; Files has no bulk Delete local/remote) — named rather than
-built, per this phase's own explicit instruction not to close gaps silently. One factual error
+complete backend since phase 3 — **since built, 2026-08-12**; Files has no bulk Delete
+local/remote — **still true**) — named rather than built, per this phase's own explicit
+instruction not to close gaps silently. One factual error
 was also caught and fixed: the README's volume table had `/staging` backwards relative to what
 phase 5 actually built (`local_path` is the download target; `staging_path` is where a
 `move`-mode item is *relocated to* afterward — the opposite of "download here, move to
 `/downloads` when complete"). `uv run pytest`: 367 passed, 0 skipped (fake seedbox up), 357
 passed / 10 skipped without it — no regressions, no backend code changed. Both lint gates
 clean. `npm run build`/`npm run lint` clean. All three compose files validate. Fake-seedbox
-containers torn down and confirmed removed via `docker ps -a` afterward. **This phase's work
-is prepared but deliberately not committed**, per that task's explicit instruction — see
-`docs/decisions.md`'s phase 9 entry and the phase 9 report for the exact file list and the
-proposed commit message.
+containers torn down and confirmed removed via `docker ps -a` afterward. Committed as
+`9272f36` and pushed to `dev`; every decision is in `docs/decisions.md`'s phase 9 entry.
 
 **Commits so far:** repo init + standard adoption, the design revisions, phase 1 (`b0109ae`),
 phase 2 (`de6d74b`), phase 3a (`36b9123`), phase 3b (`c814aa0`), phase 4 (`db89b63`), phase 5
-(`b0c9cb3`), phase 6 (`d76a662`), phase 7 (`c6dcc03`), phase 8 (`b936576`). All on `dev`. Phase
-9's work is prepared on the working tree but **not yet committed** — see the phase 9 prompt's
-final report for the proposed commit message.
+(`b0c9cb3`), phase 6 (`d76a662`), phase 7 (`c6dcc03`), phase 8 (`b936576`), phase 9
+(`9272f36`), then the 2026-08-12 post-phase-9 session as two commits: `1235293`
+(`chore:` dev environment + logging) and `16a1a2f` (`feat:` the seven application changes,
+51 files). All on `dev`. **Everything through `9272f36` is pushed; the two 2026-08-12 commits
+are NOT** — the user asked to work locally without pushing, so `dev` is 2 ahead of
+`origin/dev`. CI on `9272f36` was green across all six jobs (Backend lint, Frontend lint +
+typecheck, Config validation, Compose validation, Image build, Test suite); **CI has not yet
+seen the two newer commits.** **489 tests pass** with the fake seedbox up (367 at phase 9),
+both lint gates clean, `npm run build` clean.
+
+**Still uncommitted, and not ours:** `CHANGELOG.md`, `standards.md`,
+`.claude/commands/release-prep.md`, and this file carry a pre-2026-08-12-session documentation
+sweep that no agent touched. Its `docs/decisions.md` entry ("Post-phase-9 documentation
+currency sweep") rode along in `16a1a2f` because it sat in the same contiguous block as the
+session's own entries — so that entry is committed while the files it describes are not. Commit
+them and the ordering resolves itself.
 
 ---
 
@@ -497,6 +648,53 @@ final report for the proposed commit message.
 
 These are the places where the obvious implementation is wrong. Each is written up in
 `DESIGN.md`; this list exists so a fresh session knows to go read it.
+
+**Added 2026-08-12 (post-phase-9 session) — read these first, they are the newest and the
+most likely to be re-broken:**
+
+- **`relevant == 0` on a directory means two different things**, and only one of them is
+  `DOWNLOADED`. Every child excluded by a `file_exclude` pattern → vacuously `DOWNLOADED`, and
+  that is load-bearing (§4.7/§3.2 rule 8: it is what stops a filtered release sitting `PARTIAL`
+  and being auto-queued forever). A genuinely empty remote directory → `REMOTE_ONLY` until
+  mirrored. `core/reconcile.py` tells them apart with `remote_file_totals`, a rollup counting
+  remote files *before* the predicate runs. **Do not "simplify" this by keying on local
+  presence** — an all-excluded directory legitimately has no local presence either (lftp never
+  creates a directory with nothing to put in), so that reintroduces the infinite re-queue loop.
+- **A state that is merely protected is a state that can never be un-stuck.** Post-processing
+  outcomes beat a freshly computed `DOWNLOADED` and *only* that: `PARTIAL` beats them (rule 2 —
+  the bytes are not all there) and absence goes to §7.3's grace period, or an item an importer
+  moved out would never reach `REMOVED_LOCAL` and auto-queue would re-download the whole
+  release. Transient `VERIFYING`/`EXTRACTING` are protected by the **live worker's existence**
+  (`PostprocessPipeline.in_flight_item_ids()`), never by the state string, so a crashed worker
+  cannot wedge an item — an in-memory registry empties on death, exception, and shutdown alike.
+- **Nothing may publish a state it did not read back from the `item` table.** `scan_queue`'s
+  order is the invariant: reconcile → persist → read back → diff → publish, with
+  `core/itemview.py` the single projection shared by the socket, the snapshot, and
+  `GET /api/files`. The reconciler's field is `structural_state` — a *candidate* — and if you
+  find yourself publishing it directly, that is the bug this rename exists to make visible.
+- **`_project`'s `rel_paths` filter is load-bearing, not tidiness.** Nothing deletes `item`
+  rows, so projecting unfiltered would resurrect rows that left both trees *and* leave
+  `diff_nodes`'s `removed` permanently empty.
+- **Extraction must never write a final-named file where an `*arr` can see it.** It stages into
+  a `_UNPACK_<name>` **sibling** (not a child — a child sits inside the tree the reconciler
+  walks and inside anything a later move relocates) and merges into place only on full success;
+  failure leaves `_FAILED_<name>` as evidence. Both prefixes, and `.lftpweb-mount-ok`, are
+  filtered out in `core/local_scan.py` — lftpweb's own bookkeeping must never reconcile to a
+  `LOCAL_ONLY` node. Downloads were already safe via `xfer:use-temp-file`/`*.lftp`.
+- **`job.bytes_done` is not monotonic** — a retry or resume resets it, which is why
+  `bytes_start` exists. Any code differencing it (the metrics sampler, anything new) must
+  compute deltas per job and clamp, or a restart renders as a phantom throughput spike.
+- **The dev image is not the runtime image.** It has no entrypoint, so anything
+  `docker/entrypoint.sh` does for production (creating/chowning `/run/lftpweb`, writing
+  `/etc/passwd` for the running uid) must be arranged another way in
+  `docker-compose.dev.yml`/the `dev` stage — see the session notes above. A dev-only breakage
+  that production does not share is easy to misdiagnose as an application bug.
+- **Vite's `/api` proxy needs `ws: true`.** The one WebSocket is opened at
+  `window.location.host`, which in dev is the Vite server, not the backend. Without it the
+  Files page connects to nothing and renders empty while every REST call succeeds.
+- **`root.setLevel()` sets the level for every library in the process.** `logsetup.py` applies
+  per-logger floors for exactly this reason; `LFTPWEB_DEBUG_LIBS` lifts them when you actually
+  need transport-level output.
 
 - **Excluded files break completeness** (§4.7, §3.2 rule 8). A `file_exclude` of `*.nfo` means
   those files never arrive — so if the reconciler counts them as missing, every filtered
@@ -629,9 +827,9 @@ These are the places where the obvious implementation is wrong. Each is written 
   machinery on the next scan, exactly as if a human or an `*arr` importer had moved it — no new
   state, no new code path.
 - **The user's live queue's `sync_mode = 'move'` row went from inert to live the moment phase
-  5 shipped, and was deliberately left untouched** — see the warning near the top of this
-  file's "Where we are" and docs/decisions.md's phase 5 entry, point 0. The first thing to tell
-  the user when they're back.
+  5 shipped, and was deliberately left untouched** — see item 1 of the decisions-awaited list
+  near the top of "Where we are", and docs/decisions.md's phase 5 entry, point 0. The user has
+  been told; they had not answered as of the last session. Don't change the row for them.
 - **A list endpoint over an unbounded table must not inline a per-row blob just because a
   bounded sibling endpoint does** (phase 6). `api/jobs.py`'s `JobOut` inlines `output_tail`
   (~4KB) because that endpoint's row set is bounded by construction (`list_jobs()`'s own
