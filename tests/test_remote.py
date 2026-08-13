@@ -3,17 +3,21 @@ from __future__ import annotations
 import socket
 from pathlib import Path
 
+import asyncssh
 import pytest
 
 from lftpweb.core.remote import (
     HostConfig,
+    InvalidPrivateKeyError,
     RemoteConnectionPool,
     RemoteEntry,
     RemoteRecord,
     RemoteScanError,
+    _resolve_client_keys,
     interpret_primary_scan_result,
     parse_find_records,
     records_to_entries,
+    validate_private_key,
 )
 
 
@@ -185,6 +189,76 @@ def test_interpret_primary_scan_result_multiple_skipped_paths_summarized():
     assert outcome.raw == stdout.decode()
     assert outcome.warning is not None
     assert "2 paths skipped" in outcome.warning
+
+
+# --- migration 014: paste-a-key coexistence, in-memory client_keys resolution, validation ---
+# Real end-to-end auth against the fake seedbox (both this and the lftp side) lives in
+# tests/test_ssh_key_e2e.py; these are the pure-function unit tests that don't need a network
+# connection at all.
+
+
+def _generate_test_key_pem() -> str:
+    key = asyncssh.generate_private_key("ssh-ed25519")
+    return key.export_private_key().decode("ascii")
+
+
+def test_resolve_client_keys_pasted_key_returns_parsed_key_material_not_a_path():
+    # The whole point of DESIGN.md §8's "verify asyncssh accepts key material, not only
+    # paths" -- confirmed here against the installed asyncssh: this must be an already-parsed
+    # `SSHKey`, never a bare string, or scanning would need a file after all.
+    pem = _generate_test_key_pem()
+    host = HostConfig(id=1, address="h", port=22, username="u", auth_method="key", ssh_key=pem)
+    result = _resolve_client_keys(host)
+    assert len(result) == 1
+    assert isinstance(result[0], asyncssh.SSHKey)
+
+
+def test_resolve_client_keys_key_path_only_is_passed_through_unchanged():
+    host = HostConfig(
+        id=1, address="h", port=22, username="u", auth_method="key", key_path="/config/keys/id"
+    )
+    assert _resolve_client_keys(host) == ["/config/keys/id"]
+
+
+def test_resolve_client_keys_pasted_key_wins_when_both_are_set():
+    pem = _generate_test_key_pem()
+    host = HostConfig(
+        id=1,
+        address="h",
+        port=22,
+        username="u",
+        auth_method="key",
+        key_path="/config/keys/id",
+        ssh_key=pem,
+    )
+    result = _resolve_client_keys(host)
+    assert len(result) == 1
+    assert isinstance(result[0], asyncssh.SSHKey)  # the pasted key, not the path string
+
+
+def test_resolve_client_keys_neither_set_raises():
+    host = HostConfig(id=1, address="h", port=22, username="u", auth_method="key")
+    with pytest.raises(ValueError):
+        _resolve_client_keys(host)
+
+
+def test_validate_private_key_accepts_a_real_unencrypted_key():
+    validate_private_key(_generate_test_key_pem())  # does not raise
+
+
+def test_validate_private_key_rejects_garbage():
+    with pytest.raises(InvalidPrivateKeyError):
+        validate_private_key("not a key at all")
+
+
+def test_validate_private_key_rejects_a_passphrase_protected_key_with_a_clear_message():
+    key = asyncssh.generate_private_key("ssh-rsa", key_size=2048)
+    encrypted_pem = key.export_private_key(format_name="pkcs8-pem", passphrase="hunter2").decode(
+        "ascii"
+    )
+    with pytest.raises(InvalidPrivateKeyError) as excinfo:
+        validate_private_key(encrypted_pem)
+    assert "passphrase" in str(excinfo.value).lower()
 
 
 # --- Live regression against the real fake seedbox (GNU find) -----------------------------

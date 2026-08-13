@@ -48,10 +48,15 @@ KnownHostsPolicy = Literal["accept-and-pin", "strict", "insecure"]
 
 
 class HostIn(BaseModel):
-    """A create/update request for the (single, v1) seedbox host. `password` is plaintext
-    here — the only place it ever appears in a request body — and is encrypted at rest
-    (`core/crypto.py`) before it touches the database; it is never included in any response
-    (DESIGN.md §9.2: "must never round-trip the stored secret back to the browser").
+    """A create/update request for the (single, v1) seedbox host. `password` and `ssh_key` are
+    plaintext here — the only place either ever appears in a request body — and are encrypted
+    at rest (`core/crypto.py`) before they touch the database; neither is ever included in any
+    response (DESIGN.md §9.2: "must never round-trip the stored secret back to the browser").
+
+    `ssh_key` (migration 014, DESIGN.md §8) is an *additional* way to satisfy `auth_method =
+    'key'`, alongside `key_path` — not a replacement. When both are set on save, the pasted key
+    wins (`api/settings.py.put_host`); `key_path` keeps working untouched for anyone already
+    mounting a key file.
     """
 
     name: str
@@ -61,6 +66,7 @@ class HostIn(BaseModel):
     auth_method: AuthMethod
     key_path: str | None = None
     password: str | None = None
+    ssh_key: str | None = None
     known_hosts_policy: KnownHostsPolicy = "accept-and-pin"
 
 
@@ -73,6 +79,13 @@ class HostOut(BaseModel):
     auth_method: AuthMethod
     key_path: str | None
     has_password: bool
+    # migration 014: whether a key is currently stored, mirroring `has_password` — never the
+    # key itself (DESIGN.md §9.2).
+    has_ssh_key: bool = False
+    # Which of `key_path` / a pasted key is actually in use for `auth_method = 'key'` — the
+    # coexistence rule (pasted wins) lives in exactly one place, `api/settings.py`, so the UI
+    # never has to re-derive it. `None` when `auth_method != 'key'` or neither is set.
+    active_key_source: Literal["pasted", "path"] | None = None
     known_hosts_policy: KnownHostsPolicy
     credentials_need_reentry: bool = False
     # Read-only: DESIGN.md §4.5/§9.3 calls `net:connection-limit` "a first-class setting,
@@ -85,7 +98,8 @@ class HostOut(BaseModel):
 class HostTestRequest(BaseModel):
     """*Test connection* against either the saved host (omit every field) or a form the
     user hasn't saved yet (fill in what should override the stored row) — so the UI can
-    test before committing. `password = None` means "use the currently stored password."
+    test before committing. `password = None` means "use the currently stored password";
+    `ssh_key = None` means the same for a pasted key.
     """
 
     name: str | None = None
@@ -95,6 +109,7 @@ class HostTestRequest(BaseModel):
     auth_method: AuthMethod | None = None
     key_path: str | None = None
     password: str | None = None
+    ssh_key: str | None = None
     known_hosts_policy: KnownHostsPolicy | None = None
 
 

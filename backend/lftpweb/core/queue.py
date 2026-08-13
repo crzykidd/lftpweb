@@ -1088,6 +1088,7 @@ class TransferQueue:
             auth_method=host.auth_method,
             key_path=host.key_path,
             password=host.password,
+            ssh_key=host.ssh_key,
             known_hosts_policy=host.known_hosts_policy,
             pinned_host_key=await self._pinned_host_key(host),
         )

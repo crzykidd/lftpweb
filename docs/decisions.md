@@ -6,6 +6,80 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-13 — Pasted SSH key: DB ciphertext over a separate file, and per-job materialisation
+## over per-process
+
+**Handoff prompt `prompts/2026-08-13-paste-ssh-key.md`, executed end to end.** Migration 014
+adds `host.ssh_key_enc` so Settings → Connection can accept a pasted private key alongside the
+existing `key_path` (mounted file) option, encrypted at rest and decrypted to `/run` tmpfs only
+where lftp genuinely needs a file.
+
+**Storage: ciphertext in the `host` row, not a separate file outside the database.** The
+alternative considered was a ciphertext file living next to `secret.key` under `/config`,
+mirroring how the install secret itself is stored. The database won on one concrete ground:
+`docs/decisions.md` and DESIGN.md §10.2 already establish that a config backup (`VACUUM INTO`)
+is the recovery path an operator actually uses, and it walks the database, not arbitrary files
+under `/config`. A ciphertext file excluded from that backup would mean a pasted key silently
+fails to survive a restore even though nothing about the key changed — the exact "credentials
+need re-entry" state DESIGN.md §8 designs for the *install secret* going away, now happening for
+no reason at all. Storing it in `host.ssh_key_enc` means one crypto mechanism (`core/crypto.py`,
+already proven — a test byte-searches a real backup for `secret.key` and finds nothing) instead
+of two, and it round-trips through backup/restore for free, the same as `password_enc` always
+has. The security difference between the two options is narrow either way: both leave only
+ciphertext in a backup, because the install secret itself is excluded from `VACUUM INTO` under
+both designs. There was no reason to pay the "second mechanism, one more failure mode" cost for
+a difference that thin.
+
+**Materialisation: per-job file for lftp, not a file held for the process's lifetime — and
+nothing at all for asyncssh.** Two things had to be decided, not assumed:
+
+1. *Does asyncssh need a file at all?* No — checked directly against the installed asyncssh
+   (2.24.0), not assumed from documentation: `asyncssh.import_private_key(pem_text)` returns a
+   parsed `SSHKey` object, and `connect(client_keys=[...])` accepts that object directly, not
+   only a path or path-like string (`load_keypairs`'s own `SpecifyingPrivateKeys` reference,
+   verified with a throwaway generated key in a REPL). So the asyncssh scanning path
+   (`core/remote.py._resolve_client_keys`) decrypts a pasted key straight into memory and never
+   touches disk for it at all — strictly better than materialising a file this path doesn't
+   need.
+2. *lftp does need a file* — it shells out to `ssh -i <path>` (`core/lftp.py`'s
+   `sftp:connect-program`), and there is no lftp-level way to hand `ssh` key material any other
+   way. The question was **per-job or per-process**: write it once at process startup (and again
+   on every settings change) to a stable path, or write/unlink it inside `spawn()`/`cleanup()`
+   exactly like the per-job rc file already does. Chosen: **per-job**, alongside the rc file.
+   Reasoning: the plaintext then exists on the `/run` tmpfs only while a transfer is actually in
+   flight, not for the entire process lifetime — strictly less exposure, at the cost of one
+   extra small file write/unlink per job, which is negligible next to the rc file `spawn()`
+   already writes unconditionally on every single job. The decisive secondary win: per-job
+   sidesteps "materialise on startup and on change" as a *problem* entirely. `/run` is emptied by
+   every container restart, so a per-process file would need an explicit re-materialisation step
+   on startup, plus a change-listener to rewrite it when the host row is edited — two places to
+   get it wrong, and a real failure mode (a transfer that starts failing with a missing-file
+   error after a restart, until someone remembers to re-save Settings → Connection to force a
+   rewrite). Per-job has neither: every `spawn()` call decrypts fresh from whatever
+   `core/engine.py.load_host_config` most recently read out of the `host` row, the same way the
+   rc file's password line already does today, so the first job after a restart and the
+   five-hundredth job after an unrelated settings change both just work with no separate step to
+   remember.
+
+**Coexistence: a pasted key wins over `key_path` when both are set**, decided once, server-side
+(`api/settings.py._host_out_from_row`'s `active_key_source`), rather than left for the frontend
+or `core/lftp.py`/`core/remote.py` to independently (and possibly divergently) infer. Both
+`core/remote.py._resolve_client_keys` and `core/lftp.py.spawn`'s key resolution implement the
+same rule and say so in their own docstrings, so the two auth paths can't silently disagree —
+the failure mode DESIGN.md §8 already worries about for asyncssh vs. lftp's differing leniency
+on file permissions, now avoided for this decision too by construction rather than by
+convention.
+
+**Passphrase-protected pasted keys are rejected outright at save time**, not accepted with a
+stored passphrase. Both consumers are non-interactive (`asyncssh.connect` in a scan loop, `ssh
+-i` inside a spawned lftp process) and neither can be handed a passphrase prompt to answer, so
+storing one would only defer the failure to the next scan or transfer attempt — DESIGN.md §8's
+"credentials need re-entry" state is prevention-shaped for a decryption failure the install
+secret causes; it would be the wrong tool for a self-inflicted one caught by validation before
+save even needed to happen.
+
+---
+
 ## 2026-08-13 — The settle countdown's denominator stays fixed at `n/2`; a same-shaped fix to
 ## the numerator was tried, caught by the e2e suite, and reverted in favor of a second field
 

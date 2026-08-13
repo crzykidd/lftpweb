@@ -50,9 +50,28 @@ _CREDENTIAL_RE = re.compile(
     r"(?P<scheme>[a-zA-Z][a-zA-Z0-9+.\-]*://)(?P<user>[^:/@\s]+):(?P<password>[^@/\s]+)@"
 )
 
+# A pasted SSH private key (migration 014, DESIGN.md §8) is a PEM block spanning many lines —
+# `-----BEGIN ... PRIVATE KEY-----`, base64 body, `-----END ... PRIVATE KEY-----`. The single-
+# line `_CREDENTIAL_RE` above can't touch this: it has no line-ending awareness at all, and even
+# a redactor that *did* work line-by-line would still leak the key, just one line at a time,
+# which is the exact failure this exists to prevent (nothing in this codebase should ever log a
+# key in the first place — see core/lftp.py / core/remote.py's docstrings — but log redaction is
+# the last line of defense, not the first, and it must actually hold). `re.DOTALL` is what makes
+# `.*?` cross newlines; `(?P=label)` requires the same key-type label on both BEGIN and END so a
+# log line that merely mentions "PRIVATE KEY" without a real block isn't swallowed, and the
+# non-greedy `.*?` stops at the *first* END so two distinct keys logged back to back are each
+# redacted separately rather than one match spanning both.
+_PRIVATE_KEY_RE = re.compile(
+    r"-----BEGIN (?P<label>[A-Z0-9 ]*PRIVATE KEY)-----.*?-----END (?P=label)-----",
+    re.DOTALL,
+)
+
 
 class CredentialRedactor(logging.Filter):
-    """Logging filter that redacts `user:pass@` credentials embedded in URLs."""
+    """Logging filter that redacts `user:pass@` credentials embedded in URLs, and any pasted
+    SSH private key's PEM block, wherever either appears in a log message — including a
+    message that spans multiple lines, which a private key's own PEM form always does.
+    """
 
     def filter(self, record: logging.LogRecord) -> bool:
         # Render the message now (applying %-args), then redact and stop args from being
@@ -63,7 +82,13 @@ class CredentialRedactor(logging.Filter):
 
     @staticmethod
     def redact(text: str) -> str:
-        return _CREDENTIAL_RE.sub(lambda m: f"{m.group('scheme')}{m.group('user')}:***@", text)
+        text = _CREDENTIAL_RE.sub(lambda m: f"{m.group('scheme')}{m.group('user')}:***@", text)
+        text = _PRIVATE_KEY_RE.sub(
+            lambda m: f"-----BEGIN {m.group('label')}----- ***REDACTED*** "
+            f"-----END {m.group('label')}-----",
+            text,
+        )
+        return text
 
 
 # Endpoints the UI polls on a timer. At ~1 Hz these access-log lines bury everything that

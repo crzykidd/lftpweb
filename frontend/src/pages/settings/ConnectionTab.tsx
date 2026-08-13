@@ -14,6 +14,7 @@ interface FormState {
   auth_method: AuthMethod
   key_path: string
   password: string
+  ssh_key: string
   known_hosts_policy: KnownHostsPolicy
 }
 
@@ -25,12 +26,16 @@ const EMPTY_FORM: FormState = {
   auth_method: 'key',
   key_path: '',
   password: '',
+  ssh_key: '',
   known_hosts_policy: 'accept-and-pin',
 }
 
-/** DESIGN.md §9.2 Settings → Connection. The password field is write-only by design (§9.2):
- * it is never pre-filled from a saved host, so leaving it blank on save means "keep the
- * stored value" (enforced server-side, see api/settings.py's put_host).
+/** DESIGN.md §9.2 Settings → Connection. The password and pasted-key fields are write-only by
+ * design (§9.2): neither is ever pre-filled from a saved host, so leaving either blank on save
+ * means "keep the stored value" (enforced server-side, see api/settings.py's put_host). A
+ * pasted key (migration 014) is an *additional* way to satisfy key auth, alongside `key_path`
+ * -- not a replacement -- and wins over `key_path` when both are set; `saved.active_key_source`
+ * says which one is actually in use.
  */
 export function ConnectionTab() {
   const [form, setForm] = useState<FormState>(EMPTY_FORM)
@@ -54,6 +59,7 @@ export function ConnectionTab() {
             auth_method: host.auth_method,
             key_path: host.key_path ?? '',
             password: '',
+            ssh_key: '',
             known_hosts_policy: host.known_hosts_policy,
           })
         }
@@ -76,10 +82,12 @@ export function ConnectionTab() {
         auth_method: form.auth_method,
         key_path: form.auth_method === 'key' ? form.key_path || null : null,
         password: form.password || null,
+        ssh_key: form.auth_method === 'key' ? form.ssh_key || null : null,
         known_hosts_policy: form.known_hosts_policy,
       })
       setSaved(host)
       update('password', '')
+      update('ssh_key', '')
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err))
     } finally {
@@ -99,6 +107,7 @@ export function ConnectionTab() {
         auth_method: form.auth_method,
         key_path: form.auth_method === 'key' ? form.key_path || null : null,
         password: form.password || null,
+        ssh_key: form.auth_method === 'key' ? form.ssh_key || null : null,
         known_hosts_policy: form.known_hosts_policy,
       })
       setTestResult(result)
@@ -155,10 +164,46 @@ export function ConnectionTab() {
       </label>
 
       {form.auth_method === 'key' && (
-        <label className="flex flex-col gap-1">
-          <span className={labelClasses}>Key path</span>
-          <input className={inputClasses} value={form.key_path} onChange={(e) => update('key_path', e.target.value)} />
-        </label>
+        <>
+          <label className="flex flex-col gap-1">
+            <span className={labelClasses}>
+              Private key{' '}
+              {saved?.has_ssh_key && (
+                <span className="text-zinc-400">(leave blank to keep the stored one)</span>
+              )}
+            </span>
+            <textarea
+              className={`${inputClasses} h-28 font-mono text-xs`}
+              value={form.ssh_key}
+              onChange={(e) => update('ssh_key', e.target.value)}
+              placeholder="-----BEGIN OPENSSH PRIVATE KEY-----&#10;...&#10;-----END OPENSSH PRIVATE KEY-----"
+              autoComplete="off"
+              spellCheck={false}
+            />
+            <span className="text-xs text-zinc-500 dark:text-zinc-400">
+              Encrypted at rest, decrypted only in memory. Passphrase-protected keys are
+              rejected — strip the passphrase first, or use Key path below instead.
+            </span>
+          </label>
+
+          <label className="flex flex-col gap-1">
+            <span className={labelClasses}>Key path</span>
+            <input className={inputClasses} value={form.key_path} onChange={(e) => update('key_path', e.target.value)} />
+            <span className="text-xs text-zinc-500 dark:text-zinc-400">
+              A key file already mounted into the container. Ignored while a pasted key above is
+              stored — a pasted key always takes priority.
+            </span>
+          </label>
+
+          {saved?.active_key_source && (
+            <p className="text-xs text-zinc-500 dark:text-zinc-400">
+              Currently using:{' '}
+              <span className="font-medium text-zinc-700 dark:text-zinc-300">
+                {saved.active_key_source === 'pasted' ? 'the pasted key' : 'Key path'}
+              </span>
+            </p>
+          )}
+        </>
       )}
 
       {form.auth_method === 'password' && (

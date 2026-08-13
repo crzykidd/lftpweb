@@ -102,6 +102,38 @@ class DecryptionNeededError(Exception):
     """
 
 
+class InvalidPrivateKeyError(ValueError):
+    """A pasted private key doesn't parse, or is passphrase-protected (migration 014,
+    DESIGN.md §8). Raised by `validate_private_key`; `api/settings.py` catches this at save
+    time and turns it into a 422 rather than letting a bad paste surface as a mystery
+    `AUTH_FAILED` on the next scheduled scan or transfer.
+    """
+
+
+def validate_private_key(pem_text: str) -> None:
+    """Reject at paste time, not at 3am: confirm `pem_text` parses as an SSH private key, and
+    that it isn't passphrase-protected.
+
+    A passphrase-protected key is refused outright rather than accepted with a stored
+    passphrase -- both the asyncssh scanning path and lftp's non-interactive `ssh -i` would
+    otherwise hang or fail waiting on a prompt nothing can answer. The message tells the user
+    the two ways out: strip the passphrase, or fall back to `key_path` (a file they manage
+    themselves, where an agent or an interactive unlock is their own problem to solve).
+
+    Raises `InvalidPrivateKeyError`; returns `None` on a valid, unencrypted key.
+    """
+    try:
+        asyncssh.import_private_key(pem_text)
+    except asyncssh.KeyImportError as exc:
+        if "passphrase" in str(exc).lower():
+            raise InvalidPrivateKeyError(
+                "this key is passphrase-protected -- lftpweb cannot supply a passphrase "
+                "non-interactively. Strip the passphrase (e.g. `ssh-keygen -p`) before "
+                "pasting it, or mount the key file and use Key path instead."
+            ) from exc
+        raise InvalidPrivateKeyError(f"does not parse as a private key: {exc}") from exc
+
+
 @dataclass(frozen=True)
 class HostConfig:
     """Connection parameters for the seedbox. Mirrors the `host` table (DESIGN.md §3.1); the
@@ -124,8 +156,16 @@ class HostConfig:
     # `password is None`, which is also true for `key`/`agent` auth where no password is
     # expected at all -- this flag is what `core/queue.py._admit` and `core/engine.py.
     # scan_queue` check to hold transfers / skip scanning cleanly instead of retrying a
-    # connection that can only ever fail the same way.
+    # connection that can only ever fail the same way. A pasted key that fails to decrypt
+    # (migration 014) sets this exact same flag -- see `load_host_config` -- rather than a
+    # parallel one, so `_admit`/`scan_queue` don't need to know which credential is missing.
     credentials_need_reentry: bool = False
+    # migration 014 (docs/decisions.md, 2026-08-13): a pasted-and-encrypted key, already
+    # decrypted into memory by `core/engine.py.load_host_config` -- never written to disk by
+    # this module (see `_resolve_client_keys`). `None` when `auth_method != 'key'`, when no
+    # key was ever pasted, or when decryption failed (`credentials_need_reentry` covers that
+    # case). Wins over `key_path` when both are set -- see `_resolve_client_keys`.
+    ssh_key: str | None = None
 
 
 def parse_connection_limit(connection_overrides_json: str | None) -> int | None:
@@ -424,6 +464,29 @@ def _make_client_factory(
     return PinningSSHClient
 
 
+def _resolve_client_keys(host: HostConfig) -> list[asyncssh.SSHKey | str]:
+    """What to hand asyncssh's `client_keys=` for `auth_method='key'` (DESIGN.md §8, migration
+    014). A pasted key wins over `key_path` when both are set -- stated explicitly here rather
+    than left to accident, and the one place both this and `core/lftp.py.spawn`'s equivalent
+    resolution have to agree on.
+
+    A pasted key is parsed straight into an in-memory `asyncssh.SSHKey` and handed to asyncssh
+    that way -- confirmed against the installed asyncssh (2.24.0) that `client_keys` accepts
+    already-loaded key objects, not only paths or path-like strings (`load_keypairs`'s
+    `SpecifyingPrivateKeys` reference; verified directly, not assumed, docs/decisions.md). So
+    scanning never writes the plaintext to disk at all -- unlike `core/lftp.py`, which must
+    materialise a file because lftp shells out to `ssh -i <path>`.
+
+    `key_path` (pre-existing, user-mounted) is passed through unchanged -- asyncssh reads it
+    itself. Raises `ValueError` if neither is set, same as the pre-migration-014 behavior.
+    """
+    if host.ssh_key:
+        return [asyncssh.import_private_key(host.ssh_key)]
+    if host.key_path:
+        return [host.key_path]
+    raise ValueError("auth_method 'key' requires key_path or a pasted key")
+
+
 class RemoteConnectionPool:
     """Owns exactly one reused asyncssh connection, serving scanning, *Test connection*, and
     (later) remote deletes — DESIGN.md §5: "the same connection serves scanning, Test
@@ -475,9 +538,7 @@ class RemoteConnectionPool:
             "connect_timeout": host.connect_timeout,
         }
         if host.auth_method == "key":
-            if not host.key_path:
-                raise ValueError("auth_method 'key' requires key_path")
-            kwargs["client_keys"] = [host.key_path]
+            kwargs["client_keys"] = _resolve_client_keys(host)
             kwargs["password"] = None
         elif host.auth_method == "agent":
             kwargs["agent_path"] = None  # use SSH_AUTH_SOCK / platform default

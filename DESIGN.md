@@ -187,6 +187,8 @@ host(
   protocol TEXT,                     -- 'sftp' in v1
   username, auth_method TEXT,        -- 'key' | 'agent' | 'password'
   key_path NULL, password_enc NULL, known_hosts_policy,
+  ssh_key_enc NULL,                  -- migration 014: a pasted key, encrypted like password_enc.
+                                      -- Additional to key_path, not a replacement -- see §8.
   connection_overrides JSON,         -- net:connection-limit, net:socket-buffer, timeouts, retry
   created_at)
 
@@ -1385,7 +1387,7 @@ Seedbox credentials are encrypted at rest with a key derived from a per-install 
 
 **The key is not included in database backups (§10.2), by design.** A `.db` backup therefore
 contains no usable secret and is safe to download and store anywhere — the trade is that
-restoring to a fresh install cannot recover the seedbox password.
+restoring to a fresh install cannot recover the seedbox password (or a pasted key, below).
 
 That has to be a designed behavior, not a documented caveat. On startup, if a credential blob
 will not decrypt with the current install key, lftpweb must:
@@ -1396,6 +1398,42 @@ will not decrypt with the current install key, lftpweb must:
 
 The failure mode this prevents is a restore that produces a pile of `AUTH_FAILED` jobs and no
 explanation of why.
+
+**Pasting a private key (migration 014, 2026-08-13).** Until this, `auth_method = 'key'` meant
+`key_path` alone — the operator mounts a key file into the container themselves, unvalidated
+beyond "the field is non-empty." That fails opaquely: OpenSSH refuses a private key with loose
+permissions, and lftp shells out to `ssh` (which enforces that) while asyncssh scanning is more
+lenient, so a wrongly-permissioned mounted key gave working scans and failing transfers with
+nothing pointing at the cause.
+
+Settings → Connection can now accept a **pasted** key instead, stored as `host.ssh_key_enc`,
+encrypted with the exact same `core/crypto.py` mechanism as `password_enc` — not a second
+crypto scheme, and not a ciphertext file kept outside the database: a config backup round-trips
+a pasted key the same way it round-trips a password, where a file excluded from backups would
+drop the user into "credentials need re-entry" on restore even though nothing about the key
+itself changed (docs/decisions.md has the full reasoning, including why the security difference
+between the two options is narrow).
+
+This is **additive, never a replacement**: `key_path` keeps working untouched for anyone
+already mounting a key. When both are set, **the pasted key wins** — decided once, server-side
+(`api/settings.py`), and surfaced to the UI as `active_key_source` so it never has to re-derive
+the rule. A pasted key is validated at save time (parses as a private key; a passphrase-
+protected key is rejected outright, with a message pointing at stripping the passphrase or
+using `key_path` instead — lftpweb cannot supply a passphrase non-interactively), and a stored
+key that later fails to decrypt (the restore-to-fresh-install case above) sets the exact same
+`credentials_need_reentry` flag a bad password does, not a parallel one.
+
+Materialisation differs by consumer, because only one of the two actually needs a file:
+**asyncssh scanning takes the decrypted key straight into memory** (`asyncssh.import_private_key`,
+confirmed against the installed asyncssh rather than assumed — `client_keys` accepts parsed key
+material, not only paths), so scanning never writes the plaintext to disk at all. **lftp shells
+out to `ssh -i <path>`**, so it genuinely needs a file — written **per job**, alongside the
+existing per-job rc file on the `/run` tmpfs (§11), mode 0600, unlinked the moment the job ends.
+Per-job rather than a file held for the process's lifetime: the plaintext then exists on tmpfs
+only while a transfer is actually in flight, and — because every spawn decrypts fresh from
+whatever the DB row currently holds — there is no separate "re-materialise on startup" step to
+remember; `/run` being emptied by a container restart simply doesn't matter, the same as it
+doesn't matter for the per-job rc file today.
 
 ---
 

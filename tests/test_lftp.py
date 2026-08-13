@@ -6,14 +6,20 @@ place lftp's actual output is ever read, and only for classification on a non-ze
 
 from __future__ import annotations
 
+import stat
+from pathlib import Path
+
 import pytest
 
 from lftpweb.core.lftp import (
     HostCreds,
+    JobSpec,
     NoHostKeyPinError,
     build_rc_text,
     build_transfer_command,
     classify_output,
+    spawn,
+    terminate,
 )
 
 
@@ -338,3 +344,109 @@ def test_rc_always_bounds_retries_and_timeouts():
     # One connection for anything under 1 MiB: `pget -n 4` on a 16-byte file otherwise opens
     # four SSH connections to move 16 bytes, and multiplies any handshake failure by four.
     assert "set pget:min-chunk-size 1048576;" in rc
+
+
+# --- migration 014: per-job materialisation of a pasted key (DESIGN.md §8) ------------------
+#
+# Real authentication against the fake seedbox with a pasted key (both the asyncssh and lftp
+# paths) is proven end to end in tests/test_ssh_key_e2e.py; these tests use an unreachable
+# host (127.0.0.1:1, matching the "nothing listens here" convention in the classify_output
+# tests above) so lftp's ssh child fails fast, and only check what `spawn()` puts on disk and
+# what `cleanup()` removes -- never an actual transfer outcome.
+
+_FAKE_PEM = "-----BEGIN OPENSSH PRIVATE KEY-----\nFAKEKEYMATERIALFORTESTSONLY\n-----END OPENSSH PRIVATE KEY-----\n"
+
+
+def _key_spec(tmp_path, **creds_overrides) -> JobSpec:
+    base = dict(
+        address="127.0.0.1",
+        port=1,  # nothing listens here -- the ssh child fails immediately
+        auth_method="key",
+        key_path=None,
+        password=None,
+    )
+    base.update(creds_overrides)
+    creds = _creds(**base)
+    return JobSpec(
+        job_id=4242,
+        kind="pget",
+        creds=creds,
+        remote_path="/remote/x",
+        local_path=str(tmp_path / "x"),
+        run_dir=str(tmp_path / "run"),
+    )
+
+
+async def test_spawn_materializes_a_pasted_key_to_a_per_job_tmpfs_file_mode_0600(tmp_path):
+    job = await spawn(_key_spec(tmp_path, ssh_key=_FAKE_PEM))
+    try:
+        assert job.ssh_key_path is not None
+        assert job.ssh_key_path.parent == Path(tmp_path / "run")
+        assert job.ssh_key_path.read_text() == _FAKE_PEM
+        assert stat.S_IMODE(job.ssh_key_path.stat().st_mode) == 0o600
+
+        # The key text lives only in its own file -- never folded into the rc file, which
+        # only references its path via `-i`.
+        rc_text = job.rc_path.read_text()
+        assert _FAKE_PEM not in rc_text
+        assert f"-i {job.ssh_key_path}" in rc_text
+    finally:
+        await terminate(job)
+        job.cleanup()
+
+    assert not job.ssh_key_path.exists()
+    assert not job.rc_path.exists()
+
+
+async def test_spawn_without_a_pasted_key_never_creates_a_key_file(tmp_path):
+    # `key_path` alone (the pre-existing, user-mounted case) must be untouched by this --
+    # spawn() references it as-is and creates nothing of its own.
+    job = await spawn(_key_spec(tmp_path, key_path="/mounted/operator-key"))
+    try:
+        assert job.ssh_key_path is None
+        rc_text = job.rc_path.read_text()
+        assert "-i /mounted/operator-key" in rc_text
+    finally:
+        await terminate(job)
+        job.cleanup()
+
+
+async def test_spawn_pasted_key_wins_over_key_path_and_never_touches_it(tmp_path):
+    job = await spawn(_key_spec(tmp_path, key_path="/mounted/operator-key", ssh_key=_FAKE_PEM))
+    try:
+        assert job.ssh_key_path is not None
+        rc_text = job.rc_path.read_text()
+        # The materialized path is used, not the mounted one -- and the mounted path is
+        # never created, chmod'd, or otherwise touched (it isn't ours to manage).
+        assert f"-i {job.ssh_key_path}" in rc_text
+        assert "/mounted/operator-key" not in rc_text
+        assert not Path("/mounted/operator-key").exists()
+    finally:
+        await terminate(job)
+        job.cleanup()
+
+
+async def test_spawn_recreates_the_key_file_on_a_fresh_run_dir_no_startup_step_needed(tmp_path):
+    """Simulates two spawns of the *same* job across a container restart: `/run` is emptied
+    (a fresh `run_dir` here), and nothing but the encrypted DB row (represented here by
+    `creds.ssh_key`, exactly what `core/engine.py.load_host_config` would hand back after
+    decrypting) is needed to materialise the file again. There is no separate
+    "re-materialise on startup" step to forget, because every spawn decrypts fresh --
+    see `spawn()`'s own docstring.
+    """
+    job1 = await spawn(_key_spec(tmp_path, ssh_key=_FAKE_PEM))
+    try:
+        assert job1.ssh_key_path.exists()
+    finally:
+        await terminate(job1)
+        job1.cleanup()
+    assert not job1.ssh_key_path.exists()  # gone, as if `/run` had been wiped by a restart
+
+    # "Restart": run_dir starts fresh again, same creds (as if freshly decrypted from the DB).
+    job2 = await spawn(_key_spec(tmp_path, ssh_key=_FAKE_PEM))
+    try:
+        assert job2.ssh_key_path.exists()
+        assert job2.ssh_key_path.read_text() == _FAKE_PEM
+    finally:
+        await terminate(job2)
+        job2.cleanup()

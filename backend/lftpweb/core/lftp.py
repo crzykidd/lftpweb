@@ -18,6 +18,11 @@ mode 0600, on the `/run` tmpfs, unlinked the moment the process exits (successfu
 string passed as argv contains only `source <rc-path>` plus the transfer command itself
 (paths, not secrets), so a `ps aux` inside the container never shows a credential.
 
+**A pasted private key (migration 014, DESIGN.md §8) gets the same treatment**, one file
+alongside the rc file rather than folded into it: `spawn()` writes it to its own per-job path,
+also `/run` tmpfs, also mode 0600, also unlinked by `cleanup()`. See `spawn()`'s own docstring
+for why per-job rather than a file held for the process lifetime.
+
 **Host-key verification for the lftp-spawned ssh child — a gap in DESIGN.md §4.2, resolved
 here.** §5/§8's `known_hosts_policy` (accept-and-pin / strict / insecure) is specified for the
 asyncssh scanning connection (`core/remote.py`) but DESIGN.md never says whether the *separate*
@@ -51,7 +56,7 @@ import logging
 import os
 import re
 import stat as stat_module
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Literal
 
@@ -141,6 +146,14 @@ class HostCreds:
     password: str | None
     known_hosts_policy: str  # 'accept-and-pin' | 'strict' | 'insecure'
     pinned_host_key: str | None = None  # exported OpenSSH pubkey line, if `core/remote.py` has one
+    # migration 014, DESIGN.md §8: a pasted-and-decrypted key (plaintext, in memory only --
+    # never logged, never round-tripped to the API). `None` when auth is not 'key', when no key
+    # was ever pasted, or when it failed to decrypt (`credentials_need_reentry` covers that
+    # case upstream in `core/queue.py._admit`, which never reaches `spawn()` at all then).
+    # `spawn()` is the only place this ever touches a filesystem -- see its docstring on why
+    # per-job, not per-process. Wins over `key_path` when both are set, mirroring
+    # `core/remote.py._resolve_client_keys` so the two auth paths agree.
+    ssh_key: str | None = None
 
 
 class NoHostKeyPinError(Exception):
@@ -346,6 +359,10 @@ class SpawnedJob:
     pid: int
     rc_path: Path
     known_hosts_path: Path | None
+    # A pasted-key file this job's own `spawn()` call materialised on `/run` tmpfs (never a
+    # `key_path` the operator mounted themselves -- that file is not ours to delete). `None`
+    # whenever `key_path` (mounted or absent) was used instead of a pasted key.
+    ssh_key_path: Path | None = None
     _stdout_buf: bytearray = field(default_factory=bytearray)
     _stderr_buf: bytearray = field(default_factory=bytearray)
 
@@ -353,7 +370,7 @@ class SpawnedJob:
         """Unlink the credential-bearing files. Idempotent, never raises — a missing file
         (already cleaned up, or a run-dir that vanished) is not an error at this point.
         """
-        for path in (self.rc_path, self.known_hosts_path):
+        for path in (self.rc_path, self.known_hosts_path, self.ssh_key_path):
             if path is None:
                 continue
             try:
@@ -388,30 +405,64 @@ def _known_hosts_line(creds: HostCreds) -> str | None:
 
 
 async def spawn(spec: JobSpec, *, lftp_bin: str = "lftp") -> SpawnedJob:
-    """Build the rc file (+ known_hosts pin, if any), build the `-c` command, and exec lftp
-    with **pipes for stdin/stdout/stderr — never a PTY** (DESIGN.md §4.1): with stdin not a
-    tty, lftp disables readline, so none of §1.2's escape/wrapping problems can occur.
+    """Build the rc file (+ known_hosts pin, if any, + a pasted key, if any), build the `-c`
+    command, and exec lftp with **pipes for stdin/stdout/stderr — never a PTY** (DESIGN.md
+    §4.1): with stdin not a tty, lftp disables readline, so none of §1.2's escape/wrapping
+    problems can occur.
+
+    **Per-job, not per-process, key materialisation (migration 014, DESIGN.md §8).** Only lftp
+    needs a file at all -- asyncssh scanning takes the decrypted key straight into memory
+    (`core/remote.py._resolve_client_keys`) -- and lftp only needs one for as long as *this*
+    job's `ssh` child is running. Writing it here, alongside the rc file this function already
+    creates and tears down per job, means the plaintext exists on the `/run` tmpfs only while a
+    transfer is actually in flight, strictly less exposure than a file held for the whole
+    process lifetime would be. It also sidesteps "materialise on startup and on change"
+    entirely: there is nothing to go stale, because every spawn decrypts fresh from whatever
+    `core/engine.py.load_host_config` most recently read out of the `host` row -- the first job
+    after a container restart (`/run` is empty then) and the five-hundredth job after an
+    unrelated settings change both just work, with no separate re-materialisation step to
+    remember. The trade is one extra small file write/unlink per job when a key is pasted --
+    negligible next to the rc file this function already writes on every single job regardless.
     """
     run_dir = Path(spec.run_dir)
     rc_path = run_dir / f"job-{spec.job_id}.rc"
     known_hosts_path: Path | None = None
+    ssh_key_path: Path | None = None
+    creds = spec.creds
 
     kh_line = _known_hosts_line(spec.creds)
     if kh_line is not None:
         known_hosts_path = run_dir / f"job-{spec.job_id}.known_hosts"
         _write_secret_file(known_hosts_path, kh_line)
 
-    rc_text = build_rc_text(
-        spec.creds,
-        known_hosts_path,
-        rate_limit_bps=spec.rate_limit_bps,
-        connection_limit=spec.connection_limit,
-        parallel=spec.parallel,
-        pget_n=spec.pget_n,
-        save_status_interval_s=spec.save_status_interval_s,
-        extra_settings=spec.extra_settings,
-    )
-    _write_secret_file(rc_path, rc_text)
+    try:
+        if creds.auth_method == "key" and creds.ssh_key:
+            # A pasted key wins over `key_path` when both are set (mirrors
+            # `core/remote.py._resolve_client_keys`, stated explicitly there and here so the
+            # two auth paths can't silently disagree). `key_path` itself is never touched --
+            # it may be a file the operator mounted and manages themselves.
+            ssh_key_path = run_dir / f"job-{spec.job_id}.key"
+            key_text = creds.ssh_key if creds.ssh_key.endswith("\n") else creds.ssh_key + "\n"
+            _write_secret_file(ssh_key_path, key_text)
+            creds = replace(creds, key_path=str(ssh_key_path))
+
+        rc_text = build_rc_text(
+            creds,
+            known_hosts_path,
+            rate_limit_bps=spec.rate_limit_bps,
+            connection_limit=spec.connection_limit,
+            parallel=spec.parallel,
+            pget_n=spec.pget_n,
+            save_status_interval_s=spec.save_status_interval_s,
+            extra_settings=spec.extra_settings,
+        )
+        _write_secret_file(rc_path, rc_text)
+    except BaseException:
+        if ssh_key_path is not None:
+            ssh_key_path.unlink(missing_ok=True)
+        if known_hosts_path is not None:
+            known_hosts_path.unlink(missing_ok=True)
+        raise
 
     transfer_cmd = build_transfer_command(
         spec.kind,
@@ -436,10 +487,18 @@ async def spawn(spec: JobSpec, *, lftp_bin: str = "lftp") -> SpawnedJob:
         rc_path.unlink(missing_ok=True)
         if known_hosts_path is not None:
             known_hosts_path.unlink(missing_ok=True)
+        if ssh_key_path is not None:
+            ssh_key_path.unlink(missing_ok=True)
         raise
 
     assert proc.pid is not None
-    return SpawnedJob(proc=proc, pid=proc.pid, rc_path=rc_path, known_hosts_path=known_hosts_path)
+    return SpawnedJob(
+        proc=proc,
+        pid=proc.pid,
+        rc_path=rc_path,
+        known_hosts_path=known_hosts_path,
+        ssh_key_path=ssh_key_path,
+    )
 
 
 async def wait_and_capture(job: SpawnedJob) -> tuple[int, str]:

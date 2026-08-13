@@ -35,6 +35,13 @@ export interface HostOut {
   auth_method: AuthMethod
   key_path: string | null
   has_password: boolean
+  // migration 014 (DESIGN.md §8): whether a pasted key is currently stored, mirroring
+  // `has_password` -- never the key itself.
+  has_ssh_key: boolean
+  // Which of `key_path` / a pasted key is actually in use for `auth_method === 'key'` -- the
+  // pasted-wins-over-path rule is decided once, server-side (`api/settings.py`), so this is
+  // read, never re-derived. `null` when `auth_method !== 'key'` or neither is set.
+  active_key_source: 'pasted' | 'path' | null
   known_hosts_policy: KnownHostsPolicy
   credentials_need_reentry: boolean
   // Read-only (DESIGN.md §4.5/§9.3, docs/decisions.md 2026-08-12): whatever currently sits
@@ -44,8 +51,8 @@ export interface HostOut {
   net_connection_limit: number | null
 }
 
-// Mirrors HostIn — password is plaintext here only, and only ever sent, never received back
-// (§9.2: the password field must never round-trip the stored secret to the browser).
+// Mirrors HostIn — password/ssh_key are plaintext here only, and only ever sent, never
+// received back (§9.2: neither must ever round-trip the stored secret to the browser).
 export interface HostIn {
   name: string
   address: string
@@ -54,6 +61,9 @@ export interface HostIn {
   auth_method: AuthMethod
   key_path: string | null
   password: string | null
+  // migration 014: an *additional* way to satisfy `auth_method === 'key'`, alongside
+  // `key_path` -- not a replacement. Wins over `key_path` when both are set.
+  ssh_key: string | null
   known_hosts_policy: KnownHostsPolicy
 }
 
@@ -65,6 +75,7 @@ export interface HostTestRequest {
   auth_method?: AuthMethod | null
   key_path?: string | null
   password?: string | null
+  ssh_key?: string | null
   known_hosts_policy?: KnownHostsPolicy | null
 }
 

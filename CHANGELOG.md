@@ -382,6 +382,34 @@ alongside this list: several entries below ship with deliberate, documented limi
   (`settle_total_bytes`/`settle_first_observed_at`/`settle_last_changed_at`) are gated on
   `substate == "settling"` exactly like the two that already existed — the same WebSocket-delta
   regression `tests/test_ws_deltas.py` already guards against for those two now covers all five.
+- **Settings → Connection can now accept a pasted SSH private key** *(2026-08-13)*, alongside
+  the existing `key_path` (a file mounted into the container). Until this, key auth meant
+  mounting a file yourself, with nothing checking it was parseable or sanely permissioned before
+  a transfer failed on it — confusingly, because lftp's `ssh` enforces OpenSSH's strict
+  permission rules while the asyncssh scanning path is more lenient, so a bad mount gave working
+  scans and failing transfers with nothing pointing at the cause. Migration 014 adds
+  `host.ssh_key_enc`, encrypted at rest with the exact same mechanism as `password_enc` — the
+  ciphertext round-trips through a config backup the same way a password already does, where a
+  file kept outside the database would not (`docs/decisions.md` has the full reasoning). A
+  pasted key is validated at save time (must parse as a private key; a passphrase-protected key
+  is rejected outright with a clear message, since neither the scanning path nor lftp can supply
+  a passphrase non-interactively) and never round-trips back to the browser, mirroring exactly
+  how the password field already behaves. It is purely additive: `key_path` keeps working
+  unchanged for anyone already mounting a key, and a pasted key wins when both are set — decided
+  once, server-side, and surfaced to the UI so it always shows which one is actually in use.
+  Materialisation differs by consumer: the asyncssh scanning path decrypts the key straight into
+  memory and never writes it to disk at all (confirmed directly against the installed asyncssh
+  that `client_keys` accepts parsed key material, not only a path); lftp, which has no way to
+  hand `ssh -i` anything but a real file, gets one written **per job** — alongside the existing
+  per-job rc file, same `/run` tmpfs, same mode 0600, same unlink-on-exit — rather than a file
+  held for the whole process's lifetime, so the plaintext exists on disk only while a transfer is
+  actually in flight, and a container restart (which empties `/run`) needs no separate
+  re-materialisation step, because every job spawn decrypts fresh from the database row. A key
+  that fails to decrypt (a restore onto a fresh install, same as a password) rides the exact same
+  `credentials_need_reentry` state a bad password already triggers, holding transfers instead of
+  spawning doomed jobs. `logsetup.CredentialRedactor` now also scrubs a private key's multi-line
+  PEM block wherever one appears in a log line, not only the single-line `user:pass@` form it
+  already handled.
 
 ### Changed
 

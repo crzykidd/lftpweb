@@ -72,6 +72,46 @@ async def test_load_host_config_flags_credentials_need_reentry_after_restore(tmp
     assert host_b.credentials_need_reentry is True
 
 
+async def test_load_host_config_flags_credentials_need_reentry_for_a_pasted_key_after_restore(
+    tmp_path, db
+):
+    """migration 014, DESIGN.md §8: a pasted key that fails to decrypt must ride the exact same
+    `credentials_need_reentry` flag a password does -- not a parallel one -- so `_admit` and
+    `scan_queue` (already generic over the flag, proven by the two tests below) hold/skip
+    cleanly for this case too without any changes of their own.
+    """
+    dir_a = tmp_path / "a"
+    dir_b = tmp_path / "b"
+    dir_a.mkdir()
+    dir_b.mkdir()
+
+    ssh_key_enc = encrypt_secret(
+        str(dir_a), "-----BEGIN OPENSSH PRIVATE KEY-----\nfake\n-----END OPENSSH PRIVATE KEY-----\n"
+    )
+    await db.execute(
+        "INSERT INTO host (name, address, port, username, auth_method, ssh_key_enc, "
+        "known_hosts_policy) VALUES ('seedbox', 'example.invalid', 22, 'seeduser', 'key', "
+        "?, 'strict')",
+        (ssh_key_enc,),
+    )
+    await db.commit()
+
+    # Same install: decrypts fine.
+    host = await load_host_config(db, str(dir_a))
+    assert host is not None
+    assert (
+        host.ssh_key
+        == "-----BEGIN OPENSSH PRIVATE KEY-----\nfake\n-----END OPENSSH PRIVATE KEY-----\n"
+    )
+    assert host.credentials_need_reentry is False
+
+    # A restore onto a fresh install -- different secret.key, ciphertext no longer decrypts.
+    host_b = await load_host_config(db, str(dir_b))
+    assert host_b is not None
+    assert host_b.ssh_key is None
+    assert host_b.credentials_need_reentry is True
+
+
 async def test_scan_queue_holds_cleanly_without_attempting_a_connection(tmp_path, db):
     engine = Engine(db=db, config_dir=str(tmp_path), events=EventBus())
     q = QueueConfig(

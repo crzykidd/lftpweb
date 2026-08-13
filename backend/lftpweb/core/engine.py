@@ -116,22 +116,25 @@ class QueueConfig:
 
 
 async def load_host_config(db: aiosqlite.Connection, config_dir: str) -> HostConfig | None:
-    """Load the (single, v1) host row and decrypt its password if applicable.
+    """Load the (single, v1) host row and decrypt its password / pasted key if applicable.
 
     Returns `None` if no host is configured yet. Decryption failure (DESIGN.md §8's
     "credentials need re-entry") is *not* raised here — it's deferred until something
-    actually needs the password (`core/remote.py` raises `DecryptionNeededError` at connect
-    time), so a key-auth or agent-auth host isn't blocked by an unrelated password field.
+    actually needs the credential (`core/remote.py` raises `DecryptionNeededError` for a
+    password at connect time; a pasted key that fails here sets `credentials_need_reentry`
+    the same way a password does), so a key-auth or agent-auth host isn't blocked by an
+    unrelated password field, and vice versa.
     """
     cursor = await db.execute(
         "SELECT id, address, port, username, auth_method, key_path, password_enc, "
-        "known_hosts_policy FROM host ORDER BY id LIMIT 1"
+        "ssh_key_enc, known_hosts_policy FROM host ORDER BY id LIMIT 1"
     )
     row = await cursor.fetchone()
     if row is None:
         return None
 
     password: str | None = None
+    ssh_key: str | None = None
     credentials_need_reentry = False
     if row["auth_method"] == "password" and row["password_enc"]:
         try:
@@ -142,6 +145,17 @@ async def load_host_config(db: aiosqlite.Connection, config_dir: str) -> HostCon
             )
             password = None
             credentials_need_reentry = True
+    elif row["auth_method"] == "key" and row["ssh_key_enc"]:
+        try:
+            ssh_key = decrypt_secret(config_dir, row["ssh_key_enc"])
+        except DecryptionError as exc:
+            logger.warning(
+                "host %s: pasted key does not decrypt (credentials need re-entry): %s",
+                row["id"],
+                exc,
+            )
+            ssh_key = None
+            credentials_need_reentry = True
 
     return HostConfig(
         id=row["id"],
@@ -151,6 +165,7 @@ async def load_host_config(db: aiosqlite.Connection, config_dir: str) -> HostCon
         auth_method=row["auth_method"],
         key_path=row["key_path"],
         password=password,
+        ssh_key=ssh_key,
         known_hosts_policy=row["known_hosts_policy"],
         credentials_need_reentry=credentials_need_reentry,
     )

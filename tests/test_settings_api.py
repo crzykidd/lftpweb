@@ -1,9 +1,15 @@
 from __future__ import annotations
 
+import asyncssh
 from fastapi.testclient import TestClient
 
 from lftpweb.core.itemview import ItemView, item_view
 from lftpweb.main import app
+
+
+def _generate_test_key_pem() -> str:
+    key = asyncssh.generate_private_key("ssh-ed25519")
+    return key.export_private_key().decode("ascii")
 
 
 def _view(
@@ -109,6 +115,157 @@ def test_put_host_key_auth_requires_key_path(isolated_config):
             },
         )
         assert resp.status_code == 422
+
+
+# --- migration 014: paste-a-key (DESIGN.md §8) ---------------------------------------------
+
+
+def test_put_host_key_auth_accepts_a_pasted_key_without_key_path(isolated_config):
+    with TestClient(app) as client:
+        resp = client.put(
+            "/api/settings/host",
+            json={
+                "name": "seedbox",
+                "address": "example.invalid",
+                "username": "seeduser",
+                "auth_method": "key",
+                "ssh_key": _generate_test_key_pem(),
+            },
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["has_ssh_key"] is True
+        assert body["active_key_source"] == "pasted"
+        assert "ssh_key" not in body
+        assert "PRIVATE KEY" not in resp.text
+
+
+def test_put_host_never_returns_the_pasted_key_plaintext(isolated_config):
+    key_pem = _generate_test_key_pem()
+    with TestClient(app) as client:
+        client.put(
+            "/api/settings/host",
+            json={
+                "name": "seedbox",
+                "address": "example.invalid",
+                "username": "seeduser",
+                "auth_method": "key",
+                "ssh_key": key_pem,
+            },
+        )
+        # Re-fetch: still no plaintext anywhere in the response, same guarantee as the
+        # password test above.
+        resp = client.get("/api/settings/host")
+        assert key_pem not in resp.text
+        assert "BEGIN OPENSSH PRIVATE KEY" not in resp.text
+
+
+def test_put_host_rejects_an_unparseable_pasted_key(isolated_config):
+    with TestClient(app) as client:
+        resp = client.put(
+            "/api/settings/host",
+            json={
+                "name": "seedbox",
+                "address": "example.invalid",
+                "username": "seeduser",
+                "auth_method": "key",
+                "ssh_key": "not a real private key",
+            },
+        )
+        assert resp.status_code == 422
+        assert "does not parse" in resp.text
+
+
+def test_put_host_rejects_a_passphrase_protected_pasted_key(isolated_config):
+    key = asyncssh.generate_private_key("ssh-rsa", key_size=2048)
+    encrypted_pem = key.export_private_key(format_name="pkcs8-pem", passphrase="hunter2").decode(
+        "ascii"
+    )
+    with TestClient(app) as client:
+        resp = client.put(
+            "/api/settings/host",
+            json={
+                "name": "seedbox",
+                "address": "example.invalid",
+                "username": "seeduser",
+                "auth_method": "key",
+                "ssh_key": encrypted_pem,
+            },
+        )
+        assert resp.status_code == 422
+        assert "passphrase" in resp.text.lower()
+
+
+def test_put_host_without_new_key_keeps_previous_one(isolated_config):
+    key_pem = _generate_test_key_pem()
+    with TestClient(app) as client:
+        client.put(
+            "/api/settings/host",
+            json={
+                "name": "seedbox",
+                "address": "example.invalid",
+                "username": "seeduser",
+                "auth_method": "key",
+                "ssh_key": key_pem,
+            },
+        )
+        # Update the address only; omit ssh_key entirely -- "unchanged" must not mean
+        # "cleared," same as the password case.
+        resp = client.put(
+            "/api/settings/host",
+            json={
+                "name": "seedbox",
+                "address": "example2.invalid",
+                "username": "seeduser",
+                "auth_method": "key",
+            },
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["has_ssh_key"] is True
+        assert body["active_key_source"] == "pasted"
+        assert body["address"] == "example2.invalid"
+
+
+def test_active_key_source_is_path_when_only_key_path_is_set(isolated_config):
+    with TestClient(app) as client:
+        resp = client.put(
+            "/api/settings/host",
+            json={
+                "name": "seedbox",
+                "address": "example.invalid",
+                "username": "seeduser",
+                "auth_method": "key",
+                "key_path": "/config/keys/id_ed25519",
+            },
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["has_ssh_key"] is False
+        assert body["active_key_source"] == "path"
+        assert body["key_path"] == "/config/keys/id_ed25519"
+
+
+def test_active_key_source_pasted_key_wins_when_both_are_set(isolated_config):
+    with TestClient(app) as client:
+        resp = client.put(
+            "/api/settings/host",
+            json={
+                "name": "seedbox",
+                "address": "example.invalid",
+                "username": "seeduser",
+                "auth_method": "key",
+                "key_path": "/config/keys/id_ed25519",
+                "ssh_key": _generate_test_key_pem(),
+            },
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["has_ssh_key"] is True
+        # key_path is still stored and returned (it keeps working for anyone relying on it --
+        # migration 014 is additive) but is not the one actually in use.
+        assert body["key_path"] == "/config/keys/id_ed25519"
+        assert body["active_key_source"] == "pasted"
 
 
 def test_test_connection_without_any_host_returns_404(isolated_config):
