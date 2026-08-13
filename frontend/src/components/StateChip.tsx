@@ -72,6 +72,13 @@ interface StateChipProps {
    * caller before this field existed) shows `state` verbatim, unchanged.
    */
   label?: string
+  /** Native hover text for the chip (2026-08-13, prompts/2026-08-13-resizable-file-columns.md)
+   * -- for a chip whose `label` is a shortened stand-in (the settle countdown), this carries
+   * the complete sentence back, so shortening the in-cell text never loses it, just moves it
+   * to hover. `undefined` (every caller before this field existed) shows no tooltip -- the
+   * chip's own visible text already is the whole story for those.
+   */
+  title?: string
 }
 
 /** DESIGN.md §9.2's Files-row state chip. The progress fill is the pill's own background, not
@@ -80,7 +87,7 @@ interface StateChipProps {
  * timer): the fill only ever needs to catch up to a new `percent` prop, which is already bounded
  * by how often this row re-renders (the WebSocket's own ~1 Hz progress cadence).
  */
-export function StateChip({ state, percent, label }: StateChipProps) {
+export function StateChip({ state, percent, label, title }: StateChipProps) {
   const style = STYLES[state] ?? FALLBACK_STYLE
   const fillStyle = FILL_STYLES[state]
   const showBar = fillStyle != null && percent != null
@@ -88,7 +95,7 @@ export function StateChip({ state, percent, label }: StateChipProps) {
 
   if (!showBar) {
     return (
-      <span className={`rounded px-1.5 py-0.5 text-xs font-medium whitespace-nowrap ${style}`}>
+      <span title={title} className={`rounded px-1.5 py-0.5 text-xs font-medium whitespace-nowrap ${style}`}>
         {text}
       </span>
     )
@@ -96,6 +103,7 @@ export function StateChip({ state, percent, label }: StateChipProps) {
 
   return (
     <span
+      title={title}
       className={`relative inline-block overflow-hidden rounded px-1.5 py-0.5 text-xs font-medium whitespace-nowrap ${style}`}
     >
       <span

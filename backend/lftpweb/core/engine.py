@@ -55,6 +55,15 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_SCAN_INTERVAL_S = 30.0
 
+# 2026-08-13 (prompts/2026-08-13-vanished-rows-should-leave-the-tree.md): the two states
+# `_persist`'s vanished-from-both-trees sweep can land on that mean "gone for good, in neither
+# tree" -- DESIGN.md §3.2's own "kept as history" states. Once the sweep resolves a row to one
+# of these, that row must stop being **published** (though it keeps being *written* -- see
+# `_persist`'s use of this set, below). Same pairing as `core/itemview.py`'s private
+# `_LOCAL_REMOVED_STATES`, duplicated rather than imported: that constant is itemview's own
+# "always render dark" rule, a different question that happens to share the same two states.
+_TERMINAL_REMOVED_STATES = frozenset({"REMOVED_LOCAL", "REMOVED_BOTH"})
+
 
 def _now_iso() -> str:
     return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
@@ -896,9 +905,9 @@ class Engine:
         # (`core/reconcile.py`'s `all_paths` is `set(remote_tree) | set(local_tree)`, and this
         # path is in neither). The loop above only ever visits `nodes.values()`, so without
         # this, such a row is simply never written again: whatever outcome it last held
-        # (`EXTRACTED`, say) would freeze forever instead of reaching `REMOVED_LOCAL` through
-        # §7.3's grace period the way an ordinary importer-moved-it-out item does -- defeating
-        # rule 3 for exactly the items `move` mode produces the most of.
+        # (`EXTRACTED`, say) would freeze forever instead of resolving through §7.3's grace
+        # period the way an ordinary importer-moved-it-out item does -- defeating rule 3 for
+        # exactly the items `move` mode produces the most of.
         #
         # Deliberately narrow, reusing `resolve_absence`'s own gate rather than re-implementing
         # it: `structural_state="REMOTE_ONLY"` is the closest existing reading for "there is
@@ -925,6 +934,27 @@ class Engine:
             )
             if override is not None:
                 vanished_state, vanished_first_missing_at = override
+                if vanished_state == "REMOVED_LOCAL":
+                    # `prompts/open-issues.md` "resolve_absence never writes REMOVED_BOTH":
+                    # `resolve_absence` itself is correct and untouched -- its real call site
+                    # above (the ordinary per-node loop) means exactly "REMOTE_ONLY", remote
+                    # genuinely present. *This* call site fakes that reading ("the closest
+                    # existing reading for 'there is nothing here to compare'", per the comment
+                    # above) for a `rel_path` this pass already knows is in neither tree, so its
+                    # only two truthful terminal states are the vanished-sweep's own coinage,
+                    # `REMOVED_BOTH` -- correct whether the grace clock just expired or was
+                    # already sitting sticky at `REMOVED_LOCAL` from a *previous* pass, since a
+                    # `REMOVED_LOCAL` row only ever gets here by losing its remote copy (its
+                    # last known-good structural reading) between that pass and this one. Left
+                    # unsuppressed, deliberately, same as `resolve_vanished`'s own `REMOVED_BOTH`
+                    # a few lines down: nothing here asserts *who* removed the remote copy, and
+                    # `REMOVED_BOTH` is already excluded from `core/autoqueue.py.ELIGIBLE_STATES`
+                    # by name (not by `auto_queue_suppressed`), so no flag is needed to keep this
+                    # row out of auto-queue -- closing the 🔴 issue right above this one in
+                    # open-issues.md: a bare `REMOVED_LOCAL` here is what let
+                    # `re_download_externally_removed` queue a doomed job against a remote that
+                    # no longer exists. See docs/decisions.md for the full reasoning.
+                    vanished_state = "REMOVED_BOTH"
             else:
                 # 2026-08-13 (prompts/2026-08-13-delete-state-truthfulness.md, defect 3):
                 # `resolve_absence` has no opinion about this `prev_state` (PARTIAL, LOCAL_ONLY,
@@ -935,7 +965,20 @@ class Engine:
                 if fallback_state is None:
                     continue
                 vanished_state, vanished_first_missing_at = fallback_state, None
-            written.add(rel_path)
+
+            # 2026-08-13 (prompts/2026-08-13-vanished-rows-should-leave-the-tree.md): `written`
+            # is not just "persist this" any more -- `_project` filters publication by it -- so
+            # the row this loop just resolved to a *terminal* removed state (kept "as history"
+            # by design, `_project`'s own docstring) must NOT re-enter `written`. It still gets
+            # written below, every pass, so the History page (which reads `item` directly, not
+            # through `written`/`_project`) keeps seeing it. Only a *non-terminal* resolution --
+            # still holding a content-asserting outcome state during the grace period, or (for
+            # the `resolve_vanished` fallback) there is no non-terminal outcome it can reach --
+            # re-enters `written` and keeps showing up in the Files tree, exactly per the rule:
+            # publish while the grace period runs, stop once it lands on `REMOVED_LOCAL`/
+            # `REMOVED_BOTH` with nothing left in either tree.
+            if vanished_state not in _TERMINAL_REMOVED_STATES:
+                written.add(rel_path)
             await self.db.execute(
                 "UPDATE item SET remote_size = NULL, local_size = NULL, local_mtime = NULL, "
                 "state = ?, first_missing_at = ? WHERE queue_id = ? AND rel_path = ?",

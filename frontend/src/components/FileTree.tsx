@@ -1,8 +1,16 @@
 import { useVirtualizer } from '@tanstack/react-virtual'
-import { useEffect, useMemo, useReducer, useRef, useState } from 'react'
+import type { CSSProperties, KeyboardEvent as ReactKeyboardEvent, PointerEvent as ReactPointerEvent, RefObject } from 'react'
+import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react'
 import { deleteItem, getSettleSettings, queueItem, stopItem } from '../api/client'
 import type { FileNode, SettleSettingsOut } from '../api/types'
-import { formatBytes, formatPercent, percentValue, settleWaitLabel, stateAgeLabel } from '../lib/format'
+import {
+  formatBytes,
+  formatPercent,
+  percentValue,
+  settleWaitLabel,
+  settleWaitShortLabel,
+  stateAgeLabel,
+} from '../lib/format'
 import { readLocalStorage, writeLocalStorage } from '../lib/storage'
 import { DetailButton, LifecycleIcons } from './LifecycleIcons'
 import { ItemDrawer } from './ItemDrawer'
@@ -422,6 +430,209 @@ function matchesFacetFilter(entry: TreeEntry, filter: FacetFilter): boolean {
   }
 }
 
+// --- Column widths (2026-08-13, prompts/2026-08-13-resizable-file-columns.md): one shared -----
+// definition drives both the header row and `Row` -- previously the header hardcoded Tailwind
+// widths (`w-24`/`w-28`/`w-20`/`w-32`) and `Row` hardcoded a second, matching set, kept in sync
+// by hand with nothing stopping them drifting apart. `ColumnDef` below is that one definition;
+// both callers read it (`RESIZABLE_COLUMNS`, `fixedColumnStyle`), so a header and its column
+// can never disagree on width again, and it's also what makes resizing possible at all.
+
+interface ColumnDef {
+  id: string
+  label: string
+  defaultWidth: number
+  minWidth: number
+  align: 'right' | 'left'
+  sortKey?: SortKey
+  /** Overrides the header's own hover text -- only "Status" needs one today, to spell out that
+   * it sorts by % complete despite its shorter visible label (unchanged from before this task).
+   */
+  title?: string
+}
+
+/** The five fixed-width columns, in render order. **Name is not here** -- it keeps flexing
+ * (`flex-1`, a floor of `NAME_MIN_WIDTH_PX`) and absorbs whatever space these five don't claim,
+ * which is also why only these five get a drag handle: Name's width is derived from the
+ * container and the other five, never set directly. Resizing one of these five just changes how
+ * much of the remaining space Name gets -- the model already implied by "Name flexes, the rest
+ * are fixed" before this task, kept rather than switched to a two-column paired resize, per the
+ * task's own instruction to keep it unless there's a reason not to (there wasn't one).
+ */
+const RESIZABLE_COLUMNS: ColumnDef[] = [
+  { id: 'size', label: 'Size', defaultWidth: 96, minWidth: 56, align: 'right', sortKey: 'size' },
+  {
+    id: 'status',
+    label: 'Status',
+    // Was 112px (`w-28`), widened by 16px in the same audit that shortened the settle-wait
+    // text below -- a comfortable margin for the longest bare state names this chip ever
+    // shows verbatim ("EXTRACT_FAILED", "DOWNLOADING 100%"), unverified against a real
+    // browser (no UI access in this environment) but a reasoned default, not a guess.
+    defaultWidth: 128,
+    minWidth: 72,
+    align: 'right',
+    sortKey: 'percent',
+    title: 'Sort by % complete',
+  },
+  { id: 'lifecycle', label: 'R L V E', defaultWidth: 80, minWidth: 68, align: 'right' },
+  { id: 'changed', label: 'Changed', defaultWidth: 128, minWidth: 72, align: 'right', sortKey: 'state_changed_at' },
+  { id: 'actions', label: 'Actions', defaultWidth: 128, minWidth: 88, align: 'right' },
+]
+
+/** Name's own floor -- not a `ColumnDef` entry since nothing ever sets Name's width directly
+ * (see the comment above), but it still needs a minimum so an aggressively widened neighbor
+ * can't squeeze it to nothing. Below this, the row's total width exceeds the scroll
+ * container's, which is what makes the container's own horizontal scrollbar (unchanged,
+ * `overflow-auto` on `scrollRef`'s div) appear -- a deliberate choice over clamping total row
+ * width to the container and letting every column get proportionally thinner instead: a
+ * user who drags a column wide presumably wants to see it wide, not have that undone by
+ * squeezing everything else.
+ */
+const NAME_MIN_WIDTH_PX = 160
+
+const RESIZE_STEP_PX = 8
+const RESIZE_STEP_LARGE_PX = 32
+
+type ColumnWidths = Record<string, number>
+
+function defaultColumnWidths(): ColumnWidths {
+  return Object.fromEntries(RESIZABLE_COLUMNS.map((c) => [c.id, c.defaultWidth]))
+}
+
+function columnMinWidth(id: string): number {
+  return RESIZABLE_COLUMNS.find((c) => c.id === id)?.minWidth ?? 40
+}
+
+/** No maximum -- growing a column just eats into Name's share (down to `NAME_MIN_WIDTH_PX`) or,
+ * past that, widens the row past the scroll container, which picks up its own horizontal
+ * scrollbar (see `NAME_MIN_WIDTH_PX`'s own comment). A ceiling would just be one more number to
+ * justify with no real failure mode it prevents -- a column dragged absurdly wide is recoverable
+ * with one double-click, unlike one dragged to zero.
+ */
+function clampColumnWidth(id: string, width: number): number {
+  return Math.max(columnMinWidth(id), Math.round(width))
+}
+
+function isColumnWidths(value: unknown): value is ColumnWidths {
+  if (typeof value !== 'object' || value == null) return false
+  return Object.entries(value as Record<string, unknown>).every(
+    ([, v]) => typeof v === 'number' && Number.isFinite(v),
+  )
+}
+
+/** Saved widths merged onto the defaults -- an id no longer in `RESIZABLE_COLUMNS` (a column
+ * removed or renamed later) is silently dropped rather than applied to whatever now occupies
+ * that slot, per the task's own instruction to store and read by id, never by position, and to
+ * ignore unknown ids on read. Re-clamps every surviving value in case its `minWidth` changed
+ * since it was saved.
+ */
+function mergeColumnWidths(saved: ColumnWidths | null): ColumnWidths {
+  const widths = defaultColumnWidths()
+  if (saved == null) return widths
+  for (const col of RESIZABLE_COLUMNS) {
+    const savedWidth = saved[col.id]
+    if (typeof savedWidth === 'number' && Number.isFinite(savedWidth)) {
+      widths[col.id] = clampColumnWidth(col.id, savedWidth)
+    }
+  }
+  return widths
+}
+
+/** Both the header cell and the matching `Row` cell size themselves off the same CSS custom
+ * property, `--col-size-<id>`, rather than off `widths` state directly -- that indirection is
+ * the whole mechanism that keeps a drag off the React render path (see `ColumnResizeHandle`
+ * below): the property is written straight to the DOM on every `pointermove` frame via a ref,
+ * with no `setState` and so no re-render of the virtualized list, which can hold thousands of
+ * rows. `width`/`minWidth`/`maxWidth` are all pinned to the same value so a flex child can never
+ * grow past it to fit its own content (e.g. a long state name) -- that used to be how a cell's
+ * content could bleed into its neighbor instead of clipping to its own column.
+ */
+function fixedColumnStyle(id: string): CSSProperties {
+  const v = `var(--col-size-${id})`
+  return { width: v, minWidth: v, maxWidth: v }
+}
+
+/** The drag handle living at the right edge of one resizable header cell (a sibling of the
+ * header's label/`SortHeaderButton`, never nested inside it -- clicks on the handle can
+ * therefore never bubble into the sort button's own `onClick`, so a drag can't accidentally
+ * fire a sort; `stopPropagation` below is belt-and-suspenders, not the only thing preventing
+ * it). Pointer events, not mouse events (`setPointerCapture` on `pointerdown`), so a drag keeps
+ * tracking the pointer even once it leaves the 8px-wide handle, and so this also works on
+ * touch. Drag state lives in a plain ref, not React state -- writing the live width to state on
+ * every `pointermove` would re-render the whole visible window on every frame of the drag; the
+ * only `setState` this ever causes is the one `onCommit` call on `pointerup` (or the equivalent
+ * single call from a keyboard step or a double-click reset).
+ */
+function ColumnResizeHandle({
+  column,
+  currentWidth,
+  containerRef,
+  onCommit,
+}: {
+  column: ColumnDef
+  currentWidth: number
+  containerRef: RefObject<HTMLDivElement | null>
+  onCommit: (id: string, width: number) => void
+}) {
+  const dragRef = useRef<{ pointerId: number; startX: number; startWidth: number } | null>(null)
+
+  const writeLiveWidth = (width: number) => {
+    containerRef.current?.style.setProperty(`--col-size-${column.id}`, `${width}px`)
+  }
+
+  const handlePointerDown = (e: ReactPointerEvent<HTMLDivElement>) => {
+    e.stopPropagation()
+    dragRef.current = { pointerId: e.pointerId, startX: e.clientX, startWidth: currentWidth }
+    e.currentTarget.setPointerCapture(e.pointerId)
+  }
+
+  const handlePointerMove = (e: ReactPointerEvent<HTMLDivElement>) => {
+    const drag = dragRef.current
+    if (!drag || e.pointerId !== drag.pointerId) return
+    // Direct DOM write via the ref -- the module comment above (and the task's own bar) is why
+    // this is not `setState`.
+    writeLiveWidth(clampColumnWidth(column.id, drag.startWidth + (e.clientX - drag.startX)))
+  }
+
+  const finishDrag = (e: ReactPointerEvent<HTMLDivElement>) => {
+    const drag = dragRef.current
+    if (!drag || e.pointerId !== drag.pointerId) return
+    dragRef.current = null
+    onCommit(column.id, clampColumnWidth(column.id, drag.startWidth + (e.clientX - drag.startX)))
+  }
+
+  const handleKeyDown = (e: ReactKeyboardEvent<HTMLDivElement>) => {
+    if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return
+    e.preventDefault()
+    const step = e.shiftKey ? RESIZE_STEP_LARGE_PX : RESIZE_STEP_PX
+    const delta = e.key === 'ArrowRight' ? step : -step
+    onCommit(column.id, clampColumnWidth(column.id, currentWidth + delta))
+  }
+
+  return (
+    <div
+      role="separator"
+      aria-orientation="vertical"
+      aria-label={`Resize ${column.label} column`}
+      aria-valuenow={Math.round(currentWidth)}
+      aria-valuemin={column.minWidth}
+      tabIndex={0}
+      onPointerDown={handlePointerDown}
+      onPointerMove={handlePointerMove}
+      onPointerUp={finishDrag}
+      onPointerCancel={finishDrag}
+      onDoubleClick={(e) => {
+        // Reset to default (2026-08-13): the escape hatch for a column dragged down toward its
+        // minimum -- cheap and conventional rather than requiring a drag back to undo one.
+        e.stopPropagation()
+        onCommit(column.id, column.defaultWidth)
+      }}
+      onKeyDown={handleKeyDown}
+      onClick={(e) => e.stopPropagation()}
+      className="absolute inset-y-0 -right-1 z-10 w-2 cursor-col-resize touch-none rounded bg-zinc-300/50 hover:bg-zinc-400 focus-visible:bg-sky-500 focus-visible:outline-none dark:bg-zinc-700/50 dark:hover:bg-zinc-500 dark:focus-visible:bg-sky-400"
+    />
+  )
+}
+
 interface RowProps {
   entry: TreeEntry
   isCollapsed: boolean
@@ -502,29 +713,36 @@ function Row({
           (`DetailButton`'s own styling). Disabled for a row with no `id` -- there is no item
           to fetch history for yet (see `ItemDrawer`'s own itemId handling). */}
       <DetailButton label={entry.name} onOpen={() => onOpenDrawer(entry)} />
-      <span className="min-w-0 flex-1 truncate" title={hoverTooltip(entry)}>
+      <span className="flex-1 truncate" style={{ minWidth: NAME_MIN_WIDTH_PX }} title={hoverTooltip(entry)}>
         {entry.name}
         {entry.is_dir && '/'}
       </span>
-      <span className="w-24 shrink-0 text-right text-zinc-500 dark:text-zinc-400">
+      <span
+        className="shrink-0 overflow-hidden text-right text-zinc-500 dark:text-zinc-400"
+        style={fixedColumnStyle('size')}
+      >
         {size != null ? formatBytes(size) : '—'}
       </span>
-      <span className="w-28 shrink-0 text-right">
+      <span className="shrink-0 overflow-hidden text-right" style={fixedColumnStyle('status')}>
         {/* The settle gate's wait (2026-08-13, item 3): was a 6px dot next to the chip
             (effectively invisible) -- now a readable substitution over the chip itself, the
             same substitution shape `isRemoving`/REMOVING above already established, with a
-            countdown ("1 of 2 scans, 35s of 60s") rather than a bare word. */}
+            countdown ("1 of 2 scans, 35s of 60s"). Shortened to `settleWaitShortLabel` for the
+            chip's own in-cell text (2026-08-13, prompts/2026-08-13-resizable-file-columns.md)
+            -- the full sentence (`settleWaitLabel`) simply didn't fit this column and is no
+            longer lost, just moved to the chip's own `title` (hover). */}
         <StateChip
           state={isRemoving ? 'REMOVING' : isSettling ? 'SETTLING' : entry.state}
           percent={isRemoving || isSettling ? null : stateProgressPercent(entry)}
-          label={isSettling ? settleWaitLabel(entry, settleSettings) : undefined}
+          label={isSettling ? settleWaitShortLabel(entry, settleSettings) : undefined}
+          title={isSettling ? settleWaitLabel(entry, settleSettings) : undefined}
         />
       </span>
       {/* Lifecycle icons (2026-08-13): R/L/V/E, one glyph per `entry.facets`
           (`core/itemview.py`) -- the accumulated lifecycle, alongside the state chip's current
           verb rather than folded into it. `settle` threads through to `LifecycleIcons`'s own
           settle-gate override on R (its own docstring). */}
-      <span className="flex w-20 shrink-0 justify-end">
+      <span className="flex shrink-0 justify-end overflow-hidden" style={fixedColumnStyle('lifecycle')}>
         <LifecycleIcons node={entry} settle={settleSettings} />
       </span>
       {/* migration 006's `state_changed_at`: "when did this row last move," labeled by the
@@ -532,12 +750,16 @@ function Row({
           local time on hover -- History's date filters are UTC-only (a documented phase 6
           limitation), and this sidesteps that question rather than inheriting it. */}
       <span
-        className="w-32 shrink-0 truncate text-right text-xs text-zinc-500 dark:text-zinc-400"
+        className="shrink-0 overflow-hidden truncate text-right text-xs text-zinc-500 dark:text-zinc-400"
+        style={fixedColumnStyle('changed')}
         title={entry.state_changed_at ? new Date(entry.state_changed_at).toLocaleString() : undefined}
       >
         {stateAgeLabel(entry.state, entry.state_changed_at)}
       </span>
-      <span className="flex w-32 shrink-0 justify-end gap-1 text-right">
+      <span
+        className="flex shrink-0 justify-end gap-1 overflow-hidden text-right"
+        style={fixedColumnStyle('actions')}
+      >
         {action && (
           <button
             type="button"
@@ -756,6 +978,50 @@ export function FileTree({ nodes }: { nodes: FileNode[] }) {
   }, [tree, collapsePref, filtersActive, fullFlat, visiblePaths])
 
   const scrollRef = useRef<HTMLDivElement>(null)
+
+  // Column widths (2026-08-13): read synchronously in the initial `useState`, same reasoning
+  // and same mechanism as the sort/collapse preferences above -- a `useEffect` would paint at
+  // the defaults and then jump once the saved widths loaded.
+  const [columnWidths, setColumnWidths] = useState<ColumnWidths>(() =>
+    mergeColumnWidths(readLocalStorage('files.columnWidths', isColumnWidths)),
+  )
+  // Kept in sync every render so the callback ref below (which only runs on mount/unmount, not
+  // on every render) can still read the *current* widths the one time it needs them -- the
+  // container's CSS variables for an already-mounted element are instead kept current by the
+  // `useEffect` a few lines down, which does run on every `columnWidths` change.
+  const columnWidthsRef = useRef(columnWidths)
+  columnWidthsRef.current = columnWidths
+
+  const commitColumnWidth = (id: string, width: number) => {
+    setColumnWidths((prev) => {
+      const next = { ...prev, [id]: clampColumnWidth(id, width) }
+      writeLocalStorage('files.columnWidths', next)
+      return next
+    })
+  }
+
+  /** A callback ref, not a plain object one -- `scrollRef`'s div only exists while `flat.length
+   * > 0` (below), so it mounts and unmounts as filters change, and a plain ref's value would sit
+   * on default (unset) CSS variables until the next time `columnWidths` itself happened to
+   * change. This runs exactly when the element (re)appears, seeding it from whatever's current
+   * right then; the `useEffect` below covers every *later* change while it stays mounted.
+   */
+  const attachScrollRef = useCallback((el: HTMLDivElement | null) => {
+    scrollRef.current = el
+    if (el == null) return
+    for (const col of RESIZABLE_COLUMNS) {
+      el.style.setProperty(`--col-size-${col.id}`, `${columnWidthsRef.current[col.id] ?? col.defaultWidth}px`)
+    }
+  }, [])
+
+  useEffect(() => {
+    const el = scrollRef.current
+    if (el == null) return
+    for (const col of RESIZABLE_COLUMNS) {
+      el.style.setProperty(`--col-size-${col.id}`, `${columnWidths[col.id] ?? col.defaultWidth}px`)
+    }
+  }, [columnWidths])
+
   const virtualizer = useVirtualizer({
     count: flat.length,
     getScrollElement: () => scrollRef.current,
@@ -1091,51 +1357,57 @@ export function FileTree({ nodes }: { nodes: FileNode[] }) {
         <p className="p-3 text-sm text-zinc-500 dark:text-zinc-400">No files match these filters.</p>
       ) : (
         <div
-          ref={scrollRef}
+          ref={attachScrollRef}
           className="max-h-[70vh] overflow-auto rounded-md border border-zinc-200 dark:border-zinc-800"
         >
-          {/* Column labels -- mirrors `Row`'s own widths so the header stays aligned with the
-              virtualized rows beneath it. Sortable columns (2026-08-13, item 1) are themselves
-              the sort control -- `SortHeaderButton` above -- rather than a separate widget;
-              every other header stays a plain `<span>` so it never looks clickable. "Status"
-              sorts by percent-complete (`SORT_KEYS`'s `'percent'`) -- the state chip's own
-              fill is where that percentage already shows, so that's the header it belongs to;
-              its `title` spells out "% complete" for anyone who hovers to check. */}
+          {/* Column labels -- driven by the same `RESIZABLE_COLUMNS` definition `Row` reads
+              (2026-08-13; see that block's own comment for why there was previously a second,
+              hand-synced copy of every width here). Sortable columns (2026-08-13, item 1) are
+              themselves the sort control -- `SortHeaderButton` above -- rather than a separate
+              widget; every other header stays a plain `<span>` so it never looks clickable.
+              "Status" sorts by percent-complete (`SORT_KEYS`'s `'percent'`) -- the state chip's
+              own fill is where that percentage already shows, so that's the header it belongs
+              to; its `title` spells out "% complete" for anyone who hovers to check. Each
+              resizable column also carries a drag handle (`ColumnResizeHandle`) at its right
+              edge, a sibling of the label rather than nested inside it -- see that component's
+              own comment for why a drag can never fire a sort. */}
           <div className="sticky top-0 z-10 flex items-center gap-2 border-b border-zinc-200 bg-zinc-50 px-2 py-1 text-[10px] font-medium tracking-wide text-zinc-500 uppercase dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-400">
             <span className="w-4 shrink-0" />
             <span className="w-4 shrink-0" />
             <span className="w-4 shrink-0" />
-            <SortHeaderButton
-              sortKey="name"
-              label="Name"
-              sortPref={sortPref}
-              onSort={toggleSort}
-              className="min-w-0 flex-1 justify-start"
-            />
-            <SortHeaderButton
-              sortKey="size"
-              label="Size"
-              sortPref={sortPref}
-              onSort={toggleSort}
-              className="w-24 shrink-0 justify-end"
-            />
-            <SortHeaderButton
-              sortKey="percent"
-              label="Status"
-              title="Sort by % complete"
-              sortPref={sortPref}
-              onSort={toggleSort}
-              className="w-28 shrink-0 justify-end"
-            />
-            <span className="w-20 shrink-0 text-right">R L V E</span>
-            <SortHeaderButton
-              sortKey="state_changed_at"
-              label="Changed"
-              sortPref={sortPref}
-              onSort={toggleSort}
-              className="w-32 shrink-0 justify-end"
-            />
-            <span className="w-32 shrink-0 text-right">Actions</span>
+            <div className="flex min-w-0 flex-1 items-center" style={{ minWidth: NAME_MIN_WIDTH_PX }}>
+              <SortHeaderButton
+                sortKey="name"
+                label="Name"
+                sortPref={sortPref}
+                onSort={toggleSort}
+                className="w-full justify-start"
+              />
+            </div>
+            {RESIZABLE_COLUMNS.map((col) => (
+              <div key={col.id} className="relative flex shrink-0 items-center" style={fixedColumnStyle(col.id)}>
+                {col.sortKey ? (
+                  <SortHeaderButton
+                    sortKey={col.sortKey}
+                    label={col.label}
+                    title={col.title}
+                    sortPref={sortPref}
+                    onSort={toggleSort}
+                    className={`w-full ${col.align === 'right' ? 'justify-end' : 'justify-start'}`}
+                  />
+                ) : (
+                  <span className={`w-full truncate ${col.align === 'right' ? 'text-right' : ''}`}>
+                    {col.label}
+                  </span>
+                )}
+                <ColumnResizeHandle
+                  column={col}
+                  currentWidth={columnWidths[col.id] ?? col.defaultWidth}
+                  containerRef={scrollRef}
+                  onCommit={commitColumnWidth}
+                />
+              </div>
+            ))}
           </div>
           <div style={{ height: virtualizer.getTotalSize(), position: 'relative' }}>
             {virtualizer.getVirtualItems().map((virtualRow) => {

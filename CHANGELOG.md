@@ -258,6 +258,25 @@ alongside this list: several entries below ship with deliberate, documented limi
   within each parent**, never the flattened list the virtualizer walks, so a sorted tree
   never tears a child away from its actual parent. Composes with the existing text/state
   filters and with collapse state.
+- **Files columns are now drag-resizable, and remembered per browser** *(2026-08-13)*. A drag
+  handle at the right edge of Size / Status / R L V E / Changed / Actions (Name keeps flexing to
+  absorb whatever space the rest don't claim, as it always has) lets each column be resized by
+  pointer or touch; a double-click on the handle resets that column to its default, and arrow
+  keys (Shift for a bigger step) resize it from the keyboard, since a drag-only affordance isn't
+  usable without a pointer. Widths persist in `localStorage`, keyed by column id (an unrecognised
+  id is dropped, not misapplied to whatever now occupies that slot) so they survive a reload and
+  degrade safely if a future column is added or renamed. **The header row and each data row now
+  read one shared column definition** instead of two independently hardcoded, hand-synced sets
+  of Tailwind widths (the drift risk this replaces: header and rows could quietly disagree, and
+  had no defense if they did). During a drag, the live width is written straight to a CSS custom
+  property on the tree's scroll container — a DOM write via a ref, never a React state update —
+  so dragging a column costs a reflow, not a re-render of the virtualized list underneath it;
+  the one `setState` (and `localStorage` write) happens once, on release. **The settle
+  countdown's in-cell text is shorter** as part of the same pass — the full sentence ("Waiting
+  for changes — 1 of 2 scans, 35s of 60s") was overflowing its column outright; the chip now
+  shows `Waiting 1/2 · 35s` with the complete sentence still available on hover. Not verified
+  against a real browser (no UI access in this environment) — the widths, minimums, and drag
+  feel are reasoned choices, not observed ones.
 - **Expand all / Collapse all now remembers your last choice** *(2026-08-13)*, in
   `localStorage`, surviving a reload. Stored as a default-plus-exceptions preference, not a
   saved set of collapsed paths — a directory that arrives later over the WebSocket inherits
@@ -537,6 +556,25 @@ alongside this list: several entries below ship with deliberate, documented limi
   and, for that reason, deliberately still not an `event` (the volume would be almost pure
   noise) — but it did not even log at debug level, so a user diagnosing "why didn't cleanup run"
   had nothing to find. Now logs at debug.
+- **A row that left both trees for good never left the Files tree** *(2026-08-13, regression
+  found by the user within hours of the fix directly above it — a real `move` queue: "in move
+  mode it deleted the upstream, shows local only. but then when I delete local via CLI the files
+  list shows them in the tree still as Extracted for the directory and removed_local on the
+  mkv")*. The fix above it correctly stopped a vanished-from-both-trees row from freezing on its
+  outcome forever, by writing a fresh resolved state for it every scan pass — but the same change
+  also made every one of those rows *published* forever, since the set it wrote to is the same
+  one the WebSocket projection filters on. A row is now published while it holds a
+  content-asserting outcome during §7.3's grace period (the content could still come back), and
+  drops out of the tree — reported once in that scan's delta — the moment it lands on a terminal
+  `REMOVED_LOCAL`/`REMOVED_BOTH` with nothing left in either tree; it keeps being written to the
+  database on every later pass regardless, so the History page is unaffected. The opposite case —
+  delete locally while the remote survives — was never at risk and is now guarded by an explicit
+  test: that row stays in the tree, `REMOVED_LOCAL`, "Re-Download" available, exactly as before.
+  In the same fix: a fully-vanished `move`-mode item was landing on a bare `REMOVED_LOCAL`
+  ("remote still present") rather than `REMOVED_BOTH`, a known, documented gap
+  (`prompts/open-issues.md`) that also made `AutoQueueSettings.re_download_externally_removed`
+  capable of queuing a doomed transfer against a remote that no longer exists; closed in the same
+  pass rather than left open, since it was the same underlying question asked twice.
 
 ### Security
 

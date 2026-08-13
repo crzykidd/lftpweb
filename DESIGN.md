@@ -361,29 +361,27 @@ Nine rules that are easy to get wrong and that want review:
    externally-removed path; it can never make a self-delete (`REMOVED_BOTH`) eligible. This
    is in practice a `copy`-mode concern — in `move` the remote copy is already gone by the time
    an item could read bare `REMOVED_LOCAL`, so there is nothing left for the setting to
-   re-fetch. Read the gap below before relying on that last clause.
+   re-fetch, and (closed 2026-08-13, see below) it now genuinely reaches `REMOVED_BOTH` instead,
+   the same as any other self-contained "gone from both trees" row.
 
-   > **Known gap, stated rather than papered over (2026-08-13).** This rule used to end "(it
-   > reaches `REMOVED_BOTH` instead)". **That is not what the code does.**
-   > `core/mount_sentinel.py.resolve_absence` — the only thing that ever writes this transition
-   > — always writes the literal `REMOVED_LOCAL`, and takes neither the queue's `sync_mode` nor
-   > `remote_deleted_at` as an input. So a fully-completed `move`-mode item lands on bare,
-   > **unsuppressed** `REMOVED_LOCAL`, not on `REMOVED_BOTH`.
-   >
-   > This was latent until §7.3's leaves-both-trees sweep shipped, because before it such items
-   > never reached that function at all. Now that they do, the practical consequence is narrow
-   > but real: the row is still excluded from auto-queue at the default setting, exactly as
-   > intended — but it is excluded **by its state name**, not by `auto_queue_suppressed`, and
-   > `core/autoqueue.py`'s eligibility query never consults the current remote tree. So turning
-   > `re_download_externally_removed` **on** makes such a row eligible and produces a job doomed
-   > against a remote that is already gone. The setting is therefore not the no-op for `move`
-   > queues that the paragraph above claims.
-   >
-   > Widening `resolve_absence` to emit `REMOVED_BOTH` is a real design decision, not a two-line
-   > fix: it would also have to decide whether such a row is `auto_queue_suppressed` like a
-   > self-delete, which that function currently has no opinion about. Recorded here as the
-   > discrepancy between this rule and the implementation, with the implementation being what
-   > ships.
+   > **Gap closed 2026-08-13** (`prompts/2026-08-13-vanished-rows-should-leave-the-tree.md`;
+   > previously recorded here as a known gap). This rule used to end "(it reaches `REMOVED_BOTH`
+   > instead)" while `core/mount_sentinel.py.resolve_absence` — the only thing that ever writes
+   > this transition — always wrote the literal `REMOVED_LOCAL`, taking neither `sync_mode` nor
+   > `remote_deleted_at` as input, so a fully-completed `move`-mode item actually landed on bare,
+   > **unsuppressed** `REMOVED_LOCAL`. `resolve_absence` itself is unchanged — its real call site
+   > (an item genuinely reading structural `REMOTE_ONLY`, remote present) still means exactly
+   > what it always did. The fix lives at its *other* call site instead: §7.3's leaves-both-trees
+   > sweep (`core/engine.py._persist`) already fakes a `REMOTE_ONLY` reading there purely to reuse
+   > `resolve_absence`'s grace-period clock ("the closest existing reading for 'there is nothing
+   > here to compare'") for a `rel_path` it already knows is in *neither* tree — so that call site
+   > now remaps a resolved `REMOVED_LOCAL` to `REMOVED_BOTH` itself before writing it, since only
+   > it knows the remote is genuinely gone too. Left **unsuppressed**, deliberately — the same
+   > choice `resolve_vanished`'s own `REMOVED_BOTH` output already made (rule 9 below): nothing
+   > here asserts *who* removed the remote copy, and `REMOVED_BOTH` is excluded from
+   > `core/autoqueue.py.ELIGIBLE_STATES` by state name, not by `auto_queue_suppressed`, so no flag
+   > is needed to keep it out of auto-queue. `re_download_externally_removed` is therefore now
+   > genuinely a no-op for `move` queues, as this rule's prose always claimed.
 4. **Remote size is a moving target** — a torrent may still be downloading on the seedbox.
    Never latch it; recompute completeness on every scan.
 5. **The same detection drives different actions by mode** (§7). `REMOVED_LOCAL` is one
@@ -458,7 +456,10 @@ Nine rules that are easy to get wrong and that want review:
      local one, so the reconciler produces no node for it at all. §7.3 covers what happens
      then. Every `prev_state` §7.3's grace-period function (`resolve_absence`) has an opinion
      about goes through the same grace period as if it were freshly absent — the point of
-     that half. **A second, narrower fallback exists for two `prev_state`s it does not**
+     that half — but its terminal output is remapped from `REMOVED_LOCAL` to `REMOVED_BOTH`
+     before it is written, since this call site (unlike `resolve_absence`'s ordinary one) already
+     knows the remote copy is gone too; see rule 3's gap note above for why. **A second, narrower
+     fallback exists for two `prev_state`s `resolve_absence` has no opinion about at all**
      (2026-08-13, a real bug — see below): `PARTIAL` and `LOCAL_ONLY` both assert *some*
      concrete content was actually here, so a row that leaves both trees carrying either one
      rests at `REMOVED_BOTH` rather than being frozen forever, because the scan loop only
@@ -467,6 +468,20 @@ Nine rules that are easy to get wrong and that want review:
      purpose) are deliberately left out of that fallback and keep the older "simply drops from
      the published tree" behavior — see `core/mount_sentinel.py.resolve_vanished`'s own
      docstring for why widening it to cover them too would be a regression, not a fix.
+
+     **Written every pass regardless, published only until terminal (2026-08-13,
+     `prompts/2026-08-13-vanished-rows-should-leave-the-tree.md`).** This whole mechanism exists
+     so a row that has left both trees is never *frozen* — `core/engine.py._persist` writes a
+     fresh resolved state for it on every pass, without exception, so the History page (which
+     reads `item` directly) always has the truth. That is a different question from whether the
+     row still belongs in the *live* Files tree: once it lands on `REMOVED_LOCAL`/`REMOVED_BOTH`
+     with nothing left in either tree, it is "kept as history" (the state table above, rule 6) —
+     which means exactly that, not "kept in the tree forever." It stops being handed to
+     `_project` the pass it turns terminal, `diff_nodes` reports it `removed` exactly once, and
+     `GET /api/files`/History still see it because they read `item` directly, same as the
+     write above. While it holds a non-terminal, content-asserting state during the grace window
+     (any of the states rule 9's second bullet lists), it keeps publishing — the content could
+     still come back, and hiding it early would be worse than the freeze this section fixes.
 
      **Found 2026-08-13** (`prompts/2026-08-13-delete-state-truthfulness.md`): a `move` queue's
      throttled per-child progress writer (`core/queue.py._publish_child_progress`) can leave a
@@ -1464,6 +1479,17 @@ state chip already reads (§2.2's one shared projection, never a second read of 
   day once used for real. A header that isn't sortable stays a plain label. Reorders
   **siblings within each parent**, never the flattened list the virtualizer walks, so a sorted
   tree can never tear a child away from its actual parent.
+- **Columns are drag-resizable and remembered per browser** (2026-08-13). Name keeps flexing to
+  absorb whatever space the fixed columns (Size / Status / R L V E / Changed / Actions) don't
+  claim — resizing one of those five just changes how much Name gets, never a paired
+  shrink-your-neighbor resize. A shared column definition drives both the header row and each
+  data row, replacing two independently hardcoded, hand-synced sets of widths. **The drag never
+  touches React state** — the live width is written straight to a CSS custom property on the
+  tree's scroll container via a ref on every `pointermove`, so the virtualized list underneath
+  never re-renders mid-drag; state (and `localStorage`, keyed by column id) is written once, on
+  release. Keyboard-resizable too (arrow keys, Shift for a bigger step), since a drag-only
+  affordance is unusable without a pointer, and a double-click on the handle resets that column
+  to its default.
 - **The Expand all / Collapse all choice persists** across reloads, stored as a default plus
   per-row exceptions rather than a saved set of collapsed paths. The tree updates continuously
   over the socket, and a directory that arrives *after* a saved set was written would not be in

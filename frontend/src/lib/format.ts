@@ -123,7 +123,14 @@ const STATE_AGE_LABELS: Record<string, string> = {
   EXTRACT_FAILED: 'Extract failed',
   FAILED: 'Failed',
   LOCAL_ONLY: 'Local',
-  REMOVED_LOCAL: 'Removed locally',
+  // 'Removed locally' (2026-08-13, prompts/2026-08-13-resizable-file-columns.md audit)
+  // combined with a relative-time reading ("Removed locally yesterday") ran past this
+  // column's width more often than any other label here -- shortened to 'Deleted', still
+  // distinct from REMOVED_BOTH's 'Removed' below (this row's remote copy survives; that one's
+  // doesn't). The fuller distinction stays available regardless: the Status chip in the
+  // neighboring column always shows the raw state, `REMOVED_LOCAL`/`REMOVED_BOTH` verbatim,
+  // uncut -- this column is a second, shorter reading of the same fact, not the only one.
+  REMOVED_LOCAL: 'Deleted',
   REMOVED_BOTH: 'Removed',
 }
 
@@ -174,4 +181,24 @@ export function settleWaitLabel(node: SettleProgressNode, settle: SettleConstant
     `Waiting for changes -- ${node.settle_matched_scans} of ${settle.required_scans} scans, ` +
     `${elapsedS}s of ${Math.round(settle.min_age_s)}s`
   )
+}
+
+/** The Status chip's own in-cell text (2026-08-13, prompts/2026-08-13-resizable-file-
+ * columns.md) -- `settleWaitLabel` above is the complete sentence, right for a hover tooltip,
+ * but it was being shown verbatim *in the chip itself*, inside a column a few characters wide,
+ * where it just ran off the edge. This is the short form the chip actually renders; the full
+ * sentence survives on hover (`FileTree.tsx`'s `Row` passes `settleWaitLabel`'s result as the
+ * chip's own `title`), so nothing is lost, just not force-fit into the cell. Keeps a verb
+ * ("Waiting") rather than a bare `1/2 · 35s` -- a number pair with no verb reads as data, not
+ * status, which was the one thing to avoid per the task's own bar.
+ */
+export function settleWaitShortLabel(node: SettleProgressNode, settle: SettleConstants | null): string {
+  if (settle == null || node.settle_matched_scans == null || node.settle_first_matched_at == null) {
+    return 'Waiting…'
+  }
+  const elapsedS = Math.max(
+    0,
+    Math.floor((Date.now() - new Date(node.settle_first_matched_at).getTime()) / 1000),
+  )
+  return `Waiting ${node.settle_matched_scans}/${settle.required_scans} · ${elapsedS}s`
 }

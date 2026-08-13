@@ -15,34 +15,6 @@ and it held all night.
 
 ## Still open — read these first
 
-### 🔴 `re_download_externally_removed` can queue doomed jobs on a `move` queue
-
-Found by the documentation sweep on 2026-08-13, and it contradicts something the orchestrating
-session asserted to the user earlier that evening.
-
-The claim was: the setting is a no-op for `move` queues, because the remote copy is already
-gone so there is nothing to re-fetch. **That is true of the intent and false of the code.**
-`core/autoqueue.py`'s eligibility query selects on `state` and `auto_queue_suppressed` and
-**never consults the current remote tree**. So a `move`-mode row sitting at bare, unsuppressed
-`REMOVED_LOCAL` becomes eligible the moment that setting is turned on, and produces a transfer
-job against a remote that no longer exists.
-
-The setting defaults **off**, so nothing is broken today. Recorded in `DESIGN.md` §3.2 rule 3,
-`README.md`'s Known gaps, and the changelog.
-
-### `resolve_absence` never writes `REMOVED_BOTH`
-
-`core/mount_sentinel.py.resolve_absence` always writes the literal `"REMOVED_LOCAL"`, taking
-neither `sync_mode` nor `remote_deleted_at` as input. So a fully-completed `move`-mode item
-that leaves both trees lands at `REMOVED_LOCAL`, not the `REMOVED_BOTH` that `DESIGN.md` and
-`core/autoqueue.py`'s comments both describe.
-
-Latent until `56ec523` — before that, such items never reached the function at all. Widening it
-is a real design decision (it must also decide whether to set `auto_queue_suppressed`), so it
-was documented rather than guessed at. **This and the item above are the same underlying
-question**: what a completed `move` item's terminal state should be, and whether suppression
-belongs with it. Answer them together.
-
 ### No frontend test runner exists — at all
 
 No vitest, no jest, nothing, anywhere in the tree. The 2026-08-13 Files revamp added sorting,
@@ -149,6 +121,8 @@ Plus the backup `VACUUM INTO` race (`209928d`) and the pending `DESIGN.md` wordi
 
 | Summary | Commit |
 |---|---|
+| `re_download_externally_removed` could queue doomed jobs on a `move` queue, and `resolve_absence` never wrote `REMOVED_BOTH` — the same underlying question, closed together; see `docs/decisions.md` and `DESIGN.md` §3.2 rule 3 | `prompts/2026-08-13-vanished-rows-should-leave-the-tree.md` |
+| A vanished-both row (`56ec523`'s own fix) stayed *published* in the Files tree forever once it reached a terminal removed state, instead of leaving it once `_project` stopped being handed it — the sweep must keep *writing* the row (unchanged) but stop *publishing* it once terminal | `prompts/2026-08-13-vanished-rows-should-leave-the-tree.md` |
 | Archive volumes optionally deleted after extraction, without breaking completeness | `4533617` |
 | Delete marks the whole subtree; `REMOVED_LOCAL` vs `REMOVED_BOTH` chosen per row | `b39158e` |
 | A `move`-mode outcome survives the rescan that finds it `LOCAL_ONLY`; items that leave both trees no longer freeze | `56ec523` |

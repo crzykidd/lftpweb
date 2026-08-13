@@ -104,15 +104,6 @@ reduction made during the build, recorded in full in `docs/decisions.md`:
   unverified, unextracted, and — for a `move` queue — with its remote copy never deleted, until
   something re-touches that item (e.g. a manual re-queue). Phase 5's own deliberate call; the
   settle-gate half of it was closed on 2026-08-12, the placed-by-hand half was not.
-- **A completed `move`-mode item lands on `REMOVED_LOCAL`, not the `REMOVED_BOTH` the design
-  describes.** `core/mount_sentinel.py.resolve_absence` always writes `REMOVED_LOCAL` and takes
-  neither `sync_mode` nor `remote_deleted_at` as an input. At the default settings this is
-  harmless — the row is excluded from auto-queue either way — but it is excluded by its state
-  name rather than by `auto_queue_suppressed`, so turning on "re-download items removed outside
-  lftpweb" makes such a row eligible and produces a doomed job against a remote that is already
-  gone. Widening `resolve_absence` is a real design decision (it would also have to decide
-  whether that row should be suppressed like a self-delete), so it is documented in
-  `DESIGN.md` §3.2 rule 3 rather than quietly patched.
 - **Encrypted-rar password retry is implemented but has never been tested against a real
   encrypted archive.** No RAR compressor exists anywhere in this project's toolchain — `unrar`
   only extracts, and no Alpine package ships one — so there is no way to build the fixture. The

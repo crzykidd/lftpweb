@@ -19,6 +19,8 @@ able to *stop* protecting it is a worse bug than the one it fixes (docs/decision
 
 from __future__ import annotations
 
+import asyncio
+
 import aiosqlite
 import pytest
 
@@ -507,17 +509,24 @@ async def test_partial_wins_over_the_outcome_even_with_remote_deleted(tmp_path, 
         await db.close()
 
 
-async def test_move_mode_item_that_leaves_both_trees_still_reaches_removed_local(
-    tmp_path, monkeypatch
-):
+async def test_move_mode_item_that_leaves_both_trees_reaches_removed_both(tmp_path, monkeypatch):
     """The other half of the reproduction. Once `_do_move` (auto_move) relocates the local
     copy too -- or an importer takes it -- the rel_path is in *neither* tree, so
     `core/reconcile.py` produces no node for it at all and the LOCAL_ONLY fix above is never
     even asked. Without `core/engine.py._persist`'s own "vanished from both trees" handling,
     this row would simply never be written again: `EXTRACTED` forever, freezing the item on
-    its outcome instead of letting §7.3's grace period carry it to `REMOVED_LOCAL` the way an
-    ordinary importer-moved-it-out item already does. This proves the fix does not introduce
-    that freeze.
+    its outcome instead of letting §7.3's grace period carry it to a terminal removed state the
+    way an ordinary importer-moved-it-out item already does. This proves the fix does not
+    introduce that freeze.
+
+    **`REMOVED_BOTH`, not `REMOVED_LOCAL`** (2026-08-13,
+    `prompts/2026-08-13-vanished-rows-should-leave-the-tree.md`, closing the gap
+    `prompts/open-issues.md` recorded as "`resolve_absence` never writes `REMOVED_BOTH`"): the
+    remote copy is gone too -- this is a `move` queue whose remote was already deleted before
+    this test even starts -- so `REMOVED_LOCAL` ("remote still present") would assert something
+    false. Before this fix, `_persist`'s vanished-sweep reused `resolve_absence`'s grace-period
+    machinery (correctly) but published its literal `"REMOVED_LOCAL"` output verbatim
+    (incorrectly) for a `rel_path` it already knows is in neither tree.
     """
     local_present = {"value": True}
 
@@ -563,7 +572,7 @@ async def test_move_mode_item_that_leaves_both_trees_still_reaches_removed_local
         await db.commit()
 
         await engine.scan_queue(q, host)
-        assert (await _state_of(db, item_id))[0] == "REMOVED_LOCAL"
+        assert (await _state_of(db, item_id))[0] == "REMOVED_BOTH"
     finally:
         await db.close()
 
@@ -605,5 +614,197 @@ async def test_a_vanished_remote_only_row_is_still_left_alone(tmp_path, monkeypa
     try:
         await engine.scan_queue(q, host)
         assert (await _state_of(db, item_id))[0] == "REMOTE_ONLY"
+    finally:
+        await db.close()
+
+
+# --- A terminal removed row must leave the *published* tree, not just get written -----------
+#
+# 2026-08-13 (prompts/2026-08-13-vanished-rows-should-leave-the-tree.md), a regression the user
+# found within hours of `56ec523` (the fix proven above -- the vanished sweep must keep
+# *writing* a row in neither tree, or it freezes forever): `written.add(rel_path)` at the end of
+# that same sweep made every row it resolves *published* forever too, since `written` is exactly
+# what `core/engine.py._project` filters publication by. A row that reaches a terminal removed
+# state (`REMOVED_LOCAL`/`REMOVED_BOTH`) with nothing left in either tree is meant to be kept
+# only "as history" (`_project`'s own docstring) -- these tests assert that on the actual wire
+# shapes (`queue_delta`'s `removed` list, a fresh `snapshot()`), the way the user actually
+# observed the bug, not just against the database (which `_persist` writing correctly would
+# still pass).
+
+
+async def _next_queue_delta(subscription: asyncio.Queue) -> dict:
+    """Pop from the subscription until a `queue_delta` arrives, discarding any interleaved
+    `scan_complete` -- same shape as `tests/test_ws_deltas.py`'s `_next_message`, duplicated
+    rather than imported since there is no `tests` package for a cross-file import.
+    """
+    while True:
+        message = await subscription.get()
+        if message["type"] == "queue_delta":
+            return message
+        assert (
+            message["type"] == "scan_complete"
+        ), f"unexpected message while waiting for queue_delta: {message['type']!r}"
+
+
+async def test_vanished_both_row_stops_publishing_once_it_reaches_removed_both(
+    tmp_path, monkeypatch
+):
+    """The user's exact scenario, end to end: a `move` queue whose remote copy is already gone,
+    then the local copy removed *outside* lftpweb too (their CLI `rm`, simulated here the same
+    way `_do_move` relocating it out of `local_path` would be). While the grace period is
+    running the row must keep publishing, holding its outcome state -- the content could still
+    come back. Once the grace period elapses and it lands on a terminal state, it must leave the
+    published tree: reported once in `queue_delta`'s `removed` list, and absent from every
+    `snapshot()` after.
+    """
+    local_present = {"value": True}
+    engine, q, host, db, item_id = await _make_move_engine(
+        tmp_path,
+        monkeypatch,
+        local_size=SIZE,
+        state="EXTRACTED",
+        remote_deleted_at="2026-08-13T00:00:00.000000Z",
+    )
+    monkeypatch.setattr(
+        engine_module.local_scan,
+        "scan_local",
+        lambda root: (_local_tree(SIZE) if local_present["value"] else {}),  # noqa: ARG005
+    )
+    try:
+        subscription = engine.events.subscribe()
+
+        # 1. Baseline: local present, remote already gone (move mode) -- published normally.
+        await engine.scan_queue(q, host)
+        delta = await _next_queue_delta(subscription)
+        assert REL_PATH in {node["rel_path"] for node in delta["changed"]}
+        snapshot = (await engine.snapshot())[0]
+        assert REL_PATH in {node["rel_path"] for node in snapshot["nodes"]}
+
+        # 2. The CLI `rm`: local copy gone too, rel_path in neither tree now. The grace period
+        # is running -- must still be published, still reading the outcome it held.
+        local_present["value"] = False
+        await engine.scan_queue(q, host)
+        delta = await _next_queue_delta(subscription)
+        assert REL_PATH not in delta["removed"], "must keep publishing during the grace period"
+        snapshot = (await engine.snapshot())[0]
+        published = {node["rel_path"]: node["state"] for node in snapshot["nodes"]}
+        assert published.get(REL_PATH) == "EXTRACTED"
+
+        # 3. A second pass inside the window: still published, unchanged.
+        await engine.scan_queue(q, host)
+        delta = await _next_queue_delta(subscription)
+        assert REL_PATH not in delta["removed"]
+
+        # 4. Backdate the clock past the grace window rather than sleeping ten minutes.
+        await db.execute(
+            "UPDATE item SET first_missing_at = STRFTIME('%Y-%m-%dT%H:%M:%fZ', 'now', ?) "
+            "WHERE id = ?",
+            (f"-{int(DEFAULT_GRACE_S) + 60} seconds", item_id),
+        )
+        await db.commit()
+
+        # 5. The grace period elapses: the row reaches REMOVED_BOTH (terminal, in neither tree)
+        # and must leave the published tree in this very pass's delta.
+        await engine.scan_queue(q, host)
+        delta = await _next_queue_delta(subscription)
+        assert (await _state_of(db, item_id))[0] == "REMOVED_BOTH"
+        assert REL_PATH in delta["removed"], "a terminal removed row must leave the published tree"
+        assert REL_PATH not in {node["rel_path"] for node in delta["changed"]}
+
+        snapshot = (await engine.snapshot())[0]
+        assert REL_PATH not in {
+            node["rel_path"] for node in snapshot["nodes"]
+        }, "a fresh snapshot must not resurrect a row this pass already resolved to terminal"
+
+        # 6. And it stays gone -- not a one-scan blip. The row is still *written* every pass
+        # (56ec523's fix, still correct -- the History page reads it straight from `item`), just
+        # never published again.
+        await engine.scan_queue(q, host)
+        delta = await _next_queue_delta(subscription)
+        assert delta["removed"] == [], "already removed; nothing left to report a second time"
+        assert (await _state_of(db, item_id))[0] == "REMOVED_BOTH"
+        snapshot = (await engine.snapshot())[0]
+        assert REL_PATH not in {node["rel_path"] for node in snapshot["nodes"]}
+    finally:
+        await db.close()
+
+
+async def test_removed_local_with_surviving_remote_stays_published(tmp_path, monkeypatch):
+    """The regression risk called out by name: manual delete while the remote survives. This
+    row never enters the vanished sweep at all -- the remote copy keeps it in `nodes` every
+    scan, so it is published through the ordinary per-node path, `written.add(rel_path)`
+    unconditional at the top of that loop -- but a fix scoped to the wrong place could easily
+    have broken it anyway. Guarded explicitly, at the wire level: after the grace period lands
+    it on `REMOVED_LOCAL`, the row must still be in the published tree, and `remote_size` must
+    still be present (what `FileTree.tsx.rowAction` keys "Re-Download" on, alongside the state).
+    """
+    engine, q, host, db, item_id = await _make_engine(
+        tmp_path, monkeypatch, local_size=None, state="DOWNLOADED"
+    )
+    try:
+        subscription = engine.events.subscribe()
+        await engine.scan_queue(q, host)
+        await _next_queue_delta(subscription)
+
+        await db.execute(
+            "UPDATE item SET first_missing_at = STRFTIME('%Y-%m-%dT%H:%M:%fZ', 'now', ?) "
+            "WHERE id = ?",
+            (f"-{int(DEFAULT_GRACE_S) + 60} seconds", item_id),
+        )
+        await db.commit()
+
+        await engine.scan_queue(q, host)
+        delta = await _next_queue_delta(subscription)
+        assert (await _state_of(db, item_id))[0] == "REMOVED_LOCAL"
+        assert (
+            REL_PATH not in delta["removed"]
+        ), "remote still exists -- must stay visible, not be dropped from the tree"
+
+        snapshot = (await engine.snapshot())[0]
+        nodes_by_path = {node["rel_path"]: node for node in snapshot["nodes"]}
+        assert REL_PATH in nodes_by_path, "Re-Download must still have a row to act on"
+        assert nodes_by_path[REL_PATH]["state"] == "REMOVED_LOCAL"
+        assert (
+            nodes_by_path[REL_PATH]["remote_size"] is not None
+        ), "the remote copy surviving is exactly what makes Re-Download meaningful"
+
+        # And a further scan doesn't disturb it either.
+        await engine.scan_queue(q, host)
+        delta = await _next_queue_delta(subscription)
+        assert REL_PATH not in delta["removed"]
+    finally:
+        await db.close()
+
+
+async def test_a_row_that_leaves_both_trees_and_later_returns_is_published_again(
+    tmp_path, monkeypatch
+):
+    """The other side of the same fix: dropping a terminal row from `written` must not be
+    permanent. DESIGN.md §3.2 rule 6: "if the same rel_path reappears... it is a genuinely new
+    item" -- once the ordinary per-node path sees content on either side again, the row must
+    re-enter `written` and be published like any other row, not stay silently excluded because
+    an earlier pass once resolved it to `REMOVED_BOTH`.
+    """
+    engine, q, host, db, item_id = await _make_move_engine(
+        tmp_path, monkeypatch, local_size=None, state="REMOVED_BOTH", remote_deleted_at=None
+    )
+    monkeypatch.setattr(engine_module.local_scan, "scan_local", lambda root: {})  # noqa: ARG005
+    try:
+        # Baseline: genuinely in neither tree, REMOVED_BOTH already resting there -- stays
+        # unpublished, exactly `test_a_vanished_local_only_row_rests_at_removed_both_not_left_
+        # alone`'s sibling case at the wire level.
+        await engine.scan_queue(q, host)
+        snapshot = (await engine.snapshot())[0]
+        assert REL_PATH not in {node["rel_path"] for node in snapshot["nodes"]}
+
+        # The re-upload: remote content returns (local stays absent).
+        engine.pool = _FakePool(_remote_tree())
+        await engine.scan_queue(q, host)
+
+        state, _ = await _state_of(db, item_id)
+        assert state == "REMOTE_ONLY", "a fresh structural reading, not the stale REMOVED_BOTH"
+        snapshot = (await engine.snapshot())[0]
+        published = {node["rel_path"]: node["state"] for node in snapshot["nodes"]}
+        assert published.get(REL_PATH) == "REMOTE_ONLY", "content returned -- published again"
     finally:
         await db.close()

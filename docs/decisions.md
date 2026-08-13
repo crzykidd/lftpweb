@@ -6,6 +6,115 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-13 — A terminal removed row must stop publishing, not just stop freezing
+
+**Handoff prompt `prompts/2026-08-13-vanished-rows-should-leave-the-tree.md`, executed end to
+end.** A regression the user found within hours of `56ec523` (the fix, from earlier the same
+session, for a `move`-mode row freezing on its outcome once it left both trees). `56ec523`'s own
+fix was correct and is **not** reverted: `core/engine.py._persist`'s vanished-from-both-trees
+sweep still writes a fresh state for every `rel_path` it resolves, every pass, or the freeze
+comes right back. What was wrong is what came bundled with it: the sweep also unconditionally
+added every resolved `rel_path` to `written` — the exact set `_project` filters *publication* by
+— so a row that reached `REMOVED_LOCAL`/`REMOVED_BOTH` (`_project`'s own docstring: kept "as
+history") stayed in the Files tree forever instead of leaving it once, the way `diff_nodes`'s
+`removed` list is supposed to report. **Two different needs were conflated: resolving a row so it
+doesn't freeze, and publishing it.** Fixed by gating the `written.add` on whether this pass's
+resolution landed on a terminal state (`REMOVED_LOCAL`/`REMOVED_BOTH`) — non-terminal (still
+holding a content-asserting outcome during the grace period) keeps publishing; terminal-and-in-
+neither-tree stops, while the `UPDATE` that keeps the row from freezing runs unconditionally
+either way, so the History page (which reads `item` directly, never through `written`) is
+unaffected. The asymmetric case the fix must not touch — delete locally while the remote
+survives — was never at risk: that row stays in `core/reconcile.py`'s `nodes` every scan (the
+remote copy keeps it there), so it publishes through the *ordinary* per-node loop, whose own
+`written.add` was never conditional and wasn't touched. Guarded with an explicit test
+(`test_removed_local_with_surviving_remote_stays_published`) rather than trusted by inspection,
+since it is the single highest-consequence regression this fix could have introduced.
+
+**The `REMOVED_BOTH` gap (`prompts/open-issues.md`) was closed in the same task, not deferred.**
+`core/mount_sentinel.py.resolve_absence` always writes the literal `"REMOVED_LOCAL"` — correct at
+its real call site (the ordinary per-node loop, where `structural_state == "REMOTE_ONLY"`
+genuinely means the remote is present) but wrong at the vanished-sweep's call site, which fakes
+that same reading ("the closest existing reading for 'there is nothing here to compare'") for a
+`rel_path` this pass already knows is in *neither* tree. Rather than widen `resolve_absence`
+itself — its unit contract (`tests/test_mount_sentinel.py`) is correct and other callers rely on
+it meaning exactly what it says — the remap lives only at the vanished-sweep's own call site in
+`core/engine.py._persist`: if the resolved terminal state is `"REMOVED_LOCAL"`, it becomes
+`"REMOVED_BOTH"`, since this call site already knows the remote is gone too (that is why the row
+reached the sweep at all). **Left unsuppressed, deliberately** — same choice `resolve_vanished`
+already made for its own `REMOVED_BOTH` output: nothing here asserts *who* removed the remote
+copy, and `REMOVED_BOTH` is excluded from `core/autoqueue.py.ELIGIBLE_STATES` by state name, not
+by `auto_queue_suppressed`, so no flag is needed to keep it out of auto-queue. This closes the 🔴
+open issue directly: a bare `REMOVED_LOCAL` on a fully-vanished `move`-mode item was exactly what
+let `AutoQueueSettings.re_download_externally_removed` queue a doomed job against a remote that
+no longer exists. One pre-existing test (`test_move_mode_item_that_leaves_both_trees_still_
+reaches_removed_local`, renamed to `..._reaches_removed_both`) asserted the old, wrong output and
+was updated along with it — it was documenting the gap, not a second, independent guarantee.
+
+---
+
+## 2026-08-13 — Resizable Files columns: CSS variables, not `setState`, on drag
+
+**Handoff prompt `prompts/2026-08-13-resizable-file-columns.md`, executed end to end.** The
+user asked for drag-resizable Files columns, persisted per browser, prompted by the settle
+countdown clipping in its cell. Three things landed: the clipped in-cell text shortened at the
+source, the header/row width declarations unified into one `RESIZABLE_COLUMNS` definition, and
+drag-to-resize with keyboard support, persisted through the existing `lib/storage.ts`.
+
+**The obvious implementation — `setState` on every `pointermove` — was rejected before writing
+it, not after profiling it.** The Files tree is virtualized (`@tanstack/react-virtual`) and can
+hold thousands of rows; a `setState` per pointer-move event would re-render the entire mounted
+window on every animation frame of a drag, on a page whose entire reason for existing as a
+virtualized list is to avoid exactly that class of re-render. Instead, both the header cell and
+the matching `Row` cell size themselves off a CSS custom property, `--col-size-<id>`, set on the
+scroll container (`FileTree.tsx`'s `scrollRef`). During a drag, `ColumnResizeHandle` writes the
+live width straight to that property via the DOM (`containerRef.current.style.setProperty(...)`)
+on every `pointermove` — a browser reflow, not a React re-render. The one and only `setState` (→
+`writeLocalStorage`) happens once, on `pointerup` (or the single-step equivalent from an arrow
+key or a double-click reset). This is the one future contributors will want flagged loudest: the
+straightforward-looking `setState`-per-move version is a real regression waiting to happen the
+next time someone "simplifies" this file without re-reading why it's built this way.
+
+**A callback ref, not a plain object ref, owns seeding the CSS variables.** `scrollRef`'s div
+only exists in the DOM while `flat.length > 0` (filtered-to-nothing swaps it for a plain
+message), so it mounts and unmounts as filters change. A `useEffect` keyed on the widths state
+only fires when that state *changes*, not when the element *re-appears* with the same state it
+already had — which would leave a freshly remounted container reading unset (default) custom
+properties until the next unrelated width change. `attachScrollRef` (a `useCallback`-wrapped
+callback ref) seeds the properties the moment the element (re)appears, reading the latest widths
+off a ref (`columnWidthsRef`, kept current every render) rather than a stale closure; the
+`useEffect` still owns every later change while the element stays mounted.
+
+**Name flexes, the other five are fixed — kept, not switched to a paired two-column resize.**
+Each of the five drag handles changes only its own column's width; Name (`flex-1`, floored at
+`NAME_MIN_WIDTH_PX = 160`) automatically absorbs or gives up whatever space that leaves. This
+was the model implied by the pre-existing code (`min-w-0 flex-1` on Name, hardcoded fixed widths
+on everything else) and there was no reason found to replace it with the more complex "shrink
+your right neighbor to grow" pairing real spreadsheets sometimes use.
+
+**No maximum width, and total row width is not clamped to the container.** Growing a column
+below the point where Name shrinks to its own floor just widens the row past the scroll
+container's own width; `scrollRef`'s existing `overflow-auto` (unchanged) then shows a
+horizontal scrollbar rather than every other column getting proportionally squeezed to keep the
+row inside the visible width. A user who deliberately drags a column wide almost certainly wants
+to see it wide, not have that undone by shrinking its neighbors — and a runaway width is one
+double-click (reset-to-default, on the handle) away from fixed either way, so a numeric ceiling
+would just be one more constant to justify with no failure mode it actually prevents.
+
+**The settle countdown's in-cell text is now a different string from its own tooltip, on
+purpose.** `settleWaitLabel` (`lib/format.ts`) is still the complete sentence — the settle gate's
+own §4.5 wording — but it never fit the Status column it was first shown in verbatim. A new
+`settleWaitShortLabel` renders in the chip itself (`Waiting 1/2 · 35s`); `settleWaitLabel`'s full
+text is passed straight through as `StateChip`'s new optional `title` prop, so hovering still
+gives the whole sentence. Kept the verb ("Waiting") in the short form deliberately — the task's
+own bar was that a bare `1/2 · 35s` reads as data, not status.
+
+**Not done: verifying any of this actually looks or feels right.** No browser is available in
+this environment. The widths, minimums, handle affordance (a persistent low-contrast 8px strip,
+stronger on hover/focus), and drag feel are reasoned choices, not observed ones — the next
+session with real UI access should click-test this before calling it finished.
+
+---
+
 ## 2026-08-13 — Files/Transfers/Dashboard UX pass: five presentation changes from live use
 
 **Handoff prompt `prompts/2026-08-13-files-ux-pass.md`, executed end to end.** Five
