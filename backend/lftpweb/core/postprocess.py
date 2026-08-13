@@ -23,11 +23,16 @@ calls into `core/verify.py` / `core/extract.py` / `move_tree` via `asyncio.to_th
 
 **Every step defaults off, at two independent layers** (DESIGN.md §6: "toggleable globally
 and per path queue"). A step runs for an item only when *both* `PostprocessSettings`'s own
-flag and the queue's `auto_verify`/`auto_extract`/`auto_move` column are true -- except
-verification for a `move`-mode queue, which always runs regardless of either toggle, because
-it is the sole gate on an irreversible remote delete (see the decision recorded in
-`docs/decisions.md`: muting it via an unrelated global switch would silently turn `move` into
-"downloads, never deletes, never says why").
+flag and the queue's `auto_verify`/`auto_extract`/`auto_move`/`auto_delete_archives` column
+are true -- except verification for a `move`-mode queue, which always runs regardless of
+either toggle, because it is the sole gate on an irreversible remote delete (see the decision
+recorded in `docs/decisions.md`: muting it via an unrelated global switch would silently turn
+`move` into "downloads, never deletes, never says why"). `auto_delete_archives` (migration 012,
+2026-08-13) is the youngest of the four -- archive cleanup originally shipped site-only
+(migration 010) and was the one step that didn't follow this shape; brought in line by
+`prompts/2026-08-13-per-queue-archive-cleanup.md` because it is also the most destructive of
+the four (it can be the last copy of an archive's compressed bytes anywhere, on a `move`
+queue -- see `_do_extract` below).
 
 **Deletion (§7.4).** `move` deletes the remote copy only after verification returns
 `VERIFIED` -- never `CORRUPT`, never `SKIPPED` (no evidence). Every delete and every withheld
@@ -673,7 +678,15 @@ class PostprocessPipeline:
         # `find_archives`'s pre-extraction listing (first volume of each set only) -- untouched
         # by `extract_item`, which only ever writes to its own staging directory and merges into
         # `local_root`, so it is still exactly what to expand and remove.
-        if result.state == "EXTRACTED" and settings.delete_archives_after_extract:
+        #
+        # Two-layer gating (migration 012, 2026-08-13,
+        # prompts/2026-08-13-per-queue-archive-cleanup.md), the same shape as
+        # verify_effective/extract_effective/move_effective in `_process_item` above -- archive
+        # cleanup shipped site-only (migration 010) and was the odd one out.
+        delete_archives_effective = settings.delete_archives_after_extract and bool(
+            queue["auto_delete_archives"]
+        )
+        if result.state == "EXTRACTED" and delete_archives_effective:
             # Imported locally: `core/local_delete.py` imports `core/mount_sentinel.py`, which
             # imports this module for `OWNED_STATES` -- a top-level import here would be
             # circular (the same reason `core/extract.py.extract_item` imports `move_tree`

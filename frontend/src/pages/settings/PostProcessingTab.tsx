@@ -19,14 +19,36 @@ const EMPTY: PostprocessSettingsOut = {
 
 /** Settings → Post-processing (DESIGN.md §6, phase 5): the *site-wide* defaults for
  * verify/extract/move. A step only actually runs for a given queue's items when both this
- * global flag AND that queue's own auto_verify/auto_extract/auto_move toggle (Settings →
- * Queues) are on -- see docs/decisions.md for why the two layers are ANDed rather than one
- * overriding the other. Every field here defaults off; a fresh install runs no
+ * global flag AND that queue's own auto_verify/auto_extract/auto_move/auto_delete_archives
+ * toggle (Settings → Queues, which also shows what this site-wide half currently resolves to
+ * for each one) are on -- see docs/decisions.md for why the two layers are ANDed rather than
+ * one overriding the other. Every field here defaults off; a fresh install runs no
  * post-processing at all even before anyone visits this page.
+ *
+ * `_FAILED_` staging-directory retention (`failed_retention_enabled`/`failed_retention_days`)
+ * has no field on this page or on `PostprocessSettingsOut` above -- a pre-existing "backend
+ * first, UI catches up later" gap (same shape as several other settings in this project),
+ * distinct from every other field here. Saving from this form has always omitted those two
+ * keys entirely; `api/settings.py.put_postprocess_settings` now merges any field genuinely
+ * absent from the request over the previously-stored value rather than resetting it to its
+ * model default, so a value set via that endpoint directly (there is no UI for it yet) survives
+ * a save from this page rather than being silently discarded on every single one (found while
+ * investigating `prompts/2026-08-13-per-queue-archive-cleanup.md`'s item 3).
  */
 export function PostProcessingTab() {
   const [settings, setSettings] = useState<PostprocessSettingsOut>(EMPTY)
   const [loading, setLoading] = useState(true)
+  // Whether the initial GET actually landed (2026-08-13,
+  // `prompts/2026-08-13-per-queue-archive-cleanup.md`, item 3). `loading` alone already keeps
+  // the Save button out of the DOM while the fetch is in flight -- so the literal "clicked Save
+  // before the response arrived" race isn't reachable here -- but a *failed* fetch (a transient
+  // 500, the backend not up yet) used to leave `settings` at `EMPTY` with `loading` false and
+  // no indication anything was wrong, and Save was fully clickable: a real, reachable way for
+  // this page to write defaults over whatever was actually saved, including turning off the
+  // deletion toggle below. `loaded` is only ever set on a *successful* load, so Save stays
+  // disabled through a failed one instead.
+  const [loaded, setLoaded] = useState(false)
+  const [loadError, setLoadError] = useState<string | null>(null)
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [passwordsText, setPasswordsText] = useState('')
@@ -36,7 +58,9 @@ export function PostProcessingTab() {
       .then((s) => {
         setSettings(s)
         setPasswordsText(s.extract_passwords.join('\n'))
+        setLoaded(true)
       })
+      .catch((err) => setLoadError(err instanceof Error ? err.message : String(err)))
       .finally(() => setLoading(false))
   }, [])
 
@@ -75,6 +99,14 @@ export function PostProcessingTab() {
         A step here only runs for a queue's items when it's also turned on for that queue in
         Settings → Queues — both are off by default (DESIGN.md §6).
       </p>
+
+      {loadError && (
+        <p className="rounded-md bg-red-50 px-3 py-2 text-sm text-red-700 dark:bg-red-900/30 dark:text-red-300">
+          Couldn't load the current settings ({loadError}). Saving is disabled until this
+          loads — reload the page and try again; saving from a blank form would overwrite your
+          real settings with these defaults.
+        </p>
+      )}
 
       <div className="flex flex-col gap-2 rounded-md border border-zinc-200 p-4 dark:border-zinc-800">
         <h3 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">Verify</h3>
@@ -187,7 +219,7 @@ export function PostProcessingTab() {
 
       <button
         type="button"
-        disabled={saving}
+        disabled={saving || !loaded}
         onClick={handleSave}
         className="w-fit rounded-md bg-zinc-900 px-3 py-1.5 text-sm font-medium text-white hover:bg-zinc-700 disabled:opacity-50 dark:bg-zinc-100 dark:text-zinc-900 dark:hover:bg-zinc-300"
       >

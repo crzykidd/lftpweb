@@ -948,6 +948,17 @@ async def delete_extracted_archives(
         return ArchiveCleanupResult(deleted_rel_paths=(), bytes_freed=0, withheld_reason=reason)
 
     if not archive_heads:
+        # No `event` row here, deliberately -- most items have no archives at all, and this is
+        # the *only* caller-eligible path (`_do_extract` already returned earlier, before ever
+        # reaching this call, whenever `find_archives` came back empty), so an event per scan
+        # would be near-pure noise for the common case. But it used to be genuinely silent (no
+        # log line either) -- the one withhold this function had that left no trace at all when
+        # a user was diagnosing why cleanup hadn't run (2026-08-13,
+        # prompts/2026-08-13-per-queue-archive-cleanup.md, item 4). A debug line at least gives
+        # `LFTPWEB_LOG_LEVEL=DEBUG` something to find.
+        logger.debug(
+            "archive-cleanup: no archives to clean up for %r (queue %s)", rel_path, queue_id
+        )
         return ArchiveCleanupResult(deleted_rel_paths=(), bytes_freed=0)
 
     if not item["is_dir"]:

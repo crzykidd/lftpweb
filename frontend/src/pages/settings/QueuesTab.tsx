@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react'
+import { Link } from 'react-router-dom'
 import {
   createPattern,
   createQueue,
@@ -6,6 +7,7 @@ import {
   deletePattern,
   getAutoQueueSettings,
   getAutoQueueStatus,
+  getPostprocessSettings,
   listPatterns,
   listQueues,
   previewPatterns,
@@ -18,6 +20,7 @@ import type {
   PatternKind,
   PatternOut,
   PatternPreviewResponse,
+  PostprocessSettingsOut,
   QueueAutoQueueStatus,
   SyncMode,
 } from '../../api/types'
@@ -39,6 +42,7 @@ interface FormState {
   auto_verify: boolean
   auto_extract: boolean
   auto_move: boolean
+  auto_delete_archives: boolean
   scan_interval_s: number | null
 }
 
@@ -54,7 +58,74 @@ const EMPTY_FORM: FormState = {
   auto_verify: false,
   auto_extract: false,
   auto_move: false,
+  auto_delete_archives: false,
   scan_interval_s: null,
+}
+
+/** Settings → Post-processing's site-wide defaults, fetched here too so each per-queue toggle
+ * below can show what it actually resolves to (2026-08-13,
+ * `prompts/2026-08-13-per-queue-archive-cleanup.md`, item 2) -- a per-queue toggle can be on
+ * while the matching site-wide flag is off, and until this task nothing on this page said so.
+ * `null` while loading; the readout below degrades to a neutral "loading" line rather than
+ * guessing on or off.
+ */
+function usePostprocessSiteSettings(): PostprocessSettingsOut | null {
+  const [settings, setSettings] = useState<PostprocessSettingsOut | null>(null)
+  useEffect(() => {
+    getPostprocessSettings()
+      .then(setSettings)
+      .catch(() => setSettings(null))
+  }, [])
+  return settings
+}
+
+/** One per-queue post-processing toggle's readout: what the site-wide half currently resolves
+ * to, and therefore whether the queue's own toggle above actually does anything right now.
+ * `forcedOn` is `move`-mode verification's own case -- DESIGN.md §6/§7.3: it runs regardless of
+ * *either* toggle, so the readout must say "always on," never "system setting: off" (which
+ * would be a lie for exactly that queue).
+ */
+function PostprocessStepReadout({
+  site,
+  queueEnabled,
+  forcedOn = false,
+}: {
+  // `null` covers two cases the same way: the site-wide fetch hasn't resolved yet, or it
+  // failed -- both render the same "loading" line rather than guessing a value that could be
+  // wrong in either direction.
+  site: boolean | null
+  queueEnabled: boolean
+  forcedOn?: boolean
+}) {
+  if (forcedOn) {
+    return (
+      <p className={hintClasses}>
+        Always runs for this <code>move</code> queue, regardless of the site-wide setting or
+        this toggle — verification is the sole gate on the irreversible remote delete
+        (DESIGN.md §6/§7.3).
+      </p>
+    )
+  }
+  if (site == null) {
+    return <p className={hintClasses}>Loading the site-wide setting…</p>
+  }
+  if (!site) {
+    return (
+      <p className="text-xs text-amber-600 dark:text-amber-400">
+        System setting: off — this queue's toggle has no effect until it's also turned on in{' '}
+        <Link to="/settings/post-processing" className="underline">
+          Settings → Post-processing
+        </Link>
+        .
+      </p>
+    )
+  }
+  return (
+    <p className={hintClasses}>
+      System setting: on —{' '}
+      {queueEnabled ? 'active for this queue.' : "this queue's toggle above is off, so nothing runs yet."}
+    </p>
+  )
 }
 
 /** The dropdown's own fixed choices (DESIGN.md §5/§9.3; prompts/open-issues.md #11). `null` is
@@ -185,6 +256,7 @@ export function QueuesTab() {
   // from 'move', so saving a move queue always requires a fresh, deliberate acknowledgement
   // in *this* editing session rather than a checkbox that silently stays checked.
   const [moveConfirmed, setMoveConfirmed] = useState(false)
+  const postprocessSite = usePostprocessSiteSettings()
 
   const refresh = () => listQueues().then(setQueues)
 
@@ -212,6 +284,7 @@ export function QueuesTab() {
       auto_verify: queue.auto_verify,
       auto_extract: queue.auto_extract,
       auto_move: queue.auto_move,
+      auto_delete_archives: queue.auto_delete_archives,
       scan_interval_s: queue.scan_interval_s,
     })
   }
@@ -249,6 +322,7 @@ export function QueuesTab() {
       auto_verify: effectiveAutoVerify,
       auto_extract: form.auto_extract,
       auto_move: form.auto_move,
+      auto_delete_archives: form.auto_delete_archives,
       scan_interval_s: form.scan_interval_s,
     }
     try {
@@ -504,44 +578,81 @@ export function QueuesTab() {
             Post-processing (DESIGN.md §6) — off by default; also gated by the site-wide
             defaults in Settings → Post-processing
           </span>
-          <label className="flex items-center gap-2">
-            <input
-              type="checkbox"
-              checked={effectiveAutoVerify}
-              onChange={(e) => update('auto_verify', e.target.checked)}
-              disabled={form.sync_mode === 'move'}
+          <div className="flex flex-col gap-1">
+            <label className="flex items-center gap-2">
+              <input
+                type="checkbox"
+                checked={effectiveAutoVerify}
+                onChange={(e) => update('auto_verify', e.target.checked)}
+                disabled={form.sync_mode === 'move'}
+              />
+              <span className="text-sm text-zinc-700 dark:text-zinc-300">
+                Verify (.sfv/.md5, or hash-on-disk if enabled site-wide)
+                {form.sync_mode === 'move' && (
+                  <span className="ml-1 text-amber-600 dark:text-amber-400">
+                    — forced on for move (it gates the remote delete)
+                  </span>
+                )}
+              </span>
+            </label>
+            <PostprocessStepReadout
+              site={postprocessSite && postprocessSite.verify_enabled}
+              queueEnabled={form.auto_verify}
+              forcedOn={form.sync_mode === 'move'}
             />
-            <span className="text-sm text-zinc-700 dark:text-zinc-300">
-              Verify (.sfv/.md5, or hash-on-disk if enabled site-wide)
-              {form.sync_mode === 'move' && (
-                <span className="ml-1 text-amber-600 dark:text-amber-400">
-                  — forced on for move (it gates the remote delete)
-                </span>
-              )}
-            </span>
-          </label>
-          <label className="flex items-center gap-2">
-            <input
-              type="checkbox"
-              checked={form.auto_extract}
-              onChange={(e) => update('auto_extract', e.target.checked)}
+          </div>
+          <div className="flex flex-col gap-1">
+            <label className="flex items-center gap-2">
+              <input
+                type="checkbox"
+                checked={form.auto_extract}
+                onChange={(e) => update('auto_extract', e.target.checked)}
+              />
+              <span className="text-sm text-zinc-700 dark:text-zinc-300">
+                Extract archives (7zz — zip/7z/rar/rar5/tar/gz/bz2/xz)
+              </span>
+            </label>
+            <PostprocessStepReadout
+              site={postprocessSite && postprocessSite.extract_enabled}
+              queueEnabled={form.auto_extract}
             />
-            <span className="text-sm text-zinc-700 dark:text-zinc-300">
-              Extract archives (7zz — zip/7z/rar/rar5/tar/gz/bz2/xz)
-            </span>
-          </label>
-          <label className="flex items-center gap-2">
-            <input
-              type="checkbox"
-              checked={form.auto_move}
-              onChange={(e) => update('auto_move', e.target.checked)}
-              disabled={!form.staging_path}
+          </div>
+          <div className="flex flex-col gap-1">
+            <label className="flex items-center gap-2">
+              <input
+                type="checkbox"
+                checked={form.auto_delete_archives}
+                onChange={(e) => update('auto_delete_archives', e.target.checked)}
+                disabled={!form.auto_extract}
+              />
+              <span className="text-sm text-zinc-700 dark:text-zinc-300">
+                Delete archive volumes once they've extracted successfully
+                {!form.auto_extract && ' (turn on Extract above first)'}
+              </span>
+            </label>
+            <PostprocessStepReadout
+              site={postprocessSite && postprocessSite.delete_archives_after_extract}
+              queueEnabled={form.auto_delete_archives}
             />
-            <span className="text-sm text-zinc-700 dark:text-zinc-300">
-              Move to staging path once finished
-              {!form.staging_path && ' (set a staging path above first)'}
-            </span>
-          </label>
+          </div>
+          <div className="flex flex-col gap-1">
+            <label className="flex items-center gap-2">
+              <input
+                type="checkbox"
+                checked={form.auto_move}
+                onChange={(e) => update('auto_move', e.target.checked)}
+                disabled={!form.staging_path}
+              />
+              <span className="text-sm text-zinc-700 dark:text-zinc-300">
+                Move to staging path once finished
+                {!form.staging_path && ' (set a staging path above first)'}
+              </span>
+            </label>
+            <PostprocessStepReadout
+              site={postprocessSite && postprocessSite.move_enabled}
+              queueEnabled={form.auto_move}
+            />
+          </div>
         </div>
 
         {error && <p className="text-sm text-red-600 dark:text-red-400">{error}</p>}

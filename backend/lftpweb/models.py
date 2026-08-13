@@ -130,6 +130,12 @@ class PathQueueIn(BaseModel):
     auto_verify: bool = False
     auto_extract: bool = False
     auto_move: bool = False
+    # Migration 012 (prompts/2026-08-13-per-queue-archive-cleanup.md). Default off, same as the
+    # three above -- `PostprocessSettings.delete_archives_after_extract` shipped site-only
+    # (migration 010) and was the odd one out; this brings it in line with the other three's
+    # "toggleable globally and per path queue" shape (DESIGN.md §6). ANDed with the site-wide
+    # flag in `core/postprocess.py.process_item`, never a tri-state.
+    auto_delete_archives: bool = False
     # Migration 009 (prompts/done/2026-08-12-per-queue-scan-interval.md). `None` (the default,
     # and what an existing queue's row already has -- `ADD COLUMN` with no `DEFAULT` leaves it
     # NULL) means "use the site-wide `scan_interval_s` default (`config.py`, currently 30s)" --
@@ -171,7 +177,18 @@ class PostprocessSettingsOut(BaseModel):
 
 
 class PostprocessSettingsIn(PostprocessSettingsOut):
-    pass
+    """`PUT /api/settings/postprocess`'s body. **Any field this pair's own defaults cover
+    (`failed_retention_enabled`/`_days`, `delete_archives_after_extract`) that is genuinely
+    absent from the request JSON is merged with the previously-stored value, not silently reset
+    to the default above** (`api/settings.py.put_postprocess_settings`, fix,
+    2026-08-13/`prompts/2026-08-13-per-queue-archive-cleanup.md` -- found because
+    `failed_retention_enabled`/`_days` have no frontend field at all yet, so every save from
+    Settings -> Post-processing was already discarding them on every single request, not just a
+    hypothetical race). Every other field is required (no default), so FastAPI 422s before the
+    handler ever runs if one is missing -- the merge only ever has work to do for the pair
+    above, via `body.model_fields_set` (pydantic v2: which keys the *request* actually carried,
+    not which fields merely have a value).
+    """
 
 
 # --- Settings -> the settle gate (prompts/open-issues.md #2, `core/settle.py`) ----------
@@ -225,7 +242,10 @@ class RetentionSettingsOut(BaseModel):
 
 
 class RetentionSettingsIn(RetentionSettingsOut):
-    pass
+    """`PUT /api/settings/retention`'s body. Both fields above default, so `api/settings.py.
+    put_retention_settings` merges over the previously-stored settings for any field genuinely
+    absent from the request JSON rather than resetting it -- the same fix, for the same reason,
+    as `PostprocessSettingsIn`'s own docstring."""
 
 
 class RetentionPreviewRequest(BaseModel):

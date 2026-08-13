@@ -255,6 +255,36 @@ def test_new_queue_defaults_postprocess_toggles_off(isolated_config):
         assert queue["auto_verify"] is False
         assert queue["auto_extract"] is False
         assert queue["auto_move"] is False
+        # Migration 012, 2026-08-13: archive cleanup's per-queue half. Shipped site-only
+        # originally (migration 010) -- this closes that gap, so it must default off exactly
+        # like its three siblings above for an existing/newly-created queue alike.
+        assert queue["auto_delete_archives"] is False
+
+
+def test_queue_round_trips_auto_delete_archives(isolated_config):
+    """The per-queue half of archive cleanup (migration 012) round-trips through create and
+    update, the same as `auto_verify`/`auto_extract`/`auto_move`.
+    """
+    with TestClient(app) as client:
+        queue = _make_host_and_queue(client, auto_extract=True, auto_delete_archives=True)
+        assert queue["auto_delete_archives"] is True
+
+        resp = client.put(
+            f"/api/settings/queues/{queue['id']}",
+            json={
+                "name": queue["name"],
+                "remote_path": queue["remote_path"],
+                "local_path": queue["local_path"],
+                "auto_extract": True,
+                "auto_delete_archives": False,
+            },
+        )
+        assert resp.status_code == 200
+        assert resp.json()["auto_delete_archives"] is False
+
+        # Persisted, not just echoed back.
+        resp = client.get("/api/settings/queues")
+        assert resp.json()[0]["auto_delete_archives"] is False
 
 
 def test_postprocess_settings_round_trip_and_default_off(isolated_config):
@@ -322,6 +352,91 @@ def test_postprocess_settings_put_omitting_failed_retention_fields_keeps_them_of
         saved = resp.json()
         assert saved["failed_retention_enabled"] is False
         assert saved["failed_retention_days"] == 14.0
+
+
+def test_postprocess_settings_put_omitting_a_field_preserves_its_previous_value(
+    isolated_config,
+):
+    """The actual footgun (`prompts/2026-08-13-per-queue-archive-cleanup.md` item 3): once a
+    real, non-default value is stored, a later PUT that omits one of the three optional-default
+    fields must not silently reset it -- `api/settings.py.put_postprocess_settings` merges over
+    the stored settings via `body.model_fields_set` rather than replacing wholesale. Unlike
+    `test_postprocess_settings_put_omitting_failed_retention_fields_keeps_them_off` above (whose
+    "omitted -> off" assertion happens to coincide with the model default because nothing had
+    ever been saved yet), this test proves the merge, not the default.
+    """
+    with TestClient(app) as client:
+        # First, save real, non-default values for all three optional fields.
+        resp = client.put(
+            "/api/settings/postprocess",
+            json={
+                "verify_enabled": True,
+                "verify_hash_on_disk": False,
+                "extract_enabled": True,
+                "extract_target_dir": None,
+                "extract_passwords": [],
+                "failed_retention_enabled": True,
+                "failed_retention_days": 45.0,
+                "delete_archives_after_extract": True,
+                "move_enabled": False,
+                "concurrency": 1,
+            },
+        )
+        assert resp.status_code == 200
+
+        # Then PUT a body that omits every one of the three optional fields entirely -- the
+        # exact shape a pre-this-fix client (or the frontend, for the two fields it has never
+        # had a UI for) sends.
+        resp = client.put(
+            "/api/settings/postprocess",
+            json={
+                "verify_enabled": True,
+                "verify_hash_on_disk": True,  # also prove a *changed* required field applies
+                "extract_enabled": True,
+                "extract_target_dir": "/config/extracted",
+                "extract_passwords": ["hunter2"],
+                "move_enabled": True,
+                "concurrency": 2,
+            },
+        )
+        assert resp.status_code == 200
+        saved = resp.json()
+        # The omitted fields survived, not reset to their model defaults (False / 14.0 / False).
+        assert saved["failed_retention_enabled"] is True
+        assert saved["failed_retention_days"] == 45.0
+        assert saved["delete_archives_after_extract"] is True
+        # The fields the second PUT did supply took effect -- this is a merge, not "ignore the
+        # whole request."
+        assert saved["verify_hash_on_disk"] is True
+        assert saved["extract_target_dir"] == "/config/extracted"
+        assert saved["extract_passwords"] == ["hunter2"]
+        assert saved["move_enabled"] is True
+        assert saved["concurrency"] == 2
+
+        # Persisted, not just echoed back.
+        resp = client.get("/api/settings/postprocess")
+        assert resp.json() == saved
+
+
+def test_retention_settings_put_omitting_a_field_preserves_its_previous_value(isolated_config):
+    """`RetentionSettingsIn` is a worse instance of the same shape: *both* fields default, so
+    the whole body could previously be omitted and still 200, silently turning off local-data
+    retention. Found auditing other `*Settings` endpoints for the postprocess fix above; same
+    merge fix applied here (`api/settings.py.put_retention_settings`).
+    """
+    with TestClient(app) as client:
+        resp = client.put("/api/settings/retention", json={"enabled": True, "retention_days": 45.0})
+        assert resp.status_code == 200
+
+        # Omit `retention_days` entirely -- only `enabled` is in this request.
+        resp = client.put("/api/settings/retention", json={"enabled": True})
+        assert resp.status_code == 200
+        saved = resp.json()
+        assert saved["enabled"] is True
+        assert saved["retention_days"] == 45.0  # preserved, not reset to the 30.0 default
+
+        resp = client.get("/api/settings/retention")
+        assert resp.json() == saved
 
 
 # --- The settle gate (prompts/open-issues.md #2, `core/settle.py`) -----------------------

@@ -234,7 +234,7 @@ async def test_host(
 _QUEUE_SELECT_COLUMNS = (
     "id, host_id, name, remote_path, local_path, staging_path, enabled, sync_mode, "
     "auto_queue_enabled, auto_queue_patterns_only, auto_verify, auto_extract, auto_move, "
-    "scan_interval_s"
+    "auto_delete_archives, scan_interval_s"
 )
 
 
@@ -253,6 +253,7 @@ def _queue_out_from_row(row) -> PathQueueOut:
         auto_verify=bool(row["auto_verify"]),
         auto_extract=bool(row["auto_extract"]),
         auto_move=bool(row["auto_move"]),
+        auto_delete_archives=bool(row["auto_delete_archives"]),
         scan_interval_s=row["scan_interval_s"],
     )
 
@@ -325,8 +326,8 @@ async def create_queue(body: PathQueueIn, request: Request) -> PathQueueOut:
     cursor = await db.execute(
         "INSERT INTO path_queue (host_id, name, remote_path, local_path, staging_path, "
         "enabled, sync_mode, auto_queue_enabled, auto_queue_patterns_only, "
-        "auto_verify, auto_extract, auto_move, scan_interval_s) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "auto_verify, auto_extract, auto_move, auto_delete_archives, scan_interval_s) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             host_row["id"],
             body.name,
@@ -340,6 +341,7 @@ async def create_queue(body: PathQueueIn, request: Request) -> PathQueueOut:
             1 if _effective_auto_verify(body) else 0,
             1 if body.auto_extract else 0,
             1 if body.auto_move else 0,
+            1 if body.auto_delete_archives else 0,
             body.scan_interval_s,
         ),
     )
@@ -365,7 +367,8 @@ async def update_queue(queue_id: int, body: PathQueueIn, request: Request) -> Pa
     cursor = await db.execute(
         "UPDATE path_queue SET name = ?, remote_path = ?, local_path = ?, staging_path = ?, "
         "enabled = ?, sync_mode = ?, auto_queue_enabled = ?, auto_queue_patterns_only = ?, "
-        "auto_verify = ?, auto_extract = ?, auto_move = ?, scan_interval_s = ? WHERE id = ?",
+        "auto_verify = ?, auto_extract = ?, auto_move = ?, auto_delete_archives = ?, "
+        "scan_interval_s = ? WHERE id = ?",
         (
             body.name,
             body.remote_path,
@@ -378,6 +381,7 @@ async def update_queue(queue_id: int, body: PathQueueIn, request: Request) -> Pa
             1 if _effective_auto_verify(body) else 0,
             1 if body.auto_extract else 0,
             1 if body.auto_move else 0,
+            1 if body.auto_delete_archives else 0,
             body.scan_interval_s,
             queue_id,
         ),
@@ -596,17 +600,36 @@ async def get_postprocess_settings(request: Request) -> PostprocessSettingsOut:
 async def put_postprocess_settings(
     body: PostprocessSettingsIn, request: Request
 ) -> PostprocessSettingsOut:
+    """Merges over the previously-stored settings rather than replacing them wholesale --
+    `PostprocessSettingsIn`'s own docstring for why. `body.model_fields_set` (pydantic v2) is
+    which keys the *request JSON* actually carried; every field on this model except
+    `failed_retention_enabled`/`_days`/`delete_archives_after_extract` is required (no default),
+    so FastAPI itself 422s before this handler runs if any of those is missing -- the merge
+    below only ever has real work to do for that trio, and it costs nothing for a request that
+    (like the frontend's own) supplies every field: `provided` then contains all of them, and
+    every `field()` call below just returns `getattr(body, name)` unchanged.
+    """
+    current = await load_postprocess_settings(request.app.state.db)
+    provided = body.model_fields_set
+
+    def field(name: str, current_value):
+        return getattr(body, name) if name in provided else current_value
+
     settings = PostprocessSettings(
-        verify_enabled=body.verify_enabled,
-        verify_hash_on_disk=body.verify_hash_on_disk,
-        extract_enabled=body.extract_enabled,
-        extract_target_dir=body.extract_target_dir,
-        extract_passwords=tuple(body.extract_passwords),
-        failed_retention_enabled=body.failed_retention_enabled,
-        failed_retention_days=body.failed_retention_days,
-        delete_archives_after_extract=body.delete_archives_after_extract,
-        move_enabled=body.move_enabled,
-        concurrency=max(1, body.concurrency),
+        verify_enabled=field("verify_enabled", current.verify_enabled),
+        verify_hash_on_disk=field("verify_hash_on_disk", current.verify_hash_on_disk),
+        extract_enabled=field("extract_enabled", current.extract_enabled),
+        extract_target_dir=field("extract_target_dir", current.extract_target_dir),
+        extract_passwords=tuple(field("extract_passwords", list(current.extract_passwords))),
+        failed_retention_enabled=field(
+            "failed_retention_enabled", current.failed_retention_enabled
+        ),
+        failed_retention_days=field("failed_retention_days", current.failed_retention_days),
+        delete_archives_after_extract=field(
+            "delete_archives_after_extract", current.delete_archives_after_extract
+        ),
+        move_enabled=field("move_enabled", current.move_enabled),
+        concurrency=max(1, field("concurrency", current.concurrency)),
     )
     await save_postprocess_settings(request.app.state.db, settings)
     return _postprocess_out(settings)
@@ -686,8 +709,22 @@ async def get_retention_settings(request: Request) -> RetentionSettingsOut:
 async def put_retention_settings(
     body: RetentionSettingsIn, request: Request
 ) -> RetentionSettingsOut:
+    """Merges over the previously-stored settings, same shape and same reason as
+    `put_postprocess_settings` above -- **both** fields on `RetentionSettingsIn` default
+    (`enabled: bool = False`, `retention_days: float = 30.0`), so unlike `postprocess` this
+    endpoint's *entire* body could previously be omitted and still 200, silently turning off a
+    deletion feature already flagged as this project's one non-negotiable "ships off." Found
+    while auditing `*Settings` endpoints for the same shape as
+    `prompts/2026-08-13-per-queue-archive-cleanup.md`'s item 3; fixed here too since the fix is
+    identical and the risk (a destructive toggle silently reset) is the same class.
+    """
+    current = await local_delete.load_retention_settings(request.app.state.db)
+    provided = body.model_fields_set
     settings = local_delete.RetentionSettings(
-        enabled=body.enabled, retention_days=body.retention_days
+        enabled=body.enabled if "enabled" in provided else current.enabled,
+        retention_days=(
+            body.retention_days if "retention_days" in provided else current.retention_days
+        ),
     )
     await local_delete.save_retention_settings(request.app.state.db, settings)
     return RetentionSettingsOut(enabled=settings.enabled, retention_days=settings.retention_days)

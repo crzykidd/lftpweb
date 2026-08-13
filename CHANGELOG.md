@@ -269,6 +269,19 @@ alongside this list: several entries below ship with deliberate, documented limi
   the first time. `GET /api/history/jobs` gained an `item_id` filter to match
   `GET /api/history/events`'s existing one, so the drawer's history fetch doesn't have to
   pull a whole queue's jobs client-side.
+- **Archive cleanup after extraction is now a per-queue toggle too, and every post-processing
+  toggle now shows what its site-wide half currently resolves to** *(2026-08-13)*. It shipped
+  site-only (the entry above, `delete_archives_after_extract`) and was the one post-processing
+  step that didn't follow verify/extract/move's own "toggleable globally *and* per path queue"
+  shape — the user noticed after cleanup silently did nothing because the site-wide setting had
+  been switched off without them realising. `path_queue.auto_delete_archives` (migration 012,
+  **default off**, every existing queue unaffected) is ANDed with the site-wide flag exactly
+  like the other three. Settings → Queues now shows, next to every one of the four toggles —
+  not only the new one — whether the matching site-wide setting is on or off and therefore
+  whether the queue's own toggle is currently doing anything, with a link to Settings →
+  Post-processing; a `move`-mode queue's Verify readout says it always runs regardless of
+  either toggle, never "system setting: off," since it is the sole gate on the irreversible
+  remote delete.
 
 ### Changed
 
@@ -481,6 +494,29 @@ alongside this list: several entries below ship with deliberate, documented limi
   - A completed directory showed no size at all on a `move` queue, while every file inside it
     still did — files already fell back from a cleared `remote_size` to `local_size`;
     directories now do too.
+- **`PUT /api/settings/postprocess` and `PUT /api/settings/retention` could silently reset a
+  field a request genuinely omitted, rather than leaving it as previously saved** *(2026-08-13,
+  found while hardening archive cleanup's own settings)*. Every field on `PostprocessSettingsIn`
+  defaults except three (`failed_retention_enabled`/`_days`, `delete_archives_after_extract`),
+  and both fields on `RetentionSettingsIn` default — a request missing any of those got the
+  model's hardcoded default silently written over whatever was actually stored, no error, no
+  event. Concretely reachable today for `failed_retention_enabled`/`_days`: Settings →
+  Post-processing has no field for either (a pre-existing "backend first, UI catches up later"
+  gap), so every save from that page has always omitted both, discarding any value set directly
+  against the endpoint. Both endpoints now merge: a field present in the request is applied, a
+  field genuinely absent keeps its previously-stored value, using pydantic's own
+  `model_fields_set` to tell "omitted" apart from "sent." The literal race this was found
+  investigating — a save fired before the initial `GET` populates the form — turned out not to
+  be reachable in `PostProcessingTab.tsx` today (the Save button isn't in the DOM until loading
+  finishes either way), but a related gap was: a *failed* initial load left the form at empty
+  defaults with nothing telling the user, and Save fully clickable. The page now tracks a
+  successful load separately from "not loading," disables Save until one lands, and surfaces the
+  load error if it doesn't.
+- **The one branch in archive cleanup that left no trace at all** *(2026-08-13)*: every withheld
+  cleanup wrote an `event` row except "this item has no archives," the most common case by far
+  and, for that reason, deliberately still not an `event` (the volume would be almost pure
+  noise) — but it did not even log at debug level, so a user diagnosing "why didn't cleanup run"
+  had nothing to find. Now logs at debug.
 
 ### Security
 

@@ -6,6 +6,86 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-13 — Per-queue archive cleanup, the settings-merge fix, and what got left alone
+
+**Handoff prompt `prompts/2026-08-13-per-queue-archive-cleanup.md`, executed end to end.** The
+user asked, after archive cleanup silently did nothing because the site-wide setting had been
+switched off: "Do we want to make this an override on each queue? Or at least show 'System
+setting' in the queues?" Both, since archive cleanup (`4533617`) shipped site-only and was the
+one post-processing step that didn't follow verify/extract/move's own two-layer shape.
+
+**Per-queue toggle.** `path_queue.auto_delete_archives` (migration 012, default off — every
+existing queue keeps its current behavior), ANDed with `PostprocessSettings.
+delete_archives_after_extract` in `core/postprocess.py._do_extract`, the identical shape
+`_process_item`'s `verify_effective`/`extract_effective`/`move_effective` already use. No
+tri-state considered or built — the prompt was explicit, and the existing three-toggle pattern
+gave no reason to invent one.
+
+**The readout.** Settings → Queues now shows, next to *every* per-queue post-processing toggle
+(not only the new one — the user's question named all of them), whether the matching site-wide
+flag is on and therefore whether the queue's toggle currently does anything, with a link to
+Settings → Post-processing. The one wrinkle: a `move`-mode queue's Verify checkbox is already
+forced on and disabled regardless of either toggle (`sync_mode == 'move'` bypasses *both* layers
+in `process_item`, not just the per-queue one) — the readout for that case says "always runs,
+regardless," never "system setting: off," which would be a lie for exactly the queue where
+verification matters most (it gates the irreversible remote delete).
+
+**The silent-reset race — investigated, and mostly not what it looked like.** The prompt's
+hypothesis was a save fired before `PostProcessingTab.tsx`'s initial `GET` populates the form,
+sending the `EMPTY` constant's defaults over real settings. Traced it: `if (loading) return
+<p>Loading…</p>` keeps the Save button out of the DOM entirely until the initial fetch settles,
+success or failure — so the literal "clicked before the response arrived" race is not reachable
+in the code as it stands. What *is* reachable: that `useEffect` had no `.catch`, so a *failed*
+initial load (a transient 500, the backend not up yet) left `settings` at `EMPTY`, `loading`
+false, and nothing telling the user anything was wrong — Save fully clickable from a blank form.
+Fixed with a `loaded` flag set only on a successful fetch, Save disabled until it's true, and
+the load error surfaced.
+
+**A second, worse instance of the same bug class, found by inspection, not hypothesis.**
+`PostprocessSettingsIn`'s `failed_retention_enabled`/`failed_retention_days` have model
+defaults (unlike every other field) for exactly the reason `delete_archives_after_extract` does
+— "an old PUT body must not 422" — but neither has ever had a frontend field or a
+`PostprocessSettingsOut` TS type entry. That means every save from Settings → Post-processing,
+not just a mis-timed one, has always omitted both keys, and the endpoint's old
+replace-the-whole-row behavior silently reset them to their hardcoded defaults on every single
+save. Chose **API-side merge** over the frontend-only fix for this reason specifically: a
+frontend guard (form unsubmittable until loaded) does nothing for a field the frontend doesn't
+know exists at all. `api/settings.py.put_postprocess_settings` now loads the currently-stored
+settings first and, via pydantic v2's `body.model_fields_set`, applies only the fields the
+request actually carried — a field genuinely absent keeps its stored value instead of the
+model's default. Every field besides the three noted is required (no default), so FastAPI 422s
+before the handler runs if one is truly missing; the merge only ever has real work to do for
+that trio, and costs nothing when a client (like the frontend, for the fields it does send)
+supplies everything.
+
+**Applied the identical merge to `PUT /api/settings/retention` too**, found auditing other
+`*Settings` endpoints for the same shape: `RetentionSettingsIn`'s *both* fields default
+(`enabled`, `retention_days`), so its entire body could previously be omitted and still 200,
+turning off local-data retention with no error. Same fix, same file, same risk class
+(destructive deletion silently disabled) — judged "uniform and obvious" per the prompt's own
+instruction, unlike the rest of the audit below.
+
+**Audited, not fixed:** `SettleSettingsIn`/`AutoQueueSettingsIn` each have exactly one field, so
+there is no "one field explicit, the other silently reset" case to have — omitting the field
+*is* the whole request, and each default (`enabled=True`, `re_download_externally_removed=
+False`) already matches this project's own recommended value for that setting, so an accidental
+reset isn't even destructive. `AuthSettingsIn.proxy_header`/`proxy_trusted_cidrs` have the same
+default-field shape and materially higher stakes (an omitted trusted-CIDR list empties proxy-mode
+trust), but auth security semantics were judged out of this task's scope and not "obvious" to
+touch blindly — left for its own review. `BackupSettingsIn`/`TransferSettingsIn`/
+`MetricsSettingsIn` have no defaulted fields at all; not vulnerable to this shape.
+
+**The no-archives branch.** `core/local_delete.py.delete_extracted_archives`'s `if not
+archive_heads: return` had no event and no log line — the one silent path left after this
+feature's original review made every other withhold write an event. Given a debug-level log
+line rather than an event: `_do_extract` is this function's only caller today, and it already
+returns early (never calling this function at all) whenever `find_archives` comes back empty —
+so the branch is presently unreachable dead code from that caller, kept as defensive coverage
+for a future caller or an ordering change, and an event-per-scan would be near-pure noise for
+what is, structurally, the common case (most items have no archives).
+
+---
+
 ## 2026-08-13 — Delete-state truthfulness: four defects found within hours of shipping deletion
 
 **Handoff prompt `prompts/2026-08-13-delete-state-truthfulness.md`, executed end to end.** The

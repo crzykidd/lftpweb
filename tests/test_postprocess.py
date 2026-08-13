@@ -980,7 +980,14 @@ async def _make_db():
 
 
 async def _make_host_and_queue_rows(
-    db, *, sync_mode: str, auto_verify=0, auto_extract=0, auto_move=0, staging_path=None
+    db,
+    *,
+    sync_mode: str,
+    auto_verify=0,
+    auto_extract=0,
+    auto_move=0,
+    auto_delete_archives=0,
+    staging_path=None,
 ):
     cursor = await db.execute(
         "INSERT INTO host (name, address, port, username, auth_method, known_hosts_policy) "
@@ -989,8 +996,18 @@ async def _make_host_and_queue_rows(
     host_id = cursor.lastrowid
     cursor = await db.execute(
         "INSERT INTO path_queue (host_id, name, remote_path, local_path, staging_path, enabled, "
-        "sync_mode, auto_verify, auto_extract, auto_move) VALUES (?, 'q', '/data/pickup', ?, ?, 1, ?, ?, ?, ?)",
-        (host_id, "/local", staging_path, sync_mode, auto_verify, auto_extract, auto_move),
+        "sync_mode, auto_verify, auto_extract, auto_move, auto_delete_archives) "
+        "VALUES (?, 'q', '/data/pickup', ?, ?, 1, ?, ?, ?, ?, ?)",
+        (
+            host_id,
+            "/local",
+            staging_path,
+            sync_mode,
+            auto_verify,
+            auto_extract,
+            auto_move,
+            auto_delete_archives,
+        ),
     )
     queue_id = cursor.lastrowid
     await db.commit()
@@ -1645,7 +1662,9 @@ async def test_pipeline_deletes_every_archive_volume_after_success_and_preserves
         write_if_needed(str(local_root))
         item_dir = await _make_multivolume_rar_release(local_root)
 
-        _, queue_id = await _make_host_and_queue_rows(db, sync_mode="copy", auto_extract=1)
+        _, queue_id = await _make_host_and_queue_rows(
+            db, sync_mode="copy", auto_extract=1, auto_delete_archives=1
+        )
         await db.execute(
             "UPDATE path_queue SET local_path = ? WHERE id = ?", (str(local_root), queue_id)
         )
@@ -1684,6 +1703,61 @@ async def test_pipeline_deletes_every_archive_volume_after_success_and_preserves
         assert "archive_cleanup_withheld" not in kinds
     finally:
         await db.close()
+
+
+@pytestmark_unrar
+async def test_pipeline_and_gating_all_four_combinations(tmp_path):
+    """Item 1's own required test: archive cleanup (migration 012, 2026-08-13) is ANDed across
+    the site-wide flag and the queue's own `auto_delete_archives`, the identical shape
+    `verify`/`extract`/`move` already use -- runs only when *both* are on, exactly the same as
+    `test_pipeline_deletes_every_archive_volume_after_success_and_preserves_sidecar` (both on)
+    and `test_pipeline_default_off_leaves_archives_on_disk` (both off) already cover, plus the
+    two mixed combinations neither of those exercises.
+    """
+    for site_on, queue_on, expect_deleted in (
+        (True, True, True),
+        (True, False, False),
+        (False, True, False),
+        (False, False, False),
+    ):
+        db = await _make_db()
+        try:
+            local_root = tmp_path / f"local-{site_on}-{queue_on}"
+            local_root.mkdir()
+            write_if_needed(str(local_root))
+            item_dir = await _make_multivolume_rar_release(local_root)
+
+            _, queue_id = await _make_host_and_queue_rows(
+                db, sync_mode="copy", auto_extract=1, auto_delete_archives=int(queue_on)
+            )
+            await db.execute(
+                "UPDATE path_queue SET local_path = ? WHERE id = ?", (str(local_root), queue_id)
+            )
+            await db.commit()
+            item_id = await _make_item_row(db, queue_id, "Release", state="DOWNLOADED")
+            await db.execute("UPDATE item SET is_dir = 1 WHERE id = ?", (item_id,))
+            await db.commit()
+
+            pipeline = postprocess.PostprocessPipeline(
+                db=db, events=EventBus(), remote_pool=_FakeRemotePool(), host_provider=_async_host
+            )
+            settings = postprocess.PostprocessSettings(
+                extract_enabled=True, delete_archives_after_extract=site_on
+            )
+            await pipeline.process_item(item_id, settings)
+
+            item = await (
+                await db.execute("SELECT * FROM item WHERE id = ?", (item_id,))
+            ).fetchone()
+            assert item["state"] == "EXTRACTED", (site_on, queue_on, item["error_detail"])
+
+            still_there = (item_dir / "release.rar").exists()
+            assert still_there == (not expect_deleted), (site_on, queue_on)
+
+            deleted = await local_delete.load_deleted_archive_paths(db, queue_id)
+            assert bool(deleted) == expect_deleted, (site_on, queue_on)
+        finally:
+            await db.close()
 
 
 @pytestmark_unrar
@@ -1795,7 +1869,9 @@ async def test_pipeline_never_deletes_a_loose_top_level_archive_file(tmp_path):
         write_if_needed(str(local_root))
         (local_root / "release.rar").write_bytes(_RAR_SINGLE)
 
-        _, queue_id = await _make_host_and_queue_rows(db, sync_mode="copy", auto_extract=1)
+        _, queue_id = await _make_host_and_queue_rows(
+            db, sync_mode="copy", auto_extract=1, auto_delete_archives=1
+        )
         await db.execute(
             "UPDATE path_queue SET local_path = ? WHERE id = ?", (str(local_root), queue_id)
         )
@@ -1860,7 +1936,9 @@ async def test_move_mode_cleanup_runs_even_though_the_remote_copy_is_already_gon
         (item_dir / "checksums.sfv").write_bytes(sfv_content)
         total_bytes = len(_RAR_MULTIVOL_VOL1) + len(_RAR_MULTIVOL_VOL2) + len(sfv_content)
 
-        _, queue_id = await _make_host_and_queue_rows(db, sync_mode="move", auto_extract=1)
+        _, queue_id = await _make_host_and_queue_rows(
+            db, sync_mode="move", auto_extract=1, auto_delete_archives=1
+        )
         await db.execute(
             "UPDATE path_queue SET local_path = ? WHERE id = ?", (str(local_root), queue_id)
         )
@@ -1919,6 +1997,7 @@ async def test_cleanup_composes_with_the_relocate_step_leaving_no_orphans(tmp_pa
             sync_mode="copy",
             auto_extract=1,
             auto_move=1,
+            auto_delete_archives=1,
             staging_path=str(staging_root),
         )
         await db.execute(
@@ -1990,7 +2069,9 @@ async def _setup_extracted_and_cleaned_release(tmp_path):
     await _make_multivolume_rar_release(local_root)
     sfv_size = len(_sfv_bytes())
 
-    host_id, queue_id = await _make_host_and_queue_rows(db, sync_mode="copy", auto_extract=1)
+    host_id, queue_id = await _make_host_and_queue_rows(
+        db, sync_mode="copy", auto_extract=1, auto_delete_archives=1
+    )
     await db.execute(
         "UPDATE path_queue SET local_path = ? WHERE id = ?", (str(local_root), queue_id)
     )

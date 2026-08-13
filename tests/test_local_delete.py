@@ -1992,3 +1992,57 @@ async def test_a_suppressed_stopped_item_is_still_fully_protected_from_recomputa
         assert item["suppressed_reason"] == "user_stopped"
     finally:
         await db.close()
+
+
+# --- delete_extracted_archives -- the one withhold that used to leave no trace at all ----------
+#
+# (2026-08-13, prompts/2026-08-13-per-queue-archive-cleanup.md, item 4.) The full pipeline
+# (verify -> extract -> cleanup) is exercised through `PostprocessPipeline` in
+# tests/test_postprocess.py, which needs real `unrar`/`7zz` fixtures; this calls the primitive
+# directly with `archive_heads=()`, which needs neither.
+
+
+async def test_delete_extracted_archives_no_archives_logs_debug_not_an_event(tmp_path, caplog):
+    """`archive_heads=()` -- the one withhold that wrote neither an `event` row nor a log line
+    before this fix. Deliberately still no `event` here (the module-level comment above
+    `delete_extracted_archives` explains why: most items have no archives, so an event per scan
+    would be near-pure noise for the common case) -- only the debug line is new.
+
+    In the real pipeline (`core/postprocess.py._do_extract`) this branch is presently
+    unreachable: the only caller already returns early, before ever calling this function,
+    whenever `find_archives` comes back empty. Calling the primitive directly here is what
+    actually exercises it -- kept as defensive coverage for a future caller or ordering change,
+    per this task's own docs/decisions.md entry.
+    """
+    import logging
+
+    local_root = tmp_path / "local"
+    local_root.mkdir()
+    write_if_needed(str(local_root))
+    (local_root / "Release").mkdir()
+
+    db = await _make_db()
+    try:
+        queue_id = await _make_queue(db, local_root)
+        item_id = await _make_item(db, queue_id, "Release", is_dir=True)
+
+        with caplog.at_level(logging.DEBUG, logger="lftpweb.core.local_delete"):
+            result = await local_delete.delete_extracted_archives(
+                db,
+                item=await _item_row(db, item_id),
+                queue=await _queue_row(db, queue_id),
+                archive_heads=(),
+            )
+
+        assert result.deleted_rel_paths == ()
+        assert result.bytes_freed == 0
+        assert result.withheld_reason is None
+
+        events = await _events_for(db, item_id)
+        assert not events, "no archives is the common case -- must not write an event row"
+
+        assert any(
+            "no archives to clean up" in record.message for record in caplog.records
+        ), "the one withhold that used to leave no trace at all must at least log at debug"
+    finally:
+        await db.close()

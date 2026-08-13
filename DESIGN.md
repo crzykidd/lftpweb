@@ -1074,13 +1074,20 @@ configurable age exists and, like every other new capability, ships off. Unatten
 the last place to grant an exception for "the containment check is solid."
 
 **Deleting the archives after a successful extraction is a separate, off-by-default option**
-(`PostprocessSettings.delete_archives_after_extract`). When on, every file belonging to each
-extracted archive — including a multi-volume rar's continuation volumes, not just the head — is
-removed once extraction reports `EXTRACTED`; nothing is removed on `EXTRACT_FAILED` or a
-precondition failure, and non-archive files (`.nfo`, `.sfv`/`.md5`, samples, subtitles) are
-never touched. It only ever acts on a **directory** item — a loose top-level archive file is
-left alone with a withheld-cleanup event, since removing its one file would be removing the
-whole item, which is the local-delete primitive's job and not this one's.
+(`PostprocessSettings.delete_archives_after_extract`, ANDed with a queue's own
+`auto_delete_archives` column — migration 012, 2026-08-13 — the same two-layer shape as
+verify/extract/move above; it shipped site-only in migration 010 and was the odd one out until
+this fix). When on at both layers, every file belonging to each extracted archive — including a
+multi-volume rar's continuation volumes, not just the head — is removed once extraction reports
+`EXTRACTED`; nothing is removed on `EXTRACT_FAILED` or a precondition failure, and non-archive
+files (`.nfo`, `.sfv`/`.md5`, samples, subtitles) are never touched. It only ever acts on a
+**directory** item — a loose top-level archive file is left alone with a withheld-cleanup event,
+since removing its one file would be removing the whole item, which is the local-delete
+primitive's job and not this one's. Settings → Queues shows, next to every per-queue
+post-processing toggle (not only this one), what the matching site-wide flag currently resolves
+to — a per-queue toggle being on while the site-wide flag is off is otherwise invisible on that
+page, and archive cleanup is the most destructive of the four to get wrong silently (§7 below:
+on a `move` queue it can be the last copy of an archive's compressed bytes anywhere).
 
 The naive version of this feature is an infinite loop, and avoiding it is the whole design.
 Deleting the archives drops the item's local byte total below its remote total, which reads

@@ -95,6 +95,10 @@ export interface PathQueueIn {
   auto_verify: boolean
   auto_extract: boolean
   auto_move: boolean
+  // Migration 012 (2026-08-13). Default off, same shape as the three above -- archive cleanup
+  // (Settings -> Post-processing -> Extract) shipped site-only and was the odd one out; this
+  // is its per-queue half, ANDed with the site-wide flag on the backend.
+  auto_delete_archives: boolean
   // Migration 009 (prompts/done/2026-08-12-per-queue-scan-interval.md). `null` -- the default,
   // and what an existing queue already has -- means "use the site-wide default (30s)"; `0`
   // means on-demand only (no timer; "Rescan now" and auto-queue-driving passes still work when
