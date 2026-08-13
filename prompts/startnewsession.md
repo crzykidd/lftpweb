@@ -201,6 +201,38 @@ call site. `snapshot()` re-reads the database (and became `async`) because write
 Before this, a `REMOVED_LOCAL` item was published as `REMOTE_ONLY` — Queue button and all —
 since phase 4, and REST and the socket could disagree about the same item.
 
+### 🔴 KNOWN BUG, unfixed, shipped in `:dev` — fix this first
+
+**Scheduled backups are broken by a race that CI caught on `fe80aaf`.**
+`tests/test_backup_api.py::test_backup_now_creates_and_lists_and_downloads` fails in CI with
+`sqlite3.OperationalError: cannot VACUUM from within a transaction`. It passes locally — this
+is timing-dependent, so **a green local run proves nothing here.**
+
+**Mechanism** (reproduced deterministically, not theorised): `core/backup.py.create_backup`
+runs `VACUUM INTO` on the **shared application connection**, and `VACUUM` cannot run inside a
+transaction. Every writer holds one between its `execute` and its `commit`. Reproduction —
+insert a row without committing, then call `create_backup`, and it raises every time:
+
+```
+in_transaction: True
+BACKUP FAILED: OperationalError cannot VACUUM from within a transaction
+```
+
+**The race has existed since phase 7**, but writes used to be event-driven (scans, transfers)
+so the window was narrow and nobody hit it. The 2026-08-12 metrics sampler writes a heartbeat
+**every 30 seconds unconditionally, including when completely idle**, which turned it from
+rare into routine. **Scheduled backups default ON (daily, keep 7)**, so a real instance starts
+silently failing its nightly backup. The pre-migration backup in `db.py.migrate()` runs before
+the background loops start, so it is *probably* safe — verify rather than assume.
+
+**The fix** (agreed direction, not yet written): give `VACUUM INTO` its own connection, so it
+cannot inherit anyone else's transaction state. `db.py.db_path(config_dir)` gives the path;
+WAL mode makes a second connection safe. Committing first and then vacuuming is **not**
+sufficient — another coroutine can open a transaction between the commit and the `VACUUM`.
+Add the reproduction above as a regression test.
+
+`:dev` images were published from `fe80aaf`, so the currently-pulled `:dev` contains this bug.
+
 ### ⚠ Open items awaiting the user — updated 2026-08-12 (post-phase-9 session)
 
 They stay in this file until the user resolves them, not until the phase that raised them

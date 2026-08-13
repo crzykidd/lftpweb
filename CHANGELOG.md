@@ -23,11 +23,10 @@ Skeleton for the next roll:
 
 ### Added
 
-Everything below reflects `DESIGN.md` §13 build phases 1–9 — **all nine are built**, matching
-the state `README.md` describes. Nothing here has been released; `0.0.1` remains the
-in-development version. Read `README.md`'s "Known gaps" alongside this list: several entries
-below ship with deliberate, documented limitations, and **no UI screen in this project has
-ever been opened in a browser**.
+Everything below reflects `DESIGN.md` §13 build phases 1–9 — **all nine are built** — plus a
+post-phase-9 session on 2026-08-12 (its entries are marked *(2026-08-12)*). Nothing here has
+been released; `0.0.1` remains the in-development version. Read `README.md`'s "Known gaps"
+alongside this list: several entries below ship with deliberate, documented limitations.
 
 - **Phase 1 — skeleton + container.** FastAPI + SQLite backend, `host` / `path_queue`
   schema, `/api/health`, both production and development `docker compose` files, and the
@@ -72,12 +71,34 @@ ever been opened in a browser**.
 - **Phase 9 — polish.** Files-page text/state filters, honest partial-failure reporting on
   bulk actions ("7 of 10 queued, these 3 failed because …"), and a seedbox-reachability /
   scheduler-liveness readout in the stats header.
+- **A Dashboard page with throughput charts** *(2026-08-12)*. Bytes transferred per hour over
+  the last 24 hours, and transfer speed over a selectable 1 h / 12 h / 24 h window, both
+  hand-rolled SVG with no charting dependency. Backed by a new per-queue sample store
+  (30-second interval, 7-day retention, configurable to 30) that also distinguishes **idle
+  from down** — an instance that was stopped renders as a gap, never a flat zero line.
+- **Settings → Transfer** *(2026-08-12)*. Every site-level bandwidth, concurrency, fast-lane
+  and retry knob, plus the free-text "extra lftp settings" box — previously reachable only by
+  hand-crafting HTTP requests despite the API existing since phase 3a. Includes §9.3's live
+  worst-case connection-count readout ("2 jobs × 4 parallel × 4 pget-n = 32 concurrent SFTP
+  sessions"), since those three numbers multiply silently and seedboxes refuse connections
+  well below what the inputs accept.
+- **Expand all / Collapse all** on the Files tree, and the **queue name on each Transfers
+  row** *(2026-08-12)*.
 
 ### Changed
 
 - **`sync_mode = 'move'` went from stored-but-inert to fully live** when phase 5 shipped.
   An existing queue already configured for `move` begins deleting verified remote copies
   with no further action — review any stored `move` queue before pulling this.
+- **Extraction now stages into `_UNPACK_<name>` and merges into place only on full success**
+  *(2026-08-12)*; a failure leaves `_FAILED_<name>` as evidence. Extraction was the one step
+  that wrote files under their *final* names while incomplete, which meant Sonarr/Radarr could
+  import a half-extracted release — both prefixes are the convention those tools already skip.
+  Downloads were never exposed this way (`xfer:use-temp-file`).
+- **The `item` table is now the single authority for item state** *(2026-08-12)*. The
+  WebSocket, its connect-time snapshot, and `GET /api/files` all publish a projection read
+  back from the database rather than the reconciler's structural reading, so the REST view and
+  the live view can no longer disagree about the same item.
 
 ### Fixed
 
@@ -94,6 +115,44 @@ ever been opened in a browser**.
   partial scan with a surfaced warning.
 - The `README.md` volume table described `/staging` and `/downloads` backwards relative to
   what post-processing actually does.
+- **Post-processing outcomes were erased ~30 seconds after being set** *(2026-08-12)*. The
+  periodic rescan overwrote every §6 state with a freshly computed structural one, so a
+  verified, extracted release read as plain `DOWNLOADED` within half a minute — and, worse,
+  **`CORRUPT` and `EXTRACT_FAILED` disappeared on their own** before anyone could see them.
+  Outcomes now win over a fresh `DOWNLOADED` while the content is present, `PARTIAL` still
+  beats them, and absence still reaches `REMOVED_LOCAL` through the grace period. Present
+  since phase 5.
+- **A `REMOVED_LOCAL` item was published to the UI as `REMOTE_ONLY`** — Queue button and all —
+  because the WebSocket carried the structural reading rather than what was persisted
+  *(2026-08-12)*. Present since phase 4.
+- **An empty remote directory reported itself as `DOWNLOADED`** when nothing had been
+  downloaded *(2026-08-12)*, because a directory with no files that count is vacuously
+  complete. Now `REMOTE_ONLY` until mirrored — while a directory whose children are *all
+  excluded* by a pattern still reads `DOWNLOADED`, which is what stops a filtered release
+  being re-queued forever.
+- **lftpweb's own mount sentinel (`.lftpweb-mount-ok`) appeared in the Files tree** as a
+  local-only file the remote was missing *(2026-08-12)*.
+- **The development container could not transfer anything** *(2026-08-12)*: the `dev` image
+  shipped without `lftp`, `ssh` or `7zz`, had no `/etc/passwd` entry for the running uid (which
+  OpenSSH fatally requires), and could not write `/run/lftpweb`. Scanning worked throughout, so
+  the environment looked healthy until the first Queue click. Production was unaffected in all
+  three cases. Also: the Vite dev proxy never forwarded the WebSocket upgrade, so the Files
+  page connected to nothing while every REST call succeeded.
+- **Application logs were 99.8% library noise** *(2026-08-12)*: `LFTPWEB_LOG_LEVEL=DEBUG` set
+  the *root* logger, so `aiosqlite` logged every statement twice — measured 37,388 library
+  lines against 1 from lftpweb itself, on a rotating handler whose fixed budget meant that
+  chatter evicted anything an incident would need. Third-party loggers now have floors, lifted
+  per-library with `LFTPWEB_DEBUG_LIBS`.
+
+### Known issues
+
+- **Scheduled backups are broken** *(found 2026-08-12, unfixed)*. `VACUUM INTO` runs on the
+  shared application connection and cannot execute inside a transaction, so a backup taken
+  while any other write sits between its statement and its commit fails with
+  `cannot VACUUM from within a transaction`. The race dates from phase 7 but became routine
+  when the metrics sampler began writing a heartbeat every 30 seconds. Backups default on, so
+  an unattended instance fails its nightly backup silently. Reproduction and the agreed fix
+  are in `prompts/startnewsession.md`.
 
 ### Security
 
