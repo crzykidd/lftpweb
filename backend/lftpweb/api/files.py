@@ -21,7 +21,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Request
 
-from lftpweb.core.itemview import ITEM_VIEW_COLUMNS, item_view
+from lftpweb.core.itemview import ITEM_VIEW_COLUMNS_QUALIFIED, item_view
 from lftpweb.models import FileNode, FilesResponse, QueueFiles
 
 router = APIRouter(prefix="/api/files")
@@ -34,8 +34,18 @@ async def get_files(request: Request) -> FilesResponse:
     queues: list[QueueFiles] = []
 
     for queue_id, meta in engine.queue_meta.items():
+        # `LEFT JOIN item_settle` (2026-08-13, prompts/2026-08-13-files-ux-pass.md item 3): the
+        # same join and reasoning as `core/engine.py._project`, which this endpoint otherwise
+        # duplicates by design (this module's own docstring) -- both must agree on what a row's
+        # settle countdown looks like.
         cursor = await db.execute(
-            f"SELECT {ITEM_VIEW_COLUMNS} FROM item WHERE queue_id = ? ORDER BY rel_path",  # noqa: S608 - a module constant, not user input
+            f"SELECT {ITEM_VIEW_COLUMNS_QUALIFIED}, "  # noqa: S608 - a module constant, not user input
+            "settle.matched_scans AS settle_matched_scans, "
+            "settle.updated_at AS settle_first_matched_at "
+            "FROM item "
+            "LEFT JOIN item_settle AS settle "
+            "ON settle.queue_id = item.queue_id AND settle.rel_path = item.rel_path "
+            "WHERE item.queue_id = ? ORDER BY item.rel_path",
             (queue_id,),
         )
         rows = await cursor.fetchall()

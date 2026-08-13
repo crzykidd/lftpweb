@@ -5,6 +5,7 @@ import { BytesPerHourChart } from '../components/charts/BytesPerHourChart'
 import { SpeedLineChart } from '../components/charts/SpeedLineChart'
 import { assignQueueColorSlots, colorVarForSlot } from '../components/charts/queueColors'
 import { usePoll } from '../hooks/usePoll'
+import { readLocalStorage, writeLocalStorage } from '../lib/storage'
 
 const RANGES: { value: MetricsRange; label: string }[] = [
   { value: '1h', label: '1h' },
@@ -22,6 +23,14 @@ const POLL_INTERVAL_MS = 60_000
 const selectClasses =
   'rounded-md border border-zinc-300 bg-white px-2.5 py-1.5 text-sm text-zinc-900 outline-none focus:border-zinc-500 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100'
 
+// The remembered timeframe (2026-08-13, prompts/2026-08-13-files-ux-pass.md item 5) -- same
+// `lib/storage.ts` helper the Files page's sort/collapse preferences already use, not a second
+// one, with the same "a preference read/write failing must never break the page" guarantee.
+const RANGE_VALUES: MetricsRange[] = ['1h', '12h', '24h']
+function isMetricsRange(value: unknown): value is MetricsRange {
+  return typeof value === 'string' && (RANGE_VALUES as string[]).includes(value)
+}
+
 /** DESIGN.md — new "Dashboard" page proposed alongside this task (docs/decisions.md); not an
  * expansion of the header stats (decision 4) -- a new page, so the header doesn't try to
  * cram a chart into a single row of chrome. Two hand-rolled SVG charts, both fed by
@@ -30,7 +39,17 @@ const selectClasses =
  */
 export function DashboardPage() {
   const [queues, setQueues] = useState<PathQueueOut[]>([])
-  const [range, setRange] = useState<MetricsRange>('24h')
+  // Read synchronously in the initial `useState`, not a `useEffect` (2026-08-13, item 5) -- a
+  // `useEffect` would paint the default range first and then jump to the saved one once it
+  // runs, which is exactly the flash the task's prompt calls out ("read it synchronously...
+  // or the chart renders one timeframe and then jumps").
+  const [range, setRangeState] = useState<MetricsRange>(
+    () => readLocalStorage('dashboard.range', isMetricsRange) ?? '24h',
+  )
+  const setRange = (next: MetricsRange) => {
+    setRangeState(next)
+    writeLocalStorage('dashboard.range', next)
+  }
   const [queueId, setQueueId] = useState<number | undefined>(undefined)
 
   useEffect(() => {

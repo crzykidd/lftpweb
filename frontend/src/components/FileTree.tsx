@@ -1,8 +1,8 @@
 import { useVirtualizer } from '@tanstack/react-virtual'
 import { useEffect, useMemo, useReducer, useRef, useState } from 'react'
-import { deleteItem, queueItem, stopItem } from '../api/client'
-import type { FileNode } from '../api/types'
-import { formatBytes, formatPercent, percentValue, stateAgeLabel } from '../lib/format'
+import { deleteItem, getSettleSettings, queueItem, stopItem } from '../api/client'
+import type { FileNode, SettleSettingsOut } from '../api/types'
+import { formatBytes, formatPercent, percentValue, settleWaitLabel, stateAgeLabel } from '../lib/format'
 import { readLocalStorage, writeLocalStorage } from '../lib/storage'
 import { DetailButton, LifecycleIcons } from './LifecycleIcons'
 import { ItemDrawer } from './ItemDrawer'
@@ -112,6 +112,53 @@ const SORT_LABELS: Record<SortKey, string> = {
   size: 'Size',
   state_changed_at: 'Last change',
   percent: '% complete',
+}
+
+/** Column header, itself the sort control (2026-08-13, prompts/2026-08-13-files-ux-pass.md
+ * item 1) -- replaces the previous separate "Sort by" dropdown plus asc/desc toggle button.
+ * Click sorts by this column; click again reverses direction, the conventional shape the task's
+ * own prompt asked for rather than a new affordance. A caret next to the label marks the active
+ * column and its direction -- `▲`/`▼`, the same style of glyph this file already uses for the
+ * collapse arrows (`▸`/`▾`) rather than reaching for an icon. `title` carries the full "Last
+ * change"/"% complete" wording (`SORT_LABELS`) even where the header's own visible text is
+ * shorter ("Changed"/"Status") so the column's real sort key is still discoverable on hover.
+ * A header that isn't sortable is a plain `<span>` (unchanged, below), not this component --
+ * "must not look clickable" from the same prompt.
+ */
+function SortHeaderButton({
+  sortKey,
+  label,
+  title,
+  sortPref,
+  onSort,
+  className,
+}: {
+  sortKey: SortKey
+  label: string
+  title?: string
+  sortPref: SortPreference
+  onSort: (key: SortKey) => void
+  className: string
+}) {
+  const active = sortPref.key === sortKey
+  return (
+    <button
+      type="button"
+      onClick={() => onSort(sortKey)}
+      title={title}
+      aria-label={
+        active
+          ? `Sort by ${SORT_LABELS[sortKey]}, ${sortPref.dir === 'asc' ? 'ascending' : 'descending'} -- click to reverse`
+          : `Sort by ${SORT_LABELS[sortKey]}`
+      }
+      className={`flex items-center gap-0.5 truncate hover:text-zinc-900 dark:hover:text-zinc-100 ${
+        active ? 'text-zinc-900 dark:text-zinc-100' : ''
+      } ${className}`}
+    >
+      {label}
+      {active && <span aria-hidden="true">{sortPref.dir === 'asc' ? '▲' : '▼'}</span>}
+    </button>
+  )
 }
 
 function sortValue(entry: TreeEntry, key: SortKey): string | number | null {
@@ -325,6 +372,56 @@ function hoverTooltip(entry: TreeEntry): string {
   return lines.join('\n')
 }
 
+// --- Facet filter (2026-08-13, prompts/2026-08-13-files-ux-pass.md item 2): replaces the
+// previous "Missing only" checkbox -- a real diagnostic (`downloaded_at` set but no local
+// presence, the *arr-import case) that the user could not tell the meaning of from its name
+// alone, which is the whole verdict on it. A dropdown over the lifecycle facets that already
+// exist (`core/itemview.py`, `LifecycleIcons.tsx`) instead of a second, parallel filtering
+// mechanism -- composes with the text/state filters through the same `visiblePaths` set below.
+
+type FacetFilter = '' | 'has_remote' | 'has_local' | 'extracted' | 'not_extracted' | 'missing_locally'
+
+const FACET_FILTER_LABELS: Record<FacetFilter, string> = {
+  '': 'All items',
+  has_remote: 'Has remote copy',
+  has_local: 'Has local copy',
+  extracted: 'Extracted',
+  not_extracted: 'Not extracted',
+  // Names itself, unlike the checkbox it replaces -- the exact behavior the old "Missing only"
+  // checkbox had (`downloaded_at` set, `facets.local.reason === 'missing'`), just findable now.
+  missing_locally: 'Downloaded but missing locally',
+}
+
+const FACET_FILTER_VALUES: FacetFilter[] = [
+  '',
+  'has_remote',
+  'has_local',
+  'extracted',
+  'not_extracted',
+  'missing_locally',
+]
+
+/** One predicate per facet-filter option, each keyed off `core/itemview.py`'s own
+ * `level`/`reason` codes rather than re-deriving presence from raw bytes here -- the frontend
+ * composes what the backend already classified, it doesn't reclassify.
+ */
+function matchesFacetFilter(entry: TreeEntry, filter: FacetFilter): boolean {
+  switch (filter) {
+    case '':
+      return true
+    case 'has_remote':
+      return entry.facets.remote.reason === 'present'
+    case 'has_local':
+      return entry.facets.local.level !== 'dim'
+    case 'extracted':
+      return entry.facets.extracted.reason === 'extracted'
+    case 'not_extracted':
+      return entry.facets.extracted.reason !== 'extracted'
+    case 'missing_locally':
+      return entry.downloaded_at != null && entry.facets.local.reason === 'missing'
+  }
+}
+
 interface RowProps {
   entry: TreeEntry
   isCollapsed: boolean
@@ -335,6 +432,10 @@ interface RowProps {
   onDeleteRequest: (entry: TreeEntry) => void
   onOpenDrawer: (entry: TreeEntry) => void
   actionBusy: boolean
+  // The settle gate's site-wide constants (2026-08-13, item 3) -- fetched once by `FileTree`,
+  // threaded down rather than re-fetched per row. See that fetch's own comment for the `null`
+  // cases.
+  settleSettings: SettleSettingsOut | null
 }
 
 function Row({
@@ -347,6 +448,7 @@ function Row({
   onDeleteRequest,
   onOpenDrawer,
   actionBusy,
+  settleSettings,
 }: RowProps) {
   const size = nodeDisplaySize(entry)
   const action = rowAction(entry)
@@ -359,6 +461,10 @@ function Row({
   // for the same item is already withheld server-side (`DeleteInFlight`), but there's no
   // reason to invite the click.
   const isRemoving = entry.substate === 'removing'
+  // The settle gate's wait (2026-08-13, item 3): same shape as `isRemoving` above -- a display
+  // substitution over the chip, not a change to `entry.state` itself, which stays REMOTE_ONLY
+  // server-side for the duration (`core/settle.py`).
+  const isSettling = entry.state === 'REMOTE_ONLY' && entry.substate === 'settling'
 
   return (
     <div
@@ -404,25 +510,22 @@ function Row({
         {size != null ? formatBytes(size) : '—'}
       </span>
       <span className="w-28 shrink-0 text-right">
+        {/* The settle gate's wait (2026-08-13, item 3): was a 6px dot next to the chip
+            (effectively invisible) -- now a readable substitution over the chip itself, the
+            same substitution shape `isRemoving`/REMOVING above already established, with a
+            countdown ("1 of 2 scans, 35s of 60s") rather than a bare word. */}
         <StateChip
-          state={isRemoving ? 'REMOVING' : entry.state}
-          percent={isRemoving ? null : stateProgressPercent(entry)}
+          state={isRemoving ? 'REMOVING' : isSettling ? 'SETTLING' : entry.state}
+          percent={isRemoving || isSettling ? null : stateProgressPercent(entry)}
+          label={isSettling ? settleWaitLabel(entry, settleSettings) : undefined}
         />
-        {/* The settle gate (prompts/open-issues.md #2): most REMOTE_ONLY items pass through
-            this on every first sighting, so it's deliberately quiet -- a small dot, not a
-            second chip -- rather than something that reads as a problem. */}
-        {entry.state === 'REMOTE_ONLY' && entry.substate === 'settling' && (
-          <span
-            className="ml-1 inline-block h-1.5 w-1.5 rounded-full bg-sky-400 align-middle dark:bg-sky-500"
-            title="Waiting for another scan to confirm this item has stopped changing before it's queued"
-          />
-        )}
       </span>
       {/* Lifecycle icons (2026-08-13): R/L/V/E, one glyph per `entry.facets`
           (`core/itemview.py`) -- the accumulated lifecycle, alongside the state chip's current
-          verb rather than folded into it. */}
+          verb rather than folded into it. `settle` threads through to `LifecycleIcons`'s own
+          settle-gate override on R (its own docstring). */}
       <span className="flex w-20 shrink-0 justify-end">
-        <LifecycleIcons node={entry} />
+        <LifecycleIcons node={entry} settle={settleSettings} />
       </span>
       {/* migration 006's `state_changed_at`: "when did this row last move," labeled by the
           state it's already showing rather than a second, redundant chip. Absolute time in
@@ -511,6 +614,22 @@ export function FileTree({ nodes }: { nodes: FileNode[] }) {
     return () => clearInterval(id)
   }, [])
 
+  // The settle gate's own constants (2026-08-13, item 3) -- `REQUIRED_SETTLE_SCANS`/
+  // `SETTLE_MIN_AGE_S`, fetched once for the whole tree via the existing `GET
+  // /api/settings/settle` endpoint (already built for Settings -> Transfer's not-yet-existing
+  // UI), not per row: they're site-wide constants, not something that varies row to row.
+  // `null` until the fetch resolves, or forever on failure -- `settleWaitLabel`
+  // (`LifecycleIcons.tsx`) degrades to a bare "Waiting for changes" either way, never blocking
+  // the tree from rendering.
+  const [settleSettings, setSettleSettings] = useState<SettleSettingsOut | null>(null)
+  useEffect(() => {
+    getSettleSettings()
+      .then(setSettleSettings)
+      .catch(() => {
+        // Degrades gracefully -- see the comment above.
+      })
+  }, [])
+
   // Sort preference (2026-08-13): read synchronously in the initial `useState`, not a
   // `useEffect`, or the tree paints in the default order and then snaps into the saved one on
   // first load. Same storage helper and failure handling as the collapse preference below --
@@ -521,6 +640,13 @@ export function FileTree({ nodes }: { nodes: FileNode[] }) {
   const setSort = (next: SortPreference) => {
     setSortPref(next)
     writeLocalStorage('files.sort', next)
+  }
+  // The header buttons' own click handler (2026-08-13, item 1): clicking the active column's
+  // header reverses direction; clicking a different column switches to it, ascending -- the
+  // conventional shape the task's own prompt asked for ("not sure on where to put asc/desc...
+  // do the conventional thing").
+  const toggleSort = (key: SortKey) => {
+    setSort(sortPref.key === key ? { key, dir: sortPref.dir === 'asc' ? 'desc' : 'asc' } : { key, dir: 'asc' })
   }
 
   const tree = useMemo(
@@ -550,11 +676,10 @@ export function FileTree({ nodes }: { nodes: FileNode[] }) {
   const [bulkOutcome, setBulkOutcome] = useState<BulkOutcome | null>(null)
   const [searchText, setSearchText] = useState('')
   const [stateFilter, setStateFilter] = useState('')
-  // The *arr-import case (item 8, prompts/2026-08-13-lifecycle-icons.md): an item with a
-  // download history but no local presence right now (`core/itemview.py`'s "local" facet
-  // reads `reason: "missing"` -- distinct from "never downloaded," which this checkbox does
-  // not match). Composes with the text/state filters below via the same `visiblePaths` set.
-  const [missingOnly, setMissingOnly] = useState(false)
+  // The facet filter (2026-08-13): replaces "Missing only" -- see the module-level comment on
+  // `FacetFilter` above for why. Composes with the text/state filters below via the same
+  // `visiblePaths` set.
+  const [facetFilter, setFacetFilter] = useState<FacetFilter>('')
   // Delete is irreversible (Queue/Stop are not) -- a confirmation step sits between "the user
   // asked to delete" and "anything actually runs," for both the per-row button and the bulk
   // action. `null` = no pending confirmation; otherwise the exact entries about to be deleted,
@@ -578,7 +703,7 @@ export function FileTree({ nodes }: { nodes: FileNode[] }) {
     [nodes],
   )
 
-  const filtersActive = stateFilter !== '' || searchText.trim() !== '' || missingOnly
+  const filtersActive = stateFilter !== '' || searchText.trim() !== '' || facetFilter !== ''
 
   // Whether there is any directory to fold/unfold at all -- drives disabling Expand/Collapse
   // all the same way other controls on this page disable for an empty state, rather than a
@@ -608,9 +733,7 @@ export function FileTree({ nodes }: { nodes: FileNode[] }) {
     const visible = new Set<string>()
     for (const entry of fullFlat) {
       if (stateFilter && entry.state !== stateFilter) continue
-      if (missingOnly && !(entry.downloaded_at != null && entry.facets.local.reason === 'missing')) {
-        continue
-      }
+      if (!matchesFacetFilter(entry, facetFilter)) continue
       if (needle && !entry.name.toLowerCase().includes(needle) && !entry.rel_path.toLowerCase().includes(needle)) {
         continue
       }
@@ -622,7 +745,7 @@ export function FileTree({ nodes }: { nodes: FileNode[] }) {
       }
     }
     return visible
-  }, [filtersActive, fullFlat, missingOnly, searchText, stateFilter])
+  }, [filtersActive, fullFlat, facetFilter, searchText, stateFilter])
 
   const flat = useMemo(() => {
     if (!filtersActive || visiblePaths == null) return flatten(tree, isPathCollapsed)
@@ -802,39 +925,20 @@ export function FileTree({ nodes }: { nodes: FileNode[] }) {
             </option>
           ))}
         </select>
-        <label className="flex items-center gap-1.5 text-xs font-medium text-zinc-700 dark:text-zinc-200">
-          <input
-            type="checkbox"
-            checked={missingOnly}
-            onChange={(e) => setMissingOnly(e.target.checked)}
-          />
-          Missing only
-        </label>
-        <span className="mx-1 h-5 w-px bg-zinc-200 dark:bg-zinc-800" aria-hidden="true" />
-        <label className="flex items-center gap-1.5 text-xs font-medium text-zinc-700 dark:text-zinc-200">
-          Sort
-          <select
-            className={inputClasses}
-            value={sortPref.key}
-            onChange={(e) => setSort({ key: e.target.value as SortKey, dir: sortPref.dir })}
-            aria-label="Sort by"
-          >
-            {SORT_KEYS.map((key) => (
-              <option key={key} value={key}>
-                {SORT_LABELS[key]}
-              </option>
-            ))}
-          </select>
-        </label>
-        <button
-          type="button"
-          onClick={() => setSort({ key: sortPref.key, dir: sortPref.dir === 'asc' ? 'desc' : 'asc' })}
-          title={sortPref.dir === 'asc' ? 'Ascending -- click for descending' : 'Descending -- click for ascending'}
-          aria-label={sortPref.dir === 'asc' ? 'Sort ascending' : 'Sort descending'}
-          className="rounded-md border border-zinc-300 px-2 py-1 text-xs font-medium text-zinc-700 hover:bg-zinc-50 dark:border-zinc-700 dark:text-zinc-200 dark:hover:bg-zinc-900"
+        {/* The facet filter (2026-08-13): replaces "Missing only" -- see the module-level
+            comment on `FacetFilter` above. */}
+        <select
+          className={inputClasses}
+          value={facetFilter}
+          onChange={(e) => setFacetFilter(e.target.value as FacetFilter)}
+          aria-label="Filter by lifecycle facet"
         >
-          {sortPref.dir === 'asc' ? '↑ Asc' : '↓ Desc'}
-        </button>
+          {FACET_FILTER_VALUES.map((f) => (
+            <option key={f} value={f}>
+              {FACET_FILTER_LABELS[f]}
+            </option>
+          ))}
+        </select>
         <span className="mx-1 h-5 w-px bg-zinc-200 dark:bg-zinc-800" aria-hidden="true" />
         <button
           type="button"
@@ -864,7 +968,7 @@ export function FileTree({ nodes }: { nodes: FileNode[] }) {
               onClick={() => {
                 setSearchText('')
                 setStateFilter('')
-                setMissingOnly(false)
+                setFacetFilter('')
               }}
               className="rounded-md px-2 py-1 text-xs font-medium text-zinc-600 underline hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800"
             >
@@ -991,18 +1095,46 @@ export function FileTree({ nodes }: { nodes: FileNode[] }) {
           className="max-h-[70vh] overflow-auto rounded-md border border-zinc-200 dark:border-zinc-800"
         >
           {/* Column labels -- mirrors `Row`'s own widths so the header stays aligned with the
-              virtualized rows beneath it. Static, not itself sortable -- the sort control
-              lives in the toolbar above; this just names what the new lifecycle-icon column
-              (R/L/V/E) is. */}
+              virtualized rows beneath it. Sortable columns (2026-08-13, item 1) are themselves
+              the sort control -- `SortHeaderButton` above -- rather than a separate widget;
+              every other header stays a plain `<span>` so it never looks clickable. "Status"
+              sorts by percent-complete (`SORT_KEYS`'s `'percent'`) -- the state chip's own
+              fill is where that percentage already shows, so that's the header it belongs to;
+              its `title` spells out "% complete" for anyone who hovers to check. */}
           <div className="sticky top-0 z-10 flex items-center gap-2 border-b border-zinc-200 bg-zinc-50 px-2 py-1 text-[10px] font-medium tracking-wide text-zinc-500 uppercase dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-400">
             <span className="w-4 shrink-0" />
             <span className="w-4 shrink-0" />
             <span className="w-4 shrink-0" />
-            <span className="min-w-0 flex-1">Name</span>
-            <span className="w-24 shrink-0 text-right">Size</span>
-            <span className="w-28 shrink-0 text-right">Status</span>
+            <SortHeaderButton
+              sortKey="name"
+              label="Name"
+              sortPref={sortPref}
+              onSort={toggleSort}
+              className="min-w-0 flex-1 justify-start"
+            />
+            <SortHeaderButton
+              sortKey="size"
+              label="Size"
+              sortPref={sortPref}
+              onSort={toggleSort}
+              className="w-24 shrink-0 justify-end"
+            />
+            <SortHeaderButton
+              sortKey="percent"
+              label="Status"
+              title="Sort by % complete"
+              sortPref={sortPref}
+              onSort={toggleSort}
+              className="w-28 shrink-0 justify-end"
+            />
             <span className="w-20 shrink-0 text-right">R L V E</span>
-            <span className="w-32 shrink-0 text-right">Changed</span>
+            <SortHeaderButton
+              sortKey="state_changed_at"
+              label="Changed"
+              sortPref={sortPref}
+              onSort={toggleSort}
+              className="w-32 shrink-0 justify-end"
+            />
             <span className="w-32 shrink-0 text-right">Actions</span>
           </div>
           <div style={{ height: virtualizer.getTotalSize(), position: 'relative' }}>
@@ -1030,6 +1162,7 @@ export function FileTree({ nodes }: { nodes: FileNode[] }) {
                     onDeleteRequest={requestDeleteRow}
                     onOpenDrawer={setDrawerEntry}
                     actionBusy={rowBusy.has(entry.rel_path)}
+                    settleSettings={settleSettings}
                   />
                 </div>
               )

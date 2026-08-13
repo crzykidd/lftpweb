@@ -257,6 +257,16 @@ export interface FileNode {
   // When this row was first ever seen (migration 001) -- the first entry in the item drawer's
   // lifecycle chronology (2026-08-13). Existed server-side since phase 2; new to the wire only.
   first_seen_at: string | null
+  // The settle gate's countdown (2026-08-13, prompts/2026-08-13-files-ux-pass.md item 3):
+  // item_settle.matched_scans/updated_at (core/settle.py.SettleRecord), joined in only for
+  // top-level rows and only while substate === 'settling' -- null the rest of the time,
+  // including for a non-top-level row (item_settle has no row for one at all) or before this
+  // item's first scan. See core/itemview.py.item_view's own docstring for why this is gated
+  // on substate rather than passed through whenever the join happens to have a row (an
+  // ungated read would make this climb forever on a row nothing else about is changing,
+  // which would defeat the WebSocket delta's "only publish what changed" property).
+  settle_matched_scans: number | null
+  settle_first_matched_at: string | null
   // Milestone/audit timestamps (2026-08-13) -- raw material for a lifecycle icon's tooltip.
   // `downloaded_at` already existed server-side (§7.3's retention key); the other four are new
   // to the wire only.

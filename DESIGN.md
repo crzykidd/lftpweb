@@ -1418,8 +1418,9 @@ scheduler looks broken at exactly the moments it is working correctly.
 
 **Files** — virtualized tree (must stay smooth at 10k+ rows), per row: state chip, progress
 bar, size, speed, ETA. Grouped by queue, collapsible per queue. Expand/collapse, multi-select
-with shift-range, bulk *Queue / Stop / Delete local / Delete remote*, text search and state
-filters.
+with shift-range, bulk *Queue / Stop / Delete local / Delete remote*, text search, state
+filter, and a lifecycle facet filter (below) — composed together, never a second filtering
+path.
 
 Four further row-level readings, all of them projections of the same persisted `item` row the
 state chip already reads (§2.2's one shared projection, never a second read of it):
@@ -1440,14 +1441,29 @@ state chip already reads (§2.2's one shared projection, never a second read of 
   all `EXCLUDED` (rule 8), and an `EXTRACTED` item whose spent archive volumes were deleted (§6).
   The one case that genuinely is broken — a `DOWNLOADED` row still claiming bytes an importer
   took — is told apart by `first_missing_at`, set only while §7.3's grace period is actually
-  running, which is also what makes a **Missing only** filter both correct and cheap.
+  running. Originally surfaced as a **Missing only** checkbox; replaced (2026-08-13) by a
+  **lifecycle facet filter** dropdown (has remote copy / has local copy / extracted / not
+  extracted / "downloaded but missing locally") once the user could not tell what the checkbox
+  meant from its name alone — the verdict on it. Composes with the text/state filters through
+  the same mechanism; distinct from the state filter, which the facet filter does not make
+  redundant — facets cannot tell `QUEUED` from `DOWNLOADING` from `STOPPED` from `FAILED`,
+  which read identically on presence/milestone alone.
+  **R also reads amber, client-side only, while `substate = 'settling'`** (2026-08-13):
+  `core/itemview.py._remote_facet` itself never produces amber (only green/dim, by design), so
+  this is a display override layered on top of the presence fact for exactly this one
+  substate, never on L (the local side is legitimately empty during the wait, so amber there
+  would imply activity that isn't happening).
 - **Inline progress**, drawn as the state chip's own background growing under the label, for
   `PARTIAL`/`DOWNLOADING` rows only — including a directory's rolled-up percentage, so a 40 GB
   release shows real progress rather than the word "partial". No new backend data and no
   per-row timer.
 - **Sorting** by name, size, last state change, or percent complete, either direction, persisted
-  across reloads. It reorders **siblings within each parent**, never the flattened list the
-  virtualizer walks, so a sorted tree can never tear a child away from its actual parent.
+  across reloads. **The sortable column headers are themselves the control** (2026-08-13) —
+  click to sort, click again to reverse, with a caret marking the active column and direction;
+  a separate "Sort by" dropdown plus asc/desc button shipped first and was replaced the same
+  day once used for real. A header that isn't sortable stays a plain label. Reorders
+  **siblings within each parent**, never the flattened list the virtualizer walks, so a sorted
+  tree can never tear a child away from its actual parent.
 - **The Expand all / Collapse all choice persists** across reloads, stored as a default plus
   per-row exceptions rather than a saved set of collapsed paths. The tree updates continuously
   over the socket, and a directory that arrives *after* a saved set was written would not be in
@@ -1485,7 +1501,13 @@ Some.Release.S03E04.2160p    [downloading]   18 files   62%   4.1 MB/s   ETA 12m
 - Visible status vocabulary is **queued / downloading / downloaded**. The other internal states
   (§3.2) surface only on rows where they actually apply, rather than expanding everyone's
   mental model to twelve chips.
-- **Move to top** on each row (§4.5); default order is oldest-first.
+- **Move to top** on each row (§4.5); default order is oldest-first. **Each still-queued row
+  shows its actual run position** (2026-08-13) — a small `#N` ordinal, 1/2/3… in the order
+  `GET /api/jobs` already returns them (`rank DESC, queued_at ASC`), plus a one-line caption
+  once there is more than one queued job that the list order *is* the queue order. The
+  capability (ordering, Move to top, Start now) existed before this and was invisible; nothing
+  new was added server-side, the list was already sorted. `rank` grows monotonically on every
+  "Move to top" with no compaction — not a practical problem at 64-bit `INTEGER` width.
 - **Start now at max bandwidth** as a per-row action, with its oversubscription behavior
   explained inline the first time it's used.
 - Failures show the error class plus the captured lftp output tail.
@@ -1522,7 +1544,9 @@ the last 24 h, broken down by queue with a site total, and speed over a selectab
 24 h window for the site or one queue. Its own page rather than more chrome in the header —
 the header answers "what is happening now" in a single row, and a chart is a different
 question. **Downtime renders as a gap, never as a zero**, in both charts; that distinction is
-the whole reason the store keeps a separate liveness heartbeat (§10.4).
+the whole reason the store keeps a separate liveness heartbeat (§10.4). **The selected
+timeframe is remembered per browser** (2026-08-13, `localStorage`), read synchronously on
+first render so the chart never paints the default range and then jumps to the saved one.
 
 **Settings** — tabbed:
 

@@ -401,6 +401,14 @@ class FileNode(BaseModel):
     # lifecycle chronology (2026-08-13, prompts/2026-08-13-files-detail-inspector.md). Existed
     # on the row since phase 2; new to the wire only with this task.
     first_seen_at: str | None = None
+    # The settle gate's countdown (2026-08-13, prompts/2026-08-13-files-ux-pass.md item 3):
+    # `item_settle.matched_scans`/`updated_at` (`core/settle.py.SettleRecord`), joined in only
+    # by the two `item_view` callers that need it for the Files page's "1 of 2 scans, 35s of
+    # 60s" readout (`core/itemview.py._optional`'s own docstring has the full reasoning for why
+    # this is optional rather than universal). `None` for a non-top-level row -- `item_settle`
+    # has no row for one at all -- or before this item's first scan.
+    settle_matched_scans: int | None = None
+    settle_first_matched_at: str | None = None
     # Milestone/audit timestamps (2026-08-13, prompts/2026-08-13-lifecycle-icons.md) -- passed
     # through verbatim from the `item` row (`core/itemview.py.item_view`), the raw material a
     # lifecycle icon's tooltip is built from. `downloaded_at` already existed on the row before

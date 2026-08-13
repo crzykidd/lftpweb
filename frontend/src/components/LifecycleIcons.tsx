@@ -1,6 +1,6 @@
 import type { SVGProps } from 'react'
-import type { FacetLevel, FileNode } from '../api/types'
-import { formatBytes, formatRelativeTimeIntl } from '../lib/format'
+import type { FacetLevel, FileNode, SettleSettingsOut } from '../api/types'
+import { formatBytes, formatRelativeTimeIntl, settleWaitLabel } from '../lib/format'
 
 // Lifecycle icons (2026-08-13, prompts/2026-08-13-lifecycle-icons.md): R(emote)/L(ocal)/
 // V(erified)/E(xtracted), one glyph per facet in `FileNode.facets`
@@ -152,7 +152,14 @@ const FACET_LEVEL_CLASSES: Record<FacetLevel, string> = {
  * lives server-side so every consumer agrees; turning a reason code into English is exactly the
  * kind of presentation `lib/format.ts.stateAgeLabel` already owns for `state`/`state_changed_at`.
  */
-function remoteTooltip(node: FileNode): string {
+function remoteTooltip(node: FileNode, settle: SettleSettingsOut | null): string {
+  if (node.substate === 'settling') {
+    // The settle gate's own remote-facet override (below `LifecycleIcons`'s own docstring for
+    // the full reasoning): the remote copy genuinely exists (`core/itemview.py._remote_facet`
+    // would read green), but hasn't been *confirmed stable* yet, which is the fact worth
+    // surfacing on hover here rather than plain presence.
+    return `Remote: ${settleWaitLabel(node, settle)}`
+  }
   const facet = node.facets.remote
   switch (facet.reason) {
     case 'present':
@@ -225,12 +232,24 @@ function extractedTooltip(node: FileNode): string {
 /** The four-icon cluster for one Files-tree row -- always renders all four (a variable-width
  * set would be harder to scan than a consistently dim one), colour and tooltip driven entirely
  * by `node.facets` (`core/itemview.py`), never re-derived here.
+ *
+ * **The one exception: R during the settle gate's wait** (2026-08-13,
+ * prompts/2026-08-13-files-ux-pass.md item 3). `core/itemview.py._remote_facet` only ever
+ * produces green ("present") or dim ("no copy") -- it has no amber reading of its own, by
+ * design (confirmed by reading that function, not assumed). While `node.substate ===
+ * 'settling'`, this component overrides R to amber here, client-side: the remote copy genuinely
+ * exists (green would be accurate) but has not yet held still long enough to trust, and amber is
+ * the fact worth surfacing. **Never L** -- the task's own instruction, confirmed against
+ * `_local_facet` too: local is legitimately empty during settling (nothing has been queued yet),
+ * so amber there would read as activity that isn't happening.
  */
-export function LifecycleIcons({ node }: { node: FileNode }) {
+export function LifecycleIcons({ node, settle }: { node: FileNode; settle: SettleSettingsOut | null }) {
   const { remote, local, verified, extracted } = node.facets
+  const isSettling = node.substate === 'settling'
+  const remoteLevel: FacetLevel = isSettling ? 'amber' : remote.level
   return (
     <span className="flex shrink-0 items-center gap-1">
-      <CloudIcon title={remoteTooltip(node)} className={FACET_LEVEL_CLASSES[remote.level]} />
+      <CloudIcon title={remoteTooltip(node, settle)} className={FACET_LEVEL_CLASSES[remoteLevel]} />
       <HardDriveIcon title={localTooltip(node)} className={FACET_LEVEL_CLASSES[local.level]} />
       <ShieldCheckIcon title={verifiedTooltip(node)} className={FACET_LEVEL_CLASSES[verified.level]} />
       <PackageIcon title={extractedTooltip(node)} className={FACET_LEVEL_CLASSES[extracted.level]} />

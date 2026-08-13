@@ -114,8 +114,11 @@ alongside this list: several entries below ship with deliberate, documented limi
   succeeded self-heals: the next scan that finds the remote genuinely quiet reaches
   `DOWNLOADED` and triggers post-processing on its own, with no new transfer and without
   needing auto-queue or another click. Held items surface as `REMOTE_ONLY` with a new
-  `substate: "settling"` (a small, deliberately quiet dot next to the state chip on the Files
-  page — most items pass through it on every first sighting). **On by default, which costs up
+  `substate: "settling"` — originally a 6px dot next to the state chip, effectively invisible
+  in practice; replaced *(2026-08-13)* with a readable countdown ("Waiting for changes — 1 of
+  2 scans, 35s of 60s") on the Status chip itself, and the R lifecycle icon reads amber for
+  the same duration (never L — the local side is legitimately empty during the wait, so amber
+  there would imply activity that isn't happening). **On by default, which costs up
   to about a minute per transfer**, including on an atomic hardlink-pickup path where it buys
   nothing — the third reasoned exception to this project's "every new capability ships off"
   rule, made because it is the fix for a confirmed-live directory-corruption bug rather than a
@@ -235,8 +238,11 @@ alongside this list: several entries below ship with deliberate, documented limi
   reads complete/green despite also having zero local bytes. `item.state` itself, its
   transitions, and the grace period are unchanged — this is a display projection, not a
   state-machine change. Icons are inline SVG copied from Lucide (ISC), not a new npm
-  dependency (see `NOTICE`). A new **Missing only** Files filter surfaces exactly the
-  `*arr`-import case, composing with the existing text/state filters.
+  dependency (see `NOTICE`). A **lifecycle facet filter** (has remote copy / has local copy /
+  extracted / not extracted / "downloaded but missing locally") surfaces exactly the
+  `*arr`-import case (a checkbox literally named **Missing only**, replaced *(2026-08-13)*
+  once the user could not tell what it meant — the verdict on it), composing with the
+  existing text/state filters through the same mechanism.
 - **Inline progress bars on the Files tree's state chip** *(2026-08-13)*, for `PARTIAL`/
   `DOWNLOADING` rows only (including a top-level directory's own rolled-up percentage, so a
   40 GB multi-file release shows real progress, not just "partial"). The fill is the chip's
@@ -244,7 +250,11 @@ alongside this list: several entries below ship with deliberate, documented limi
   loop. No new backend data: `local_size`/`remote_size` were already in the projection and
   already rolled up for directories.
 - **Sortable Files tree** *(2026-08-13)*: name, size, last state change, or percent
-  complete, ascending or descending, persisted across reloads. Sorting reorders **siblings
+  complete, ascending or descending, persisted across reloads. **The column headers
+  themselves are the control** — click to sort, click again to reverse, with a caret marking
+  the active column and direction — a separate "Sort by" dropdown plus asc/desc button
+  shipped first and was replaced the same day once used for real; a header that isn't
+  sortable stays a plain label, never looking clickable. Sorting reorders **siblings
   within each parent**, never the flattened list the virtualizer walks, so a sorted tree
   never tears a child away from its actual parent. Composes with the existing text/state
   filters and with collapse state.
@@ -282,6 +292,16 @@ alongside this list: several entries below ship with deliberate, documented limi
   Post-processing; a `move`-mode queue's Verify readout says it always runs regardless of
   either toggle, never "system setting: off," since it is the sole gate on the irreversible
   remote delete.
+- **The Transfers page now shows a queued job's actual run position** *(2026-08-13)* — the
+  capability (`rank DESC, queued_at ASC`, "Move to top", "Start now") already existed and was
+  invisible, so a user asking "what is the proper way to see the priority of the download
+  queue" had to infer it from row order. Each still-`queued` row now carries a small `#N`
+  ordinal (1, 2, 3… in the order jobs will actually run), and a one-line caption states that
+  the list order *is* the queue order once there is more than one queued job to order. No new
+  endpoint — `GET /api/jobs` already returns jobs pre-sorted; the frontend just counts.
+- **The Dashboard page now remembers your last-selected timeframe** *(2026-08-13)*, in
+  `localStorage`, per browser — read synchronously on first render so the chart doesn't paint
+  the default range and then jump to the saved one.
 
 ### Changed
 

@@ -254,8 +254,12 @@ async def test_scan_delta_is_small_and_exact_regardless_of_tree_size(tmp_path, m
     # now also carries `facets` (four small dicts) plus five raw milestone/audit timestamps
     # (`core/itemview.py`), a fixed per-node cost that doesn't scale with `n` either -- see
     # `test_scan_delta_payload_does_not_scale_with_tree_size` below for the assertion that
-    # actually proves that.
-    assert len(json.dumps(delta)) < 3000
+    # actually proves that. Bumped again, 3000->3200 (2026-08-13,
+    # prompts/2026-08-13-files-ux-pass.md item 3): every changed node now also carries
+    # `settle_matched_scans`/`settle_first_matched_at`, `null` for these four rows (none of them
+    # is `settling`) but still two more keys' worth of JSON per node -- another small, fixed
+    # per-node cost, not one that scales with `n`.
+    assert len(json.dumps(delta)) < 3200
 
 
 async def test_scan_delta_payload_does_not_scale_with_tree_size(tmp_path, monkeypatch):

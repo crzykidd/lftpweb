@@ -6,6 +6,54 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-13 — Files/Transfers/Dashboard UX pass: five presentation changes from live use
+
+**Handoff prompt `prompts/2026-08-13-files-ux-pass.md`, executed end to end.** Five
+presentation changes the user asked for after using the revamped Files page for real —
+sortable column headers, a lifecycle facet filter replacing "Missing only", a visible
+settle-gate countdown, queue position on Transfers, and a remembered Dashboard timeframe.
+None were correctness bugs; the data was already right, the presentation was not.
+
+**The settle-progress join almost reintroduced the exact bug phase 3b fixed, from a new
+field.** `core/itemview.py.item_view` initially surfaced `settle_matched_scans`/
+`settle_first_matched_at` (joined from `item_settle`) for every top-level row unconditionally.
+But `core/engine.py._persist` advances `item_settle` for *every* top-level item on *every*
+scan for as long as its fingerprint keeps matching — including one that finished downloading
+scans ago and will never be `settling` again. `diff_nodes`'s "changed" check is whole-dict
+equality, so an ungated read made `settle_matched_scans` climb forever on rows nothing else
+about was changing, which made *every* top-level item look changed on *every* scan —
+`tests/test_ws_deltas.py`'s tree-size-independence tests caught this immediately (they failed
+outright, not just a size-threshold miss). Fix: gate both fields on `substate == "settling"`
+in `item_view` itself, so the churn is confined to the handful of rows actually mid-settle —
+which is also the only case the frontend ever reads them for. Recorded here because the next
+person adding a joined, frequently-updated column to this projection needs to ask the same
+question the settle join skipped the first time: does this value change on rows that are
+otherwise quiescent, and if so, does `diff_nodes` need it gated the same way?
+
+**Settle join query cost, measured, not guessed.** `item_settle`'s own primary key is
+`(queue_id, rel_path)`, so `EXPLAIN QUERY PLAN` on the joined query confirms an indexed
+per-row lookup, never a second table scan. Measured directly (`sqlite3`, in-memory, warmed)
+against a synthetic 20,800-row tree (800 top-level items, 25 files each, every top-level item
+carrying an `item_settle` row — the real worst case): ~20.0ms/query unjoined vs. ~23.4ms/query
+joined, +3.4ms. Called once per scan (default 30s) and once per WebSocket connect — not worth
+avoiding at any queue size this project targets.
+
+**The state filter is not made redundant by the new facet filter.** The facet filter (has
+remote copy / has local copy / extracted / not extracted / downloaded-but-missing-locally) is
+a presence/milestone reading — the same vocabulary `core/itemview.py`'s facets already use, and
+it cannot distinguish `QUEUED` from `DOWNLOADING` from `STOPPED` from `FAILED`: all four read
+identically on facets (local presence dim/amber, nothing else moves). The state filter is the
+only way to isolate, say, just the `FAILED` rows. Both filters compose through the same
+`visiblePaths` mechanism (AND, not a second filtering path) — kept, not removed, unasked.
+
+**`rank` grows monotonically forever on `move_to_top` (`rank = MAX(rank) + 1`, no
+compaction) — not fixed, and not worth fixing.** SQLite's `INTEGER` is 64-bit; reaching
+overflow would take quintillions of "Move to top" clicks on a single install. Noted per the
+handoff prompt's own instruction to report on this rather than silently leave it alone or
+silently "fix" something that was never a real problem.
+
+---
+
 ## 2026-08-13 — Per-queue archive cleanup, the settings-merge fix, and what got left alone
 
 **Handoff prompt `prompts/2026-08-13-per-queue-archive-cleanup.md`, executed end to end.** The

@@ -51,6 +51,14 @@ from typing import Any
 # which the state string alone cannot -- `REMOVED_LOCAL`/`REMOVED_BOTH` can also be produced by
 # `core/mount_sentinel.py.resolve_vanished` with no suppression at all (defect 3). See
 # `FileTree.tsx.rowAction` for where this is actually used.
+#
+# `settle_matched_scans`/`settle_first_matched_at` (2026-08-13, `prompts/2026-08-13-files-ux-
+# pass.md` item 3) are deliberately **not** in this list -- they live in `item_settle`, a
+# different table, not a column `item` itself has. A caller that wants them adds its own
+# `LEFT JOIN item_settle ... AS settle_matched_scans, ... AS settle_first_matched_at` alongside
+# `{ITEM_VIEW_COLUMNS}` in its own SELECT (`core/engine.py._project`, `api/files.py.get_files`);
+# `item_view` reads them via `_optional` below rather than requiring them, so a query that
+# doesn't join still works.
 ITEM_VIEW_COLUMNS = (
     "id, rel_path, is_dir, remote_size, local_size, remote_mtime, local_mtime, state, substate, "
     "suppressed_reason, "
@@ -58,10 +66,41 @@ ITEM_VIEW_COLUMNS = (
     "first_missing_at, remote_deleted_at"
 )
 
+# The same column list, `item.`-qualified, for the two callers that `LEFT JOIN item_settle`
+# alongside it (`core/engine.py._project`, `api/files.py.get_files`, both 2026-08-13,
+# `prompts/2026-08-13-files-ux-pass.md` item 3) -- `rel_path` is the one name both `item` and
+# `item_settle` have, so an unqualified `ITEM_VIEW_COLUMNS` list would be ambiguous the moment
+# the join is added (SQLite rejects it outright, it does not guess). Derived from
+# `ITEM_VIEW_COLUMNS` rather than hand-duplicated, so the two stay identical by construction.
+ITEM_VIEW_COLUMNS_QUALIFIED = ", ".join(
+    f"item.{col.strip()}" for col in ITEM_VIEW_COLUMNS.split(",")
+)
+
 # The published shape is a plain dict on purpose: it *is* the JSON that goes on the wire and
 # the kwargs `models.FileNode` takes, so there is no second representation to convert between
 # (and nothing that can be serialized differently by one caller than another).
 ItemView = dict[str, Any]
+
+
+def _optional(row: Mapping[str, Any], key: str) -> Any:
+    """`row[key]` if present, `None` otherwise.
+
+    Exists because of one specific shape mismatch (2026-08-13, `prompts/2026-08-13-files-ux-
+    pass.md` item 3): the settle-progress fields below (`settle_matched_scans`/
+    `settle_first_matched_at`) come from a `LEFT JOIN item_settle` that only two of this
+    projection's callers add (`core/engine.py._project`, `api/files.py.get_files`) -- the
+    single-item callers (`core/postprocess.py`, `core/local_delete.py`, `core/queue.py`) read a
+    bare `SELECT * FROM item`, which never has these columns at all, and never needs to: a job
+    or postprocess state transition can't fire on a `REMOTE_ONLY`/`settling` row in the first
+    place. `sqlite3.Row` (what `aiosqlite.Row` is -- confirmed against the driver, not assumed)
+    has no `.get`, unlike a plain dict; `row[key]` raises `IndexError` on it and `KeyError` on a
+    dict, so both are caught.
+    """
+    try:
+        return row[key]
+    except (KeyError, IndexError):
+        return None
+
 
 # --- Lifecycle facets (2026-08-13, prompts/2026-08-13-lifecycle-icons.md) --------------------
 #
@@ -308,6 +347,35 @@ def item_view(row: Mapping[str, Any]) -> ItemView:
     (migration 001) is plain ISO-8601 text like `state_changed_at`, passed through verbatim —
     both are new to the wire with this task, not new to the database.
 
+    `settle_matched_scans`/`settle_first_matched_at` (2026-08-13, `prompts/2026-08-13-files-ux-
+    pass.md` item 3): the Files page's settle-gate countdown ("1 of 2 scans, 35s of 60s"),
+    joined in from `item_settle` (`core/settle.py`) only by the two callers that add the join
+    (`core/engine.py._project`, `api/files.py.get_files`) — `_optional` (above) reads `None` for
+    every caller that doesn't, rather than requiring every reader of this table to carry a join
+    only one page's one substate needs.
+
+    **Gated on `substate == "settling"`, not passed through whenever the join happens to have a
+    row.** `core/engine.py._persist` advances `item_settle` for *every* top-level item on *every*
+    scan for as long as its remote fingerprint keeps matching — including one that finished
+    downloading scans ago and will never be `settling` again — so an ungated read would make
+    `settle_matched_scans` climb forever on a row nothing else about is changing. `diff_nodes`
+    (this module's own docstring: "an `ItemView` is a plain dict of scalars, so 'changed' is
+    exactly the equality check") would then see *every* top-level item as changed on *every*
+    scan, forever — reintroducing the exact "delta scales with tree size" bug phase 3b fixed,
+    just from a new field instead of the old structural-vs-persisted disagreement
+    (`tests/test_ws_deltas.py` caught this in review before it shipped). Gating on `substate`
+    keeps the field's churn confined to the handful of rows actually mid-settle, which is also
+    the only case the frontend ever reads it for.
+
+    The DB column is `updated_at` (`core/settle.py.SettleRecord`'s own docstring explains why
+    that name, despite what it suggests, already holds exactly the value this field wants); the
+    two callers alias it to `settle_first_matched_at` in the SELECT itself, so this function
+    reads a name it doesn't have to translate. Passed through as the raw ISO string it already
+    is, verbatim, the same "raw material, not a pre-formatted sentence" convention as every
+    other timestamp on this row — a test can assert the value without needing `Date.now()`.
+    `None` whenever `substate != "settling"` (including a non-top-level row, which never has an
+    `item_settle` row at all, and a not-yet-first-scanned one) — the frontend must handle that.
+
     `facets` (`_lifecycle_facets`) is the one place R/L/V/E get computed, so `GET /api/files`,
     `queue_delta`, `item_delta`, and connect-time `snapshot()` cannot disagree about what a
     row's icons should show — they are all this same function.
@@ -325,6 +393,12 @@ def item_view(row: Mapping[str, Any]) -> ItemView:
         "local_mtime": float(row["local_mtime"]) if row["local_mtime"] is not None else None,
         "state_changed_at": row["state_changed_at"],
         "first_seen_at": row["first_seen_at"],
+        "settle_matched_scans": (
+            _optional(row, "settle_matched_scans") if row["substate"] == "settling" else None
+        ),
+        "settle_first_matched_at": (
+            _optional(row, "settle_first_matched_at") if row["substate"] == "settling" else None
+        ),
         "downloaded_at": row["downloaded_at"],
         "verified_at": row["verified_at"],
         "extracted_at": row["extracted_at"],

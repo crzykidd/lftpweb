@@ -137,3 +137,41 @@ export function stateAgeLabel(state: string, stateChangedAt: string | null): str
   if (stateChangedAt == null) return label
   return `${label} ${formatRelativeTimeIntl(stateChangedAt)}`
 }
+
+// The settle gate's wait, spelled out (2026-08-13, prompts/2026-08-13-files-ux-pass.md item 3)
+// -- replaces the previous 6px dot (`h-1.5 w-1.5`, effectively invisible in `FileTree.tsx`)
+// with a readable countdown, "Waiting for changes -- 1 of 2 scans, 35s of 60s". Shared between
+// `FileTree.tsx`'s Status-column chip label (which substitutes it wholesale for the normal
+// state text while a top-level item is settling) and `LifecycleIcons.tsx`'s R-icon tooltip --
+// one function, so the two can never disagree about what "waiting" means for the same row. The
+// node/settings shapes it needs (`settle_matched_scans`/`_first_matched_at`, `required_scans`/
+// `min_age_s`) are structural enough not to warrant importing `api/types.ts`'s named types here
+// -- a minimal inline shape keeps this file free of a dependency on the wire-shape module.
+interface SettleProgressNode {
+  settle_matched_scans: number | null
+  settle_first_matched_at: string | null
+}
+interface SettleConstants {
+  required_scans: number
+  min_age_s: number
+}
+
+/** `settle` is `null` before `getSettleSettings()`'s one site-wide fetch resolves
+ * (`FileTree.tsx` fetches it once, not per row) or if it failed; `node.settle_matched_scans`/
+ * `_first_matched_at` are `null` whenever `core/itemview.py.item_view` didn't have both a join
+ * match and `substate === 'settling'` for this row. Either way this degrades to the bare label
+ * rather than showing a stale or fabricated count -- never blocks the row from rendering.
+ */
+export function settleWaitLabel(node: SettleProgressNode, settle: SettleConstants | null): string {
+  if (settle == null || node.settle_matched_scans == null || node.settle_first_matched_at == null) {
+    return 'Waiting for changes'
+  }
+  const elapsedS = Math.max(
+    0,
+    Math.floor((Date.now() - new Date(node.settle_first_matched_at).getTime()) / 1000),
+  )
+  return (
+    `Waiting for changes -- ${node.settle_matched_scans} of ${settle.required_scans} scans, ` +
+    `${elapsedS}s of ${Math.round(settle.min_age_s)}s`
+  )
+}

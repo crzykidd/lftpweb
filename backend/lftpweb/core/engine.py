@@ -47,7 +47,7 @@ from lftpweb.core import local_delete, local_scan, mount_sentinel, patterns, pos
 from lftpweb.core.autoqueue import AutoQueue, QueueAutoConfig
 from lftpweb.core.crypto import DecryptionError, decrypt_secret
 from lftpweb.core.events import EventBus
-from lftpweb.core.itemview import ITEM_VIEW_COLUMNS, ItemView, item_view
+from lftpweb.core.itemview import ITEM_VIEW_COLUMNS_QUALIFIED, ItemView, item_view
 from lftpweb.core.reconcile import ReconciledNode, reconcile
 from lftpweb.core.remote import HostConfig, RemoteConnectionPool, RemoteEntry, RemoteScanError
 
@@ -991,9 +991,30 @@ class Engine:
         never disappear from the projection. Passing the set `_persist` just wrote keeps the
         published node set identical to the reconciled one, exactly as before; only the
         *values* now come from the database.
+
+        **`LEFT JOIN item_settle`** (2026-08-13, `prompts/2026-08-13-files-ux-pass.md` item 3):
+        the Files page's settle-gate countdown needs `item_settle.matched_scans`/`updated_at`
+        for top-level rows, and this is the one place both `queue_delta` (`scan_queue`, below)
+        and connect-time `snapshot()` read the `item` table back from. `item_settle`'s own
+        primary key is `(queue_id, rel_path)`, so `EXPLAIN QUERY PLAN` confirms this is a
+        per-row indexed lookup (`SEARCH settle USING INDEX sqlite_autoindex_item_settle_1
+        (queue_id=? AND rel_path=?) LEFT-JOIN`), never a second table scan. Measured directly
+        (`sqlite3`, in-memory, warmed) against a synthetic 20,800-row tree (800 top-level items,
+        25 files each, every top-level item carrying an `item_settle` row -- the real worst
+        case, since `_persist` advances that row for every top-level item on every scan
+        regardless of `state`): ~20.0ms/query unjoined vs. ~23.4ms/query joined, +3.4ms per
+        call. Called once per scan (`scan_interval_s`, default 30s) and once per new WebSocket
+        connection (`snapshot()`) -- +3.4ms at either cadence is not worth avoiding at any queue
+        size this project targets. docs/decisions.md records the method and numbers.
         """
         cursor = await self.db.execute(
-            f"SELECT {ITEM_VIEW_COLUMNS} FROM item WHERE queue_id = ?",  # noqa: S608 - a module constant, not user input
+            f"SELECT {ITEM_VIEW_COLUMNS_QUALIFIED}, "  # noqa: S608 - a module constant, not user input
+            "settle.matched_scans AS settle_matched_scans, "
+            "settle.updated_at AS settle_first_matched_at "
+            "FROM item "
+            "LEFT JOIN item_settle AS settle "
+            "ON settle.queue_id = item.queue_id AND settle.rel_path = item.rel_path "
+            "WHERE item.queue_id = ?",
             (queue_id,),
         )
         return {

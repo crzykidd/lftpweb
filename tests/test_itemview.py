@@ -14,16 +14,22 @@ and only place `GET /api/files`, `queue_delta`/`snapshot()`, and `item_delta` al
 
 from __future__ import annotations
 
+import sqlite3
+
 import aiosqlite
 import pytest
 from fastapi import Request
 
 from lftpweb.api.files import get_files
+from lftpweb.core.engine import Engine
+from lftpweb.core.events import EventBus
 from lftpweb.core.itemview import (
     ITEM_VIEW_COLUMNS,
+    ITEM_VIEW_COLUMNS_QUALIFIED,
     _extracted_facet,
     _lifecycle_facets,
     _local_facet,
+    _optional,
     _remote_facet,
     _verified_facet,
     item_view,
@@ -275,6 +281,74 @@ def test_item_view_passes_first_seen_at_through_verbatim():
     assert item_view(row)["first_seen_at"] == "2026-08-12T23:00:00Z"
 
 
+# --- settle-progress fields (2026-08-13, prompts/2026-08-13-files-ux-pass.md item 3) ---------
+
+
+def test_optional_returns_none_for_a_dict_row_missing_the_key():
+    # `_row()`'s base dict never carries settle_matched_scans/settle_first_matched_at -- the
+    # exact shape of a bare `SELECT * FROM item` row (core/postprocess.py, core/local_delete.py,
+    # core/queue.py), which never joins item_settle at all.
+    assert _optional(_row(), "settle_matched_scans") is None
+
+
+def test_optional_returns_none_for_a_sqlite_row_missing_the_key():
+    # sqlite3.Row (what aiosqlite.Row is) raises IndexError, not KeyError, for an absent column
+    # -- both must be caught, not just the dict case above.
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.execute("CREATE TABLE t (a)")
+    conn.execute("INSERT INTO t VALUES (1)")
+    row = conn.execute("SELECT a FROM t").fetchone()
+    assert _optional(row, "settle_matched_scans") is None
+    conn.close()
+
+
+def test_optional_returns_the_value_when_present():
+    assert _optional({"settle_matched_scans": 2}, "settle_matched_scans") == 2
+
+
+def test_item_view_settle_fields_default_none_when_row_lacks_them():
+    # `_row()`'s base dict has no settle columns at all -- the projection must not KeyError,
+    # and must publish None rather than fabricating a value.
+    view = item_view(_row(substate="settling"))
+    assert view["settle_matched_scans"] is None
+    assert view["settle_first_matched_at"] is None
+
+
+def test_item_view_passes_settle_fields_through_when_present_and_settling():
+    row = _row(
+        substate="settling",
+        settle_matched_scans=1,
+        settle_first_matched_at="2026-08-13T00:00:00Z",
+    )
+    view = item_view(row)
+    assert view["settle_matched_scans"] == 1
+    assert view["settle_first_matched_at"] == "2026-08-13T00:00:00Z"
+
+
+def test_item_view_settle_fields_are_none_when_not_settling_even_if_the_row_has_them():
+    # `core/engine.py._persist` keeps advancing `item_settle` for a top-level item on every scan
+    # for as long as its fingerprint keeps matching -- including long after it finished
+    # downloading and stopped being `settling`. An ungated read would make
+    # `settle_matched_scans` climb forever on a row nothing else about is changing, which
+    # defeats `diff_nodes`'s "only publish what actually changed" property
+    # (`tests/test_ws_deltas.py`). A joined row with real settle data but `substate != None`
+    # -- meaning `"settling"` -- must still publish `None` for both fields.
+    row = _row(
+        substate=None, settle_matched_scans=9, settle_first_matched_at="2026-08-13T00:00:00Z"
+    )
+    view = item_view(row)
+    assert view["settle_matched_scans"] is None
+    assert view["settle_first_matched_at"] is None
+
+
+def test_item_view_columns_qualified_matches_item_view_columns_prefixed():
+    # Derived, not hand-duplicated -- this is the one thing that could let the two drift.
+    assert ITEM_VIEW_COLUMNS_QUALIFIED == ", ".join(
+        f"item.{c.strip()}" for c in ITEM_VIEW_COLUMNS.split(",")
+    )
+
+
 # --- The headline test: a completed move-mode item, through the real Engine pipeline ---------
 
 
@@ -436,3 +510,66 @@ async def test_facets_reach_get_files_endpoint(db):
     assert node.facets.remote.reason == "deleted_by_us"
     assert node.facets.verified.level == "green"
     assert node.facets.extracted.level == "green"
+
+
+# --- The item_settle join reaches both callers (2026-08-13, prompts/2026-08-13-files-ux-pass.md
+# item 3) -----------------------------------------------------------------------------------
+#
+# `core/engine.py._project` and `api/files.py.get_files` each add their own `LEFT JOIN
+# item_settle` -- the risk is those two drifting (one joins, the other doesn't; one aliases a
+# column differently). Both are exercised directly against the same seeded row below, the same
+# "don't just trust the two SQL shapes agree" spirit as `test_facets_agree_between_select_star_
+# and_item_view_columns` above.
+
+
+async def test_engine_project_joins_settle_progress_for_a_top_level_row(db, tmp_path):
+    queue_id, item_id = await _seed_item(
+        db, state="REMOTE_ONLY", substate="settling", remote_size=1000, local_size=None
+    )
+    await db.execute(
+        "INSERT INTO item_settle (queue_id, rel_path, file_count, total_bytes, max_mtime, "
+        "matched_scans, updated_at) VALUES (?, 'Release.One', 3, 1000, 123.0, 1, "
+        "'2026-08-13T00:00:00.000000Z')",
+        (queue_id,),
+    )
+    await db.commit()
+
+    engine = Engine(db=db, config_dir=str(tmp_path), events=EventBus())
+    published = await engine._project(queue_id, {"Release.One"})
+    node = published["Release.One"]
+
+    assert node["settle_matched_scans"] == 1
+    assert node["settle_first_matched_at"] == "2026-08-13T00:00:00.000000Z"
+    assert node["id"] == item_id  # the join must not change which row this still is
+
+
+async def test_engine_project_settle_fields_are_none_without_an_item_settle_row(db, tmp_path):
+    # No INSERT into item_settle at all -- a row not yet scanned, or not top-level, has no
+    # match, and the LEFT JOIN must degrade to NULL rather than dropping the item row entirely.
+    queue_id, _item_id = await _seed_item(db, state="REMOTE_ONLY", substate=None)
+
+    engine = Engine(db=db, config_dir=str(tmp_path), events=EventBus())
+    published = await engine._project(queue_id, {"Release.One"})
+    node = published["Release.One"]
+
+    assert node["settle_matched_scans"] is None
+    assert node["settle_first_matched_at"] is None
+
+
+async def test_get_files_joins_settle_progress(db):
+    queue_id, _item_id = await _seed_item(
+        db, state="REMOTE_ONLY", substate="settling", remote_size=1000, local_size=None
+    )
+    await db.execute(
+        "INSERT INTO item_settle (queue_id, rel_path, file_count, total_bytes, max_mtime, "
+        "matched_scans, updated_at) VALUES (?, 'Release.One', 1, 500, 100.0, 2, "
+        "'2026-08-13T00:01:00.000000Z')",
+        (queue_id,),
+    )
+    await db.commit()
+    request = Request(scope={"type": "http", "app": _FakeApp(db, queue_id)})
+
+    response = await get_files(request)
+    node = response.queues[0].nodes[0]
+    assert node.settle_matched_scans == 2
+    assert node.settle_first_matched_at == "2026-08-13T00:01:00.000000Z"

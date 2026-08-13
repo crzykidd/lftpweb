@@ -47,6 +47,12 @@ interface RowProps {
   job: JobOut
   nodes: FileNode[]
   live: { bytes_done: number; bytes_total: number | null; speed_bps: number; eta_s: number | null } | undefined
+  // Where this job sits in the actual run order (2026-08-13, prompts/2026-08-13-files-ux-pass.md
+  // item 4) -- 1, 2, 3... counting only `state === 'queued'` rows, in the order `useJobs` already
+  // returns them (`core/queue.py.list_jobs`'s own `ORDER BY job.rank DESC, job.queued_at ASC`,
+  // the real future run order). `undefined` for a running/failed/cancelled row -- those aren't
+  // "queued" in the sense a position means anything for.
+  queuePosition: number | undefined
   onOpenDrawer: (job: JobOut) => void
   onMoveToTop: (job: JobOut) => void
   onStartNow: (job: JobOut) => void
@@ -55,7 +61,18 @@ interface RowProps {
   busy: boolean
 }
 
-function Row({ job, nodes, live, onOpenDrawer, onMoveToTop, onStartNow, onStop, onRetry, busy }: RowProps) {
+function Row({
+  job,
+  nodes,
+  live,
+  queuePosition,
+  onOpenDrawer,
+  onMoveToTop,
+  onStartNow,
+  onStop,
+  onRetry,
+  busy,
+}: RowProps) {
   const running = job.state === 'running'
   const bytesDone = running ? (live?.bytes_done ?? job.bytes_done) : job.bytes_done
   const bytesTotal = (running ? live?.bytes_total : job.bytes_total) ?? job.bytes_total
@@ -65,6 +82,19 @@ function Row({ job, nodes, live, onOpenDrawer, onMoveToTop, onStartNow, onStop, 
   return (
     <div className="flex flex-col gap-2 border-b border-zinc-200 px-3 py-2.5 text-sm last:border-b-0 dark:border-zinc-800">
       <div className="flex flex-wrap items-center gap-3">
+        {/* Queue position (2026-08-13, item 4): "what is the proper way to see the priority of
+         * the download queue" -- the capability (`rank DESC, queued_at ASC`, Move to top) already
+         * existed and was invisible; this makes the row order legible as an order rather than
+         * something to infer. Only for a still-`queued` row -- a running job isn't waiting on
+         * anything anymore, so a position wouldn't mean the same thing for it. */}
+        {queuePosition != null && (
+          <span
+            className="shrink-0 rounded-full bg-indigo-100 px-1.5 py-0.5 text-xs font-semibold tabular-nums text-indigo-800 dark:bg-indigo-900/40 dark:text-indigo-300"
+            title={`Queue position ${queuePosition} -- runs in this order (Move to top to reorder)`}
+          >
+            #{queuePosition}
+          </span>
+        )}
         {/* Which queue this row belongs to (DESIGN.md §9.2) -- deliberately a plain muted
          * tag, not a StateChip, so it never competes with the state color for attention;
          * with more than one active queue this is the only thing that tells rows apart. */}
@@ -180,6 +210,22 @@ export function TransfersPage() {
     return map
   }, [queues])
 
+  // Queue position (2026-08-13, item 4): `jobs` (`useJobs`/`GET /api/jobs`) already comes back
+  // in the real run order (`core/queue.py.list_jobs`'s `ORDER BY job.rank DESC, job.queued_at
+  // ASC`) -- no new endpoint, just counting the `queued` rows in the order already returned.
+  // Running/failed/cancelled rows are in the same list (`list_jobs`'s own docstring) but never
+  // get a position: a running job isn't waiting, and a failed/cancelled one isn't in line at
+  // all.
+  const queuePositions = useMemo(() => {
+    const positions = new Map<number, number>()
+    let n = 0
+    for (const job of jobs) {
+      if (job.state === 'queued') positions.set(job.id, ++n)
+    }
+    return positions
+  }, [jobs])
+  const queuedCount = queuePositions.size
+
   const withBusy = async (jobId: number, action: () => Promise<unknown>) => {
     setBusyIds((prev) => new Set(prev).add(jobId))
     try {
@@ -234,6 +280,18 @@ export function TransfersPage() {
         </div>
       )}
 
+      {/* Makes the row order legible as an order (2026-08-13, item 4) -- "what is the proper
+       * way to see the priority of the download queue" was the ask; the ordering already
+       * existed (`rank DESC, queued_at ASC`) but nothing said so. Only shown once there's an
+       * actual order to explain (2+ queued jobs) -- a single queued job's position is not
+       * interesting on its own. */}
+      {queuedCount > 1 && (
+        <p className="text-xs text-zinc-500 dark:text-zinc-400">
+          Queued jobs run in the order shown, top to bottom — use <strong>Move to top</strong> to
+          reorder.
+        </p>
+      )}
+
       {jobs.length > 0 && (
         <div className="overflow-hidden rounded-md border border-zinc-200 dark:border-zinc-800">
           {jobs.map((job) => (
@@ -242,6 +300,7 @@ export function TransfersPage() {
               job={job}
               nodes={nodesByQueue.get(job.queue_id) ?? []}
               live={progressByJobId[job.id]}
+              queuePosition={queuePositions.get(job.id)}
               onOpenDrawer={setDrawerJob}
               onMoveToTop={handleMoveToTop}
               onStartNow={handleStartNow}

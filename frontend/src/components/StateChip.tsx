@@ -35,6 +35,13 @@ const STYLES: Record<string, string> = {
   // `DOWNLOADED`/`EXTRACTED`) with no indication anything is happening. Red, like FAILED/
   // CORRUPT -- this is destructive and irreversible, unlike the blue "still arriving" states.
   REMOVING: 'bg-red-100 text-red-800 dark:bg-red-900/40 dark:text-red-300',
+  // Also not a real `item.state` (2026-08-13, prompts/2026-08-13-files-ux-pass.md item 3):
+  // `FileTree.tsx`'s Row substitutes this whenever `substate === 'settling'` on a REMOTE_ONLY
+  // row, the same substitution pattern REMOVING above already established -- replaces the
+  // previous 6px dot (`h-1.5 w-1.5`, effectively invisible) with a readable, amber chip.
+  // Amber, like PARTIAL/DOWNLOADING's in-progress fill: this is also "still becoming what it
+  // will be," just one step earlier -- before anything has even been queued.
+  SETTLING: 'bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300',
 }
 const FALLBACK_STYLE = 'bg-zinc-100 text-zinc-700 dark:bg-zinc-800 dark:text-zinc-300'
 
@@ -58,6 +65,13 @@ interface StateChipProps {
    * state itself.
    */
   percent?: number | null
+  /** Overrides the displayed text without changing which `STYLES`/`FILL_STYLES` bucket `state`
+   * keys into (2026-08-13, prompts/2026-08-13-files-ux-pass.md item 3) -- the settle gate's
+   * wait ("Waiting for changes -- 1 of 2 scans, 35s of 60s") needs its own sentence, not the
+   * bare word `SETTLING`, while still getting `SETTLING`'s amber styling. `undefined` (every
+   * caller before this field existed) shows `state` verbatim, unchanged.
+   */
+  label?: string
 }
 
 /** DESIGN.md §9.2's Files-row state chip. The progress fill is the pill's own background, not
@@ -66,15 +80,16 @@ interface StateChipProps {
  * timer): the fill only ever needs to catch up to a new `percent` prop, which is already bounded
  * by how often this row re-renders (the WebSocket's own ~1 Hz progress cadence).
  */
-export function StateChip({ state, percent }: StateChipProps) {
+export function StateChip({ state, percent, label }: StateChipProps) {
   const style = STYLES[state] ?? FALLBACK_STYLE
   const fillStyle = FILL_STYLES[state]
   const showBar = fillStyle != null && percent != null
+  const text = label ?? state
 
   if (!showBar) {
     return (
       <span className={`rounded px-1.5 py-0.5 text-xs font-medium whitespace-nowrap ${style}`}>
-        {state}
+        {text}
       </span>
     )
   }
@@ -89,7 +104,7 @@ export function StateChip({ state, percent }: StateChipProps) {
         style={{ width: `${percent}%` }}
       />
       <span className="relative z-10">
-        {state} {percent}%
+        {text} {percent}%
       </span>
     </span>
   )
