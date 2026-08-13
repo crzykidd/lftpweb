@@ -57,3 +57,35 @@ using the UnRAR source to develop a RAR (WinRAR) compatible *archiver* or to
 re-implement RAR's proprietary compression algorithm. lftpweb only extracts archives
 with it; it never creates or re-compresses one, so this restriction does not apply to
 how lftpweb uses it. Full licence text: https://www.rarlab.com/license.htm
+
+
+Third-party source copied into the frontend
+---------------------------------------------
+
+`frontend/src/components/LifecycleIcons.tsx` (2026-08-13) contains SVG path data copied
+verbatim, unmodified, from the Lucide icon set (cloud, hard-drive, shield-check, package):
+
+  Lucide icons     ISC License   https://lucide.dev / https://github.com/lucide-icons/lucide
+
+  ISC License
+
+  Copyright (c) 2026 Lucide Icons and Contributors
+
+  Permission to use, copy, modify, and/or distribute this software for any purpose
+  with or without fee is hereby granted, provided that the above copyright notice
+  and this permission notice appear in all copies.
+
+  THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES WITH
+  REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY AND
+  FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY SPECIAL, DIRECT,
+  INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM
+  LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR
+  OTHER TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR
+  PERFORMANCE OF THIS SOFTWARE.
+
+Chosen over adding an icon package as a dependency: this project has added exactly
+one frontend dependency since phase 1 (`@tanstack/react-virtual`, itself a flagged
+deviation — see docs/decisions.md), and four small glyphs don't clear that bar.
+None of the four icons copied here are among the handful of Lucide icons derived
+from the Feather project (which carry an additional MIT notice in Lucide's own
+LICENSE file) — these four are ISC-only.

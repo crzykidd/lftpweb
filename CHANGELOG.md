@@ -196,6 +196,38 @@ alongside this list: several entries below ship with deliberate, documented limi
   cleanup, per the pipeline's fixed step order, so there is nothing to reconcile between the
   two). No Settings-page UI gap this time — the toggle lives in Settings → Post-processing
   alongside the other extraction options.
+- **The Files tree now shows an item's whole lifecycle, not just its current state word**
+  *(2026-08-13)*. Four small colour-coded icons per row — **R**emote / **L**ocal /
+  **V**erified / **E**xtracted — read from `core/itemview.py`'s new `facets` projection
+  (`GET /api/files`, `queue_delta`, `item_delta`, and connect-time `snapshot()` all agree,
+  since it's the one shared code path). R/L are *presence* facets and may legitimately go
+  dark (a `move`-mode item's remote copy going dark once deleted on purpose is the success
+  path, rendered **dim, never red**); V/E are *milestones*, read from `verified_at`/
+  `extracted_at` rather than `state`, so they stay lit even after a later rescan moves
+  `state` on. Makes visible, for the first time, the exact case a `DOWNLOADED` row can
+  claim bytes that are not on disk (an `*arr` import mid-§7.3-grace-period) — a dark **L**
+  distinguishes it from a directory whose children were all `EXCLUDED` by design, which
+  reads complete/green despite also having zero local bytes. `item.state` itself, its
+  transitions, and the grace period are unchanged — this is a display projection, not a
+  state-machine change. Icons are inline SVG copied from Lucide (ISC), not a new npm
+  dependency (see `NOTICE`). A new **Missing only** Files filter surfaces exactly the
+  `*arr`-import case, composing with the existing text/state filters.
+- **Inline progress bars on the Files tree's state chip** *(2026-08-13)*, for `PARTIAL`/
+  `DOWNLOADING` rows only (including a top-level directory's own rolled-up percentage, so a
+  40 GB multi-file release shows real progress, not just "partial"). The fill is the chip's
+  own background, growing with a CSS width transition — no per-row timer, no JS animation
+  loop. No new backend data: `local_size`/`remote_size` were already in the projection and
+  already rolled up for directories.
+- **Sortable Files tree** *(2026-08-13)*: name, size, last state change, or percent
+  complete, ascending or descending, persisted across reloads. Sorting reorders **siblings
+  within each parent**, never the flattened list the virtualizer walks, so a sorted tree
+  never tears a child away from its actual parent. Composes with the existing text/state
+  filters and with collapse state.
+- **Expand all / Collapse all now remembers your last choice** *(2026-08-13)*, in
+  `localStorage`, surviving a reload. Stored as a default-plus-exceptions preference, not a
+  saved set of collapsed paths — a directory that arrives later over the WebSocket inherits
+  the current default automatically rather than defaulting to expanded regardless of what
+  was last chosen.
 
 ### Changed
 

@@ -23,9 +23,23 @@ export function formatEta(etaSeconds: number | null | undefined): string {
   return `${s}s`
 }
 
+/** The one place `done`/`total` becomes a percentage (0-100, clamped, or `null` when it
+ * wouldn't mean anything -- no total, a non-positive total, or no `done` reading yet). Guards
+ * the exact inputs that would otherwise produce `NaN` or a negative width: `total <= 0`
+ * (division by zero or a nonsensical negative denominator) and `done == null`/`total == null`
+ * (nothing to compare). `formatPercent` and `FileTree.tsx`'s inline progress bar both build on
+ * this rather than each rolling their own -- "reuse formatPercent rather than writing a second
+ * percentage" (prompts/2026-08-13-lifecycle-icons.md), factored so the bar's numeric fraction
+ * and the text's rounded label can never disagree.
+ */
+export function percentValue(done: number | null, total: number | null): number | null {
+  if (done == null || total == null || total <= 0) return null
+  return Math.min(Math.round((done / total) * 100), 100)
+}
+
 export function formatPercent(done: number | null, total: number | null): string {
-  if (done == null || total == null || total <= 0) return '—'
-  return `${Math.min(Math.round((done / total) * 100), 100)}%`
+  const value = percentValue(done, total)
+  return value == null ? '—' : `${value}%`
 }
 
 // DESIGN.md §4.5/§9.3's Settings -> Transfer fields are stored on the wire as bytes(/s) --

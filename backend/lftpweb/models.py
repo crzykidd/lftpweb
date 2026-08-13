@@ -325,6 +325,25 @@ class QueueAutoQueueStatus(BaseModel):
 # --- Files (DESIGN.md §9.2) --------------------------------------------------------------
 
 
+class LifecycleFacet(BaseModel):
+    """One R/L/V/E reading (2026-08-13, `core/itemview.py._lifecycle_facets`). `level` is the
+    color a renderer needs (`"green" | "amber" | "red" | "dim"`); `reason` is the short code a
+    tooltip is built from, alongside this row's own raw size/timestamp fields -- see
+    `core/itemview.py`'s module docstring for why the classification lives there and the
+    wording lives in the frontend.
+    """
+
+    level: Literal["green", "amber", "red", "dim"]
+    reason: str
+
+
+class LifecycleFacets(BaseModel):
+    remote: LifecycleFacet
+    local: LifecycleFacet
+    verified: LifecycleFacet
+    extracted: LifecycleFacet
+
+
 class FileNode(BaseModel):
     id: int | None = None  # the persisted `item` row's id -- what POST /api/jobs takes (§4.7)
     rel_path: str
@@ -344,6 +363,17 @@ class FileNode(BaseModel):
     # the planned local-retention feature, which must use `downloaded_at` instead: "when did
     # it complete" and "when did it last move" are different questions.
     state_changed_at: str | None = None
+    # Milestone/audit timestamps (2026-08-13, prompts/2026-08-13-lifecycle-icons.md) -- passed
+    # through verbatim from the `item` row (`core/itemview.py.item_view`), the raw material a
+    # lifecycle icon's tooltip is built from. `downloaded_at` already existed on the row before
+    # this task (§7.3's retention key); the other four are new to the wire, not new to the
+    # database.
+    downloaded_at: str | None = None
+    verified_at: str | None = None
+    extracted_at: str | None = None
+    first_missing_at: str | None = None
+    remote_deleted_at: str | None = None
+    facets: LifecycleFacets
 
 
 class QueueFiles(BaseModel):

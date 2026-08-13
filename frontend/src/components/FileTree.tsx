@@ -2,7 +2,9 @@ import { useVirtualizer } from '@tanstack/react-virtual'
 import { useEffect, useMemo, useReducer, useRef, useState } from 'react'
 import { deleteItem, queueItem, stopItem } from '../api/client'
 import type { FileNode } from '../api/types'
-import { formatBytes, stateAgeLabel } from '../lib/format'
+import { formatBytes, percentValue, stateAgeLabel } from '../lib/format'
+import { readLocalStorage, writeLocalStorage } from '../lib/storage'
+import { LifecycleIcons } from './LifecycleIcons'
 import { StateChip } from './StateChip'
 
 // One shared ticker per tree, not a `setInterval` per row (migration 006's `state_changed_at`
@@ -21,6 +23,15 @@ interface TreeEntry extends FileNode {
   name: string
   depth: number
   children: TreeEntry[]
+}
+
+/** What a row's own size column shows -- a directory's `remote_size` (already a rollup,
+ * `core/reconcile.py`), a file's `local_size` falling back to `remote_size` (a not-yet-touched
+ * file has no local bytes to show at all). Named and shared so `Row` and the `size` sort key
+ * (below) can never quietly disagree about what "size" means for a node.
+ */
+function nodeDisplaySize(entry: TreeEntry): number | null {
+  return entry.is_dir ? entry.remote_size : (entry.local_size ?? entry.remote_size)
 }
 
 function buildTree(nodes: FileNode[]): TreeEntry[] {
@@ -56,20 +67,133 @@ function buildTree(nodes: FileNode[]): TreeEntry[] {
   return roots
 }
 
-/** Depth-first, respecting `collapsed` -- this is what gets virtualized. A collapsed
+/** Depth-first, respecting `isCollapsed` -- this is what gets virtualized. A collapsed
  * directory's children simply never enter the flat list, so scroll math stays correct
- * without the virtualizer needing to know anything about tree structure.
+ * without the virtualizer needing to know anything about tree structure. A predicate rather
+ * than a `Set` of collapsed paths (2026-08-13) -- the persisted collapse preference below is
+ * "default plus exceptions," not an enumerable set of collapsed paths, and a predicate is the
+ * one shape that works for both that and the old plain-`Set` caller.
  */
-function flatten(roots: TreeEntry[], collapsed: Set<string>): TreeEntry[] {
+function flatten(roots: TreeEntry[], isCollapsed: (path: string) => boolean): TreeEntry[] {
   const out: TreeEntry[] = []
   const walk = (entries: TreeEntry[]) => {
     for (const entry of entries) {
       out.push(entry)
-      if (entry.is_dir && !collapsed.has(entry.rel_path)) walk(entry.children)
+      if (entry.is_dir && !isCollapsed(entry.rel_path)) walk(entry.children)
     }
   }
   walk(roots)
   return out
+}
+
+// --- Sorting (2026-08-13): reorders siblings within each parent, never the flattened array --
+// flattening is what the virtualizer walks, and sorting it directly would tear children away
+// from their parents. `sortTree` below runs on the built tree, before `flatten`.
+
+type SortKey = 'name' | 'size' | 'state_changed_at' | 'percent'
+type SortDir = 'asc' | 'desc'
+
+const SORT_KEYS: SortKey[] = ['name', 'size', 'state_changed_at', 'percent']
+const SORT_LABELS: Record<SortKey, string> = {
+  name: 'Name',
+  size: 'Size',
+  state_changed_at: 'Last change',
+  percent: '% complete',
+}
+
+function sortValue(entry: TreeEntry, key: SortKey): string | number | null {
+  switch (key) {
+    case 'name':
+      return entry.name.toLowerCase()
+    case 'size':
+      return nodeDisplaySize(entry)
+    case 'state_changed_at':
+      return entry.state_changed_at
+    case 'percent':
+      return percentValue(entry.local_size, entry.remote_size)
+  }
+}
+
+/** Null/absent values always sort last, regardless of direction -- an "unknown" reading
+ * (no `remote_size`, no `state_changed_at` yet) staying put rather than jumping to the top the
+ * moment a user flips to descending is the less surprising behavior of the two.
+ */
+function compareValues(a: string | number | null, b: string | number | null, dir: SortDir): number {
+  if (a == null && b == null) return 0
+  if (a == null) return 1
+  if (b == null) return -1
+  const cmp = typeof a === 'string' && typeof b === 'string' ? a.localeCompare(b) : (a as number) - (b as number)
+  return dir === 'asc' ? cmp : -cmp
+}
+
+function sortSiblingsRecursive(entries: TreeEntry[], key: SortKey, dir: SortDir): void {
+  entries.sort((a, b) => {
+    if (key === 'name') {
+      // Preserves the tree's existing default look (directories grouped before files) --
+      // direction flips the name ordering within each group, not the grouping itself.
+      if (a.is_dir !== b.is_dir) return a.is_dir ? -1 : 1
+      const cmp = a.name.localeCompare(b.name)
+      return dir === 'asc' ? cmp : -cmp
+    }
+    const cmp = compareValues(sortValue(a, key), sortValue(b, key), dir)
+    if (cmp !== 0) return cmp
+    // Tie-break so equal values don't jitter across renders: directories first, then name.
+    if (a.is_dir !== b.is_dir) return a.is_dir ? -1 : 1
+    return a.name.localeCompare(b.name)
+  })
+  for (const entry of entries) sortSiblingsRecursive(entry.children, key, dir)
+}
+
+/** Sorts every level of the tree by `key`/`dir`, siblings only -- a directory's own position
+ * among its siblings is decided by its rollup size/percent/`state_changed_at` (already computed
+ * by `core/reconcile.py`/`core/itemview.py`, nothing derived here), and its children are sorted
+ * the same way one level down. Returns a fresh tree (deep-cloned) rather than mutating `roots`
+ * in place, so this stays a pure function of its inputs -- safe to call from a `useMemo`.
+ */
+function sortTree(roots: TreeEntry[], key: SortKey, dir: SortDir): TreeEntry[] {
+  const clone = (entries: TreeEntry[]): TreeEntry[] =>
+    entries.map((entry) => ({ ...entry, children: clone(entry.children) }))
+  const cloned = clone(roots)
+  sortSiblingsRecursive(cloned, key, dir)
+  return cloned
+}
+
+// --- Collapse preference (2026-08-13): "default plus exceptions," not a saved set of ---------
+// collapsed paths -- a directory that appears later (over the WebSocket) inherits the current
+// default automatically; only per-row overrides are tracked explicitly.
+
+interface CollapsePreference {
+  defaultCollapsed: boolean
+  exceptions: string[]
+}
+
+const DEFAULT_COLLAPSE_PREFERENCE: CollapsePreference = { defaultCollapsed: false, exceptions: [] }
+
+function isCollapsePreference(value: unknown): value is CollapsePreference {
+  if (typeof value !== 'object' || value == null) return false
+  const v = value as Record<string, unknown>
+  return (
+    typeof v.defaultCollapsed === 'boolean' &&
+    Array.isArray(v.exceptions) &&
+    v.exceptions.every((p) => typeof p === 'string')
+  )
+}
+
+interface SortPreference {
+  key: SortKey
+  dir: SortDir
+}
+
+const DEFAULT_SORT_PREFERENCE: SortPreference = { key: 'name', dir: 'asc' }
+
+function isSortPreference(value: unknown): value is SortPreference {
+  if (typeof value !== 'object' || value == null) return false
+  const v = value as Record<string, unknown>
+  return (
+    typeof v.key === 'string' &&
+    (SORT_KEYS as string[]).includes(v.key) &&
+    (v.dir === 'asc' || v.dir === 'desc')
+  )
 }
 
 /** What this row's own action button offers, if anything (DESIGN.md §9.2, §4.7). Manual
@@ -140,6 +264,18 @@ function remoteCopyNote(total: number, remoteCount: number): string {
   )
 }
 
+/** The state chip's inline fill (2026-08-13): only where a percentage means something.
+ * `DOWNLOADING`/`PARTIAL` are the two states an in-progress read is actually informative for --
+ * a complete item doesn't need a 100% bar, and `REMOTE_ONLY`/`EXCLUDED` have no denominator
+ * that means anything yet. `percentValue` already guards the `NaN`/divide-by-zero cases (no or
+ * non-positive `remote_size`), so a queue whose `remote_size` hasn't arrived yet just shows no
+ * bar rather than a broken one.
+ */
+function stateProgressPercent(node: FileNode): number | null {
+  if (node.state !== 'DOWNLOADING' && node.state !== 'PARTIAL') return null
+  return percentValue(node.local_size, node.remote_size)
+}
+
 interface RowProps {
   entry: TreeEntry
   isCollapsed: boolean
@@ -161,7 +297,7 @@ function Row({
   onDeleteRequest,
   actionBusy,
 }: RowProps) {
-  const size = entry.is_dir ? entry.remote_size : (entry.local_size ?? entry.remote_size)
+  const size = nodeDisplaySize(entry)
   const action = rowAction(entry)
   const deletable = canDeleteLocal(entry)
 
@@ -204,7 +340,7 @@ function Row({
         {size != null ? formatBytes(size) : '—'}
       </span>
       <span className="w-28 shrink-0 text-right">
-        <StateChip state={entry.state} />
+        <StateChip state={entry.state} percent={stateProgressPercent(entry)} />
         {/* The settle gate (prompts/open-issues.md #2): most REMOTE_ONLY items pass through
             this on every first sighting, so it's deliberately quiet -- a small dot, not a
             second chip -- rather than something that reads as a problem. */}
@@ -214,6 +350,12 @@ function Row({
             title="Waiting for another scan to confirm this item has stopped changing before it's queued"
           />
         )}
+      </span>
+      {/* Lifecycle icons (2026-08-13): R/L/V/E, one glyph per `entry.facets`
+          (`core/itemview.py`) -- the accumulated lifecycle, alongside the state chip's current
+          verb rather than folded into it. */}
+      <span className="flex w-20 shrink-0 justify-end">
+        <LifecycleIcons node={entry} />
       </span>
       {/* migration 006's `state_changed_at`: "when did this row last move," labeled by the
           state it's already showing rather than a second, redundant chip. Absolute time in
@@ -302,8 +444,38 @@ export function FileTree({ nodes }: { nodes: FileNode[] }) {
     return () => clearInterval(id)
   }, [])
 
-  const tree = useMemo(() => buildTree(nodes), [nodes])
-  const [collapsed, setCollapsed] = useState<Set<string>>(new Set())
+  // Sort preference (2026-08-13): read synchronously in the initial `useState`, not a
+  // `useEffect`, or the tree paints in the default order and then snaps into the saved one on
+  // first load. Same storage helper and failure handling as the collapse preference below --
+  // one mechanism, not two.
+  const [sortPref, setSortPref] = useState<SortPreference>(
+    () => readLocalStorage('files.sort', isSortPreference) ?? DEFAULT_SORT_PREFERENCE,
+  )
+  const setSort = (next: SortPreference) => {
+    setSortPref(next)
+    writeLocalStorage('files.sort', next)
+  }
+
+  const tree = useMemo(
+    () => sortTree(buildTree(nodes), sortPref.key, sortPref.dir),
+    [nodes, sortPref],
+  )
+
+  // Collapse preference (2026-08-13): "default plus exceptions," not a saved set of collapsed
+  // paths -- see this task's own prompt for why persisting the collapsed set directly breaks
+  // the moment a new directory arrives over the WebSocket after the set was saved. Also read
+  // synchronously, for the same first-paint reason as the sort preference above.
+  const [collapsePref, setCollapsePrefState] = useState<CollapsePreference>(
+    () => readLocalStorage('files.collapse', isCollapsePreference) ?? DEFAULT_COLLAPSE_PREFERENCE,
+  )
+  const setCollapsePref = (next: CollapsePreference) => {
+    setCollapsePrefState(next)
+    writeLocalStorage('files.collapse', next)
+  }
+  const exceptionSet = useMemo(() => new Set(collapsePref.exceptions), [collapsePref.exceptions])
+  const isPathCollapsed = (path: string): boolean =>
+    exceptionSet.has(path) ? !collapsePref.defaultCollapsed : collapsePref.defaultCollapsed
+
   const [selected, setSelected] = useState<Set<string>>(new Set())
   const [lastClickedPath, setLastClickedPath] = useState<string | null>(null)
   const [bulkBusy, setBulkBusy] = useState(false)
@@ -311,6 +483,11 @@ export function FileTree({ nodes }: { nodes: FileNode[] }) {
   const [bulkOutcome, setBulkOutcome] = useState<BulkOutcome | null>(null)
   const [searchText, setSearchText] = useState('')
   const [stateFilter, setStateFilter] = useState('')
+  // The *arr-import case (item 8, prompts/2026-08-13-lifecycle-icons.md): an item with a
+  // download history but no local presence right now (`core/itemview.py`'s "local" facet
+  // reads `reason: "missing"` -- distinct from "never downloaded," which this checkbox does
+  // not match). Composes with the text/state filters below via the same `visiblePaths` set.
+  const [missingOnly, setMissingOnly] = useState(false)
   // Delete is irreversible (Queue/Stop are not) -- a confirmation step sits between "the user
   // asked to delete" and "anything actually runs," for both the per-row button and the bulk
   // action. `null` = no pending confirmation; otherwise the exact entries about to be deleted,
@@ -319,15 +496,16 @@ export function FileTree({ nodes }: { nodes: FileNode[] }) {
 
   // Every entry regardless of collapse state -- selection and the state-filter dropdown's
   // own option list must survive a directory being collapsed, and a text/state match inside
-  // a collapsed directory must still be findable (below).
-  const fullFlat = useMemo(() => flatten(tree, new Set()), [tree])
+  // a collapsed directory must still be findable (below). Always the *sorted* tree's own
+  // order (`tree` above), so filtering never has to re-sort.
+  const fullFlat = useMemo(() => flatten(tree, () => false), [tree])
   const byPath = useMemo(() => new Map(fullFlat.map((e) => [e.rel_path, e])), [fullFlat])
   const availableStates = useMemo(
     () => [...new Set(nodes.map((n) => n.state))].sort(),
     [nodes],
   )
 
-  const filtersActive = stateFilter !== '' || searchText.trim() !== ''
+  const filtersActive = stateFilter !== '' || searchText.trim() !== '' || missingOnly
 
   // Whether there is any directory to fold/unfold at all -- drives disabling Expand/Collapse
   // all the same way other controls on this page disable for an empty state, rather than a
@@ -348,14 +526,18 @@ export function FileTree({ nodes }: { nodes: FileNode[] }) {
   // A match plus every one of its ancestor directories (so the tree stays navigable down to
   // the hit) -- computed over the *full*, uncollapsed set, then substituted for the normal
   // collapse-respecting flatten below. Filtering while a directory happens to be collapsed
-  // must still surface matches inside it, so a filter's flat list ignores `collapsed`
-  // entirely rather than compounding with it.
+  // must still surface matches inside it, so a filter's flat list ignores the collapse
+  // preference entirely rather than compounding with it -- and the preference itself is left
+  // untouched, so it applies again unchanged the moment filters clear.
   const visiblePaths = useMemo(() => {
     if (!filtersActive) return null
     const needle = searchText.trim().toLowerCase()
     const visible = new Set<string>()
     for (const entry of fullFlat) {
       if (stateFilter && entry.state !== stateFilter) continue
+      if (missingOnly && !(entry.downloaded_at != null && entry.facets.local.reason === 'missing')) {
+        continue
+      }
       if (needle && !entry.name.toLowerCase().includes(needle) && !entry.rel_path.toLowerCase().includes(needle)) {
         continue
       }
@@ -367,12 +549,15 @@ export function FileTree({ nodes }: { nodes: FileNode[] }) {
       }
     }
     return visible
-  }, [filtersActive, fullFlat, searchText, stateFilter])
+  }, [filtersActive, fullFlat, missingOnly, searchText, stateFilter])
 
   const flat = useMemo(() => {
-    if (!filtersActive || visiblePaths == null) return flatten(tree, collapsed)
+    if (!filtersActive || visiblePaths == null) return flatten(tree, isPathCollapsed)
     return fullFlat.filter((e) => visiblePaths.has(e.rel_path))
-  }, [tree, collapsed, filtersActive, fullFlat, visiblePaths])
+    // isPathCollapsed is a plain closure over collapsePref -- listed below instead of the
+    // function identity, which is recreated every render.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tree, collapsePref, filtersActive, fullFlat, visiblePaths])
 
   const scrollRef = useRef<HTMLDivElement>(null)
   const virtualizer = useVirtualizer({
@@ -382,25 +567,28 @@ export function FileTree({ nodes }: { nodes: FileNode[] }) {
     overscan: 16,
   })
 
+  /** A per-row toggle flips this path's *exception* membership, not a collapsed/expanded bit
+   * directly -- `isPathCollapsed` above is what turns "is this path an exception" back into an
+   * actual collapsed/expanded reading against the current default. Persisted like every other
+   * change to the preference (2026-08-13): whether a manual per-row override survives a reload
+   * was this task's own call to make, and persisting it (rather than resetting to the default
+   * every time) is the more consistent choice, since it goes through the exact same mechanism.
+   */
   const toggleCollapse = (path: string) => {
-    setCollapsed((prev) => {
-      const next = new Set(prev)
-      if (next.has(path)) next.delete(path)
-      else next.add(path)
-      return next
-    })
+    const nextExceptions = new Set(collapsePref.exceptions)
+    if (nextExceptions.has(path)) nextExceptions.delete(path)
+    else nextExceptions.add(path)
+    setCollapsePref({ defaultCollapsed: collapsePref.defaultCollapsed, exceptions: [...nextExceptions] })
   }
 
-  /** `collapsed` starts empty (default expanded, see the field above), so expand-all is just
-   * clearing it, and collapse-all is filling it with every directory path. Built from
-   * `fullFlat` -- already a full, uncollapsed walk of the whole tree (above) -- rather than
-   * re-walking `tree`, so this stays one O(tree size) pass over data already computed for
-   * filtering, not a second traversal. Both are pure `Set` replacements, no per-row effects.
+  /** Expand all / Collapse all set the *default* and clear every exception -- not an
+   * enumerated set of paths (2026-08-13; see the module-level comment on `CollapsePreference`
+   * for why enumerating breaks the moment a new directory arrives over the WebSocket). This is
+   * also what makes the preference itself trivial to persist: two scalars, not a set whose
+   * membership would need reconciling against the live tree on every load.
    */
-  const expandAll = () => setCollapsed(new Set())
-  const collapseAll = () => {
-    setCollapsed(new Set(fullFlat.filter((e) => e.is_dir).map((e) => e.rel_path)))
-  }
+  const expandAll = () => setCollapsePref({ defaultCollapsed: false, exceptions: [] })
+  const collapseAll = () => setCollapsePref({ defaultCollapsed: true, exceptions: [] })
 
   const toggleSelect = (entry: TreeEntry, shiftKey: boolean) => {
     setSelected((prev) => {
@@ -541,6 +729,40 @@ export function FileTree({ nodes }: { nodes: FileNode[] }) {
             </option>
           ))}
         </select>
+        <label className="flex items-center gap-1.5 text-xs font-medium text-zinc-700 dark:text-zinc-200">
+          <input
+            type="checkbox"
+            checked={missingOnly}
+            onChange={(e) => setMissingOnly(e.target.checked)}
+          />
+          Missing only
+        </label>
+        <span className="mx-1 h-5 w-px bg-zinc-200 dark:bg-zinc-800" aria-hidden="true" />
+        <label className="flex items-center gap-1.5 text-xs font-medium text-zinc-700 dark:text-zinc-200">
+          Sort
+          <select
+            className={inputClasses}
+            value={sortPref.key}
+            onChange={(e) => setSort({ key: e.target.value as SortKey, dir: sortPref.dir })}
+            aria-label="Sort by"
+          >
+            {SORT_KEYS.map((key) => (
+              <option key={key} value={key}>
+                {SORT_LABELS[key]}
+              </option>
+            ))}
+          </select>
+        </label>
+        <button
+          type="button"
+          onClick={() => setSort({ key: sortPref.key, dir: sortPref.dir === 'asc' ? 'desc' : 'asc' })}
+          title={sortPref.dir === 'asc' ? 'Ascending -- click for descending' : 'Descending -- click for ascending'}
+          aria-label={sortPref.dir === 'asc' ? 'Sort ascending' : 'Sort descending'}
+          className="rounded-md border border-zinc-300 px-2 py-1 text-xs font-medium text-zinc-700 hover:bg-zinc-50 dark:border-zinc-700 dark:text-zinc-200 dark:hover:bg-zinc-900"
+        >
+          {sortPref.dir === 'asc' ? '↑ Asc' : '↓ Desc'}
+        </button>
+        <span className="mx-1 h-5 w-px bg-zinc-200 dark:bg-zinc-800" aria-hidden="true" />
         <button
           type="button"
           disabled={!hasDirectories || filtersActive}
@@ -569,6 +791,7 @@ export function FileTree({ nodes }: { nodes: FileNode[] }) {
               onClick={() => {
                 setSearchText('')
                 setStateFilter('')
+                setMissingOnly(false)
               }}
               className="rounded-md px-2 py-1 text-xs font-medium text-zinc-600 underline hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800"
             >
@@ -694,6 +917,20 @@ export function FileTree({ nodes }: { nodes: FileNode[] }) {
           ref={scrollRef}
           className="max-h-[70vh] overflow-auto rounded-md border border-zinc-200 dark:border-zinc-800"
         >
+          {/* Column labels -- mirrors `Row`'s own widths so the header stays aligned with the
+              virtualized rows beneath it. Static, not itself sortable -- the sort control
+              lives in the toolbar above; this just names what the new lifecycle-icon column
+              (R/L/V/E) is. */}
+          <div className="sticky top-0 z-10 flex items-center gap-2 border-b border-zinc-200 bg-zinc-50 px-2 py-1 text-[10px] font-medium tracking-wide text-zinc-500 uppercase dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-400">
+            <span className="w-4 shrink-0" />
+            <span className="w-4 shrink-0" />
+            <span className="min-w-0 flex-1">Name</span>
+            <span className="w-24 shrink-0 text-right">Size</span>
+            <span className="w-28 shrink-0 text-right">Status</span>
+            <span className="w-20 shrink-0 text-right">R L V E</span>
+            <span className="w-32 shrink-0 text-right">Changed</span>
+            <span className="w-32 shrink-0 text-right">Actions</span>
+          </div>
           <div style={{ height: virtualizer.getTotalSize(), position: 'relative' }}>
             {virtualizer.getVirtualItems().map((virtualRow) => {
               const entry = flat[virtualRow.index]
@@ -711,7 +948,7 @@ export function FileTree({ nodes }: { nodes: FileNode[] }) {
                 >
                   <Row
                     entry={entry}
-                    isCollapsed={collapsed.has(entry.rel_path)}
+                    isCollapsed={isPathCollapsed(entry.rel_path)}
                     isSelected={selected.has(entry.rel_path)}
                     onToggleCollapse={toggleCollapse}
                     onToggleSelect={toggleSelect}

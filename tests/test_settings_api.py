@@ -27,6 +27,11 @@ def _view(
             "local_size": None,
             "remote_mtime": remote_mtime,
             "state_changed_at": None,
+            "downloaded_at": None,
+            "verified_at": None,
+            "extracted_at": None,
+            "first_missing_at": None,
+            "remote_deleted_at": None,
         }
     )
 

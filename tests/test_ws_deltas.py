@@ -47,6 +47,11 @@ def _node(rel_path: str, size: int) -> ItemView:
             "local_size": None,
             "remote_mtime": 1.0,
             "state_changed_at": None,
+            "downloaded_at": None,
+            "verified_at": None,
+            "extracted_at": None,
+            "first_missing_at": None,
+            "remote_deleted_at": None,
         }
     )
 
@@ -241,8 +246,13 @@ async def test_scan_delta_is_small_and_exact_regardless_of_tree_size(tmp_path, m
     }
     assert set(delta["removed"]) == {"Release.00003", "Release.00003/movie.mkv"}
 
-    # The actual point: payload size is bounded by what changed, not by `n`.
-    assert len(json.dumps(delta)) < 2000
+    # The actual point: payload size is bounded by what changed, not by `n`. The threshold was
+    # bumped from 2000 (2026-08-13, prompts/2026-08-13-lifecycle-icons.md): every changed node
+    # now also carries `facets` (four small dicts) plus five raw milestone/audit timestamps
+    # (`core/itemview.py`), a fixed per-node cost that doesn't scale with `n` either -- see
+    # `test_scan_delta_payload_does_not_scale_with_tree_size` below for the assertion that
+    # actually proves that.
+    assert len(json.dumps(delta)) < 3000
 
 
 async def test_scan_delta_payload_does_not_scale_with_tree_size(tmp_path, monkeypatch):

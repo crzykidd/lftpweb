@@ -6,6 +6,105 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-13 — Lifecycle icons: presence vs. milestone, and why `item.state` stays untouched
+
+**Handoff prompt `prompts/2026-08-13-lifecycle-icons.md`, executed end to end.** User design
+decision, after a night of state bugs: replace the single state word with small icons — R
+(remote) / L (local) / V (verified) / E (extracted) — because `item.state` was carrying at
+least five orthogonal facts in one slot, and every 2026-08-12/13 state bug was two of those
+facts fighting over the same slot (`LOCAL_ONLY` clobbering a `move`-mode item's `EXTRACTED`
+outcome; `REMOVED_BOTH` overloaded to also mean "local gone, remote untouched"; a `DOWNLOADED`
+row claiming bytes that are not on disk during §7.3's grace period).
+
+**The load-bearing idea, which the next person must not collapse back: presence vs. milestone.**
+R and L are read fresh on every projection and may legitimately go dark — a `move`-mode item's
+R goes dark the instant its verified remote copy is deleted on purpose, and that is the display
+being honest, not a regression. V and E are milestones: read from `verified_at`/`extracted_at`
+(timestamp columns nothing ever clears), never from `state`, so they stay correctly lit after a
+later rescan moves `state` on (e.g. held at `EXTRACTED` by `outcome_survives_rescan` while the
+structural reading underneath is `LOCAL_ONLY`). This is the whole reason the bug class disappears
+at the display layer even before (if ever) it's fixed in the state layer itself — see
+`core/itemview.py`'s module-level docstring, where this is recorded a second time on purpose,
+next to the code it governs.
+
+**Explicitly out of scope, honored:** `item.state`, `resolve_absence`, the grace period, and
+every state transition are byte-for-byte unchanged. `core/itemview.py._lifecycle_facets` is a
+pure *projection* of already-persisted facts (`remote_size`/`local_size`/`state`/`verified_at`/
+`extracted_at`/`first_missing_at`/`remote_deleted_at`), computed in exactly one place so
+`GET /api/files`, `queue_delta`, `item_delta`, and connect-time `snapshot()` cannot disagree —
+they are all the same `item_view()` call.
+
+**L's completeness rule reuses the leaf byte rule (`local_size >= remote_size`,
+`core/reconcile.py`'s own inequality) only for the "not yet resolved" states
+(QUEUED/DOWNLOADING/PARTIAL/STOPPED/FAILED/REMOTE_ONLY, and directories in the same structural
+states — `local_size`/`remote_size` are already rollup sums for a directory, so no second
+directory rule was needed).** Every state past that point (`DOWNLOADED` and everything
+`core/postprocess.py` refines it into) reads complete directly from `state`, *not* from the byte
+comparison — because two real cases would otherwise misread: a directory whose remote children
+were all `EXCLUDED` (§3.2 rule 8) has real remote bytes and zero local bytes by design, and an
+`EXTRACTED` item whose spent archive volumes were deleted after extraction (`4533617`) has
+`local_size < remote_size` by design. Both must read complete/green, and neither can be told
+apart from a genuinely broken item by bytes alone. The one thing that *can* tell a genuinely
+broken case apart — an `*arr`-imported-out `DOWNLOADED` item, still claiming complete while the
+disk is empty — is `first_missing_at`: set only while §7.3's grace period is actually running,
+never for the vacuous-exclude case. That single column is what makes item 8 of the prompt (a
+Files "Missing only" filter) both correct and cheap.
+
+**`REMOVED_LOCAL`/`REMOVED_BOTH` force L dark directly from `state`, never from `local_size`** —
+found while reasoning through `core/local_delete.py._mark_subtree_removed`, which updates only
+`state`/`auto_queue_suppressed`/`suppressed_reason` at delete time and never touches
+`local_size`. The `item_delta` published immediately after a manual delete (before the next scan
+corrects the column) would otherwise show a stale, pre-delete `local_size` and misread as still
+present. This is exactly the kind of thing a hand-built test fixture cannot catch and an
+end-to-end test (this task's headline test, run through the real `Engine.scan_queue` on a
+`move`-mode queue) can — see `tests/test_itemview.py`.
+
+**A duplicated constant, on purpose, with the duplication flagged in code rather than hidden.**
+`core/itemview.py._LOCAL_CONTENT_ASSERTED_STATES` restates
+`core/mount_sentinel.py.COMPLETE_STATES`'s exact value rather than importing it: `core/
+postprocess.py` already imports `item_view` from `core/itemview.py`, and `core/mount_sentinel.py`
+imports `core/postprocess.py` in turn, so importing either back into `core/itemview.py` would be
+circular. `core/itemview.py` is deliberately the one module with no dependencies of its own
+(every other module reads back through it) — restructuring that to share the constant felt like
+a bigger, riskier change than this task's "display projection, not a state-machine change" scope
+allowed. Flagged with a comment on both the frozenset and, if a state is ever added to the state
+CHECK constraint, is the one place a reviewer needs to remember to touch twice.
+
+**Frontend: collapse preference is default-plus-exceptions, never a saved set of collapsed
+paths.** The Files tree updates continuously over the WebSocket; a directory that first appears
+*after* a naive "persisted collapsed set" was saved would not be in it and would render expanded
+against the user's stated "always start collapsed" preference. Storing `{defaultCollapsed,
+exceptions}` instead means a new directory inherits the current default automatically, and a
+per-row override is just membership in `exceptions`. Sort preference persists through the exact
+same `lib/storage.ts` helper (`readLocalStorage`/`writeLocalStorage`), per the prompt's own "same
+storage helper, same failure handling. Do not write two." Per-row exceptions are persisted too
+(not reset to the default on reload) — the simpler of the two consistent choices, since they
+already go through the identical write path as Expand all / Collapse all.
+
+**Icons: inline SVG copied from Lucide (ISC), not an npm dependency.** This project has added
+exactly one frontend dependency since phase 1 (`@tanstack/react-virtual`, itself flagged as a
+deviation below); four 24×24 glyphs don't clear that bar. Path data for `cloud`/`hard-drive`/
+`shield-check`/`package` copied verbatim from Lucide's GitHub source, none of them among the
+handful of Feather-derived icons that carry a second (MIT) notice — see `NOTICE`.
+
+**DESIGN.md §9.2 — draft wording only, not applied.** Current text already names "state chip,
+progress bar" for the Files row (so the progress bar itself needed no design-doc change); it
+says nothing about lifecycle icons, sorting, or a persisted collapse preference. Proposed
+addition, pending a nod:
+
+> Each row also shows four small lifecycle icons — Remote / Local / Verified / Extracted —
+> derived from the same persisted `item` row as the state chip (`core/itemview.py`'s `facets`
+> projection), never a second read of it. Remote/Local are presence (may go dark; a `move`-mode
+> item's deleted-on-purpose remote copy is dim, never red); Verified/Extracted are milestones
+> (stay lit once earned, independent of the row's current `state`). The tree is sortable by
+> name, size, last state change, or percent complete, siblings-only (a sort never reorders across
+> parents), and the Expand all / Collapse all choice persists across reloads.
+
+Not applied to `DESIGN.md` itself per this repo's own convention for draft wording (see the
+2026-08-12 "settle gate" and "`state_changed_at`" entries below, same pattern).
+
+---
+
 ## 2026-08-13 — A `move`-mode outcome must survive `LOCAL_ONLY`, and a rel_path that leaves
 ## both trees must not freeze on it forever
 

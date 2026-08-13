@@ -199,6 +199,27 @@ export interface QueueAutoQueueStatus {
 
 // --- Files (phase 2, DESIGN.md §9.2) ----------------------------------------------------
 
+// Lifecycle facets (2026-08-13, prompts/2026-08-13-lifecycle-icons.md,
+// core/itemview.py._lifecycle_facets) -- R(emote)/L(ocal)/V(erified)/E(xtracted), derived
+// server-side from the same persisted row `state` comes from, so there is exactly one place
+// that decides what a fact means. `level` drives color; `reason` plus this row's own raw
+// size/timestamp fields (below) is what `FileTree.tsx` builds a tooltip sentence from --
+// deliberately not a pre-formatted string, the same split `stateAgeLabel` already uses for
+// `state`/`state_changed_at`.
+export type FacetLevel = 'green' | 'amber' | 'red' | 'dim'
+
+export interface LifecycleFacet {
+  level: FacetLevel
+  reason: string
+}
+
+export interface LifecycleFacets {
+  remote: LifecycleFacet
+  local: LifecycleFacet
+  verified: LifecycleFacet
+  extracted: LifecycleFacet
+}
+
 export interface FileNode {
   id: number | null
   rel_path: string
@@ -216,6 +237,15 @@ export interface FileNode {
   // (downloaded_at, the planned local-retention feature's key) -- a DOWNLOADED item that dips
   // to PARTIAL and back moves this without earning a fresh retention lease.
   state_changed_at: string | null
+  // Milestone/audit timestamps (2026-08-13) -- raw material for a lifecycle icon's tooltip.
+  // `downloaded_at` already existed server-side (§7.3's retention key); the other four are new
+  // to the wire only.
+  downloaded_at: string | null
+  verified_at: string | null
+  extracted_at: string | null
+  first_missing_at: string | null
+  remote_deleted_at: string | null
+  facets: LifecycleFacets
 }
 
 // `POST /api/items/{item_id}/delete` (prompts/open-issues.md "7 + 8" -- the first delete
