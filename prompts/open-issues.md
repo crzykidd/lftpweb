@@ -13,6 +13,41 @@ and it held all night.
 
 ---
 
+## Awaiting a decision from the user
+
+### Post-processing settings: site-wide *and* per-queue, for four toggles
+
+Raised by the user 2026-08-13: *"if we have these settings per queue then why have some of them
+here?"* Scanned and written up; **not built — this changes behaviour and is the user's call.**
+
+Only **four** settings are duplicated, and they are ANDed
+(`core/postprocess.py.process_item`): `verify_enabled`/`auto_verify`,
+`extract_enabled`/`auto_extract`, `move_enabled`/`auto_move`,
+`delete_archives_after_extract`/`auto_delete_archives`.
+
+Everything else site-wide is genuine *configuration* with no per-queue twin —
+`verify_hash_on_disk`, `extract_target_dir`, `extract_passwords`, `concurrency`,
+`failed_retention_enabled`/`_days`. Nobody is confused by those and they should stay put.
+
+Three options:
+
+1. **Status quo** — keep the AND, rely on the "System setting: off" readout added in `0781352`.
+   No work, but it papers over the confusion instead of removing it.
+2. **Site toggle becomes the default for new queues, not an AND gate.** The queue owns the
+   decision; the site value is the template applied at creation. "Toggle on but nothing
+   happens" becomes structurally impossible. **The migration can preserve behaviour exactly** —
+   set each queue's toggle to `(site AND queue)` as it currently resolves, then stop ANDing, so
+   no existing install changes.
+3. **Drop the site toggles entirely.** Simplest model; costs a global kill switch.
+
+**Recommendation: 2.** Keeps set-policy-once convenience, makes a queue's behaviour readable
+from one screen, migration is behaviour-preserving. The only loss is a global off switch, which
+is better expressed as one explicit "pause post-processing" control than as four ANDs that each
+fail silently — the user has been bitten by exactly that twice.
+
+Under all three, `sync_mode == 'move'` still forces verification on regardless of both layers,
+because it gates an irreversible remote delete.
+
 ## Still open — read these first
 
 ### No frontend test runner exists — at all
@@ -132,6 +167,12 @@ Plus the backup `VACUUM INTO` race (`209928d`) and the pending `DESIGN.md` wordi
 | Delete/removal state honest under a slow delete, a returning release, and a stuck `PARTIAL` child | `7dc045f` |
 | Per-queue archive cleanup, site-setting readout, settings-merge fix for silent resets | `0781352` |
 | Header sorting, facet filter, settle countdown, queue position, dashboard timeframe | `38efaaa` |
+| Vanished rows stop being published once terminal; `REMOVED_BOTH` gap closed; Files columns drag-resizable; clipped labels shortened | `a4a626d` |
+| Empty Files tree says what it means instead of "Nothing scanned yet" | `f1f4009` |
+| **Delete now stops an active transfer instead of refusing** — and the `.lftp` temp file of a mid-transfer loose file is removed too | `21c41b0` |
+| Both-sides remote/local hover card, sharing one formatter with the item drawer | `f4a4205` |
+| Settle display split into "still arriving" (with the climbing byte count) and "waiting to settle" | `1d651ed` |
+| **SSH key can be pasted, encrypted at rest**, decrypted in memory for asyncssh and materialised to tmpfs per-job only where lftp needs a file | `6359569` |
 
 Three of those came from a second round of live testing after the first push, and two found
 bugs nobody was looking for: `shutil.rmtree` was blocking the event loop for the whole duration
