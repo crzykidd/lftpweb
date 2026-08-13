@@ -321,6 +321,24 @@ alongside this list: several entries below ship with deliberate, documented limi
 - **The Dashboard page now remembers your last-selected timeframe** *(2026-08-13)*, in
   `localStorage`, per browser — read synchronously on first render so the chart doesn't paint
   the default range and then jump to the saved one.
+- **Deleting a file or folder mid-transfer now works, instead of refusing** *(2026-08-13)*. The
+  Delete button was already offered on a `DOWNLOADING`/`QUEUED` row, but clicking it just
+  bounced off a 409 — the guard that refuses a delete with an active job is correct (deleting a
+  directory an lftp process is still writing into races the writer) and is unchanged; what
+  changed is that `POST /api/items/{id}/delete` now satisfies it itself first, stopping the
+  item's active job through the exact same SIGTERM → grace → SIGKILL path the Stop button
+  already uses and confirming the process is actually dead and reaped — not just signalled —
+  before deleting. A stop that can't be confirmed within 25s withholds the delete with a 409
+  and an audit event, rather than deleting blind; the stop attempt itself keeps running in the
+  background rather than being abandoned. The Files-page confirmation dialog now says so
+  plainly ("N of M is/are transferring now — deleting will cancel it/them first") as an added
+  line alongside — never replacing — the existing remote-copy line, not a second dialog. A
+  loose top-level file stopped mid-transfer can exist on disk only as lftp's own `<name>.lftp`
+  temp name (§4.4b); the delete now removes that (and its `.lftp-pget-status` sidecar) too, so
+  it never leaves the very bytes it was asked to remove sitting there under a different name.
+  The resulting row always reads `suppressed_reason = 'deleted_local'`, never the stop path's
+  own `user_stopped`, and — like every delete this codebase performs — is never re-queued by
+  auto-queue, regardless of the `re_download_externally_removed` setting.
 
 ### Changed
 

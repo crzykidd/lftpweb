@@ -6,9 +6,14 @@ through the API itself and the fake seedbox rather than through a UI that doesn'
 
 from __future__ import annotations
 
+import asyncio
+import logging
+from collections.abc import Coroutine
+from typing import Any
+
 from fastapi import APIRouter, HTTPException, Request
 
-from lftpweb.core import local_delete
+from lftpweb.core import audit, local_delete
 from lftpweb.core.queue import TransferSettings, load_transfer_settings, save_transfer_settings
 from lftpweb.models import (
     DeleteItemResponse,
@@ -19,7 +24,48 @@ from lftpweb.models import (
     TransferSettingsOut,
 )
 
+logger = logging.getLogger(__name__)
+
 router = APIRouter()
+
+# 2026-08-13 (prompts/2026-08-13-delete-during-transfer.md): the bound on how long `delete_item`
+# waits for `TransferQueue.stop_item()` to confirm an active job is really gone before giving up
+# and withholding the delete. Generous headroom over `core/queue.py.stop_job`'s own internal
+# SIGTERM grace (`lftp.terminate(grace_s=10.0)`) plus SIGKILL-and-reap, which is normally
+# near-instant once the kill lands -- this is a backstop for a genuinely wedged process (a stuck
+# NFS write, say), not the expected path.
+STOP_BEFORE_DELETE_TIMEOUT_S = 25.0
+
+# A stop attempt that outlasts the timeout above is deliberately *not* cancelled (see
+# `delete_item`'s own docstring) -- it keeps running so `core/queue.py`'s own bookkeeping
+# finishes cleanly instead of being abandoned half-updated. asyncio only holds a *weak*
+# reference to a `Task`, though (its own docs: "save a reference ... to avoid a task
+# disappearing mid-execution due to garbage collection"), so a task nothing else references
+# once this request returns is a real risk of being GC'd before it finishes, not a
+# hypothetical one. This module-level set is that reference, for exactly the tasks that outlive
+# the request that spawned them; `_forget_background_stop` (its own `add_done_callback`) is what
+# keeps it from growing forever.
+_background_stop_tasks: set[asyncio.Task] = set()
+
+
+def _forget_background_stop(task: asyncio.Task) -> None:
+    _background_stop_tasks.discard(task)
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        # Nothing is awaiting this task's result anymore (the request that spawned it already
+        # returned a 409) -- log rather than let it vanish as an "exception was never retrieved"
+        # warning, since a failed background stop is exactly the kind of thing an operator
+        # diagnosing a stuck delete needs to find.
+        logger.exception("background stop-before-delete failed", exc_info=exc)
+
+
+def _run_stop_in_background(coro: Coroutine[Any, Any, bool]) -> asyncio.Task:
+    task = asyncio.ensure_future(coro)
+    _background_stop_tasks.add(task)
+    task.add_done_callback(_forget_background_stop)
+    return task
 
 
 def _job_out(row: dict) -> JobOut:
@@ -106,6 +152,27 @@ async def delete_item(item_id: int, request: Request) -> DeleteItemResponse:
     block (the module's own docstring). A withheld guard raises rather than returning
     `deleted=False`, so `FileTree.tsx`'s existing `Promise.allSettled` bulk-action reporting
     (Queue/Stop, phase 9) picks this up as a per-item failure with no new frontend plumbing.
+
+    **Stop first, then delete** (2026-08-13, `prompts/2026-08-13-delete-during-transfer.md`).
+    `delete_local`'s own "no active job" guard is unchanged and still correct -- see that
+    module's docstring -- so a Delete request for an item mid-transfer used to just bounce off
+    it with a 409. This endpoint now satisfies the guard itself first: `TransferQueue.
+    stop_item()` (the identical stop path the Stop button drives, §4.6 -- SIGTERM, a grace
+    period, SIGKILL, no second implementation) is always called before `delete_local`, whether
+    or not the item actually has an active job -- it's already a safe no-op when it doesn't
+    (`stop_item`'s own docstring). The call is run as a background task and awaited with a
+    bound (`STOP_BEFORE_DELETE_TIMEOUT_S`) **without cancelling it on timeout**: cancelling
+    mid-stop would abandon `core/queue.py`'s own bookkeeping (`self._running`, the job row)
+    half-updated, which is exactly the inconsistency this feature exists to avoid introducing.
+    A timeout instead just means this *request* stops waiting -- the stop attempt keeps running
+    in the background and will still finish reaping and persisting the job's terminal state on
+    its own -- and the delete is withheld with a 409 naming the reason, per the task's own
+    instruction: "if the stop cannot be confirmed within a bounded time, withhold the delete and
+    say why." By the time `stop_item()` *does* return, `_reap_one` has already persisted the
+    job as terminal (`cancelled`) and the item as `STOPPED`/`user_stopped` -- so `delete_local`'s
+    guard passes on this same call, and its own unconditional `suppressed_reason = 'deleted_local'`
+    write (`_mark_subtree_removed`) overwrites `user_stopped` a moment later: the row that comes
+    out the other end reads as a deliberate deletion, never a user stop.
     """
     db = request.app.state.db
     cursor = await db.execute("SELECT * FROM item WHERE id = ?", (item_id,))
@@ -116,6 +183,31 @@ async def delete_item(item_id: int, request: Request) -> DeleteItemResponse:
     queue = await cursor.fetchone()
     if queue is None:
         raise HTTPException(status_code=404, detail="item's queue no longer exists")
+
+    q = getattr(request.app.state, "queue", None)
+    if q is not None:
+        stop_task = _run_stop_in_background(q.stop_item(item_id))
+        done, _pending = await asyncio.wait({stop_task}, timeout=STOP_BEFORE_DELETE_TIMEOUT_S)
+        if stop_task not in done:
+            reason = (
+                f"an active transfer for {item['rel_path']!r} (queue {queue['id']} "
+                f"'{queue['name']}') could not be confirmed stopped within "
+                f"{STOP_BEFORE_DELETE_TIMEOUT_S:.0f}s -- refusing to delete out from under a "
+                "transfer that may still be running; the stop is still being attempted in the "
+                "background and this item can be deleted once it settles"
+            )
+            await audit.record_event(
+                db,
+                level="error",
+                item_id=item_id,
+                kind="local_delete_withheld",
+                message=f"manual: delete withheld -- {reason}",
+            )
+            raise HTTPException(status_code=409, detail=reason)
+        # Propagate a genuine failure from stop_item itself (e.g. the job row vanished between
+        # the SELECT above and stop_item's own lookup -- ValueError, per stop_job's contract)
+        # rather than silently swallowing it and proceeding to delete anyway.
+        stop_task.result()
 
     postprocess = getattr(request.app.state, "postprocess", None)
     in_flight = postprocess.in_flight_item_ids() if postprocess is not None else frozenset()

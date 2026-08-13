@@ -22,6 +22,19 @@ is a state that can never be un-stuck"), and the mount-sentinel gate `core/autoq
 already uses. The `nlink > 1` guard is the one place the two callers differ, so it is a
 parameter of the caller (`require_nlink_guard`), never baked into the primitive.
 
+**The active-job guard is an ordering requirement, not a dead end** (2026-08-13,
+`prompts/2026-08-13-delete-during-transfer.md`). The user asked to be able to delete an item
+that's actively transferring, and the wrong fix is dropping this guard: `rmtree`-ing a
+directory lftp is still writing into races the writer (files can reappear mid-delete, or a
+mirror job can recreate directories it's midway through), so the guard staying in `delete_local`
+itself is correct. What changed is who satisfies it and when -- `api/jobs.py.delete_item` now
+stops the item's active job through `core/queue.py.TransferQueue.stop_item()` (the exact same
+SIGTERM -> grace -> SIGKILL path the Stop button uses, DESIGN.md §4.6; no second stop
+implementation exists anywhere) and only calls `delete_local()` once that stop has been
+confirmed complete -- the process reaped, its job row terminal, never merely "signal sent." A
+stop that can't be confirmed within a bounded window withholds the delete instead of proceeding
+blind. See that endpoint's own docstring for the exact sequencing and what "confirmed" means.
+
 **Row lifetime.** Deletion never removes the `item` row -- nothing in this codebase does
 (`core/engine.py._project`'s own docstring; row lifetime stays an explicitly open question,
 per `prompts/startnewsession.md` item 6, that this module must not answer by accident). A
@@ -89,7 +102,7 @@ from typing import Any
 
 import aiosqlite
 
-from lftpweb.core import audit, extract, mount_sentinel
+from lftpweb.core import audit, extract, local_scan, mount_sentinel
 from lftpweb.core.events import EventBus
 from lftpweb.core.itemview import item_view
 from lftpweb.core.util import to_safe_text
@@ -329,13 +342,37 @@ def _do_remove_from_disk(local_root: Path, resolved: Path) -> None:
     via `asyncio.to_thread` (see that function's docstring for why that matters: a large
     `shutil.rmtree` run inline would block the *entire* event loop, including the WS delivery
     of the transient state this same change adds, for as long as the delete takes).
+
+    **The loose-file branch also cleans up lftp's own in-flight leftovers** (2026-08-13,
+    `prompts/2026-08-13-delete-during-transfer.md`). A delete of a top-level item is now only
+    reachable after its active job has been stopped and reaped (see `delete_local`'s own
+    docstring for the ordering), but "stopped" is not "finished" -- a `pget` job killed
+    mid-transfer leaves its bytes under `<name>.lftp` (`xfer:use-temp-file`,
+    `core/local_scan.py.TEMP_FILE_SUFFIX`), not under the item's own final name, plus that temp
+    file's own `.lftp-pget-status` sidecar. For a **directory** item `shutil.rmtree` below
+    already sweeps both regardless of what's inside it -- only a **loose top-level file** item
+    (whose `local_root`/`resolved` *is* the final name) can have its actual bytes sitting under
+    a name this function was never told about. Removing only `resolved` in that case would
+    leave exactly the bytes the delete was asked to remove, orphaned under a different name --
+    the failure mode `prompts/2026-08-13-delete-during-transfer.md` calls out by name. Both
+    removals are `missing_ok=True`: the common case (a fully-finished file, or one that was
+    never in flight at all) has neither, and that's not an error here.
     """
     if local_root.is_symlink():
         local_root.unlink()
     elif resolved.is_dir():
         shutil.rmtree(resolved)
     else:
-        resolved.unlink()
+        if resolved.exists():
+            resolved.unlink()
+        # The sidecar's own name is built on top of the *temp* name, not the final one --
+        # lftp's `pget:save-status` writes `<currently-in-use-name>.lftp-pget-status`, and the
+        # currently-in-use name is `<final-name>.lftp` for as long as `xfer:use-temp-file` (on,
+        # `core/lftp.py.build_rc_text`) hasn't yet renamed it. Matches the same two-suffix
+        # stacking `core/local_scan.py.scan_local`'s own sidecar lookup expects.
+        temp_path = resolved.with_name(resolved.name + local_scan.TEMP_FILE_SUFFIX)
+        temp_path.with_name(temp_path.name + local_scan.PGET_STATUS_SUFFIX).unlink(missing_ok=True)
+        temp_path.unlink(missing_ok=True)
 
 
 def _all_hardlinked(local_root: Path, resolved: Path) -> bool:
@@ -471,7 +508,15 @@ async def delete_local(
             "scan with the mount sentinel present"
         )
 
-    if not local_root.exists() and not local_root.is_symlink():
+    # A loose top-level file stopped mid-transfer (see this function's own docstring) can exist
+    # on disk *only* as `<name>.lftp` -- its own final name never got there. Checked
+    # unconditionally rather than gated on `item["is_dir"]`: a directory's own name never
+    # carries this suffix (mirror writes temp names to the *files inside* it, not to the
+    # directory itself), so this is safe to check for every item without needing to know its
+    # kind, and `RetentionScheduler`'s own `item` dict (`_select_expired`) doesn't carry
+    # `is_dir` at all.
+    temp_local_root = local_root.with_name(local_root.name + local_scan.TEMP_FILE_SUFFIX)
+    if not local_root.exists() and not local_root.is_symlink() and not temp_local_root.exists():
         return await withhold(f"{local_root} does not exist -- nothing to delete")
 
     # 5. The nlink guard -- caller's choice (module docstring).

@@ -189,6 +189,83 @@ async def test_active_job_guard_withholds(tmp_path):
         await db.close()
 
 
+async def test_loose_file_delete_removes_lftp_temp_leftover(tmp_path):
+    """`prompts/2026-08-13-delete-during-transfer.md`: a loose top-level file item's own final
+    name never lands on disk until lftp's transfer completes (`xfer:use-temp-file`,
+    `core/local_scan.py.TEMP_FILE_SUFFIX`) -- a delete that reaches this item once its job has
+    stopped (no active job row here, by construction; the ordering that gets it here is
+    `api/jobs.py.delete_item`'s job) but before that rename happened finds only `<name>.lftp`
+    plus its own `.lftp-pget-status` sidecar on disk. Both must go, or the delete leaves exactly
+    the bytes it was asked to remove sitting there under a different name.
+    """
+    local_root = tmp_path / "local"
+    local_root.mkdir()
+    temp = local_root / "Release.mkv.lftp"
+    temp.write_bytes(b"x" * 30)
+    sidecar = local_root / "Release.mkv.lftp.lftp-pget-status"
+    sidecar.write_text("size=100\n0.pos=0 0.limit=70\n")
+    write_if_needed(str(local_root))
+
+    db = await _make_db()
+    try:
+        queue_id = await _make_queue(db, local_root)
+        item_id = await _make_item(db, queue_id, "Release.mkv", local_size=30)
+
+        outcome = await local_delete.delete_local(
+            db,
+            item=await _item_row(db, item_id),
+            queue=await _queue_row(db, queue_id),
+            caller="manual",
+            require_nlink_guard=False,
+            in_flight_item_ids=frozenset(),
+        )
+
+        assert outcome.deleted is True
+        assert not temp.exists(), "the in-flight .lftp temp file must be removed too"
+        assert not sidecar.exists(), "its .lftp-pget-status sidecar must go with it"
+        assert not (local_root / "Release.mkv").exists()
+
+        item = await _item_row(db, item_id)
+        assert item["state"] == "REMOVED_LOCAL"
+        assert item["auto_queue_suppressed"] == 1
+        assert item["suppressed_reason"] == "deleted_local"
+    finally:
+        await db.close()
+
+
+async def test_directory_item_delete_sweeps_lftp_temp_leftovers_too(tmp_path):
+    """The directory branch doesn't need the loose-file branch's special-casing -- `rmtree`
+    already removes everything under the directory, `.lftp` suffixes and all. Asserted rather
+    than assumed, since it's the one place the two branches could plausibly diverge.
+    """
+    local_root = tmp_path / "local"
+    local_root.mkdir()
+    release = local_root / "Release"
+    release.mkdir()
+    (release / "a.mkv").write_bytes(b"x" * 10)
+    (release / "b.mkv.lftp").write_bytes(b"x" * 5)
+    write_if_needed(str(local_root))
+
+    db = await _make_db()
+    try:
+        queue_id = await _make_queue(db, local_root)
+        item_id = await _make_item(db, queue_id, "Release", is_dir=True, local_size=15)
+
+        outcome = await local_delete.delete_local(
+            db,
+            item=await _item_row(db, item_id),
+            queue=await _queue_row(db, queue_id),
+            caller="manual",
+            require_nlink_guard=False,
+            in_flight_item_ids=frozenset(),
+        )
+
+        assert outcome.deleted is True
+        assert not release.exists()
+    finally:
+        await db.close()
+
+
 async def test_in_flight_postprocess_guard_withholds(tmp_path):
     local_root = tmp_path / "local"
     local_root.mkdir()

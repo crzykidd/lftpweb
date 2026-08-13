@@ -1510,6 +1510,37 @@ state chip already reads (§2.2's one shared projection, never a second read of 
   brand-new item — derived from the suppression reason plus current remote presence, never from
   the state string alone, since an *unsuppressed* `REMOVED_LOCAL`/`REMOVED_BOTH`
   (`core/mount_sentinel.py.resolve_vanished`, rule 9) is a plain "Queue".
+- **Deleting a `DOWNLOADING`/`QUEUED` item stops it first, rather than refusing** (2026-08-13,
+  `prompts/2026-08-13-delete-during-transfer.md`). The Delete button was always offered on a
+  mid-transfer row (`canDeleteLocal` never excluded those states), but the click used to just
+  bounce off `core/local_delete.py.delete_local`'s "no active job" guard with a withheld 409 —
+  the worst of both, a button that promises an action it can't perform. That guard is still
+  correct and unchanged (`rmtree`-ing a directory lftp is still writing into races the writer);
+  what changed is who satisfies it and when. `api/jobs.py.delete_item` now always calls
+  `core/queue.py.TransferQueue.stop_item()` first — the identical SIGTERM → grace → SIGKILL path
+  the Stop button drives (§4.6), a safe no-op when nothing is active — and only proceeds to
+  `delete_local()` once that stop is confirmed complete: the process reaped, its job row
+  terminal, never merely "signal sent." A stop that can't be confirmed within a bounded window
+  withholds the delete with a 409 naming why, rather than deleting blind; the stop attempt itself
+  is *not* cancelled on that timeout (it keeps running so `core/queue.py`'s own bookkeeping
+  finishes cleanly instead of being abandoned half-updated) — the item can simply be deleted
+  again once it settles. The confirmation dialog says so plainly before the click ("N of M is/are
+  transferring now — deleting will cancel it/them first"), as its own line alongside — never
+  replacing — the existing remote-copy line, since a selection can be both at once; this is a
+  stronger sentence in the one existing dialog, not a second confirmation step stacked on it. The
+  row that comes out the other end always reads `suppressed_reason = 'deleted_local'`, never the
+  stop path's own `user_stopped` — `delete_local`'s unconditional write (rule 3) overwrites it a
+  moment later, so a stopped-then-deleted item is indistinguishable from an idle one deleted
+  directly, and (the user's own question) is never re-queued by auto-queue either way,
+  regardless of `re_download_externally_removed`.
+- **A loose top-level file's in-flight `.lftp` temp name is cleaned up too.** lftp writes to
+  `<name>.lftp` while a transfer is in flight (`xfer:use-temp-file`, §4.4b) and renames it on
+  completion; a **directory** item's delete (`shutil.rmtree`) sweeps that regardless of what's
+  inside it, but a **loose file** item's delete targets the item's own final name — which, for
+  an item stopped mid-transfer, may not exist yet at all. `core/local_delete.py._do_remove_
+  from_disk` removes the `.lftp` temp file and its own `.lftp-pget-status` sidecar alongside
+  the final name (whichever of the two, or both, are actually present), so a delete never
+  leaves behind exactly the bytes it was asked to remove under a different name.
 
 **Item detail.** A small info icon on each row — deliberately quieter than the lifecycle icons,
 because it is a control and not a status — opens the item drawer described below. Hovering a row

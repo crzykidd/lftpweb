@@ -289,11 +289,15 @@ function rowAction(node: FileNode): 'queue' | 'stop' | 'redownload' | null {
 }
 
 /** Whether "Delete local" (DESIGN.md §9.2; prompts/open-issues.md "7 + 8") makes sense to
- * offer at all -- a node with no local content has nothing this action could do. The backend
- * (`core/local_delete.py.delete_local`) still runs every guard regardless (active job,
- * mount sentinel, path containment) and can withhold even when this returns true; this is
- * only about not showing a button that could never do anything, not a prediction of the
- * guard outcome.
+ * offer at all -- a node with no local content has nothing this action could do. `DOWNLOADING`/
+ * `QUEUED` are deliberately *not* excluded: a node mid-transfer has real partial bytes on disk
+ * (or is about to), and (2026-08-13, `prompts/2026-08-13-delete-during-transfer.md`)
+ * `api/jobs.py.delete_item` now stops that transfer first rather than refusing outright, so
+ * offering the button here is no longer a dead end -- `hasActiveJob` below is what the
+ * confirmation panel uses to say so. The backend (`core/local_delete.py.delete_local`) still
+ * runs its own guards regardless (mount sentinel, path containment, a delete already in
+ * flight) and can withhold even when this returns true; this is only about not showing a
+ * button that could never do anything, not a prediction of the guard outcome.
  */
 const NO_LOCAL_CONTENT_STATES = new Set(['REMOTE_ONLY', 'EXCLUDED', 'REMOVED_LOCAL', 'REMOVED_BOTH'])
 function canDeleteLocal(node: FileNode): boolean {
@@ -320,6 +324,40 @@ function localBytes(node: FileNode): number {
  */
 function hasRemoteCopy(node: FileNode): boolean {
   return node.remote_size != null
+}
+
+/** Whether this node currently has an active job -- the identical presence test `rowAction`
+ * above already uses to decide whether to show "Stop" instead of "Queue". Drives the delete
+ * confirmation's "this will cancel a transfer" sentence (2026-08-13,
+ * `prompts/2026-08-13-delete-during-transfer.md`): `api/jobs.py.delete_item` now stops an
+ * active job before deleting rather than refusing outright (backend: `core/local_delete.py`'s
+ * own "no active job" guard is unchanged -- the endpoint satisfies it itself, see that
+ * module's docstring), so the confirmation has to say that plainly rather than leaving the
+ * user to find out after clicking Delete.
+ */
+function hasActiveJob(node: FileNode): boolean {
+  return node.state === 'QUEUED' || node.state === 'DOWNLOADING'
+}
+
+/** The delete confirmation's active-transfer sentence -- deliberately its own line, not folded
+ * into `remoteCopyNote` below: a selection can be transferring *and* have a surviving remote
+ * copy at once (the common case, since a `copy`-mode item's remote copy is untouched either
+ * way), and both facts change what the user should expect, so neither should crowd the other
+ * out. `null` when nothing selected is active, so the caller can skip rendering the line
+ * entirely rather than showing an empty one.
+ */
+function activeTransferNote(total: number, activeCount: number): string | null {
+  if (activeCount === 0) return null
+  if (activeCount === total) {
+    return total === 1
+      ? "It's transferring right now -- deleting will cancel that transfer first, then remove what has downloaded so far."
+      : "All of them are transferring right now -- deleting will cancel each transfer first, then remove what has downloaded so far."
+  }
+  return (
+    `${activeCount} of ${total} ${activeCount === 1 ? 'is' : 'are'} transferring right now -- ` +
+    `deleting will cancel ${activeCount === 1 ? 'it' : 'them'} first, then remove what has ` +
+    'downloaded so far.'
+  )
 }
 
 /** The delete confirmation's remote-copy sentence -- factual and short, telling the user what
@@ -1172,6 +1210,14 @@ export function FileTree({
     () => (pendingDelete ?? []).filter(hasRemoteCopy).length,
     [pendingDelete],
   )
+  // How many of the pending selection are actively transferring right now (2026-08-13,
+  // prompts/2026-08-13-delete-during-transfer.md) -- a bulk selection can mix transferring and
+  // idle items, so this is a count, not a boolean, exactly like `pendingDeleteRemoteCount`
+  // above.
+  const pendingDeleteActiveCount = useMemo(
+    () => (pendingDelete ?? []).filter(hasActiveJob).length,
+    [pendingDelete],
+  )
 
   if (tree.length === 0) {
     return (
@@ -1304,7 +1350,13 @@ export function FileTree({
 
       {/* Delete is irreversible (Queue/Stop are not) -- a confirmation dialog with the count
           and total bytes, per the task's own bar ("meet `move` mode": two-layer opt-in, a UI
-          confirmation), sits between the request above and `runAction('delete', ...)`. */}
+          confirmation), sits between the request above and `runAction('delete', ...)`. One
+          dialog, not two (2026-08-13, prompts/2026-08-13-delete-during-transfer.md): the user
+          asked for a confirmation that says an active transfer will be cancelled, not a second
+          confirmation step stacked on this one, so the active-transfer fact is a line inside
+          the same panel, right alongside (never replacing) the remote-copy line -- a selection
+          can be transferring *and* have a surviving remote copy at once, and both are true
+          statements the user should see together. */}
       {pendingDelete && (
         <div className="flex flex-col gap-2 rounded-md border border-red-300 bg-red-50 px-3 py-2 text-sm dark:border-red-900 dark:bg-red-950/40">
           <p className="text-red-900 dark:text-red-200">
@@ -1313,6 +1365,11 @@ export function FileTree({
             This only removes the local copy -- nothing remote is touched -- and cannot be
             undone.
           </p>
+          {pendingDeleteActiveCount > 0 && (
+            <p className="font-medium text-red-900 dark:text-red-200">
+              {activeTransferNote(pendingDelete.length, pendingDeleteActiveCount)}
+            </p>
+          )}
           <p className="text-red-900 dark:text-red-200">
             {remoteCopyNote(pendingDelete.length, pendingDeleteRemoteCount)}
           </p>

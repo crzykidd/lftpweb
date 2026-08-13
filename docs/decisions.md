@@ -6,6 +6,76 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-13 — Deleting mid-transfer: the active-job guard became an ordering requirement, not a removal
+
+**Handoff prompt `prompts/2026-08-13-delete-during-transfer.md`, executed end to end.** The
+user's own words: "need to be able to delete a folder or file when in progress. currently says
+you can't.. but it should say active copy going. are you sure confirm. and then let the delete
+happen." The wrong fix — the one this task explicitly ruled out — is deleting
+`core/local_delete.py.delete_local`'s "no active job" guard. It exists because `rmtree`-ing a
+directory an lftp process is still writing into races the writer: files can reappear mid-delete
+as the mirror job keeps writing, or lftp can recreate directories it's midway through. Dropping
+the guard trades one bug (a button that refuses) for a worse one (silent data corruption on a
+delete).
+
+**The actual fix is an ordering requirement, enforced by the caller, not the primitive.**
+`api/jobs.py.delete_item` now always calls `core/queue.py.TransferQueue.stop_item()` — the exact
+same SIGTERM → grace → SIGKILL path the Stop button already drives (§4.6) — before calling
+`delete_local()`, whether or not the item actually has an active job (`stop_item()` is already a
+safe no-op when it doesn't). `delete_local` itself is untouched: its guard still refuses an
+active job, but by the time it runs, the job is no longer active. Reused, not reimplemented —
+the task named this explicitly, and `lftp.terminate()` already `await`s the process's own
+`proc.wait()` (after SIGTERM's grace window, or after SIGKILL), so by the time `stop_item()`
+returns the process is confirmed dead *and reaped* by the OS, not just signalled. `_reap_one`
+persists the job as terminal (`cancelled`) and the item as `STOPPED`/`user_stopped` in that same
+call, so no row is ever left `running` for a restart's `_reconcile_orphaned_jobs` to have to
+clean up later.
+
+**Bounded, and the bound doesn't cancel.** A stop that can't be confirmed within
+`STOP_BEFORE_DELETE_TIMEOUT_S` (25s — generous headroom over `stop_job`'s own internal 10s
+SIGTERM grace) withholds the delete with a 409 and an `event` row, per the task's own
+instruction ("if the stop cannot be confirmed within a bounded time, withhold the delete and say
+why"). The considered-and-rejected alternative was wrapping the stop call in
+`asyncio.wait_for`, which cancels the awaited coroutine on timeout — but cancelling mid-stop
+would abandon `core/queue.py`'s own bookkeeping (`self._running`, the job row) exactly
+half-updated, the identical inconsistency this whole feature exists not to introduce. Instead
+the stop runs as a background `asyncio.Task`, awaited with `asyncio.wait(..., timeout=...)`
+**without** cancelling on timeout, so a genuinely wedged process (a stuck NFS write, the same
+edge case `lftp.terminate`'s own docstring names) still gets torn down correctly, just later
+than this one HTTP request waited for. One correctness trap this surfaced: asyncio only holds a
+*weak* reference to a `Task` (its own docs warn about this explicitly) — a task nothing else
+references after the request returns risks being garbage-collected mid-stop, silently abandoning
+the very thing this design exists not to abandon. Fixed with a module-level set in `api/jobs.py`
+holding a strong reference for exactly the tasks that outlive the request that spawned them,
+discarded via `add_done_callback` once they finish.
+
+**The `.lftp` temp-file gap, found while writing this.** `_do_remove_from_disk`'s loose-file
+branch (`resolved.unlink()`) assumed the item's own final name was always present — true before
+this task, since the old guard never let a delete reach a mid-transfer item at all. Once deletes
+can reach one, a loose top-level file stopped mid-transfer can exist on disk *only* as
+`<name>.lftp` (lftp's own `xfer:use-temp-file` convention, §4.4b) — unlinking only `resolved`
+would silently leave those exact bytes behind under a different name, the failure mode named
+directly in the task prompt. Fixed at two points that have to move together: the existence guard
+(`local_root.exists()`) now also checks for the `.lftp` sibling, and the removal itself deletes
+the temp file and its own `.lftp-pget-status` sidecar alongside the final name. Checked
+unconditionally (not gated on `item["is_dir"]`) since a directory's own name never carries this
+suffix and `RetentionScheduler`'s `item` dict (`_select_expired`) doesn't carry `is_dir` at all —
+one fewer thing for a second caller to have to get right.
+
+**Verified, not assumed: the two suppression reasons don't fight.** The stop path writes
+`suppressed_reason = 'user_stopped'`; `delete_local`'s own `_mark_subtree_removed` write is
+unconditional and lands a moment later with `suppressed_reason = 'deleted_local'` — so the row
+that comes out the other end always reads as a deliberate deletion, never a user stop, with no
+special-casing needed anywhere. Covered directly by an e2e test against the fake seedbox (a real
+mirror job, stopped mid-transfer via the real API endpoint, asserting the final
+`suppressed_reason`) rather than trusted by inspection, per the task's explicit instruction to
+verify this rather than assume it. The user's own question — "a cancelled job doesn't get auto
+added again?" — is answered the same way: `auto_queue_suppressed` is what `AutoQueue` actually
+checks, `re_download_externally_removed` only ever widens which *state names* are eligible, and
+neither the stop nor the delete path lets a mid-transfer delete slip past that flag.
+
+---
+
 ## 2026-08-13 — A terminal removed row must stop publishing, not just stop freezing
 
 **Handoff prompt `prompts/2026-08-13-vanished-rows-should-leave-the-tree.md`, executed end to

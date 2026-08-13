@@ -7,6 +7,7 @@ HTTPException), not FastAPI's routing layer.
 
 from __future__ import annotations
 
+import asyncio
 import os
 from datetime import UTC, datetime, timedelta
 
@@ -33,20 +34,47 @@ async def db():
 
 
 class _FakeState:
-    def __init__(self, db, *, postprocess=None):
+    def __init__(self, db, *, postprocess=None, queue=None):
         self.db = db
         self.events = EventBus()
         self.postprocess = postprocess
+        # 2026-08-13 (prompts/2026-08-13-delete-during-transfer.md): `None` by default, exactly
+        # like every existing test in this file that never sets it -- `delete_item`'s
+        # `getattr(..., "queue", None)` reading skips the stop-before-delete step entirely in
+        # that case, which is what keeps every guard test above unaffected by this addition.
+        self.queue = queue
 
 
 class _FakeApp:
-    def __init__(self, db, *, postprocess=None):
-        self.state = _FakeState(db, postprocess=postprocess)
+    def __init__(self, db, *, postprocess=None, queue=None):
+        self.state = _FakeState(db, postprocess=postprocess, queue=queue)
 
 
 class _FakeRequest:
-    def __init__(self, db, *, postprocess=None):
-        self.app = _FakeApp(db, postprocess=postprocess)
+    def __init__(self, db, *, postprocess=None, queue=None):
+        self.app = _FakeApp(db, postprocess=postprocess, queue=queue)
+
+
+class _FakeStopQueue:
+    """A minimal stand-in for `core/queue.py.TransferQueue`, exposing only the one method
+    `delete_item` calls (`stop_item`) -- controllable delay/result so the orchestration
+    (always-call, bounded-wait-without-cancelling, propagate-a-real-failure) can be exercised
+    without a real lftp process or the fake seedbox.
+    """
+
+    def __init__(self, *, delay_s: float = 0.0, result: bool = True, exc: Exception | None = None):
+        self.delay_s = delay_s
+        self.result = result
+        self.exc = exc
+        self.calls: list[int] = []
+
+    async def stop_item(self, item_id: int) -> bool:
+        self.calls.append(item_id)
+        if self.delay_s:
+            await asyncio.sleep(self.delay_s)
+        if self.exc is not None:
+            raise self.exc
+        return self.result
 
 
 async def _make_queue(db, local_path) -> int:
@@ -131,6 +159,121 @@ async def test_delete_item_manual_guard_is_off_for_nlink(db, tmp_path):
     result = await jobs.delete_item(item_id, _FakeRequest(db))
     assert result.deleted is True
     assert not target.exists()
+
+
+# --- Stop-before-delete orchestration (2026-08-13, prompts/2026-08-13-delete-during-transfer.md)
+# ------------------------------------------------------------------------------------------------
+# Real "stop a running lftp process, confirm it's gone" coverage lives in
+# tests/test_delete_during_transfer_e2e.py against the fake seedbox -- these are the fast,
+# no-process guard-behavior tests: `stop_item` is always called, a slow-but-eventually-
+# successful stop still lets the delete through, a stop that never confirms in time withholds
+# and records why, and a genuine failure from `stop_item` itself propagates rather than being
+# swallowed.
+
+
+async def test_delete_item_calls_stop_item_before_deleting_even_with_no_active_job(db, tmp_path):
+    """`stop_item()` is a safe no-op when nothing is active for the item (its own docstring) --
+    `delete_item` calls it unconditionally rather than pre-checking for a job row itself, so
+    there is exactly one place ("is there anything to stop") that answer is computed.
+    """
+    local_root = tmp_path / "local"
+    local_root.mkdir()
+    target = local_root / "junk.txt"
+    target.write_bytes(b"only copy")
+    write_if_needed(str(local_root))
+
+    queue_id = await _make_queue(db, local_root)
+    item_id = await _make_item(db, queue_id, "junk.txt")
+
+    stop_queue = _FakeStopQueue()
+    result = await jobs.delete_item(item_id, _FakeRequest(db, queue=stop_queue))
+
+    assert stop_queue.calls == [item_id]
+    assert result.deleted is True
+    assert not target.exists()
+
+
+async def test_delete_item_proceeds_once_a_slow_stop_confirms_within_the_bound(db, tmp_path):
+    """A stop that takes a little while (but well inside `STOP_BEFORE_DELETE_TIMEOUT_S`) is not
+    a withhold -- the delete goes through exactly as if the stop had been instant.
+    """
+    local_root = tmp_path / "local"
+    local_root.mkdir()
+    target = local_root / "junk.txt"
+    target.write_bytes(b"only copy")
+    write_if_needed(str(local_root))
+
+    queue_id = await _make_queue(db, local_root)
+    item_id = await _make_item(db, queue_id, "junk.txt")
+
+    stop_queue = _FakeStopQueue(delay_s=0.05)
+    result = await jobs.delete_item(item_id, _FakeRequest(db, queue=stop_queue))
+
+    assert stop_queue.calls == [item_id]
+    assert result.deleted is True
+    assert not target.exists()
+
+
+async def test_delete_item_withheld_when_stop_cannot_be_confirmed_in_time(
+    db, tmp_path, monkeypatch
+):
+    """The task's own instruction, verified directly: "if the stop cannot be confirmed within a
+    bounded time, withhold the delete and say why." Nothing is deleted, a 409 names the reason,
+    an `event` row records it, and -- the part that matters most -- the stop attempt is not
+    abandoned: it keeps running in the background rather than being cancelled the instant this
+    request stops waiting for it (cancelling it would leave `core/queue.py`'s own bookkeeping
+    half-updated, exactly the inconsistency this feature must not introduce).
+    """
+    monkeypatch.setattr(jobs, "STOP_BEFORE_DELETE_TIMEOUT_S", 0.05)
+
+    local_root = tmp_path / "local"
+    local_root.mkdir()
+    target = local_root / "still-downloading.txt"
+    target.write_bytes(b"partial")
+    write_if_needed(str(local_root))
+
+    queue_id = await _make_queue(db, local_root)
+    item_id = await _make_item(db, queue_id, "still-downloading.txt")
+
+    stop_queue = _FakeStopQueue(delay_s=0.5)
+    with pytest.raises(HTTPException) as excinfo:
+        await jobs.delete_item(item_id, _FakeRequest(db, queue=stop_queue))
+    assert excinfo.value.status_code == 409
+    assert "could not be confirmed stopped" in excinfo.value.detail
+
+    # The withhold happened before delete_local ever ran -- nothing on disk moved.
+    assert target.exists()
+
+    cursor = await db.execute("SELECT kind, message FROM event WHERE item_id = ?", (item_id,))
+    events = await cursor.fetchall()
+    assert [e["kind"] for e in events] == ["local_delete_withheld"]
+    assert "still-downloading.txt" in events[0]["message"]
+
+    # Not cancelled: give the background task time to actually finish and confirm it did.
+    await asyncio.sleep(0.6)
+    assert stop_queue.calls == [item_id]
+
+
+async def test_delete_item_propagates_a_genuine_stop_failure(db, tmp_path):
+    """`stop_item()` raising (the `ValueError` `stop_job` documents for "job vanished between
+    lookup and stop") must surface as a real error, not be swallowed on the way to a delete that
+    then runs anyway against a job whose fate is actually unknown.
+    """
+    local_root = tmp_path / "local"
+    local_root.mkdir()
+    target = local_root / "junk.txt"
+    target.write_bytes(b"only copy")
+    write_if_needed(str(local_root))
+
+    queue_id = await _make_queue(db, local_root)
+    item_id = await _make_item(db, queue_id, "junk.txt")
+
+    stop_queue = _FakeStopQueue(exc=ValueError("job 999 not found"))
+    with pytest.raises(ValueError, match="job 999 not found"):
+        await jobs.delete_item(item_id, _FakeRequest(db, queue=stop_queue))
+
+    # Never reached delete_local -- the file must still be there.
+    assert target.exists()
 
 
 # --- Settings -> retention ---------------------------------------------------------------
