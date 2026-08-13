@@ -6,6 +6,131 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-12 — Reverted same-day `REMOVED_LOCAL` auto-queue eligibility (`855e7a3`): it is
+## now a site-level setting, default off, and DESIGN.md's three resulting staleness problems
+## are corrected
+
+**Handoff prompt `prompts/done/2026-08-12-revert-removed-local-eligibility.md`, executed end
+to end.** Reverses one part of the "local deletion" task earlier the same day
+(`prompts/done/2026-08-12-local-deletion-and-retention.md`, recorded below) — not because that
+task's implementation was wrong, but because the orchestrating session that framed it as "issue
+4" got the premise wrong, and the implementing agent built carefully on top of a bad premise.
+
+**Why the premise was wrong.** There are exactly two ways an item's local copy goes away:
+(1) lftpweb deleted it itself — `core/local_delete.py.delete_local` always writes
+`REMOVED_BOTH` *and* `auto_queue_suppressed = 1` in the same write, and this was, and remains,
+correctly excluded from auto-queue unconditionally; (2) something *outside* lftpweb removed it
+— an `*arr` importer picking up a finished release (the ordinary, expected end of a successful
+import, DESIGN.md §7.2), a human, a script — which reaches bare `REMOVED_LOCAL` through §7.3's
+grace period with `auto_queue_suppressed` clear. Adding `REMOVED_LOCAL` to
+`core/autoqueue.py.ELIGIBLE_STATES` unconditionally made case 2 eligible again by default. On a
+`copy`-mode queue with auto-queue on — the live, in-use shape this deployment is built around,
+not a hypothetical — `copy` mode never touches the remote, so the moment an importer moves a
+release out, the item is right back to matching its own select pattern: re-queued,
+re-downloaded, re-imported, forever, every scan interval. `DESIGN.md` §3.2 rule 3 existed
+specifically to prevent this before the same-day change removed the protection. The narrower
+worry that motivated the original change — a half-imported release whose straggler files
+arrive later and can never be fetched again — is now handled by the settle gate (shipped
+on by default the same day, `prompts/done/2026-08-12-settle-gate-followups.md`): the gate stops
+a release being marked `DOWNLOADED` off a partial remote set in the first place, so the
+motivation for the original change is gone and the cost it introduced is not.
+
+**Built as a setting, not a hardcoded revert — `core/autoqueue.py.AutoQueueSettings.
+re_download_externally_removed`, default `False`.** The behaviour case 2 enables is not
+*always* wrong, only wrong as an unconditional default: `False` keeps `ELIGIBLE_STATES` at
+`("REMOTE_ONLY", "PARTIAL")`, matching pre-`855e7a3` behaviour; `True` adds `REMOVED_LOCAL`
+back in (`ELIGIBLE_STATES_WITH_EXTERNALLY_REMOVED`), for anyone who genuinely wants a
+`copy`-mode queue to re-fetch what something outside lftpweb removed. **Scoped by who removed
+the file, never by the state name alone** — the setting can never make `REMOVED_BOTH` eligible;
+lftpweb's own deletions are excluded by that state simply not appearing in either tuple, under
+either setting value, with no code path that reads the setting before excluding it. The concrete
+case that decided the default, named in both the code comment and the Settings UI copy:
+Sonarr/Radarr importing locally on one schedule, a separate cleanup script pruning the seedbox
+on another — between the import and the remote cleanup running, the same release re-fetches on
+every scan and the importer is handed duplicates repeatedly. Only bites `copy`-mode queues:
+`move` deletes the remote copy on verified completion, so an item can never read bare
+`REMOVED_LOCAL` in the first place (it reaches `REMOVED_BOTH` instead) — stated in the setting's
+own help text so a `move` user isn't left wondering whether it affects them, and it's also why
+defaulting site-wide to `False` costs `move` users nothing at all.
+
+**Site-level, not per-queue — matching the retention-settings precedent, with the per-queue
+argument recorded rather than acted on.** Stored in `setting` (JSON, no migration), same shape
+as `SettleSettings`/`RetentionSettings`. The counter-argument is real and left for the user to
+weigh: auto-queue enablement *and* `sync_mode` are both already per-`path_queue` columns, and
+since this setting only ever matters for `copy`-mode queues, a per-queue version is a
+defensible design — but it needs a migration, site-level matches how every other
+`core.*Settings` dataclass in this codebase is scoped, and the prompt was explicit not to build
+it, only to give an opinion. Surfaced in Settings → Queues (the page that already owns every
+other auto-queue-related toggle — per-queue enable, patterns-only, the pattern editor) as a
+self-contained section mirroring `TransferTab.tsx`'s `SettleGateSection` load/save idiom, rather
+than folded into the per-queue form, since it is a site-level setting.
+
+**Comments and docstrings replaced, not deleted.** `core/autoqueue.py`'s module docstring point
+3 and the long comment above `ELIGIBLE_STATES` argued carefully for the change being reverted;
+both are rewritten with the two-paths distinction named explicitly, the concrete motivating case,
+and a pointer to the setting, rather than silently dropped in favor of the new reasoning.
+
+**Tests inverted, not deleted, per the prompt's own instruction — plus one named for the
+regression.** `tests/test_autoqueue.py::test_removed_local_unsuppressed_is_eligible_again`
+became `test_removed_local_unsuppressed_is_not_eligible_by_default` (queued == 0 at the default
+setting); `test_removed_local_suppressed_by_our_own_delete_is_never_resurrected` is unchanged
+(still true regardless of the setting) and gained a sibling asserting the same thing with the
+setting explicitly `True`, plus a new
+`test_re_download_externally_removed_setting_makes_unsuppressed_removed_local_eligible` proving
+the opt-in half works. A new
+`test_importer_moving_a_completed_release_out_does_not_cause_a_redownload` is named for the
+regression itself rather than the mechanism — a real select pattern, a `REMOVED_LOCAL` item
+with suppression clear, default settings, asserting nothing is queued.
+`tests/test_local_delete.py::test_retention_deleted_item_is_not_requeued_by_autoqueue`'s
+`assert "REMOVED_LOCAL" in ELIGIBLE_STATES` line — which was pinning the same-day change as an
+implementation detail of an otherwise-unrelated retention test — is now
+`assert "REMOVED_LOCAL" not in ELIGIBLE_STATES`, with the comment above it repointed at the
+real safety net (`auto_queue_suppressed`), which was never at risk either way.
+
+**`CHANGELOG.md` corrected in place rather than getting a second, contradicting entry** — per
+the prompt's own instruction, since neither the original change nor this reversal has shipped
+in a release: the `### Fixed` bullet claiming `REMOVED_LOCAL` items "could never be re-queued...
+now fixed" no longer describes what ships (the default net result is the original, safe
+behaviour), so it was removed; the `### Added` local-deletion bullet's "also fixes a coupled
+bug" aside was replaced with a description of the new setting.
+
+**DESIGN.md corrected, not left stale — three separate problems, all introduced by `855e7a3`
+applying wordings whose premises this task invalidates.**
+1. §3.2 rule 3, §4.6, and §4.7 were rewritten around the `855e7a3` premise that `REMOVED_LOCAL`
+   is unconditionally eligible; restored to the corrected default-excluded reasoning, with the
+   two-paths distinction and the new setting documented in place of the old text — not reverted
+   to the *pre*-`855e7a3` wording, since the setting is new. §13 phase 4's mount-gate
+   justification and §14's sync-mode test bullet, which also assumed unconditional eligibility,
+   are corrected too.
+2. §6's "the trigger is the job-success transition, and only that one" was already false before
+   this task even started — `prompts/done/2026-08-12-settle-gate-followups.md`'s stuck-item
+   self-heal (same day, unrelated to the eligibility revert) added a second, narrow trigger in
+   `core/engine.py._persist`, and the replacement wording for it was drafted in this file's
+   settle-gate-follow-ups entry but never applied. Applied now, verbatim in substance: two call
+   sites, the guard that makes the second safe (`prev_state`/`prev_substate` precondition, plus
+   `_process_item`'s independent `item.state == 'DOWNLOADED'` re-check), and §3.3's own "two
+   gates" framing gained the third, smaller consequence the same entry named (the scan pass
+   that clears a job-originated hold is itself what un-sticks it, not only auto-queue/a manual
+   click).
+3. §3.3's "Off by default" was already false before this task started too — the same
+   settle-gate-follow-ups task flipped the default on, the third reasoned exception to "every
+   new capability ships off" (after `move`-mode verification and the phase 7 scheduled backup).
+   Rewritten to describe both the scan-count and wall-clock-floor conditions, the on-by-default
+   status, and the existing-install latency consequence, matching that entry's already-recorded
+   reasoning.
+
+None of these three were touched by the eligibility revert itself — they were simply already
+wrong in the doc and got fixed alongside it, per the prompt's explicit instruction to handle
+all three while already editing the document.
+
+**Conventions followed.** `docs/decisions.md` (this entry, newest at top). `CHANGELOG.md`
+corrected in place (above). Both `uvx ruff@0.8.4 check`/`format --config ruff.toml` clean.
+`npm run lint` (oxlint) and `npm run build` clean. `uv run pytest` with the fake seedbox up:
+587 passed, 0 failed, 0 skipped (584 plus three new tests; one existing test in
+`tests/test_local_delete.py` was inverted in place rather than counted as new).
+
+---
+
 ## 2026-08-12 — Settle gate follow-ups: a stuck item now self-heals through a second,
 ## narrower post-processing trigger; the settle window gained a wall-clock floor alongside its
 ## scan count; the gate now defaults on (third reasoned exception to "ships off"); Settings UI

@@ -15,16 +15,14 @@ Three things this module must get right, in order of consequence:
    local root must pass `core/mount_sentinel.py.check()`. Failing that, this queue's pass
    does nothing at all — not deferred item-by-item — and the reason is logged and kept on
    `self.gated` for the API/UI to surface.
-3. **Suppression (§4.6).** `auto_queue_suppressed`, plus the terminal states it's paired
-   with (`STOPPED`, `FAILED`, `REMOVED_BOTH`), are excluded by construction: the eligibility
-   query only ever selects `ELIGIBLE_STATES` items with the flag clear. A `STOPPED` item whose
-   pattern still matches must never be picked up here. `REMOVED_LOCAL` is *also* in
-   `ELIGIBLE_STATES` (fix, 2026-08-12, prompts/open-issues.md issue 4) -- unlike the other
-   three, it is not itself a marker of anything this codebase decided; it only means "locally
-   absent, once downloaded, past the grace period" (§3.2 rule 3), which is exactly as often "a
-   human or an *arr importer moved it" as "we deleted it ourselves." The flag is what tells
-   the two apart: `core/local_delete.py.delete_local` sets `auto_queue_suppressed` on every
-   item it removes, so only the former ever reaches this branch unsuppressed.
+3. **Suppression (§4.6), and the two ways a local copy can go away.** `auto_queue_suppressed`,
+   plus the terminal states it's paired with (`STOPPED`, `FAILED`, `REMOVED_BOTH`), are
+   excluded by construction: the eligibility query only ever selects `ELIGIBLE_STATES` items
+   with the flag clear. A `STOPPED` item whose pattern still matches must never be picked up
+   here. `REMOVED_LOCAL` is deliberately **not** in `ELIGIBLE_STATES` by default (reverted,
+   2026-08-12, docs/decisions.md) -- see the long comment on `ELIGIBLE_STATES` below for why a
+   same-day attempt to include it unconditionally was wrong, and `AutoQueueSettings.
+   re_download_externally_removed` for the opt-in that puts it back for anyone who wants it.
 4. **The settle gate (prompts/open-issues.md #2, `core/settle.py`).** Off by default like
    everything else in this list; when `settle.SettleSettings.enabled` is on, a matched item is
    still skipped -- left for a later pass -- until its remote fingerprint has held for
@@ -44,6 +42,7 @@ is applied to everything already sitting there the very next scan, with no separ
 
 from __future__ import annotations
 
+import json
 import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -59,19 +58,88 @@ logger = logging.getLogger(__name__)
 # EXCLUDED, REMOVED_BOTH, and any post-processing state -- is excluded by *not* being named
 # here, rather than by naming every excluded state explicitly.
 #
-# `REMOVED_LOCAL` fix, 2026-08-12 (prompts/open-issues.md issue 4, coupled to "7 + 8 -- the
-# deletion cluster"; docs/decisions.md). Previously excluded outright, which meant an item
-# whose local copy was moved away by a human or an *arr importer -- the ordinary, expected end
-# state of a successful import (DESIGN.md §7.2) -- could never be re-fetched again, by anyone,
-# short of a raw SQL edit. Adding it back is only safe because `auto_queue_suppressed` now does
-# the real work the state name alone used to be asked to do: `core/local_delete.py.
-# delete_local` sets `state = 'REMOVED_BOTH'` (never `REMOVED_LOCAL`) *and*
-# `auto_queue_suppressed = 1` in the same write for every item it deletes, so nothing this
-# codebase deleted on purpose ever reaches this branch with the flag clear. A `REMOVED_LOCAL`
-# item with `auto_queue_suppressed = 0` is, by construction, one this codebase never touched --
-# a human or an importer moved it, exactly the case DESIGN.md §3.2 rule 3 already says should
-# not be lost forever. The query below still requires the flag clear either way.
-ELIGIBLE_STATES = ("REMOTE_ONLY", "PARTIAL", "REMOVED_LOCAL")
+# `REMOVED_LOCAL` is excluded here by default, on purpose -- reverted, 2026-08-12
+# (docs/decisions.md), after a same-day attempt (prompts/open-issues.md issue 4) added it
+# unconditionally and got the premise wrong. **There are exactly two ways an item's local copy
+# goes away, and they need opposite treatment:**
+#
+#   1. lftpweb deleted it itself (`core/local_delete.py.delete_local` -- a manual delete from
+#      Files, or the retention sweep). That write always lands on `REMOVED_BOTH`, never bare
+#      `REMOVED_LOCAL`, *and* sets `auto_queue_suppressed = 1` in the same write. Already
+#      excluded by `ELIGIBLE_STATES` not naming `REMOVED_BOTH` at all -- unaffected by anything
+#      below, under either setting.
+#   2. Something *outside* lftpweb moved it -- an `*arr` importer picking up a finished
+#      release (DESIGN.md §7.2's ordinary, expected import), a human, a script. This is the
+#      only path that ever produces a bare `REMOVED_LOCAL` with `auto_queue_suppressed` clear
+#      (via §7.3's grace period), and it is what this setting governs.
+#
+# Making case 2 eligible again by default was the bug: on a `copy`-mode queue with auto-queue
+# on, the remote copy is never deleted (`copy` mode never touches the remote), so the moment an
+# importer moves the files out, the item is right back to matching its own select pattern --
+# re-queued, re-downloaded, re-imported, forever, every scan interval. The concrete case that
+# decided the default: Sonarr/Radarr importing locally on one schedule, and a separate cleanup
+# script pruning the seedbox on another -- between the import and the remote cleanup running,
+# the same release re-fetches on every scan and the importer is handed duplicates repeatedly.
+# `move` queues are immune either way -- the remote copy is deleted on verified completion, so
+# there is nothing left to re-fetch and the item simply reaches `REMOVED_BOTH` instead.
+#
+# So `REMOVED_LOCAL` stays out of the default eligible set, and `AutoQueueSettings.
+# re_download_externally_removed` (default `False`) is what puts it back in, for anyone who
+# genuinely wants a copy-mode queue to re-fetch what something outside lftpweb removed. Named
+# and scoped by *who removed the file*, never by the state name alone -- "locally deleted" is
+# ambiguous about the agent of deletion, which is the exact confusion that produced this bug.
+# lftpweb's own deletions are excluded by `REMOVED_BOTH` not appearing in either tuple below,
+# under either setting value -- that is not something this toggle can ever switch on.
+ELIGIBLE_STATES = ("REMOTE_ONLY", "PARTIAL")
+ELIGIBLE_STATES_WITH_EXTERNALLY_REMOVED = ELIGIBLE_STATES + ("REMOVED_LOCAL",)
+
+SETTING_KEY = "autoqueue_settings"
+
+
+@dataclass(frozen=True)
+class AutoQueueSettings:
+    """Site-level toggle (`setting` table, JSON, no migration -- same shape as
+    `core/settle.py.SettleSettings` / `core/local_delete.py.RetentionSettings`).
+
+    **Default `False`.** This is not "every new capability ships off" caution alone -- the
+    behaviour it enables is actively wrong for the common `copy`-mode-plus-importer shape this
+    project is built around (see the long comment on `ELIGIBLE_STATES` above), so `False` is
+    the *correct* default, not merely the cautious one. Flip it on only for a queue where a
+    local copy going missing outside lftpweb should always be re-fetched.
+
+    **Only matters for `copy`-mode queues.** In `move` mode the remote copy is already deleted
+    by the time an item could ever read bare `REMOVED_LOCAL` -- it reaches `REMOVED_BOTH`
+    instead -- so there is nothing left to re-fetch and this setting changes nothing for a
+    `move` queue either way. `sync` mode is not yet built (DESIGN.md §7, "not scheduled").
+    """
+
+    re_download_externally_removed: bool = False
+
+
+async def load_autoqueue_settings(db: aiosqlite.Connection) -> AutoQueueSettings:
+    cursor = await db.execute("SELECT value FROM setting WHERE key = ?", (SETTING_KEY,))
+    row = await cursor.fetchone()
+    if row is None:
+        return AutoQueueSettings()
+    try:
+        data = json.loads(row["value"])
+    except (ValueError, TypeError):
+        return AutoQueueSettings()
+    return AutoQueueSettings(
+        re_download_externally_removed=bool(data.get("re_download_externally_removed", False))
+    )
+
+
+async def save_autoqueue_settings(db: aiosqlite.Connection, settings: AutoQueueSettings) -> None:
+    await db.execute(
+        "INSERT INTO setting (key, value, updated_at) VALUES (?, ?, STRFTIME('%Y-%m-%dT%H:%M:%fZ','now')) "
+        "ON CONFLICT (key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+        (
+            SETTING_KEY,
+            json.dumps({"re_download_externally_removed": settings.re_download_externally_removed}),
+        ),
+    )
+    await db.commit()
 
 
 @dataclass(frozen=True)
@@ -123,12 +191,18 @@ class AutoQueue:
         )
 
         settle_settings = await settle.load_settle_settings(self.db)
+        autoqueue_settings = await load_autoqueue_settings(self.db)
+        eligible_states = (
+            ELIGIBLE_STATES_WITH_EXTERNALLY_REMOVED
+            if autoqueue_settings.re_download_externally_removed
+            else ELIGIBLE_STATES
+        )
 
         cursor = await self.db.execute(
             "SELECT id, rel_path, is_dir FROM item WHERE queue_id = ? "
             "AND instr(rel_path, '/') = 0 AND auto_queue_suppressed = 0 "
-            f"AND state IN ({','.join('?' for _ in ELIGIBLE_STATES)})",
-            (queue.id, *ELIGIBLE_STATES),
+            f"AND state IN ({','.join('?' for _ in eligible_states)})",
+            (queue.id, *eligible_states),
         )
         rows = await cursor.fetchall()
 

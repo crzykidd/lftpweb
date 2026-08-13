@@ -13,6 +13,11 @@ from fastapi import APIRouter, HTTPException, Request
 
 from lftpweb.core import local_delete
 from lftpweb.core import patterns as patterns_core
+from lftpweb.core.autoqueue import (
+    AutoQueueSettings,
+    load_autoqueue_settings,
+    save_autoqueue_settings,
+)
 from lftpweb.core.crypto import DecryptionError, decrypt_secret, encrypt_secret
 from lftpweb.core.mount_sentinel import check as mount_ok_check
 from lftpweb.core.postprocess import (
@@ -29,6 +34,8 @@ from lftpweb.core.settle import (
     save_settle_settings,
 )
 from lftpweb.models import (
+    AutoQueueSettingsIn,
+    AutoQueueSettingsOut,
     HostIn,
     HostOut,
     HostTestRequest,
@@ -605,6 +612,34 @@ async def put_settle_settings(body: SettleSettingsIn, request: Request) -> Settl
         enabled=settings.enabled,
         required_scans=REQUIRED_SETTLE_SCANS,
         min_age_s=SETTLE_MIN_AGE_S,
+    )
+
+
+# --- Settings -> auto-queue (`core/autoqueue.py.AutoQueueSettings`) ---------------------
+#
+# Settings -> Queues (the page that already owns every other auto-queue-related toggle: the
+# per-queue enable, patterns-only, and the pattern editor) gained a self-contained "Re-download
+# items removed outside lftpweb" section for this, mirroring `TransferTab.tsx`'s
+# `SettleGateSection` idiom -- its own load/save cycle against this endpoint rather than folded
+# into the per-queue form, since it's a site-level setting, not a `path_queue` column.
+
+
+@router.get("/autoqueue", response_model=AutoQueueSettingsOut)
+async def get_autoqueue_settings(request: Request) -> AutoQueueSettingsOut:
+    settings = await load_autoqueue_settings(request.app.state.db)
+    return AutoQueueSettingsOut(
+        re_download_externally_removed=settings.re_download_externally_removed
+    )
+
+
+@router.put("/autoqueue", response_model=AutoQueueSettingsOut)
+async def put_autoqueue_settings(
+    body: AutoQueueSettingsIn, request: Request
+) -> AutoQueueSettingsOut:
+    settings = AutoQueueSettings(re_download_externally_removed=body.re_download_externally_removed)
+    await save_autoqueue_settings(request.app.state.db, settings)
+    return AutoQueueSettingsOut(
+        re_download_externally_removed=settings.re_download_externally_removed
     )
 
 

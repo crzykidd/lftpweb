@@ -4,13 +4,16 @@ import {
   createQueue,
   deleteQueue,
   deletePattern,
+  getAutoQueueSettings,
   getAutoQueueStatus,
   listPatterns,
   listQueues,
   previewPatterns,
+  putAutoQueueSettings,
   updateQueue,
 } from '../../api/client'
 import type {
+  AutoQueueSettingsOut,
   PathQueueOut,
   PatternKind,
   PatternOut,
@@ -22,6 +25,7 @@ import type {
 const inputClasses =
   'w-full rounded-md border border-zinc-300 bg-white px-2.5 py-1.5 text-sm text-zinc-900 outline-none focus:border-zinc-500 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100'
 const labelClasses = 'text-sm font-medium text-zinc-700 dark:text-zinc-300'
+const hintClasses = 'text-xs text-zinc-500 dark:text-zinc-400'
 
 interface FormState {
   name: string
@@ -49,6 +53,83 @@ const EMPTY_FORM: FormState = {
   auto_verify: false,
   auto_extract: false,
   auto_move: false,
+}
+
+const AUTOQUEUE_SETTINGS_EMPTY: AutoQueueSettingsOut = { re_download_externally_removed: false }
+
+/** Settings → Queues' "Re-download items removed outside lftpweb" section
+ * (`core/autoqueue.py.AutoQueueSettings`; reverted+setting-ified 2026-08-12, docs/decisions.md).
+ * A self-contained load/save cycle against its own endpoint (`GET`/`PUT /api/settings/
+ * autoqueue`), the same idiom `TransferTab.tsx`'s `SettleGateSection` uses -- this is a
+ * site-level setting, not a per-queue `path_queue` column, even though it only ever affects
+ * auto-queue, which is why it lives here rather than folded into each queue's own form below.
+ */
+function AutoQueueSettingsSection() {
+  const [settings, setSettings] = useState<AutoQueueSettingsOut>(AUTOQUEUE_SETTINGS_EMPTY)
+  const [loading, setLoading] = useState(true)
+  const [saving, setSaving] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+
+  useEffect(() => {
+    getAutoQueueSettings()
+      .then(setSettings)
+      .finally(() => setLoading(false))
+  }, [])
+
+  const handleToggle = async (re_download_externally_removed: boolean) => {
+    setError(null)
+    setSaving(true)
+    try {
+      setSettings(await putAutoQueueSettings({ re_download_externally_removed }))
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  return (
+    <div className="flex flex-col gap-3 rounded-md border border-zinc-200 p-4 dark:border-zinc-800">
+      <h3 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">
+        Re-download items removed outside lftpweb
+      </h3>
+      <p className={hintClasses}>
+        There are two ways an item's local copy can go away: lftpweb deleted it itself (a
+        manual delete from Files, or the retention sweep) -- that item is <strong>never</strong>{' '}
+        re-fetched, no matter what this setting is. Or something outside lftpweb removed it --
+        an <code>*arr</code> importer picking up a finished release, a human, a script. This
+        setting controls only the second case.
+      </p>
+      {loading ? (
+        <p className="text-sm text-zinc-500 dark:text-zinc-400">Loading…</p>
+      ) : (
+        <label className="flex items-center gap-2">
+          <input
+            type="checkbox"
+            checked={settings.re_download_externally_removed}
+            disabled={saving}
+            onChange={(e) => handleToggle(e.target.checked)}
+          />
+          <span className={labelClasses}>
+            Re-fetch an item auto-queue's pattern still matches once something outside lftpweb
+            removes its local copy
+          </span>
+        </label>
+      )}
+      <p className={hintClasses}>
+        Off by default. Only matters on a <strong>copy</strong>-mode queue with auto-queue on:
+        in <code>copy</code> mode the remote copy is never touched, so if this is on, an item an
+        importer just moved into your library re-downloads on the very next scan, gets
+        re-imported, and repeats forever -- the concrete case that decided the default is
+        Sonarr/Radarr importing on one schedule while a separate script prunes the seedbox on
+        another, with every release in between re-fetched and handed to the importer as a
+        duplicate. On a <strong>move</strong>-mode queue this changes nothing either way -- the
+        remote copy is already deleted once a download verifies, so there is nothing left to
+        re-fetch.
+      </p>
+      {error && <p className="text-sm text-red-600 dark:text-red-400">{error}</p>}
+    </div>
+  )
 }
 
 /** DESIGN.md §9.2 Settings → Queues: add/edit/remove named path queues with their remote →
@@ -156,6 +237,8 @@ export function QueuesTab() {
 
   return (
     <div className="flex flex-col gap-6">
+      <AutoQueueSettingsSection />
+
       <div className="overflow-hidden rounded-md border border-zinc-200 dark:border-zinc-800">
         <table className="w-full text-sm">
           <thead className="bg-zinc-50 text-left text-zinc-500 dark:bg-zinc-900 dark:text-zinc-400">

@@ -104,6 +104,42 @@ function localBytes(node: FileNode): number {
   return node.local_size ?? node.remote_size ?? 0
 }
 
+/** Whether this node still has a remote copy -- `remote_size` is `null` only for `LOCAL_ONLY`
+ * (never tracked remotely; everything else was seen on a scan). Drives the delete
+ * confirmation's "what happens to this after I delete it" wording: a remote copy surviving
+ * means lftpweb will never re-fetch it on its own (`core/local_delete.py.delete_local` always
+ * writes `REMOVED_BOTH` + `auto_queue_suppressed`, which auto-queue excludes unconditionally,
+ * regardless of the `re_download_externally_removed` setting -- that setting only ever governs
+ * an item *something else* removed, never one this app just deleted).
+ */
+function hasRemoteCopy(node: FileNode): boolean {
+  return node.remote_size != null
+}
+
+/** The delete confirmation's remote-copy sentence -- factual and short, telling the user what
+ * happens rather than warning them off a safe action (a remote copy surviving is the normal,
+ * expected outcome of a `copy`-mode delete, not something to be alarmed about).
+ */
+function remoteCopyNote(total: number, remoteCount: number): string {
+  const localOnlyCount = total - remoteCount
+  if (remoteCount === total) {
+    return total === 1
+      ? 'Its remote copy stays untouched, and lftpweb will not re-fetch it -- it never re-downloads what it just deleted itself.'
+      : 'Their remote copies stay untouched, and lftpweb will not re-fetch any of them -- it never re-downloads what it just deleted itself.'
+  }
+  if (remoteCount === 0) {
+    return total === 1
+      ? 'It has no remote copy -- once deleted, it is gone entirely.'
+      : 'None of them have a remote copy -- once deleted, they are gone entirely.'
+  }
+  return (
+    `${remoteCount} of ${total} still ${remoteCount === 1 ? 'has' : 'have'} a remote copy, which ` +
+    `stays untouched and will not be re-fetched; the other ${localOnlyCount} ${
+      localOnlyCount === 1 ? 'has' : 'have'
+    } no remote copy and will be gone entirely.`
+  )
+}
+
 interface RowProps {
   entry: TreeEntry
   isCollapsed: boolean
@@ -469,6 +505,13 @@ export function FileTree({ nodes }: { nodes: FileNode[] }) {
     () => (pendingDelete ?? []).reduce((sum, e) => sum + localBytes(e), 0),
     [pendingDelete],
   )
+  // Split by whether a remote copy survives the delete -- entirely different outcomes worth
+  // telling the user apart (see `hasRemoteCopy`'s own docstring for why "will this come back"
+  // is always answerable from `remote_size` alone, never a guess).
+  const pendingDeleteRemoteCount = useMemo(
+    () => (pendingDelete ?? []).filter(hasRemoteCopy).length,
+    [pendingDelete],
+  )
 
   if (tree.length === 0) {
     return <p className="p-3 text-sm text-zinc-500 dark:text-zinc-400">Nothing scanned yet.</p>
@@ -587,6 +630,9 @@ export function FileTree({ nodes }: { nodes: FileNode[] }) {
             {pendingDelete.length === 1 ? 'item' : 'items'} ({formatBytes(pendingDeleteBytes)})?
             This only removes the local copy -- nothing remote is touched -- and cannot be
             undone.
+          </p>
+          <p className="text-red-900 dark:text-red-200">
+            {remoteCopyNote(pendingDelete.length, pendingDeleteRemoteCount)}
           </p>
           <div className="flex gap-2">
             <button

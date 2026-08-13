@@ -131,15 +131,28 @@ alongside this list: several entries below ship with deliberate, documented limi
   `LOCAL_ONLY` junk by hand (Files page) does not need that proof, since removing the one and
   only copy is the point. A dry-run preview endpoint (`POST /api/settings/retention/preview`)
   reports exactly what a real retention pass would delete, using the same guard chain rather
-  than a second approximation of it. Also fixes a coupled bug: `REMOVED_LOCAL` items (a local
-  copy moved away by a human or an `*arr` importer) were previously excluded from auto-queue
-  forever with no way back; they're eligible again now that a deleted-by-this-app item is
-  distinguishable from one that merely left (a new `auto_queue_suppressed` reason,
-  `'deleted_local'`, migration 008). **"Delete remote" is explicitly out of scope** — the only
-  remote deletion in this app remains `move` mode's verification-gated pipeline; a manual
-  remote-delete button is a materially larger safety conversation, deliberately deferred, not
-  forgotten. No Settings-page UI for the retention toggle yet — same named gap as the settle
-  gate above and Settings → Transfer.
+  than a second approximation of it. Also adds a new `auto_queue_suppressed` reason,
+  `'deleted_local'` (migration 008), that distinguishes an item lftpweb deleted on purpose from
+  one that merely left (moved out by an `*arr` importer, a human, or a script) — the mechanism
+  the re-download setting below needs to stay safe. The Files-page delete confirmation also
+  says, factually, what happens next: an item with a remote copy stays there untouched and is
+  never re-fetched by lftpweb; a `LOCAL_ONLY` item with no remote copy is gone entirely.
+  **"Delete remote" is explicitly out of scope** — the only remote deletion in this app remains
+  `move` mode's verification-gated pipeline; a manual remote-delete button is a materially
+  larger safety conversation, deliberately deferred, not forgotten. No Settings-page UI for the
+  retention toggle yet — same named gap as the settle gate above and Settings → Transfer.
+- **A setting to re-download items removed outside lftpweb** *(2026-08-12)*. There are two ways
+  an item's local copy can go away: lftpweb deleted it itself (never re-queued, no matter what —
+  see above), or something outside lftpweb removed it (an `*arr` importer picking up a finished
+  release, a human, a script). `AutoQueueSettings.re_download_externally_removed`
+  (`GET`/`PUT /api/settings/autoqueue`, Settings → Queues), **default off**, governs only the
+  second case: on, a `REMOVED_LOCAL` item whose pattern still matches is eligible for auto-queue
+  again; off (the default), it stays excluded, exactly as before this session. Off is the
+  *correct* default, not merely the cautious one — on a `copy`-mode queue (remote copy never
+  touched) with auto-queue on, an importer moving a release out would otherwise be re-fetched on
+  the very next scan, re-imported, and repeat forever. Only matters for `copy`-mode queues;
+  `move` deletes the remote copy on verified completion, so there is nothing left to re-fetch
+  either way.
 
 ### Changed
 
@@ -214,13 +227,6 @@ alongside this list: several entries below ship with deliberate, documented limi
 - **A `REMOVED_LOCAL` item was published to the UI as `REMOTE_ONLY`** — Queue button and all —
   because the WebSocket carried the structural reading rather than what was persisted
   *(2026-08-12)*. Present since phase 4.
-- **`REMOVED_LOCAL` items could never be re-queued, even deliberately** *(2026-08-12)*: a local
-  copy moved away by a human or an `*arr` importer (the normal end state of a successful
-  import) was excluded from auto-queue outright, forever, with no way back short of editing the
-  database by hand. Fixed alongside the local-deletion feature above, which is what makes it
-  safe: an item this app deleted on purpose is now distinguishable (a new
-  `auto_queue_suppressed` reason) from one that merely left, so only the latter becomes eligible
-  again. Present since phase 4.
 - **An empty remote directory reported itself as `DOWNLOADED`** when nothing had been
   downloaded *(2026-08-12)*, because a directory with no files that count is vacuously
   complete. Now `REMOTE_ONLY` until mirrored — while a directory whose children are *all

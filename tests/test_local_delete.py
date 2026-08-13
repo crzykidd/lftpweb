@@ -649,9 +649,14 @@ async def test_retention_deleted_item_is_not_requeued_by_autoqueue(tmp_path):
         assert item["state"] == "REMOVED_BOTH"
         assert item["auto_queue_suppressed"] == 1
 
-        # Issue 4's fix put REMOVED_LOCAL in ELIGIBLE_STATES, so this asserts the actual safety
-        # mechanism (suppression), not the (already-excluded) state name.
-        assert "REMOVED_LOCAL" in ELIGIBLE_STATES
+        # `REMOVED_LOCAL` is excluded from `ELIGIBLE_STATES` by default (reverted, 2026-08-12,
+        # docs/decisions.md), so this item would stay excluded by state name alone even without
+        # the assertion below -- but `delete_local` never writes bare `REMOVED_LOCAL` anyway
+        # (it goes straight to `REMOVED_BOTH`, already asserted above), so the real safety net
+        # this test is pinning is suppression, which holds regardless of the eligible-states
+        # tuple or the `re_download_externally_removed` setting -- lftpweb never re-fetches
+        # what it deleted itself.
+        assert "REMOVED_LOCAL" not in ELIGIBLE_STATES
 
         enqueued: list[int] = []
 

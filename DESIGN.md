@@ -321,21 +321,26 @@ Nine rules that are easy to get wrong and that want review:
 2. `local_size < remote_size` with **no active job** ⇒ `PARTIAL`, never `DOWNLOADED`. This is
    what makes a stopped transfer resumable rather than silently "done".
 3. Previously downloaded, now absent locally, still present remotely ⇒ `REMOVED_LOCAL`, once
-   §7.3's grace period has elapsed. **What must never be re-fetched is what *we* removed, and
-   that is carried by `auto_queue_suppressed`, not by the state name.** Every delete lftpweb
-   performs itself — a manual delete from Files, the retention sweep — writes `REMOVED_BOTH`
-   *and* sets the suppression flag (`suppressed_reason = 'deleted_local'`) in the same write,
-   so it is excluded from auto-queue for the same reason a `STOPPED` item is (rule 7, §4.6).
-   A bare `REMOVED_LOCAL` therefore only ever means "locally absent, once downloaded, and
-   lftpweb did not do it" — a human, or an importer moving files into the media library (§7.2)
-   — and it stays eligible for auto-queue rather than being written off forever. Reading the
-   state name as the suppression signal is what made an imported release un-fetchable by any
-   route short of a hand-written SQL update; the flag is the mechanism, the state is the
-   description. **The cost is stated plainly, because it is the reverse of the old failure:**
-   on a `copy`-mode queue with auto-queue on, an item an importer moved out still matches its
-   select pattern and *will* be fetched again. In `move` mode it cannot — the remote copy is
-   already gone by then — which is the mode this deployment shape (§7.1, §7.2) is built
-   around.
+   §7.3's grace period has elapsed. **There are exactly two ways a local copy goes away, and
+   auto-queue must treat them oppositely.** Every delete lftpweb performs itself — a manual
+   delete from Files, the retention sweep — writes `REMOVED_BOTH` *and* sets
+   `auto_queue_suppressed` (`suppressed_reason = 'deleted_local'`) in the same write, so it is
+   excluded from auto-queue for the same reason a `STOPPED` item is (rule 7, §4.6), under every
+   setting, with no way to switch it back on — that is not a behaviour anyone should be able to
+   enable. A bare `REMOVED_LOCAL`, by contrast, only ever means something *outside* lftpweb
+   removed it — a human, or an importer moving a finished release into the media library
+   (§7.2) — and by default it is **excluded from auto-queue** exactly like `REMOVED_BOTH`,
+   not eligible again: on a `copy`-mode queue with auto-queue on, the remote copy is never
+   touched, so an item an importer just moved out still matches its select pattern and would
+   be fetched again on the very next scan, re-imported, and repeat forever — a live loop, not a
+   theoretical one, for the common shape of a `copy`-mode queue feeding an `*arr` importer on
+   one schedule while a separate script prunes the seedbox on another. `core/autoqueue.py.
+   AutoQueueSettings.re_download_externally_removed` (site-level, default `False`) is the
+   opt-in for anyone who genuinely wants that case re-fetched; it governs only the
+   externally-removed path; it can never make a self-delete (`REMOVED_BOTH`) eligible. This
+   only bites `copy` mode — in `move`, the remote copy is already gone by the time an item
+   could read bare `REMOVED_LOCAL` (it reaches `REMOVED_BOTH` instead), so the setting changes
+   nothing for a `move` queue either way.
 4. **Remote size is a moving target** — a torrent may still be downloading on the seedbox.
    Never latch it; recompute completeness on every scan.
 5. **The same detection drives different actions by mode** (§7). `REMOVED_LOCAL` is one
@@ -426,8 +431,13 @@ restated as a fix.
   job runs — a `mirror` job transfers whatever was visible when it started and can exit 0
   having moved every file it was asked for while the item itself is not done. Such an item is
   held at `REMOTE_ONLY` with `substate = 'settling'`, its suppression cleared so a later pass
-  or a user click resumes it, and **post-processing is not triggered**. An `event` row records
-  the hold, so a job that visibly succeeded without completing anything is not a mystery.
+  or a user click resumes it, and **post-processing is not triggered by that job's success**.
+  An `event` row records the hold, so a job that visibly succeeded without completing anything
+  is not a mystery. A **third, smaller consequence of this same gate** (§6): the scan pass
+  that eventually finds the remote genuinely quiet and releases the hold to `DOWNLOADED` is
+  itself a second, narrow post-processing trigger — so a job-originated hold does not depend on
+  auto-queue or a manual click to ever get post-processed; it can also clear entirely on its
+  own, the next time the scan pass runs.
 
 **A manual Queue click overrides the eligibility gate and never the completion gate.** Explicit
 user action beats a heuristic, so a click queues immediately; the completion check applies
@@ -444,10 +454,30 @@ The verdict is persisted (`item_settle`, §3.1) rather than counted in memory: i
 restart, and — decisively — `substate = 'settling'` goes out over the WebSocket, so it has to
 be read back from a table like everything else (§2.2).
 
-**Off by default.** The gate delays every transfer by up to two scan intervals (~60 s at the
-default), including on an atomic hardlink pickup path (§7.1) where nothing is still arriving
-and the delay buys nothing. That is a real latency regression for an existing install, which is
-exactly the bar this project's "every new capability ships off" rule exists to catch.
+**On by default — settling requires both a scan count *and* a wall-clock floor.** Two
+independently load-bearing conditions, `SettleSettings.enabled` and `core/settle.py`'s own
+constants: `REQUIRED_SETTLE_SCANS` (2) consecutive matching scans, **and** at least
+`SETTLE_MIN_AGE_S` (60.0) seconds of wall-clock time since the current matching streak began.
+The count alone cannot tell a fast-settling item from a slow-polling one that simply hasn't
+been rescanned enough times yet; the floor alone cannot tell "genuinely unchanged" from "haven't
+looked in a while" — a queue that gets disabled mid-settle and never rescanned again is not
+"settled" just because a clock ran out with nobody checking. The floor exists because the
+counter's whole meaning assumes every queue shares one scan interval — true today (one global
+30 s value) but not guaranteed once a per-queue interval lands — and 60 s is the exact number
+already documented everywhere in this project as what the gate costs at today's default, so a
+30 s queue's worst case is unchanged by the floor while a faster future queue is held to the
+same guarantee rather than quietly given a weaker one.
+
+This is the **third reasoned exception** to this project's "every new capability ships off"
+rule, after `move`-mode verification (§6) and the phase 7 scheduled backup (§10.2). Shipped off
+originally; flipped once real use confirmed non-atomic remote copies (plain copies, and
+cross-device moves that are copies in disguise) are a real path on this deployment's own
+setup, at which point "off by default" stopped being the safe choice — it is the fix for a
+real, confirmed-live directory-corruption bug, not a latency preference. **Existing installs
+upgrading into this default will see transfers complete up to about a minute later than
+before** — stated plainly (CHANGELOG.md's `### Changed` entry), not left for someone to notice.
+Still switchable off (`GET`/`PUT /api/settings/settle`, Settings → Transfer) for anyone whose
+seedbox landing path is atomic end to end and would rather not pay the delay at all.
 
 ---
 
@@ -709,11 +739,14 @@ auto-queue never learned about the failure.
 Manual re-queue always wins. It clears suppression, resets `attempt`, and puts the item back in
 the job queue — that is the intended way to say "try again", and it is explicit.
 
-**The same flag, not a second mechanism, is what makes a delete stick.** When lftpweb removes
-an item's local copy itself — a manual delete from Files, or the retention sweep — it sets
-`auto_queue_suppressed` with `suppressed_reason = 'deleted_local'` in the same write that marks
-the row terminal. That is why §3.2 rule 3 can leave a plain `REMOVED_LOCAL` eligible: the flag
-distinguishes "we removed it" from "it went away", and only the first is written off.
+**The same flag is what makes a delete stick, permanently, regardless of settings.** When
+lftpweb removes an item's local copy itself — a manual delete from Files, or the retention
+sweep — it sets `auto_queue_suppressed` with `suppressed_reason = 'deleted_local'` in the same
+write that marks the row terminal (`REMOVED_BOTH`, never bare `REMOVED_LOCAL`). §3.2 rule 3's
+`AutoQueueSettings.re_download_externally_removed` toggle only ever changes whether a bare
+`REMOVED_LOCAL` — nothing lftpweb touched — is eligible; the flag is what tells "we removed it"
+from "it went away" apart, and the first is never re-fetched, under either value of that
+setting.
 
 ### 4.7 What enters the queue: manual add, auto-queue, and patterns
 
@@ -724,12 +757,16 @@ it clears `auto_queue_suppressed` (§4.6) and ignores every pattern. An explicit
 never second-guessed by a filter.
 
 **Auto-queue.** Per path queue, off by default, evaluated against every eligible top-level
-remote item on each scan. Eligible means `REMOTE_ONLY`, `PARTIAL`, or `REMOVED_LOCAL`, with
-`auto_queue_suppressed` clear — so `STOPPED`, `FAILED`, `REMOVED_BOTH`, anything already
-complete or in flight, and anything lftpweb itself deleted are all excluded, the last three by
-the flag rather than by their state name (§3.2 rules 3 and 7). It additionally skips an item
-whose remote fingerprint has not settled (§3.3), leaving it for a later pass. Before evaluating
-anything at all for a queue, the queue's local root must pass the mount gate (§7.3); if it
+remote item on each scan. Eligible means `REMOTE_ONLY` or `PARTIAL`, with `auto_queue_suppressed`
+clear — so `STOPPED`, `FAILED`, `REMOVED_BOTH`, and anything already complete or in flight are
+all excluded, `STOPPED`/`FAILED`/`REMOVED_BOTH` by the flag rather than by their state name
+(§3.2 rules 3 and 7). `REMOVED_LOCAL` is excluded too by default — not by the flag, since a
+plain `REMOVED_LOCAL` usually carries it clear, but because the state itself is left out of the
+eligible set; `AutoQueueSettings.re_download_externally_removed` (site-level, default `False`,
+§3.2 rule 3) is the opt-in that adds it back in, for anyone who wants an item something outside
+lftpweb removed to be re-fetched. It additionally skips an item whose remote fingerprint has not
+settled (§3.3), leaving it for a later pass. Before evaluating anything at all for a queue, the
+queue's local root must pass the mount gate (§7.3); if it
 does not, the whole pass is skipped for that queue and the reason is surfaced, rather than each
 item being judged against a tree that isn't mounted.
 
@@ -900,17 +937,22 @@ post-processes nothing before anyone has visited a settings page.
 Failures are recorded on the item (`EXTRACT_FAILED`, `CORRUPT`) and never abort the pipeline
 for other items.
 
-**The trigger is the job-success transition, and only that one.** Post-processing fires from
-the point where a transfer job exits 0 for a top-level item — not from a scan that happens to
-compute `DOWNLOADED`. An item the settle gate held back (§3.3) re-enters this path by being
-re-queued (by auto-queue once it is eligible again, or by a user click), with lftp resuming
-rather than re-fetching; that job's own success is what reaches the trigger. **The consequence
-is named rather than papered over:** an item that becomes complete with no job involved — files
-placed by hand, a restore, or a held-back item that settles on a pass while auto-queue is off
-and nobody clicks — is never verified, extracted, or moved until something re-touches it. A
-second, scan-driven trigger was considered and rejected: it would give this module two entry
-points, one of which fires on a state nobody asserted, for a case that does not arise in this
-deployment.
+**Two call sites, both narrow.** The job-success transition in `core/queue.py._reap_one` —
+post-processing fires from the point where a transfer job exits 0 for a top-level item, not
+from a scan that happens to compute `DOWNLOADED`. And `core/engine.py._persist`, but only for
+an item its own settle-gate bookkeeping (§3.3) just released straight from
+`REMOTE_ONLY`/`substate='settling'` to `DOWNLOADED` with no fresh job in between — the fix for
+a real bug: a job can finish while its item is still unsettled, get held back, and with
+auto-queue off and nobody re-clicking, never reach a job-success trigger at all. Both call
+sites fire on the identical precondition (state about to become `DOWNLOADED`, no
+post-processing outcome yet). This is still not a general scan-driven trigger — a pre-existing
+local file reading `DOWNLOADED` on its first-ever scan, with no gate hold behind it, triggers
+nothing, exactly as before this fix. **The remaining consequence is named rather than papered
+over:** an item that
+becomes complete with no job involved *and* no settle-gate hold behind it — files placed by
+hand, or a restore — is never verified, extracted, or moved until something re-touches it. An
+item the settle gate genuinely held (the second call site's whole reason to exist) no longer
+has this problem.
 
 **Extraction stages off to the side and merges into position on success.** Archives extract
 into an `_UNPACK_<name>` directory created as a **sibling** of the final directory — never a
@@ -1584,9 +1626,10 @@ Each phase ends at something that can actually be looked at and judged.
    under `sync` mode because that is where they were first needed, but auto-queue is the point
    at which local absence starts *driving action*, and a network mount that drops makes every
    item look locally absent at once. Without the gate, one NFS hiccup re-downloads the entire
-   library — every item reads `REMOTE_ONLY`, or rides the grace period to `REMOVED_LOCAL` and,
-   being nothing lftpweb deleted, is eligible again (§3.2 rule 3). Do not ship auto-queue
-   without it.
+   library — every item reads `REMOTE_ONLY` the moment the mount is unreachable, right back to
+   matching its own select pattern (§3.2 rule 3 excludes `REMOVED_LOCAL` from this by default;
+   it is `REMOTE_ONLY` alone that does the damage here, and that exclusion offers no protection
+   against it). Do not ship auto-queue without it.
 5. ✅ **Post-processing + `move` mode** — verify, extract, staging move; and remote deletion on
    verified completion via §7.4, with its audit trail. `move` ships here because it is
    verification plus one delete call, and the delete path it establishes is what `sync` later
@@ -1611,7 +1654,7 @@ That is the whole of v1. `0.0.1` is the first version (§12).
 
 **Since phase 9 (2026-08-12), still pre-release.** Real use surfaced a set of correctness gaps
 that the nine phases' green CI never touched, and the fixes are documented in the sections
-above rather than as a tenth phase: the settle gate (§3.3, off by default), the publish
+above rather than as a tenth phase: the settle gate (§3.3, on by default), the publish
 invariant and the single item-view projection (§2.2), state ownership between the three writers
 of `item.state` (§3.2 rule 9), the empty-remote-directory reading (§3.2 rule 1), the
 `REMOVED_LOCAL`/suppression correction (§3.2 rule 3), `_UNPACK_` extraction staging and the
@@ -1688,11 +1731,15 @@ assertions are v1, because `move` deletes too.
 - **Mode behavior differences.** The same observation (`DOWNLOADED` item now locally absent)
   against all three modes: `copy` → no remote action ever; `sync` → propagate after the rails;
   `move` → already deleted at verified completion, nothing further.
-- **An item lftpweb deleted itself is never re-queued** — the auto-queue regression that would
-  otherwise re-download everything the retention sweep just removed, on a 30-second loop. Both
-  halves have to be asserted together (§3.2 rule 3): a `REMOVED_LOCAL` item nothing in this
-  codebase touched *is* eligible again, and one carrying `auto_queue_suppressed` from our own
-  delete never is.
+- **An item lftpweb deleted itself is never re-queued, under either `AutoQueueSettings.
+  re_download_externally_removed` value** — the regression that would otherwise re-download
+  everything the retention sweep just removed, on a 30-second loop. Asserted alongside its
+  default-off counterpart (§3.2 rule 3): a `REMOVED_LOCAL` item nothing in this codebase
+  touched stays excluded at the default setting, becomes eligible once the setting is turned
+  on, and one carrying `auto_queue_suppressed` from our own delete never is, at either setting
+  value. A fourth, named-for-the-scenario test covers the regression directly: an `*arr`
+  importer moving a completed release out of the local downloads directory must not cause a
+  re-download on the next scan.
 - **Verification gate.** A `CORRUPT` or unverified item in `move` / `sync` propagates no
   delete, and the withheld delete is recorded.
 - **Dry-run** performs no remote mutation while producing the identical decision list to a

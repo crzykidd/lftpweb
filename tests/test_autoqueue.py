@@ -9,7 +9,12 @@ from __future__ import annotations
 import aiosqlite
 import pytest
 
-from lftpweb.core.autoqueue import AutoQueue, QueueAutoConfig
+from lftpweb.core.autoqueue import (
+    AutoQueue,
+    AutoQueueSettings,
+    QueueAutoConfig,
+    save_autoqueue_settings,
+)
 from lftpweb.core.settle import SettleSettings, save_settle_settings
 from lftpweb.db import migrate
 
@@ -127,9 +132,12 @@ async def test_stopped_item_is_never_resurrected_even_though_its_pattern_matches
 
 
 async def test_failed_and_removed_states_are_also_never_picked_up(db, tmp_path):
-    """`REMOVED_LOCAL` is deliberately not in this list -- see the two tests below (issue 4,
-    2026-08-12): whether it's picked up now depends on `auto_queue_suppressed`, not on the
-    state name alone.
+    """`REMOVED_LOCAL` is deliberately not in this list -- see the tests below. Unlike
+    `FAILED`/`REMOVED_BOTH`/`QUEUED`/`DOWNLOADING`/`DOWNLOADED`, whether a `REMOVED_LOCAL` item
+    is picked up depends on `AutoQueueSettings.re_download_externally_removed`
+    (`re_download_externally_removed_setting_*` tests below), not on the state name alone --
+    but with that setting at its default (`False`, and this fixture's default `db`), it is
+    excluded exactly like this group.
     """
     from lftpweb.core.mount_sentinel import write_if_needed
 
@@ -147,16 +155,91 @@ async def test_failed_and_removed_states_are_also_never_picked_up(db, tmp_path):
     assert recorder.enqueued == []
 
 
-async def test_removed_local_unsuppressed_is_eligible_again(db, tmp_path):
-    """Issue 4 (prompts/open-issues.md, coupled to "7 + 8 -- the deletion cluster"), fixed
-    2026-08-12: an item whose local copy was moved away by a human or an *arr importer --
-    `REMOVED_LOCAL` with `auto_queue_suppressed` still clear, since nothing in this codebase
-    decided to remove it -- must be re-fetchable again, not stuck forever just because of its
-    state name.
+async def test_removed_local_unsuppressed_is_not_eligible_by_default(db, tmp_path):
+    """Reverted, 2026-08-12 (docs/decisions.md): a same-day change (issue 4) made `REMOVED_LOCAL`
+    eligible unconditionally on the premise that only lftpweb's own deletes needed excluding.
+    That premise was wrong -- on a `copy`-mode queue with auto-queue on, an item something
+    *outside* lftpweb removed (an `*arr` importer picking up a finished release, a human, a
+    script) still matches its own select pattern, so making it eligible again re-downloads the
+    same release forever, every scan, until the remote copy is also gone. `AutoQueueSettings.
+    re_download_externally_removed` defaults `False`, so at the fixture's default settings this
+    item -- `REMOVED_LOCAL`, `auto_queue_suppressed` clear, nothing this codebase touched --
+    stays right where a `STOPPED`/`FAILED` item does: not picked up.
     """
     from lftpweb.core.mount_sentinel import write_if_needed
 
     write_if_needed(str(tmp_path))
+    queue_id = await _make_queue(db, tmp_path)
+    await _make_item(db, queue_id, "Release.One", state="REMOVED_LOCAL", suppressed=0)
+    recorder = _Recorder()
+    aq = AutoQueue(db, recorder)
+
+    queued = await aq.on_scan(_mounted_config(queue_id, tmp_path))
+    assert queued == 0
+    assert recorder.enqueued == []
+
+
+async def test_importer_moving_a_completed_release_out_does_not_cause_a_redownload(db, tmp_path):
+    """The regression this revert exists to prevent, named for the scenario rather than the
+    mechanism: a `copy`-mode queue with auto-queue on and a select pattern that still matches
+    the release name. An `*arr` importer (or a human) moves the finished release out of the
+    local downloads directory -- the ordinary, expected end of a successful import (DESIGN.md
+    §7.2) -- and the item rides §7.3's grace period to `REMOVED_LOCAL` with
+    `auto_queue_suppressed` clear, since nothing in this codebase decided to remove it. The next
+    scan's auto-queue pass must not re-fetch it: the remote copy is untouched in `copy` mode, so
+    a naive "still matches, still absent locally" reading would re-download, re-import, and
+    repeat on every scan interval forever.
+    """
+    from lftpweb.core.mount_sentinel import write_if_needed
+
+    write_if_needed(str(tmp_path))
+    queue_id = await _make_queue(db, tmp_path)
+    await db.execute(
+        "INSERT INTO pattern (queue_id, kind, expr) VALUES (?, 'select', 'Release*')", (queue_id,)
+    )
+    await db.commit()
+    await _make_item(db, queue_id, "Release.One", state="REMOVED_LOCAL", suppressed=0)
+    recorder = _Recorder()
+    aq = AutoQueue(db, recorder)
+
+    queued = await aq.on_scan(_mounted_config(queue_id, tmp_path))
+    assert queued == 0
+    assert recorder.enqueued == []
+
+
+async def test_removed_local_suppressed_by_our_own_delete_is_never_resurrected(db, tmp_path):
+    """A `REMOVED_LOCAL` item this codebase deleted on purpose carries `auto_queue_suppressed =
+    1` (`core/local_delete.py.delete_local` sets it in the same write) and must stay excluded --
+    lftpweb never re-fetches what it deleted itself, regardless of the eligible-states tuple. In
+    practice `delete_local` sets `state = 'REMOVED_BOTH'`, never bare `REMOVED_LOCAL`, but this
+    asserts the actual safety mechanism (the flag), not an implementation detail of which state
+    string happens to accompany it.
+    """
+    from lftpweb.core.mount_sentinel import write_if_needed
+
+    write_if_needed(str(tmp_path))
+    queue_id = await _make_queue(db, tmp_path)
+    await _make_item(db, queue_id, "Release.One", state="REMOVED_LOCAL", suppressed=1)
+    recorder = _Recorder()
+    aq = AutoQueue(db, recorder)
+
+    queued = await aq.on_scan(_mounted_config(queue_id, tmp_path))
+    assert queued == 0
+    assert recorder.enqueued == []
+
+
+async def test_re_download_externally_removed_setting_makes_unsuppressed_removed_local_eligible(
+    db, tmp_path
+):
+    """The opt-in: with `AutoQueueSettings.re_download_externally_removed = True`, the exact
+    item the default-off test above leaves alone -- `REMOVED_LOCAL`, `auto_queue_suppressed`
+    clear -- becomes eligible again, for anyone who genuinely wants a `copy`-mode queue to
+    re-fetch what something outside lftpweb removed.
+    """
+    from lftpweb.core.mount_sentinel import write_if_needed
+
+    write_if_needed(str(tmp_path))
+    await save_autoqueue_settings(db, AutoQueueSettings(re_download_externally_removed=True))
     queue_id = await _make_queue(db, tmp_path)
     item_id = await _make_item(db, queue_id, "Release.One", state="REMOVED_LOCAL", suppressed=0)
     recorder = _Recorder()
@@ -167,18 +250,16 @@ async def test_removed_local_unsuppressed_is_eligible_again(db, tmp_path):
     assert recorder.enqueued == [item_id]
 
 
-async def test_removed_local_suppressed_by_our_own_delete_is_never_resurrected(db, tmp_path):
-    """The other half of the same fix: a `REMOVED_LOCAL` item this codebase deleted on purpose
-    carries `auto_queue_suppressed = 1` (`core/local_delete.py.delete_local` sets it in the
-    same write) and must stay excluded -- otherwise fixing issue 4 would turn retention into a
-    30-second re-download loop, exactly the trap prompts/open-issues.md warns about. In
-    practice `delete_local` sets `state = 'REMOVED_BOTH'`, never bare `REMOVED_LOCAL`, but this
-    asserts the actual safety mechanism (the flag), not an implementation detail of which state
-    string happens to accompany it.
+async def test_re_download_externally_removed_setting_never_resurrects_our_own_delete(db, tmp_path):
+    """The setting governs only the externally-removed case, never lftpweb's own deletions --
+    even with it on, a `REMOVED_LOCAL` item carrying `auto_queue_suppressed = 1` (our own
+    delete) stays excluded. There is no value of this setting that re-fetches what lftpweb
+    deleted itself.
     """
     from lftpweb.core.mount_sentinel import write_if_needed
 
     write_if_needed(str(tmp_path))
+    await save_autoqueue_settings(db, AutoQueueSettings(re_download_externally_removed=True))
     queue_id = await _make_queue(db, tmp_path)
     await _make_item(db, queue_id, "Release.One", state="REMOVED_LOCAL", suppressed=1)
     recorder = _Recorder()

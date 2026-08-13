@@ -132,6 +132,20 @@ export interface SettleSettingsIn {
   enabled: boolean
 }
 
+// --- Settings -> auto-queue (`core/autoqueue.py.AutoQueueSettings`) ---------------------
+//
+// Site-level, default false. Governs only whether an item something *outside* lftpweb removed
+// (an `*arr` importer, a human, a script) is eligible to be re-fetched by auto-queue --
+// lftpweb's own deletions (Files-page delete, retention) are never re-fetched regardless of
+// this setting. Only matters for `copy`-mode queues; `move` deletes the remote copy on
+// completion, so there is nothing left to re-fetch either way.
+
+export interface AutoQueueSettingsOut {
+  re_download_externally_removed: boolean
+}
+
+export type AutoQueueSettingsIn = AutoQueueSettingsOut
+
 // --- Settings -> Queues -> Patterns (phase 4, DESIGN.md §3.1 `pattern`, §4.7) -----------
 
 export type PatternKind = 'select' | 'skip' | 'file_exclude'

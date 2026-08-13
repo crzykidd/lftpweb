@@ -184,6 +184,21 @@ class SettleSettingsIn(BaseModel):
     enabled: bool = True
 
 
+# --- Settings -> auto-queue (`core/autoqueue.py.AutoQueueSettings`) ---------------------
+
+
+class AutoQueueSettingsOut(BaseModel):
+    # Default False -- see core/autoqueue.py.AutoQueueSettings's own docstring for why this is
+    # the *correct* default, not merely the cautious one: on for a copy-mode queue means an
+    # item something outside lftpweb removed (an importer, a human, a script) is re-fetched on
+    # the next scan its pattern still matches, forever, until the remote copy is also gone.
+    re_download_externally_removed: bool = False
+
+
+class AutoQueueSettingsIn(AutoQueueSettingsOut):
+    pass
+
+
 # --- Settings -> local retention (prompts/open-issues.md "7 + 8", `core/local_delete.py`) -----
 
 

@@ -5,6 +5,8 @@ import type {
   AuthSessionOut,
   AuthSettingsIn,
   AuthSettingsOut,
+  AutoQueueSettingsIn,
+  AutoQueueSettingsOut,
   ChangePasswordIn,
   BackupInfoOut,
   BackupListResponse,
@@ -185,6 +187,16 @@ export function getSettleSettings(): Promise<SettleSettingsOut> {
 
 export function putSettleSettings(body: SettleSettingsIn): Promise<SettleSettingsOut> {
   return sendJson<SettleSettingsOut>('/api/settings/settle', 'PUT', body)
+}
+
+// --- Settings -> auto-queue (`core/autoqueue.py.AutoQueueSettings`) ---------------------
+
+export function getAutoQueueSettings(): Promise<AutoQueueSettingsOut> {
+  return getJson<AutoQueueSettingsOut>('/api/settings/autoqueue')
+}
+
+export function putAutoQueueSettings(body: AutoQueueSettingsIn): Promise<AutoQueueSettingsOut> {
+  return sendJson<AutoQueueSettingsOut>('/api/settings/autoqueue', 'PUT', body)
 }
 
 // --- Files ---------------------------------------------------------------------------------
