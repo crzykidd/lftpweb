@@ -21,7 +21,13 @@ from lftpweb.core.postprocess import (
     save_postprocess_settings,
 )
 from lftpweb.core.remote import HostConfig, parse_connection_limit
-from lftpweb.core.settle import SettleSettings, load_settle_settings, save_settle_settings
+from lftpweb.core.settle import (
+    REQUIRED_SETTLE_SCANS,
+    SETTLE_MIN_AGE_S,
+    SettleSettings,
+    load_settle_settings,
+    save_settle_settings,
+)
 from lftpweb.models import (
     HostIn,
     HostOut,
@@ -576,24 +582,30 @@ async def put_postprocess_settings(
 
 # --- Settings -> the settle gate (prompts/open-issues.md #2, `core/settle.py`) -----------
 #
-# No frontend page yet -- this task's scope was the backend gate and its two consumers
-# (`core/autoqueue.py`, `core/queue.py._reap_one`); see the handoff report for the same
-# "backend first, UI catches up later" gap this project already accepted for Settings ->
-# Transfer across several earlier phases. Defaults off either way, so its absence from any
-# settings screen changes nothing about how an existing install behaves.
+# UI built in prompts/2026-08-12-settle-gate-followups.md, at Settings -> Transfer (the natural
+# home -- see that page's own "the settle gate" section). Defaults **on** as of that task; see
+# CHANGELOG.md's `### Changed` entry and `core/settle.py.SettleSettings`'s docstring for why.
 
 
 @router.get("/settle", response_model=SettleSettingsOut)
 async def get_settle_settings(request: Request) -> SettleSettingsOut:
     settings = await load_settle_settings(request.app.state.db)
-    return SettleSettingsOut(enabled=settings.enabled)
+    return SettleSettingsOut(
+        enabled=settings.enabled,
+        required_scans=REQUIRED_SETTLE_SCANS,
+        min_age_s=SETTLE_MIN_AGE_S,
+    )
 
 
 @router.put("/settle", response_model=SettleSettingsOut)
 async def put_settle_settings(body: SettleSettingsIn, request: Request) -> SettleSettingsOut:
     settings = SettleSettings(enabled=body.enabled)
     await save_settle_settings(request.app.state.db, settings)
-    return SettleSettingsOut(enabled=settings.enabled)
+    return SettleSettingsOut(
+        enabled=settings.enabled,
+        required_scans=REQUIRED_SETTLE_SCANS,
+        min_age_s=SETTLE_MIN_AGE_S,
+    )
 
 
 # --- Settings -> local retention (prompts/open-issues.md "7 + 8", `core/local_delete.py`) -----

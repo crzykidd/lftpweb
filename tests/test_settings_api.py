@@ -316,6 +316,41 @@ def test_postprocess_settings_put_omitting_failed_retention_fields_keeps_them_of
         assert saved["failed_retention_days"] == 14.0
 
 
+# --- The settle gate (prompts/open-issues.md #2, `core/settle.py`) -----------------------
+
+
+def test_settle_settings_default_on_and_round_trip(isolated_config):
+    """prompts/2026-08-12-settle-gate-followups.md item 3: unlike every other capability in
+    this file, this one now defaults **on** -- the third reasoned exception to the "ships off"
+    rule (docs/decisions.md). `required_scans`/`min_age_s` are read-only, always the module's
+    own constants, never a stored value.
+    """
+    from lftpweb.core.settle import REQUIRED_SETTLE_SCANS, SETTLE_MIN_AGE_S
+
+    with TestClient(app) as client:
+        resp = client.get("/api/settings/settle")
+        assert resp.status_code == 200
+        defaults = resp.json()
+        assert defaults["enabled"] is True
+        assert defaults["required_scans"] == REQUIRED_SETTLE_SCANS
+        assert defaults["min_age_s"] == SETTLE_MIN_AGE_S
+
+        resp = client.put("/api/settings/settle", json={"enabled": False})
+        assert resp.status_code == 200
+        saved = resp.json()
+        assert saved["enabled"] is False
+        # Still surfaced, and still the constants, even with the toggle off.
+        assert saved["required_scans"] == REQUIRED_SETTLE_SCANS
+        assert saved["min_age_s"] == SETTLE_MIN_AGE_S
+
+        # Persisted, not just echoed back.
+        resp = client.get("/api/settings/settle")
+        assert resp.json() == saved
+
+        resp = client.put("/api/settings/settle", json={"enabled": True})
+        assert resp.json()["enabled"] is True
+
+
 # --- Phase 4: queues carry auto-queue toggles, default off (DESIGN.md §4.7) ---------------
 
 

@@ -155,6 +155,39 @@ alongside this list: several entries below ship with deliberate, documented limi
   WebSocket, its connect-time snapshot, and `GET /api/files` all publish a projection read
   back from the database rather than the reconciler's structural reading, so the REST view and
   the live view can no longer disagree about the same item.
+- **`DESIGN.md` caught up with the code** *(2026-08-12, documentation only)*. The backlog of
+  replacement wordings that earlier sessions drafted into `docs/decisions.md` rather than
+  editing the doc was applied: three new sections (§2.2 the publish invariant, §3.3 the settle
+  gate, §10.4 throughput metrics), a new §3.2 rule 9 on which module wins when two of them
+  write `item.state`, and corrections to §3.1, §3.2, §4.6, §4.7, §5, §6, §7.3, §9, §11, §13,
+  and §14. No behavior changed; nothing was renumbered.
+- **The settle gate now defaults on, gained a wall-clock floor alongside its scan count, a
+  self-heal for a stuck item, and a Settings UI** *(2026-08-12)*, three follow-ups to the gate
+  added above:
+  1. **`SettleSettings.enabled` now defaults `True`.** The third reasoned exception to this
+     project's "every new capability ships off" rule, after `move`-mode verification and the
+     phase 7 scheduled backup. **Existing installs will see transfers complete up to about a
+     minute later than before this upgrade** — deliberate, not a regression: it is the fix for
+     a real, confirmed-live directory-corruption bug (a release caught mid-upload can read as
+     complete off whichever files happened to arrive first). Switch it back off at
+     Settings → Transfer if your seedbox's landing path is atomic end to end (e.g. hardlinked
+     torrent pickup) and you'd rather not pay the delay.
+  2. **Settling now requires *both* 2 consecutive matching scans *and* at least 60 seconds of
+     wall-clock time** since the fingerprint was first observed — a scan count alone is only a
+     reliable proxy for "quiet for a while" as long as every queue shares one scan interval,
+     which stops being true the moment a per-queue interval lands.
+  3. **An item stuck at `REMOTE_ONLY`/`settling` now self-heals.** Previously, if a job
+     finished while its item was still unsettled, the item was held back (correctly — see the
+     entry above) but then only ever reached `DOWNLOADED` by being re-queued; with auto-queue
+     off and nobody clicking Queue again, it could sit there forever with its bytes already
+     complete. The next scan that finds the remote genuinely quiet now reaches `DOWNLOADED` on
+     its own and triggers post-processing, with no new transfer. This is a second, narrower
+     entry point into post-processing (`core/engine.py._persist`, alongside the existing
+     job-success trigger in `core/queue.py._reap_one`) — DESIGN.md §6's trigger paragraph is
+     now stale and needs a follow-up correction; see `docs/decisions.md`.
+  4. **Settings → Transfer gained a "Settle gate" section**: the enable toggle, plus a
+     read-only readout of the required scan count and the wall-clock floor, with an
+     explanation of what the gate does.
 
 ### Fixed
 
@@ -277,6 +310,19 @@ alongside this list: several entries below ship with deliberate, documented limi
   one — and `VERIFIED` is the sole gate on a `move`-mode queue's irreversible remote delete.
   The fallback now also compares total bytes read against the item's known remote size and
   returns `CORRUPT` on a mismatch.
+- **Rar extraction has never worked** *(found against a real production failure, 2026-08-12)*.
+  `core/extract.py` routed `.rar` through `7zz`, and Alpine's `7zip` package has never shipped
+  a RAR codec at all — `7zz i` inside the built image lists no `Rar`/`Rar5` handler, distros
+  strip it because 7-Zip's RAR decoder derives from unRAR source, whose licence they won't ship
+  in `main`. Every `.rar` extraction attempt failed with the opaque "Cannot open the file as
+  archive," present since phase 5 and undetected through nine phases of green CI because no test
+  ever built a real rar — every fixture was fake bytes exercising naming logic only. `unrar`,
+  built from RARLAB source in a new Docker builder stage (statically linked against
+  libstdc++/libgcc so the runtime and dev images need nothing but musl libc), now handles rar
+  and rar5; `7zz` keeps zip/7z/tar/gz/bz2/xz, which it genuinely does support. See `NOTICE` and
+  `docs/decisions.md` for the licence position (UnRAR's own licence permits redistributing the
+  binary; it forbids only using its source to build a RAR-compatible compressor, which this
+  project never needed).
 
 ### Security
 

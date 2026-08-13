@@ -24,6 +24,7 @@ from lftpweb.core.itemview import ItemView, item_view
 from lftpweb.core.local_scan import LocalEntry
 from lftpweb.core.mount_sentinel import DEFAULT_GRACE_S
 from lftpweb.core.remote import HostConfig, RemoteEntry, RemoteScanError
+from lftpweb.core.settle import SettleSettings, save_settle_settings
 from lftpweb.db import migrate
 
 # --- diff_nodes: the pure function, tested directly ----------------------------------------
@@ -160,6 +161,13 @@ async def _make_engine(tmp_path, trees: list[dict[str, RemoteEntry]]):
     )
     await db.commit()
     queue_id = cursor.lastrowid
+
+    # This file is about the delta/snapshot projection, not the settle gate -- which now
+    # defaults on (prompts/2026-08-12-settle-gate-followups.md item 3) and would otherwise
+    # hold every freshly-DOWNLOADED item at REMOTE_ONLY/settling across these single- and
+    # double-scan tests. Disabled to isolate what this file actually tests; the gate itself is
+    # covered by tests/test_settle.py and tests/test_settle_gate_e2e.py.
+    await save_settle_settings(db, SettleSettings(enabled=False))
 
     engine = Engine(db, str(tmp_path), EventBus())
     engine.pool = _FakePool(trees)

@@ -14,6 +14,18 @@ Deliberately does **not** reuse `docker/test-seedbox/seed_tree.sh`'s baked-in fi
 tests write their own throwaway content into a uniquely-named remote subdirectory per test
 (the same convention `test_postprocess_e2e.py` uses), so a run can never collide with any
 other test's fixture data on the same shared container.
+
+**`SETTLE_MIN_AGE_S` is monkeypatched down in the count-focused reproductions below**
+(prompts/2026-08-12-settle-gate-followups.md item 2 added the wall-clock floor on top of the
+scan count -- `core/settle.py`'s own module docstring explains why neither alone is enough).
+At its real default (60s) these tests would either need three real minutes of `sleep` or would
+conflate "does the fingerprint/count logic work" with "did an unrelated clock run out," which
+is not what they're reproducing. Patched to something far shorter than the real ~1.1s gap
+between this file's own uploads, so the *count* rule is still exercised exactly as before and
+the age floor is simply not the bottleneck for those tests.
+`test_directory_settles_only_once_the_age_floor_also_clears` below is the one test that keeps
+`SETTLE_MIN_AGE_S` meaningfully larger than the scan cadence, specifically to prove the age
+floor holds an item back for real, not just in `tests/test_settle.py`'s pure arithmetic.
 """
 
 from __future__ import annotations
@@ -25,10 +37,12 @@ from uuid import uuid4
 import aiosqlite
 import pytest
 
+import lftpweb.core.settle as settle_module
 from lftpweb.core.autoqueue import AutoQueue
 from lftpweb.core.engine import Engine, QueueConfig
 from lftpweb.core.events import EventBus
 from lftpweb.core.mount_sentinel import write_if_needed
+from lftpweb.core.queue import TransferQueue
 from lftpweb.core.remote import HostConfig, RemoteConnectionPool
 from lftpweb.core.settle import SettleSettings, save_settle_settings
 from lftpweb.db import migrate
@@ -97,12 +111,25 @@ async def _item_row(db, queue_id: int, rel_path: str):
     return await cursor.fetchone()
 
 
-async def test_growing_remote_file_is_not_queued_until_it_settles(db, tmp_path):
+async def _wait_until(predicate, timeout_s: float = 30.0, interval_s: float = 0.2) -> bool:
+    deadline = asyncio.get_event_loop().time() + timeout_s
+    while asyncio.get_event_loop().time() < deadline:
+        if await predicate():
+            return True
+        await asyncio.sleep(interval_s)
+    return False
+
+
+async def test_growing_remote_file_is_not_queued_until_it_settles(db, tmp_path, monkeypatch):
     """Reproduction 1 of 2, per this task's handoff prompt: a single remote file, written in
     chunks with a real scan between each write. The settle gate's *eligibility* half
     (`core/autoqueue.py`) must not queue it while it's still visibly growing, and must queue
     it exactly once it stops.
     """
+    # This test is about the count/fingerprint rule, not the wall-clock floor (see module
+    # docstring) -- shrink SETTLE_MIN_AGE_S well under the ~1.1s gap between writes so it's
+    # never the bottleneck here.
+    monkeypatch.setattr(settle_module, "SETTLE_MIN_AGE_S", 1e-6)
     remote_subdir = f"settle-file-{uuid4().hex[:12]}"
     remote_root = f"/data/pickup/{remote_subdir}"
     rel_path = "growing.bin"
@@ -185,7 +212,9 @@ async def test_growing_remote_file_is_not_queued_until_it_settles(db, tmp_path):
         await upload_pool.close()
 
 
-async def test_growing_remote_file_does_not_read_downloaded_until_settled(db, tmp_path):
+async def test_growing_remote_file_does_not_read_downloaded_until_settled(
+    db, tmp_path, monkeypatch
+):
     """Same growing file, but this time local content is written to match the remote's
     current size after every scan -- the "single file self-heals" scenario from
     `prompts/open-issues.md` #2. Before the settle gate, each snapshot alone looks complete
@@ -193,6 +222,7 @@ async def test_growing_remote_file_does_not_read_downloaded_until_settled(db, tm
     than DOWNLOADED for as long as the remote keeps changing, and only reads DOWNLOADED once
     it genuinely stops.
     """
+    monkeypatch.setattr(settle_module, "SETTLE_MIN_AGE_S", 1e-6)
     remote_subdir = f"settle-file2-{uuid4().hex[:12]}"
     remote_root = f"/data/pickup/{remote_subdir}"
     rel_path = "growing.bin"
@@ -269,7 +299,9 @@ async def test_growing_remote_file_does_not_read_downloaded_until_settled(db, tm
         await upload_pool.close()
 
 
-async def test_directory_gaining_files_does_not_read_downloaded_off_the_partial_set(db, tmp_path):
+async def test_directory_gaining_files_does_not_read_downloaded_off_the_partial_set(
+    db, tmp_path, monkeypatch
+):
     """Reproduction 2 of 2: the directory case from `prompts/open-issues.md` #2, the one that
     doesn't self-heal without this gate. A release directory gains a second file between
     scans; the first file, on its own, is already whole. Before this fix, the rollup in
@@ -277,6 +309,7 @@ async def test_directory_gaining_files_does_not_read_downloaded_off_the_partial_
     test proves it no longer does, and that it correctly reaches DOWNLOADED once the directory
     genuinely stops changing.
     """
+    monkeypatch.setattr(settle_module, "SETTLE_MIN_AGE_S", 1e-6)
     remote_subdir = f"settle-dir-{uuid4().hex[:12]}"
     remote_root = f"/data/pickup/{remote_subdir}"
     release = "Release.Name"
@@ -353,5 +386,257 @@ async def test_directory_gaining_files_does_not_read_downloaded_off_the_partial_
         row = await _item_row(db, queue_id, release)
         assert row["state"] == "DOWNLOADED"
         assert row["substate"] is None
+    finally:
+        await upload_pool.close()
+
+
+async def test_directory_settles_only_once_the_age_floor_also_clears(db, tmp_path, monkeypatch):
+    """prompts/2026-08-12-settle-gate-followups.md item 2's own reproduction, against the real
+    fake seedbox rather than only `tests/test_settle.py`'s pure arithmetic: an item whose
+    fingerprint has already matched `REQUIRED_SETTLE_SCANS` times must still read REMOTE_ONLY/
+    settling if `SETTLE_MIN_AGE_S` has not also elapsed, and only reaches DOWNLOADED once both
+    conditions hold.
+    """
+    age_floor_s = 3.0
+    monkeypatch.setattr(settle_module, "SETTLE_MIN_AGE_S", age_floor_s)
+
+    remote_subdir = f"settle-age-{uuid4().hex[:12]}"
+    remote_root = f"/data/pickup/{remote_subdir}"
+    rel_path = "atomic.bin"
+
+    upload_pool = RemoteConnectionPool(tmp_path / "known_hosts_upload4")
+    host = _host_config()
+    conn = await upload_pool.get_connection(host)
+    try:
+        async with conn.start_sftp_client() as sftp:
+            await sftp.makedirs(remote_root, exist_ok=True)
+            async with sftp.open(f"{remote_root}/{rel_path}", "wb") as f:
+                await f.write(b"a" * 100)
+
+        await save_settle_settings(db, SettleSettings(enabled=True))
+
+        local_dir = tmp_path / "local"
+        local_dir.mkdir()
+        write_if_needed(str(local_dir))
+        # Atomic arrival: complete locally from the very first sighting (the hardlink-pickup
+        # case docs/decisions.md describes) -- proves the age floor binds even on the path
+        # that needed the settle gate least.
+        (local_dir / rel_path).write_bytes(b"a" * 100)
+
+        cursor = await db.execute(
+            "INSERT INTO host (name, address, port, username, auth_method, password_enc, "
+            "known_hosts_policy) VALUES ('seedbox', ?, ?, ?, 'password', NULL, 'insecure')",
+            (SEEDBOX_HOST, SEEDBOX_PORT, SEEDBOX_USER),
+        )
+        host_id = cursor.lastrowid
+        cursor = await db.execute(
+            "INSERT INTO path_queue (host_id, name, remote_path, local_path, enabled, "
+            "sync_mode) VALUES (?, 'e2e-settle-age', ?, ?, 1, 'copy')",
+            (host_id, remote_root, str(local_dir)),
+        )
+        queue_id = cursor.lastrowid
+        await db.commit()
+
+        engine = Engine(db=db, config_dir=str(tmp_path), events=EventBus())
+        qcfg = QueueConfig(
+            id=queue_id,
+            host_id=host_id,
+            name="e2e-settle-age",
+            remote_path=remote_root,
+            local_path=str(local_dir),
+            staging_path=None,
+            enabled=True,
+            sync_mode="copy",
+        )
+
+        # Scan 1: first sighting -- never settled regardless of the age floor.
+        await engine.scan_queue(qcfg, host)
+        row = await _item_row(db, queue_id, rel_path)
+        assert row["state"] == "REMOTE_ONLY"
+        assert row["substate"] == "settling"
+
+        # Scan 2: unchanged -- REQUIRED_SETTLE_SCANS is now met, but almost no wall-clock time
+        # has passed since the first sighting. The age floor must still hold it back; this is
+        # the assertion that would fail without item 2's fix.
+        await engine.scan_queue(qcfg, host)
+        row = await _item_row(db, queue_id, rel_path)
+        assert row["state"] == "REMOTE_ONLY", "the scan count alone must not be enough"
+        assert row["substate"] == "settling"
+
+        # Wait past the (patched) age floor, then rescan with the remote still unchanged --
+        # now both conditions hold.
+        await asyncio.sleep(age_floor_s + 0.5)
+        await engine.scan_queue(qcfg, host)
+        row = await _item_row(db, queue_id, rel_path)
+        assert row["state"] == "DOWNLOADED"
+        assert row["substate"] is None
+    finally:
+        await upload_pool.close()
+
+
+class _TriggerSpy:
+    """Stands in for `PostprocessPipeline` for the one thing `core/engine.py._persist` needs:
+    proof that it called `trigger()` -- and, just as importantly, proof of when it did *not*.
+    The full verify/extract/move pipeline is exercised for real in
+    `tests/test_postprocess_e2e.py`; this file's job is the settle gate's own wiring into it.
+    """
+
+    def __init__(self) -> None:
+        self.triggered: list[int] = []
+
+    def trigger(self, item_id: int) -> None:
+        self.triggered.append(item_id)
+
+    def in_flight_item_ids(self) -> frozenset[int]:
+        return frozenset()
+
+
+async def test_stuck_settling_item_reaches_downloaded_on_its_own_when_remote_goes_quiet(
+    db, tmp_path, monkeypatch
+):
+    """prompts/2026-08-12-settle-gate-followups.md item 1 -- found but not fixed by the task
+    that built the gate (`prompts/done/2026-08-12-settle-gate.md`): a job can finish while its
+    item is still unsettled, and `core/queue.py._reap_one`'s completion gate holds it at
+    REMOTE_ONLY/substate='settling' rather than DOWNLOADED. With auto-queue **off** and nobody
+    clicking Queue again, the item used to sit there forever with its bytes already complete.
+
+    This reproduces the real sequence end to end: a real `TransferQueue` job actually
+    transfers the file over lftp and succeeds *before* any scan has ever populated
+    `item_settle` for it (so `_item_is_settled` reads not-settled and holds it back, exactly
+    the race the bug report describes) -- then, with the remote quiet and no job and no
+    auto-queue involved, plain `Engine.scan_queue` passes are what un-stick it, and
+    post-processing (the trigger spy) fires for it exactly once, never on a later scan that
+    finds it already `DOWNLOADED`.
+    """
+    monkeypatch.setattr(settle_module, "SETTLE_MIN_AGE_S", 1e-6)
+
+    remote_subdir = f"settle-stuck-{uuid4().hex[:12]}"
+    remote_root = f"/data/pickup/{remote_subdir}"
+    rel_path = "stuck.bin"
+    content = b"settle gate stuck-item e2e fixture -- safe to delete\n"
+
+    upload_pool = RemoteConnectionPool(tmp_path / "known_hosts_upload6")
+    host = _host_config()
+    conn = await upload_pool.get_connection(host)
+    try:
+        async with conn.start_sftp_client() as sftp:
+            await sftp.makedirs(remote_root, exist_ok=True)
+            async with sftp.open(f"{remote_root}/{rel_path}", "wb") as f:
+                await f.write(content)
+
+        entries, _ = await upload_pool.scan(host, remote_root)
+        assert rel_path in entries, "setup fixture failed to upload"
+        remote_size = entries[rel_path].size
+        assert remote_size == len(content)
+
+        await save_settle_settings(db, SettleSettings(enabled=True))
+
+        local_dir = tmp_path / "local"
+        local_dir.mkdir()
+        write_if_needed(str(local_dir))
+
+        cursor = await db.execute(
+            "INSERT INTO host (name, address, port, username, auth_method, password_enc, "
+            "known_hosts_policy) VALUES ('seedbox', ?, ?, ?, 'password', NULL, 'insecure')",
+            (SEEDBOX_HOST, SEEDBOX_PORT, SEEDBOX_USER),
+        )
+        host_id = cursor.lastrowid
+        # auto_queue_enabled = 0 -- the exact scenario named in the bug report.
+        cursor = await db.execute(
+            "INSERT INTO path_queue (host_id, name, remote_path, local_path, enabled, "
+            "sync_mode, auto_queue_enabled) VALUES (?, 'e2e-stuck', ?, ?, 1, 'copy', 0)",
+            (host_id, remote_root, str(local_dir)),
+        )
+        queue_id = cursor.lastrowid
+        # Inserted directly (as a real scan would have left it) rather than run through a
+        # scan -- no `item_settle` row exists yet, matching "a job can finish between two scan
+        # passes" (`core/settle.py.is_settled_in_db`'s own docstring).
+        cursor = await db.execute(
+            "INSERT INTO item (queue_id, rel_path, is_dir, remote_size, local_size, state) "
+            "VALUES (?, ?, 0, ?, 0, 'REMOTE_ONLY')",
+            (queue_id, rel_path, remote_size),
+        )
+        item_id = cursor.lastrowid
+        await db.commit()
+
+        spy = _TriggerSpy()
+
+        async def _host_provider():
+            return host
+
+        q = TransferQueue(
+            db=db,
+            config_dir=str(tmp_path),
+            events=EventBus(),
+            run_dir=str(tmp_path / "run"),
+            tick_s=0.2,
+            host_provider=_host_provider,
+        )
+        q.postprocess = spy
+
+        await q.start()
+        try:
+            job_id = await q.enqueue_item(item_id)  # a manual Queue click, not auto-queue
+
+            async def job_succeeded():
+                row = await (
+                    await db.execute("SELECT state FROM job WHERE id = ?", (job_id,))
+                ).fetchone()
+                return row is not None and row["state"] == "succeeded"
+
+            assert await _wait_until(job_succeeded, timeout_s=20), "transfer job never succeeded"
+        finally:
+            await q.stop()
+
+        local_file = local_dir / rel_path
+        assert local_file.read_bytes() == content, "the job must have actually transferred it"
+
+        # The job succeeded, but nothing had ever scanned this item, so `_item_is_settled`
+        # read not-settled -- held at REMOTE_ONLY/settling, exactly the reported bug, and
+        # post-processing must not have been triggered from the job-success path.
+        row = await _item_row(db, queue_id, rel_path)
+        assert row["state"] == "REMOTE_ONLY"
+        assert row["substate"] == "settling"
+        assert spy.triggered == []
+
+        # No job, no auto-queue (queue.auto_queue_enabled = 0), nobody clicking Queue again --
+        # only plain scans from here. Engine and TransferQueue share the same `db`, exactly
+        # like production's single connection.
+        engine = Engine(db=db, config_dir=str(tmp_path), events=EventBus())
+        engine.postprocess = spy
+        qcfg = QueueConfig(
+            id=queue_id,
+            host_id=host_id,
+            name="e2e-stuck",
+            remote_path=remote_root,
+            local_path=str(local_dir),
+            staging_path=None,
+            enabled=True,
+            sync_mode="copy",
+            auto_queue_enabled=False,
+        )
+
+        # Scan 1 since the hold: a fresh fingerprint for this item_settle row -- matched_scans
+        # starts at 1, so still held.
+        await engine.scan_queue(qcfg, host)
+        row = await _item_row(db, queue_id, rel_path)
+        assert row["state"] == "REMOTE_ONLY"
+        assert row["substate"] == "settling"
+        assert spy.triggered == []
+
+        # Scan 2: remote still quiet -- matched_scans reaches REQUIRED_SETTLE_SCANS and (the
+        # patched-tiny) SETTLE_MIN_AGE_S has elapsed. The item's bytes were already complete
+        # (the job really did transfer them), so this scan's own structural reading is
+        # DOWNLOADED with nothing left to gate -- and this task's fix triggers post-processing
+        # for it, with no new job involved.
+        await engine.scan_queue(qcfg, host)
+        row = await _item_row(db, queue_id, rel_path)
+        assert row["state"] == "DOWNLOADED"
+        assert row["substate"] is None
+        assert spy.triggered == [item_id], "must self-heal and trigger post-processing exactly once"
+
+        # A further scan, with the item now genuinely DOWNLOADED, must not trigger it again.
+        await engine.scan_queue(qcfg, host)
+        assert spy.triggered == [item_id], "must not re-trigger post-processing on a later scan"
     finally:
         await upload_pool.close()

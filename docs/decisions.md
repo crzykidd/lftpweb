@@ -6,6 +6,477 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-12 — Settle gate follow-ups: a stuck item now self-heals through a second,
+## narrower post-processing trigger; the settle window gained a wall-clock floor alongside its
+## scan count; the gate now defaults on (third reasoned exception to "ships off"); Settings UI
+
+**Handoff prompt `prompts/done/2026-08-12-settle-gate-followups.md`, executed end to end** —
+three follow-ups the user asked for, by name, after reading how the gate built in `9b11df6`
+(`prompts/done/2026-08-12-settle-gate.md`) actually works. **The user explicitly prioritized
+this: they want the gate correct and on before starting real testing against their own
+seedbox.** That is the bar this session optimized for.
+
+**1. The stuck item now self-heals — and that means widening the post-processing trigger
+contract, done explicitly rather than quietly.** The build task found but didn't fix this: if
+a job finishes while its item is still unsettled, `core/queue.py._reap_one`'s completion gate
+holds it at `REMOTE_ONLY`/`substate='settling'` with its bytes already fully on disk, and the
+*only* way it used to reach `DOWNLOADED` was being re-queued — by auto-queue once eligible
+again, or a manual click. With auto-queue off and nobody clicking, it sat there forever. The
+build task's own decision record considered a scan-driven re-trigger and rejected it, reasoning
+it "works against the module's own stated design" (`core/postprocess.py`'s docstring: "the only
+realistic way an item reaches `DOWNLOADED` is by lftpweb having just transferred it"). That
+reasoning was sound *as a scope call* for that task, but it was never a correctness argument —
+and the design tension it named is real, so this task resolves it rather than reopening the
+same rejection:
+
+- `core/engine.py._persist` already recomputes every item's structural state on every scan and
+  already knows the settle verdict (it's what downgrades a fresh `DOWNLOADED` to
+  `REMOTE_ONLY`/`settling` in the first place). It is the natural place to also recognize the
+  reverse transition — an item *leaving* that hold, straight to `DOWNLOADED`, with no fresh job
+  in between — and fire `PostprocessPipeline.trigger()` for it, the exact call
+  `core/queue.py._reap_one` already makes on its own job-success path.
+- **Recognized narrowly, by the transition itself, not by re-deriving "was this ever
+  job-downloaded."** `_persist` now tracks `prev_state == "REMOTE_ONLY" and prev_substate ==
+  "settling" and state == "DOWNLOADED"` for the current pass (`engine.py`'s `unstuck` set) and
+  triggers post-processing only for rel_paths in it. This deliberately does **not** become a
+  general "scan found DOWNLOADED, trigger post-processing" hook — a pre-existing local file
+  that reads `DOWNLOADED` on its very first-ever scan (never held by *this* gate) still
+  triggers nothing, exactly the pre-existing, out-of-scope gap `core/postprocess.py`'s
+  docstring already named. The narrowing matters: it's what keeps this a two-entry-point
+  design (job success; this gate's own release) rather than reopening the general question the
+  build task correctly scoped out.
+- **Why this can't re-trigger an item that already completed post-processing, without extra
+  bookkeeping.** The `unstuck` condition requires `prev_state == "REMOTE_ONLY"` — an item that
+  has already gone through verify/extract/move carries one of `core/postprocess.py`'s
+  `TERMINAL_STATES` (`VERIFIED`/`CORRUPT`/`EXTRACTED`/`EXTRACT_FAILED`) or plain `DOWNLOADED`,
+  never `REMOTE_ONLY`, so it can never match. Belt-and-braces: `PostprocessPipeline.
+  _process_item` already re-checks `item.state == 'DOWNLOADED'` before doing anything (a
+  pre-existing guard, built for the "stale trigger" case — state moved on since scheduling), so
+  even a hypothetical duplicate `trigger()` call is a safe no-op, not a rerun. And an item
+  genuinely mid-run is never visible to this code path at all: `_protected_rel_paths` already
+  excludes anything in `PostprocessPipeline.in_flight_item_ids()` before `_persist`'s per-node
+  loop runs, matching the existing "live worker, not the state string" protection
+  `core/postprocess.py`'s `TRANSIENT_STATES` rely on elsewhere.
+- **DESIGN.md's §6 trigger paragraph is now wrong, not just incomplete, and that's flagged
+  explicitly rather than left to drift.** The build task drafted the wording "the trigger is
+  the job-success transition, and only that one... a second, scan-driven trigger was
+  considered and rejected" and — per `docs/decisions.md`'s own record — it was **applied** to
+  DESIGN.md §6 in the 2026-08-12 documentation-currency session, i.e. it is (or, if the
+  parallel `apply-design-wordings` session is still landing at the moment this is read, is
+  about to be) live text in the doc that this task's own fix directly contradicts. Drafted
+  correction, not applied (same "propose, don't silently diverge" posture every prior
+  DESIGN.md-touching task here has used):
+  - Replace §6's "**The trigger is the job-success transition, and only that one**" paragraph
+    with: *"Two call sites, both narrow. The job-success transition in
+    `core/queue.py._reap_one` (unchanged from above). And `core/engine.py._persist`, but only
+    for an item its own settle-gate bookkeeping (§3.3) just released straight from
+    `REMOTE_ONLY`/`substate='settling'` to `DOWNLOADED` with no fresh job in between — the fix
+    for a real bug: a job can finish while its item is still unsettled, get held back, and
+    with auto-queue off and nobody re-clicking, never reach a job-success trigger at all. Both
+    call sites fire on the identical precondition (state about to become `DOWNLOADED`, no
+    post-processing outcome yet). This is still not a general scan-driven trigger — a
+    pre-existing local file reading `DOWNLOADED` on its first-ever scan, with no gate hold
+    behind it, triggers nothing, exactly as before."*
+  - The sentence *"an item that becomes complete with no job involved... is never verified,
+    extracted, or moved until something re-touches it"* is now only true for the pre-existing
+    (out-of-scope) case, not the settle-gate-held case — needs the same narrowing.
+  - §3.3's own "Two gates, and both are needed" framing should note there is now a third,
+    smaller consequence of the completion gate: the scan pass that eventually clears it is
+    also what un-sticks a job-originated hold, not only auto-queue/a manual click.
+- **Tested end to end against the real fake seedbox, the exact scenario named in the bug
+  report**: `tests/test_settle_gate_e2e.py::test_stuck_settling_item_reaches_downloaded_on_its_own_when_remote_goes_quiet`
+  — a real `TransferQueue` job actually transfers a file and succeeds *before* any scan has
+  ever populated `item_settle` for it (so `_item_is_settled` reads not-settled, reproducing the
+  race precisely), with `auto_queue_enabled = 0` on the queue row and no further job or
+  auto-queue pass at all. Asserts the held state immediately after job success, that a
+  trigger spy is *not* called then, that it *is* called exactly once once the remote goes quiet
+  and the gate clears on its own, and that a further scan does not call it again.
+
+**2. The settle window needed a wall-clock floor, not just a scan count — `SETTLE_MIN_AGE_S =
+60.0`, a named constant alongside `REQUIRED_SETTLE_SCANS`.** The per-queue scan interval
+(`prompts/open-issues.md` #11) has **not** landed yet — `scan_interval_s` is still one global
+30s value — but the counter's whole meaning already assumed every queue shares one interval,
+and this fix is what makes that assumption safe to drop later rather than something a future
+session has to notice and retrofit. `60.0` chosen, not merely "somewhere in the recommended
+60–90s range," because it is the exact number already on record everywhere in this project
+(this file, `CHANGELOG.md`, `core/settle.py`'s own comments) as what the gate costs today at
+the 30s default — picking the floor to match keeps a 30s queue's worst case unchanged from what
+was already documented and accepted, while bringing a hypothetical faster queue up to the same
+guarantee instead of quietly handing it a weaker one merely because it polls more often.
+
+**Both conditions are independently load-bearing — recorded so the next session doesn't
+"simplify" one away**, per the prompt's own warning: the count alone cannot tell a
+fast-settling item from a slow-polling one that simply hasn't been rescanned enough times yet;
+the age alone cannot tell "genuinely unchanged" from "haven't looked in a while" (a queue that
+gets disabled mid-settle and never rescanned again is not "settled" just because a clock ran
+out with nobody checking).
+
+**Implementation: `SettleRecord` gained `first_matched_at`, persisted by repurposing
+`item_settle.updated_at` — no migration.** The column already exists, and nothing outside
+`core/settle.py` has ever read it (`load_settle_records`'s own `SELECT` didn't even select it
+until this task). `advance_settle` now takes `now` and computes the right value in every
+branch: a fresh sighting or a changed fingerprint starts a new streak at `now`; a matching scan
+**carries the previous streak's start forward unchanged** (matched_scans increments, but the
+clock does not reset on every confirming match — otherwise the floor would measure "since the
+last scan" instead of "since first observed" and would never actually bind); a held
+partial-scan pass carries it forward too, for the same "no evidence anything changed" reasoning
+`matched_scans`'s own hold already uses. `is_settled`/`is_settled_in_db` both now check
+`matched_scans >= REQUIRED_SETTLE_SCANS` **and** `(now - first_matched_at) >=
+SETTLE_MIN_AGE_S`. `now` is injectable everywhere (`float | None = None`, defaulting to
+`time.time()`), matching `core/progress.py.ProgressSampler.sample`'s existing shape, so every
+new test is deterministic rather than sleeping for real seconds — except
+`tests/test_settle_gate_e2e.py::test_directory_settles_only_once_the_age_floor_also_clears`,
+which deliberately keeps a real (patched-down-from-60s-to-3s, not to near-zero) floor against
+the real fake seedbox specifically to prove it holds back a real scan pass, not just pure
+arithmetic.
+
+**Considered and rejected: a bare `matched_scans` reset on the age check instead of two
+independent conditions.** Folding the floor into the counter (e.g. "a match only counts if it's
+at least N seconds after the previous one") would conflate two different failure modes into one
+number and make the "held, not reset, on a partial scan" rule (already subtle) harder to reason
+about correctly. Two named, independently-tested conditions read exactly as what they are.
+
+**3. Defaulted on — the third reasoned exception to "every new capability ships off," after
+`move`-mode verification and the phase 7 scheduled backup.** The build task shipped it off,
+correctly, under the rule as it stood then. The user has since read how the gate actually works
+and named it as how the system *should* behave, and confirmed non-atomic remote copies (plain
+copies, and cross-device moves that are copies in disguise) are a real path on their own setup
+— at which point "off by default" stopped being the safe choice: it is the fix for a real,
+already-confirmed-live directory-corruption bug, and an existing install silently keeps running
+with that bug live unless the default carries it forward. **Existing installs will see
+transfers complete up to about a minute later than before this upgrade** — stated plainly in
+`CHANGELOG.md`'s `### Changed` entry, not buried in `### Added`, per the prompt's own
+instruction, since this changes behavior for installs that already exist rather than adding a
+new one.
+
+**4. Settings UI**: `SettleSettingsOut` gained two **read-only** fields,
+`required_scans`/`min_age_s`, always filled from `core/settle.py`'s own constants at request
+time (never a stored value) rather than duplicated as frontend literals that could drift —
+`SettleSettingsIn` stayed a separate, narrower model (just `enabled`) rather than inheriting
+the read-only fields the way every other `*SettingsIn`/`*SettingsOut` pair in this codebase
+does, specifically so a client can't be misled into thinking it could `PUT` a scan count or a
+time floor that are constants, not settings (see the followups prompt's own framing: these are
+"a decision, not an accident," not tunables). Settings → Transfer gained a self-contained
+"Settle gate" section (`TransferTab.tsx`'s `SettleGateSection`) with its own load/save cycle
+against `GET`/`PUT /api/settings/settle` — deliberately not folded into `TransferTab`'s own
+big form-state object, since it's a different settings object entirely and, unlike everything
+else on that page, isn't part of DESIGN.md §4.5's bandwidth/concurrency surface. Matches this
+project's own naming: Settings → Transfer was itself a "backend with no UI" gap closed earlier
+the same day, and the prompt's instruction was explicit not to add a second one for this.
+
+**Test suite blast radius from flipping the default, and how it was resolved.** Every existing
+test that drives a real `Engine.scan_queue` pass or a real `TransferQueue.enqueue_item` →
+job-success completion, without ever populating `item_settle` itself, used to reach
+`DOWNLOADED` in one pass; with the gate now on by default, all of them would instead read
+`REMOTE_ONLY`/`settling` for their first ~60 seconds (which none of them wait for, since none
+of them are testing the settle gate). Rather than weaken the new default-on assumption or
+special-case `_persist`, every affected file's `db` fixture/helper now explicitly disables the
+gate (`save_settle_settings(db, SettleSettings(enabled=False))`), each with a comment naming
+why and pointing at `tests/test_settle.py`/`tests/test_settle_gate_e2e.py` as where the gate
+itself is actually covered: `tests/test_queue.py`, `tests/test_autoqueue_e2e.py`,
+`tests/test_postprocess_e2e.py`, `tests/test_local_delete.py`, `tests/test_state_persistence.py`,
+`tests/test_ws_deltas.py`, and `tests/test_autoqueue.py`'s shared fixture (its settle-specific
+tests re-enable it explicitly, per test, exactly as before). `tests/test_credentials_reentry.py`
+and `tests/test_history_e2e.py`/`tests/test_transfers_list_jobs.py` needed no change — the
+former's scans fail before reconciliation runs at all, and the latter two assert only
+`job.state`, which the settle gate never touches. One existing test,
+`test_settle_gate_off_by_default_ignores_unsettled_items`, asserted the literal old default and
+was rewritten as `test_settle_gate_is_on_by_default` (a genuinely fresh, unmodified database,
+not this file's own gate-disabled fixture) rather than deleted, so the default itself stays
+under test, not just its "off" and "on-explicitly" cases (which already had their own tests).
+
+**Conventions followed.** `docs/decisions.md` (this entry, newest at top).
+`CHANGELOG.md`'s settle-gate follow-ups landed under `### Changed`, not `### Added`. Both
+`uvx ruff@0.8.4 check`/`format --config ruff.toml` clean. `npm run lint` (oxlint) and
+`npm run build` clean. `uv run pytest` with the fake seedbox up: 584 passed, 0 failed, 0
+skipped (see the handoff report for the exact before/after test-count delta).
+
+---
+
+## 2026-08-12 — Rar extraction has never worked: `unrar` built from source replaces 7zz for
+## rar/rar5, with a hand-built real fixture closing the test gap that hid this for nine phases
+
+**Handoff prompt `prompts/done/2026-08-12-rar-extraction-is-broken.md`, executed end to end.**
+Highest-priority open item: rar is the dominant format for the releases this app exists to
+fetch, and rar extraction was completely non-functional, on every image this project has ever
+built, since phase 5. Found against a real production failure
+(`all.american.s08e06.1080p.web.h264-ggwp.rar: ERROR: ... Cannot open the file as archive`,
+confirmed good with `unrar t` on the host).
+
+**Root cause, confirmed by building the image and inspecting it, not by reading changelogs.**
+`7zz i` inside the built runtime image lists `zip`, `7z`, `tar`, `gzip`, `bzip2`, `Lzh`, `Cab`,
+`Iso`, `SquashFS` and others — no `Rar`, no `Rar5`. The 2026-08-11 decision ("`7zz` as the
+single extraction tool," below) reasoned from upstream 7-Zip's own changelog ("7-Zip 21.07+
+extracts RAR and RAR5 natively") without verifying that *Alpine's build* of `7zz` carried it.
+It doesn't: Alpine's `7zip` package (26.01) ships without the RAR codec, because 7-Zip's RAR
+decoder derives from unRAR source, whose licence distributions won't ship in `main`. Checked
+against the live Alpine 3.24 indexes: `unrar`, `unar`, `p7zip`, `unrar-free` are absent from
+both `main` and `community`. `libarchive-tools` (`bsdtar`) is present but rejected below.
+
+**Why nine phases of green CI missed it.** Every rar fixture in `tests/test_postprocess.py` was
+fake bytes (`b"volume 1"`, `b"not real rar bytes, just non-empty"`) exercising
+`check_extract_preconditions`'s naming/gap-detection logic — pure filesystem I/O — and never
+handing a genuine rar to a decoder. Today's extraction-gating and precondition work (see the
+2026-08-12 entries below) extended that same pattern without noticing the gap, because nothing
+in this codebase had ever asked "does the decoder we ship actually decode rar."
+
+### Decoder chosen: `unrar`, built from RARLAB source in a new Dockerfile builder stage
+
+Evaluated two options:
+
+- **`unrar` from RARLAB source (chosen).** Small (~50 `.cpp` files), builds cleanly against
+  Alpine's `build-base` with a plain `make`, no autotools/cmake, no third-party build
+  dependencies. What most comparable containers (`*arr` ecosystem images, media-server
+  seedbox images) do for exactly this reason. One risk found and fixed during verification:
+  the naive build dynamically links `libstdc++`/`libgcc`, which the runtime and dev stages
+  don't carry (no `build-base`, no libstdc++ apk) — confirmed by building it the naive way
+  first and running the result in a bare `python:3.13-alpine` container, which failed with
+  `Error loading shared library libstdc++.so.6`. `LDFLAGS="-pthread -static-libstdc++
+  -static-libgcc"` fixes it; the resulting binary depends on nothing but musl libc (`ldd`
+  confirms), the same footprint `7zz` already has.
+- **Rejected: `libarchive-tools` (`bsdtar`).** Licence-clean (BSD), present in Alpine `main`,
+  no build step needed. Rejected because its RAR support is read-only *and* historically weak
+  on exactly the multi-volume sets scene releases actually use (old-style `.r00`/`.r01`/... and
+  new-style `.partNN.rar`) — this project's core case, not an edge case. Not independently
+  re-verified against a real multi-volume archive in this session (no `bsdtar` on the
+  verification host); the decision rests on well-documented, longstanding upstream limitations
+  in libarchive's RAR reader rather than a fresh test here. If `unrar`'s licence position
+  becomes a blocker for the user (see below), `bsdtar` is the fallback to re-evaluate, with the
+  multi-volume weakness re-tested before trusting it.
+
+**Version pinned:** 7.2.3 (current as of 2026-08-12, matching RARLAB's `rarlinux-x64-723`
+release), fetched over HTTPS and pinned by `ARG UNRAR_VERSION` + a `sha256sum -c` check against
+the download in `docker/Dockerfile`'s `unrar-builder` stage. Not vendored into this repo (no
+source tree committed) — Alpine base images are already pinned by digest per §11.1's existing
+convention, and this follows the same "pin the input, don't vendor it" pattern.
+
+### The licence question — real, surfaced plainly, not a blocker
+
+UnRAR's own source licence (`unrar/license.txt` in the RARLAB tarball) is freeware: "UnRAR
+source code may be used in any software to handle RAR archives without limitations free of
+charge, but cannot be used to develop RAR (WinRAR) compatible archiver and to re-create RAR
+compression algorithm, which is proprietary... The UnRAR utility may be freely distributed. It
+is allowed to distribute UnRAR inside of other software packages." lftpweb only ever runs
+`unrar x` (extract) — never builds a compressor, never re-implements the compression
+algorithm — so the one thing the licence forbids is not something this project does or has ever
+needed. Redistributing the compiled binary, aggregated in the image exactly the way `NOTICE`
+already documents lftp/OpenSSH/7-Zip/su-exec/tini (arm's-length subprocess, not linked), is
+explicitly permitted. `NOTICE` gained a new entry for it, distinguished from the Alpine-package
+entries above it since it's compiled from upstream source rather than an unmodified distro
+package, with a link to RARLAB's own licence page.
+
+**This is not being treated as a blocker, per the prompt's explicit instruction** — implemented,
+with the reasoning and the BSD-but-weaker alternative (`libarchive-tools`) recorded here so the
+user can reverse the decision with full context if the licence position doesn't sit right with
+them.
+
+### Real fixtures: two hand-built RAR4 archives, no compressor exists anywhere to make one
+
+Nothing in this project's toolchain can *create* a rar — `unrar` decompresses only, and no
+Alpine package ships a RAR compressor (the same licence reasoning that makes 7zz's Alpine build
+decoder-only in the first place). So `tests/test_postprocess.py` now carries two archives as
+raw bytes, hand-built directly against the RAR 1.5–4.x container format that RARLAB's own
+`unrar` source documents (`unrar/headers.hpp`, `unrar/arcread.cpp`) — permitted use under the
+same source licence quoted above ("source code may be used in any software to handle RAR
+archives... without limitations free of charge"). Both use the `store` method (zero
+compression: marker + main header + file header(s) + raw bytes + end-of-archive marker, each
+header's 16-bit CRC computed the same way `RawRead::GetCRC15` does), so no compression codec is
+involved anywhere in their construction — only the container format.
+
+- `_RAR_SINGLE` (80 bytes): one file, no volumes.
+- `_RAR_MULTIVOL_VOL1` / `_RAR_MULTIVOL_VOL2` (78 bytes each): a genuine two-volume old-style
+  split set (`.rar` + `.r00`), the file's 20 bytes of content split 10/10 across the volumes,
+  `LHD_SPLIT_AFTER`/`LHD_SPLIT_BEFORE` set correctly, volume 1's `FileCRC` set to the RAR
+  sentinel `0xFFFFFFFF` (tells `unrar` to skip the per-volume packed-data-hash check rather than
+  compute one for an arbitrary mid-file byte split — the field real WinRAR-produced volumes
+  don't use this way, but it's the cleanest construction that `unrar` itself validates without
+  warnings), volume 2's `FileCRC` set to the real CRC32 of the complete reassembled file, which
+  is what `unrar` actually checks once the last volume is read.
+
+**Cross-validated two ways before being committed**, not trusted on the strength of one
+self-built binary: (1) a real desktop 7-Zip build (23.01, with an actual RAR codec — unlike
+Alpine's stripped `7zz`) reads and extracts both, confirming the bytes are RAR-format-shaped and
+not merely shaped to please this project's own `unrar` build; and (2) `extract.extract_item()`
+— the actual pipeline code, not a bare subprocess call — extracts both correctly *inside the
+actual built runtime and dev container images* (see below), which is the level of proof the
+prompt asked for and the level nine phases of unit tests never reached. Note for anyone
+reproducing this: the desktop 7-Zip cross-check reported "CRC Failed" on the multi-volume
+fixture even though it extracted the correct bytes — apparently a p7zip quirk in how it
+validates legacy RAR3 split-volume CRC bookkeeping, not a defect in the fixture (`unrar`, the
+decoder this project actually ships, reports a clean "All OK" on both `t` and `x` with no
+warnings). Recorded rather than chased further, since `unrar` is the decoder that matters here.
+
+### Two-layer regression guard, both real
+
+1. **Capability assertion** (`test_unrar_binary_reports_rar_decode_capability`): `unrar l -p-`
+   against the single-file fixture, asserting the filename appears in the listing — the RAR
+   analogue of grepping `7zz i`'s format list, proving the resolved binary can parse a real RAR
+   header rather than asserting a package name appears anywhere in the Dockerfile.
+2. **Real extraction, both single- and multi-volume**
+   (`test_extract_real_rar_archive_single_volume`,
+   `test_extract_real_rar_archive_multivolume_old_style`) — full `extract_item()` round trips:
+   staging, `unrar` invocation, merge into the final directory, content verified byte-for-byte.
+   The multi-volume test is the upgrade the prompt asked for by name: the existing
+   `check_extract_preconditions` multi-volume tests (naming/gap-detection, fake bytes) stay as
+   they are — they're correctly scoped to filesystem-only logic that doesn't touch a decoder —
+   and this is their decode-level counterpart.
+
+Both are skipped, not faked, when no `unrar` binary is on `PATH` (`pytestmark_unrar`, mirroring
+the existing `pytestmark_7z` pattern) — same posture the 7zz tests already had for a dev host
+without the tool, verified in-session by building `unrar` for the host (glibc) directly from the
+same source and confirming all three new tests actually run rather than skip.
+
+**Verified inside the built image, both stages, per the prompt's explicit requirement that a
+green unit test against a host binary proves nothing about what ships.** Built `runtime` and
+`dev` targets from this repo's actual `docker/Dockerfile`; in both, confirmed `unrar` present at
+`/usr/local/bin/unrar`, `7zz i` still lists no Rar handler (unchanged, as expected), and ran
+`extract.extract_item()` from the image's own installed `lftpweb` package against both fixtures
+(single- and multi-volume) inside the running container — not just the raw `unrar` CLI by hand.
+All four checks (dev × {single, multi}, runtime × {single, multi}) passed.
+
+### What this touches, and what it deliberately doesn't
+
+- `core/extract.py`: `.rar` now routes to a new `_extract_rar`/`_run_unrar` pair instead of
+  `_run_7z`; `extract_archive`/`extract_item` gained a `rar_binary` parameter
+  (`DEFAULT_RAR_BINARY`, env-overridable via `LFTPWEB_UNRAR_BIN`, mirroring `DEFAULT_BINARY`'s
+  existing `LFTPWEB_7Z_BIN` pattern exactly). Everything else — `_UNPACK_`/`_FAILED_` staging,
+  first-volume-only multi-part handling, the precondition checks added earlier today, password
+  support — is unchanged; rar just plugs a different subprocess into the same password-retry
+  loop and the same staging/merge flow.
+- `docker/Dockerfile`'s stale comment ("7zip: 7zz, the sole archive tool
+  (rar/rar5/zip/7z/tar/gz/bz2/xz)") corrected in both the `unrar-builder` and `runtime` stage
+  comments; the `dev` stage now copies the same `unrar` binary forward, called out explicitly in
+  a comment referencing the 2026-08-12 dev-image-missing-tools incident
+  (`prompts/startnewsession.md`) so this doesn't quietly regress the same way lftp/ssh/7zz once
+  did there.
+- **`DESIGN.md` not edited, per the prompt's explicit instruction** — and, by fortunate timing,
+  didn't need to be: a concurrent session applying the drafted-wordings backlog (the entry
+  immediately below this one) had already worded §6's extraction line generically ("zip / 7z /
+  tar / gz / bz2 / xz, and rar / rar5; §11 records which binaries the image ships for that and
+  why the answer is not the obvious one") and added a §11 correction callout that explicitly
+  defers the exact tooling and licence footing to "`docs/decisions.md` and `NOTICE`" — which is
+  this entry and the `NOTICE` change above. Nothing in DESIGN.md currently states or implies
+  "7zz alone." One further wording is still proposed, not applied, for whenever the user wants
+  §11's temporary callout folded into settled prose instead of a blockquote:
+
+  > **Archive tooling: two tools, chosen for what each is licensed and able to do.** `7zz` (the
+  > `7zip` package) covers zip / 7z / tar / gz / bz2 / xz. `unrar`, built from RARLAB source in
+  > its own builder stage, covers rar / rar5 — Alpine's `7zz` build ships with no RAR codec at
+  > all (7-Zip's RAR decoder derives from unRAR source, whose licence Alpine's `main` repo won't
+  > carry), and no packaged alternative (`unrar`, `unrar-free`, `unar`, `p7zip`) exists in
+  > Alpine's indexes either. Both tools only ever extract; neither builds or re-compresses an
+  > archive, which is what keeps unRAR's own "no RAR-compatible archiver" licence restriction
+  > out of scope. See `NOTICE` and `docs/decisions.md` for the full licence reasoning and the
+  > rejected `libarchive-tools` alternative.
+
+  **Applied to DESIGN.md 2026-08-12**, by that same concurrent session before it finished —
+  this wording landed while it was still working, so it replaced §11's original
+  "`7zz` alone" paragraph *and* the temporary callout, exactly as written above. One paragraph
+  was added after it, not drafted here: a short note that the document carried the wrong claim
+  for nine phases and why, kept so the tooling line doesn't get "simplified" back to one binary
+  by someone reading upstream 7-Zip's changelog the same way. §6's step 2 now names both
+  binaries and defers the reasoning to §11.
+
+- **Password-protected rar: implemented, not independently tested with a real encrypted
+  archive.** `_extract_rar` follows the same `-p<password>`/`-p-` retry-per-attempt shape 7zz's
+  branch already uses (unit-tested there against a real encrypted zip, since 7zz can compress
+  one), but RAR encryption key derivation is far too involved to hand-construct correctly
+  without a compressor to validate against, and none exists. Flagged rather than silently
+  assumed correct.
+- **Multi-volume real-archive coverage is old-style (`.r00`) only**, matching the prompt's
+  explicit ask ("at least one"). New-style `.partNN.rar` multi-volume real-archive extraction is
+  not separately fixture-tested — the header format and volume-continuation mechanics
+  (`MergeArchive` in `unrar/volume.cpp`) are the same regardless of naming convention, and
+  `find_archives`/`check_rar_volume_set`'s naming-convention branching is already covered by the
+  existing fake-bytes precondition tests for both conventions.
+
+---
+
+## 2026-08-12 — The backlog of proposed DESIGN.md wordings was applied: nine drafts landed,
+## three sections added, and three places where the draft was wrong about the code
+
+**Handoff prompt `prompts/done/2026-08-12-apply-design-wordings.md`, executed end to end.**
+Documentation only — no code changed, and `uv run pytest` was run at the end to prove it.
+Across the 2026-08-12 sessions, agents that found `DESIGN.md` wrong or silent drafted
+replacement wording into this file and deliberately left the doc untouched. The user approved
+applying all of them; this entry records where each landed and what had to be decided along
+the way. Each source entry below now carries its own "**Applied to DESIGN.md 2026-08-12**"
+line, so settled and pending stay distinguishable without re-reading the whole file.
+
+**What landed where.** §2.2 (publish invariant, new), §3.1 (`state_changed_at`, `item_settle`,
+`metric_sample`/`metric_heartbeat`, `suppressed_reason = 'deleted_local'`), §3.2 (the
+`REMOVED_BOTH` overload; rule 1's empty-directory half; rule 3 rewritten around the suppression
+flag; rule 5's mode clause; rule 8's cross-reference; **rule 9**, state ownership, new), §3.3
+(the settle gate, new), §4.6 (the delete-suppression paragraph), §4.7 (auto-queue eligibility),
+§5 (scan cadence as the settle gate's unit of time; the per-pass completion message), §6
+(trigger, staging, preconditions, ordering, the two extraction binaries), §7.3 (what each kind
+of verification evidence proves), §9/§9.1/§9.2 (publish invariant, Dashboard), §10.4
+(throughput metrics, new), §11 (the archive-tooling rewrite — see the rar entry above), §13
+(phase 9's two "not shipped" items are shipped; a post-phase-9 index), §14 (three test bullets
+corrected or added).
+
+**Three sections were added rather than existing ones renumbered — deliberately.** §2.2, §3.3,
+and §10.4 are all *appended* after the last existing subsection of their parent, so no
+`§N.M` reference anywhere in the repo changed meaning. This project cites DESIGN.md sections
+constantly, in code comments most of all, and a stale `§4.5` is worse than an imperfect
+insertion point. Verified afterwards by extracting every `§` reference in the repo and
+resolving it against the headings that now exist.
+
+**Where a draft disagreed with the code, the code won — three times, and one of them inverts a
+rule that has been in the document since the first draft.**
+
+1. **§3.2 rule 3 ("auto-queue must *not* re-fetch a `REMOVED_LOCAL` item") is no longer what
+   the code does**, and the local-deletion entry below is what changed it: `REMOVED_LOCAL` is
+   now in `core/autoqueue.py.ELIGIBLE_STATES`, and suppression — not the state name — is what
+   writes an item off. Rule 3 was rewritten to say that, and the *consequence* is stated in the
+   rule rather than left to be discovered: on a `copy`-mode queue with auto-queue on, an item
+   an importer moved out will be fetched again. That is a real behavioral trade, not a wording
+   choice, and it is now visible in the document instead of only in a code comment. §4.6's
+   closing paragraph, §4.7's eligibility line, §3.2 rule 5's "do not re-queue this" clause,
+   §13's phase 4 note and §14's test bullet all said the old thing and were corrected with it.
+2. **§6's "rar (`unrar`), zip/7z (`7z`), tar/gz/bz2/xz (stdlib)" and §11's "7zz alone" were
+   both already false**, and the rar task running concurrently with this one established why:
+   Alpine's `7zip` package is built without the RAR codec, and no packaged alternative exists
+   in its indexes. §6 step 2 was first written tool-agnostically against that task's landed
+   working tree (`docker/Dockerfile`, `NOTICE`, `core/extract.py`) while its own entry was
+   still being written; that entry — now at the top of this file — then arrived carrying a
+   proposed §11 replacement, and it was folded in rather than left as a ninth pending draft,
+   since it is the same backlog this task exists to clear. §11 now reads as settled prose
+   naming both binaries, with one added paragraph recording that the document was wrong about
+   this for nine phases and why, so nobody reading upstream 7-Zip's changelog "simplifies" it
+   back.
+3. **§7.3's "never deleted on a size comparison alone"** sat awkwardly against the hardened
+   hash-on-disk fallback, which now *is* readability plus a size comparison. Rewritten to say
+   what each kind of evidence actually proves, keeping the original intent (a stale rollup is
+   not evidence, `SKIPPED` is not evidence) while being honest that the fallback's guarantee is
+   "the bytes are all here", no stronger — the same bar the rest of the system runs on.
+
+**Two edits went beyond the literal drafts, both factual sync rather than new design:** §3.1
+had drifted from the shipped schema (three tables and two columns missing), and §13's phase 9
+entry still listed Settings → Transfer and Files "Delete local" as not built when both shipped
+later the same day. Bulk *Delete remote* remains genuinely unbuilt and is now named as the one
+that is.
+
+**Two paragraphs written here are already scheduled to be superseded, and that is flagged
+rather than left for someone to notice.** A third session
+(`prompts/2026-08-12-settle-gate-followups.md`) was running concurrently and is changing the
+settle gate itself: a wall-clock floor alongside the scan count, the default flipping **on**,
+and a fix for the held-item case §6's new trigger paragraph currently describes as an accepted
+limitation. So **§3.3's "Off by default" paragraph and §6's "The trigger is the job-success
+transition" paragraph are the two that will need rewriting** when that task's own wording is
+applied — everything else here is independent of it. Written against the committed behavior
+rather than guessed forward, because a doc that describes half-landed code is worse than one
+that is a session behind.
+
+**Gaps found with no drafted wording, left alone and reported rather than filled:** §9's
+"TanStack Query for REST" has never been true (a hand-rolled `usePoll`/`fetch` layer is what
+exists — flagged in phase 3b and still undecided); §12's file list omits every module added
+since phase 4; local retention and the manual delete endpoint have no section of their own
+(only the state-level consequences are documented, in §3.2); and the per-file live child
+progress work has no §9.2 wording. Filling any of those is a decision, not a transcription.
+
+---
+
 ## 2026-08-12 — Local deletion (manual + retention): one primitive, `REMOVED_BOTH` overloaded
 ## on purpose, and fixing issue 4 turned out to be free
 
@@ -47,6 +518,14 @@ proposed, not applied** — same pattern the settle gate and `state_changed_at` 
 "Skips anything suppressed, STOPPED, FAILED, REMOVED_LOCAL, or REMOVED_BOTH" line is now stale
 (see the next paragraph) — left for the user to fold in explicitly rather than diverged from
 quietly.
+
+**Applied to DESIGN.md 2026-08-12.** §3.2's state list now carries a "`REMOVED_BOTH` is
+deliberately broader than its name" paragraph (including the rejected `LOCALLY_DELETED`
+alternative and `remote_deleted_at` as what actually distinguishes the two cases); §3.2 rule 3
+was rewritten around `auto_queue_suppressed` rather than the state name, with the re-fetch
+consequence stated; §4.6 gained the matching "same flag, not a second mechanism" paragraph;
+§4.7's auto-queue line and §14's `REMOVED_LOCAL` test bullet were corrected to match
+`ELIGIBLE_STATES`.
 
 **Fixing issue 4 turned out to be free, once the suppression marker existed — not a scope
 compromise.** The prompt is genuinely unsure whether to attempt it ("decide... if too large,
@@ -177,6 +656,11 @@ different questions, and a `DOWNLOADED` item that dips to `PARTIAL` (a stopped/r
 transfer, a partial rescan) and back would otherwise earn a fresh retention lease it never
 actually earned. Left as a column comment in the migration and a docstring note in
 `models.py`/`types.ts` so the next person doesn't wire it up wrongly.
+
+**Applied to DESIGN.md 2026-08-12** (no wording was drafted here, but the schema had drifted):
+§3.1's `item` block now lists `state_changed_at`, and §3.2's new rule 9 records that it is
+stamped by a trigger rather than by each of the three writers of `item.state`, for the reason
+above — a wrong timestamp is worse than none.
 
 ---
 
@@ -347,6 +831,16 @@ tasks are already awaiting the user's approval; these join them):
   a known, reasoned limitation rather than an oversight.
 - **§7.3's verification guarantees**: the hash-on-disk fallback's guarantee should read
   "readable end to end and matches the known remote size," not just "readable end to end."
+
+**Applied to DESIGN.md 2026-08-12.** All three, plus the surrounding scaffolding they needed:
+the settle gate is now **§3.3** (its own subsection after the state rules, since it is a rule
+about when a state may be believed, and both gates and the partial-scan hold are described
+there); §3.1 lists `item_settle`; §3.2's state list notes `substate = 'settling'`; §4.7's
+auto-queue paragraph and §5's cadence paragraph both point at it. §6's trigger paragraph gained
+the job-success clause and names the deliberately-not-built scan-driven path as a known
+limitation. §7.3's verification-gate bullet now spells out what each kind of evidence proves,
+including the size half of the fallback and why demoting it to `SKIPPED` for `move` was
+rejected.
 
 **Reported but not fixed.** The scan-driven re-trigger gap above (no auto-queue, no manual
 click → a settled-but-held item can sit indefinitely without post-processing ever running).
@@ -771,6 +1265,12 @@ field-for-field (0 mismatches over 6 nodes). Idle `queue_delta`s stayed at 144 b
 **10. `DESIGN.md` §2/§9 say nothing about which of the two readings is published** and should —
 proposed wording is in the session report; not edited here, per the prompt.
 
+**Applied to DESIGN.md 2026-08-12.** New **§2.2** ("What is published is the persisted state,
+never the structural one") carries the reconcile → persist → read back → diff → publish order
+as the invariant, the rejected patch-the-nodes alternative, the `structural_state` rename, and
+the load-bearing `rel_paths` filter with the REST-vs-socket difference it leaves open. §9's
+intro points at it and says which transitions only the scan path can carry.
+
 ---
 
 ## 2026-08-12 — Files tree Expand all / Collapse all — disabled while a filter is active,
@@ -989,6 +1489,12 @@ row added to §2's component table, is in the session report.** DESIGN.md curren
 Dashboard page (§9.2's page list is Files/Transfers/History/Settings) and no metrics store
 (§3.1's schema doesn't mention `metric_sample`/`metric_heartbeat`).
 
+**Applied to DESIGN.md 2026-08-12.** New **§10.4 "Throughput metrics"** (the ~30 s tick-driven
+sample, the two-tables idle-vs-down decision, the `bytes_start`-relative delta and the phantom
+spike it prevents, retention); a **Dashboard** entry in §9.2's page list, including
+"downtime renders as a gap, never a zero"; a `Metrics (core/metrics.py)` row in §2's component
+diagram; `metric_sample`/`metric_heartbeat` in §3.1; Dashboard added to §9.1's nav sketch.
+
 **Backend tests (`tests/test_metrics.py`, `tests/test_metrics_api.py`, both new; 3 lines added
 to `tests/test_auth_api.py`'s `PROTECTED_ROUTE_TEMPLATES` for the two new routes, required by
 its own drift-detection test).** `uv run ruff format --check .` and `uv run ruff check .` both
@@ -1072,6 +1578,13 @@ state comparison (`core/engine.py._persist`, `api/files.py`'s serialization).
 
 **`DESIGN.md` §3.2 is silent on this exact case and should say so** — proposed wording (not
 applied, per the prompt; the user decides doc changes) is in the session report.
+
+**Applied to DESIGN.md 2026-08-12.** §3.2 rule 1 gained the second half of the `relevant == 0`
+reading: no remote files anywhere beneath a directory ⇒ `REMOTE_ONLY` until it exists locally,
+told apart by counting remote files *before* the exclusion predicate runs, with the
+local-presence shortcut named and rejected in place. Rule 8 cross-references it so the two
+readings are always read together, and §14's all-excluded test bullet now asks for both to be
+asserted side by side.
 
 **Tests (`tests/test_reconcile.py`, 15 → 18; one repurposed).** The pre-existing
 `test_directory_vacuously_downloaded_when_empty` encoded the bug itself (an empty remote
@@ -1182,6 +1695,13 @@ test module reference.
 session report; not edited here, per the prompt (the user decides doc changes). In short: §3.2
 lists the six states but never says who wins when a rescan's structural state disagrees with a
 lifecycle one, which is why this gap survived four phases.
+
+**Applied to DESIGN.md 2026-08-12.** §3.2 gained **rule 9** — the three writers of
+`item.state`, and precedence-with-a-domain rather than blanket stickiness: a live claim (job,
+in-flight worker, suppression) is not recomputed; an outcome wins over structural `DOWNLOADED`
+only; `PARTIAL` wins over an outcome; absence goes to §7.3's grace period carrying the outcome.
+The "protected by the live worker, never by the state string" point is stated where a reader
+will hit it, since it is the half most likely to be re-broken.
 
 **7. Found while fixing this, deliberately NOT fixed here: `Engine`'s in-memory model — and
 therefore the WebSocket — still publishes the *structural* state, not the persisted one.**
@@ -1399,6 +1919,16 @@ extraction's *tools* and *target* but says nothing about the `_UNPACK_`/`_FAILED
 convention this task adds, and nothing about extraction's ordering relative to the §7.4
 remote delete (see point 5's second bullet). Both are now real, load-bearing behavior that
 the design doc doesn't reflect.
+
+**Applied to DESIGN.md 2026-08-12.** §6 now describes the `_UNPACK_` sibling staging and the
+merge-on-full-success rule (with *why* a sibling and not a child, the local-scan filtering of
+both prefixes, and the loud failure on a colliding merge), the `_FAILED_` retention sweep and
+its default-off posture, and the extraction preconditions with both of their stated limits. The
+ordering paragraph records the pipeline order **and** that extraction's position relative to
+the `move`-mode delete is incidental rather than reasoned, naming the consequence — an
+`EXTRACT_FAILED` item whose remote copy is already gone — rather than presenting the order as a
+design. Also folded in from the same entry's point 1: §6's step 2 now says an archive-less item
+is `SKIPPED` and keeps whatever state verification left.
 
 ---
 

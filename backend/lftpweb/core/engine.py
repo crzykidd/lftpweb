@@ -435,15 +435,22 @@ class Engine:
         rows = await cursor.fetchall()
         return {row["rel_path"] for row in rows}
 
-    async def _previous_states(self, queue_id: int) -> dict[str, tuple[str, str | None]]:
-        """`rel_path -> (state, first_missing_at)` as currently persisted, for the grace-period
-        decision below. One query per scan, same shape as `_protected_rel_paths`.
+    async def _previous_states(
+        self, queue_id: int
+    ) -> dict[str, tuple[str, str | None, str | None]]:
+        """`rel_path -> (state, substate, first_missing_at)` as currently persisted, for the
+        grace-period decision below and (prompts/open-issues.md #2's stuck-item follow-up) the
+        settle-gate release check. One query per scan, same shape as `_protected_rel_paths`.
         """
         cursor = await self.db.execute(
-            "SELECT rel_path, state, first_missing_at FROM item WHERE queue_id = ?", (queue_id,)
+            "SELECT rel_path, state, substate, first_missing_at FROM item WHERE queue_id = ?",
+            (queue_id,),
         )
         rows = await cursor.fetchall()
-        return {row["rel_path"]: (row["state"], row["first_missing_at"]) for row in rows}
+        return {
+            row["rel_path"]: (row["state"], row["substate"], row["first_missing_at"])
+            for row in rows
+        }
 
     async def _persist(
         self,
@@ -475,6 +482,10 @@ class Engine:
         settle_settings = await settle.load_settle_settings(self.db)
         prev_settle = await settle.load_settle_records(self.db, queue_id) if fingerprints else {}
         new_settle: dict[str, settle.SettleRecord] = {}
+        # prompts/open-issues.md #2's stuck-item follow-up: `rel_path`s this pass releases from
+        # a settle-gate hold straight to DOWNLOADED, so post-processing can be triggered for
+        # them below -- see the long comment where this set is consumed.
+        unstuck: set[str] = set()
 
         for node in nodes.values():
             rel_path = to_safe_text(node.rel_path)
@@ -492,7 +503,10 @@ class Engine:
                 fp = fingerprints.get(node.rel_path)
                 if fp is not None:
                     settle_record = settle.advance_settle(
-                        prev_settle.get(rel_path), fp, partial_scan=partial_scan
+                        prev_settle.get(rel_path),
+                        fp,
+                        partial_scan=partial_scan,
+                        now=now.timestamp(),
                     )
                     new_settle[rel_path] = settle_record
 
@@ -526,7 +540,9 @@ class Engine:
             # history and the mount gate first. The branch above it is the same arbitration
             # for the opposite reading, presence rather than absence. Every other node's
             # freshly-computed state is trusted as-is, exactly like phase 2/3.
-            prev_state, prev_first_missing_at = previous.get(rel_path, (None, None))
+            prev_state, prev_substate, prev_first_missing_at = previous.get(
+                rel_path, (None, None, None)
+            )
             if postprocess.outcome_survives_rescan(prev_state, node.structural_state):
                 # DESIGN.md §3.2/§6: the content is all still here, and a post-processing
                 # outcome says something about it this scan's byte comparison cannot --
@@ -550,7 +566,10 @@ class Engine:
             # The settle gate's completion half (prompts/open-issues.md #2): a top-level item
             # that would otherwise publish DOWNLOADED is held at REMOTE_ONLY/substate=settling
             # until its remote fingerprint has held for `settle.REQUIRED_SETTLE_SCANS`
-            # consecutive scans. This is what actually fixes the directory case -- byte
+            # consecutive scans *and* `settle.SETTLE_MIN_AGE_S` of wall-clock time
+            # (prompts/2026-08-12-settle-gate-followups.md item 2 -- the scan-count alone would
+            # silently weaken once a queue's own scan interval can be shorter than today's one
+            # global default). This is what actually fixes the directory case -- byte
             # comparison alone can't tell "3 of 8 files, all whole" from "done." Deliberately
             # simple rather than precise: an item that is genuinely, permanently complete but
             # merely hasn't had its second confirming scan yet is *also* shown REMOTE_ONLY for
@@ -561,13 +580,32 @@ class Engine:
             if (
                 settle_settings.enabled
                 and settle_record is not None
-                and not settle.is_settled(settle_record)
+                and not settle.is_settled(settle_record, now=now.timestamp())
             ):
                 if state == "DOWNLOADED":
                     state = "REMOTE_ONLY"
                     first_missing_at = None
                 if state == "REMOTE_ONLY":
                     substate = "settling"
+
+            # prompts/open-issues.md #2's stuck-item follow-up (this task): a job can finish
+            # while its item is still unsettled (`core/queue.py._reap_one`'s completion gate),
+            # which leaves it at REMOTE_ONLY/substate='settling' with its bytes already fully
+            # on disk. Nothing re-queues it (auto-queue is off, or eligible again but coincides
+            # with a busy queue, or nobody clicks) -- but this scan pass, right above, is what
+            # actually knows the fingerprint just finished settling: `state` computed to
+            # DOWNLOADED on its own, off the structural reading, with no fresh job involved.
+            # Recognized here by the transition itself (previously *our own* gate's hold, now
+            # DOWNLOADED) rather than by re-deriving "was this ever job-downloaded," which the
+            # settle gate can't tell from a pre-existing local file anyway -- and doesn't need
+            # to: both cases have complete bytes and no post-processing outcome yet, which is
+            # exactly what makes triggering it here safe (see the trigger call below).
+            if (
+                prev_state == "REMOTE_ONLY"
+                and prev_substate == "settling"
+                and state == "DOWNLOADED"
+            ):
+                unstuck.add(rel_path)
 
             # `downloaded_at` backfill (prompts/open-issues.md "7 + 8": retention keys on this
             # column, not `state_changed_at`, and it is otherwise written in exactly one place
@@ -617,6 +655,33 @@ class Engine:
         if new_settle:
             await settle.save_settle_records(self.db, queue_id, new_settle)
         await self.db.commit()
+
+        # prompts/open-issues.md #2's stuck-item follow-up: for every rel_path this pass just
+        # released from the settle gate straight to DOWNLOADED (`unstuck`, built above), fire
+        # post-processing exactly the way `core/queue.py._reap_one` does on a job's own success
+        # -- this **is** the item's first (and only) transition into DOWNLOADED with nothing
+        # left pending, `core/postprocess.py`'s own precondition for the trigger. This widens
+        # that module's documented trigger contract from "job success only" to "job success, or
+        # a scan releasing this exact gate's own hold" -- DESIGN.md §6 currently says only the
+        # former and needs a follow-up correction (see docs/decisions.md, this task's entry, and
+        # `prompts/open-issues.md` #2). Not a general scan-driven trigger: `unstuck` is narrowly
+        # the settle gate's own prior hold resolving, never a plain first-scan-finds-existing-
+        # files DOWNLOADED (which stays out of scope, unchanged, exactly as before this task).
+        # Safe against a double-fire because `prev_state`/`prev_substate` are read fresh every
+        # pass: once this write lands, the *next* scan's `prev_state` is `DOWNLOADED`, not
+        # `REMOTE_ONLY`/`settling`, so the same item can't retrigger on the following pass --
+        # and `_process_item` itself re-checks `item.state == 'DOWNLOADED'` before doing
+        # anything, so even a theoretical duplicate trigger is a safe no-op, never a rerun of an
+        # outcome already recorded.
+        if unstuck and self.postprocess is not None:
+            placeholders = ",".join("?" for _ in unstuck)
+            cursor = await self.db.execute(
+                f"SELECT id FROM item WHERE queue_id = ? AND rel_path IN ({placeholders})",  # noqa: S608 - placeholders only, no interpolated values
+                (queue_id, *sorted(unstuck)),
+            )
+            for row in await cursor.fetchall():
+                self.postprocess.trigger(row["id"])
+
         return written
 
     async def _project(self, queue_id: int, rel_paths: set[str]) -> dict[str, ItemView]:

@@ -56,12 +56,46 @@ FROM python-base AS python-builder
 # only .venv needs to be copied into the runtime stage.
 RUN uv sync --locked --no-dev --no-editable
 
+# unrar, built from RARLAB source (2026-08-12 fix — DESIGN.md §6, docs/decisions.md,
+# core/extract.py's module docstring). Alpine's `7zip` package (7zz) ships with NO RAR codec
+# at all — `7zz i` inside the runtime image lists no Rar/Rar5 handler, verified by building
+# and inspecting this exact image, not by reasoning about upstream 7-Zip's feature list.
+# Distros strip it because 7-Zip's RAR decoder derives from unRAR source, whose licence they
+# won't ship in `main`. So there is no RAR-capable archive tool anywhere in Alpine's package
+# indexes (`unrar`, `unar`, `p7zip`, `unrar-free` are all absent from both `main` and
+# `community`) — building from source is the only path. UnRAR's own licence is freeware:
+# redistributing the built binary is explicitly permitted (see NOTICE), decompression-only
+# (never a RAR-compatible compressor, which this project never needed anyway).
+#
+# Reuses python-base's build-base rather than a fresh stage — it's already on this layer
+# chain and this is a builder stage that ships nothing forward but the one stripped binary.
+# `-static-libstdc++ -static-libgcc`: the runtime and dev stages carry no C++ runtime package
+# (no build-base, no libstdc++ apk), so a dynamically-linked unrar would fail to start there
+# with "Error loading shared library libstdc++.so.6" — confirmed by building it the naive way
+# first and running the result in a bare python:3.13-alpine container. Statically linking
+# those two leaves musl libc (present in every Alpine image) as the only runtime dependency,
+# same as 7zz's own footprint.
+FROM python-base AS unrar-builder
+ARG UNRAR_VERSION=7.2.3
+ARG UNRAR_SHA256=3995af0aa32b1505a566da053725551a1f0698dc42b2fdf7ba7d65db0d004e33
+WORKDIR /build
+RUN wget -qO unrarsrc.tar.gz "https://www.rarlab.com/rar/unrarsrc-${UNRAR_VERSION}.tar.gz" \
+ && echo "${UNRAR_SHA256}  unrarsrc.tar.gz" | sha256sum -c - \
+ && tar xzf unrarsrc.tar.gz \
+ && make -C unrar -j"$(nproc)" LDFLAGS="-pthread -static-libstdc++ -static-libgcc" \
+ && strip unrar/unrar
+
 FROM python-base AS dev
 # The same transfer/archive tooling the runtime stage installs. Without it the dev container
 # can scan (asyncssh is pure Python) but every transfer dies `SPAWN_FAILED: FileNotFoundError`
 # the moment core/lftp.py tries to exec `lftp` — a failure that only surfaces on the first
 # Queue click, long after the environment looks healthy.
 RUN apk add --no-cache lftp openssh-client 7zip
+# unrar (see the unrar-builder stage above): the dev image has historically been missing
+# tools the runtime stage had, which cost a whole debugging session (2026-08-12,
+# prompts/startnewsession.md) — copied here explicitly rather than trusting that omission
+# not to repeat itself for the one format this project exists to fetch.
+COPY --from=unrar-builder /build/unrar/unrar /usr/local/bin/unrar
 
 # Must match docker-compose.dev.yml's `user:` (the developer's own uid/gid, §11.2), same
 # reasoning as the frontend-dev stage above — but here it is /etc/passwd, not file ownership,
@@ -88,10 +122,13 @@ EXPOSE 8087
 CMD ["uvicorn", "lftpweb.main:app", "--host", "0.0.0.0", "--port", "8087", "--reload", "--reload-dir", "/app/backend"]
 
 FROM python:3.13-alpine@sha256:540c7d91f98ff6880174c40e99067bf5941eb54d818a7a5e094d188b196a934d AS runtime
-# lftp: the transfer engine. openssh-client: ssh/sftp. 7zip: 7zz, the sole archive tool
-# (rar/rar5/zip/7z/tar/gz/bz2/xz — see docs/decisions.md). su-exec: privilege drop after
-# the entrypoint fixes ownership. tini: PID 1, reaps lftp children. curl: HEALTHCHECK.
+# lftp: the transfer engine. openssh-client: ssh/sftp. 7zip: 7zz, zip/7z/tar/gz/bz2/xz — NOT
+# rar (Alpine's build has no RAR codec; see the unrar-builder stage above and
+# docs/decisions.md). su-exec: privilege drop after the entrypoint fixes ownership. tini:
+# PID 1, reaps lftp children. curl: HEALTHCHECK.
 RUN apk add --no-cache lftp openssh-client 7zip su-exec tini curl
+# unrar: the rar/rar5 decoder 7zz doesn't have (see the unrar-builder stage above).
+COPY --from=unrar-builder /build/unrar/unrar /usr/local/bin/unrar
 
 WORKDIR /app
 COPY --from=python-builder /app/.venv /app/.venv

@@ -8,6 +8,12 @@ package, whose binary is `7zz`; a Debian/Ubuntu dev host's `7zip` package (insta
 session: `apt-get install 7zip`) names the identical upstream binary `7z` instead -- so every
 extraction test passes `binary=_SEVEN_ZIP_BIN` (env-overridable) rather than hardcoding
 either name. Skipped automatically if no such binary is on PATH.
+
+`.rar` needs a real `unrar` binary instead (2026-08-12 fix -- docs/decisions.md: 7zz has no
+RAR codec in Alpine's build, contrary to what this project believed for nine phases). Built
+from source in `docker/Dockerfile`'s `unrar-builder` stage; not installed by any package
+manager, so a dev host running these tests needs it built and on `PATH`, or `LFTPWEB_UNRAR_BIN`
+pointed at it. Skipped automatically otherwise -- see `pytestmark_unrar` below.
 """
 
 from __future__ import annotations
@@ -593,13 +599,132 @@ def test_sweep_failed_dirs_is_a_no_op_on_a_root_that_does_not_exist(tmp_path):
 
 def test_first_rar_volume_detection_is_name_based_only():
     """Pure name matching, no filesystem access needed: DESIGN.md §6's "extract from the
-    first volume only" -- 7zz is only ever handed `.part1.rar` (or a bare `.rar`), never
+    first volume only" -- `unrar` is only ever handed `.part1.rar` (or a bare `.rar`), never
     `.part2.rar`/`.part02.rar`, which it follows on its own once given the first volume.
     """
     assert extract._is_first_rar_volume("release.part1.rar") is True
     assert extract._is_first_rar_volume("release.part2.rar") is False
     assert extract._is_first_rar_volume("release.part02.rar") is False
     assert extract._is_first_rar_volume("release.rar") is True
+
+
+# --- core/extract.py: rar decoding via `unrar` (2026-08-12 fix -- docs/decisions.md) ----------
+#
+# The bug this task exists to fix: `core/extract.py` routed `.rar` through 7zz for nine phases
+# of green CI, and Alpine's `7zip` package has never had a RAR codec at all (`7zz i` inside the
+# built image lists no Rar/Rar5 handler -- verified by building the image and inspecting it, not
+# by reading upstream 7-Zip's changelog). Every rar fixture that existed before this fix was
+# fake bytes (`b"volume 1"`, `b"not real rar bytes, just non-empty"`, above) -- they exercised
+# `check_extract_preconditions`'s naming/gap-detection logic, which is pure filesystem I/O, but
+# never asked a real decoder to open a real archive. This section replaces that blind spot.
+#
+# **Two fixtures, hand-built as raw RAR4 container bytes, not compressed with any tool.** No
+# compressor exists anywhere in this project's toolchain to *create* a rar -- `unrar` only
+# decompresses, and RARLAB's own licence forbids using its source to build a RAR-compatible
+# archiver, which is exactly why no Alpine package ships one either. RARLAB's unrar source
+# (`unrar/headers.hpp`, `unrar/arcread.cpp`) documents the RAR 1.5-4.x container format in full,
+# and that source's own licence explicitly permits this: "source code may be used in any
+# software to handle RAR archives... without limitations free of charge." Both fixtures use the
+# `store` method (method byte `0x30`) -- zero compression, just marker + main header + file
+# header(s) + raw bytes + end-of-archive marker, each header's CRC16 computed the same way
+# `RawRead::GetCRC15` does. Before being committed, both were cross-validated two ways: (1)
+# against a real 7-Zip build with an actual RAR codec (unlike Alpine's 7zz, a desktop `7z`
+# reads and extracts them, confirming the container bytes are spec-shaped, not just
+# unrar-shaped) and (2) inside the actual built runtime and dev container images via
+# `extract.extract_item`, not just this test file's own subprocess calls.
+#
+# `_RAR_SINGLE`: one file ("hello.txt" -> b"hello world\n"), no volumes.
+_RAR_SINGLE = (
+    b"Rar!\x1a\x07\x00\xcf\x90s\x00\x00\r\x00\x00\x00\x00\x00\x00\x00fit\x00\x00)\x00\x0c\x00"
+    b"\x00\x00\x0c\x00\x00\x00\x00-;\x08\xaf\x00\x00!(\x140\t\x00 \x00\x00\x00hello.txthello "
+    b"world\n\x04\xb0{\x00\x00\x07\x00"
+)
+
+# `_RAR_MULTIVOL_VOL1` / `_RAR_MULTIVOL_VOL2`: one file ("multi.txt" -> the 20 ASCII bytes
+# b"0123456789abcdefghij"), old-style split at the 10-byte midpoint -- `<base>.rar` (volume 1,
+# `LHD_SPLIT_AFTER`, `FileCRC` set to the RAR sentinel `0xFFFFFFFF` that tells `unrar` to skip
+# the per-volume packed-data hash check rather than compute one for an arbitrary byte split) and
+# `<base>.r00` (volume 2, `LHD_SPLIT_BEFORE`, `FileCRC` = the CRC32 of the complete 20-byte
+# file, which is what `unrar` actually validates against once the last volume is read). This is
+# the exact naming convention `_rar_volume_number` above already assumes for old-style sets.
+_RAR_MULTIVOL_VOL1 = (
+    b"Rar!\x1a\x07\x00\xb2\xefs\x01\x01\r\x00\x00\x00\x00\x00\x00\x003;t\x02\x00)\x00\n\x00"
+    b"\x00\x00\x14\x00\x00\x00\x00\xff\xff\xff\xff\x00\x00!(\x140\t\x00 \x00\x00\x00multi.txt"
+    b"0123456789a\xd7{\x01\x00\x07\x00"
+)
+_RAR_MULTIVOL_VOL2 = (
+    b"Rar!\x1a\x07\x00\xf1\xfbs\x01\x00\r\x00\x00\x00\x00\x00\x00\x00\x16\x8ct\x01\x00)\x00\n\x00"
+    b"\x00\x00\x14\x00\x00\x00\x00)\r\x8cc\x00\x00!(\x140\t\x00 \x00\x00\x00multi.txtabcdefghij"
+    b"\x04\xb0{\x00\x00\x07\x00"
+)
+
+_UNRAR_BIN = os.environ.get("LFTPWEB_UNRAR_BIN") or shutil.which("unrar")
+pytestmark_unrar = pytest.mark.skipif(
+    _UNRAR_BIN is None,
+    reason="no unrar binary on PATH -- build it (docker/Dockerfile's unrar-builder stage) or "
+    "set LFTPWEB_UNRAR_BIN",
+)
+
+
+@pytestmark_unrar
+def test_unrar_binary_reports_rar_decode_capability(tmp_path):
+    """Layer 1 of the regression guard (2026-08-12, docs/decisions.md): fails if the resolved
+    `unrar` binary cannot actually parse a RAR archive's own headers -- catching, for example,
+    a build that silently produced a non-functional binary (missing libstdc++ at runtime is
+    exactly the failure this project hit while developing this fix, before `-static-libstdc++`
+    was added to `docker/Dockerfile`'s unrar-builder stage). Deliberately does not assert
+    anything about a package name in the Dockerfile, which proves nothing about what actually
+    got built -- it greps the decoder's own listing output for the file the fixture contains,
+    the RAR analogue of `7zz i`'s format list.
+    """
+    archive = tmp_path / "single.rar"
+    archive.write_bytes(_RAR_SINGLE)
+
+    result = subprocess.run(
+        [_UNRAR_BIN, "l", "-p-", str(archive)],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "hello.txt" in result.stdout
+
+
+@pytestmark_unrar
+def test_extract_real_rar_archive_single_volume(tmp_path):
+    """Layer 2 of the regression guard: a genuine RAR archive, actually extracted through the
+    full `extract_item` pipeline (staging, `unrar` invocation, merge into the final directory)
+    -- not just a naming/precondition check against fake bytes.
+    """
+    item = tmp_path / "Release"
+    item.mkdir()
+    (item / "release.rar").write_bytes(_RAR_SINGLE)
+
+    result = extract.extract_item(item, rar_binary=_UNRAR_BIN)
+
+    assert result.ok, result.detail
+    assert (item / "hello.txt").read_text() == "hello world\n"
+    assert not (tmp_path / f"{extract.UNPACK_PREFIX}Release").exists()
+
+
+@pytestmark_unrar
+def test_extract_real_rar_archive_multivolume_old_style(tmp_path):
+    """The multi-volume upgrade this task calls for by name: `check_extract_preconditions`
+    already has real-filesystem tests for old-style `.rar`+`.r00` completeness (naming and gap
+    detection only, above) -- this is the decode-level counterpart, an actual two-volume RAR set
+    handed to `unrar` and extracted end to end, reassembling both volumes' data into one file.
+    """
+    item = tmp_path / "Release"
+    item.mkdir()
+    (item / "release.rar").write_bytes(_RAR_MULTIVOL_VOL1)
+    (item / "release.r00").write_bytes(_RAR_MULTIVOL_VOL2)
+
+    result = extract.extract_item(item, rar_binary=_UNRAR_BIN)
+
+    assert result.ok, result.detail
+    assert (item / "multi.txt").read_text() == "0123456789abcdefghij"
+    assert not (tmp_path / f"{extract.UNPACK_PREFIX}Release").exists()
 
 
 # --- move_tree (staging -> final, DESIGN.md §6) -----------------------------------------------

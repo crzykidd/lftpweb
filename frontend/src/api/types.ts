@@ -116,6 +116,22 @@ export interface PostprocessSettingsOut {
 
 export type PostprocessSettingsIn = PostprocessSettingsOut
 
+// --- Settings -> the settle gate (prompts/open-issues.md #2, `core/settle.py`) ---------
+
+export interface SettleSettingsOut {
+  enabled: boolean
+  // Read-only -- core/settle.py.REQUIRED_SETTLE_SCANS / SETTLE_MIN_AGE_S. Not settable from
+  // this API; surfaced only so the Settings page can explain what the gate requires without
+  // hardcoding numbers that could drift from the backend's own constants.
+  required_scans: number
+  min_age_s: number
+}
+
+// Only `enabled` is writable -- `required_scans`/`min_age_s` are informational.
+export interface SettleSettingsIn {
+  enabled: boolean
+}
+
 // --- Settings -> Queues -> Patterns (phase 4, DESIGN.md §3.1 `pattern`, §4.7) -----------
 
 export type PatternKind = 'select' | 'skip' | 'file_exclude'

@@ -1,16 +1,31 @@
-"""Archive extraction via `7zz` (DESIGN.md §6) -- the image's only archive tool. See `NOTICE`
-and `docs/decisions.md`: 7-Zip 21.07+ reads rar/rar5/zip/7z/tar/gz/bz2/xz natively, so there is
-no `unrar` anywhere in this project, deliberately.
+"""Archive extraction via two tools (DESIGN.md §6; the 2026-08-12 rar fix -- see NOTICE and
+docs/decisions.md): `7zz` for zip/7z/tar/gz/bz2/xz, and `unrar` for rar/rar5.
 
-`binary` defaults to `"7zz"` (the Alpine `7zip` package's binary name, matching the runtime
+**This project shipped nine phases believing 7zz alone covered rar too -- it never did.**
+Alpine's `7zip` package (the one this image actually ships) is built without the RAR codec at
+all: `7zz i` lists no `Rar`/`Rar5` handler, distros strip it because 7-Zip's RAR decoder derives
+from unRAR source, whose licence they won't ship in `main`. `rar (unrar)` was DESIGN.md §6's
+original wording all along; a 2026-08-11 decision (docs/decisions.md) replaced it with "7zz
+covers everything" on the strength of upstream 7-Zip's own native RAR support, without verifying
+that Alpine's *build* of 7zz carried it. It didn't, and no test ever built a real rar to catch
+that. `unrar` is back, built from RARLAB source in the image's builder stage (`docker/
+Dockerfile`) -- see docs/decisions.md for the licence position (freeware, redistribution
+permitted, decompression only) and why `libarchive-tools`/`bsdtar` was rejected.
+
+`binary` (7zz) defaults to `"7zz"` (the Alpine `7zip` package's binary name, matching the runtime
 image) but is always an overridable parameter -- exactly `core/lftp.py.spawn`'s `lftp_bin`
 pattern -- because the *development* host this project is built on names the same real 7-Zip
 binary `7z` (Debian/Ubuntu's `7zip` package). Tests pass `binary="7z"` (or set
 `LFTPWEB_7Z_BIN`) to run against a real local binary without needing the container image.
+`rar_binary` (unrar) follows the identical pattern: defaults to `"unrar"`, overridable, and
+`LFTPWEB_UNRAR_BIN` env-overridable for a dev host where it isn't on `PATH` under that name.
 
-Every subprocess call passes `stdin=DEVNULL`: 7z prompts for a password on an encrypted
+Every subprocess call passes `stdin=DEVNULL`: both tools prompt for a password on an encrypted
 archive if none (or the wrong one) was given, and a prompt with no stdin attached must fail
-fast, not hang the postprocessing worker forever.
+fast, not hang the postprocessing worker forever. `unrar` additionally gets `-p-` (disable the
+password prompt outright) when no password is being tried, rather than relying on the closed
+stdin alone -- belt and suspenders, and `-p-` also short-circuits `unrar` faster than waiting on
+a doomed read.
 """
 
 from __future__ import annotations
@@ -29,6 +44,13 @@ from typing import Literal
 logger = logging.getLogger(__name__)
 
 DEFAULT_BINARY = os.environ.get("LFTPWEB_7Z_BIN", "7zz")
+
+# The rar decoder (2026-08-12 fix -- see module docstring and docs/decisions.md). Built from
+# RARLAB unrar source in `docker/Dockerfile`'s builder stage; `unrar` is the binary name on
+# both the runtime image and a dev host that built it the same way, so unlike `DEFAULT_BINARY`
+# there is no dev-vs-container name split -- the env override exists for the same reason
+# `LFTPWEB_7Z_BIN` does: a test or operator pointing at a differently-named binary.
+DEFAULT_RAR_BINARY = os.environ.get("LFTPWEB_UNRAR_BIN", "unrar")
 
 # `extract_item`'s "nothing to extract" outcome (fix, 2026-08-12 -- docs/decisions.md): named
 # once here so `core/postprocess.py`'s own pre-check (which skips the step entirely rather than
@@ -49,10 +71,11 @@ FAILED_RETENTION_DEFAULT_DAYS = 14.0
 UNPACK_PREFIX = "_UNPACK_"
 FAILED_PREFIX = "_FAILED_"
 
-# Extensions this module will try to extract as a *direct* 7zz target. Compound tar formats
-# need two passes (see `_is_compound_tar`); rar multi-part sets are filtered in `find_archives`
-# so only the first volume is ever a target (DESIGN.md §6: "extract from the first volume
-# only" -- 7zz itself follows the rest of the set once given that one).
+# Extensions this module will try to extract as a *direct* 7zz target (rar goes to `unrar`
+# instead -- see `extract_archive`). Compound tar formats need two passes (see
+# `_is_compound_tar`); rar multi-part sets are filtered in `find_archives` so only the first
+# volume is ever a target (DESIGN.md §6: "extract from the first volume only" -- `unrar`
+# follows the rest of the set on its own once given that one).
 _SIMPLE_SUFFIXES = (".zip", ".7z", ".tar", ".gz", ".bz2", ".xz")
 _COMPOUND_SUFFIXES = (".tar.gz", ".tar.bz2", ".tar.xz", ".tgz", ".tbz2", ".txz")
 
@@ -105,9 +128,10 @@ def _is_compound_tar(name_lower: str) -> bool:
 
 
 def find_archives(root: Path) -> list[Path]:
-    """Every archive under `root` that should itself be handed to 7zz. Multi-part rar sets
+    """Every archive under `root` that should itself be handed to a decoder (7zz for
+    zip/7z/tar/gz/bz2/xz, `unrar` for rar -- see `extract_archive`). Multi-part rar sets
     contribute only their first volume; old-style `.r00`/`.r01`/... continuation volumes are
-    never a direct target at all (7zz reads them once given the `.rar` head of the set).
+    never a direct target at all (`unrar` reads them once given the `.rar` head of the set).
     """
     candidates = [root] if root.is_file() else sorted(p for p in root.rglob("*") if p.is_file())
 
@@ -156,14 +180,14 @@ def check_rar_volume_set(head: Path) -> str | None:
     gating gap -- see docs/decisions.md). Covers **both** conventions via `_rar_volume_number`'s
     shared numbering, and detects *gaps* in the sequence, not just "some siblings exist": `.r00`,
     `.r01`, `.r03` with `.r02` missing must fail exactly like a wholly-absent set, not silently
-    hand 7zz the volumes that happen to be there and let it discover the gap mid-extraction --
-    which is the exact "Cannot open the file as archive" symptom this exists to pre-empt.
+    hand `unrar` the volumes that happen to be there and let it discover the gap mid-extraction
+    -- which is the exact "Cannot open the file as archive" symptom this exists to pre-empt.
 
     A volume counts as present only if it exists *and* is non-zero-length: a zero-byte volume
-    is exactly as useless to 7zz as an absent one, and reporting it as "missing" gives a truer
-    diagnosis ("volume 3 of 15 missing") than the symptom 7zz would otherwise surface after the
-    fact. `head` itself is assumed present -- the caller (`check_extract_preconditions`) already
-    ran the zero-length check on it before this function is reached.
+    is exactly as useless to `unrar` as an absent one, and reporting it as "missing" gives a
+    truer diagnosis ("volume 3 of 15 missing") than the symptom `unrar` would otherwise surface
+    after the fact. `head` itself is assumed present -- the caller (`check_extract_preconditions`)
+    already ran the zero-length check on it before this function is reached.
 
     **Cannot detect a wholly-absent final volume.** There is no filename evidence of the true
     total volume count without opening the archive, which is deliberately out of scope for a
@@ -196,8 +220,9 @@ def check_rar_volume_set(head: Path) -> str | None:
 
 
 def check_extract_preconditions(archive: Path) -> str | None:
-    """Cheap, filesystem-only gates run before an archive is ever handed to 7zz (DESIGN.md §6;
-    the 2026-08-12 production failure and gating gap -- see docs/decisions.md). Returns `None`
+    """Cheap, filesystem-only gates run before an archive is ever handed to a decoder (7zz or
+    `unrar`, DESIGN.md §6; the 2026-08-12 production failure and gating gap -- see
+    docs/decisions.md). Returns `None`
     when it's safe to proceed, or a clean, named failure reason ("volume 3 of 15 missing", not
     "Cannot open the file as archive") when it isn't. Exported at module level, unit-testable
     without going through `extract_item` or the postprocessing pipeline at all.
@@ -227,12 +252,40 @@ def _run_7z(binary: str, args: list[str]) -> subprocess.CompletedProcess:
     )
 
 
+def _run_unrar(binary: str, args: list[str]) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        [binary, *args],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=_SUBPROCESS_TIMEOUT_S,
+    )
+
+
+def _extract_rar(
+    archive: Path, target_dir: Path, *, password: str | None, binary: str
+) -> subprocess.CompletedProcess:
+    """One `unrar x` attempt. `-y` assumes yes on every query (matching 7zz's `-y` above);
+    `-p<password>` / `-p-` (no password) matches this module's password-list retry loop, which
+    is shared with the 7zz branch in `extract_archive` -- rar just plugs a different subprocess
+    into the same per-attempt loop.
+
+    The trailing `os.sep` on the destination is required, not cosmetic: `unrar x archive dest`
+    with no trailing separator is ambiguous with "extract this one member as a file named
+    `dest`" for a single-file archive, exactly the shape every fixture and most real releases
+    have.
+    """
+    pw_arg = f"-p{password}" if password else "-p-"
+    return _run_unrar(binary, ["x", "-y", pw_arg, str(archive), f"{target_dir}{os.sep}"])
+
+
 def extract_archive(
     archive: Path,
     target_dir: Path,
     *,
     passwords: tuple[str, ...] = (),
     binary: str = DEFAULT_BINARY,
+    rar_binary: str = DEFAULT_RAR_BINARY,
 ) -> ExtractResult:
     """Extract one archive into `target_dir` (created if needed).
 
@@ -240,12 +293,29 @@ def extract_archive(
     7zz passes -- one to strip the outer compression, one to unpack the resulting `.tar` --
     because 7-Zip only peels one layer of a chained format per invocation. The intermediate
     `.tar` lives in a throwaway subdirectory of `target_dir` that is removed either way.
+
+    `.rar` (any volume count -- `find_archives` already filtered to the first volume only)
+    goes to `unrar` instead, handed just the head file: `unrar`, like the 7zz-native RAR
+    support this project mistakenly relied on for nine phases (2026-08-12, docs/decisions.md),
+    follows the rest of a multi-volume set on its own once given the first volume, using
+    whichever naming convention (`.r00`/`.r01`/... or `.partNN.rar`) the sibling volumes use.
     """
     target_dir.mkdir(parents=True, exist_ok=True)
     attempts = list(passwords) if passwords else [None]
     last_error = ""
+    is_rar = archive.name.lower().endswith(".rar")
 
     for password in attempts:
+        if is_rar:
+            result = _extract_rar(archive, target_dir, password=password, binary=rar_binary)
+            if result.returncode == 0:
+                return ExtractResult(
+                    state="EXTRACTED",
+                    detail=f"extracted {archive.name}",
+                    extracted_dirs=(target_dir,),
+                )
+            last_error = (result.stderr or result.stdout).strip()
+            continue
         pw_args = [f"-p{password}"] if password else []
         if _is_compound_tar(archive.name.lower()):
             with tempfile.TemporaryDirectory(dir=target_dir) as tmp:
@@ -327,6 +397,7 @@ def extract_item(
     target_dir: Path | None = None,
     passwords: tuple[str, ...] = (),
     binary: str = DEFAULT_BINARY,
+    rar_binary: str = DEFAULT_RAR_BINARY,
 ) -> ExtractResult:
     """Extract every archive found under `root` (DESIGN.md §6). `target_dir=None` means "in
     place" -- the final directory is `root` itself. An item with no archives at all (most
@@ -394,7 +465,9 @@ def extract_item(
         # its existing flat behavior (one shared destination for every archive in the item;
         # see docs/decisions.md) -- staging just interposes ahead of it.
         rel = archive.parent.relative_to(in_place_dir) if target_dir is None else Path()
-        result = extract_archive(archive, staging_dir / rel, passwords=passwords, binary=binary)
+        result = extract_archive(
+            archive, staging_dir / rel, passwords=passwords, binary=binary, rar_binary=rar_binary
+        )
         if not result.ok:
             failures.append(result.detail)
 

@@ -23,6 +23,7 @@ from lftpweb.core.events import EventBus
 from lftpweb.core.local_scan import LocalEntry
 from lftpweb.core.mount_sentinel import write_if_needed
 from lftpweb.core.remote import HostConfig, RemoteEntry
+from lftpweb.core.settle import SettleSettings, save_settle_settings
 from lftpweb.db import migrate
 
 
@@ -31,6 +32,12 @@ async def _make_db():
     db.row_factory = aiosqlite.Row
     await db.execute("PRAGMA foreign_keys = ON")
     await migrate(db)
+    # This file is about local_delete/retention, not the settle gate -- which now defaults on
+    # (prompts/2026-08-12-settle-gate-followups.md item 3) and would otherwise hold a fresh
+    # `Engine.scan_queue` pass's items at REMOTE_ONLY/settling instead of DOWNLOADED. Disabled
+    # to isolate what this file actually tests; the gate itself is covered by
+    # tests/test_settle.py and tests/test_settle_gate_e2e.py.
+    await save_settle_settings(db, SettleSettings(enabled=False))
     return db
 
 

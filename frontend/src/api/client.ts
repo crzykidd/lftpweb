@@ -39,6 +39,8 @@ import type {
   PostprocessSettingsIn,
   PostprocessSettingsOut,
   QueueAutoQueueStatus,
+  SettleSettingsIn,
+  SettleSettingsOut,
   StatsResponse,
   TestConnectionResponse,
   TransferSettingsIn,
@@ -173,6 +175,16 @@ export function putPostprocessSettings(
   body: PostprocessSettingsIn,
 ): Promise<PostprocessSettingsOut> {
   return sendJson<PostprocessSettingsOut>('/api/settings/postprocess', 'PUT', body)
+}
+
+// --- Settings -> the settle gate (prompts/open-issues.md #2, `core/settle.py`) ---------
+
+export function getSettleSettings(): Promise<SettleSettingsOut> {
+  return getJson<SettleSettingsOut>('/api/settings/settle')
+}
+
+export function putSettleSettings(body: SettleSettingsIn): Promise<SettleSettingsOut> {
+  return sendJson<SettleSettingsOut>('/api/settings/settle', 'PUT', body)
 }
 
 // --- Files ---------------------------------------------------------------------------------

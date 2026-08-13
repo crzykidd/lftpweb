@@ -42,6 +42,7 @@ from lftpweb.core.postprocess import (
 )
 from lftpweb.core.queue import TransferQueue, TransferSettings, save_transfer_settings
 from lftpweb.core.remote import HostConfig, RemoteConnectionPool
+from lftpweb.core.settle import SettleSettings, save_settle_settings
 from lftpweb.db import migrate
 
 SEEDBOX_HOST = "127.0.0.1"
@@ -93,6 +94,13 @@ async def db():
     conn.row_factory = aiosqlite.Row
     await conn.execute("PRAGMA foreign_keys = ON")
     await migrate(conn)
+    # These tests build their `item` rows directly (never through an `Engine` scan pass), so
+    # no `item_settle` row is ever populated -- and the settle gate now defaults on
+    # (prompts/2026-08-12-settle-gate-followups.md item 3), which would hold every job at
+    # REMOTE_ONLY/settling forever and never trigger post-processing at all. Disabled to
+    # isolate what this file actually tests (verify/extract/move); the gate itself is covered
+    # by tests/test_settle.py and tests/test_settle_gate_e2e.py.
+    await save_settle_settings(conn, SettleSettings(enabled=False))
     yield conn
     await conn.close()
 

@@ -60,56 +60,100 @@ def test_fingerprint_ignores_a_nested_directorys_own_mtime():
 
 # --- advance_settle / is_settled -----------------------------------------------------------
 
+# An arbitrary fixed epoch so every test below is deterministic -- never `time.time()`.
+_T0 = 1_700_000_000.0
+
 
 def test_first_sighting_starts_at_one_and_is_not_settled():
-    record = settle.advance_settle(None, (1, 100, 1.0), partial_scan=False)
+    record = settle.advance_settle(None, (1, 100, 1.0), partial_scan=False, now=_T0)
     assert record.matched_scans == 1
-    assert not settle.is_settled(record)
+    assert record.first_matched_at == _T0
+    assert not settle.is_settled(record, now=_T0)
 
 
-def test_atomic_arrival_settles_after_exactly_two_scans_and_no_more():
+def test_atomic_arrival_settles_after_exactly_two_scans_and_the_age_floor():
+    """prompts/2026-08-12-settle-gate-followups.md item 2: settled requires **both**
+    `REQUIRED_SETTLE_SCANS` matches **and** `SETTLE_MIN_AGE_S` of wall-clock time since the
+    streak began -- neither alone is enough.
+    """
     fp = (3, 300, 5.0)
-    first = settle.advance_settle(None, fp, partial_scan=False)
-    assert not settle.is_settled(first)
-    second = settle.advance_settle(first, fp, partial_scan=False)
+    first = settle.advance_settle(None, fp, partial_scan=False, now=_T0)
+    assert not settle.is_settled(first, now=_T0)
+    second = settle.advance_settle(first, fp, partial_scan=False, now=_T0 + 1.0)
     assert second.matched_scans == 2 == settle.REQUIRED_SETTLE_SCANS
-    assert settle.is_settled(second)
+    # Count alone is satisfied, but almost no time has passed since the streak began --
+    # must not read settled yet.
+    assert not settle.is_settled(second, now=_T0 + 1.0)
+    assert not settle.is_settled(second, now=_T0 + settle.SETTLE_MIN_AGE_S - 1.0)
+    # Once both the count and the age floor are met, and no later.
+    assert settle.is_settled(second, now=_T0 + settle.SETTLE_MIN_AGE_S)
 
 
-def test_a_changed_fingerprint_resets_the_counter():
-    first = settle.advance_settle(None, (1, 100, 1.0), partial_scan=False)
-    second = settle.advance_settle(first, (1, 100, 1.0), partial_scan=False)
-    assert settle.is_settled(second)
-    grown = settle.advance_settle(second, (2, 200, 2.0), partial_scan=False)
+def test_first_matched_at_is_carried_forward_across_matching_scans_not_reset():
+    """The streak's start time must not creep forward on every confirming match -- only a
+    fresh sighting or a changed fingerprint may move it, or the age floor above would never
+    actually bind (it would always measure "since the last scan," not "since first observed").
+    """
+    fp = (3, 300, 5.0)
+    first = settle.advance_settle(None, fp, partial_scan=False, now=_T0)
+    second = settle.advance_settle(first, fp, partial_scan=False, now=_T0 + 30.0)
+    third = settle.advance_settle(second, fp, partial_scan=False, now=_T0 + 90.0)
+    assert third.matched_scans == 3
+    assert third.first_matched_at == _T0
+
+
+def test_a_changed_fingerprint_resets_the_counter_and_the_age_floor():
+    first = settle.advance_settle(None, (1, 100, 1.0), partial_scan=False, now=_T0)
+    second = settle.advance_settle(
+        first, (1, 100, 1.0), partial_scan=False, now=_T0 + settle.SETTLE_MIN_AGE_S
+    )
+    assert settle.is_settled(second, now=_T0 + settle.SETTLE_MIN_AGE_S)
+    grown = settle.advance_settle(
+        second, (2, 200, 2.0), partial_scan=False, now=_T0 + settle.SETTLE_MIN_AGE_S + 500.0
+    )
     assert grown.matched_scans == 1
-    assert not settle.is_settled(grown)
+    assert grown.first_matched_at == _T0 + settle.SETTLE_MIN_AGE_S + 500.0
+    assert not settle.is_settled(grown, now=_T0 + settle.SETTLE_MIN_AGE_S + 500.0)
 
 
 def test_partial_scan_holds_rather_than_resets_or_advances():
-    first = settle.advance_settle(None, (1, 100, 1.0), partial_scan=False)
+    first = settle.advance_settle(None, (1, 100, 1.0), partial_scan=False, now=_T0)
     # A partial scan mid-arrival: even though the (truncated) reading happens to be identical,
     # this must not count as a confirming match.
-    held = settle.advance_settle(first, (1, 100, 1.0), partial_scan=True)
+    held = settle.advance_settle(first, (1, 100, 1.0), partial_scan=True, now=_T0 + 500.0)
     assert held == first
     # Nor may a *different* truncated reading reset the counter.
-    held_again = settle.advance_settle(first, (9, 9, 9.0), partial_scan=True)
+    held_again = settle.advance_settle(first, (9, 9, 9.0), partial_scan=True, now=_T0 + 500.0)
     assert held_again == first
 
 
+def test_partial_scan_holds_first_matched_at_too():
+    """A hold must not let the streak's start time creep forward either -- only the actual
+    matched-scan count has a documented "held, not reset" rule; this proves the age floor
+    inherits the same conservative treatment rather than accidentally resetting on every
+    partial-scan hiccup.
+    """
+    first = settle.advance_settle(None, (1, 100, 1.0), partial_scan=False, now=_T0)
+    held = settle.advance_settle(first, (1, 100, 1.0), partial_scan=True, now=_T0 + 500.0)
+    assert held.first_matched_at == _T0
+
+
 def test_partial_scan_with_no_previous_record_still_starts_at_one():
-    record = settle.advance_settle(None, (1, 100, 1.0), partial_scan=True)
+    record = settle.advance_settle(None, (1, 100, 1.0), partial_scan=True, now=_T0)
     assert record.matched_scans == 1
-    assert not settle.is_settled(record)
+    assert record.first_matched_at == _T0
+    assert not settle.is_settled(record, now=_T0)
 
 
 def test_none_record_is_never_settled():
     assert not settle.is_settled(None)
+    assert not settle.is_settled(None, now=_T0 + 1_000_000.0)
 
 
 # --- persistence ----------------------------------------------------------------------------
 
 
-async def test_settle_records_round_trip_through_the_database(db):
+async def _make_queue(db) -> int:
     cursor = await db.execute(
         "INSERT INTO host (name, address, username, auth_method, known_hosts_policy) "
         "VALUES ('h', 'example.invalid', 'u', 'key', 'insecure')"
@@ -122,26 +166,78 @@ async def test_settle_records_round_trip_through_the_database(db):
     )
     queue_id = cursor.lastrowid
     await db.commit()
+    return queue_id
+
+
+async def test_settle_records_round_trip_through_the_database(db):
+    """`first_matched_at` round-trips through `item_settle.updated_at` (the repurposed column,
+    prompts/2026-08-12-settle-gate-followups.md item 2) exactly, not just `matched_scans`.
+    """
+    queue_id = await _make_queue(db)
 
     assert await settle.load_settle_records(db, queue_id) == {}
-    assert not await settle.is_settled_in_db(db, queue_id, "Release")
+    assert not await settle.is_settled_in_db(db, queue_id, "Release", now=_T0)
 
-    records = {"Release": settle.SettleRecord(fingerprint=(2, 250, 5.0), matched_scans=1)}
+    records = {
+        "Release": settle.SettleRecord(
+            fingerprint=(2, 250, 5.0), matched_scans=1, first_matched_at=_T0
+        )
+    }
     await settle.save_settle_records(db, queue_id, records)
     await db.commit()
 
     loaded = await settle.load_settle_records(db, queue_id)
     assert loaded == records
-    assert not await settle.is_settled_in_db(db, queue_id, "Release")
+    # matched_scans below REQUIRED_SETTLE_SCANS -- not settled regardless of age.
+    assert not await settle.is_settled_in_db(db, queue_id, "Release", now=_T0 + 1_000_000.0)
 
-    records["Release"] = settle.SettleRecord(fingerprint=(2, 250, 5.0), matched_scans=2)
+    records["Release"] = settle.SettleRecord(
+        fingerprint=(2, 250, 5.0), matched_scans=2, first_matched_at=_T0
+    )
     await settle.save_settle_records(db, queue_id, records)
     await db.commit()
 
-    assert await settle.is_settled_in_db(db, queue_id, "Release")
+    assert await settle.load_settle_records(db, queue_id) == records
+    # Count now met, but not yet old enough.
+    assert not await settle.is_settled_in_db(db, queue_id, "Release", now=_T0 + 1.0)
+    # Both met.
+    assert await settle.is_settled_in_db(db, queue_id, "Release", now=_T0 + settle.SETTLE_MIN_AGE_S)
 
 
-async def test_settle_settings_default_off_and_round_trip(db):
+async def test_is_settled_in_db_requires_the_age_floor_too(db):
+    """The DB-row-shape check (`core/autoqueue.py`, `core/queue.py._reap_one`) must apply the
+    same two-condition rule `is_settled` does for an in-memory `SettleRecord` -- a matched
+    count alone is not enough.
+    """
+    queue_id = await _make_queue(db)
+    await settle.save_settle_records(
+        db,
+        queue_id,
+        {
+            "Release": settle.SettleRecord(
+                fingerprint=(2, 250, 5.0),
+                matched_scans=settle.REQUIRED_SETTLE_SCANS,
+                first_matched_at=_T0,
+            )
+        },
+    )
+    await db.commit()
+
+    assert not await settle.is_settled_in_db(db, queue_id, "Release", now=_T0)
+    assert not await settle.is_settled_in_db(
+        db, queue_id, "Release", now=_T0 + settle.SETTLE_MIN_AGE_S - 1.0
+    )
+    assert await settle.is_settled_in_db(db, queue_id, "Release", now=_T0 + settle.SETTLE_MIN_AGE_S)
+
+
+async def test_settle_settings_default_on_and_round_trip(db):
+    """prompts/2026-08-12-settle-gate-followups.md item 3: the default flipped from off to on
+    -- a real behavior change, asserted here rather than left to drift back unnoticed.
+    """
+    settings = await settle.load_settle_settings(db)
+    assert settings.enabled is True
+
+    await settle.save_settle_settings(db, settle.SettleSettings(enabled=False))
     settings = await settle.load_settle_settings(db)
     assert settings.enabled is False
 

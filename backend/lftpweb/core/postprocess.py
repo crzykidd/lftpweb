@@ -1,13 +1,22 @@
 """Post-processing pipeline: verify, extract, staging move (DESIGN.md §6) -- plus the
 `move`-mode remote delete this phase adds on top of it (§7, §7.4).
 
-**Trigger.** `core/queue.py._reap_one`'s job-success path calls `PostprocessPipeline.trigger`
-the moment a *top-level* item (no `/` in `rel_path` -- the same eligibility shape
-`core/autoqueue.py` uses) transitions to `DOWNLOADED`. Deliberately not also hooked into
-`core/engine.py`'s scan-driven persistence: the only realistic way an item reaches
-`DOWNLOADED` in this deployment is by lftpweb having just transferred it, and limiting the
-trigger to the one code path that always fires keeps this phase from reaching back into
-phase 2/3's already-verified scan/reconcile machinery. See `docs/decisions.md`.
+**Trigger.** Two call sites, both narrow, neither a general "scan found DOWNLOADED" hook.
+`core/queue.py._reap_one`'s job-success path calls `PostprocessPipeline.trigger` the moment a
+*top-level* item (no `/` in `rel_path` -- the same eligibility shape `core/autoqueue.py` uses)
+transitions to `DOWNLOADED`. `core/engine.py._persist` calls it too, but only for a `rel_path`
+its own settle-gate bookkeeping (prompts/open-issues.md #2) just released straight from
+`REMOTE_ONLY`/`substate='settling'` to `DOWNLOADED` with no fresh job in between -- the
+stuck-item bug this second trigger fixes: a job can finish while its item is still unsettled,
+`_reap_one` holds it rather than calling `trigger` itself, and without this second call site
+nothing else ever un-wedges it once the remote goes quiet and auto-queue is off. Both call
+sites fire on the identical precondition (`item.state` about to become `DOWNLOADED`, no
+post-processing outcome yet), so this is not a scan-driven trigger for the general case -- a
+pre-existing local file that reads `DOWNLOADED` on its very first-ever scan, with no gate hold
+behind it, still triggers nothing, exactly as before this widening. DESIGN.md §6 currently
+describes only the first call site and needs a follow-up correction; see docs/decisions.md
+(this task's entry) for the drafted wording. See docs/decisions.md more generally for why the
+second path was rejected once already and is now built anyway.
 
 **Runs off the event loop.** Hashing, `7zz`, and file copies are all blocking I/O; every step
 calls into `core/verify.py` / `core/extract.py` / `move_tree` via `asyncio.to_thread`.

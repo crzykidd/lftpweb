@@ -18,6 +18,7 @@ import pytest
 from lftpweb.core.queue import TransferQueue, TransferSettings, save_transfer_settings
 from lftpweb.core.remote import HostConfig
 from lftpweb.core.events import EventBus
+from lftpweb.core.settle import SettleSettings, save_settle_settings
 from lftpweb.db import migrate
 
 SEEDBOX_HOST = "127.0.0.1"
@@ -104,6 +105,13 @@ async def _wait_until(predicate, timeout_s: float = 30.0, interval_s: float = 0.
 @pytest.fixture
 async def db(tmp_path):
     conn = await _make_db(tmp_path)
+    # This file's tests are about the transfer engine (checksum, stop/resume, concurrency,
+    # spawn failure) -- none of them build `item_settle` rows, and the settle gate now
+    # defaults on (prompts/2026-08-12-settle-gate-followups.md item 3), so left alone every
+    # job success here would be held at REMOTE_ONLY/settling instead of reaching DOWNLOADED.
+    # Disabled here to isolate what these tests actually verify; the gate itself is covered by
+    # tests/test_settle.py and tests/test_settle_gate_e2e.py.
+    await save_settle_settings(conn, SettleSettings(enabled=False))
     yield conn
     await conn.close()
 

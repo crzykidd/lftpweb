@@ -30,8 +30,9 @@ progress, auto-queue on patterns, and optionally verify, extract, and relocate f
   dry-run preview endpoint (no Settings-page toggle yet — see "What doesn't yet")
 - Bandwidth ceiling and concurrency limits with an admission-control scheduler
 - Auto-queue on select/skip/file-exclude patterns, with a live "what would this match" preview
-- Post-processing: verify (sidecar or hash-on-disk), extract (7zz), and `move` mode's
-  verification-gated remote delete, all with an audited trail on the History page
+- Post-processing: verify (sidecar or hash-on-disk), extract (`7zz` for zip/7z/tar/gz/bz2/xz,
+  `unrar` for rar/rar5 — see `NOTICE`), and `move` mode's verification-gated remote delete, all
+  with an audited trail on the History page
 - The History page: every completed/failed/cancelled transfer and every audit event
   (including remote deletes and deletes withheld), filterable and grouped by queue
 - Rotating log viewer, on-demand `VACUUM INTO` database backups (scheduled + manual), and a
@@ -179,6 +180,7 @@ The fake seedbox is two sshd containers seeded with an identical known-size tree
 **[AGPL-3.0](LICENSE)** — if you run a modified lftpweb as a service for other people, you have
 to publish your changes.
 
-The container image also bundles unmodified third-party programs (lftp, OpenSSH, 7-Zip, su-exec,
-tini), each under its own licence. lftpweb runs them as separate processes rather than linking
+The container image also bundles third-party programs — unmodified Alpine packages (lftp,
+OpenSSH, 7-Zip, su-exec, tini) plus `unrar`, built from RARLAB source in the image's builder
+stage — each under its own licence. lftpweb runs them as separate processes rather than linking
 against them. See [`NOTICE`](NOTICE).

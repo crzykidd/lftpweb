@@ -10,6 +10,7 @@ import aiosqlite
 import pytest
 
 from lftpweb.core.autoqueue import AutoQueue, QueueAutoConfig
+from lftpweb.core.settle import SettleSettings, save_settle_settings
 from lftpweb.db import migrate
 
 
@@ -19,6 +20,12 @@ async def db():
     conn.row_factory = aiosqlite.Row
     await conn.execute("PRAGMA foreign_keys = ON")
     await migrate(conn)
+    # Every test in this file except the "settle gate's eligibility half" section below is
+    # about mount/suppression/pattern behavior, not the settle gate -- which now defaults on
+    # (prompts/2026-08-12-settle-gate-followups.md item 3) and would otherwise hold back every
+    # item here that has no `item_settle` row (i.e. all of them). Disabled here; the settle
+    # section re-enables it explicitly per test, right where it's actually being exercised.
+    await save_settle_settings(conn, SettleSettings(enabled=False))
     yield conn
     await conn.close()
 
@@ -272,30 +279,63 @@ async def test_global_pattern_queue_id_null_applies_to_every_queue(db, tmp_path)
 # --- the settle gate's eligibility half (prompts/open-issues.md #2, `core/settle.py`) -----
 
 
-async def _set_settle_record(db, queue_id, rel_path, matched_scans: int) -> None:
-    await db.execute(
-        "INSERT INTO item_settle (queue_id, rel_path, file_count, total_bytes, max_mtime, matched_scans) "
-        "VALUES (?, ?, 1, 100, 1.0, ?)",
-        (queue_id, rel_path, matched_scans),
-    )
+async def _set_settle_record(
+    db, queue_id, rel_path, matched_scans: int, *, updated_at: str | None = None
+) -> None:
+    """`updated_at` carries `SettleRecord.first_matched_at`
+    (prompts/2026-08-12-settle-gate-followups.md item 2) -- omitted, it defaults to "now" (the
+    schema's own `DEFAULT`), which is *not* old enough to clear `settle.SETTLE_MIN_AGE_S` by
+    the time a test's own assertion runs a moment later. Callers wanting a genuinely settled
+    row must pass `updated_at=_LONG_AGO` explicitly; this is deliberate, not an oversight --
+    it's exactly the age-floor behavior this task added.
+    """
+    if updated_at is None:
+        await db.execute(
+            "INSERT INTO item_settle (queue_id, rel_path, file_count, total_bytes, max_mtime, matched_scans) "
+            "VALUES (?, ?, 1, 100, 1.0, ?)",
+            (queue_id, rel_path, matched_scans),
+        )
+    else:
+        await db.execute(
+            "INSERT INTO item_settle "
+            "(queue_id, rel_path, file_count, total_bytes, max_mtime, matched_scans, updated_at) "
+            "VALUES (?, ?, 1, 100, 1.0, ?, ?)",
+            (queue_id, rel_path, matched_scans, updated_at),
+        )
     await db.commit()
 
 
-async def test_settle_gate_off_by_default_ignores_unsettled_items(db, tmp_path):
-    """No settle settings row at all -- `settle.load_settle_settings` defaults to disabled --
-    must reproduce the exact pre-gate behaviour: an item with no `item_settle` row (never
-    scanned by the settle-aware code path) is still queued.
+# Far enough in the past that `settle.SETTLE_MIN_AGE_S` has elapsed under any real clock --
+# used wherever a test needs a record that reads as genuinely settled by age, not just by count.
+_LONG_AGO = "2000-01-01T00:00:00.000000Z"
+
+
+async def test_settle_gate_is_on_by_default(tmp_path):
+    """prompts/2026-08-12-settle-gate-followups.md item 3: the default flipped from off to on
+    -- this used to assert the opposite. Deliberately does **not** use this file's own `db`
+    fixture, which explicitly disables the gate for every other test here (see that fixture's
+    comment); this test needs a genuinely fresh database with no `setting` row at all, to prove
+    "on" is what a real fresh install gets, not merely what an explicit opt-in produces (that's
+    `test_settle_gate_on_with_no_settle_row_yet_is_conservative` below).
     """
     from lftpweb.core.mount_sentinel import write_if_needed
 
-    write_if_needed(str(tmp_path))
-    queue_id = await _make_queue(db, tmp_path)
-    await _make_item(db, queue_id, "Release.One")
-    recorder = _Recorder()
-    aq = AutoQueue(db, recorder)
+    conn = await aiosqlite.connect(":memory:")
+    conn.row_factory = aiosqlite.Row
+    await conn.execute("PRAGMA foreign_keys = ON")
+    await migrate(conn)
+    try:
+        write_if_needed(str(tmp_path))
+        queue_id = await _make_queue(conn, tmp_path)
+        await _make_item(conn, queue_id, "Release.One")
+        recorder = _Recorder()
+        aq = AutoQueue(conn, recorder)
 
-    assert await aq.on_scan(_mounted_config(queue_id, tmp_path)) == 1
-    assert recorder.enqueued == [1]
+        queued = await aq.on_scan(_mounted_config(queue_id, tmp_path))
+        assert queued == 0, "an item with no item_settle row must be held back by default now"
+        assert recorder.enqueued == []
+    finally:
+        await conn.close()
 
 
 async def test_settle_gate_on_holds_back_an_unsettled_item(db, tmp_path):
@@ -323,13 +363,39 @@ async def test_settle_gate_on_queues_a_settled_item(db, tmp_path):
     write_if_needed(str(tmp_path))
     queue_id = await _make_queue(db, tmp_path)
     await _make_item(db, queue_id, "Release.One")
-    await _set_settle_record(db, queue_id, "Release.One", matched_scans=2)  # settled
+    # settled: matched_scans met *and* old enough (updated_at far in the past)
+    await _set_settle_record(db, queue_id, "Release.One", matched_scans=2, updated_at=_LONG_AGO)
     recorder = _Recorder()
     aq = AutoQueue(db, recorder)
 
     queued = await aq.on_scan(_mounted_config(queue_id, tmp_path))
     assert queued == 1
     assert recorder.enqueued == [1]
+
+
+async def test_settle_gate_on_holds_back_a_recently_matched_item_even_though_the_count_is_met(
+    db, tmp_path
+):
+    """prompts/2026-08-12-settle-gate-followups.md item 2: `REQUIRED_SETTLE_SCANS` alone is
+    not sufficient -- a matched item whose streak only just began (default `updated_at`, "now")
+    must still be held back until `SETTLE_MIN_AGE_S` has also elapsed.
+    """
+    from lftpweb.core.mount_sentinel import write_if_needed
+    from lftpweb.core.settle import SettleSettings, save_settle_settings
+
+    await save_settle_settings(db, SettleSettings(enabled=True))
+    write_if_needed(str(tmp_path))
+    queue_id = await _make_queue(db, tmp_path)
+    await _make_item(db, queue_id, "Release.One")
+    # matched_scans meets REQUIRED_SETTLE_SCANS, but updated_at defaults to "now" -- not old
+    # enough by SETTLE_MIN_AGE_S yet.
+    await _set_settle_record(db, queue_id, "Release.One", matched_scans=2)
+    recorder = _Recorder()
+    aq = AutoQueue(db, recorder)
+
+    queued = await aq.on_scan(_mounted_config(queue_id, tmp_path))
+    assert queued == 0
+    assert recorder.enqueued == []
 
 
 async def test_settle_gate_on_with_no_settle_row_yet_is_conservative(db, tmp_path):

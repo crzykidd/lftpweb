@@ -164,12 +164,24 @@ class PostprocessSettingsIn(PostprocessSettingsOut):
 
 
 class SettleSettingsOut(BaseModel):
-    # Defaults off -- see core/settle.py.SettleSettings's own docstring for the reasoning.
-    enabled: bool = False
+    # Defaults **on** as of prompts/2026-08-12-settle-gate-followups.md -- see
+    # core/settle.py.SettleSettings's own docstring for the full reasoning, and
+    # CHANGELOG.md's `### Changed` entry: this is a behavior change for existing installs,
+    # not a new-install-only default.
+    enabled: bool = True
+    # Read-only, informational -- not accepted on `SettleSettingsIn`. `core/settle.py`'s
+    # `REQUIRED_SETTLE_SCANS`/`SETTLE_MIN_AGE_S` are named constants, not per-install settings
+    # (see that module's own comment on why both are load-bearing and neither is meant to be
+    # tuned away independently); surfaced here so Settings -> Transfer can explain what the
+    # gate actually requires without hardcoding numbers in the frontend that could drift out
+    # of sync with the code. The endpoint always fills these from the real constants, never
+    # from a stored value -- the defaults here are only for the OpenAPI schema.
+    required_scans: int = 2
+    min_age_s: float = 60.0
 
 
-class SettleSettingsIn(SettleSettingsOut):
-    pass
+class SettleSettingsIn(BaseModel):
+    enabled: bool = True
 
 
 # --- Settings -> local retention (prompts/open-issues.md "7 + 8", `core/local_delete.py`) -----

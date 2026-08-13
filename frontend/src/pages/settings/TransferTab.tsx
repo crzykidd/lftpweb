@@ -1,6 +1,12 @@
 import { useEffect, useState } from 'react'
-import { getHost, getTransferSettings, putTransferSettings } from '../../api/client'
-import type { TransferSettingsOut } from '../../api/types'
+import {
+  getHost,
+  getSettleSettings,
+  getTransferSettings,
+  putSettleSettings,
+  putTransferSettings,
+} from '../../api/client'
+import type { SettleSettingsOut, TransferSettingsOut } from '../../api/types'
 import { bytesToMB, formatRate, mbToBytes } from '../../lib/format'
 
 const inputClasses =
@@ -147,6 +153,89 @@ function NumberField({ label, hint, value, step, min = 0, onChange }: NumberFiel
       />
       {hint && <span className={hintClasses}>{hint}</span>}
     </label>
+  )
+}
+
+// SettleSettingsOut before the real GET resolves -- `required_scans`/`min_age_s` are only
+// ever overwritten by the server's response (they're read-only, computed from
+// core/settle.py's own constants), so these two values just need to not flash something
+// implausible for the one render before the fetch lands.
+const SETTLE_EMPTY: SettleSettingsOut = { enabled: true, required_scans: 2, min_age_s: 60 }
+
+/** Settings → Transfer's "the settle gate" section (prompts/open-issues.md #2,
+ * `core/settle.py`; UI built in prompts/2026-08-12-settle-gate-followups.md). A self-contained
+ * load/save cycle against its own endpoint (`GET`/`PUT /api/settings/settle`) rather than
+ * folded into `TransferTab`'s own form state -- a different settings object entirely, and
+ * unlike every other field on this page it isn't part of DESIGN.md §4.5's bandwidth/
+ * concurrency surface.
+ */
+function SettleGateSection() {
+  const [settings, setSettings] = useState<SettleSettingsOut>(SETTLE_EMPTY)
+  const [loading, setLoading] = useState(true)
+  const [saving, setSaving] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const [saved, setSaved] = useState(false)
+
+  useEffect(() => {
+    getSettleSettings()
+      .then(setSettings)
+      .finally(() => setLoading(false))
+  }, [])
+
+  const handleToggle = async (enabled: boolean) => {
+    setError(null)
+    setSaving(true)
+    setSaved(false)
+    try {
+      const result = await putSettleSettings({ enabled })
+      setSettings(result)
+      setSaved(true)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  return (
+    <div className="flex flex-col gap-3 rounded-md border border-zinc-200 p-4 dark:border-zinc-800">
+      <h3 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">Settle gate</h3>
+      <p className={hintClasses}>
+        Before an item is treated as complete, its remote side must stop changing: the same
+        fingerprint of file count, total bytes, and newest modification time must hold across{' '}
+        {loading ? '…' : settings.required_scans} consecutive scans, spread over at least{' '}
+        {loading ? '…' : settings.min_age_s} seconds of wall-clock time. Both conditions are
+        required — the scan count alone can't tell a genuinely settled item from one on a
+        queue that just hasn't been rescanned enough times yet. Without this, a multi-file
+        release caught mid-upload can read as fully downloaded off whichever files happened to
+        finish first, and post-processing (verify/extract/move, and any remote delete) runs on
+        a release that is still arriving.
+      </p>
+      {loading ? (
+        <p className="text-sm text-zinc-500 dark:text-zinc-400">Loading…</p>
+      ) : (
+        <label className="flex items-center gap-2">
+          <input
+            type="checkbox"
+            checked={settings.enabled}
+            disabled={saving}
+            onChange={(e) => handleToggle(e.target.checked)}
+          />
+          <span className={labelClasses}>Enabled</span>
+        </label>
+      )}
+      <p className={hintClasses}>
+        Delays every transfer's completion by up to about {loading ? '…' : settings.min_age_s}{' '}
+        seconds, including on a landing path that was already atomic and never needed the
+        wait — the price of not being fooled by one that isn't. On by default; turn this off
+        only if your seedbox's landing path is atomic end to end (e.g. hardlinked torrent
+        pickup) and you want to shed that latency entirely.
+      </p>
+      {error && <p className="text-sm text-red-600 dark:text-red-400">{error}</p>}
+      {saved && !error && (
+        <p className="text-sm text-emerald-600 dark:text-emerald-400">Saved.</p>
+      )}
+    </div>
   )
 }
 
@@ -402,6 +491,8 @@ export function TransferTab() {
           />
         </div>
       </div>
+
+      <SettleGateSection />
 
       <div className="flex flex-col gap-2 rounded-md border border-zinc-200 p-4 dark:border-zinc-800">
         <h3 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">

@@ -28,6 +28,7 @@ from lftpweb.core.events import EventBus
 from lftpweb.core.local_scan import LocalEntry
 from lftpweb.core.mount_sentinel import DEFAULT_GRACE_S
 from lftpweb.core.remote import HostConfig, RemoteEntry
+from lftpweb.core.settle import SettleSettings, save_settle_settings
 from lftpweb.db import migrate
 
 REL_PATH = "Release.One"
@@ -96,6 +97,13 @@ async def _make_engine(tmp_path, monkeypatch, *, local_size: int | None, state: 
     )
     item_id = cursor.lastrowid
     await db.commit()
+
+    # This file is about state-precedence, not the settle gate -- which now defaults on
+    # (prompts/2026-08-12-settle-gate-followups.md item 3) and would otherwise hold a fresh
+    # scan's DOWNLOADED items at REMOTE_ONLY/settling for their first couple of passes,
+    # breaking every single-scan assertion below. Disabled to isolate what this file actually
+    # tests; the gate itself is covered by tests/test_settle.py and tests/test_settle_gate_e2e.py.
+    await save_settle_settings(db, SettleSettings(enabled=False))
 
     monkeypatch.setattr(
         engine_module.local_scan,
