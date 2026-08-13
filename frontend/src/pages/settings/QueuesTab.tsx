@@ -39,6 +39,7 @@ interface FormState {
   auto_verify: boolean
   auto_extract: boolean
   auto_move: boolean
+  scan_interval_s: number | null
 }
 
 const EMPTY_FORM: FormState = {
@@ -53,6 +54,41 @@ const EMPTY_FORM: FormState = {
   auto_verify: false,
   auto_extract: false,
   auto_move: false,
+  scan_interval_s: null,
+}
+
+/** The dropdown's own fixed choices (DESIGN.md §5/§9.3; prompts/open-issues.md #11). `null` is
+ * "site default" and `0` is "none, on-demand only" -- both reserved by the API/DB, not just
+ * this form (`api/types.ts`'s `PathQueueIn.scan_interval_s` doc comment). A queue whose stored
+ * value doesn't match one of these four (e.g. set by a direct API call) still round-trips --
+ * see `scanIntervalOptions` below, which appends a synthetic entry for it rather than silently
+ * snapping to the nearest preset the moment the form is opened.
+ */
+const SCAN_INTERVAL_CHOICES: { value: string; label: string }[] = [
+  { value: 'default', label: 'Site default (30s unless overridden by LFTPWEB_SCAN_INTERVAL_S)' },
+  { value: '10', label: '10s' },
+  { value: '30', label: '30s' },
+  { value: '60', label: '60s' },
+  { value: 'none', label: 'None — on-demand only' },
+]
+
+function scanIntervalToChoice(value: number | null): string {
+  if (value === null) return 'default'
+  if (value === 0) return 'none'
+  if (value === 10 || value === 30 || value === 60) return String(value)
+  return String(value) // a custom value set outside this form -- kept as its own option below
+}
+
+function choiceToScanInterval(choice: string): number | null {
+  if (choice === 'default') return null
+  if (choice === 'none') return 0
+  return Number(choice)
+}
+
+function formatScanInterval(value: number | null): string {
+  if (value === null) return 'default'
+  if (value === 0) return 'none'
+  return `${value}s`
 }
 
 const AUTOQUEUE_SETTINGS_EMPTY: AutoQueueSettingsOut = { re_download_externally_removed: false }
@@ -176,6 +212,7 @@ export function QueuesTab() {
       auto_verify: queue.auto_verify,
       auto_extract: queue.auto_extract,
       auto_move: queue.auto_move,
+      scan_interval_s: queue.scan_interval_s,
     })
   }
 
@@ -212,6 +249,7 @@ export function QueuesTab() {
       auto_verify: effectiveAutoVerify,
       auto_extract: form.auto_extract,
       auto_move: form.auto_move,
+      scan_interval_s: form.scan_interval_s,
     }
     try {
       if (editingId != null) {
@@ -248,6 +286,7 @@ export function QueuesTab() {
               <th className="px-3 py-2 font-medium">Local path</th>
               <th className="px-3 py-2 font-medium">Sync mode</th>
               <th className="px-3 py-2 font-medium">Enabled</th>
+              <th className="px-3 py-2 font-medium">Scan interval</th>
               <th className="px-3 py-2 font-medium">Auto-queue</th>
               <th className="px-3 py-2" />
             </tr>
@@ -255,7 +294,7 @@ export function QueuesTab() {
           <tbody>
             {queues.length === 0 && (
               <tr>
-                <td colSpan={7} className="px-3 py-4 text-center text-zinc-400">
+                <td colSpan={8} className="px-3 py-4 text-center text-zinc-400">
                   No queues yet.
                 </td>
               </tr>
@@ -267,6 +306,7 @@ export function QueuesTab() {
                 <td className="px-3 py-2 font-mono text-xs">{q.local_path}</td>
                 <td className="px-3 py-2">{q.sync_mode}</td>
                 <td className="px-3 py-2">{q.enabled ? 'yes' : 'no'}</td>
+                <td className="px-3 py-2">{formatScanInterval(q.scan_interval_s)}</td>
                 <td className="px-3 py-2">
                   {q.auto_queue_enabled
                     ? q.auto_queue_patterns_only
@@ -391,6 +431,46 @@ export function QueuesTab() {
         <label className="flex items-center gap-2">
           <input type="checkbox" checked={form.enabled} onChange={(e) => update('enabled', e.target.checked)} />
           <span className={labelClasses}>Enabled</span>
+        </label>
+
+        <label className="flex flex-col gap-1">
+          <span className={labelClasses}>Scan interval (DESIGN.md §5/§9.3)</span>
+          <select
+            className={inputClasses}
+            value={scanIntervalToChoice(form.scan_interval_s)}
+            onChange={(e) => update('scan_interval_s', choiceToScanInterval(e.target.value))}
+          >
+            {[
+              ...SCAN_INTERVAL_CHOICES,
+              ...(SCAN_INTERVAL_CHOICES.some((c) => c.value === scanIntervalToChoice(form.scan_interval_s))
+                ? []
+                : [
+                    {
+                      value: scanIntervalToChoice(form.scan_interval_s),
+                      label: `Custom: ${form.scan_interval_s}s (set outside this form)`,
+                    },
+                  ]),
+            ].map((choice) => (
+              <option key={choice.value} value={choice.value}>
+                {choice.label}
+              </option>
+            ))}
+          </select>
+          {scanIntervalToChoice(form.scan_interval_s) === '10' && (
+            <span className="text-xs text-amber-600 dark:text-amber-400">
+              ⚠ A scan is an SSH round trip running <code>find</code> over the entire remote
+              tree. Every 10s is real, continuous load on a shared seedbox — use it only if you
+              need this queue's changes to show up fast and the seedbox can take it.
+            </span>
+          )}
+          {scanIntervalToChoice(form.scan_interval_s) === 'none' && (
+            <span className={hintClasses}>
+              This queue is never scanned on a timer — only "Rescan now" (Files page) or a
+              settings change here triggers a pass. Auto-queue only runs at the end of a scan
+              pass (DESIGN.md §4.7), so with auto-queue on, new remote items will not be picked
+              up automatically until something forces a scan.
+            </span>
+          )}
         </label>
 
         <div className="flex flex-col gap-2 rounded-md border border-zinc-200 p-3 dark:border-zinc-800">

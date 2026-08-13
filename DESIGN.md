@@ -898,7 +898,24 @@ script over SFTP and run it, emitting the same records. Kept small and only used
 **Cadence:** every 30 s by default, plus a forced rescan after any queue/stop/delete and on
 job completion. Local full walk every 10 s; the 1 Hz active-set poll (§4.4) covers the hot set
 in between. The scan interval is also the settle gate's unit of time (§3.3 counts *scans*, not
-seconds), so changing it changes how long an arriving item is held.
+seconds), so changing it changes how long an arriving item is held — which is why §3.3's gate
+also enforces its own wall-clock floor (`SETTLE_MIN_AGE_S`) independent of scan count, so a
+faster queue (below) is held to the same real-time guarantee rather than a weaker one.
+
+**Overridable per queue, as of `prompts/done/2026-08-12-per-queue-scan-interval.md`
+(migration 009, `path_queue.scan_interval_s`).** `NULL` (every queue predating this feature)
+means "use the site-wide default above"; `0` means on-demand only — never scanned on a timer,
+reachable only via a forced pass (`request_rescan()`: "Rescan now," a config change, *Test
+connection* succeeding); any positive number is a literal per-queue interval in seconds, with
+10 / 30 / 60 / none offered as the Settings → Queues dropdown (values outside that set are
+still accepted from a direct API call). The engine loop (`core/engine.py`) tracks one next-due
+time per queue and wakes at the earliest of them, scanning only the queues that are actually
+due — not every queue on the fastest one's cadence. A single serial `asyncio.Task` runs the
+whole loop, so an overrunning scan (a real risk at 10 s against a slow shared seedbox: a scan
+is an SSH round trip running `find` over the entire remote tree) can never stack a second,
+concurrent scan of the same queue — its own next-due is scheduled from its completion, not its
+scheduled start, so an overrun costs that queue a longer effective interval rather than a
+pile-up.
 
 Every pass — success or failure — announces its own completion on the WebSocket, rather than
 leaving a client to infer it from the next tree update. A failed pass produces no fresh tree,

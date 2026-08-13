@@ -1,10 +1,29 @@
 ---
 name: 2026-08-12-per-queue-scan-interval
-status: pending
+status: done
 created: 2026-08-12
 model: sonnet
-completed:
-result:
+completed: 2026-08-12
+result: >
+  Added migration 009 (path_queue.scan_interval_s, nullable REAL, CHECK >= 0): NULL means
+  "use the site-wide default," 0 means on-demand only, a positive number is a literal
+  per-queue interval in seconds. core/engine.py.effective_scan_interval resolves it; the
+  engine loop is now multi-cadence -- Engine._next_due/_next_wake_delay/_schedule_next/_is_due
+  track one next-due time per queue, scan_all(force=...) scans only due queues on the timer
+  path and every enabled queue on the forced path (request_rescan(), unchanged semantics), and
+  a queue's next-due is scheduled from its own scan's completion time so an overrun can never
+  stack a second concurrent scan of itself -- proven in tests/test_engine_scan_cadence.py
+  (9 new tests, including one that runs the real _loop with an artificially slow scan_queue
+  and asserts zero overlaps). Settings -> Queues got a scan-interval dropdown (10s/30s/60s/
+  none, following the existing per-queue-field conventions) with a load warning on 10s and an
+  auto-queue-depends-on-scan-passes note on none. core/settle.py was read but not touched --
+  its SETTLE_MIN_AGE_S wall-clock floor already makes the settle gate immune to a fast
+  per-queue interval, confirmed by reasoning and the existing
+  test_atomic_arrival_settles_after_exactly_two_scans_and_the_age_floor test. Both ruff gates,
+  npm lint, and npm build are clean; full suite is 596 passed (587 + 9 new) with the fake
+  seedbox up. docs/decisions.md and CHANGELOG.md (### Added) both updated; DESIGN.md §5 got a
+  short addition documenting the per-queue override. Nothing left unfixed against the prompt's
+  "What to do" list.
 ---
 
 # Task: Make the scan interval per-queue and settable from the UI

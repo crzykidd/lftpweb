@@ -6,6 +6,89 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-12 — Per-queue scan interval (migration 009): `NULL` means the site default, `0`
+## means on-demand only, and the engine loop became multi-cadence rather than one shared timer
+
+**Handoff prompt `prompts/done/2026-08-12-per-queue-scan-interval.md`, executed end to end.**
+`scan_interval_s` was one global (`config.py:33`, default 30s, env-overridable) driving a
+single `asyncio.wait_for(self._wake.wait(), timeout=self.scan_interval_s)` in
+`core/engine.py._loop`. The user asked for a 10/30/60/none dropdown; the orchestrating prompt
+was explicit that the real knob is server-side scan cadence, not a client-side Files-page
+refresh timer (the Files page renders off one WebSocket and does not poll at all).
+
+**Reserved-value encoding on one nullable column, not a second column or a separate enum.**
+`path_queue.scan_interval_s REAL` (migration 009, `ADD COLUMN`, no `DEFAULT` so every existing
+row is `NULL`): `NULL` = "no opinion, use the site-wide default"; `0` = "on-demand only, never
+on a timer"; any positive value = a literal per-queue interval in seconds. `NULL` and `0` do
+different jobs and both had to survive independently of each other, which ruled out a single
+"0 means default" convention (the more common one) — `core/engine.py.effective_scan_interval`
+is the one place that resolves the three-way column reading down to the two-way thing the
+scheduler actually needs (`float` interval, or `None` meaning "never fire a timer"), so a
+literal DB `0` and an *unset* per-queue interval collapse to the identical scheduling behavior
+without either meaning being lost from where it's actually decided. A `CHECK (scan_interval_s
+IS NULL OR scan_interval_s >= 0)` on the column, plus `api/settings.py._reject_invalid_scan_
+interval` giving the same rule a clean 400 instead of a raw `IntegrityError` → 500, is the only
+constraint — the three dropdown presets (10/30/60) are a UI convenience, not a DB-level
+restriction, so a direct API call can still set an arbitrary positive interval.
+
+**The loop stayed a single serial `asyncio.Task` — the deliberate choice that makes "can't
+stack a concurrent scan of the same queue" true by construction, not by a lock.** The
+alternative considered and rejected: `asyncio.gather` over every due queue each wake, for
+throughput on an instance with many queues at different cadences. Rejected because it
+reintroduces exactly the failure mode the user asked about directly — two scans of two
+*different* queues running concurrently is fine, but nothing then prevents a queue whose scan
+overran its own interval from becoming "due" again while its own previous scan is still
+in-flight, unless that's re-guarded with a per-queue busy flag anyway. Keeping `scan_all`
+sequential (loop over due queues, `await` each `scan_queue` in turn, exactly as it always
+has) gets the same guarantee for free: there is structurally only ever one `scan_queue` call
+in flight for the whole engine, so "the same queue twice" is a subset of "at all," which is
+already impossible. The cost — queues cannot scan in parallel with each other — was already
+true before this task and the prompt did not ask to change it; a future task adding real
+concurrency will have to reintroduce a per-queue guard deliberately, not inherit one from here
+that was never actually needed for it.
+
+**Next-due is scheduled from each queue's own scan *completion*, not from the batch start or
+the queue's previous due time.** This is what actually keeps an overrun from being "free" or
+causing a pile-up: if a 10s-interval queue's scan takes 15s, its next-due becomes
+`completion_time + 10`, i.e. ~15s after the *previous* scan started — the interval is measured
+end-to-start, the same shape a plain `while True: work(); sleep(interval)` loop gets for free.
+The alternative (schedule from the batch's start time, or from the previous due time plus a
+fixed step) can produce a due time already in the past the moment the scan finishes, which
+`_next_wake_delay`'s `max(0.0, ...)` clamp would turn into an immediate re-fire — not a stacked
+*concurrent* scan (still impossible, see above) but a busy-loop of back-to-back scans eating
+100% of one thread's attention on a permanently-overloaded queue. Completion-based scheduling
+self-corrects instead: a queue that can't keep up with its own interval simply settles into
+scanning back-to-back at whatever cadence it can actually sustain, which is the honest outcome
+given the SSH round trip involved.
+
+**`request_rescan()` forces every enabled queue and restarts each one's own clock, not just
+the ones already due.** Pre-existing "Rescan now" / config-change semantics (`api/files.py`,
+every `api/settings.py` write) scanned everything unconditionally; a per-queue cadence made it
+necessary to decide explicitly whether a forced pass also *reschedules* the queues it touches.
+Chosen: yes — a forced scan is a real scan, so leaving a queue's next-due at its old,
+now-stale value would mean a "Rescan now" moments before a queue's natural due time effectively
+double-scans it (once forced, once naturally, seconds apart) instead of the forced pass simply
+absorbing the natural one. `Engine._force_full`, set by `request_rescan()` and consumed once by
+`_loop`, carries this rather than threading a parameter through the WebSocket/HTTP layer.
+
+**Settle gate: confirmed, not modified.** `core/settle.py`'s `SETTLE_MIN_AGE_S` wall-clock
+floor (added the same day, `prompts/done/2026-08-12-settle-gate-followups.md`, specifically
+*because* a per-queue interval was already known to be coming) means `is_settled` cannot return
+`True` before `SETTLE_MIN_AGE_S` of real time has elapsed since the current matching streak
+began, regardless of how many scans produced that streak or how fast they arrived — proven
+already by `tests/test_settle.py::test_atomic_arrival_settles_after_exactly_two_scans_and_the_
+age_floor`, which injects `now` directly. A 10s-interval queue reaching `REQUIRED_SETTLE_SCANS`
+(2) in ~20s is still held at `REMOTE_ONLY`/`substate=settling` until the 60s floor clears. No
+code in this task touches `core/settle.py`; this decision entry exists so a future reader does
+not have to re-derive whether the interaction is safe.
+
+**No global-default UI added.** `config.py.Settings.scan_interval_s` remains env-var-only
+(`LFTPWEB_SCAN_INTERVAL_S`); the handoff prompt's UI ask was Settings → Queues' per-queue
+field, and the site-wide default already had no Settings-page control before this task —
+adding one was out of scope and not requested.
+
+---
+
 ## 2026-08-12 — Reverted same-day `REMOVED_LOCAL` auto-queue eligibility (`855e7a3`): it is
 ## now a site-level setting, default off, and DESIGN.md's three resulting staleness problems
 ## are corrected

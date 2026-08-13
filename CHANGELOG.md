@@ -153,6 +153,23 @@ alongside this list: several entries below ship with deliberate, documented limi
   the very next scan, re-imported, and repeat forever. Only matters for `copy`-mode queues;
   `move` deletes the remote copy on verified completion, so there is nothing left to re-fetch
   either way.
+- **The scan interval is now per-queue, not one global 30s for every queue** *(2026-08-12)*.
+  `scan_interval_s` (`path_queue`, migration 009; `GET`/`PUT /api/settings/queues`, Settings →
+  Queues) offers 10s / 30s / 60s / **None** — **default unset** (every existing queue keeps
+  using the site-wide `LFTPWEB_SCAN_INTERVAL_S` default, currently 30s, exactly as before this
+  release). *None* means on-demand only: the queue is never scanned on a timer, only via
+  "Rescan now" or a settings change that forces a rescan — the UI says so next to the option,
+  because auto-queue only runs at the end of a scan pass, so a "none" queue with auto-queue on
+  will not pick up new remote items until something forces one. 10s carries a warning in the UI
+  (a scan is an SSH round trip running `find` over the entire remote tree — real, continuous
+  load on a shared seedbox). The engine loop now wakes at the earliest next-due time across all
+  queues and scans only the ones actually due, not every queue on the fastest one's cadence; an
+  overrunning scan (a real risk at 10s against a slow seedbox) reschedules its own queue from
+  its own completion time and can never stack a second, concurrent scan of itself — the loop
+  remains one serial task, which is what actually guarantees this. The settle gate's wall-clock
+  floor (`SETTLE_MIN_AGE_S`, shipped the same day specifically anticipating this feature) is
+  unaffected: a fast per-queue interval cannot shrink the ~60s settle window below what a 30s
+  queue already gets.
 
 ### Changed
 

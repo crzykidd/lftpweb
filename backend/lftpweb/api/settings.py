@@ -233,7 +233,8 @@ async def test_host(
 
 _QUEUE_SELECT_COLUMNS = (
     "id, host_id, name, remote_path, local_path, staging_path, enabled, sync_mode, "
-    "auto_queue_enabled, auto_queue_patterns_only, auto_verify, auto_extract, auto_move"
+    "auto_queue_enabled, auto_queue_patterns_only, auto_verify, auto_extract, auto_move, "
+    "scan_interval_s"
 )
 
 
@@ -252,6 +253,7 @@ def _queue_out_from_row(row) -> PathQueueOut:
         auto_verify=bool(row["auto_verify"]),
         auto_extract=bool(row["auto_extract"]),
         auto_move=bool(row["auto_move"]),
+        scan_interval_s=row["scan_interval_s"],
     )
 
 
@@ -286,6 +288,22 @@ def _reject_unimplemented_sync_mode(mode: str) -> None:
         )
 
 
+def _reject_invalid_scan_interval(value: float | None) -> None:
+    """The DB `CHECK` (migration 009) would refuse a negative value too, but as a raw
+    `IntegrityError` -> 500, not the clean 400 every other rejected `path_queue` input in this
+    module gets (`_reject_unimplemented_sync_mode` above is the existing precedent). `0` (on-
+    demand only) and `None` (use the site default) are both valid -- only strictly negative is
+    rejected, matching `core/engine.py.effective_scan_interval`'s own `<= 0` -> "none" reading:
+    a negative number isn't a *stricter* "none," it's meaningless, so it's refused rather than
+    silently folded into the same bucket as 0.
+    """
+    if value is not None and value < 0:
+        raise HTTPException(
+            status_code=400,
+            detail="scan_interval_s must be null (site default), 0 (on-demand only), or positive",
+        )
+
+
 @router.get("/queues", response_model=list[PathQueueOut])
 async def list_queues(request: Request) -> list[PathQueueOut]:
     cursor = await request.app.state.db.execute(
@@ -298,6 +316,7 @@ async def list_queues(request: Request) -> list[PathQueueOut]:
 @router.post("/queues", response_model=PathQueueOut, status_code=201)
 async def create_queue(body: PathQueueIn, request: Request) -> PathQueueOut:
     _reject_unimplemented_sync_mode(body.sync_mode)
+    _reject_invalid_scan_interval(body.scan_interval_s)
     db = request.app.state.db
     host_row = await _get_host_row(db)
     if host_row is None:
@@ -306,7 +325,8 @@ async def create_queue(body: PathQueueIn, request: Request) -> PathQueueOut:
     cursor = await db.execute(
         "INSERT INTO path_queue (host_id, name, remote_path, local_path, staging_path, "
         "enabled, sync_mode, auto_queue_enabled, auto_queue_patterns_only, "
-        "auto_verify, auto_extract, auto_move) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "auto_verify, auto_extract, auto_move, scan_interval_s) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             host_row["id"],
             body.name,
@@ -320,6 +340,7 @@ async def create_queue(body: PathQueueIn, request: Request) -> PathQueueOut:
             1 if _effective_auto_verify(body) else 0,
             1 if body.auto_extract else 0,
             1 if body.auto_move else 0,
+            body.scan_interval_s,
         ),
     )
     await db.commit()
@@ -339,11 +360,12 @@ async def create_queue(body: PathQueueIn, request: Request) -> PathQueueOut:
 @router.put("/queues/{queue_id}", response_model=PathQueueOut)
 async def update_queue(queue_id: int, body: PathQueueIn, request: Request) -> PathQueueOut:
     _reject_unimplemented_sync_mode(body.sync_mode)
+    _reject_invalid_scan_interval(body.scan_interval_s)
     db = request.app.state.db
     cursor = await db.execute(
         "UPDATE path_queue SET name = ?, remote_path = ?, local_path = ?, staging_path = ?, "
         "enabled = ?, sync_mode = ?, auto_queue_enabled = ?, auto_queue_patterns_only = ?, "
-        "auto_verify = ?, auto_extract = ?, auto_move = ? WHERE id = ?",
+        "auto_verify = ?, auto_extract = ?, auto_move = ?, scan_interval_s = ? WHERE id = ?",
         (
             body.name,
             body.remote_path,
@@ -356,6 +378,7 @@ async def update_queue(queue_id: int, body: PathQueueIn, request: Request) -> Pa
             1 if _effective_auto_verify(body) else 0,
             1 if body.auto_extract else 0,
             1 if body.auto_move else 0,
+            body.scan_interval_s,
             queue_id,
         ),
     )

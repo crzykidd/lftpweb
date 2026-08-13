@@ -1,7 +1,9 @@
 """The asyncio loop that owns scanning and holds the current model (DESIGN.md §2).
 
 Phase 2 scope: no job queue, no scheduler, no lftp process — this is scanning and
-reconciliation only. Every `scan_interval_s` (default 30s, DESIGN.md §5), and on demand via
+reconciliation only. Every `scan_interval_s` (default 30s, DESIGN.md §5) — per queue, as of
+migration 009 (prompts/done/2026-08-12-per-queue-scan-interval.md); `effective_scan_interval`
+resolves each queue's own column against this site-wide default — and on demand via
 `request_rescan()`, the engine re-loads `host` + `path_queue` from the database (so a config
 change takes effect on the *next* cycle without a restart), scans each enabled queue's remote
 and local trees, reconciles them (`core/reconcile.py`), persists the result to `item` rows, and
@@ -13,13 +15,27 @@ covers the gap is phase 3's `ProgressSampler`, since there's no active transfer 
 Phase 2 runs one combined interval instead; see docs/decisions.md. Splitting the cadence is a
 scale optimization for when scans are expensive, not a phase 2 correctness requirement — every
 verification in the phase 2 prompt is satisfied by a fresh combined scan, and `request_rescan()`
-gives an immediate on-demand path that doesn't wait on either interval.
+gives an immediate on-demand path that doesn't wait on either interval. The per-queue interval
+above is a different axis from this one — one combined remote+local scan *per queue*, at a
+cadence that can now vary *across* queues — and does not revisit this simplification.
+
+**The loop is a single serial `asyncio.Task` (`_loop`/`start`/`stop`), never concurrent
+fan-out.** `scan_all` awaits each due queue's `scan_queue` one at a time, in the same task that
+will next compute the following wake delay — this is the whole reason an overrunning scan can
+never stack a second concurrent scan of the same queue (or of any other queue): there is
+nowhere for a second call to run from until this one returns. A per-queue interval makes that
+guarantee worth stating explicitly rather than leaving it implicit, because a 10s option is the
+first place in this codebase an overrun (a slow shared seedbox's `find` taking longer than the
+queue's own interval) becomes a realistic, not merely theoretical, occurrence — see
+`_schedule_next`'s docstring for how the schedule itself stays correct when that happens.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import math
+import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -44,6 +60,31 @@ def _now_iso() -> str:
     return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
+def effective_scan_interval(
+    queue_scan_interval_s: float | None, site_default_s: float
+) -> float | None:
+    """Resolve one queue's `path_queue.scan_interval_s` (migration 009,
+    prompts/done/2026-08-12-per-queue-scan-interval.md) against the site-wide default.
+
+    Three states on the stored column, not two: `None` (the column's own NULL) means "this
+    queue has no opinion -- use `site_default_s`," a positive number is a literal per-queue
+    interval in seconds, and `0` (or anything `<= 0`, though the API/DB CHECK only ever lets
+    `0` or a positive value through) means **on-demand only** -- returned here as `None` too,
+    but a *result* `None` means something different from an *input* `None`: no timer will ever
+    fire for this queue again, versus "substitute the site default and treat that as the
+    timer." `core/engine.py`'s scheduling code below only ever sees the return value, so both
+    input shapes collapsing to one "never" output is exactly the simplification that matters to
+    the caller -- the loop does not need to know *why* a queue has no timer, only that it
+    doesn't. Pure and unit-tested on its own (`tests/test_engine_scan_cadence.py`) because this
+    is the one piece of the per-queue-cadence feature that is easy to get quietly backwards.
+    """
+    if queue_scan_interval_s is None:
+        return site_default_s
+    if queue_scan_interval_s <= 0:
+        return None
+    return queue_scan_interval_s
+
+
 @dataclass(frozen=True)
 class QueueConfig:
     id: int
@@ -59,6 +100,10 @@ class QueueConfig:
     # turns itself on for an existing queue is a bug -- see docs/decisions.md.
     auto_queue_enabled: bool = False
     auto_queue_patterns_only: bool = False
+    # Migration 009: `None` (every existing row -- `ADD COLUMN` with no `DEFAULT` leaves it
+    # NULL) means "use the site-wide `scan_interval_s` default," resolved through
+    # `effective_scan_interval` above -- never read as a literal 0/None interval directly here.
+    scan_interval_s: float | None = None
 
 
 async def load_host_config(db: aiosqlite.Connection, config_dir: str) -> HostConfig | None:
@@ -105,7 +150,7 @@ async def load_host_config(db: aiosqlite.Connection, config_dir: str) -> HostCon
 async def load_queues(db: aiosqlite.Connection) -> list[QueueConfig]:
     cursor = await db.execute(
         "SELECT id, host_id, name, remote_path, local_path, staging_path, enabled, sync_mode, "
-        "auto_queue_enabled, auto_queue_patterns_only FROM path_queue ORDER BY id"
+        "auto_queue_enabled, auto_queue_patterns_only, scan_interval_s FROM path_queue ORDER BY id"
     )
     rows = await cursor.fetchall()
     return [
@@ -120,6 +165,7 @@ async def load_queues(db: aiosqlite.Connection) -> list[QueueConfig]:
             sync_mode=row["sync_mode"],
             auto_queue_enabled=bool(row["auto_queue_enabled"]),
             auto_queue_patterns_only=bool(row["auto_queue_patterns_only"]),
+            scan_interval_s=row["scan_interval_s"],
         )
         for row in rows
     ]
@@ -207,6 +253,24 @@ class Engine:
         # anything" is answerable without reading a log.
         self.mount_ok: dict[int, bool] = {}
 
+        # Per-queue next-due bookkeeping for the multi-cadence loop below
+        # (prompts/done/2026-08-12-per-queue-scan-interval.md). `time.monotonic()`-comparable
+        # epoch, never wall-clock -- a clock step must not skip or double a scan. A queue
+        # absent from this dict has never completed a pass and is therefore due immediately
+        # (matches every prior phase's behavior: the very first `scan_all()` call, with this
+        # dict empty, scans every enabled queue exactly as it always has). `math.inf` is the
+        # explicit "never due on a timer" marker for a queue whose `effective_scan_interval`
+        # resolved to `None` (the "none" / on-demand-only choice) -- kept distinct from simply
+        # never appearing in the dict, which instead means "not yet scanned even once."
+        self._next_due: dict[int, float] = {}
+        # Set by `request_rescan()`, consumed and cleared by `_loop` on its next wake: a forced
+        # pass scans every enabled queue regardless of its own due time (the same "Rescan now" /
+        # config-change semantics this loop has always had), and *also* restarts every scanned
+        # queue's own clock from that pass's completion -- a forced rescan is not free for a
+        # slow-cadence queue, it is a real scan, and its next natural due time moves accordingly
+        # rather than firing again moments later.
+        self._force_full = False
+
         self._task: asyncio.Task | None = None
         self._wake = asyncio.Event()
 
@@ -225,33 +289,103 @@ class Engine:
         await self.pool.close()
 
     def request_rescan(self) -> None:
-        """Trigger an immediate scan pass rather than waiting for the interval — used by the
-        on-demand rescan API and by *Test connection* succeeding after a config change.
+        """Trigger an immediate, full scan pass rather than waiting for any queue's own
+        interval — used by the on-demand rescan API, *Test connection* succeeding after a
+        config change, and every settings write that can change what a scan would see.
         """
+        self._force_full = True
         self._wake.set()
 
     async def _loop(self) -> None:
         while True:
+            forced = self._force_full
+            self._force_full = False
             try:
-                await self.scan_all()
+                await self.scan_all(force=forced)
             except asyncio.CancelledError:
                 raise
             except Exception:  # noqa: BLE001 - one bad cycle must not kill the loop
                 logger.exception("engine scan cycle failed")
+            # `None` here means "wait indefinitely for `request_rescan()`" -- every enabled
+            # queue is on-demand-only, or there are no enabled queues at all. `asyncio.wait_for`
+            # treats `timeout=None` as "no timeout," not "timeout immediately."
+            timeout = self._next_wake_delay()
             try:
-                await asyncio.wait_for(self._wake.wait(), timeout=self.scan_interval_s)
+                await asyncio.wait_for(self._wake.wait(), timeout=timeout)
             except TimeoutError:
                 pass
             self._wake.clear()
 
-    async def scan_all(self) -> None:
+    def _next_wake_delay(self) -> float | None:
+        """How long `_loop` should sleep before its next pass: the shortest remaining time
+        across every *enabled* queue's own next-due, clamped so it is never negative (an
+        overrunning scan can only ever push a queue's own next-due into the future -- see
+        `scan_all` -- but this still guards the general case defensively). A queue not yet in
+        `_next_due` (never scanned) is due right now, so its presence alone collapses the whole
+        result to `0.0` without needing to compare a timestamp. A queue schedules `math.inf`
+        (never on a timer -- see `_next_due`'s own comment) and is excluded from the min()
+        below; if every enabled queue is like that, or there are no enabled queues, there is
+        nothing to wait *for* on a timer and this returns `None`.
+        """
+        now = time.monotonic()
+        delays: list[float] = []
+        for q in self.queue_meta.values():
+            if not q.enabled:
+                continue
+            due_at = self._next_due.get(q.id)
+            if due_at is None:
+                return 0.0
+            if due_at == math.inf:
+                continue
+            delays.append(due_at - now)
+        if not delays:
+            return None
+        return max(0.0, min(delays))
+
+    def _schedule_next(self, q: QueueConfig, *, now: float) -> None:
+        """Set queue `q`'s next-due from `now` (its own scan's completion time, not the batch
+        start -- see `scan_all`), so an overrun costs only that queue's own next interval and
+        can never make it due again before the loop has even finished this pass, let alone
+        while a scan of it is still in flight (`_loop`/`scan_all` are one serial task; nothing
+        in this class ever awaits two `scan_queue` calls for the same queue concurrently).
+        """
+        interval = effective_scan_interval(q.scan_interval_s, self.scan_interval_s)
+        self._next_due[q.id] = now + interval if interval is not None else math.inf
+
+    def _is_due(self, queue_id: int, now: float) -> bool:
+        due_at = self._next_due.get(queue_id)
+        return due_at is None or now >= due_at
+
+    async def scan_all(self, *, force: bool = False) -> None:
+        """One pass over every configured queue. `force=True` (only ever set by
+        `request_rescan()`, via `_loop`) scans every *enabled* queue unconditionally, the
+        original "one global interval" behavior; `force=False` (the timer path) scans only the
+        queues whose own `_is_due` says are due, which is the entire point of a per-queue
+        cadence -- see `_loop`'s docstring-equivalent comments and
+        `tests/test_engine_scan_cadence.py`.
+        """
         host = await load_host_config(self.db, self.config_dir)
         queues = await load_queues(self.db)
         self.queue_meta = {q.id: q for q in queues}
+
+        # A deleted queue's leftover due-time must not linger forever -- harmless (it's never
+        # read again once the id is gone from `queue_meta`), but unbounded growth in a
+        # long-running process is still worth not doing.
+        current_ids = {q.id for q in queues}
+        for stale_id in [qid for qid in self._next_due if qid not in current_ids]:
+            del self._next_due[stale_id]
+
+        now = time.monotonic()
         for q in queues:
             if not q.enabled:
                 continue
+            if not force and not self._is_due(q.id, now):
+                continue
             await self.scan_queue(q, host)
+            # Scheduled from *this queue's own* completion time, not the shared `now` above or
+            # the batch's start -- see `_schedule_next`'s docstring for why that's what actually
+            # prevents an overrunning scan from stacking a second one of the same queue.
+            self._schedule_next(q, now=time.monotonic())
 
     async def scan_queue(self, q: QueueConfig, host: HostConfig | None) -> None:
         try:

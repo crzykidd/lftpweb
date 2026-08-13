@@ -95,6 +95,12 @@ export interface PathQueueIn {
   auto_verify: boolean
   auto_extract: boolean
   auto_move: boolean
+  // Migration 009 (prompts/done/2026-08-12-per-queue-scan-interval.md). `null` -- the default,
+  // and what an existing queue already has -- means "use the site-wide default (30s)"; `0`
+  // means on-demand only (no timer; "Rescan now" and auto-queue-driving passes still work when
+  // something else forces a scan); any positive number is a literal per-queue interval in
+  // seconds. The backend rejects a negative value with a 400.
+  scan_interval_s: number | null
 }
 
 export interface PathQueueOut extends PathQueueIn {

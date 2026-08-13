@@ -130,6 +130,15 @@ class PathQueueIn(BaseModel):
     auto_verify: bool = False
     auto_extract: bool = False
     auto_move: bool = False
+    # Migration 009 (prompts/done/2026-08-12-per-queue-scan-interval.md). `None` (the default,
+    # and what an existing queue's row already has -- `ADD COLUMN` with no `DEFAULT` leaves it
+    # NULL) means "use the site-wide `scan_interval_s` default (`config.py`, currently 30s)" --
+    # the same "a new capability changes nothing for an existing install" rule every other field
+    # on this model already follows. `0` means on-demand only (no timer at all -- still
+    # scannable via "Rescan now" / `POST /api/files/rescan`); any positive number is a literal
+    # per-queue interval in seconds. `api/settings.py._reject_invalid_scan_interval` rejects a
+    # negative value with a 400 before it ever reaches the DB's own `CHECK`.
+    scan_interval_s: float | None = None
 
 
 class PathQueueOut(PathQueueIn):
