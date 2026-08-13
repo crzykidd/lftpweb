@@ -114,6 +114,32 @@ alongside this list: several entries below ship with deliberate, documented limi
   Settings-page UI yet — a named gap, same as Settings → Transfer for several earlier
   phases). See `docs/decisions.md` for the full reasoning and the DESIGN.md wording drafted,
   not yet applied, alongside this entry.
+- **Delete local files — manually from the Files page, and on a retention schedule**
+  *(2026-08-12)*. The Files tree now has a per-row and bulk "Delete" action (with a
+  confirmation dialog showing the count and total bytes — this is irreversible, unlike
+  Queue/Stop), and a new background `RetentionScheduler` can remove local copies older than a
+  configurable number of days, keyed on `downloaded_at` (not `state_changed_at` — "when did it
+  complete" and "when did it last move" are different questions). **Retention defaults off,
+  non-negotiably** — this deletes the user's own data, and that is not where this project makes
+  its one "ships on" exception (scheduled backups, which only ever add files). Both callers
+  share one primitive (`core/local_delete.py.delete_local`), which enforces path containment
+  (refusing to follow a symlink out of the queue's local root), no active job, no in-flight
+  post-processing worker, and the same mount-sentinel gate auto-queue uses — with an audited
+  `event` row for every delete *and* every withheld one. They differ in exactly one guard: a
+  robot deleting unattended (retention) requires proof another copy exists via a hard link
+  (`nlink > 1`, e.g. an `*arr`'s pickup directory) before it will act; a human deleting
+  `LOCAL_ONLY` junk by hand (Files page) does not need that proof, since removing the one and
+  only copy is the point. A dry-run preview endpoint (`POST /api/settings/retention/preview`)
+  reports exactly what a real retention pass would delete, using the same guard chain rather
+  than a second approximation of it. Also fixes a coupled bug: `REMOVED_LOCAL` items (a local
+  copy moved away by a human or an `*arr` importer) were previously excluded from auto-queue
+  forever with no way back; they're eligible again now that a deleted-by-this-app item is
+  distinguishable from one that merely left (a new `auto_queue_suppressed` reason,
+  `'deleted_local'`, migration 008). **"Delete remote" is explicitly out of scope** — the only
+  remote deletion in this app remains `move` mode's verification-gated pipeline; a manual
+  remote-delete button is a materially larger safety conversation, deliberately deferred, not
+  forgotten. No Settings-page UI for the retention toggle yet — same named gap as the settle
+  gate above and Settings → Transfer.
 
 ### Changed
 
@@ -155,6 +181,13 @@ alongside this list: several entries below ship with deliberate, documented limi
 - **A `REMOVED_LOCAL` item was published to the UI as `REMOTE_ONLY`** — Queue button and all —
   because the WebSocket carried the structural reading rather than what was persisted
   *(2026-08-12)*. Present since phase 4.
+- **`REMOVED_LOCAL` items could never be re-queued, even deliberately** *(2026-08-12)*: a local
+  copy moved away by a human or an `*arr` importer (the normal end state of a successful
+  import) was excluded from auto-queue outright, forever, with no way back short of editing the
+  database by hand. Fixed alongside the local-deletion feature above, which is what makes it
+  safe: an item this app deleted on purpose is now distinguishable (a new
+  `auto_queue_suppressed` reason) from one that merely left, so only the latter becomes eligible
+  again. Present since phase 4.
 - **An empty remote directory reported itself as `DOWNLOADED`** when nothing had been
   downloaded *(2026-08-12)*, because a directory with no files that count is vacuously
   complete. Now `REMOTE_ONLY` until mirrored — while a directory whose children are *all

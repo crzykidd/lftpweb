@@ -10,6 +10,7 @@ import type {
   BackupListResponse,
   BackupSettingsIn,
   BackupSettingsOut,
+  DeleteItemResponse,
   FilesResponse,
   HealthResponse,
   HistoryEventsFilter,
@@ -218,6 +219,15 @@ export function retryItem(itemId: number): Promise<JobOut> {
  */
 export function stopItem(itemId: number): Promise<{ applied: boolean }> {
   return sendJson<{ applied: boolean }>(`/api/items/${itemId}/stop`, 'POST')
+}
+
+/** Delete-by-item (DESIGN.md §9.2's Files-page "Delete local"; prompts/open-issues.md
+ * "7 + 8"). A withheld guard responds non-2xx, so `sendJson` throws -- this rejects exactly
+ * the way `queueItem`/`stopItem` already do on failure, which is what lets `FileTree.tsx`'s
+ * existing `Promise.allSettled` bulk-action reporting cover Delete with no new mechanism.
+ */
+export function deleteItem(itemId: number): Promise<DeleteItemResponse> {
+  return sendJson<DeleteItemResponse>(`/api/items/${itemId}/delete`, 'POST')
 }
 
 // --- Settings -> Transfer (phase 3a API, phase-9-follow-up UI -- DESIGN.md §4.5/§9.3) -----

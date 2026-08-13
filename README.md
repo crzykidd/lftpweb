@@ -22,8 +22,12 @@ progress, auto-queue on patterns, and optionally verify, extract, and relocate f
 - Connect to a seedbox over SSH/SFTP; browse the remote tree alongside the local one
 - Named **path queues** — one remote → local mapping each, with their own settings
 - Queue transfers manually, watch live progress, stop them, resume from the partial;
-  multi-select with shift-range and bulk Queue/Stop that reports partial failure honestly
-  ("7 of 10 queued, these 3 failed because …"), plus text/state filters, on the Files page
+  multi-select with shift-range and bulk Queue/Stop/Delete-local that reports partial failure
+  honestly ("7 of 10 queued, these 3 failed because …"), plus text/state filters, on the Files
+  page. Deleting local files is guarded (path containment, no active job, mount sentinel) and
+  confirmed before it runs — irreversible, unlike Queue/Stop
+- Optional scheduled retention: delete local copies older than N days, off by default, with a
+  dry-run preview endpoint (no Settings-page toggle yet — see "What doesn't yet")
 - Bandwidth ceiling and concurrency limits with an admission-control scheduler
 - Auto-queue on select/skip/file-exclude patterns, with a live "what would this match" preview
 - Post-processing: verify (sidecar or hash-on-disk), extract (7zz), and `move` mode's
@@ -44,8 +48,9 @@ and how it was verified), but real gaps remain:
 
 | | Notes |
 |---|---|
-| Files page has no bulk "Delete local" / "Delete remote" | §9.2 lists both alongside Queue/Stop; phase 9 built honest partial-failure reporting and filters for Queue/Stop only, per its own scope. Deletion still only happens automatically through `move` mode's verification-gated pipeline. |
+| Files page has no "Delete remote" | §9.2 lists it alongside "Delete local" (which now exists, per-item and bulk, with a confirmation dialog — 2026-08-12). Deliberately deferred, not forgotten: the only remote deletion is still `move` mode's verification-gated pipeline; a manual remote-delete button is a materially larger safety conversation. |
 | Propagating local deletes to the seedbox (`sync` mode) | Designed (`DESIGN.md` §7) but **not scheduled** — built only if it proves wanted. |
+| Local retention (delete-local-files-older-than-N-days) has no Settings-page UI | Backend, API (including a dry-run preview), and the background scheduler all exist (2026-08-12) and default off; only the settings screen to turn it on hasn't shipped yet — same "backend first" gap as the settle gate and Settings → Transfer before it. |
 
 See "Known gaps" below for the rest — behavioral limitations and deliberate trade-offs, as
 opposed to the unbuilt UI above.

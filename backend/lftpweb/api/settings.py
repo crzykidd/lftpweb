@@ -11,6 +11,7 @@ import logging
 
 from fastapi import APIRouter, HTTPException, Request
 
+from lftpweb.core import local_delete
 from lftpweb.core import patterns as patterns_core
 from lftpweb.core.crypto import DecryptionError, decrypt_secret, encrypt_secret
 from lftpweb.core.mount_sentinel import check as mount_ok_check
@@ -36,6 +37,11 @@ from lftpweb.models import (
     PostprocessSettingsIn,
     PostprocessSettingsOut,
     QueueAutoQueueStatus,
+    RetentionPreviewItem,
+    RetentionPreviewRequest,
+    RetentionPreviewResponse,
+    RetentionSettingsIn,
+    RetentionSettingsOut,
     SettleSettingsIn,
     SettleSettingsOut,
     TestConnectionResponse,
@@ -588,3 +594,65 @@ async def put_settle_settings(body: SettleSettingsIn, request: Request) -> Settl
     settings = SettleSettings(enabled=body.enabled)
     await save_settle_settings(request.app.state.db, settings)
     return SettleSettingsOut(enabled=settings.enabled)
+
+
+# --- Settings -> local retention (prompts/open-issues.md "7 + 8", `core/local_delete.py`) -----
+#
+# No frontend page yet -- same accepted "backend first, UI catches up later" gap as the settle
+# gate immediately above and Settings -> Transfer across several earlier phases. Defaults off
+# either way, non-negotiably (this deletes the user's own data), so its absence from any
+# settings screen changes nothing about how an existing install behaves.
+
+
+@router.get("/retention", response_model=RetentionSettingsOut)
+async def get_retention_settings(request: Request) -> RetentionSettingsOut:
+    settings = await local_delete.load_retention_settings(request.app.state.db)
+    return RetentionSettingsOut(enabled=settings.enabled, retention_days=settings.retention_days)
+
+
+@router.put("/retention", response_model=RetentionSettingsOut)
+async def put_retention_settings(
+    body: RetentionSettingsIn, request: Request
+) -> RetentionSettingsOut:
+    settings = local_delete.RetentionSettings(
+        enabled=body.enabled, retention_days=body.retention_days
+    )
+    await local_delete.save_retention_settings(request.app.state.db, settings)
+    return RetentionSettingsOut(enabled=settings.enabled, retention_days=settings.retention_days)
+
+
+@router.post("/retention/preview", response_model=RetentionPreviewResponse)
+async def retention_preview(
+    body: RetentionPreviewRequest, request: Request
+) -> RetentionPreviewResponse:
+    """ "Here is exactly what would be deleted, and the total bytes" (prompts/open-issues.md
+    "7 + 8"), mirroring `pattern_preview`'s idiom above: preview an unsaved value (or, when
+    `retention_days` is omitted, the currently saved one) without writing anything.
+    """
+    db = request.app.state.db
+    if body.retention_days is not None:
+        retention_days = body.retention_days
+    else:
+        retention_days = (await local_delete.load_retention_settings(db)).retention_days
+
+    postprocess = getattr(request.app.state, "postprocess", None)
+    in_flight = postprocess.in_flight_item_ids() if postprocess is not None else frozenset()
+
+    candidates = await local_delete.preview_retention(
+        db, retention_days=retention_days, in_flight_item_ids=in_flight
+    )
+    items = [
+        RetentionPreviewItem(
+            item_id=c["item_id"],
+            queue_id=c["queue_id"],
+            queue_name=c["queue_name"],
+            rel_path=c["rel_path"],
+            local_size=c["local_size"],
+            downloaded_at=c["downloaded_at"],
+        )
+        for c in candidates
+    ]
+    total_bytes = sum(c["local_size"] or 0 for c in candidates)
+    return RetentionPreviewResponse(
+        retention_days=retention_days, count=len(items), total_bytes=total_bytes, items=items
+    )

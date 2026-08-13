@@ -179,6 +179,15 @@ export interface FileNode {
   state_changed_at: string | null
 }
 
+// `POST /api/items/{item_id}/delete` (prompts/open-issues.md "7 + 8" -- the first delete
+// endpoint in this API). A withheld guard is a non-2xx response (client.ts's `sendJson`
+// throws), not `deleted: false` -- this shape only ever describes a successful delete.
+export interface DeleteItemResponse {
+  deleted: boolean
+  reason: string
+  bytes_freed: number | null
+}
+
 export interface QueueFiles {
   queue_id: number
   queue_name: string

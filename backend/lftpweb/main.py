@@ -24,6 +24,7 @@ from lftpweb.config import settings
 from lftpweb.core import auth
 from lftpweb.core.autoqueue import AutoQueue
 from lftpweb.core.backup import BackupScheduler
+from lftpweb.core.local_delete import RetentionScheduler
 from lftpweb.core.metrics import MetricsRetentionScheduler
 from lftpweb.core.engine import Engine, load_host_config
 from lftpweb.core.events import EventBus
@@ -102,16 +103,29 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # inside `TransferQueue.__init__` and ticks from `TransferQueue.tick()` itself, not from
     # here.
     app.state.metrics_retention = MetricsRetentionScheduler(db=app.state.db)
+    # Local-file retention (prompts/open-issues.md "7 + 8", DESIGN.md §7.1/§7.3/§7.4's bar for
+    # an irreversible-delete feature): same background-loop shape as the schedulers above,
+    # default off (core/local_delete.py.RetentionSettings). `in_flight_provider` is a thin
+    # closure over `app.state.postprocess`, constructed above, rather than a direct reference,
+    # for the same "can't hand over an instance that doesn't exist yet at construction time"
+    # reason `Engine.postprocess` is wired as a plain attribute instead of a constructor arg.
+    app.state.retention_scheduler = RetentionScheduler(
+        db=app.state.db,
+        events=app.state.events,
+        in_flight_provider=lambda: app.state.postprocess.in_flight_item_ids(),
+    )
 
     await app.state.engine.start()
     await app.state.queue.start()
     await app.state.backup_scheduler.start()
     await app.state.metrics_retention.start()
+    await app.state.retention_scheduler.start()
 
     logger.info("lftpweb %s started", __version__)
     try:
         yield
     finally:
+        await app.state.retention_scheduler.stop()
         await app.state.metrics_retention.stop()
         await app.state.backup_scheduler.stop()
         await app.state.queue.stop()

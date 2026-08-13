@@ -569,10 +569,28 @@ class Engine:
                 if state == "REMOTE_ONLY":
                     substate = "settling"
 
+            # `downloaded_at` backfill (prompts/open-issues.md "7 + 8": retention keys on this
+            # column, not `state_changed_at`, and it is otherwise written in exactly one place
+            # -- `core/queue.py`'s job-success path, `_reap_one`. An item that reaches
+            # `DOWNLOADED` by reconcile alone (pre-existing local files on first scan, a
+            # restart that resumes a scan-only view of a directory an external process
+            # finished) never passes through that write and would sit at `downloaded_at IS
+            # NULL` forever, silently invisible to retention. `COALESCE`-style: only ever fills
+            # a NULL, so a rescan can never overwrite a real job's timestamp with "now" -- the
+            # `COALESCE` reads the *stored* value on the `ON CONFLICT` branch (SQLite evaluates
+            # the pre-update column, not `excluded`), and `downloaded_stamp` below is `None`
+            # (so the `COALESCE` is a no-op) on every scan where this pass's own `state` isn't
+            # `DOWNLOADED` -- computed from `state` after every arbitration above (the settle
+            # gate included), so an item the settle gate is still holding at REMOTE_ONLY never
+            # gets stamped as if it had completed.
+            downloaded_stamp = (
+                now.strftime("%Y-%m-%dT%H:%M:%S.%fZ") if state == "DOWNLOADED" else None
+            )
+
             await self.db.execute(
                 """
-                INSERT INTO item (queue_id, rel_path, is_dir, remote_size, local_size, remote_mtime, state, substate, first_missing_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO item (queue_id, rel_path, is_dir, remote_size, local_size, remote_mtime, state, substate, first_missing_at, downloaded_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT (queue_id, rel_path) DO UPDATE SET
                     is_dir = excluded.is_dir,
                     remote_size = excluded.remote_size,
@@ -580,7 +598,8 @@ class Engine:
                     remote_mtime = excluded.remote_mtime,
                     state = excluded.state,
                     substate = excluded.substate,
-                    first_missing_at = excluded.first_missing_at
+                    first_missing_at = excluded.first_missing_at,
+                    downloaded_at = COALESCE(downloaded_at, excluded.downloaded_at)
                 """,
                 (
                     queue_id,
@@ -592,6 +611,7 @@ class Engine:
                     state,
                     substate,
                     first_missing_at,
+                    downloaded_stamp,
                 ),
             )
         if new_settle:

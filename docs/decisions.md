@@ -6,6 +6,113 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-12 — Local deletion (manual + retention): one primitive, `REMOVED_BOTH` overloaded
+## on purpose, and fixing issue 4 turned out to be free
+
+**Handoff prompt `prompts/done/2026-08-12-local-deletion-and-retention.md`, executed end to
+end** — `prompts/open-issues.md` "7 + 8 -- the deletion cluster," migration 008. The second
+irreversible-delete feature in this codebase and the first that touches the user's own data.
+
+**One primitive, `core/local_delete.py.delete_local()`, both callers.** The manual Files-page
+button (`POST /api/items/{item_id}/delete`, new — the first delete endpoint in this API) and
+`RetentionScheduler` differ in exactly one parameter, `require_nlink_guard`: off for manual
+(a human deleting `LOCAL_ONLY` junk with one copy is the point), on for retention (a robot
+deleting unattended must refuse when it can't prove another copy exists via an `*arr`'s
+hardlink out of the download directory). Every other guard — path containment, active job,
+`PostprocessPipeline.in_flight_item_ids()`, the mount sentinel — runs for both, in that order,
+with an `event` row on every delete and every withhold, matching the bar `move` mode's
+`_maybe_delete_remote` already set.
+
+**Containment: reused, not duplicated, per the prompt's own instruction.** `core/extract.py`'s
+`sweep_failed_dirs` already had a symlink-escape check (direct-child-of-root only). Pulled the
+resolve-and-compare logic out into `core/extract.py.resolve_within_root(candidate, root)` —
+returns the resolved path when `candidate` is `root` or any descendant of it, `None` on any
+escape — and both `sweep_failed_dirs` (which still additionally requires a *direct* child) and
+`delete_local` (which allows any depth, since an item's `rel_path` can itself contain `/`) call
+it. Two different containment checks guarding two different delete features is exactly how one
+of them quietly ends up weaker; there is now one.
+
+**`REMOVED_BOTH` is deliberately overloaded, and it's recorded here rather than left implicit.**
+DESIGN.md §3.2 defines it as "was downloaded, absent locally, remote deleted by us." A
+`copy`-mode queue's local-only delete doesn't touch the remote at all — "delete remote" is
+explicitly out of scope for this task (see the prompt) — so applying `REMOVED_BOTH` there is not
+literally true. It was chosen anyway over inventing a new state, because (a) it's already the
+one terminal "we're done with this row, don't touch it again" state excluded from
+`core/autoqueue.py.ELIGIBLE_STATES`, (b) it correctly tells History "something deliberate and
+final happened here," and (c) the prompt's own row-lifetime section calls for exactly this,
+by name, to avoid a delete making `_project`'s `rel_paths` filter silently drop the row from
+every published tree with nobody having "removed" it on purpose. **DESIGN.md wording is
+proposed, not applied** — same pattern the settle gate and `state_changed_at` sessions used:
+§3.2's `REMOVED_BOTH` line needs a clause acknowledging the local-only case, and §4.7's
+"Skips anything suppressed, STOPPED, FAILED, REMOVED_LOCAL, or REMOVED_BOTH" line is now stale
+(see the next paragraph) — left for the user to fold in explicitly rather than diverged from
+quietly.
+
+**Fixing issue 4 turned out to be free, once the suppression marker existed — not a scope
+compromise.** The prompt is genuinely unsure whether to attempt it ("decide... if too large,
+leave it and say so"). Tracing it through: `core/local_delete.py.delete_local` never writes
+bare `REMOVED_LOCAL` — a successful delete goes straight to `REMOVED_BOTH`, in the same write as
+`auto_queue_suppressed = 1`. So the only way an item ever reaches `REMOVED_LOCAL` at all is
+still `core/mount_sentinel.py.resolve_absence`'s grace period — the "a human or an `*arr`
+importer moved this away" case issue 4 is actually about — and *that* path has never set
+`auto_queue_suppressed`. Adding `REMOVED_LOCAL` to `ELIGIBLE_STATES` therefore only ever
+re-exposes items nothing in this codebase decided to remove; anything this codebase deleted
+stays excluded by the flag, regardless of state name. It was a one-line change plus a test
+proving both halves (`tests/test_autoqueue.py::test_removed_local_unsuppressed_is_eligible_again`
+/ `::test_removed_local_suppressed_by_our_own_delete_is_never_resurrected`) — the "trap" the
+prompt warns about (retention re-downloading everything it just deleted, forever) only exists
+if the suppression write and the `ELIGIBLE_STATES` change land in the wrong order or without
+each other, which is exactly why they shipped in the same commit.
+
+**`downloaded_at` backfill lives in `core/engine.py._persist`'s *non-protected* branch only,
+computed after every arbitration.** An item the settle gate is still holding at `REMOTE_ONLY`
+(prompts/open-issues.md #2) must not get stamped as if it had completed — computing the
+`COALESCE` value from the *final* `state` (after the settle-gate downgrade, not the
+structural reading) makes that automatic rather than a second special case. Protected rows
+(active job / suppressed) never reach this code at all — `core/queue.py._reap_one` already
+stamps the real one when a job succeeds — so there's nothing to fight there, matching the
+prompt's own warning to read that branch carefully rather than duplicate its job.
+
+**Migration 008 rebuilds the whole `item` table, and that was verified empirically before
+being written up as inevitable.** SQLite has no `ALTER TABLE ... ALTER COLUMN`; widening
+`suppressed_reason`'s `CHECK` to add `'deleted_local'` can only be done by rebuilding the
+table (`CREATE item_new`, copy, `DROP TABLE item`, rename, recreate the two indexes and
+migration 006's two triggers). Two things were confirmed against a real SQLite connection
+rather than assumed from the docs before committing to this: (1) the rebuild survives
+`job`/`event`'s foreign keys into `item` with `PRAGMA foreign_keys = ON` held the whole time —
+`DROP TABLE` doesn't run `ON DELETE` actions, and the FK simply re-resolves by name once
+`item_new` is renamed back to `item`; (2) `PRAGMA foreign_keys = OFF` (the textbook first step
+of SQLite's own 12-step "other kinds of schema change" recipe) is a documented no-op inside an
+open transaction, and `db.py.migrate()` already wraps every migration script in `BEGIN ...
+COMMIT`, so it was left out entirely rather than shipped as a pragma that does nothing. Since
+`item` rows are never deleted (an existing codebase invariant), the copy carries every row's
+`id` intact and `AUTOINCREMENT`'s sequence for the rebuilt table ends up tracking the true
+historical maximum — there's no scenario here where a rebuild could make an id get reused.
+
+**Retention settings are global, not per-queue.** `RetentionSettings` (`enabled`,
+`retention_days`) lives in `setting` like `SettleSettings`/`PostprocessSettings`/
+`BackupSettings`, not as new `path_queue` columns. Different queues wanting different
+retention windows is a real, plausible want that this doesn't serve — recorded as a
+scope-narrowing choice, not an oversight, made to keep this task's migration to the one
+`CHECK` widening it actually needed rather than also reshaping `path_queue`. No Settings-page
+UI ships either, for retention or for the manual-delete confirmation dialog's styling — the
+same "backend (and, for Files, the actual delete UI) first, a dedicated settings screen catches
+up later" gap this project already accepted for Settings → Transfer and the settle gate.
+
+**Rejected: a bulk delete endpoint.** `FileTree.tsx` already had `Promise.allSettled`
+per-item bulk Queue/Stop (phase 9). Delete slots into that same mechanism — one new
+per-item endpoint, `POST /api/items/{item_id}/delete`, called N times client-side — rather
+than a second, parallel bulk-request shape on the backend. A withheld guard raises
+`HTTPException` (409) instead of returning `deleted: false`, specifically so it flows into the
+existing "N of M succeeded, these failed because …" reporting as a real per-item failure.
+
+**Explicitly out of scope, confirmed and not built:** "Delete remote." The only remote
+deletion in this codebase remains `move` mode's verification-gated pipeline (§7.4); a manual
+remote-delete button is a materially larger safety conversation, named in the prompt as
+deliberately deferred rather than forgotten.
+
+---
+
 ## 2026-08-12 — `item.state_changed_at`: two triggers instead of writer discipline, and why
 ## the column has no `DEFAULT`
 

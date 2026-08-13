@@ -120,16 +120,60 @@ async def test_stopped_item_is_never_resurrected_even_though_its_pattern_matches
 
 
 async def test_failed_and_removed_states_are_also_never_picked_up(db, tmp_path):
+    """`REMOVED_LOCAL` is deliberately not in this list -- see the two tests below (issue 4,
+    2026-08-12): whether it's picked up now depends on `auto_queue_suppressed`, not on the
+    state name alone.
+    """
     from lftpweb.core.mount_sentinel import write_if_needed
 
     write_if_needed(str(tmp_path))
     queue_id = await _make_queue(db, tmp_path)
-    for i, state in enumerate(
-        ("FAILED", "REMOVED_LOCAL", "REMOVED_BOTH", "QUEUED", "DOWNLOADING", "DOWNLOADED")
-    ):
+    for i, state in enumerate(("FAILED", "REMOVED_BOTH", "QUEUED", "DOWNLOADING", "DOWNLOADED")):
         await _make_item(
             db, queue_id, f"Release.{i}", state=state, suppressed=1 if state == "FAILED" else 0
         )
+    recorder = _Recorder()
+    aq = AutoQueue(db, recorder)
+
+    queued = await aq.on_scan(_mounted_config(queue_id, tmp_path))
+    assert queued == 0
+    assert recorder.enqueued == []
+
+
+async def test_removed_local_unsuppressed_is_eligible_again(db, tmp_path):
+    """Issue 4 (prompts/open-issues.md, coupled to "7 + 8 -- the deletion cluster"), fixed
+    2026-08-12: an item whose local copy was moved away by a human or an *arr importer --
+    `REMOVED_LOCAL` with `auto_queue_suppressed` still clear, since nothing in this codebase
+    decided to remove it -- must be re-fetchable again, not stuck forever just because of its
+    state name.
+    """
+    from lftpweb.core.mount_sentinel import write_if_needed
+
+    write_if_needed(str(tmp_path))
+    queue_id = await _make_queue(db, tmp_path)
+    item_id = await _make_item(db, queue_id, "Release.One", state="REMOVED_LOCAL", suppressed=0)
+    recorder = _Recorder()
+    aq = AutoQueue(db, recorder)
+
+    queued = await aq.on_scan(_mounted_config(queue_id, tmp_path))
+    assert queued == 1
+    assert recorder.enqueued == [item_id]
+
+
+async def test_removed_local_suppressed_by_our_own_delete_is_never_resurrected(db, tmp_path):
+    """The other half of the same fix: a `REMOVED_LOCAL` item this codebase deleted on purpose
+    carries `auto_queue_suppressed = 1` (`core/local_delete.py.delete_local` sets it in the
+    same write) and must stay excluded -- otherwise fixing issue 4 would turn retention into a
+    30-second re-download loop, exactly the trap prompts/open-issues.md warns about. In
+    practice `delete_local` sets `state = 'REMOVED_BOTH'`, never bare `REMOVED_LOCAL`, but this
+    asserts the actual safety mechanism (the flag), not an implementation detail of which state
+    string happens to accompany it.
+    """
+    from lftpweb.core.mount_sentinel import write_if_needed
+
+    write_if_needed(str(tmp_path))
+    queue_id = await _make_queue(db, tmp_path)
+    await _make_item(db, queue_id, "Release.One", state="REMOVED_LOCAL", suppressed=1)
     recorder = _Recorder()
     aq = AutoQueue(db, recorder)
 

@@ -61,6 +61,13 @@ DEFAULT_GRACE_S = 600.0
 # §3.2 rule 3 defeated for exactly the items it matters most for.
 _COMPLETE_PREV_STATES = frozenset({"DOWNLOADED"}) | _POSTPROCESS_STATES
 
+# Public alias for the same set (`core/local_delete.py`'s retention query needs "every state
+# that asserts the item's bytes are all here" too, for exactly the same reason -- only these
+# states are eligible for a retention delete at all, since anything else either isn't fully
+# downloaded or has already left one of the trees). Named and exported here rather than
+# duplicated, so the two modules can never drift onto two different definitions of "complete."
+COMPLETE_STATES = _COMPLETE_PREV_STATES
+
 # ...plus `REMOVED_LOCAL`, where the clock has already landed and must stay landed until the
 # item's local copy genuinely reappears.
 _STICKY_PREV_STATES = _COMPLETE_PREV_STATES | frozenset({"REMOVED_LOCAL"})

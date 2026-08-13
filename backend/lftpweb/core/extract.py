@@ -284,6 +284,32 @@ def extract_archive(
     )
 
 
+def resolve_within_root(candidate: Path, root: Path) -> Path | None:
+    """Resolve `candidate` and confirm it is `root` itself or a descendant of it, refusing to
+    follow a symlink (anywhere along `candidate`'s own path, or at `candidate` itself) that
+    would place it outside `root`. Returns the resolved path when contained, `None` on any
+    escape.
+
+    The one containment check this codebase deletes disk content through -- shared by
+    `sweep_failed_dirs` below (which additionally requires a *direct* child: see its own
+    check) and `core/local_delete.py.delete_local` (which allows any depth, since an item's
+    `rel_path` can itself contain `/`). `prompts/open-issues.md` "7 + 8": "two different
+    containment checks guarding deletion is how one of them ends up subtly weaker" -- so this
+    is the only one, both a `LOCAL_ONLY` `_FAILED_` staging directory and a `LOCAL_ONLY` item
+    can be a symlink, and `rm -rf`/`shutil.rmtree` through one pointing outside the queue's
+    `local_path` is the worst possible outcome either deleting feature could produce.
+
+    `root` not existing is not this function's concern -- callers that need `root` to be a
+    real directory check that themselves (this project's queues can have a `local_path` that
+    hasn't mounted yet, and *that* failure has its own, more specific message).
+    """
+    resolved_root = root.resolve()
+    resolved_candidate = candidate.resolve()
+    if resolved_candidate != resolved_root and resolved_root not in resolved_candidate.parents:
+        return None
+    return resolved_candidate
+
+
 def _staging_dirs(final_dir: Path) -> tuple[Path, Path]:
     """The `_UNPACK_`/`_FAILED_` siblings of `final_dir`. Always siblings, never children --
     a child would sit inside the tree `core/local_scan.py` walks (and inside anything a later
@@ -421,11 +447,13 @@ def sweep_failed_dirs(
     half of that decision, run as its own pass so a directory a user is actively inspecting
     survives at least `max_age_days` before it can be swept.
 
-    **Containment is re-verified here, not assumed from the caller.** This is the one place in
-    the codebase allowed to `rmtree` disk content with nobody in the loop, so it re-checks its
-    own precondition rather than trusting a caller that got the naming right by construction:
-    a candidate is only ever removed if it resolves to a direct child of `queue_root` (rules
-    out a symlink escaping the queue root) whose basename starts with `FAILED_PREFIX`.
+    **Containment is re-verified here, not assumed from the caller.** This is one of two places
+    in the codebase allowed to remove disk content with nobody in the loop (the other is
+    `core/local_delete.py.delete_local`), so it re-checks its own precondition rather than
+    trusting a caller that got the naming right by construction: a candidate is only ever
+    removed if `resolve_within_root` confirms containment *and* it is a direct child of
+    `queue_root` (rules out a symlink escaping the queue root one level deeper than its own
+    entry) whose basename starts with `FAILED_PREFIX`.
 
     Returns `(path, age_days)` for every directory actually removed, so the caller
     (`core/postprocess.py`) can write one `event` row per removal -- DESIGN.md §3.1's audit
@@ -439,8 +467,8 @@ def sweep_failed_dirs(
     for child in sorted(resolved_root.iterdir()):
         if not child.is_dir() or not child.name.startswith(FAILED_PREFIX):
             continue
-        resolved_child = child.resolve()
-        if resolved_child.parent != resolved_root:
+        resolved_child = resolve_within_root(child, resolved_root)
+        if resolved_child is None or resolved_child.parent != resolved_root:
             continue  # symlink (or similar) escaping the queue root -- refuse
         age_days = (now_ts - child.stat().st_mtime) / 86400
         if age_days < max_age_days:

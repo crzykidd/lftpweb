@@ -172,6 +172,58 @@ class SettleSettingsIn(SettleSettingsOut):
     pass
 
 
+# --- Settings -> local retention (prompts/open-issues.md "7 + 8", `core/local_delete.py`) -----
+
+
+class RetentionSettingsOut(BaseModel):
+    # Defaults off -- non-negotiable (core/local_delete.py.RetentionSettings's own docstring):
+    # this deletes the user's own data, and deletion is not where this project makes its one
+    # "ships on" exception (scheduled backups).
+    enabled: bool = False
+    retention_days: float = 30.0
+
+
+class RetentionSettingsIn(RetentionSettingsOut):
+    pass
+
+
+class RetentionPreviewRequest(BaseModel):
+    """Mirrors `PatternPreviewRequest`'s idiom: preview against a not-yet-saved value.
+    `retention_days=None` previews the currently saved setting instead.
+    """
+
+    retention_days: float | None = None
+
+
+class RetentionPreviewItem(BaseModel):
+    item_id: int
+    queue_id: int
+    queue_name: str
+    rel_path: str
+    local_size: int | None
+    downloaded_at: str | None
+
+
+class RetentionPreviewResponse(BaseModel):
+    retention_days: float
+    count: int
+    total_bytes: int
+    items: list[RetentionPreviewItem]
+
+
+class DeleteItemResponse(BaseModel):
+    """`POST /api/items/{item_id}/delete` -- the first delete endpoint in this API (DESIGN.md
+    §9.2's Files-page "Delete local"). A withheld guard raises `HTTPException` instead of
+    returning `deleted=False` here, so the existing `Promise.allSettled` bulk-action shape
+    (`FileTree.tsx`, phase 9) reports it as a per-item failure without any new frontend
+    plumbing.
+    """
+
+    deleted: bool
+    reason: str
+    bytes_freed: int | None = None
+
+
 # --- Settings -> Queues -> Patterns (DESIGN.md §3.1 `pattern`, §4.7) --------------------
 
 PatternKind = Literal["select", "skip", "file_exclude"]

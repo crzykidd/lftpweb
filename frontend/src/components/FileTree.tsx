@@ -1,6 +1,6 @@
 import { useVirtualizer } from '@tanstack/react-virtual'
 import { useEffect, useMemo, useReducer, useRef, useState } from 'react'
-import { queueItem, stopItem } from '../api/client'
+import { deleteItem, queueItem, stopItem } from '../api/client'
 import type { FileNode } from '../api/types'
 import { formatBytes, stateAgeLabel } from '../lib/format'
 import { StateChip } from './StateChip'
@@ -84,6 +84,26 @@ function rowAction(node: FileNode): 'queue' | 'stop' | null {
   return 'queue'
 }
 
+/** Whether "Delete local" (DESIGN.md §9.2; prompts/open-issues.md "7 + 8") makes sense to
+ * offer at all -- a node with no local content has nothing this action could do. The backend
+ * (`core/local_delete.py.delete_local`) still runs every guard regardless (active job,
+ * mount sentinel, path containment) and can withhold even when this returns true; this is
+ * only about not showing a button that could never do anything, not a prediction of the
+ * guard outcome.
+ */
+const NO_LOCAL_CONTENT_STATES = new Set(['REMOTE_ONLY', 'EXCLUDED', 'REMOVED_LOCAL', 'REMOVED_BOTH'])
+function canDeleteLocal(node: FileNode): boolean {
+  return node.id != null && !NO_LOCAL_CONTENT_STATES.has(node.state)
+}
+
+/** Bytes this node's delete would free -- the same "how much is there" reading the size
+ * column already shows (`Row`'s own `size` computation), reused so the confirmation dialog's
+ * total can never disagree with what's rendered per-row.
+ */
+function localBytes(node: FileNode): number {
+  return node.local_size ?? node.remote_size ?? 0
+}
+
 interface RowProps {
   entry: TreeEntry
   isCollapsed: boolean
@@ -91,12 +111,23 @@ interface RowProps {
   onToggleCollapse: (path: string) => void
   onToggleSelect: (entry: TreeEntry, shiftKey: boolean) => void
   onAction: (entry: TreeEntry) => void
+  onDeleteRequest: (entry: TreeEntry) => void
   actionBusy: boolean
 }
 
-function Row({ entry, isCollapsed, isSelected, onToggleCollapse, onToggleSelect, onAction, actionBusy }: RowProps) {
+function Row({
+  entry,
+  isCollapsed,
+  isSelected,
+  onToggleCollapse,
+  onToggleSelect,
+  onAction,
+  onDeleteRequest,
+  actionBusy,
+}: RowProps) {
   const size = entry.is_dir ? entry.remote_size : (entry.local_size ?? entry.remote_size)
   const action = rowAction(entry)
+  const deletable = canDeleteLocal(entry)
 
   return (
     <div
@@ -158,7 +189,7 @@ function Row({ entry, isCollapsed, isSelected, onToggleCollapse, onToggleSelect,
       >
         {stateAgeLabel(entry.state, entry.state_changed_at)}
       </span>
-      <span className="w-16 shrink-0 text-right">
+      <span className="flex w-32 shrink-0 justify-end gap-1 text-right">
         {action && (
           <button
             type="button"
@@ -171,6 +202,17 @@ function Row({ entry, isCollapsed, isSelected, onToggleCollapse, onToggleSelect,
             }`}
           >
             {action === 'stop' ? 'Stop' : 'Queue'}
+          </button>
+        )}
+        {deletable && (
+          <button
+            type="button"
+            disabled={actionBusy}
+            onClick={() => onDeleteRequest(entry)}
+            title="Delete the local copy -- this cannot be undone"
+            className="rounded border border-red-300 px-1.5 py-0.5 text-xs font-medium text-red-700 hover:bg-red-50 disabled:opacity-50 dark:border-red-900 dark:text-red-300 dark:hover:bg-red-950"
+          >
+            Delete
           </button>
         )}
       </span>
@@ -189,10 +231,16 @@ interface BulkFailure {
 }
 
 interface BulkOutcome {
-  action: 'queue' | 'stop'
+  action: 'queue' | 'stop' | 'delete'
   total: number
   succeeded: number
   failures: BulkFailure[]
+}
+
+const BULK_OUTCOME_LABEL: Record<BulkOutcome['action'], string> = {
+  queue: 'Queue selected',
+  stop: 'Stop selected',
+  delete: 'Delete',
 }
 
 function errorMessage(reason: unknown): string {
@@ -227,6 +275,11 @@ export function FileTree({ nodes }: { nodes: FileNode[] }) {
   const [bulkOutcome, setBulkOutcome] = useState<BulkOutcome | null>(null)
   const [searchText, setSearchText] = useState('')
   const [stateFilter, setStateFilter] = useState('')
+  // Delete is irreversible (Queue/Stop are not) -- a confirmation step sits between "the user
+  // asked to delete" and "anything actually runs," for both the per-row button and the bulk
+  // action. `null` = no pending confirmation; otherwise the exact entries about to be deleted,
+  // so the dialog's count/byte total is read from the same list the delete itself will use.
+  const [pendingDelete, setPendingDelete] = useState<TreeEntry[] | null>(null)
 
   // Every entry regardless of collapse state -- selection and the state-filter dropdown's
   // own option list must survive a directory being collapsed, and a text/state match inside
@@ -364,15 +417,22 @@ export function FileTree({ nodes }: { nodes: FileNode[] }) {
    * wins with `Promise.all`) or silently swallowing which ones didn't make it. Entries that
    * failed stay selected afterward so the summary's list lines up with what's still checked
    * and a retry is one click away; entries that succeeded are deselected.
+   *
+   * `targets` is explicit (not always `selectedEntries`) so this same runner covers a
+   * single-row Delete confirmation, not just the multi-select bulk bar -- one mechanism for
+   * both, per the task's own instruction not to build a parallel one.
    */
-  const runBulk = async (action: 'queue' | 'stop') => {
-    const targets = selectedEntries
+  const runAction = async (action: BulkOutcome['action'], targets: TreeEntry[]) => {
     if (targets.length === 0) return
     setBulkBusy(true)
     setBulkOutcome(null)
     try {
       const results = await Promise.allSettled(
-        targets.map((e) => (action === 'queue' ? queueItem(e.id as number) : stopItem(e.id as number))),
+        targets.map((e) => {
+          if (action === 'queue') return queueItem(e.id as number)
+          if (action === 'stop') return stopItem(e.id as number)
+          return deleteItem(e.id as number)
+        }),
       )
       const failures: BulkFailure[] = []
       const succeededPaths = new Set<string>()
@@ -392,8 +452,23 @@ export function FileTree({ nodes }: { nodes: FileNode[] }) {
     }
   }
 
-  const bulkQueue = () => runBulk('queue')
-  const bulkStop = () => runBulk('stop')
+  const bulkQueue = () => runAction('queue', selectedEntries)
+  const bulkStop = () => runAction('stop', selectedEntries)
+
+  const deletableSelected = useMemo(() => selectedEntries.filter(canDeleteLocal), [selectedEntries])
+  const requestDeleteRow = (entry: TreeEntry) => setPendingDelete([entry])
+  const requestDeleteSelected = () => {
+    if (deletableSelected.length > 0) setPendingDelete(deletableSelected)
+  }
+  const confirmDelete = async () => {
+    const targets = pendingDelete
+    setPendingDelete(null)
+    if (targets) await runAction('delete', targets)
+  }
+  const pendingDeleteBytes = useMemo(
+    () => (pendingDelete ?? []).reduce((sum, e) => sum + localBytes(e), 0),
+    [pendingDelete],
+  )
 
   if (tree.length === 0) {
     return <p className="p-3 text-sm text-zinc-500 dark:text-zinc-400">Nothing scanned yet.</p>
@@ -481,11 +556,54 @@ export function FileTree({ nodes }: { nodes: FileNode[] }) {
           </button>
           <button
             type="button"
+            disabled={bulkBusy || deletableSelected.length === 0}
+            onClick={requestDeleteSelected}
+            title={
+              deletableSelected.length === 0
+                ? 'None of the selected rows have a local copy to delete'
+                : undefined
+            }
+            className="rounded-md border border-red-300 px-2 py-1 text-xs font-medium text-red-700 hover:bg-red-50 disabled:cursor-not-allowed disabled:opacity-50 dark:border-red-900 dark:text-red-300 dark:hover:bg-red-950"
+          >
+            Delete selected{deletableSelected.length > 0 && ` (${deletableSelected.length})`}
+          </button>
+          <button
+            type="button"
             onClick={clearSelection}
             className="rounded-md px-2 py-1 text-xs font-medium text-zinc-600 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800"
           >
             Clear
           </button>
+        </div>
+      )}
+
+      {/* Delete is irreversible (Queue/Stop are not) -- a confirmation dialog with the count
+          and total bytes, per the task's own bar ("meet `move` mode": two-layer opt-in, a UI
+          confirmation), sits between the request above and `runAction('delete', ...)`. */}
+      {pendingDelete && (
+        <div className="flex flex-col gap-2 rounded-md border border-red-300 bg-red-50 px-3 py-2 text-sm dark:border-red-900 dark:bg-red-950/40">
+          <p className="text-red-900 dark:text-red-200">
+            Delete the local copy of <strong>{pendingDelete.length}</strong>{' '}
+            {pendingDelete.length === 1 ? 'item' : 'items'} ({formatBytes(pendingDeleteBytes)})?
+            This only removes the local copy -- nothing remote is touched -- and cannot be
+            undone.
+          </p>
+          <div className="flex gap-2">
+            <button
+              type="button"
+              onClick={confirmDelete}
+              className="rounded-md bg-red-700 px-2 py-1 text-xs font-medium text-white hover:bg-red-800 dark:bg-red-800 dark:hover:bg-red-700"
+            >
+              Delete
+            </button>
+            <button
+              type="button"
+              onClick={() => setPendingDelete(null)}
+              className="rounded-md border border-zinc-300 px-2 py-1 text-xs font-medium text-zinc-700 hover:bg-zinc-50 dark:border-zinc-700 dark:text-zinc-200 dark:hover:bg-zinc-900"
+            >
+              Cancel
+            </button>
+          </div>
         </div>
       )}
 
@@ -499,8 +617,8 @@ export function FileTree({ nodes }: { nodes: FileNode[] }) {
         >
           <div className="flex items-center justify-between gap-3">
             <span className="font-medium">
-              {bulkOutcome.action === 'queue' ? 'Queue selected' : 'Stop selected'}: {bulkOutcome.succeeded} of{' '}
-              {bulkOutcome.total} succeeded
+              {BULK_OUTCOME_LABEL[bulkOutcome.action]}: {bulkOutcome.succeeded} of {bulkOutcome.total}{' '}
+              succeeded
               {bulkOutcome.failures.length > 0 && `, ${bulkOutcome.failures.length} failed`}
             </span>
             <button
@@ -552,6 +670,7 @@ export function FileTree({ nodes }: { nodes: FileNode[] }) {
                     onToggleCollapse={toggleCollapse}
                     onToggleSelect={toggleSelect}
                     onAction={runRowAction}
+                    onDeleteRequest={requestDeleteRow}
                     actionBusy={rowBusy.has(entry.rel_path)}
                   />
                 </div>

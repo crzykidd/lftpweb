@@ -16,9 +16,15 @@ Three things this module must get right, in order of consequence:
    does nothing at all — not deferred item-by-item — and the reason is logged and kept on
    `self.gated` for the API/UI to surface.
 3. **Suppression (§4.6).** `auto_queue_suppressed`, plus the terminal states it's paired
-   with (`STOPPED`, `FAILED`, `REMOVED_LOCAL`, `REMOVED_BOTH`), are excluded by construction:
-   the eligibility query only ever selects `REMOTE_ONLY`/`PARTIAL` items with the flag clear.
-   A `STOPPED` item whose pattern still matches must never be picked up here.
+   with (`STOPPED`, `FAILED`, `REMOVED_BOTH`), are excluded by construction: the eligibility
+   query only ever selects `ELIGIBLE_STATES` items with the flag clear. A `STOPPED` item whose
+   pattern still matches must never be picked up here. `REMOVED_LOCAL` is *also* in
+   `ELIGIBLE_STATES` (fix, 2026-08-12, prompts/open-issues.md issue 4) -- unlike the other
+   three, it is not itself a marker of anything this codebase decided; it only means "locally
+   absent, once downloaded, past the grace period" (§3.2 rule 3), which is exactly as often "a
+   human or an *arr importer moved it" as "we deleted it ourselves." The flag is what tells
+   the two apart: `core/local_delete.py.delete_local` sets `auto_queue_suppressed` on every
+   item it removes, so only the former ever reaches this branch unsuppressed.
 4. **The settle gate (prompts/open-issues.md #2, `core/settle.py`).** Off by default like
    everything else in this list; when `settle.SettleSettings.enabled` is on, a matched item is
    still skipped -- left for a later pass -- until its remote fingerprint has held for
@@ -50,9 +56,22 @@ logger = logging.getLogger(__name__)
 
 # DESIGN.md §4.6/§4.7: only a top-level item with no active job, not suppressed, and not yet
 # complete is eligible. Everything else -- QUEUED, DOWNLOADING, DOWNLOADED, STOPPED, FAILED,
-# EXCLUDED, REMOVED_LOCAL, REMOVED_BOTH, and any post-processing state -- is excluded by
-# *not* being named here, rather than by naming every excluded state explicitly.
-ELIGIBLE_STATES = ("REMOTE_ONLY", "PARTIAL")
+# EXCLUDED, REMOVED_BOTH, and any post-processing state -- is excluded by *not* being named
+# here, rather than by naming every excluded state explicitly.
+#
+# `REMOVED_LOCAL` fix, 2026-08-12 (prompts/open-issues.md issue 4, coupled to "7 + 8 -- the
+# deletion cluster"; docs/decisions.md). Previously excluded outright, which meant an item
+# whose local copy was moved away by a human or an *arr importer -- the ordinary, expected end
+# state of a successful import (DESIGN.md §7.2) -- could never be re-fetched again, by anyone,
+# short of a raw SQL edit. Adding it back is only safe because `auto_queue_suppressed` now does
+# the real work the state name alone used to be asked to do: `core/local_delete.py.
+# delete_local` sets `state = 'REMOVED_BOTH'` (never `REMOVED_LOCAL`) *and*
+# `auto_queue_suppressed = 1` in the same write for every item it deletes, so nothing this
+# codebase deleted on purpose ever reaches this branch with the flag clear. A `REMOVED_LOCAL`
+# item with `auto_queue_suppressed = 0` is, by construction, one this codebase never touched --
+# a human or an importer moved it, exactly the case DESIGN.md §3.2 rule 3 already says should
+# not be lost forever. The query below still requires the flag clear either way.
+ELIGIBLE_STATES = ("REMOTE_ONLY", "PARTIAL", "REMOVED_LOCAL")
 
 
 @dataclass(frozen=True)
