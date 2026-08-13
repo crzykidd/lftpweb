@@ -256,6 +256,10 @@ def test_postprocess_settings_round_trip_and_default_off(isolated_config):
         assert defaults["extract_enabled"] is False
         assert defaults["move_enabled"] is False
         assert defaults["concurrency"] == 1
+        # `_FAILED_` retention (fix, 2026-08-12): a new capability, so off by default even
+        # though it's the more conservative choice of the pair -- see docs/decisions.md.
+        assert defaults["failed_retention_enabled"] is False
+        assert defaults["failed_retention_days"] == 14.0
 
         resp = client.put(
             "/api/settings/postprocess",
@@ -265,6 +269,8 @@ def test_postprocess_settings_round_trip_and_default_off(isolated_config):
                 "extract_enabled": True,
                 "extract_target_dir": "/config/extracted",
                 "extract_passwords": ["hunter2", "letmein"],
+                "failed_retention_enabled": True,
+                "failed_retention_days": 21,
                 "move_enabled": True,
                 "concurrency": 3,
             },
@@ -273,11 +279,39 @@ def test_postprocess_settings_round_trip_and_default_off(isolated_config):
         saved = resp.json()
         assert saved["verify_enabled"] is True
         assert saved["extract_passwords"] == ["hunter2", "letmein"]
+        assert saved["failed_retention_enabled"] is True
+        assert saved["failed_retention_days"] == 21
         assert saved["concurrency"] == 3
 
         # Persisted, not just echoed back.
         resp = client.get("/api/settings/postprocess")
         assert resp.json() == saved
+
+
+def test_postprocess_settings_put_omitting_failed_retention_fields_keeps_them_off(
+    isolated_config,
+):
+    """A PUT body written before this fix existed (this endpoint's own contract: every field
+    required except this pair -- see `PostprocessSettingsOut`) must not 422, and must still
+    default the new capability off rather than raising or silently guessing on.
+    """
+    with TestClient(app) as client:
+        resp = client.put(
+            "/api/settings/postprocess",
+            json={
+                "verify_enabled": False,
+                "verify_hash_on_disk": False,
+                "extract_enabled": True,
+                "extract_target_dir": None,
+                "extract_passwords": [],
+                "move_enabled": False,
+                "concurrency": 1,
+            },
+        )
+        assert resp.status_code == 200
+        saved = resp.json()
+        assert saved["failed_retention_enabled"] is False
+        assert saved["failed_retention_days"] == 14.0
 
 
 # --- Phase 4: queues carry auto-queue toggles, default off (DESIGN.md §4.7) ---------------

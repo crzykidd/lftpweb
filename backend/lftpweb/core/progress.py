@@ -17,11 +17,19 @@ than silently skipped: the fake seedbox's directories (a handful of files) never
 and the phase 3 prompt's scope is the process/scheduler mechanics, not a synthetic
 tens-of-thousands-of-files fixture. `JobProgress` and `ProgressSampler` are shaped so that
 degradation is a change to `_bytes_done_for` alone when it's needed.
+
+**The per-file breakdown that walk produces is no longer thrown away.** `JobProgress.children`
+carries it (mirror jobs only) so `core/queue.py._publish_child_progress` can publish live
+per-file progress for the files inside a mirroring directory without a second walk — see that
+function's docstring for why this mattered: without it, a child file's `state`/`local_size`
+only ever changed on the next full engine scan (`scan_interval_s`, default 30s), so a multi-file
+release appeared to sit frozen and then flip to `DOWNLOADED` in one visible batch.
 """
 
 from __future__ import annotations
 
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Literal
 
@@ -55,13 +63,22 @@ class JobProgress:
     bytes_total: int | None
     speed_bps: float  # EMA-smoothed instantaneous rate; 0 on a job's first sample
     eta_s: float | None  # None when speed is 0 or bytes_total is unknown
+    # The per-file breakdown `_bytes_done_for` already walks to build `bytes_done` above, kept
+    # alongside it rather than discarded -- see this module's docstring. `None` for a `pget`
+    # job (a single file has no children); for a `mirror` job, every entry `scan_local` found
+    # under `local_root`, keyed by its `.lftp`-suffix-stripped rel_path (relative to
+    # `local_root`, i.e. relative to the *item's* own directory, not the queue root). Directory
+    # entries are included too (size always 0, per `local_scan.LocalEntry`) -- it's
+    # `core/queue.py`'s job to decide what to do with those, not this module's.
+    children: Mapping[str, local_scan.LocalEntry] | None = None
 
 
-def _bytes_done_for(job: ActiveJob) -> int:
+def _bytes_done_for(job: ActiveJob) -> tuple[int, Mapping[str, local_scan.LocalEntry] | None]:
     if job.kind == "pget":
-        return local_scan.effective_file_size(job.local_root)
+        return local_scan.effective_file_size(job.local_root), None
     entries = local_scan.scan_local(job.local_root)
-    return sum(e.size for e in entries.values() if not e.is_dir)
+    total = sum(e.size for e in entries.values() if not e.is_dir)
+    return total, entries
 
 
 class ProgressSampler:
@@ -92,7 +109,7 @@ class ProgressSampler:
 
         result: dict[int, JobProgress] = {}
         for job in jobs:
-            bytes_done = _bytes_done_for(job)
+            bytes_done, children = _bytes_done_for(job)
             prev_bytes = self._prev_bytes.get(job.job_id)
             prev_time = self._prev_time.get(job.job_id)
 
@@ -121,5 +138,6 @@ class ProgressSampler:
                 bytes_total=job.bytes_total,
                 speed_bps=speed,
                 eta_s=eta_s,
+                children=children,
             )
         return result

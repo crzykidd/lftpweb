@@ -146,6 +146,12 @@ class PostprocessSettingsOut(BaseModel):
     extract_enabled: bool
     extract_target_dir: str | None
     extract_passwords: list[str]
+    # `_FAILED_` staging directory retention (core/extract.py) -- fix, 2026-08-12
+    # (docs/decisions.md). Off by default; see core/postprocess.py.PostprocessSettings. Field
+    # defaults (unlike every other field on this model) so a PUT body from before this fix
+    # existed keeps defaulting off rather than 422ing on a field it doesn't know about.
+    failed_retention_enabled: bool = False
+    failed_retention_days: float = 14.0
     move_enabled: bool
     concurrency: int
 

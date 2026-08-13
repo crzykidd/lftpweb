@@ -17,6 +17,7 @@ import errno
 import os
 import shutil
 import subprocess
+import time
 import zipfile
 from pathlib import Path
 
@@ -341,14 +342,216 @@ def test_extract_never_writes_the_final_name_mid_extraction(tmp_path, monkeypatc
     assert (item / "inner.txt").read_text() == "zip contents"
 
 
-def test_extract_no_archives_is_a_no_op_success(tmp_path):
+def test_extract_no_archives_is_skipped_not_extracted(tmp_path):
+    """Fix, 2026-08-12 (docs/decisions.md): `SKIPPED`, not `EXTRACTED` -- a no-op must never
+    be reported as a success that claims work was done. `result.ok` (the `EXTRACTED`-only
+    convenience) is therefore False here, unlike before this fix.
+    """
     item = tmp_path / "Release"
     item.mkdir()
     (item / "video.mkv").write_bytes(b"not an archive")
 
     result = extract.extract_item(item, binary="does-not-need-to-exist")
-    assert result.ok is True
+    assert result.state == "SKIPPED"
+    assert result.ok is False
     assert "no archives" in result.detail
+    assert not (tmp_path / f"{extract.UNPACK_PREFIX}Release").exists()
+    assert not (tmp_path / f"{extract.FAILED_PREFIX}Release").exists()
+
+
+# --- core/extract.py: extraction preconditions (fix, 2026-08-12) -----------------------------
+#
+# None of these need a real 7-Zip binary: `check_extract_preconditions` is pure filesystem
+# I/O (stat + name matching) run *before* `extract_item` ever calls `_run_7z`, so every test
+# below passes `binary="does-not-need-to-exist"` the same way the no-archives test above
+# does, and asserts on real files on the real filesystem -- never a mocked `find_archives` or
+# `check_extract_preconditions` return value.
+
+
+def test_zero_length_head_is_a_named_precondition_failure_not_a_7z_attempt(tmp_path):
+    item = tmp_path / "Release"
+    item.mkdir()
+    (item / "payload.zip").write_bytes(b"")  # zero-length -- e.g. a truncated transfer
+
+    result = extract.extract_item(item, binary="does-not-need-to-exist")
+
+    assert result.state == "EXTRACT_FAILED"
+    assert "zero-length" in result.detail
+    # No attempt was made -- no staging, and therefore no `_FAILED_` litter for something
+    # 7zz was never even handed (see `extract_item`'s docstring).
+    assert not (tmp_path / f"{extract.UNPACK_PREFIX}Release").exists()
+    assert not (tmp_path / f"{extract.FAILED_PREFIX}Release").exists()
+
+
+def test_check_extract_preconditions_zero_length_file(tmp_path):
+    archive = tmp_path / "payload.zip"
+    archive.write_bytes(b"")
+    reason = extract.check_extract_preconditions(archive)
+    assert reason is not None
+    assert "zero-length" in reason
+
+
+def test_check_extract_preconditions_complete_single_volume_rar_passes(tmp_path):
+    head = tmp_path / "release.rar"
+    head.write_bytes(b"not real rar bytes, just non-empty")
+    assert extract.check_extract_preconditions(head) is None
+
+
+def test_check_extract_preconditions_old_style_complete_set_passes(tmp_path):
+    """`release.rar` + `.r00`/`.r01`/`.r02`, all present and non-empty -- a real (if
+    content-fake) multi-volume old-style rar fixture on the real filesystem, not a mock."""
+    base = tmp_path / "release.rar"
+    base.write_bytes(b"volume 1")
+    (tmp_path / "release.r00").write_bytes(b"volume 2")
+    (tmp_path / "release.r01").write_bytes(b"volume 3")
+    (tmp_path / "release.r02").write_bytes(b"volume 4")
+
+    assert extract.check_extract_preconditions(base) is None
+
+
+def test_check_extract_preconditions_old_style_missing_middle_volume_fails(tmp_path):
+    """The production shape this fix exists for: `.r00`, `.r01`, `.r03` present, `.r02`
+    missing -- a gap, not merely "some siblings exist". Must be caught before 7zz ever sees
+    the head, as a clean, named reason ("volume N of M missing"), not left to surface later
+    as "Cannot open the file as archive".
+    """
+    base = tmp_path / "All.American.S08E06.1080p.WEB.h264-GGWP.rar"
+    base.write_bytes(b"volume 1")
+    (tmp_path / "All.American.S08E06.1080p.WEB.h264-GGWP.r00").write_bytes(b"volume 2")
+    (tmp_path / "All.American.S08E06.1080p.WEB.h264-GGWP.r01").write_bytes(b"volume 3")
+    # .r02 deliberately absent
+    (tmp_path / "All.American.S08E06.1080p.WEB.h264-GGWP.r03").write_bytes(b"volume 5")
+
+    reason = extract.check_extract_preconditions(base)
+    assert reason is not None
+    assert "volume 4 of 5 missing" in reason
+
+
+def test_check_extract_preconditions_old_style_zero_length_volume_counts_as_missing(tmp_path):
+    base = tmp_path / "release.rar"
+    base.write_bytes(b"volume 1")
+    (tmp_path / "release.r00").write_bytes(b"")  # zero-length -- as useless as absent
+    (tmp_path / "release.r01").write_bytes(b"volume 3")
+
+    reason = extract.check_extract_preconditions(base)
+    assert reason is not None
+    assert "volume 2 of 3 missing" in reason
+
+
+def test_check_extract_preconditions_new_style_complete_set_passes(tmp_path):
+    head = tmp_path / "release.part1.rar"
+    head.write_bytes(b"volume 1")
+    (tmp_path / "release.part2.rar").write_bytes(b"volume 2")
+    (tmp_path / "release.part3.rar").write_bytes(b"volume 3")
+
+    assert extract.check_extract_preconditions(head) is None
+
+
+def test_check_extract_preconditions_new_style_missing_middle_volume_fails(tmp_path):
+    head = tmp_path / "release.part1.rar"
+    head.write_bytes(b"volume 1")
+    (tmp_path / "release.part2.rar").write_bytes(b"volume 2")
+    # .part3.rar deliberately absent
+    (tmp_path / "release.part4.rar").write_bytes(b"volume 4")
+
+    reason = extract.check_extract_preconditions(head)
+    assert reason is not None
+    assert "volume 3 of 4 missing" in reason
+
+
+def test_extract_item_with_incomplete_volume_set_fails_before_creating_any_staging_dir(tmp_path):
+    """End-to-end through `extract_item` (not just the precondition function directly): a
+    gap in a real multi-volume rar set on the real filesystem must produce `EXTRACT_FAILED`
+    with the named reason, and -- because the failure is caught before extraction is ever
+    attempted -- neither `_UNPACK_` nor `_FAILED_` ever exists on disk for this run.
+    """
+    item = tmp_path / "Release"
+    item.mkdir()
+    (item / "Release.rar").write_bytes(b"volume 1")
+    (item / "Release.r00").write_bytes(b"volume 2")
+    # Release.r01 (volume 3) deliberately missing; Release.r02 (volume 4) present is what
+    # makes this a *gap*, not merely "the set ends here" -- the shape this precondition can
+    # actually detect (see `check_rar_volume_set`'s docstring on the wholly-absent-final-
+    # volume limitation).
+    (item / "Release.r02").write_bytes(b"volume 4")
+
+    result = extract.extract_item(item, binary="does-not-need-to-exist")
+
+    assert result.state == "EXTRACT_FAILED"
+    assert "volume 3 of 4 missing" in result.detail
+    assert not (tmp_path / f"{extract.UNPACK_PREFIX}Release").exists()
+    assert not (tmp_path / f"{extract.FAILED_PREFIX}Release").exists()
+
+
+# --- core/extract.py.sweep_failed_dirs (fix 3, 2026-08-12) -----------------------------------
+
+
+def test_sweep_failed_dirs_removes_dirs_older_than_retention(tmp_path):
+    old_dir = tmp_path / f"{extract.FAILED_PREFIX}OldRelease"
+    old_dir.mkdir()
+    (old_dir / "evidence.txt").write_text("stale")
+    old_ts = time.time() - 20 * 86400  # 20 days old
+    os.utime(old_dir, (old_ts, old_ts))
+
+    removed = extract.sweep_failed_dirs(tmp_path, max_age_days=14.0)
+
+    assert len(removed) == 1
+    assert removed[0][0] == old_dir.resolve()
+    assert removed[0][1] >= 14.0
+    assert not old_dir.exists()
+
+
+def test_sweep_failed_dirs_leaves_recent_dirs_alone(tmp_path):
+    recent_dir = tmp_path / f"{extract.FAILED_PREFIX}FreshRelease"
+    recent_dir.mkdir()  # mtime is "now"
+
+    removed = extract.sweep_failed_dirs(tmp_path, max_age_days=14.0)
+
+    assert removed == []
+    assert recent_dir.exists()
+
+
+def test_sweep_failed_dirs_ignores_non_failed_directories(tmp_path):
+    """A same-age ordinary directory (e.g. a genuine downloaded item) must never be swept --
+    only the `_FAILED_` prefix, matched exactly, is ever a candidate.
+    """
+    other = tmp_path / "OrdinaryRelease"
+    other.mkdir()
+    old_ts = time.time() - 100 * 86400
+    os.utime(other, (old_ts, old_ts))
+
+    removed = extract.sweep_failed_dirs(tmp_path, max_age_days=14.0)
+
+    assert removed == []
+    assert other.exists()
+
+
+def test_sweep_failed_dirs_refuses_a_symlink_escaping_the_queue_root(tmp_path):
+    """Containment re-verified inside the sweep itself, not assumed from naming alone -- a
+    `_FAILED_`-prefixed entry that is actually a symlink pointing outside `queue_root` must
+    never be followed and removed.
+    """
+    outside = tmp_path.parent / f"outside-{tmp_path.name}"
+    outside.mkdir()
+    (outside / "do-not-delete.txt").write_text("must survive")
+
+    queue_root = tmp_path / "queue"
+    queue_root.mkdir()
+    escape = queue_root / f"{extract.FAILED_PREFIX}Escape"
+    escape.symlink_to(outside, target_is_directory=True)
+    old_ts = time.time() - 100 * 86400
+    os.utime(str(escape), (old_ts, old_ts), follow_symlinks=False)
+
+    try:
+        removed = extract.sweep_failed_dirs(queue_root, max_age_days=14.0)
+        assert removed == []
+        assert (outside / "do-not-delete.txt").exists()
+    finally:
+        shutil.rmtree(outside, ignore_errors=True)
+
+
+def test_sweep_failed_dirs_is_a_no_op_on_a_root_that_does_not_exist(tmp_path):
+    assert extract.sweep_failed_dirs(tmp_path / "gone", max_age_days=14.0) == []
 
 
 def test_first_rar_volume_detection_is_name_based_only():
@@ -548,6 +751,9 @@ async def test_postprocess_settings_default_off():
         assert settings.extract_enabled is False
         assert settings.move_enabled is False
         assert settings.concurrency == 1
+        # Fix, 2026-08-12: a new capability defaults off, same rule as everything else here.
+        assert settings.failed_retention_enabled is False
+        assert settings.failed_retention_days == extract.FAILED_RETENTION_DEFAULT_DAYS
     finally:
         await db.close()
 
@@ -563,6 +769,8 @@ async def test_postprocess_settings_round_trip():
             extract_enabled=True,
             extract_target_dir="/config/extracted",
             extract_passwords=("a", "b"),
+            failed_retention_enabled=True,
+            failed_retention_days=21.0,
             move_enabled=True,
             concurrency=4,
         )
@@ -780,6 +988,213 @@ async def test_every_step_defaults_off_for_a_copy_mode_queue(tmp_path):
 
 async def _async_host() -> HostConfig:
     return _host_config()
+
+
+# --- PostprocessPipeline._do_extract -- fixes 1-3 of this task, through the real pipeline ------
+
+
+async def test_pipeline_no_archives_never_stamps_extracted_and_preserves_verified(tmp_path):
+    """Fix 1, exercised end to end: a plain (non-archive) download on a queue with both verify
+    and extract on must never be stamped `EXTRACTED`, and -- the non-obvious part -- must not
+    be knocked back to `DOWNLOADED` either. Verification ran first this pass and produced a
+    real `VERIFIED`; the extract step finding nothing to do must leave that alone.
+    """
+    db = await _make_db()
+    try:
+        local_root = tmp_path / "local"
+        local_root.mkdir()
+        rel_path = "loose.txt"
+        (local_root / rel_path).write_bytes(b"just a normal, non-archive download")
+
+        _, queue_id = await _make_host_and_queue_rows(
+            db, sync_mode="copy", auto_verify=1, auto_extract=1
+        )
+        await db.execute(
+            "UPDATE path_queue SET local_path = ? WHERE id = ?", (str(local_root), queue_id)
+        )
+        await db.commit()
+        item_id = await _make_item_row(db, queue_id, rel_path)
+
+        pipeline = postprocess.PostprocessPipeline(
+            db=db, events=EventBus(), remote_pool=_FakeRemotePool(), host_provider=_async_host
+        )
+        settings = postprocess.PostprocessSettings(
+            verify_enabled=True, verify_hash_on_disk=True, extract_enabled=True
+        )
+        await pipeline.process_item(item_id, settings)
+
+        item = await (await db.execute("SELECT * FROM item WHERE id = ?", (item_id,))).fetchone()
+        assert item["state"] == "VERIFIED"  # not EXTRACTED, and not reverted to DOWNLOADED
+        assert item["extracted_at"] is None
+        assert item["verified_at"] is not None
+
+        events = await (
+            await db.execute("SELECT kind, level, message FROM event WHERE item_id = ?", (item_id,))
+        ).fetchall()
+        extract_events = [e for e in events if e["kind"] == "extract"]
+        assert len(extract_events) == 1
+        assert extract_events[0]["level"] == "info"
+        assert "no archives" in extract_events[0]["message"]
+    finally:
+        await db.close()
+
+
+async def test_pipeline_incomplete_volume_set_reports_extract_failed_with_named_reason(tmp_path):
+    """Fix 2, exercised end to end: the precondition gate must run for real inside
+    `_do_extract`, not just at the `core/extract.py` unit level -- a `copy`-mode queue with
+    verification off (the production shape this fix was written for) must still gate
+    extraction on set completeness, not just on a scan's size rollup.
+    """
+    db = await _make_db()
+    try:
+        local_root = tmp_path / "local"
+        local_root.mkdir()
+        rel_path = "Release"
+        item_dir = local_root / rel_path
+        item_dir.mkdir()
+        (item_dir / "Release.rar").write_bytes(b"volume 1")
+        (item_dir / "Release.r00").write_bytes(b"volume 2")
+        # Release.r01 (volume 3) missing; Release.r02 (volume 4) present makes it a gap.
+        (item_dir / "Release.r02").write_bytes(b"volume 4")
+
+        _, queue_id = await _make_host_and_queue_rows(db, sync_mode="copy", auto_extract=1)
+        await db.execute(
+            "UPDATE path_queue SET local_path = ? WHERE id = ?", (str(local_root), queue_id)
+        )
+        await db.commit()
+        item_id = await _make_item_row(db, queue_id, rel_path)
+
+        pipeline = postprocess.PostprocessPipeline(
+            db=db, events=EventBus(), remote_pool=_FakeRemotePool(), host_provider=_async_host
+        )
+        settings = postprocess.PostprocessSettings(extract_enabled=True)
+        await pipeline.process_item(item_id, settings)
+
+        item = await (await db.execute("SELECT * FROM item WHERE id = ?", (item_id,))).fetchone()
+        assert item["state"] == "EXTRACT_FAILED"
+        assert item["error_class"] == "EXTRACT_FAILED"
+        assert "volume 3 of 4 missing" in item["error_detail"]
+        assert item["extracted_at"] is None
+
+        # No attempt was made -- caught before any staging directory was ever created.
+        assert not (local_root / f"{extract.UNPACK_PREFIX}{rel_path}").exists()
+        assert not (local_root / f"{extract.FAILED_PREFIX}{rel_path}").exists()
+    finally:
+        await db.close()
+
+
+async def test_pipeline_failed_retention_off_by_default_leaves_stale_dir_alone(tmp_path):
+    db = await _make_db()
+    try:
+        local_root = tmp_path / "local"
+        local_root.mkdir()
+        rel_path = "loose.txt"
+        (local_root / rel_path).write_bytes(b"just a normal download")
+
+        stale = local_root / f"{extract.FAILED_PREFIX}SomeOldRelease"
+        stale.mkdir()
+        old_ts = time.time() - 100 * 86400
+        os.utime(stale, (old_ts, old_ts))
+
+        _, queue_id = await _make_host_and_queue_rows(db, sync_mode="copy", auto_extract=1)
+        await db.execute(
+            "UPDATE path_queue SET local_path = ? WHERE id = ?", (str(local_root), queue_id)
+        )
+        await db.commit()
+        item_id = await _make_item_row(db, queue_id, rel_path)
+
+        pipeline = postprocess.PostprocessPipeline(
+            db=db, events=EventBus(), remote_pool=_FakeRemotePool(), host_provider=_async_host
+        )
+        # extract_enabled on, failed_retention_enabled left at its default (off).
+        await pipeline.process_item(item_id, postprocess.PostprocessSettings(extract_enabled=True))
+
+        assert stale.exists(), "retention is off by default -- nothing should have swept it"
+        events = await (await db.execute("SELECT kind FROM event")).fetchall()
+        assert "failed_dir_removed" not in [e["kind"] for e in events]
+    finally:
+        await db.close()
+
+
+async def test_pipeline_failed_retention_enabled_sweeps_stale_dir_and_records_event(tmp_path):
+    """Fix 3, exercised end to end: enabling retention sweeps a stale `_FAILED_` sibling on
+    the same pass that would otherwise create a new one, and writes an `event` row that can be
+    traced back to the item it belonged to (recovered from the directory's own name).
+    """
+    db = await _make_db()
+    try:
+        local_root = tmp_path / "local"
+        local_root.mkdir()
+
+        stale_rel_path = "Old.Failed.Release"
+        stale = local_root / f"{extract.FAILED_PREFIX}{stale_rel_path}"
+        stale.mkdir()
+        old_ts = time.time() - 100 * 86400
+        os.utime(stale, (old_ts, old_ts))
+
+        _, queue_id = await _make_host_and_queue_rows(db, sync_mode="copy", auto_extract=1)
+        await db.execute(
+            "UPDATE path_queue SET local_path = ? WHERE id = ?", (str(local_root), queue_id)
+        )
+        await db.commit()
+        # The item that originally produced the stale `_FAILED_` dir -- already terminal
+        # (EXTRACT_FAILED) from a previous run, unrelated to the item this pass processes.
+        stale_owner_id = await _make_item_row(db, queue_id, stale_rel_path, state="EXTRACT_FAILED")
+
+        rel_path = "loose.txt"
+        (local_root / rel_path).write_bytes(b"just a normal download, unrelated to the stale dir")
+        item_id = await _make_item_row(db, queue_id, rel_path)
+
+        pipeline = postprocess.PostprocessPipeline(
+            db=db, events=EventBus(), remote_pool=_FakeRemotePool(), host_provider=_async_host
+        )
+        settings = postprocess.PostprocessSettings(
+            extract_enabled=True, failed_retention_enabled=True, failed_retention_days=14.0
+        )
+        await pipeline.process_item(item_id, settings)
+
+        assert not stale.exists(), "stale _FAILED_ dir should have been swept"
+
+        removal_events = await (
+            await db.execute("SELECT item_id, message FROM event WHERE kind = 'failed_dir_removed'")
+        ).fetchall()
+        assert len(removal_events) == 1
+        assert removal_events[0]["item_id"] == stale_owner_id
+        assert str(stale.resolve()) in removal_events[0]["message"]
+    finally:
+        await db.close()
+
+
+async def test_pipeline_failed_retention_sweep_leaves_recent_dirs_alone(tmp_path):
+    db = await _make_db()
+    try:
+        local_root = tmp_path / "local"
+        local_root.mkdir()
+
+        recent = local_root / f"{extract.FAILED_PREFIX}RecentFailure"
+        recent.mkdir()  # mtime "now"
+
+        rel_path = "loose.txt"
+        (local_root / rel_path).write_bytes(b"just a normal download")
+
+        _, queue_id = await _make_host_and_queue_rows(db, sync_mode="copy", auto_extract=1)
+        await db.execute(
+            "UPDATE path_queue SET local_path = ? WHERE id = ?", (str(local_root), queue_id)
+        )
+        await db.commit()
+        item_id = await _make_item_row(db, queue_id, rel_path)
+
+        pipeline = postprocess.PostprocessPipeline(
+            db=db, events=EventBus(), remote_pool=_FakeRemotePool(), host_provider=_async_host
+        )
+        settings = postprocess.PostprocessSettings(
+            extract_enabled=True, failed_retention_enabled=True, failed_retention_days=14.0
+        )
+        await pipeline.process_item(item_id, settings)
+
+        assert recent.exists()
+    finally:
+        await db.close()
 
 
 # --- The states this module owns: precedence over a rescan, and the in-flight registry -------

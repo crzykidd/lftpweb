@@ -21,12 +21,25 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_BINARY = os.environ.get("LFTPWEB_7Z_BIN", "7zz")
+
+# `extract_item`'s "nothing to extract" outcome (fix, 2026-08-12 -- docs/decisions.md): named
+# once here so `core/postprocess.py`'s own pre-check (which skips the step entirely rather than
+# calling into this module at all -- see that module's `_do_extract`) and this module's own
+# late-discovery fallback branch can never drift onto two different strings for the same event.
+NO_ARCHIVES_DETAIL = "no archives found"
+
+# `_FAILED_` staging directories are kept as diagnostic evidence on failure (see
+# `_staging_dirs`) but nothing removed them until this fix -- see docs/decisions.md for why
+# 14 days was chosen and why the sweep that acts on this default ships off.
+FAILED_RETENTION_DEFAULT_DAYS = 14.0
 
 # Extraction writes under these names, never the final one, until it is known to have
 # succeeded (DESIGN.md §6). Same convention `core/lftp.py` already uses for in-flight
@@ -48,12 +61,36 @@ _RAR_OLD_VOLUME_RE = re.compile(r"\.r\d{2,}$", re.IGNORECASE)  # .r00, .r01, ...
 
 _SUBPROCESS_TIMEOUT_S = 600
 
+ExtractState = Literal["EXTRACTED", "EXTRACT_FAILED", "SKIPPED"]
+
 
 @dataclass(frozen=True)
 class ExtractResult:
-    ok: bool
+    """Three outcomes, the same shape `core/verify.py.VerifyResult` already uses for exactly
+    this reason (fix, 2026-08-12 -- docs/decisions.md): a plain boolean `ok` conflated "nothing
+    to extract" with "extraction succeeded", so an item with no archives at all -- most items,
+    since extraction is opt-in per queue -- was stamped `EXTRACTED` with a real `extracted_at`
+    timestamp for work that never happened.
+
+    - `EXTRACTED`      -- every archive found under the item extracted and merged cleanly.
+    - `EXTRACT_FAILED` -- an archive failed to extract, a precondition (`check_extract_
+                          preconditions`) refused to hand one to 7zz, or the post-extraction
+                          merge into the final directory failed.
+    - `SKIPPED`         -- nothing to do: no archives were found. Not a failure and not a
+                          success -- `core/postprocess.py` must not advance `item.state` off
+                          this, the same way it never advances state off `VerifyResult.SKIPPED`.
+
+    `ok` is kept as a derived convenience for callers (and the many existing tests) that only
+    ever cared about "did extraction change anything on disk" -- true for `EXTRACTED` only.
+    """
+
+    state: ExtractState
     detail: str
     extracted_dirs: tuple[Path, ...] = ()
+
+    @property
+    def ok(self) -> bool:
+        return self.state == "EXTRACTED"
 
 
 def _is_first_rar_volume(name_lower: str) -> bool:
@@ -86,6 +123,98 @@ def find_archives(root: Path) -> list[Path]:
         if _is_compound_tar(name_lower) or name_lower.endswith(_SIMPLE_SUFFIXES):
             out.append(p)
     return out
+
+
+def _rar_volume_number(name_lower: str, head_name_lower: str) -> int | None:
+    """This file's 1-based position in `head`'s multi-volume set, or `None` if it isn't a
+    member of the set at all. Shared numbering for both conventions so
+    `check_extract_preconditions` only has to build one `{position: path}` map and look for
+    gaps in it, rather than two separate gap-detection code paths that could disagree.
+
+    - New-style (`.partNN.rar`): `head` is itself `<base>.part1.rar`; a sibling
+      `<base>.partNN.rar` is volume `N`.
+    - Old-style (bare `.rar` + `.r00`/`.r01`/...): `head` is volume 1; `<stem>.r00` is volume
+      2, `<stem>.r01` is volume 3, and so on -- WinRAR's own off-by-one continuation numbering,
+      not something this project invented.
+    """
+    if name_lower == head_name_lower:
+        return 1
+    m = _RAR_PART_RE.search(head_name_lower)
+    if m:
+        base = head_name_lower[: m.start()]
+        pm = re.match(re.escape(base) + r"\.part(\d+)\.rar$", name_lower)
+        return int(pm.group(1)) if pm else None
+    if head_name_lower.endswith(".rar"):
+        base = head_name_lower[: -len(".rar")]
+        om = re.match(re.escape(base) + r"\.r(\d{2,})$", name_lower)
+        return int(om.group(1)) + 2 if om else None
+    return None
+
+
+def check_rar_volume_set(head: Path) -> str | None:
+    """Multi-volume rar completeness precondition (DESIGN.md §6; the 2026-08-12 production
+    gating gap -- see docs/decisions.md). Covers **both** conventions via `_rar_volume_number`'s
+    shared numbering, and detects *gaps* in the sequence, not just "some siblings exist": `.r00`,
+    `.r01`, `.r03` with `.r02` missing must fail exactly like a wholly-absent set, not silently
+    hand 7zz the volumes that happen to be there and let it discover the gap mid-extraction --
+    which is the exact "Cannot open the file as archive" symptom this exists to pre-empt.
+
+    A volume counts as present only if it exists *and* is non-zero-length: a zero-byte volume
+    is exactly as useless to 7zz as an absent one, and reporting it as "missing" gives a truer
+    diagnosis ("volume 3 of 15 missing") than the symptom 7zz would otherwise surface after the
+    fact. `head` itself is assumed present -- the caller (`check_extract_preconditions`) already
+    ran the zero-length check on it before this function is reached.
+
+    **Cannot detect a wholly-absent final volume.** There is no filename evidence of the true
+    total volume count without opening the archive, which is deliberately out of scope for a
+    filesystem-only precondition -- see docs/decisions.md. Gaps *between* present volumes are
+    still caught, which is what the production failure this was written for actually looked
+    like (a mid-set volume, not the last one, went missing).
+    """
+    head_name_lower = head.name.lower()
+    present: dict[int, Path] = {1: head}
+    for sibling in head.parent.iterdir():
+        if sibling == head or not sibling.is_file():
+            continue
+        n = _rar_volume_number(sibling.name.lower(), head_name_lower)
+        if n is None:
+            continue
+        try:
+            if sibling.stat().st_size > 0:
+                present[n] = sibling
+        except OSError:
+            continue
+
+    total = max(present)
+    missing = [n for n in range(1, total + 1) if n not in present]
+    if not missing:
+        return None
+    return (
+        f"{head.name}: incomplete multi-volume set -- volume {missing[0]} of {total} "
+        "missing or zero-length"
+    )
+
+
+def check_extract_preconditions(archive: Path) -> str | None:
+    """Cheap, filesystem-only gates run before an archive is ever handed to 7zz (DESIGN.md §6;
+    the 2026-08-12 production failure and gating gap -- see docs/decisions.md). Returns `None`
+    when it's safe to proceed, or a clean, named failure reason ("volume 3 of 15 missing", not
+    "Cannot open the file as archive") when it isn't. Exported at module level, unit-testable
+    without going through `extract_item` or the postprocessing pipeline at all.
+
+    Deliberately **not** a remote-vs-local byte comparison -- that belongs with the settle-gate
+    work, a separate task, and duplicating a weaker version of it here would just be the wrong
+    place for it (see docs/decisions.md).
+    """
+    try:
+        size = archive.stat().st_size
+    except OSError as exc:
+        return f"{archive.name}: cannot stat ({exc})"
+    if size == 0:
+        return f"{archive.name}: zero-length file, refusing to extract"
+    if archive.name.lower().endswith(".rar"):
+        return check_rar_volume_set(archive)
+    return None
 
 
 def _run_7z(binary: str, args: list[str]) -> subprocess.CompletedProcess:
@@ -136,7 +265,7 @@ def extract_archive(
                     last_error = (result2.stderr or result2.stdout).strip()
                     continue
                 return ExtractResult(
-                    ok=True,
+                    state="EXTRACTED",
                     detail=f"extracted {archive.name} (compound tar)",
                     extracted_dirs=(target_dir,),
                 )
@@ -144,11 +273,15 @@ def extract_archive(
             result = _run_7z(binary, ["x", str(archive), f"-o{target_dir}", "-y", *pw_args])
             if result.returncode == 0:
                 return ExtractResult(
-                    ok=True, detail=f"extracted {archive.name}", extracted_dirs=(target_dir,)
+                    state="EXTRACTED",
+                    detail=f"extracted {archive.name}",
+                    extracted_dirs=(target_dir,),
                 )
             last_error = (result.stderr or result.stdout).strip()
 
-    return ExtractResult(ok=False, detail=f"{archive.name}: {last_error or 'extraction failed'}")
+    return ExtractResult(
+        state="EXTRACT_FAILED", detail=f"{archive.name}: {last_error or 'extraction failed'}"
+    )
 
 
 def _staging_dirs(final_dir: Path) -> tuple[Path, Path]:
@@ -171,9 +304,20 @@ def extract_item(
 ) -> ExtractResult:
     """Extract every archive found under `root` (DESIGN.md §6). `target_dir=None` means "in
     place" -- the final directory is `root` itself. An item with no archives at all (most
-    items) is a no-op success, not a failure -- extraction is opt-in per queue and most
-    releases aren't archives to begin with, and a no-op must leave no `_UNPACK_` litter
-    behind for an item that was never touched.
+    items) is a no-op, `SKIPPED` -- not `EXTRACTED` -- because extraction is opt-in per queue
+    and most releases aren't archives to begin with; claiming `EXTRACTED` (and stamping
+    `extracted_at`) for work that never happened is exactly the bug this fix (2026-08-12,
+    docs/decisions.md) removes. A no-op leaves no `_UNPACK_` litter behind either way, for an
+    item that was never touched.
+
+    Before anything is staged, every candidate archive is run through
+    `check_extract_preconditions` (2026-08-12, docs/decisions.md: the production gating gap --
+    extraction had no completeness precondition of its own, so a `copy`-mode queue with
+    verification off, the default, gated extraction on nothing but a stale size rollup). A
+    precondition failure is reported as `EXTRACT_FAILED` **without ever creating a staging or
+    `_FAILED_` directory** -- nothing was actually attempted, so there is no partial output to
+    keep as evidence, and a `_FAILED_` directory implying otherwise would be its own kind of
+    dishonesty (the same complaint fix 1, above, exists to fix in the first place).
 
     Every archive extracts into a `_UNPACK_<name>` directory staged as a *sibling* of the
     final directory (see `_staging_dirs`), never in place under the final name. Once every
@@ -188,7 +332,19 @@ def extract_item(
     """
     archives = find_archives(root)
     if not archives:
-        return ExtractResult(ok=True, detail="no archives found")
+        return ExtractResult(state="SKIPPED", detail=NO_ARCHIVES_DETAIL)
+
+    precondition_failures = [
+        msg for msg in (check_extract_preconditions(a) for a in archives) if msg
+    ]
+    if precondition_failures:
+        return ExtractResult(
+            state="EXTRACT_FAILED",
+            detail=(
+                f"{len(precondition_failures)} of {len(archives)} archive(s) failed a "
+                "precondition check before extraction began: " + "; ".join(precondition_failures)
+            ),
+        )
 
     # `root` is a directory for the common case (a release), but §4.7's loose top-level file
     # can make `root` the archive itself -- "its own directory" is then `root.parent`, the
@@ -219,7 +375,7 @@ def extract_item(
     if failures:
         staging_dir.rename(failed_dir)
         return ExtractResult(
-            ok=False,
+            state="EXTRACT_FAILED",
             detail=(
                 f"{len(failures)} of {len(archives)} archive(s) failed: "
                 + "; ".join(failures)
@@ -239,7 +395,7 @@ def extract_item(
                 shutil.rmtree(failed_dir)
             staging_dir.rename(failed_dir)
         return ExtractResult(
-            ok=False,
+            state="EXTRACT_FAILED",
             detail=(
                 f"extracted {len(archives)} archive(s) but placing them under {final_dir} "
                 f"failed: {exc} -- partial output kept at {failed_dir}"
@@ -247,7 +403,48 @@ def extract_item(
         )
 
     return ExtractResult(
-        ok=True,
+        state="EXTRACTED",
         detail=f"extracted {len(archives)} of {len(archives)} archive(s)",
         extracted_dirs=(final_dir,),
     )
+
+
+def sweep_failed_dirs(
+    queue_root: Path, *, max_age_days: float, now: float | None = None
+) -> list[tuple[Path, float]]:
+    """Remove `_FAILED_<name>` staging directories older than `max_age_days` directly under
+    `queue_root` (a path queue's `local_path`) -- fix for the third defect in this task
+    (2026-08-12, docs/decisions.md): `_FAILED_` is deliberately never cleaned up by
+    `extract_item` itself (kept as diagnostic evidence, see its docstring), but nothing ever
+    removed it either, and `core/local_scan.py` filters the prefix out of every scan -- so it
+    was invisible in the UI while consuming disk indefinitely. This is the bounded-lifetime
+    half of that decision, run as its own pass so a directory a user is actively inspecting
+    survives at least `max_age_days` before it can be swept.
+
+    **Containment is re-verified here, not assumed from the caller.** This is the one place in
+    the codebase allowed to `rmtree` disk content with nobody in the loop, so it re-checks its
+    own precondition rather than trusting a caller that got the naming right by construction:
+    a candidate is only ever removed if it resolves to a direct child of `queue_root` (rules
+    out a symlink escaping the queue root) whose basename starts with `FAILED_PREFIX`.
+
+    Returns `(path, age_days)` for every directory actually removed, so the caller
+    (`core/postprocess.py`) can write one `event` row per removal -- DESIGN.md §3.1's audit
+    trail must cover this the same as any other thing that deletes content on disk.
+    """
+    resolved_root = queue_root.resolve()
+    if not resolved_root.is_dir():
+        return []
+    now_ts = now if now is not None else time.time()
+    removed: list[tuple[Path, float]] = []
+    for child in sorted(resolved_root.iterdir()):
+        if not child.is_dir() or not child.name.startswith(FAILED_PREFIX):
+            continue
+        resolved_child = child.resolve()
+        if resolved_child.parent != resolved_root:
+            continue  # symlink (or similar) escaping the queue root -- refuse
+        age_days = (now_ts - child.stat().st_mtime) / 86400
+        if age_days < max_age_days:
+            continue
+        removed.append((resolved_child, age_days))
+        shutil.rmtree(resolved_child)
+    return removed

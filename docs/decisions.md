@@ -6,6 +6,164 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-12 — Per-file progress inside a mirroring directory is now published live, throttled
+## to every 3rd tick; the parent item's WS row is read back from `item` instead of hardcoding
+## `"state": "DOWNLOADING"`
+
+**Handoff prompt `prompts/done/2026-08-12-live-child-progress.md`, executed end to end.**
+Reported by the user watching a real multi-rar release: individual files sat visibly frozen,
+then a whole batch flipped to `DOWNLOADED` at once. Cause: `_sample_and_publish_progress`
+iterates `self._running` — one entry per *job*, one job per top-level item — so every `.rar`
+inside a mirroring directory only ever got a fresh `local_size`/`state` from the next full
+engine scan (`scan_interval_s`, default 30s), never from the ~1 Hz progress tick. Compounded by
+`xfer:use-temp-file`: a child doesn't exist under its final name until it's done, so even the
+scan sees files *appear* in clumps — the quantization is real, not just perceived.
+
+**1. No new I/O — the per-file data was already being computed and thrown away.**
+`core/progress.py`'s `_bytes_done_for` already walks a mirror job's subtree every tick via
+`local_scan.scan_local` and kept only the sum. `JobProgress` gained a `children:
+Mapping[str, LocalEntry] | None` field (`None` for `pget`, since a single file has no children)
+so that same walk's per-file breakdown rides alongside the aggregate instead of being discarded.
+No caller that only reads the existing scalar fields needed to change.
+
+**2. Throttle value: `CHILD_PROGRESS_THROTTLE_TICKS = 3`** (a new module constant in
+`core/queue.py`, ~3s at the default `tick_s=1.0`). The prompt asked for "smooth feedback, not
+1 Hz precision on each `.rar`," and named the reason to keep it well above 1: a 50-file release
+changing every file every tick is up to 50 `UPDATE`s a second, and steady write pressure like
+that is exactly what turned the `VACUUM INTO` backup race (see the entry below this one) from
+rare into routine. 3 was picked as the smallest throttle that still reads as "live" rather than
+"every few seconds" to someone watching the Files page, with headroom under the write-pressure
+threshold that mattered for the VACUUM race. **Only child (per-file) publishing is throttled —
+the parent item's own `local_size`/`job.bytes_done` update every tick, unchanged**; the defect
+was specifically the missing per-file layer, not the top-level progress bar.
+
+**3. A `MAX_CHILD_PROGRESS_UPDATES_PER_TICK = 100` cap, with a logged truncation.** In practice
+the changed set per throttled tick is bounded by lftp's own parallelism
+(`mirror_parallel_transfer_count`, a handful of files), never by release size — but the prompt
+explicitly asked for a structural cap anyway ("a silent cap reads as 'we published everything'
+when we did not"), so one exists and `logger.warning`s when it truncates. A child the cap skips
+is not marked "seen" in the diff cache, so it's picked up on a later throttled tick rather than
+silently dropped.
+
+**4. Child state uses exactly `core/reconcile.py`'s leaf rule — `local >= remote_size ->
+DOWNLOADED, else PARTIAL`** — computed in the same `UPDATE` as the size write (a `CASE` against
+the row's own `remote_size`, left alone when `remote_size IS NULL`) rather than a second
+read-then-write round trip. No second completeness rule was invented, per the prompt's explicit
+instruction; this does not touch how a *top-level* item's completeness is computed (still
+`core/reconcile.py`/scan-driven — that's the settle-gate work's territory, out of scope here).
+
+**5. The hardcoded `"state": "DOWNLOADING"` in the parent's hand-built dict was fixed, not kept
+as a deliberate fast path.** It happened to always be correct in practice — `_spawn_decision` is
+the only writer of a running job's item state, and scans never overwrite a job-lifecycle state —
+but it was *asserted*, not *read back*, which is exactly the shape that let a `REMOVED_LOCAL`
+item publish as `REMOTE_ONLY` before the 2026-08-12 `item_view` unification (entry below). The
+read-back costs one extra `SELECT ... WHERE id IN (...)` per tick, on the primary key, bounded
+by `len(self._running)` — a handful of concurrent top-level transfers, never queue size — so
+there was no performance case for keeping the hardcoded fast path. Both the parent and the new
+child rows now go through `ITEM_VIEW_COLUMNS`/`item_view`, matching `core/engine.py.scan_queue`'s
+persist -> read back -> publish invariant.
+
+**6. Tests live in a new `tests/test_queue_child_progress.py`, not `tests/test_queue.py`.**
+`_sample_and_publish_progress`/`_publish_child_progress` only read the filesystem and the
+database — no real lftp process is needed to exercise them — so, following
+`tests/test_queue_orphans.py`'s precedent, a `_RunningProcess` is built by hand (its
+`spawned`/`wait_task` fields are never touched by this code path) rather than gating the whole
+file behind the fake-seedbox `skipif`.
+
+---
+
+## 2026-08-12 — Extraction gets `VerifyResult`'s three-outcome shape; a filesystem-only
+## completeness precondition; `_FAILED_` directories get a bounded, opt-in lifetime
+
+**Handoff prompt `prompts/done/2026-08-12-extraction-honesty-and-gating.md`, executed end to
+end** — three defects in `core/extract.py`/`core/postprocess.py`, two found by code
+inspection and one from a real production extraction failure the user reported the same day.
+Grouped into one prompt because all three live in the same two files.
+
+**1. `ExtractResult` changes shape, not just a bug fix at one call site.** The bug was
+`ok: bool` conflating "nothing to extract" (most items — extraction is opt-in per queue) with
+"extraction succeeded", so a plain `.mkv` on an auto-extract queue got stamped `EXTRACTED`
+with a real `extracted_at`. The fix mirrors `core/verify.py.VerifyResult` exactly:
+`state: Literal["EXTRACTED", "EXTRACT_FAILED", "SKIPPED"]`, with `ok` kept only as a derived
+`state == "EXTRACTED"` property so the many existing tests that only ever asserted `result.ok`
+kept working unchanged. **Rejected: a second boolean (`extracted: bool` alongside `ok`).** That
+reproduces the exact bug shape one field over — two independent booleans can still be set to a
+combination nobody intended (`ok=True, extracted=False`?), where a `Literal` state can't.
+`core/verify.py` already proved the three-outcome shape works for exactly this "did nothing /
+succeeded / failed" trichotomy; there was no reason to invent a second design for the sibling
+step.
+
+**2. The pipeline skips the step entirely rather than letting `extract_item` discover the
+no-op.** `core/postprocess.py._do_extract` now calls `extract.find_archives` itself before
+`_set_item_state(..., "EXTRACTING")`; when it's empty, the method writes the (unchanged)
+`"no archives found"` audit event and returns having never touched `item.state` at all. Two
+reasons this beats letting `extract_item`'s own `SKIPPED` result flow through unconditionally:
+no `EXTRACTING` flicker on the Files page for every non-archive item (most of them), and no
+need for a restore step at all in the common case. The **non-obvious part**, still handled for
+the rare late-discovery race (archives present at the pre-check, gone by the time
+`extract_item` actually looks): `_do_extract` re-fetches the item's *current* row immediately
+before setting `EXTRACTING` and restores exactly that state on a late `SKIPPED` — never a
+hardcoded `DOWNLOADED`. The item row `_process_item` fetched at the top of its run is stale by
+the time extraction runs if verification ran first this pass (`DOWNLOADED` in memory, `VERIFIED`
+in the database); hardcoding `DOWNLOADED` here would silently throw away a real verification
+result computed one step earlier in the same pipeline run.
+
+**3. `check_extract_preconditions` is filesystem-only and runs before any staging directory
+is created.** The production failure ("Cannot open the file as archive" on a head rar volume)
+came from a `copy`-mode queue with verification off — the default — where nothing gated
+extraction on completeness at all, only a stale size rollup from the last scan. **The root
+cause of that specific failure was never confirmed** (the user was going to inspect the actual
+files and hadn't reported back); this fix doesn't assert one, and deliberately checks for the
+gating *gap*, which is real regardless of what turns out to have truncated that file. Two
+checks, both cheap and synchronous: a zero-length head, and — the one requiring real logic — a
+multi-volume rar set with a gap in it (`.r00`/`.r01`/... old-style and `.partNN.rar` new-style
+share one `{1-based position: path}` map via `_rar_volume_number`, so there's one gap-detection
+code path, not two that could disagree; a volume counts as present only if it's both there and
+non-zero-length). **A precondition failure never creates `_UNPACK_`/`_FAILED_` at all** — unlike
+a real extraction failure, nothing was actually attempted, so there's no partial output to keep
+as evidence, and a `_FAILED_` directory implying an attempt happened would be exactly the kind
+of dishonesty decision 1, above, exists to remove. **Known, accepted limitation:** a wholly
+*absent* final volume (rather than a gap between volumes that are present) can't be detected
+this way — there's no filename evidence of the true total volume count without opening the
+archive. The production failure this was written for was a mid-set gap, which this does catch.
+**Deliberately out of scope:** re-checking local bytes against remote bytes at extract time
+(the settle-gate work, a separate task) — a weaker version of that check bolted on here would
+just be in the wrong module.
+
+**4. `_FAILED_` retention defaults off, chosen over "on but conservative".** `_FAILED_`
+directories were already correctly kept forever as diagnostic evidence on a real failure — the
+bug was that nothing bounded that, and `core/local_scan.py` already filters the prefix out of
+scans, so they consumed disk with zero UI trace. `core/extract.py.sweep_failed_dirs` takes a
+`max_age_days` (14 default, arbitrary but conservative — long enough that a user who filed a bug
+report still has the evidence when someone gets to it, short enough not to be indistinguishable
+from "never") and re-verifies containment itself rather than trusting the caller: a candidate is
+only removed if it resolves to a *direct child* of the queue's `local_path` whose basename
+starts with `_FAILED_` — catches a symlink escape, not just a naming coincidence. Despite that
+containment check being about as tight as this codebase can make it, the setting
+(`PostprocessSettings.failed_retention_enabled`) still **defaults off** — this project's
+standing rule is that a new capability defaults off, and unattended deletion is exactly the
+place *not* to grant an exception for "the check is solid." The sweep runs inside
+`_do_extract`, on every pass that step runs (not conditioned on this item's own archives),
+which is simpler than a second periodic-scheduler class and still satisfies "the same pass that
+would create one" loosely enough to be worth the simplicity. Every removal writes an `event`
+row; `core/postprocess.py._find_item_id_for_failed_dir` best-effort recovers the original
+item id from the directory's own name (`_FAILED_<rel_path>`) so the removal is traceable from
+that item's own audit trail when the item row still exists, `NULL` otherwise (queue
+reconfigured, item long gone) — the event row still stands on its own with the path in the
+message either way.
+
+**5. `models.py`/`api/settings.py` also changed**, despite the prompt naming only
+`core/extract.py`/`core/postprocess.py` as the files this task lives in. Without wiring
+`failed_retention_enabled`/`failed_retention_days` through `PostprocessSettingsOut`/`In` and
+the GET/PUT handlers, the new setting could never actually be persisted from the API — every
+unrelated Settings → Post-processing save would silently reset it back to the dataclass
+default. The two new Pydantic fields carry defaults (unlike every other field on
+`PostprocessSettingsOut`) specifically so a client's existing PUT body, written before this
+fix existed, keeps defaulting the capability off instead of 422ing on an unrecognized-but-now-
+required field.
+
+---
+
 ## 2026-08-12 — `scan_complete` is a new, dedicated WebSocket message rather than a blocking
 ## `/api/files/rescan`; the busy-button clears on the message, not a request id
 

@@ -137,6 +137,14 @@ class PostprocessSettings:
     # site-level here, like bandwidth/concurrency (§4.5) rather than per-queue.
     extract_target_dir: str | None = None
     extract_passwords: tuple[str, ...] = ()
+    # `_FAILED_` staging directories (core/extract.py) are kept as diagnostic evidence
+    # forever unless this sweeps them -- fix, 2026-08-12 (docs/decisions.md). Off by default
+    # on this project's own rule ("a new capability defaults off, and deletion is not where
+    # to make an exception") even though the sweep's own containment check
+    # (`extract.sweep_failed_dirs`) is deliberately conservative: only a direct child of the
+    # queue's `local_path` whose name starts with `_FAILED_` is ever a candidate.
+    failed_retention_enabled: bool = False
+    failed_retention_days: float = extract.FAILED_RETENTION_DEFAULT_DAYS
     move_enabled: bool = False
     # DESIGN.md §6: "executed in a thread pool, one item at a time by default (configurable)."
     concurrency: int = 1
@@ -148,6 +156,8 @@ class PostprocessSettings:
             "extract_enabled": self.extract_enabled,
             "extract_target_dir": self.extract_target_dir,
             "extract_passwords": list(self.extract_passwords),
+            "failed_retention_enabled": self.failed_retention_enabled,
+            "failed_retention_days": self.failed_retention_days,
             "move_enabled": self.move_enabled,
             "concurrency": self.concurrency,
         }
@@ -169,6 +179,10 @@ async def load_postprocess_settings(db: aiosqlite.Connection) -> PostprocessSett
         extract_enabled=bool(data.get("extract_enabled", False)),
         extract_target_dir=data.get("extract_target_dir"),
         extract_passwords=tuple(passwords),
+        failed_retention_enabled=bool(data.get("failed_retention_enabled", False)),
+        failed_retention_days=float(
+            data.get("failed_retention_days", extract.FAILED_RETENTION_DEFAULT_DAYS)
+        ),
         move_enabled=bool(data.get("move_enabled", False)),
         concurrency=max(1, int(data.get("concurrency", 1))),
     )
@@ -418,7 +432,7 @@ class PostprocessPipeline:
             await self._maybe_delete_remote(item, queue, verify_state)
 
         if extract_effective:
-            await self._do_extract(item, local_root, settings)
+            await self._do_extract(item, queue, local_root, settings)
 
         if move_effective:
             await self._do_move(item, queue, local_root)
@@ -520,7 +534,42 @@ class PostprocessPipeline:
         )
         await self._publish(item_id)
 
-    async def _do_extract(self, item: Any, local_root: Path, settings: PostprocessSettings) -> None:
+    async def _do_extract(
+        self, item: Any, queue: Any, local_root: Path, settings: PostprocessSettings
+    ) -> None:
+        """Fix, 2026-08-12 (docs/decisions.md): `ok: bool` used to conflate "nothing to
+        extract" with "extraction succeeded" -- a plain `.mkv` download on an auto-extract
+        queue got stamped `EXTRACTED`, with a real `extracted_at`, for work that never
+        happened. The pre-check below (`find_archives`, not `extract_item`) is what stops
+        that: when there is nothing to extract, this method returns having never called
+        `_set_item_state(..., "EXTRACTING")` at all -- no transient-state flicker on the Files
+        page for every non-archive item, which is most of them, and no state change to
+        restore afterwards. The capture-and-restore branch inside the try below exists only
+        for a no-op `extract_item` itself discovers *late* (a race between this pre-check and
+        the real call) -- see `core/extract.py.extract_item`'s docstring for why that path
+        must restore the item's actual prior state, never hardcode `DOWNLOADED`.
+        """
+        if settings.failed_retention_enabled:
+            await self._sweep_failed_dirs(queue, settings)
+
+        archives = await asyncio.to_thread(extract.find_archives, local_root)
+        if not archives:
+            await audit.record_event(
+                self.db,
+                level="info",
+                item_id=item["id"],
+                kind="extract",
+                message=extract.NO_ARCHIVES_DETAIL,
+            )
+            await self._publish(item["id"])
+            return
+
+        # Read fresh, not from the `item` row `_process_item` fetched at the top of this run:
+        # verification (if it ran first this pass) may already have moved the item off
+        # DOWNLOADED, and that in-memory row would still say DOWNLOADED regardless.
+        current = await self._fetch_item(item["id"])
+        prior_state = current["state"] if current is not None else item["state"]
+
         await self._set_item_state(item["id"], "EXTRACTING")
         target = (
             Path(settings.extract_target_dir) / item["rel_path"]
@@ -533,26 +582,78 @@ class PostprocessPipeline:
             target_dir=target,
             passwords=settings.extract_passwords,
         )
-        if result.ok:
+        if result.state == "EXTRACTED":
             await self.db.execute(
                 "UPDATE item SET state = 'EXTRACTED', extracted_at = ? WHERE id = ?",
                 (_now_iso(), item["id"]),
             )
-        else:
+        elif result.state == "EXTRACT_FAILED":
             await self.db.execute(
                 "UPDATE item SET state = 'EXTRACT_FAILED', error_class = 'EXTRACT_FAILED', "
                 "error_detail = ? WHERE id = ?",
                 (result.detail[:2000], item["id"]),
             )
+        else:  # SKIPPED, discovered late -- restore exactly what this run found, never a
+            # hardcoded DOWNLOADED (see this method's own docstring).
+            await self.db.execute(
+                "UPDATE item SET state = ? WHERE id = ?", (prior_state, item["id"])
+            )
         await self.db.commit()
         await audit.record_event(
             self.db,
-            level="info" if result.ok else "warning",
+            level="info" if result.state in ("EXTRACTED", "SKIPPED") else "warning",
             item_id=item["id"],
             kind="extract",
             message=result.detail,
         )
         await self._publish(item["id"])
+
+    async def _sweep_failed_dirs(self, queue: Any, settings: PostprocessSettings) -> None:
+        """Fix, 2026-08-12 (docs/decisions.md): `_FAILED_` staging directories
+        (`core/extract.py`) were kept as diagnostic evidence forever -- correct on failure,
+        but nothing ever removed them, and `core/local_scan.py` filters the prefix out of
+        every scan, so they consumed disk invisibly. Runs on the same pass that would create a
+        new one (this method's only caller, `_do_extract`), gated by
+        `PostprocessSettings.failed_retention_enabled` -- default off, this project's rule for
+        anything that deletes, regardless of how conservative the containment check
+        (`extract.sweep_failed_dirs`) already is.
+        """
+        removed = await asyncio.to_thread(
+            extract.sweep_failed_dirs,
+            Path(queue["local_path"].rstrip("/")),
+            max_age_days=settings.failed_retention_days,
+        )
+        for path, age_days in removed:
+            item_id = await self._find_item_id_for_failed_dir(queue["id"], path)
+            await audit.record_event(
+                self.db,
+                level="info",
+                item_id=item_id,
+                kind="failed_dir_removed",
+                message=(
+                    f"removed stale extraction-failure evidence {path} "
+                    f"(age {age_days:.1f}d >= retention {settings.failed_retention_days}d)"
+                ),
+            )
+            if item_id is not None:
+                await self._publish(item_id)
+
+    async def _find_item_id_for_failed_dir(self, queue_id: int, path: Path) -> int | None:
+        """Best-effort: `_FAILED_<name>` directories are not tied to a live item row by
+        construction (the item that produced one may since have been re-downloaded, or the
+        directory may outlive it entirely), but its `rel_path` is recoverable from its own
+        name -- so the removal event can usually still be found from that item's own audit
+        trail, matching DESIGN.md §6's "something invisible that consumes disk is worse than
+        something ugly" for the *removal* record, not only the original failure. `None` if no
+        matching item exists any more; the event row still stands on its own, with the path in
+        the message.
+        """
+        rel_path = path.name[len(extract.FAILED_PREFIX) :]
+        cursor = await self.db.execute(
+            "SELECT id FROM item WHERE queue_id = ? AND rel_path = ?", (queue_id, rel_path)
+        )
+        row = await cursor.fetchone()
+        return row["id"] if row is not None else None
 
     async def _do_move(self, item: Any, queue: Any, local_root: Path) -> None:
         dest = Path(queue["staging_path"].rstrip("/")) / item["rel_path"]

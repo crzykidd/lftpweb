@@ -169,6 +169,45 @@ alongside this list: several entries below ship with deliberate, documented limi
   now shows each queue's last-scanned time relative to now (absolute on hover), driven by the
   same message, with a partial-scan warning folded into the same readout instead of only a log
   line.
+- **An item with nothing to extract was stamped `EXTRACTED`, with a real `extracted_at`**
+  *(2026-08-12)*: `extract_item` returned a bare `ok=True` for "no archives found", and
+  post-processing treated any `ok=True` as a genuine success — so a plain, non-archive download
+  on an auto-extract queue got a false extraction record. `ExtractResult` now carries the same
+  three-outcome shape as `core/verify.py`'s `VerifyResult` (`EXTRACTED` / `EXTRACT_FAILED` /
+  `SKIPPED`); the pipeline checks `find_archives` itself before ever transitioning an item to
+  `EXTRACTING`, so a non-archive item's state (including a real `VERIFIED` from earlier the same
+  pass) is left untouched rather than overwritten or reverted to `DOWNLOADED`.
+- **Extraction had no completeness precondition of its own** *(2026-08-12, found against a real
+  production failure — root cause of the specific file involved not confirmed, but the gating
+  gap is real regardless)*: a `copy`-mode queue with verification off — the default — gated
+  extraction on nothing but a size rollup computed at the last scan, so a truncated or
+  short-by-one-volume rar set reached 7zz and failed with the opaque "Cannot open the file as
+  archive" instead of a diagnosis. `core/extract.py.check_extract_preconditions` now rejects a
+  zero-length head and an incomplete multi-volume rar set (both old-style `.r00`/`.r01`/... and
+  new-style `.partNN.rar`, detecting gaps in the sequence, not just "some volumes exist") before
+  any archive is handed to 7zz, with a named reason ("volume 3 of 4 missing") — and, since
+  nothing was actually attempted, without creating a `_UNPACK_`/`_FAILED_` staging directory for
+  the failed attempt.
+- **`_FAILED_` extraction-evidence directories accumulated on disk forever, invisibly** — kept
+  correctly as diagnostic evidence on a real extraction failure, but nothing ever removed them,
+  and `core/local_scan.py` already filtered the prefix out of every scan, so they consumed disk
+  with no UI trace at all *(2026-08-12)*. `core/extract.py.sweep_failed_dirs` can now bound their
+  lifetime (default 14 days), gated by a new Settings → Post-processing toggle that defaults
+  **off** — a new capability, and deletion isn't where this project makes an exception to that
+  rule — with a re-verified containment check and an `event` row for every removal.
+- **Files inside a mirroring directory sat visibly frozen, then flipped a whole batch to
+  `DOWNLOADED` at once** *(2026-08-12)*: `_sample_and_publish_progress` samples one entry per
+  running *job*, and a `mirror` job is one job for the whole release, so every child `.rar` only
+  got a fresh `local_size`/`state` from the next full engine scan (`scan_interval_s`, default
+  30s) — and `xfer:use-temp-file` meant even that scan saw files *appear* in clumps, since a
+  child doesn't exist under its final name until it's done. `core/progress.py`'s per-tick
+  subtree walk already computed every child's size and discarded it; it now surfaces that
+  breakdown, and `core/queue.py` diffs it against the previous tick and publishes only the
+  children that changed (throttled to every 3rd tick, capped, with a logged truncation) using
+  the same `local >= remote_size -> DOWNLOADED : PARTIAL` rule `core/reconcile.py` uses for a
+  leaf file. In the same pass, the parent item's WS row stopped hardcoding `"state":
+  "DOWNLOADING"` and is now read back from `item` like everything else `core/itemview.py`
+  projects.
 
 ### Security
 

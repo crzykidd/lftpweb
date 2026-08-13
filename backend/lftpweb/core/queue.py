@@ -27,9 +27,9 @@ import aiosqlite
 
 from lftpweb.core import lftp, patterns, scheduler
 from lftpweb.core.events import EventBus
-from lftpweb.core.itemview import item_view
+from lftpweb.core.itemview import ITEM_VIEW_COLUMNS, ItemView, item_view
 from lftpweb.core.metrics import RunningJobBytes, ThroughputSampler
-from lftpweb.core.progress import ActiveJob, ProgressSampler
+from lftpweb.core.progress import ActiveJob, JobProgress, ProgressSampler
 from lftpweb.core.remote import HostConfig, parse_connection_limit
 
 logger = logging.getLogger(__name__)
@@ -44,6 +44,24 @@ DEFAULT_RETRY_BACKOFF_MAX_S = 15 * 60.0
 PERMANENT_ERROR_CLASSES = frozenset(
     {"AUTH_FAILED", "PERMISSION_DENIED", "REMOTE_GONE", "DISK_FULL"}
 )
+
+# Live per-file progress inside a mirroring directory (see `_publish_child_progress`), tuned
+# separately from the ~1 Hz `tick_s` cadence everything else in this module runs at:
+#
+# - `CHILD_PROGRESS_THROTTLE_TICKS`: publish/persist per-child progress only every Nth tick,
+#   not every tick. Smooth feedback doesn't need 1 Hz precision on each `.rar`, and a 50-file
+#   release changing every tick at 1 Hz is up to 50 `UPDATE`s a second -- steady write pressure
+#   like that is exactly what turned the `VACUUM INTO` backup race from rare into routine (see
+#   `docs/decisions.md`, `209928d`). 3 ticks (~3s at the default `tick_s`) keeps the writes
+#   batched while still reading as "live" to someone watching the Files page.
+# - `MAX_CHILD_PROGRESS_UPDATES_PER_TICK`: a safety cap, not the normal case. In practice the
+#   changed set per throttled tick is bounded by lftp's own parallelism
+#   (`mirror_parallel_transfer_count`, a handful of files at a time), never by how large the
+#   release is -- but nothing here enforces that bound structurally, so a cap plus a logged
+#   truncation (rather than a silent one) is cheap insurance against a future case where it
+#   doesn't hold.
+CHILD_PROGRESS_THROTTLE_TICKS = 3
+MAX_CHILD_PROGRESS_UPDATES_PER_TICK = 100
 
 
 def _now_iso() -> str:
@@ -212,6 +230,19 @@ class TransferQueue:
         # skews the instantaneous rate it derives). This cache is what `list_jobs()` reads
         # instead: whatever the last real tick computed.
         self._last_progress: dict[int, Any] = {}  # job_id -> progress.JobProgress
+
+        # Live per-file (child) progress inside a mirroring directory -- see
+        # `_publish_child_progress`. `_progress_tick_count` counts calls to
+        # `_sample_and_publish_progress` so child publishing can be throttled to every
+        # `CHILD_PROGRESS_THROTTLE_TICKS`-th one. `_prev_child_sizes` is job_id -> {child
+        # rel_path (relative to the job's own `local_root`, i.e. the item's directory, not the
+        # queue root) -> the size last diffed for it} -- only the rel_paths this module has
+        # actually persisted/published, so a child skipped by the cap on one tick still reads
+        # as "changed" on the next rather than being silently marked seen. Reset per job_id in
+        # `_reap_one` below so a future job id never inherits stale history (same shape as
+        # `self.progress.drop`).
+        self._progress_tick_count = 0
+        self._prev_child_sizes: dict[int, dict[str, int]] = {}
 
         self._task: asyncio.Task | None = None
         self._wake = asyncio.Event()
@@ -438,6 +469,7 @@ class TransferQueue:
         self.metrics.drop(proc.job_id)
         self._last_speeds.pop(proc.job_id, None)
         self._last_progress.pop(proc.job_id, None)
+        self._prev_child_sizes.pop(proc.job_id, None)
 
         if not proc.wait_task.done():
             # stop_job() reaps immediately after terminate() returns, before the task's own
@@ -554,6 +586,20 @@ class TransferQueue:
           live instead of waiting for the next full engine scan (up to `scan_interval_s`,
           default 30s) — the gap that made "stop it and see it go STOPPED without a page
           refresh" impossible before this phase.
+
+        The parent item's row is *persisted then read back* through `core/itemview.py` rather
+        than hand-built, matching `core/engine.py.scan_queue`'s invariant (DESIGN.md §2/§9):
+        nothing goes on the wire that wasn't read back out of `item`. This used to hand-build
+        the dict with `"state": "DOWNLOADING"` hardcoded instead -- true in practice, because
+        `_spawn_decision` is the only writer of a running job's item state and scans never
+        overwrite a job-lifecycle state, but asserted rather than read, which is exactly the
+        shape that let a `REMOVED_LOCAL` item publish as `REMOTE_ONLY` before this file's WS
+        paths were unified onto `item_view` (`docs/decisions.md`, 2026-08-12). The extra
+        `SELECT` is one indexed lookup per running job -- bounded by `len(self._running)`, a
+        handful of concurrent top-level transfers, never queue size.
+
+        Child (per-file) progress inside a mirroring directory is a separate, throttled pass
+        -- see `_publish_child_progress`.
         """
         if not self._running:
             return
@@ -569,7 +615,6 @@ class TransferQueue:
                 "UPDATE job SET bytes_done = ? WHERE id = ?", (prog.bytes_done, job_id)
             )
 
-        by_queue: dict[int, list[dict[str, Any]]] = {}
         for p in self._running.values():
             prog = results.get(p.job_id)
             if prog is None:
@@ -577,20 +622,34 @@ class TransferQueue:
             await self.db.execute(
                 "UPDATE item SET local_size = ? WHERE id = ?", (prog.bytes_done, p.item_id)
             )
-            by_queue.setdefault(p.queue_id, []).append(
-                {
-                    "id": p.item_id,
-                    "rel_path": p.rel_path,
-                    "is_dir": p.is_dir,
-                    "state": "DOWNLOADING",
-                    "remote_size": p.bytes_total,
-                    "local_size": prog.bytes_done,
-                    "remote_mtime": p.remote_mtime,
-                }
-            )
         await self.db.commit()
         self._last_speeds = {job_id: prog.speed_bps for job_id, prog in results.items()}
         self._last_progress = results
+
+        parent_ids = [p.item_id for p in self._running.values() if p.job_id in results]
+        parent_views: dict[int, ItemView] = {}
+        if parent_ids:
+            placeholders = ",".join("?" * len(parent_ids))
+            cursor = await self.db.execute(
+                # ITEM_VIEW_COLUMNS is a module constant and `placeholders` is just `?`
+                # repeated once per id; the only bound values are `parent_ids` itself.
+                f"SELECT {ITEM_VIEW_COLUMNS} FROM item WHERE id IN ({placeholders})",  # noqa: S608
+                parent_ids,
+            )
+            parent_views = {row["id"]: item_view(row) for row in await cursor.fetchall()}
+
+        by_queue: dict[int, list[dict[str, Any]]] = {}
+        for p in self._running.values():
+            view = parent_views.get(p.item_id)
+            if view is not None:
+                by_queue.setdefault(p.queue_id, []).append(view)
+
+        # Throttled, not every tick -- see CHILD_PROGRESS_THROTTLE_TICKS's comment. Appends
+        # into `by_queue` in place so a child rides the same `item_delta` message as its
+        # parent's row instead of a second WS round trip.
+        self._progress_tick_count += 1
+        if self._progress_tick_count % CHILD_PROGRESS_THROTTLE_TICKS == 0:
+            await self._publish_child_progress(results, by_queue)
 
         for queue_id, nodes in by_queue.items():
             self.events.publish({"type": "item_delta", "queue_id": queue_id, "nodes": nodes})
@@ -611,6 +670,119 @@ class TransferQueue:
                 ],
             }
         )
+
+    async def _publish_child_progress(
+        self, results: dict[int, JobProgress], by_queue: dict[int, list[dict[str, Any]]]
+    ) -> None:
+        """Live per-file progress for the files inside a mirroring directory -- the fix this
+        task exists for.
+
+        The defect: a `mirror` job is one row in `self._running` no matter how many files it
+        contains, so the loop above only ever updates and publishes the *parent* item. Every
+        child file's `local_size`/`state` was previously only ever recomputed by the next full
+        engine scan (`scan_interval_s`, default 30s) -- so a multi-file release sat visibly
+        frozen, then flipped a whole batch of rows to `DOWNLOADED` at once when the scan caught
+        up. Two things compound that: lftp writes `foo.rar.lftp` while transferring and renames
+        it on completion (so a child doesn't exist under its final name until it's done -- real
+        quantization, not just a perceived one), and the per-file sizes were already being
+        computed by `core/progress.py`'s walk and thrown away, keeping only the sum. Neither
+        needs new I/O; `JobProgress.children` (from that same walk, already `.lftp`-suffix
+        stripped by `local_scan.scan_local`) is the fix.
+
+        Diffs each mirror job's children against `self._prev_child_sizes` (last tick *this
+        method actually ran*, not every `tick_s`) so only files whose effective size changed
+        do any work -- naturally small, since `mirror` only transfers a handful of files
+        concurrently (bounded by `mirror_parallel_transfer_count`), never by release size.
+        Directories are excluded from the diff: `local_scan.LocalEntry.size` is always 0 for a
+        directory, so a real directory is never "changed" by this rule, and excluding it
+        explicitly (rather than relying on that always being true) keeps the child-state rule
+        below scoped to files, which is the only shape `core/reconcile.py` defines it for.
+
+        Child state uses the exact rule `core/reconcile.py` uses for a leaf file: `local >=
+        remote -> DOWNLOADED, else PARTIAL` -- against the child's own persisted
+        `item.remote_size`, left alone (not overwritten) when that's `NULL` (remote size not
+        yet known), since "unknown vs. 0" is not this method's call to make. This does not
+        change how a *top-level* item's completeness is computed (out of scope here; that's
+        `core/reconcile.py`/the settle-gate work) -- only leaf files nested under a currently
+        downloading mirror item.
+
+        Persist -> read back -> publish, same invariant as the parent above and
+        `core/engine.py.scan_queue`: a child's `UPDATE` is issued for every changed file (up
+        to the cap), all committed together (batching the writes is the point -- see
+        `CHILD_PROGRESS_THROTTLE_TICKS`'s comment), then read back through `ITEM_VIEW_COLUMNS`/
+        `item_view` and only *that* goes on the wire. A child with no matching `item` row (not
+        yet persisted by an engine scan) is silently skipped, not invented here -- `_persist`
+        in `core/engine.py` is the only writer of new `item` rows.
+        """
+        parent_by_job = {p.job_id: p for p in self._running.values()}
+        updates_remaining = MAX_CHILD_PROGRESS_UPDATES_PER_TICK
+        truncated = False
+        to_read_back: dict[int, list[str]] = {}  # queue_id -> full rel_paths to read back
+
+        for job_id, prog in results.items():
+            if prog.children is None:  # pget job: no children to report
+                continue
+            parent = parent_by_job.get(job_id)
+            if parent is None:
+                continue
+
+            prev = self._prev_child_sizes.setdefault(job_id, {})
+            current = {rel: entry.size for rel, entry in prog.children.items() if not entry.is_dir}
+            changed = [rel for rel, size in current.items() if prev.get(rel) != size]
+            if not changed:
+                continue
+
+            if len(changed) > updates_remaining:
+                changed = changed[:updates_remaining]
+                truncated = True
+            updates_remaining -= len(changed)
+
+            full_paths = []
+            for rel in changed:
+                size = current[rel]
+                full_path = f"{parent.rel_path}/{rel}"
+                full_paths.append(full_path)
+                await self.db.execute(
+                    "UPDATE item SET local_size = ?, state = CASE "
+                    "WHEN remote_size IS NULL THEN state "
+                    "WHEN ? >= remote_size THEN 'DOWNLOADED' "
+                    "ELSE 'PARTIAL' END "
+                    "WHERE queue_id = ? AND rel_path = ?",
+                    (size, size, parent.queue_id, full_path),
+                )
+                # Only mark a rel_path "seen" once it's actually been persisted -- a child the
+                # cap skipped this tick must still read as "changed" on the next one, not be
+                # silently dropped from the diff.
+                prev[rel] = size
+
+            if full_paths:
+                to_read_back.setdefault(parent.queue_id, []).extend(full_paths)
+
+            if updates_remaining <= 0:
+                break
+
+        if to_read_back:
+            await self.db.commit()
+            for queue_id, full_paths in to_read_back.items():
+                placeholders = ",".join("?" * len(full_paths))
+                cursor = await self.db.execute(
+                    # ITEM_VIEW_COLUMNS is a module constant and `placeholders` is just `?`
+                    # repeated once per path; the only bound values are
+                    # `queue_id`/`full_paths`.
+                    f"SELECT {ITEM_VIEW_COLUMNS} FROM item WHERE queue_id = ? AND rel_path IN ({placeholders})",  # noqa: S608
+                    (queue_id, *full_paths),
+                )
+                by_queue.setdefault(queue_id, []).extend(
+                    item_view(row) for row in await cursor.fetchall()
+                )
+
+        if truncated:
+            # A silent cap reads as "we published everything this tick" when we did not.
+            logger.warning(
+                "child progress publish capped at %d update(s) this tick; remaining children "
+                "will show on a later tick instead",
+                MAX_CHILD_PROGRESS_UPDATES_PER_TICK,
+            )
 
     async def _sample_metrics(self) -> None:
         """Feeds `core/metrics.py`'s 30-tick throughput sampler from the exact same per-job
