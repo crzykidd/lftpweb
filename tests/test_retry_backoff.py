@@ -11,6 +11,8 @@ sessions. These assert the two properties that were silently broken: the delay i
 *passed* base rather than the constant, and the cap still applies.
 """
 
+import asyncio
+
 from lftpweb.core.queue import (
     DEFAULT_RETRY_BACKOFF_BASE_S,
     DEFAULT_RETRY_BACKOFF_MAX_S,
@@ -50,3 +52,82 @@ def test_zero_base_means_retry_immediately():
     """
     assert compute_retry_backoff(0.0, 1) == 0.0
     assert compute_retry_backoff(0.0, 5) == 0.0
+
+
+# --- Shutdown terminates children concurrently (2026-08-14) -----------------------------------
+#
+# `TransferQueue.stop()` used to await `lftp.terminate(..., grace_s=10.0)` once per in-flight
+# child, in sequence -- so worst-case shutdown was `len(running) * grace_s`. With the main lane
+# and the fast lane both full that is ~40s before `stop()` even returns, and the retention/
+# metrics/backup schedulers stop after it. Docker SIGKILLs at `stop_grace_period`, so an
+# oversized shutdown does not degrade gracefully: it is cut off, and the clean-resume path
+# `stop()` exists to provide never runs. Concurrent termination bounds it at ~one grace period
+# however many transfers are in flight.
+
+
+class _FakeSpawned:
+    def __init__(self) -> None:
+        self.cleaned = False
+
+    def cleanup(self) -> None:
+        self.cleaned = True
+
+
+class _FakeProc:
+    def __init__(self, job_id: int) -> None:
+        self.job_id = job_id
+        self.spawned = _FakeSpawned()
+
+
+async def test_stop_terminates_every_child_concurrently(monkeypatch):
+    """Overlap is the assertion: N children whose termination each take `delay` must finish in
+    about `delay`, not `N * delay`. Timing-based, so the bar is deliberately loose -- it fails
+    hard on sequential behaviour (0.5s vs 0.05s) without being flaky on a slow machine.
+    """
+    import time as _time
+
+    from lftpweb.core import queue as queue_module
+
+    n_children = 10
+    delay = 0.05
+
+    async def _slow_terminate(spawned, *, grace_s):  # noqa: ARG001
+        await asyncio.sleep(delay)
+
+    monkeypatch.setattr(queue_module.lftp, "terminate", _slow_terminate)
+
+    q = queue_module.TransferQueue.__new__(queue_module.TransferQueue)
+    q._task = None
+    procs = {i: _FakeProc(i) for i in range(n_children)}
+    q._running = procs
+
+    started = _time.monotonic()
+    await q.stop()
+    elapsed = _time.monotonic() - started
+
+    assert elapsed < delay * n_children / 2, (
+        f"stop() took {elapsed:.3f}s for {n_children} children at {delay}s each -- "
+        "that is sequential termination, not concurrent"
+    )
+    assert all(p.spawned.cleaned for p in procs.values()), "every rc file must be cleaned up"
+
+
+async def test_stop_cleans_up_even_when_a_child_fails_to_terminate(monkeypatch):
+    """One child raising must not strand the others' rc files -- each holds that job's seedbox
+    password in the `/run` tmpfs (DESIGN.md §4.2/§11.1), so cleanup is not optional.
+    """
+    from lftpweb.core import queue as queue_module
+
+    async def _explode(spawned, *, grace_s):  # noqa: ARG001
+        raise RuntimeError("child would not die")
+
+    monkeypatch.setattr(queue_module.lftp, "terminate", _explode)
+
+    q = queue_module.TransferQueue.__new__(queue_module.TransferQueue)
+    q._task = None
+    procs = {i: _FakeProc(i) for i in range(3)}
+    q._running = procs
+
+    await q.stop()  # must not raise
+
+    assert all(p.spawned.cleaned for p in procs.values())

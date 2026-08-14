@@ -350,6 +350,21 @@ class TransferQueue:
     async def stop(self) -> None:
         """Graceful shutdown (DESIGN.md §10.3): SIGTERM every in-flight lftp child so its
         `-c` resume state is clean, rather than SIGKILLing them via process-group teardown.
+
+        **Children are terminated concurrently, not one after another** (2026-08-14). Sequential
+        termination cost `len(self._running) * grace_s` in the worst case -- with the main lane
+        and the fast lane both full that is ~40s of SIGTERM grace before this method even
+        returns, and the retention/metrics/backup schedulers still have to stop after it. Docker
+        sends SIGKILL when `stop_grace_period` expires, so an oversized shutdown does not degrade
+        gracefully: it gets cut off, and the clean-resume path this method exists to provide
+        never actually runs. Concurrently, total shutdown is bounded at roughly one `grace_s`
+        regardless of how many transfers are in flight, which is what makes
+        `docker-compose.yml`'s `stop_grace_period: 60s` comfortable rather than marginal.
+
+        Each child is independent -- separate processes, separate `/run` rc files, no shared
+        state between them -- so there is nothing to serialize for correctness. `gather` with
+        `return_exceptions=True` because one child failing to die must not prevent the others
+        being signalled, or leave their per-job rc files (`spawned.cleanup()`) behind.
         """
         if self._task is not None:
             self._task.cancel()
@@ -358,9 +373,29 @@ class TransferQueue:
             except asyncio.CancelledError:
                 pass
             self._task = None
-        for proc in list(self._running.values()):
-            await lftp.terminate(proc.spawned, grace_s=10.0)
-            proc.spawned.cleanup()
+
+        async def _terminate_one(proc: _RunningProcess) -> None:
+            try:
+                await lftp.terminate(proc.spawned, grace_s=10.0)
+            finally:
+                # Always -- an rc file left in the `/run` tmpfs holds this job's seedbox
+                # password (§4.2/§11.1), so cleanup must not be skipped just because
+                # termination raised.
+                proc.spawned.cleanup()
+
+        running = list(self._running.values())
+        if not running:
+            return
+        results = await asyncio.gather(
+            *(_terminate_one(proc) for proc in running), return_exceptions=True
+        )
+        for proc, result in zip(running, results, strict=True):
+            if isinstance(result, Exception):
+                logger.warning(
+                    "job %s: error terminating lftp child during shutdown: %r",
+                    proc.job_id,
+                    result,
+                )
 
     def request_tick(self) -> None:
         self._wake.set()

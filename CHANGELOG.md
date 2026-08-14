@@ -644,6 +644,18 @@ alongside this list: several entries below ship with deliberate, documented limi
 
 ### Fixed
 
+- **Shutdown while transfers are running is now survivable in practice, not just in design.**
+  `TransferQueue.stop()` SIGTERMs each in-flight lftp child so its `-c` resume state is written
+  out cleanly, but it did so *sequentially* with a 10s grace each — up to ~40s with both lanes
+  full, before the other schedulers even begin stopping. `docker-compose.yml` set no
+  `stop_grace_period`, so Docker's 10s default cut the container off mid-shutdown and the
+  graceful path effectively never ran. Children are now terminated concurrently (bounded at
+  roughly one grace period however many transfers are in flight) and the compose file sets
+  `stop_grace_period: 60s`. Not a correctness fix — `pget -c`/`mirror -c` resume from whatever
+  partial is on disk however the process died, and `_reconcile_orphaned_jobs` already marks an
+  orphaned job `INTERRUPTED` at startup and leaves its item eligible to be picked up again —
+  but a clean resume state rather than a merely recoverable one, which matters most on an image
+  pull mid-release.
 - Ten defects found only against real hardware, none reachable from unit tests or the fake
   seedbox: OpenSSH fatally requiring a `/etc/passwd` entry for its own uid under the
   PUID/PGID identity model; lftp retrying forever with no `net:max-retries` / `net:timeout`

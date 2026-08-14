@@ -15,6 +15,20 @@ services:
     image: ghcr.io/crzykidd/lftpweb:latest
     container_name: lftpweb
     restart: unless-stopped
+    # Docker's default is 10s, which is not enough to shut down cleanly while transfers are
+    # running -- and shutting down cleanly is the whole point of `core/queue.py.stop()`, which
+    # SIGTERMs each in-flight lftp child so its `-c` resume state is written out properly rather
+    # than letting the container teardown SIGKILL them. That path terminates children with a 10s
+    # grace each, plus the retention/metrics/backup/engine schedulers stopping first, so a busy
+    # instance needs well over Docker's default to finish. Undersized, the container is killed
+    # mid-shutdown and the graceful path never actually runs.
+    #
+    # Not a correctness requirement -- `pget -c`/`mirror -c` resume from whatever partial is on
+    # disk however the process died (`core/queue.py._reconcile_orphaned_jobs` marks the orphaned
+    # job INTERRUPTED at next startup and leaves the item eligible to be picked up again). This
+    # buys a clean resume state rather than a recoverable one, which matters most on an image
+    # pull while a large multi-file release is mid-transfer.
+    stop_grace_period: 60s
     ports:
       # Not 8080: chosen to avoid collisions with other dev stacks on the shared build
       # host (see docs/decisions.md). Edit here if it collides on yours too.
