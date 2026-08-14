@@ -12,10 +12,18 @@
 # archive tooling underneath a running deployment (§11.1). Bump deliberately.
 
 FROM node:22-alpine@sha256:c610fcdfb1d5b4740dd70c284ed3cb16bb857e0f7166196e36a5501df7a3aa32 AS frontend-builder
-WORKDIR /app
+WORKDIR /app/frontend
 COPY frontend/package.json frontend/package-lock.json ./
 RUN npm ci
 COPY frontend/ ./
+# The in-app Docs section imports the repo-root Markdown directly (`../../../../docs/*.md?raw`,
+# 2026-08-14) so that `docs/` is the single source both GitHub and the running app read — see
+# docs/decisions.md. That import reaches *outside* `frontend/`, so this stage's build context
+# must contain the real repo layout, not just the frontend subtree: hence `WORKDIR /app/frontend`
+# and this copy, rather than the flat `WORKDIR /app` + `COPY frontend/ ./` this used before.
+# Caught only by the CI image build — `npm run build` on a dev machine passes either way,
+# because the repo root is right there.
+COPY docs/ /app/docs/
 RUN npm run build
 
 FROM node:22-alpine@sha256:c610fcdfb1d5b4740dd70c284ed3cb16bb857e0f7166196e36a5501df7a3aa32 AS frontend-dev
@@ -132,7 +140,7 @@ COPY --from=unrar-builder /build/unrar/unrar /usr/local/bin/unrar
 
 WORKDIR /app
 COPY --from=python-builder /app/.venv /app/.venv
-COPY --from=frontend-builder /app/dist /app/static
+COPY --from=frontend-builder /app/frontend/dist /app/static
 COPY docker/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 

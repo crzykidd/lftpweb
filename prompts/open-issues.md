@@ -7,25 +7,26 @@ A living list, not a handoff prompt. It never moves to `done/`.
 *why* is what is worth finding again — one fix was shipped and deliberately reversed the same
 night, and the reasoning for that reversal is more valuable than the diff.
 
-**2026-08-14 added one closed item (exit-0-is-not-completion, see below) and one still open**
-(the `bytes_start` anomaly, "Still open" below) — found and left honest rather than papered
-over.
+**Everything raised on 2026-08-14 is closed too**, across ten commits (`a75dc38`…`b4de50a`).
+Tests **701 → 967 backend / 189 frontend**. The queue that existed at the start of that session
+is empty.
 
 Almost every item came from the user running the app against a real seedbox and reporting what
 looked wrong. **CI was green before each one was found.** That is the pattern of this project
-and it held all night.
+and it held across all three sessions.
+
+**The 2026-08-14 session's own hard lesson is recorded in the `bytes_start` section below.**
+A second application (an old `seedsync` container, autostarted by an unrelated update) was
+writing into the same download directory, and produced symptoms that were confidently
+misdiagnosed as three separate application bugs before anyone thought to check `ps`. Read that
+section before trusting any live-evidence conclusion in this file.
 
 ---
 
 ## Queued, written, not yet run
 
-**`prompts/2026-08-13-field-help-sweep.md`** — per-field help across the settings surface,
-using the `FieldHelp` component built in `dfff677`. **It also carries a real bug fix**:
-`QueuesTab.tsx` and `PostProcessingTab.tsx` label extraction as *"7zz — zip/7z/rar/rar5/…"*,
-which is false. Alpine's `7zz` has **no RAR codec** (`855e7a3`); a separately-built `unrar`
-handles rar and rar5, and `README.md`/`NOTICE` already say so. This is the same class of defect
-as the Dockerfile comment that claimed rar support for nine phases while extraction was
-completely broken — UI text outliving the behaviour it describes.
+**Nothing.** The queue is empty as of 2026-08-14. Every prompt written during the
+2026-08-12/13/14 sessions has been executed and lives in `prompts/done/`.
 
 ## Decisions waiting on the user
 
@@ -39,7 +40,19 @@ completely broken — UI text outliving the behaviour it describes.
   existed). A copied compose file now resolves to the newest published build instead of a
   version tag that does not exist yet.
 - **A `dev` → `main` PR, and the first release.** `dev` is far ahead of `main`; nothing has been
-  tagged, and `release-prep`/`release-cut` have never been run.
+  tagged, and `release-prep`/`release-cut` have never been run. **Planned for 2026-08-14
+  afternoon**, after the user click-tests the night's work.
+- **Should "Folder prefix during transfer" default ON?** It shipped **off**, per this project's
+  "every new capability ships off" rule (`342f96c`). But it fixes a *reproduced* data-loss-shaped
+  bug — Sonarr importing a partial release mid-`mirror` and deleting the folder underneath lftp —
+  which is the same argument that got the settle gate flipped to on-by-default after its own
+  follow-up task. Not flipped unilaterally; the user's call.
+- **Two `DESIGN.md` §4.3 wordings are drafted and unapplied**, both in `docs/decisions.md`
+  awaiting approval: (1) exit 0 means lftp reported no error, not that every byte arrived —
+  completion is confirmed from the filesystem; (2) the new `LOCAL_FS_ERROR` class and its place
+  in the transient set. The repo's rule is that a build revealing `DESIGN.md` is wrong gets the
+  doc corrected rather than quietly diverged from, so these should land or be rejected, not
+  linger.
 
 ## Still open — read these first
 
@@ -103,34 +116,40 @@ Auth tab omits those fields on save — but it is the same pattern that *was* re
 `BackupSettingsIn`/`TransferSettingsIn`/`MetricsSettingsIn` have no defaults and are not
 vulnerable.
 
-### A job spawned with `bytes_start` reading ~18 GB against a directory confirmed empty
+### ~~A job spawned with `bytes_start` reading ~18 GB against a directory confirmed empty~~ — **not a bug; closed 2026-08-14**
 
-2026-08-14 (`prompts/2026-08-14-exit-zero-is-not-completion.md`), live incident: job 43 spawned
-with `bytes_start = 18002714542` against a local directory the user confirms was empty at the
-time. `bytes_start` is written once at spawn from `item["local_size"] or 0`
-(`core/queue.py._spawn_decision`), so `item.local_size` held ~18 GB for a directory with
-nothing in it. Corrupts `core/metrics.py`'s throughput accounting
-(`contribution = max(bytes_done - bytes_start, 0)`), under-counting that transfer's Dashboard
-contribution by the stale amount.
+**There was no defect. A second application was writing into the same directory.** The user's
+old `seedsync` container had autostarted after an unrelated update and was downloading into
+`/mnt/fs02-media/working/box-ar-tv` alongside lftpweb. `item.local_size` was reporting real
+bytes that really were on disk; the directory was not empty, it only appeared so because nobody
+knew seedsync was running.
 
-**Not reproduced.** Traced every writer of `item.local_size` (`core/reconcile.py`'s rollup,
-`core/engine.py._persist`'s main loop and its "protected"-row branch, the vanished-row sweep,
-`core/queue.py`'s progress writers) — all recompute or overwrite fresh on every pass; none
-found could latch a stale value across the several scan intervals the 03:59:44→04:06:21
-timeline implies should have occurred before spawn. The one path that *can* freeze a row
-indefinitely — `_persist`'s vanished-row sweep, when a `rel_path` sits in neither the remote
-nor local tree — only ever touches `state`/`first_missing_at`, confirmed never `local_size`,
-and the path re-entering `nodes` the moment new remote content reappears at the same name
-should force a fresh (`NULL`) write well before spawn, not survive it.
+The evidence is clean, because the same job shape ran on both sides of the discovery:
 
-**Leading unconfirmed hypothesis:** the queue's actual `scan_interval_s` at incident time may
-have been configured well above the 30s default, so far fewer scans landed in that ~6.5-minute
-window than "several" assumes — possibly just one — or the first post-reappearance scan raced
-a slow/just-remounted volume and transiently misread the directory as non-empty. Confirming
-either needs the real instance's `path_queue.scan_interval_s` for that queue, or a targeted
-repro against the fake seedbox: fully download and move away a release at a given `rel_path`,
-re-seed a new release at the *same* `rel_path`, and watch `item.local_size` across consecutive
-scans with `scan_interval_s` set high.
+| Job | Environment | `bytes_start` |
+|---|---|---|
+| 45 | seedsync running | 1,531,314,176 |
+| 46 | seedsync running | 1,703,575,552 |
+| **47** | **seedsync destroyed** | **0** |
+
+The earlier writeup here traced every writer of `item.local_size` and correctly concluded none
+of them could latch a stale value — that analysis was right, and the reason nothing explained it
+is that nothing in this codebase was responsible. The "leading hypothesis" recorded at the time
+(an inflated `scan_interval_s`, or a scan racing a slow mount) was **wrong**; it is preserved
+here only as an example of a plausible theory built on contaminated evidence.
+
+**The lesson worth keeping.** Two hours of that session went into confident, detailed, wrong
+diagnoses — the settle gate releasing early, lftp "lying" about exit 0, this. Each fit the
+available evidence. The tell that was missed for a long time: files were actively being written
+while `ps aux | grep [l]ftp` showed **no lftp process in the container at all**. When live
+behaviour contradicts code that reads correctly, check for a second actor before theorising
+about the code. Cheap discriminators: is the process that should be doing the work in `ps`? Does
+a running job's recorded `pid` exist? Is disk usage larger than one copy of the data?
+
+A media importer counts as a second actor too — Sonarr was separately confirmed the same night
+importing completed episodes mid-`mirror` and deleting the release folder while lftp was still
+transferring into it. That one **was** a real gap, and it is what
+`prompts/done/2026-08-14-in-flight-folder-prefix.md` closed.
 
 ### Smaller, and genuinely optional
 
