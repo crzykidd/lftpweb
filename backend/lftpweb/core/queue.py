@@ -29,7 +29,6 @@ from lftpweb.core import audit, download_prefix, lftp, local_scan, patterns, sch
 from lftpweb.core.events import EventBus
 from lftpweb.core.itemview import ITEM_VIEW_COLUMNS, ItemView, item_view
 from lftpweb.core.metrics import RunningJobBytes, ThroughputSampler
-from lftpweb.core.postprocess import move_tree
 from lftpweb.core.progress import ActiveJob, JobProgress, ProgressSampler, child_speed_bps
 from lftpweb.core.remote import HostConfig, parse_connection_limit
 
@@ -205,13 +204,6 @@ class _RunningProcess:
     # module's docstring for why `bytes_done` alone can't be differenced by job id.
     bytes_start: int = 0
     stop_requested: bool = False
-    # "Folder prefix during transfer" (2026-08-14, `core/download_prefix.py`). `None` for
-    # every `pget` job and every `mirror` job the feature doesn't apply to; otherwise the exact
-    # prefix string this job's `local_root` is currently written under -- fixed at spawn
-    # (`_spawn_decision`), the same "never re-shaped mid-life" convention DESIGN.md §4.5 uses
-    # for bandwidth. `_reap_one` reads this, never re-resolves current settings, to know
-    # whether (and from what physical name) to rename the directory back to its real one.
-    download_prefix: str | None = None
 
 
 class TransferQueue:
@@ -750,20 +742,6 @@ class TransferQueue:
             # asks "did we actually get it all?" Both must hold before DOWNLOADED.
             complete, local_bytes, evidence = await self._completeness_on_disk(proc)
 
-            # "Folder prefix during transfer" (2026-08-14, `core/download_prefix.py`): the one
-            # and only place the prefix comes off, right before an item is allowed to become
-            # DOWNLOADED -- see `_finalize_download_prefix`'s own docstring for why here and not
-            # "after verify." A no-op (`rename_error is None` immediately) unless this job
-            # actually used a prefix and everything above already confirmed `settled and
-            # complete` -- an incomplete or unsettled job must leave the prefixed directory
-            # exactly where it is, for the next job to resume into.
-            rename_error: str | None = None
-            if settled and complete:
-                rename_error = await self._finalize_download_prefix(proc)
-                if rename_error is not None:
-                    complete = False
-                    evidence = [*evidence, f"folder-prefix rename failed: {rename_error}"]
-
             if settled and not complete:
                 # Exit 0, but the disk disagrees: either a leftover lftp temp file/sidecar
                 # (`local_scan.TEMP_FILE_RE`/`find_orphan_sidecars`) or local bytes short of
@@ -803,10 +781,24 @@ class TransferQueue:
                 # transfer succeeded, so the item is DOWNLOADED now, not "probably, pending the
                 # next scan." The engine's own reconcile pass will confirm sizes on its next
                 # cycle; this is what makes the UI update immediately instead of waiting for it.
+                #
+                # `pending_download_prefix` is deliberately left untouched here (2026-08-14,
+                # prompts/done/2026-08-14-rename-after-postprocessing-not-before.md, reversing
+                # part of the same day's earlier "folder prefix during transfer" entry in
+                # docs/decisions.md). That entry renamed the directory back to its real name
+                # right here, before DOWNLOADED, on the reasoning that the transfer -- the thing
+                # the setting's name says it protects -- was over by this point. It still is, but
+                # "over" isn't "safe to publish": verify/extract haven't run yet, and a `.sfv`
+                # mismatch or a bad archive can only be discovered by post-processing, which
+                # hasn't started. Renaming here published an unverified release under its real
+                # name for however long verify+extract take -- measured at 7.7s for 1.7 GB, so a
+                # 21 GB release sat exposed for roughly a minute and a half, the exact window an
+                # importer needs to grab something that then turns out corrupt. The rename now
+                # happens in `core/postprocess.py`, as the pipeline's last step on a release nothing
+                # along the way flagged bad -- see that module's `_finalize_download_prefix`.
                 await self.db.execute(
                     "UPDATE item SET state = 'DOWNLOADED', downloaded_at = ?, substate = NULL, "
-                    "auto_queue_suppressed = 0, suppressed_reason = NULL, error_class = NULL, error_detail = NULL, "
-                    "pending_download_prefix = NULL "
+                    "auto_queue_suppressed = 0, suppressed_reason = NULL, error_class = NULL, error_detail = NULL "
                     "WHERE id = ?",
                     (finished_at, proc.item_id),
                 )
@@ -973,71 +965,6 @@ class TransferQueue:
 
         complete = not evidence and local_bytes >= remote_total
         return complete, local_bytes, evidence
-
-    async def _finalize_download_prefix(self, proc: _RunningProcess) -> str | None:
-        """Rename `proc`'s directory from its in-flight, prefixed name back to its real one
-        ("folder prefix during transfer," `core/download_prefix.py`) -- the one and only place
-        the prefix ever comes off, called from `_reap_one` immediately after `settled and
-        complete` are both confirmed and immediately before an item is allowed to become
-        `DOWNLOADED`. A no-op (`None`, no I/O) whenever this job never used a prefix
-        (`proc.download_prefix is None` -- every `pget` job, and a `mirror` job the feature
-        doesn't apply to).
-
-        **Why right here, and not "after verify" (the user's own first instinct -- see this
-        task's prompt and docs/decisions.md for the full argument).** The setting's own name is
-        "*during transfer*": its job is to hide bytes that are still arriving, and by the time
-        this method runs, `_completeness_on_disk` has already confirmed -- from the filesystem,
-        never the exit code alone (§1.3/§4.3) -- that every remote byte this job was asked for
-        is on disk. The race this feature exists to close is over. `core/postprocess.py`'s
-        verify/extract/move are refinements of an already-complete item (DESIGN.md §6), not
-        protection against a partial one, and all three derive `local_root` from
-        `queue.local_path` + `item.rel_path` alone with no prefix-awareness of their own --
-        delaying the rename into the middle of that pipeline would mean teaching the
-        highest-consequence module in this codebase (§6: it deletes and moves data) a second way
-        to compute the same path, for no protection against the actual bug this task fixes.
-
-        Uses `core/postprocess.py.move_tree` -- never a bare `os.rename` -- so this reuses the
-        one "move a directory, atomically from an observer's point of view, same-filesystem fast
-        path plus an EXDEV copy-then-rename fallback" implementation already in this codebase,
-        even though `src`/`dst` share a parent directory here and so are always same-filesystem
-        in practice; a second, parallel implementation of that logic is exactly what this task's
-        own instructions warn against.
-
-        Returns `None` on success. On failure (most plausibly `dst` already existing --
-        `move_tree`'s `merge=False` refuses to overwrite, which is the correct behaviour: this
-        codebase must never silently clobber content already sitting under an item's real name),
-        returns a detail string; the caller downgrades `complete` to `False` and folds this into
-        the same `incomplete_on_exit_zero` handling an ordinary short-on-bytes transfer already
-        gets -- every byte is genuinely present, just still under its in-flight name, so `PARTIAL`
-        (re-queueable; the next attempt resumes straight into the still-prefixed directory,
-        `_resolve_download_prefix_for_spawn` above) is the honest reading, not a hard failure.
-        """
-        if proc.download_prefix is None:
-            return None
-        src = Path(proc.local_root)
-        dst = src.parent / src.name[len(proc.download_prefix) :]
-        try:
-            move_tree(src, dst)
-        except Exception as exc:  # noqa: BLE001 - reported to the caller, never raised
-            logger.exception(
-                "job %s: renaming %s -> %s (folder prefix during transfer) failed",
-                proc.job_id,
-                src,
-                dst,
-            )
-            return f"{type(exc).__name__}: {exc}"
-        await audit.record_event(
-            self.db,
-            level="info",
-            item_id=proc.item_id,
-            job_id=proc.job_id,
-            kind="download_prefix_removed",
-            message=(
-                f"{proc.rel_path!r}: renamed {src} -> {dst} now that the transfer is complete "
-                "(folder prefix during transfer)"
-            ),
-        )
-        return None
 
     async def _relevant_remote_total(self, proc: _RunningProcess) -> int:
         """The byte total that actually counts toward `proc`'s completeness -- `proc.bytes_total`
@@ -1702,7 +1629,6 @@ class TransferQueue:
             spawned=spawned,
             wait_task=wait_task,
             bytes_start=item["local_size"] or 0,  # same value written to job.bytes_start below
-            download_prefix=resolved_download_prefix,
         )
         self._running[decision.job_id] = proc
 

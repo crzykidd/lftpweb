@@ -6,6 +6,227 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-14 — Rename off the download-prefix moved to `core/postprocess.py`'s last step, reversing that same day's "at the DOWNLOADED transition, not after verify" entry
+
+**Handoff prompt `prompts/done/2026-08-14-rename-after-postprocessing-not-before.md`, executed
+end to end.** Reverses the ordering decision recorded a few hours earlier in this same file's
+**"'Folder prefix during transfer': reversing part of phase 5's `staging_path` decision, on new
+evidence, not a re-litigation"** entry (below), specifically its **"When the rename happens: at
+the DOWNLOADED transition, not 'after verify'"** subsection. That entry is not wrong about
+anything it argued from — it is superseded by new evidence, the same relationship it itself had
+to phase 5: a user watched a real transfer complete on the live instance and asked why
+verification runs *after* the item is already visible under its real name.
+
+**What changed, concretely.** `core/queue.py._reap_one` used to rename `<local_path>/
+<prefix><name>/` back to `<local_path>/<name>/` the instant `settled and complete` were both
+confirmed — before `postprocess.trigger()` ever fired, on the reasoning that the transfer (what
+the setting's name says it protects) was over by then. Measured against the live instance: a
+1.7 GB item takes 7.7s to verify (the hash-on-disk fallback reads every byte), so a 21 GB
+release sat exposed under its real name for roughly a minute and a half while still
+unverified — the exact window an importer needs to grab something that then turns out
+`CORRUPT`. The rename now happens in `core/postprocess.py`, as the pipeline's own last step,
+gated on nothing along the way (verify, extract) having flagged the release bad.
+
+**The specific argument the earlier entry made, and why it doesn't survive the new evidence.**
+That entry gave three reasons for renaming early; each is addressed rather than ignored:
+
+- *"The setting's own name is 'during transfer.' ... nothing downstream is 'still arriving.'"*
+  True, and beside the point once restated precisely: "the transfer is over" and "safe to
+  publish under the real name" are different claims. Nothing was still *arriving*, but
+  something could still turn out to be *wrong* — that is exactly what verify and extract exist
+  to discover, and they hadn't run yet.
+- *"Delaying to 'after verify' would require `core/postprocess.py` to become prefix-aware
+  mid-pipeline ... in the one module in this codebase with the least room for a second way to
+  compute a path."* This was the load-bearing objection, and it is answered by reuse, not by
+  accepting the risk: `core/local_delete.py._physical_local_root` (2026-08-14, written the same
+  day for `delete_local`'s identical "where are this item's bytes actually" question) already
+  existed by the time this task ran. `core/postprocess.py._process_item` now calls it once, at
+  the top, and every step (`_do_verify`, `_maybe_delete_remote`'s remote-side path is unrelated
+  and untouched, `_do_extract`, `_do_move`) operates on whatever it returns — one physical-path
+  resolver, reused, not a second one invented for this task. The module gained a handful of new
+  branches for *when* to rename (see below), not a second way to compute *where* a file is.
+- *"The `move`-mode remote-delete gate is untouched by this choice either way."* Still true, and
+  still untouched — `_maybe_delete_remote` is unmoved in the pipeline and still gated on
+  `verify_state == "VERIFIED"` alone.
+
+**Order landed on**: completeness check (`_reap_one`, unchanged) → verify → (`move`-mode
+remote delete, unchanged position) → extract → **rename off the prefix** → staging move, or
+**no separate rename at all when a staging move is also configured** (see below). This matches
+DESIGN.md §6's existing verify → delete → extract → staging-move ordering with exactly one new
+step inserted before the last one.
+
+**`_reap_one` no longer touches the physical directory at all.** It still runs the
+completeness check exactly as before (`_completeness_on_disk` continues to gate `DOWNLOADED`
+unconditionally — this task changes *when the directory is renamed*, never *what gates
+completion*, per its own constraint), and it still transitions the item to `DOWNLOADED` and
+calls `postprocess.trigger()`. The one thing removed is the `UPDATE ... pending_download_prefix
+= NULL` that used to ride along with that same statement: the column now stays set for the
+item's *entire* time in the pipeline, not just its time in flight, and `core/postprocess.py` is
+the only writer that ever clears it. `_finalize_download_prefix` (the rename itself) moved out
+of `core/queue.py` entirely into `core/postprocess.py`, reusing `move_tree` exactly as before,
+now via `asyncio.to_thread` (this module's own "runs off the event loop" rule, which the old
+`core/queue.py` copy did not follow — a small, free improvement that fell out of the move).
+
+**The staging-move case: no separate rename at all, by design, not an oversight.** When a
+queue has `staging_path` configured and its own move step is effective, `_do_move`'s
+destination is already built from `item.rel_path` — which never carries the prefix
+(§ the original feature's own invariant) — so relocating the still-prefixed physical source
+straight to that destination both moves the item *and* removes the prefix in the same
+operation. A standalone rename first, then a move, would be two directory operations doing the
+work of one; `_process_item` branches on `pending_download_prefix and move_effective` and skips
+`_finalize_download_prefix` entirely in that case, clearing the column only once `_do_move`
+itself reports success (see below for why success has to gate the clear).
+
+**Failure handling had to be redesigned, not just relocated, because the failure this method
+can hit is no longer recoverable the way it used to be.** The old `core/queue.py` version ran
+*before* `DOWNLOADED`, so a rename failure could downgrade `complete = False` and the item
+landed at `PARTIAL` — genuinely re-queueable, the next attempt resumes straight into the
+still-prefixed directory. The new version runs *after* verify/extract have already committed
+real outcomes (`VERIFIED`, `EXTRACTED`, ...); there is no `complete` left to downgrade, and
+nothing re-triggers `process_item` for an item that already finished post-processing once. A
+rename-conflict failure (`move_tree`'s `merge=False` refusing an already-occupied destination —
+the only realistic cause) now leaves the item exactly where post-processing put it, records a
+`download_prefix_rename_failed` event, and says plainly that nothing retries this
+automatically — a human has to resolve the name collision, then delete-and-redownload or rename
+by hand. Same reasoning applied to `_do_move`: it now returns whether it succeeded, and
+`pending_download_prefix` is only cleared on `True` — `move_tree` itself guarantees a failed
+attempt never touches `src`, so a failed move must not claim the bytes moved (and got
+un-prefixed) when they didn't.
+
+**A `CORRUPT`/`EXTRACT_FAILED` item is never renamed — the prompt's own recommendation, taken.**
+`release_ok = verify_state != "CORRUPT" and extract_state != "EXTRACT_FAILED"` gates the whole
+rename-or-move branch. An importer that skips the hidden folder would find the release under
+its real name too if it were renamed regardless of outcome — precisely the scenario this
+feature exists to prevent, just widened from "still transferring" to "turned out bad." The
+staging move is withheld for the identical reason when both conditions coincide (prefixed *and*
+bad *and* move-configured): relocating to `staging_path/rel_path` would itself be the un-hiding
+this branch exists to prevent, even though `_do_move` still runs unconditionally for a
+*non*-prefixed item regardless of verify/extract outcome (existing, `pre-this-task` behavior —
+see "left deliberately unchanged" below). Every withheld-rename case writes a
+`download_prefix_rename_withheld` event unconditionally, not only when a move was also on the
+table — this module's own "no silent path for a withheld action" rule (`_maybe_delete_remote`'s
+docstring) applied consistently.
+
+**Left deliberately unchanged, named rather than silently inherited: extract and the staging
+move already ran regardless of a `CORRUPT` verify result, before this task and after it.**
+`_process_item` never gated `_do_extract`/`_do_move` on `verify_state` for the general
+(non-prefixed) case — that is pre-existing behavior this task did not touch, because doing so
+would have been a materially different, larger change than "move the rename." It does mean a
+`CORRUPT` item on a queue with `extract_target_dir` configured (a separate directory, entirely
+outside the download-prefix mechanism, which only ever protects a queue's own `local_path`) can
+still have its archives extracted into that external location regardless of the corrupt
+verdict — a real, named gap, orthogonal to this task and not worsened by it (identical exposure
+existed in the shipped code before this task ran, just via a different observation path: in the
+old ordering the item had *already* been renamed to its real name in `local_path` by the time
+extraction ran, so there was nothing there to protect in the first place).
+
+**Three defects have already come from one assumption (physical path == logical path); this
+task widens the window in which they differ and audits every caller that builds a path from
+`local_path + rel_path` during it, per its own instruction:**
+
+- `core/postprocess.py._process_item` — fixed as described above (`_physical_local_root` reused
+  for `local_root`, once, at the top).
+- `core/extract.py.extract_item`/`_staging_dirs` — needed **no change at all**. Both already
+  compute the `_UNPACK_`/`_FAILED_` staging siblings from whatever `root` they're handed
+  (`final_dir.parent / f"{UNPACK_PREFIX}{final_dir.name}"`), so handing them the *physical*
+  (still-prefixed) root produces `_UNPACK_<prefix><name>` — still a sibling, still outside the
+  tree `scan_local` walks (the prefix filter and the `_UNPACK_`/`_FAILED_` filter are
+  independent and both apply regardless of what the other matched), still merged into the
+  correct (still-prefixed, at that point) final directory. Confirmed with a new e2e-shaped
+  unit test (`test_extraction_stages_into_unpack_correctly_for_a_prefixed_item`,
+  `tests/test_postprocess.py`) that spies on `extract.find_archives` to record the literal
+  `root` it was called with.
+- `core/local_delete.py.delete_extracted_archives` — **a real bug found and fixed**, not a
+  clean pass. It recorded each deleted archive's path as `candidate.relative_to(root)` (`root`
+  = `queue.local_path`) rather than relative to the *item's* physical root — harmless when the
+  physical and logical roots coincided (always true before this task), silently wrong the
+  moment they don't: `deleted_archive.rel_path` is compared against `item.rel_path` verbatim in
+  `core/engine.py.build_scan_counts_predicate` (both always logical, never prefixed), so a path
+  recorded relative to a still-prefixed physical root would embed the prefix and simply never
+  match — defeating the archive-cleanup completeness accounting (DESIGN.md §6) the moment
+  cleanup ran on a still-prefixed item, reopening the exact infinite re-download loop that
+  accounting exists to close. Fixed by resolving the item's physical root the same way
+  (`_physical_local_root`, same function, same module — reused in place, not duplicated) and
+  reattaching each candidate's path *relative to that* onto the item's logical `rel_path`.
+- `core/postprocess.py._find_item_id_for_failed_dir` — a second, smaller instance of the same
+  bug class, also fixed: a `_FAILED_` staging directory for a still-prefixed item is now named
+  `_FAILED_<prefix><rel_path>`, and stripping only `FAILED_PREFIX` before matching against
+  `item.rel_path` would miss every one of those (falling back to the already-existing "no
+  matching item" path, which only degrades an audit event's item attribution — never data loss,
+  but a real, avoidable degradation this task introduced the possibility of). Fixed with a
+  second SQL candidate: `pending_download_prefix || rel_path = ?`.
+- **The retention sweeper** (`core/local_delete.py._select_expired`/`preview_retention`/
+  `RetentionScheduler`) — audited, needed no change. It already resolves every deletion target
+  through `delete_local`, which already calls `_physical_local_root` (written the same day as
+  the original "folder prefix during transfer" task, for exactly this question) — this task's
+  reordering doesn't create a new gap here, it just makes an existing, already-correct code
+  path exercised for longer.
+
+**A gap opened by the widened prefixed-window that was fixed, not just noticed: descendant
+`item` rows could flicker during post-processing the same way they used to during download.**
+`core/engine.py._protected_rel_paths` already protects a *child* row inside an actively-
+downloading `mirror` release from a scan recomputing it to `REMOTE_ONLY` while `scan_local`'s
+prefix filter hides the whole (still-prefixed) directory (2026-08-14, the original "folder
+prefix during transfer" task, its own documented live-reproduced bug). That protection is keyed
+on an *active job* existing for the top-level parent. Once a job finishes, there is no more
+`job` row — but under this task's new ordering, the top-level item can now sit in
+`VERIFYING`/`EXTRACTING` for as long as verify/extract take (the same 7.7s-for-1.7GB figure
+this whole task is about) while its directory is *still* physically prefixed, hence *still*
+filtered from `scan_local` — and `core/engine.py.queue_is_active` already treats
+`VERIFYING`/`EXTRACTING` as "active," which keeps the fast ~5s local-only scan cadence running
+throughout, making a mid-postprocessing scan landing on an unprotected child likely, not
+theoretical. Fixed by extending `_protected_rel_paths`' existing descendant-protection clause
+(previously keyed only on an active-job parent) to also cover descendants of any parent
+currently in `PostprocessPipeline.in_flight_item_ids()`/`DeleteInFlight` — the identical shape,
+one more `OR EXISTS`, reusing the same `in_flight` id list `_protected_rel_paths` already builds
+for the top-level-item clause immediately above it.
+
+**Frontend copy updated, not just backend behavior.** `ItemDrawer.tsx`'s physical-location panel
+used to say "Currently downloading... will be renamed once the transfer completes" whenever
+`pending_download_prefix` was set — accurate under the old ordering (the column was only ever
+set while a job was actually running), flatly wrong under the new one (the column now stays set
+through `DOWNLOADED`/`VERIFYING`/`EXTRACTING`/`VERIFIED`/`EXTRACTED`, and permanently for a
+`CORRUPT`/`EXTRACT_FAILED` item). Replaced with a `downloadPrefixNote(state)` helper that reads
+correctly for all of: still downloading, still post-processing, and permanently hidden after a
+verify/extract failure ("will only be renamed if a retry succeeds," not "will be renamed once it
+completes" — that promise would be false for exactly this state). Settings → Transfer's and
+Settings → Queues' own `FieldHelp` copy for the setting updated the same way — both used to say
+"rename it back only once the transfer is fully complete"; both now say "complete *and*
+post-processing (verify, then extract) has finished successfully," and both now name the
+`CORRUPT`/extraction-failure case explicitly rather than leaving it to be discovered. Same
+correction applied to `docs/quick-start.md`'s own description of the feature (the in-app Docs
+section's source).
+
+**Not edited: DESIGN.md.** Per this project's own convention (`prompts/done/2026-08-14-in-flight-
+folder-prefix.md`: "if DESIGN.md needs a clause for this, draft it in docs/decisions.md and
+ask — do not edit DESIGN.md directly"), §6's existing "verify → delete → extract → staging move"
+ordering paragraph and its "Ordering, including the one ordering that is not yet a decision"
+aside are left as they stand; this entry is the drafted addendum, and a human should decide
+whether/how to fold "the rename off a download-prefix, when one is in play, is the pipeline's
+last step" into §6's own prose.
+
+**Testing.** `uv run pytest` — full suite, including two rewritten sections and one new e2e
+test file section: `tests/test_postprocess.py` gained seven new tests directly against
+`PostprocessPipeline` (renamed-after-verify success, `CORRUPT` never renamed, `EXTRACT_FAILED`
+never renamed, a rename conflict leaves bytes in place and logs an event, a staging move
+relocates directly from the prefixed source and clears the prefix, a staging move is withheld
+for a `CORRUPT` prefixed item, and extraction stages into `_UNPACK_` correctly for a prefixed
+item); `tests/test_download_prefix.py`'s old `core/queue.py._reap_one` rename-step tests were
+replaced with tests confirming `_reap_one` now leaves the prefix and directory untouched and
+simply triggers post-processing; `tests/test_download_prefix_e2e.py` gained two new tests
+against the real fake seedbox — this task's own required, single-most-important assertion
+(`verify.verify_item` monkeypatched to sleep so the `VERIFYING` window is observable: the real,
+unprefixed name does not exist on disk while it's running, and does exist once verification
+finishes) and a `CORRUPT` item (a deliberately-wrong `.sfv` sidecar) whose bytes are confirmed
+to remain under the prefixed name with the real name never appearing — and its two existing
+tests were updated to wire a real `PostprocessPipeline` (previously unwired, which would now
+silently skip the rename entirely, per `_reap_one`'s "only if `self.postprocess is not None`"
+trigger guard). `ruff check`/`ruff format --check`, `npm run lint`/`npm test`/`npm run build`,
+`docker compose config --quiet` on all three compose files — real output for all of the above
+recorded in the executing session's final report, not restated here.
+
+---
+
 ## 2026-08-14 — ETA on Files rows: appended into the Speed cell, honest-not-capped, no new sort key
 
 **Handoff prompt `prompts/done/2026-08-14-eta-on-files-rows.md`, executed end to end, after

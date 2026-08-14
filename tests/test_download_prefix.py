@@ -2,8 +2,17 @@
 `prompts/2026-08-14-in-flight-folder-prefix.md`, `core/download_prefix.py`) -- the pieces that
 don't need a live seedbox: prefix resolution and validation, the `mirror`-target argv change,
 `core/local_scan.py`'s configurable filter, `core/engine.py.Engine._active_download_prefixes`'s
-DB-backed prefix set, and `core/queue.py._reap_one`'s rename-before-DOWNLOADED step. The full
-pipeline against the real fake seedbox is `tests/test_download_prefix_e2e.py`.
+DB-backed prefix set, and `core/queue.py._reap_one`'s handoff to post-processing with the prefix
+still in place. The full pipeline against the real fake seedbox is
+`tests/test_download_prefix_e2e.py`.
+
+**The rename itself moved to `core/postprocess.py` on 2026-08-14**
+(`prompts/done/2026-08-14-rename-after-postprocessing-not-before.md`, reversing this same day's
+earlier "at the DOWNLOADED transition, not after verify" decision -- see `docs/decisions.md` for
+both entries). `_reap_one` no longer renames anything; it leaves `pending_download_prefix` set
+and hands the still-prefixed item to `PostprocessPipeline.trigger`. The rename-behavior unit
+tests below now exercise `PostprocessPipeline` directly, in `test_postprocess.py`'s own style
+(`_make_host_and_queue_rows`/`_make_item_row`), not `_reap_one`.
 
 No seedbox needed anywhere in this file -- `_reap_one` is exercised directly against a hand-built
 `_RunningProcess` whose `wait_task` is an already-resolved `asyncio.Task`, exactly
@@ -22,7 +31,6 @@ from lftpweb.core.queue import _RunningProcess
 from lftpweb.core.settle import SettleSettings, save_settle_settings
 from test_queue import _make_db, _make_host_row, _make_item_row, _make_queue_row, _queue_for
 from test_queue_completeness import (
-    _event_rows,
     _fake_spawned,
     _FakePostprocess,
     _item_row,
@@ -292,11 +300,11 @@ async def test_resolve_download_prefix_for_spawn_disabled_returns_none(db, tmp_p
     assert resolved is None
 
 
-# --- core/queue.py._reap_one: the rename step, directory items only ----------------------------
+# --- core/queue.py._reap_one: hands off to postprocessing with the prefix still in place -------
 
 
 def _mirror_proc_with_prefix(
-    *, job_id, item_id, queue_id, rel_path, local_root, bytes_total, tmp_path, download_prefix_
+    *, job_id, item_id, queue_id, rel_path, local_root, bytes_total, tmp_path
 ):
     return _RunningProcess(
         job_id=job_id,
@@ -313,11 +321,18 @@ def _mirror_proc_with_prefix(
         remote_mtime=None,
         spawned=_fake_spawned(tmp_path, job_id),
         wait_task=_resolved_wait_task(0, "lftp output"),
-        download_prefix=download_prefix_,
     )
 
 
-async def test_reap_one_renames_the_prefixed_directory_to_its_real_name_on_success(db, tmp_path):
+async def test_reap_one_leaves_the_prefixed_directory_in_place_and_triggers_postprocess(
+    db, tmp_path
+):
+    """The rename itself moved to `core/postprocess.py` (2026-08-14,
+    prompts/done/2026-08-14-rename-after-postprocessing-not-before.md) -- `_reap_one` now does
+    nothing to the physical directory or `pending_download_prefix` beyond confirming the item is
+    settled and complete; it hands the still-prefixed item straight to `postprocess.trigger()`,
+    which is where the rename now happens (see `test_postprocess.py`'s own coverage of that).
+    """
     host_id = await _make_host_row(db)
     local_dir = tmp_path / "local"
     local_dir.mkdir()
@@ -344,125 +359,33 @@ async def test_reap_one_renames_the_prefixed_directory_to_its_real_name_on_succe
         local_root=prefixed_dir,
         bytes_total=1000,
         tmp_path=tmp_path,
-        download_prefix_=".downloading-",
     )
     q._running[1] = proc
 
     await q._reap_one(proc)
 
-    final_dir = local_dir / "Release"
-    assert final_dir.is_dir(), "the item must end up under its real, unprefixed name"
-    assert (final_dir / "a.mkv").read_bytes() == b"a" * 1000
-    assert not prefixed_dir.exists(), "the prefixed directory must be gone once renamed"
+    assert prefixed_dir.is_dir(), "must still be under its in-flight name -- nothing renames here"
+    assert not (local_dir / "Release").exists(), "must not exist under its real name yet"
+    assert (prefixed_dir / "a.mkv").read_bytes() == b"a" * 1000
 
     item = await _item_row(db, item_id)
     assert item["state"] == "DOWNLOADED"
 
     cursor = await db.execute("SELECT pending_download_prefix FROM item WHERE id = ?", (item_id,))
     row = await cursor.fetchone()
-    assert row["pending_download_prefix"] is None, "cleared once the physical rename happened"
-
-    events = await _event_rows(db, item_id, "download_prefix_removed")
-    assert len(events) == 1
-    assert str(prefixed_dir) in events[0]["message"]
-    assert str(final_dir) in events[0]["message"]
+    assert (
+        row["pending_download_prefix"] == ".downloading-"
+    ), "left set for postprocessing to resolve the physical path with -- no longer cleared here"
 
     assert q.postprocess.triggered == [
         item_id
-    ], "post-processing must see the item at its real path, after the rename"
-
-
-async def test_reap_one_rename_conflict_holds_the_item_at_partial_not_downloaded(db, tmp_path):
-    """A destination collision (something already sitting under the real name) must never be
-    silently clobbered -- `core/postprocess.py.move_tree`'s `merge=False` refuses it, and
-    `_reap_one` downgrades to the same PARTIAL/`incomplete_on_exit_zero` handling an ordinary
-    short-on-bytes transfer gets: the bytes are all still there, just under the in-flight name.
-    """
-    host_id = await _make_host_row(db)
-    local_dir = tmp_path / "local"
-    local_dir.mkdir()
-    queue_id = await _make_queue_row(db, host_id, local_dir)
-    prefixed_dir = local_dir / ".downloading-Release"
-    prefixed_dir.mkdir()
-    (prefixed_dir / "a.mkv").write_bytes(b"a" * 1000)
-    # The real name already exists -- a genuine conflict `move_tree` must refuse.
-    (local_dir / "Release").mkdir()
-    (local_dir / "Release" / "old.mkv").write_bytes(b"stale")
-
-    item_id = await _make_item_row(db, queue_id, "Release", is_dir=True, remote_size=1000)
-    await db.commit()
-
-    q = await _queue_for(db, tmp_path)
-    q.postprocess = _FakePostprocess()
-    await _make_job_row(db, job_id=2, item_id=item_id, kind="mirror")
-    proc = _mirror_proc_with_prefix(
-        job_id=2,
-        item_id=item_id,
-        queue_id=queue_id,
-        rel_path="Release",
-        local_root=prefixed_dir,
-        bytes_total=1000,
-        tmp_path=tmp_path,
-        download_prefix_=".downloading-",
-    )
-    q._running[2] = proc
-
-    await q._reap_one(proc)
-
-    item = await _item_row(db, item_id)
-    assert item["state"] == "PARTIAL"
-    assert prefixed_dir.exists(), "the in-flight content must be preserved, not lost"
-    assert (prefixed_dir / "a.mkv").read_bytes() == b"a" * 1000
-
-    events = await _event_rows(db, item_id, "incomplete_on_exit_zero")
-    assert len(events) == 1
-    assert "folder-prefix rename failed" in events[0]["message"]
-    assert q.postprocess.triggered == []
-
-
-async def test_reap_one_pget_job_is_unaffected(db, tmp_path):
-    """Scope limit: `download_prefix` is `None` for every `pget` job (`core/queue.py.
-    _spawn_decision` never sets it for a single-file item) -- `_finalize_download_prefix` must
-    be a pure no-op for one, exactly the existing (pre-this-task) success path.
-    """
-    from test_queue_completeness import _pget_proc
-
-    host_id = await _make_host_row(db)
-    local_dir = tmp_path / "local"
-    local_dir.mkdir()
-    queue_id = await _make_queue_row(db, host_id, local_dir)
-    target = local_dir / "file.mkv"
-    target.write_bytes(b"x" * 500)
-
-    item_id = await _make_item_row(db, queue_id, "file.mkv", is_dir=False, remote_size=500)
-    await db.commit()
-
-    q = await _queue_for(db, tmp_path)
-    q.postprocess = _FakePostprocess()
-    await _make_job_row(db, job_id=3, item_id=item_id, kind="pget")
-    proc = _pget_proc(
-        job_id=3,
-        item_id=item_id,
-        queue_id=queue_id,
-        rel_path="file.mkv",
-        local_root=target,
-        bytes_total=500,
-        tmp_path=tmp_path,
-    )
-    assert proc.download_prefix is None
-    q._running[3] = proc
-
-    await q._reap_one(proc)
-
-    item = await _item_row(db, item_id)
-    assert item["state"] == "DOWNLOADED"
-    assert target.exists()
+    ], "post-processing must fire even though the item is still physically prefixed"
 
 
 async def test_reap_one_unsettled_item_leaves_the_prefixed_directory_untouched(db, tmp_path):
-    """The settle gate held (§4.7's directory-upload race) must not rename anything -- the
-    release may not be whole yet, and a resumed job needs the prefixed directory to still be
-    exactly where it left it.
+    """The settle gate held (§4.7's directory-upload race) must not trigger post-processing at
+    all -- the release may not be whole yet, and a resumed job needs the prefixed directory to
+    still be exactly where it left it.
     """
     await save_settle_settings(db, SettleSettings(enabled=True))
     host_id = await _make_host_row(db)
@@ -487,7 +410,6 @@ async def test_reap_one_unsettled_item_leaves_the_prefixed_directory_untouched(d
         local_root=prefixed_dir,
         bytes_total=1000,
         tmp_path=tmp_path,
-        download_prefix_=".downloading-",
     )
     q._running[4] = proc
 

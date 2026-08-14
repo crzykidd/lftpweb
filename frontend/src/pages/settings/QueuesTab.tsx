@@ -871,10 +871,13 @@ export function QueuesTab() {
               <p>
                 While a <strong>directory</strong> item is downloading, write it into a
                 hidden-by-convention folder (e.g. <code>.downloading-Release.Name</code>) and
-                rename it to its real name only once the transfer is fully complete. Sonarr,
-                Radarr, Plex, and Jellyfin all skip hidden (dot-prefixed) folders regardless of
-                whether they know about lftpweb, so an importer polling the download tree never
-                sees a partial multi-file release.
+                rename it to its real name only once the transfer is complete <em>and</em>
+                post-processing (verify, then extract) has finished successfully. Sonarr, Radarr,
+                Plex, and Jellyfin all skip hidden (dot-prefixed) folders regardless of whether
+                they know about lftpweb, so an importer polling the download tree never sees a
+                partial multi-file release, nor one that downloaded cleanly but came back
+                <code>CORRUPT</code> or failed to extract — those stay hidden under the prefixed
+                name until a retry succeeds.
               </p>
               <p>
                 <strong>Directory items only</strong> — a single-file download is already

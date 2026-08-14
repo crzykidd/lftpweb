@@ -10,6 +10,15 @@ lftp command with the prefix feature on, ends up on disk under its **real** name
 of the prefixed directory left behind -- and, for a `move` queue, only after verification, with
 the remote copy deleted afterwards, exactly like an unprefixed `move` transfer already does.
 
+**The rename moved to `core/postprocess.py` as the pipeline's own last step** (2026-08-14,
+`prompts/done/2026-08-14-rename-after-postprocessing-not-before.md`, reversing the ordering
+decision this file's own tests originally verified -- see `docs/decisions.md` for both entries).
+Every test below now wires a real `PostprocessPipeline` alongside the `TransferQueue`, exactly
+as `main.py` does; without one, `core/queue.py._reap_one` no longer renames anything itself. The
+two tests at the bottom of this file (`test_real_name_does_not_exist_while_verification_is_
+running_and_does_exist_after`, `test_corrupt_item_never_appears_under_its_real_name`) are this
+task's own required coverage -- the first is its single most important assertion.
+
 Deliberately does **not** reuse `docker/test-seedbox/seed_tree.sh`'s baked-in fixture tree --
 shared by every other test on this container, and the `move` test here deletes its source. Each
 test uploads its own throwaway content into a dedicated, uniquely-named remote subdirectory over
@@ -21,12 +30,13 @@ from __future__ import annotations
 import asyncio
 import os
 import socket
+import time
 from uuid import uuid4
 
 import aiosqlite
 import pytest
 
-from lftpweb.core import download_prefix
+from lftpweb.core import download_prefix, verify
 from lftpweb.core.events import EventBus
 from lftpweb.core.postprocess import (
     PostprocessPipeline,
@@ -169,14 +179,25 @@ async def test_directory_item_downloads_into_prefixed_folder_and_is_renamed_on_c
     async def host_provider():
         return host
 
+    events = EventBus()
+    # The rename off the prefix moved to `core/postprocess.py` (2026-08-14,
+    # prompts/done/2026-08-14-rename-after-postprocessing-not-before.md) -- without a wired
+    # pipeline, `core/queue.py._reap_one` no longer renames anything itself, so this test would
+    # never see the item reach its real name at all. Everything here is off by default
+    # (`PostprocessSettings()`), so the pipeline reaches the rename immediately once triggered.
+    pipeline_pool = RemoteConnectionPool(tmp_path / "known_hosts_pipeline")
+    pipeline = PostprocessPipeline(
+        db=db, events=events, remote_pool=pipeline_pool, host_provider=host_provider
+    )
     q = TransferQueue(
         db=db,
         config_dir=str(tmp_path),
-        events=EventBus(),
+        events=events,
         run_dir=str(tmp_path / "run"),
         tick_s=0.2,
         host_provider=host_provider,
     )
+    q.postprocess = pipeline
 
     await q.start()
     try:
@@ -205,13 +226,20 @@ async def test_directory_item_downloads_into_prefixed_folder_and_is_renamed_on_c
 
         assert await _wait_until(job_succeeded, timeout_s=30), "transfer job never succeeded"
 
-        async def item_downloaded():
-            row = await (
-                await db.execute("SELECT state FROM item WHERE id = ?", (item_id,))
-            ).fetchone()
-            return row is not None and row["state"] == "DOWNLOADED"
+        # The rename is now post-processing's own last step, not part of the DOWNLOADED
+        # transition itself -- wait for the pipeline to actually finish (fire-and-forget via
+        # `trigger()`) rather than just for `item.state == 'DOWNLOADED'`.
+        await pipeline.wait_idle()
 
-        assert await _wait_until(item_downloaded, timeout_s=15), "item never reached DOWNLOADED"
+        async def prefix_cleared():
+            row = await (
+                await db.execute(
+                    "SELECT pending_download_prefix FROM item WHERE id = ?", (item_id,)
+                )
+            ).fetchone()
+            return row is not None and row["pending_download_prefix"] is None
+
+        assert await _wait_until(prefix_cleared, timeout_s=15), "never renamed off the prefix"
 
         final_dir = local_dir / "Release.Name"
         assert final_dir.is_dir(), "must end up under its real, unprefixed name"
@@ -234,6 +262,7 @@ async def test_directory_item_downloads_into_prefixed_folder_and_is_renamed_on_c
             )
     finally:
         await q.stop()
+        await pipeline.wait_idle()
         # Best-effort cleanup of the throwaway remote subdirectory (this is a `copy` queue, so
         # nothing else ever removes it) -- matches tests/test_postprocess_e2e.py's own pattern.
         cleanup_pool = RemoteConnectionPool(tmp_path / "known_hosts_cleanup")
@@ -427,14 +456,23 @@ async def test_stop_mid_transfer_then_resume_finds_the_partial_in_the_prefixed_d
     async def host_provider():
         return host
 
+    events = EventBus()
+    # See the sibling test above -- without a wired pipeline, nothing renames the item off the
+    # prefix any more (`core/postprocess.py` owns that now, 2026-08-14,
+    # prompts/done/2026-08-14-rename-after-postprocessing-not-before.md).
+    pipeline_pool = RemoteConnectionPool(tmp_path / "known_hosts_pipeline")
+    pipeline = PostprocessPipeline(
+        db=db, events=events, remote_pool=pipeline_pool, host_provider=host_provider
+    )
     q = TransferQueue(
         db=db,
         config_dir=str(tmp_path),
-        events=EventBus(),
+        events=events,
         run_dir=str(tmp_path / "run"),
         tick_s=0.2,
         host_provider=host_provider,
     )
+    q.postprocess = pipeline
     await q.start()
     try:
         job_id = await q.enqueue_item(item_id)
@@ -501,6 +539,20 @@ async def test_stop_mid_transfer_then_resume_finds_the_partial_in_the_prefixed_d
 
         assert await _wait_until(item_downloaded, timeout_s=15)
 
+        # The rename is post-processing's own last step now, not part of the DOWNLOADED
+        # transition -- wait for the (fire-and-forget) pipeline to actually finish.
+        await pipeline.wait_idle()
+
+        async def prefix_cleared():
+            row = await (
+                await db.execute(
+                    "SELECT pending_download_prefix FROM item WHERE id = ?", (item_id,)
+                )
+            ).fetchone()
+            return row is not None and row["pending_download_prefix"] is None
+
+        assert await _wait_until(prefix_cleared, timeout_s=15), "never renamed off the prefix"
+
         final_dir = local_dir / "Big.Release"
         assert final_dir.is_dir()
         assert (final_dir / "big.bin").read_bytes() == big_content
@@ -511,6 +563,272 @@ async def test_stop_mid_transfer_then_resume_finds_the_partial_in_the_prefixed_d
         assert final_item["pending_download_prefix"] is None
     finally:
         await q.stop()
+        await pipeline.wait_idle()
+        cleanup_pool = RemoteConnectionPool(tmp_path / "known_hosts_cleanup")
+        try:
+            await cleanup_pool.delete_path(host, f"/data/pickup/{remote_subdir}")
+        except Exception:  # noqa: BLE001 - cleanup only
+            pass
+        await cleanup_pool.close()
+
+
+async def test_real_name_does_not_exist_while_verification_is_running_and_does_exist_after(
+    db, tmp_path, monkeypatch
+):
+    """This task's own single most important assertion (per its prompt): while verification is
+    genuinely still running, the item's real, unprefixed name must not exist on disk at all --
+    the whole point of moving the rename to the end of post-processing rather than the start.
+    `verify.verify_item` is monkeypatched to sleep briefly so the `VERIFYING` window is long
+    enough to observe deterministically, rather than racing a fast loopback verify.
+    """
+    real_verify_item = verify.verify_item
+
+    def _slow_verify_item(root, **kwargs):
+        time.sleep(1.5)
+        return real_verify_item(root, **kwargs)
+
+    monkeypatch.setattr(verify, "verify_item", _slow_verify_item)
+
+    remote_subdir = f"prefix-e2e-slow-verify-{uuid4().hex[:12]}"
+    host = _host_config()
+    remote_size = await _upload_release_dir(host, tmp_path, remote_subdir)
+
+    local_dir = tmp_path / "local"
+    local_dir.mkdir()
+    cursor = await db.execute(
+        "INSERT INTO host (name, address, port, username, auth_method, password_enc, "
+        "known_hosts_policy) VALUES ('seedbox', ?, ?, ?, 'password', NULL, 'insecure')",
+        (SEEDBOX_HOST, SEEDBOX_PORT, SEEDBOX_USER),
+    )
+    host_id = cursor.lastrowid
+    cursor = await db.execute(
+        "INSERT INTO path_queue (host_id, name, remote_path, local_path, enabled, "
+        "sync_mode, auto_verify) VALUES (?, 'e2e-slow-verify', ?, ?, 1, 'copy', 1)",
+        (host_id, f"/data/pickup/{remote_subdir}", str(local_dir)),
+    )
+    queue_id = cursor.lastrowid
+    cursor = await db.execute(
+        "INSERT INTO item (queue_id, rel_path, is_dir, remote_size, local_size, state) "
+        "VALUES (?, 'Release.Name', 1, ?, 0, 'REMOTE_ONLY')",
+        (queue_id, remote_size),
+    )
+    item_id = cursor.lastrowid
+    await db.commit()
+
+    await download_prefix.save_download_prefix_settings(
+        db, download_prefix.DownloadPrefixSettings(enabled=True, prefix=".downloading-")
+    )
+    # Hash-on-disk fallback on -> no sidecar needed for verify to actually do the (slowed-down)
+    # work; queue's own `auto_verify=1` above is what turns verification on at all.
+    await save_postprocess_settings(db, PostprocessSettings(verify_hash_on_disk=True))
+    await save_transfer_settings(
+        db,
+        TransferSettings(
+            max_bandwidth_bps=10_000_000,
+            max_concurrent_transfers=2,
+            small_item_threshold_bytes=0,
+            small_lane_reserve_bps=0,
+            min_share_floor_bps=0,
+            mirror_parallel_transfer_count=2,
+            mirror_use_pget_n=2,
+            pget_default_n=2,
+        ),
+    )
+
+    async def host_provider():
+        return host
+
+    events = EventBus()
+    pipeline_pool = RemoteConnectionPool(tmp_path / "known_hosts_pipeline")
+    pipeline = PostprocessPipeline(
+        db=db, events=events, remote_pool=pipeline_pool, host_provider=host_provider
+    )
+    q = TransferQueue(
+        db=db,
+        config_dir=str(tmp_path),
+        events=events,
+        run_dir=str(tmp_path / "run"),
+        tick_s=0.2,
+        host_provider=host_provider,
+    )
+    q.postprocess = pipeline
+
+    await q.start()
+    try:
+        await q.enqueue_item(item_id)
+
+        final_dir = local_dir / "Release.Name"
+
+        async def verifying():
+            row = await (
+                await db.execute("SELECT state FROM item WHERE id = ?", (item_id,))
+            ).fetchone()
+            return row is not None and row["state"] == "VERIFYING"
+
+        assert await _wait_until(verifying, timeout_s=30), "item never reached VERIFYING"
+
+        # Caught genuinely mid-verify (the slowdown above buys ~1.5s of window at a 0.2s poll
+        # interval): the real, unprefixed name must not exist on disk at all yet.
+        assert (
+            not final_dir.exists()
+        ), "must not be published under its real name while verification is still running"
+        prefixed_dir = local_dir / ".downloading-Release.Name"
+        assert prefixed_dir.is_dir(), "the bytes are all here, just still under the prefixed name"
+
+        async def prefix_cleared():
+            row = await (
+                await db.execute(
+                    "SELECT pending_download_prefix FROM item WHERE id = ?", (item_id,)
+                )
+            ).fetchone()
+            return row is not None and row["pending_download_prefix"] is None
+
+        assert await _wait_until(
+            prefix_cleared, timeout_s=15
+        ), "never renamed after verification finished"
+
+        assert final_dir.is_dir(), "must exist under its real name once verification is done"
+        assert (final_dir / "a.mkv").read_bytes() == _FILE_A
+        assert (final_dir / "b.mkv").read_bytes() == _FILE_B
+        assert not prefixed_dir.exists()
+
+        item = await (
+            await db.execute("SELECT state, verified_at FROM item WHERE id = ?", (item_id,))
+        ).fetchone()
+        assert item["state"] == "VERIFIED"
+        assert item["verified_at"] is not None
+    finally:
+        await q.stop()
+        await pipeline.wait_idle()
+        cleanup_pool = RemoteConnectionPool(tmp_path / "known_hosts_cleanup")
+        try:
+            await cleanup_pool.delete_path(host, f"/data/pickup/{remote_subdir}")
+        except Exception:  # noqa: BLE001 - cleanup only
+            pass
+        await cleanup_pool.close()
+
+
+async def test_corrupt_item_never_appears_under_its_real_name(db, tmp_path):
+    """The prompt's own required test: a release that turns out `CORRUPT` must never be renamed
+    -- its bytes stay hidden under the prefixed directory, forever, until a human retries it.
+    An importer that skips hidden folders must never find this release under its real name
+    either -- that is the whole problem this task exists to close.
+    """
+    remote_subdir = f"prefix-e2e-corrupt-{uuid4().hex[:12]}"
+    host = _host_config()
+
+    scan_pool = RemoteConnectionPool(tmp_path / "known_hosts_scan")
+    conn = await scan_pool.get_connection(host)
+    async with conn.start_sftp_client() as sftp:
+        remote_dir = f"/data/pickup/{remote_subdir}/Release.Name"
+        await sftp.makedirs(remote_dir, exist_ok=True)
+        async with sftp.open(f"{remote_dir}/a.mkv", "wb") as f:
+            await f.write(_FILE_A)
+        async with sftp.open(f"{remote_dir}/b.mkv", "wb") as f:
+            await f.write(_FILE_B)
+        # A checksum sidecar with a deliberately *wrong* CRC32 for both files -- `verify.py`
+        # prefers sidecar evidence over the hash-on-disk fallback, so this reliably produces
+        # CORRUPT regardless of whether that fallback is even enabled.
+        async with sftp.open(f"{remote_dir}/checksums.sfv", "wb") as f:
+            await f.write(b"a.mkv deadbeef\nb.mkv deadbeef\n")
+
+    entries, _ = await scan_pool.scan(host, f"/data/pickup/{remote_subdir}")
+    assert "Release.Name/a.mkv" in entries and "Release.Name/checksums.sfv" in entries
+    remote_size = sum(e.size for rel, e in entries.items() if rel.startswith("Release.Name/"))
+
+    local_dir = tmp_path / "local"
+    local_dir.mkdir()
+    cursor = await db.execute(
+        "INSERT INTO host (name, address, port, username, auth_method, password_enc, "
+        "known_hosts_policy) VALUES ('seedbox', ?, ?, ?, 'password', NULL, 'insecure')",
+        (SEEDBOX_HOST, SEEDBOX_PORT, SEEDBOX_USER),
+    )
+    host_id = cursor.lastrowid
+    cursor = await db.execute(
+        "INSERT INTO path_queue (host_id, name, remote_path, local_path, enabled, "
+        "sync_mode, auto_verify) VALUES (?, 'e2e-corrupt', ?, ?, 1, 'copy', 1)",
+        (host_id, f"/data/pickup/{remote_subdir}", str(local_dir)),
+    )
+    queue_id = cursor.lastrowid
+    cursor = await db.execute(
+        "INSERT INTO item (queue_id, rel_path, is_dir, remote_size, local_size, state) "
+        "VALUES (?, 'Release.Name', 1, ?, 0, 'REMOTE_ONLY')",
+        (queue_id, remote_size),
+    )
+    item_id = cursor.lastrowid
+    await db.commit()
+
+    await download_prefix.save_download_prefix_settings(
+        db, download_prefix.DownloadPrefixSettings(enabled=True, prefix=".downloading-")
+    )
+    await save_transfer_settings(
+        db,
+        TransferSettings(
+            max_bandwidth_bps=10_000_000,
+            max_concurrent_transfers=2,
+            small_item_threshold_bytes=0,
+            small_lane_reserve_bps=0,
+            min_share_floor_bps=0,
+            mirror_parallel_transfer_count=2,
+            mirror_use_pget_n=2,
+            pget_default_n=2,
+        ),
+    )
+
+    async def host_provider():
+        return host
+
+    events = EventBus()
+    pipeline_pool = RemoteConnectionPool(tmp_path / "known_hosts_pipeline")
+    pipeline = PostprocessPipeline(
+        db=db, events=events, remote_pool=pipeline_pool, host_provider=host_provider
+    )
+    q = TransferQueue(
+        db=db,
+        config_dir=str(tmp_path),
+        events=events,
+        run_dir=str(tmp_path / "run"),
+        tick_s=0.2,
+        host_provider=host_provider,
+    )
+    q.postprocess = pipeline
+
+    await q.start()
+    try:
+        await q.enqueue_item(item_id)
+
+        async def item_corrupt():
+            row = await (
+                await db.execute("SELECT state FROM item WHERE id = ?", (item_id,))
+            ).fetchone()
+            return row is not None and row["state"] == "CORRUPT"
+
+        assert await _wait_until(item_corrupt, timeout_s=30), "item never reached CORRUPT"
+        await pipeline.wait_idle()
+
+        final_dir = local_dir / "Release.Name"
+        prefixed_dir = local_dir / ".downloading-Release.Name"
+        assert not final_dir.exists(), "a CORRUPT item must never appear under its real name"
+        assert prefixed_dir.is_dir(), "bytes stay under the prefixed directory"
+        assert (prefixed_dir / "a.mkv").read_bytes() == _FILE_A
+        assert (prefixed_dir / "b.mkv").read_bytes() == _FILE_B
+
+        item = await (
+            await db.execute("SELECT pending_download_prefix FROM item WHERE id = ?", (item_id,))
+        ).fetchone()
+        assert item["pending_download_prefix"] == ".downloading-"
+
+        events = await (
+            await db.execute(
+                "SELECT kind FROM event WHERE item_id = ? "
+                "AND kind = 'download_prefix_rename_withheld'",
+                (item_id,),
+            )
+        ).fetchall()
+        assert len(events) == 1
+    finally:
+        await q.stop()
+        await pipeline.wait_idle()
         cleanup_pool = RemoteConnectionPool(tmp_path / "known_hosts_cleanup")
         try:
             await cleanup_pool.delete_path(host, f"/data/pickup/{remote_subdir}")

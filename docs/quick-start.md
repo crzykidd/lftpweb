@@ -110,10 +110,12 @@ next.
   Settings → Queues (per-queue override). **On by default** — one of the few things in lftpweb
   that is, because it fixes a defect rather than adding a preference. A directory item downloads
   into a hidden-by-convention folder (`.downloading-<name>` by default, configurable) and is
-  renamed to its real name only once the transfer is fully complete, so an importer that skips
-  dot-prefixed folders (Sonarr, Radarr, Plex, Jellyfin, ...) can never see a partial multi-file
-  release mid-arrival. Single-file downloads are unaffected — there's no partial window for that
-  shape.
+  renamed to its real name only once the transfer is complete _and_ post-processing (verify, then
+  extract) has finished successfully, so an importer that skips dot-prefixed folders (Sonarr,
+  Radarr, Plex, Jellyfin, ...) can never see a partial multi-file release mid-arrival, nor one
+  that downloaded cleanly but turned out corrupt or failed to extract — those stay hidden under
+  the prefixed name until a retry succeeds. Single-file downloads are unaffected — there's no
+  partial window for that shape.
 - **The settle gate** — [Settings → Transfer](/settings/transfer). This one is _on_ by default,
   unlike everything else here. Read the settle-gate section under
   [Concepts](/docs/concepts) before switching it off.

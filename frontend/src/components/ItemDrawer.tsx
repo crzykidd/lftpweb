@@ -50,6 +50,37 @@ function physicalLocalPath(localPath: string, node: FileNode): string {
   return `${dir}/${node.pending_download_prefix}${name}`
 }
 
+/** The rename is now the *last* step of post-processing, not the first (2026-08-14,
+ * prompts/done/2026-08-14-rename-after-postprocessing-not-before.md) -- so `state` can be
+ * `DOWNLOADING`, `DOWNLOADED`, `VERIFYING`, `EXTRACTING`, `VERIFIED`, `EXTRACTED`, `CORRUPT`, or
+ * `EXTRACT_FAILED` while `pending_download_prefix` is still set, not just `DOWNLOADING`. The old
+ * "currently downloading... once the transfer completes" copy was simply wrong once verify/
+ * extract could run for a minute or more after the transfer itself was already done, and
+ * actively misleading for `CORRUPT`/`EXTRACT_FAILED` -- those items are never renamed at all
+ * (the whole point of moving the rename here: an importer must never see an unverified release
+ * under its real name), so "will be renamed once it completes" was a promise that specific item
+ * would never keep.
+ */
+function downloadPrefixNote(state: string): string {
+  if (state === 'CORRUPT' || state === 'EXTRACT_FAILED') {
+    return (
+      'Verification or extraction failed -- this item stays under its prefixed folder name, ' +
+      'not its real one, so an importer watching this directory cannot pick it up. It will ' +
+      'only be renamed if a retry succeeds.'
+    )
+  }
+  if (state === 'DOWNLOADING') {
+    return (
+      'Currently downloading into a prefixed folder ("folder prefix during transfer") -- will ' +
+      'be renamed to its real name once the transfer completes and post-processing finishes.'
+    )
+  }
+  return (
+    'Post-processing (verify/extract) is still running or has not finished -- this item stays ' +
+    'under its prefixed folder name until it does, then it is renamed to its real name.'
+  )
+}
+
 /** The physical-location panel itself -- rendered whenever the caller supplied `localPath`,
  * regardless of whether the item is currently prefixed, so "where is this file right now" has
  * one consistent answer rather than appearing only for the in-flight case.
@@ -62,10 +93,7 @@ function PhysicalLocation({ localPath, node }: { localPath: string; node: FileNo
         {physicalLocalPath(localPath, node)}
       </span>
       {node.pending_download_prefix && (
-        <p className="mt-1 text-amber-700 dark:text-amber-400">
-          Currently downloading into a prefixed folder ("folder prefix during transfer") — will
-          be renamed to its real name once the transfer completes.
-        </p>
+        <p className="mt-1 text-amber-700 dark:text-amber-400">{downloadPrefixNote(node.state)}</p>
       )}
     </div>
   )

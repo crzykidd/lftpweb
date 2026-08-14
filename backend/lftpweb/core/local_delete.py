@@ -1199,6 +1199,16 @@ async def delete_extracted_archives(
             "scan with the mount sentinel present"
         )
 
+    # "Folder prefix during transfer" (`core/download_prefix.py`) can still have this item's
+    # bytes physically sitting under a prefixed directory name when this runs -- extraction
+    # (this function's only caller, `core/postprocess.py._do_extract`) now runs as part of the
+    # pipeline *before* the rename off the prefix (2026-08-14,
+    # prompts/done/2026-08-14-rename-after-postprocessing-not-before.md), so `find_archives` was
+    # handed the physical, still-prefixed root. Resolved the same way `delete_local` already
+    # does (reused, not re-derived, per this task's own instruction) so the two agree on "where
+    # are this item's bytes actually."
+    physical_root = await _physical_local_root(db, queue_id=queue_id, root=root, rel_path=rel_path)
+
     candidates: list[Path] = []
     for head in archive_heads:
         candidates.extend(extract.archive_volume_paths(head))
@@ -1223,7 +1233,16 @@ async def delete_extracted_archives(
         except OSError as exc:
             failed.append(f"{candidate.name} ({exc})")
             continue
-        deleted.append(candidate.relative_to(root).as_posix())
+        # Recorded under the item's *logical* `rel_path`, never the physical one -- `rel_path`
+        # relative to `physical_root` (which may be the prefixed directory) reattached onto
+        # `item["rel_path"]` (never prefixed, DESIGN.md's own invariant for that column). This
+        # is compared against `item.rel_path` elsewhere (`core/engine.py.
+        # build_scan_counts_predicate`), so a path recorded relative to the physical root here
+        # would silently embed the prefix and never match, defeating the archive-cleanup
+        # completeness accounting (DESIGN.md §6) the moment this ran on a still-prefixed item.
+        rest = candidate.relative_to(physical_root)
+        logical_rel = f"{rel_path}/{rest.as_posix()}" if str(rest) != "." else rel_path
+        deleted.append(logical_rel)
         bytes_freed += size
 
     if not deleted:

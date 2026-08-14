@@ -542,10 +542,11 @@ alongside this list: several entries below ship with deliberate, documented limi
   finished, then its own post-import cleanup deleted the release folder while lftp was still
   writing the last two, and lftp died mid-rename for both. Directory items only — a single-file
   download is already complete the instant it's renamed off its own in-flight name, so there is
-  no partial window to protect against. The rename happens the moment the transfer's own
-  filesystem completeness check passes (DESIGN.md §4.3's exit-zero-is-not-completion fix,
-  *2026-08-14* below), before verify/extract/move ever run, so none of them need to know the
-  prefix exists. A stale prefix (the setting changed, or turned off, mid-transfer or while an
+  no partial window to protect against. The rename happens once the transfer's own filesystem
+  completeness check passes (DESIGN.md §4.3's exit-zero-is-not-completion fix, *2026-08-14*
+  below) **and** post-processing (verify, then extract) has finished with nothing flagging the
+  release bad — see the same-day reversal entry below for why this moved later than originally
+  shipped. A stale prefix (the setting changed, or turned off, mid-transfer or while an
   item sits `STOPPED`) is handled: a resume always reuses whatever prefix is already recorded on
   the item rather than recomputing from current settings, and a scan keeps filtering whatever
   prefix is physically in use, not merely today's configured one. See `docs/decisions.md` for
@@ -604,6 +605,29 @@ alongside this list: several entries below ship with deliberate, documented limi
   in-progress job keeps whatever it started with. Single-file downloads are unaffected either
   way. Turn it off at Settings → Transfer, or per queue at Settings → Queues, if nothing watches
   your download directory.
+- **"Folder prefix during transfer"'s rename moved to the *end* of post-processing, not the
+  start** *(2026-08-14, same day)* — reversing that morning's own "rename before verify/
+  extract/move" decision on new evidence: measured on the live instance, a 1.7 GB item takes
+  7.7s to verify (the hash-on-disk fallback reads every byte), so a 21 GB release was
+  previously visible under its real, unprefixed name for roughly a minute and a half while
+  still unverified. If verify then returned `CORRUPT`, an importer watching the directory had
+  that whole window to grab it — the exact scenario this feature exists to prevent. The rename
+  is now the pipeline's own last step in `core/postprocess.py`, run only once nothing along the
+  way (verify, extract) has flagged the release bad; a `CORRUPT` or `EXTRACT_FAILED` item is
+  never renamed at all and stays hidden under its prefixed name until a retry succeeds. A queue
+  with a staging move configured skips a separate rename entirely — the move's own destination
+  is already built from the item's real name, so relocating the still-prefixed source straight
+  there does both jobs in one operation. Two related defects, found auditing every place that
+  builds a path from `local_path + rel_path` during the now-longer prefixed window and fixed in
+  the same pass: `core/local_delete.py.delete_extracted_archives` was recording a deleted
+  archive's path relative to the *physical* (possibly still-prefixed) root instead of the
+  item's *logical* one, which would have silently broken the archive-cleanup completeness
+  accounting the first time cleanup ran on a still-prefixed item; and a scan landing mid-verify/
+  extract could flicker a mirrored release's child files between `PARTIAL`/`REMOTE_ONLY` for
+  the same reason "folder prefix during transfer" already had to fix that flicker for the
+  download window itself. See `docs/decisions.md` for the full reasoning, including why this
+  doesn't reopen phase 5's original "the reconciler must never compare against a different
+  root" worry.
 - **`sync_mode = 'move'` went from stored-but-inert to fully live** when phase 5 shipped.
   An existing queue already configured for `move` begins deleting verified remote copies
   with no further action — review any stored `move` queue before pulling this.

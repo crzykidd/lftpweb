@@ -1013,6 +1013,31 @@ class Engine:
         in_flight_clause = (
             f" OR item.id IN ({','.join('?' for _ in in_flight)})" if in_flight else ""
         )
+        # Descendants of an in-flight *postprocess/delete* parent, mirroring the active-job
+        # descendant clause immediately below (2026-08-14,
+        # prompts/done/2026-08-14-rename-after-postprocessing-not-before.md). Before that task,
+        # `pending_download_prefix` was always cleared by the time an item reached DOWNLOADED --
+        # postprocessing only ever ran against an already-unprefixed, fully visible tree, so a
+        # child row was never at risk here. Now the rename is postprocessing's own *last* step,
+        # so a top-level item can sit in VERIFYING/EXTRACTING for as long as verify/extract take
+        # (measured: 7.7s for 1.7 GB) while its directory is still physically prefixed and
+        # therefore still filtered out of `scan_local` entirely -- the exact shape that already
+        # produced the PARTIAL/REMOTE_ONLY flicker the sibling clause below was written to fix,
+        # just for a different, newly-widened window. The in-flight *item id* clause above only
+        # protects the top-level row itself; without this, a child file inside a release that's
+        # merely being verified or extracted (no `job` row anymore -- the transfer already
+        # finished) would flip to REMOTE_ONLY on every scan that lands mid-postprocessing, exactly
+        # as `core/queue.py._publish_child_progress`'s own sibling comment describes for the
+        # download window.
+        in_flight_descendant_clause = (
+            "  OR EXISTS ("
+            "    SELECT 1 FROM item AS ppparent"
+            f"    WHERE ppparent.queue_id = item.queue_id AND ppparent.id IN ({','.join('?' for _ in in_flight)})"
+            "      AND instr(item.rel_path, ppparent.rel_path || '/') = 1"
+            "  )"
+            if in_flight
+            else ""
+        )
         cursor = await self.db.execute(
             "SELECT item.rel_path FROM item WHERE item.queue_id = ? AND ("
             "  item.auto_queue_suppressed = 1"
@@ -1045,8 +1070,9 @@ class Engine:
             "      AND instr(item.rel_path, parent.rel_path || '/') = 1"
             "  )"
             f"{in_flight_clause}"
+            f"{in_flight_descendant_clause}"
             ")",
-            (queue_id, *in_flight),
+            (queue_id, *in_flight, *in_flight),
         )
         rows = await cursor.fetchall()
         return {row["rel_path"] for row in rows}

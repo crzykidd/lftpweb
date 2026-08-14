@@ -20,6 +20,8 @@ from __future__ import annotations
 
 import asyncio
 import errno
+import functools
+import io
 import os
 import shutil
 import subprocess
@@ -2227,5 +2229,417 @@ async def test_archive_cleanup_reaches_the_same_conclusion_after_a_simulated_res
 
         row = await (await db.execute("SELECT state FROM item WHERE id = ?", (item_id,))).fetchone()
         assert row["state"] == "EXTRACTED"
+    finally:
+        await db.close()
+
+
+# --- The rename off "folder prefix during transfer" moved here as the pipeline's last step -----
+# (2026-08-14, prompts/done/2026-08-14-rename-after-postprocessing-not-before.md, reversing
+# `core/queue.py._reap_one`'s earlier "rename before postprocess.trigger" decision --
+# docs/decisions.md has both entries.) `core/queue.py._reap_one` no longer touches the physical
+# directory at all; it leaves `item.pending_download_prefix` set and calls `trigger()` with the
+# item still sitting at `<local_path>/<prefix><name>/`. Everything below exercises
+# `PostprocessPipeline` directly, the same way the rest of this file does -- `local_root` is
+# resolved from `item.pending_download_prefix` via `core/local_delete.py._physical_local_root`,
+# reused rather than re-derived (this task's own instruction).
+
+
+async def _make_prefixed_dir_item(
+    db, queue_id, rel_path, *, local_root_dir: Path, prefix: str = ".downloading-", remote_size
+):
+    """A directory item whose bytes physically live under `<prefix><rel_path>`, matching what
+    `core/queue.py._reap_one` now hands to post-processing: `state='DOWNLOADED'`,
+    `is_dir=1`, `pending_download_prefix` set. Returns `(item_id, prefixed_dir)`.
+    """
+    prefixed_dir = local_root_dir / f"{prefix}{rel_path}"
+    item_id = await _make_item_row(db, queue_id, rel_path, remote_size=remote_size)
+    await db.execute(
+        "UPDATE item SET is_dir = 1, pending_download_prefix = ? WHERE id = ?",
+        (prefix, item_id),
+    )
+    await db.commit()
+    return item_id, prefixed_dir
+
+
+async def test_prefix_renamed_off_only_after_verify_succeeds(tmp_path):
+    """The single most important behaviour this task adds: nothing renames a still-unverified
+    release, and the rename *does* happen once verification comes back clean -- proving the
+    pipeline resolves the physical (prefixed) path for every step, not just the last one.
+    """
+    db = await _make_db()
+    try:
+        local_dir = tmp_path / "local"
+        local_dir.mkdir()
+        rel_path = "Release"
+        content = b"a real, complete release"
+        _, queue_id = await _make_host_and_queue_rows(db, sync_mode="copy", auto_verify=1)
+        await db.execute(
+            "UPDATE path_queue SET local_path = ? WHERE id = ?", (str(local_dir), queue_id)
+        )
+        await db.commit()
+        item_id, prefixed_dir = await _make_prefixed_dir_item(
+            db, queue_id, rel_path, local_root_dir=local_dir, remote_size=len(content)
+        )
+        prefixed_dir.mkdir()
+        (prefixed_dir / "a.mkv").write_bytes(content)
+
+        pipeline = postprocess.PostprocessPipeline(
+            db=db, events=EventBus(), remote_pool=_FakeRemotePool(), host_provider=_async_host
+        )
+        settings = postprocess.PostprocessSettings(verify_enabled=True, verify_hash_on_disk=True)
+        await pipeline.process_item(item_id, settings)
+
+        final_dir = local_dir / rel_path
+        assert final_dir.is_dir(), "verified -> renamed to its real name"
+        assert (final_dir / "a.mkv").read_bytes() == content
+        assert not prefixed_dir.exists()
+
+        item = await (await db.execute("SELECT * FROM item WHERE id = ?", (item_id,))).fetchone()
+        assert item["state"] == "VERIFIED"
+        assert item["pending_download_prefix"] is None
+
+        events = await (
+            await db.execute(
+                "SELECT kind, message FROM event WHERE item_id = ? AND kind = 'download_prefix_removed'",
+                (item_id,),
+            )
+        ).fetchall()
+        assert len(events) == 1
+        assert str(prefixed_dir) in events[0]["message"]
+        assert str(final_dir) in events[0]["message"]
+    finally:
+        await db.close()
+
+
+async def test_corrupt_item_is_never_renamed_off_the_prefix(tmp_path):
+    """The prompt's own recommendation, verified: an importer that skips the hidden folder must
+    never find a `CORRUPT` release under its real name either -- bytes stay hidden.
+    """
+    db = await _make_db()
+    try:
+        local_dir = tmp_path / "local"
+        local_dir.mkdir()
+        rel_path = "Release"
+        content = b"short"
+        _, queue_id = await _make_host_and_queue_rows(db, sync_mode="copy", auto_verify=1)
+        await db.execute(
+            "UPDATE path_queue SET local_path = ? WHERE id = ?", (str(local_dir), queue_id)
+        )
+        await db.commit()
+        # remote_size deliberately larger than what's on disk -> hash-on-disk fallback reports
+        # CORRUPT (verify.py: total_read < expected_total_bytes).
+        item_id, prefixed_dir = await _make_prefixed_dir_item(
+            db, queue_id, rel_path, local_root_dir=local_dir, remote_size=len(content) + 1000
+        )
+        prefixed_dir.mkdir()
+        (prefixed_dir / "a.mkv").write_bytes(content)
+
+        pipeline = postprocess.PostprocessPipeline(
+            db=db, events=EventBus(), remote_pool=_FakeRemotePool(), host_provider=_async_host
+        )
+        settings = postprocess.PostprocessSettings(verify_enabled=True, verify_hash_on_disk=True)
+        await pipeline.process_item(item_id, settings)
+
+        assert prefixed_dir.is_dir(), "bytes must stay under the prefixed directory"
+        assert not (local_dir / rel_path).exists(), "must never appear under its real name"
+
+        item = await (await db.execute("SELECT * FROM item WHERE id = ?", (item_id,))).fetchone()
+        assert item["state"] == "CORRUPT"
+        assert item["pending_download_prefix"] == ".downloading-"
+
+        events = await (
+            await db.execute(
+                "SELECT kind, message FROM event WHERE item_id = ? "
+                "AND kind = 'download_prefix_rename_withheld'",
+                (item_id,),
+            )
+        ).fetchall()
+        assert len(events) == 1
+        assert "CORRUPT" in events[0]["message"]
+    finally:
+        await db.close()
+
+
+async def test_extract_failed_item_is_never_renamed_off_the_prefix(tmp_path):
+    """Same guarantee as the `CORRUPT` case, for the other failure mode this task's `release_ok`
+    gate covers -- a precondition failure (missing rar volume) discovered by extraction.
+    """
+    db = await _make_db()
+    try:
+        local_dir = tmp_path / "local"
+        local_dir.mkdir()
+        rel_path = "Release"
+        _, queue_id = await _make_host_and_queue_rows(db, sync_mode="copy", auto_extract=1)
+        await db.execute(
+            "UPDATE path_queue SET local_path = ? WHERE id = ?", (str(local_dir), queue_id)
+        )
+        await db.commit()
+        item_id, prefixed_dir = await _make_prefixed_dir_item(
+            db, queue_id, rel_path, local_root_dir=local_dir, remote_size=100
+        )
+        prefixed_dir.mkdir()
+        (prefixed_dir / "Release.rar").write_bytes(b"volume 1")
+        (prefixed_dir / "Release.r00").write_bytes(b"volume 2")
+        # Release.r01 missing, Release.r02 present -> a named gap.
+
+        pipeline = postprocess.PostprocessPipeline(
+            db=db, events=EventBus(), remote_pool=_FakeRemotePool(), host_provider=_async_host
+        )
+        (prefixed_dir / "Release.r02").write_bytes(b"volume 4")
+        settings = postprocess.PostprocessSettings(extract_enabled=True)
+        await pipeline.process_item(item_id, settings)
+
+        assert prefixed_dir.is_dir()
+        assert not (local_dir / rel_path).exists()
+
+        item = await (await db.execute("SELECT * FROM item WHERE id = ?", (item_id,))).fetchone()
+        assert item["state"] == "EXTRACT_FAILED"
+        assert item["pending_download_prefix"] == ".downloading-"
+        # No attempt was made -- caught before any staging directory was ever created, and its
+        # name (if it existed) would itself carry the prefix -- confirm neither exists.
+        assert not (local_dir / f"{extract.UNPACK_PREFIX}.downloading-{rel_path}").exists()
+        assert not (local_dir / f"{extract.FAILED_PREFIX}.downloading-{rel_path}").exists()
+    finally:
+        await db.close()
+
+
+async def test_rename_conflict_leaves_bytes_under_the_prefix_and_logs_an_event(tmp_path):
+    """A destination collision (something already sitting under the real name) must never be
+    silently clobbered -- `move_tree`'s `merge=False` refuses it. Unlike the old
+    `core/queue.py._reap_one` version of this rename, there is no PARTIAL to downgrade to here
+    (post-processing has already run); the item is simply left exactly where it is, loudly.
+    """
+    db = await _make_db()
+    try:
+        local_dir = tmp_path / "local"
+        local_dir.mkdir()
+        rel_path = "Release"
+        _, queue_id = await _make_host_and_queue_rows(db, sync_mode="copy")
+        await db.execute(
+            "UPDATE path_queue SET local_path = ? WHERE id = ?", (str(local_dir), queue_id)
+        )
+        await db.commit()
+        item_id, prefixed_dir = await _make_prefixed_dir_item(
+            db, queue_id, rel_path, local_root_dir=local_dir, remote_size=5
+        )
+        prefixed_dir.mkdir()
+        (prefixed_dir / "a.mkv").write_bytes(b"hello")
+        # The real name already exists -- a genuine conflict `move_tree` must refuse.
+        (local_dir / rel_path).mkdir()
+        (local_dir / rel_path / "old.mkv").write_bytes(b"stale")
+
+        pipeline = postprocess.PostprocessPipeline(
+            db=db, events=EventBus(), remote_pool=_FakeRemotePool(), host_provider=_async_host
+        )
+        # Everything off -- nothing to flag the release bad, so the pipeline reaches the rename.
+        await pipeline.process_item(item_id, postprocess.PostprocessSettings())
+
+        assert prefixed_dir.is_dir(), "the in-flight content must be preserved, not lost"
+        assert (prefixed_dir / "a.mkv").read_bytes() == b"hello"
+        assert (local_dir / rel_path / "old.mkv").read_bytes() == b"stale", "conflict untouched"
+
+        item = await (await db.execute("SELECT * FROM item WHERE id = ?", (item_id,))).fetchone()
+        assert item["pending_download_prefix"] == ".downloading-"
+
+        events = await (
+            await db.execute(
+                "SELECT kind, message FROM event WHERE item_id = ? "
+                "AND kind = 'download_prefix_rename_failed'",
+                (item_id,),
+            )
+        ).fetchall()
+        assert len(events) == 1
+        assert "FileExistsError" in events[0]["message"]
+    finally:
+        await db.close()
+
+
+async def test_move_relocates_directly_from_the_prefixed_source_and_clears_the_prefix(tmp_path):
+    """No redundant standalone rename when a staging move is also configured: `_do_move`'s
+    destination is already built from the item's unprefixed `rel_path`, so relocating the
+    still-prefixed source straight there both moves it and removes the prefix in one operation.
+    """
+    db = await _make_db()
+    try:
+        local_dir = tmp_path / "local"
+        local_dir.mkdir()
+        staging_dir = tmp_path / "staging"
+        staging_dir.mkdir()
+        rel_path = "Release"
+        content = b"ready to relocate"
+        _, queue_id = await _make_host_and_queue_rows(
+            db, sync_mode="copy", auto_move=1, staging_path=str(staging_dir)
+        )
+        await db.execute(
+            "UPDATE path_queue SET local_path = ? WHERE id = ?", (str(local_dir), queue_id)
+        )
+        await db.commit()
+        item_id, prefixed_dir = await _make_prefixed_dir_item(
+            db, queue_id, rel_path, local_root_dir=local_dir, remote_size=len(content)
+        )
+        prefixed_dir.mkdir()
+        (prefixed_dir / "a.mkv").write_bytes(content)
+
+        pipeline = postprocess.PostprocessPipeline(
+            db=db, events=EventBus(), remote_pool=_FakeRemotePool(), host_provider=_async_host
+        )
+        settings = postprocess.PostprocessSettings(move_enabled=True)
+        await pipeline.process_item(item_id, settings)
+
+        final_dir = staging_dir / rel_path
+        assert final_dir.is_dir()
+        assert (final_dir / "a.mkv").read_bytes() == content
+        assert not prefixed_dir.exists()
+        assert not (local_dir / rel_path).exists(), "never created under the unprefixed local path"
+
+        item = await (await db.execute("SELECT * FROM item WHERE id = ?", (item_id,))).fetchone()
+        assert item["pending_download_prefix"] is None
+
+        events = await (
+            await db.execute("SELECT kind FROM event WHERE item_id = ?", (item_id,))
+        ).fetchall()
+        kinds = [e["kind"] for e in events]
+        assert "move" in kinds
+        assert "download_prefix_removed" not in kinds, "the move already did the rename's job"
+    finally:
+        await db.close()
+
+
+async def test_move_withheld_when_prefixed_item_is_corrupt(tmp_path):
+    """The staging move must not un-hide a `CORRUPT` release either -- its destination is built
+    from the unprefixed `rel_path`, so relocating there would itself be the un-hiding this
+    feature exists to prevent.
+    """
+    db = await _make_db()
+    try:
+        local_dir = tmp_path / "local"
+        local_dir.mkdir()
+        staging_dir = tmp_path / "staging"
+        staging_dir.mkdir()
+        rel_path = "Release"
+        content = b"short"
+        _, queue_id = await _make_host_and_queue_rows(
+            db,
+            sync_mode="copy",
+            auto_verify=1,
+            auto_move=1,
+            staging_path=str(staging_dir),
+        )
+        await db.execute(
+            "UPDATE path_queue SET local_path = ? WHERE id = ?", (str(local_dir), queue_id)
+        )
+        await db.commit()
+        item_id, prefixed_dir = await _make_prefixed_dir_item(
+            db, queue_id, rel_path, local_root_dir=local_dir, remote_size=len(content) + 1000
+        )
+        prefixed_dir.mkdir()
+        (prefixed_dir / "a.mkv").write_bytes(content)
+
+        pipeline = postprocess.PostprocessPipeline(
+            db=db, events=EventBus(), remote_pool=_FakeRemotePool(), host_provider=_async_host
+        )
+        settings = postprocess.PostprocessSettings(
+            verify_enabled=True, verify_hash_on_disk=True, move_enabled=True
+        )
+        await pipeline.process_item(item_id, settings)
+
+        assert not (staging_dir / rel_path).exists(), "move withheld"
+        assert prefixed_dir.is_dir()
+        assert (prefixed_dir / "a.mkv").read_bytes() == content
+
+        item = await (await db.execute("SELECT * FROM item WHERE id = ?", (item_id,))).fetchone()
+        assert item["state"] == "CORRUPT"
+        assert item["pending_download_prefix"] == ".downloading-"
+
+        events = await (
+            await db.execute(
+                "SELECT message FROM event WHERE item_id = ? "
+                "AND kind = 'download_prefix_rename_withheld'",
+                (item_id,),
+            )
+        ).fetchall()
+        assert len(events) == 1
+        assert "Staging move withheld" in events[0]["message"]
+    finally:
+        await db.close()
+
+
+@pytestmark_7z
+async def test_extraction_stages_into_unpack_correctly_for_a_prefixed_item(tmp_path, monkeypatch):
+    """The prompt's own required coverage: extraction must stage into `_UNPACK_` correctly when
+    the item is still physically under its download-prefix directory -- proving `_process_item`
+    hands `_do_extract` the *physical* root (`_physical_local_root`), not `local_path/rel_path`.
+    """
+    monkeypatch.setattr(
+        extract, "extract_item", functools.partial(extract.extract_item, binary=_SEVEN_ZIP_BIN)
+    )
+    seen_roots: list[Path] = []
+    real_find_archives = extract.find_archives
+
+    def _spying_find_archives(root):
+        seen_roots.append(root)
+        return real_find_archives(root)
+
+    monkeypatch.setattr(extract, "find_archives", _spying_find_archives)
+
+    db = await _make_db()
+    try:
+        local_dir = tmp_path / "local"
+        local_dir.mkdir()
+        rel_path = "Release"
+        archive_buf = io.BytesIO()
+        with zipfile.ZipFile(archive_buf, "w") as zf:
+            zf.writestr("inner.txt", "extracted from inside the prefixed directory")
+        archive_content = archive_buf.getvalue()
+
+        _, queue_id = await _make_host_and_queue_rows(db, sync_mode="copy", auto_extract=1)
+        await db.execute(
+            "UPDATE path_queue SET local_path = ? WHERE id = ?", (str(local_dir), queue_id)
+        )
+        await db.commit()
+        item_id, prefixed_dir = await _make_prefixed_dir_item(
+            db, queue_id, rel_path, local_root_dir=local_dir, remote_size=len(archive_content)
+        )
+        prefixed_dir.mkdir()
+        (prefixed_dir / "payload.zip").write_bytes(archive_content)
+
+        pipeline = postprocess.PostprocessPipeline(
+            db=db, events=EventBus(), remote_pool=_FakeRemotePool(), host_provider=_async_host
+        )
+        settings = postprocess.PostprocessSettings(extract_enabled=True)
+        await pipeline.process_item(item_id, settings)
+
+        # The physical root `find_archives` actually walked was the prefixed directory, every
+        # time it was called (once by `_do_extract`'s own precheck, once more inside
+        # `extract_item` itself) -- confirms the staging sibling (`_UNPACK_<prefix><name>`) was
+        # computed relative to where the bytes actually were, not the logical, not-yet-real name.
+        assert seen_roots, "find_archives was never called"
+        assert all(r == prefixed_dir for r in seen_roots)
+
+        final_dir = local_dir / rel_path
+        assert final_dir.is_dir(), "extracted, then renamed off the prefix"
+        assert (
+            final_dir / "inner.txt"
+        ).read_text() == "extracted from inside the prefixed directory"
+        assert (
+            final_dir / "payload.zip"
+        ).exists(), "archive itself untouched (cleanup is separate)"
+        assert not prefixed_dir.exists()
+
+        # No leftover staging/failure directory anywhere under the queue's local root, prefixed
+        # name or not.
+        leftovers = [
+            p
+            for p in local_dir.rglob("*")
+            if p.is_dir()
+            and (
+                p.name.startswith(extract.UNPACK_PREFIX) or p.name.startswith(extract.FAILED_PREFIX)
+            )
+        ]
+        assert leftovers == []
+
+        item = await (await db.execute("SELECT * FROM item WHERE id = ?", (item_id,))).fetchone()
+        assert item["state"] == "EXTRACTED"
+        assert item["pending_download_prefix"] is None
     finally:
         await db.close()

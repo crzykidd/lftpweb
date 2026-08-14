@@ -482,7 +482,25 @@ class PostprocessPipeline:
             logger.warning("postprocess: item %s has an empty rel_path, refusing to act", item_id)
             return
 
-        local_root = Path(queue["local_path"].rstrip("/")) / item["rel_path"]
+        # `local_path` + `rel_path` is only the item's *logical* location. Its *physical* one
+        # can still differ for as long as "folder prefix during transfer"
+        # (`core/download_prefix.py`) has this item's bytes sitting under
+        # `<prefix><name>/` -- true for the item's whole time in this pipeline now that the
+        # rename off the prefix is the pipeline's own last step, not something that already
+        # happened before this method was ever called (2026-08-14,
+        # prompts/done/2026-08-14-rename-after-postprocessing-not-before.md). Resolved the
+        # established way (`core/local_delete.py._physical_local_root`, reused rather than
+        # re-derived) so verify/extract/move all operate on wherever the bytes actually are.
+        # Imported locally: `core/local_delete.py` imports `core/mount_sentinel.py`, which
+        # imports this module for `OWNED_STATES` -- a top-level import here would be circular
+        # (the same reason `core/extract.py.extract_item` imports `move_tree` locally).
+        from lftpweb.core import local_delete
+
+        root = Path(queue["local_path"].rstrip("/"))
+        local_root = await local_delete._physical_local_root(
+            self.db, queue_id=item["queue_id"], root=root, rel_path=item["rel_path"]
+        )
+        pending_prefix = item["pending_download_prefix"]
         sync_mode = queue["sync_mode"]
 
         # DESIGN.md §6: verification is forced on for `move` regardless of either layer --
@@ -502,10 +520,84 @@ class PostprocessPipeline:
         if sync_mode == "move":
             await self._maybe_delete_remote(item, queue, verify_state)
 
+        extract_state: str | None = None
         if extract_effective:
-            await self._do_extract(item, queue, local_root, settings)
+            extract_state = await self._do_extract(item, queue, local_root, settings)
 
-        if move_effective:
+        # The rename off the download-prefix ("folder prefix during transfer") is now the
+        # pipeline's *last* step on a release nothing along the way flagged bad -- see
+        # `docs/decisions.md`'s 2026-08-14 reversal entry for the full reasoning (moved out of
+        # `core/queue.py._reap_one`, where it ran before verify/extract instead of after them).
+        # A no-op whenever `pending_prefix` is falsy -- every `pget` job, and a `mirror` job the
+        # feature doesn't apply to or that already got renamed by an earlier pass.
+        release_ok = verify_state != "CORRUPT" and extract_state != "EXTRACT_FAILED"
+        if pending_prefix and not release_ok:
+            # Never renamed: an importer watching this directory under its real name must never
+            # find a release that turned out corrupt or failed to extract -- the exact scenario
+            # this whole feature exists to prevent, just extended to cover verification/
+            # extraction failures discovered after the transfer itself already succeeded. The
+            # staging move is withheld too, on the same reasoning: `_do_move`'s destination is
+            # built from the item's logical `rel_path`, which never carries the prefix, so
+            # relocating there would itself be the un-hiding this branch exists to prevent.
+            # Always logged, not only when a staging move was also on the table -- "no silent
+            # path" for a withheld action is this pipeline's own rule elsewhere
+            # (`_maybe_delete_remote`'s docstring); a release staying hidden is exactly the kind
+            # of fact a user needs explained, not left to be inferred from an absent rename.
+            await audit.record_event(
+                self.db,
+                level="warning",
+                item_id=item["id"],
+                kind="download_prefix_rename_withheld",
+                message=(
+                    f"{item['rel_path']!r}: not renamed off its download-prefix directory "
+                    f"{local_root} -- verify={verify_state!r}, extract={extract_state!r}. "
+                    "Stays hidden under the prefixed name rather than being published under its "
+                    "real one."
+                    + (" Staging move withheld for the same reason." if move_effective else "")
+                ),
+            )
+            await self._publish(item["id"])
+        elif pending_prefix and move_effective:
+            # The move destination is already the item's real, unprefixed name (`_do_move`
+            # builds it from `item.rel_path`, which never carries the prefix) -- relocating the
+            # still-prefixed source straight there both moves it *and* removes the prefix in the
+            # same operation, so a separate standalone rename first would be redundant. The move
+            # event's own message already names the physical (prefixed) source path, which is
+            # evidence enough of where this item physically came from; no second event needed.
+            # Only cleared on success -- see `_do_move`'s own docstring for why a failed move
+            # must leave this column set (the bytes are still physically under the prefix).
+            moved = await self._do_move(item, queue, local_root)
+            if moved:
+                await self.db.execute(
+                    "UPDATE item SET pending_download_prefix = NULL WHERE id = ?", (item["id"],)
+                )
+                await self.db.commit()
+        elif pending_prefix:
+            local_root, rename_error = await self._finalize_download_prefix(
+                item, local_root, pending_prefix
+            )
+            if rename_error is not None:
+                # No automatic retry for this one -- unlike a failed transfer (re-queueable) or
+                # a failed verify/extract (a retry re-runs the whole pipeline from `DOWNLOADED`),
+                # this item has already finished post-processing; nothing re-triggers this
+                # method for it again on its own. The most plausible cause (`move_tree`'s
+                # `merge=False`) is a real name collision at the destination that needs a human
+                # to resolve -- said plainly, rather than implying a retry that will not happen.
+                await audit.record_event(
+                    self.db,
+                    level="error",
+                    item_id=item["id"],
+                    kind="download_prefix_rename_failed",
+                    message=(
+                        f"{item['rel_path']!r}: renaming off its download-prefix directory "
+                        f"{local_root} to its real name failed -- {rename_error}. Bytes remain "
+                        "under the prefixed name and this item stays hidden under it; nothing "
+                        "retries this automatically -- resolve the conflict at the destination, "
+                        "then delete the local copy and re-download, or rename it by hand."
+                    ),
+                )
+                await self._publish(item["id"])
+        elif move_effective:
             await self._do_move(item, queue, local_root)
 
     # --- steps ---------------------------------------------------------------------------
@@ -615,7 +707,7 @@ class PostprocessPipeline:
 
     async def _do_extract(
         self, item: Any, queue: Any, local_root: Path, settings: PostprocessSettings
-    ) -> None:
+    ) -> str | None:
         """Fix, 2026-08-12 (docs/decisions.md): `ok: bool` used to conflate "nothing to
         extract" with "extraction succeeded" -- a plain `.mkv` download on an auto-extract
         queue got stamped `EXTRACTED`, with a real `extracted_at`, for work that never
@@ -627,6 +719,13 @@ class PostprocessPipeline:
         for a no-op `extract_item` itself discovers *late* (a race between this pre-check and
         the real call) -- see `core/extract.py.extract_item`'s docstring for why that path
         must restore the item's actual prior state, never hardcode `DOWNLOADED`.
+
+        Returns `result.state` (`"EXTRACTED"`/`"EXTRACT_FAILED"`/`"SKIPPED"`), or `None` when
+        extraction never even started (no archives found) -- `_process_item` (2026-08-14,
+        prompts/done/2026-08-14-rename-after-postprocessing-not-before.md) reads this to decide
+        whether the item is safe to rename off its download-prefix directory: only
+        `"EXTRACT_FAILED"` withholds the rename, so `None`/`"SKIPPED"` both mean "nothing here
+        says this release is bad."
         """
         if settings.failed_retention_enabled:
             await self._sweep_failed_dirs(queue, settings)
@@ -641,7 +740,7 @@ class PostprocessPipeline:
                 message=extract.NO_ARCHIVES_DETAIL,
             )
             await self._publish(item["id"])
-            return
+            return None
 
         # Read fresh, not from the `item` row `_process_item` fetched at the top of this run:
         # verification (if it ran first this pass) may already have moved the item off
@@ -714,6 +813,8 @@ class PostprocessPipeline:
                 self.db, item=item, queue=queue, archive_heads=archives
             )
 
+        return result.state
+
     async def _sweep_failed_dirs(self, queue: Any, settings: PostprocessSettings) -> None:
         """Fix, 2026-08-12 (docs/decisions.md): `_FAILED_` staging directories
         (`core/extract.py`) were kept as diagnostic evidence forever -- correct on failure,
@@ -753,15 +854,42 @@ class PostprocessPipeline:
         something ugly" for the *removal* record, not only the original failure. `None` if no
         matching item exists any more; the event row still stands on its own, with the path in
         the message.
+
+        **Two candidates, not one** (2026-08-14,
+        prompts/done/2026-08-14-rename-after-postprocessing-not-before.md). A `_FAILED_` staging
+        directory is now created as a sibling of whatever `local_root` *physically* was at
+        extraction time -- which, for an item still under "folder prefix during transfer"
+        (extraction now always runs before the rename off that prefix), is
+        `_FAILED_<prefix><rel_path>`, not `_FAILED_<rel_path>`. Stripping only `FAILED_PREFIX`
+        and matching on `rel_path` alone would silently miss every one of those. Tried first
+        because it's the common case (feature off, or the item was never prefixed); the second
+        candidate matches an item whose own recorded `pending_download_prefix` plus its
+        `rel_path` reproduces the directory name exactly -- the same "trust what's actually
+        recorded on the item over recomputing from today's settings" rule
+        `_resolve_download_prefix_for_spawn` (`core/queue.py`) already uses.
         """
-        rel_path = path.name[len(extract.FAILED_PREFIX) :]
+        name = path.name[len(extract.FAILED_PREFIX) :]
         cursor = await self.db.execute(
-            "SELECT id FROM item WHERE queue_id = ? AND rel_path = ?", (queue_id, rel_path)
+            "SELECT id FROM item WHERE queue_id = ? AND ("
+            "  rel_path = ?"
+            "  OR (pending_download_prefix IS NOT NULL AND pending_download_prefix || rel_path = ?)"
+            ") LIMIT 1",
+            (queue_id, name, name),
         )
         row = await cursor.fetchone()
         return row["id"] if row is not None else None
 
-    async def _do_move(self, item: Any, queue: Any, local_root: Path) -> None:
+    async def _do_move(self, item: Any, queue: Any, local_root: Path) -> bool:
+        """Relocate `local_root` to the queue's `staging_path`. Returns whether it succeeded --
+        consulted by `_process_item` (2026-08-14,
+        prompts/done/2026-08-14-rename-after-postprocessing-not-before.md) before clearing
+        `item.pending_download_prefix` for a still-prefixed item moved straight from its
+        download-prefix directory: `move_tree` leaves `local_root` untouched on any failure
+        (`FileExistsError` before touching anything; the EXDEV fallback only removes `src` after
+        its own atomic rename succeeds), so a failed move here means the bytes are still
+        physically sitting under the prefix and that bookkeeping column must say so, not be
+        cleared as if the relocation-and-implicit-rename had actually happened.
+        """
         dest = Path(queue["staging_path"].rstrip("/")) / item["rel_path"]
         try:
             await asyncio.to_thread(move_tree, local_root, dest)
@@ -774,7 +902,7 @@ class PostprocessPipeline:
                 kind="move_failed",
                 message=f"relocating {local_root} -> {dest} failed: {exc}",
             )
-            return
+            return False
         await audit.record_event(
             self.db,
             level="info",
@@ -785,6 +913,71 @@ class PostprocessPipeline:
         # No item.state change here -- see the module docstring: the next scan finds
         # local_path empty for this rel_path and phase 4's REMOVED_LOCAL grace-period
         # machinery takes it from there, the same as any other externally-caused move.
+        return True
+
+    async def _finalize_download_prefix(
+        self, item: Any, local_root: Path, prefix: str
+    ) -> tuple[Path, str | None]:
+        """Rename `local_root` from its in-flight, prefixed name back to its real one ("folder
+        prefix during transfer," `core/download_prefix.py`) -- the pipeline's own last step on a
+        release nothing along the way flagged bad, for the case where there is no staging move
+        to fold the rename into (`_process_item`'s other branch handles that one by relocating
+        straight to the unprefixed destination instead).
+
+        **Moved here from `core/queue.py._reap_one`, 2026-08-14
+        (prompts/done/2026-08-14-rename-after-postprocessing-not-before.md), reversing that
+        entry's own reasoning in `docs/decisions.md`.** That version ran this the instant the
+        completeness check passed, before `postprocess.trigger()` ever fired, on the argument
+        that the transfer -- what the setting's name says it protects -- was already over by
+        then. It was, but "the transfer is over" and "safe to publish under the real name" are
+        different claims: verify and extract hadn't run yet, so a release that turns out
+        `CORRUPT` or fails to extract was already visible under its real name for however long
+        those steps took (measured: 7.7s for 1.7 GB -- a 21 GB release sat exposed for roughly a
+        minute and a half). `_process_item` now calls this only after confirming neither verify
+        nor extract flagged the release bad (`release_ok`), so nothing renamed here has ever
+        been anything but hidden the whole time it might have been wrong.
+
+        Uses `move_tree` -- never a bare `os.rename` -- reusing the one "move a directory,
+        atomically from an observer's point of view, same-filesystem fast path plus an EXDEV
+        copy-then-rename fallback" implementation already in this module, even though `src`/
+        `dst` share a parent directory here and so are always same-filesystem in practice.
+
+        Returns `(new_local_root, None)` on success -- `pending_download_prefix` is cleared in
+        the same breath, committed together so a crash between the two can never leave the
+        directory already renamed but the column still claiming otherwise. On failure (most
+        plausibly `dst` already existing -- `move_tree`'s `merge=False` refuses to overwrite,
+        correctly: this codebase must never silently clobber content already sitting under an
+        item's real name), returns `(local_root, detail)` unchanged; the caller records why and
+        leaves the item exactly where post-processing left it -- see that caller's own comment
+        for why nothing retries this automatically.
+        """
+        dst = local_root.parent / local_root.name[len(prefix) :]
+        try:
+            await asyncio.to_thread(move_tree, local_root, dst)
+        except Exception as exc:  # noqa: BLE001 - reported to the caller, never raised
+            logger.exception(
+                "item %s: renaming %s -> %s (folder prefix during transfer) failed",
+                item["id"],
+                local_root,
+                dst,
+            )
+            return local_root, f"{type(exc).__name__}: {exc}"
+        await self.db.execute(
+            "UPDATE item SET pending_download_prefix = NULL WHERE id = ?", (item["id"],)
+        )
+        await self.db.commit()
+        await audit.record_event(
+            self.db,
+            level="info",
+            item_id=item["id"],
+            kind="download_prefix_removed",
+            message=(
+                f"{item['rel_path']!r}: renamed {local_root} -> {dst} now that it has been "
+                "downloaded, verified, and extracted (folder prefix during transfer)"
+            ),
+        )
+        await self._publish(item["id"])
+        return dst, None
 
     # --- small DB helpers ------------------------------------------------------------------
 

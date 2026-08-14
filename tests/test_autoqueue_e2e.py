@@ -18,6 +18,7 @@ import aiosqlite
 import pytest
 
 from lftpweb.core.autoqueue import AutoQueue, QueueAutoConfig
+from lftpweb.core.download_prefix import DownloadPrefixSettings, save_download_prefix_settings
 from lftpweb.core.mount_sentinel import write_if_needed
 from lftpweb.core.queue import TransferQueue, TransferSettings, save_transfer_settings
 from lftpweb.core.remote import HostConfig
@@ -75,6 +76,16 @@ async def db():
     # what this file actually tests (file_exclude patterns driving auto-queue); the gate
     # itself is covered by tests/test_settle.py and tests/test_settle_gate_e2e.py.
     await save_settle_settings(conn, SettleSettings(enabled=False))
+    # "Folder prefix during transfer" also defaults on (2026-08-14) and, since 2026-08-14
+    # (prompts/done/2026-08-14-rename-after-postprocessing-not-before.md), the rename off a
+    # prefixed directory happens only inside `core/postprocess.py`, triggered from
+    # `core/queue.py._reap_one` -- which this file's `TransferQueue` never gets one wired into
+    # (it drives `AutoQueue` directly, not the full `main.py` stack). Left on, a directory item
+    # here would download into `.downloading-<name>/` and simply stay there forever, since
+    # nothing would ever rename it back. Disabled for the same "isolate what this file actually
+    # tests" reason as the settle gate above; the prefix rename itself is covered by
+    # tests/test_download_prefix.py and tests/test_download_prefix_e2e.py.
+    await save_download_prefix_settings(conn, DownloadPrefixSettings(enabled=False))
     yield conn
     await conn.close()
 

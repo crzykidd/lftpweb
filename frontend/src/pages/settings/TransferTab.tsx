@@ -302,10 +302,14 @@ function DownloadPrefixSection() {
           <p>
             While a <strong>directory</strong> item is downloading, write it into a
             hidden-by-convention folder (e.g. <code>.downloading-Release.Name</code>) instead of
-            its real name, and rename it back only once the transfer is fully complete. Sonarr,
-            Radarr, Plex, and Jellyfin all skip hidden (dot-prefixed) folders regardless of
-            whether they know about lftpweb, so an importer polling the download tree can never
-            see a partial multi-file release mid-arrival.
+            its real name, and rename it back only once the transfer is complete <em>and</em>
+            post-processing (verify, then extract) has finished successfully — not the instant
+            the transfer itself ends. Sonarr, Radarr, Plex, and Jellyfin all skip hidden
+            (dot-prefixed) folders regardless of whether they know about lftpweb, so an importer
+            polling the download tree can never see a partial multi-file release mid-arrival, nor
+            one that downloaded cleanly but failed verification or extraction — a release that
+            comes back <code>CORRUPT</code> or fails to extract is never renamed at all, and stays
+            hidden under its prefixed name until a retry succeeds.
           </p>
           <p>
             <strong>Directory items only.</strong> A single-file download is already complete
