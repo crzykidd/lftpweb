@@ -6,6 +6,77 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-14 — Files page Speed column; column resize handles moved to the left edge
+
+**Handoff prompt `prompts/done/2026-08-14-files-page-speed-column.md`, executed end to end.**
+Two decisions, one fix.
+
+**Decision: fixed the column-resize handle by moving it to each column's *left* edge, not by
+switching to paired resize.** Reported live 2026-08-14: dragging the line next to a column
+"kind of works" for Size but visibly wrong for Status ("moves the left side of Status while the
+line to drag is on the right"). Traced to geometry, not an off-by-one: `RESIZABLE_COLUMNS` are
+fixed-width flex siblings and Name is the only flex item, absorbing every width change. Widening
+column K by `delta` shrinks Name by `delta`; since Name sits to the left of every fixed column,
+that shrink is a uniform leftward shift of every fixed column's left edge (K's included), while
+K's own width grows by the same `delta` in the same step — net effect, K's **right** edge stays
+exactly where it was and K's **left** edge is what visibly moves. The old handle sat at each
+column's right edge (`-right-1`), which is provably the one point that never tracks the drag,
+for every column, not just Status. The task's own brief offered two fixes: move the handle
+(chosen — minimal, and it happens to land the leftmost column's handle exactly on the Name|Size
+boundary, the one boundary a user can actually see move), or pair the resize (adjust the
+dragged column and Name together so the grabbed edge stays under the cursor regardless of which
+side it's on). Paired resize was already considered and rejected during `a4a626d` (documented at
+`FileTree.tsx`'s `RESIZABLE_COLUMNS` comment) as more code for no behavioural gain over "Name
+flexes, the rest are fixed" — this bug doesn't change that trade-off, so the model itself is
+kept, not reversed. Moving the handle also required flipping the sign of the pointer-drag delta
+(`startWidth - (clientX - startX)`, not `+`) — the conventional feel of a left-edge handle on a
+right-anchored box (drag the edge further left, the box gets wider), same as resizing a window
+from its left edge. The keyboard path (`handleKeyDown`) needed no change: it already reasons in
+"bigger"/"smaller" per arrow key, never in raw screen-pixel deltas, so it was never affected by
+which edge the handle sits on. **This fix could not be visually confirmed — no browser exists in
+this environment.** It's reasoned from the layout math above (also fully written out inline as
+`ColumnResizeHandle`'s own docstring in `FileTree.tsx`) and needs a human to drag every column
+and confirm the boundary tracks the cursor, especially with the pre-existing behaviour ("Size
+kind of works") no longer half-right, half-wrong.
+
+**Decision: the Speed column shows only the live, EMA-smoothed instantaneous `speed_bps` off
+the `progress` WS message — never a derived average, and blank rather than `0 B/s` for anything
+not actively downloading.** The task's brief already flagged the trap in the alternative
+(`local_size / (now - state_changed_at)`): cumulative bytes divided by time-since-last-transition
+produces a phantom rate on a resumed transfer, the same non-monotonicity trap `core/metrics.py`
+documents for `bytes_done`/`bytes_start`. Since the live `speed_bps` was already on the wire and
+already smoothed, there was no reason to build a fallback derivation at all — one number, one
+source, never two vocabularies for "how fast." Gating display/sort on `entry.state ===
+'DOWNLOADING'` (rather than on whether a value happens to be present) turned out to be load-
+bearing, not cosmetic: `useLiveModel.ts`'s new `speedByItemId` map is never pruned when a job
+finishes (same as the pre-existing `progressByJobId` never was), so a completed item's last
+`speed_bps` reading would otherwise linger forever. `state` leaving `DOWNLOADING` the moment a
+job stops (`core/queue.py`, the only writer of that state transition) is the one signal that's
+actually live, so `lib/format.ts`'s `transferSpeedLabel`/`transferSpeedSortValue` key off it, not
+off the value.
+
+**Decision: a mirrored directory's row shows the job's own rate; its children never show a rate
+at all — not a documented UI trade-off, a fact about what's on the wire.** Read
+`core/queue.py._publish_child_progress`'s own docstring before assuming a choice was needed: the
+`progress` message's `speed_bps` is per-job, keyed by the job's own `item_id` (the top-level
+parent being transferred), and child progress (`_publish_child_progress`) only ever publishes a
+child's `local_size`/`state` via `item_delta` — no per-child speed exists anywhere in the
+backend. So there was no risk of double-counting a parent-plus-children rate to guard against;
+children simply have no entry in `speedByItemId` and render blank via the same `state !==
+'DOWNLOADING'` gate as every other non-transferring row (a child's own state during an active
+mirror is `PARTIAL`/`DOWNLOADED`, per that same docstring's child-state rule, never
+`DOWNLOADING`).
+
+**Not a decision, a note on scope:** `useLiveModel.ts`'s new `speedByItemId` map is deliberately
+just `Record<number, number>` (item id → `speed_bps`), not a second copy of the full
+`ProgressJob` shape — the Files page's rows already carry `local_size`/`remote_size` from
+`item_view`, so bytes/ETA were never missing from this page; only the live rate was. The queued,
+not-yet-run `prompts/2026-08-14-transfer-timing-and-throughput-display.md` (Transfers page +
+item drawer, elapsed/average speed from job timestamps) does not depend on this map and wasn't
+touched.
+
+---
+
 ## 2026-08-14 — A local rename failure is no longer misclassified `REMOTE_GONE`: a new
 ## `LOCAL_FS_ERROR` transient class, matched by message shape
 

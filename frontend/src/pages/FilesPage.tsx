@@ -12,7 +12,7 @@ import { formatRelativeTime } from '../lib/format'
  * and in bulk via multi-select (`FileTree.tsx`), plus virtualization.
  */
 export function FilesPage() {
-  const { queues, state, scanCompleteSeq } = useLiveModel()
+  const { queues, state, scanCompleteSeq, speedByItemId } = useLiveModel()
   const [rescanning, setRescanning] = useState(false)
 
   // The `path_queue` config this page's own `useLiveModel` reading never carries (`QueueFiles`
@@ -127,6 +127,7 @@ export function FilesPage() {
               syncMode={config?.sync_mode ?? 'copy'}
               autoQueueEnabled={config?.auto_queue_enabled ?? false}
               scanIntervalS={config?.scan_interval_s ?? null}
+              speedByItemId={speedByItemId}
             />
             {/* Queue-scoped reset controls (2026-08-13, prompts/2026-08-13-reset-item-tracking.md)
              * -- the whole-queue and purge-by-pattern scopes, sitting below the tree rather than

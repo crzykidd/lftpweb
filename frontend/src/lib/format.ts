@@ -11,6 +11,46 @@ export function formatRate(bytesPerSecond: number): string {
   return `${formatBytes(bytesPerSecond)}/s`
 }
 
+// The Files page's Speed column (2026-08-14, prompts/2026-08-14-files-page-speed-column.md):
+// `FileTree.tsx`'s `TreeEntry.speed_bps` is the live, EMA-smoothed instantaneous rate from
+// `core/progress.py`, threaded in from the `progress` WS message
+// (`core/queue.py._sample_and_publish_progress`) keyed by `item_id` -- never a derived average.
+// The task's own brief spells out why a derived average was rejected here: dividing the row's
+// cumulative `local_size` by time-since-`state_changed_at` produces a phantom rate on a resumed
+// transfer (18 GB already on disk, state changed 2 minutes ago reads as ~150 MB/s, a number
+// nothing ever achieved) -- the same non-monotonicity trap `core/metrics.py`'s own docstring
+// documents for `bytes_done` vs. `bytes_start`. So this column shows the live rate or nothing,
+// never a computed one.
+//
+// Both functions gate on `state === 'DOWNLOADING'`, not on whether `speedBps` happens to be
+// present -- the `progress` WS message is never pruned client-side once a job finishes
+// (`useLiveModel.ts`'s `speedByItemId` keeps the last value forever, same as `progressByJobId`
+// always has), so a stale reading from a completed transfer would otherwise linger. `state`
+// leaving `DOWNLOADING` (`core/queue.py` line ~304/1491: only the currently-running item's job
+// holds that state) is the one signal that's actually live, so it's what gates display -- not a
+// zero/non-zero check on the value itself. A real `0 B/s` while `DOWNLOADING` (a stalled but
+// still-running transfer) is an honest reading and is shown as such: "a zero rate and 'not
+// transferring' are different statements" (the task's own bar).
+
+/** The Speed column's in-cell text. `null`/dash for anything not currently downloading --
+ * never `0 B/s` for a row that simply isn't transferring (see the module comment above).
+ */
+export function transferSpeedLabel(state: string, speedBps: number | null | undefined): string {
+  if (state !== 'DOWNLOADING' || speedBps == null || !Number.isFinite(speedBps)) return '—'
+  return formatRate(Math.max(speedBps, 0))
+}
+
+/** The Speed column's sort value -- `null` for anything not currently downloading, so
+ * `compareValues`' existing null-last rule (`FileTree.tsx`) puts every non-transferring row at
+ * one end regardless of direction, rather than interleaving them by a coincidental zero. A
+ * transferring row with a genuine `0 B/s` reading still sorts as `0`, not `null` -- it's a real
+ * measurement, not an absence of one.
+ */
+export function transferSpeedSortValue(state: string, speedBps: number | null | undefined): number | null {
+  if (state !== 'DOWNLOADING' || speedBps == null || !Number.isFinite(speedBps)) return null
+  return speedBps
+}
+
 /** `eta_s` from `core/progress.py` -- `null` when speed is 0 or the total is unknown. */
 export function formatEta(etaSeconds: number | null | undefined): string {
   if (etaSeconds == null || !Number.isFinite(etaSeconds)) return '—'

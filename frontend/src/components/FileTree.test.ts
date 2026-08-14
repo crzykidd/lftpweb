@@ -88,6 +88,28 @@ describe('buildTree', () => {
     expect(tree).toHaveLength(1)
     expect(tree[0].rel_path).toBe('orphan/child.txt')
   })
+
+  // 2026-08-14 (prompts/2026-08-14-files-page-speed-column.md): `speed_bps` is looked up by id
+  // from the second, optional `speedByItemId` argument -- not part of `FileNode`'s wire shape,
+  // computed here the same way `name`/`depth` already are.
+  it('resolves speed_bps by id from the optional speedByItemId map, null when absent', () => {
+    const nodes = [
+      node('a.txt', false, { id: 1 }),
+      node('b.txt', false, { id: 2 }),
+      node('c.txt', false, { id: null }),
+    ]
+    const tree = buildTree(nodes, { 1: 5_000_000 })
+    expect(tree.find((e) => e.rel_path === 'a.txt')?.speed_bps).toBe(5_000_000)
+    // Present in the tree but no matching id in the map (job finished, or never ran).
+    expect(tree.find((e) => e.rel_path === 'b.txt')?.speed_bps).toBeNull()
+    // No id at all (a node the backend never persisted an item row for).
+    expect(tree.find((e) => e.rel_path === 'c.txt')?.speed_bps).toBeNull()
+  })
+
+  it('defaults speed_bps to null for every row when no speedByItemId argument is passed at all', () => {
+    const tree = buildTree([node('a.txt', false, { id: 1 })])
+    expect(tree[0].speed_bps).toBeNull()
+  })
 })
 
 // --- flatten -------------------------------------------------------------------------------
@@ -184,6 +206,48 @@ describe('sortTree', () => {
     sortTree(tree, 'name', 'desc')
     expect(tree[0].children.map((c) => c.name)).toEqual(originalOrder)
   })
+
+  // 2026-08-14 (prompts/2026-08-14-files-page-speed-column.md): sorting by Speed must put
+  // every non-transferring row (never downloading at all, or downloading and finished/stopped)
+  // in a defined place -- all at one end, not interleaved by a coincidental zero -- covering the
+  // sibling-preserving shape the other sort tests above use, not a flat-ordering assertion.
+  describe('sorting by speed', () => {
+    it('a transferring row sorts by its live rate; non-transferring rows sort last regardless of direction', () => {
+      const nodes = [
+        node('root', true),
+        // Actively downloading, id matches an entry in speedByItemId below.
+        node('root/fast.bin', false, { id: 10, state: 'DOWNLOADING' }),
+        node('root/slow.bin', false, { id: 11, state: 'DOWNLOADING' }),
+        // Completed -- state isn't DOWNLOADING even though a stale speed value happens to
+        // still be sitting in the map (useLiveModel never prunes on completion; see
+        // lib/format.ts.transferSpeedSortValue's own docstring for why state is what gates
+        // this, not presence of a value).
+        node('root/done.bin', false, { id: 12, state: 'DOWNLOADED' }),
+        // Never transferred at all -- no entry in the map.
+        node('root/idle.bin', false, { id: 13, state: 'REMOTE_ONLY' }),
+      ]
+      const speedByItemId = { 10: 5_000_000, 11: 1_000_000, 12: 9_999_999 }
+      const asc = sortTree(buildTree(nodes, speedByItemId), 'speed', 'asc')[0].children.map((c) => c.rel_path)
+      const desc = sortTree(buildTree(nodes, speedByItemId), 'speed', 'desc')[0].children.map((c) => c.rel_path)
+      // Transferring rows order by rate (ascending/descending flips just those two); the two
+      // non-transferring rows always land after them, in either direction, and their relative
+      // order between each other is stable (tie-broken by name, same as every other sort key).
+      expect(asc).toEqual(['root/slow.bin', 'root/fast.bin', 'root/done.bin', 'root/idle.bin'])
+      expect(desc).toEqual(['root/fast.bin', 'root/slow.bin', 'root/done.bin', 'root/idle.bin'])
+    })
+
+    it('a transferring row with a genuine 0 B/s reading sorts as a real zero, not with the non-transferring rows', () => {
+      const nodes = [
+        node('root', true),
+        node('root/stalled.bin', false, { id: 20, state: 'DOWNLOADING' }),
+        node('root/idle.bin', false, { id: 21, state: 'REMOTE_ONLY' }),
+      ]
+      const sorted = sortTree(buildTree(nodes, { 20: 0 }), 'speed', 'asc')[0].children.map((c) => c.rel_path)
+      // The stalled-but-running 0 B/s row sorts before the row with no reading at all -- a real
+      // zero is a lesser value than "unknown", not the same bucket as it.
+      expect(sorted).toEqual(['root/stalled.bin', 'root/idle.bin'])
+    })
+  })
 })
 
 // --- Collapse preference: default-plus-exceptions -------------------------------------------
@@ -260,6 +324,7 @@ describe('matchesFacetFilter', () => {
     name: 'x',
     depth: 0,
     children: [],
+    speed_bps: null,
   })
 
   it('"" (All items) matches everything', () => {
@@ -362,6 +427,26 @@ describe('column width helpers', () => {
       const merged = mergeColumnWidths({ 'removed-column-from-a-past-version': 999 })
       expect(merged).toEqual(defaultColumnWidths())
       expect(merged['removed-column-from-a-past-version']).toBeUndefined()
+    })
+
+    // 2026-08-14 (prompts/2026-08-14-files-page-speed-column.md): a layout saved before the
+    // Speed column existed has no 'speed' key at all -- simulates exactly that upgrade case
+    // rather than relying on the generic "absent id" test above to happen to cover it.
+    it('a layout persisted before the Speed column existed gets a sane default for it, ' +
+      'and every pre-existing width survives untouched', () => {
+      const preSpeedSaved = { size: 140, status: 150, lifecycle: 90, changed: 160, actions: 100 }
+      const merged = mergeColumnWidths(preSpeedSaved)
+      expect(merged.speed).toBe(defaultColumnWidths().speed)
+      expect(merged.size).toBe(140)
+      expect(merged.status).toBe(150)
+      expect(merged.lifecycle).toBe(90)
+      expect(merged.changed).toBe(160)
+      expect(merged.actions).toBe(100)
+      // Every value is a finite, renderable number -- an upgrade must not corrupt the header
+      // into an unrenderable width for the one column that predates this saved layout.
+      for (const width of Object.values(merged)) {
+        expect(Number.isFinite(width)).toBe(true)
+      }
     })
   })
 })

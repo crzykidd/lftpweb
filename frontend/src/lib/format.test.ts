@@ -17,6 +17,8 @@ import {
   settleWaitLabel,
   settleWaitShortLabel,
   stateAgeLabel,
+  transferSpeedLabel,
+  transferSpeedSortValue,
 } from './format'
 
 describe('formatBytes', () => {
@@ -46,6 +48,55 @@ describe('formatRate', () => {
   it('wraps formatBytes with a /s suffix', () => {
     expect(formatRate(0)).toBe('0 B/s')
     expect(formatRate(1024)).toBe('1.0 KB/s')
+  })
+})
+
+// 2026-08-14 (prompts/2026-08-14-files-page-speed-column.md): the Files page's Speed column.
+// Both functions gate on state === 'DOWNLOADING', never on whether a value is present -- see
+// their own docstrings in format.ts for why (a `progress` WS reading is never pruned client-side
+// on job completion, so a stale value must not linger past the state that actually made it live).
+describe('transferSpeedLabel', () => {
+  it('shows the formatted rate for an actively downloading row', () => {
+    expect(transferSpeedLabel('DOWNLOADING', 5_242_880)).toBe('5.0 MB/s')
+  })
+
+  it('shows a real 0 B/s for a downloading row with a genuine zero reading -- ' +
+    'a stalled transfer is not the same statement as "not transferring"', () => {
+    expect(transferSpeedLabel('DOWNLOADING', 0)).toBe('0 B/s')
+  })
+
+  it('is a dash for any non-DOWNLOADING state regardless of what speed value happens to be present', () => {
+    expect(transferSpeedLabel('DOWNLOADED', 5_000_000)).toBe('—')
+    expect(transferSpeedLabel('PARTIAL', 5_000_000)).toBe('—')
+    expect(transferSpeedLabel('QUEUED', 5_000_000)).toBe('—')
+    expect(transferSpeedLabel('REMOTE_ONLY', null)).toBe('—')
+  })
+
+  it('is a dash when downloading but no speed reading has arrived yet, or the value is non-finite', () => {
+    expect(transferSpeedLabel('DOWNLOADING', null)).toBe('—')
+    expect(transferSpeedLabel('DOWNLOADING', undefined)).toBe('—')
+    expect(transferSpeedLabel('DOWNLOADING', Number.NaN)).toBe('—')
+  })
+
+  it('floors a negative speed reading to zero rather than showing a negative rate', () => {
+    expect(transferSpeedLabel('DOWNLOADING', -100)).toBe('0 B/s')
+  })
+})
+
+describe('transferSpeedSortValue', () => {
+  it('returns the raw speed for an actively downloading row, including a genuine zero', () => {
+    expect(transferSpeedSortValue('DOWNLOADING', 5_000_000)).toBe(5_000_000)
+    expect(transferSpeedSortValue('DOWNLOADING', 0)).toBe(0)
+  })
+
+  it('returns null for any non-transferring row, so it sorts alongside every other unknown reading', () => {
+    expect(transferSpeedSortValue('DOWNLOADED', 5_000_000)).toBeNull()
+    expect(transferSpeedSortValue('REMOTE_ONLY', null)).toBeNull()
+  })
+
+  it('returns null when downloading but no reading is present yet', () => {
+    expect(transferSpeedSortValue('DOWNLOADING', null)).toBeNull()
+    expect(transferSpeedSortValue('DOWNLOADING', undefined)).toBeNull()
   })
 })
 

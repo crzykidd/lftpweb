@@ -16,6 +16,8 @@ import {
   settleWaitLabel,
   settleWaitShortLabel,
   stateAgeLabel,
+  transferSpeedLabel,
+  transferSpeedSortValue,
 } from '../lib/format'
 import { placePopover, POPOVER_EDGE_MARGIN_PX } from '../lib/popoverPosition'
 import { resetWarningLines } from '../lib/resetWarning'
@@ -44,6 +46,18 @@ export interface TreeEntry extends FileNode {
   name: string
   depth: number
   children: TreeEntry[]
+  /** The live, EMA-smoothed instantaneous rate from the `progress` WS message
+   * (2026-08-14, prompts/2026-08-14-files-page-speed-column.md), looked up by this row's own
+   * `id` from the `speedByItemId` map `FileTree` threads in from `useLiveModel`. Not part of
+   * `FileNode`'s wire shape -- computed here by `buildTree`, the same way `name`/`depth` are,
+   * so it's available wherever a `TreeEntry` is (sorting, the Row cell) without a second prop
+   * drilled down to `Row`. `null` for any row that isn't the parent item of a currently-running
+   * job -- including every child of a mirroring directory, which never gets its own speed on
+   * the wire at all (`core/queue.py._publish_child_progress`'s own docstring). See
+   * `lib/format.ts`'s module comment above `transferSpeedLabel` for why this is never a derived
+   * average.
+   */
+  speed_bps: number | null
 }
 
 /** What a row's own size column shows. A **file** prefers `local_size` (falling back to
@@ -67,7 +81,7 @@ function nodeDisplaySize(entry: TreeEntry): number | null {
     : (entry.local_size ?? entry.remote_size)
 }
 
-export function buildTree(nodes: FileNode[]): TreeEntry[] {
+export function buildTree(nodes: FileNode[], speedByItemId: Record<number, number> = {}): TreeEntry[] {
   const byPath = new Map<string, TreeEntry>()
   const roots: TreeEntry[] = []
 
@@ -84,7 +98,13 @@ export function buildTree(nodes: FileNode[]): TreeEntry[] {
     const name = lastSlash === -1 ? node.rel_path : node.rel_path.slice(lastSlash + 1)
     const parentPath = lastSlash === -1 ? null : node.rel_path.slice(0, lastSlash)
     const parent = parentPath ? byPath.get(parentPath) : undefined
-    const entry: TreeEntry = { ...node, name, depth: parent ? parent.depth + 1 : 0, children: [] }
+    const entry: TreeEntry = {
+      ...node,
+      name,
+      depth: parent ? parent.depth + 1 : 0,
+      children: [],
+      speed_bps: node.id != null ? (speedByItemId[node.id] ?? null) : null,
+    }
     byPath.set(node.rel_path, entry)
     if (parent) parent.children.push(entry)
     else roots.push(entry)
@@ -123,13 +143,14 @@ export function flatten(roots: TreeEntry[], isCollapsed: (path: string) => boole
 // flattening is what the virtualizer walks, and sorting it directly would tear children away
 // from their parents. `sortTree` below runs on the built tree, before `flatten`.
 
-export type SortKey = 'name' | 'size' | 'state_changed_at' | 'percent'
+export type SortKey = 'name' | 'size' | 'speed' | 'state_changed_at' | 'percent'
 export type SortDir = 'asc' | 'desc'
 
-const SORT_KEYS: SortKey[] = ['name', 'size', 'state_changed_at', 'percent']
+const SORT_KEYS: SortKey[] = ['name', 'size', 'speed', 'state_changed_at', 'percent']
 const SORT_LABELS: Record<SortKey, string> = {
   name: 'Name',
   size: 'Size',
+  speed: 'Speed',
   state_changed_at: 'Last change',
   percent: '% complete',
 }
@@ -187,6 +208,11 @@ function sortValue(entry: TreeEntry, key: SortKey): string | number | null {
       return entry.name.toLowerCase()
     case 'size':
       return nodeDisplaySize(entry)
+    case 'speed':
+      // Non-transferring rows sort to one end regardless of direction (`compareValues`'s
+      // existing null-last rule) rather than interleaving by a coincidental zero -- see
+      // `transferSpeedSortValue`'s own docstring in `lib/format.ts`.
+      return transferSpeedSortValue(entry.state, entry.speed_bps)
     case 'state_changed_at':
       return entry.state_changed_at
     case 'percent':
@@ -702,6 +728,14 @@ interface ColumnDef {
  */
 export const RESIZABLE_COLUMNS: ColumnDef[] = [
   { id: 'size', label: 'Size', defaultWidth: 96, minWidth: 56, align: 'right', sortKey: 'size' },
+  // Speed (2026-08-14, prompts/2026-08-14-files-page-speed-column.md), between Size and Status
+  // per that task's own placement. Blank/dash for anything not actively downloading -- never
+  // `0 B/s` for a row that simply isn't transferring (`lib/format.ts.transferSpeedLabel`) -- so
+  // this column reads mostly empty at a glance, which is correct: most rows aren't transferring
+  // at any given moment. `minWidth` matches `size`'s own floor; `defaultWidth` a touch wider to
+  // fit "12.3 MB/s" without truncating, unverified against a real browser (no UI access in this
+  // environment) but reasoned from the longest realistic rate string this format produces.
+  { id: 'speed', label: 'Speed', defaultWidth: 88, minWidth: 56, align: 'right', sortKey: 'speed' },
   {
     id: 'status',
     label: 'Status',
@@ -793,7 +827,7 @@ function fixedColumnStyle(id: string): CSSProperties {
   return { width: v, minWidth: v, maxWidth: v }
 }
 
-/** The drag handle living at the right edge of one resizable header cell (a sibling of the
+/** The drag handle living at the **left** edge of one resizable header cell (a sibling of the
  * header's label/`SortHeaderButton`, never nested inside it -- clicks on the handle can
  * therefore never bubble into the sort button's own `onClick`, so a drag can't accidentally
  * fire a sort; `stopPropagation` below is belt-and-suspenders, not the only thing preventing
@@ -803,6 +837,42 @@ function fixedColumnStyle(id: string): CSSProperties {
  * every `pointermove` would re-render the whole visible window on every frame of the drag; the
  * only `setState` this ever causes is the one `onCommit` call on `pointerup` (or the equivalent
  * single call from a keyboard step or a double-click reset).
+ *
+ * **Left edge, not right -- fixed 2026-08-14
+ * (`prompts/2026-08-14-files-page-speed-column.md`, step 1b), reported live as "the line to
+ * drag is on the right [edge of a column] but [that column] moves its left side."** This was
+ * never an off-by-one in which column a handle resizes -- `RESIZABLE_COLUMNS` (above) are five
+ * (now six) fixed-width columns and **Name is the only flex item**, absorbing whatever width a
+ * resize adds or removes. Work out what that means geometrically: widening column K by `delta`
+ * shrinks Name by the same `delta` (it's the only thing that can give); Name sits to the left of
+ * every fixed column, so that shrink is a leftward shift applied uniformly to every fixed
+ * column's own left edge, K's included. K's own width grew by `delta` in the same step, and
+ * growing a box whose left edge just moved left by `delta` while adding `delta` of width back
+ * lands its **right edge exactly where it started** -- unchanged. Everything to the right of K
+ * (unaffected by K's resize at all, by the same argument one level up) doesn't move either. So
+ * for *any* of these columns, resizing it moves its **left edge** and leaves its right edge (and
+ * everything after it) exactly where it was -- "the column grows leftward" (this file's own
+ * comment above `RESIZABLE_COLUMNS` already said as much). A handle glued to K's *right* edge
+ * (the old `-right-1` position) therefore never moves at all when K resizes; a handle at K's
+ * *left* edge is the one pixel that actually tracks the drag.
+ *
+ * That also flips the arithmetic below: a box anchored on its right edge, resized from its left
+ * edge, gets **wider** as the left edge moves **left of** the pointer's start position -- the
+ * conventional feel of dragging a left-side resize handle (like a window's left edge: drag it
+ * further left, the window gets wider). So the live width is `startWidth - (clientX - startX)`,
+ * not `+`, the one deliberate sign flip in `handlePointerMove`/`finishDrag` below.
+ * `handleKeyDown` needs no equivalent change -- it already reasons in the abstract ("bigger"/
+ * "smaller" per arrow key), never in raw screen-pixel deltas, so it was never affected by which
+ * edge the handle sits on.
+ *
+ * Two options existed for fixing this (that task's own brief): move the handle (done here,
+ * minimal, and it happens to land the leftmost resizable column's handle exactly on the
+ * Name|Size boundary -- the one boundary a user can actually see move) or resize the dragged
+ * column and Name together so the grabbed edge stays under the cursor regardless of which side
+ * it's on ("paired resize"). Paired resize was already considered and rejected during `a4a626d`
+ * (see the comment above `RESIZABLE_COLUMNS`) as more code for no behavioural gain over "Name
+ * flexes, the rest are fixed" -- nothing about this bug changes that trade-off, so the fix here
+ * keeps that model rather than reversing it.
  */
 function ColumnResizeHandle({
   column,
@@ -831,15 +901,17 @@ function ColumnResizeHandle({
     const drag = dragRef.current
     if (!drag || e.pointerId !== drag.pointerId) return
     // Direct DOM write via the ref -- the module comment above (and the task's own bar) is why
-    // this is not `setState`.
-    writeLiveWidth(clampColumnWidth(column.id, drag.startWidth + (e.clientX - drag.startX)))
+    // this is not `setState`. `startWidth - delta`, not `+` -- see this component's own
+    // docstring ("Left edge, not right") for why a left-edge handle on a right-anchored column
+    // must subtract the pointer's rightward movement to widen it, not add it.
+    writeLiveWidth(clampColumnWidth(column.id, drag.startWidth - (e.clientX - drag.startX)))
   }
 
   const finishDrag = (e: ReactPointerEvent<HTMLDivElement>) => {
     const drag = dragRef.current
     if (!drag || e.pointerId !== drag.pointerId) return
     dragRef.current = null
-    onCommit(column.id, clampColumnWidth(column.id, drag.startWidth + (e.clientX - drag.startX)))
+    onCommit(column.id, clampColumnWidth(column.id, drag.startWidth - (e.clientX - drag.startX)))
   }
 
   const handleKeyDown = (e: ReactKeyboardEvent<HTMLDivElement>) => {
@@ -870,7 +942,7 @@ function ColumnResizeHandle({
       }}
       onKeyDown={handleKeyDown}
       onClick={(e) => e.stopPropagation()}
-      className="absolute inset-y-0 -right-1 z-10 w-2 cursor-col-resize touch-none rounded bg-zinc-300/50 hover:bg-zinc-400 focus-visible:bg-sky-500 focus-visible:outline-none dark:bg-zinc-700/50 dark:hover:bg-zinc-500 dark:focus-visible:bg-sky-400"
+      className="absolute inset-y-0 -left-1 z-10 w-2 cursor-col-resize touch-none rounded bg-zinc-300/50 hover:bg-zinc-400 focus-visible:bg-sky-500 focus-visible:outline-none dark:bg-zinc-700/50 dark:hover:bg-zinc-500 dark:focus-visible:bg-sky-400"
     />
   )
 }
@@ -1019,6 +1091,18 @@ function Row({
       >
         {size != null ? formatBytes(size) : '—'}
       </span>
+      {/* Speed (2026-08-14, prompts/2026-08-14-files-page-speed-column.md): the live rate from
+          the `progress` WS message, already resolved onto `entry.speed_bps` by `buildTree`.
+          `transferSpeedLabel` is the one place that decides blank-vs-shown -- gated on
+          `entry.state === 'DOWNLOADING'`, never on the value itself, so a real `0 B/s` on a
+          stalled-but-still-running transfer still shows as `0 B/s`, not blank (see that
+          function's own docstring in `lib/format.ts`). */}
+      <span
+        className="shrink-0 overflow-hidden text-right text-zinc-500 dark:text-zinc-400"
+        style={fixedColumnStyle('speed')}
+      >
+        {transferSpeedLabel(entry.state, entry.speed_bps)}
+      </span>
       <span className="shrink-0 overflow-hidden text-right" style={fixedColumnStyle('status')}>
         {/* The settle gate's wait (2026-08-13, item 3): was a 6px dot next to the chip
             (effectively invisible) -- now a readable substitution over the chip itself, the
@@ -1149,6 +1233,7 @@ export function FileTree({
   syncMode,
   autoQueueEnabled,
   scanIntervalS,
+  speedByItemId,
 }: {
   nodes: FileNode[]
   /** Whether the WebSocket is open, i.e. whether the connect-time `snapshot` has arrived.
@@ -1165,6 +1250,13 @@ export function FileTree({
   syncMode: SyncMode
   autoQueueEnabled: boolean
   scanIntervalS: number | null
+  /** The `progress` WS message's `speed_bps`, keyed by `item_id` (2026-08-14,
+   * `prompts/2026-08-14-files-page-speed-column.md`) -- `useLiveModel.ts`'s own map, threaded
+   * in by `FilesPage.tsx` rather than a second subscription here. Fed straight into `buildTree`
+   * below so every `TreeEntry` carries its own `speed_bps`, the one place both sorting and the
+   * Row cell read it from.
+   */
+  speedByItemId: Record<number, number>
 }) {
   // The shared age ticker (module docstring above): bumping this forces a re-render of
   // whatever rows are currently mounted, which is all `stateAgeLabel` needs to catch up --
@@ -1211,8 +1303,8 @@ export function FileTree({
   }
 
   const tree = useMemo(
-    () => sortTree(buildTree(nodes), sortPref.key, sortPref.dir),
-    [nodes, sortPref],
+    () => sortTree(buildTree(nodes, speedByItemId), sortPref.key, sortPref.dir),
+    [nodes, speedByItemId, sortPref],
   )
 
   // Collapse preference (2026-08-13): "default plus exceptions," not a saved set of collapsed
@@ -1868,9 +1960,10 @@ export function FileTree({
               "Status" sorts by percent-complete (`SORT_KEYS`'s `'percent'`) -- the state chip's
               own fill is where that percentage already shows, so that's the header it belongs
               to; its `title` spells out "% complete" for anyone who hovers to check. Each
-              resizable column also carries a drag handle (`ColumnResizeHandle`) at its right
-              edge, a sibling of the label rather than nested inside it -- see that component's
-              own comment for why a drag can never fire a sort. */}
+              resizable column also carries a drag handle (`ColumnResizeHandle`) at its left
+              edge (2026-08-14: moved from the right edge, which never tracked the cursor -- see
+              that component's own docstring), a sibling of the label rather than nested inside
+              it -- see that component's own comment for why a drag can never fire a sort. */}
           <div className="sticky top-0 z-10 flex items-center gap-2 border-b border-zinc-200 bg-zinc-50 px-2 py-1 text-[10px] font-medium tracking-wide text-zinc-500 uppercase dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-400">
             <span className="w-4 shrink-0" />
             <span className="w-4 shrink-0" />

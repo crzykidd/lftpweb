@@ -49,6 +49,17 @@ function toQueueFiles(q: QueueState): QueueFiles {
 export function useLiveModel(): {
   queues: QueueFiles[]
   progressByJobId: Record<number, ProgressJob>
+  /** The same `progress` WS message's `speed_bps`, re-keyed by `item_id` rather than `job_id`
+   * (2026-08-14, prompts/2026-08-14-files-page-speed-column.md) -- the Files page's rows are
+   * items, not jobs, and `FileTree.tsx`'s Speed column needs to look a rate up by the id its own
+   * rows already carry (`FileNode.id`). Built from the exact same message as `progressByJobId`
+   * above, not a second subscription or poll -- see that map's own shape for why one `progress`
+   * tick already carries both ids per running job. Like `progressByJobId`, entries are never
+   * pruned on job completion; a stale value here is harmless because `lib/format.ts`'s
+   * `transferSpeedLabel`/`transferSpeedSortValue` gate display on the row's own `state ===
+   * 'DOWNLOADING'`, not on whether a value is present.
+   */
+  speedByItemId: Record<number, number>
   state: SocketState
   /** Bumped by one on every `scan_complete` message, for any queue. Purely a change signal --
    * a caller (`FilesPage.tsx`'s "Rescan now") that captures this value before triggering a
@@ -59,6 +70,7 @@ export function useLiveModel(): {
 } {
   const [queuesById, setQueuesById] = useState<Record<number, QueueState>>({})
   const [progressByJobId, setProgressByJobId] = useState<Record<number, ProgressJob>>({})
+  const [speedByItemId, setSpeedByItemId] = useState<Record<number, number>>({})
   const [state, setState] = useState<SocketState>('connecting')
   const [scanCompleteSeq, setScanCompleteSeq] = useState(0)
 
@@ -171,6 +183,11 @@ export function useLiveModel(): {
             for (const job of msg.jobs) next[job.job_id] = job
             return next
           })
+          setSpeedByItemId((prev) => {
+            const next = { ...prev }
+            for (const job of msg.jobs) next[job.item_id] = job.speed_bps
+            return next
+          })
         }
       }
 
@@ -198,5 +215,5 @@ export function useLiveModel(): {
     .map(toQueueFiles)
     .sort((a, b) => a.queue_id - b.queue_id)
 
-  return { queues, progressByJobId, state, scanCompleteSeq }
+  return { queues, progressByJobId, speedByItemId, state, scanCompleteSeq }
 }
