@@ -24,6 +24,50 @@ interface ItemDrawerProps {
   itemId: number | null
   nodes: FileNode[]
   onClose: () => void
+  // The owning queue's `local_path` (2026-08-14, "folder prefix during transfer") -- optional
+  // because not every caller has it loaded (`TransfersPage.tsx` doesn't fetch queue configs
+  // today). `undefined` simply means the physical-location line below doesn't render; every
+  // other section of the drawer is unaffected.
+  localPath?: string
+}
+
+/** The item's *actual* on-disk path right now (2026-08-14, "folder prefix during transfer",
+ * `core/download_prefix.py`) -- distinct from `rootRelPath`, which is the logical name the
+ * Files tree always shows and never carries a prefix (`core/queue.py._spawn_decision`'s own
+ * comment has the full "why the tree needs no special-casing" argument; this is the one place
+ * that answers "where is this file *right now*", the drawer's own job per that task).
+ * `node.pending_download_prefix` (`core/itemview.py`) is `null` once nothing is in flight under
+ * a prefixed name, in which case this is just `<localPath>/<rel_path>`.
+ */
+function physicalLocalPath(localPath: string, node: FileNode): string {
+  const base = localPath.replace(/\/+$/, '')
+  if (!node.pending_download_prefix) return `${base}/${node.rel_path}`
+  const parts = node.rel_path.split('/')
+  const name = parts.pop() ?? node.rel_path
+  const parent = parts.join('/')
+  const dir = parent ? `${base}/${parent}` : base
+  return `${dir}/${node.pending_download_prefix}${name}`
+}
+
+/** The physical-location panel itself -- rendered whenever the caller supplied `localPath`,
+ * regardless of whether the item is currently prefixed, so "where is this file right now" has
+ * one consistent answer rather than appearing only for the in-flight case.
+ */
+function PhysicalLocation({ localPath, node }: { localPath: string; node: FileNode }) {
+  return (
+    <div className="border-b border-zinc-200 px-4 py-2 text-xs dark:border-zinc-800">
+      <span className="text-zinc-500 dark:text-zinc-400">Local path: </span>
+      <span className="font-mono break-all text-zinc-700 dark:text-zinc-300">
+        {physicalLocalPath(localPath, node)}
+      </span>
+      {node.pending_download_prefix && (
+        <p className="mt-1 text-amber-700 dark:text-amber-400">
+          Currently downloading into a prefixed folder ("folder prefix during transfer") — will
+          be renamed to its real name once the transfer completes.
+        </p>
+      )}
+    </div>
+  )
 }
 
 /** Every file under `rootRelPath` (the queued item), whichever queue it belongs to. A
@@ -275,7 +319,14 @@ function Row({ node, rootRelPath }: { node: FileNode; rootRelPath: string }) {
  * rather than two drifting in and out of agreement (see the drawer's own module comment above
  * `filesUnder` for the pre-existing per-file breakdown this only adds to, never replaces).
  */
-export function ItemDrawer({ title, rootRelPath, itemId, nodes, onClose }: ItemDrawerProps) {
+export function ItemDrawer({
+  title,
+  rootRelPath,
+  itemId,
+  nodes,
+  onClose,
+  localPath,
+}: ItemDrawerProps) {
   const files = useMemo(() => filesUnder(nodes, rootRelPath), [nodes, rootRelPath])
   // The clicked item's own row -- distinct from `files` above, which is only the *descendant*
   // files (and excludes directories entirely). A directory's own size/mtime/lifecycle facts
@@ -330,6 +381,7 @@ export function ItemDrawer({ title, rootRelPath, itemId, nodes, onClose }: ItemD
         {/* Both sides, the lifecycle chronology, and a little history -- all item-level
             (`rootNode`/`itemId`), not per descendant file, so they render once above the
             per-file breakdown rather than repeating for every row in it. */}
+        {rootNode && localPath && <PhysicalLocation localPath={localPath} node={rootNode} />}
         {rootNode && <SideBySideDetails node={rootNode} />}
         {rootNode && <LifecycleChronology node={rootNode} />}
         {itemId != null && <HistoryPanel itemId={itemId} />}

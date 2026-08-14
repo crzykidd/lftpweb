@@ -1231,6 +1231,7 @@ export function FileTree({
   speedByItemId,
   selected,
   onSelectionChange,
+  queueLocalPath,
 }: {
   nodes: FileNode[]
   /** Whether the WebSocket is open, i.e. whether the connect-time `snapshot` has arrived.
@@ -1258,6 +1259,13 @@ export function FileTree({
    */
   selected: Set<string>
   onSelectionChange: (next: Set<string>) => void
+  /** This queue's `path_queue.local_path` (2026-08-14, "folder prefix during transfer") --
+   * passed straight through to `ItemDrawer` so it can show an item's actual on-disk path.
+   * Optional (`undefined` while `FilesPage.tsx`'s own queue-config fetch hasn't resolved yet,
+   * or simply not supplied by a caller that doesn't have it) -- the drawer's physical-location
+   * panel just doesn't render without it; nothing else here is affected.
+   */
+  queueLocalPath?: string
 }) {
   // The shared age ticker (module docstring above): bumping this forces a re-render of
   // whatever rows are currently mounted, which is all `stateAgeLabel` needs to catch up --
@@ -1955,6 +1963,7 @@ export function FileTree({
           itemId={drawerEntry.id}
           nodes={nodes}
           onClose={() => setDrawerEntry(null)}
+          localPath={queueLocalPath}
         />
       )}
 

@@ -6,6 +6,169 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-14 — "Folder prefix during transfer": reversing part of phase 5's `staging_path` decision, on new evidence, not a re-litigation
+
+**Handoff prompt `prompts/done/2026-08-14-in-flight-folder-prefix.md`, executed end to end.**
+Live incident, 2026-08-13/14: a `mirror` job renames each file to its final name as that file
+completes, so an importer (Sonarr) watching the download directory imported the episodes that had
+finished, then its own post-import cleanup deleted the whole release folder while lftp was still
+writing the last two — lftp died `rename(...): No such file or directory` for both. Built
+`core/download_prefix.py` (site-wide `DownloadPrefixSettings` + per-queue inherit-or-override
+resolution + prefix validation), migration 017 (`path_queue.download_prefix_enabled`/
+`download_prefix`, both nullable-for-inherit; `item.pending_download_prefix`, the "what's
+physically in use right now" bookkeeping column), a `mirror_rename_target` flag on
+`core/lftp.py.build_transfer_command`/`JobSpec` so lftp's `mirror` can be handed the *literal*
+target directory name instead of always appending the remote basename, the rename step itself in
+`core/queue.py._reap_one` (`_finalize_download_prefix`), the matching resume logic
+(`_resolve_download_prefix_for_spawn`), a configurable `extra_dir_prefixes` filter in
+`core/local_scan.py.scan_local` (previously the `_UNPACK_`/`_FAILED_` filter was a module
+constant — this one can't be, since it's user-configurable), `core/engine.py.Engine.
+_active_download_prefixes` (the resolved current prefix unioned with every distinct
+`item.pending_download_prefix` on record for a queue, so a *stale* prefix a running/stopped job
+is still physically using keeps being filtered even after the setting moves on), and the item
+drawer's new "actual local path" panel. Settings → Transfer gets the site-wide toggle+prefix
+field, Settings → Queues the per-queue inherit-or-override pair, both using `FieldHelp`.
+
+**The reversal, named explicitly.** Phase 5's entry ("`local_path` stays exactly what phases 1–4
+already built... `staging_path`, when set, is the post-processing Move step's *destination*, not
+the download target") rejected making a transfer's *physical write target* differ from
+`local_path`, specifically because it would mean the reconciler comparing remote-vs-local at a
+different root during a transfer than after one completes — and chose the reading that required
+zero changes to the already-verified scan/reconcile/progress code. **That cost is real here too,
+and this task pays it, deliberately, the same way phase 5's own `staging_path` scoping already
+implied a precedent for**: `<local_path>/<prefix><name>/` is where lftp actually writes while a
+prefixed directory item is transferring, a different physical root than `<local_path>/<name>/`
+the reconciler and every post-processing step compare against once it's DOWNLOADED.
+
+**What's new since phase 5, and why it's new evidence rather than a re-litigation**: phase 5
+weighed that cost against *staging semantics* (an operator wanting to download to fast local
+storage and settle on slower array storage) — a workflow-convenience question. Nobody had yet
+watched an importer delete a folder out from under a running `mirror` job. This task weighs the
+identical architectural cost against *data loss on someone else's tools* (an importer's cleanup
+step racing a still-running transfer) — a correctness question with a live reproduction, not a
+hypothetical. The two are different enough in kind that the same cost is worth paying for one and
+wasn't for the other; this isn't "phase 5 was wrong," it's "a materially different problem showed
+up that the earlier reasoning never had to weigh."
+
+**How the reversal is actually contained, so it doesn't reopen phase 5's whole worry.** Phase 5's
+fear was the reconciler needing to know about a different root *at all*. This task doesn't teach
+it that: `core/reconcile.py`, `core/postprocess.py` (verify/extract/move), `core/settle.py`,
+`core/patterns.py`, and auto-queue are all completely unaware the prefix exists. The physical
+divergence is confined to exactly two places that already had to reason about "what lftp is
+literally doing right now" for other reasons — `core/queue.py._spawn_decision` (which already
+computes lftp's argv, including the existing `mirror`-target-is-the-parent asymmetry this task's
+own prompt calls "documented and load-bearing") and `core/local_scan.py`'s filter (which already
+excludes `_UNPACK_`/`_FAILED_`, lftpweb's other in-flight bookkeeping directories, for the
+identical reason). `_reap_one` renames the directory back to its real name *before* any
+downstream consumer — including `postprocess.trigger()` — ever looks at the item, so by
+construction nothing past that one method ever observes the prefixed path. `item.rel_path` — the
+identity the reconciler matches against the remote tree, `item_settle` is keyed by, and
+auto-queue patterns evaluate — never carries the prefix at any point; the constraint in the
+task's own brief ("`item.rel_path` must NEVER contain the prefix") is what makes this containment
+possible at all, not an afterthought on top of it.
+
+**Directory items only — confirmed, not widened.** A single-file `pget` job is complete the
+instant lftp renames it off `.lftp` (§4.4b); there is no window in which an importer can see a
+partial release, because the release *is* that one file. `download_prefix`/
+`pending_download_prefix` are therefore never set for a `pget` job anywhere in this codebase.
+
+**When the rename happens: at the DOWNLOADED transition, not "after verify."** The user's own
+first instinct was "after verify is complete." Investigated and rejected in favor of renaming
+immediately once `core/queue.py._reap_one`'s existing completeness check
+(`prompts/done/2026-08-14-exit-zero-is-not-completion.md`) confirms `settled and complete` —
+i.e., the same instant the item would otherwise transition straight to `DOWNLOADED` — before
+`postprocess.trigger()` ever fires. Reasons:
+
+- **The setting's own name is "*during transfer*."** Its job is to hide bytes that are still
+  arriving. By the completeness check, the transfer is over — every byte is on disk under lftp's
+  own `cmd:fail-exit true` guarantee, filesystem-verified rather than exit-code-trusted (§4.3, as
+  amended by the exit-zero task above). The race this feature exists to close is already closed
+  at that point; nothing downstream is "still arriving."
+- **Delaying to "after verify" would require `core/postprocess.py` to become prefix-aware
+  mid-pipeline** — verify operating on the prefixed path, extract/move on the unprefixed one —
+  in the one module in this codebase with the least room for a second way to compute a path
+  (§6: it deletes and moves data). That risk buys protection against a *different* problem
+  (an importer grabbing content that later turns out `CORRUPT`) this task was never scoped to
+  solve — nothing today hides a `CORRUPT` item from the Files tree or the local disk either, so
+  gating the rename on verify would be a partial, inconsistent fix for that problem while adding
+  real risk to the one this task actually needs to close reliably.
+- **The `move`-mode remote-delete gate is untouched by this choice either way** — it already
+  depends on `verify_state == "VERIFIED"`, independent of when the physical rename happened. Doing
+  the rename earlier doesn't move the delete earlier.
+
+**Every combination the prompt asked to handle, worked through**: verify on/off, extract on/off,
+`copy`/`move` — the rename is one unconditional step, gated only on `settled and complete`, run
+once, before postprocessing is triggered at all. So none of the four combinations change its
+timing; verify/extract/move all always see the item at its final, correct location by the time
+they run, with zero prefix-related branching added to any of the three.
+
+**The stale-prefix problem, and the design that closes it**: `item.pending_download_prefix`
+(migration 017) is written once, at spawn, fixed for that job's lifetime — the identical "fixed at
+spawn, never re-shaped mid-life" convention DESIGN.md §4.5 already uses for a job's bandwidth
+allocation — and cleared only when `_finalize_download_prefix` successfully renames the directory
+back. Two consumers read it, and both prefer it over recomputing from *today's* settings:
+
+- **Resume** (`_resolve_download_prefix_for_spawn`): if an item already has a recorded pending
+  prefix, a fresh spawn reuses it verbatim, regardless of what the site/queue setting currently
+  resolves to. This is what makes changing (or disabling) the setting mid-flight, or while an item
+  sits `STOPPED`, safe rather than data-losing — a resume targets the exact directory its own
+  partial bytes are physically sitting in, never a fresh, empty one under a different name.
+- **The scan filter** (`Engine._active_download_prefixes`): unions the *currently resolved* prefix
+  with every distinct non-NULL `item.pending_download_prefix` on record for the queue, so a scan
+  keeps skipping whatever directory name is physically in use for an active or stopped item, not
+  merely whatever today's settings say. This is what stops a differently-prefixed directory from
+  becoming a permanent phantom `LOCAL_ONLY` node the moment someone edits Settings → Transfer
+  while a transfer is running.
+
+**Left honestly unsolved, narrow and named rather than papered over**: an item `STOPPED` under
+prefix X, whose queue's setting is *then* changed to prefix Y (or the feature disabled) *and*
+whose row is never re-queued, keeps `pending_download_prefix = 'X'` forever — the scan filter
+still correctly skips it (so it never turns into a phantom node), but nothing ever reclaims the
+disk it occupies short of a human noticing and re-queueing (which resumes into the same,
+still-correct, prefixed directory) or manually deleting it. Considered building a sweep for this
+and rejected for this task: the codebase's own precedent for orphaned lftpweb bookkeeping
+directories (`_FAILED_` staging dirs, `core/extract.py.sweep_failed_dirs`) is itself an
+off-by-default, separately-scoped feature, not something bundled into the feature that creates the
+directories in the first place — the same shape applies here if it's ever wanted.
+
+**Rejected: making `mirror`'s target argv always the literal final directory name (dropping the
+existing append-basename convention entirely), instead of adding a second `mirror_rename_target`
+mode.** Tested directly against the fake seedbox (both a fresh transfer and a `-c` resume into an
+already-populated directory land flat under the literal name lftp is given, never doubly nested —
+confirmed empirically, since this behaviour is undocumented in lftp's own `--help`, exactly like
+the append-basename convention `core/lftp.py.build_transfer_command`'s existing docstring already
+flags as "found running against the fake seedbox, not documented anywhere"). Rejected because the
+unprefixed path is this project's default, most-exercised, best-tested behaviour for a `mirror`
+job — changing its argv shape unconditionally, even to something behaviourally identical, is a
+strictly larger diff for zero benefit over adding one boolean flag that defaults to today's exact
+argv.
+
+**Rejected: threading the prefix into `core/postprocess.py` so the rename could happen at a later
+pipeline stage.** Covered above (the "after verify" analysis) — the same reasoning rules out any
+later stage (after extract, after move), since the completeness check has already closed the race
+by the time any of them run and every later stage would only add prefix-awareness with no
+corresponding new protection.
+
+**Scope not widened beyond what the prompt asked for**: the item drawer's new physical-location
+panel (`ItemDrawer.tsx`) only renders when the caller supplies the owning queue's `local_path` —
+wired from `FilesPage.tsx` → `FileTree.tsx` → `ItemDrawer.tsx`. `TransfersPage.tsx` opens the same
+drawer but doesn't have queue configs loaded; rather than adding that plumbing (a separate,
+unrelated fetch) for one panel, the panel simply doesn't render there. Named in `README.md`'s
+"Known gaps," not silently accepted.
+
+**Flagged for the user, not decided unilaterally**: this feature ships **off** by default, per
+this project's "every new capability ships off" rule — but unlike most such features, turning it
+on changes where in-flight bytes physically live, which is more disruptive to notice than most
+toggles (a transfer already running when someone upgrades and flips it on keeps using its old,
+unprefixed path — spawned-at-fixed behaviour, not a bug — but every transfer *started after* the
+flip changes its on-disk shape mid-deployment). The user may want this defaulted **on** given it
+fixes a live, reproduced data-loss bug, the same way the settle gate was flipped on post-build
+once its cost was understood (`prompts/2026-08-12-settle-gate-followups.md`) — but that's the
+user's call, not this task's, and is called out in the executing session's final report rather
+than decided here.
+
+---
+
 ## 2026-08-14 — Adaptive scan cadence: restoring, not inventing, DESIGN.md §5's split cadence — and a settle-gate enforcement gap the naive version would have reopened
 
 **Handoff prompt `prompts/done/2026-08-14-adaptive-scan-cadence-when-active.md`, executed end to

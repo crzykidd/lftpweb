@@ -42,6 +42,12 @@ progress, auto-queue on patterns, and optionally verify, extract, and relocate f
   extracted, relocated, and (on a `move` queue) deleted from the remote with files still
   missing. It costs up to about a minute per transfer; switch it off at Settings → Transfer if
   your seedbox's landing path is atomic end to end
+- **Folder prefix during transfer, off by default**: a directory item can download into a
+  hidden-by-convention folder (`.downloading-<name>` by default, configurable site-wide and
+  per-queue) and be renamed to its real name only once the transfer is fully complete, so an
+  importer (Sonarr, Radarr, Plex, Jellyfin — anything that skips dot-prefixed folders) can never
+  see a partial multi-file release mid-arrival. Single-file downloads are unaffected — there's no
+  partial window for that shape. See Settings → Transfer
 - Post-processing: verify (sidecar or hash-on-disk, which now also checks total bytes so it
   cannot bless a truncated file), extract (`7zz` for zip/7z/tar/gz/bz2/xz, `unrar` for rar/rar5
   — see `NOTICE`), and `move` mode's verification-gated remote delete, all with an audited trail
@@ -107,6 +113,10 @@ reduction made during the build, recorded in full in `docs/decisions.md`:
 - **`net:connection-limit` can't be set from the UI.** It lives only in the `host` row's
   `connection_overrides` JSON blob with no write path anywhere, so Settings → Transfer's
   "over the limit" warning can never fire on a current install.
+- **The item drawer's "actual local path" panel (folder-prefix-during-transfer's physical
+  location) only appears from the Files page.** `TransfersPage.tsx` opens the same drawer but
+  doesn't have the owning queue's `local_path` loaded, so that one panel simply doesn't render
+  there — every other section of the drawer is unaffected.
 
 ## Locked out?
 
@@ -158,7 +168,7 @@ link you to the setting it's talking about.
 | Volume | Holds |
 |---|---|
 | `/config` | SQLite database, logs, backups, encryption key |
-| `/downloads` | where lftp writes and what the reconciler scans (`local_path`) — this is the download target, not a landing zone that gets relocated out of |
+| `/downloads` | where lftp writes and what the reconciler scans (`local_path`) — this is the download target, not a landing zone that gets relocated out of. A directory item optionally downloads into a hidden-prefixed subfolder here first (`.downloading-<name>`, "Folder prefix during transfer" in Settings → Transfer, off by default) and is renamed to its real name only once complete — still under `/downloads` throughout, never a second volume |
 | `/staging` | optional; the *destination* a `move`-mode queue's post-processing step relocates a verified, finished item **to**, once it's fully downloaded and verified in `/downloads`. Labeled "Final destination" in Settings → Queues to match this — see `docs/decisions.md`'s phase 5 entry for why this reads backwards from the field's own name (`staging_path`) |
 
 `PUID` / `PGID` / `UMASK` are honored, which matters if your downloads live on an NFS share —

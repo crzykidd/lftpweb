@@ -13,6 +13,8 @@ import type {
   BackupSettingsIn,
   BackupSettingsOut,
   DeleteItemResponse,
+  DownloadPrefixSettingsIn,
+  DownloadPrefixSettingsOut,
   FilesResponse,
   HealthResponse,
   HistoryClearResponse,
@@ -193,6 +195,18 @@ export function getSettleSettings(): Promise<SettleSettingsOut> {
 
 export function putSettleSettings(body: SettleSettingsIn): Promise<SettleSettingsOut> {
   return sendJson<SettleSettingsOut>('/api/settings/settle', 'PUT', body)
+}
+
+// --- Settings -> "folder prefix during transfer" (core/download_prefix.py) -------------
+
+export function getDownloadPrefixSettings(): Promise<DownloadPrefixSettingsOut> {
+  return getJson<DownloadPrefixSettingsOut>('/api/settings/download-prefix')
+}
+
+export function putDownloadPrefixSettings(
+  body: DownloadPrefixSettingsIn,
+): Promise<DownloadPrefixSettingsOut> {
+  return sendJson<DownloadPrefixSettingsOut>('/api/settings/download-prefix', 'PUT', body)
 }
 
 // --- Settings -> auto-queue (`core/autoqueue.py.AutoQueueSettings`) ---------------------

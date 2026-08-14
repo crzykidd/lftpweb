@@ -167,6 +167,16 @@ class PathQueueIn(BaseModel):
     # per-queue interval in seconds. `api/settings.py._reject_invalid_scan_interval` rejects a
     # negative value with a 400 before it ever reaches the DB's own `CHECK`.
     scan_interval_s: float | None = None
+    # Migration 017 ("folder prefix during transfer", `core/download_prefix.py`). Both
+    # nullable-for-inherit, resolved independently (`3500b3f`'s shape, never an AND): `None`
+    # means "inherit the matching Settings -> Transfer field," an explicit value is this
+    # queue's own override. `download_prefix_enabled` defaults `None` (inherit) same as every
+    # other new-capability field on this model; `download_prefix` defaults `None` (inherit the
+    # site-wide prefix string) rather than the literal default prefix, so a queue that has never
+    # touched this setting tracks the site default if it's ever changed, instead of freezing
+    # whatever the default happened to be when the queue was created.
+    download_prefix_enabled: bool | None = None
+    download_prefix: str | None = None
 
 
 class PathQueueOut(PathQueueIn):
@@ -235,6 +245,21 @@ class SettleSettingsOut(BaseModel):
 
 class SettleSettingsIn(BaseModel):
     enabled: bool = True
+
+
+# --- Settings -> "folder prefix during transfer" (`core/download_prefix.py`) -----------
+
+
+class DownloadPrefixSettingsOut(BaseModel):
+    # Off by default -- this project's rule for every new capability
+    # (`prompts/startnewsession.md`); see `core/download_prefix.py.DownloadPrefixSettings`'s
+    # own docstring for why this one wasn't given the settle gate's "ships on" exception.
+    enabled: bool = False
+    prefix: str = ".downloading-"  # matches core/download_prefix.py.DEFAULT_PREFIX
+
+
+class DownloadPrefixSettingsIn(DownloadPrefixSettingsOut):
+    pass
 
 
 # --- Settings -> auto-queue (`core/autoqueue.py.AutoQueueSettings`) ---------------------
@@ -539,6 +564,11 @@ class FileNode(BaseModel):
     extracted_at: str | None = None
     first_missing_at: str | None = None
     remote_deleted_at: str | None = None
+    # "Folder prefix during transfer" (2026-08-14, `core/download_prefix.py`): the exact prefix
+    # string this item's local root is *currently* written under, `None` when nothing is in
+    # flight under a prefixed name. Never part of `rel_path` -- see that module's docstring --
+    # this is purely the item drawer's "where does this actually live right now" answer.
+    pending_download_prefix: str | None = None
     facets: LifecycleFacets
 
 

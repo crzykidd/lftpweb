@@ -221,13 +221,30 @@ def effective_file_size(path: str | Path) -> int:
         return 0
 
 
-def scan_local(root: str | Path) -> dict[str, LocalEntry]:
+def scan_local(
+    root: str | Path, *, extra_dir_prefixes: tuple[str, ...] = ()
+) -> dict[str, LocalEntry]:
     """Walk `root` and return every entry keyed by POSIX-style `rel_path`.
 
     `.lftp-pget-status` sidecars never appear as their own entries — they're consumed to
     correct the size of the file they describe. A `*.lftp` temp file is reported under its
     *final* name (suffix stripped), so it matches its remote counterpart directly; if the
     sidecar-adjusted size is also available for that temp file, it wins over raw `st_size`.
+
+    `extra_dir_prefixes` (2026-08-14, "folder prefix during transfer" --
+    `core/download_prefix.py`) is every directory-name prefix currently in play for the queue
+    being scanned -- the site/queue-resolved prefix plus every distinct
+    `item.pending_download_prefix` still on record, per `core/engine.py.
+    Engine._active_download_prefixes` -- filtered out exactly like `UNPACK_PREFIX`/
+    `FAILED_PREFIX` below, and for the same reason: a directory a `mirror` job is still writing
+    into under its prefixed name is lftpweb's own in-flight bookkeeping, not content the user
+    asked for, and left in the walk it would reconcile to a growing `LOCAL_ONLY` node for as
+    long as the transfer runs. Unlike the two module-level prefixes, this one **cannot** be a
+    module constant -- it is configurable, site-wide and per-queue -- so every caller that wants
+    it filtered has to pass it in explicitly; the default `()` is exactly today's behaviour for
+    every caller that doesn't (in particular, every existing test). Checked at any depth, the
+    same as `UNPACK_PREFIX`/`FAILED_PREFIX`, since a directory item being downloaded need not be
+    top-level.
     """
     root = Path(root)
     entries: dict[str, LocalEntry] = {}
@@ -277,7 +294,11 @@ def scan_local(root: str | Path) -> dict[str, LocalEntry]:
                 # would reconcile to a growing LOCAL_ONLY node while extraction runs, and a
                 # `_FAILED_` dir would sit there forever as a permanent LOCAL_ONLY once
                 # extraction stops touching it -- neither is content the user asked for.
-                if name.startswith(UNPACK_PREFIX) or name.startswith(FAILED_PREFIX):
+                if (
+                    name.startswith(UNPACK_PREFIX)
+                    or name.startswith(FAILED_PREFIX)
+                    or any(name.startswith(p) for p in extra_dir_prefixes)
+                ):
                     continue
                 entries[rel_path] = LocalEntry(rel_path=rel_path, is_dir=True)
                 walk(Path(entry.path), rel_path)

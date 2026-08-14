@@ -1,12 +1,19 @@
 import { useEffect, useState } from 'react'
 import {
+  getDownloadPrefixSettings,
   getHost,
   getSettleSettings,
   getTransferSettings,
+  putDownloadPrefixSettings,
   putSettleSettings,
   putTransferSettings,
 } from '../../api/client'
-import type { SettleSettingsOut, TransferSettingsOut } from '../../api/types'
+import type {
+  DownloadPrefixSettingsOut,
+  SettleSettingsOut,
+  TransferSettingsOut,
+} from '../../api/types'
+import { FieldHelp } from '../../components/FieldHelp'
 import { bytesToMB, formatRate, mbToBytes } from '../../lib/format'
 
 const inputClasses =
@@ -231,6 +238,121 @@ function SettleGateSection() {
         only if your seedbox's landing path is atomic end to end (e.g. hardlinked torrent
         pickup) and you want to shed that latency entirely.
       </p>
+      {error && <p className="text-sm text-red-600 dark:text-red-400">{error}</p>}
+      {saved && !error && (
+        <p className="text-sm text-emerald-600 dark:text-emerald-400">Saved.</p>
+      )}
+    </div>
+  )
+}
+
+const DOWNLOAD_PREFIX_EMPTY: DownloadPrefixSettingsOut = {
+  enabled: false,
+  prefix: '.downloading-',
+}
+
+/** Settings → Transfer's "folder prefix during transfer" section (2026-08-14,
+ * `core/download_prefix.py`) -- the site-wide default; Settings → Queues has each queue's own
+ * inherit-or-override of both fields. Same self-contained load/save shape as
+ * `SettleGateSection` above, against its own `GET`/`PUT /api/settings/download-prefix`.
+ */
+function DownloadPrefixSection() {
+  const [settings, setSettings] = useState<DownloadPrefixSettingsOut>(DOWNLOAD_PREFIX_EMPTY)
+  const [prefixDraft, setPrefixDraft] = useState(DOWNLOAD_PREFIX_EMPTY.prefix)
+  const [loading, setLoading] = useState(true)
+  const [saving, setSaving] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const [saved, setSaved] = useState(false)
+
+  useEffect(() => {
+    getDownloadPrefixSettings()
+      .then((s) => {
+        setSettings(s)
+        setPrefixDraft(s.prefix)
+      })
+      .finally(() => setLoading(false))
+  }, [])
+
+  const save = async (next: DownloadPrefixSettingsOut) => {
+    setError(null)
+    setSaving(true)
+    setSaved(false)
+    try {
+      const result = await putDownloadPrefixSettings(next)
+      setSettings(result)
+      setPrefixDraft(result.prefix)
+      setSaved(true)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  return (
+    <div className="flex flex-col gap-3 rounded-md border border-zinc-200 p-4 dark:border-zinc-800">
+      <h3 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">
+        Folder prefix during transfer
+        <FieldHelp label="Folder prefix during transfer">
+          <p>
+            While a <strong>directory</strong> item is downloading, write it into a
+            hidden-by-convention folder (e.g. <code>.downloading-Release.Name</code>) instead of
+            its real name, and rename it back only once the transfer is fully complete. Sonarr,
+            Radarr, Plex, and Jellyfin all skip hidden (dot-prefixed) folders regardless of
+            whether they know about lftpweb, so an importer polling the download tree can never
+            see a partial multi-file release mid-arrival.
+          </p>
+          <p>
+            <strong>Directory items only.</strong> A single-file download is already complete
+            the instant it's renamed off its own in-flight name — there is no window in which an
+            importer could see a partial release, because the release <em>is</em> that one file.
+          </p>
+          <p>
+            The prefix is configurable rather than fixed to <code>.downloading-</code> because
+            other tools (or your own scripts) may already use a different in-flight convention
+            you'd rather match. Settings → Queues can override either field per queue.
+          </p>
+        </FieldHelp>
+      </h3>
+      <p className={hintClasses}>
+        Off by default, unlike the settle gate above — this changes where in-flight bytes
+        physically live on disk, which an install with a transfer already running when it
+        upgrades would notice immediately as a changed path. Turn it on deliberately.
+      </p>
+      {loading ? (
+        <p className="text-sm text-zinc-500 dark:text-zinc-400">Loading…</p>
+      ) : (
+        <>
+          <label className="flex items-center gap-2">
+            <input
+              type="checkbox"
+              checked={settings.enabled}
+              disabled={saving}
+              onChange={(e) => save({ ...settings, enabled: e.target.checked })}
+            />
+            <span className={labelClasses}>Enabled</span>
+          </label>
+          <label className="flex flex-col gap-1">
+            <span className={labelClasses}>Prefix</span>
+            <div className="flex items-center gap-2">
+              <input
+                type="text"
+                className={`${inputClasses} max-w-64`}
+                value={prefixDraft}
+                disabled={saving}
+                onChange={(e) => setPrefixDraft(e.target.value)}
+                onBlur={() => {
+                  if (prefixDraft !== settings.prefix) save({ ...settings, prefix: prefixDraft })
+                }}
+              />
+            </div>
+            <span className={hintClasses}>
+              No path separator; must not collide with lftpweb's own <code>_UNPACK_</code>,{' '}
+              <code>_FAILED_</code>, or <code>.lftpweb-mount-ok</code> conventions.
+            </span>
+          </label>
+        </>
+      )}
       {error && <p className="text-sm text-red-600 dark:text-red-400">{error}</p>}
       {saved && !error && (
         <p className="text-sm text-emerald-600 dark:text-emerald-400">Saved.</p>
@@ -493,6 +615,8 @@ export function TransferTab() {
       </div>
 
       <SettleGateSection />
+
+      <DownloadPrefixSection />
 
       <div className="flex flex-col gap-2 rounded-md border border-zinc-200 p-4 dark:border-zinc-800">
         <h3 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">

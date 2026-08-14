@@ -237,6 +237,7 @@ def _row(**overrides):
         "extracted_at": None,
         "first_missing_at": None,
         "remote_deleted_at": None,
+        "pending_download_prefix": None,
     }
     base.update(overrides)
     return base

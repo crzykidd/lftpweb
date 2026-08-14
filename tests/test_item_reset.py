@@ -512,7 +512,7 @@ async def test_reset_item_then_a_real_scan_creates_a_fresh_unsuppressed_row(tmp_
                 rel_path=f"{rel_path}/a.mkv", is_dir=False, size=10, mtime=1.0
             ),
         }
-        monkeypatch.setattr(engine_module.local_scan, "scan_local", lambda root: {})
+        monkeypatch.setattr(engine_module.local_scan, "scan_local", lambda root, **_kwargs: {})
 
         engine = Engine(db, str(tmp_path), EventBus())
         engine.pool = _FakePool(remote_tree)

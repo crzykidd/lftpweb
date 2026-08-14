@@ -147,6 +147,7 @@ export function FilesPage() {
               speedByItemId={speedByItemId}
               selected={getSelected(queue.queue_id)}
               onSelectionChange={(next) => setSelectedForQueue(queue.queue_id, next)}
+              queueLocalPath={config?.local_path}
             />
             {/* The unified "Reset item tracking" control (2026-08-14,
              * prompts/2026-08-14-reset-panel-counts-and-layout.md) -- one scope selector

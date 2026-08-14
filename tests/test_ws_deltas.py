@@ -55,6 +55,7 @@ def _node(rel_path: str, size: int) -> ItemView:
             "extracted_at": None,
             "first_missing_at": None,
             "remote_deleted_at": None,
+            "pending_download_prefix": None,
         }
     )
 
@@ -206,7 +207,7 @@ async def _mutated_delta_payload(tmp_path, monkeypatch, n: int) -> tuple[dict, d
     -up sizes) change and one release is removed. Returns `(delta_message, full_snapshot)` so
     a test can compare the two directly.
     """
-    monkeypatch.setattr(engine_module.local_scan, "scan_local", lambda root: {})  # noqa: ARG005
+    monkeypatch.setattr(engine_module.local_scan, "scan_local", lambda root, **_kwargs: {})  # noqa: ARG005
 
     tree1 = _release_tree(n)
     tree2 = dict(tree1)
@@ -261,7 +262,11 @@ async def test_scan_delta_is_small_and_exact_regardless_of_tree_size(tmp_path, m
     # per-node cost, not one that scales with `n`. Bumped again, 3200->3500 (2026-08-13,
     # prompts/2026-08-13-settle-progress-visibility.md): three more `null` keys per node
     # (`settle_total_bytes`/`settle_first_observed_at`/`settle_last_changed_at`), same reasoning.
-    assert len(json.dumps(delta)) < 3500
+    # Bumped again, 3500->3700 (2026-08-14, "folder prefix during transfer",
+    # `core/download_prefix.py`): every changed node now also carries `pending_download_prefix`,
+    # one more `null` key per node -- the same fixed, not-`n`-scaling cost every prior bump here
+    # was for.
+    assert len(json.dumps(delta)) < 3700
 
 
 async def test_scan_delta_payload_does_not_scale_with_tree_size(tmp_path, monkeypatch):
@@ -308,7 +313,7 @@ async def test_ws_nodes_carry_item_id_so_the_ui_can_act_on_them(tmp_path, monkey
     reintroduce — the projection is built from the `item` row, so the id is its primary key
     (`core/itemview.py`).
     """
-    monkeypatch.setattr(engine_module.local_scan, "scan_local", lambda root: {})  # noqa: ARG005
+    monkeypatch.setattr(engine_module.local_scan, "scan_local", lambda root, **_kwargs: {})  # noqa: ARG005
 
     tree = _release_tree(3)
     engine, q, host, db = await _make_engine(tmp_path, [tree, tree])
@@ -395,7 +400,7 @@ async def test_published_state_is_the_persisted_state_not_the_structural_one(
     monkeypatch.setattr(
         engine_module.local_scan,
         "scan_local",
-        lambda root: _mirrored_locally(tree, absent=absent),  # noqa: ARG005
+        lambda root, **_kwargs: _mirrored_locally(tree, absent=absent),  # noqa: ARG005
     )
 
     engine, q, host, db = await _make_engine(tmp_path, [tree, tree])
@@ -456,7 +461,10 @@ async def test_published_state_is_the_persisted_state_not_the_structural_one(
         # again, 2400->2700 (2026-08-13, prompts/2026-08-13-settle-progress-visibility.md):
         # three more `null` keys per node (`settle_total_bytes`/`settle_first_observed_at`/
         # `settle_last_changed_at`), same reasoning as the other threshold's identical bump.
-        assert len(json.dumps(delta)) < 2700, "the delta must stay proportional to what changed"
+        # Bumped again, 2700->2900 (2026-08-14, "folder prefix during transfer",
+        # `core/download_prefix.py`): one more `null` key per node (`pending_download_prefix`),
+        # same fixed, not-tree-size-scaling reasoning as every prior bump here.
+        assert len(json.dumps(delta)) < 2900, "the delta must stay proportional to what changed"
 
         # ...and the connect-time snapshot -- the reload path, which is how this bug was
         # actually visible to a user -- agrees with the database for every node, not just the
@@ -481,7 +489,7 @@ async def test_snapshot_reflects_a_lifecycle_write_made_since_the_last_scan(tmp_
     monkeypatch.setattr(
         engine_module.local_scan,
         "scan_local",
-        lambda root: _mirrored_locally(tree, absent=set()),  # noqa: ARG005
+        lambda root, **_kwargs: _mirrored_locally(tree, absent=set()),  # noqa: ARG005
     )
 
     engine, q, host, db = await _make_engine(tmp_path, [tree])
@@ -521,7 +529,7 @@ async def test_scan_complete_published_on_a_successful_pass(tmp_path, monkeypatc
     partial-scan warning, and small and fixed-size regardless of tree size (DESIGN.md §2/§9's
     delta rule: never proportional to the tree).
     """
-    monkeypatch.setattr(engine_module.local_scan, "scan_local", lambda root: {})  # noqa: ARG005
+    monkeypatch.setattr(engine_module.local_scan, "scan_local", lambda root, **_kwargs: {})  # noqa: ARG005
 
     tree = _release_tree(500)
     engine, q, host, db = await _make_engine(tmp_path, [tree])

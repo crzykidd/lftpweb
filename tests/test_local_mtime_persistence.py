@@ -35,7 +35,7 @@ async def test_local_mtime_persisted_on_an_ordinary_scan(tmp_path, monkeypatch):
     monkeypatch.setattr(
         engine_module.local_scan,
         "scan_local",
-        lambda root: _local_tree_with_mtime(SIZE, LOCAL_MTIME),  # noqa: ARG005
+        lambda root, **_kwargs: _local_tree_with_mtime(SIZE, LOCAL_MTIME),  # noqa: ARG005
     )
     try:
         await engine.scan_queue(q, host)
@@ -60,7 +60,7 @@ async def test_local_mtime_refreshed_even_on_a_protected_row(tmp_path, monkeypat
     monkeypatch.setattr(
         engine_module.local_scan,
         "scan_local",
-        lambda root: _local_tree_with_mtime(SIZE // 2, LOCAL_MTIME),  # noqa: ARG005
+        lambda root, **_kwargs: _local_tree_with_mtime(SIZE // 2, LOCAL_MTIME),  # noqa: ARG005
     )
     try:
         await engine.scan_queue(q, host)
@@ -80,7 +80,7 @@ async def test_local_mtime_updates_across_repeated_scans(tmp_path, monkeypatch):
     monkeypatch.setattr(
         engine_module.local_scan,
         "scan_local",
-        lambda root: _local_tree_with_mtime(SIZE, LOCAL_MTIME),  # noqa: ARG005
+        lambda root, **_kwargs: _local_tree_with_mtime(SIZE, LOCAL_MTIME),  # noqa: ARG005
     )
     try:
         await engine.scan_queue(q, host)
@@ -90,7 +90,7 @@ async def test_local_mtime_updates_across_repeated_scans(tmp_path, monkeypatch):
         monkeypatch.setattr(
             engine_module.local_scan,
             "scan_local",
-            lambda root: _local_tree_with_mtime(SIZE, later),  # noqa: ARG005
+            lambda root, **_kwargs: _local_tree_with_mtime(SIZE, later),  # noqa: ARG005
         )
         await engine.scan_queue(q, host)
         assert await _local_mtime_of(db, item_id) == later
@@ -115,7 +115,7 @@ async def test_local_mtime_cleared_when_the_item_vanishes_from_both_trees(tmp_pa
     monkeypatch.setattr(
         engine_module.local_scan,
         "scan_local",
-        lambda root: _local_tree_with_mtime(SIZE, LOCAL_MTIME),  # noqa: ARG005
+        lambda root, **_kwargs: _local_tree_with_mtime(SIZE, LOCAL_MTIME),  # noqa: ARG005
     )
     try:
         await engine.scan_queue(q, host)
@@ -123,7 +123,7 @@ async def test_local_mtime_cleared_when_the_item_vanishes_from_both_trees(tmp_pa
 
         # The local copy leaves too (auto_move relocated it, or an importer took it) -- the
         # rel_path is now in neither tree.
-        monkeypatch.setattr(engine_module.local_scan, "scan_local", lambda root: {})  # noqa: ARG005
+        monkeypatch.setattr(engine_module.local_scan, "scan_local", lambda root, **_kwargs: {})  # noqa: ARG005
         await engine.scan_queue(q, host)
         assert await _local_mtime_of(db, item_id) is None
     finally:

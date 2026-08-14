@@ -49,7 +49,15 @@ from typing import Any
 
 import aiosqlite
 
-from lftpweb.core import local_delete, local_scan, mount_sentinel, patterns, postprocess, settle
+from lftpweb.core import (
+    download_prefix,
+    local_delete,
+    local_scan,
+    mount_sentinel,
+    patterns,
+    postprocess,
+    settle,
+)
 from lftpweb.core.autoqueue import AutoQueue, QueueAutoConfig
 from lftpweb.core.crypto import DecryptionError, decrypt_secret
 from lftpweb.core.events import EventBus
@@ -211,6 +219,12 @@ class QueueConfig:
     # NULL) means "use the site-wide `scan_interval_s` default," resolved through
     # `effective_scan_interval` above -- never read as a literal 0/None interval directly here.
     scan_interval_s: float | None = None
+    # Migration 017 ("folder prefix during transfer", `core/download_prefix.py`). Both `None` =
+    # inherit the site-wide `DownloadPrefixSettings` field, resolved independently
+    # (`download_prefix.resolve_for_queue`) -- see `_active_download_prefixes` below, the only
+    # reader of these two on this dataclass.
+    download_prefix_enabled: bool | None = None
+    download_prefix: str | None = None
 
 
 async def load_host_config(db: aiosqlite.Connection, config_dir: str) -> HostConfig | None:
@@ -272,7 +286,8 @@ async def load_host_config(db: aiosqlite.Connection, config_dir: str) -> HostCon
 async def load_queues(db: aiosqlite.Connection) -> list[QueueConfig]:
     cursor = await db.execute(
         "SELECT id, host_id, name, remote_path, local_path, staging_path, enabled, sync_mode, "
-        "auto_queue_enabled, auto_queue_patterns_only, scan_interval_s FROM path_queue ORDER BY id"
+        "auto_queue_enabled, auto_queue_patterns_only, scan_interval_s, "
+        "download_prefix_enabled, download_prefix FROM path_queue ORDER BY id"
     )
     rows = await cursor.fetchall()
     return [
@@ -288,6 +303,15 @@ async def load_queues(db: aiosqlite.Connection) -> list[QueueConfig]:
             auto_queue_enabled=bool(row["auto_queue_enabled"]),
             auto_queue_patterns_only=bool(row["auto_queue_patterns_only"]),
             scan_interval_s=row["scan_interval_s"],
+            # Nullable-for-inherit (migration 017) -- unlike `auto_queue_enabled` above, `None`
+            # here is a real, distinct value (`bool(row[...])` would collapse it to `False`,
+            # silently turning "inherit" into an explicit override the moment a queue is loaded).
+            download_prefix_enabled=(
+                None
+                if row["download_prefix_enabled"] is None
+                else bool(row["download_prefix_enabled"])
+            ),
+            download_prefix=row["download_prefix"],
         )
         for row in rows
     ]
@@ -686,6 +710,36 @@ class Engine:
                 await self._scan_queue_local_only(q)
             self._schedule_next_local(q, now=time.monotonic())
 
+    async def _active_download_prefixes(self, q: QueueConfig) -> tuple[str, ...]:
+        """Every directory-name prefix a local scan of `q` must filter out right now
+        ("folder prefix during transfer," `core/download_prefix.py`) -- the resolved
+        site/queue prefix, *if* currently enabled, unioned with every distinct
+        `item.pending_download_prefix` still on record for this queue. The union, not just the
+        resolved value, is what keeps a *stale* prefix from orphaning a directory: an item
+        spawned while the site or queue prefix said `.downloading-` keeps writing into
+        `.downloading-<name>` for that job's whole lifetime even if the setting is edited (or
+        turned off, or a `STOPPED` item just sits there) before it finishes --
+        `core/queue.py._spawn_decision` never re-derives the prefix for an item that already has
+        one recorded, and this is the matching read side: a scan must keep skipping whatever
+        directory name is *physically* in use, not merely whatever today's settings resolve to.
+        `pending_download_prefix` is cleared the moment `core/queue.py._reap_one` renames a
+        directory back to its real name, so a queue with nothing currently in flight under an
+        old prefix costs this method nothing beyond the one indexed query below.
+        """
+        site = await download_prefix.load_download_prefix_settings(self.db)
+        enabled, prefix = download_prefix.resolve_for_queue(
+            q.download_prefix_enabled, q.download_prefix, site
+        )
+        prefixes = {prefix} if enabled else set()
+        cursor = await self.db.execute(
+            "SELECT DISTINCT pending_download_prefix FROM item "
+            "WHERE queue_id = ? AND pending_download_prefix IS NOT NULL",
+            (q.id,),
+        )
+        rows = await cursor.fetchall()
+        prefixes.update(row["pending_download_prefix"] for row in rows)
+        return tuple(prefixes)
+
     async def scan_queue(self, q: QueueConfig, host: HostConfig | None) -> None:
         try:
             if host is None:
@@ -711,7 +765,8 @@ class Engine:
             # failure path in this method already has. `_scan_queue_local_only` is this cache's
             # only reader.
             self._cached_remote_tree[q.id] = remote_tree
-            local_tree = local_scan.scan_local(q.local_path)
+            prefixes = await self._active_download_prefixes(q)
+            local_tree = local_scan.scan_local(q.local_path, extra_dir_prefixes=prefixes)
 
             # The mount sentinel (DESIGN.md §7.3, required starting this phase — see
             # docs/decisions.md): written once the local root is confirmed present and
@@ -855,7 +910,8 @@ class Engine:
         if cached_remote is None:
             return
         try:
-            local_tree = local_scan.scan_local(q.local_path)
+            prefixes = await self._active_download_prefixes(q)
+            local_tree = local_scan.scan_local(q.local_path, extra_dir_prefixes=prefixes)
 
             # Local-only, same as `scan_queue`'s own use of this sentinel -- no SSH involved
             # either way.

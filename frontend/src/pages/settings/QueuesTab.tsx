@@ -8,6 +8,7 @@ import {
   deletePattern,
   getAutoQueueSettings,
   getAutoQueueStatus,
+  getDownloadPrefixSettings,
   getPostprocessSettings,
   listPatterns,
   listQueues,
@@ -17,6 +18,7 @@ import {
 } from '../../api/client'
 import type {
   AutoQueueSettingsOut,
+  DownloadPrefixSettingsOut,
   PathQueueOut,
   PatternKind,
   PatternOut,
@@ -48,6 +50,12 @@ interface FormState {
   auto_move: boolean | null
   auto_delete_archives: boolean | null
   scan_interval_s: number | null
+  // "Folder prefix during transfer" (core/download_prefix.py), migration 017 -- same
+  // inherit-or-override shape as the four post-processing toggles above, resolved
+  // independently of each other (a queue can override just the toggle, just the prefix
+  // string, both, or neither).
+  download_prefix_enabled: boolean | null
+  download_prefix: string | null
 }
 
 const EMPTY_FORM: FormState = {
@@ -64,6 +72,22 @@ const EMPTY_FORM: FormState = {
   auto_move: null,
   auto_delete_archives: null,
   scan_interval_s: null,
+  download_prefix_enabled: null,
+  download_prefix: null,
+}
+
+/** Settings → Transfer's site-wide "folder prefix during transfer" default, fetched here so
+ * this page's own per-queue override can show what it actually resolves to -- the identical
+ * shape `usePostprocessSiteSettings` below uses for the four post-processing toggles.
+ */
+function useDownloadPrefixSiteSettings(): DownloadPrefixSettingsOut | null {
+  const [settings, setSettings] = useState<DownloadPrefixSettingsOut | null>(null)
+  useEffect(() => {
+    getDownloadPrefixSettings()
+      .then(setSettings)
+      .catch(() => setSettings(null))
+  }, [])
+  return settings
 }
 
 /** Settings → Post-processing's site-wide defaults, fetched here too so each per-queue toggle
@@ -157,6 +181,78 @@ function InheritableToggle({
             type="button"
             disabled={disabled}
             onClick={() => onChange(!!siteValue)}
+            className="text-zinc-600 underline hover:no-underline disabled:opacity-50 dark:text-zinc-300"
+          >
+            Override for this queue
+          </button>
+        </p>
+      )}
+      {overridden && (
+        <p className={hintClasses}>
+          Overridden for this queue.{' '}
+          <button
+            type="button"
+            onClick={() => onChange(null)}
+            className="text-zinc-600 underline hover:no-underline dark:text-zinc-300"
+          >
+            Revert to inherit (currently resolves to {siteLabel})
+          </button>
+        </p>
+      )}
+      {disabled && disabledMessage && (
+        <p className="text-xs text-amber-600 dark:text-amber-400">{disabledMessage}</p>
+      )}
+    </div>
+  )
+}
+
+/** `InheritableToggle`'s text-field counterpart -- the "folder prefix during transfer" string
+ * itself (`download_prefix`), inherit-or-override just like the toggle above but resolving to
+ * a string rather than a boolean. `value === null` means this queue inherits the site-wide
+ * prefix; the input shows that resolved value but is locked until "Override for this queue"
+ * seeds it with the currently-resolved text, exactly mirroring `InheritableToggle`'s own
+ * discoverability reasoning (a checkbox/field that silently starts editing from empty, rather
+ * than from what's actually in effect, is the same surprise in both shapes).
+ */
+function InheritableTextField({
+  label,
+  value,
+  onChange,
+  siteValue,
+  disabled = false,
+  disabledMessage,
+}: {
+  label: ReactNode
+  value: string | null
+  onChange: (next: string | null) => void
+  siteValue: string | null
+  disabled?: boolean
+  disabledMessage?: ReactNode
+}) {
+  const siteLabel = siteValue == null ? 'loading…' : `"${siteValue}"`
+  const overridden = value !== null
+  const effective = overridden ? value : (siteValue ?? '')
+
+  return (
+    <div className="flex flex-col gap-1">
+      <label className="flex flex-col gap-1">
+        <span className="text-sm text-zinc-700 dark:text-zinc-300">{label}</span>
+        <input
+          type="text"
+          className={`${inputClasses} max-w-64`}
+          value={effective}
+          disabled={disabled || !overridden}
+          onChange={(e) => onChange(e.target.value)}
+        />
+      </label>
+      {!overridden && (
+        <p className={hintClasses}>
+          Inherits Settings → Transfer's site-wide prefix (currently <strong>{siteLabel}</strong>
+          ).{' '}
+          <button
+            type="button"
+            disabled={disabled}
+            onClick={() => onChange(siteValue ?? '')}
             className="text-zinc-600 underline hover:no-underline disabled:opacity-50 dark:text-zinc-300"
           >
             Override for this queue
@@ -311,6 +407,7 @@ export function QueuesTab() {
   // in *this* editing session rather than a checkbox that silently stays checked.
   const [moveConfirmed, setMoveConfirmed] = useState(false)
   const postprocessSite = usePostprocessSiteSettings()
+  const downloadPrefixSite = useDownloadPrefixSiteSettings()
 
   const refresh = () => listQueues().then(setQueues)
 
@@ -340,6 +437,8 @@ export function QueuesTab() {
       auto_move: queue.auto_move,
       auto_delete_archives: queue.auto_delete_archives,
       scan_interval_s: queue.scan_interval_s,
+      download_prefix_enabled: queue.download_prefix_enabled,
+      download_prefix: queue.download_prefix,
     })
   }
 
@@ -386,6 +485,8 @@ export function QueuesTab() {
       auto_move: form.auto_move,
       auto_delete_archives: form.auto_delete_archives,
       scan_interval_s: form.scan_interval_s,
+      download_prefix_enabled: form.download_prefix_enabled,
+      download_prefix: form.download_prefix,
     }
     try {
       if (editingId != null) {
@@ -715,6 +816,43 @@ export function QueuesTab() {
             siteValue={postprocessSite ? postprocessSite.move_enabled : null}
             disabled={!form.staging_path}
             disabledMessage="Set a staging path above first."
+          />
+        </div>
+
+        <div className="flex flex-col gap-3 rounded-md border border-zinc-200 p-3 dark:border-zinc-800">
+          <span className={labelClasses}>
+            Folder prefix during transfer — inherits its site-wide default from{' '}
+            <Link to="/settings/transfer" className="underline">
+              Settings → Transfer
+            </Link>{' '}
+            unless explicitly overridden below.
+            <FieldHelp label="Folder prefix during transfer">
+              <p>
+                While a <strong>directory</strong> item is downloading, write it into a
+                hidden-by-convention folder (e.g. <code>.downloading-Release.Name</code>) and
+                rename it to its real name only once the transfer is fully complete. Sonarr,
+                Radarr, Plex, and Jellyfin all skip hidden (dot-prefixed) folders regardless of
+                whether they know about lftpweb, so an importer polling the download tree never
+                sees a partial multi-file release.
+              </p>
+              <p>
+                <strong>Directory items only</strong> — a single-file download is already
+                complete the instant it's renamed off its own in-flight name, so there is no
+                partial state for this to protect against.
+              </p>
+            </FieldHelp>
+          </span>
+          <InheritableToggle
+            label="Enabled"
+            value={form.download_prefix_enabled}
+            onChange={(v) => update('download_prefix_enabled', v)}
+            siteValue={downloadPrefixSite ? downloadPrefixSite.enabled : null}
+          />
+          <InheritableTextField
+            label="Prefix"
+            value={form.download_prefix}
+            onChange={(v) => update('download_prefix', v)}
+            siteValue={downloadPrefixSite ? downloadPrefixSite.prefix : null}
           />
         </div>
 

@@ -331,6 +331,7 @@ def build_transfer_command(
     parallel: int,
     pget_n: int,
     exclude_globs: tuple[str, ...],
+    mirror_rename_target: bool = False,
 ) -> str:
     """The transfer command itself (DESIGN.md §4.1) — paths only, no secrets, safe to place in
     the `-c` argv string. `-c` (continue) on both `pget`/`mirror` is what makes every restart
@@ -345,11 +346,28 @@ def build_transfer_command(
     `<local-parent>/<item>/` as the target — the "obvious" symmetric choice with `pget` —
     produces a doubly-nested `<item>/<item>/...` tree instead. The caller (`core/queue.py`) is
     responsible for passing the *parent* for a `mirror` job.
+
+    **`mirror_rename_target` (2026-08-14, the "folder prefix during transfer" task) is the one
+    exception to the paragraph above.** lftp's `mirror` also supports being handed the *exact*
+    target directory name (no trailing slash, target not pre-existing under a different name):
+    `mirror -c '<remote>/<item>' '<local-parent>/<prefix><item>'` writes straight into
+    `<local-parent>/<prefix><item>/...` with no basename appended — verified against the fake
+    seedbox (both a fresh transfer and a `-c` resume into an already-partially-populated
+    directory of that literal name land flat, never doubly nested). This is what lets
+    `core/queue.py` write a directory item's in-flight bytes into
+    `<prefix><name>` instead of `<name>` without inventing a second transfer mechanism: the
+    caller passes the already-prefixed full path as `local_path` and sets this flag, which
+    simply skips the trailing-slash-forcing below rather than taking the append-basename branch.
+    Never set for `pget` (the branch below never reads it) and never set when the prefix feature
+    is off or the item is a single file — see `core/queue.py._spawn_decision`.
     """
     if kind == "pget":
         cmd = f"pget -c -n {pget_n} {_lftp_quote(remote_path)} -o {_lftp_quote(local_path)}"
     else:
-        local_dir = local_path if local_path.endswith("/") else local_path + "/"
+        if mirror_rename_target:
+            local_dir = local_path
+        else:
+            local_dir = local_path if local_path.endswith("/") else local_path + "/"
         parts = ["mirror", "-c", f"--parallel={parallel}", f"--use-pget-n={pget_n}"]
         for glob in exclude_globs:
             parts.append(f"--exclude-glob {_lftp_quote(glob)}")
@@ -373,6 +391,10 @@ class JobSpec:
     extra_settings: str = ""
     save_status_interval_s: int = 1
     run_dir: str = DEFAULT_RUN_DIR
+    # 2026-08-14 ("folder prefix during transfer"): see `build_transfer_command`'s own docstring
+    # for exactly what this changes. `core/queue.py._spawn_decision` is the only place that ever
+    # sets it `True`, and only for a `mirror` job whose target is already the prefixed directory.
+    mirror_rename_target: bool = False
 
 
 @dataclass
@@ -495,6 +517,7 @@ async def spawn(spec: JobSpec, *, lftp_bin: str = "lftp") -> SpawnedJob:
         parallel=spec.parallel,
         pget_n=spec.pget_n,
         exclude_globs=spec.exclude_globs,
+        mirror_rename_target=spec.mirror_rename_target,
     )
     script = f"source {_lftp_quote(str(rc_path))}; set cmd:fail-exit true; {transfer_cmd}"
 

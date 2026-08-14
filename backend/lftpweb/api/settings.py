@@ -20,6 +20,12 @@ from lftpweb.core.autoqueue import (
     save_autoqueue_settings,
 )
 from lftpweb.core.crypto import DecryptionError, decrypt_secret, encrypt_secret
+from lftpweb.core.download_prefix import (
+    DownloadPrefixSettings,
+    load_download_prefix_settings,
+    save_download_prefix_settings,
+    validate_prefix,
+)
 from lftpweb.core.mount_sentinel import check as mount_ok_check
 from lftpweb.core.postprocess import (
     PostprocessSettings,
@@ -42,6 +48,8 @@ from lftpweb.core.settle import (
 from lftpweb.models import (
     AutoQueueSettingsIn,
     AutoQueueSettingsOut,
+    DownloadPrefixSettingsIn,
+    DownloadPrefixSettingsOut,
     HostIn,
     HostOut,
     HostTestRequest,
@@ -304,7 +312,7 @@ async def test_host(
 _QUEUE_SELECT_COLUMNS = (
     "id, host_id, name, remote_path, local_path, staging_path, enabled, sync_mode, "
     "auto_queue_enabled, auto_queue_patterns_only, auto_verify, auto_extract, auto_move, "
-    "auto_delete_archives, scan_interval_s"
+    "auto_delete_archives, scan_interval_s, download_prefix_enabled, download_prefix"
 )
 
 
@@ -335,6 +343,8 @@ def _queue_out_from_row(row) -> PathQueueOut:
         auto_move=_nullable_bool(row["auto_move"]),
         auto_delete_archives=_nullable_bool(row["auto_delete_archives"]),
         scan_interval_s=row["scan_interval_s"],
+        download_prefix_enabled=_nullable_bool(row["download_prefix_enabled"]),
+        download_prefix=row["download_prefix"],
     )
 
 
@@ -399,6 +409,24 @@ def _reject_invalid_scan_interval(value: float | None) -> None:
         )
 
 
+def _reject_invalid_download_prefix(body: PathQueueIn) -> None:
+    """`core/download_prefix.py.validate_prefix`, applied to a queue's own override
+    (`body.download_prefix`) -- `None` (inherit) needs no check at all, it carries no shape of
+    its own to validate. `enabled=bool(body.download_prefix_enabled)` treats "inherit" (`None`)
+    the same as an explicit `False` here: this check only ever gates the "must not be empty"
+    rule (`validate_prefix`'s own docstring), and this endpoint cannot know what a *site-wide*
+    toggle will resolve to later, so it validates only what it can see now -- shape and
+    collision checks run unconditionally regardless, which is what actually protects against a
+    garbage value reaching the database and taking effect once something (site or queue) does
+    turn the toggle on.
+    """
+    if body.download_prefix is None:
+        return
+    error = validate_prefix(body.download_prefix, enabled=bool(body.download_prefix_enabled))
+    if error is not None:
+        raise HTTPException(status_code=400, detail=error)
+
+
 @router.get("/queues", response_model=list[PathQueueOut])
 async def list_queues(request: Request) -> list[PathQueueOut]:
     cursor = await request.app.state.db.execute(
@@ -412,6 +440,7 @@ async def list_queues(request: Request) -> list[PathQueueOut]:
 async def create_queue(body: PathQueueIn, request: Request) -> PathQueueOut:
     _reject_unimplemented_sync_mode(body.sync_mode)
     _reject_invalid_scan_interval(body.scan_interval_s)
+    _reject_invalid_download_prefix(body)
     db = request.app.state.db
     host_row = await _get_host_row(db)
     if host_row is None:
@@ -420,8 +449,9 @@ async def create_queue(body: PathQueueIn, request: Request) -> PathQueueOut:
     cursor = await db.execute(
         "INSERT INTO path_queue (host_id, name, remote_path, local_path, staging_path, "
         "enabled, sync_mode, auto_queue_enabled, auto_queue_patterns_only, "
-        "auto_verify, auto_extract, auto_move, auto_delete_archives, scan_interval_s) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "auto_verify, auto_extract, auto_move, auto_delete_archives, scan_interval_s, "
+        "download_prefix_enabled, download_prefix) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             host_row["id"],
             body.name,
@@ -437,6 +467,8 @@ async def create_queue(body: PathQueueIn, request: Request) -> PathQueueOut:
             _sql_bool(body.auto_move),
             _sql_bool(body.auto_delete_archives),
             body.scan_interval_s,
+            _sql_bool(body.download_prefix_enabled),
+            body.download_prefix,
         ),
     )
     await db.commit()
@@ -471,6 +503,19 @@ def _merged_toggle(
     return _sql_bool(getattr(body, field_name))
 
 
+def _merged_field(body: PathQueueIn, provided: set[str], field_name: str, current_stored):
+    """`_merged_toggle`'s identical absent-vs-null distinction, for a plain (non-boolean)
+    nullable field -- `download_prefix` (migration 017): a field genuinely absent from the
+    request body leaves the stored value untouched, while an explicitly sent `null` clears an
+    existing override back to inherit. Kept separate from `_merged_toggle` rather than
+    generalised into one function with a coercion callback -- one extra four-line function reads
+    more plainly than a callback parameter for what is, today, exactly one caller.
+    """
+    if field_name not in provided:
+        return current_stored
+    return getattr(body, field_name)
+
+
 @router.put("/queues/{queue_id}", response_model=PathQueueOut)
 async def update_queue(queue_id: int, body: PathQueueIn, request: Request) -> PathQueueOut:
     """Every field **except** the four post-processing toggles is a full replace, same as this
@@ -494,7 +539,8 @@ async def update_queue(queue_id: int, body: PathQueueIn, request: Request) -> Pa
     db = request.app.state.db
 
     cursor = await db.execute(
-        "SELECT auto_verify, auto_extract, auto_move, auto_delete_archives "
+        "SELECT auto_verify, auto_extract, auto_move, auto_delete_archives, "
+        "download_prefix_enabled, download_prefix "
         "FROM path_queue WHERE id = ?",
         (queue_id,),
     )
@@ -511,12 +557,26 @@ async def update_queue(queue_id: int, body: PathQueueIn, request: Request) -> Pa
         if body.sync_mode == "move"
         else _merged_toggle(body, provided, "auto_verify", existing["auto_verify"])
     )
+    # `download_prefix` (migration 017), merged the same way -- validated against the
+    # *resulting* `download_prefix_enabled` merge below, not `body`'s own possibly-absent
+    # value, since a validate-then-merge body that only overrides one of the two fields must
+    # still be checked against what the row will actually end up with.
+    download_prefix_enabled_value = _merged_toggle(
+        body, provided, "download_prefix_enabled", existing["download_prefix_enabled"]
+    )
+    download_prefix_value = _merged_field(
+        body, provided, "download_prefix", existing["download_prefix"]
+    )
+    if download_prefix_value is not None:
+        error = validate_prefix(download_prefix_value, enabled=bool(download_prefix_enabled_value))
+        if error is not None:
+            raise HTTPException(status_code=400, detail=error)
 
     await db.execute(
         "UPDATE path_queue SET name = ?, remote_path = ?, local_path = ?, staging_path = ?, "
         "enabled = ?, sync_mode = ?, auto_queue_enabled = ?, auto_queue_patterns_only = ?, "
         "auto_verify = ?, auto_extract = ?, auto_move = ?, auto_delete_archives = ?, "
-        "scan_interval_s = ? WHERE id = ?",
+        "scan_interval_s = ?, download_prefix_enabled = ?, download_prefix = ? WHERE id = ?",
         (
             body.name,
             body.remote_path,
@@ -533,6 +593,8 @@ async def update_queue(queue_id: int, body: PathQueueIn, request: Request) -> Pa
                 body, provided, "auto_delete_archives", existing["auto_delete_archives"]
             ),
             body.scan_interval_s,
+            download_prefix_enabled_value,
+            download_prefix_value,
             queue_id,
         ),
     )
@@ -809,6 +871,39 @@ async def put_settle_settings(body: SettleSettingsIn, request: Request) -> Settl
         required_scans=REQUIRED_SETTLE_SCANS,
         min_age_s=SETTLE_MIN_AGE_S,
     )
+
+
+# --- Settings -> "folder prefix during transfer" (`core/download_prefix.py`) -----------
+#
+# Site-wide half lives at Settings -> Transfer, the same page as the settle gate above -- both
+# are transfer-shaping settings that aren't part of DESIGN.md §4.5's bandwidth surface but don't
+# have a page of their own either. The per-queue override half is on Settings -> Queues (the
+# `_QUEUE_SELECT_COLUMNS`/`_queue_out_from_row`/`create_queue`/`update_queue` changes below).
+
+
+@router.get("/download-prefix", response_model=DownloadPrefixSettingsOut)
+async def get_download_prefix_settings(request: Request) -> DownloadPrefixSettingsOut:
+    settings = await load_download_prefix_settings(request.app.state.db)
+    return DownloadPrefixSettingsOut(enabled=settings.enabled, prefix=settings.prefix)
+
+
+@router.put("/download-prefix", response_model=DownloadPrefixSettingsOut)
+async def put_download_prefix_settings(
+    body: DownloadPrefixSettingsIn, request: Request
+) -> DownloadPrefixSettingsOut:
+    error = validate_prefix(body.prefix, enabled=body.enabled)
+    if error is not None:
+        raise HTTPException(status_code=400, detail=error)
+    settings = DownloadPrefixSettings(enabled=body.enabled, prefix=body.prefix)
+    await save_download_prefix_settings(request.app.state.db, settings)
+    engine = getattr(request.app.state, "engine", None)
+    if engine is not None:
+        # A changed prefix (or the toggle itself) changes what the very next scan's
+        # `core/local_scan.py` filter must skip (`Engine._active_download_prefixes`) -- request
+        # a fresh pass rather than waiting out the current interval, matching every other
+        # setting write in this module that affects scan behaviour.
+        engine.request_rescan()
+    return DownloadPrefixSettingsOut(enabled=settings.enabled, prefix=settings.prefix)
 
 
 # --- Settings -> auto-queue (`core/autoqueue.py.AutoQueueSettings`) ---------------------

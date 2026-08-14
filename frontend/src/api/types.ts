@@ -121,6 +121,12 @@ export interface PathQueueIn {
   // something else forces a scan); any positive number is a literal per-queue interval in
   // seconds. The backend rejects a negative value with a 400.
   scan_interval_s: number | null
+  // Migration 017 ("folder prefix during transfer", core/download_prefix.py). Both
+  // nullable-for-inherit, resolved independently -- `null` means "inherit the matching
+  // Settings -> Transfer field," an explicit value is this queue's own override. Directory
+  // items only; see Settings -> Transfer's own section for why.
+  download_prefix_enabled: boolean | null
+  download_prefix: string | null
 }
 
 export interface PathQueueOut extends PathQueueIn {
@@ -160,6 +166,21 @@ export interface SettleSettingsOut {
 export interface SettleSettingsIn {
   enabled: boolean
 }
+
+// --- Settings -> "folder prefix during transfer" (core/download_prefix.py) -------------
+//
+// Site-wide default; a queue's own `download_prefix_enabled`/`download_prefix` (PathQueueOut,
+// above) can independently override either half. Off by default -- unlike the settle gate,
+// this one was not given the "ships on" exception (see core/download_prefix.py's docstring):
+// it changes where in-flight bytes physically live, which an install with a transfer already
+// running when it upgrades would notice immediately.
+
+export interface DownloadPrefixSettingsOut {
+  enabled: boolean
+  prefix: string
+}
+
+export type DownloadPrefixSettingsIn = DownloadPrefixSettingsOut
 
 // --- Settings -> auto-queue (`core/autoqueue.py.AutoQueueSettings`) ---------------------
 //
@@ -306,6 +327,11 @@ export interface FileNode {
   extracted_at: string | null
   first_missing_at: string | null
   remote_deleted_at: string | null
+  // "Folder prefix during transfer" (core/download_prefix.py): the exact prefix string this
+  // item's local root is *currently* written under, null when nothing is in flight under a
+  // prefixed name. Never part of rel_path -- purely the item drawer's "where does this
+  // actually live right now" answer.
+  pending_download_prefix: string | null
   facets: LifecycleFacets
 }
 

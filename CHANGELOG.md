@@ -506,6 +506,24 @@ alongside this list: several entries below ship with deliberate, documented limi
   or resets `item_settle`, but still enforces whatever verdict the gate last recorded, so an
   item the real gate hasn't cleared cannot be released early just because local bytes caught up
   to a stale cached remote total.
+- **"Folder prefix during transfer", off by default** *(2026-08-14)*. A directory item can now
+  download into a hidden-by-convention folder (`.downloading-<name>` by default, configurable
+  site-wide and per-queue, both nullable-for-inherit) and is renamed to its real name only once
+  the transfer is fully complete — a `mirror` job renames each file to its final name as that
+  file finishes, so an importer polling the download directory could previously see (and act on)
+  a partial multi-file release. Live incident this fixes: Sonarr imported the episodes that had
+  finished, then its own post-import cleanup deleted the release folder while lftp was still
+  writing the last two, and lftp died mid-rename for both. Directory items only — a single-file
+  download is already complete the instant it's renamed off its own in-flight name, so there is
+  no partial window to protect against. The rename happens the moment the transfer's own
+  filesystem completeness check passes (DESIGN.md §4.3's exit-zero-is-not-completion fix,
+  *2026-08-14* below), before verify/extract/move ever run, so none of them need to know the
+  prefix exists. A stale prefix (the setting changed, or turned off, mid-transfer or while an
+  item sits `STOPPED`) is handled: a resume always reuses whatever prefix is already recorded on
+  the item rather than recomputing from current settings, and a scan keeps filtering whatever
+  prefix is physically in use, not merely today's configured one. See `docs/decisions.md` for
+  the full design, including why this reverses part of phase 5's `staging_path` reasoning on new
+  evidence.
 
 ### Changed
 

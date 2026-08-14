@@ -64,7 +64,7 @@ ITEM_VIEW_COLUMNS = (
     "id, rel_path, is_dir, remote_size, local_size, remote_mtime, local_mtime, state, substate, "
     "suppressed_reason, "
     "state_changed_at, first_seen_at, downloaded_at, verified_at, extracted_at, "
-    "first_missing_at, remote_deleted_at"
+    "first_missing_at, remote_deleted_at, pending_download_prefix"
 )
 
 # The same column list, `item.`-qualified, for the two callers that `LEFT JOIN item_settle`
@@ -431,5 +431,13 @@ def item_view(row: Mapping[str, Any]) -> ItemView:
         "extracted_at": row["extracted_at"],
         "first_missing_at": row["first_missing_at"],
         "remote_deleted_at": row["remote_deleted_at"],
+        # "Folder prefix during transfer" (2026-08-14, `core/download_prefix.py`): the exact
+        # prefix string this item's local root is *currently* written under, or `None` when
+        # nothing is in flight under a prefixed name. `rel_path` above never carries this --
+        # it is a physical detail of where the bytes live right now, surfaced verbatim so the
+        # item drawer can say "this currently lives in `<prefix><name>`" while it's true and
+        # say nothing once it isn't (`_reap_one` clears this the moment it renames the
+        # directory back to its real name).
+        "pending_download_prefix": row["pending_download_prefix"],
         "facets": _lifecycle_facets(row),
     }

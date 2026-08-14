@@ -110,7 +110,7 @@ async def _make_engine(tmp_path, monkeypatch, *, local_size: int | None, state: 
     monkeypatch.setattr(
         engine_module.local_scan,
         "scan_local",
-        lambda root: _local_tree(local_size),  # noqa: ARG005
+        lambda root, **_kwargs: _local_tree(local_size),  # noqa: ARG005
     )
 
     engine = Engine(db, str(tmp_path), EventBus())
@@ -282,7 +282,7 @@ async def test_a_returning_local_copy_clears_the_state_and_the_clock(tmp_path, m
         monkeypatch.setattr(
             engine_module.local_scan,
             "scan_local",
-            lambda root: _local_tree(SIZE),  # noqa: ARG005
+            lambda root, **_kwargs: _local_tree(SIZE),  # noqa: ARG005
         )
         await engine.scan_queue(q, host)
         assert (await _state_of(db, item_id)) == ("EXTRACTED", None)
@@ -413,7 +413,7 @@ async def _make_move_engine(
     monkeypatch.setattr(
         engine_module.local_scan,
         "scan_local",
-        lambda root: _local_tree(local_size),  # noqa: ARG005
+        lambda root, **_kwargs: _local_tree(local_size),  # noqa: ARG005
     )
 
     engine = Engine(db, str(tmp_path), EventBus())
@@ -541,7 +541,7 @@ async def test_move_mode_item_that_leaves_both_trees_reaches_removed_both(tmp_pa
     monkeypatch.setattr(
         engine_module.local_scan,
         "scan_local",
-        lambda root: (_local_tree(SIZE) if local_present["value"] else {}),  # noqa: ARG005
+        lambda root, **_kwargs: (_local_tree(SIZE) if local_present["value"] else {}),  # noqa: ARG005
     )
     try:
         # 1. Remote already gone, local still here -- LOCAL_ONLY structurally, must hold (the
@@ -668,7 +668,7 @@ async def test_vanished_both_row_stops_publishing_once_it_reaches_removed_both(
     monkeypatch.setattr(
         engine_module.local_scan,
         "scan_local",
-        lambda root: (_local_tree(SIZE) if local_present["value"] else {}),  # noqa: ARG005
+        lambda root, **_kwargs: (_local_tree(SIZE) if local_present["value"] else {}),  # noqa: ARG005
     )
     try:
         subscription = engine.events.subscribe()
@@ -788,7 +788,7 @@ async def test_a_row_that_leaves_both_trees_and_later_returns_is_published_again
     engine, q, host, db, item_id = await _make_move_engine(
         tmp_path, monkeypatch, local_size=None, state="REMOVED_BOTH", remote_deleted_at=None
     )
-    monkeypatch.setattr(engine_module.local_scan, "scan_local", lambda root: {})  # noqa: ARG005
+    monkeypatch.setattr(engine_module.local_scan, "scan_local", lambda root, **_kwargs: {})  # noqa: ARG005
     try:
         # Baseline: genuinely in neither tree, REMOVED_BOTH already resting there -- stays
         # unpublished, exactly `test_a_vanished_local_only_row_rests_at_removed_both_not_left_

@@ -1109,7 +1109,7 @@ async def test_reconcile_only_completion_backfills_downloaded_at_for_retention(
         monkeypatch.setattr(
             engine_module.local_scan,
             "scan_local",
-            lambda root: {
+            lambda root, **_kwargs: {
                 rel_path: LocalEntry(rel_path=rel_path, is_dir=True),
                 f"{rel_path}/a.mkv": LocalEntry(
                     rel_path=f"{rel_path}/a.mkv", is_dir=False, size=10
