@@ -1,7 +1,11 @@
 # README screenshot plan
 
-Written 2026-08-14, revised the same day against the real fixture tree. **Nobody has taken these
-yet** — this is the shooting order and the staging notes, not a record of work done.
+Written 2026-08-14, revised the same day against the real fixture tree.
+
+**Six shots were taken on 2026-08-14** — both heroes plus four gallery images; see
+[`images/README.md`](images/README.md) for which. This document remains the reference for the six
+that were **not** taken (settling, verifying, extracting, single-file, Settings → Queues,
+Docs → How it works), and for restaging any of them later.
 
 A coding agent cannot take them: no browser exists in the environment agents run in. These have
 to be captured by hand from a running instance.
