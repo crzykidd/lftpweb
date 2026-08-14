@@ -2,8 +2,8 @@ import { useVirtualizer } from '@tanstack/react-virtual'
 import type { CSSProperties, KeyboardEvent as ReactKeyboardEvent, PointerEvent as ReactPointerEvent, RefObject } from 'react'
 import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useReducer, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
-import { deleteItem, getSettleSettings, queueItem, stopItem } from '../api/client'
-import type { FileNode, SettleSettingsOut } from '../api/types'
+import { deleteItem, getSettleSettings, queueItem, resetItem, stopItem } from '../api/client'
+import type { FileNode, SettleSettingsOut, SyncMode } from '../api/types'
 import {
   bothSidesRows,
   formatBytes,
@@ -17,6 +17,7 @@ import {
   settleWaitShortLabel,
   stateAgeLabel,
 } from '../lib/format'
+import { resetWarningLines } from '../lib/resetWarning'
 import { readLocalStorage, writeLocalStorage } from '../lib/storage'
 import { DetailButton, LifecycleIcons } from './LifecycleIcons'
 import { ItemDrawer } from './ItemDrawer'
@@ -1103,7 +1104,7 @@ interface BulkFailure {
 }
 
 interface BulkOutcome {
-  action: 'queue' | 'stop' | 'delete'
+  action: 'queue' | 'stop' | 'delete' | 'reset'
   total: number
   succeeded: number
   failures: BulkFailure[]
@@ -1113,6 +1114,7 @@ const BULK_OUTCOME_LABEL: Record<BulkOutcome['action'], string> = {
   queue: 'Queue selected',
   stop: 'Stop selected',
   delete: 'Delete',
+  reset: 'Reset item tracking',
 }
 
 function errorMessage(reason: unknown): string {
@@ -1131,6 +1133,9 @@ function errorMessage(reason: unknown): string {
 export function FileTree({
   nodes,
   connected = true,
+  syncMode,
+  autoQueueEnabled,
+  scanIntervalS,
 }: {
   nodes: FileNode[]
   /** Whether the WebSocket is open, i.e. whether the connect-time `snapshot` has arrived.
@@ -1138,6 +1143,15 @@ export function FileTree({
    * an empty tree really does mean "there is nothing on either side" -- not "we haven't looked
    * yet", which is what this used to claim regardless (found 2026-08-13). */
   connected?: boolean
+  /** The queue's own `sync_mode`/`auto_queue_enabled`/`scan_interval_s` (2026-08-13,
+   * `prompts/2026-08-13-reset-item-tracking.md`) -- read straight from `PathQueueOut` by
+   * `FilesPage.tsx` and passed down rather than re-fetched here, purely so the "Reset selected"
+   * confirm panel's warning (`lib/resetWarning.ts`) can state the real consequence for *this*
+   * queue instead of a generic hedge. Not used for anything else this component already does.
+   */
+  syncMode: SyncMode
+  autoQueueEnabled: boolean
+  scanIntervalS: number | null
 }) {
   // The shared age ticker (module docstring above): bumping this forces a re-render of
   // whatever rows are currently mounted, which is all `stateAgeLabel` needs to catch up --
@@ -1219,6 +1233,14 @@ export function FileTree({
   // action. `null` = no pending confirmation; otherwise the exact entries about to be deleted,
   // so the dialog's count/byte total is read from the same list the delete itself will use.
   const [pendingDelete, setPendingDelete] = useState<TreeEntry[] | null>(null)
+
+  // Reset item tracking (2026-08-13, prompts/2026-08-13-reset-item-tracking.md) -- a
+  // *different*, more dangerous action than Delete above: forgets the row outright (so the
+  // path can be reused) rather than removing bytes, and is irreversible in a way Delete isn't
+  // quite (job/event history for the item is gone too, not just its files). Same confirm-panel
+  // shape as Delete -- `null` = nothing pending, otherwise the exact entries about to be reset,
+  // so the warning's counts are read from the same list the reset itself will use.
+  const [pendingReset, setPendingReset] = useState<TreeEntry[] | null>(null)
 
   // The item drawer (2026-08-13, prompts/2026-08-13-files-detail-inspector.md) -- opened by a
   // row's `DetailButton`, never by the row click itself (that drives selection, above). `null`
@@ -1444,6 +1466,7 @@ export function FileTree({
         targets.map((e) => {
           if (action === 'queue') return queueItem(e.id as number)
           if (action === 'stop') return stopItem(e.id as number)
+          if (action === 'reset') return resetItem(e.id as number)
           return deleteItem(e.id as number)
         }),
       )
@@ -1511,6 +1534,39 @@ export function FileTree({
   const pendingDeleteActiveCount = useMemo(
     () => (pendingDelete ?? []).filter(hasActiveJob).length,
     [pendingDelete],
+  )
+
+  // Reset item tracking's own selection/confirm plumbing -- the identical shape Delete's own
+  // (above), filtered by `hasActiveJob` rather than `canDeleteLocal`: unlike Delete, a reset
+  // never stops an active transfer first (it refuses instead, `core/local_delete.py._guard_
+  // busy`'s own "refuse, don't race" docstring), so a row that's actively transferring is
+  // filtered out here rather than offered and then bounced off a 409.
+  const resettableSelected = useMemo(
+    () => selectedEntries.filter((e) => !hasActiveJob(e)),
+    [selectedEntries],
+  )
+  const requestResetSelected = () => {
+    if (resettableSelected.length > 0) setPendingReset(resettableSelected)
+  }
+  const confirmReset = async () => {
+    const targets = pendingReset
+    setPendingReset(null)
+    if (targets) await runAction('reset', targets)
+  }
+  const pendingResetRemoteCount = useMemo(
+    () => (pendingReset ?? []).filter(hasRemoteCopy).length,
+    [pendingReset],
+  )
+  const pendingResetWarningLines = useMemo(
+    () =>
+      pendingReset
+        ? resetWarningLines(pendingReset.length, pendingResetRemoteCount, {
+            syncMode,
+            autoQueueEnabled,
+            scanIntervalS,
+          })
+        : [],
+    [pendingReset, pendingResetRemoteCount, syncMode, autoQueueEnabled, scanIntervalS],
   )
 
   if (tree.length === 0) {
@@ -1637,6 +1693,25 @@ export function FileTree({
           >
             Delete selected{deletableSelected.length > 0 && ` (${deletableSelected.length})`}
           </button>
+          {/* "Reset item tracking" (2026-08-13) -- deliberately not styled or worded anything
+              like Delete above or "Clear History" (a few pixels away on the History page, and
+              a wholly different action: that one deletes job/event records and never touches
+              an item; this one forgets the item's own tracking so its path can be reused). A
+              violet accent, distinct from Delete's red and Queue's sky, so the two destructive
+              buttons are never confused at a glance. */}
+          <button
+            type="button"
+            disabled={bulkBusy || resettableSelected.length === 0}
+            onClick={requestResetSelected}
+            title={
+              resettableSelected.length === 0
+                ? 'None of the selected rows can be reset (actively transferring -- stop them first)'
+                : "Forget these items' tracking so their paths can be reused -- this does not delete local files"
+            }
+            className="rounded-md border border-violet-300 px-2 py-1 text-xs font-medium text-violet-700 hover:bg-violet-50 disabled:cursor-not-allowed disabled:opacity-50 dark:border-violet-800 dark:text-violet-300 dark:hover:bg-violet-950"
+          >
+            Reset item tracking{resettableSelected.length > 0 && ` (${resettableSelected.length})`}
+          </button>
           <button
             type="button"
             onClick={clearSelection}
@@ -1683,6 +1758,46 @@ export function FileTree({
             <button
               type="button"
               onClick={() => setPendingDelete(null)}
+              className="rounded-md border border-zinc-300 px-2 py-1 text-xs font-medium text-zinc-700 hover:bg-zinc-50 dark:border-zinc-700 dark:text-zinc-200 dark:hover:bg-zinc-900"
+            >
+              Cancel
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* "Reset item tracking"'s own confirm panel -- violet, not red, so it never reads as a
+          second Delete dialog. The warning lines (`lib/resetWarning.ts`) are the real numbers
+          for *this* selection and *this* queue's settings, not a generic hedge -- see that
+          module for the exact wording and why it's shared with the whole-queue/purge-by-pattern
+          scopes (`QueueResetControls.tsx`). A plain confirm click is the whole confirmation for
+          this scope (the task's own call: a typed-name confirmation is for the whole-queue
+          scope, which is categorically more destructive; a clear panel with real numbers is
+          enough for a bounded selection). */}
+      {pendingReset && (
+        <div className="flex flex-col gap-2 rounded-md border border-violet-300 bg-violet-50 px-3 py-2 text-sm dark:border-violet-800 dark:bg-violet-950/40">
+          <p className="font-medium text-violet-900 dark:text-violet-200">
+            Reset tracking for <strong>{pendingReset.length}</strong>{' '}
+            {pendingReset.length === 1 ? 'item' : 'items'}? This forgets lftpweb ever saw{' '}
+            {pendingReset.length === 1 ? 'it' : 'them'} -- the next scan treats{' '}
+            {pendingReset.length === 1 ? 'it' : 'them'} as brand new. This cannot be undone.
+          </p>
+          {pendingResetWarningLines.map((line) => (
+            <p key={line} className="text-violet-900 dark:text-violet-200">
+              {line}
+            </p>
+          ))}
+          <div className="flex gap-2">
+            <button
+              type="button"
+              onClick={confirmReset}
+              className="rounded-md bg-violet-700 px-2 py-1 text-xs font-medium text-white hover:bg-violet-800 dark:bg-violet-800 dark:hover:bg-violet-700"
+            >
+              Reset tracking
+            </button>
+            <button
+              type="button"
+              onClick={() => setPendingReset(null)}
               className="rounded-md border border-zinc-300 px-2 py-1 text-xs font-medium text-zinc-700 hover:bg-zinc-50 dark:border-zinc-700 dark:text-zinc-200 dark:hover:bg-zinc-900"
             >
               Cancel

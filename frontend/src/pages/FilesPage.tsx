@@ -1,6 +1,8 @@
 import { useEffect, useRef, useState } from 'react'
-import { rescanFiles } from '../api/client'
+import { listQueues, rescanFiles } from '../api/client'
+import type { PathQueueOut } from '../api/types'
 import { FileTree } from '../components/FileTree'
+import { QueueResetControls } from '../components/QueueResetControls'
 import { useLiveModel } from '../hooks/useLiveModel'
 import { formatRelativeTime } from '../lib/format'
 
@@ -12,6 +14,27 @@ import { formatRelativeTime } from '../lib/format'
 export function FilesPage() {
   const { queues, state, scanCompleteSeq } = useLiveModel()
   const [rescanning, setRescanning] = useState(false)
+
+  // The `path_queue` config this page's own `useLiveModel` reading never carries (`QueueFiles`
+  // is deliberately just the tree -- `queue_id`/`queue_name`/nodes; see hooks/useLiveModel.ts's
+  // own `QueueState`). Fetched once via the same REST endpoint Settings → Queues uses, and
+  // needed here for exactly one thing added 2026-08-13
+  // (`prompts/2026-08-13-reset-item-tracking.md`): `FileTree`'s "Reset selected" and
+  // `QueueResetControls`'s whole-queue/purge-by-pattern panels need `sync_mode`/
+  // `auto_queue_enabled`/`scan_interval_s` to state the real re-download consequence rather
+  // than a generic hedge. Not live-updated over the socket -- these change rarely, and a stale
+  // read for the few seconds after an edit in Settings is a fine trade against a second
+  // WS-driven cache for config that already has one.
+  const [queueConfigs, setQueueConfigs] = useState<Record<number, PathQueueOut>>({})
+  useEffect(() => {
+    listQueues()
+      .then((rows) => setQueueConfigs(Object.fromEntries(rows.map((q) => [q.id, q]))))
+      .catch(() => {
+        // Degrades gracefully: FileTree/QueueResetControls below fall back to safe defaults
+        // (`copy`/`false`/`null`) when a queue's config hasn't loaded yet, same as
+        // `settleSettings`'s own load failure already does elsewhere on this page.
+      })
+  }, [])
   // The sequence value seen right before this rescan was requested -- `POST
   // /api/files/rescan` (`api/files.py`) only sets the engine's wake event and returns 202
   // immediately, so completion can only be observed on the wire, not from the response. A
@@ -71,34 +94,54 @@ export function FilesPage() {
         </div>
       )}
 
-      {queues.map((queue) => (
-        <section key={queue.queue_id} className="flex flex-col gap-2">
-          <div className="flex items-baseline gap-2">
-            <h2 className="text-base font-semibold text-zinc-900 dark:text-zinc-100">{queue.queue_name}</h2>
-            {/* Relative reading driven by `scan_complete` (`useLiveModel.ts`), the readout the
-             * user actually asked for when they asked for a refresh dropdown -- it makes the
-             * 30s `scan_interval_s` visible instead of something inferred from rows not
-             * changing. Absolute timestamp on hover via `title`, not a second visible string.
-             * A warning surfaces right here rather than only in a log, per the same message. */}
-            <span
-              className="text-xs text-zinc-500 dark:text-zinc-400"
-              title={queue.scanned_at ? new Date(queue.scanned_at).toLocaleString() : undefined}
-            >
-              {queue.scanned_at ? `scanned ${formatRelativeTime(queue.scanned_at)}` : 'not scanned yet'}
-              {queue.warning ? ' ⚠' : ''}
-            </span>
-            {queue.error && (
-              <span className="text-xs text-red-600 dark:text-red-400">scan error: {queue.error}</span>
-            )}
-            {!queue.error && queue.warning && (
-              <span className="text-xs text-amber-600 dark:text-amber-400" title={queue.warning}>
-                {queue.warning}
+      {queues.map((queue) => {
+        const config = queueConfigs[queue.queue_id]
+        return (
+          <section key={queue.queue_id} className="flex flex-col gap-2">
+            <div className="flex items-baseline gap-2">
+              <h2 className="text-base font-semibold text-zinc-900 dark:text-zinc-100">{queue.queue_name}</h2>
+              {/* Relative reading driven by `scan_complete` (`useLiveModel.ts`), the readout the
+               * user actually asked for when they asked for a refresh dropdown -- it makes the
+               * 30s `scan_interval_s` visible instead of something inferred from rows not
+               * changing. Absolute timestamp on hover via `title`, not a second visible string.
+               * A warning surfaces right here rather than only in a log, per the same message. */}
+              <span
+                className="text-xs text-zinc-500 dark:text-zinc-400"
+                title={queue.scanned_at ? new Date(queue.scanned_at).toLocaleString() : undefined}
+              >
+                {queue.scanned_at ? `scanned ${formatRelativeTime(queue.scanned_at)}` : 'not scanned yet'}
+                {queue.warning ? ' ⚠' : ''}
               </span>
-            )}
-          </div>
-          <FileTree nodes={queue.nodes} connected={state === 'open'} />
-        </section>
-      ))}
+              {queue.error && (
+                <span className="text-xs text-red-600 dark:text-red-400">scan error: {queue.error}</span>
+              )}
+              {!queue.error && queue.warning && (
+                <span className="text-xs text-amber-600 dark:text-amber-400" title={queue.warning}>
+                  {queue.warning}
+                </span>
+              )}
+            </div>
+            <FileTree
+              nodes={queue.nodes}
+              connected={state === 'open'}
+              syncMode={config?.sync_mode ?? 'copy'}
+              autoQueueEnabled={config?.auto_queue_enabled ?? false}
+              scanIntervalS={config?.scan_interval_s ?? null}
+            />
+            {/* Queue-scoped reset controls (2026-08-13, prompts/2026-08-13-reset-item-tracking.md)
+             * -- the whole-queue and purge-by-pattern scopes, sitting below the tree rather than
+             * inside its toolbar since they act on the queue as a whole, not on a selection. */}
+            <QueueResetControls
+              queueId={queue.queue_id}
+              queueName={queue.queue_name}
+              syncMode={config?.sync_mode ?? 'copy'}
+              autoQueueEnabled={config?.auto_queue_enabled ?? false}
+              scanIntervalS={config?.scan_interval_s ?? null}
+              nodes={queue.nodes}
+            />
+          </section>
+        )
+      })}
     </div>
   )
 }

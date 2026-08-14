@@ -25,6 +25,12 @@ from lftpweb.models import (
     JobOut,
     JobsResponse,
     QueueItemRequest,
+    QueueResetRequest,
+    ResetItemResponse,
+    ResetPatternPreviewItem,
+    ResetPatternPreviewRequest,
+    ResetPatternPreviewResponse,
+    ResetSummaryResponse,
     TransferSettingsIn,
     TransferSettingsOut,
 )
@@ -253,6 +259,186 @@ async def delete_item(item_id: int, request: Request) -> DeleteItemResponse:
         raise HTTPException(status_code=409, detail=outcome.reason)
     return DeleteItemResponse(
         deleted=outcome.deleted, reason=outcome.reason, bytes_freed=outcome.bytes_freed
+    )
+
+
+def _busy_context(request: Request) -> tuple[frozenset[int], Any]:
+    """The two "something is already touching this item" reads every reset endpoint below
+    needs, in the exact shape `core/local_delete.py._guard_busy` takes -- factored out once
+    rather than repeated four times.
+    """
+    postprocess = getattr(request.app.state, "postprocess", None)
+    in_flight = postprocess.in_flight_item_ids() if postprocess is not None else frozenset()
+    delete_in_flight = getattr(request.app.state, "delete_in_flight", None)
+    return in_flight, delete_in_flight
+
+
+def _forget_and_rescan(
+    request: Request, queue_id: int, affected_rel_paths: tuple[str, ...]
+) -> None:
+    """After a successful reset, tell `Engine` to drop the forgotten rows from its own
+    in-memory model (`Engine.forget_rel_paths`'s own docstring for why only `Engine` can do
+    this) and request an immediate rescan -- the same "retroactive" idiom
+    `api/settings.py`'s pattern create/update/delete already use -- so a path that still exists
+    on the seedbox reappears fresh within moments rather than waiting up to a whole
+    `scan_interval_s`.
+    """
+    if not affected_rel_paths:
+        return
+    engine = getattr(request.app.state, "engine", None)
+    if engine is None:
+        return
+    engine.forget_rel_paths(queue_id, affected_rel_paths)
+    engine.request_rescan()
+
+
+@router.post("/api/items/{item_id}/reset", response_model=ResetItemResponse)
+async def reset_item(item_id: int, request: Request) -> ResetItemResponse:
+    """ "Reset item tracking" -- the selected-item(s) scope (DESIGN.md §9.2's Files page;
+    `prompts/2026-08-13-reset-item-tracking.md`). Forgets this item's row, and every descendant
+    of its subtree, from `item`/`item_settle`/`deleted_archive` -- **not** a delete
+    (`core/local_delete.py.delete_local` is that; local files are never touched here) and
+    **not** Clear History (`api/history.py`; that clears `job`/`event` rows and deliberately
+    never touches `item`). A bulk reset from the Files page's multi-select is this same endpoint
+    called once per selected row (`Promise.allSettled`, identical to bulk Delete) -- there is no
+    separate bulk endpoint.
+
+    A withheld guard (active job, in-flight post-processing, or a delete currently removing
+    this item's files) is a 409, matching `delete_item`'s own convention so the frontend's
+    existing per-item bulk-failure reporting covers this with no new plumbing.
+    """
+    db = request.app.state.db
+    cursor = await db.execute("SELECT * FROM item WHERE id = ?", (item_id,))
+    item = await cursor.fetchone()
+    if item is None:
+        raise HTTPException(status_code=404, detail="item not found")
+    cursor = await db.execute("SELECT * FROM path_queue WHERE id = ?", (item["queue_id"],))
+    queue = await cursor.fetchone()
+    if queue is None:
+        raise HTTPException(status_code=404, detail="item's queue no longer exists")
+
+    in_flight, delete_in_flight = _busy_context(request)
+    outcome = await local_delete.reset_item(
+        db,
+        item=item,
+        queue=queue,
+        caller="manual",
+        in_flight_item_ids=in_flight,
+        delete_in_flight=delete_in_flight,
+    )
+    if outcome.reset_top_level == 0:
+        reason = outcome.withheld[0]["reason"] if outcome.withheld else "nothing to reset"
+        raise HTTPException(status_code=409, detail=reason)
+
+    _forget_and_rescan(request, item["queue_id"], outcome.affected_rel_paths)
+    return ResetItemResponse(
+        reset=True, reason="reset", affected_rel_paths=list(outcome.affected_rel_paths)
+    )
+
+
+@router.post("/api/queues/{queue_id}/reset-all", response_model=ResetSummaryResponse)
+async def reset_queue_all(
+    queue_id: int, body: QueueResetRequest, request: Request
+) -> ResetSummaryResponse:
+    """ "Reset item tracking" -- the whole-queue scope, the clean-slate case. The most
+    destructive action in the app (every item this queue has ever tracked, forgotten at once),
+    so it requires a **typed confirmation**: `body.confirm_name` must equal the queue's own
+    `name` exactly, checked again here as defense in depth alongside the frontend's own
+    type-to-confirm UI -- a request that reaches this endpoint without having gone through that
+    UI still has to get the name right.
+
+    Never all-or-nothing: an item mid-transfer is withheld (its own guard, `ResetSummaryResponse
+    .withheld`) while every other item in the queue still resets -- see
+    `core/local_delete.py.reset_queue`'s own docstring.
+    """
+    db = request.app.state.db
+    cursor = await db.execute("SELECT * FROM path_queue WHERE id = ?", (queue_id,))
+    queue = await cursor.fetchone()
+    if queue is None:
+        raise HTTPException(status_code=404, detail="queue not found")
+    if body.confirm_name != queue["name"]:
+        raise HTTPException(
+            status_code=400,
+            detail=f"confirm_name {body.confirm_name!r} does not match this queue's name",
+        )
+
+    in_flight, delete_in_flight = _busy_context(request)
+    outcome = await local_delete.reset_queue(
+        db,
+        queue=queue,
+        caller="manual",
+        in_flight_item_ids=in_flight,
+        delete_in_flight=delete_in_flight,
+    )
+    _forget_and_rescan(request, queue_id, outcome.affected_rel_paths)
+    return ResetSummaryResponse(
+        reset_top_level=outcome.reset_top_level,
+        withheld=list(outcome.withheld),
+        affected_count=len(outcome.affected_rel_paths),
+    )
+
+
+@router.post("/api/queues/{queue_id}/reset-preview", response_model=ResetPatternPreviewResponse)
+async def reset_preview(
+    queue_id: int, body: ResetPatternPreviewRequest, request: Request
+) -> ResetPatternPreviewResponse:
+    """The purge-by-pattern scope's own safety mechanism (mirrors `api/settings.py.
+    pattern_preview`'s "what would this match" idiom): every top-level item `body.pattern`
+    would reset, with enough per-item data for the frontend to compute the same real-numbers
+    warning the other two scopes already show, before anything is confirmed. Never resets
+    anything itself -- `core/local_delete.py.reset_pattern_matches` is the identical query
+    `reset_by_pattern` below actually executes against, so a mistake is visible before it's
+    acted on rather than discovered after.
+    """
+    db = request.app.state.db
+    cursor = await db.execute("SELECT id FROM path_queue WHERE id = ?", (queue_id,))
+    if await cursor.fetchone() is None:
+        raise HTTPException(status_code=404, detail="queue not found")
+    rows = await local_delete.reset_pattern_matches(db, queue_id=queue_id, pattern=body.pattern)
+    return ResetPatternPreviewResponse(
+        items=[
+            ResetPatternPreviewItem(
+                rel_path=row["rel_path"],
+                is_dir=bool(row["is_dir"]),
+                remote_size=row["remote_size"],
+                local_size=row["local_size"],
+            )
+            for row in rows
+        ]
+    )
+
+
+@router.post("/api/queues/{queue_id}/reset-by-pattern", response_model=ResetSummaryResponse)
+async def reset_by_pattern(
+    queue_id: int, body: ResetPatternPreviewRequest, request: Request
+) -> ResetSummaryResponse:
+    """ "Reset item tracking" -- the purge-by-pattern scope, single-queue only (confirmed with
+    the user rather than inferred -- items are keyed `(queue_id, rel_path)` and a cross-queue
+    purge is a much bigger gun than "let me reuse this one release name on this one queue" ever
+    asked for). No typed confirmation here, unlike the whole-queue scope -- reviewing
+    `reset_preview`'s own list first *is* the confirmation this scope relies on, per the task
+    this shipped from.
+    """
+    db = request.app.state.db
+    cursor = await db.execute("SELECT * FROM path_queue WHERE id = ?", (queue_id,))
+    queue = await cursor.fetchone()
+    if queue is None:
+        raise HTTPException(status_code=404, detail="queue not found")
+
+    in_flight, delete_in_flight = _busy_context(request)
+    outcome = await local_delete.reset_by_pattern(
+        db,
+        queue=queue,
+        pattern=body.pattern,
+        caller="manual",
+        in_flight_item_ids=in_flight,
+        delete_in_flight=delete_in_flight,
+    )
+    _forget_and_rescan(request, queue_id, outcome.affected_rel_paths)
+    return ResetSummaryResponse(
+        reset_top_level=outcome.reset_top_level,
+        withheld=list(outcome.withheld),
+        affected_count=len(outcome.affected_rel_paths),
     )
 
 

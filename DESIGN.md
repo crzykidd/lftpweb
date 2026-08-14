@@ -1655,6 +1655,35 @@ state chip already reads (§2.2's one shared projection, never a second read of 
   from_disk` removes the `.lftp` temp file and its own `.lftp-pget-status` sidecar alongside
   the final name (whichever of the two, or both, are actually present), so a delete never
   leaves behind exactly the bytes it was asked to remove under a different name.
+- **"Reset item tracking"** (2026-08-13, distinct from Delete above and from History's own
+  "Clear," §9.2 below) — forgets a path outright rather than removing bytes, so a `STOPPED`/
+  `deleted_local`/permanently-`FAILED` path (or a new release reusing an old name) can be
+  fetched clean. `item` rows are never deleted by anything else in this codebase (§2.2's own
+  invariant), which is exactly right for every state Delete produces but leaves no escape
+  hatch for a path a user genuinely wants to forget. Removes the `item` row, its `item_settle`
+  fingerprint, and its `deleted_archive` bookkeeping together — missing any one of the latter
+  two leaves a fresh item at the same path inheriting someone else's settle count, or (the
+  named trap) reading `EXCLUDED` immediately because a stale `deleted_archive` row still folds
+  into the reconciler's completeness predicate. Three scopes: **selected items** (multi-select,
+  a violet "Reset item tracking" bulk action beside Delete's red one — the everyday case),
+  **whole queue** (typed queue-name confirmation, the most destructive action in the app), and
+  **purge by filename pattern** (single-queue only; a live preview of every top-level item the
+  pattern would match, reusing the identical `select`/`skip` evaluator — §4.7, §12 — is this
+  scope's own confirmation, since a typed pattern is easier to get wrong than a checkbox
+  selection). Every scope states the real consequence from the queue's own `sync_mode`/
+  `auto_queue_enabled`/`scan_interval_s` rather than a generic warning — "N of M items still
+  exist on the seedbox, and auto-queue is on, so they will start downloading again within
+  about `scan_interval_s`" — plus two facts stated plainly regardless of counts: local files
+  are never touched, and transfer history for a reset item is gone too (`job.item_id ON DELETE
+  CASCADE`), an unavoidable consequence of forgetting the row rather than a silent one. Refused,
+  not raced, for a busy item (an active job, in-flight post-processing, or an in-progress
+  delete) — the identical guard vocabulary Delete's own guards use, but no stop-then-act
+  ordering: forgetting a path has none of Delete's urgency, so a busy target is simply skipped
+  and reported (per-target, never all-or-nothing for a whole-queue/pattern-purge request) rather
+  than stopped first. `Engine.forget_rel_paths()` evicts the forgotten rows from the engine's
+  own in-memory model and republishes over the existing `queue_delta` wire shape — without it, a
+  fully-forgotten item with nothing left on either side would be a permanent ghost row no future
+  scan would ever revisit.
 
 **Item detail.** A small info icon on each row — deliberately quieter than the lifecycle icons,
 because it is a control and not a status — opens the item drawer described below. The icon exists
@@ -1738,7 +1767,11 @@ matching the current filter ("by outcome" falls out of that for free — filter 
 `kind`/`level`, then clear), or everything, deleting the `job`/`event` rows outright rather than
 just hiding them. Confirmed before running (unlike Dismiss, which destroys nothing). No category
 is protected — the delete-audit events clear the same as anything else; see docs/decisions.md
-for why the obvious "protect the audit trail" alternative was considered and rejected. Bulk
+for why the obvious "protect the audit trail" alternative was considered and rejected. **Not to
+be confused with the Files page's "Reset item tracking"** (2026-08-13, above) — that forgets an
+`item` row so a path can be re-fetched; this page's Clear only ever touches `job`/`event` rows
+and is explicitly barred from touching `item` (next sentence) — clearing here must never change
+what the next scan does. Bulk
 clears run as one server-side `DELETE ... WHERE`, built from the same filter the matching `GET`
 uses, rather than a client-side loop over ids. **Never touches `item`**, `auto_queue_suppressed`,
 or `suppressed_reason` — clearing is bookkeeping, not behavior, and cannot change what the next

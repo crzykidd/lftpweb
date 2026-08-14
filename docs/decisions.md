@@ -6,6 +6,83 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-13 — "Reset item tracking": a third way to forget a path, deliberately unlike Delete
+## and Clear History, plus a mid-task addition (purge by pattern)
+
+**Handoff prompt `prompts/2026-08-13-reset-item-tracking.md`, executed end to end**, with a
+mid-task scope addition from the user (purge by filename pattern) folded in before completion.
+User report, after hitting this three separate times: a reused directory name, a cross-queue
+test, and clearing History only to find the item still suppressed — because `48ad72c`'s Clear
+History deliberately never touches `item` rows, and nothing else in the codebase ever deletes
+one either (`core/engine.py._project`'s own long-standing rule).
+
+**Decision: name it "Reset item tracking," never anything close to "Clear History."** The user's
+own phrase was "clean history," which the task explicitly forbade using — Clear History exists
+a few pixels away on the History page and does something categorically different (deletes
+`job`/`event` rows, never touches `item`). Two near-identical names with wildly different blast
+radii is a footgun on the more dangerous of the two. Carried through to the UI as a violet accent
+distinct from Delete's red and Queue's sky, on every reset control in the app.
+
+**Decision: clear `item`, `item_settle`, and `deleted_archive` together, and independently
+compute `deleted_archive`'s own subtree rather than trusting `item`'s.** The task named the trap
+by name: `item_settle` and `deleted_archive` both cascade from `path_queue`, not from `item`
+(no FK to `item.id` at all), so deleting only the `item` row leaves both behind. Worse, a first
+implementation pass computed `deleted_archive`'s affected rows the same way as `item`'s — by
+expanding a subtree from `item` rows and reusing that set. A dedicated test
+(`test_reset_item_clears_all_three_tables`) caught this immediately: a `deleted_archive` row for
+a path with no live `item` row (a real, if less common, possibility — nothing guarantees the
+spent archive volume's own `item` row still exists) survived a reset untouched. Fixed by giving
+`deleted_archive` its own independent subtree lookup
+(`core/local_delete.py._subtree_deleted_archive_paths`), unioned with `item`'s subtree before the
+actual `DELETE`s run — closing the trap unconditionally rather than depending on `item`-table
+consistency that usually, but not provably always, holds.
+
+**Decision: refuse, don't race — no stop-then-act ordering the way `delete_item` uses.**
+`delete_item` (2026-08-13, delete-during-transfer) satisfies its own active-job guard by
+stopping the job first, because a delete has real urgency (the user asked for bytes gone,
+now). Reset has none: forgetting a path is just as available a minute from now, once whatever
+is happening to it finishes on its own. So `core/local_delete.py._guard_busy` only ever refuses
+(same three checks `delete_local` already established — active job, postprocess in-flight,
+`DeleteInFlight`) and never calls `TransferQueue.stop_item()`. Refusal is per-target, not
+all-or-nothing: a busy item in a whole-queue or pattern-purge reset is skipped and reported
+(`ResetOutcome.withheld`) while every other target still resets.
+
+**Decision: `Engine.forget_rel_paths()` is a new, necessary method — not an oversight this task
+almost shipped without.** Every existing writer of `item` rows either publishes through a scan
+(`Engine._persist`/`_project`/`diff_nodes`) or keeps the row alive (`delete_local`, which updates
+`state` but never deletes the row). A reset is the first thing in this codebase that deletes an
+`item` row outright while the process keeps running, entirely outside a scan pass. Without
+telling `Engine` to evict the row from its own `self.models` cache, a reset item with nothing
+left on either side (the "forget this, it's fully gone" case) becomes a permanent ghost row on
+the Files page — no future scan would ever revisit a path present on neither tree, so the stale
+cached entry would never self-correct. `forget_rel_paths()` reuses `queue_delta`'s exact wire
+shape (`changed=[]`, `removed=[...]`) rather than inventing a new WS message type, so
+`hooks/useLiveModel.ts` needed zero changes. The API layer also calls `request_rescan()`
+immediately after, so a path that still exists on the seedbox reappears within moments rather
+than waiting a full `scan_interval_s`.
+
+**Decision: typed confirmation for whole-queue, a plain confirm panel for selected items, and
+preview-as-confirmation for purge-by-pattern — three different bars, deliberately.** The task
+asked for a reasoned choice, not a uniform one. Whole-queue is the most destructive action in the
+app (every item a queue has ever tracked, at once) and gets a type-the-queue-name input, checked
+again server-side (`QueueResetRequest.confirm_name`) as defense in depth. Selected items is the
+"surgical, everyday" case the task itself named as most likely to be used — a clear panel with
+real counts is enough, matching Delete's own existing bar. Purge-by-pattern sits in between: a
+typed pattern is easier to get wrong than a checkbox selection, so the live preview (reusing
+`core/patterns.py.pattern_matches`, the identical evaluator `select`/`skip` patterns use — never
+a second matcher) *is* the confirmation mechanism, per the user's own framing when the scope was
+added mid-task ("matching `*` by accident should show you 400 rows before it does anything").
+
+**Mid-task addition: purge by pattern, scoped to a single queue.** The user asked for this after
+the task was already underway ("maybe a purge file matching"), and confirmed directly — not
+inferred — that it should never span queues: items are keyed `(queue_id, rel_path)`, and a
+cross-queue purge is a much bigger gun than "let me reuse this one release name on this one
+queue" ever asked for. `core/local_delete.reset_pattern_matches()` is the one query both the
+preview endpoint and the execute endpoint share, so "what the preview showed" and "what got
+reset" can never drift apart — the same reasoning `delete_local`'s `dry_run` already uses.
+
+---
+
 ## 2026-08-13 — Duplicate jobs spawn duplicate lftp processes; `~timestamp~` temp files are the
 ## symptom, not the disease
 

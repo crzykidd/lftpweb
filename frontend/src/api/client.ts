@@ -42,6 +42,11 @@ import type {
   PostprocessSettingsIn,
   PostprocessSettingsOut,
   QueueAutoQueueStatus,
+  QueueResetRequest,
+  ResetItemResponse,
+  ResetPatternPreviewRequest,
+  ResetPatternPreviewResponse,
+  ResetSummaryResponse,
   SettleSettingsIn,
   SettleSettingsOut,
   StatsResponse,
@@ -262,6 +267,58 @@ export function stopItem(itemId: number): Promise<{ applied: boolean }> {
  */
 export function deleteItem(itemId: number): Promise<DeleteItemResponse> {
   return sendJson<DeleteItemResponse>(`/api/items/${itemId}/delete`, 'POST')
+}
+
+// --- Reset item tracking (2026-08-13, prompts/2026-08-13-reset-item-tracking.md) -----------
+//
+// A different, more dangerous action than Delete above: this forgets an item's row (and its
+// item_settle/deleted_archive bookkeeping) outright rather than removing bytes, so a
+// suppressed or failed path can be reused. Also unrelated to Clear History (api/history.py) --
+// see api/types.ts's own comment on why the two must never be confused.
+
+/** Selected-item(s) scope -- one row, or a bulk selection resolved to one call per item
+ * (`Promise.allSettled`, the identical shape `FileTree.tsx` already uses for bulk Delete).
+ * A withheld guard responds non-2xx, so `sendJson` throws exactly like `deleteItem`.
+ */
+export function resetItem(itemId: number): Promise<ResetItemResponse> {
+  return sendJson<ResetItemResponse>(`/api/items/${itemId}/reset`, 'POST')
+}
+
+/** Whole-queue scope -- the clean-slate case, and the most destructive action in the app.
+ * `confirm_name` must equal the queue's own name exactly; the server checks this too (defense
+ * in depth), so a mismatch is a 400. Never all-or-nothing: an item mid-transfer is withheld
+ * (named in the response's `withheld`) while the rest of the queue still resets.
+ */
+export function resetQueue(
+  queueId: number,
+  body: QueueResetRequest,
+): Promise<ResetSummaryResponse> {
+  return sendJson<ResetSummaryResponse>(`/api/queues/${queueId}/reset-all`, 'POST', body)
+}
+
+/** The purge-by-pattern scope's own safety mechanism -- every top-level item `body.pattern`
+ * would reset, single-queue only, with enough per-item data to compute the same real-numbers
+ * warning the other two scopes show. Never resets anything itself.
+ */
+export function previewResetByPattern(
+  queueId: number,
+  body: ResetPatternPreviewRequest,
+): Promise<ResetPatternPreviewResponse> {
+  return sendJson<ResetPatternPreviewResponse>(
+    `/api/queues/${queueId}/reset-preview`,
+    'POST',
+    body,
+  )
+}
+
+/** Executes the purge-by-pattern scope reviewed via `previewResetByPattern` above -- same
+ * pattern, same single-queue scope, same evaluator server-side.
+ */
+export function resetByPattern(
+  queueId: number,
+  body: ResetPatternPreviewRequest,
+): Promise<ResetSummaryResponse> {
+  return sendJson<ResetSummaryResponse>(`/api/queues/${queueId}/reset-by-pattern`, 'POST', body)
 }
 
 // --- Settings -> Transfer (phase 3a API, phase-9-follow-up UI -- DESIGN.md §4.5/§9.3) -----

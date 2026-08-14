@@ -85,6 +85,24 @@ See its own docstring for the naive-implementation trap
 (`prompts/2026-08-13-delete-archives-after-extract.md`) this exists to avoid, and
 `load_deleted_archive_paths`/`save_deleted_archive_paths` for how the reconciler is told these
 files are gone on purpose rather than missing.
+
+**A fourth caller, added 2026-08-13, is not a delete at all.** `reset_item()`/`reset_scope()`
+below forget an item's tracking outright -- removing its row from `item`, `item_settle`, and
+`deleted_archive` -- without touching a single byte on disk (`prompts/2026-08-13-reset-item-
+tracking.md`, user report: hitting the same suppressed path three times with no way to make it
+reusable again). This exists because nothing else in the codebase can do what it does: `item`
+rows are never deleted by anything above (this module's own "Row lifetime" paragraph), which is
+exactly right for every *delete* in this file -- the suppression has to survive a rescan -- but
+it also means a path that was once `STOPPED`, `deleted_local`'d, or permanently `FAILED`
+carries that verdict forever, and a *new* release arriving at the identical name inherits it.
+Reset is the deliberate escape hatch: forget the row entirely, so the next scan sees a genuinely
+unknown path and starts clean. Three scopes share one primitive (`_reset_targets` below) --
+selected items (any depth, expanded to their own subtree via `_subtree_rows`, identical to
+`delete_local`'s own shape), a whole queue, and a purge by filename pattern (matched with
+`core/patterns.py.pattern_matches`, the same single evaluator `select`/`skip` patterns use --
+DESIGN.md §12 requires there be only one). See `reset_item`/`reset_scope`'s own docstrings for
+the guard reuse (active job, in-flight post-processing, `DeleteInFlight`) and why this is
+"refuse, don't race" rather than the stop-then-act ordering `delete_item` uses.
 """
 
 from __future__ import annotations
@@ -103,6 +121,7 @@ from typing import Any
 import aiosqlite
 
 from lftpweb.core import audit, extract, local_scan, mount_sentinel
+from lftpweb.core import patterns as patterns_core
 from lftpweb.core.events import EventBus
 from lftpweb.core.itemview import item_view
 from lftpweb.core.util import to_safe_text
@@ -1185,3 +1204,354 @@ async def delete_extracted_archives(
         message=message,
     )
     return ArchiveCleanupResult(deleted_rel_paths=tuple(deleted), bytes_freed=bytes_freed)
+
+
+# --- Reset item tracking (2026-08-13, prompts/2026-08-13-reset-item-tracking.md) ---------------
+#
+# **Not a delete.** `delete_local()` above removes bytes and marks the row so a rescan leaves it
+# alone. This removes the *row* -- and every other row keyed to the same path -- so a rescan
+# treats the path as never having been seen. Named "Reset item tracking" deliberately, not
+# anything close to "Clear History" (`48ad72c`, `api/history.py`): that feature deletes `job`/
+# `event` rows and explicitly never touches `item` -- "clearing records must not change
+# behaviour" was the right call there. This is the opposite: the whole point is to change
+# behaviour (a suppressed/failed path becomes fetchable again), and it belongs on the Files page
+# where the items are, never on the History page.
+#
+# **All three tables, every time -- this is the whole point of the task.** `item_settle`
+# (migration 007) and `deleted_archive` (migration 010) both cascade from `path_queue`, *not*
+# from `item` (`PRIMARY KEY (queue_id, rel_path)` on both, no FK to `item.id` at all) -- so
+# deleting only the `item` row leaves both behind, keyed to the same `(queue_id, rel_path)` a
+# freshly re-downloaded item at that path would get. A stale `item_settle` row hands the new
+# item someone else's fingerprint and scan count; a stale `deleted_archive` row is worse and
+# silent -- `core/engine.py.build_scan_counts_predicate` folds it straight into the completeness
+# seam, so a freshly re-downloaded archive reads `EXCLUDED` immediately, with no error and no
+# obvious cause. Checked at the time this was written: no other table is keyed by
+# `(queue_id, rel_path)` (`grep` across every migration) -- `job`/`event` key off `item.id`
+# instead and are handled by the schema's own `ON DELETE CASCADE` / `ON DELETE SET NULL`, not by
+# this module.
+#
+# **The `job`/`event` consequence is real and is not this module's to avoid.**
+# `job.item_id REFERENCES item (id) ON DELETE CASCADE` (`001_initial_schema.sql:109`) -- every
+# transfer-attempt record for a reset item is gone the instant its `item` row is, not merely
+# hidden. `event.item_id ... ON DELETE SET NULL` (line 139) -- audit rows survive but lose the
+# link back to what they were about. Both fire automatically (`PRAGMA foreign_keys = ON`,
+# `core/db.py.connect`) the moment `_reset_targets` below deletes the row; there is no way to
+# reset tracking *without* this, short of denormalising `job`/`event` first (open issue #1,
+# `prompts/open-issues.md`). The right response is to say so plainly before it happens, not to
+# build around it -- see the API layer (`api/jobs.py`) for the warning text this is paired with.
+#
+# **Refuse, don't race -- deliberately not `delete_item`'s stop-then-act ordering.** `delete_item`
+# satisfies its own "no active job" guard by stopping the job first, because a delete has to run
+# regardless (the user asked for the bytes gone). Reset has no such urgency -- forgetting a path
+# is just as available a minute from now, once whatever is happening to it has finished on its
+# own -- so `_guard_busy` below only ever refuses; it never calls `TransferQueue.stop_item()`.
+# Same three guards `delete_local` already established: an active `job` row for the target's own
+# id (not its descendants' -- a "mirror" job is tracked against the top-level item's id, exactly
+# the same reading `delete_local`'s guard 2 uses), `PostprocessPipeline.in_flight_item_ids()`,
+# and (2026-08-13's own addition) `DeleteInFlight` -- resetting the rows out from under a delete
+# that is still `rmtree`-ing the same subtree would let `_mark_subtree_removed`'s writes target
+# rows that raced back into existence mid-delete.
+#
+# **No new in-flight marker, and that is a considered omission, not an oversight.** Every write
+# below is a handful of `DELETE ... WHERE queue_id = ? AND rel_path IN (...)` statements followed
+# by one `commit()` -- no `asyncio.to_thread`, no filesystem work, nothing that holds the event
+# loop or a transaction open long enough for `core/engine.py._protected_rel_paths` to need to
+# shield it from a racing scan the way `delete_local`'s (potentially large, potentially slow)
+# `rmtree` needs shielding. If this module ever grows a reset path with real latency in the
+# middle, that omission is the first thing to revisit.
+
+
+@dataclass(frozen=True)
+class ResetOutcome:
+    """One reset call's outcome, covering all three scopes (a selected item, a whole queue, a
+    pattern purge) with one shape -- deliberately never all-or-nothing for a multi-target scope:
+    `withheld` is the parallel list of what a busy target's own guard refused, each with its own
+    reason, while every other target in the same request still goes through. This mirrors
+    `delete_local`'s per-target guard shape (and the Files page's existing `Promise.allSettled`
+    bulk reporting) rather than failing an entire whole-queue reset because one item happened to
+    be mid-transfer.
+
+    `reset_top_level` counts the *root* targets actually reset (a selected item, or one matched
+    top-level item for a queue/pattern scope) -- `len(affected_rel_paths)` is the real row count
+    across every level, always `>= reset_top_level` once subtrees are expanded.
+    """
+
+    reset_top_level: int
+    withheld: tuple[dict[str, str], ...]
+    affected_rel_paths: tuple[str, ...]
+
+
+async def _guard_busy(
+    db: aiosqlite.Connection,
+    item_id: int,
+    *,
+    in_flight_item_ids: frozenset[int],
+    delete_in_flight: DeleteInFlight | None,
+) -> str | None:
+    """A withhold reason, or `None` if this target is clear to reset -- the same three checks
+    `delete_local`'s guards 2/3 run, reused rather than re-derived (this module's own "refuse,
+    don't race" paragraph above for why there is no fourth check calling `stop_item()`).
+    """
+    cursor = await db.execute(
+        "SELECT 1 FROM job WHERE item_id = ? AND state IN ('queued', 'running') LIMIT 1",
+        (item_id,),
+    )
+    if await cursor.fetchone() is not None:
+        return "an active job exists for this item"
+    if item_id in in_flight_item_ids:
+        return "a post-processing worker is currently running for this item"
+    if delete_in_flight is not None and item_id in delete_in_flight.in_flight_item_ids():
+        return "a delete is currently removing this item's local files"
+    return None
+
+
+async def _subtree_deleted_archive_paths(
+    db: aiosqlite.Connection, *, queue_id: int, rel_path: str
+) -> list[str]:
+    """`deleted_archive`'s own subtree membership, computed independently of `item` -- this is
+    the fix for the trap this task named by name. Under normal operation a spent archive volume
+    still carries its own `item` row (state `EXCLUDED`, DESIGN.md §3.2 rule 8 -- `reconcile()`
+    marks a file `EXCLUDED` rather than dropping its node), so `_subtree_rows` alone would
+    usually already catch it. But `deleted_archive` has no foreign key to `item.id` at all
+    (migration 010's own docstring -- it cascades from `path_queue`, not `item`), so nothing
+    guarantees that row still exists at reset time, and a reset that only ever looked at what
+    `_subtree_rows` happened to return would silently miss a `deleted_archive` row for a path
+    with no matching `item` row. Matched the identical way `_subtree_rows` matches (`rel_path ==
+    target` or a genuine `target/`-prefixed child), for the identical reason (a raw SQL `LIKE`
+    both over-matches a `target-extra` sibling and treats `_` as a wildcard).
+    """
+    cursor = await db.execute(
+        "SELECT rel_path FROM deleted_archive WHERE queue_id = ?", (queue_id,)
+    )
+    rows = await cursor.fetchall()
+    prefix = rel_path + "/"
+    return [
+        row["rel_path"]
+        for row in rows
+        if row["rel_path"] == rel_path or row["rel_path"].startswith(prefix)
+    ]
+
+
+async def _reset_rows(db: aiosqlite.Connection, queue_id: int, rel_paths: Sequence[str]) -> None:
+    """The actual forgetting -- `item`, `item_settle`, `deleted_archive`, exactly the three
+    tables this module's own section docstring says are keyed to `(queue_id, rel_path)`. One
+    call per target's whole subtree (`rel_paths` is the *union* of `_subtree_rows`'s and
+    `_subtree_deleted_archive_paths`'s output -- see `_reset_targets`); the caller batches every
+    target's rows into one list before calling this so the whole scope's reset is one
+    transaction.
+
+    `item_settle` only ever has a row for a *top-level* `rel_path` (migration 007's own
+    docstring), so this deletes a no-op for every nested path in `rel_paths` -- cheaper to let
+    SQLite match nothing than to split the list by depth first. `deleted_archive` is the
+    opposite: its rows are individual (often nested) file paths, so the same unsplit list is
+    exactly what it needs.
+    """
+    if not rel_paths:
+        return
+    placeholders = ",".join("?" for _ in rel_paths)
+    for table in ("item", "item_settle", "deleted_archive"):
+        await db.execute(
+            f"DELETE FROM {table} WHERE queue_id = ? AND rel_path IN ({placeholders})",  # noqa: S608 - table name is a fixed tuple, placeholders only
+            (queue_id, *rel_paths),
+        )
+
+
+async def _reset_targets(
+    db: aiosqlite.Connection,
+    *,
+    queue: Mapping[str, Any],
+    targets: Sequence[Mapping[str, Any]],
+    caller: str,
+    in_flight_item_ids: frozenset[int],
+    delete_in_flight: DeleteInFlight | None,
+) -> ResetOutcome:
+    """The one primitive behind `reset_item`/`reset_scope` -- `targets` is every root this call
+    should attempt (`{"id": ..., "rel_path": ...}`, any depth), independently guarded so one busy
+    item never blocks the rest of a whole-queue or pattern-purge request. Every resettable
+    target's *whole subtree* is forgotten (`_subtree_rows`, the identical expansion
+    `delete_local` uses for the identical reason: a directory's descendant rows must not survive
+    with a stale identity once their parent's is forgotten).
+
+    One transaction for the whole call: every target's rows are queued up first, then written
+    and committed together, so a whole-queue reset is atomic from the caller's perspective even
+    though it iterates many targets -- a crash partway through leaves either the pre-reset state
+    or (once the single `commit()` below runs) the fully-reset one, never a queue half forgotten
+    with no record of which half.
+    """
+    withheld: list[dict[str, str]] = []
+    reset_root_ids: list[int] = []
+    all_affected: list[str] = []
+
+    for target in targets:
+        item_id = target["id"]
+        rel_path = target["rel_path"]
+        reason = await _guard_busy(
+            db, item_id, in_flight_item_ids=in_flight_item_ids, delete_in_flight=delete_in_flight
+        )
+        if reason is not None:
+            withheld.append({"rel_path": rel_path, "reason": reason})
+            await audit.record_event(
+                db,
+                level="warning",
+                item_id=item_id,
+                kind="item_reset_withheld",
+                message=(
+                    f"{caller}: reset of {rel_path!r} (queue {queue['id']} '{queue['name']}') "
+                    f"withheld -- {reason}"
+                ),
+            )
+            continue
+        subtree = await _subtree_rows(db, queue_id=queue["id"], rel_path=rel_path)
+        archive_paths = await _subtree_deleted_archive_paths(
+            db, queue_id=queue["id"], rel_path=rel_path
+        )
+        # The union, not either alone -- this module's own section docstring ("the trap") and
+        # `_subtree_deleted_archive_paths`'s docstring for why `deleted_archive` needs its own
+        # independent subtree lookup rather than trusting whatever `_subtree_rows` happened to
+        # find in `item`.
+        affected = sorted({row["rel_path"] for row in subtree} | set(archive_paths))
+        if not affected:
+            continue
+        await _reset_rows(db, queue["id"], affected)
+        all_affected.extend(affected)
+        reset_root_ids.append(item_id)
+
+    if all_affected:
+        await db.commit()
+        await audit.record_event(
+            db,
+            level="info",
+            item_id=None,  # the rows this refers to no longer exist -- see this module's own
+            # section docstring on why the FK would set this NULL a moment later regardless.
+            kind="item_reset",
+            message=(
+                f"{caller}: reset tracking for {len(all_affected)} row(s) across "
+                f"{len(reset_root_ids)} item(s) in queue {queue['id']} '{queue['name']}' -- "
+                "item/item_settle/deleted_archive rows forgotten, local files untouched"
+            ),
+        )
+        # No WS publish here, deliberately: unlike `delete_local` (which updates rows that
+        # still exist), a reset removes the row outright, and only `Engine` can evict its own
+        # `self.models` cache -- publishing from here without that eviction would tell a
+        # connected browser the row is gone while `Engine`'s next scan still thinks it's there.
+        # `core/engine.py.Engine.forget_rel_paths` is the API layer's job to call
+        # (`api/jobs.py`) with `affected_rel_paths` below, once this transaction has committed.
+
+    return ResetOutcome(
+        reset_top_level=len(reset_root_ids),
+        withheld=tuple(withheld),
+        affected_rel_paths=tuple(all_affected),
+    )
+
+
+async def reset_item(
+    db: aiosqlite.Connection,
+    *,
+    item: Mapping[str, Any],
+    queue: Mapping[str, Any],
+    caller: str,
+    in_flight_item_ids: frozenset[int],
+    delete_in_flight: DeleteInFlight | None = None,
+) -> ResetOutcome:
+    """Reset one item (the Files-page single-row and multi-select-bulk scopes -- a bulk reset is
+    this same call once per selected item, the identical `Promise.allSettled` shape
+    `FileTree.tsx` already uses for bulk Delete, not a second bulk endpoint). `item` can be any
+    depth -- a top-level directory/loose file or a nested file the user selected directly -- its
+    whole subtree beneath `rel_path` is what actually gets forgotten (`_reset_targets`).
+    """
+    return await _reset_targets(
+        db,
+        queue=queue,
+        targets=[{"id": item["id"], "rel_path": item["rel_path"]}],
+        caller=caller,
+        in_flight_item_ids=in_flight_item_ids,
+        delete_in_flight=delete_in_flight,
+    )
+
+
+async def reset_queue(
+    db: aiosqlite.Connection,
+    *,
+    queue: Mapping[str, Any],
+    caller: str,
+    in_flight_item_ids: frozenset[int],
+    delete_in_flight: DeleteInFlight | None = None,
+) -> ResetOutcome:
+    """Reset every top-level item in `queue` -- the clean-slate scope. Every top-level `item` row
+    (`instr(rel_path, '/') = 0`, the same "top-level only" idiom `_select_expired` above uses) is
+    a target; each is independently guarded, so one item mid-transfer is withheld and reported
+    while the rest of the queue still resets. Confirmation (typed queue name, since this is the
+    most destructive action in the app) is the API layer's job (`api/jobs.py`), not this one's --
+    a primitive that also had to know about a confirmation string would be harder to test and
+    reuse than one that trusts its caller.
+    """
+    cursor = await db.execute(
+        "SELECT id, rel_path FROM item WHERE queue_id = ? AND instr(rel_path, '/') = 0",
+        (queue["id"],),
+    )
+    targets = [{"id": row["id"], "rel_path": row["rel_path"]} for row in await cursor.fetchall()]
+    return await _reset_targets(
+        db,
+        queue=queue,
+        targets=targets,
+        caller=caller,
+        in_flight_item_ids=in_flight_item_ids,
+        delete_in_flight=delete_in_flight,
+    )
+
+
+async def reset_pattern_matches(
+    db: aiosqlite.Connection, *, queue_id: int, pattern: str
+) -> list[aiosqlite.Row]:
+    """Every top-level item in `queue_id` whose own name matches `pattern` -- the preview *and*
+    the execute path share this one query, so "what the preview showed" and "what got reset" can
+    never drift apart (the same reason `delete_local`'s `dry_run` reuses every real guard rather
+    than approximating them).
+
+    `core/patterns.py.pattern_matches` -- the identical evaluator a `select` pattern uses against
+    an item's own name (case-insensitive, glob when the string contains `*`/`?`/`[`, substring
+    otherwise) -- is reused directly rather than building a `CompiledPatterns` for one ad-hoc
+    string; DESIGN.md §12 requires there be exactly one matcher, and a purge that matched
+    differently from auto-queue's own patterns would be genuinely dangerous, since a user typing
+    a pattern here has every reason to assume it behaves the same way.
+
+    Deliberately **single-queue, never cross-queue** (confirmed with the user rather than
+    inferred): items are keyed `(queue_id, rel_path)`, and a pattern purge spanning every queue
+    at once is a much bigger blast radius than "let me reuse this one release name on this one
+    queue" ever asked for. There is no `queue_id: None` form of this function.
+    """
+    cursor = await db.execute(
+        "SELECT id, rel_path, is_dir, remote_size, local_size FROM item "
+        "WHERE queue_id = ? AND instr(rel_path, '/') = 0",
+        (queue_id,),
+    )
+    rows = await cursor.fetchall()
+    return [row for row in rows if patterns_core.pattern_matches(pattern, row["rel_path"])]
+
+
+async def reset_by_pattern(
+    db: aiosqlite.Connection,
+    *,
+    queue: Mapping[str, Any],
+    pattern: str,
+    caller: str,
+    in_flight_item_ids: frozenset[int],
+    delete_in_flight: DeleteInFlight | None = None,
+) -> ResetOutcome:
+    """Execute half of the purge-by-pattern scope -- `reset_pattern_matches` for the candidate
+    set, then the same per-target guard-and-reset `reset_queue` uses. The live "what would this
+    match" preview (`reset_pattern_matches` called directly, no reset performed) is this scope's
+    own safety mechanism, per the task this shipped from: a typed pattern is far easier to get
+    wrong than a checkbox selection, and matching everything by accident should be visible before
+    it does anything, not after.
+    """
+    matches = await reset_pattern_matches(db, queue_id=queue["id"], pattern=pattern)
+    targets = [{"id": row["id"], "rel_path": row["rel_path"]} for row in matches]
+    return await _reset_targets(
+        db,
+        queue=queue,
+        targets=targets,
+        caller=caller,
+        in_flight_item_ids=in_flight_item_ids,
+        delete_in_flight=delete_in_flight,
+    )

@@ -36,6 +36,7 @@ import asyncio
 import logging
 import math
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -364,6 +365,53 @@ class Engine:
         """
         self._force_full = True
         self._wake.set()
+
+    def forget_rel_paths(self, queue_id: int, rel_paths: Iterable[str]) -> None:
+        """Evict `rel_paths` from `self.models[queue_id]` and tell every connected browser they
+        are gone — the one piece of `core/local_delete.py.reset_item`/`reset_queue`/
+        `reset_by_pattern` (2026-08-13, `prompts/2026-08-13-reset-item-tracking.md`) that module
+        cannot do itself, because `self.models` is this class's own private cache and nothing
+        outside it may write to it.
+
+        **Why this exists at all.** Every other writer of `item` rows publishes through a scan
+        (`scan_queue` above, via `_persist`/`_project`/`diff_nodes`) or keeps the row alive
+        (`delete_local`, which updates `state` but never removes the row — its own module
+        docstring's "Row lifetime" paragraph). A reset is the first thing in this codebase that
+        deletes an `item` row outright while the process keeps running, and it does so from a
+        plain SQL `DELETE`, entirely outside a scan pass. Without this call, `self.models` keeps
+        serving the pre-reset row forever: if nothing remote or local exists at that path anymore
+        (the "fully forget this, it's gone" case), no future scan ever revisits it — reconcile
+        only produces entries for paths present on *some* side — so the stale entry would be a
+        permanent ghost row on the Files page, contradicting "genuinely gone" the whole feature
+        promises. If the path *does* still exist on either side, the next scan would eventually
+        self-correct this on its own (a fresh `item` row diffs as "changed" against the stale
+        cached one) — but "eventually" is up to one whole `scan_interval_s` away, and the API
+        layer (`api/jobs.py`) already calls `request_rescan()` right after this for exactly that
+        gap, the same "retroactive" idiom pattern create/update/delete already use.
+
+        Reuses `queue_delta`'s exact wire shape (`changed=[]`, `removed=rel_paths`) rather than
+        inventing a new message type — `hooks/useLiveModel.ts` already knows how to drop rows
+        named in `removed` (the ordinary "this node left the tree" case `diff_nodes` produces
+        every scan), so there is nothing new for the frontend to learn.
+        """
+        nodes = self.models.get(queue_id)
+        if not nodes:
+            return
+        removed = [rel_path for rel_path in rel_paths if nodes.pop(rel_path, None) is not None]
+        if not removed:
+            return
+        meta = self.queue_meta.get(queue_id)
+        self.events.publish(
+            {
+                "type": "queue_delta",
+                "queue_id": queue_id,
+                "queue_name": meta.name if meta else "",
+                "changed": [],
+                "removed": removed,
+                "scanned_at": self.last_scan_at.get(queue_id),
+                "warning": self.scan_warnings.get(queue_id),
+            }
+        )
 
     async def _loop(self) -> None:
         while True:

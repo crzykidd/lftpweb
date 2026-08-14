@@ -410,6 +410,31 @@ alongside this list: several entries below ship with deliberate, documented limi
   spawning doomed jobs. `logsetup.CredentialRedactor` now also scrubs a private key's multi-line
   PEM block wherever one appears in a log line, not only the single-line `user:pass@` form it
   already handled.
+- **"Reset item tracking"** *(2026-08-13)* — a real way to forget a path so it can be reused,
+  after the user hit the lack of one three times (a reused directory name, a cross-queue test,
+  and clearing History only to find the item still suppressed). Deliberately **not** "Clear
+  History" (`48ad72c`, a few pixels away on the History page) — that clears `job`/`event`
+  records and never touches `item`; this forgets the `item` row itself, plus its `item_settle`
+  and `deleted_archive` bookkeeping, so a suppressed, stopped, or permanently-failed path reads
+  as genuinely new on the next scan. Three scopes, one primitive: **selected items** (Files
+  page multi-select, the everyday case — a violet "Reset item tracking" bulk button, distinct
+  from Delete's red), a **whole queue** (the clean-slate case, requiring a typed queue-name
+  confirmation — the most destructive action in the app), and **purge by filename pattern**
+  (single-queue only, with a live "what would this match" preview as its own confirmation —
+  reuses `core/patterns.py`'s single evaluator, never a second matcher). Every scope states the
+  real consequence rather than a generic warning: "12 of these 14 items still exist on the
+  seedbox, and auto-queue is on for this queue, so they will start downloading again within
+  about 30s" — computed from the queue's actual `sync_mode`/`auto_queue_enabled`/
+  `scan_interval_s`, not a hedge. Also states plainly that local files are never touched, and
+  that transfer history for reset items is gone too (`job.item_id` cascades on delete) — an
+  unavoidable consequence, not a silent one. Refused, not raced, for a busy item (active job,
+  in-flight post-processing, or an in-progress delete) — per-target, so one busy item in a
+  whole-queue or pattern purge is skipped and reported while the rest still resets; no
+  stop-then-act ordering the way Delete uses, since forgetting a path has no urgency Delete's
+  bytes-must-go-now case has. New `Engine.forget_rel_paths()` evicts the reset rows from the
+  engine's own in-memory model and republishes over the existing `queue_delta` wire shape (no
+  new WebSocket message type needed) — without it, a fully-forgotten item with nothing left on
+  either side would be a permanent ghost row no future scan would ever revisit.
 
 ### Changed
 

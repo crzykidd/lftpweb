@@ -325,6 +325,70 @@ class DeleteItemResponse(BaseModel):
     bytes_freed: int | None = None
 
 
+# --- Reset item tracking (2026-08-13, prompts/2026-08-13-reset-item-tracking.md) -----------
+#
+# Distinct from Delete (above, removes bytes) and from Clear History (`api/history.py`, removes
+# job/event rows and never touches `item`) -- this forgets an item's tracking outright, so a
+# suppressed or failed path can be reused. See `core/local_delete.py`'s own "Reset item
+# tracking" section for the full reasoning; these are just its wire shapes.
+
+
+class ResetItemResponse(BaseModel):
+    """`POST /api/items/{item_id}/reset` -- the selected-item(s) scope (single row, or one call
+    per selected row for a bulk reset, mirroring `DeleteItemResponse`'s own `Promise.allSettled`
+    shape). A withheld guard raises `HTTPException` (409) rather than `reset=False`, for the
+    identical frontend reason `DeleteItemResponse` documents.
+    """
+
+    reset: bool
+    reason: str
+    affected_rel_paths: list[str] = Field(default_factory=list)
+
+
+class QueueResetRequest(BaseModel):
+    """`POST /api/queues/{queue_id}/reset-all`'s body -- the whole-queue scope. `confirm_name`
+    must equal the queue's own `name` exactly (case-sensitive); this is defense in depth
+    alongside the frontend's own typed-confirmation UI, not a replacement for it -- the most
+    destructive action in the app gets two independent places asking "are you sure," not one.
+    """
+
+    confirm_name: str
+
+
+class ResetSummaryResponse(BaseModel):
+    """The outcome of a multi-target reset (whole-queue or purge-by-pattern) -- never
+    all-or-nothing: `withheld` names every target a guard refused and why, while everything
+    else in scope still reset. `affected_count` is every row actually forgotten across
+    `item`/`item_settle`/`deleted_archive`, at every depth -- `reset_top_level` is just the
+    count of root items (selected/matched top-level entries) that succeeded.
+    """
+
+    reset_top_level: int
+    withheld: list[dict[str, str]] = Field(default_factory=list)
+    affected_count: int
+
+
+class ResetPatternPreviewRequest(BaseModel):
+    pattern: str
+
+
+class ResetPatternPreviewItem(BaseModel):
+    rel_path: str
+    is_dir: bool
+    remote_size: int | None
+    local_size: int | None
+
+
+class ResetPatternPreviewResponse(BaseModel):
+    """The purge-by-pattern scope's own safety mechanism (per the task this shipped from): see
+    every top-level item a pattern would reset, with enough per-item data
+    (`remote_size`/`local_size`) for the frontend to compute the same real-numbers warning the
+    other two scopes already show, before anything is confirmed.
+    """
+
+    items: list[ResetPatternPreviewItem] = Field(default_factory=list)
+
+
 # --- Settings -> Queues -> Patterns (DESIGN.md §3.1 `pattern`, §4.7) --------------------
 
 PatternKind = Literal["select", "skip", "file_exclude"]

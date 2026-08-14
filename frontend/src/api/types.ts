@@ -318,6 +318,45 @@ export interface DeleteItemResponse {
   bytes_freed: number | null
 }
 
+// --- Reset item tracking (2026-08-13, prompts/2026-08-13-reset-item-tracking.md) -----------
+//
+// Distinct from Delete (above, removes bytes) and from Clear History (a few pixels away on
+// the History page, which removes job/event rows and never touches an item at all) -- this
+// forgets an item's tracking outright, so a suppressed or failed path can be reused.
+
+export interface ResetItemResponse {
+  reset: boolean
+  reason: string
+  affected_rel_paths: string[]
+}
+
+export interface QueueResetRequest {
+  /** Must equal the queue's own `queue_name` exactly -- the whole-queue scope's typed
+   * confirmation, checked again server-side as defense in depth. */
+  confirm_name: string
+}
+
+export interface ResetSummaryResponse {
+  reset_top_level: number
+  withheld: { rel_path: string; reason: string }[]
+  affected_count: number
+}
+
+export interface ResetPatternPreviewRequest {
+  pattern: string
+}
+
+export interface ResetPatternPreviewItem {
+  rel_path: string
+  is_dir: boolean
+  remote_size: number | null
+  local_size: number | null
+}
+
+export interface ResetPatternPreviewResponse {
+  items: ResetPatternPreviewItem[]
+}
+
 export interface QueueFiles {
   queue_id: number
   queue_name: string
