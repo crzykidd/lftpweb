@@ -29,9 +29,11 @@ completely broken — UI text outliving the behaviour it describes.
   string is a **live required status check** on `main` (verified via `gh api`). Renaming the job
   without updating branch protection in the same motion blocks every future PR. Rename both
   together, or leave it.
-- **`docker-compose.yml` pins `ghcr.io/crzykidd/lftpweb:0.0.1`** while its own comment says
-  nothing has been published to that registry. The in-app docs deliberately make no
-  pullable-image claim because of it. Worth resolving before a release.
+- ~~**`docker-compose.yml` pins `ghcr.io/crzykidd/lftpweb:0.0.1`**~~ — **resolved 2026-08-13**:
+  it now uses `:latest`, the tag the publish matrix actually pushes on every merge to `main`
+  and every published release, with the comment corrected (it still claimed no GitHub remote
+  existed). A copied compose file now resolves to the newest published build instead of a
+  version tag that does not exist yet.
 - **A `dev` → `main` PR, and the first release.** `dev` is far ahead of `main`; nothing has been
   tagged, and `release-prep`/`release-cut` have never been run.
 

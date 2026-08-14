@@ -106,8 +106,9 @@ The most consequential finds, in rough order:
 - **The CI job name `"Frontend lint + typecheck"` is a live required status check** on `main`
   (verified via `gh api`). It now also runs tests. Renaming the job without updating branch
   protection in the same motion will block every PR.
-- **`docker-compose.yml` pins `ghcr.io/crzykidd/lftpweb:0.0.1`** while its own comment says
-  nothing has been published. Unresolved; the docs deliberately make no pullable-image claim.
+- **`docker-compose.yml` uses `ghcr.io/crzykidd/lftpweb:latest`** (changed from `:0.0.1` on
+  2026-08-13) — the tag the publish matrix pushes on every merge to `main` and every published
+  release. Don't put a semver tag back until one has actually been released.
 
 **Three things a fresh session must not undo:**
 

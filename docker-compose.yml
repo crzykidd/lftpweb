@@ -2,16 +2,17 @@
 # dedicated uid/gid, and the hardening from §11.1 — read-only rootfs, all capabilities
 # dropped, no-new-privileges, a small /run tmpfs.
 #
-# `image:` names the tag the code-checkin-and-pr publishing matrix will push
-# (.github/workflows/publish.yml) — `ghcr.io/crzykidd/lftpweb`. It's still a placeholder
-# in the sense that no image has actually been published yet (no GitHub remote exists at
-# adoption time; see docs/repo-setup.md), so nothing can be pulled until the first push to
-# `main` publishes `:latest`. Once real releases exist, prefer pinning by digest —
-# `ghcr.io/crzykidd/lftpweb@sha256:...` — over a floating tag for production.
+# `image:` names the tag the code-checkin-and-pr publishing matrix pushes
+# (.github/workflows/publish.yml) — `:latest` on every push to `main` and on every
+# published release, `:dev` on every push to `dev`. `:latest` is the right default for
+# a compose file people copy: it always resolves to the newest published build rather
+# than a specific version that may not exist yet. Once you are running this in earnest,
+# prefer pinning — a released semver tag (`:0.0.1`) or, better, a digest
+# (`ghcr.io/crzykidd/lftpweb@sha256:...`) — over a floating tag for production.
 
 services:
   lftpweb:
-    image: ghcr.io/crzykidd/lftpweb:0.0.1
+    image: ghcr.io/crzykidd/lftpweb:latest
     container_name: lftpweb
     restart: unless-stopped
     ports:
