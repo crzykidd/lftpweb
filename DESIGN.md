@@ -647,12 +647,27 @@ the captured error text clean.
 
 ### 4.3 Success, failure, retry
 
-- **Success is exit code 0**, guaranteed by `set cmd:fail-exit true`. No inference needed.
+- **Exit code 0 means lftp reported no error** (`set cmd:fail-exit true`) — it does not by itself
+  mean every byte arrived. Before an item reaches `DOWNLOADED`, `core/queue.py._reap_one` confirms
+  completeness from the filesystem (§1.3's own principle: progress and completion are derived from
+  what's on disk, never inferred from the process) — no lftp temp file
+  (`.lftp`/`.lftp~<timestamp>~`) or orphaned `.lftp-pget-status` sidecar remains under the item,
+  and local bytes meet the relevant remote total (excluding anything `EXCLUDED`, §3.2 rule 1). If
+  either check fails despite exit 0, the item goes `PARTIAL` instead — re-queueable, not a failure
+  — and an `incomplete_on_exit_zero` event names the gap. This is still "no inference": it reads
+  what's actually on disk rather than guessing from partial progress samples or parsing `jobs -v`
+  (§1.2); it just does not stop at the exit code alone for the one claim the exit code never made.
 - On nonzero, classify the captured output into `AUTH_FAILED`, `HOST_UNREACHABLE`,
-  `TLS_ERROR`, `PERMISSION_DENIED`, `DISK_FULL`, `REMOTE_GONE`, `UNKNOWN`, and store the last
-  ~4 KB on the `job` row so the UI can show *why* rather than a red dot.
+  `TLS_ERROR`, `PERMISSION_DENIED`, `DISK_FULL`, `REMOTE_GONE`, `LOCAL_FS_ERROR`, `UNKNOWN`, and
+  store the last ~4 KB on the `job` row so the UI can show *why* rather than a red dot.
+  `LOCAL_FS_ERROR` names a failure in a local filesystem operation lftp performed as part of the
+  transfer (today: the `*.lftp` → final-name rename) — distinct from `REMOTE_GONE`, which is about
+  the remote side, even though both can share the substring "no such file" in lftp's own wording.
+  Matched by message shape (`rename(<src>, <dst>): No such file or directory`, both operands local
+  by construction — see `core/lftp.py.ERROR_PATTERNS`), not by comparing the paths involved
+  against the job's known roots.
 - **Retry only on transient classes**, with exponential backoff, bounded by `max_attempts`
-  (default 3): `HOST_UNREACHABLE`, `TLS_ERROR`, timeouts, connection resets.
+  (default 3): `HOST_UNREACHABLE`, `TLS_ERROR`, `LOCAL_FS_ERROR`, timeouts, connection resets.
 - **Never retry permanent classes.** `AUTH_FAILED`, `PERMISSION_DENIED`, `REMOTE_GONE`, and
   `DISK_FULL` surface immediately rather than hammering the seedbox or the disk.
 - Attempts exhausted, or a permanent class ⇒ `FAILED`, **and no further automatic attempt from
@@ -1199,12 +1214,25 @@ nothing was attempted and a staging directory implying otherwise would be the sa
 the `SKIPPED` outcome exists to remove.
 
 **Ordering, including the one ordering that is not yet a decision.** The pipeline runs verify →
-(`move` mode's remote delete) → extract → staging move. The delete sits where it does because
-verification is its gate and verification has just run; nothing in this document has ever
-argued for its position relative to *extraction*, and the consequence is real: a `move`-mode
-item whose archive fails to extract has already lost its remote copy — `EXTRACT_FAILED` with
-nothing left to re-fetch from. Recorded as a known, unreasoned ordering rather than presented
-as a design.
+(`move` mode's remote delete) → extract → (rename off the download prefix) → staging move. The
+delete sits where it does because verification is its gate and verification has just run; nothing
+in this document has ever argued for its position relative to *extraction*, and the consequence
+is real: a `move`-mode item whose archive fails to extract has already lost its remote copy —
+`EXTRACT_FAILED` with nothing left to re-fetch from. Recorded as a known, unreasoned ordering
+rather than presented as a design.
+
+**The rename off a download prefix, when one is in play, is the pipeline's last step.** With
+"folder prefix during transfer" enabled (§4.4b), a directory item downloads into
+`<local_path>/<prefix><name>/` and only takes its real name once post-processing has *succeeded* —
+so an importer watching the download directory never sees a release that is incomplete **or
+unverified**. An earlier implementation renamed at the `DOWNLOADED` transition, before verify ran;
+on a large release that left the real name exposed for as long as verification took (measured:
+~7.7s per 1.7 GB, so ~90s for a 21 GB release), which is exactly the window this feature exists to
+close. A `CORRUPT` or `EXTRACT_FAILED` item is therefore **never** renamed — its bytes stay under
+the hidden name, because an importer would find them under the real one just as readily as a human
+would. Where a queue also has a staging path, the staging move *is* the rename: its destination is
+built from the item's unprefixed `rel_path`, so relocating the prefixed source there does both in
+one operation.
 
 **Verification stops being optional garnish whenever `sync_mode != copy`.** In `copy` mode a
 `CORRUPT` result is an annoyance you can re-download from. In `move` and `sync` it is the gate

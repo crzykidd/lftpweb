@@ -252,13 +252,15 @@ post-processing (verify, then extract) has finished successfully," and both now 
 correction applied to `docs/quick-start.md`'s own description of the feature (the in-app Docs
 section's source).
 
-**Not edited: DESIGN.md.** Per this project's own convention (`prompts/done/2026-08-14-in-flight-
+**DESIGN.md — APPLIED 2026-08-14.** Drafted here first per this project's own convention (`prompts/done/2026-08-14-in-flight-
 folder-prefix.md`: "if DESIGN.md needs a clause for this, draft it in docs/decisions.md and
-ask — do not edit DESIGN.md directly"), §6's existing "verify → delete → extract → staging move"
-ordering paragraph and its "Ordering, including the one ordering that is not yet a decision"
-aside are left as they stand; this entry is the drafted addendum, and a human should decide
-whether/how to fold "the rename off a download-prefix, when one is in play, is the pipeline's
-last step" into §6's own prose.
+ask — do not edit DESIGN.md directly"), then approved and applied on the same day. §6's
+"Ordering, including the one ordering that is not yet a decision" aside now names the rename in
+its pipeline sequence, and a following paragraph states that the rename is the pipeline's last
+step, that a `CORRUPT`/`EXTRACT_FAILED` item is never renamed, and that a staging move *is* the
+rename where one is configured. The measured exposure window that motivated it (~7.7s per 1.7 GB
+of verification, so ~90s for a 21 GB release) is recorded there too, so the reasoning survives in
+the doc and not only here.
 
 **Testing.** `uv run pytest` — full suite, including two rewritten sections and one new e2e
 test file section: `tests/test_postprocess.py` gained seven new tests directly against
@@ -1051,8 +1053,8 @@ is no hardcoded "the remote file is gone" copy anywhere to fix. `LOCAL_FS_ERROR`
 self-explanatory next to lftp's own `rename(...)` line, and the prompt explicitly asked not to
 invent phrasing lftp's own message already states more precisely.
 
-**Proposed `DESIGN.md` §4.3 wording (drafted here, not applied — awaiting approval before it
-lands in the doc, per this repo's own rule):**
+**`DESIGN.md` §4.3 wording — APPLIED 2026-08-14** (approved by the user; the doc now carries
+both changes below verbatim):
 
 > Replace:
 >
@@ -1093,9 +1095,8 @@ Live incident: `cmd:fail-exit true` exited 0 for job 43 having left one file 500
 (§4.3's "no inference" rule was being read as "exit 0 proves every byte arrived," which it
 never promised).
 
-**Proposed `DESIGN.md` §4.3 wording (drafted here, not applied — the user approves the
-wording before it lands in the doc itself, per this repo's own rule that it corrects the doc
-rather than diverging from it):**
+**`DESIGN.md` §4.3 wording — APPLIED 2026-08-14** (approved by the user; the doc now carries
+this replacement verbatim):
 
 > Replace "**Success is exit code 0**, guaranteed by `set cmd:fail-exit true`. No inference
 > needed." with:
