@@ -220,6 +220,81 @@ async def test_reset_queue_all_reports_withheld_items_without_failing_the_rest(d
     assert [r["rel_path"] for r in await cursor.fetchall()] == ["Busy"]
 
 
+# --- POST /api/queues/{queue_id}/reset-all-preview ----------------------------------------
+#
+# 2026-08-14, prompts/2026-08-14-reset-all-preview-undercounts.md: before this endpoint existed,
+# the frontend improvised the All scope's preview from the published Files tree, which
+# `core/engine.py` stops publishing a row from once it reaches a terminal removed state with
+# nothing left in either tree (`a4a626d`) -- so a `REMOVED_BOTH` row already off the wire was
+# invisible to that preview while a confirmed reset-all forgot it regardless. These tests assert
+# the fix's own invariant directly: the preview and the execute path report the same count.
+
+
+async def test_reset_all_preview_404s_on_unknown_queue(db):
+    with pytest.raises(HTTPException) as excinfo:
+        await jobs.reset_all_preview(999, _FakeRequest(db))
+    assert excinfo.value.status_code == 404
+
+
+async def test_reset_all_preview_never_touches_the_database(db):
+    queue_id = await _make_queue(db)
+    await _make_item(db, queue_id, "One", is_dir=True)
+    await _make_item(db, queue_id, "Two", is_dir=True)
+
+    result = await jobs.reset_all_preview(queue_id, _FakeRequest(db))
+
+    assert {i.rel_path for i in result.items} == {"One", "Two"}
+    cursor = await db.execute("SELECT id FROM item WHERE queue_id = ?", (queue_id,))
+    assert len(await cursor.fetchall()) == 2  # nothing was reset by a preview
+
+
+async def test_reset_all_preview_includes_a_row_no_longer_published(db):
+    """The regression case that matters most: a queue with one live item and one `REMOVED_BOTH`
+    item that `core/engine.py` would no longer publish to the Files tree (both sizes NULL,
+    nothing left in either tree). The All preview must report both, and `reset-all`'s own
+    outcome count must equal the preview's count exactly -- asserted directly, not by eyeballing
+    two numbers.
+    """
+    queue_id = await _make_queue(db, name="my-queue")
+    await _make_item(db, queue_id, "Live", is_dir=True)
+    await db.execute(
+        "INSERT INTO item (queue_id, rel_path, is_dir, remote_size, local_size, state, "
+        "auto_queue_suppressed, suppressed_reason) "
+        "VALUES (?, 'Gone', 1, NULL, NULL, 'REMOVED_BOTH', 0, NULL)",
+        (queue_id,),
+    )
+    await db.commit()
+
+    preview = await jobs.reset_all_preview(queue_id, _FakeRequest(db))
+    assert {i.rel_path for i in preview.items} == {"Live", "Gone"}
+
+    result = await jobs.reset_queue_all(
+        queue_id, QueueResetRequest(confirm_name="my-queue"), _FakeRequest(db)
+    )
+
+    assert result.reset_top_level == len(preview.items)
+    assert result.affected_count == len(preview.items)
+    cursor = await db.execute("SELECT id FROM item WHERE queue_id = ?", (queue_id,))
+    assert await cursor.fetchall() == []
+
+
+async def test_reset_all_preview_and_pattern_star_report_the_same_set(db):
+    """`All` is supposed to be a superset of any pattern match -- for a bare `*` (matches
+    everything, `core/patterns.py.pattern_matches`), the two scopes must report the identical
+    set for the same queue.
+    """
+    queue_id = await _make_queue(db)
+    await _make_item(db, queue_id, "One", is_dir=True)
+    await _make_item(db, queue_id, "Two", is_dir=True)
+
+    all_preview = await jobs.reset_all_preview(queue_id, _FakeRequest(db))
+    pattern_preview = await jobs.reset_preview(
+        queue_id, ResetPatternPreviewRequest(pattern="*"), _FakeRequest(db)
+    )
+
+    assert {i.rel_path for i in all_preview.items} == {i.rel_path for i in pattern_preview.items}
+
+
 # --- POST /api/queues/{queue_id}/reset-preview and reset-by-pattern ------------------------
 
 

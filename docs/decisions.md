@@ -6,6 +6,56 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-14 — Reset-all preview: a real endpoint sharing `reset_queue`'s own query; "unpublished" explained via a set-diff against `nodes`, not a server-side flag; the per-item scope's own gap named, not fixed
+
+**Handoff prompt `prompts/2026-08-14-reset-all-preview-undercounts.md`, executed end to end.**
+Live report: Reset item tracking → Pattern `*` showed 2 items; **All** showed *none*, then reset
+those same 2 anyway. The All scope's preview was improvised client-side from `nodes` (the
+published Files tree), which `core/engine.py` (`a4a626d`) deliberately stops publishing a row
+from once it lands on a terminal removed state with nothing left in either tree — correct for
+the Files page, wrong for "everything this queue has ever tracked." The execute path
+(`reset_queue`) always enumerated the `item` table directly and reset that superset regardless.
+Three decisions worth recording separately from the CHANGELOG entry:
+
+**One shared enumeration, `reset_queue_targets`, extracted the same shape
+`reset_pattern_matches` already used for its own pair.** Rather than write a second `SELECT`
+that happens to match `reset_queue`'s today, both the new `POST /api/queues/{id}/
+reset-all-preview` endpoint and `reset_queue`'s own execute path call the identical function —
+so "what the preview showed" and "what got reset" cannot drift apart, structurally, not by
+convention. `reset_all_preview` reuses the existing `ResetPatternPreviewResponse` wire shape
+rather than inventing a fourth one, since the columns (`rel_path`/`is_dir`/`remote_size`/
+`local_size`) are identical to the pattern scope's own preview.
+
+**"Unpublished" is computed client-side, as a set-diff against `nodes`, not a server-side
+flag.** The obvious alternative — have the backend annotate each preview row with whether
+`core/engine.py` currently publishes it — would duplicate the publish-filter logic
+(`_TERMINAL_REMOVED_STATES` plus the vanished-from-both-trees sweep) a second time, in a second
+module, for a question the frontend can already answer for free: it already holds `nodes` (the
+published set) as a prop, so comparing the preview's `rel_path`s against that set's membership is
+one `useMemo` and no new backend concept. This also means the same comparison works unmodified
+for the Pattern scope's preview (which was *already* reading straight from the `item` table, and
+could equally list a row `nodes` doesn't show) with zero extra code — `unpublishedCount` is
+computed once, generically, and is always `0` for Selected by construction (it can only ever
+offer rows it can see).
+
+**Chose not to visually distinguish an unpublished row inside the (currently list-free) All
+preview, and did not add a per-row list to the All scope at all.** The task's own instruction
+left this as a judgment call ("state is available"). All never had a per-row list before this
+task (only Pattern does, for its typically-small matched set); adding one now would be a second,
+unrelated UI change to a preview that already gets a correct aggregate count and a stated
+unpublished count via `resetComposition.ts`'s existing breakdown line. If a future session wants
+per-row visibility for the All scope, `state` is already selected server-side and the frontend
+already has `publishedRelPaths` to test membership against — the plumbing is there, just unused
+for rendering.
+
+**The per-item Selected scope's own gap was named, not fixed, per the task's explicit
+boundary.** `POST /api/items/{item_id}/reset` (`api/jobs.py.reset_item`) works given any real
+`item.id` and does not itself check publish status — the gap is that the Files page's Selected
+scope can only ever select rows it can see, so a lone unpublished row has no checkbox and no way
+for a user to learn its `item_id`. Recorded in `prompts/open-issues.md` under "A terminal removed
+row has no UI path to an individual reset" rather than widened into a "removed items" picker,
+which is a real feature the task was not scoped to build.
+
 ## 2026-08-14 — Removal-grace countdown: new GET-only settings endpoint for the grace constant; capped the countdown rather than plumbing `mount_ok` onto the WebSocket; rejected making the chip permanently show presence
 
 **Handoff prompt `prompts/done/2026-08-14-removal-grace-countdown.md`, executed end to end.**

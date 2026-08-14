@@ -58,6 +58,25 @@ section before trusting any live-evidence conclusion in this file.
 
 ## Still open — read these first
 
+### A terminal removed row has no UI path to an individual reset
+
+2026-08-14, found while fixing the All-scope reset preview
+(`prompts/done/2026-08-14-reset-all-preview-undercounts.md`). `POST /api/items/{item_id}/reset`
+(`api/jobs.py.reset_item`) works fine given any real `item.id` — it does not check whether the
+row is currently published. The gap is entirely client-side: the Files-page **Selected** scope
+(`QueueResetControls.tsx`) can only ever select rows it can see, and `core/engine.py` stops
+publishing a row once it lands on `REMOVED_LOCAL`/`REMOVED_BOTH` with nothing left in either
+tree (`a4a626d`) — so a single already-removed-but-still-tracked item has no checkbox to select
+and no way for a user to learn its `item_id` from the UI at all.
+
+**All** now reaches these rows (`reset_queue_targets`), and **Pattern** already did
+(`reset_pattern_matches` reads the `item` table directly, not the published tree) — so both
+multi-target scopes can reset one of these rows today. Only the single-item scope cannot target
+one deliberately, on its own, without going through a broader scope that also touches everything
+else matching it. Not fixed here — the task that found it was scoped to the All-scope preview
+defect, and giving the Files page a "removed items" view or picker is a real feature, not a
+one-line fix.
+
 ### ~~No frontend test runner~~ — **closed `129cfcf`**
 
 Vitest + happy-dom, `npm test`, wired into the CI Frontend job. 118 tests covering the pure

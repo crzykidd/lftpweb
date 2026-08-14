@@ -152,6 +152,13 @@ reset, then confirm. The whole-queue scope, the most destructive, additionally a
 the queue's name once you have reviewed that preview. Any target that is busy —
 mid-transfer, mid-post-processing, mid-delete — is skipped and reported rather than raced.
 
+**The whole-queue and pattern previews can include items you can't currently see on the Files
+page.** A row that finished, then vanished from both the seedbox and your local disk, eventually
+drops off the Files tree entirely — but the database keeps tracking it, and it is exactly the
+kind of stale row Reset exists to forget. Both previews say how many of the listed items are in
+that state. The selected-rows scope can never show this, because it can only ever offer rows you
+had in front of you to check in the first place.
+
 ## The lifecycle icons {#icons}
 
 Every Files row carries four small icons: a **cloud** (Remote), a **hard drive** (Local), a

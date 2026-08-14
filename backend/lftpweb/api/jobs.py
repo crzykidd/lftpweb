@@ -392,6 +392,38 @@ async def reset_queue_all(
     )
 
 
+@router.post("/api/queues/{queue_id}/reset-all-preview", response_model=ResetPatternPreviewResponse)
+async def reset_all_preview(queue_id: int, request: Request) -> ResetPatternPreviewResponse:
+    """The All scope's own preview -- the whole-queue counterpart to `reset_preview` below, with
+    no pattern to type since "All" means every top-level item this queue tracks. Reads
+    `core/local_delete.py.reset_queue_targets`, the exact enumeration `reset_queue_all` below
+    (via `local_delete.reset_queue`) executes against, so the count and list shown here can never
+    drift from what a confirmed reset actually does -- the same invariant `reset_preview` already
+    holds for the pattern scope, extended to close a real gap: before this endpoint existed, the
+    frontend improvised the All scope's preview from the published Files tree, which does not
+    show a row once it reaches a terminal removed state with nothing left in either tree
+    (`core/engine.py`), so an already-removed-but-still-tracked item was invisible to the preview
+    while a confirmed reset forgot it anyway (2026-08-14,
+    prompts/2026-08-14-reset-all-preview-undercounts.md). Never resets anything itself.
+    """
+    db = request.app.state.db
+    cursor = await db.execute("SELECT id FROM path_queue WHERE id = ?", (queue_id,))
+    if await cursor.fetchone() is None:
+        raise HTTPException(status_code=404, detail="queue not found")
+    rows = await local_delete.reset_queue_targets(db, queue_id=queue_id)
+    return ResetPatternPreviewResponse(
+        items=[
+            ResetPatternPreviewItem(
+                rel_path=row["rel_path"],
+                is_dir=bool(row["is_dir"]),
+                remote_size=row["remote_size"],
+                local_size=row["local_size"],
+            )
+            for row in rows
+        ]
+    )
+
+
 @router.post("/api/queues/{queue_id}/reset-preview", response_model=ResetPatternPreviewResponse)
 async def reset_preview(
     queue_id: int, body: ResetPatternPreviewRequest, request: Request

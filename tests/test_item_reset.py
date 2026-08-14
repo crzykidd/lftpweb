@@ -402,6 +402,54 @@ async def test_reset_queue_skips_a_busy_item_but_resets_the_rest(tmp_path):
         await db.close()
 
 
+async def test_reset_queue_targets_includes_a_row_no_longer_published(tmp_path):
+    """The regression this task fixes (2026-08-14,
+    prompts/2026-08-14-reset-all-preview-undercounts.md): `core/engine.py` stops *publishing* a
+    row to the Files tree once it resolves to a terminal removed state
+    (REMOVED_LOCAL/REMOVED_BOTH) with nothing left in either tree (`a4a626d`) -- but the row is
+    still in the `item` table, and `reset_queue_targets` (the All scope's own enumeration) must
+    still report it. `reset_queue`'s own execute path must reset it too, with the two counts
+    equal -- not merely similar -- since that equality is the whole invariant this task exists
+    to restore.
+    """
+    local_root = tmp_path / "local"
+    local_root.mkdir()
+    write_if_needed(str(local_root))
+
+    db = await _make_db()
+    try:
+        queue_id = await _make_queue(db, local_root)
+        await _make_item(db, queue_id, "Live", is_dir=True)
+        removed_id = await _make_item(
+            db,
+            queue_id,
+            "Gone",
+            is_dir=True,
+            state="REMOVED_BOTH",
+            local_size=None,
+            remote_size=None,
+        )
+
+        preview_rows = await local_delete.reset_queue_targets(db, queue_id=queue_id)
+        assert {row["rel_path"] for row in preview_rows} == {"Live", "Gone"}
+
+        outcome = await local_delete.reset_queue(
+            db,
+            queue=await _queue_row(db, queue_id),
+            caller="manual",
+            in_flight_item_ids=frozenset(),
+        )
+
+        # The invariant asserted directly, not eyeballed: the preview's own row count and the
+        # reset's own outcome count must be exactly equal.
+        assert outcome.reset_top_level == len(preview_rows)
+        assert len(outcome.affected_rel_paths) == len(preview_rows)
+        assert set(outcome.affected_rel_paths) == {"Live", "Gone"}
+        assert await _item_row(db, removed_id) is None
+    finally:
+        await db.close()
+
+
 # --- Purge by pattern, single-queue only --------------------------------------------------
 
 

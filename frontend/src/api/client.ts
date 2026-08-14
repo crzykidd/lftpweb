@@ -318,6 +318,18 @@ export function resetQueue(
   return sendJson<ResetSummaryResponse>(`/api/queues/${queueId}/reset-all`, 'POST', body)
 }
 
+/** The All scope's own preview (2026-08-14,
+ * prompts/2026-08-14-reset-all-preview-undercounts.md) -- every top-level item this queue
+ * tracks, read from the same `item`-table query `resetQueue`'s own execute path uses server-side
+ * (`core/local_delete.py.reset_queue_targets`), so it can include a row the Files page's `nodes`
+ * prop no longer publishes (a terminal `REMOVED_LOCAL`/`REMOVED_BOTH` row with nothing left in
+ * either tree, `core/engine.py`) without disagreeing with what a confirmed reset will actually
+ * do. Never resets anything itself.
+ */
+export function previewResetAll(queueId: number): Promise<ResetPatternPreviewResponse> {
+  return sendJson<ResetPatternPreviewResponse>(`/api/queues/${queueId}/reset-all-preview`, 'POST')
+}
+
 /** The purge-by-pattern scope's own safety mechanism -- every top-level item `body.pattern`
  * would reset, single-queue only, with enough per-item data to compute the same real-numbers
  * warning the other two scopes show. Never resets anything itself.

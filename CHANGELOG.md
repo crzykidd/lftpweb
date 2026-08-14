@@ -743,6 +743,19 @@ alongside this list: several entries below ship with deliberate, documented limi
 
 ### Fixed
 
+- **The whole-queue Reset preview undercounted what Reset would actually do, then reset the
+  larger set anyway** *(2026-08-14)*. Reported live: Pattern `*` showed 2 items; **All** showed
+  *none*, then reset those same 2 items when confirmed. The All scope's preview read the
+  published Files tree (`nodes`), which deliberately stops showing a row once it reaches a
+  terminal removed state with nothing left in either tree — correct for the Files page, wrong for
+  "everything this queue tracks." The execute path (`reset_queue`) always enumerated the `item`
+  table directly, so an already-removed-but-still-tracked row was invisible in the preview and
+  reset regardless. Fixed by giving the All scope a real `reset-all-preview` endpoint that reads
+  the identical query `reset_queue` executes against (`core/local_delete.py.
+  reset_queue_targets`), the same share-one-query invariant the Pattern scope already had. The
+  preview now also states how many of its rows are already-removed items the Files page no
+  longer shows. The Selected scope is unchanged — it can only ever offer rows the user can see,
+  which is correct.
 - **Archive cleanup no longer deletes a release's archives after a failed verification**
   *(2026-08-14)*. Found live: a release whose `.sfv` no longer matched its files reported
   `CORRUPT`, extraction still succeeded, and cleanup then removed all twelve rar volumes (2.2 GB)

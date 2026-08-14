@@ -1,5 +1,5 @@
 import { useMemo, useState } from 'react'
-import { previewResetByPattern, resetByPattern, resetItem, resetQueue } from '../api/client'
+import { previewResetAll, previewResetByPattern, resetByPattern, resetItem, resetQueue } from '../api/client'
 import type { FileNode, ResetPatternPreviewItem, ResetSummaryResponse, SyncMode } from '../api/types'
 import { describeResetTargets } from '../lib/resetComposition'
 import { resetWarningLines } from '../lib/resetWarning'
@@ -146,13 +146,18 @@ export function QueueResetControls({
 }) {
   const ctx = { syncMode, autoQueueEnabled, scanIntervalS }
 
-  // Only top-level entries are "items" in the sense the All/Pattern scopes actually target
-  // (DESIGN.md §4.7; the same filter `api/settings.py.pattern_preview` applies to its own
-  // remote-tree read) -- a nested file's presence/absence isn't what either warning is about.
-  // Selected is different on purpose: a user can check a nested file directly, and each checked
+  // The All and Pattern scopes both target top-level items (DESIGN.md §4.7), but neither reads
+  // `nodes` for its own list of targets (see `allPreview`/`patternPreview` below) -- both are
+  // server previews read straight from the `item` table, so a row `core/engine.py` has stopped
+  // *publishing* (a terminal REMOVED_LOCAL/REMOVED_BOTH row, `a4a626d`) still shows up in either
+  // scope's preview, exactly like it would in a confirmed reset (2026-08-14,
+  // prompts/2026-08-14-reset-all-preview-undercounts.md). `nodes` is still used below, just for
+  // a different question: which of a preview's rows the user can actually *see* right now
+  // (`publishedRelPaths`/`unpublishedCount`), and for Selected, which can only ever offer rows
+  // it can see in the first place -- a user can check a nested file directly, and each checked
   // row resets individually regardless of depth (`api/jobs.py.reset_item`'s own docstring), so
   // `eligibleSelected` below is deliberately *not* filtered to top-level.
-  const topLevel = useMemo(() => nodes.filter((n) => !n.rel_path.includes('/')), [nodes])
+  const publishedRelPaths = useMemo(() => new Set(nodes.map((n) => n.rel_path)), [nodes])
 
   const selectedEntries = useMemo(
     () => nodes.filter((n) => n.id != null && selected.has(n.rel_path)),
@@ -166,6 +171,14 @@ export function QueueResetControls({
 
   const [open, setOpen] = useState(false)
   const [scope, setScope] = useState<Scope | null>(null)
+
+  // The All scope's own server preview (2026-08-14,
+  // prompts/2026-08-14-reset-all-preview-undercounts.md) -- fetched automatically the moment
+  // this scope is chosen, since there is no pattern for the user to type first, unlike Pattern's
+  // own explicit Preview button below.
+  const [allPreview, setAllPreview] = useState<ResetPatternPreviewItem[] | null>(null)
+  const [allPreviewBusy, setAllPreviewBusy] = useState(false)
+  const [allPreviewError, setAllPreviewError] = useState<string | null>(null)
 
   const [pattern, setPattern] = useState('')
   const [patternPreview, setPatternPreview] = useState<ResetPatternPreviewItem[] | null>(null)
@@ -182,6 +195,8 @@ export function QueueResetControls({
   const [outcome, setOutcome] = useState<ResetOutcome | null>(null)
 
   const resetScopeState = () => {
+    setAllPreview(null)
+    setAllPreviewError(null)
     setPattern('')
     setPatternPreview(null)
     setPatternPreviewError(null)
@@ -210,6 +225,21 @@ export function QueueResetControls({
   const selectScope = (next: Scope) => {
     setScope(next)
     resetScopeState()
+    if (next === 'all') void runAllPreview()
+  }
+
+  const runAllPreview = async () => {
+    setAllPreviewBusy(true)
+    setAllPreviewError(null)
+    setAllPreview(null)
+    try {
+      const result = await previewResetAll(queueId)
+      setAllPreview(result.items)
+    } catch (err) {
+      setAllPreviewError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setAllPreviewBusy(false)
+    }
   }
 
   const runPatternPreview = async () => {
@@ -229,12 +259,17 @@ export function QueueResetControls({
   }
 
   // What the currently-open scope's preview is showing -- `null` means "no preview available
-  // yet" (Pattern before its first successful Preview click), as opposed to a preview that ran
-  // and matched nothing (`[]`), which is what drives `lib/resetWarning.ts`'s own zero branch.
+  // yet" (Pattern before its first successful Preview click, or All before its automatic preview
+  // fetch resolves), as opposed to a preview that ran and matched nothing (`[]`), which is what
+  // drives `lib/resetWarning.ts`'s own zero branch.
   const targets: { rel_path: string; is_dir: boolean; remote_size: number | null }[] | null =
-    scope === 'all' ? topLevel : scope === 'selected' ? eligibleSelected : patternPreview
+    scope === 'all' ? allPreview : scope === 'selected' ? eligibleSelected : patternPreview
 
   const remoteCount = (targets ?? []).filter(hasRemoteCopy).length
+  // How many of the current preview's rows the Files page isn't currently showing at all
+  // (`resetComposition.ts`'s own docstring for why) -- always `0` for Selected, whose list is
+  // `nodes`-derived by construction.
+  const unpublishedCount = (targets ?? []).filter((t) => !publishedRelPaths.has(t.rel_path)).length
 
   const confirmAllReset = async () => {
     if (confirmName !== queueName) return
@@ -353,6 +388,31 @@ export function QueueResetControls({
             </p>
           )}
 
+          {scope === 'all' && (
+            <div className="flex flex-col gap-2">
+              <p className="text-violet-900 dark:text-violet-200">
+                Reset tracking for every item <strong>{queueName}</strong> has ever tracked --
+                including items no longer shown on the Files page (already-removed rows the
+                database still tracks).
+              </p>
+              {allPreviewBusy && (
+                <p className="text-violet-900 dark:text-violet-200">Loading preview…</p>
+              )}
+              {allPreviewError && (
+                <div className="flex items-center gap-2">
+                  <p className="text-red-700 dark:text-red-300">{allPreviewError}</p>
+                  <button
+                    type="button"
+                    onClick={runAllPreview}
+                    className="rounded-md border border-zinc-300 px-2 py-1 text-xs font-medium text-zinc-700 hover:bg-zinc-50 dark:border-zinc-700 dark:text-zinc-200 dark:hover:bg-zinc-900"
+                  >
+                    Retry
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
+
           {scope === 'pattern' && (
             <div className="flex flex-col gap-2">
               <p className="text-violet-900 dark:text-violet-200">
@@ -410,7 +470,9 @@ export function QueueResetControls({
                   ))}
                 </ul>
               )}
-              <p className="font-medium text-violet-900 dark:text-violet-200">{describeResetTargets(targets)}</p>
+              <p className="font-medium text-violet-900 dark:text-violet-200">
+                {describeResetTargets(targets, unpublishedCount)}
+              </p>
               {resetWarningLines(targets.length, remoteCount, ctx).map((line) => (
                 <p key={line} className="text-violet-900 dark:text-violet-200">
                   {line}

@@ -1535,6 +1535,35 @@ async def reset_item(
     )
 
 
+async def reset_queue_targets(db: aiosqlite.Connection, *, queue_id: int) -> list[aiosqlite.Row]:
+    """Every top-level item in `queue_id` -- the All scope's whole candidate set, and the exact
+    enumeration `reset_queue` below executes against. The All-scope preview endpoint
+    (`api/jobs.py.reset_all_preview`) calls this function directly, never a second `SELECT` that
+    happens to match it today, so "what the preview showed" and "what got reset" can never drift
+    apart -- the identical invariant `reset_pattern_matches`' own docstring states for the
+    pattern scope, and copied here for the same reason.
+
+    **The bug this closes** (2026-08-14, `prompts/2026-08-14-reset-all-preview-undercounts.md`):
+    before this function existed, the All scope's preview was improvised client-side from the
+    *published* Files tree (the `nodes` prop), which `core/engine.py` (`a4a626d`) deliberately
+    stops publishing a row from once it resolves to a terminal removed state
+    (`REMOVED_LOCAL`/`REMOVED_BOTH`) with nothing left in either tree -- correct for the Files
+    page, which should not show ghosts, but wrong for "everything this queue tracks." A
+    `REMOVED_BOTH` row already off the wire was invisible to that improvised preview while
+    `reset_queue`'s own `item`-table query reset it regardless: the preview undercounted the
+    reset's actual blast radius.
+
+    Same columns `reset_pattern_matches` selects (`is_dir`/`remote_size`/`local_size`) so the
+    identical `ResetPatternPreviewItem` wire shape serves both scopes with no second schema.
+    """
+    cursor = await db.execute(
+        "SELECT id, rel_path, is_dir, remote_size, local_size FROM item "
+        "WHERE queue_id = ? AND instr(rel_path, '/') = 0",
+        (queue_id,),
+    )
+    return await cursor.fetchall()
+
+
 async def reset_queue(
     db: aiosqlite.Connection,
     *,
@@ -1544,18 +1573,15 @@ async def reset_queue(
     delete_in_flight: DeleteInFlight | None = None,
 ) -> ResetOutcome:
     """Reset every top-level item in `queue` -- the clean-slate scope. Every top-level `item` row
-    (`instr(rel_path, '/') = 0`, the same "top-level only" idiom `_select_expired` above uses) is
-    a target; each is independently guarded, so one item mid-transfer is withheld and reported
+    (`reset_queue_targets`, the same "top-level only" idiom `_select_expired` above uses) is a
+    target; each is independently guarded, so one item mid-transfer is withheld and reported
     while the rest of the queue still resets. Confirmation (typed queue name, since this is the
     most destructive action in the app) is the API layer's job (`api/jobs.py`), not this one's --
     a primitive that also had to know about a confirmation string would be harder to test and
     reuse than one that trusts its caller.
     """
-    cursor = await db.execute(
-        "SELECT id, rel_path FROM item WHERE queue_id = ? AND instr(rel_path, '/') = 0",
-        (queue["id"],),
-    )
-    targets = [{"id": row["id"], "rel_path": row["rel_path"]} for row in await cursor.fetchall()]
+    rows = await reset_queue_targets(db, queue_id=queue["id"])
+    targets = [{"id": row["id"], "rel_path": row["rel_path"]} for row in rows]
     return await _reset_targets(
         db,
         queue=queue,
