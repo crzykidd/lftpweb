@@ -766,6 +766,18 @@ alongside this list: several entries below ship with deliberate, documented limi
 
 ### Fixed
 
+- **The Files page still offered "Queue" on a row with no remote copy to fetch** *(2026-08-14)*.
+  Reported live: after a `move`-mode release completed and its remote copy was deleted, the
+  parent folder and every removed child still showed a **Queue** button — clicking it would
+  spawn a job against a remote path that no longer exists. `rowAction` used to special-case only
+  `state === 'LOCAL_ONLY'`; it now gates on `hasRemoteCopy(node)` (`remote_size != null`)
+  generally, so a `REMOVED_BOTH` child and a move-mode parent whose remote this codebase deleted
+  on purpose are treated the same way `LOCAL_ONLY` already was. The button is hidden, not
+  disabled with an explanation — there is nothing a "Queue" click could ever mean for these rows,
+  unlike the transient, user-changeable reasons `cd74f91` added tooltips for. "Re-Download" for a
+  row whose remote copy has since come back is unaffected — its own branch already required a
+  remote copy and now simply sits after the new, more general gate. Bulk "Queue selected" already
+  filtered through the same `rowAction` rule and needed no separate fix.
 - **A cleaned-up archive volume ran the ten-minute removal-grace countdown instead of resting
   as `Extracted`** *(2026-08-14)*. Live evidence: nine seconds after extraction succeeded,
   archive cleanup removed twelve rar volumes, and the very next scan started

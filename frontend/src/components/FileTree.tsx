@@ -431,24 +431,40 @@ export function isSortPreference(value: unknown): value is SortPreference {
 
 /** What this row's own action button offers, if anything (DESIGN.md §9.2, §4.7). Manual
  * queueing always wins over auto-queue suppression and is never filtered by the UI based on
- * state (STOPPED/FAILED included) -- the one exception is a node with nothing remote to
- * fetch at all (`LOCAL_ONLY`), where there is nothing a "Queue" action could mean.
+ * state (STOPPED/FAILED included) -- the one exception is a node with nothing remote to fetch
+ * at all (`!hasRemoteCopy(node)`, defined below), where there is nothing a "Queue" action could
+ * mean.
+ *
+ * **Gated on the fact, not a state string** (2026-08-14, reported live: after a `move`-mode
+ * release completed and its remote copy was deleted, this still offered "Queue" on the parent
+ * folder and on every removed child). `LOCAL_ONLY` used to be the only state tested here, but
+ * it's just one way a node can have no remote copy -- a `REMOVED_BOTH` child, or a move-mode
+ * parent whose remote *this codebase* deleted on purpose (`remote_deleted_at` set, `remote_size`
+ * NULL, state left at `VERIFIED`/`EXTRACTED`), both used to fall through to `'queue'` even
+ * though clicking it would spawn a job against a remote path that no longer exists. `remote_size
+ * != null` (`hasRemoteCopy`) is never null for a node that genuinely has a remote copy --
+ * `core/reconcile.py` sets it the moment a remote scan sees the path, and
+ * `core/itemview.py._remote_facet`'s own docstring establishes presence, not "not yet
+ * measured," as the one reading of this column -- so this gate can't hide a button that should
+ * be there.
  *
  * `'redownload'` (2026-08-13, `prompts/2026-08-13-delete-state-truthfulness.md` defect 2) is
  * the same click as `'queue'` -- `Row` below dispatches both through the identical `onAction`
  * handler -- just a different label for one specific case: a row *we* deleted
  * (`suppressed_reason === 'deleted_local'`) whose remote copy has since come back
- * (`hasRemoteCopy`, defined below). Derived from the suppression reason plus remote presence,
- * never from the state string alone, because `REMOVED_LOCAL`/`REMOVED_BOTH` can also be
- * produced with no suppression at all (`core/mount_sentinel.py.resolve_vanished`, defect 3) --
- * that row is a plain "Queue", not a "Re-Download". "Queue" reads like a brand-new item;
- * "Re-Download" tells the user this is the release they already had, back again, and nothing
- * fetches it automatically.
+ * (`hasRemoteCopy`). Its own branch already requires `hasRemoteCopy`, and now sits *after* the
+ * general no-remote-copy gate above, so that gate can never shadow it -- a row we deleted
+ * locally, whose remote copy has since come back, still reaches `'redownload'`. Derived from
+ * the suppression reason plus remote presence, never from the state string alone, because
+ * `REMOVED_LOCAL`/`REMOVED_BOTH` can also be produced with no suppression at all
+ * (`core/mount_sentinel.py.resolve_vanished`, defect 3) -- that row is a plain "Queue", not a
+ * "Re-Download". "Queue" reads like a brand-new item; "Re-Download" tells the user this is the
+ * release they already had, back again, and nothing fetches it automatically.
  */
-function rowAction(node: FileNode): 'queue' | 'stop' | 'redownload' | null {
+export function rowAction(node: FileNode): 'queue' | 'stop' | 'redownload' | null {
   if (node.id == null) return null
   if (node.state === 'QUEUED' || node.state === 'DOWNLOADING') return 'stop'
-  if (node.state === 'LOCAL_ONLY') return null
+  if (!hasRemoteCopy(node)) return null
   if (node.suppressed_reason === 'deleted_local' && hasRemoteCopy(node)) return 'redownload'
   return 'queue'
 }
@@ -477,13 +493,19 @@ function localBytes(node: FileNode): number {
   return node.local_size ?? node.remote_size ?? 0
 }
 
-/** Whether this node still has a remote copy -- `remote_size` is `null` only for `LOCAL_ONLY`
- * (never tracked remotely; everything else was seen on a scan). Drives the delete
- * confirmation's "what happens to this after I delete it" wording (a remote copy surviving
- * means `delete_local` writes `REMOVED_LOCAL`, not `REMOVED_BOTH` -- `core/local_delete.py.
- * _removed_state_for`) and, since 2026-08-13, `rowAction`'s "Re-Download" label above. Either
- * way lftpweb will never re-fetch what it deleted itself on its own: `delete_local` always sets
- * `auto_queue_suppressed`, which auto-queue excludes unconditionally regardless of the
+/** Whether this node still has a remote copy -- `remote_size` is `null` for `LOCAL_ONLY` (never
+ * tracked remotely), for `REMOVED_BOTH`/a vanished row (`core/engine.py`'s vanished-row path
+ * writes `remote_size = NULL` explicitly), and for a `move`-mode item whose verified remote copy
+ * this codebase deleted on purpose (`remote_deleted_at` set, state left at
+ * `VERIFIED`/`EXTRACTED`) -- every other node was seen on a scan and has it set, per
+ * `core/itemview.py._remote_facet`'s own docstring ("`remote_size IS NOT NULL` is the whole
+ * rule"). Drives the delete confirmation's "what happens to this after I delete it" wording (a
+ * remote copy surviving means `delete_local` writes `REMOVED_LOCAL`, not `REMOVED_BOTH` --
+ * `core/local_delete.py._removed_state_for`), since 2026-08-13 `rowAction`'s "Re-Download" label,
+ * and since 2026-08-14 `rowAction`'s general "nothing to queue" gate above (there is no reading
+ * of "not measured yet" this column can be confused with -- see that gate's own docstring).
+ * Either way lftpweb will never re-fetch what it deleted itself on its own: `delete_local` always
+ * sets `auto_queue_suppressed`, which auto-queue excludes unconditionally regardless of the
  * `re_download_externally_removed` setting -- that setting only ever governs an item
  * *something else* removed, never one this app just deleted.
  */

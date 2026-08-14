@@ -18,6 +18,7 @@ import {
   mergeColumnWidths,
   RESIZABLE_COLUMNS,
   resolveCollapsed,
+  rowAction,
   sortTree,
   type TreeEntry,
 } from './FileTree'
@@ -664,5 +665,61 @@ describe('column width helpers', () => {
         expect(Number.isFinite(width)).toBe(true)
       }
     })
+  })
+})
+
+// --- rowAction -----------------------------------------------------------------------------
+// 2026-08-14 (prompts/2026-08-14-hide-queue-when-there-is-no-remote-copy.md): the Files page
+// still offered "Queue" on a row with nothing remote to fetch -- a REMOVED_BOTH child, and a
+// move-mode parent whose remote this codebase deleted itself. `rowAction` now gates on
+// `hasRemoteCopy` (remote_size != null) generally rather than testing the single `LOCAL_ONLY`
+// state string.
+
+describe('rowAction', () => {
+  it('offers nothing for a REMOVED_BOTH row with no remote copy', () => {
+    expect(rowAction(node('gone/child.mkv', false, { state: 'REMOVED_BOTH', remote_size: null }))).toBeNull()
+  })
+
+  it('offers nothing for a move-mode parent whose verified remote copy was deleted on purpose ' +
+    '(remote_size null, remote_deleted_at set, state left at VERIFIED/EXTRACTED)', () => {
+    const deletedParent = node('release', true, {
+      state: 'EXTRACTED',
+      remote_size: null,
+      local_size: 12345,
+      remote_deleted_at: '2026-08-14T00:00:00Z',
+    })
+    expect(rowAction(deletedParent)).toBeNull()
+  })
+
+  it('still offers nothing for LOCAL_ONLY, now via the general no-remote-copy rule', () => {
+    expect(rowAction(node('local-only-file.txt', false, { state: 'LOCAL_ONLY', remote_size: null }))).toBeNull()
+  })
+
+  it('still offers redownload for a row we deleted locally whose remote copy has come back', () => {
+    const backAgain = node('came-back', true, {
+      state: 'REMOVED_BOTH',
+      suppressed_reason: 'deleted_local',
+      remote_size: 500,
+    })
+    expect(rowAction(backAgain)).toBe('redownload')
+  })
+
+  it('still offers queue for STOPPED with a remote copy -- manual queueing stays unfiltered by suppression', () => {
+    expect(
+      rowAction(node('stopped.iso', false, { state: 'STOPPED', remote_size: 1000, local_size: 200 })),
+    ).toBe('queue')
+  })
+
+  it('still offers queue for FAILED with a remote copy', () => {
+    expect(rowAction(node('failed.iso', false, { state: 'FAILED', remote_size: 1000, local_size: 0 }))).toBe('queue')
+  })
+
+  it('still offers stop for QUEUED/DOWNLOADING regardless of remote presence', () => {
+    expect(rowAction(node('q.iso', false, { state: 'QUEUED', remote_size: 1000 }))).toBe('stop')
+    expect(rowAction(node('d.iso', false, { state: 'DOWNLOADING', remote_size: 1000 }))).toBe('stop')
+  })
+
+  it('offers nothing for a row with no id', () => {
+    expect(rowAction(node('unpersisted.iso', false, { id: null, remote_size: 1000 }))).toBeNull()
   })
 })

@@ -6,6 +6,56 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-14 — The Files-page Queue button is hidden, not disabled-with-a-reason, when a row has no remote copy to fetch
+
+**Handoff prompt `prompts/done/2026-08-14-hide-queue-when-there-is-no-remote-copy.md`, executed
+end to end.** Reported live: after a `move`-mode release completed and its remote copy was
+deleted, the Files page still offered **Queue** on the parent folder and on every removed child.
+Clicking it would spawn a job against a remote path that no longer exists.
+
+**`rowAction` now gates on `hasRemoteCopy(node)` (`remote_size != null`) generally, replacing the
+single `state === 'LOCAL_ONLY'` special case it used to test.** `LOCAL_ONLY` was only one way a
+node can have no remote copy; a `REMOVED_BOTH` child and a move-mode parent whose remote *this
+codebase* deleted on purpose (`remote_deleted_at` set, `remote_size` NULL, state left at
+`VERIFIED`/`EXTRACTED`) both used to fall through to `'queue'` regardless. The new gate sits
+before the `redownload` branch, which already required `hasRemoteCopy` on its own — so a row we
+deleted locally whose remote copy has since come back still reaches `'redownload'`, unchanged.
+Bulk "Queue selected" and the item drawer needed no separate fix: the bulk button already filters
+its targets through this same `rowAction` (`queueableSelected`), and the drawer offers no Queue
+affordance of its own (read-only history/detail).
+
+**Checked whether `remote_size` can be null for a row that genuinely does have a remote copy (a
+freshly-seen row before its first size is recorded) — it cannot.** `core/reconcile.py.reconcile`
+sets `remote_size` from the rollup total the instant `remote_entry is not None` (0 for an empty
+directory, never null), and `core/itemview.py._remote_facet`'s own docstring already establishes
+`remote_size IS NOT NULL` as "the whole rule," matching every existing reader of this column. The
+one place `core/engine.py` explicitly writes `remote_size = NULL` (the vanished-row path) is
+exactly the case where there genuinely is no remote copy. So there is no "not measured yet"
+reading this column could be confused with, and the gate is safe to apply directly with no new
+sentinel needed.
+
+**Hidden, not disabled-with-a-reason — the opposite of the convention `cd74f91` established the
+same week for Expand all/Collapse all.** That commit's own reasoning was that a *disabled*
+button with no explanation reads as a broken feature, so it added a `title` explaining why. This
+case is different in kind, not degree: Expand/Collapse all are disabled because of *transient*
+UI state (an active filter, or simply no directories yet) that the user can change and retry —
+"why is this greyed out right now" is a real, useful question with a real answer. A row with no
+remote copy has no such answer: there is nothing a "Queue" click could ever mean for it, not now,
+not after doing anything else in the UI, until a future scan makes the remote copy real again (at
+which point the row simply isn't this case anymore). Disabling-with-a-reason here would mean
+permanently showing a greyed-out button whose tooltip amounts to "this will never work" on every
+one of what can be hundreds of completed `move`-mode rows — worse clutter than the bug being
+fixed. This matches the row's own pre-existing `LOCAL_ONLY` behavior (already hidden, never
+disabled) rather than reversing it; the fix widens that existing precedent to the fact it was
+always meant to describe (`hasRemoteCopy`) instead of the one state string it happened to be
+tested against.
+
+`rowAction` is now exported from `FileTree.tsx` (trivial, non-behavioral, matching the file's
+existing "exported so `FileTree.test.ts` can call the pure helpers directly" convention) so the
+new test cases exercise it directly rather than mounting the component.
+
+---
+
 ## 2026-08-14 — `scan_local` maps a prefixed directory onto its logical name instead of filtering it out, reversing the same day's own "in-flight folder prefix" mechanism
 
 **Handoff prompt `prompts/done/2026-08-14-map-the-download-prefix-not-filter-it.md`, executed
