@@ -92,12 +92,36 @@ that session is **empty** — every one executed and in `prompts/done/`.
 | **Files-page Speed column**, and the column-resize handles moved to the edge that actually moves | `f728373` |
 | **The three reset panels became one** All/Pattern/Selected control with a uniform preview → confirm flow | `4b15fcc` |
 | **A ~5s local-only scan while a queue is active**, restoring §5's original two-cadence design | `33db032` |
-| **Folder prefix during transfer** (off by default) — a directory downloads into `.downloading-<name>` so an importer can't grab a partial release | `342f96c` |
+| **Folder prefix during transfer** (**on** by default as of `d73e221`) — a directory downloads into `.downloading-<name>` and is renamed onto its real name only after post-processing succeeds (`a6b50ae`), so an importer can't grab a partial *or unverified* release | `342f96c` |
 | **FieldHelp swept across Settings**; the false "7zz handles rar" label corrected | `8dc3c15` |
 | **The retry-backoff-base setting was inert since phase 3a** and now actually applies | `94e2377` |
 | **Transfers show elapsed / average speed / queued wait / post-processing state** | `6e6b217` |
 | **The Docs section's prose moved to `docs/*.md`** — one source, readable on GitHub and rendered in-app | `b4de50a` |
 | The image build needed the repo-root `docs/` copied into the frontend stage | `d1fe8ca` |
+
+**The one assumption that has now caused five separate defects — check this before writing code
+that touches a local path.** "Folder prefix during transfer" made an item's **logical** path
+(`local_path + rel_path`, what the reconciler matches, what `item_settle` is keyed by, what
+patterns evaluate) differ from its **physical** path (`local_path + prefix + rel_path`, where the
+bytes actually are). Five things assumed those were the same:
+
+1. Child rows inside a mirroring directory flipped `PARTIAL`↔`REMOTE_ONLY` every scan —
+   `_protected_rel_paths` only protected items with a job of their *own*, and a `mirror` job
+   belongs to the top-level item.
+2. Delete refused to clean up a stopped transfer — it built the logical path, found nothing, and
+   said "does not exist".
+3. The settle gate's stuck-item recovery can't fire, because the in-flight tree is hidden from
+   `scan_local` so the item never computes `DOWNLOADED` (open, self-recovering, see
+   `prompts/open-issues.md`).
+4. `delete_extracted_archives` recorded an archive's path relative to the physical root instead
+   of `rel_path`, silently breaking completeness accounting.
+5. `_find_item_id_for_failed_dir` had the same bug for `_FAILED_` staging directories.
+
+`core/local_delete.py._physical_local_root` is the one resolver for "where are this item's bytes
+actually" — it handles a nested child by resolving through the top-level ancestor, and falls back
+to the logical path when the prefixed one isn't on disk. **Use it; don't write a second one.**
+`a6b50ae` widened the window in which the two differ from "during transfer" to "until
+post-processing finishes", so the surface is larger now, not smaller.
 
 **The 2026-08-14 lesson, which outranks any individual fix here:** an old `seedsync` container
 autostarted after an unrelated update and wrote into the same download directory. It produced
