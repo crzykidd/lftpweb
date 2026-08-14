@@ -827,6 +827,20 @@ alongside this list: several entries below ship with deliberate, documented limi
   `job.bytes_total` at spawn, the same "fixed at admission, never re-shaped" invariant §4.5
   already uses for bandwidth; `api/jobs.py`/`api/history.py` prefer that frozen value over the
   live column.
+- **A local rename failure was misclassified `REMOTE_GONE` and permanently failed the item**
+  *(2026-08-14, live incident: fired three times in one evening on `pget: rename(<file>.lftp,
+  <file>): No such file or directory` — another process writing into the same directory once,
+  Sonarr importing and removing the download folder mid-transfer twice)*. `REMOTE_GONE`'s
+  pattern matched the bare substring "no such file" with no regard for whether the path
+  involved was remote or local, and `REMOTE_GONE` never retries — so a transient local failure
+  permanently failed the job and suppressed the item, every time reported to the user as "the
+  remote file is gone." A local rename failure now classifies as a new `LOCAL_FS_ERROR`, matched
+  by lftp's distinct `rename(<src>, <dst>): No such file or directory` message shape (both
+  operands always local — lftp's sftp backend never shells a remote-side rename as part of a
+  plain download), and joins the transient set: it retries with the same backoff as
+  `HOST_UNREACHABLE`/`TLS_ERROR` instead of suppressing the item. A genuinely missing remote
+  file — a different message shape, no `rename(...)` wrapper — still classifies `REMOTE_GONE`
+  and still never retries.
 
 ### Security
 

@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 
 from lftpweb.core.lftp import (
+    TRANSIENT_ERROR_CLASSES,
     HostCreds,
     JobSpec,
     NoHostKeyPinError,
@@ -52,6 +53,22 @@ def _creds(**overrides) -> HostCreds:
             "pget: /data/x.mkv: /downloads/x.mkv: No space left on device",
             "DISK_FULL",
         ),
+        # The three live 2026-08-13/14 incidents this class exists for
+        # (prompts/done/2026-08-14-local-errors-misclassified-as-remote-gone.md) — a local
+        # rename failure, misclassified as REMOTE_GONE before this fix even though both
+        # operands are local paths and the remote side is untouched.
+        (
+            "pget: rename(/mnt/fs02-media/working/box-ar-tv/Some.Show.S01E01.mkv.lftp, "
+            "/mnt/fs02-media/working/box-ar-tv/Some.Show.S01E01.mkv): No such file or directory",
+            "LOCAL_FS_ERROR",
+        ),
+        (
+            "pget: rename(/mnt/data/xpost/S06E21.mkv.lftp, /mnt/data/xpost/S06E21.mkv): "
+            "No such file or directory\n"
+            "pget: rename(/mnt/data/xpost/S06E22.mkv.lftp, /mnt/data/xpost/S06E22.mkv): "
+            "No such file or directory",
+            "LOCAL_FS_ERROR",
+        ),
         (
             "ls: Fatal error: max-retries exceeded (connect to host 127.0.0.1 port 2299: Connection refused)",
             "HOST_UNREACHABLE",
@@ -72,6 +89,42 @@ def test_classify_output_permission_denied_takes_priority_over_generic_host_text
     # "Permission denied" also appears in ssh's own publickey-rejection message; the
     # AUTH_FAILED pattern is checked first specifically for that phrase.
     assert classify_output("Permission denied (publickey).") == "AUTH_FAILED"
+
+
+def test_classify_output_local_rename_failure_is_not_remote_gone():
+    # The exact defect this class exists to fix: both operands of the failing rename() are
+    # local paths (lftp's local xfer:use-temp-file rename from *.lftp to the final name), so
+    # this must never read as "the remote file is gone."
+    output = (
+        "pget: rename(/mnt/fs02-media/working/box-ar-tv/x.mkv.lftp, "
+        "/mnt/fs02-media/working/box-ar-tv/x.mkv): No such file or directory"
+    )
+    assert classify_output(output) == "LOCAL_FS_ERROR"
+    assert classify_output(output) != "REMOTE_GONE"
+
+
+def test_classify_output_genuinely_missing_remote_file_is_still_remote_gone():
+    # Do not delete the REMOTE_GONE pattern outright — a genuinely missing remote file is a
+    # real case it must keep naming correctly. No "rename(...)" shape here, unlike the local
+    # case above.
+    assert (
+        classify_output("pget: /data/pickup/does-not-exist.file: Access failed: No such file")
+        == "REMOTE_GONE"
+    )
+
+
+def test_local_fs_error_is_transient_remote_gone_is_not():
+    # LOCAL_FS_ERROR retries (all three live incidents were transient by nature); REMOTE_GONE
+    # stays in the never-retry set — this narrows a misfire, it does not loosen the policy.
+    assert "LOCAL_FS_ERROR" in TRANSIENT_ERROR_CLASSES
+    assert "REMOTE_GONE" not in TRANSIENT_ERROR_CLASSES
+
+
+def test_classify_output_unknown_still_does_not_retry():
+    # Existing whitelist reasoning, unchanged by this fix: an unrecognized failure is not
+    # assumed transient just because it isn't one of the four permanent classes.
+    assert classify_output("a completely unrecognized error string") == "UNKNOWN"
+    assert "UNKNOWN" not in TRANSIENT_ERROR_CLASSES
 
 
 # --- rc file construction ----------------------------------------------------------------

@@ -6,6 +6,82 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-14 — A local rename failure is no longer misclassified `REMOTE_GONE`: a new
+## `LOCAL_FS_ERROR` transient class, matched by message shape
+
+**Handoff prompt `prompts/done/2026-08-14-local-errors-misclassified-as-remote-gone.md`,
+executed end to end.** Live incident, three times in one evening (2026-08-13/14): lftp's own
+`pget: rename(<src>.lftp, <src>): No such file or directory` — the local rename from the
+in-flight `*.lftp` temp name to the final name failing because another process was writing
+into the same directory, and separately because Sonarr imported and then removed the download
+folder mid-transfer — matched `core/lftp.py`'s `REMOTE_GONE` pattern (`no such file`, unanchored)
+and permanently failed + suppressed the item. Both real causes were transient and local; a
+retry would have recovered every one of them.
+
+**Decision: match by message shape, not by comparing paths against the job's known local
+root/remote path.** The prompt offered two approaches. Path-comparison is more precise in the
+abstract but would have required threading `_RunningProcess.local_root` (or the job's remote
+path) into `classify_output`, which today is a pure `str -> str` function called from exactly
+one place (`core/queue.py._reap_one`) with only the captured output tail — a signature change
+for every future caller, and every existing/future test, to carry context that message shape
+already gives away for free. lftp's `rename(<src>, <dst>): No such file or directory` here is
+printed only by the local `xfer:use-temp-file` rename step (confirmed in `core/lftp.py`'s own
+transfer-command docstring and by grep across this module and `core/queue.py`: nothing shells a
+remote-side `rename` as part of a plain `pget`/`mirror` download) — lftp's sftp backend never
+does this. So the shape alone is sufficient to know both operands are local, with no
+false-positive risk against a genuinely missing remote file, which uses a completely different
+message shape (`<path>: Access failed: No such file`, no `rename(...)` wrapper) — see
+`tests/test_lftp.py`'s `test_classify_output_genuinely_missing_remote_file_is_still_remote_gone`.
+
+**Decision: `LOCAL_FS_ERROR`, added to `TRANSIENT_ERROR_CLASSES` only — `PERMANENT_ERROR_CLASSES`
+in `core/queue.py` untouched.** All three live cases were transient by nature (the interfering
+process stopped; the importer finished), so the existing retry-with-backoff path is the correct
+fix, and it required no other change: `core/queue.py._reap_one`'s existing branch already only
+suppresses on the `else` (not-`can_retry`) path, and only tags `suppressed_reason =
+'permanent_error'` when the class is in `PERMANENT_ERROR_CLASSES` (unchanged, still the same
+four) — a `LOCAL_FS_ERROR` job with attempts remaining just requeues, with `auto_queue_suppressed`
+never touched, same as `HOST_UNREACHABLE`/`TLS_ERROR` already do. Nothing in `_suppress_item` or
+the reason-selection `if` needed to name the new class explicitly.
+
+**Decision: no frontend change.** Transfers/History already print the raw `error_class` string
+plus the retained `output_tail` verbatim (`TransfersPage.tsx`, `HistoryJobsSection.tsx`) — there
+is no hardcoded "the remote file is gone" copy anywhere to fix. `LOCAL_FS_ERROR` as a label is
+self-explanatory next to lftp's own `rename(...)` line, and the prompt explicitly asked not to
+invent phrasing lftp's own message already states more precisely.
+
+**Proposed `DESIGN.md` §4.3 wording (drafted here, not applied — awaiting approval before it
+lands in the doc, per this repo's own rule):**
+
+> Replace:
+>
+> "On nonzero, classify the captured output into `AUTH_FAILED`, `HOST_UNREACHABLE`,
+> `TLS_ERROR`, `PERMISSION_DENIED`, `DISK_FULL`, `REMOTE_GONE`, `UNKNOWN`, and store the last
+> ~4 KB on the `job` row so the UI can show *why* rather than a red dot."
+>
+> with:
+>
+> "On nonzero, classify the captured output into `AUTH_FAILED`, `HOST_UNREACHABLE`,
+> `TLS_ERROR`, `PERMISSION_DENIED`, `DISK_FULL`, `REMOTE_GONE`, `LOCAL_FS_ERROR`, `UNKNOWN`, and
+> store the last ~4 KB on the `job` row so the UI can show *why* rather than a red dot.
+> `LOCAL_FS_ERROR` names a failure in a local filesystem operation lftp performed as part of the
+> transfer (today: the `*.lftp` → final-name rename) — distinct from `REMOTE_GONE`, which is
+> about the remote side, even though both can share the substring 'no such file' in lftp's own
+> wording. Matched by message shape (`rename(<src>, <dst>): No such file or directory`, both
+> operands local by construction — see `core/lftp.py.ERROR_PATTERNS`), not by comparing the
+> paths involved against the job's known roots."
+>
+> And replace:
+>
+> "**Retry only on transient classes**, with exponential backoff, bounded by `max_attempts`
+> (default 3): `HOST_UNREACHABLE`, `TLS_ERROR`, timeouts, connection resets."
+>
+> with:
+>
+> "**Retry only on transient classes**, with exponential backoff, bounded by `max_attempts`
+> (default 3): `HOST_UNREACHABLE`, `TLS_ERROR`, `LOCAL_FS_ERROR`, timeouts, connection resets."
+
+---
+
 ## 2026-08-14 — Exit 0 is not completion: a filesystem completeness gate before DOWNLOADED,
 ## output_tail retained on every success, succeeded jobs surfaced on Transfers
 

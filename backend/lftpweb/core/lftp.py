@@ -95,6 +95,22 @@ ERROR_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ),
     ("PERMISSION_DENIED", re.compile(r"permission denied", re.IGNORECASE)),
     ("DISK_FULL", re.compile(r"no space left on device|disk full", re.IGNORECASE)),
+    # Checked *before* the generic REMOTE_GONE pattern below, even though both match the
+    # substring "no such file" — this one is more specific and must win (DESIGN.md §4.3,
+    # "ordered most-specific-first"). Found three times live, 2026-08-13/14
+    # (prompts/done/2026-08-14-local-errors-misclassified-as-remote-gone.md): lftp's own
+    # `rename(<src>, <dst>): No such file or directory` is what pget/mirror print when the
+    # local `xfer:use-temp-file` rename from `*.lftp` to the final name fails -- both `<src>`
+    # and `<dst>` are always local paths (this rename never touches the remote side; lftp's
+    # sftp backend does not shell a remote `rename` as part of a plain download), so this
+    # shape can never legitimately mean "the remote file is gone." Both live causes were a
+    # transient local condition (another process writing into the target directory, an
+    # importer removing the download folder mid-transfer) -- see LOCAL_FS_ERROR below, not the
+    # never-retry REMOTE_GONE this used to fall into.
+    (
+        "LOCAL_FS_ERROR",
+        re.compile(r"rename\([^)]*\):\s*no such file or directory", re.IGNORECASE),
+    ),
     ("REMOTE_GONE", re.compile(r"no such file|not found on server|file not found", re.IGNORECASE)),
     (
         "HOST_UNREACHABLE",
@@ -114,7 +130,15 @@ ERROR_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
 # non-retryable (not adding it here) is the smaller-blast-radius reading: retrying a failure we
 # failed to even classify risks hammering the seedbox on something a human should look at,
 # rather than losing at most one retry cycle on a transient failure our patterns missed.
-TRANSIENT_ERROR_CLASSES = frozenset({"HOST_UNREACHABLE", "TLS_ERROR"})
+#
+# LOCAL_FS_ERROR joined this set 2026-08-14
+# (prompts/done/2026-08-14-local-errors-misclassified-as-remote-gone.md) — every live instance
+# was a transient local condition outliving the transfer by seconds (another writer in the same
+# directory, an importer mid-move), not a durable local fault like a full or unmounted disk
+# (those already classify as DISK_FULL/get surfaced separately and stay out of this set). This
+# narrows an existing misfire rather than loosening the policy above: it does not touch the
+# whitelist reasoning for UNKNOWN or add a second, looser transient rule.
+TRANSIENT_ERROR_CLASSES = frozenset({"HOST_UNREACHABLE", "TLS_ERROR", "LOCAL_FS_ERROR"})
 
 
 def classify_output(output: str) -> str:
