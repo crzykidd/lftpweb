@@ -78,3 +78,50 @@ def test_every_generated_setting_is_accepted_by_lftp(pget_n, rate_limit_bps):
         output = (result.stdout + result.stderr).strip()
         assert not output, f"lftp rejected `{line}`: {output}"
         assert result.returncode == 0, f"lftp exited {result.returncode} for `{line}`"
+
+
+def test_extra_lftp_settings_override_a_colliding_lftpweb_default(tmp_path):
+    """Whether an "extra lftp settings" line that names a key lftpweb already sets actually
+    *wins* is a behavioural claim about lftp's own `set` parser, not something this project
+    controls — so it must be proven against the real binary, not assumed, before the Settings
+    → Transfer UI is allowed to say anything about which side wins a collision.
+
+    Verified interactively against lftp 4.9.2 first (`lftp -c "set K v1; set K v2; set -a"`
+    prints only `v2`), then reproduced here through the exact rc `build_rc_text` generates,
+    `source`d the same way `core/lftp.py.spawn` sources it — extra_settings is appended after
+    every built-in tuning line and before the credential-bearing `open`, so a colliding key
+    here is the same shape a real job would `source`.
+    """
+    rc = build_rc_text(
+        _creds(),
+        None,
+        rate_limit_bps=None,
+        connection_limit=None,
+        parallel=1,
+        pget_n=1,
+        save_status_interval_s=1,
+        extra_settings="set pget:min-chunk-size 999999;",
+    )
+    # lftpweb's own default line is still present, ahead of the override — this proves the
+    # test would catch a regression where extra_settings stopped being appended last, rather
+    # than passing vacuously because the built-in line was never there to collide with.
+    assert "set pget:min-chunk-size 1048576;" in rc
+    assert rc.index("set pget:min-chunk-size 1048576;") < rc.index(
+        "set pget:min-chunk-size 999999;"
+    )
+
+    rc_path = tmp_path / "job.rc"
+    rc_path.write_text(rc)
+    result = subprocess.run(  # noqa: S603
+        ["lftp", "-c", f"source {rc_path}; set -a"],  # noqa: S607
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    assert result.returncode == 0, result.stderr
+    altered = [
+        line for line in result.stdout.splitlines() if line.startswith("set pget:min-chunk-size ")
+    ]
+    assert altered == [
+        "set pget:min-chunk-size 999999"
+    ], f"expected the later extra_settings line to win (last-write-wins), got: {altered}"

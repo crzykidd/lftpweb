@@ -15,6 +15,7 @@ import type {
   DeleteItemResponse,
   DownloadPrefixSettingsIn,
   DownloadPrefixSettingsOut,
+  EffectiveLftpSettingsOut,
   FilesResponse,
   HealthResponse,
   HistoryClearResponse,
@@ -343,6 +344,10 @@ export function getTransferSettings(): Promise<TransferSettingsOut> {
 
 export function putTransferSettings(body: TransferSettingsIn): Promise<TransferSettingsOut> {
   return sendJson<TransferSettingsOut>('/api/settings/transfer', 'PUT', body)
+}
+
+export function getEffectiveLftpSettings(): Promise<EffectiveLftpSettingsOut> {
+  return getJson<EffectiveLftpSettingsOut>('/api/settings/transfer/effective-lftp')
 }
 
 // --- History (phase 6, DESIGN.md §9.2 History page) ---------------------------------------

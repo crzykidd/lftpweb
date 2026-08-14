@@ -28,6 +28,27 @@ post-phase-9 session on 2026-08-12 (its entries are marked *(2026-08-12)*). Noth
 been released; `0.0.1` remains the in-development version. Read `README.md`'s "Known gaps"
 alongside this list: several entries below ship with deliberate, documented limitations.
 
+- **A read-only "What lftpweb already sets" readout on Settings → Transfer** *(2026-08-14)*,
+  collapsed by default directly above the **Extra lftp settings** box — so far this has been a
+  free-text field with no indication of what lftpweb already writes into every job's rc file,
+  leaving a user typing into it unable to tell whether they're adding a setting, duplicating
+  one, or fighting one. Shows, per job kind (mirror/pget), the transfer command's real argv
+  (`pget -c -n N`, `mirror -c --parallel=N --use-pget-n=N`) and every `set` line lftpweb writes,
+  each with a short *why* — all generated from `core/lftp.py.effective_tuning_settings` /
+  `build_transfer_command` (the same functions that build a real job's rc and argv), never
+  hand-typed, so this can't drift the way the Dockerfile's old rar-support claim and the
+  Settings page's old `7zz` claim both did. **Credential-free by construction**: the two
+  credential-bearing rc lines (`sftp:connect-program`, `open -u ...`) are built in a separate
+  code path this feature's endpoint never touches, not filtered out of rendered text — proven
+  absent by a byte-search test (`tests/test_effective_lftp_settings.py`), not assumed. **Flags a
+  collision** when a line in the Extra lftp settings box names a key lftpweb already sets, and
+  says the user's line wins — verified against a real lftp binary first
+  (`tests/test_lftp_settings_accepted.py`'s new
+  `test_extra_lftp_settings_override_a_colliding_lftpweb_default`: lftp's own `set` command is
+  last-write-wins within one sourced script, and the box's contents are always appended after
+  every built-in line) rather than assumed. Not yet click-tested — no browser exists in the
+  environment this was built in, so density and placement on an already-dense tab need a human
+  look.
 - **A "How it works" page** *(2026-08-14)*, in the app under **Docs → How it works** and in the
   repo as [`docs/how-it-works.md`](docs/how-it-works.md) — the same single source, rendered both
   places. Two minutes on the one decision the rest of the design follows from (lftp is a transfer

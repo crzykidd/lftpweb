@@ -221,6 +221,174 @@ def _connect_program(creds: HostCreds, known_hosts_path: Path | None) -> str:
     return " ".join(parts)
 
 
+@dataclass(frozen=True)
+class TuningSetting:
+    """One `set` line lftpweb writes into every job's rc file, carrying no credential.
+
+    This is the entire tuning half of `build_rc_text` — every `set` line except the two
+    credential-bearing ones (`sftp:connect-program`, `open -u ...`). Those two are built
+    directly inside `build_rc_text` and never constructed through `effective_tuning_settings`
+    below, which is what lets the read-only Settings → Transfer "effective settings" endpoint
+    (`api/jobs.py`) call `effective_tuning_settings` for display without a credential ever
+    being reachable through that path — a future credential-bearing setting would have to be
+    deliberately added *here* to leak, not merely added to `build_rc_text` and forgotten about.
+    """
+
+    key: str
+    value: str  # exactly as it appears after the key in the rendered `set` line
+    why: str
+    # True when a `TransferSettings`/admission-time value drives this line's presence or
+    # number; False when lftpweb always writes this exact value regardless of any setting.
+    configurable: bool
+
+
+def effective_tuning_settings(
+    *,
+    rate_limit_bps: int | None,
+    connection_limit: int | None,
+    parallel: int,
+    pget_n: int,
+    save_status_interval_s: int,
+    min_chunk_size: int = DEFAULT_MIN_CHUNK_SIZE,
+    max_retries: int = DEFAULT_MAX_RETRIES,
+    net_timeout_s: int = DEFAULT_NET_TIMEOUT_S,
+    reconnect_interval_base_s: int = DEFAULT_RECONNECT_INTERVAL_BASE_S,
+) -> list[TuningSetting]:
+    """The rc file's tuning half, in the exact order `build_rc_text` renders it — the single
+    source both `build_rc_text` (turns these into rc-file lines) and the read-only effective-
+    settings endpoint (turns these into a UI list) build from, so the two can never drift.
+    """
+    settings: list[TuningSetting] = [
+        TuningSetting(
+            key="pget:save-status",
+            value=f"{save_status_interval_s}s",
+            why=(
+                "How often the .lftp-pget-status sidecar is refreshed. lftp's own default "
+                "(10s) is far too coarse for the ~1 Hz progress sampler (DESIGN.md §4.4) — "
+                "found running a real transfer where the sidecar simply didn't exist yet at "
+                "the 1s/2s/3s marks under the default."
+            ),
+            configurable=False,
+        ),
+        TuningSetting(
+            key="pget:min-chunk-size",
+            value=str(min_chunk_size),
+            why=(
+                "Never fan a file smaller than this across pget_n connections. Without it, "
+                "`pget -n 4` splits a 16-byte file into four chunks and opens four SSH "
+                "connections to move 16 bytes — pointless on its own, and it multiplies any "
+                "connection failure by four (observed against a real seedbox)."
+            ),
+            configurable=False,
+        ),
+        TuningSetting(
+            key="net:max-retries",
+            value=str(max_retries),
+            why=(
+                "Bounded so a connection that cannot succeed (bad host key, refused auth, "
+                "dead route) fails loudly and quickly instead of retrying forever with the "
+                'job stuck at "downloading, 0 bytes" and nothing in the log.'
+            ),
+            configurable=False,
+        ),
+        TuningSetting(
+            key="net:timeout",
+            value=f"{net_timeout_s}s",
+            why="Same reason as net:max-retries — a hung connection must fail, not hang.",
+            configurable=False,
+        ),
+        TuningSetting(
+            key="net:reconnect-interval-base",
+            value=str(reconnect_interval_base_s),
+            why=(
+                "Bare unsigned number, not a duration — unlike net:timeout, a trailing `s` "
+                'here makes lftp reject the line with "invalid unsigned number" while the '
+                "transfer keeps running on its defaults, failing later with a misleading "
+                "HOST_UNREACHABLE."
+            ),
+            configurable=False,
+        ),
+        TuningSetting(
+            key="net:reconnect-interval-multiplier",
+            value="1.5",
+            why="Backoff multiplier applied between successive reconnect attempts.",
+            configurable=False,
+        ),
+        TuningSetting(
+            key="xfer:use-temp-file",
+            value="yes",
+            why=(
+                "In-flight files are written under a temp suffix (see xfer:temp-file-name "
+                "below) so core/local_scan.py can tell a partial download from a finished one."
+            ),
+            configurable=False,
+        ),
+        TuningSetting(
+            key="xfer:temp-file-name",
+            value='"*.lftp"',
+            why="The `.lftp` suffix core/local_scan.py's temp-suffix handling strips (DESIGN.md §4.4b).",
+            configurable=False,
+        ),
+        TuningSetting(
+            key="mirror:parallel-directories",
+            value="yes",
+            why="Lets mirror descend into subdirectories in parallel rather than one at a time.",
+            configurable=False,
+        ),
+    ]
+    if rate_limit_bps is not None:
+        settings.append(
+            TuningSetting(
+                key="net:limit-total-rate",
+                value=str(rate_limit_bps),
+                why=(
+                    "Process-wide bandwidth cap — one number bounds this job's entire subtree "
+                    "of connections (DESIGN.md §4.5). Computed per job at admission time from "
+                    "Max bandwidth and how many jobs currently share the ceiling, so the real "
+                    "number varies job to job rather than being fixed; shown here is what a "
+                    "job admitted alone, at the full ceiling, would receive."
+                ),
+                configurable=True,
+            )
+        )
+    if connection_limit is not None:
+        settings.append(
+            TuningSetting(
+                key="net:connection-limit",
+                value=str(connection_limit),
+                why="Hard cap on concurrent connections this job may open (from the host's connection overrides).",
+                configurable=True,
+            )
+        )
+    if parallel > 1:
+        settings.append(
+            TuningSetting(
+                key="mirror:parallel-transfer-count",
+                value=str(parallel),
+                why='Files transferred at once within one mirror job — Settings → Transfer\'s "Files in parallel per job".',
+                configurable=True,
+            )
+        )
+    if pget_n > 1:
+        settings.append(
+            TuningSetting(
+                key="mirror:use-pget-n",
+                value=str(pget_n),
+                why="Connections per file inside a mirror job.",
+                configurable=True,
+            )
+        )
+        settings.append(
+            TuningSetting(
+                key="pget:default-n",
+                value=str(pget_n),
+                why="Connections per file for a plain (non-mirror) pget job.",
+                configurable=True,
+            )
+        )
+    return settings
+
+
 def build_rc_text(
     creds: HostCreds,
     known_hosts_path: Path | None,
@@ -240,60 +408,29 @@ def build_rc_text(
     blank line (see the module docstring's lftp-quirk note). Every line is a `set` or `open`
     lftp command; no shell metacharacters are interpreted here because this file is `source`d
     by lftp's own parser, not by a shell.
+
+    The tuning lines below are `effective_tuning_settings`'s output, rendered — see that
+    function's own docstring for why the split exists. The two credential-bearing lines
+    (`sftp:connect-program`, `open -u ...`) are built right here, never through that function.
     """
     lines: list[str] = [
         "# lftpweb per-job settings + credentials — mode 0600, /run tmpfs, unlinked on exit.",
         f'set sftp:connect-program "{_connect_program(creds, known_hosts_path)}";',
-        # Sidecar freshness (DESIGN.md §4.4) — lftp's own default is 10s, far too coarse for a
-        # ~1 Hz progress sampler (found running a real transfer against the fake seedbox: the
-        # sidecar simply didn't exist yet at the 1s/2s/3s marks under the default). This is the
-        # one non-obvious tunable this module owns that DESIGN.md doesn't mention.
-        f"set pget:save-status {save_status_interval_s}s;",
-        # Bounded retries and timeouts, always set — never left to lftp's defaults.
-        #
-        # Without these, a connection that cannot succeed (bad host key, refused auth, dead
-        # route) makes lftp retry *forever*: the process never exits, so the supervisor never
-        # sees a non-zero exit, `classify_output` never runs, and the job sits at
-        # "DOWNLOADING, 0 bytes" indefinitely with nothing in the log. Observed against a real
-        # seedbox — a 16-byte file "downloading" for minutes. A transfer that cannot start
-        # must fail loudly and quickly, so the error class reaches the UI (§4.3).
-        #
-        # DESIGN.md §9.3 lists these as host-level knobs; they were in the design's knob list
-        # but had never been written to the rc file.
-        # Never fan a small file out across N connections. Without this, `pget -n 4` splits a
-        # 16-byte file into four chunks and opens four SSH connections to move 16 bytes —
-        # pointless on its own, and it multiplies any connection failure by N (observed
-        # against a real seedbox: four connections each retrying a failing handshake). It also
-        # burns the host-wide connection ceiling §4.5 warns about. lftp uses one connection for
-        # anything smaller than this. §9.3 lists the knob; it was never written to the rc.
-        f"set pget:min-chunk-size {min_chunk_size};",
-        f"set net:max-retries {max_retries};",
-        f"set net:timeout {net_timeout_s}s;",
-        # No `s` suffix: net:timeout is a time interval and takes "30s", but
-        # net:reconnect-interval-base takes a bare unsigned number. Getting this wrong
-        # makes lftp reject the line with "5s: invalid unsigned number." while still
-        # running the transfer — so the job failed with a misleading HOST_UNREACHABLE.
-        # Every setting here is verified against a real lftp binary by
-        # tests/test_lftp_settings_accepted.py.
-        f"set net:reconnect-interval-base {reconnect_interval_base_s};",
-        "set net:reconnect-interval-multiplier 1.5;",
-        # DESIGN.md §4.4b: in-flight files carry a `.lftp` suffix so `core/local_scan.py`'s
-        # temp-suffix handling has something to strip. lftp's own defaults are `no` / `.in.*`.
-        "set xfer:use-temp-file yes;",
-        'set xfer:temp-file-name "*.lftp";',
-        "set mirror:parallel-directories yes;",
     ]
-    if rate_limit_bps is not None:
-        # net:limit-total-rate is process-wide (DESIGN.md §4.5) — one number bounds this job's
-        # entire subtree of connections, which is exactly why it's the knob the scheduler uses.
-        lines.append(f"set net:limit-total-rate {rate_limit_bps};")
-    if connection_limit is not None:
-        lines.append(f"set net:connection-limit {connection_limit};")
-    if parallel > 1:
-        lines.append(f"set mirror:parallel-transfer-count {parallel};")
-    if pget_n > 1:
-        lines.append(f"set mirror:use-pget-n {pget_n};")
-        lines.append(f"set pget:default-n {pget_n};")
+    lines += [
+        f"set {ts.key} {ts.value};"
+        for ts in effective_tuning_settings(
+            rate_limit_bps=rate_limit_bps,
+            connection_limit=connection_limit,
+            parallel=parallel,
+            pget_n=pget_n,
+            save_status_interval_s=save_status_interval_s,
+            min_chunk_size=min_chunk_size,
+            max_retries=max_retries,
+            net_timeout_s=net_timeout_s,
+            reconnect_interval_base_s=reconnect_interval_base_s,
+        )
+    ]
     if extra_settings.strip():
         # The free-text "extra lftp settings" box (DESIGN.md §9.3) — injected verbatim, after
         # everything above so a power user can override any of it. Not sanitized: it's a

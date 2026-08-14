@@ -478,6 +478,20 @@ export interface TransferSettingsOut {
 
 export type TransferSettingsIn = TransferSettingsOut
 
+// --- Settings -> Transfer's "effective lftp settings" readout (2026-08-14,
+// prompts/2026-08-14-show-effective-lftp-settings.md) -------------------------------------
+//
+// Read-only and credential-free by construction -- see `core/lftp.py.effective_tuning_settings`
+// and `api/jobs.py.get_effective_lftp_settings`'s own module comment for why. Re-exported from
+// `lib/effectiveLftpSettings.ts` rather than duplicated -- that module's collision-detection
+// pure functions are typed against these same shapes.
+export type { EffectiveLftpJobKind, EffectiveLftpSetting } from '../lib/effectiveLftpSettings'
+
+export interface EffectiveLftpSettingsOut {
+  kinds: import('../lib/effectiveLftpSettings').EffectiveLftpJobKind[]
+  bandwidth_note: string
+}
+
 // --- History (phase 6, DESIGN.md §9.2 History page) ---------------------------------------
 
 /** Deliberately not `JobOut` -- that shape carries `output_tail` inline because the

@@ -652,6 +652,45 @@ class TransferSettingsIn(TransferSettingsOut):
     pass
 
 
+# --- Settings -> Transfer's "effective lftp settings" readout (2026-08-14,
+# prompts/2026-08-14-show-effective-lftp-settings.md) -------------------------------------
+#
+# Read-only, credential-free by construction: every field here is built from
+# `core/lftp.py.effective_tuning_settings` / `build_transfer_command`, which never see the two
+# credential-bearing rc lines (`sftp:connect-program`, `open -u ...`) -- see that module's own
+# docstring for why the split is structural, not a filter applied to rendered text.
+
+
+class EffectiveLftpSetting(BaseModel):
+    key: str
+    value: str
+    why: str
+    # True when a TransferSettings-derived number drives this line's value or presence; False
+    # when lftpweb always writes this exact value regardless of any setting.
+    configurable: bool
+
+
+class EffectiveLftpJobKind(BaseModel):
+    kind: Literal["mirror", "pget"]
+    # The transfer command's argv, with illustrative (not real) paths -- built by
+    # `core/lftp.py.build_transfer_command` itself, so `-c`, `--parallel`, `--use-pget-n` stay
+    # in lockstep with what a real job actually runs.
+    argv: str
+    argv_why: str
+    rc_settings: list[EffectiveLftpSetting]
+
+
+class EffectiveLftpSettingsOut(BaseModel):
+    kinds: list[EffectiveLftpJobKind]
+    # A per-job bandwidth cap (net:limit-total-rate) is always set on a real job, but the
+    # number is computed at admission time (DESIGN.md §4.5) from how many jobs are currently
+    # sharing the ceiling -- not a fixed value this static endpoint can state without
+    # re-deriving scheduler admission math outside core/scheduler.py. Left as prose rather than
+    # a fabricated number; see the live connection-count readout above it on this page for what
+    # a job admitted right now would actually get.
+    bandwidth_note: str
+
+
 # --- History (DESIGN.md §9.2 History page, phase 6) -------------------------------------
 #
 # Deliberately a *separate* shape from JobOut/JobsResponse (api/jobs.py), even though both

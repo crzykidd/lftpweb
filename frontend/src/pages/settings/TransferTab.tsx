@@ -1,7 +1,8 @@
 import type { ReactNode } from 'react'
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import {
   getDownloadPrefixSettings,
+  getEffectiveLftpSettings,
   getHost,
   getSettleSettings,
   getTransferSettings,
@@ -11,10 +12,12 @@ import {
 } from '../../api/client'
 import type {
   DownloadPrefixSettingsOut,
+  EffectiveLftpSettingsOut,
   SettleSettingsOut,
   TransferSettingsOut,
 } from '../../api/types'
 import { FieldHelp } from '../../components/FieldHelp'
+import { findLftpSettingCollisions } from '../../lib/effectiveLftpSettings'
 import { bytesToMB, formatRate, mbToBytes } from '../../lib/format'
 
 const inputClasses =
@@ -370,6 +373,135 @@ function DownloadPrefixSection() {
   )
 }
 
+/** Settings → Transfer's "what lftpweb already sets" readout (2026-08-14,
+ * prompts/2026-08-14-show-effective-lftp-settings.md), rendered directly above "Extra lftp
+ * settings" (§ the task's own placement instruction: adjacent, visually subordinate to it —
+ * this is reference material, not a second control). Collapsed by default via `<details>`:
+ * this tab is already dense (DESIGN.md §9.3's live connection-count readout, bandwidth, fast
+ * lane, retry, settle gate, and folder-prefix sections all live here too), and a closed
+ * disclosure widget is the one option that cannot make an already-crowded page more crowded —
+ * no human has click-tested this placement (CLAUDE.md's own "no UI has ever been
+ * click-tested" gap), so the safest default was chosen deliberately rather than guessed.
+ *
+ * Every value shown comes from `GET /api/settings/transfer/effective-lftp`
+ * (`api/jobs.py.get_effective_lftp_settings`), itself generated from
+ * `core/lftp.py.effective_tuning_settings` / `build_transfer_command` — never hand-typed here,
+ * so this section cannot drift the way the Dockerfile's rar-support comment and the old 7zz
+ * claim did (both cited in this project's handoff prompt as the failure mode to avoid).
+ *
+ * Collision detection against the *unsaved* "Extra lftp settings" draft (`extraLftpSettings`
+ * prop) is a pure client-side comparison (`lib/effectiveLftpSettings.ts`) — no reason to
+ * round-trip a draft to the server just to compare two lists of strings.
+ */
+function EffectiveLftpSettingsSection({ extraLftpSettings }: { extraLftpSettings: string }) {
+  const [data, setData] = useState<EffectiveLftpSettingsOut | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState<string | null>(null)
+
+  useEffect(() => {
+    getEffectiveLftpSettings()
+      .then(setData)
+      .catch((err) => setError(err instanceof Error ? err.message : String(err)))
+      .finally(() => setLoading(false))
+  }, [])
+
+  const collisions = useMemo(
+    () => (data ? findLftpSettingCollisions(extraLftpSettings, data.kinds) : []),
+    [data, extraLftpSettings],
+  )
+
+  return (
+    <details className="group rounded-md border border-zinc-200 dark:border-zinc-800">
+      <summary className="cursor-pointer select-none px-4 py-3 text-sm font-medium text-zinc-700 dark:text-zinc-300">
+        What lftpweb already sets
+        {collisions.length > 0 && (
+          <span className="ml-2 font-normal text-amber-600 dark:text-amber-400">
+            — {collisions.length} line{collisions.length === 1 ? '' : 's'} below collide
+            {collisions.length === 1 ? 's' : ''} with a setting lftpweb already applies
+          </span>
+        )}
+      </summary>
+      <div className="flex flex-col gap-4 border-t border-zinc-200 px-4 py-3 dark:border-zinc-800">
+        <p className={hintClasses}>
+          Every job's rc file and transfer command, generated from this page's own settings —
+          so you can tell whether a line in the box below is adding something new, duplicating
+          what's already here, or overriding it. Never includes credentials (the seedbox
+          password and ssh identity are built separately and never reach this readout).
+        </p>
+        {loading && <p className="text-sm text-zinc-500 dark:text-zinc-400">Loading…</p>}
+        {error && <p className="text-sm text-red-600 dark:text-red-400">{error}</p>}
+        {data && (
+          <>
+            {collisions.length > 0 && (
+              <div className="flex flex-col gap-2 rounded-md border border-amber-300 bg-amber-50 p-3 dark:border-amber-800 dark:bg-amber-950/30">
+                <p className="text-sm font-medium text-amber-800 dark:text-amber-300">
+                  Your "Extra lftp settings" box sets the same key lftpweb already sets, below.
+                </p>
+                <ul className="flex flex-col gap-1 text-sm text-amber-800 dark:text-amber-300">
+                  {collisions.map((c, i) => (
+                    <li key={i} className="font-mono text-xs">
+                      {c.key}: lftpweb writes{' '}
+                      {c.lftpwebOccurrences.map((o) => `${o.value} (${o.kind})`).join(', ')} — your
+                      line sets it to {c.userValue}
+                    </li>
+                  ))}
+                </ul>
+                <p className={hintClasses}>
+                  Your line is appended after every setting lftpweb writes, and lftp applies
+                  the last <code>set</code> for a given key — verified against a real lftp
+                  binary (tests/test_lftp_settings_accepted.py), so your value is the one that
+                  takes effect.
+                </p>
+              </div>
+            )}
+            {data.kinds.map((k) => (
+              <div key={k.kind} className="flex flex-col gap-2">
+                <h4 className="text-xs font-semibold uppercase tracking-wide text-zinc-500 dark:text-zinc-400">
+                  {k.kind === 'mirror' ? 'Directory downloads (mirror)' : 'Single-file downloads (pget)'}
+                </h4>
+                <p className="break-all rounded bg-zinc-100 px-2 py-1.5 font-mono text-xs text-zinc-800 dark:bg-zinc-900 dark:text-zinc-200">
+                  {k.argv}
+                </p>
+                <p className={hintClasses}>{k.argv_why}</p>
+                <div className="overflow-x-auto">
+                  <table className="w-full text-left text-xs">
+                    <thead>
+                      <tr className="text-zinc-500 dark:text-zinc-400">
+                        <th className="pb-1 pr-3 font-medium">Setting</th>
+                        <th className="pb-1 pr-3 font-medium">Value</th>
+                        <th className="pb-1 font-medium">Why</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {k.rc_settings.map((s) => (
+                        <tr key={s.key} className="align-top">
+                          <td className="py-1 pr-3 font-mono text-zinc-800 dark:text-zinc-200">
+                            {s.key}
+                            {s.configurable && (
+                              <span className="ml-1 rounded bg-zinc-200 px-1 text-[10px] font-sans font-normal text-zinc-600 dark:bg-zinc-800 dark:text-zinc-400">
+                                from this page
+                              </span>
+                            )}
+                          </td>
+                          <td className="py-1 pr-3 font-mono text-zinc-800 dark:text-zinc-200">
+                            {s.value}
+                          </td>
+                          <td className={`py-1 ${hintClasses}`}>{s.why}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            ))}
+            <p className={hintClasses}>{data.bandwidth_note}</p>
+          </>
+        )}
+      </div>
+    </details>
+  )
+}
+
 /** Settings → Transfer (DESIGN.md §4.5, §9.2, §9.3). Site-level bandwidth, concurrency, fast
  * lane, and retry -- "a queue governs what and where, never how fast" (§4.5), so these
  * twelve fields are the entire transfer-tuning surface for the whole instance, not per-queue.
@@ -678,6 +810,8 @@ export function TransferTab() {
       <SettleGateSection />
 
       <DownloadPrefixSection />
+
+      <EffectiveLftpSettingsSection extraLftpSettings={form.extraLftpSettings} />
 
       <div className="flex flex-col gap-2 rounded-md border border-zinc-200 p-4 dark:border-zinc-800">
         <h3 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">

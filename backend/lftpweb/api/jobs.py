@@ -14,14 +14,19 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Request
 
 from lftpweb.core import audit, local_delete
+from lftpweb.core.lftp import build_transfer_command, effective_tuning_settings
 from lftpweb.core.queue import (
     JobNotDismissableError,
     TransferSettings,
     load_transfer_settings,
     save_transfer_settings,
 )
+from lftpweb.core.remote import parse_connection_limit
 from lftpweb.models import (
     DeleteItemResponse,
+    EffectiveLftpJobKind,
+    EffectiveLftpSetting,
+    EffectiveLftpSettingsOut,
     JobOut,
     JobsResponse,
     QueueItemRequest,
@@ -486,3 +491,102 @@ async def put_transfer_settings(body: TransferSettingsIn, request: Request) -> T
     if q is not None:
         q.request_tick()
     return _settings_out(settings)
+
+
+# --- Settings -> Transfer's "effective lftp settings" readout (2026-08-14,
+# prompts/2026-08-14-show-effective-lftp-settings.md) -------------------------------------
+#
+# A user typing into "Extra lftp settings" has no way to tell whether they're adding a
+# setting, duplicating one, or fighting one that lftpweb already sets -- this is the read-only
+# answer, placed next to that field. Credential-free by construction (see
+# `core/lftp.py.effective_tuning_settings`'s own docstring): this handler never imports or
+# touches `HostCreds`, `build_rc_text`, or anything that has ever seen a password or key path,
+# so there is no rendered-output string to filter and nothing here to audit for a stray
+# credential slipping through.
+
+# Illustrative-only paths for the argv preview -- never a real queue's remote/local path, since
+# this endpoint has no queue context (it's a site-level page). `build_transfer_command` doesn't
+# care what the paths look like; only the flags around them are what this exists to show.
+_ARGV_PREVIEW_REMOTE = "<remote-path>/<item>"
+_ARGV_PREVIEW_LOCAL = "<local-path>/<item>"
+
+_ARGV_WHY = {
+    "pget": (
+        "`-c` (continue) is what makes a restart resumable rather than starting over from "
+        "byte zero (DESIGN.md §4.1) -- load-bearing for restart survivability. `-n` is "
+        "connections for this one file."
+    ),
+    "mirror": (
+        "`-c` (continue) is what makes a restart resumable rather than re-fetching everything "
+        "already on disk (DESIGN.md §4.1). `--parallel` is files transferred at once within "
+        "this job; `--use-pget-n` is connections per file. A queue with file-exclude patterns "
+        "adds one `--exclude-glob '<pattern>'` per pattern (DESIGN.md §4.7) -- not shown here "
+        "since this page has no queue context; see that queue's own pattern editor."
+    ),
+}
+
+_BANDWIDTH_NOTE = (
+    "A per-job bandwidth cap (net:limit-total-rate) is always set on a real job, computed at "
+    "admission time (DESIGN.md §4.5) from how many jobs are currently sharing the ceiling -- "
+    "see the live connection-count readout above for what a job admitted right now would get."
+)
+
+
+async def _effective_connection_limit(request: Request) -> int | None:
+    cursor = await request.app.state.db.execute(
+        "SELECT connection_overrides FROM host ORDER BY id LIMIT 1"
+    )
+    row = await cursor.fetchone()
+    if row is None:
+        return None
+    return parse_connection_limit(row["connection_overrides"])
+
+
+def _kind_settings(
+    kind: str, settings: TransferSettings, connection_limit: int | None
+) -> EffectiveLftpJobKind:
+    pget_n = settings.mirror_use_pget_n if kind == "mirror" else settings.pget_default_n
+    rc_settings = [
+        EffectiveLftpSetting(key=ts.key, value=ts.value, why=ts.why, configurable=ts.configurable)
+        for ts in effective_tuning_settings(
+            # Not the numeric bandwidth cap -- see `_BANDWIDTH_NOTE` above for why that's prose
+            # here rather than a value from this function.
+            rate_limit_bps=None,
+            connection_limit=connection_limit,
+            parallel=settings.mirror_parallel_transfer_count,
+            pget_n=pget_n,
+            save_status_interval_s=1,  # always 1 -- see JobSpec's own default, never configurable
+        )
+    ]
+    if kind == "mirror":
+        argv = build_transfer_command(
+            "mirror",
+            _ARGV_PREVIEW_REMOTE,
+            _ARGV_PREVIEW_LOCAL,
+            parallel=settings.mirror_parallel_transfer_count,
+            pget_n=pget_n,
+            exclude_globs=(),
+        )
+    else:
+        argv = build_transfer_command(
+            "pget",
+            _ARGV_PREVIEW_REMOTE,
+            _ARGV_PREVIEW_LOCAL,
+            parallel=settings.mirror_parallel_transfer_count,
+            pget_n=pget_n,
+            exclude_globs=(),
+        )
+    return EffectiveLftpJobKind(
+        kind=kind, argv=argv, argv_why=_ARGV_WHY[kind], rc_settings=rc_settings
+    )
+
+
+@router.get("/api/settings/transfer/effective-lftp", response_model=EffectiveLftpSettingsOut)
+async def get_effective_lftp_settings(request: Request) -> EffectiveLftpSettingsOut:
+    settings = await load_transfer_settings(request.app.state.db)
+    connection_limit = await _effective_connection_limit(request)
+    kinds = [
+        _kind_settings("mirror", settings, connection_limit),
+        _kind_settings("pget", settings, connection_limit),
+    ]
+    return EffectiveLftpSettingsOut(kinds=kinds, bandwidth_note=_BANDWIDTH_NOTE)

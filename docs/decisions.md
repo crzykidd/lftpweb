@@ -6,6 +6,61 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-14 — "Effective lftp settings" readout: split the rc builder into a credential half and a generated tuning half, rather than filtering rendered text; declined to compute a numeric bandwidth-cap preview; collision-winner claim gated on a real-lftp test
+
+**Handoff prompt `prompts/done/2026-08-14-show-effective-lftp-settings.md`, executed end to
+end.** Three decisions worth recording separately from the CHANGELOG entry:
+
+**Structural credential separation, not string-filtering.** The prompt's hard requirement was
+that the two credential-bearing rc lines (`sftp:connect-program`, `open -u ...`) never reach
+this feature's response, and that this hold even after a future setting is added to
+`core/lftp.py`. The straightforward-looking alternative — render the full rc via the existing
+`build_rc_text` and strip/grep out the `open`/`connect-program` lines before returning them —
+was rejected: it would work today, but a new credential-bearing line added to `build_rc_text`
+later would silently start being published unless whoever added it remembered this filter
+exists. Instead, `build_rc_text` was refactored so its tuning half is built by a new pure
+function, `effective_tuning_settings()`, that never receives `HostCreds` and cannot construct
+an `open`/`connect-program` line even by accident — the credential lines are built directly in
+`build_rc_text`, in the same two places they always were, and never pass through the function
+the API endpoint calls. The split is enforced by what each function's signature can even see,
+not by a rule someone has to remember to follow.
+
+**No numeric prediction for `net:limit-total-rate`.** Every other rc line is a fixed value or a
+straightforward function of `TransferSettings`, but the per-job bandwidth cap is computed by
+`core/scheduler.py`'s admission formula (DESIGN.md §4.5) from how many jobs are *currently*
+sharing the ceiling — genuinely dynamic, runtime state this static endpoint has no access to.
+Reimplementing a "what would a job get right now" preview here was rejected: it would duplicate
+scheduler admission math in a second place (this project's `TransferTab.tsx` already has exactly
+that duplication once, for the *existing* live connection-count readout, with a comment
+explaining it's a client-side mirror of `effective_small_lane_reserve_bps()` kept in lockstep by
+hand) — a third copy of the same formula, for a feature whose whole purpose is preventing drift,
+would be the wrong tradeoff. The line is shown as prose ("computed at admission time... see the
+live connection-count readout above") instead of a number.
+
+**The "your line wins" claim is gated on a passing real-lftp test, not asserted from reasoning.**
+The prompt required verifying last-write-wins against a real lftp binary before the UI says
+anything about which side of a collision takes effect. Confirmed interactively first
+(`lftp -c "set K v1; set K v2; set -a"` prints only `v2`), then written as a permanent
+regression test, `test_extra_lftp_settings_override_a_colliding_lftpweb_default` in
+`tests/test_lftp_settings_accepted.py` — it builds a real rc via `build_rc_text` with a
+colliding `extra_settings` line, `source`s it in a real lftp process, and asserts `set -a` shows
+only the override. Both the frontend copy shown on a detected collision and this decision entry
+cite that test rather than lftp's documented behaviour, since `tests/test_lftp_settings_accepted.py`'s
+own docstring is explicit that lftp's parser is exactly the kind of thing this project has been
+burned by trusting without checking (the `net:reconnect-interval-base` bare-number bug that test
+file already exists because of).
+
+**Collision detection lives in the frontend as a pure function, not the backend.** `lib/
+effectiveLftpSettings.ts`'s `findLftpSettingCollisions` compares the *unsaved* "Extra lftp
+settings" textarea draft against the fetched effective-settings response, client-side. Doing
+this on the backend would mean either round-tripping the unsaved draft to a server endpoint on
+every keystroke, or duplicating the parsing logic in both places — a pure function the frontend
+already owns (matching this project's existing convention: `resetWarning.ts`,
+`transferTiming.ts`, `resetComposition.ts` are all pure `lib/` functions computed over data the
+component already has) is the smaller, more testable surface.
+
+---
+
 ## 2026-08-14 — Rename off the download-prefix moved to `core/postprocess.py`'s last step, reversing that same day's "at the DOWNLOADED transition, not after verify" entry
 
 **Handoff prompt `prompts/done/2026-08-14-rename-after-postprocessing-not-before.md`, executed
