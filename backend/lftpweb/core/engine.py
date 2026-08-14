@@ -9,15 +9,20 @@ change takes effect on the *next* cycle without a restart), scans each enabled q
 and local trees, reconciles them (`core/reconcile.py`), persists the result to `item` rows, and
 publishes the fresh model over `core/events.py` for `api/ws.py` to fan out.
 
-**Simplification recorded rather than silently taken:** DESIGN.md §5 specifies two cadences —
-remote scan every 30s, a faster local-only walk every 10s (the 1 Hz active-file poll that
-covers the gap is phase 3's `ProgressSampler`, since there's no active transfer to sample yet).
-Phase 2 runs one combined interval instead; see docs/decisions.md. Splitting the cadence is a
-scale optimization for when scans are expensive, not a phase 2 correctness requirement — every
-verification in the phase 2 prompt is satisfied by a fresh combined scan, and `request_rescan()`
-gives an immediate on-demand path that doesn't wait on either interval. The per-queue interval
-above is a different axis from this one — one combined remote+local scan *per queue*, at a
-cadence that can now vary *across* queues — and does not revisit this simplification.
+**Simplification recorded, then partially restored.** DESIGN.md §5 originally specified two
+cadences — remote scan every 30s, a faster local-only walk every 10s (the 1 Hz active-file poll
+that covers the gap is phase 3's `ProgressSampler`). Phase 2 collapsed that into one combined
+interval (docs/decisions.md's phase 2 entry) because nothing was producing local-only changes
+on that timescale yet. `prompts/2026-08-14-adaptive-scan-cadence-when-active.md` restored the
+local half: while a queue is active (`queue_is_active` below — a running job, an item mid
+download/verify/extract, an item held at the settle gate, or post-processing in flight), an
+additional local-only pass (`_scan_queue_local_only`, `ACTIVE_SCAN_INTERVAL_S`, default 5s)
+runs *between* full scans, reconciling a fresh local walk against the **cached** remote tree
+from this queue's last full scan (`_cached_remote_tree`) — never a fresh SSH round trip. The
+remote/full cadence itself (`_next_due`/`_schedule_next`, per-queue `effective_scan_interval`)
+is untouched by activity; see that docstring and docs/decisions.md's entry for this task for
+why a local-only pass must never advance `item_settle` and must never run before a queue's
+first successful full scan.
 
 **The loop is a single serial `asyncio.Task` (`_loop`/`start`/`stop`), never concurrent
 fan-out.** `scan_all` awaits each due queue's `scan_queue` one at a time, in the same task that
@@ -55,6 +60,98 @@ from lftpweb.core.remote import HostConfig, RemoteConnectionPool, RemoteEntry, R
 logger = logging.getLogger(__name__)
 
 DEFAULT_SCAN_INTERVAL_S = 30.0
+
+# `prompts/2026-08-14-adaptive-scan-cadence-when-active.md`, restoring the local half of
+# DESIGN.md §5's original two-cadence design (docs/decisions.md). The user's own rule,
+# verbatim: "local refresh 5 seconds if there is an active job, arriving, downloading etc." A
+# named module constant, not a bare literal, and not (yet) a settings row -- see
+# `resolve_active_check_interval`'s docstring for how it composes with a queue's own configured
+# interval, and this task's decisions.md entry for why a settings row was deferred.
+ACTIVE_SCAN_INTERVAL_S = 5.0
+
+# The item-lifecycle states `queue_is_active` treats as "a transfer or post-processing step is
+# actively touching this item's files right now" -- DESIGN.md §3.2's transient vocabulary,
+# minus QUEUED (waiting, not yet touching anything) and minus the settle-gate hold (REMOTE_ONLY
+# + substate='settling'), which `queue_is_active` checks separately since it isn't a `state`
+# value on its own.
+_TRANSIENT_ACTIVE_STATES = ("DOWNLOADING", "VERIFYING", "EXTRACTING")
+
+
+def resolve_active_check_interval(full_interval: float | None) -> float | None:
+    """The cadence at which `Engine` re-evaluates whether a queue is active and, if so, runs
+    another local-only pass (`_scan_queue_local_only`) -- layered on top of that queue's own
+    resolved full-scan interval (`effective_scan_interval`), never replacing it.
+
+    `None` propagates as `None`: a queue whose full-scan interval already resolved to
+    "on-demand only" (§5's `scan_interval_s = 0` convention) must not gain a timer of any kind
+    just by becoming active -- this task's own explicit requirement, proven by
+    `tests/test_engine_scan_cadence.py`. Otherwise `min(full_interval, ACTIVE_SCAN_INTERVAL_S)`
+    -- a queue already configured *faster* than the active floor keeps its own faster cadence
+    rather than being slowed down to it (`min`, deliberately not "replace").
+    """
+    if full_interval is None:
+        return None
+    return min(full_interval, ACTIVE_SCAN_INTERVAL_S)
+
+
+async def queue_is_active(
+    db: aiosqlite.Connection,
+    queue_id: int,
+    postprocess_in_flight_ids: frozenset[int] = frozenset(),
+) -> bool:
+    """Whether queue `queue_id` has anything happening in it right now that the fast local-only
+    pass exists to keep current -- the predicate `Engine._queue_is_active` below evaluates once
+    per scheduling decision (never threaded through as extra engine state, per this task's own
+    brief). `True` when any of:
+
+    - a `job` row `queued` or `running` for one of this queue's items
+    - an item in a transient lifecycle state (`_TRANSIENT_ACTIVE_STATES`)
+    - an item held at the settle gate (`REMOTE_ONLY`/`substate='settling'`) -- the "arriving"
+      case the user named explicitly
+    - an item `PostprocessPipeline.in_flight_item_ids()` (passed in as `postprocess_in_flight_ids`
+      -- an in-memory set, not a table) is currently working on
+
+    One query -- a `UNION` of indexed `EXISTS`-shaped selects (`idx_item_queue_id`,
+    `idx_item_state`, `idx_job_state`, `idx_job_item_id` already cover every branch) -- not four
+    round trips. A free function, not an `Engine` method, so it's unit-testable against a bare
+    `aiosqlite.Connection` and a hand-built `item`/`job` fixture, no running engine required.
+    """
+    in_flight = sorted(postprocess_in_flight_ids)
+    in_flight_clause = (
+        " UNION SELECT 1 FROM item WHERE item.queue_id = ? AND item.id IN "
+        f"({','.join('?' for _ in in_flight)})"
+        if in_flight
+        else ""
+    )
+    # Positional params, in the exact order their `?` placeholders appear above: job/queued
+    # clause, transient-state clause (queue_id then the state list), settling clause, and --
+    # only when non-empty -- the in-flight clause (queue_id then the id list).
+    params: list[Any] = [
+        queue_id,
+        queue_id,
+        *_TRANSIENT_ACTIVE_STATES,
+        queue_id,
+    ]
+    if in_flight:
+        params.append(queue_id)
+        params.extend(in_flight)
+    cursor = await db.execute(
+        "SELECT EXISTS ("
+        "  SELECT 1 FROM job JOIN item ON item.id = job.item_id"
+        "  WHERE item.queue_id = ? AND job.state IN ('queued', 'running')"
+        "  UNION"
+        "  SELECT 1 FROM item WHERE item.queue_id = ? AND item.state IN "
+        f"({','.join('?' for _ in _TRANSIENT_ACTIVE_STATES)})"
+        "  UNION"
+        "  SELECT 1 FROM item WHERE item.queue_id = ? AND item.state = 'REMOTE_ONLY' "
+        "AND item.substate = 'settling'"
+        f"{in_flight_clause}"
+        ")",
+        params,
+    )
+    row = await cursor.fetchone()
+    return bool(row[0])
+
 
 # 2026-08-13 (prompts/2026-08-13-vanished-rows-should-leave-the-tree.md): the two states
 # `_persist`'s vanished-from-both-trees sweep can land on that mean "gone for good, in neither
@@ -333,6 +430,23 @@ class Engine:
         # resolved to `None` (the "none" / on-demand-only choice) -- kept distinct from simply
         # never appearing in the dict, which instead means "not yet scanned even once."
         self._next_due: dict[int, float] = {}
+        # Companion to `_next_due`, for the ~5s active-only local pass
+        # (`prompts/2026-08-14-adaptive-scan-cadence-when-active.md`, `ACTIVE_SCAN_INTERVAL_S`)
+        # layered on top of it -- same `time.monotonic()`-comparable / `math.inf`-means-never
+        # convention, set alongside `_next_due` every time a *full* scan runs (see `scan_all`)
+        # and re-set on its own between full scans (see `_schedule_next_local`). A forced pass
+        # restarts this clock too, for the same reason `_next_due`'s own comment gives.
+        self._next_local_due: dict[int, float] = {}
+        # This queue's remote tree as of its last full scan (`scan_queue`, refreshed there on
+        # every successful `self.pool.scan`, including a partial-scan warning -- never left
+        # stale across one) -- what a local-only pass (`_scan_queue_local_only`) reconciles a
+        # fresh local walk against instead of re-reading the seedbox. Absent entirely for a
+        # queue that has never completed a full scan; that absence is the guard
+        # `_scan_queue_local_only`'s caller checks before ever calling it (a local-only pass
+        # against no remote tree at all would read every local file as `LOCAL_ONLY` and, worse,
+        # feed `_persist`'s vanished-row sweep an empty remote for every previously-tracked
+        # path -- see this task's decisions.md entry).
+        self._cached_remote_tree: dict[int, dict[str, RemoteEntry]] = {}
         # Set by `request_rescan()`, consumed and cleared by `_loop` on its next wake: a forced
         # pass scans every enabled queue regardless of its own due time (the same "Rescan now" /
         # config-change semantics this loop has always had), and *also* restarts every scanned
@@ -435,13 +549,17 @@ class Engine:
 
     def _next_wake_delay(self) -> float | None:
         """How long `_loop` should sleep before its next pass: the shortest remaining time
-        across every *enabled* queue's own next-due, clamped so it is never negative (an
-        overrunning scan can only ever push a queue's own next-due into the future -- see
-        `scan_all` -- but this still guards the general case defensively). A queue not yet in
-        `_next_due` (never scanned) is due right now, so its presence alone collapses the whole
-        result to `0.0` without needing to compare a timestamp. A queue schedules `math.inf`
-        (never on a timer -- see `_next_due`'s own comment) and is excluded from the min()
-        below; if every enabled queue is like that, or there are no enabled queues, there is
+        across every *enabled* queue's own next-due -- **both** clocks, `_next_due` (full scans)
+        and `_next_local_due` (the ~5s active-only local pass, `prompts/2026-08-14-adaptive-
+        scan-cadence-when-active.md`) -- clamped so it is never negative (an overrunning scan
+        can only ever push a queue's own next-due into the future -- see `scan_all` -- but this
+        still guards the general case defensively). A queue not yet due-tracked on either clock
+        (never scanned at all) is due right now, so its presence alone collapses the whole
+        result to `0.0` without needing to compare a timestamp -- in practice this only fires
+        for a queue `scan_all` hasn't processed even once yet, since both clocks are always set
+        together on a queue's first pass (see `scan_all`). A clock reading `math.inf` (never on
+        a timer -- see `_next_due`'s own comment) is excluded from the min() below; if every
+        enabled queue's every clock is like that, or there are no enabled queues, there is
         nothing to wait *for* on a timer and this returns `None`.
         """
         now = time.monotonic()
@@ -449,12 +567,13 @@ class Engine:
         for q in self.queue_meta.values():
             if not q.enabled:
                 continue
-            due_at = self._next_due.get(q.id)
-            if due_at is None:
-                return 0.0
-            if due_at == math.inf:
-                continue
-            delays.append(due_at - now)
+            for due_times in (self._next_due, self._next_local_due):
+                due_at = due_times.get(q.id)
+                if due_at is None:
+                    return 0.0
+                if due_at == math.inf:
+                    continue
+                delays.append(due_at - now)
         if not delays:
             return None
         return max(0.0, min(delays))
@@ -465,13 +584,49 @@ class Engine:
         can never make it due again before the loop has even finished this pass, let alone
         while a scan of it is still in flight (`_loop`/`scan_all` are one serial task; nothing
         in this class ever awaits two `scan_queue` calls for the same queue concurrently).
+
+        **Unaffected by activity** (`queue_is_active`) -- this is the *full*-scan clock, and
+        "the remote keeps its configured cadence" regardless of how busy the queue is
+        (`prompts/2026-08-14-adaptive-scan-cadence-when-active.md`'s explicit decision, restoring
+        DESIGN.md §5's original two-cadence shape -- see docs/decisions.md). `_schedule_next_local`
+        is the companion that *does* tighten while active.
         """
         interval = effective_scan_interval(q.scan_interval_s, self.scan_interval_s)
         self._next_due[q.id] = now + interval if interval is not None else math.inf
 
+    def _schedule_next_local(self, q: QueueConfig, *, now: float) -> None:
+        """Set queue `q`'s next *local-check* due time -- the companion clock
+        `_scan_queue_local_only`'s caller (`scan_all`) uses to decide when to next re-evaluate
+        `queue_is_active` and, if active, run another local-only pass. Same completion-time
+        scheduling discipline as `_schedule_next` (an overrunning local-only pass costs itself a
+        longer effective gap, never a stacked second one), and the same `math.inf`-means-never
+        convention when the underlying full interval is on-demand-only
+        (`resolve_active_check_interval(None) is None` -- a queue with no timer must not gain
+        one just by becoming active).
+        """
+        interval = resolve_active_check_interval(
+            effective_scan_interval(q.scan_interval_s, self.scan_interval_s)
+        )
+        self._next_local_due[q.id] = now + interval if interval is not None else math.inf
+
     def _is_due(self, queue_id: int, now: float) -> bool:
         due_at = self._next_due.get(queue_id)
         return due_at is None or now >= due_at
+
+    def _is_local_due(self, queue_id: int, now: float) -> bool:
+        due_at = self._next_local_due.get(queue_id)
+        return due_at is None or now >= due_at
+
+    async def _queue_is_active(self, queue_id: int) -> bool:
+        """`queue_is_active` (module-level, free function -- see its own docstring for why),
+        supplying it this instance's live `postprocess.in_flight_item_ids()` -- `frozenset()`
+        when no pipeline is attached, matching every other reader of that attribute in this
+        class.
+        """
+        in_flight = (
+            frozenset(self.postprocess.in_flight_item_ids()) if self.postprocess else frozenset()
+        )
+        return await queue_is_active(self.db, queue_id, in_flight)
 
     async def scan_all(self, *, force: bool = False) -> None:
         """One pass over every configured queue. `force=True` (only ever set by
@@ -480,29 +635,56 @@ class Engine:
         queues whose own `_is_due` says are due, which is the entire point of a per-queue
         cadence -- see `_loop`'s docstring-equivalent comments and
         `tests/test_engine_scan_cadence.py`.
+
+        **A queue not due for a full scan may still get a local-only pass**
+        (`prompts/2026-08-14-adaptive-scan-cadence-when-active.md`): when its `_next_local_due`
+        clock is due, this checks `queue_is_active` (one cheap query, no SSH) and, only if both
+        that *and* a cached remote tree from a prior full scan exist, runs
+        `_scan_queue_local_only`. The local clock is always rescheduled when checked -- even
+        when guarded out or found idle -- so this never busy-spins waiting on a queue that never
+        becomes active or never gets its first successful full scan.
         """
         host = await load_host_config(self.db, self.config_dir)
         queues = await load_queues(self.db)
         self.queue_meta = {q.id: q for q in queues}
 
-        # A deleted queue's leftover due-time must not linger forever -- harmless (it's never
-        # read again once the id is gone from `queue_meta`), but unbounded growth in a
-        # long-running process is still worth not doing.
+        # A deleted queue's leftover due-time (and cached remote tree) must not linger forever
+        # -- harmless (never read again once the id is gone from `queue_meta`), but unbounded
+        # growth in a long-running process is still worth not doing.
         current_ids = {q.id for q in queues}
         for stale_id in [qid for qid in self._next_due if qid not in current_ids]:
             del self._next_due[stale_id]
+        for stale_id in [qid for qid in self._next_local_due if qid not in current_ids]:
+            del self._next_local_due[stale_id]
+        for stale_id in [qid for qid in self._cached_remote_tree if qid not in current_ids]:
+            del self._cached_remote_tree[stale_id]
 
         now = time.monotonic()
         for q in queues:
             if not q.enabled:
                 continue
-            if not force and not self._is_due(q.id, now):
+            if force or self._is_due(q.id, now):
+                await self.scan_queue(q, host)
+                # Scheduled from *this queue's own* completion time, not the shared `now` above
+                # or the batch's start -- see `_schedule_next`'s docstring for why that's what
+                # actually prevents an overrunning scan from stacking a second one of the same
+                # queue. Both clocks restart here -- a full scan is strictly fresher than any
+                # local-only pass could be, so it absorbs a pending local check the same way a
+                # forced full scan already absorbs a pending natural one.
+                completion = time.monotonic()
+                self._schedule_next(q, now=completion)
+                self._schedule_next_local(q, now=completion)
                 continue
-            await self.scan_queue(q, host)
-            # Scheduled from *this queue's own* completion time, not the shared `now` above or
-            # the batch's start -- see `_schedule_next`'s docstring for why that's what actually
-            # prevents an overrunning scan from stacking a second one of the same queue.
-            self._schedule_next(q, now=time.monotonic())
+            if not self._is_local_due(q.id, now):
+                continue
+            # Guard (prompts/2026-08-14-adaptive-scan-cadence-when-active.md): never reconcile
+            # a local-only pass against a remote tree this queue hasn't actually observed yet --
+            # see `_cached_remote_tree`'s own comment for what an empty remote would do to
+            # `_persist`'s vanished-row sweep. `queue_is_active` is a real query; skip it
+            # entirely when the guard alone already rules out doing any work this tick.
+            if q.id in self._cached_remote_tree and await self._queue_is_active(q.id):
+                await self._scan_queue_local_only(q)
+            self._schedule_next_local(q, now=time.monotonic())
 
     async def scan_queue(self, q: QueueConfig, host: HostConfig | None) -> None:
         try:
@@ -520,6 +702,15 @@ class Engine:
                     "Settings -> Connection"
                 )
             remote_tree, scan_warning = await self.pool.scan(host, q.remote_path)
+            # Refreshed here, unconditionally, on every successful remote read -- including one
+            # that comes back with a `scan_warning` (a partial scan still returns a real tree,
+            # just possibly missing an unreadable subtree; see `core/remote.py.interpret_
+            # primary_scan_result`). Never touched on the exception path below -- a queue whose
+            # remote scan fails outright keeps its last-known-good cached tree rather than losing
+            # it, the same "don't invent data, don't discard good data either" shape every other
+            # failure path in this method already has. `_scan_queue_local_only` is this cache's
+            # only reader.
+            self._cached_remote_tree[q.id] = remote_tree
             local_tree = local_scan.scan_local(q.local_path)
 
             # The mount sentinel (DESIGN.md §7.3, required starting this phase — see
@@ -634,6 +825,81 @@ class Engine:
                 }
             )
 
+    async def _scan_queue_local_only(self, q: QueueConfig) -> None:
+        """The fast (~`ACTIVE_SCAN_INTERVAL_S`) pass while queue `q` is active
+        (`queue_is_active`) -- `prompts/2026-08-14-adaptive-scan-cadence-when-active.md`,
+        restoring the local half of DESIGN.md §5's original two-cadence design. Rescans **only**
+        the local filesystem and reconciles it against `self._cached_remote_tree[q.id]`, the
+        tree from this queue's last full scan -- never an SSH round trip. Callers (`scan_all`)
+        must not invoke this before that cache exists; see `_cached_remote_tree`'s own comment
+        for what a missing/empty remote tree would do to `_persist`'s vanished-row handling.
+
+        **`fingerprints=None`** on the `_persist` call below -- the one line that matters most
+        in this whole task. This pass never re-read the remote, so it has no fresh evidence
+        about whether a top-level item is still arriving; `_persist` reads the *last-persisted*
+        settle verdict to decide whether a `DOWNLOADED` reading is still gated (so an item the
+        real settle gate hasn't cleared yet cannot be released early just because local bytes
+        caught up to a stale cached remote total), but never advances or resets
+        `item_settle` itself -- `settle.save_settle_records` is only ever called when this
+        pass's own `new_settle` accumulates something, which it cannot when `fingerprints` is
+        `None` (see `_persist`'s docstring). `tests/test_engine_scan_cadence.py` asserts
+        `item_settle` is byte-for-byte unchanged by a local-only pass.
+
+        No `scan_error`/`scan_complete` events -- those are the full-scan "Rescan now" button's
+        completion signal (see `scan_queue`'s own comments); a background local-only heartbeat
+        firing one every few seconds would be noise a client has no reason to wait on. A
+        `queue_delta` still goes out, same as every full pass, so sibling-item and transient-
+        state changes reach the Files page without waiting on the next full scan.
+        """
+        cached_remote = self._cached_remote_tree.get(q.id)
+        if cached_remote is None:
+            return
+        try:
+            local_tree = local_scan.scan_local(q.local_path)
+
+            # Local-only, same as `scan_queue`'s own use of this sentinel -- no SSH involved
+            # either way.
+            mount_sentinel.write_if_needed(q.local_path)
+            self.mount_ok[q.id] = mount_sentinel.check(q.local_path)
+
+            compiled = await patterns.compiled_for_queue(self.db, q.id)
+            pattern_predicate = patterns.build_counts_predicate(compiled)
+            deleted_archive_paths = await local_delete.load_deleted_archive_paths(self.db, q.id)
+            counts_predicate = build_scan_counts_predicate(pattern_predicate, deleted_archive_paths)
+            nodes = reconcile(cached_remote, local_tree, counts_predicate=counts_predicate)
+
+            written = await self._persist(q.id, nodes, fingerprints=None, partial_scan=False)
+            published = await self._project(q.id, written)
+
+            old_nodes = self.models.get(q.id, {})
+            changed, removed = diff_nodes(old_nodes, published)
+            self.models[q.id] = published
+
+            self.last_scan_at[q.id] = _now_iso()
+            self.events.publish(
+                {
+                    "type": "queue_delta",
+                    "queue_id": q.id,
+                    "queue_name": q.name,
+                    "changed": changed,
+                    "removed": removed,
+                    "scanned_at": self.last_scan_at[q.id],
+                    "warning": self.scan_warnings.get(q.id),
+                }
+            )
+
+            if self.autoqueue is not None:
+                await self.autoqueue.on_scan(
+                    QueueAutoConfig(
+                        id=q.id,
+                        local_path=q.local_path,
+                        auto_queue_enabled=q.auto_queue_enabled,
+                        patterns_only=q.auto_queue_patterns_only,
+                    )
+                )
+        except Exception:  # noqa: BLE001 - one bad local-only tick must not kill the loop
+            logger.exception("local-only scan failed for queue %s (%s)", q.id, q.name)
+
     async def _protected_rel_paths(self, queue_id: int) -> set[str]:
         """Items whose `state` this scan pass must **not** overwrite — DESIGN.md never says
         who wins when a periodic rescan's structural state (REMOTE_ONLY/PARTIAL/DOWNLOADED,
@@ -744,9 +1010,19 @@ class Engine:
         `fingerprints`/`partial_scan` feed the settle gate (`core/settle.py`,
         prompts/open-issues.md #2): `fingerprints` is keyed by the *un*-safe-texted top-level
         `rel_path`, matching `node.rel_path` and the tree `settle.compute_fingerprints` was
-        built from; `None` (every existing caller/test before this task) disables the gate
-        entirely regardless of the site setting, the same "opt in explicitly or nothing
-        changes" shape every other gate in this method already has.
+        built from.
+
+        **`fingerprints=None` (`prompts/2026-08-14-adaptive-scan-cadence-when-active.md`'s
+        local-only pass, and every caller/test before that task) never advances or writes
+        `item_settle`** -- `new_settle` can only gain an entry inside the `fingerprints is not
+        None` branch below, so `save_settle_records` (only called `if new_settle:`) is a no-op
+        for the whole pass. It does **not** mean "disable the gate": the *last-persisted*
+        verdict (`prev_settle`, now always loaded, not conditionally) still gates a fresh
+        `DOWNLOADED` reading exactly as it would on a full scan -- read-only, via the
+        `fingerprints is None` branch just below -- because a pass with no new remote evidence
+        must not be able to release an item the real gate hasn't actually cleared, merely
+        because a stale cached remote total and a freshly-caught-up local tree happen to match
+        (see this task's decisions.md entry for the scenario this closes).
         """
         from lftpweb.core.util import to_safe_text
 
@@ -757,7 +1033,10 @@ class Engine:
         written: set[str] = set()
 
         settle_settings = await settle.load_settle_settings(self.db)
-        prev_settle = await settle.load_settle_records(self.db, queue_id) if fingerprints else {}
+        # Unconditional: needed both to *advance* (fingerprints supplied) and to *read-only
+        # enforce* (fingerprints is None) the gate -- see the branch below and this method's
+        # own docstring.
+        prev_settle = await settle.load_settle_records(self.db, queue_id)
         new_settle: dict[str, settle.SettleRecord] = {}
         # prompts/open-issues.md #2's stuck-item follow-up: `rel_path`s this pass releases from
         # a settle-gate hold straight to DOWNLOADED, so post-processing can be triggered for
@@ -786,6 +1065,13 @@ class Engine:
                         now=now.timestamp(),
                     )
                     new_settle[rel_path] = settle_record
+            elif fingerprints is None and "/" not in node.rel_path:
+                # `prompts/2026-08-14-adaptive-scan-cadence-when-active.md`: a local-only pass
+                # has no fresh fingerprint to advance the counter with, but the gate's
+                # last-persisted verdict still applies -- read `prev_settle` straight through,
+                # untouched. `new_settle` gains nothing here (this is the branch, not the write
+                # side), so `item_settle` stays byte-for-byte what it was before this pass.
+                settle_record = prev_settle.get(rel_path)
 
             if rel_path in protected:
                 # 2026-08-13 (prompts/2026-08-13-delete-state-truthfulness.md, defect 2): a

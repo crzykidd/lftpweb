@@ -490,6 +490,22 @@ alongside this list: several entries below ship with deliberate, documented limi
   so the text is announced. Demonstrated on three fields here (**Sync mode**, **Patterns-only**,
   and **Known-hosts policy**); a companion task applies it across the rest of the settings
   surface.
+- **Adaptive scan cadence: a queue refreshes every ~5 seconds while something is actually
+  happening in it** *(2026-08-14)*. Previously every queue polled at one fixed interval
+  (default 30s, overridable per queue) regardless of activity, so the Files page could lag
+  reality by most of that interval while a transfer was running, an item was settling, or
+  post-processing was working. Now, while a queue has a running job, an item mid
+  download/verify/extract, an item held at the settle gate ("arriving"), or post-processing in
+  flight, an additional local-only pass runs every `min(configured interval, 5s)` between full
+  scans — filesystem only, no SSH round trip, reconciled against the remote tree from the
+  queue's last full scan. **The remote side keeps its own configured cadence unchanged** — this
+  restores, rather than invents, the two-cadence shape `DESIGN.md` §5 originally specified
+  before phase 2 collapsed it into one interval (`docs/decisions.md`). A queue configured with
+  no timer (on-demand only) or already faster than 5s is unaffected. See `docs/decisions.md`
+  for the settle-gate interaction this required getting right: a local-only pass never advances
+  or resets `item_settle`, but still enforces whatever verdict the gate last recorded, so an
+  item the real gate hasn't cleared cannot be released early just because local bytes caught up
+  to a stale cached remote total.
 
 ### Changed
 

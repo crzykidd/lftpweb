@@ -6,6 +6,116 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-14 — Adaptive scan cadence: restoring, not inventing, DESIGN.md §5's split cadence — and a settle-gate enforcement gap the naive version would have reopened
+
+**Handoff prompt `prompts/done/2026-08-14-adaptive-scan-cadence-when-active.md`, executed end to
+end.** The user's rule, verbatim: "local refresh 5 seconds if there is an active job, arriving,
+downloading etc." `core/engine.py`'s per-queue scan interval (migration 009,
+`prompts/done/2026-08-12-per-queue-scan-interval.md`) was one fixed cadence regardless of
+activity, so the Files page could lag reality by most of a 30s interval exactly while it mattered
+most.
+
+**This is a restoration, not a new design.** `DESIGN.md` §5 originally specified two cadences —
+remote scan every 30s, a faster local-only walk every 10s — and phase 2 collapsed that into one
+combined interval because nothing was producing local-only changes on that timescale yet (its own
+decisions.md entry, "one combined scan interval, not DESIGN.md §5's separate 30s remote / 10s
+local cadences," 2026-08-11, said explicitly that splitting the cadence was deferred, not
+rejected, and that `scan_queue` already separated the remote scan, the local scan, and the
+reconcile call so a second, faster local-only loop wouldn't need restructuring it later). This
+task is that later moment. The shape differs in one respect from the original: the fast cadence
+is now conditional on activity (`queue_is_active`) rather than unconditional, since a fully idle
+queue gains nothing from a faster local walk and the original 10s-always design was written before
+anything but the fixed timer existed to compare against.
+
+**Design chosen: two independent per-queue due-time clocks (`_next_due`, `_next_local_due`),
+driven by the same single `_loop`/`asyncio.wait_for` primitive, not two timer loops.**
+`_next_wake_delay` takes the min across both dicts for every enabled queue. `_next_due` (the
+full-scan clock) is completely untouched by activity — `_schedule_next` still resolves purely
+from `effective_scan_interval`, so "the remote keeps its configured cadence" is true by
+construction, not by a special case. `_next_local_due` is a companion clock, always rescheduled to
+`now + min(configured, ACTIVE_SCAN_INTERVAL_S)` every time it's checked — whether or not the queue
+turned out active, whether or not a cached remote tree exists yet — specifically so it never
+busy-spins and never goes silent. A queue whose own full interval already resolves to `None`
+(on-demand only) gets `math.inf` on this clock too (`resolve_active_check_interval(None) is
+None`), so it never gains a timer of any kind from becoming active.
+
+**Rejected: a single dict where "the next pass" alternates between full and local-only,
+determined by comparing elapsed time to the full interval.** Tried first, on the theory that "one
+schedule, `min()`'d while active" was the literal reading of the prompt's "the interval for the
+next pass becomes `min(configured, ACTIVE_SCAN_INTERVAL_S)`." It works, but only by inventing a
+second `_last_full_scan_at` timestamp anyway to know which kind of pass a given firing should be —
+no simpler than two dicts, and it makes `_next_due`'s long-standing meaning ("this queue's own
+full-scan due time," read and tested directly by `tests/test_engine_scan_cadence.py`) ambiguous
+mid-refactor. Two dicts keep that existing contract untouched and add one clearly-named companion
+next to it instead.
+
+**Rejected: only start the local-only heartbeat once activity is first observed, instead of
+running it continuously.** This would avoid the modest constant cost of a cheap DB query every
+~5s per enabled queue even while fully idle. Rejected because nothing else in the loop is woken by
+a job starting (`core/queue.py.TransferQueue` runs its own separate `_wake`/tick loop; enqueuing a
+job never calls `Engine.request_rescan()`), so if the local clock only started ticking once
+activity was already known, the *first* detection of new activity would still be gated on the
+queue's full-scan clock — up to the full configured interval away, defeating the "5 seconds"
+promise for exactly the moment it matters most (a user just clicked Queue). Running the heartbeat
+unconditionally, and paying one indexed `EXISTS`-shaped query per tick, bounds that detection
+latency to `ACTIVE_SCAN_INTERVAL_S` regardless of prior state — the query is local SQLite against
+`idx_item_queue_id`/`idx_item_state`/`idx_job_state`/`idx_job_item_id`, not the SSH round trip
+this task's own brief was explicit about not paying more often.
+
+**The bug the naive "`fingerprints=None` disables the gate" reading would have reintroduced, found
+before it shipped.** The prompt's own text says a local-only pass should "skip the [settle]
+bookkeeping entirely, exactly as `_persist` already does when `fingerprints is None`." Read
+literally, that also skips *enforcement* — `_persist`'s completion-gate block
+(`if settle_settings.enabled and settle_record is not None and not is_settled(settle_record)`)
+only runs when `settle_record` was computed at all, and the pre-existing code only ever computed
+it inside the `fingerprints is not None` branch. With `fingerprints=None`, `settle_record` stayed
+`None` for every node, the gate-enforcement block never ran, and a structurally-`DOWNLOADED`
+reading (local bytes caught up to the *stale cached* remote total a local-only pass reconciles
+against) sailed straight through ungated — including firing `_persist`'s own `unstuck` set, which
+triggers post-processing. That is the exact directory-corruption bug the settle gate exists to
+prevent (`prompts/open-issues.md` #2), reintroduced through the new fast path in a new disguise.
+Caught by writing `tests/test_engine_adaptive_cadence.py::
+test_local_only_pass_does_not_release_an_unsettled_item_early` *before* trusting the
+implementation, then deliberately reverting the fix locally and confirming the test fails (it
+does, with `('DOWNLOADED', None) != ('REMOTE_ONLY', 'settling')`) before restoring it — the same
+falsifiability discipline the settle gate's own test suite already uses.
+
+**Fix: `_persist` now always loads `prev_settle` (not conditionally on `fingerprints`), and gained
+a third branch — `elif fingerprints is None and "/" not in node.rel_path: settle_record =
+prev_settle.get(rel_path)` — that reads the last-persisted verdict without advancing or resetting
+it.** This is still exactly "skip the bookkeeping": `new_settle` only ever gains an entry inside
+the `fingerprints is not None` branch, so `save_settle_records` (gated on `if new_settle:`) is a
+no-op for the whole pass regardless of what this new branch reads. Proven both ways in the test
+file: `test_local_only_pass_never_writes_item_settle` and
+`test_local_only_pass_can_still_release_an_already_settled_item` assert `item_settle` is
+byte-for-byte unchanged (comparing two DB *reads* around the pass, not a freshly-constructed
+record against a read-back one, to avoid a false failure from `_format_iso`/`_parse_iso`'s own
+microsecond-precision round trip — an early draft of the test compared the wrong pair and would
+have failed for a reason unrelated to the code under test); the unsettled-item test above proves
+the gate still *holds*; the settled-item test proves it still correctly *releases* a genuinely
+already-settled item (point 4 of the prompt's own brief — "the transition to DOWNLOADED after a
+job reaps" — must still work).
+
+**Guard against reconciling before a queue's first successful full scan, proven the same way.**
+`_cached_remote_tree` is populated only inside `scan_queue`, right after a successful
+`self.pool.scan()` — refreshed on every successful read including a partial-scan warning (a
+partial scan still returns a real, if incomplete, tree), left untouched on an outright failure so
+a transient SSH error doesn't discard a last-known-good tree. `scan_all` checks `q.id in
+self._cached_remote_tree` before ever calling `queue_is_active` or `_scan_queue_local_only` for
+the local-only branch. Verified by temporarily removing the guard and confirming
+`test_local_only_pass_never_runs_before_first_successful_full_scan` fails (`local_spy.calls ==
+[1, 1, 1, 1, 1]` instead of `[]`) before restoring it. Without this, an unreachable host's queue —
+active from a leftover job row, say — would reconcile local files against an empty remote tree on
+every 5s tick, and `_persist`'s vanished-row sweep (`vanished = set(previous) - written -
+protected`) would read every previously-tracked, not-currently-local path as gone from the remote
+too.
+
+**No settings row for `ACTIVE_SCAN_INTERVAL_S` (module constant, 5.0).** Matches the prompt's own
+explicit instruction not to add one in this task; if it proves worth configuring, that's a
+follow-up with its own UI/API surface, not bundled into a scheduling change.
+
+---
+
 ## 2026-08-14 — Reset item tracking unified into one control; typed-name confirmation kept, on borrowed time
 
 **Handoff prompt `prompts/done/2026-08-14-reset-panel-counts-and-layout.md`, executed end to
