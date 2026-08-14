@@ -183,7 +183,7 @@ importing completed episodes mid-`mirror` and deleting the release folder while 
 transferring into it. That one **was** a real gap, and it is what
 `prompts/done/2026-08-14-in-flight-folder-prefix.md` closed.
 
-### The folder prefix and the settle gate's stuck-item recovery don't compose
+### ~~The folder prefix and the settle gate's stuck-item recovery don't compose~~ — **closed 2026-08-14**
 
 2026-08-14, found by auditing every caller that builds a local path after two prefix bugs in one
 morning. **Not data loss, and self-recovering when auto-queue is on** — recorded because the
@@ -216,6 +216,17 @@ radius. Revisit only if this is actually hit.
 `settled and complete` gate, and a failed rename sets `complete = False`), retention deletion (it
 routes through `delete_local`, which resolves the physical root), and the orphan-temp sweeper
 (age-gated at 2 days; a live transfer refreshes mtime constantly).
+
+**Closed by `prompts/done/2026-08-14-map-the-download-prefix-not-filter-it.md`, not by the
+"tempting fix" this section rejected.** The root cause named above — the reconciler being blind
+to its own in-flight working directory — is what got fixed, not worked around a second time:
+`scan_local` now **maps** a prefixed directory onto its logical rel_path instead of filtering it
+out of the walk, so the item genuinely computes structurally `DOWNLOADED` once its bytes are all
+present, whether or not auto-queue is on to paper over it. Reproduced directly against the real
+fake seedbox and proven to fire the `unstuck` path itself, not just inferred:
+`tests/test_download_prefix_e2e.py::test_engine_scan_unsticks_a_settled_item_whose_bytes_are_
+still_prefixed`. See `docs/decisions.md`'s entry for that task for the full reasoning and every
+consumer checked.
 
 ### Smaller, and genuinely optional
 

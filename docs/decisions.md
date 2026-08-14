@@ -6,6 +6,162 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-14 — `scan_local` maps a prefixed directory onto its logical name instead of filtering it out, reversing the same day's own "in-flight folder prefix" mechanism
+
+**Handoff prompt `prompts/done/2026-08-14-map-the-download-prefix-not-filter-it.md`, executed
+end to end.** The user's own words: *"the .download is a first class citizen and so therefore we
+need to map to that as that is where all directory level downloads happen if set."*
+
+**What this reverses.** `prompts/done/2026-08-14-in-flight-folder-prefix.md` (same day, earlier)
+added `core/local_scan.py.scan_local`'s `extra_dir_prefixes` parameter and had it **filter** a
+`.downloading-<name>/` directory out of the local walk entirely, the same treatment as
+`core/extract.py`'s `_UNPACK_`/`_FAILED_` staging directories. That made lftpweb's own reconciler
+blind to its own working directory for the entire window `item.pending_download_prefix` is set —
+which, after `prompts/done/2026-08-14-rename-after-postprocessing-not-before.md` widened that
+window to cover verify/extract too, turned out to be one root cause behind three separate,
+already-individually-patched defects (children flipping `PARTIAL`↔`REMOTE_ONLY`,
+`core/local_delete.py` refusing a stopped transfer's leftovers, and `bytes_start` reading 0 on
+resume) plus one *unpatched* one: `prompts/open-issues.md`'s "the folder prefix and the settle
+gate's stuck-item recovery don't compose". The precedent this follows instead already existed one
+level down: `scan_local` reports a still-in-flight `foo.mkv.lftp` under its *final, stripped* name
+so it matches its remote counterpart, while `find_temp_files` exists separately for a caller that
+needs the real on-disk path. `_resolve_prefixed_dir_names` (new, in `core/local_scan.py`) does the
+same thing one level up, for directories.
+
+**The four hard cases, and the rule chosen for each:**
+
+1. **Both a real (`Release/`) and a stale prefixed (`.downloading-Release/`) directory exist as
+   siblings** — exactly what the user hit live. The real, already-unprefixed directory always
+   wins the shared logical name (the same "a real, already-renamed file always wins over a temp
+   one" rule `scan_local`'s own same-name file tie-break already applies one level down).
+   Silently merging the two subtrees into one `rel_path` was rejected outright as the worst
+   option the prompt itself named; the loser is **not** silently dropped either — it is reported
+   under its own, still-prefixed, literal name, so it reads as an ordinary `LOCAL_ONLY` leftover
+   a user can find and delete through the normal Files path. This is the one place a
+   `.downloading-`-style name is expected to ever appear in `scan_local`'s output; every
+   non-colliding directory — the overwhelming majority — is mapped. (Two prefixed siblings
+   colliding on the same stripped name with no plain sibling present resolve the same way, by raw
+   on-disk name, alphabetically first — arbitrary but deterministic, since `scandir` order itself
+   is not.)
+2. **A stale prefix** (the setting changed, or a per-item prefix that predates it). Already solved
+   at the call-site level by `core/engine.py.Engine._active_download_prefixes`'s existing unioned
+   set (resolved current prefix plus every distinct `item.pending_download_prefix` on record) —
+   `scan_local` just needed to map against that same set instead of filtering against it, which
+   required no change to `_active_download_prefixes` itself.
+3. **Nested prefixed directories.** Mapped at any depth, matching `UNPACK_PREFIX`/`FAILED_PREFIX`'s
+   own existing choice and the prior filtering behaviour — a directory item need not be top-level
+   (phase 2's own `item`-row-per-node design), and a `mirror` job's own spawn logic does not
+   restrict itself to top-level items either.
+4. **Collision with a real remote release literally named `.downloading-something`.** Accepted,
+   undecidable at this layer: `scan_local` has no view of the remote tree, so it will map such a
+   directory the same as any other match, exactly the same accepted limitation
+   `UNPACK_PREFIX`/`FAILED_PREFIX` already carry for an identically-named real release today.
+   Vanishingly unlikely; not solved here, stated explicitly rather than left undefined.
+
+**Every consumer of `scan_local`'s output, checked:**
+
+- `core/reconcile.py` — needs **zero changes**. It only ever reads whatever `rel_path`s
+  `scan_local` hands it; since mapped entries now arrive keyed by the same logical `rel_path` the
+  remote tree uses, reconciliation "just works" the way it always has for a finished, unprefixed
+  directory. This was the entire point of mapping over filtering.
+- `core/engine.py._persist` — unaffected in its own logic; it already reads whatever structural
+  state `reconcile` computed. Verified end to end (see testing below): a `STOPPED` item's
+  `local_size` is now truthful, and the settle gate's stuck-item `unstuck` path (below) now fires.
+  `_protected_rel_paths` and the `deleted_archive` exemption added earlier the same day were
+  audited and need no change — neither keys on anything `scan_local` produces differently.
+- `core/settle.py` — confirmed unaffected: `compute_fingerprints` takes only the **remote** tree.
+- `core/autoqueue.py` — eligibility keys off `item.state`
+  (`ELIGIBLE_STATES = ("REMOTE_ONLY", "PARTIAL")`), computed by `reconcile`/`_persist` from
+  whatever `scan_local` now reports; a `DOWNLOADING`/`STOPPED`/`FAILED` item stays excluded exactly
+  as before (job-state or suppression, not scan output, gates those). No change needed.
+- `core/progress.py` — confirmed unaffected. Its `scan_local(job.local_root)` call passes no
+  `extra_dir_prefixes` and is already rooted **at** the item's physical location
+  (`core/queue.py._spawn_decision`'s `local_root_for_progress`), so it never encounters the
+  prefixed name as a child in the first place — the same reasoning as the next bullet.
+- `core/queue.py._spawn_decision`'s `bytes_start` (reads `item.local_size`) — **confirmed correct
+  by construction now, closing the separately-tracked `bytes_start` fix.** Verified directly:
+  `tests/test_download_prefix_e2e.py::test_engine_scan_maps_a_stopped_transfers_prefixed_
+  directory_to_the_logical_item` stops a real mid-transfer job, runs a real `Engine.scan_queue`
+  pass with no job left running, and asserts `item.local_size` equals the real physical byte
+  count under the still-prefixed directory. Before this task that column read `0` (children
+  invisible), which is exactly the false-100%-progress defect in the original task's own table.
+- `core/queue.py._completeness_on_disk` — confirmed unaffected. Its `scan_local(root)` call for a
+  `mirror` job passes no `extra_dir_prefixes` and `root` is already the physical (possibly
+  prefixed) directory itself, so the prefixed name is the walk's own root, never a child it could
+  map.
+- `core/local_delete.py._physical_local_root` — still needed, confirmed. It resolves the
+  *physical* delete target from the item's own `item.pending_download_prefix` column, which
+  `scan_local`'s mapped, purely-logical output never touches — the two cannot disagree because
+  they answer different questions (logical identity vs. physical location) from the same source
+  of truth (the recorded prefix). One residual gap found and recorded, not silently fixed: a
+  `.downloading-<name>/` directory with **no** `item.pending_download_prefix` ever recorded for it
+  at all (a leftover predating this bookkeeping, say) is now visible in the Files tree as an
+  ordinary `LOCAL_ONLY` row (a real improvement — previously invisible outright) but is **not**
+  deletable through the normal path yet, because `_physical_local_root` has nothing to resolve
+  against and falls back to the logical path, which was never actually created on disk. Verified
+  directly, not assumed: `tests/test_download_prefix_e2e.py::test_engine_scan_surfaces_an_
+  orphaned_prefixed_directory_as_local_only` asserts `delete_local` returns `deleted=False,
+  reason` containing `"does not exist"` for exactly this shape. Out of this task's own scope
+  (`core/local_scan.py`, not `core/local_delete.py`'s resolution heuristic) — recorded here so it
+  is a known, narrower gap rather than a silent one, should it come up in a real leftover cleanup.
+- `core/postprocess.py`/`core/extract.py` — confirmed unaffected; both operate on the physical
+  `local_root` `_physical_local_root` resolves for them, never on `scan_local`'s mapped output
+  directly.
+
+**What this closes:**
+
+- **The false-100% progress / `bytes_start` fix is subsumed**, not a separate change — see the
+  `_spawn_decision` bullet above. `prompts/open-issues.md` had no separate entry for this (it was
+  folded into the mapping task's own table), so nothing there needed closing for this specific
+  point beyond the entry below.
+- **`prompts/open-issues.md`'s "The folder prefix and the settle gate's stuck-item recovery don't
+  compose" is closed** and removed from that file. Reproduced directly against the real fake
+  seedbox (no `TransferQueue`/lftp spawn needed — the item's full content was written straight to
+  disk under its prefixed name, with `item.pending_download_prefix` set exactly as a real job
+  would leave it): `tests/test_download_prefix_e2e.py::test_engine_scan_unsticks_a_settled_item_
+  whose_bytes_are_still_prefixed` runs two real `Engine.scan_queue` passes against unchanged
+  remote content and asserts the item moves `REMOTE_ONLY/settling` → `DOWNLOADED` on the second
+  pass, with `core/engine.py._persist`'s `unstuck` path firing `PostprocessPipeline.trigger`. The
+  "tempting fix" that entry rejected (a second owner of the prefix rename) was never needed —
+  mapping fixes the actual root cause (the reconciler's own blindness) instead of working around
+  it a second time.
+- **A stalled/failed item's leftovers now surface as a deletable row** — for the realistic shape
+  of that defect (an item a real job already recorded a prefix for: `STOPPED`, `FAILED`, or a
+  `CORRUPT`/`EXTRACT_FAILED` item permanently hidden under the prefix per the same day's earlier
+  rename-ordering entry). Verified end to end, including a real `delete_local` call that actually
+  removes the physical directory
+  (`test_engine_scan_maps_a_stopped_transfers_prefixed_directory_to_the_logical_item`). **Not**
+  yet true for a fully history-less orphan with zero recorded prefix — see the
+  `_physical_local_root` bullet above.
+
+**DESIGN.md needed no correction.** Checked explicitly (§3.2, §4.4, §4.7, §5, and §6's "rename off
+a download prefix" passage): nothing in DESIGN.md itself ever asserted that `scan_local` filters
+the prefixed directory — that description lived only in `core/local_scan.py`'s own docstring and
+in `core/engine.py`'s comments (both updated in place), and in this file's own prior entries
+(left as history, not edited, per this project's append-only convention). §6's own description of
+*when* the rename happens (the pipeline's last step, after verify/extract) is unchanged by this
+task — only what the reconciler sees of the directory *before* that rename changed.
+
+**Testing.** `uv run pytest` — full suite (fake seedbox already running, left alone), 1036 passed
+(up from 1033 before this task's own 3 new tests). Four existing unit tests in
+`tests/test_download_prefix.py` that asserted the old *filtering* behaviour were rewritten in
+place to assert the new *mapping* behaviour instead (renamed `test_scan_local_filters_*` →
+`test_scan_local_maps_*`, `test_scan_local_multiple_prefixes_stale_plus_current` →
+`..._both_map`) — each is a direct, intentional flip of what this task reverses, not an
+accidental breakage. One new unit test added for hard case 1
+(`test_scan_local_maps_a_real_and_a_stale_prefixed_sibling_without_merging_them`). Three new e2e
+tests added to `tests/test_download_prefix_e2e.py` against the real fake seedbox (listed above).
+One comment block in `tests/test_state_persistence.py` (the "mirror job's children are protected
+too" section) was reworded, **not** its assertions — the test itself (a monkeypatched empty
+`scan_local` proving a child row stays protected while its parent job runs) remains a valid,
+strictly more general regression guard; only its docstring's claim that the *specific* trigger was
+prefix filtering needed updating, since that mechanism is now gone. `ruff check`/`ruff format
+--check` clean, `npm run lint`/`npm test` (258 passed)/`npm run build` clean, `docker compose
+config --quiet` clean on all three compose files — real output recorded in the executing
+session's own final report, not restated here.
+
+---
+
 ## 2026-08-14 — A cleaned-up archive rests at `EXCLUDED`, never through the removal-grace clock; the reason travels as a new wire field, not a new state; the collapsible summary row (Part 2) not built
 
 **Handoff prompt `prompts/2026-08-14-extracted-archives-rest-as-extracted.md`, executed end to

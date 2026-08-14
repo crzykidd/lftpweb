@@ -128,6 +128,20 @@ def test_build_transfer_command_pget_ignores_the_flag():
 
 
 # --- core/local_scan.py.scan_local's extra_dir_prefixes ----------------------------------------
+#
+# 2026-08-14 (prompts/2026-08-14-map-the-download-prefix-not-filter-it.md): these four tests
+# used to assert *filtering* -- a prefixed directory disappeared from `scan_local`'s output
+# entirely. That mechanism is reversed: the directory is now *mapped* onto its logical,
+# unprefixed name (`Release`, not `.downloading-Release`) so the reconciler can actually see the
+# bytes lftpweb itself is writing, the same way an in-flight `*.lftp` file already reports under
+# its own final name. `test_scan_local_filters_the_active_prefix_at_the_top_level` and
+# `test_scan_local_filters_a_prefixed_directory_at_any_depth` are rewritten in place (same
+# fixture shape, opposite assertion) rather than deleted, since the scenario they guard --
+# "does the active prefix affect this directory at all" -- is still exactly what they cover.
+# `test_scan_local_multiple_prefixes_stale_plus_current`'s old assertion (`entries == {}`) was a
+# direct assertion of the filtering behaviour itself and is replaced with the mapped equivalent.
+# A new `test_scan_local_maps_a_real_and_a_stale_prefixed_sibling_without_merging_them` covers
+# this task's own "hard case 1" (both names present) that had no filtering-era analogue.
 
 
 def test_scan_local_default_does_not_filter_anything_new(tmp_path):
@@ -137,19 +151,25 @@ def test_scan_local_default_does_not_filter_anything_new(tmp_path):
     assert ".downloading-Release" in entries
 
 
-def test_scan_local_filters_the_active_prefix_at_the_top_level(tmp_path):
+def test_scan_local_maps_the_active_prefix_at_the_top_level(tmp_path):
     (tmp_path / ".downloading-Release").mkdir()
     (tmp_path / ".downloading-Release" / "a.mkv").write_bytes(b"x")
     (tmp_path / "Other.Release").mkdir()
     (tmp_path / "Other.Release" / "b.mkv").write_bytes(b"y")
     entries = local_scan.scan_local(tmp_path, extra_dir_prefixes=(".downloading-",))
+    # No phantom node under the literal, still-prefixed name...
     assert ".downloading-Release" not in entries
     assert ".downloading-Release/a.mkv" not in entries
+    # ...it is reported under its logical, unprefixed name instead -- matching what its remote
+    # counterpart would be called, so the reconciler can actually see these bytes.
+    assert "Release" in entries and entries["Release"].is_dir
+    assert "Release/a.mkv" in entries
+    # A sibling that never had the prefix is untouched either way.
     assert "Other.Release" in entries
     assert "Other.Release/b.mkv" in entries
 
 
-def test_scan_local_filters_a_prefixed_directory_at_any_depth(tmp_path):
+def test_scan_local_maps_a_prefixed_directory_at_any_depth(tmp_path):
     """Matches UNPACK_PREFIX/FAILED_PREFIX's own "any depth" behaviour -- a directory item
     being downloaded need not be top-level (DESIGN.md phase 2: `item` rows exist per node).
     """
@@ -160,18 +180,41 @@ def test_scan_local_filters_a_prefixed_directory_at_any_depth(tmp_path):
     assert "parent" in entries
     assert "parent/.downloading-Child" not in entries
     assert "parent/.downloading-Child/f.mkv" not in entries
+    assert "parent/Child" in entries
+    assert "parent/Child/f.mkv" in entries
 
 
-def test_scan_local_multiple_prefixes_stale_plus_current(tmp_path):
+def test_scan_local_multiple_prefixes_stale_plus_current_both_map(tmp_path):
     """The stale-prefix case `Engine._active_download_prefixes` exists for: a job spawned under
-    an old prefix is still filtered even after the active setting has moved on to a new one.
+    an old prefix is still *mapped* even after the active setting has moved on to a new one, or
+    content written under the new prefix would go invisible again.
     """
     (tmp_path / ".old-Release").mkdir()
     (tmp_path / ".old-Release" / "a.mkv").write_bytes(b"x")
     (tmp_path / ".new-Other").mkdir()
     (tmp_path / ".new-Other" / "b.mkv").write_bytes(b"y")
     entries = local_scan.scan_local(tmp_path, extra_dir_prefixes=(".old-", ".new-"))
-    assert entries == {}
+    assert set(entries) == {"Release", "Release/a.mkv", "Other", "Other/b.mkv"}
+
+
+def test_scan_local_maps_a_real_and_a_stale_prefixed_sibling_without_merging_them(tmp_path):
+    """This task's own "hard case 1": a stale prefixed directory can sit beside a release that
+    has since completed under its real name -- exactly what the user hit live. The real
+    directory wins the shared logical name; the stale one is neither merged into it (the
+    explicitly-rejected "worst option") nor silently dropped -- it stays visible under its own,
+    still-prefixed, literal name, so it reads as an ordinary local-only leftover a user can find
+    and delete through the normal Files path.
+    """
+    (tmp_path / "Release").mkdir()
+    (tmp_path / "Release" / "real.mkv").write_bytes(b"real")
+    (tmp_path / ".downloading-Release").mkdir()
+    (tmp_path / ".downloading-Release" / "stale.mkv").write_bytes(b"stale")
+    entries = local_scan.scan_local(tmp_path, extra_dir_prefixes=(".downloading-",))
+    assert "Release" in entries
+    assert "Release/real.mkv" in entries
+    assert "Release/stale.mkv" not in entries, "must not silently merge the two subtrees"
+    assert ".downloading-Release" in entries, "the loser must stay visible, not vanish"
+    assert ".downloading-Release/stale.mkv" in entries
 
 
 # --- core/engine.py.Engine._active_download_prefixes -------------------------------------------

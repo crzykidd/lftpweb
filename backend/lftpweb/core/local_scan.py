@@ -221,6 +221,77 @@ def effective_file_size(path: str | Path) -> int:
         return 0
 
 
+def _matching_prefix(name: str, prefixes: tuple[str, ...]) -> str | None:
+    """The longest of `prefixes` that `name` starts with, or `None`. Longest wins so that two
+    configured prefixes sharing a leading substring (an old value and a newly edited one, say)
+    resolve deterministically regardless of `prefixes`' own iteration order -- it is built from
+    a `set` (`core/engine.py.Engine._active_download_prefixes`), which is not itself ordered.
+    """
+    matches = [p for p in prefixes if p and name.startswith(p)]
+    return max(matches, key=len) if matches else None
+
+
+def _resolve_prefixed_dir_names(
+    raw_entries: list[os.DirEntry], extra_dir_prefixes: tuple[str, ...]
+) -> dict[str, str]:
+    """For every directory entry in one `scandir` batch that isn't `_UNPACK_`/`_FAILED_`
+    staging, the name it should be walked and *reported* under (2026-08-14,
+    `prompts/2026-08-14-map-the-download-prefix-not-filter-it.md`): its own on-disk name with
+    a matching `extra_dir_prefixes` entry stripped, mapping it onto the logical name its remote
+    counterpart carries -- the same thing this module already does for an in-flight `*.lftp`
+    file one level down, applied one level up. Entries with no matching prefix are absent from
+    the returned dict; callers fall back to the entry's own raw name for those, unchanged from
+    before this task.
+
+    **Collision rule (docs/decisions.md, this task's own entry -- "hard case 1"), because a
+    real, already-renamed directory and a stale prefixed one can coexist as siblings** (a prior
+    attempt's leftover beside a release that has since completed under a fresh job, say).
+    Exactly one directory may ever claim a given reported name at one level:
+
+    - An already-unprefixed ("plain") sibling always wins over a prefixed one that would
+      strip down to the same name -- it is the item's current, authoritative location, the same
+      "a real, already-renamed file always wins over a temp one" rule `scan_local`'s own
+      same-name file tie-break already applies one level down. Mapping the stale prefixed
+      directory on top of it would silently merge two unrelated subtrees into one `rel_path`,
+      which this design explicitly rejects as the worst available option.
+    - Two prefixed siblings colliding on the same stripped name with no plain sibling present
+      (a stale leftover under an old prefix, say, beside a fresh spawn under a newly edited
+      one) resolve by raw on-disk name, alphabetically first -- arbitrary, but deterministic,
+      since `scandir` order itself is not.
+
+    Every entry that loses a collision is **not** included in the returned mapping, so the
+    caller reports it under its own raw, still-prefixed name -- never silently dropped. Its
+    content is then a directory the reconciler cannot safely attribute to the real item, so it
+    reads as an ordinary local-only leftover: visible in the Files tree, and deletable through
+    the normal path, exactly like any other untracked local directory. This is the one place a
+    `.downloading-`-style name is expected to ever appear in this module's output -- every
+    non-colliding directory, the overwhelming majority, is mapped.
+    """
+    plain_names: set[str] = set()
+    prefixed: list[tuple[str, str]] = []  # (raw_name, stripped_name)
+    for entry in raw_entries:
+        if not entry.is_dir(follow_symlinks=False):
+            continue
+        name = entry.name
+        if name.startswith(UNPACK_PREFIX) or name.startswith(FAILED_PREFIX):
+            continue
+        matched = _matching_prefix(name, extra_dir_prefixes)
+        if matched is None:
+            plain_names.add(name)
+        else:
+            prefixed.append((name, name[len(matched) :]))
+
+    winners: dict[str, str] = {}  # stripped_name -> raw_name of the current winner
+    for raw_name, stripped_name in prefixed:
+        if stripped_name in plain_names:
+            continue  # the plain sibling always wins; this one stays literal (see docstring)
+        current = winners.get(stripped_name)
+        if current is None or raw_name < current:
+            winners[stripped_name] = raw_name
+
+    return {raw_name: stripped_name for stripped_name, raw_name in winners.items()}
+
+
 def scan_local(
     root: str | Path, *, extra_dir_prefixes: tuple[str, ...] = ()
 ) -> dict[str, LocalEntry]:
@@ -231,20 +302,47 @@ def scan_local(
     *final* name (suffix stripped), so it matches its remote counterpart directly; if the
     sidecar-adjusted size is also available for that temp file, it wins over raw `st_size`.
 
-    `extra_dir_prefixes` (2026-08-14, "folder prefix during transfer" --
-    `core/download_prefix.py`) is every directory-name prefix currently in play for the queue
-    being scanned -- the site/queue-resolved prefix plus every distinct
-    `item.pending_download_prefix` still on record, per `core/engine.py.
-    Engine._active_download_prefixes` -- filtered out exactly like `UNPACK_PREFIX`/
-    `FAILED_PREFIX` below, and for the same reason: a directory a `mirror` job is still writing
-    into under its prefixed name is lftpweb's own in-flight bookkeeping, not content the user
-    asked for, and left in the walk it would reconcile to a growing `LOCAL_ONLY` node for as
-    long as the transfer runs. Unlike the two module-level prefixes, this one **cannot** be a
+    `extra_dir_prefixes` (2026-08-14, "folder prefix during transfer" -- `core/download_prefix.py`;
+    **mapped, not filtered, as of `prompts/2026-08-14-map-the-download-prefix-not-filter-it.md`,
+    reversing this parameter's original behaviour** -- see `docs/decisions.md` for both entries)
+    is every directory-name prefix currently in play for the queue being scanned -- the
+    site/queue-resolved prefix plus every distinct `item.pending_download_prefix` still on
+    record, per `core/engine.py.Engine._active_download_prefixes`. A directory matching one of
+    these is reported under its **logical** (stripped) name and walked in place -- the same
+    "physical detail mapped back to the logical one" this module already does for an in-flight
+    `*.lftp` file, one level up: `<local_path>/.downloading-Release/a.mkv` on disk is reported
+    as `Release/a.mkv`, matching its remote counterpart directly, so the reconciler is never
+    blind to lftpweb's own in-flight working directory. `find_temp_files`'s directory-level
+    counterpart -- something that needs the real, physical path rather than the mapped one --
+    is `core/local_delete.py._physical_local_root`, not this module; nothing here reports a
+    prefixed directory's *physical* path, only its logical one.
+
+    The user's own words for why this must be a mapping, not a filter (2026-08-14): "the
+    .download is a first class citizen ... that is where all directory level downloads happen
+    if set." Importers still cannot see the content -- that was always the on-disk dot-prefixed
+    name's job, never this module's filtering -- so mapping loses no protection while restoring
+    the reconciler's own view of what is actually on disk. `_resolve_prefixed_dir_names` above
+    is where the one real subtlety (a real and a prefixed directory coexisting) is resolved;
+    see its own docstring.
+
+    Unlike the two module-level prefixes (`UNPACK_PREFIX`/`FAILED_PREFIX`, still filtered
+    outright below -- extraction staging, never the item itself), this one **cannot** be a
     module constant -- it is configurable, site-wide and per-queue -- so every caller that wants
-    it filtered has to pass it in explicitly; the default `()` is exactly today's behaviour for
-    every caller that doesn't (in particular, every existing test). Checked at any depth, the
-    same as `UNPACK_PREFIX`/`FAILED_PREFIX`, since a directory item being downloaded need not be
+    it mapped has to pass it in explicitly; the default `()` is exactly "nothing to map" for
+    every caller that doesn't (in particular, every existing test, and both
+    `core/queue.py._completeness_on_disk`/`core/progress.py`'s own `scan_local` calls, which
+    are already rooted *at* the item's physical location and so never encounter the prefixed
+    name as a child in the first place). Checked at any depth, the same as
+    `UNPACK_PREFIX`/`FAILED_PREFIX`, since a directory item being downloaded need not be
     top-level.
+
+    **Accepted, undecidable edge case**: a genuine remote release whose own name happens to
+    start with an active prefix (e.g. a release literally named `.downloading-Foo` while
+    `.downloading-` is the active prefix) is indistinguishable, from this module alone, from
+    lftpweb's own in-flight directory of the same on-disk name -- it will be mapped (reported as
+    `Foo`) the same as any other match. `scan_local` has no view of the remote tree to
+    disambiguate with, the same accepted limitation `UNPACK_PREFIX`/`FAILED_PREFIX` already
+    carry for an identically-named real release today. Vanishingly unlikely; not solved here.
     """
     root = Path(root)
     entries: dict[str, LocalEntry] = {}
@@ -266,9 +364,19 @@ def scan_local(
                 if status is not None:
                     sidecars[carrier] = status
 
+        # Resolved once per directory level (never per-entry): every directory in this batch
+        # that maps onto a different, logical on-disk name -- see `_resolve_prefixed_dir_names`'s
+        # own docstring for the collision rule. A directory absent from this dict (the common
+        # case -- nothing to map, or `extra_dir_prefixes` is empty) is walked under its own name,
+        # exactly as before this task.
+        prefixed_dir_names = (
+            _resolve_prefixed_dir_names(raw_entries, extra_dir_prefixes)
+            if extra_dir_prefixes
+            else {}
+        )
+
         for entry in raw_entries:
             name = entry.name
-            rel_path = f"{rel_prefix}{name}" if rel_prefix == "" else f"{rel_prefix}/{name}"
 
             # `core/mount_sentinel.py` writes this at the queue's local root after every
             # successful scan (DESIGN.md §7.3). It is lftpweb's own bookkeeping, not content
@@ -293,15 +401,29 @@ def scan_local(
                 # carry one at any depth. Left in the walk, an in-progress `_UNPACK_` dir
                 # would reconcile to a growing LOCAL_ONLY node while extraction runs, and a
                 # `_FAILED_` dir would sit there forever as a permanent LOCAL_ONLY once
-                # extraction stops touching it -- neither is content the user asked for.
-                if (
-                    name.startswith(UNPACK_PREFIX)
-                    or name.startswith(FAILED_PREFIX)
-                    or any(name.startswith(p) for p in extra_dir_prefixes)
-                ):
+                # extraction stops touching it -- neither is content the user asked for. Checked
+                # first, and on the entry's own raw `name`, before any prefix mapping below --
+                # `_FAILED_.downloading-Show…` (a real production shape: a `_FAILED_` staging
+                # directory for an item that was itself still prefix-downloading) starts with
+                # `_FAILED_`, never with the active prefix, so it is caught here regardless of
+                # mapping order; stated explicitly because getting this backwards would be easy
+                # to get wrong silently.
+                if name.startswith(UNPACK_PREFIX) or name.startswith(FAILED_PREFIX):
                     continue
-                entries[rel_path] = LocalEntry(rel_path=rel_path, is_dir=True)
-                walk(Path(entry.path), rel_path)
+                # "folder prefix during transfer" (2026-08-14, `core/download_prefix.py`; mapped
+                # rather than filtered as of `prompts/2026-08-14-map-the-download-prefix-not-
+                # filter-it.md` -- see this function's own docstring and `_resolve_prefixed_dir_
+                # names`'s for the full reasoning and the same-name-collision rule). A directory
+                # this batch's pre-pass resolved to a logical name is reported and walked under
+                # that name instead of its own; everything else (nothing to map, or this entry
+                # lost a collision and stays literal) keeps its own raw `name`, unchanged from
+                # before this task.
+                dir_name = prefixed_dir_names.get(name, name)
+                dir_rel_path = (
+                    f"{rel_prefix}{dir_name}" if rel_prefix == "" else f"{rel_prefix}/{dir_name}"
+                )
+                entries[dir_rel_path] = LocalEntry(rel_path=dir_rel_path, is_dir=True)
+                walk(Path(entry.path), dir_rel_path)
                 continue
 
             if name.endswith(PGET_STATUS_SUFFIX):

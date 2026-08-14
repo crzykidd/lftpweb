@@ -921,9 +921,21 @@ async def test_a_row_that_leaves_both_trees_and_later_returns_is_published_again
 # Two writers, one unprotected row. A `mirror` job is tracked against the *top-level* item only,
 # so a child file has no `job` row of its own and `_protected_rel_paths` never caught it -- while
 # `core/queue.py._publish_child_progress` writes exactly those children's `local_size`/`state` on
-# every progress tick. The prefix is what makes it reproducible rather than theoretical:
-# `scan_local(extra_dir_prefixes=...)` deliberately hides the in-flight `.downloading-<name>/`
-# tree, so the reconciler sees no local bytes for those children and computes REMOTE_ONLY.
+# every progress tick. The prefix is what made it reproducible rather than theoretical, at the
+# time: `scan_local(extra_dir_prefixes=...)` used to *filter* the in-flight `.downloading-<name>/`
+# tree out of the walk entirely, so the reconciler saw no local bytes for those children and
+# computed REMOTE_ONLY.
+#
+# **2026-08-14 (`prompts/2026-08-14-map-the-download-prefix-not-filter-it.md`): that filtering
+# mechanism is gone.** `scan_local` now *maps* a prefixed directory onto its logical name, so in
+# production the reconciler no longer sees an empty local tree for an in-flight release at all --
+# the specific trigger this section names no longer exists. The test below still monkeypatches
+# `scan_local` to return `{}` directly, though, which is a strictly more general fixture than the
+# live incident that motivated it: an empty local tree can still occur for other reasons (a
+# transient scan error, a not-yet-mounted local root), and `_protected_rel_paths` must hold a
+# child's row steady against *any* such reading while its parent job is running, not only the one
+# this section's own bug happened to produce. Left in place as that broader regression guard
+# rather than removed with the mechanism that first exposed it.
 #
 # The 5s active-queue pass turned a 30s flip into a 5s one and is what made it visible, but
 # neither feature is the cause -- the subtree simply was never protected.

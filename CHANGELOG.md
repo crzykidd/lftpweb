@@ -589,7 +589,9 @@ alongside this list: several entries below ship with deliberate, documented limi
   the item rather than recomputing from current settings, and a scan keeps filtering whatever
   prefix is physically in use, not merely today's configured one. See `docs/decisions.md` for
   the full design, including why this reverses part of phase 5's `staging_path` reasoning on new
-  evidence.
+  evidence. **Correction, same day:** the phrase "a scan keeps filtering whatever prefix is
+  physically in use" describes what shipped first, not what shipped last — see the "Changed"
+  entry below for the reversal that landed the same day.
 - **The Docs section's prose moved to Markdown** *(2026-08-14)* — `docs/quick-start.md` and
   `docs/concepts.md` are now the only copy of the Quick start/Concepts text; the app reads those
   same two files (`?raw` import) instead of carrying a parallel copy as hand-written JSX, and
@@ -666,6 +668,27 @@ alongside this list: several entries below ship with deliberate, documented limi
   download window itself. See `docs/decisions.md` for the full reasoning, including why this
   doesn't reopen phase 5's original "the reconciler must never compare against a different
   root" worry.
+- **"Folder prefix during transfer": the reconciler now *maps* a still-prefixed directory onto
+  its real name instead of filtering it out of the local scan entirely** *(2026-08-14, same
+  day)* — reversing the original mechanism while keeping its goal (importers still cannot see
+  in-flight content; that was always the dot-prefixed on-disk name's job, never the scanner's).
+  Filtering made lftpweb's own reconciler blind to its own in-flight working directory, which
+  turned out to be the root cause behind three defects fixed individually that morning (a
+  mirror's child rows flipping `PARTIAL`↔`REMOTE_ONLY`, a delete refusing a stopped transfer's
+  leftovers, and `bytes_start` reading 0 on resume) plus one that stayed open:
+  `.downloading-Release/a.mkv` on disk is now reported as `Release/a.mkv`, matching its remote
+  counterpart directly — the same "physical detail mapped back to a logical one" `scan_local`
+  already does for an in-flight `*.lftp` file, one level up. A stale prefixed directory sitting
+  beside a since-completed release (the same coexistence the user hit live) is resolved rather
+  than merged or dropped: the real, unprefixed directory always wins the shared name, and the
+  stale one stays visible under its own literal, still-prefixed name — an ordinary leftover a
+  user can find and delete through the normal Files path, not a silent merge of two unrelated
+  subtrees. Closes `prompts/open-issues.md`'s "the folder prefix and the settle gate's stuck-item
+  recovery don't compose" for real, rather than leaving it to auto-queue's own self-recovery. See
+  `docs/decisions.md` for the full design, every consumer checked, and one narrower residual gap
+  named rather than silently left: a `.downloading-<name>/` leftover with **no** recorded
+  `item.pending_download_prefix` at all (predating this bookkeeping, say) is now visible as an
+  ordinary local-only row but not yet deletable through the normal path.
 - **`sync_mode = 'move'` went from stored-but-inert to fully live** when phase 5 shipped.
   An existing queue already configured for `move` begins deleting verified remote copies
   with no further action — review any stored `move` queue before pulling this.

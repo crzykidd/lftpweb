@@ -19,6 +19,15 @@ two tests at the bottom of this file (`test_real_name_does_not_exist_while_verif
 running_and_does_exist_after`, `test_corrupt_item_never_appears_under_its_real_name`) are this
 task's own required coverage -- the first is its single most important assertion.
 
+**The two tests at the very bottom, added 2026-08-14
+(`prompts/2026-08-14-map-the-download-prefix-not-filter-it.md`), are this later task's own
+required coverage** -- a real `Engine.scan_queue` pass (remote scan, reconcile, persist) against
+a genuinely still-prefixed directory, proving `core/local_scan.py.scan_local` now *maps* it onto
+its logical name instead of filtering it out of the walk. Everything above this point predates
+that task and is unchanged by it -- the prefix's own resolution, the rename-on-completion
+pipeline, and `_reap_one`'s handoff to post-processing are all untouched; only what the
+reconciler sees of a still-in-flight or leftover prefixed directory changed.
+
 Deliberately does **not** reuse `docker/test-seedbox/seed_tree.sh`'s baked-in fixture tree --
 shared by every other test on this container, and the `move` test here deletes its source. Each
 test uploads its own throwaway content into a dedicated, uniquely-named remote subdirectory over
@@ -36,8 +45,11 @@ from uuid import uuid4
 import aiosqlite
 import pytest
 
-from lftpweb.core import download_prefix, verify
+import lftpweb.core.settle as settle_module
+from lftpweb.core import download_prefix, local_delete, verify
+from lftpweb.core.engine import Engine, QueueConfig
 from lftpweb.core.events import EventBus
+from lftpweb.core.mount_sentinel import write_if_needed
 from lftpweb.core.postprocess import (
     PostprocessPipeline,
     PostprocessSettings,
@@ -832,6 +844,459 @@ async def test_corrupt_item_never_appears_under_its_real_name(db, tmp_path):
         cleanup_pool = RemoteConnectionPool(tmp_path / "known_hosts_cleanup")
         try:
             await cleanup_pool.delete_path(host, f"/data/pickup/{remote_subdir}")
+        except Exception:  # noqa: BLE001 - cleanup only
+            pass
+        await cleanup_pool.close()
+
+
+# --- Mapped, not filtered (2026-08-14, prompts/2026-08-14-map-the-download-prefix-not-filter-
+# it.md) -- a real Engine.scan_queue pass against a genuinely still-prefixed directory ----------
+
+
+async def test_engine_scan_maps_a_stopped_transfers_prefixed_directory_to_the_logical_item(
+    db, tmp_path
+):
+    """Stop a directory transfer mid-stream, so its bytes sit under
+    `<local_path>/.downloading-<name>/` with no job left running, then run a real
+    `Engine.scan_queue` pass against it -- exactly the reconciler's own scan cadence, entirely
+    separate from `TransferQueue`. `core/local_scan.py.scan_local` must report those bytes under
+    the item's *logical* rel_path (matching its remote counterpart), not lose them:
+    `item.local_size` must be non-zero and correct -- the same value `core/queue.py._spawn_
+    decision`'s `bytes_start` reads on a later resume, so this is also this task's own required
+    verification that the separate `bytes_start` fix is subsumed -- no phantom node named
+    literally `.downloading-<name>` may appear anywhere in the published tree, and the leftover
+    must be deletable through the ordinary `core/local_delete.py.delete_local` path, closing
+    `prompts/open-issues.md`'s "leftovers invisible in the UI with no row to delete" for exactly
+    the realistic shape of that defect: an item a real job already recorded
+    `pending_download_prefix` for.
+    """
+    remote_subdir = f"prefix-map-e2e-{uuid4().hex[:12]}"
+    host = _host_config()
+
+    scan_pool = RemoteConnectionPool(tmp_path / "known_hosts_scan")
+    conn = await scan_pool.get_connection(host)
+    big_content = os.urandom(5 * 1024 * 1024)  # 5 MB -- big enough for a deterministic partial
+    async with conn.start_sftp_client() as sftp:
+        remote_dir = f"/data/pickup/{remote_subdir}/Big.Release"
+        await sftp.makedirs(remote_dir, exist_ok=True)
+        async with sftp.open(f"{remote_dir}/big.bin", "wb") as f:
+            await f.write(big_content)
+    entries, _ = await scan_pool.scan(host, f"/data/pickup/{remote_subdir}")
+    assert "Big.Release/big.bin" in entries, "setup fixture failed to upload"
+    remote_size = entries["Big.Release/big.bin"].size
+
+    local_dir = tmp_path / "local"
+    local_dir.mkdir()
+    write_if_needed(str(local_dir))
+    cursor = await db.execute(
+        "INSERT INTO host (name, address, port, username, auth_method, password_enc, "
+        "known_hosts_policy) VALUES ('seedbox', ?, ?, ?, 'password', NULL, 'insecure')",
+        (SEEDBOX_HOST, SEEDBOX_PORT, SEEDBOX_USER),
+    )
+    host_id = cursor.lastrowid
+    cursor = await db.execute(
+        "INSERT INTO path_queue (host_id, name, remote_path, local_path, enabled, sync_mode) "
+        "VALUES (?, 'e2e-prefix-map', ?, ?, 1, 'copy')",
+        (host_id, f"/data/pickup/{remote_subdir}", str(local_dir)),
+    )
+    queue_id = cursor.lastrowid
+    cursor = await db.execute(
+        "INSERT INTO item (queue_id, rel_path, is_dir, remote_size, local_size, state) "
+        "VALUES (?, 'Big.Release', 1, ?, 0, 'REMOTE_ONLY')",
+        (queue_id, remote_size),
+    )
+    item_id = cursor.lastrowid
+    await db.commit()
+
+    await download_prefix.save_download_prefix_settings(
+        db, download_prefix.DownloadPrefixSettings(enabled=True, prefix=".downloading-")
+    )
+    # Low bandwidth cap, same as the resume test above -- makes the mid-transfer window
+    # deterministic instead of racing a fast loopback transfer.
+    await save_transfer_settings(
+        db,
+        TransferSettings(
+            max_bandwidth_bps=300_000,
+            max_concurrent_transfers=1,
+            small_item_threshold_bytes=0,
+            small_lane_reserve_bps=0,
+            min_share_floor_bps=0,
+            mirror_parallel_transfer_count=1,
+            mirror_use_pget_n=1,
+            pget_default_n=1,
+        ),
+    )
+
+    async def host_provider():
+        return host
+
+    q = TransferQueue(
+        db=db,
+        config_dir=str(tmp_path),
+        events=EventBus(),
+        run_dir=str(tmp_path / "run"),
+        tick_s=0.2,
+        host_provider=host_provider,
+    )
+    await q.start()
+    physical_bytes = 0
+    try:
+        job_id = await q.enqueue_item(item_id)
+
+        async def job_running():
+            row = await (
+                await db.execute("SELECT state, pid FROM job WHERE id = ?", (job_id,))
+            ).fetchone()
+            return row is not None and row["state"] == "running" and row["pid"] is not None
+
+        assert await _wait_until(job_running, timeout_s=15)
+        await asyncio.sleep(2.0)  # let real bytes accumulate under the bandwidth cap
+
+        await q.stop_job(job_id)
+
+        item_row = await (
+            await db.execute(
+                "SELECT state, pending_download_prefix FROM item WHERE id = ?", (item_id,)
+            )
+        ).fetchone()
+        assert item_row["state"] == "STOPPED"
+        assert item_row["pending_download_prefix"] == ".downloading-"
+
+        prefixed_dir = local_dir / ".downloading-Big.Release"
+        assert prefixed_dir.is_dir(), "the partial must sit under the prefixed directory"
+        physical_bytes = sum(p.stat().st_size for p in prefixed_dir.rglob("*") if p.is_file())
+        assert 0 < physical_bytes < remote_size, "partial bytes must exist and be incomplete"
+    finally:
+        await q.stop()
+
+    # A real Engine pass, entirely separate from TransferQueue -- exactly what the reconciler
+    # itself sees on its own scan cadence, with no job left running for this item at all.
+    engine = Engine(db=db, config_dir=str(tmp_path), events=EventBus())
+    qcfg = QueueConfig(
+        id=queue_id,
+        host_id=host_id,
+        name="e2e-prefix-map",
+        remote_path=f"/data/pickup/{remote_subdir}",
+        local_path=str(local_dir),
+        staging_path=None,
+        enabled=True,
+        sync_mode="copy",
+    )
+    try:
+        await engine.scan_queue(qcfg, host)
+
+        snapshot = (await engine.snapshot())[0]
+        published = {node["rel_path"]: node for node in snapshot["nodes"]}
+        assert "Big.Release" in published, "the item's own logical rel_path must be present"
+        assert "Big.Release/big.bin" in published, "the child must map onto the logical rel_path"
+        assert not any(
+            rel.startswith(".downloading-") for rel in published
+        ), "no phantom node under the literal, still-prefixed name may appear"
+
+        item_row = await (
+            await db.execute("SELECT * FROM item WHERE id = ?", (item_id,))
+        ).fetchone()
+        # STOPPED is protected (`_protected_rel_paths`) -- state text is left alone, but
+        # `local_size` is still refreshed from the mapped local tree every scan, which is
+        # exactly `core/queue.py._spawn_decision`'s `bytes_start` on a later resume.
+        assert item_row["state"] == "STOPPED"
+        assert item_row["local_size"] == physical_bytes, (
+            "item.local_size must be truthful, not blind, now that the prefixed directory's "
+            "contents are mapped onto the item's own rel_path"
+        )
+
+        # No `item` row was ever created under the literal, still-prefixed name either --
+        # confirmed at the persisted-row level, not just the published-snapshot level.
+        rows = await (
+            await db.execute(
+                "SELECT rel_path FROM item WHERE queue_id = ? AND rel_path LIKE '.downloading-%'",
+                (queue_id,),
+            )
+        ).fetchall()
+        assert rows == []
+
+        # And the leftover is genuinely deletable through the normal UI path -- closing
+        # `prompts/open-issues.md`'s "leftovers invisible... no row to delete" for this shape.
+        queue_row = await (
+            await db.execute("SELECT * FROM path_queue WHERE id = ?", (queue_id,))
+        ).fetchone()
+        outcome = await local_delete.delete_local(
+            db,
+            item=item_row,
+            queue=queue_row,
+            caller="test",
+            require_nlink_guard=False,
+            in_flight_item_ids=frozenset(),
+        )
+        assert outcome.deleted is True, outcome.reason
+        assert not prefixed_dir.exists(), "the physical, still-prefixed directory must be gone"
+    finally:
+        cleanup_pool = RemoteConnectionPool(tmp_path / "known_hosts_cleanup")
+        try:
+            await cleanup_pool.delete_path(host, f"/data/pickup/{remote_subdir}")
+        except Exception:  # noqa: BLE001 - cleanup only
+            pass
+        await cleanup_pool.close()
+
+
+async def test_engine_scan_surfaces_an_orphaned_prefixed_directory_as_local_only(db, tmp_path):
+    """A narrower, residual case than the test above: a `.downloading-<name>/` directory with
+    **no** supporting `item` history at all -- no job ever recorded a `pending_download_prefix`
+    for it (a leftover from before this feature existed, say, or one whose owning row was
+    dropped some other way). Mapping still fixes the reconciler's own blindness -- it surfaces
+    as an ordinary `LOCAL_ONLY` row instead of vanishing from the walk entirely -- but
+    `core/local_delete.py._physical_local_root` resolves the *physical* delete target from the
+    **item's own** `pending_download_prefix` column, which this row was never given a chance to
+    have. Deleting it through the normal path therefore still fails here (`"does not exist"`,
+    since the logical path `local_dir/Orphan.Release` was never actually created) -- verified
+    directly below, not assumed, so this residual gap is recorded rather than silently
+    papered over. It is outside this task's own scope (`core/local_scan.py`, not
+    `core/local_delete.py`'s resolution heuristic) and is named explicitly in this task's
+    `docs/decisions.md` entry.
+    """
+    remote_subdir = f"prefix-map-orphan-e2e-{uuid4().hex[:12]}"
+    host = _host_config()
+
+    scan_pool = RemoteConnectionPool(tmp_path / "known_hosts_scan")
+    conn = await scan_pool.get_connection(host)
+    async with conn.start_sftp_client() as sftp:
+        # An empty remote directory -- this queue has nothing else in it; the orphan below is
+        # purely local.
+        await sftp.makedirs(f"/data/pickup/{remote_subdir}", exist_ok=True)
+
+    local_dir = tmp_path / "local"
+    local_dir.mkdir()
+    write_if_needed(str(local_dir))
+
+    orphan = local_dir / ".downloading-Orphan.Release"
+    orphan.mkdir()
+    (orphan / "leftover.bin").write_bytes(b"x" * 4096)
+
+    cursor = await db.execute(
+        "INSERT INTO host (name, address, port, username, auth_method, password_enc, "
+        "known_hosts_policy) VALUES ('seedbox', ?, ?, ?, 'password', NULL, 'insecure')",
+        (SEEDBOX_HOST, SEEDBOX_PORT, SEEDBOX_USER),
+    )
+    host_id = cursor.lastrowid
+    cursor = await db.execute(
+        "INSERT INTO path_queue (host_id, name, remote_path, local_path, enabled, sync_mode) "
+        "VALUES (?, 'e2e-prefix-orphan', ?, ?, 1, 'copy')",
+        (host_id, f"/data/pickup/{remote_subdir}", str(local_dir)),
+    )
+    queue_id = cursor.lastrowid
+    await db.commit()
+
+    await download_prefix.save_download_prefix_settings(
+        db, download_prefix.DownloadPrefixSettings(enabled=True, prefix=".downloading-")
+    )
+
+    engine = Engine(db=db, config_dir=str(tmp_path), events=EventBus())
+    qcfg = QueueConfig(
+        id=queue_id,
+        host_id=host_id,
+        name="e2e-prefix-orphan",
+        remote_path=f"/data/pickup/{remote_subdir}",
+        local_path=str(local_dir),
+        staging_path=None,
+        enabled=True,
+        sync_mode="copy",
+    )
+    try:
+        await engine.scan_queue(qcfg, host)
+
+        snapshot = (await engine.snapshot())[0]
+        published = {node["rel_path"]: node for node in snapshot["nodes"]}
+        assert "Orphan.Release" in published, "must surface under its logical, mapped name"
+        assert published["Orphan.Release"]["state"] == "LOCAL_ONLY"
+        assert not any(
+            rel.startswith(".downloading-") for rel in published
+        ), "no phantom node under the literal name"
+
+        item_row = await (
+            await db.execute(
+                "SELECT * FROM item WHERE queue_id = ? AND rel_path = 'Orphan.Release'",
+                (queue_id,),
+            )
+        ).fetchone()
+        assert item_row is not None, "a real, persisted row a user can now see and act on"
+        assert (
+            item_row["pending_download_prefix"] is None
+        ), "nothing ever recorded a prefix for this row -- that is exactly this test's point"
+
+        queue_row = await (
+            await db.execute("SELECT * FROM path_queue WHERE id = ?", (queue_id,))
+        ).fetchone()
+        outcome = await local_delete.delete_local(
+            db,
+            item=item_row,
+            queue=queue_row,
+            caller="test",
+            require_nlink_guard=False,
+            in_flight_item_ids=frozenset(),
+        )
+        # The residual gap, verified rather than assumed: without a recorded prefix to resolve
+        # against, `_physical_local_root` falls back to the logical (unprefixed) path, which was
+        # never actually created on disk -- so the delete is withheld, and the orphan survives.
+        assert outcome.deleted is False
+        assert "does not exist" in outcome.reason
+        assert orphan.exists(), "the leftover is visible now, but not yet deletable this way"
+    finally:
+        cleanup_pool = RemoteConnectionPool(tmp_path / "known_hosts_cleanup")
+        try:
+            await cleanup_pool.delete_path(host, f"/data/pickup/{remote_subdir}")
+        except Exception:  # noqa: BLE001 - cleanup only
+            pass
+        await cleanup_pool.close()
+
+
+class _PostprocessRecorder:
+    """A minimal stand-in for `PostprocessPipeline` -- just enough surface for
+    `core/engine.py._persist`'s `unstuck` path (`self.postprocess.trigger`) and
+    `core/engine.py._queue_is_active`/`_protected_rel_paths` (`in_flight_item_ids`), without
+    spawning a real pipeline or touching the remote at all.
+    """
+
+    def __init__(self) -> None:
+        self.triggered: list[int] = []
+
+    def trigger(self, item_id: int) -> None:
+        self.triggered.append(item_id)
+
+    def in_flight_item_ids(self):
+        return frozenset()
+
+
+async def test_engine_scan_unsticks_a_settled_item_whose_bytes_are_still_prefixed(
+    db, tmp_path, monkeypatch
+):
+    """`prompts/open-issues.md`'s "the folder prefix and the settle gate's stuck-item recovery
+    don't compose": that entry's own root cause was `scan_local(extra_dir_prefixes=...)`
+    "deliberately hiding" a still-prefixed directory's bytes, so a directory item held at
+    `REMOTE_ONLY/settling` could never compute structurally `DOWNLOADED` no matter how complete
+    the copy on disk actually was -- `core/engine.py._persist`'s `unstuck` path (this exact
+    scenario) could never fire.
+
+    Reproduced directly (no `TransferQueue`/lftp spawn needed): a directory item's full content
+    is written straight to disk under its prefixed name, with `item.pending_download_prefix`
+    already recorded exactly as a real job would have left it. Two real `Engine.scan_queue`
+    passes against unchanged remote content -- the settle gate's own count-of-2 rule -- must
+    still resolve `REMOTE_ONLY/settling` -> `DOWNLOADED` and fire post-processing, proving the
+    bytes are now visible under the item's logical rel_path even while still physically sitting
+    under the prefixed one.
+    """
+    monkeypatch.setattr(settle_module, "SETTLE_MIN_AGE_S", 1e-6)
+    remote_subdir = f"prefix-unstuck-e2e-{uuid4().hex[:12]}"
+    remote_root = f"/data/pickup/{remote_subdir}"
+    release = "Release.Name"
+
+    upload_pool = RemoteConnectionPool(tmp_path / "known_hosts_upload")
+    host = _host_config()
+    conn = await upload_pool.get_connection(host)
+    try:
+        async with conn.start_sftp_client() as sftp:
+            remote_dir = f"{remote_root}/{release}"
+            await sftp.makedirs(remote_dir, exist_ok=True)
+            async with sftp.open(f"{remote_dir}/a.mkv", "wb") as f:
+                await f.write(_FILE_A)
+            async with sftp.open(f"{remote_dir}/b.mkv", "wb") as f:
+                await f.write(_FILE_B)
+
+        await save_settle_settings(db, SettleSettings(enabled=True))
+        await download_prefix.save_download_prefix_settings(
+            db, download_prefix.DownloadPrefixSettings(enabled=True, prefix=".downloading-")
+        )
+
+        local_dir = tmp_path / "local"
+        local_dir.mkdir()
+        write_if_needed(str(local_dir))
+        # The full release, already complete, sitting under its *prefixed* name -- exactly what
+        # a `mirror` job that already succeeded, but is still held by the settle gate, leaves
+        # behind (`_reap_one`'s "settled" branch never touches `pending_download_prefix`).
+        prefixed_dir = local_dir / f".downloading-{release}"
+        prefixed_dir.mkdir()
+        (prefixed_dir / "a.mkv").write_bytes(_FILE_A)
+        (prefixed_dir / "b.mkv").write_bytes(_FILE_B)
+
+        cursor = await db.execute(
+            "INSERT INTO host (name, address, port, username, auth_method, password_enc, "
+            "known_hosts_policy) VALUES ('seedbox', ?, ?, ?, 'password', NULL, 'insecure')",
+            (SEEDBOX_HOST, SEEDBOX_PORT, SEEDBOX_USER),
+        )
+        host_id = cursor.lastrowid
+        cursor = await db.execute(
+            "INSERT INTO path_queue (host_id, name, remote_path, local_path, enabled, "
+            "sync_mode) VALUES (?, 'e2e-prefix-unstuck', ?, ?, 1, 'copy')",
+            (host_id, remote_root, str(local_dir)),
+        )
+        queue_id = cursor.lastrowid
+        # A job already recorded this item's pending prefix, matching real `_spawn_decision`
+        # bookkeeping -- the same thing that keeps a *stale* prefix mapped even after settings
+        # move on (`Engine._active_download_prefixes`'s union).
+        cursor = await db.execute(
+            "INSERT INTO item (queue_id, rel_path, is_dir, state, pending_download_prefix) "
+            "VALUES (?, ?, 1, 'REMOTE_ONLY', '.downloading-')",
+            (queue_id, release),
+        )
+        await db.commit()
+
+        recorder = _PostprocessRecorder()
+        engine = Engine(db=db, config_dir=str(tmp_path), events=EventBus())
+        engine.postprocess = recorder
+        qcfg = QueueConfig(
+            id=queue_id,
+            host_id=host_id,
+            name="e2e-prefix-unstuck",
+            remote_path=remote_root,
+            local_path=str(local_dir),
+            staging_path=None,
+            enabled=True,
+            sync_mode="copy",
+        )
+
+        # Scan 1: first sighting. Byte comparison alone already says DOWNLOADED (the mapped
+        # local content matches the remote exactly) -- the settle gate must still downgrade it,
+        # since the fingerprint has not held for two consecutive scans yet.
+        await engine.scan_queue(qcfg, host)
+        row = await (
+            await db.execute(
+                "SELECT state, substate FROM item WHERE queue_id = ? AND rel_path = ?",
+                (queue_id, release),
+            )
+        ).fetchone()
+        assert row["state"] == "REMOTE_ONLY"
+        assert row["substate"] == "settling"
+        assert recorder.triggered == []
+
+        # Scan 2: remote unchanged since scan 1 -- settled. If the prefixed directory's bytes
+        # were still invisible to the reconciler (the old filtering behaviour), this would stay
+        # REMOTE_ONLY forever, no matter how many scans ran -- the exact gap
+        # `prompts/open-issues.md` named. Mapping fixes it: the item now computes structurally
+        # DOWNLOADED, `_persist`'s `unstuck` path recognizes the REMOTE_ONLY/settling ->
+        # DOWNLOADED transition, and post-processing is triggered.
+        await engine.scan_queue(qcfg, host)
+        row = await (
+            await db.execute(
+                "SELECT state, substate, local_size FROM item WHERE queue_id = ? AND rel_path = ?",
+                (queue_id, release),
+            )
+        ).fetchone()
+        assert row["state"] == "DOWNLOADED"
+        assert row["substate"] is None
+        assert row["local_size"] == len(_FILE_A) + len(_FILE_B)
+
+        item_id = (
+            await (
+                await db.execute(
+                    "SELECT id FROM item WHERE queue_id = ? AND rel_path = ?", (queue_id, release)
+                )
+            ).fetchone()
+        )["id"]
+        assert recorder.triggered == [item_id], "the stuck-item recovery path must have fired"
+    finally:
+        await upload_pool.close()
+        cleanup_pool = RemoteConnectionPool(tmp_path / "known_hosts_cleanup")
+        try:
+            await cleanup_pool.delete_path(host, remote_root)
         except Exception:  # noqa: BLE001 - cleanup only
             pass
         await cleanup_pool.close()
