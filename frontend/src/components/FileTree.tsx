@@ -7,9 +7,11 @@ import type { FileNode, SettleSettingsOut } from '../api/types'
 import type { ChildSpeedSample } from '../hooks/useLiveModel'
 import {
   bothSidesRows,
+  childEtaS,
   childSpeedLabel,
   childSpeedSortValue,
   formatBytes,
+  formatEta,
   formatPercent,
   hasBothSides,
   isStillArriving,
@@ -19,6 +21,7 @@ import {
   settleWaitLabel,
   settleWaitShortLabel,
   stateAgeLabel,
+  transferEtaLabel,
   transferSpeedLabel,
   transferSpeedSortValue,
 } from '../lib/format'
@@ -88,6 +91,18 @@ export interface TreeEntry extends FileNode {
    * them (§9.2's "don't let the numbers read as additive").
    */
   child_speed_bps: number | null
+  /** The **job-level** ETA (2026-08-14, "ETA on Files rows") -- `core/progress.py.JobProgress.
+   * eta_s`, already fully computed server-side and threaded onto the wire on the same
+   * `progress` message `speed_bps` rides, looked up here by this row's own `id` from the
+   * `etaByItemId` map exactly the way `speed_bps` is looked up from `speedByItemId`. `null` for
+   * the same set of rows `speed_bps` is `null` for, plus whenever the backend itself has no ETA
+   * to report (unknown `bytes_total`, or a zero smoothed speed) -- see `transferEtaLabel`
+   * (`lib/format.ts`) for the display gate. There is no `child_eta_s` field alongside this one:
+   * a child's ETA isn't carried on the wire at all (`_publish_child_progress` only ever emits a
+   * rate), so it's derived on demand from `remote_size`/`local_size`/`child_speed_bps` by
+   * `effectiveEtaLabel` below rather than pre-computed and stored per row.
+   */
+  eta_s: number | null
 }
 
 /** What a row's own size column shows. A **file** prefers `local_size` (falling back to
@@ -136,6 +151,21 @@ export function effectiveSpeedSortValue(entry: TreeEntry): number | null {
   return transferSpeedSortValue(entry.state, entry.speed_bps) ?? childSpeedSortValue(entry.child_speed_bps)
 }
 
+/** The Speed cell's ETA text for one row (2026-08-14, "ETA on Files rows") -- same job-level-
+ * first, child-level-fallback shape as `effectiveSpeedLabel` right above, and for the identical
+ * reason: `entry.eta_s` is only ever non-null for the parent item of a currently-running job,
+ * `childEtaS(...)` only ever produces something for a leaf file with a fresh
+ * `child_speed_bps`, and the two can never both apply to the same row. Deliberately **not**
+ * given its own sort key -- see the `speed` column's own comment (`RESIZABLE_COLUMNS` below) for
+ * why the Speed column keeps sorting by rate even though its cell now shows both.
+ */
+export function effectiveEtaLabel(entry: TreeEntry): string {
+  const jobLabel = transferEtaLabel(entry.state, entry.eta_s)
+  return jobLabel !== '—'
+    ? jobLabel
+    : formatEta(childEtaS(entry.remote_size, entry.local_size, entry.child_speed_bps))
+}
+
 export function buildTree(
   nodes: FileNode[],
   speedByItemId: Record<number, number> = {},
@@ -143,6 +173,10 @@ export function buildTree(
    * default `{}` keeps every pre-existing 2-arg call site (and test) working unchanged.
    */
   childSpeedByItemId: Record<number, ChildSpeedSample> = {},
+  /** `useLiveModel.ts`'s `etaByItemId` (2026-08-14, "ETA on Files rows") -- same shape and same
+   * default as `speedByItemId` above, resolved onto `eta_s` the same way `speed_bps` is.
+   */
+  etaByItemId: Record<number, number | null> = {},
   /** Injectable so the freshness check below is deterministic in a test, exactly like
    * `core/progress.py.ProgressSampler.sample`'s own `now` parameter -- defaults to the real
    * clock for every production call site.
@@ -176,6 +210,7 @@ export function buildTree(
         childSample != null && now - childSample.receivedAt <= CHILD_SPEED_FRESHNESS_MS
           ? childSample.speedBps
           : null,
+      eta_s: node.id != null ? (etaByItemId[node.id] ?? null) : null,
     }
     byPath.set(node.rel_path, entry)
     if (parent) parent.children.push(entry)
@@ -806,10 +841,25 @@ export const RESIZABLE_COLUMNS: ColumnDef[] = [
   // per that task's own placement. Blank/dash for anything not actively downloading -- never
   // `0 B/s` for a row that simply isn't transferring (`lib/format.ts.transferSpeedLabel`) -- so
   // this column reads mostly empty at a glance, which is correct: most rows aren't transferring
-  // at any given moment. `minWidth` matches `size`'s own floor; `defaultWidth` a touch wider to
-  // fit "12.3 MB/s" without truncating, unverified against a real browser (no UI access in this
-  // environment) but reasoned from the longest realistic rate string this format produces.
-  { id: 'speed', label: 'Speed', defaultWidth: 88, minWidth: 56, align: 'right', sortKey: 'speed' },
+  // at any given moment.
+  //
+  // **ETA appended in the same cell (2026-08-14, "ETA on Files rows"), not a new column.** The
+  // task's own brief weighed three placements: a dedicated ETA column (cleanest semantically,
+  // but this is already the sixth fixed-width column squeezing the flexing Name column, and a
+  // seventh would squeeze it further); hover/drawer only (cheapest, but defeats the point of an
+  // at-a-glance answer to "how long left"); and appending it here, "34 MB/s · 3m", since rate
+  // and ETA read as one thought and this reuses width that already exists rather than claiming
+  // more. Took the third option -- see docs/decisions.md for the fuller reasoning and the
+  // rejected alternatives. Sorting is **still by rate alone** (`sortKey: 'speed'`, unchanged) --
+  // the cell showing two numbers doesn't make the sort ambiguous, because only one of them
+  // (`speed_bps`/`child_speed_bps`) was ever the sort key.
+  //
+  // `minWidth` matches `size`'s own floor; `defaultWidth` widened from the original 88px (rate
+  // alone) to fit "12.3 MB/s · 45m" without truncating -- unverified against a real browser (no
+  // UI access in this environment) but reasoned from the longest realistic combined string this
+  // format produces. A human should check this column, and the Name column's remaining width,
+  // at a narrow browser window.
+  { id: 'speed', label: 'Speed', defaultWidth: 128, minWidth: 64, align: 'right', sortKey: 'speed' },
   {
     id: 'status',
     label: 'Status',
@@ -1054,6 +1104,11 @@ function Row({
   hoverCardRef,
 }: RowProps) {
   const size = nodeDisplaySize(entry)
+  // Speed cell text (2026-08-14, "ETA on Files rows") -- computed once here rather than inline
+  // in the JSX below, both because the JSX needs the same two values twice (the visible text and
+  // the cell's `title`) and to keep the render markup itself readable.
+  const speedLabel = effectiveSpeedLabel(entry)
+  const etaLabel = effectiveEtaLabel(entry)
   const action = rowAction(entry)
   const deletable = canDeleteLocal(entry)
   // 2026-08-13 (prompts/2026-08-13-delete-state-truthfulness.md defect 1): `substate ===
@@ -1175,12 +1230,29 @@ function Row({
           on top: a **child** file inside a mirroring directory sits at `PARTIAL`, never
           `DOWNLOADING`, so it falls through to its own freshness-gated `child_speed_bps`
           instead (`entry.speed_bps` is `null` for it in the first place -- a leaf file is never
-          the parent of a running job). */}
+          the parent of a running job).
+
+          **ETA appended in the same cell (2026-08-14, "ETA on Files rows"):** "34 MB/s · 3m",
+          not a seventh fixed-width column -- this project's Files columns are already tight
+          (`a4a626d` trimmed labels once specifically because they were clipping), and rate/ETA
+          read as one thought rather than two things to scan separately. Rejected alternatives
+          (a dedicated ETA column, hover-only) are recorded in docs/decisions.md. The column
+          still **sorts by rate only** (`sortValue`'s `'speed'` case, unchanged) -- ETA never
+          gets its own sort key, so the header's sort semantics stay exactly what its label
+          already implies. `etaLabel` is appended only when there is one to show
+          (`effectiveEtaLabel` returns `'—'` for the same "nothing to report" cases
+          `effectiveSpeedLabel` already does, so this never renders a dangling " · —"), and
+          because both derivations share the same job-level/child-level gates, `etaLabel` is
+          never non-dash while `speedLabel` is dash. Column width and busyness at a narrow
+          viewport are unverified -- no browser exists in this environment; a human should
+          check this at a narrow window. */}
       <span
         className="shrink-0 overflow-hidden text-right text-zinc-500 dark:text-zinc-400"
         style={fixedColumnStyle('speed')}
+        title={etaLabel !== '—' ? `ETA ${etaLabel}` : undefined}
       >
-        {effectiveSpeedLabel(entry)}
+        {speedLabel}
+        {etaLabel !== '—' && ` · ${etaLabel}`}
       </span>
       <span className="shrink-0 overflow-hidden text-right" style={fixedColumnStyle('status')}>
         {/* The settle gate's wait (2026-08-13, item 3): was a 6px dot next to the chip
@@ -1309,6 +1381,7 @@ export function FileTree({
   nodes,
   connected = true,
   speedByItemId,
+  etaByItemId,
   childSpeedByItemId,
   selected,
   onSelectionChange,
@@ -1327,6 +1400,12 @@ export function FileTree({
    * Row cell read it from.
    */
   speedByItemId: Record<number, number>
+  /** The `progress` WS message's `eta_s`, keyed by `item_id` (2026-08-14, "ETA on Files rows")
+   * -- `useLiveModel.ts`'s own map, the same shape and same source message as `speedByItemId`
+   * above. Fed straight into `buildTree` below so every `TreeEntry` carries its own `eta_s`, the
+   * one place the Speed cell's appended ETA text reads it from.
+   */
+  etaByItemId: Record<number, number | null>
   /** `useLiveModel.ts`'s `childSpeedByItemId` (2026-08-14, "per-file speed inside a mirror") --
    * a live rate per changed file inside a mirroring directory, each sample timestamped so
    * `buildTree` can gate display on freshness rather than `state` (see that map's own
@@ -1407,7 +1486,7 @@ export function FileTree({
   }
 
   const tree = useMemo(
-    () => sortTree(buildTree(nodes, speedByItemId, childSpeedByItemId), sortPref.key, sortPref.dir),
+    () => sortTree(buildTree(nodes, speedByItemId, childSpeedByItemId, etaByItemId), sortPref.key, sortPref.dir),
     // `ageTick` isn't read inside `buildTree` (it always calls `Date.now()` fresh) -- it's
     // listed purely to force this memo to recompute periodically (the same ticker
     // `stateAgeLabel`'s "how long ago" text already rides), which is what makes a child's
@@ -1415,7 +1494,7 @@ export function FileTree({
     // itself stops changing (a finished/stopped child receives no further `child_progress`
     // samples, so nothing else here would trigger a recompute).
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [nodes, speedByItemId, childSpeedByItemId, sortPref, ageTick],
+    [nodes, speedByItemId, etaByItemId, childSpeedByItemId, sortPref, ageTick],
   )
 
   // Collapse preference (2026-08-13): "default plus exceptions," not a saved set of collapsed

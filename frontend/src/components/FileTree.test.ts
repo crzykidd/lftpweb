@@ -7,6 +7,7 @@ import {
   clampColumnWidth,
   columnMinWidth,
   defaultColumnWidths,
+  effectiveEtaLabel,
   effectiveSpeedLabel,
   effectiveSpeedSortValue,
   flatten,
@@ -124,34 +125,34 @@ describe('buildTree', () => {
     it('a fresh sample resolves to its speed', () => {
       const nodes = [node('a.txt', false, { id: 1 })]
       const childSpeedByItemId: Record<number, ChildSpeedSample> = { 1: { speedBps: 42_000, receivedAt: 1_000 } }
-      const tree = buildTree(nodes, {}, childSpeedByItemId, 1_000)
+      const tree = buildTree(nodes, {}, childSpeedByItemId, {}, 1_000)
       expect(tree[0].child_speed_bps).toBe(42_000)
     })
 
     it('a sample exactly at the freshness boundary still counts', () => {
       const nodes = [node('a.txt', false, { id: 1 })]
       const childSpeedByItemId: Record<number, ChildSpeedSample> = { 1: { speedBps: 5_000, receivedAt: 0 } }
-      const tree = buildTree(nodes, {}, childSpeedByItemId, CHILD_SPEED_FRESHNESS_MS)
+      const tree = buildTree(nodes, {}, childSpeedByItemId, {}, CHILD_SPEED_FRESHNESS_MS)
       expect(tree[0].child_speed_bps).toBe(5_000)
     })
 
     it('a sample older than the freshness window resolves to null -- the stale-sample case', () => {
       const nodes = [node('a.txt', false, { id: 1 })]
       const childSpeedByItemId: Record<number, ChildSpeedSample> = { 1: { speedBps: 5_000, receivedAt: 0 } }
-      const tree = buildTree(nodes, {}, childSpeedByItemId, CHILD_SPEED_FRESHNESS_MS + 1)
+      const tree = buildTree(nodes, {}, childSpeedByItemId, {}, CHILD_SPEED_FRESHNESS_MS + 1)
       expect(tree[0].child_speed_bps).toBeNull()
     })
 
     it('no entry in the map at all resolves to null, same as speed_bps', () => {
       const nodes = [node('a.txt', false, { id: 1 })]
-      const tree = buildTree(nodes, {}, {}, 1_000)
+      const tree = buildTree(nodes, {}, {}, {}, 1_000)
       expect(tree[0].child_speed_bps).toBeNull()
     })
 
     it('a node with no id at all can never match, regardless of the map contents', () => {
       const nodes = [node('a.txt', false, { id: null })]
       const childSpeedByItemId: Record<number, ChildSpeedSample> = { 1: { speedBps: 5_000, receivedAt: 1_000 } }
-      const tree = buildTree(nodes, {}, childSpeedByItemId, 1_000)
+      const tree = buildTree(nodes, {}, childSpeedByItemId, {}, 1_000)
       expect(tree[0].child_speed_bps).toBeNull()
     })
 
@@ -159,6 +160,34 @@ describe('buildTree', () => {
       const tree = buildTree([node('a.txt', false, { id: 1 })])
       expect(tree[0].child_speed_bps).toBeNull()
     })
+  })
+
+  // 2026-08-14 ("ETA on Files rows"): `eta_s` is resolved by id from the optional `etaByItemId`
+  // argument, the same shape and same "null when absent" fallback `speed_bps` already has above
+  // -- it's a straight passthrough of `core/progress.py`'s own already-computed value, not a
+  // derivation `buildTree` does itself.
+  it('resolves eta_s by id from the optional etaByItemId map, null when absent', () => {
+    const nodes = [
+      node('a.txt', false, { id: 1 }),
+      node('b.txt', false, { id: 2 }),
+      node('c.txt', false, { id: null }),
+    ]
+    const tree = buildTree(nodes, {}, {}, { 1: 125 })
+    expect(tree.find((e) => e.rel_path === 'a.txt')?.eta_s).toBe(125)
+    // Present in the tree but no matching id in the map (job finished, or never ran).
+    expect(tree.find((e) => e.rel_path === 'b.txt')?.eta_s).toBeNull()
+    // No id at all.
+    expect(tree.find((e) => e.rel_path === 'c.txt')?.eta_s).toBeNull()
+  })
+
+  it('resolves eta_s to null when the map holds an explicit null for that id (bytes_total unknown or zero speed)', () => {
+    const tree = buildTree([node('a.txt', false, { id: 1 })], {}, {}, { 1: null })
+    expect(tree[0].eta_s).toBeNull()
+  })
+
+  it('defaults eta_s to null for every row when no etaByItemId argument is passed at all', () => {
+    const tree = buildTree([node('a.txt', false, { id: 1 })])
+    expect(tree[0].eta_s).toBeNull()
   })
 })
 
@@ -179,6 +208,7 @@ describe('effectiveSpeedLabel / effectiveSpeedSortValue', () => {
       children: [],
       speed_bps: null,
       child_speed_bps: null,
+      eta_s: null,
       ...overrides,
     }
   }
@@ -207,6 +237,65 @@ describe('effectiveSpeedLabel / effectiveSpeedSortValue', () => {
     const e = entry({ state: 'DOWNLOADED', speed_bps: null, child_speed_bps: null })
     expect(effectiveSpeedLabel(e)).toBe('—')
     expect(effectiveSpeedSortValue(e)).toBeNull()
+  })
+})
+
+// --- effectiveEtaLabel: job-level first, child-level fallback (2026-08-14, "ETA on Files rows")
+//
+// Same shape as effectiveSpeedLabel above, and the same reason: `entry.eta_s` (job-level, from
+// `core/progress.py.JobProgress.eta_s`) is preferred, falling back to a client-derived
+// `childEtaS(remote_size, local_size, child_speed_bps)` only when the job-level reading has
+// nothing to show -- never both, never summed.
+
+describe('effectiveEtaLabel', () => {
+  function entry(overrides: Partial<TreeEntry>): TreeEntry {
+    return {
+      ...node('x', false),
+      name: 'x',
+      depth: 0,
+      children: [],
+      speed_bps: null,
+      child_speed_bps: null,
+      eta_s: null,
+      ...overrides,
+    }
+  }
+
+  it('a DOWNLOADING parent row shows its already-computed job-level eta_s', () => {
+    const e = entry({ state: 'DOWNLOADING', eta_s: 125 })
+    expect(effectiveEtaLabel(e)).toBe('2m')
+  })
+
+  it('a DOWNLOADING parent row with no eta_s (bytes_total unknown, or zero speed) shows ' +
+    'nothing, even with a live speed reading', () => {
+    const e = entry({ state: 'DOWNLOADING', speed_bps: 5_000_000, eta_s: null })
+    expect(effectiveEtaLabel(e)).toBe('—')
+  })
+
+  it('a PARTIAL child row derives its own ETA from remote_size/local_size/child_speed_bps', () => {
+    const e = entry({
+      state: 'PARTIAL',
+      remote_size: 200_000_000,
+      local_size: 100_000_000,
+      child_speed_bps: 1_000_000,
+    })
+    expect(effectiveEtaLabel(e)).toBe('1m')
+  })
+
+  it('a completed child (remaining bytes <= 0) shows no ETA even though state is still PARTIAL', () => {
+    const e = entry({ state: 'PARTIAL', remote_size: 100, local_size: 100, child_speed_bps: 1_000 })
+    expect(effectiveEtaLabel(e)).toBe('—')
+  })
+
+  it('a PARTIAL child row with a stale (already-nulled) sample shows nothing, not a stale ETA', () => {
+    // buildTree already resolved the stale child_speed_bps to null before this ever runs.
+    const e = entry({ state: 'PARTIAL', remote_size: 200_000_000, local_size: 100_000_000, child_speed_bps: null })
+    expect(effectiveEtaLabel(e)).toBe('—')
+  })
+
+  it('a row that is neither a running job nor a fresh child shows nothing', () => {
+    const e = entry({ state: 'DOWNLOADED', eta_s: null, child_speed_bps: null })
+    expect(effectiveEtaLabel(e)).toBe('—')
   })
 })
 
@@ -366,7 +455,7 @@ describe('sortTree', () => {
         31: { speedBps: 1_000_000, receivedAt: now },
         32: { speedBps: 9_999_999, receivedAt: now - CHILD_SPEED_FRESHNESS_MS - 1 },
       }
-      const asc = sortTree(buildTree(nodes, {}, childSpeedByItemId, now), 'speed', 'asc')[0].children.map(
+      const asc = sortTree(buildTree(nodes, {}, childSpeedByItemId, {}, now), 'speed', 'asc')[0].children.map(
         (c) => c.rel_path,
       )
       expect(asc).toEqual(['root/slow.rar', 'root/fast.rar', 'root/idle.rar', 'root/stale.rar'])
@@ -450,6 +539,7 @@ describe('matchesFacetFilter', () => {
     children: [],
     speed_bps: null,
     child_speed_bps: null,
+    eta_s: null,
   })
 
   it('"" (All items) matches everything', () => {

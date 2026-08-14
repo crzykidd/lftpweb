@@ -6,6 +6,80 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-14 — ETA on Files rows: appended into the Speed cell, honest-not-capped, no new sort key
+
+**Handoff prompt `prompts/done/2026-08-14-eta-on-files-rows.md`, executed end to end, after
+`prompts/done/2026-08-14-per-file-speed-inside-a-mirror.md` (`25bc33c`).** The Files page showed
+a live transfer rate but never how long was left — "3m left" answers the question a user
+actually has; "34 MB/s" makes them do the arithmetic themselves.
+
+**The top-level item's ETA needed zero backend work.** Verified before writing any code, per the
+prompt's own instruction: `core/progress.py.ProgressSampler.sample` already computes
+`JobProgress.eta_s` (`remaining / speed`, `None` when `bytes_total` is unknown or speed is 0),
+and `core/queue.py._sample_and_publish_progress` already publishes it on the `progress` WS
+message alongside `speed_bps` (`{"eta_s": results[p.job_id].eta_s}`, unchanged). The Transfers
+page (`TransfersPage.tsx`) already renders it as `` `ETA ${formatEta(eta)}` ``. So the entire
+parent-row change is frontend plumbing: a new `etaByItemId` map in `useLiveModel.ts`, built from
+the same `progress` message `speedByItemId` already reads, threaded into `FileTree.tsx`'s
+`buildTree` the same way `speedByItemId` is, resolved onto a new `TreeEntry.eta_s` field. No
+second ETA computation exists anywhere in this codebase now, or after this change.
+
+**A child file's ETA has no server-computed counterpart and is derived client-side.**
+`_publish_child_progress` (the per-file-speed task) only ever emits a rate
+(`ChildProgressItem.speed_bps`) — there is no `child_eta_s` on the wire, deliberately: adding one
+would mean either the backend recomputing `remote_size - local_size` a second time (it already
+has both values in the `local_scan.LocalEntry` map that produced the rate) for a value the
+frontend can derive for free from data it already has (`TreeEntry.remote_size`/`local_size` are
+already on every row, `child_speed_bps` is already resolved and freshness-gated by `buildTree`).
+`lib/format.ts.childEtaS(remoteSize, localSize, speedBps)` is the one place this is computed — a
+pure function, unit-tested directly without mounting a component, per the prompt's own
+instruction. It guards every degenerate case by returning `null` rather than a wrong number:
+`remoteSize`/`localSize` null (no denominator — the identical "unknown vs. 0 is not this path's
+call" rule the Size column's `nodeDisplaySize` already follows), `speedBps` null/zero/non-finite
+(no fresh sample, or a genuinely stalled rate — never divides by zero into `Infinity`), and
+`remaining <= 0` (local already meets or exceeds remote — the file is done, a different fact from
+"0 seconds left"). No new freshness mechanism: `childSpeedBps` is already resolved to `null` for
+a stale sample by `buildTree` (`CHILD_SPEED_FRESHNESS_MS`) before it ever reaches `childEtaS`, so
+staleness is inherited, not re-implemented.
+
+**Uncapped on the high end — honest over a fabricated ceiling.** The prompt explicitly raised
+capping a very-large ETA (a rate that just collapsed to a trickle) as an option, "acceptable if
+you justify it." Rejected: a cap would mean displaying a *different number* than the one actually
+implied by the current rate, which is precisely the "never show a fabricated value" bar this same
+task set for every other guard here. A very large but real reading ("14h 20m") is more honest
+than a silently-substituted "> 1h" that hides how bad the rate currently is — the whole point of
+showing an ETA at all is to let the number itself communicate that a transfer has stalled, and
+capping it removes exactly that signal. `formatEta` (unchanged) already has no ceiling of its own
+for anything under `Number.MAX_SAFE_INTEGER` seconds, so this was a decision not to add one, not
+an omission.
+
+**Layout: appended into the existing Speed cell, not a new column or hover-only.** The prompt
+laid out three options and ranked them; this followed the ranking. A dedicated ETA column was
+rejected because the Files columns are already tight — `a4a626d` trimmed labels once specifically
+because they were clipping, and the Speed column itself (`f728373`) is the most recent addition
+squeezing the flexing Name column; a seventh fixed-width column would squeeze it further, and a
+column-width-migration concern (`mergeColumnWidths`, already solved once for Speed's own
+introduction) would need re-solving for no real gain. Hover/drawer-only was rejected because it
+fails the request's actual point — "how long left" needs to be visible at a glance while scanning
+the tree, not one hover away. Appending won: rate and ETA read as one thought ("34 MB/s · 3m"),
+it costs no new column, and it reuses `RESIZABLE_COLUMNS`' existing `speed` entry rather than
+adding a new id to `mergeColumnWidths`' migration path. Trade-off accepted as-is: the column's
+`defaultWidth` was widened from 88px to 128px to fit the combined string (unverified against a
+real browser — no UI access in this environment); a human should check this, and the Name
+column's remaining width, at a narrow viewport. The cell's `title` attribute carries `ETA <text>`
+on hover as a small mitigation if the inline text ever does get visually cramped.
+
+**No new sort key.** The prompt asked explicitly whether the column's sort key should become
+ambiguous once it shows two numbers; it does not — `sortValue`'s `'speed'` case is unchanged,
+sorting by `effectiveSpeedSortValue` (rate) alone. ETA is a derived, display-only reading of the
+same underlying state (remaining bytes and rate) already driving the rate the column sorts by, so
+a second sort key would let a user sort by a number that's a near-monotonic function of the one
+already available — not enough independent signal to justify a second header affordance, split
+sort-icon ambiguity ("which of the two numbers does the arrow describe?"), or a second entry in
+`SORT_KEYS`/`SORT_LABELS`.
+
+---
+
 ## 2026-08-14 — Per-file speed inside a mirror: a third WS message, freshness-gated on the frontend rather than a `state` check
 
 **Handoff prompt `prompts/done/2026-08-14-per-file-speed-inside-a-mirror.md`, executed end to

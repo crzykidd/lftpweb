@@ -93,6 +93,59 @@ export function formatEta(etaSeconds: number | null | undefined): string {
   return `${s}s`
 }
 
+// A Files-row ETA (2026-08-14, "ETA on Files rows") -- the top-level item's own `eta_s` is
+// already computed server-side (`core/progress.py.ProgressSampler.sample`) and threaded onto
+// the wire on the same `progress` message `speed_bps` already rides (`wsTypes.ts.ProgressJob.
+// eta_s`); nothing new is computed for it here, only formatted through the same `formatEta`
+// above the Transfers page already uses ("ETA 3m"). A **child** file inside a mirroring
+// directory has no server-computed ETA of its own -- `_publish_child_progress` only ever emits
+// a rate (`ChildProgressItem.speed_bps`), never an ETA -- so `childEtaS` below derives one
+// client-side, the same way the task's own brief spelled out. Both read through the identical
+// `formatEta`, and `FileTree.tsx`'s `effectiveEtaLabel` shows both the same way a row's Speed
+// cell already picks between job-level and child-level rates -- no second duration vocabulary,
+// no second gating mechanism.
+
+/** The Files tree row's job-level ETA text -- the same gate `transferSpeedLabel` already applies
+ * to `speed_bps` (`state === 'DOWNLOADING'`), so a stale `eta_s` from a finished or never-started
+ * job never lingers (this value, like `speedByItemId`, is never pruned client-side; see
+ * `useLiveModel.ts`). `etaS` is already `null` from the backend whenever `bytes_total` is unknown
+ * or speed is 0 (`JobProgress.eta_s`'s own docstring) -- nothing further to guard here beyond
+ * that and the usual `Number.isFinite` defense against a malformed payload.
+ */
+export function transferEtaLabel(state: string, etaS: number | null | undefined): string {
+  if (state !== 'DOWNLOADING' || etaS == null || !Number.isFinite(etaS)) return '—'
+  return formatEta(etaS)
+}
+
+/** A child file's own ETA (2026-08-14, "ETA on Files rows") -- `remote_size - local_size` (both
+ * persisted; the exact pair `_publish_child_progress`'s own DOWNLOADED/PARTIAL leaf rule already
+ * compares), divided by that child's freshness-gated smoothed rate (`child_speed_bps`, resolved
+ * by `FileTree.tsx`'s `buildTree` the same way `childSpeedLabel` already consumes it -- a stale
+ * or absent sample is already `null` by the time it reaches here, so no separate freshness check
+ * belongs in this function). "Show nothing rather than a wrong number" (this task's own bar) --
+ * every degenerate case returns `null`, never `Infinity`, `NaN`, or a negative reading:
+ *  - `remoteSize`/`localSize` null: no denominator -- the same "unknown vs. 0 is not this path's
+ *    call" rule the Size column already follows (`nodeDisplaySize`, `FileTree.tsx`).
+ *  - `speedBps` null, zero, or non-finite: no fresh sample, or a genuinely stalled rate -- never
+ *    divide by zero into `Infinity`.
+ *  - `remaining <= 0`: local already meets or exceeds remote -- the file is done, which is a
+ *    different fact from "0 seconds left."
+ * Deliberately uncapped on the high end: a very small rate produces a very large (but honest)
+ * reading rather than a fabricated "> 1h" ceiling -- see docs/decisions.md for why honest won
+ * over capped here.
+ */
+export function childEtaS(
+  remoteSize: number | null,
+  localSize: number | null,
+  speedBps: number | null,
+): number | null {
+  if (remoteSize == null || localSize == null) return null
+  if (speedBps == null || !Number.isFinite(speedBps) || speedBps <= 0) return null
+  const remaining = remoteSize - localSize
+  if (remaining <= 0) return null
+  return remaining / speedBps
+}
+
 /** The one place `done`/`total` becomes a percentage (0-100, clamped, or `null` when it
  * wouldn't mean anything -- no total, a non-positive total, or no `done` reading yet). Guards
  * the exact inputs that would otherwise produce `NaN` or a negative width: `total <= 0`

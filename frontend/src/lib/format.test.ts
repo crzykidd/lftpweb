@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   bothSidesRows,
   bytesToMB,
+  childEtaS,
   formatBytes,
   formatEta,
   formatPercent,
@@ -17,6 +18,7 @@ import {
   settleWaitLabel,
   settleWaitShortLabel,
   stateAgeLabel,
+  transferEtaLabel,
   transferSpeedLabel,
   transferSpeedSortValue,
 } from './format'
@@ -125,6 +127,76 @@ describe('formatEta', () => {
   it('renders hours and minutes once past an hour, dropping seconds', () => {
     expect(formatEta(3600)).toBe('1h 0m')
     expect(formatEta(3661)).toBe('1h 1m')
+  })
+})
+
+// 2026-08-14 ("ETA on Files rows"): the job-level ETA text for a Files row -- `entry.eta_s` is
+// already fully computed server-side (`core/progress.py.JobProgress.eta_s`), so this only gates
+// display, the identical rule `transferSpeedLabel` above already applies to `speed_bps`.
+describe('transferEtaLabel', () => {
+  it('shows the formatted ETA for an actively downloading row', () => {
+    expect(transferEtaLabel('DOWNLOADING', 125)).toBe('2m')
+  })
+
+  it('is a dash for any non-DOWNLOADING state regardless of what eta value happens to be present', () => {
+    expect(transferEtaLabel('DOWNLOADED', 125)).toBe('—')
+    expect(transferEtaLabel('PARTIAL', 125)).toBe('—')
+    expect(transferEtaLabel('QUEUED', 125)).toBe('—')
+    expect(transferEtaLabel('REMOTE_ONLY', null)).toBe('—')
+  })
+
+  it('is a dash when downloading but no eta reading has arrived, or bytes_total is unknown, ' +
+    'or the value is non-finite', () => {
+    expect(transferEtaLabel('DOWNLOADING', null)).toBe('—')
+    expect(transferEtaLabel('DOWNLOADING', undefined)).toBe('—')
+    expect(transferEtaLabel('DOWNLOADING', Number.NaN)).toBe('—')
+    expect(transferEtaLabel('DOWNLOADING', Number.POSITIVE_INFINITY)).toBe('—')
+  })
+})
+
+// 2026-08-14 ("ETA on Files rows"): a child file's own ETA, derived client-side (no `eta_s` is
+// ever published for a child -- `_publish_child_progress` only ever emits a rate). "Show nothing
+// rather than a wrong number" is the task's own bar -- every degenerate case below returns
+// `null`, never `Infinity`, `NaN`, or a negative reading.
+describe('childEtaS', () => {
+  it('divides remaining bytes by the given rate for the normal case', () => {
+    // 100 MB remaining at 1 MB/s -- 100 seconds left.
+    expect(childEtaS(200_000_000, 100_000_000, 1_000_000)).toBe(100)
+  })
+
+  it('is null when remote_size is unknown -- no denominator, not this path\'s call to guess one', () => {
+    expect(childEtaS(null, 10, 1_000_000)).toBeNull()
+  })
+
+  it('is null when local_size is unknown', () => {
+    expect(childEtaS(1_000_000, null, 1_000_000)).toBeNull()
+  })
+
+  it('is null for a zero rate -- never divides by zero into Infinity', () => {
+    expect(childEtaS(1_000_000, 0, 0)).toBeNull()
+  })
+
+  it('is null when there is no fresh sample at all (the caller passes null)', () => {
+    expect(childEtaS(1_000_000, 0, null)).toBeNull()
+  })
+
+  it('is null for a non-finite rate', () => {
+    expect(childEtaS(1_000_000, 0, Number.NaN)).toBeNull()
+    expect(childEtaS(1_000_000, 0, Number.POSITIVE_INFINITY)).toBeNull()
+  })
+
+  it('is null for a negative rate -- a malformed reading, not a valid one to divide by', () => {
+    expect(childEtaS(1_000_000, 0, -500)).toBeNull()
+  })
+
+  it('is null once remaining bytes drop to zero or below -- the file is done, not "0s ETA"', () => {
+    expect(childEtaS(1_000_000, 1_000_000, 500_000)).toBeNull() // exactly done
+    expect(childEtaS(1_000_000, 1_500_000, 500_000)).toBeNull() // local exceeds remote
+  })
+
+  it('a very small rate produces a very large (but honest, uncapped) ETA', () => {
+    // 1 GB remaining at 1 B/s -- a huge but real number, not clamped to some "> 1h" ceiling.
+    expect(childEtaS(1_000_000_000, 0, 1)).toBe(1_000_000_000)
   })
 })
 

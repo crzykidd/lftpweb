@@ -69,6 +69,16 @@ export function useLiveModel(): {
    * 'DOWNLOADING'`, not on whether a value is present.
    */
   speedByItemId: Record<number, number>
+  /** The same `progress` WS message's `eta_s`, re-keyed by `item_id` exactly like
+   * `speedByItemId` above (2026-08-14, "ETA on Files rows") -- the parent's ETA is already fully
+   * computed server-side (`core/progress.py.JobProgress.eta_s`); this is only a second read of
+   * the same `progress` message's already-arrived `ProgressJob.eta_s`, not a second
+   * subscription or a client-side computation of its own. Same lifetime contract as
+   * `speedByItemId`: never pruned client-side, so a stale value only stops mattering because
+   * `lib/format.ts`'s `transferEtaLabel` gates display on the row's own `state ===
+   * 'DOWNLOADING'`, not on presence.
+   */
+  etaByItemId: Record<number, number | null>
   /** `child_progress` WS messages (2026-08-14, "per-file speed inside a mirror"), keyed by
    * `item_id` like `speedByItemId` above -- but unlike that map, each entry also carries when
    * it arrived (`Date.now()` at receipt), because the gating rule for a child is different from
@@ -95,6 +105,7 @@ export function useLiveModel(): {
   const [queuesById, setQueuesById] = useState<Record<number, QueueState>>({})
   const [progressByJobId, setProgressByJobId] = useState<Record<number, ProgressJob>>({})
   const [speedByItemId, setSpeedByItemId] = useState<Record<number, number>>({})
+  const [etaByItemId, setEtaByItemId] = useState<Record<number, number | null>>({})
   const [childSpeedByItemId, setChildSpeedByItemId] = useState<Record<number, ChildSpeedSample>>({})
   const [state, setState] = useState<SocketState>('connecting')
   const [scanCompleteSeq, setScanCompleteSeq] = useState(0)
@@ -213,6 +224,11 @@ export function useLiveModel(): {
             for (const job of msg.jobs) next[job.item_id] = job.speed_bps
             return next
           })
+          setEtaByItemId((prev) => {
+            const next = { ...prev }
+            for (const job of msg.jobs) next[job.item_id] = job.eta_s
+            return next
+          })
         } else if (msg.type === 'child_progress') {
           const receivedAt = Date.now()
           setChildSpeedByItemId((prev) => {
@@ -247,5 +263,5 @@ export function useLiveModel(): {
     .map(toQueueFiles)
     .sort((a, b) => a.queue_id - b.queue_id)
 
-  return { queues, progressByJobId, speedByItemId, childSpeedByItemId, state, scanCompleteSeq }
+  return { queues, progressByJobId, speedByItemId, etaByItemId, childSpeedByItemId, state, scanCompleteSeq }
 }
