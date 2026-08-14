@@ -2310,6 +2310,33 @@ in between.
 the fake seedbox: delete locally → watch the grace period elapse → confirm the remote delete
 and its History entry.
 
+**Frontend unit tests (2026-08-13, `prompts/2026-08-13-frontend-test-runner.md`).** Vitest +
+happy-dom, `frontend/src/**/*.test.ts`, run via `npm test` in CI's "Frontend lint + typecheck"
+job (the job's own name is unchanged — see that step's in-file comment for why). Scope is the
+pure logic, not rendering:
+- `lib/format.ts` — `percentValue`/`formatPercent` (division guards, clamping to 100),
+  `formatBytes`, `formatEta`, `formatRelativeTime`/`formatRelativeTimeIntl` bucket boundaries,
+  `stateAgeLabel`, the settle-wait and still-arriving labels' every degrade-to-bare-label path,
+  `bothSidesRows`/`hasBothSides`.
+- `lib/storage.ts` — the `localStorage` wrapper's read/write failure paths (corrupt JSON, a
+  foreign schema the type guard rejects, `getItem`/`setItem` throwing).
+- `lib/resetWarning.ts` — every branch of the reset-consequence sentence: zero remote survivors,
+  partial vs. full survival, singular vs. plural, `move` vs. `copy`/`sync`, auto-queue on vs.
+  off, and the scan-interval phrasing's `null`/`0`/explicit-value cases.
+- `components/FileTree.tsx` — `buildTree`/`sortTree`/`flatten` (the sibling-preserving sort
+  invariant asserted on tree structure, not just flat order; null-last ordering), the
+  default-plus-exceptions collapse preference's `resolveCollapsed` (including that a path never
+  seen before — a newly-arrived directory — falls through to the current default), the facet
+  filter's six predicates, and column-width clamping/merging.
+
+A handful of already-pure top-level functions and types in `FileTree.tsx` gained an `export`
+keyword (and the collapse-resolution one-liner was hoisted into its own named function,
+`resolveCollapsed`) purely so tests could reach them without rendering — no logic changed. What
+this suite does **not** cover: any component actually mounted and rendered. `FileTree`,
+`ItemDrawer`, `LifecycleIcons`, `StateChip`, and the rest of the JSX stay covered only by
+`tsc -b`/`vite build`/`oxlint`, exactly as before this task — see `README.md`'s "Known gaps" for
+what that still leaves open.
+
 ---
 
 ## 15. Risks

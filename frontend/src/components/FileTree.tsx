@@ -35,7 +35,11 @@ const ROW_HEIGHT_PX = 32
 const inputClasses =
   'rounded-md border border-zinc-300 bg-white px-2.5 py-1.5 text-sm text-zinc-900 outline-none focus:border-zinc-500 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100'
 
-interface TreeEntry extends FileNode {
+// Exported (trivial, non-behavioral) so FileTree.test.ts can build fixtures and call the pure
+// tree/collapse/filter/column-width helpers below directly, without rendering the component --
+// prompts/2026-08-13-frontend-test-runner.md's own instruction was to add exports, not to
+// restructure working code, to make this logic reachable from a test.
+export interface TreeEntry extends FileNode {
   name: string
   depth: number
   children: TreeEntry[]
@@ -62,7 +66,7 @@ function nodeDisplaySize(entry: TreeEntry): number | null {
     : (entry.local_size ?? entry.remote_size)
 }
 
-function buildTree(nodes: FileNode[]): TreeEntry[] {
+export function buildTree(nodes: FileNode[]): TreeEntry[] {
   const byPath = new Map<string, TreeEntry>()
   const roots: TreeEntry[] = []
 
@@ -102,7 +106,7 @@ function buildTree(nodes: FileNode[]): TreeEntry[] {
  * "default plus exceptions," not an enumerable set of collapsed paths, and a predicate is the
  * one shape that works for both that and the old plain-`Set` caller.
  */
-function flatten(roots: TreeEntry[], isCollapsed: (path: string) => boolean): TreeEntry[] {
+export function flatten(roots: TreeEntry[], isCollapsed: (path: string) => boolean): TreeEntry[] {
   const out: TreeEntry[] = []
   const walk = (entries: TreeEntry[]) => {
     for (const entry of entries) {
@@ -118,8 +122,8 @@ function flatten(roots: TreeEntry[], isCollapsed: (path: string) => boolean): Tr
 // flattening is what the virtualizer walks, and sorting it directly would tear children away
 // from their parents. `sortTree` below runs on the built tree, before `flatten`.
 
-type SortKey = 'name' | 'size' | 'state_changed_at' | 'percent'
-type SortDir = 'asc' | 'desc'
+export type SortKey = 'name' | 'size' | 'state_changed_at' | 'percent'
+export type SortDir = 'asc' | 'desc'
 
 const SORT_KEYS: SortKey[] = ['name', 'size', 'state_changed_at', 'percent']
 const SORT_LABELS: Record<SortKey, string> = {
@@ -193,7 +197,7 @@ function sortValue(entry: TreeEntry, key: SortKey): string | number | null {
  * (no `remote_size`, no `state_changed_at` yet) staying put rather than jumping to the top the
  * moment a user flips to descending is the less surprising behavior of the two.
  */
-function compareValues(a: string | number | null, b: string | number | null, dir: SortDir): number {
+export function compareValues(a: string | number | null, b: string | number | null, dir: SortDir): number {
   if (a == null && b == null) return 0
   if (a == null) return 1
   if (b == null) return -1
@@ -225,7 +229,7 @@ function sortSiblingsRecursive(entries: TreeEntry[], key: SortKey, dir: SortDir)
  * the same way one level down. Returns a fresh tree (deep-cloned) rather than mutating `roots`
  * in place, so this stays a pure function of its inputs -- safe to call from a `useMemo`.
  */
-function sortTree(roots: TreeEntry[], key: SortKey, dir: SortDir): TreeEntry[] {
+export function sortTree(roots: TreeEntry[], key: SortKey, dir: SortDir): TreeEntry[] {
   const clone = (entries: TreeEntry[]): TreeEntry[] =>
     entries.map((entry) => ({ ...entry, children: clone(entry.children) }))
   const cloned = clone(roots)
@@ -237,14 +241,14 @@ function sortTree(roots: TreeEntry[], key: SortKey, dir: SortDir): TreeEntry[] {
 // collapsed paths -- a directory that appears later (over the WebSocket) inherits the current
 // default automatically; only per-row overrides are tracked explicitly.
 
-interface CollapsePreference {
+export interface CollapsePreference {
   defaultCollapsed: boolean
   exceptions: string[]
 }
 
 const DEFAULT_COLLAPSE_PREFERENCE: CollapsePreference = { defaultCollapsed: false, exceptions: [] }
 
-function isCollapsePreference(value: unknown): value is CollapsePreference {
+export function isCollapsePreference(value: unknown): value is CollapsePreference {
   if (typeof value !== 'object' || value == null) return false
   const v = value as Record<string, unknown>
   return (
@@ -254,14 +258,27 @@ function isCollapsePreference(value: unknown): value is CollapsePreference {
   )
 }
 
-interface SortPreference {
+/** The default-plus-exceptions model itself, in one place (2026-08-13,
+ * prompts/2026-08-13-frontend-test-runner.md) -- pulled out of the `isPathCollapsed` closure
+ * below purely so it's callable from a test without rendering the component; behavior is
+ * unchanged. A path in `exceptions` reads as the *opposite* of the default; every other path --
+ * including one that has never been seen before, e.g. a directory that just arrived over the
+ * WebSocket -- reads as the default itself. That "unknown path falls through to the default"
+ * behavior, not any explicit per-path bookkeeping, is what makes a newly-arrived directory
+ * inherit the current default automatically.
+ */
+export function resolveCollapsed(defaultCollapsed: boolean, exceptions: Set<string>, path: string): boolean {
+  return exceptions.has(path) ? !defaultCollapsed : defaultCollapsed
+}
+
+export interface SortPreference {
   key: SortKey
   dir: SortDir
 }
 
 const DEFAULT_SORT_PREFERENCE: SortPreference = { key: 'name', dir: 'asc' }
 
-function isSortPreference(value: unknown): value is SortPreference {
+export function isSortPreference(value: unknown): value is SortPreference {
   if (typeof value !== 'object' || value == null) return false
   const v = value as Record<string, unknown>
   return (
@@ -616,7 +633,7 @@ function HoverCardHost({ controllerRef }: { controllerRef: RefObject<HoverCardHa
 // exist (`core/itemview.py`, `LifecycleIcons.tsx`) instead of a second, parallel filtering
 // mechanism -- composes with the text/state filters through the same `visiblePaths` set below.
 
-type FacetFilter = '' | 'has_remote' | 'has_local' | 'extracted' | 'not_extracted' | 'missing_locally'
+export type FacetFilter = '' | 'has_remote' | 'has_local' | 'extracted' | 'not_extracted' | 'missing_locally'
 
 const FACET_FILTER_LABELS: Record<FacetFilter, string> = {
   '': 'All items',
@@ -642,7 +659,7 @@ const FACET_FILTER_VALUES: FacetFilter[] = [
  * `level`/`reason` codes rather than re-deriving presence from raw bytes here -- the frontend
  * composes what the backend already classified, it doesn't reclassify.
  */
-function matchesFacetFilter(entry: TreeEntry, filter: FacetFilter): boolean {
+export function matchesFacetFilter(entry: TreeEntry, filter: FacetFilter): boolean {
   switch (filter) {
     case '':
       return true
@@ -687,7 +704,7 @@ interface ColumnDef {
  * are fixed" before this task, kept rather than switched to a two-column paired resize, per the
  * task's own instruction to keep it unless there's a reason not to (there wasn't one).
  */
-const RESIZABLE_COLUMNS: ColumnDef[] = [
+export const RESIZABLE_COLUMNS: ColumnDef[] = [
   { id: 'size', label: 'Size', defaultWidth: 96, minWidth: 56, align: 'right', sortKey: 'size' },
   {
     id: 'status',
@@ -721,13 +738,13 @@ const NAME_MIN_WIDTH_PX = 160
 const RESIZE_STEP_PX = 8
 const RESIZE_STEP_LARGE_PX = 32
 
-type ColumnWidths = Record<string, number>
+export type ColumnWidths = Record<string, number>
 
-function defaultColumnWidths(): ColumnWidths {
+export function defaultColumnWidths(): ColumnWidths {
   return Object.fromEntries(RESIZABLE_COLUMNS.map((c) => [c.id, c.defaultWidth]))
 }
 
-function columnMinWidth(id: string): number {
+export function columnMinWidth(id: string): number {
   return RESIZABLE_COLUMNS.find((c) => c.id === id)?.minWidth ?? 40
 }
 
@@ -737,11 +754,11 @@ function columnMinWidth(id: string): number {
  * justify with no real failure mode it prevents -- a column dragged absurdly wide is recoverable
  * with one double-click, unlike one dragged to zero.
  */
-function clampColumnWidth(id: string, width: number): number {
+export function clampColumnWidth(id: string, width: number): number {
   return Math.max(columnMinWidth(id), Math.round(width))
 }
 
-function isColumnWidths(value: unknown): value is ColumnWidths {
+export function isColumnWidths(value: unknown): value is ColumnWidths {
   if (typeof value !== 'object' || value == null) return false
   return Object.entries(value as Record<string, unknown>).every(
     ([, v]) => typeof v === 'number' && Number.isFinite(v),
@@ -754,7 +771,7 @@ function isColumnWidths(value: unknown): value is ColumnWidths {
  * ignore unknown ids on read. Re-clamps every surviving value in case its `minWidth` changed
  * since it was saved.
  */
-function mergeColumnWidths(saved: ColumnWidths | null): ColumnWidths {
+export function mergeColumnWidths(saved: ColumnWidths | null): ColumnWidths {
   const widths = defaultColumnWidths()
   if (saved == null) return widths
   for (const col of RESIZABLE_COLUMNS) {
@@ -1215,7 +1232,7 @@ export function FileTree({
   }
   const exceptionSet = useMemo(() => new Set(collapsePref.exceptions), [collapsePref.exceptions])
   const isPathCollapsed = (path: string): boolean =>
-    exceptionSet.has(path) ? !collapsePref.defaultCollapsed : collapsePref.defaultCollapsed
+    resolveCollapsed(collapsePref.defaultCollapsed, exceptionSet, path)
 
   const [selected, setSelected] = useState<Set<string>>(new Set())
   const [lastClickedPath, setLastClickedPath] = useState<string | null>(null)

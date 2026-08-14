@@ -90,13 +90,14 @@ reduction made during the build, recorded in full in `docs/decisions.md`:
   newest work: **almost none of the 2026-08-13 Files-page revamp** — the lifecycle icons, the
   inline progress bars, sorting, the persisted collapse preference, the detail drawer, the
   hover tooltip — **has been seen by a human, and none of it by any agent.**
-- **There is no frontend test runner in this project.** No vitest, no jest, no test script in
-  `frontend/package.json` — `tsc -b`, `vite build`, and `oxlint` are the entire frontend gate.
-  That was defensible while the frontend was thin glue over a well-tested backend; it is not
-  any more. Sorting (`sortValue`/`sortSiblingsRecursive`), the default-plus-exceptions collapse
-  preference, and the progress-fraction arithmetic are pure functions with real edge cases and
-  **zero automated coverage**. Naming this as a gap rather than leaving it implicit: the next
-  frontend bug of that shape will not be caught by anything currently in CI.
+- **The frontend test runner (Vitest + happy-dom) covers the pure logic, not the components.**
+  `frontend/src/**/*.test.ts` pins `lib/format.ts`, `lib/storage.ts`, `lib/resetWarning.ts`, and
+  `components/FileTree.tsx`'s tree-sorting (the sibling-preserving invariant explicitly),
+  default-plus-exceptions collapse preference, facet filter, and column-width clamping — run in
+  CI's "Frontend lint + typecheck" job via `npm test`. What it does **not** cover: any component
+  actually renders — `FileTree`, `ItemDrawer`, `LifecycleIcons`, `StateChip`, and everything else
+  with JSX in it are exercised only by `tsc -b`/`vite build`/`oxlint`, not by a test that mounts
+  them. That gap is what "no UI has ever been click-tested" (above) still means in full.
 - **Post-processing (verify/extract/move) triggers from two narrow places — a job this app
   spawned succeeding, and the settle gate releasing its own hold on an item.** It does *not*
   trigger when a routine rescan finds a file that arrived some other way (a manual `cp`, a

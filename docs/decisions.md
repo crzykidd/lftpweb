@@ -6,6 +6,73 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-13 — First frontend test runner: Vitest + happy-dom, unit coverage only, no
+## component tests, CI job name left unchanged
+
+**Handoff prompt `prompts/2026-08-13-frontend-test-runner.md`, executed end to end** (three
+earlier agents had each independently declined to add a test runner unasked, since it's an
+infrastructure decision — the user asked for it directly this time, and asked for the stack to
+be chosen and justified rather than raised as a question).
+
+**Decision: Vitest, not Jest or anything else.** It shares Vite's own config and transform
+pipeline — no second build tool, no separate babel/webpack setup to keep in sync with
+`vite.config.ts` as the app evolves. Given this project already standardized on Vite for the
+app itself, introducing a differently-configured runner would be the deviation needing a
+reason, not the other way round.
+
+**Decision: happy-dom, not jsdom.** The suite this task asks for is pure-function unit tests —
+`format`/`storage`/`resetWarning`/tree-sorting/collapse-preference logic — that need
+`localStorage`, `window`, and `Intl` to exist, not pixel-accurate layout or exhaustive DOM-spec
+fidelity. happy-dom implements that surface and starts faster per test file than jsdom.
+Revisit if/when this suite grows real component-mounting tests, where jsdom's closer spec
+conformance might start to matter.
+
+**Decision: unit coverage only, no component tests.** The task's own bar was "if a component
+test turns into a mocking exercise, stop and say so." `FileTree.tsx`'s exported component pulls
+in the API client, a WebSocket-driven live model, `@tanstack/react-virtual` (which needs real
+layout to do anything useful), a portal-based hover card, and a nested `ItemDrawer` — mounting
+it meaningfully would mean mocking most of that stack for assertions that don't exercise the
+actual bug-prone logic (that logic is exactly what the unit tests above cover directly, without
+a render). No `@testing-library/react` was added as a devDependency as a result — nothing in
+this suite renders anything, so pulling it in would be an unused dependency, not a minimal one.
+
+**Decision: `export` a handful of already-pure functions/types, plus one one-line extraction
+(`resolveCollapsed`), rather than restructure `FileTree.tsx`.** The task explicitly ruled out
+refactoring application code to make it testable "beyond trivial exports." `buildTree`,
+`flatten`, `sortTree`, `compareValues`, `isCollapsePreference`, `isSortPreference`,
+`matchesFacetFilter`, `RESIZABLE_COLUMNS`, and the column-width helpers were already
+module-level pure functions/consts with no behavior to change — adding `export` is the whole
+diff for those. The one exception: the default-plus-exceptions collapse resolution
+(`exceptionSet.has(path) ? !collapsePref.defaultCollapsed : collapsePref.defaultCollapsed`) was
+an inline closure inside the `FileTree` component, not a standalone function — hoisted verbatim
+into a module-level `resolveCollapsed(defaultCollapsed, exceptions, path)`, called by the
+closure that used to contain the logic. Behavior is unchanged; this is the specific case the
+task called out as most important to pin (a newly-arrived directory must inherit the current
+default, which is exactly what "falls through to the default because it was never added to
+`exceptions`" gives for free — and exactly what a naive "persist the collapsed set" design would
+get wrong).
+
+**Accepted trade-off: 14 new `oxlint` `react/only-export-components` warnings, exit code still
+0.** That rule is already configured `"warn"` (not `"error"`) in `.oxlintrc.json`, a pre-existing
+project choice, not one made by this task. Exporting plain functions/consts from a component
+file trips it (Vite Fast Refresh only fully works when a file exports components only); moving
+this logic to a separate file would have avoided the warnings but is a larger structural change
+than "trivial exports" — kept in place rather than split, matching the task's own instruction not
+to restructure beyond what testability strictly requires. `npm run lint`'s exit code, which is
+what CI gates on, is unaffected.
+
+**Decision: left the CI job's `name:` ("Frontend lint + typecheck") unchanged, even though it
+now also runs tests.** That string is a required branch-protection status check on `main`
+(`docs/repo-setup.md` step 5) — confirmed live via `gh api repos/.../branches/main/protection`
+before deciding, not assumed. Renaming the job here without a matching branch-protection update
+would leave every future `dev` → `main` PR blocked on a required check GitHub can never see
+report again — a self-inflicted outage of the exact kind this session was asked not to cause
+while unsupervised. Fixing it requires an explicit follow-up `gh api` PUT against the live repo
+settings, which is a bigger blast-radius action than a workflow-file edit and was left for the
+user to authorize rather than performed unasked here.
+
+---
+
 ## 2026-08-13 — Header's "24h" reads `metric_sample`, not `job` — bytes moved, not bytes
 ## completed, and the two figures now share one query
 

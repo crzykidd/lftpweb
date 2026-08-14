@@ -62,6 +62,16 @@ jobs:
         run: npm run lint
         working-directory: frontend
 
+      - name: Unit tests (vitest)
+        # prompts/2026-08-13-frontend-test-runner.md -- the job's own `name:` above is left as
+        # "Frontend lint + typecheck" rather than renamed to mention tests too: it's a required
+        # branch-protection status check on `main` (docs/repo-setup.md step 5), bound to that
+        # exact string, and renaming the job here without also updating GitHub's branch
+        # protection would leave every future PR blocked on a required check that can never
+        # report again. The name undersells what this job does now; it doesn't misstate it.
+        run: npm test
+        working-directory: frontend
+
       - name: Typecheck + build (tsc -b && vite build)
         run: npm run build
         working-directory: frontend

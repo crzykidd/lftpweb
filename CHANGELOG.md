@@ -435,6 +435,15 @@ alongside this list: several entries below ship with deliberate, documented limi
   engine's own in-memory model and republishes over the existing `queue_delta` wire shape (no
   new WebSocket message type needed) — without it, a fully-forgotten item with nothing left on
   either side would be a permanent ghost row no future scan would ever revisit.
+- **A frontend test runner** *(2026-08-13)* — Vitest + happy-dom, `npm test`, wired into CI's
+  "Frontend lint + typecheck" job. Until now the backend had 887 tests and the frontend had
+  none; unit coverage now pins `lib/format.ts`, `lib/storage.ts`, and `lib/resetWarning.ts` in
+  full, plus `components/FileTree.tsx`'s tree-sorting (the sibling-preserving invariant
+  asserted on tree structure, not just flat order), the default-plus-exceptions collapse
+  preference (including that a newly-arrived directory inherits the current default), the facet
+  filter, and column-width clamping. Deliberately unit-only — no component is actually rendered
+  (`README.md`'s "Known gaps" still names that). See `docs/decisions.md` for the stack choice
+  and its trade-offs.
 
 ### Changed
 
