@@ -1506,13 +1506,29 @@ reasserting itself, visible at all; both are changes no writer pushes, because n
 │  History │                                    section has >1 page       │
 │ Dashboard│                                                              │
 │  Settings│                                                              │
+│  Docs    │  [ Quick start · Concepts ]   ← Docs has tabs too            │
 │ ──────── │                                                              │
 │ v0.0.1 ↗ │  ← bottom-left, links to the GitHub release notes            │
 └──────────┴─────────────────────────────────────────────────────────────┘
 ```
 
 - **Left panel for section nav**; **tabs across the top** only where a section has more than one
-  page. Settings is the one that needs them today.
+  page. Settings and **Docs** (2026-08-13) are the two that need them; `nav.ts.tabsForPath` maps
+  a route to its tab strip, so `Layout.tsx` has one lookup rather than a branch per section.
+- **Docs is in-app user documentation, not architecture.** `DESIGN.md` (this file) is for people
+  changing the code and `README.md` is for people who have not deployed yet; the Docs section
+  serves the third audience neither reaches — someone with a *running* instance who does not know
+  why nothing is downloading. Two pages: a quick start that walks the real first-run sequence, and
+  a Concepts page covering only the things that demonstrably confused real users (the settle gate,
+  auto-queue suppression, the three differently-destructive "clear" actions, the lifecycle icons,
+  `copy` vs `move`, and inherit-vs-override). It links directly into the settings pages it
+  describes, which is the one thing a README structurally cannot do. **Written as components, not
+  Markdown** — no renderer dependency (docs/decisions.md).
+- **`FieldHelp` is the per-field help affordance** (`components/FieldHelp.tsx`): an info-icon
+  button beside a field label that reveals a short explanation. It reuses the portal + placement
+  machinery of §9.2's Files-row hover card through the shared `lib/popoverPosition.ts`, rather
+  than being a third popup mechanism alongside that card and the inline confirm panels. Click/tap
+  toggles it and Enter/Space opens it, so it works without a pointer; hover only assists.
 - **Version in the bottom-left corner of the nav**, linking out to that release's notes on
   GitHub. (Repo not created yet — the base URL is a config constant so it can be filled in
   without touching the component.)
@@ -2068,7 +2084,7 @@ backend/lftpweb/
   core/itemview.py    core/settle.py     core/mount_sentinel.py
   core/audit.py       core/metrics.py    core/logtail.py
   remote_agent/scan_fs.py          # stdlib-only fallback scanner
-frontend/   Vite app — routes Files / Transfers / History / Dashboard / Settings
+frontend/   Vite app — routes Files / Transfers / History / Dashboard / Settings / Docs
 tests/      unit + integration
 private_data/   gitignored — local scratch, test fixtures, sample trees, scratch compose (§12.1)
 ```

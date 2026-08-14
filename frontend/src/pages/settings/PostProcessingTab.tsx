@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react'
+import { Link } from 'react-router-dom'
 import { getPostprocessSettings, putPostprocessSettings } from '../../api/client'
 import type { PostprocessSettingsOut } from '../../api/types'
 
@@ -97,9 +98,20 @@ export function PostProcessingTab() {
 
   return (
     <div className="flex max-w-xl flex-col gap-6">
+      {/* Corrected 2026-08-13 (prompts/2026-08-13-docs-section.md): this paragraph still
+        * described the site-wide AND per-queue **AND** that `3500b3f` replaced with
+        * inherit-or-override, so it claimed a step needed turning on in two places when a
+        * queue's toggle now follows this page's value by default. Left uncorrected it would
+        * have contradicted Docs → Concepts, which documents the real behaviour. */}
       <p className="text-sm text-zinc-600 dark:text-zinc-400">
-        A step here only runs for a queue's items when it's also turned on for that queue in
-        Settings → Queues — both are off by default (DESIGN.md §6).
+        These are the <strong>site-wide defaults</strong>. Each queue's own toggle in Settings →
+        Queues inherits the value here unless it has been explicitly overridden for that queue,
+        so changing one of these takes effect immediately for every queue still inheriting it.
+        Everything defaults off (DESIGN.md §6) — see{' '}
+        <Link className="underline" to="/docs/concepts#inherit">
+          Docs → Concepts
+        </Link>
+        .
       </p>
 
       {loadError && (

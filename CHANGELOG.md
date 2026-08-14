@@ -444,6 +444,36 @@ alongside this list: several entries below ship with deliberate, documented limi
   filter, and column-width clamping. Deliberately unit-only — no component is actually rendered
   (`README.md`'s "Known gaps" still names that). See `docs/decisions.md` for the stack choice
   and its trade-offs.
+- **A Docs section in the app** *(2026-08-13)* — `Docs` in the left nav, with **Quick start** and
+  **Concepts** tabs. Until now nothing served the person whose instance is *running*: `README.md`
+  targets someone who hasn't deployed, `DESIGN.md` targets someone changing the code, and neither
+  answers "why is nothing downloading." Quick start walks the real first-run sequence in order —
+  deploy and what each volume is actually for (including that `/downloads` is where downloads
+  land and `/staging` is only where a finished item is relocated *to*, which has been written
+  backwards before), connect, create a queue, first scan, queue something by hand, then the
+  optional layers — with every step a live link to the settings page it describes, which is the
+  one thing a README structurally cannot do. Concepts covers only what demonstrably confused real
+  users during the 2026-08-12/13 live-testing rounds: the settle gate and how to read
+  `Arriving · 3.4 GB` versus `Waiting 1/2 · 35s`; auto-queue suppression, its four reasons, and
+  why **Re-Download** appears instead of Queue; a blast-radius table for **Dismiss** vs **Clear
+  history** vs **Reset item tracking** (three similarly-named actions that respectively tidy a
+  list, delete records, and forget a path — only the last changes future behaviour); the
+  lifecycle icons and the presence-versus-milestone distinction that makes a completed `move`
+  item's dim remote icon read as success rather than failure; `copy` vs `move` including move's
+  forced verification; and inherit-vs-override on the four post-processing toggles. **Written as
+  React components — no markdown-renderer dependency was added** (`docs/decisions.md`). Every
+  claim on both pages was verified against the code before being written rather than recalled;
+  where something could not be confirmed it was left out.
+- **`FieldHelp` — per-field help popups on the settings pages** *(2026-08-13)*. A small info-icon
+  button beside a field label that reveals a short explanation of what that field actually does.
+  **Not a third popup mechanism**: it reuses the Files-row hover card's portal-and-placement
+  machinery (`f4a4205`) through a newly shared `lib/popoverPosition.ts`, which both now call, so
+  the two can't drift apart on flip/clamp edge behaviour. Click or tap toggles it and Enter/Space
+  opens it from the keyboard — a hover-only affordance is unusable on a phone — with hover layered
+  on for mouse users only, Escape/outside-click/scroll to dismiss, and `aria-describedby` wiring
+  so the text is announced. Demonstrated on three fields here (**Sync mode**, **Patterns-only**,
+  and **Known-hosts policy**); a companion task applies it across the rest of the settings
+  surface.
 
 ### Changed
 

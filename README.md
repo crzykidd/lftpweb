@@ -62,6 +62,13 @@ progress, auto-queue on patterns, and optionally verify, extract, and relocate f
 - **Authentication is optional and defaults off** (`AUTH_MODE=none`) — turn on a single-user
   password login or trust a reverse proxy's identity header, both from Settings → Auth. See
   "Locked out?" below before you flip it on.
+- **In-app user documentation**, under **Docs** in the left nav: a quick start walking the real
+  first-run sequence, and a Concepts page covering the six things that actually confuse people
+  (the settle gate, auto-queue suppression, the difference between Dismiss / Clear history /
+  Reset item tracking, the lifecycle icons, `copy` vs `move`, and inherit-vs-override on the
+  post-processing toggles). Every step links straight to the settings page it describes.
+  Per-field help popups (`FieldHelp`) are being applied across the settings surface, starting
+  with the fields whose wrong answer costs you data
 
 ## What doesn't yet
 
@@ -97,7 +104,10 @@ reduction made during the build, recorded in full in `docs/decisions.md`:
   CI's "Frontend lint + typecheck" job via `npm test`. What it does **not** cover: any component
   actually renders — `FileTree`, `ItemDrawer`, `LifecycleIcons`, `StateChip`, and everything else
   with JSX in it are exercised only by `tsc -b`/`vite build`/`oxlint`, not by a test that mounts
-  them. That gap is what "no UI has ever been click-tested" (above) still means in full.
+  them. That gap is what "no UI has ever been click-tested" (above) still means in full. The
+  newest instance: `components/FieldHelp.tsx` (2026-08-13) — its *placement* arithmetic is unit-
+  tested via `lib/popoverPosition.ts`, but its open/close behaviour (click toggles, Escape and
+  outside-click dismiss, hover assists on mouse only) is verified by reading, not by a test.
 - **Post-processing (verify/extract/move) triggers from two narrow places — a job this app
   spawned succeeding, and the settle gate releasing its own hold on an item.** It does *not*
   trigger when a routine rescan finds a file that arrived some other way (a manual `cp`, a
@@ -181,6 +191,14 @@ docker compose -f docker-compose.dev.yml up --build    # local development
 
 The UI is on **`8087`** (`5187` for the Vite dev server). Configure the host and your path
 queues under **Settings**.
+
+**Once it's up, the rest of the setup guide is in the app**, under **Docs → Quick start** — it
+walks connecting to the seedbox, creating a queue, the first scan, and queueing a transfer, with
+every step linking to the page it describes. **Docs → Concepts** explains the behaviours that
+surprise people (why a transfer waited a minute before starting, why an item won't re-download,
+and what the three different "clear this" actions each actually remove). That lives in the app
+rather than being repeated here on purpose: duplicated prose drifts, and only the in-app copy can
+link you to the setting it's talking about.
 
 | Volume | Holds |
 |---|---|

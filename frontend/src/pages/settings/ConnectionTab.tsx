@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { getHost, putHost, testHost } from '../../api/client'
 import type { AuthMethod, HostOut, KnownHostsPolicy, TestConnectionResponse } from '../../api/types'
+import { FieldHelp } from '../../components/FieldHelp'
 
 const inputClasses =
   'w-full rounded-md border border-zinc-300 bg-white px-2.5 py-1.5 text-sm text-zinc-900 outline-none focus:border-zinc-500 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100'
@@ -222,7 +223,31 @@ export function ConnectionTab() {
       )}
 
       <label className="flex flex-col gap-1">
-        <span className={labelClasses}>Known-hosts policy</span>
+        <span className={labelClasses}>
+          Known-hosts policy
+          {/* Second demonstration of `FieldHelp` (2026-08-13, prompts/2026-08-13-docs-section.md).
+           * Picked because this control has three options, no inline explanation at all, and the
+           * consequence of the wrong pick is either "it silently stops connecting one day" or
+           * "it never checked in the first place" -- neither of which the option labels convey. */}
+          <FieldHelp label="Known-hosts policy">
+            <p>What happens when the seedbox presents its SSH host key.</p>
+            <p>
+              <strong>Accept and pin on first use</strong> (default) — trust whatever key the
+              server shows the first time, remember it, and refuse to connect if it ever changes.
+              This catches a swapped-out server later, but trusts the very first connection
+              blindly.
+            </p>
+            <p>
+              <strong>Strict</strong> — only ever accept a key that has already been pinned.
+              Safest, but it will refuse to connect until something has pinned one, so it is not
+              a good first setting on a new install.
+            </p>
+            <p>
+              <strong>Insecure</strong> — never verify the host key. Only reasonable on a
+              network you fully control.
+            </p>
+          </FieldHelp>
+        </span>
         <select
           className={inputClasses}
           value={form.known_hosts_policy}

@@ -25,6 +25,7 @@ import type {
   QueueAutoQueueStatus,
   SyncMode,
 } from '../../api/types'
+import { FieldHelp } from '../../components/FieldHelp'
 
 const inputClasses =
   'w-full rounded-md border border-zinc-300 bg-white px-2.5 py-1.5 text-sm text-zinc-900 outline-none focus:border-zinc-500 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100'
@@ -521,6 +522,33 @@ export function QueuesTab() {
         <label className="flex flex-col gap-1">
           <span className={labelClasses}>
             Sync mode
+            {/* The first `FieldHelp` in the app (2026-08-13, prompts/2026-08-13-docs-section.md).
+             * `sync_mode` was the obvious field to establish the pattern on: it is the one
+             * control on this page that can delete data you cannot get back, and the inline
+             * warning below only appears *after* you have already picked a non-copy mode. A
+             * companion task applies `FieldHelp` across the rest of the settings surface. */}
+            <FieldHelp label="Sync mode">
+              <p>
+                <strong>copy</strong> downloads and never touches the seedbox. <strong>move</strong>{' '}
+                downloads, verifies, and then <strong>deletes the remote copy</strong> — once per
+                item, at the end of post-processing. That delete is irreversible.
+              </p>
+              <p>
+                A <strong>move</strong> queue's remote path must be a hardlink pickup directory
+                your torrent client populates on completion — never its live seeding data
+                directory. It also forces verification on regardless of any other toggle, because
+                verification is the only gate on that delete.
+              </p>
+              <p>
+                <strong>sync</strong> (propagating local deletes back to the seedbox) is designed
+                but not built, and is rejected if set.
+              </p>
+              <p>
+                <Link to="/docs/concepts" className="underline">
+                  copy vs move, in the docs →
+                </Link>
+              </p>
+            </FieldHelp>
             {form.sync_mode !== 'copy' && (
               <span className="ml-2 font-normal text-amber-600 dark:text-amber-400">
                 ⚠ only point this at a hardlink pickup directory, never a live torrent data
@@ -630,6 +658,22 @@ export function QueuesTab() {
             <span className="text-sm text-zinc-700 dark:text-zinc-300">
               Patterns-only (with no <code>select</code> pattern, match nothing instead of
               everything)
+              <FieldHelp label="Patterns-only">
+                <p>
+                  This changes what "no <code>select</code> pattern" means for this queue.
+                </p>
+                <p>
+                  <strong>Off</strong> (the default): with no <code>select</code> pattern,
+                  auto-queue matches <strong>everything</strong> in the remote path that isn't
+                  skipped or excluded. Turning auto-queue on with an empty pattern list starts
+                  downloading the whole tree.
+                </p>
+                <p>
+                  <strong>On</strong>: with no <code>select</code> pattern, auto-queue matches{' '}
+                  <strong>nothing</strong>. Use this when you want auto-queue armed but idle until
+                  you add the pattern you actually want.
+                </p>
+              </FieldHelp>
             </span>
           </label>
         </div>

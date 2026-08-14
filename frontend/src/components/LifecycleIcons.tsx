@@ -96,8 +96,12 @@ function PackageIcon(props: IconProps) {
  * `FACET_LEVEL_CLASSES`'s semantic colours). Lucide `info` -- unlike the four icons above, this
  * one *is* one of the handful of Lucide icons derived from the Feather project, so it carries
  * the additional Feather MIT notice in NOTICE alongside the ISC one.
+ *
+ * Exported since 2026-08-13 so `FieldHelp.tsx` (the Docs section's per-field help affordance)
+ * can reuse this exact glyph rather than pasting the same licensed path data a second time --
+ * "an info icon means there is more to read here" is already what it means on a Files row.
  */
-function InfoIcon(props: IconProps) {
+export function InfoIcon(props: IconProps) {
   return (
     <IconBase {...props}>
       <circle cx="12" cy="12" r="10" />

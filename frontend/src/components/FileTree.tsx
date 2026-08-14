@@ -17,6 +17,7 @@ import {
   settleWaitShortLabel,
   stateAgeLabel,
 } from '../lib/format'
+import { placePopover, POPOVER_EDGE_MARGIN_PX } from '../lib/popoverPosition'
 import { resetWarningLines } from '../lib/resetWarning'
 import { readLocalStorage, writeLocalStorage } from '../lib/storage'
 import { DetailButton, LifecycleIcons } from './LifecycleIcons'
@@ -459,7 +460,6 @@ interface HoverCardHandle {
 
 const HOVER_SHOW_DELAY_MS = 400
 const HOVER_HIDE_DELAY_MS = 150
-const HOVER_CARD_EDGE_MARGIN_PX = 8
 
 /** The card's contents -- built entirely from `lib/format.ts.bothSidesRows`/`hasBothSides`, the
  * same functions `ItemDrawer.tsx`'s `SideBySideDetails` reads, so the two surfaces can never
@@ -528,7 +528,9 @@ function HoverCardBody({ entry }: { entry: TreeEntry }) {
  * `opacity: 0` so its real rendered size can be measured (`cardRef`), then placed and revealed
  * in one `useLayoutEffect` -- avoids a visible jump from a guessed position to the real one.
  * Flips above the anchor when there isn't room below, and clamps both axes into the viewport
- * with `HOVER_CARD_EDGE_MARGIN_PX` of breathing room rather than ever overflowing off-screen.
+ * with `POPOVER_EDGE_MARGIN_PX` of breathing room rather than ever overflowing off-screen --
+ * that arithmetic now lives in `lib/popoverPosition.ts.placePopover`, shared verbatim with
+ * `FieldHelp.tsx`'s settings-field popover so the two can never drift apart on edge behaviour.
  */
 function HoverCardContent({ entry, anchorEl }: { entry: TreeEntry; anchorEl: HTMLElement }) {
   const cardRef = useRef<HTMLDivElement>(null)
@@ -537,18 +539,12 @@ function HoverCardContent({ entry, anchorEl }: { entry: TreeEntry; anchorEl: HTM
   useLayoutEffect(() => {
     const card = cardRef.current
     if (card == null) return
-    const anchorRect = anchorEl.getBoundingClientRect()
-    const cardRect = card.getBoundingClientRect()
-    const margin = HOVER_CARD_EDGE_MARGIN_PX
-
-    let top = anchorRect.bottom + margin
-    if (top + cardRect.height > window.innerHeight - margin) top = anchorRect.top - cardRect.height - margin
-    top = Math.max(margin, Math.min(top, window.innerHeight - cardRect.height - margin))
-
-    let left = anchorRect.left
-    if (left + cardRect.width > window.innerWidth - margin) left = window.innerWidth - cardRect.width - margin
-    left = Math.max(margin, left)
-
+    const { top, left } = placePopover(
+      anchorEl.getBoundingClientRect(),
+      card.getBoundingClientRect(),
+      { width: window.innerWidth, height: window.innerHeight },
+      POPOVER_EDGE_MARGIN_PX,
+    )
     setStyle({ position: 'fixed', top, left, opacity: 1 })
   }, [entry, anchorEl])
 

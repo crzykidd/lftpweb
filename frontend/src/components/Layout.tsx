@@ -1,5 +1,5 @@
 import { NavLink, Outlet, useLocation } from 'react-router-dom'
-import { NAV_ITEMS, SETTINGS_TABS } from '../nav'
+import { NAV_ITEMS, tabsForPath } from '../nav'
 import { useAuth } from '../hooks/authContext'
 import { CredentialsBanner } from './CredentialsBanner'
 import { StatsHeader } from './StatsHeader'
@@ -20,13 +20,13 @@ const tabLinkClasses = ({ isActive }: { isActive: boolean }) =>
       : 'border-transparent text-zinc-500 hover:text-zinc-800 dark:text-zinc-400 dark:hover:text-zinc-200'
   }`
 
-/** The app chrome: left nav, top tabs (only where a section has more than one page —
- * Settings today), and the stats header. Every later phase's pages render into the
+/** The app chrome: left nav, top tabs (only where a section has more than one page — Settings
+ * and, since 2026-08-13, Docs), and the stats header. Every later phase's pages render into the
  * <Outlet />. DESIGN.md §9.1.
  */
 export function Layout() {
   const location = useLocation()
-  const inSettings = location.pathname.startsWith('/settings')
+  const tabs = tabsForPath(location.pathname)
   const { session, logout } = useAuth()
 
   return (
@@ -65,9 +65,9 @@ export function Layout() {
       <div className="flex min-w-0 flex-1 flex-col">
         <CredentialsBanner />
         <StatsHeader />
-        {inSettings && (
+        {tabs != null && (
           <nav className="flex gap-1 overflow-x-auto border-b border-zinc-200 px-4 dark:border-zinc-800">
-            {SETTINGS_TABS.map((tab) => (
+            {tabs.map((tab) => (
               <NavLink key={tab.path} to={tab.path} className={tabLinkClasses}>
                 {tab.label}
               </NavLink>

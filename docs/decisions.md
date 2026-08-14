@@ -6,6 +6,70 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-13 — In-app Docs section: components not Markdown, in-app not README, and one
+## shared popover primitive instead of a third popup mechanism
+
+**Handoff prompt `prompts/2026-08-13-docs-section.md`, executed end to end.**
+
+**Decision: the docs live in the app, and `README.md` links onward rather than duplicating.**
+Three audiences, three homes: `README.md` for someone who hasn't deployed (what it is, how to
+run it, volumes and PUID), `DESIGN.md` for someone changing the code, and the in-app Docs
+section for the audience neither reaches — someone with a *running* instance who doesn't know
+why nothing is downloading. The deciding advantage is not tone, it's linkability: an in-app page
+saying "set this in Settings → Queues" can be a router link that takes you there, which a README
+cannot be. Rejected alternative: a longer README with an in-app pointer to it. This repo already
+has three instances of duplicated prose drifting apart, and a fourth would have been the largest.
+
+**Decision: pages are React components; no markdown renderer was added.** `react-markdown` (or
+any equivalent) plus a sanitizer would have been the second and third runtime frontend
+dependencies this project has taken since phase 1 — the first, `@tanstack/react-virtual`, is
+still flagged in this file as a deviation needing justification. A docs page is the weakest
+possible case for that, because the content is written once by the same people who write the
+components and never comes from user input. The cost is real and accepted: prose is JSX, so a
+long sentence is harder to edit than it would be in Markdown, and there is no way for a user to
+supply their own page.
+
+**Decision: `FieldHelp` reuses the hover card's machinery via a new `lib/popoverPosition.ts`,
+rather than importing `FileTree.tsx`'s card or writing a second one.** The prompt's constraint
+was "reuse `f4a4205`, don't invent a third popup mechanism" (the hover card and the inline
+confirm panels being the first two). `HoverCardContent` could not be reused directly — it is
+typed to `TreeEntry`, driven by an imperative controller built for a virtualized row list, and
+`pointer-events-none` because it floats over clickable rows. What is genuinely common is the
+*placement*: prefer below, flip above when there's no room, clamp both axes into the viewport.
+That was extracted verbatim out of `HoverCardContent`'s `useLayoutEffect` into
+`placePopover(anchor, size, viewport, margin)`, which both callers now use. Two side benefits
+that were not the motivation but are worth recording: the arithmetic is now unit-testable
+without mounting anything (`lib/popoverPosition.test.ts`), and a fix to the edge behaviour is
+now necessarily a fix to both surfaces.
+
+**Decision: `FieldHelp` opens on click, not on focus.** The usual way this pattern breaks is
+`onFocus`-opens racing the `onClick` that caused the focus — tab in, it opens; click, it opens
+then immediately toggles shut. Making the trigger a plain `<button>` whose `onClick` toggles
+gives keyboard access for free (Enter/Space fire `onClick`) and touch access for free, with no
+race. Hover is layered on top and gated to `pointerType === 'mouse'`, because a touch tap also
+raises `pointerenter` and would otherwise reintroduce exactly the race that was designed out.
+
+**Decision: `nav.ts.tabsForPath` replaces `Layout.tsx`'s hardcoded `startsWith('/settings')`.**
+Docs is the second section with top tabs. A second hardcoded branch is the shape that grows a
+third; one lookup keyed on the route is both smaller and unit-testable. It also fixes a latent
+bug the old check had — a bare `startsWith('/settings')` matches a hypothetical
+`/settings-export` route, which the new separator-aware check does not.
+
+**Decision: three fields get `FieldHelp` here, not the whole settings surface.** The prompt
+splits application across a companion task; establishing the component against a couple of real
+call sites is what proves the API is usable, and doing all of them here would have made this
+diff mostly copy. `sync_mode` was mandatory (it can delete data, and its inline warning only
+appears *after* you have already selected a destructive mode). `Patterns-only` and
+`Known-hosts policy` were chosen on the same principle: a terse label, no inline explanation at
+all, and a wrong answer with a real consequence.
+
+**Not verified, and stated rather than hidden: nobody has seen any of this.** No browser exists
+in the environment this was built in. The pages build, type-check, lint, and their pure logic is
+unit-tested — whether the prose reads well, whether the popover is legible, and whether the
+Concepts tables survive a narrow viewport are all unconfirmed.
+
+---
+
 ## 2026-08-13 — First frontend test runner: Vitest + happy-dom, unit coverage only, no
 ## component tests, CI job name left unchanged
 

@@ -12,6 +12,8 @@ import { PostProcessingTab } from './pages/settings/PostProcessingTab'
 import { LogsTab } from './pages/settings/LogsTab'
 import { BackupTab } from './pages/settings/BackupTab'
 import { AuthTab } from './pages/settings/AuthTab'
+import { QuickStartPage } from './pages/docs/QuickStartPage'
+import { ConceptsPage } from './pages/docs/ConceptsPage'
 import { useAuth } from './hooks/authContext'
 
 function App() {
@@ -46,6 +48,14 @@ function App() {
           <Route path="logs" element={<LogsTab />} />
           <Route path="backup" element={<BackupTab />} />
           <Route path="auth" element={<AuthTab />} />
+        </Route>
+        {/* In-app user documentation (2026-08-13) -- routed exactly like Settings, tabs and
+         * all, because it is the second section with more than one page and `nav.ts`'s
+         * `tabsForPath` now drives the strip for both. */}
+        <Route path="docs">
+          <Route index element={<Navigate to="/docs/quick-start" replace />} />
+          <Route path="quick-start" element={<QuickStartPage />} />
+          <Route path="concepts" element={<ConceptsPage />} />
         </Route>
         <Route path="*" element={<Navigate to="/files" replace />} />
       </Route>
