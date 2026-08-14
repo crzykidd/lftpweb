@@ -1,9 +1,10 @@
 # Concepts
 
-The six things that actually trip people up, and what to do about each.
+The seven things that actually trip people up, and what to do about each.
 
 ```jump
 Nothing downloaded for a minute|#settle
+A finished item looks broken for ten minutes|#removal-grace
 An item won't re-download|#suppression
 Dismiss vs Clear vs Reset|#blast-radius
 The lifecycle icons|#icons
@@ -50,6 +51,46 @@ later — never a bad import or a bad delete.
 > 60-second thresholds are fixed and not tunable per install. Turning it off sheds up to about a
 > minute of latency per transfer, and is only safe if your seedbox's landing path is atomic end
 > to end.
+
+## A finished item looks broken for ten minutes — the removal grace period {#removal-grace}
+
+A release you already downloaded — verified, extracted, whatever — has its local copy vanish:
+you moved it, an `*arr` importer took it, a `move` queue relocated it after verification passed.
+The remote copy is still there. lftpweb does not immediately relabel the row `REMOTE_ONLY` and
+treat it as never-fetched — that would make auto-queue cheerfully re-download something removed
+on purpose. Instead the row holds its **last-known-good state** (`VERIFIED`, `DOWNLOADED`,
+whatever it was) for a grace period — about ten minutes — before it settles on `REMOVED_LOCAL`.
+Absence has to persist across several consecutive scans, not just one, so a momentary mount
+hiccup or an importer mid-copy can't trigger it early.
+
+For most of that window nothing distinguished this from an item that just quietly finished —
+the row still read `VERIFIED`, both presence icons already dark, no size, no visible sign a
+decision was pending. It looked broken. It was working exactly as designed, seconds from
+resolving.
+
+The status chip now shows it directly:
+
+- `Missing · 1m` — the grace clock is running, with roughly how long is left before this row
+  becomes `REMOVED_LOCAL`. Hover the chip (or open the item drawer) for the full sentence,
+  including the exact time the local copy was first noticed gone.
+- `Missing` with no number — the same state, but showing a number would be a guess: the row is
+  right at the edge of the window, or lftpweb currently can't trust its own reading here (see
+  the note on unmounted shares below). Never a stuck `0s` or a negative countdown.
+
+> **Note:** This does not change the lifecycle icons, and should not. The **hard drive** icon
+> going dim while the **shield**/**box** icons stay green is not a bug the countdown is
+> covering up — it's the presence/milestone split described under [The lifecycle
+> icons](#icons) working correctly. The countdown is new information (*a decision is pending*),
+> not a correction to the icons (which already tell the truth about *right now* vs. *what
+> happened*).
+
+> **Warning:** If your local root is on a share that drops out (NFS, a flaky mount), the grace
+> clock deliberately does not advance while lftpweb can't trust its own reading of "missing" —
+> it would rather hold the last-known-good state indefinitely than misfire. The chip's own
+> countdown has no visibility into that on the Files page today, so it caps at the bare
+> `Missing` label once its local arithmetic reaches zero, rather than showing a number that
+> might already be lying. If a row sits at `Missing` far longer than the window suggests it
+> should, suspect the mount before the countdown.
 
 ## Why an item will not re-download — auto-queue suppression {#suppression}
 

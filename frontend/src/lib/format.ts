@@ -464,3 +464,135 @@ export function settleArrivingLabel(node: SettleArrivingNode): string {
 export function settleArrivingShortLabel(node: { settle_total_bytes: number | null }): string {
   return node.settle_total_bytes != null ? `Remote · ${formatBytes(node.settle_total_bytes)}` : 'Remote…'
 }
+
+// The removal grace period's countdown (2026-08-14, prompts/2026-08-14-removal-grace-
+// countdown.md, DESIGN.md §3.2 rule 3 / §7.3) -- mirrors the settle-gate countdown above
+// exactly: same substitution shape (`FileTree.tsx`'s `Row` swaps the state chip wholesale,
+// same as `isSettling`/SETTLING), same short-label-in-cell / full-sentence-on-hover split.
+//
+// The live case this closes: a `move`-mode release whose local copy had just been moved out
+// sat at `VERIFIED` -- both presence icons dim, no size, 22 children already at
+// `REMOVED_BOTH` -- for the whole ~10-minute grace window with nothing on screen saying a
+// clock was running. `DESIGN.md` §3.2 rule 3 was working correctly; the row just looked
+// broken. **The lifecycle icons (`core/itemview.py`'s R/L/V/E facets) are untouched by this
+// -- V staying green while L goes dim is correct, the presence/milestone split this project
+// already made deliberately (docs/decisions.md).** The fix belongs on the state chip, the one
+// field that already carries a transient reading (see SETTLING above).
+
+// `core/mount_sentinel.py._COMPLETE_PREV_STATES` ({"DOWNLOADED"} | core/postprocess.py.
+// OWNED_STATES), deliberately duplicated here rather than imported -- same cross-language
+// **A bootstrap default, not a second source of truth.** The real set ships from
+// `GET /api/settings/removal-grace` as `eligible_states`, straight out of
+// `core/mount_sentinel.py.COMPLETE_STATES` -- the same set `resolve_absence` actually gates the
+// grace clock on -- and `tests/test_settings_api.py` pins that equality against the live Python
+// set. `FileTree.tsx` passes the fetched set to `isRemovalGracePending`; this constant is only
+// what the one render before that fetch resolves uses, and what the pure-function tests below
+// exercise. So a state added to `_COMPLETE_PREV_STATES` on the Python side self-corrects here
+// within one fetch rather than needing a matching TypeScript edit -- which is the drift this
+// project has been bitten by repeatedly (a projection hand-copied into four publishers, column
+// widths declared twice, `_LOCAL_CONTENT_ASSERTED_STATES` forked from this very set).
+export const REMOVAL_GRACE_ELIGIBLE_STATES = new Set([
+  'DOWNLOADED',
+  'VERIFYING',
+  'VERIFIED',
+  'CORRUPT',
+  'EXTRACTING',
+  'EXTRACTED',
+  'EXTRACT_FAILED',
+])
+
+/** The grace-countdown substitution trigger, `isSettling`'s counterpart in `FileTree.tsx`'s
+ * `Row`. `first_missing_at != null` is `core/mount_sentinel.py.resolve_absence`'s own signal
+ * that the grace clock is running for this row *right now* -- a row already rewritten to
+ * `REMOVED_LOCAL`/`REMOVED_BOTH` is finished (not in `REMOVAL_GRACE_ELIGIBLE_STATES`, so this
+ * is `false` for it regardless of what `first_missing_at` still holds), and a row whose local
+ * copy never went missing has `first_missing_at === null`.
+ */
+export function isRemovalGracePending(
+  node: { state: string; first_missing_at: string | null },
+  eligibleStates: ReadonlySet<string> = REMOVAL_GRACE_ELIGIBLE_STATES,
+): boolean {
+  return eligibleStates.has(node.state) && node.first_missing_at != null
+}
+
+export interface RemovalGraceConstants {
+  grace_s: number
+}
+
+/** Seconds left before the grace window elapses, or `null` whenever showing a number would be
+ * a guess or a lie rather than a fact -- callers render the bare `Missing` label for `null`,
+ * never a fabricated or stuck figure (recommendation from
+ * prompts/2026-08-14-removal-grace-countdown.md, recorded in docs/decisions.md):
+ *
+ * - `firstMissingAt`/`graceS` not yet available (settings still loading, or the row somehow
+ *   has no timestamp) -- nothing to compute from.
+ * - `firstMissingAt` doesn't parse as a date -- guard against `NaN` arithmetic.
+ * - `firstMissingAt` in the future -- clock skew between browser and server; a negative
+ *   countdown is worse than none.
+ * - elapsed already `>= graceS` -- **both** of the two honest-but-different reasons this can
+ *   happen collapse to the same cap on purpose: the backend's own scan hasn't rewritten the
+ *   row to `REMOVED_LOCAL` yet (ordinary polling lag), *or* `core/mount_sentinel.py.
+ *   resolve_absence` has frozen the clock because `mount_ok` is false for this queue (DESIGN.md
+ *   §7.3: "never start the grace clock on a reading we can't trust"). The Files page's
+ *   WebSocket-driven tree (`FileTree.tsx`) has no per-row visibility into `mount_ok` today --
+ *   it travels only on `GET /api/files`'s per-queue `QueueFiles.mount_ok`, never on the
+ *   `snapshot`/`queue_delta`/`item_delta` messages the tree actually renders from
+ *   (`api/wsTypes.ts`) -- so a countdown ticking to zero while the backend never transitions
+ *   the row is a real possibility this function can't tell apart from ordinary lag without new
+ *   backend plumbing. Capping at `Missing` (no number) the moment elapsed reaches `graceS`
+ *   avoids the worse failure (a countdown stuck at `0s`, or negative) without claiming
+ *   precision this function doesn't have. See docs/decisions.md for the plumbing that would
+ *   remove this limitation and why it wasn't added here.
+ */
+export function removalGraceRemainingS(
+  firstMissingAt: string | null,
+  graceS: number | null,
+  now: number = Date.now(),
+): number | null {
+  if (firstMissingAt == null || graceS == null) return null
+  const missingMs = new Date(firstMissingAt).getTime()
+  if (!Number.isFinite(missingMs)) return null
+  const elapsedS = (now - missingMs) / 1000
+  if (elapsedS < 0 || elapsedS >= graceS) return null
+  return graceS - elapsedS
+}
+
+/** The Status chip's own in-cell text -- `settleWaitShortLabel`'s counterpart. `"Missing"`
+ * alone (no bullet, no number) whenever `removalGraceRemainingS` has nothing trustworthy to
+ * show; `"Missing · 1m"` once it does. Deliberately not `"Removed"` or `"Removing"` -- the
+ * item hasn't been removed yet (that's `REMOVED_LOCAL`, a real, different `state`), and it
+ * isn't this codebase doing the removing (that's `REMOVING`, `substate === 'removing'`) --
+ * `"Missing"` names what's actually different about this row: presence, not action.
+ */
+export function removalGraceShortLabel(
+  node: { first_missing_at: string | null },
+  constants: RemovalGraceConstants | null,
+): string {
+  const remainingS = removalGraceRemainingS(node.first_missing_at, constants?.grace_s ?? null)
+  return remainingS == null ? 'Missing' : `Missing · ${formatEta(remainingS)}`
+}
+
+const GRACE_TIME_FORMAT: Intl.DateTimeFormatOptions = { hour: '2-digit', minute: '2-digit' }
+
+/** The full sentence, for the chip's `title` (hover) and the item drawer -- e.g. "Local copy
+ * gone since 17:35. Treated as removed in 1m unless it comes back." Degrades the second
+ * clause to "soon" (never a stuck/negative number) under exactly the conditions
+ * `removalGraceRemainingS` itself returns `null` for, including the frozen-clock case -- see
+ * that function's own docstring.
+ */
+export function removalGraceLabel(
+  node: { first_missing_at: string | null },
+  constants: RemovalGraceConstants | null,
+): string {
+  if (node.first_missing_at == null) return 'Local copy missing.'
+  const missingDate = new Date(node.first_missing_at)
+  const sinceText = Number.isFinite(missingDate.getTime())
+    ? missingDate.toLocaleTimeString([], GRACE_TIME_FORMAT)
+    : 'an unknown time'
+  const remainingS = removalGraceRemainingS(node.first_missing_at, constants?.grace_s ?? null)
+  const outcome =
+    remainingS != null
+      ? `Treated as removed in ${formatEta(remainingS)} unless it comes back.`
+      : 'Treated as removed soon unless it comes back.'
+  return `Local copy gone since ${sinceText}. ${outcome}`
+}

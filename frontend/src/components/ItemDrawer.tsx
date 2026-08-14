@@ -1,8 +1,17 @@
 import { useVirtualizer } from '@tanstack/react-virtual'
 import { Fragment, useEffect, useMemo, useRef, useState } from 'react'
-import { getHistoryEvents, getHistoryJobs } from '../api/client'
-import type { FileNode, HistoryEventOut, HistoryJobOut } from '../api/types'
-import { bothSidesRows, formatBytes, formatEta, formatPercent, formatRate, formatRelativeTimeIntl } from '../lib/format'
+import { getHistoryEvents, getHistoryJobs, getRemovalGraceSettings } from '../api/client'
+import type { FileNode, HistoryEventOut, HistoryJobOut, RemovalGraceSettingsOut } from '../api/types'
+import {
+  bothSidesRows,
+  formatBytes,
+  formatEta,
+  formatPercent,
+  formatRate,
+  formatRelativeTimeIntl,
+  isRemovalGracePending,
+  removalGraceLabel,
+} from '../lib/format'
 import { averageSpeedBps, elapsedSeconds } from '../lib/transferTiming'
 import { StateChip } from './StateChip'
 
@@ -145,6 +154,31 @@ function SideBySideDetails({ node }: { node: FileNode }) {
         <p className="mt-2 text-xs text-amber-700 dark:text-amber-400">
           Local is {formatBytes(shortfall)} short of remote ({formatPercent(localSize, remoteSize)} complete) --
           mid-transfer or truncated.
+        </p>
+      )}
+    </div>
+  )
+}
+
+/** The removal grace period, spelled out (2026-08-14, prompts/2026-08-14-removal-grace-
+ * countdown.md, DESIGN.md §3.2 rule 3 / §7.3): `FileTree.tsx`'s state chip carries the short
+ * form (`removalGraceShortLabel`) in the tight Status column; the drawer is where someone goes
+ * to answer "what is actually happening to this item," so it gets the full sentence plus the
+ * absolute timestamp `removalGraceLabel`'s relative wording alone doesn't give -- the same
+ * "chip gets the short form, drawer/hover gets the long one" split the settle gate's own
+ * countdown already established. Renders nothing when `isRemovalGracePending` is false, same
+ * gate `FileTree.tsx`'s `Row` uses for its own substitution, so the two surfaces can't
+ * disagree about which rows this applies to.
+ */
+function RemovalGraceNotice({ node, graceSettings }: { node: FileNode; graceSettings: RemovalGraceSettingsOut | null }) {
+  if (!isRemovalGracePending(node)) return null
+
+  return (
+    <div className="border-b border-zinc-200 px-4 py-2 text-xs dark:border-zinc-800">
+      <p className="text-amber-700 dark:text-amber-400">{removalGraceLabel(node, graceSettings)}</p>
+      {node.first_missing_at != null && (
+        <p className="mt-0.5 text-zinc-500 dark:text-zinc-400">
+          First noticed missing: {new Date(node.first_missing_at).toLocaleString()}.
         </p>
       )}
     </div>
@@ -406,6 +440,23 @@ export function ItemDrawer({
     return () => window.removeEventListener('keydown', onKeyDown)
   }, [onClose])
 
+  // The removal grace period's own constant (2026-08-14, prompts/2026-08-14-removal-grace-
+  // countdown.md) -- fetched once when the drawer mounts, not per row (there is only ever one
+  // `RemovalGraceNotice` per drawer, for `rootNode`). Unlike `FileTree.tsx`, which fetches this
+  // once for the whole tree and threads it down to every row, the drawer is opened on demand
+  // and closed again, so a self-contained fetch here (the same shape `HistoryPanel` already
+  // uses) is simpler than plumbing a new prop through both of this drawer's callers
+  // (`FileTree.tsx`, `TransfersPage.tsx`) for a value only this one notice needs.
+  const [graceSettings, setGraceSettings] = useState<RemovalGraceSettingsOut | null>(null)
+  useEffect(() => {
+    getRemovalGraceSettings()
+      .then(setGraceSettings)
+      .catch(() => {
+        // Degrades gracefully, same as FileTree.tsx's own fetch: `removalGraceLabel` still
+        // renders a full sentence without the numeric countdown clause.
+      })
+  }, [])
+
   return (
     <div className="fixed inset-0 z-40 flex justify-end">
       {/* Backdrop: closes the drawer on click, but the queue behind it stays visible and
@@ -440,6 +491,7 @@ export function ItemDrawer({
             per-file breakdown rather than repeating for every row in it. */}
         {rootNode && localPath && <PhysicalLocation localPath={localPath} node={rootNode} />}
         {rootNode && <SideBySideDetails node={rootNode} />}
+        {rootNode && <RemovalGraceNotice node={rootNode} graceSettings={graceSettings} />}
         {rootNode && <LifecycleChronology node={rootNode} />}
         {itemId != null && <HistoryPanel itemId={itemId} />}
 

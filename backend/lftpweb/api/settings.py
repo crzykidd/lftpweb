@@ -26,6 +26,7 @@ from lftpweb.core.download_prefix import (
     save_download_prefix_settings,
     validate_prefix,
 )
+from lftpweb.core.mount_sentinel import COMPLETE_STATES, DEFAULT_GRACE_S
 from lftpweb.core.mount_sentinel import check as mount_ok_check
 from lftpweb.core.postprocess import (
     PostprocessSettings,
@@ -66,6 +67,7 @@ from lftpweb.models import (
     PostprocessSettingsIn,
     PostprocessSettingsOut,
     QueueAutoQueueStatus,
+    RemovalGraceSettingsOut,
     RetentionPreviewItem,
     RetentionPreviewRequest,
     RetentionPreviewResponse,
@@ -871,6 +873,24 @@ async def put_settle_settings(body: SettleSettingsIn, request: Request) -> Settl
         required_scans=REQUIRED_SETTLE_SCANS,
         min_age_s=SETTLE_MIN_AGE_S,
     )
+
+
+# --- Settings -> the removal grace period (`core/mount_sentinel.py`, DESIGN.md §7.3) -----
+#
+# GET-only -- `RemovalGraceSettingsOut`'s own docstring: `DEFAULT_GRACE_S` isn't a per-install
+# setting this phase, this endpoint exists purely so the frontend has a real number to build a
+# countdown from instead of a hardcoded one (2026-08-14, prompts/2026-08-14-removal-grace-
+# countdown.md).
+
+
+@router.get("/removal-grace", response_model=RemovalGraceSettingsOut)
+async def get_removal_grace_settings() -> RemovalGraceSettingsOut:
+    # `COMPLETE_STATES` straight from `core/mount_sentinel.py`, never a list literal here: it is
+    # the same set `resolve_absence` gates on, so the countdown can only ever be offered for a
+    # row the backend would actually run the clock for. `tests/test_settings_api.py` pins the
+    # equality so a new post-processing state added on the Python side cannot silently stop
+    # being eligible in the UI.
+    return RemovalGraceSettingsOut(grace_s=DEFAULT_GRACE_S, eligible_states=sorted(COMPLETE_STATES))
 
 
 # --- Settings -> "folder prefix during transfer" (`core/download_prefix.py`) -----------

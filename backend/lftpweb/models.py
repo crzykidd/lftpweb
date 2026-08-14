@@ -247,6 +247,29 @@ class SettleSettingsIn(BaseModel):
     enabled: bool = True
 
 
+# --- Settings -> the removal grace period (`core/mount_sentinel.py`, DESIGN.md §7.3) -----
+
+
+class RemovalGraceSettingsOut(BaseModel):
+    """Read-only, GET-only -- there is no `In` counterpart. `core/mount_sentinel.py.
+    DEFAULT_GRACE_S` is "not user-configurable this phase" by that module's own comment, so
+    unlike `SettleSettingsOut`'s `enabled` this has nothing to accept; the endpoint always
+    fills `grace_s` from the real constant, never from a stored value -- the default here is
+    only for the OpenAPI schema. Exists so the Files page's removal-grace countdown
+    (2026-08-14, prompts/2026-08-14-removal-grace-countdown.md) can read the real grace window
+    instead of a second, hand-maintained 600 baked into the frontend, the same drift risk
+    `SettleSettingsOut.required_scans`/`min_age_s` already exists to avoid for the settle gate.
+    """
+
+    grace_s: float = 600.0
+    # The states the grace clock can actually be running for -- `core/mount_sentinel.py.
+    # COMPLETE_STATES` (`DOWNLOADED` plus the post-processing outcomes), shipped for the same
+    # reason `grace_s` is: the frontend's countdown has to know which rows are eligible, and a
+    # hand-maintained copy of that set in TypeScript is a set that drifts the moment a new
+    # post-processing state is added on the Python side. Sent sorted so the response is stable.
+    eligible_states: list[str] = []
+
+
 # --- Settings -> "folder prefix during transfer" (`core/download_prefix.py`) -----------
 
 

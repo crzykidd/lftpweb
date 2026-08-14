@@ -80,10 +80,11 @@ queued, where status actually comes from, and why. It is also in the running app
   password login or trust a reverse proxy's identity header, both from Settings → Auth. See
   "Locked out?" below before you flip it on.
 - **In-app user documentation**, under **Docs** in the left nav: a quick start walking the real
-  first-run sequence, and a Concepts page covering the six things that actually confuse people
-  (the settle gate, auto-queue suppression, the difference between Dismiss / Clear history /
-  Reset item tracking, the lifecycle icons, `copy` vs `move`, and inherit-vs-override on the
-  post-processing toggles). Every step links straight to the settings page it describes.
+  first-run sequence, and a Concepts page covering the seven things that actually confuse people
+  (the settle gate, the removal grace period, auto-queue suppression, the difference between
+  Dismiss / Clear history / Reset item tracking, the lifecycle icons, `copy` vs `move`, and
+  inherit-vs-override on the post-processing toggles). Every step links straight to the settings
+  page it describes.
   Per-field help popups (`FieldHelp`) are being applied across the settings surface, starting
   with the fields whose wrong answer costs you data
 

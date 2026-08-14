@@ -167,6 +167,25 @@ export interface SettleSettingsIn {
   enabled: boolean
 }
 
+// --- Settings -> the removal grace period (core/mount_sentinel.py, DESIGN.md §7.3) -----
+//
+// GET-only -- no `...In` counterpart. `DEFAULT_GRACE_S` isn't a per-install setting this
+// phase (core/mount_sentinel.py's own comment); surfaced only so the Files page's removal-
+// grace countdown (2026-08-14, prompts/2026-08-14-removal-grace-countdown.md) reads the real
+// window instead of a second, hand-maintained 600 that could drift from the backend's own
+// constant -- the same reasoning as SettleSettingsOut's required_scans/min_age_s above.
+
+export interface RemovalGraceSettingsOut {
+  grace_s: number
+  /** The states the grace clock can actually run for -- `core/mount_sentinel.py.COMPLETE_STATES`,
+   * shipped rather than duplicated here so a new post-processing state added on the Python side
+   * can't silently stop being eligible in the UI. `lib/format.ts.REMOVAL_GRACE_ELIGIBLE_STATES`
+   * is a bootstrap default for the render before this fetch resolves, not a second source of
+   * truth; `tests/test_settings_api.py` pins the equality against the live set.
+   */
+  eligible_states: string[]
+}
+
 // --- Settings -> "folder prefix during transfer" (core/download_prefix.py) -------------
 //
 // Site-wide default; a queue's own `download_prefix_enabled`/`download_prefix` (PathQueueOut,

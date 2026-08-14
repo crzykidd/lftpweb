@@ -2,8 +2,8 @@ import { useVirtualizer } from '@tanstack/react-virtual'
 import type { CSSProperties, KeyboardEvent as ReactKeyboardEvent, PointerEvent as ReactPointerEvent, RefObject } from 'react'
 import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useReducer, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
-import { deleteItem, getSettleSettings, queueItem, stopItem } from '../api/client'
-import type { FileNode, SettleSettingsOut } from '../api/types'
+import { deleteItem, getRemovalGraceSettings, getSettleSettings, queueItem, stopItem } from '../api/client'
+import type { FileNode, RemovalGraceSettingsOut, SettleSettingsOut } from '../api/types'
 import type { ChildSpeedSample } from '../hooks/useLiveModel'
 import {
   bothSidesRows,
@@ -14,8 +14,11 @@ import {
   formatEta,
   formatPercent,
   hasBothSides,
+  isRemovalGracePending,
   isStillArriving,
   percentValue,
+  removalGraceLabel,
+  removalGraceShortLabel,
   settleArrivingLabel,
   settleArrivingShortLabel,
   settleWaitLabel,
@@ -1085,6 +1088,9 @@ interface RowProps {
   // threaded down rather than re-fetched per row. See that fetch's own comment for the `null`
   // cases.
   settleSettings: SettleSettingsOut | null
+  // The removal grace period's own site-wide constant (2026-08-14) -- same "fetched once,
+  // threaded down" shape as `settleSettings` immediately above.
+  removalGraceSettings: RemovalGraceSettingsOut | null
   // The hover card's imperative controller (2026-08-13) -- a stable ref, not state, so wiring it
   // to every row never itself causes a re-render. See `HoverCardHandle`'s own docstring.
   hoverCardRef: RefObject<HoverCardHandle | null>
@@ -1101,6 +1107,7 @@ function Row({
   onOpenDrawer,
   actionBusy,
   settleSettings,
+  removalGraceSettings,
   hoverCardRef,
 }: RowProps) {
   const size = nodeDisplaySize(entry)
@@ -1123,6 +1130,22 @@ function Row({
   // substitution over the chip, not a change to `entry.state` itself, which stays REMOTE_ONLY
   // server-side for the duration (`core/settle.py`).
   const isSettling = entry.state === 'REMOTE_ONLY' && entry.substate === 'settling'
+  // The removal grace period's countdown (2026-08-14, prompts/2026-08-14-removal-grace-
+  // countdown.md): the third substitution over the chip, same shape as `isRemoving`/
+  // `isSettling` above -- `entry.state` stays at its last complete value (VERIFIED, say) for
+  // the whole grace window (`core/mount_sentinel.py.resolve_absence`), so this is purely
+  // display, not a claim `state` itself changed. Checked *before* `isRemoving`/`isSettling`
+  // below can even apply to this row (a grace-pending row is never mid-delete or REMOTE_ONLY),
+  // but ordered after them in the ternary chain so an actual delete-in-flight or settle wait
+  // (different rows, but keep the precedence obvious) still wins if somehow both were true.
+  // The eligible-state set comes from the server (`removalGraceSettings.eligible_states`,
+  // `core/mount_sentinel.py.COMPLETE_STATES`) rather than the module constant, so a state added
+  // on the Python side self-corrects here within one fetch. `undefined` before the fetch
+  // resolves falls back to `lib/format.ts`'s bootstrap default -- see its comment.
+  const isMissing = isRemovalGracePending(
+    entry,
+    removalGraceSettings ? new Set(removalGraceSettings.eligible_states) : undefined,
+  )
   // Two different sentences for the same `substate === 'settling'` row (2026-08-13,
   // prompts/2026-08-13-settle-progress-visibility.md): `isStillArriving` picks out the case
   // the countdown below has nothing useful to say about yet -- `settle_matched_scans === 1`,
@@ -1269,23 +1292,38 @@ function Row({
             to scan (a large directory still being copied onto the seedbox) -- while that's
             true there is nothing confirmed yet for the countdown to count, so this shows the
             byte count climbing instead (`settleArrivingShortLabel`/`settleArrivingLabel`). Both
-            pairs share `SETTLING`'s amber chip styling; only the words differ. */}
+            pairs share `SETTLING`'s amber chip styling; only the words differ.
+
+            **`isMissing` is a third, independent substitution** (2026-08-14,
+            prompts/2026-08-14-removal-grace-countdown.md): DESIGN.md §3.2 rule 3's grace
+            period, running while a previously-complete item's local copy is absent and its
+            remote copy is still present. Without this the chip kept showing the row's
+            last-known-good state (VERIFIED, say) for the whole ~10-minute window with nothing
+            indicating a transition was pending -- the live case this closed. Mutually
+            exclusive with `isRemoving`/`isSettling` in practice (different `state`/`substate`
+            combinations produce each), but `isRemoving` is still checked first in case a
+            future state ever satisfies more than one, matching this ternary's existing
+            left-to-right precedence. */}
         <StateChip
-          state={isRemoving ? 'REMOVING' : isSettling ? 'SETTLING' : entry.state}
-          percent={isRemoving || isSettling ? null : stateProgressPercent(entry)}
+          state={isRemoving ? 'REMOVING' : isSettling ? 'SETTLING' : isMissing ? 'MISSING' : entry.state}
+          percent={isRemoving || isSettling || isMissing ? null : stateProgressPercent(entry)}
           label={
             isStillArrivingRow
               ? settleArrivingShortLabel(entry)
               : isSettling
                 ? settleWaitShortLabel(entry, settleSettings)
-                : undefined
+                : isMissing
+                  ? removalGraceShortLabel(entry, removalGraceSettings)
+                  : undefined
           }
           title={
             isStillArrivingRow
               ? settleArrivingLabel(entry)
               : isSettling
                 ? settleWaitLabel(entry, settleSettings)
-                : undefined
+                : isMissing
+                  ? removalGraceLabel(entry, removalGraceSettings)
+                  : undefined
           }
         />
       </span>
@@ -1461,6 +1499,21 @@ export function FileTree({
   useEffect(() => {
     getSettleSettings()
       .then(setSettleSettings)
+      .catch(() => {
+        // Degrades gracefully -- see the comment above.
+      })
+  }, [])
+
+  // The removal grace period's own constant (2026-08-14, prompts/2026-08-14-removal-grace-
+  // countdown.md): `core/mount_sentinel.py.DEFAULT_GRACE_S`, fetched once for the whole tree
+  // via `GET /api/settings/removal-grace`, the same "site-wide constant, not per-row" shape as
+  // `settleSettings` immediately above. `null` until the fetch resolves, or forever on failure
+  // -- `removalGraceShortLabel`/`removalGraceLabel` (`lib/format.ts`) degrade to the bare
+  // `Missing` label either way, never blocking the tree from rendering.
+  const [removalGraceSettings, setRemovalGraceSettings] = useState<RemovalGraceSettingsOut | null>(null)
+  useEffect(() => {
+    getRemovalGraceSettings()
+      .then(setRemovalGraceSettings)
       .catch(() => {
         // Degrades gracefully -- see the comment above.
       })
@@ -2123,6 +2176,7 @@ export function FileTree({
                     onOpenDrawer={setDrawerEntry}
                     actionBusy={rowBusy.has(entry.rel_path)}
                     settleSettings={settleSettings}
+                    removalGraceSettings={removalGraceSettings}
                     hoverCardRef={hoverCardRef}
                   />
                 </div>

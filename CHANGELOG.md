@@ -59,6 +59,23 @@ alongside this list: several entries below ship with deliberate, documented limi
   `docker/test-seedbox/make_demo_tree.py` — writes obviously-fake, generically-named releases
   into the dev seedbox's hand-testing dropbox covering the four shapes worth photographing: a
   loose file, a single-file directory, a real multi-volume rar set, and a multi-file pack.
+- **A removal-grace countdown on the Files page** *(2026-08-14)* — a previously-complete item
+  (`DOWNLOADED` or a post-processing outcome) whose local copy just vanished used to keep
+  showing its last-known-good state, unchanged, for the whole ~10-minute §7.3 grace period
+  before landing on `REMOVED_LOCAL`, with nothing indicating a decision was pending; a row like
+  that read as broken rather than as §3.2 rule 3 working correctly. The state chip now
+  substitutes a synthetic `Missing · 1m` reading (capping to a bare `Missing`, never a stuck
+  `0s` or a negative number, whenever the exact remaining time can't be trusted — including
+  while the mount gate has the grace clock deliberately frozen, DESIGN.md §7.3), the same
+  substitution shape the settle gate's own `SETTLING` chip already established
+  (`components/StateChip.tsx`, `FileTree.tsx`). The item drawer gets the full sentence plus the
+  absolute time the local copy was first noticed missing. **The lifecycle icons are
+  unchanged** — the Local icon going dim while Verified/Extracted stay green is correct, not
+  the bug this closes (`core/itemview.py`'s presence-vs-milestone split). A new `GET
+  /api/settings/removal-grace` endpoint exposes `core/mount_sentinel.py.DEFAULT_GRACE_S`
+  read-only, the same "real constant, not a hand-copied number" pattern
+  `SettleSettingsOut.required_scans`/`min_age_s` already uses. Not click-tested — no browser in
+  this environment; see docs/decisions.md for what a human should confirm.
 
 - **Phase 1 — skeleton + container.** FastAPI + SQLite backend, `host` / `path_queue`
   schema, `/api/health`, both production and development `docker compose` files, and the

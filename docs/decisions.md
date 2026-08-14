@@ -6,6 +6,68 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-14 — Removal-grace countdown: new GET-only settings endpoint for the grace constant; capped the countdown rather than plumbing `mount_ok` onto the WebSocket; rejected making the chip permanently show presence
+
+**Handoff prompt `prompts/done/2026-08-14-removal-grace-countdown.md`, executed end to end.**
+The reported case: a `move`-mode release whose local copy had just been relocated sat at
+`VERIFIED` — both presence icons dim, no size, 22 children already at `REMOVED_BOTH` — for the
+whole ~10-minute §7.3 grace window with nothing on screen indicating a clock was running.
+`DESIGN.md` §3.2 rule 3 was working correctly; the row just looked broken. Three decisions
+worth recording separately from the CHANGELOG entry:
+
+**A new `GET /api/settings/removal-grace` endpoint, not a field tacked onto an existing
+response.** `core/mount_sentinel.py.DEFAULT_GRACE_S` needed to reach the frontend without being
+hand-copied as a second `600` that could drift from the backend's own constant — the same
+problem `SettleSettingsOut.required_scans`/`min_age_s` already solved for the settle gate, by
+the same pattern (a read-only field always filled from the real constant, never stored). It
+was tempting to add `grace_s` onto `RetentionSettingsOut` (also about "how long to wait before
+touching local files") or `SettleSettingsOut` itself, but both are conceptually a different
+gate — retention is deletion after N days once *complete*; settle is confirming arrival before
+anything downloads; the removal grace period is a third thing, absence-after-completion, owned
+by `core/mount_sentinel.py`, not `core/local_delete.py` or `core/settle.py`. A new
+`RemovalGraceSettingsOut` (GET-only, no `...In` counterpart — `DEFAULT_GRACE_S` isn't
+per-install-configurable this phase either) keeps each settings response mapped to exactly one
+owning module rather than becoming a grab-bag.
+
+**The frozen-clock edge: capped the display, did not thread `mount_ok` onto the WebSocket.**
+`resolve_absence` deliberately holds the grace clock still while `mount_ok` is false for a
+queue (DESIGN.md §7.3: "never start the grace clock on a reading we can't trust"), so a
+client-side countdown computed from `first_missing_at` + a fixed grace window can, in
+principle, tick to zero while the backend never actually transitions the row — a dropped NFS
+mount being the concrete case. The prompt's preferred fix was to have the Files page say "local
+root unavailable" instead of a countdown whenever the gate is failing. Checked what the
+frontend can already see: `Engine.mount_ok` is real and per-queue, but it only reaches the
+wire on `GET /api/files`'s `QueueFiles.mount_ok` (`api/files.py`) — never on the
+`snapshot`/`queue_delta`/`item_delta` WebSocket messages `FileTree.tsx`'s `Row` actually
+renders from (`api/wsTypes.ts`). The Files page is WS-driven by design and doesn't call `GET
+/api/files` at all today. Adding `mount_ok` to three WS message shapes (and everything that
+constructs them in `core/engine.py`/`core/queue.py`) is real, multi-file backend plumbing the
+prompt explicitly said not to add on this task's own initiative if the frontend can't already
+see it — so the fallback was taken instead: `lib/format.ts.removalGraceRemainingS` returns
+`null` (renders as the bare `Missing` label, no number) once elapsed reaches the grace window,
+regardless of *why* — ordinary scan lag or a frozen clock both degrade to the same safe
+non-answer rather than a stuck `0s` or a lie. Threading `mount_ok` through the WS messages so
+the chip can say "local root unavailable" specifically is the natural follow-up if this proves
+not to be enough in practice.
+
+**Rejected: making the chip show presence (`Missing`) permanently, demoting the milestone
+state to icons only.** Considered showing `Missing`/`REMOVED_LOCAL` in the chip the instant
+local content is unconfirmed, moving `VERIFIED`/`EXTRACTED` etc. into a secondary readout.
+Rejected because it loses "this item completed successfully" for a case that lasts ten
+minutes and then resolves on its own — exactly the mistake the presence/milestone icon split
+(`core/itemview.py`, `docs/decisions.md`'s earlier entry on that split) already exists to
+prevent, just reintroduced one level up in the chip instead of the icons. The chip still shows
+the real `state` (or its settle/removing substitution) for every row that isn't mid-grace;
+`MISSING` is a third synthetic substitution, exactly mirroring `SETTLING`/`REMOVING`
+(`components/StateChip.tsx`, `FileTree.tsx`'s `Row`), not a change to what `VERIFIED`/
+`EXTRACTED`/etc. mean or when they show.
+
+**Not click-tested.** No browser exists in this environment. The `MISSING` chip
+(`components/StateChip.tsx`) was given its own shade (a more saturated amber than `SETTLING`'s)
+specifically so the two read as different situations, but whether that actually reads as
+distinct rather than "the same chip, different words" needs a human look at a real Files page
+with both states present.
+
 ## 2026-08-14 — "Effective lftp settings" readout: split the rc builder into a credential half and a generated tuning half, rather than filtering rendered text; declined to compute a numeric bandwidth-cap preview; collision-winner claim gated on a real-lftp test
 
 **Handoff prompt `prompts/done/2026-08-14-show-effective-lftp-settings.md`, executed end to

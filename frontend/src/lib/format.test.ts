@@ -10,9 +10,14 @@ import {
   formatRelativeTime,
   formatRelativeTimeIntl,
   hasBothSides,
+  isRemovalGracePending,
   isStillArriving,
   mbToBytes,
   percentValue,
+  REMOVAL_GRACE_ELIGIBLE_STATES,
+  removalGraceLabel,
+  removalGraceRemainingS,
+  removalGraceShortLabel,
   settleArrivingLabel,
   settleArrivingShortLabel,
   settleWaitLabel,
@@ -470,5 +475,128 @@ describe('settleArrivingLabel / settleArrivingShortLabel', () => {
 
   it('short label shows the byte count when known', () => {
     expect(settleArrivingShortLabel({ settle_total_bytes: 2048 })).toBe('Remote · 2.0 KB')
+  })
+})
+
+// The removal grace period's countdown (2026-08-14, prompts/2026-08-14-removal-grace-
+// countdown.md) -- DESIGN.md §3.2 rule 3 / §7.3.
+describe('isRemovalGracePending', () => {
+  // Every state outside REMOVAL_GRACE_ELIGIBLE_STATES that the §3.2 vocabulary has
+  // (`StateChip.tsx`'s own STYLES keys, minus the eligible set) -- deliberately including
+  // REMOVED_LOCAL/REMOVED_BOTH: a row already rewritten to either has *finished*, not
+  // pending, and must never show a countdown even if `first_missing_at` is somehow still set.
+  const INELIGIBLE_STATES = [
+    'REMOTE_ONLY',
+    'LOCAL_ONLY',
+    'PARTIAL',
+    'QUEUED',
+    'DOWNLOADING',
+    'STOPPED',
+    'FAILED',
+    'EXCLUDED',
+    'REMOVED_LOCAL',
+    'REMOVED_BOTH',
+  ]
+
+  it('is true for every state in REMOVAL_GRACE_ELIGIBLE_STATES once first_missing_at is set', () => {
+    for (const state of REMOVAL_GRACE_ELIGIBLE_STATES) {
+      expect(isRemovalGracePending({ state, first_missing_at: '2026-08-13T12:00:00.000Z' })).toBe(true)
+    }
+  })
+
+  it('is false for every state outside the eligible set, even with first_missing_at set', () => {
+    for (const state of INELIGIBLE_STATES) {
+      expect(isRemovalGracePending({ state, first_missing_at: '2026-08-13T12:00:00.000Z' })).toBe(false)
+    }
+  })
+
+  it('is false for an eligible state whose local copy never went missing', () => {
+    expect(isRemovalGracePending({ state: 'VERIFIED', first_missing_at: null })).toBe(false)
+  })
+})
+
+describe('removalGraceRemainingS', () => {
+  const NOW = new Date('2026-08-13T12:00:00.000Z').getTime()
+
+  it('returns seconds left within the window', () => {
+    // 524s elapsed of a 600s grace window -- the live case this task closes ("76 seconds from
+    // resolving").
+    const firstMissingAt = new Date(NOW - 524_000).toISOString()
+    expect(removalGraceRemainingS(firstMissingAt, 600, NOW)).toBe(76)
+  })
+
+  it('returns null once elapsed has reached the grace window (capped, not 0 or negative)', () => {
+    const firstMissingAt = new Date(NOW - 600_000).toISOString()
+    expect(removalGraceRemainingS(firstMissingAt, 600, NOW)).toBeNull()
+  })
+
+  it('returns null well past the grace window too -- the frozen-clock case', () => {
+    const firstMissingAt = new Date(NOW - 6_000_000).toISOString()
+    expect(removalGraceRemainingS(firstMissingAt, 600, NOW)).toBeNull()
+  })
+
+  it('returns null when first_missing_at is null', () => {
+    expect(removalGraceRemainingS(null, 600, NOW)).toBeNull()
+  })
+
+  it('returns null when the grace constant has not loaded yet', () => {
+    const firstMissingAt = new Date(NOW - 76_000).toISOString()
+    expect(removalGraceRemainingS(firstMissingAt, null, NOW)).toBeNull()
+  })
+
+  it('returns null for an unparseable timestamp', () => {
+    expect(removalGraceRemainingS('not-a-date', 600, NOW)).toBeNull()
+  })
+
+  it('returns null for a first_missing_at in the future (clock skew)', () => {
+    const firstMissingAt = new Date(NOW + 5_000).toISOString()
+    expect(removalGraceRemainingS(firstMissingAt, 600, NOW)).toBeNull()
+  })
+})
+
+describe('removalGraceShortLabel / removalGraceLabel', () => {
+  beforeEach(() => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-08-13T12:00:00.000Z'))
+  })
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  const grace = { grace_s: 600 }
+
+  it('short label shows the countdown when the number is trustworthy', () => {
+    const firstMissingAt = new Date(Date.now() - 524_000).toISOString()
+    expect(removalGraceShortLabel({ first_missing_at: firstMissingAt }, grace)).toBe('Missing · 1m')
+  })
+
+  it('short label degrades to the bare word once capped', () => {
+    const firstMissingAt = new Date(Date.now() - 600_000).toISOString()
+    expect(removalGraceShortLabel({ first_missing_at: firstMissingAt }, grace)).toBe('Missing')
+  })
+
+  it('short label degrades to the bare word when constants have not loaded', () => {
+    const firstMissingAt = new Date(Date.now() - 524_000).toISOString()
+    expect(removalGraceShortLabel({ first_missing_at: firstMissingAt }, null)).toBe('Missing')
+  })
+
+  it('full label spells out the absolute time and the countdown', () => {
+    const firstMissingAt = new Date(Date.now() - 524_000).toISOString()
+    const expectedSince = new Date(firstMissingAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+    expect(removalGraceLabel({ first_missing_at: firstMissingAt }, grace)).toBe(
+      `Local copy gone since ${expectedSince}. Treated as removed in 1m unless it comes back.`,
+    )
+  })
+
+  it('full label degrades the outcome clause to "soon" once capped', () => {
+    const firstMissingAt = new Date(Date.now() - 600_000).toISOString()
+    const expectedSince = new Date(firstMissingAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+    expect(removalGraceLabel({ first_missing_at: firstMissingAt }, grace)).toBe(
+      `Local copy gone since ${expectedSince}. Treated as removed soon unless it comes back.`,
+    )
+  })
+
+  it('full label handles a null first_missing_at without fabricating a time', () => {
+    expect(removalGraceLabel({ first_missing_at: null }, grace)).toBe('Local copy missing.')
   })
 })

@@ -42,6 +42,17 @@ const STYLES: Record<string, string> = {
   // Amber, like PARTIAL/DOWNLOADING's in-progress fill: this is also "still becoming what it
   // will be," just one step earlier -- before anything has even been queued.
   SETTLING: 'bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300',
+  // Also not a real `item.state` (2026-08-14, prompts/2026-08-14-removal-grace-countdown.md):
+  // `FileTree.tsx`'s Row substitutes this whenever `lib/format.ts.isRemovalGracePending` is
+  // true for the row -- a previously-complete item (DOWNLOADED or a post-processing outcome)
+  // whose local copy just vanished and whose §7.3 grace clock is running, still showing its
+  // last-known-good `state` (VERIFIED, say) with nothing indicating a transition is pending.
+  // Amber, same bucket as SETTLING -- both are "still becoming what it will be, not a failure"
+  // -- but a **distinct fuchsia-adjacent amber**, not SETTLING's exact shade, so the two read
+  // as different situations at a glance rather than the same chip with different words (a
+  // human should confirm this actually reads as distinct in a real browser -- no UI access in
+  // this environment). Never FAILED's red: nothing has failed, a decision is just pending.
+  MISSING: 'bg-amber-200 text-amber-900 dark:bg-amber-800/50 dark:text-amber-200',
 }
 const FALLBACK_STYLE = 'bg-zinc-100 text-zinc-700 dark:bg-zinc-800 dark:text-zinc-300'
 

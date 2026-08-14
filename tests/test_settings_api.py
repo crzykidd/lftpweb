@@ -753,6 +753,48 @@ def test_settle_settings_default_on_and_round_trip(isolated_config):
         assert resp.json()["enabled"] is True
 
 
+# --- The removal grace period (`core/mount_sentinel.py`, DESIGN.md §7.3) -----------------
+
+
+def test_removal_grace_settings_reads_the_real_constant(isolated_config):
+    """2026-08-14, prompts/2026-08-14-removal-grace-countdown.md: GET-only, no `PUT` -- the
+    endpoint exists purely so the frontend's countdown reads `DEFAULT_GRACE_S` instead of a
+    second, hand-maintained number that could drift out of sync with it.
+    """
+    from lftpweb.core.mount_sentinel import COMPLETE_STATES, DEFAULT_GRACE_S
+
+    with TestClient(app) as client:
+        resp = client.get("/api/settings/removal-grace")
+        assert resp.status_code == 200
+        assert resp.json() == {
+            "grace_s": DEFAULT_GRACE_S,
+            "eligible_states": sorted(COMPLETE_STATES),
+        }
+
+
+def test_removal_grace_eligible_states_cannot_drift_from_the_gate(isolated_config):
+    """The drift guard. `COMPLETE_STATES` is what `core/mount_sentinel.py.resolve_absence`
+    actually gates the grace clock on; the frontend decides which rows may show a countdown from
+    whatever this endpoint ships. Asserting equality against the *live* set (never a literal
+    list) means adding a post-processing state on the Python side can't silently leave the UI
+    refusing to count down for it -- the exact shape of drift that has bitten this project
+    repeatedly (a projection hand-copied into four publishers, column widths declared twice,
+    `_LOCAL_CONTENT_ASSERTED_STATES` forked from this very set).
+    """
+    from lftpweb.core.mount_sentinel import COMPLETE_STATES
+
+    with TestClient(app) as client:
+        shipped = set(client.get("/api/settings/removal-grace").json()["eligible_states"])
+
+    assert shipped == set(COMPLETE_STATES)
+    # And it must be a superset of the post-processing outcomes specifically -- those are the
+    # states an item most commonly sits in when an importer takes its local copy away, which is
+    # the case §7.3's grace period exists for.
+    from lftpweb.core.postprocess import OWNED_STATES
+
+    assert set(OWNED_STATES) <= shipped
+
+
 # --- Phase 4: queues carry auto-queue toggles, default off (DESIGN.md §4.7) ---------------
 
 

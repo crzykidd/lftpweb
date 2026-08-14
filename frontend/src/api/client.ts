@@ -46,6 +46,7 @@ import type {
   PostprocessSettingsOut,
   QueueAutoQueueStatus,
   QueueResetRequest,
+  RemovalGraceSettingsOut,
   ResetItemResponse,
   ResetPatternPreviewRequest,
   ResetPatternPreviewResponse,
@@ -196,6 +197,12 @@ export function getSettleSettings(): Promise<SettleSettingsOut> {
 
 export function putSettleSettings(body: SettleSettingsIn): Promise<SettleSettingsOut> {
   return sendJson<SettleSettingsOut>('/api/settings/settle', 'PUT', body)
+}
+
+// --- Settings -> the removal grace period (core/mount_sentinel.py, DESIGN.md §7.3) -----
+
+export function getRemovalGraceSettings(): Promise<RemovalGraceSettingsOut> {
+  return getJson<RemovalGraceSettingsOut>('/api/settings/removal-grace')
 }
 
 // --- Settings -> "folder prefix during transfer" (core/download_prefix.py) -------------
