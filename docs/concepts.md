@@ -25,9 +25,11 @@ can't tell a settled item from one on a queue that simply hasn't been scanned mu
 
 Two readings show up on a Files row's status chip while this is happening:
 
-- `Arriving · 3.4 GB` — the remote side is _still changing_. Nothing has been confirmed
-  unchanged even once yet, so there is no honest countdown to show; the byte count is what has
-  landed on the seedbox so far, and it climbing is the progress signal.
+- `Remote · 3.4 GB` — the remote side is _still changing_. Nothing has been confirmed unchanged
+  even once yet, so there is no honest countdown to show; the byte count is what has landed on
+  the seedbox so far, and it climbing is the progress signal. The chip is amber here, which is
+  what separates it from the sky-blue `Remote` chip of an item that is simply sitting on the
+  seedbox not being downloaded.
 - `Waiting 1/2 · 35s` — it has stopped changing and the clock is running: one of the two
   required matching scans so far, 35 of the 60 required seconds. Hover the chip for the same
   thing as a full sentence.

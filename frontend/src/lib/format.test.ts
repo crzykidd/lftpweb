@@ -379,7 +379,7 @@ describe('settleArrivingLabel / settleArrivingShortLabel', () => {
         settle_first_observed_at: null,
         settle_last_changed_at: null,
       }),
-    ).toBe('Still arriving -- an unknown size so far')
+    ).toBe('Still arriving on the remote -- an unknown size so far')
   })
 
   it('includes size, changed-when, and watched-for once all three are known', () => {
@@ -389,14 +389,14 @@ describe('settleArrivingLabel / settleArrivingShortLabel', () => {
         settle_first_observed_at: '2026-08-13T12:00:00.000Z',
         settle_last_changed_at: '2026-08-13T12:00:10.000Z',
       }),
-    ).toBe('Still arriving -- 1.0 KB, changed 30s ago -- watching for 40s')
+    ).toBe('Still arriving on the remote -- 1.0 KB, changed 30s ago -- watching for 40s')
   })
 
   it('short label falls back to an ellipsis without a byte count', () => {
-    expect(settleArrivingShortLabel({ settle_total_bytes: null })).toBe('Arriving…')
+    expect(settleArrivingShortLabel({ settle_total_bytes: null })).toBe('Remote…')
   })
 
   it('short label shows the byte count when known', () => {
-    expect(settleArrivingShortLabel({ settle_total_bytes: 2048 })).toBe('Arriving · 2.0 KB')
+    expect(settleArrivingShortLabel({ settle_total_bytes: 2048 })).toBe('Remote · 2.0 KB')
   })
 })

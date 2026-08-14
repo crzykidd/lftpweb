@@ -357,14 +357,27 @@ export function settleArrivingLabel(node: SettleArrivingNode): string {
       ? Math.max(0, Math.floor((Date.now() - new Date(node.settle_first_observed_at).getTime()) / 1000))
       : null
   const watched = watchedS != null ? ` -- watching for ${formatEta(watchedS)}` : ''
-  return `Still arriving -- ${size}${changed}${watched}`
+  return `Still arriving on the remote -- ${size}${changed}${watched}`
 }
 
 /** The Status chip's own in-cell text for this state -- `settleWaitShortLabel`'s counterpart,
  * kept to the same short shape ("Waiting 1/2 · 35s") since it sits in the same fixed-width,
  * already-once-trimmed column (`a4a626d`). The full sentence survives on hover via
  * `settleArrivingLabel` above.
+ *
+ * **Reads "Remote", not "Arriving" (2026-08-14, user request.)** "Arriving" was ambiguous in
+ * exactly the wrong direction: it sounds like the item is arriving *here*, i.e. downloading to
+ * the local side, when the whole point of this state is that nothing has been queued yet and the
+ * bytes are still landing on the *seedbox*. Naming the side removes the ambiguity.
+ *
+ * This deliberately shares its leading word with a plain (non-settling) `REMOTE_ONLY` chip,
+ * which reads just "Remote" (`STATE_LABELS` above) -- correctly, since both mean "on the remote,
+ * not here." The two stay distinguishable by **color**, not by wording: a settling row renders
+ * the synthetic amber `SETTLING` chip (`components/StateChip.tsx`), a settled remote-only row the
+ * sky-blue `REMOTE_ONLY` one. The climbing byte count and the trailing ellipsis carry the "still
+ * growing" reading on top of that. The function keeps its `arriving` name because the *concept*
+ * it selects for is unchanged -- only the user-facing word moved.
  */
 export function settleArrivingShortLabel(node: { settle_total_bytes: number | null }): string {
-  return node.settle_total_bytes != null ? `Arriving · ${formatBytes(node.settle_total_bytes)}` : 'Arriving…'
+  return node.settle_total_bytes != null ? `Remote · ${formatBytes(node.settle_total_bytes)}` : 'Remote…'
 }
