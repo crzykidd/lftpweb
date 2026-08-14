@@ -369,6 +369,23 @@ def item_view(row: Mapping[str, Any]) -> ItemView:
     `"settling"` row (a pre-migration row that hasn't changed again since, `core/settle.py.
     _parse_iso_opt`) — the frontend renders that as "unknown," never a fabricated time.
 
+    `deleted_archive_at` (2026-08-14, `prompts/2026-08-14-extracted-archives-rest-as-
+    extracted.md`) is `deleted_archive.deleted_at`, joined in by the same two callers that add
+    `item_settle` (`core/engine.py._project`, `api/files.py.get_files`) — `_optional` reads
+    `None` for every caller that doesn't join it, the same shape `settle_matched_scans` uses,
+    but **not gated on `substate`**: unlike the settle fields (which would otherwise churn on
+    every scan of a top-level item still mid-transfer), `deleted_archive` membership is written
+    exactly once, by `core/local_delete.py.delete_extracted_archives`, and never changes again
+    short of a reset (`reset_item`/`reset_scope`) -- there is no "ungated read climbs forever"
+    risk to gate against. This is a *display* signal only: `state` itself already reads
+    `EXCLUDED` for this row (`core/engine.py._persist`'s vanished-row sweep resolves a
+    `deleted_archive` path straight to `EXCLUDED`, on both sync modes, never through §7.3's
+    grace clock — see that sweep's own comment). `deleted_archive_at != None` is what lets the
+    frontend tell *this* `EXCLUDED` apart from an ordinary pattern-`EXCLUDED` file and render a
+    greyed-out "Extracted" chip instead of "Excluded" — same reasoning as `remote_deleted_at`
+    above, one column down the same idea: a state string alone can't carry two different reasons
+    for the same reading, so the reason travels alongside it instead.
+
     **All five settle fields are gated on `substate == "settling"`, not passed through whenever
     the join happens to have a row.** `core/engine.py._persist` advances `item_settle` for
     *every* top-level item on *every* scan for as long as its remote fingerprint keeps matching
@@ -439,5 +456,6 @@ def item_view(row: Mapping[str, Any]) -> ItemView:
         # say nothing once it isn't (`_reap_one` clears this the moment it renames the
         # directory back to its real name).
         "pending_download_prefix": row["pending_download_prefix"],
+        "deleted_archive_at": _optional(row, "deleted_archive_at"),
         "facets": _lifecycle_facets(row),
     }

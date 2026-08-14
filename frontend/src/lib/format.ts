@@ -596,3 +596,40 @@ export function removalGraceLabel(
       : 'Treated as removed soon unless it comes back.'
   return `Local copy gone since ${sinceText}. ${outcome}`
 }
+
+// A spent archive volume, resting (2026-08-14, prompts/2026-08-14-extracted-archives-rest-as-
+// extracted.md, DESIGN.md §3.2 rule 8 / §6, §7.3). `core/local_delete.py.
+// delete_extracted_archives` removes a release's `.rar`/`.r00`/... volumes once extraction has
+// succeeded -- on purpose, the successful conclusion of the thing that just worked -- and
+// `core/engine.py._persist`'s vanished-row sweep resolves that row straight to `EXCLUDED`
+// (never through §7.3's grace clock) on *both* sync modes, so a `copy` queue (remote volume
+// survives) and a `move` queue (remote already gone) read identically. `EXCLUDED` is truthful
+// (DESIGN.md §3.2 rule 8: not counted, not missing) but reads to a user as "this was never
+// wanted" -- the wrong story for a volume that *was* fetched and unpacked, then cleaned up.
+// `deleted_archive_at` (`core/itemview.py.item_view`, joined from the `deleted_archive` table)
+// is the one signal that tells this `EXCLUDED` apart from an ordinary pattern-`EXCLUDED` file;
+// these two functions are `FileTree.tsx`'s `Row` substitution (same shape as `isRemoving`/
+// `isSettling`/`isMissing` above) and `LifecycleIcons.tsx`'s matching tooltip override.
+
+/** The chip substitution trigger. `state` itself is deliberately not consulted -- a row this
+ * `true` for always carries `state === 'EXCLUDED'` server-side (`_persist`'s vanished-row
+ * sweep, above), but the wire fact that actually matters here is "did this codebase delete it
+ * as a spent archive," not the state string that happens to result from that.
+ */
+export function isDeletedArchiveVolume(node: { deleted_archive_at: string | null }): boolean {
+  return node.deleted_archive_at != null
+}
+
+/** The chip's own hover text and the item drawer's short form -- plain language, no jargon
+ * ("Extracted"/`EXCLUDED`/`deleted_archive` never appear), per the task's own instruction:
+ * "the volume was removed after its contents were extracted."
+ */
+export function deletedArchiveLabel(node: { deleted_archive_at: string | null }): string {
+  if (node.deleted_archive_at == null) {
+    return 'This archive volume was removed after its contents were extracted.'
+  }
+  return (
+    'This archive volume was removed after its contents were extracted, ' +
+    `${formatRelativeTimeIntl(node.deleted_archive_at)}.`
+  )
+}

@@ -3,6 +3,7 @@ import {
   bothSidesRows,
   bytesToMB,
   childEtaS,
+  deletedArchiveLabel,
   formatBytes,
   formatEta,
   formatPercent,
@@ -10,6 +11,7 @@ import {
   formatRelativeTime,
   formatRelativeTimeIntl,
   hasBothSides,
+  isDeletedArchiveVolume,
   isRemovalGracePending,
   isStillArriving,
   mbToBytes,
@@ -598,5 +600,37 @@ describe('removalGraceShortLabel / removalGraceLabel', () => {
 
   it('full label handles a null first_missing_at without fabricating a time', () => {
     expect(removalGraceLabel({ first_missing_at: null }, grace)).toBe('Local copy missing.')
+  })
+})
+
+describe('isDeletedArchiveVolume', () => {
+  it('is true whenever deleted_archive_at is set', () => {
+    expect(isDeletedArchiveVolume({ deleted_archive_at: '2026-08-14T22:03:25.000000Z' })).toBe(true)
+  })
+
+  it('is false when deleted_archive_at is null', () => {
+    expect(isDeletedArchiveVolume({ deleted_archive_at: null })).toBe(false)
+  })
+})
+
+describe('deletedArchiveLabel', () => {
+  beforeEach(() => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-08-14T22:13:25.000Z'))
+  })
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  it('names what happened plainly, with a relative time, when the timestamp is present', () => {
+    expect(deletedArchiveLabel({ deleted_archive_at: '2026-08-14T22:03:25.000000Z' })).toBe(
+      'This archive volume was removed after its contents were extracted, 10m ago.',
+    )
+  })
+
+  it('degrades to a plain sentence without fabricating a time', () => {
+    expect(deletedArchiveLabel({ deleted_archive_at: null })).toBe(
+      'This archive volume was removed after its contents were extracted.',
+    )
   })
 })

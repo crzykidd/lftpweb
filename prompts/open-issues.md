@@ -103,24 +103,35 @@ The specific thing to look at first: **progress-bar text contrast at around 50% 
 the label straddles filled and unfilled background. That is the case that looks fine in a
 mockup and reads badly in practice.
 
-### A cleaned-up archive rests in a different state depending on sync mode
+### ~~A cleaned-up archive rests in a different state depending on sync mode~~ — **closed 2026-08-14**
 
-After archive cleanup deletes the volumes:
+`prompts/2026-08-14-extracted-archives-rest-as-extracted.md`, executed end to end
+(`docs/decisions.md` has the full reasoning). The live trigger was worse than "different state
+depending on mode" by the time this was picked up: a `move` queue's cleaned-up volumes were
+running the ten-minute removal-grace clock and showing an alarming `Missing · 9m` countdown for
+files deleted on purpose, nine seconds after extraction succeeded.
 
-- **`copy` queue** — the remote rars still exist, so the node stays in the tree and the counts
-  predicate marks it **`EXCLUDED`**. Correct.
-- **`move` queue** — both copies are gone, so the row goes through §7.3's grace period and
-  lands at **`REMOVED_LOCAL`** after ~10 minutes. Semantically wrong: nothing went *missing*,
-  we deleted them deliberately as part of extraction.
+Fixed at the one place a deleted archive volume could ever reach that clock —
+`core/engine.py._persist`'s "vanished from both trees" sweep, reachable only on `move` queues
+(a `copy` queue's surviving remote volume already read `EXCLUDED` correctly via `reconcile()`'s
+own predicate, before `_persist` ever saw it). Both sync modes now rest at `EXCLUDED`
+identically, never through the grace clock. The Files page tells this `EXCLUDED` apart from an
+ordinary pattern-excluded file via a new `deleted_archive_at` wire field and renders a
+greyed-out `Extracted` chip instead of the misleading `Excluded` — a display projection, per
+this project's own established pattern (`core/itemview.py`'s R/L/V/E facets); no new `state`
+value, `EXCLUDED` not overloaded with new meaning.
 
-Functionally harmless today (archive volumes are children, and auto-queue only considers
-top-level items), but it means the same event produces two different readings. A cleaned-up
-archive should rest at `EXCLUDED` in both modes.
-
-**Blocks a UI decision.** The user floated collapsing archive volumes into one summary row —
-*"14 archive volumes · removed after extraction"*, expandable, so the screen stays clean but
-the provenance of the `.mkv` is still visible. Worth doing, but not until there is one
-consistent resting state to summarise. Their own note: *"Not sure on this."*
+**The summary row this was blocking is still not built.** The user floated collapsing archive
+volumes into one row — *"14 archive volumes · removed after extraction"*, expandable, so the
+screen stays clean but the provenance of the `.mkv` is still visible. This task unblocked its
+stated prerequisite (one consistent resting state to summarize) but did not build the row
+itself, per the task's own instruction to stop rather than force it if it doesn't fall out
+cleanly against `FileTree.tsx`'s virtualization, sorting, and persisted collapse preference —
+it doesn't: every row in that pipeline is a real `item` row with its own `id`/`rel_path`, which
+multi-select, sorting, and the collapse map all assume, and a synthetic grouping row with none
+of that is a structural change, not an additive one. Still open, now blocked by that real
+complexity rather than by "no consistent state to summarize." Their own note at the time:
+*"Not sure on this."*
 
 ### `AuthSettingsIn` has the silent-reset shape, with security stakes
 

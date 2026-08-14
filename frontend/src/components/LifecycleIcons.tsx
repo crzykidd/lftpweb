@@ -180,6 +180,16 @@ function remoteTooltip(node: FileNode, settle: SettleSettingsOut | null): string
 }
 
 function localTooltip(node: FileNode): string {
+  // 2026-08-14 (prompts/2026-08-14-extracted-archives-rest-as-extracted.md): a spent archive
+  // volume reads `EXCLUDED` server-side (`core/engine.py._persist`'s vanished-row sweep), the
+  // same state a `file_exclude` pattern match produces -- but the ordinary `'excluded'` reading
+  // below ("never meant to download") would be false for this row, which *was* fetched and
+  // extracted before this codebase removed it. Checked first, ahead of `facet.reason`, since
+  // the underlying state is identical for both causes and only this raw field tells them apart
+  // -- see `lib/format.ts.deletedArchiveLabel`'s own docstring for the fuller sentence.
+  if (node.deleted_archive_at != null) {
+    return `Local: archive volume removed after extraction, ${formatRelativeTimeIntl(node.deleted_archive_at)}`
+  }
   const facet = node.facets.local
   switch (facet.reason) {
     case 'complete':

@@ -54,6 +54,7 @@ function node(rel_path: string, is_dir: boolean, overrides: Partial<FileNode> = 
     first_missing_at: null,
     remote_deleted_at: null,
     pending_download_prefix: null,
+    deleted_archive_at: null,
     facets: DIM,
     ...overrides,
   }

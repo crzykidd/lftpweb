@@ -6,6 +6,68 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-14 — A cleaned-up archive rests at `EXCLUDED`, never through the removal-grace clock; the reason travels as a new wire field, not a new state; the collapsible summary row (Part 2) not built
+
+**Handoff prompt `prompts/2026-08-14-extracted-archives-rest-as-extracted.md`, executed end to
+end.** Live evidence: nine seconds after extraction succeeded, archive cleanup removed twelve
+rar volumes, and the very next scan set `first_missing_at` on all twelve, showing an alarming
+`Missing · 9m` countdown for files this codebase deleted on purpose. Also closes the
+`prompts/open-issues.md` entry "A cleaned-up archive rests in a different state depending on
+sync mode."
+
+**Where the fix actually lives, and why it's narrow.** `core/engine.py._persist`'s "vanished
+from both trees" sweep (the loop that resolves a `rel_path` absent from this pass's `nodes`
+entirely) is the *only* place a deleted archive volume could ever reach the grace clock. A
+`copy` queue's remote volume survives cleanup, so that rel_path never leaves `reconcile()`'s
+`all_paths` at all — `reconcile()`'s own predicate check (fed the same `deleted_archive_paths`
+set via `build_scan_counts_predicate`, already wired up for completeness accounting) already
+marks it `EXCLUDED` directly, before `_persist` ever sees it. Only a `move` queue's shape — the
+remote copy already deleted *before* extraction runs (`postprocess._maybe_delete_remote`), so
+the rel_path is gone from both trees the moment the local volume is unlinked too — reaches the
+vanished sweep at all. The fix is one `if rel_path in deleted_archive_paths` branch inside that
+sweep, resolving straight to `("EXCLUDED", None)` and skipping `resolve_absence`/
+`resolve_vanished` entirely, so first_missing_at is never written for these paths on either
+mode. `deleted_archive_paths` is the same `frozenset` `scan_queue`/`_scan_queue_local_only`
+already load once per pass for the counts predicate, threaded into `_persist` as a new
+parameter rather than re-queried.
+
+**Reused `EXCLUDED`, deliberately, rather than adding a state or overloading one.** This
+project's own established answer to "the display is wrong but the state is right" is a *display
+projection* riding alongside `item.state` (`core/itemview.py`'s R/L/V/E facets, the identical
+shape this reuses) — never a new `state` CHECK-constraint value, and never repurposing an
+existing one to mean something new. `EXCLUDED` was the correct choice, not a compromise:
+`build_scan_counts_predicate`'s own docstring already documents that a pattern match and a
+codebase-performed deletion "end up marked `EXCLUDED` by `reconcile()` through the exact same
+branch" — reusing it here is applying that existing definition, not stretching it. A new
+`deleted_archive_at` column on the wire (`item_view`, joined from the `deleted_archive` table
+the same way `item_settle`'s fields already are) is what tells this `EXCLUDED` apart from an
+ordinary pattern match, so the Files page can render a truthful greyed-out `Extracted` chip
+(`FileTree.tsx`'s `Row`, the same synthetic-chip substitution pattern `REMOVING`/`SETTLING`/
+`MISSING` already established) instead of the misleading `Excluded` ("never meant to
+download" — false for a file that *was* fetched and unpacked). The chip's grey comes from
+`StateChip.tsx`'s existing `FALLBACK_STYLE` by omission — the synthetic key
+`'ARCHIVE_EXTRACTED'` is deliberately never added to `STYLES`, so there is nothing to keep in
+sync if the fallback tone ever changes. `LifecycleIcons.tsx`'s local-facet tooltip and
+`ItemDrawer.tsx`'s lifecycle chronology got the same `deleted_archive_at` special-case, for the
+same reason: leaving them saying "excluded by pattern -- never meant to download" right next to
+a chip proclaiming `Extracted` would have been a visible, confusing self-contradiction on the
+same row, and the fix was a few lines once the field existed on the wire.
+
+**Part 2 (the collapsible archive-volume summary row) was not built.** The prompt's own
+instruction: build it only if it falls out cleanly against virtualization, sorting, and the
+persisted collapse preference, and stop rather than force it otherwise. It does not fall out
+cleanly. `FileTree.tsx`'s row list (`buildTree`/`flatten`/the `@tanstack/react-virtual`
+virtualizer) is built entirely from real `item` rows — every row's identity is its own
+`rel_path`/`id`, which multi-select, bulk actions, sorting, and the persisted per-`rel_path`
+collapse map (`storage.ts`) all assume. A synthetic grouping row with no `item` row behind it
+(and no `id` for a checkbox to reference) is a structural change to that pipeline, not an
+additive one — exactly the "worse than twelve honest grey chips" case the prompt names by name.
+Part 1 unblocks the open-issues entry's stated prerequisite (one consistent resting state to
+summarize); the summary row itself is still an open, larger task, recorded back in
+`prompts/open-issues.md` rather than forced here.
+
+---
+
 ## 2026-08-14 — Reset-all preview: a real endpoint sharing `reset_queue`'s own query; "unpublished" explained via a set-diff against `nodes`, not a server-side flag; the per-item scope's own gap named, not fixed
 
 **Handoff prompt `prompts/2026-08-14-reset-all-preview-undercounts.md`, executed end to end.**

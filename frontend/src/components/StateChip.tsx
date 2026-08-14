@@ -53,6 +53,17 @@ const STYLES: Record<string, string> = {
   // human should confirm this actually reads as distinct in a real browser -- no UI access in
   // this environment). Never FAILED's red: nothing has failed, a decision is just pending.
   MISSING: 'bg-amber-200 text-amber-900 dark:bg-amber-800/50 dark:text-amber-200',
+  // A fourth synthetic substitution (2026-08-14, prompts/2026-08-14-extracted-archives-rest-as-
+  // extracted.md): `FileTree.tsx`'s Row swaps to this key whenever `lib/format.ts.
+  // isDeletedArchiveVolume` is true -- a spent archive volume `core/local_delete.py.
+  // delete_extracted_archives` removed after a successful extraction, real `state ===
+  // 'EXCLUDED'` underneath, left untouched. **Deliberately absent from this map** -- the user's
+  // own call was a *greyed-out* "Extracted", the same zinc `FALLBACK_STYLE` below already
+  // renders for anything unmapped, so there is nothing to add here: the label changes (see
+  // `Row`'s own `label`/`title` wiring), the color falls through on its own. Same word as the
+  // parent's emerald `EXTRACTED` above, different weight -- "still present and unpacked" vs.
+  // "consumed, and this is why" -- never alarming red/amber the way a `Missing` chip would be
+  // for a file this codebase removed on purpose.
 }
 const FALLBACK_STYLE = 'bg-zinc-100 text-zinc-700 dark:bg-zinc-800 dark:text-zinc-300'
 

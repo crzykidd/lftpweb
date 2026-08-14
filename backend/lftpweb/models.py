@@ -592,6 +592,15 @@ class FileNode(BaseModel):
     # flight under a prefixed name. Never part of `rel_path` -- see that module's docstring --
     # this is purely the item drawer's "where does this actually live right now" answer.
     pending_download_prefix: str | None = None
+    # `deleted_archive.deleted_at` (2026-08-14,
+    # prompts/2026-08-14-extracted-archives-rest-as-extracted.md), joined in the same optional
+    # way as the settle fields above (`core/itemview.py.item_view`'s own docstring). `None`
+    # unless this rel_path is a spent archive volume `core/local_delete.py.
+    # delete_extracted_archives` removed after a successful extraction -- the row's own `state`
+    # already reads `EXCLUDED` for this reason (never through §7.3's grace clock), and this is
+    # what lets the Files page tell that apart from an ordinary pattern-`EXCLUDED` file and
+    # render a greyed-out "Extracted" chip instead of "Excluded".
+    deleted_archive_at: str | None = None
     facets: LifecycleFacets
 
 

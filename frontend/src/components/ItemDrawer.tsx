@@ -207,6 +207,12 @@ function lifecycleChronology(node: FileNode): ChronologyEntry[] {
     { label: 'Extracted', ts: node.extracted_at ?? '' },
     { label: 'First missing', ts: node.first_missing_at ?? '' },
     { label: 'Remote deleted', ts: node.remote_deleted_at ?? '' },
+    // 2026-08-14, prompts/2026-08-14-extracted-archives-rest-as-extracted.md: this row is a
+    // spent archive volume, removed after its own contents were extracted -- distinct from
+    // "Extracted" above, which is the *parent* release's own milestone (only ever set on the
+    // top-level item's row, `core/postprocess.py._do_extract`) and never fires for a child
+    // volume like this one.
+    { label: 'Archive removed', ts: node.deleted_archive_at ?? '' },
     { label: 'State last changed', ts: node.state_changed_at ?? '' },
   ]
   return candidates.filter((c) => c.ts !== '').sort((a, b) => a.ts.localeCompare(b.ts))

@@ -743,6 +743,27 @@ alongside this list: several entries below ship with deliberate, documented limi
 
 ### Fixed
 
+- **A cleaned-up archive volume ran the ten-minute removal-grace countdown instead of resting
+  as `Extracted`** *(2026-08-14)*. Live evidence: nine seconds after extraction succeeded,
+  archive cleanup removed twelve rar volumes, and the very next scan started
+  `first_missing_at`'s grace clock on all twelve — an alarming `Missing · 9m` countdown for
+  files this codebase deleted on purpose, then resolving to `REMOVED_BOTH` and vanishing. The
+  `deleted_archive` table (migration 010) already recorded exactly which paths were removed
+  this way and was already folded into completeness accounting
+  (`core/engine.py.build_scan_counts_predicate`), but nothing consulted it when deciding
+  whether a row was *missing*. Also closes the open-issues entry "A cleaned-up archive rests in
+  a different state depending on sync mode": a `copy` queue's surviving remote volume already
+  read `EXCLUDED` correctly; a `move` queue's (whose remote copy is deleted before extraction
+  even runs) fell into `core/engine.py._persist`'s "vanished from both trees" sweep, which had
+  no way to tell "we deleted this" from "this just vanished." Both sync modes now resolve to
+  the identical `EXCLUDED` reading, never through the grace clock — no new `state` value, and
+  `EXCLUDED` is not overloaded with a new meaning, since "excluded from completeness accounting,
+  for a real reason" is already what it means for a pattern-matched file. The Files page's state
+  chip now shows a greyed-out **`Extracted`** for these rows (same word as the parent release's
+  emerald `Extracted`, a duller weight, "consumed, and this is why" rather than an alarm) via a
+  new `deleted_archive_at` field on the wire, the same display-projection pattern the R/L/V/E
+  lifecycle icons already established — never a new enum value. A genuinely missing row (no
+  `deleted_archive` entry) is unaffected and still runs the countdown as before.
 - **The whole-queue Reset preview undercounted what Reset would actually do, then reset the
   larger set anyway** *(2026-08-14)*. Reported live: Pattern `*` showed 2 items; **All** showed
   *none*, then reset those same 2 items when confirmed. The All scope's preview read the

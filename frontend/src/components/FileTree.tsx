@@ -10,10 +10,12 @@ import {
   childEtaS,
   childSpeedLabel,
   childSpeedSortValue,
+  deletedArchiveLabel,
   formatBytes,
   formatEta,
   formatPercent,
   hasBothSides,
+  isDeletedArchiveVolume,
   isRemovalGracePending,
   isStillArriving,
   percentValue,
@@ -1146,6 +1148,15 @@ function Row({
     entry,
     removalGraceSettings ? new Set(removalGraceSettings.eligible_states) : undefined,
   )
+  // A fourth, independent substitution (2026-08-14, prompts/2026-08-14-extracted-archives-rest-
+  // as-extracted.md): a spent archive volume `core/local_delete.py.delete_extracted_archives`
+  // removed after a successful extraction. `entry.state` reads `EXCLUDED` for this row server-
+  // side (`core/engine.py._persist`'s vanished-row sweep, never through `isMissing`'s grace
+  // clock -- `deleted_archive_at` and `first_missing_at` are never both set for the same row),
+  // which is truthful but reads as "never wanted" rather than "fetched, unpacked, cleaned up."
+  // Mutually exclusive with `isMissing` in practice for the same reason; checked last in the
+  // ternary chain below, same left-to-right precedence the other three already established.
+  const isDeletedArchive = isDeletedArchiveVolume(entry)
   // Two different sentences for the same `substate === 'settling'` row (2026-08-13,
   // prompts/2026-08-13-settle-progress-visibility.md): `isStillArriving` picks out the case
   // the countdown below has nothing useful to say about yet -- `settle_matched_scans === 1`,
@@ -1303,10 +1314,29 @@ function Row({
             exclusive with `isRemoving`/`isSettling` in practice (different `state`/`substate`
             combinations produce each), but `isRemoving` is still checked first in case a
             future state ever satisfies more than one, matching this ternary's existing
-            left-to-right precedence. */}
+            left-to-right precedence.
+
+            **`isDeletedArchive` is a fourth substitution** (2026-08-14,
+            prompts/2026-08-14-extracted-archives-rest-as-extracted.md): a spent archive volume,
+            real `state === 'EXCLUDED'` underneath. Grey (`StateChip.tsx`'s `FALLBACK_STYLE`,
+            since `'ARCHIVE_EXTRACTED'` is deliberately not a key in its `STYLES` map), same
+            word as the parent's own emerald `EXTRACTED` chip -- "consumed, and this is why,"
+            not an alarm. Checked last: it never coincides with the other three in practice
+            (`deleted_archive_at` and `first_missing_at` are never both set), but the same
+            left-to-right precedence applies if that ever changes. */}
         <StateChip
-          state={isRemoving ? 'REMOVING' : isSettling ? 'SETTLING' : isMissing ? 'MISSING' : entry.state}
-          percent={isRemoving || isSettling || isMissing ? null : stateProgressPercent(entry)}
+          state={
+            isRemoving
+              ? 'REMOVING'
+              : isSettling
+                ? 'SETTLING'
+                : isMissing
+                  ? 'MISSING'
+                  : isDeletedArchive
+                    ? 'ARCHIVE_EXTRACTED'
+                    : entry.state
+          }
+          percent={isRemoving || isSettling || isMissing || isDeletedArchive ? null : stateProgressPercent(entry)}
           label={
             isStillArrivingRow
               ? settleArrivingShortLabel(entry)
@@ -1314,7 +1344,9 @@ function Row({
                 ? settleWaitShortLabel(entry, settleSettings)
                 : isMissing
                   ? removalGraceShortLabel(entry, removalGraceSettings)
-                  : undefined
+                  : isDeletedArchive
+                    ? 'Extracted'
+                    : undefined
           }
           title={
             isStillArrivingRow
@@ -1323,7 +1355,9 @@ function Row({
                 ? settleWaitLabel(entry, settleSettings)
                 : isMissing
                   ? removalGraceLabel(entry, removalGraceSettings)
-                  : undefined
+                  : isDeletedArchive
+                    ? deletedArchiveLabel(entry)
+                    : undefined
           }
         />
       </span>

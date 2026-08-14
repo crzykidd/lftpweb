@@ -39,16 +39,22 @@ async def get_files(request: Request) -> FilesResponse:
         # same join and reasoning as `core/engine.py._project`, which this endpoint otherwise
         # duplicates by design (this module's own docstring) -- both must agree on what a row's
         # settle display looks like, whether it's the countdown or the "still arriving" reading.
+        # `LEFT JOIN deleted_archive` (2026-08-14,
+        # prompts/2026-08-14-extracted-archives-rest-as-extracted.md): same reasoning again,
+        # this endpoint and `_project` must agree on `deleted_archive_at` too.
         cursor = await db.execute(
             f"SELECT {ITEM_VIEW_COLUMNS_QUALIFIED}, "  # noqa: S608 - a module constant, not user input
             "settle.matched_scans AS settle_matched_scans, "
             "settle.updated_at AS settle_first_matched_at, "
             "settle.total_bytes AS settle_total_bytes, "
             "settle.first_observed_at AS settle_first_observed_at, "
-            "settle.last_changed_at AS settle_last_changed_at "
+            "settle.last_changed_at AS settle_last_changed_at, "
+            "deleted_archive.deleted_at AS deleted_archive_at "
             "FROM item "
             "LEFT JOIN item_settle AS settle "
             "ON settle.queue_id = item.queue_id AND settle.rel_path = item.rel_path "
+            "LEFT JOIN deleted_archive "
+            "ON deleted_archive.queue_id = item.queue_id AND deleted_archive.rel_path = item.rel_path "
             "WHERE item.queue_id = ? ORDER BY item.rel_path",
             (queue_id,),
         )

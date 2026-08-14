@@ -327,6 +327,26 @@ def test_item_view_passes_settle_fields_through_when_present_and_settling():
     assert view["settle_first_matched_at"] == "2026-08-13T00:00:00Z"
 
 
+def test_item_view_deleted_archive_at_defaults_none_when_row_lacks_it():
+    # `_row()`'s base dict has no `deleted_archive_at` column at all -- the exact shape of a
+    # bare `SELECT * FROM item` row, which never joins `deleted_archive`.
+    assert item_view(_row())["deleted_archive_at"] is None
+
+
+def test_item_view_passes_deleted_archive_at_through_when_present():
+    row = _row(deleted_archive_at="2026-08-14T22:03:25.000000Z")
+    assert item_view(row)["deleted_archive_at"] == "2026-08-14T22:03:25.000000Z"
+
+
+def test_item_view_deleted_archive_at_is_not_gated_on_substate():
+    # Unlike the settle fields (deliberately gated to avoid ungated churn on every scan of a
+    # top-level item, `item_view`'s own docstring), `deleted_archive_at` is written exactly
+    # once and never changes again short of a reset -- it must reach the wire regardless of
+    # `substate`.
+    row = _row(substate=None, deleted_archive_at="2026-08-14T22:03:25.000000Z")
+    assert item_view(row)["deleted_archive_at"] == "2026-08-14T22:03:25.000000Z"
+
+
 def test_item_view_settle_fields_are_none_when_not_settling_even_if_the_row_has_them():
     # `core/engine.py._persist` keeps advancing `item_settle` for a top-level item on every scan
     # for as long as its fingerprint keeps matching -- including long after it finished
@@ -574,3 +594,53 @@ async def test_get_files_joins_settle_progress(db):
     node = response.queues[0].nodes[0]
     assert node.settle_matched_scans == 2
     assert node.settle_first_matched_at == "2026-08-13T00:01:00.000000Z"
+
+
+# --- The `deleted_archive` join reaches both callers (2026-08-14, prompts/2026-08-14-extracted-
+# archives-rest-as-extracted.md) -- same "don't just trust the two SQL shapes agree" spirit as
+# the settle-progress pair above, and `test_facets_agree_between_select_star_and_item_view_
+# columns` before that.
+
+
+async def test_engine_project_joins_deleted_archive_at(db, tmp_path):
+    queue_id, item_id = await _seed_item(db, state="EXCLUDED", remote_size=None, local_size=None)
+    await db.execute(
+        "INSERT INTO deleted_archive (queue_id, rel_path, deleted_at) VALUES (?, 'Release.One', "
+        "'2026-08-14T22:03:25.000000Z')",
+        (queue_id,),
+    )
+    await db.commit()
+
+    engine = Engine(db=db, config_dir=str(tmp_path), events=EventBus())
+    published = await engine._project(queue_id, {"Release.One"})
+    node = published["Release.One"]
+
+    assert node["deleted_archive_at"] == "2026-08-14T22:03:25.000000Z"
+    assert node["id"] == item_id  # the join must not change which row this still is
+
+
+async def test_engine_project_deleted_archive_at_none_without_a_deleted_archive_row(db, tmp_path):
+    # No INSERT into deleted_archive at all -- an ordinary row (never a spent archive volume)
+    # has no match, and the LEFT JOIN must degrade to NULL rather than dropping the item row.
+    queue_id, _item_id = await _seed_item(db)
+
+    engine = Engine(db=db, config_dir=str(tmp_path), events=EventBus())
+    published = await engine._project(queue_id, {"Release.One"})
+    node = published["Release.One"]
+
+    assert node["deleted_archive_at"] is None
+
+
+async def test_get_files_joins_deleted_archive_at(db):
+    queue_id, _item_id = await _seed_item(db, state="EXCLUDED", remote_size=None, local_size=None)
+    await db.execute(
+        "INSERT INTO deleted_archive (queue_id, rel_path, deleted_at) VALUES (?, 'Release.One', "
+        "'2026-08-14T22:03:25.000000Z')",
+        (queue_id,),
+    )
+    await db.commit()
+    request = Request(scope={"type": "http", "app": _FakeApp(db, queue_id)})
+
+    response = await get_files(request)
+    node = response.queues[0].nodes[0]
+    assert node.deleted_archive_at == "2026-08-14T22:03:25.000000Z"

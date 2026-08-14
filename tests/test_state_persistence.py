@@ -618,6 +618,109 @@ async def test_a_vanished_remote_only_row_is_still_left_alone(tmp_path, monkeypa
         await db.close()
 
 
+# --- A cleaned-up archive volume rests at EXCLUDED, never through the grace clock -------------
+#
+# 2026-08-14 (prompts/2026-08-14-extracted-archives-rest-as-extracted.md), live evidence: nine
+# seconds after `core/local_delete.py.delete_extracted_archives` removed a release's rar volumes
+# (the successful conclusion of extraction, not a loss), the very next scan started a ten-minute
+# "Missing" countdown on every one of them -- `deleted_archive` (migration 010) already records
+# exactly which paths were removed this way, and `build_scan_counts_predicate` already folds it
+# into completeness accounting, but nothing consulted it when deciding whether a row is
+# *missing*. These tests are the engine-level proof the fix works identically on both sync
+# modes, and that a genuinely missing row (no `deleted_archive` entry) still gets the countdown.
+
+
+async def _insert_deleted_archive(db, queue_id: int, rel_path: str) -> None:
+    await db.execute(
+        "INSERT INTO deleted_archive (queue_id, rel_path, deleted_at) VALUES (?, ?, ?)",
+        (queue_id, rel_path, "2026-08-14T22:03:25.000000Z"),
+    )
+    await db.commit()
+
+
+async def test_deleted_archive_volume_never_starts_the_grace_clock_on_a_move_queue(
+    tmp_path, monkeypatch
+):
+    """The live bug itself: a `move` queue's remote copy is already gone by the time cleanup
+    runs (deleted before extraction, `core/postprocess.py._maybe_delete_remote`), so once the
+    local volume is unlinked too the rel_path is absent from *both* trees -- exactly the shape
+    `_persist`'s vanished-row sweep handles, and until this fix the only shape it knew was
+    "started the grace clock." Exercised from the very first scan after deletion (the live case
+    was nine seconds), not just steady-state, and across several passes to prove it never drifts
+    toward `REMOVED_LOCAL`/`REMOVED_BOTH` the way a genuinely vanished row would.
+    """
+    engine, q, host, db, item_id = await _make_move_engine(
+        tmp_path, monkeypatch, local_size=None, state="DOWNLOADED", remote_deleted_at=None
+    )
+    await _insert_deleted_archive(db, q.id, REL_PATH)
+    try:
+        for _ in range(3):
+            await engine.scan_queue(q, host)
+            state, first_missing_at = await _state_of(db, item_id)
+            assert state == "EXCLUDED"
+            assert (
+                first_missing_at is None
+            ), "a file this codebase deleted on purpose must never start the grace clock"
+    finally:
+        await db.close()
+
+
+async def test_deleted_archive_volume_rests_identically_on_a_copy_queue(tmp_path, monkeypatch):
+    """The open-issues entry this closes ("A cleaned-up archive rests in a different state
+    depending on sync mode"): a `copy` queue's remote volume survives cleanup (only the local
+    copy is ever removed), so this rel_path never even reaches the vanished-row sweep --
+    `reconcile()`'s own predicate check, fed the same `deleted_archive_paths` set via
+    `build_scan_counts_predicate`, already marks it `EXCLUDED` directly. Proven here so "both
+    sync modes read identically" is asserted directly against the copy-mode path, not merely
+    inferred from the move-mode test above.
+    """
+    engine, q, host, db, item_id = await _make_engine(
+        tmp_path, monkeypatch, local_size=None, state="DOWNLOADED"
+    )
+    await _insert_deleted_archive(db, q.id, REL_PATH)
+    try:
+        await engine.scan_queue(q, host)
+        state, first_missing_at = await _state_of(db, item_id)
+        assert state == "EXCLUDED"
+        assert first_missing_at is None
+    finally:
+        await db.close()
+
+
+async def test_a_row_not_in_deleted_archive_still_gets_the_countdown(tmp_path, monkeypatch):
+    """The mechanism this task carves an exception out of must not be blunted for everyone else
+    -- an ordinary `move`-mode row that leaves both trees for a real reason (an importer took it,
+    no `deleted_archive` entry at all) must still reach `REMOVED_BOTH` through the grace clock,
+    exactly as `test_move_mode_item_that_leaves_both_trees_reaches_removed_both` above already
+    proves. Repeated here, deliberately, right next to the two tests above, so a future change to
+    the new `deleted_archive_paths` branch can never accidentally widen its match.
+    """
+    engine, q, host, db, item_id = await _make_move_engine(
+        tmp_path,
+        monkeypatch,
+        local_size=None,
+        state="EXTRACTED",
+        remote_deleted_at="2026-08-13T00:00:00.000000Z",
+    )
+    # Deliberately no `deleted_archive` row for this rel_path -- a genuinely vanished item.
+    try:
+        await engine.scan_queue(q, host)
+        state, first_missing_at = await _state_of(db, item_id)
+        assert state == "EXTRACTED", "the outcome must not be downgraded while grace runs"
+        assert first_missing_at is not None, "the grace clock should have started"
+
+        await db.execute(
+            "UPDATE item SET first_missing_at = STRFTIME('%Y-%m-%dT%H:%M:%fZ', 'now', ?) "
+            "WHERE id = ?",
+            (f"-{int(DEFAULT_GRACE_S) + 60} seconds", item_id),
+        )
+        await db.commit()
+        await engine.scan_queue(q, host)
+        assert (await _state_of(db, item_id))[0] == "REMOVED_BOTH"
+    finally:
+        await db.close()
+
+
 # --- A terminal removed row must leave the *published* tree, not just get written -----------
 #
 # 2026-08-13 (prompts/2026-08-13-vanished-rows-should-leave-the-tree.md), a regression the user

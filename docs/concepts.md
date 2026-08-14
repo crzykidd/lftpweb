@@ -92,6 +92,19 @@ The status chip now shows it directly:
 > might already be lying. If a row sits at `Missing` far longer than the window suggests it
 > should, suspect the mount before the countdown.
 
+**One deliberate exception: a spent archive volume never runs this clock at all.** When
+"delete archives after extract" is on, the `.rar`/`.r00`/... files under a successfully
+extracted release are removed on purpose, seconds after extraction finishes — not lost, the
+successful conclusion of the thing that just worked. Those rows never show `Missing`, on
+either `copy` or `move` queues: they settle immediately on a greyed-out **`Extracted`** chip,
+the same word as the parent release's own emerald `Extracted` chip but a duller weight, meaning
+"consumed, and this is why" rather than "still present and unpacked." Hover the chip (or open
+the item drawer) for the plain-language explanation and the exact removal time. Underneath,
+the row's real state reads `EXCLUDED` — the same reading a `file_exclude` pattern match
+produces, since both mean "not counted toward completeness, for a real reason" — but the chip
+never says `Excluded` for this case, since "never meant to download" would be a lie for a file
+that was fetched and unpacked before this codebase cleaned it up.
+
 ## Why an item will not re-download — auto-queue suppression {#suppression}
 
 Auto-queue deliberately refuses to pick an item up again once one of four things has happened to

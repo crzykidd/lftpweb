@@ -351,6 +351,13 @@ export interface FileNode {
   // prefixed name. Never part of rel_path -- purely the item drawer's "where does this
   // actually live right now" answer.
   pending_download_prefix: string | null
+  // `deleted_archive.deleted_at` (2026-08-14, prompts/2026-08-14-extracted-archives-rest-as-
+  // extracted.md), joined the same optional way as the settle fields above. null unless this
+  // rel_path is a spent archive volume `core/local_delete.py.delete_extracted_archives` removed
+  // after a successful extraction -- the row's own `state` already reads `EXCLUDED` for this
+  // reason (never through the removal-grace clock). `lib/format.ts.isDeletedArchiveVolume` is
+  // the one place that turns this into the chip substitution.
+  deleted_archive_at: string | null
   facets: LifecycleFacets
 }
 

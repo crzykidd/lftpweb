@@ -803,7 +803,11 @@ class Engine:
             # disagreed with. The order is the invariant: nothing goes on the wire that
             # wasn't read back out of `item`.
             written = await self._persist(
-                q.id, nodes, fingerprints=fingerprints, partial_scan=bool(scan_warning)
+                q.id,
+                nodes,
+                fingerprints=fingerprints,
+                partial_scan=bool(scan_warning),
+                deleted_archive_paths=deleted_archive_paths,
             )
             published = await self._project(q.id, written)
 
@@ -924,7 +928,13 @@ class Engine:
             counts_predicate = build_scan_counts_predicate(pattern_predicate, deleted_archive_paths)
             nodes = reconcile(cached_remote, local_tree, counts_predicate=counts_predicate)
 
-            written = await self._persist(q.id, nodes, fingerprints=None, partial_scan=False)
+            written = await self._persist(
+                q.id,
+                nodes,
+                fingerprints=None,
+                partial_scan=False,
+                deleted_archive_paths=deleted_archive_paths,
+            )
             published = await self._project(q.id, written)
 
             old_nodes = self.models.get(q.id, {})
@@ -1111,6 +1121,7 @@ class Engine:
         *,
         fingerprints: dict[str, settle.Fingerprint] | None = None,
         partial_scan: bool = False,
+        deleted_archive_paths: frozenset[str] = frozenset(),
     ) -> set[str]:
         """Write this pass's arbitrated state for every reconciled node, and return the
         `rel_path`s it wrote (already `to_safe_text`-ed, i.e. keyed exactly as the `item`
@@ -1132,6 +1143,13 @@ class Engine:
         must not be able to release an item the real gate hasn't actually cleared, merely
         because a stale cached remote total and a freshly-caught-up local tree happen to match
         (see this task's decisions.md entry for the scenario this closes).
+
+        `deleted_archive_paths` (2026-08-14,
+        `prompts/2026-08-14-extracted-archives-rest-as-extracted.md`) is the same set both
+        callers (`scan_queue`, `_scan_queue_local_only`) already load once per pass and fold
+        into `build_scan_counts_predicate` -- reused here rather than re-queried, per that
+        task's own instruction. Consulted only in the "vanished from both trees" sweep below;
+        see that loop's own comment for why the ordinary per-node path never needs to ask.
         """
         from lftpweb.core.util import to_safe_text
 
@@ -1383,14 +1401,38 @@ class Engine:
             prev_state, _prev_substate, prev_first_missing_at, _prev_remote_deleted_at = previous[
                 rel_path
             ]
-            override = mount_sentinel.resolve_absence(
-                prev_state=prev_state,
-                prev_first_missing_at=prev_first_missing_at,
-                structural_state="REMOTE_ONLY",
-                mount_ok=mount_ok,
-                now=now,
-            )
-            if override is not None:
+            if rel_path in deleted_archive_paths:
+                # 2026-08-14 (prompts/2026-08-14-extracted-archives-rest-as-extracted.md): this
+                # codebase deleted this file itself -- the successful conclusion of extraction
+                # (`core/local_delete.py.delete_extracted_archives`), never a loss -- so §7.3's
+                # grace clock (`resolve_absence` below) must not even start for it, on either
+                # sync mode. A `copy` queue's remote volume survives cleanup, so this rel_path
+                # never reaches this sweep at all: it is still in `all_paths` (the surviving
+                # remote entry), and `reconcile()`'s own predicate check -- fed this exact set
+                # via `build_scan_counts_predicate` -- already marks it `EXCLUDED` directly,
+                # before `_persist` ever sees it. A `move` queue has *already* deleted the
+                # remote copy too (`postprocess._maybe_delete_remote`, before extraction even
+                # runs), so this rel_path is absent from *both* trees and lands here instead --
+                # the live bug this closes: nine seconds after deletion, `resolve_absence` would
+                # read the fresh "REMOTE_ONLY" as a disappearance and start a ten-minute
+                # `first_missing_at` countdown for a file removed on purpose, eventually
+                # resolving to `REMOVED_BOTH`. Resolving straight to `EXCLUDED` here instead
+                # makes both sync modes rest identically (the open-issues entry this closes),
+                # reusing the one existing state that already means "excluded from completeness
+                # accounting, for a real reason" (DESIGN.md §3.2 rule 8) rather than adding a
+                # new one -- `core/itemview.py.item_view`'s `deleted_archive_at` field is what
+                # lets the frontend tell this `EXCLUDED` apart from an ordinary pattern-excluded
+                # file and render it as a greyed-out "Extracted" chip, never "Excluded".
+                vanished_state, vanished_first_missing_at = "EXCLUDED", None
+            elif (
+                override := mount_sentinel.resolve_absence(
+                    prev_state=prev_state,
+                    prev_first_missing_at=prev_first_missing_at,
+                    structural_state="REMOTE_ONLY",
+                    mount_ok=mount_ok,
+                    now=now,
+                )
+            ) is not None:
                 vanished_state, vanished_first_missing_at = override
                 if vanished_state == "REMOVED_LOCAL":
                     # `prompts/open-issues.md` "resolve_absence never writes REMOVED_BOTH":
@@ -1514,6 +1556,14 @@ class Engine:
         (`core/itemview.py.item_view`). Same single indexed per-row lookup, no second join, no
         re-measurement warranted for three more `INTEGER`/`TEXT` columns off a row already being
         fetched.
+
+        **`LEFT JOIN deleted_archive`** (2026-08-14,
+        `prompts/2026-08-14-extracted-archives-rest-as-extracted.md`): the same per-row indexed
+        lookup as `item_settle` above (`deleted_archive`'s own primary key is also
+        `(queue_id, rel_path)`), giving `core/itemview.py.item_view` `deleted_archive_at` so the
+        Files page can tell a spent, on-purpose-removed archive volume (`EXCLUDED` for this
+        reason) apart from an ordinary pattern-`EXCLUDED` file and render it as a greyed-out
+        "Extracted" chip.
         """
         cursor = await self.db.execute(
             f"SELECT {ITEM_VIEW_COLUMNS_QUALIFIED}, "  # noqa: S608 - a module constant, not user input
@@ -1521,10 +1571,13 @@ class Engine:
             "settle.updated_at AS settle_first_matched_at, "
             "settle.total_bytes AS settle_total_bytes, "
             "settle.first_observed_at AS settle_first_observed_at, "
-            "settle.last_changed_at AS settle_last_changed_at "
+            "settle.last_changed_at AS settle_last_changed_at, "
+            "deleted_archive.deleted_at AS deleted_archive_at "
             "FROM item "
             "LEFT JOIN item_settle AS settle "
             "ON settle.queue_id = item.queue_id AND settle.rel_path = item.rel_path "
+            "LEFT JOIN deleted_archive "
+            "ON deleted_archive.queue_id = item.queue_id AND deleted_archive.rel_path = item.rel_path "
             "WHERE item.queue_id = ?",
             (queue_id,),
         )
