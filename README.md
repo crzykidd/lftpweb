@@ -29,6 +29,18 @@ when the process dies.
 queued, where status actually comes from, and why. It is also in the running app under
 **Docs → How it works**. [`DESIGN.md`](DESIGN.md) §1.2 and §1.3 have the long version.
 
+## Screenshots
+
+Remote and local as one tree, with live per-file progress, speed, and ETA:
+
+![The Files page during a multi-file transfer](docs/images/files-mid-transfer.png)
+
+Every verify outcome, every remote delete, and every delete withheld — with the reason:
+
+![The History page showing the audit trail](docs/images/history-audit-trail.png)
+
+**[More screenshots →](docs/screenshots.md)**
+
 ## What works today
 
 - Connect to a seedbox over SSH/SFTP; browse the remote tree alongside the local one

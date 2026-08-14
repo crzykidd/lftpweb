@@ -1,11 +1,41 @@
 # README screenshot plan
 
-Written 2026-08-14, revised the same day against the real fixture tree the user assembled.
-**Nobody has taken these yet** — this is the shooting order and the staging notes, not a record
-of work done.
+Written 2026-08-14, revised the same day against the real fixture tree. **Nobody has taken these
+yet** — this is the shooting order and the staging notes, not a record of work done.
 
 A coding agent cannot take them: no browser exists in the environment agents run in. These have
 to be captured by hand from a running instance.
+
+## The shape: two heroes, everything else in a gallery
+
+**Two screenshots go in `README.md`. Everything else goes in
+[`screenshots.md`](screenshots.md)**, linked from the README as *"More screenshots →"*.
+
+Nine images inline is a wall someone scrolls past. Two, chosen to answer the only two questions a
+stranger actually has, are read. The gallery is where the rest belong — and it is the right place
+for anything that needs a sentence of explanation to land, which is clutter in a README and
+perfectly fine in a gallery.
+
+It also de-risks the shoot: only two frames have to be *good*. The gallery can be utilitarian and
+can grow later without touching the README.
+
+The gallery deliberately stays out of the in-app Docs nav — only `quick-start`, `how-it-works`,
+and `concepts` are wired to routes, so `screenshots.md` renders on GitHub only. Screenshots of
+the app are useless inside the app.
+
+### Hero 1 — Files page, mid-transfer
+
+Answers *"what is this, and does it work?"* Remote and local as one tree, live progress bars,
+per-file speed and ETA, lifecycle icons. One frame carries the whole idea.
+
+### Hero 2 — History, with the audit trail
+
+Answers *"can I trust it?"* Verify outcomes and remote deletes — ideally including an amber
+**`remote_delete_withheld`** row. Plenty of tools move files; this one tells you what it refused
+to do and why. That is the differentiator.
+
+**Take several frames of Hero 1** at different fill levels during the long transfer and pick the
+best afterwards, rather than trying to nail it live.
 
 ## The one warning that can cost a re-copy
 
@@ -35,50 +65,62 @@ Copied into the seedbox's staging directory, ~30 GB total, deliberately generic 
 `docker/test-seedbox/make_demo_tree.py` builds a smaller synthetic equivalent for the dev
 instance, if the real tree isn't available.
 
-## Shooting order
+## Copy order
 
-### First: copy in `Show.2…S21.1080p` (23 GB)
+Copy these onto the seedbox **one at a time, in this order**, not all at once — each produces a
+different set of transient states, and overlapping them means two things you want to photograph
+happen simultaneously.
 
-The longest window and the most valuable frames.
+1. **`Show.2.2001.S21.1080p`** (23 GB) — the long window. Hero 1 comes from here.
+2. **`Show.1.S16E13`** (the rar directory) — the only item that produces verify and extract
+   states. Hero 2 comes from here, once it finishes.
+3. **`Show3…2160p.mkv`** (4.3 GB loose) — whenever convenient.
 
-| # | Shot | When | Why this one |
+## Shot order
+
+### From copy 1 — `Show.2` (23 GB)
+
+| # | Shot | Where | When |
 |---|---|---|---|
-| 1 | **Files page, settling** | ~60s after the copy stops changing, before it queues | The amber `Remote · 23 GB` chip. Distinctive, and it is the behaviour that confuses people most |
-| 2 | **Files page, mid-transfer** | any time in the ~38 min | *The* hero shot: directory expanded, per-file speed and ETA on each of the 9 episodes, inline progress bars |
-| 3 | **Item drawer, mid-transfer** | same window | Shows the physical path under `.downloading-…` — demonstrates the folder-prefix feature in one frame |
+| 1 | Files page, **settling** | gallery | ~60s after the copy stops changing, before it queues — amber `Remote · 23 GB` |
+| 2 | **Files page, mid-transfer** | **HERO 1** | any time in the ~38 min. Directory expanded, per-file speed and ETA on all 9 episodes |
+| 3 | Item drawer, mid-transfer | gallery | same window — shows the physical path under `.downloading-…` |
 
-### Then: copy in `Show.1.S16E13` (the rar directory)
+### From copy 2 — `Show.1` (rar directory)
 
-Small and quick, but the only item that produces verify and extract states.
-
-| # | Shot | When | Why |
+| # | Shot | Where | When |
 |---|---|---|---|
-| 4 | **`VERIFYING`** | right after its transfer completes | The `.sfv` makes this a real sidecar hash check; the event text says so explicitly |
-| 5 | **`EXTRACTING`** | immediately after | 12 volumes × 191 MB is a genuinely visible extraction window |
-| 6 | **History page** | once done | The payoff: `verify VERIFIED`, `extract`, and — on a `move` queue — `remote_delete`. The differentiator shot |
+| 4 | `VERIFYING` | gallery | right after its transfer completes — the `.sfv` makes this a real sidecar hash check |
+| 5 | `EXTRACTING` | gallery | immediately after — 12 volumes × 191 MB is a visible window |
+| 6 | **History page** | **HERO 2** | once done — `verify VERIFIED`, `extract`, and on a `move` queue `remote_delete` |
 
-### Whenever convenient: `Show3…2160p.mkv` (4.3 GB loose)
+### From copy 3 — the loose file
 
-The single-file `pget` path, and the one shape the folder prefix deliberately skips (a loose file
-is complete the instant it is renamed, so there is no partial window to protect).
+| # | Shot | Where | When |
+|---|---|---|---|
+| 7 | Files page, single-file transfer | gallery | the `pget` path, and the one shape the folder prefix deliberately skips |
 
-### Static, any time after
+### Static — any time after
 
-7. **Settings → Queues** — inherit/override toggles visible
-8. **Settings → Transfer** — with the effective-lftp-settings panel expanded, showing `-c` and
-   the tuning lftpweb applies
-9. **Docs → How it works** — new 2026-08-14, and the page an evaluator actually reads
+| # | Shot | Where | Why |
+|---|---|---|---|
+| 8 | Settings → Queues | gallery | answers "how much configuration is this?" — inherit/override toggles visible |
+| 9 | Settings → Transfer | gallery | with the effective-lftp-settings panel expanded, showing `-c` and the applied tuning |
+| 10 | Docs → How it works | gallery | the page an evaluator actually reads |
 
 **Skip the Dashboard** unless there are hours of real samples behind it. A two-point chart looks
 worse than no chart.
 
-## The one shot worth going out of the way for
+### Opportunistic
 
-**History showing an amber `remote_delete_withheld` row next to successful ones.** The real
-message from 2026-08-14 — *"delete withheld — verification result was CORRUPT, not VERIFIED"* —
-is the single best argument the project makes for itself. It is hard to stage deliberately
-(it needs a genuinely failing verification), so if one ever appears naturally, photograph it
-then rather than planning for it.
+**History showing an amber `remote_delete_withheld` row.** The real message from 2026-08-14 —
+*"delete withheld — verification result was CORRUPT, not VERIFIED"* — is the single best argument
+the project makes for itself, and would make Hero 2 considerably stronger. It needs a genuinely
+failing verification, so it cannot be staged. If one ever appears naturally, photograph it then
+and swap it into Hero 2.
+
+**A `Missing · 1m` countdown chip** (2026-08-14) is worth a gallery frame if you happen to catch
+one — it demonstrates the app explaining itself rather than showing stale data.
 
 ## Before publishing
 
@@ -104,6 +146,8 @@ finds them:
   `34 MB/s · 3m` and that change has never been looked at.
 - **The column resize handles.** They were moved to each column's left edge (the boundary that
   actually moves, given `Name` absorbs the slack) — reasoned from the CSS, never observed.
+- **The `Missing` chip vs the `Remote` settling chip.** Both amber, both synthetic substitutions.
+  They need to read as *different*, not merely differently worded.
 - **The unified reset control** (All / Pattern / Selected) and the effective-lftp-settings
   `<details>` panel, both shipped 2026-08-14 and both unviewed.
 
