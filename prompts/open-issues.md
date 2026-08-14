@@ -13,17 +13,41 @@ and it held all night.
 
 ---
 
+## Queued, written, not yet run
+
+**`prompts/2026-08-13-field-help-sweep.md`** — per-field help across the settings surface,
+using the `FieldHelp` component built in `dfff677`. **It also carries a real bug fix**:
+`QueuesTab.tsx` and `PostProcessingTab.tsx` label extraction as *"7zz — zip/7z/rar/rar5/…"*,
+which is false. Alpine's `7zz` has **no RAR codec** (`855e7a3`); a separately-built `unrar`
+handles rar and rar5, and `README.md`/`NOTICE` already say so. This is the same class of defect
+as the Dockerfile comment that claimed rar support for nine phases while extraction was
+completely broken — UI text outliving the behaviour it describes.
+
+## Decisions waiting on the user
+
+- **Rename the CI job?** `"Frontend lint + typecheck"` now also runs `npm test`, but that exact
+  string is a **live required status check** on `main` (verified via `gh api`). Renaming the job
+  without updating branch protection in the same motion blocks every future PR. Rename both
+  together, or leave it.
+- **`docker-compose.yml` pins `ghcr.io/crzykidd/lftpweb:0.0.1`** while its own comment says
+  nothing has been published to that registry. The in-app docs deliberately make no
+  pullable-image claim because of it. Worth resolving before a release.
+- **A `dev` → `main` PR, and the first release.** `dev` is far ahead of `main`; nothing has been
+  tagged, and `release-prep`/`release-cut` have never been run.
+
 ## Still open — read these first
 
-### No frontend test runner exists — at all
+### ~~No frontend test runner~~ — **closed `129cfcf`**
 
-No vitest, no jest, nothing, anywhere in the tree. The 2026-08-13 Files revamp added sorting,
-a persisted collapse preference, and progress arithmetic — all written as pure, isolable
-functions specifically so they *could* be tested, and all with **zero automated coverage**.
+Vitest + happy-dom, `npm test`, wired into the CI Frontend job. 118 tests covering the pure
+logic: `sortTree`'s sibling-preserving invariant asserted on tree structure, the collapse
+preference's default-plus-exceptions model including newly-arrived directories, every branch of
+`resetWarning`, `storage.ts`'s throwing paths, `format.ts` edge cases, and popover placement.
 
-Every backend behaviour this session has tests. None of the frontend logic does. Adding a
-runner is a bigger infra decision than any single task should make unasked, which is why three
-separate agents declined to. It now needs a decision.
+**No component rendering is tested** — mounting `FileTree` would mean mocking the API client,
+the WebSocket live model, `@tanstack/react-virtual`, and a portal-based hover card, for logic
+the unit tests already cover directly. That is a deliberate boundary, recorded in
+`README.md`'s Known gaps.
 
 ### Almost none of the new UI has been seen by anyone
 

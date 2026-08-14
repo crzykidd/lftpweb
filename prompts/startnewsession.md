@@ -70,29 +70,44 @@ side effect of shipping.
 
 ## Where we are
 
-> **Read `prompts/open-issues.md` first.** The 2026-08-12/13 session closed every issue raised
-> across **sixteen commits**, and that file carries the reasoning — including one fix that was
-> shipped and then deliberately reversed the same night, and one thing the orchestrating
-> session asserted that turned out to be false. Several statements further down this file
-> predate it.
+> **Read `prompts/open-issues.md` first.** The 2026-08-12/13 session ran to **36 commits**
+> (22 of them on 2026-08-13 alone), and that file carries the reasoning — including one fix
+> that was shipped and deliberately reversed the same night, and one thing the orchestrating
+> session asserted that turned out to be false. Much of this file's older material predates it.
 
-### The four commits after the first push (2026-08-13, unpushed as of session end)
+### State at the end of 2026-08-13
 
-`4533617` … `cad5891` continued past the nine below and are **committed on `dev` but NOT
-pushed** — the user asked for local-only commits overnight. `git log origin/dev..dev` shows
-exactly what is waiting. CI has not seen them.
+**Everything is pushed to `origin/dev` and CI-green.** Tests **489 → 887 backend**, plus a new
+**105→118 frontend** suite. Migrations run to **016**. Both lint gates, `npm test`,
+`npm run build`, and all three compose files clean.
 
-| Commit | What |
+The day was driven entirely by the user running the app against a real seedbox and reporting
+what looked wrong. **CI was green before every single one of these was found** — that pattern
+has now held for two consecutive sessions and is the single most useful thing to know about
+this project.
+
+The most consequential finds, in rough order:
+
+| What | Commit |
 |---|---|
-| `4533617` | Archive volumes optionally deleted after extraction (default off) without breaking completeness — reuses §4.7's `EXCLUDED` seam via a `deleted_archive` table, so the naive infinite-re-download trap is avoided |
-| `b39158e` | A local delete marks its **whole subtree**, and picks `REMOVED_LOCAL` vs `REMOVED_BOTH` **per row** from whether a remote copy survives |
-| `56ec523` | A `move`-mode outcome survives the rescan that finds it `LOCAL_ONLY`; also fixes items that leave **both** trees freezing forever |
-| `8a54475` | Files row revamp — R/L/V/E lifecycle icons, inline progress bars, sorting, persisted collapse preference, "Missing only" filter |
-| `de85753` | Item detail drawer reachable from Files — `local_mtime` (migration 011), lifecycle chronology, bounded per-item history |
-| `cad5891` | The `DESIGN.md` wording backlog applied, plus three long-standing untruths corrected |
+| **An item could be queued twice and run two concurrent lftp processes** — `enqueue_item` had no active-job guard. The user saw 4 processes where 2 were configured and assumed his transfer settings were broken. Guards now at enqueue, admission, and spawn | `6740c84` |
+| **rar extraction had never worked, for any release** — Alpine's `7zip` has no RAR codec; `unrar` is now built from source | `855e7a3` |
+| **Reset item tracking** — forget a path so its name is reusable, by selection / whole queue / filename pattern | `244ce2a` |
+| **Clear History** (one row, by outcome, or all) and **Dismiss** for terminal jobs | `48ad72c`, `b1eb8a4` |
+| Post-processing toggles became **inherit-or-override** instead of an AND; also fixed a table-rebuild cascade-delete in `db.py.migrate()` | `3500b3f` |
+| **SSH key can be pasted**, encrypted at rest, in memory for asyncssh, tmpfs per-job for lftp | `6359569` |
+| Delete now **stops an active transfer** rather than refusing | `21c41b0` |
+| **Frontend test runner** (Vitest + happy-dom) and an in-app **Docs** section | `129cfcf`, `dfff677` |
 
-**Tests 489 → 701.** Migrations now run to **011**. Both lint gates, `npm run build`, and all
-three compose files clean at session end.
+**Three things a fresh session must not undo, beyond the list further down:**
+
+- **`enqueue_item` is idempotent and the spawn path re-checks `_running`.** Both layers are
+  deliberate; removing either reopens duplicate transfers.
+- **The CI job name `"Frontend lint + typecheck"` is a live required status check** on `main`
+  (verified via `gh api`). It now also runs tests. Renaming the job without updating branch
+  protection in the same motion will block every PR.
+- **`docker-compose.yml` pins `ghcr.io/crzykidd/lftpweb:0.0.1`** while its own comment says
+  nothing has been published. Unresolved; the docs deliberately make no pullable-image claim.
 
 **Three things a fresh session must not undo:**
 
