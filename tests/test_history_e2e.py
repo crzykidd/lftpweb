@@ -177,7 +177,12 @@ async def test_real_transfer_appears_in_history_with_byte_count(db, tmp_path):
     assert row.rel_path == "loose-notes.txt"
     assert row.bytes_total == 512
     assert row.bytes_done == 512
-    assert row.has_output_tail is False  # succeeded jobs clear output_tail (core/queue.py)
+    # 2026-08-14 (prompts/2026-08-14-exit-zero-is-not-completion.md, defect 2): a succeeded
+    # job's own `output_tail` is retained now, not nulled -- the one job whose success was in
+    # doubt on a real instance had its own lftp output captured and then unconditionally
+    # thrown away by this same code path, which is exactly the evidence that would have
+    # explained the gap. See `core/queue.py._reap_one`'s own comment on this UPDATE.
+    assert row.has_output_tail is True
 
 
 async def test_forced_failure_carries_error_class_and_output_tail(db, tmp_path):

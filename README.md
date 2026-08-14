@@ -152,6 +152,14 @@ reduction made during the build, recorded in full in `docs/decisions.md`:
   surfaces it read-only (`HostOut.net_connection_limit`) — on a fresh install, and on every
   install today, that's `null`, so the "⚠ over net:connection-limit" warning cannot fire until
   something writes to the blob some other way (direct SQL, for now).
+- **A job has spawned with `bytes_start` reading several gigabytes against a directory the
+  user confirmed was empty on disk** (2026-08-14, live incident, `prompts/open-issues.md`).
+  Genuine and unexplained: `item.local_size` is recomputed fresh from a local filesystem walk
+  on every scan pass, including for a "protected" row, so nothing found by re-reading
+  `core/reconcile.py`/`core/engine.py._persist` explains a stale multi-gigabyte value surviving
+  several scan intervals before the job that read it spawned. Not reproduced against the fake
+  seedbox; recorded rather than silently worked around, since it corrupts `core/metrics.py`'s
+  throughput accounting (`max(bytes_done - bytes_start, 0)` under-counts by the stale amount).
 
 ## Locked out?
 

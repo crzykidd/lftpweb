@@ -15,7 +15,7 @@ const START_NOW_EXPLAINED_KEY = 'lftpweb:startNowExplained'
  * verbatim, exactly the "other internal states surface only on rows where they actually
  * apply" rule §9.2 states, rather than being folded into one of the three.
  */
-function chipStateFor(job: JobOut): string {
+export function chipStateFor(job: JobOut): string {
   switch (job.state) {
     case 'queued':
       return 'QUEUED'
@@ -30,6 +30,19 @@ function chipStateFor(job: JobOut): string {
     default:
       return job.state
   }
+}
+
+/** Whether a job's Dismiss button (2026-08-13, `core/queue.py.dismiss_job`) should show for a
+ * row in this state -- must match that endpoint's own guard (`JobNotDismissableError`) exactly,
+ * or a click here would just surface a 409. `succeeded` joined 2026-08-14
+ * (prompts/2026-08-14-exit-zero-is-not-completion.md) alongside `list_jobs()` starting to
+ * surface a recently-succeeded job on this page at all -- a completed transfer needs the same
+ * "stop showing this row" action a failed or stopped one already had. Exported as its own pure
+ * function (rather than inlined in `Row`) so it can be unit-tested without mounting the
+ * component -- this project doesn't test component rendering (README.md's Known gaps).
+ */
+export function isDismissable(state: JobOut['state']): boolean {
+  return state === 'failed' || state === 'cancelled' || state === 'succeeded'
 }
 
 function fileCountFor(nodes: FileNode[], job: JobOut): number {
@@ -205,8 +218,10 @@ function Row({
          * precisely wrong for it. Purely a display action on this job row -- see
          * `core/queue.py.dismiss_job`'s docstring for why it never touches the item's own
          * state or suppression. No confirmation dialog: nothing is destroyed, the record
-         * stays on the History page. */}
-        {(job.state === 'failed' || job.state === 'cancelled') && (
+         * stays on the History page. `succeeded` joined this set 2026-08-14
+         * (prompts/2026-08-14-exit-zero-is-not-completion.md) alongside `list_jobs()` starting
+         * to surface a recently-succeeded job at all -- see `isDismissable`. */}
+        {isDismissable(job.state) && (
           <button
             type="button"
             disabled={busy}

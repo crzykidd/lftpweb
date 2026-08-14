@@ -18,6 +18,7 @@ from __future__ import annotations
 import aiosqlite
 import pytest
 
+from lftpweb.api.jobs import _job_out
 from lftpweb.core.events import EventBus
 from lftpweb.core.queue import JobNotDismissableError, TransferQueue
 from lftpweb.db import migrate
@@ -118,20 +119,113 @@ async def test_list_jobs_older_failed_attempt_superseded_by_a_fresh_requeue(db):
     assert jobs[0]["state"] == "queued"
 
 
-async def test_list_jobs_excludes_succeeded_and_unrelated_older_failures(db):
+async def test_list_jobs_includes_most_recent_succeeded_job_and_unrelated_older_failures(db):
+    """2026-08-14 (prompts/2026-08-14-exit-zero-is-not-completion.md): `succeeded` joined the
+    terminal set this method surfaces -- before this a job that finished cleanly vanished from
+    Transfers the instant it was reaped, which is what made a real, seven-minute-long transfer
+    look from the UI like nothing running and 0 B/s. Same `MAX(id)` superseding rule as
+    `failed`/`cancelled` already had: `old-history.txt`'s older `failed` attempt is superseded
+    by its own later `succeeded` retry, not shown alongside it.
+    """
     queue_id = await _make_queue(db)
     succeeded_item = await _make_item(db, queue_id, "done.txt", state="DOWNLOADED")
     await _make_job(db, succeeded_item, state="succeeded")
 
     other_item = await _make_item(db, queue_id, "also-failed.txt", state="FAILED")
     await _make_job(db, other_item, state="failed", attempt=1)
-    # A second, even older, superseded failure on a *different* item shouldn't leak in either.
+    # A superseded failure on a *different* item, followed by a succeeded retry -- only the
+    # succeeded retry should show for this item.
     third_item = await _make_item(db, queue_id, "old-history.txt", state="DOWNLOADED")
     await _make_job(db, third_item, state="failed", attempt=1)
     await _make_job(db, third_item, state="succeeded", attempt=2)
 
     jobs = await _queue(db).list_jobs()
-    assert {j["rel_path"] for j in jobs} == {"also-failed.txt"}
+    by_path = {j["rel_path"]: j["state"] for j in jobs}
+    assert by_path == {
+        "done.txt": "succeeded",
+        "also-failed.txt": "failed",
+        "old-history.txt": "succeeded",
+    }
+
+
+async def test_list_jobs_bytes_total_reflects_the_value_fixed_at_spawn_not_current_item_remote_size(
+    db,
+):
+    """Defect 4 (prompts/2026-08-14-exit-zero-is-not-completion.md): a live incident returned
+    `bytes_total: 31812118603` alongside `bytes_done: 38841560420` for the same job -- two
+    different denominators, because `job.bytes_total` was never persisted at spawn and the API
+    fell back to the *current* `item.remote_size`, which had since drifted away from whatever
+    `job.bytes_done` was actually measured against. `core/queue.py._spawn_decision` now freezes
+    `job.bytes_total` at spawn (`fixed at admission, never re-shaped`, DESIGN.md §4.5's own
+    invariant applied to this field too); `list_jobs()` must return that frozen value, not a
+    fresh join against `item.remote_size`, once it's been persisted.
+    """
+    queue_id = await _make_queue(db)
+    item = await _make_item(db, queue_id, "drifted.txt", state="DOWNLOADED")
+    job_id = await _make_job(db, item, state="succeeded")
+    await db.execute("UPDATE job SET bytes_total = 1000, bytes_done = 1000 WHERE id = ?", (job_id,))
+    # The item's own remote_size has since drifted (a later scan, a pattern edit) -- the job's
+    # own frozen total must not follow it.
+    await db.execute("UPDATE item SET remote_size = 500 WHERE id = ?", (item,))
+    await db.commit()
+
+    jobs = await _queue(db).list_jobs()
+    assert len(jobs) == 1
+    assert jobs[0]["bytes_total"] == 1000
+    assert jobs[0]["bytes_done"] == 1000
+    assert jobs[0]["bytes_done"] <= jobs[0]["bytes_total"]
+
+
+# --- api/jobs.py._job_out: the same defect 4 fix, at the HTTP-shape layer -------------------
+
+
+def _job_out_row(**overrides) -> dict:
+    base = dict(
+        id=1,
+        item_id=1,
+        queue_id=1,
+        queue_name="q",
+        rel_path="a.txt",
+        is_dir=False,
+        kind="pget",
+        state="succeeded",
+        lane="main",
+        rank=0.0,
+        attempt=1,
+        queued_at="2026-08-14T00:00:00.000000Z",
+        started_at="2026-08-14T00:00:00.000000Z",
+        finished_at="2026-08-14T00:01:00.000000Z",
+        pid=None,
+        rate_limit_bps=None,
+        forced_full_rate=0,
+        bytes_start=0,
+        bytes_done=1000,
+        bytes_total=1000,  # job.bytes_total, persisted at spawn (this task)
+        remote_size=500,  # item.remote_size -- has since drifted away from bytes_total
+        exit_code=0,
+        error_class=None,
+        output_tail=None,
+    )
+    base.update(overrides)
+    return base
+
+
+def test_job_out_prefers_persisted_bytes_total_over_live_item_remote_size():
+    """Defect 4: `job.bytes_total` (frozen at spawn) must win over `item.remote_size` (which
+    can drift after spawn) -- this is the exact pair (`bytes_total: ...603`,
+    `bytes_done: ...420`, the second exceeding the first) the live incident returned.
+    """
+    out = _job_out(_job_out_row())
+    assert out.bytes_total == 1000
+    assert out.bytes_done <= out.bytes_total
+
+
+def test_job_out_falls_back_to_item_remote_size_when_job_bytes_total_is_null():
+    """A `queued` job hasn't spawned yet, so `job.bytes_total` is still `NULL` -- the live
+    `item.remote_size` is the best estimate available before admission freezes anything.
+    """
+    out = _job_out(_job_out_row(bytes_total=None, state="queued"))
+    assert out.bytes_total == 500
 
 
 # --- _publish_item_state: one row, not the tree ---------------------------------------------
@@ -211,6 +305,22 @@ async def test_dismiss_job_removes_a_cancelled_row_from_list_jobs(db):
     job_id = await _make_job(db, item, state="cancelled")
 
     q = _queue(db)
+    await q.dismiss_job(job_id)
+
+    assert await q.list_jobs() == []
+
+
+async def test_dismiss_job_removes_a_succeeded_row_from_list_jobs(db):
+    """2026-08-14: `succeeded` joined the dismissable set alongside `list_jobs()` starting to
+    surface a recently-succeeded job at all -- a completed transfer needs the same
+    "stop showing this row" action a failed or stopped one already had.
+    """
+    queue_id = await _make_queue(db)
+    item = await _make_item(db, queue_id, "done.txt", state="DOWNLOADED")
+    job_id = await _make_job(db, item, state="succeeded")
+
+    q = _queue(db)
+    assert len(await q.list_jobs()) == 1
     await q.dismiss_job(job_id)
 
     assert await q.list_jobs() == []

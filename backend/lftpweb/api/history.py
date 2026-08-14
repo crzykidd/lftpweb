@@ -227,7 +227,13 @@ async def list_history_jobs(
     cursor = await db.execute(
         "SELECT job.id, job.item_id, item.queue_id, path_queue.name AS queue_name, "
         "item.rel_path, item.is_dir, job.kind, job.state, job.attempt, job.queued_at, "
-        "job.started_at, job.finished_at, item.remote_size AS bytes_total, job.bytes_done, "
+        # 2026-08-14 (prompts/2026-08-14-exit-zero-is-not-completion.md, defect 4): prefer the
+        # value frozen on `job.bytes_total` at spawn (`core/queue.py._spawn_decision`) --
+        # `job.bytes_done`'s own denominator, fixed at the same moment -- over the live
+        # `item.remote_size`, which can drift after this job finished. Only a job that never
+        # reached `running` (so `job.bytes_total` is still NULL -- a spawn failure, or a row
+        # from before this column was populated) falls back to the item's current value.
+        "job.started_at, job.finished_at, COALESCE(job.bytes_total, item.remote_size) AS bytes_total, job.bytes_done, "
         "job.exit_code, job.error_class, job.output_tail, job.dismissed_at "
         "FROM job "
         "JOIN item ON item.id = job.item_id "

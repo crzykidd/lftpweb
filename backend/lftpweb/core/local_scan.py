@@ -331,6 +331,89 @@ def scan_local(root: str | Path) -> dict[str, LocalEntry]:
     return entries
 
 
+def find_temp_files(root: str | Path) -> list[Path]:
+    """Recursively, every lftp temp file (`.lftp` or `.lftp~<timestamp>~`, `is_temp_name`)
+    anywhere under `root`, by its own real on-disk name.
+
+    Unlike `scan_local`'s output -- which reports a still-temp file under its *final*, stripped
+    name so it can be matched against its remote counterpart -- this is for a caller that needs
+    the actual leftover path itself: an audit message naming exactly what is still sitting on
+    disk (2026-08-14, prompts/2026-08-14-exit-zero-is-not-completion.md's completeness check,
+    `core/queue.py._completeness_on_disk`), the row that would have explained a real incident
+    at a glance instead of one that just says "500 MB short" with no filename.
+
+    `_UNPACK_`/`_FAILED_` staging directories are skipped, matching every other walk in this
+    module.
+    """
+    root = Path(root)
+    found: list[Path] = []
+    if not root.is_dir():
+        return found
+
+    def walk(dir_path: Path) -> None:
+        try:
+            with os.scandir(dir_path) as it:
+                raw_entries = list(it)
+        except OSError:
+            return
+        for entry in raw_entries:
+            if entry.is_dir(follow_symlinks=False):
+                if entry.name.startswith(UNPACK_PREFIX) or entry.name.startswith(FAILED_PREFIX):
+                    continue
+                walk(Path(entry.path))
+                continue
+            if is_temp_name(entry.name):
+                found.append(Path(entry.path))
+
+    walk(root)
+    return found
+
+
+def find_orphan_sidecars(root: str | Path) -> list[Path]:
+    """Recursively, every `.lftp-pget-status` sidecar under `root` whose carrier file -- the
+    same name with the suffix stripped -- is not present in that same directory listing.
+
+    `scan_local`'s own walk only ever *consumes* a sidecar when its carrier is present
+    alongside it (used to correct that carrier's reported size); a sidecar whose carrier was
+    renamed away or removed without the sidecar being cleaned up alongside it never appears
+    anywhere in `scan_local`'s output, so it is otherwise invisible bookkeeping. That is
+    exactly the leftover DESIGN.md §4.3's completeness check (`core/queue.py._reap_one`,
+    2026-08-14, prompts/2026-08-14-exit-zero-is-not-completion.md) needs to name explicitly:
+    a job that exited 0 leaving a stray sidecar behind is evidence lftp's own bookkeeping
+    disagrees with what's actually on disk, whatever the byte totals say.
+
+    `_UNPACK_`/`_FAILED_` staging directories are skipped, matching every other walk in this
+    module -- extraction hasn't run yet at the point this is called, but a stale one from a
+    previous cycle must not be walked into.
+    """
+    root = Path(root)
+    orphans: list[Path] = []
+    if not root.is_dir():
+        return orphans
+
+    def walk(dir_path: Path) -> None:
+        try:
+            with os.scandir(dir_path) as it:
+                raw_entries = list(it)
+        except OSError:
+            return
+        names = {e.name for e in raw_entries}
+        for entry in raw_entries:
+            if entry.is_dir(follow_symlinks=False):
+                if entry.name.startswith(UNPACK_PREFIX) or entry.name.startswith(FAILED_PREFIX):
+                    continue
+                walk(Path(entry.path))
+                continue
+            if not entry.name.endswith(PGET_STATUS_SUFFIX):
+                continue
+            carrier = entry.name[: -len(PGET_STATUS_SUFFIX)]
+            if carrier not in names:
+                orphans.append(Path(entry.path))
+
+    walk(root)
+    return orphans
+
+
 # --- Orphaned temp-file reaping (2026-08-13, prompts/2026-08-13-lftp-timestamped-temp-files.md) --
 
 # Deliberately several days, not hours: the guard is age alone (see `sweep_orphan_temp_files`'s

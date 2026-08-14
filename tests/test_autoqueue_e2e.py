@@ -106,6 +106,29 @@ async def test_file_exclude_pattern_drives_autoqueue_to_a_clean_downloaded_relea
         (queue_id, RELEASE_NAME, RELEASE_TOTAL_BYTES),
     )
     item_id = cursor.lastrowid
+    # The three descendant rows a real `core/engine.py.scan_queue` pass would already have
+    # written by the time auto-queue ever sees the parent -- the .nfo already `EXCLUDED` by
+    # the pattern above (`core/reconcile.py` rule 1/8). `core/queue.py._reap_one`'s exit-0
+    # completeness check (2026-08-14, prompts/2026-08-14-exit-zero-is-not-completion.md) reads
+    # these rows to know the .nfo's bytes don't count toward this item's completeness --
+    # without them here it would (correctly, for an *unscanned* item) fall back to the raw
+    # rollup and never see the release as complete, since lftp is deliberately never asked to
+    # fetch the excluded .nfo at all.
+    await db.execute(
+        "INSERT INTO item (queue_id, rel_path, is_dir, remote_size, local_size, state) "
+        "VALUES (?, ?, 0, ?, 0, 'REMOTE_ONLY')",
+        (queue_id, f"{RELEASE_NAME}/{RELEASE_NAME}.mkv", MKV_BYTES),
+    )
+    await db.execute(
+        "INSERT INTO item (queue_id, rel_path, is_dir, remote_size, local_size, state) "
+        "VALUES (?, ?, 0, ?, 0, 'EXCLUDED')",
+        (queue_id, f"{RELEASE_NAME}/{RELEASE_NAME}.nfo", NFO_BYTES),
+    )
+    await db.execute(
+        "INSERT INTO item (queue_id, rel_path, is_dir, remote_size, local_size, state) "
+        "VALUES (?, ?, 0, ?, 0, 'REMOTE_ONLY')",
+        (queue_id, f"{RELEASE_NAME}/Subs/eng.srt", SRT_BYTES),
+    )
     await db.commit()
 
     await save_transfer_settings(

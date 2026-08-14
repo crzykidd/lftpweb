@@ -100,7 +100,16 @@ def _job_out(row: dict) -> JobOut:
         forced_full_rate=bool(row["forced_full_rate"]),
         bytes_start=row["bytes_start"],
         bytes_done=row["bytes_done"],
-        bytes_total=row["remote_size"],
+        # 2026-08-14 (prompts/2026-08-14-exit-zero-is-not-completion.md, defect 4): prefer the
+        # value `core/queue.py._spawn_decision` froze on `job.bytes_total` at admission --
+        # `job.bytes_done`'s own denominator, fixed at the same moment (§4.5's "fixed at spawn,
+        # never re-shaped" invariant). `item.remote_size` alone can drift after spawn (a later
+        # scan, a pattern edit) while `bytes_done` stays put, which is exactly how a live
+        # incident showed `bytes_total: 31812118603` next to `bytes_done: 38841560420` -- two
+        # different denominators for the same job. Only a `queued` job (never spawned yet, so
+        # `job.bytes_total` is still NULL) falls back to the live `item.remote_size`, which is
+        # the best estimate available before admission fixes anything.
+        bytes_total=row["bytes_total"] if row["bytes_total"] is not None else row["remote_size"],
         speed_bps=row.get("speed_bps"),
         eta_s=row.get("eta_s"),
         exit_code=row["exit_code"],

@@ -521,11 +521,13 @@ class TransferQueue:
         keeps showing it. Deleting the row would erase the record of what happened, the
         opposite of what History exists for.
 
-        **Only a terminal job** (`failed`/`cancelled`) can be dismissed — `queued`/`running`
-        raises `JobNotDismissableError` rather than silently no-opping, so a client that races
-        a dismiss against a job starting gets a real error instead of an inconsistent-looking
-        success. The Transfers page only ever offers the button on a terminal row, but that's
-        a courtesy; this is the guard.
+        **Only a terminal job** (`failed`/`cancelled`/`succeeded`) can be dismissed —
+        `queued`/`running` raises `JobNotDismissableError` rather than silently no-opping, so a
+        client that races a dismiss against a job starting gets a real error instead of an
+        inconsistent-looking success. The Transfers page only ever offers the button on a
+        terminal row, but that's a courtesy; this is the guard. `succeeded` joined this set
+        2026-08-14 (prompts/2026-08-14-exit-zero-is-not-completion.md) alongside `list_jobs()`
+        starting to surface a recently-succeeded job at all — see that method's own docstring.
 
         **Deliberately does not touch `item.state` or `item.auto_queue_suppressed`/
         `suppressed_reason`.** This is a display action about the *job* row, not a decision
@@ -540,9 +542,10 @@ class TransferQueue:
         row = await self._fetch_job(job_id)
         if row is None:
             raise ValueError(f"job {job_id} not found")
-        if row["state"] not in ("failed", "cancelled"):
+        if row["state"] not in ("failed", "cancelled", "succeeded"):
             raise JobNotDismissableError(
-                f"job {job_id} is {row['state']!r}; only a failed or cancelled job can be dismissed"
+                f"job {job_id} is {row['state']!r}; only a failed, cancelled, or succeeded "
+                "job can be dismissed"
             )
         await self.db.execute("UPDATE job SET dismissed_at = ? WHERE id = ?", (_now_iso(), job_id))
         await self.db.commit()
@@ -615,14 +618,35 @@ class TransferQueue:
             # size). `cmd:fail-exit true` guarantees exit 0 only on a complete transfer
             # (§4.3), so the true byte count here is simply the job's own `bytes_total`
             # (already known from the remote scan at admission time), not a re-measurement.
+            #
+            # **This is `bytes_done`, not a completion verdict.** DESIGN.md §4.3's "no
+            # inference" rule is about *how we learn the outcome* -- trust lftp's own exit
+            # code rather than parse `jobs -v` output (§1.2) or guess from partial progress
+            # samples. It was never license to conclude exit 0 proves every byte arrived: a
+            # live incident (2026-08-13/14, queue `ar-tv`, job 43,
+            # prompts/2026-08-14-exit-zero-is-not-completion.md) had `cmd:fail-exit true`
+            # exit 0 with one file 500 MB short, still sitting on disk as a `.lftp` temp file
+            # -- lftp reported "no error," which is all exit 0 ever actually promises. Whether
+            # the transfer is *complete* is answered below, from the filesystem (§1.3's own
+            # principle: progress and completion are derived from what's on disk, not
+            # inferred from the process). See docs/decisions.md for the proposed §4.3 wording.
             logger.info(
                 "job %s succeeded: %s (%s bytes)", proc.job_id, proc.rel_path, proc.bytes_total
             )
+            # `output_tail` is retained on every success now, not just a failure -- the one
+            # job whose success was in doubt (job 43 above) had its own lftp output captured
+            # and then unconditionally thrown away by this same UPDATE, so the one thing that
+            # would have explained the gap at a glance was gone before anyone knew to look.
+            # 4 KB per job (`lftp.OUTPUT_TAIL_BYTES`) against a `job` table `list_jobs()`
+            # already bounds by construction (its own docstring) and History already
+            # paginates -- retaining it unconditionally is simpler than a second write path
+            # that only fires for the incomplete branch below, and correct for exactly the
+            # same reason that branch needs it.
             await self.db.execute(
-                "UPDATE job SET state = 'succeeded', pid = NULL, exit_code = 0, output_tail = NULL, "
+                "UPDATE job SET state = 'succeeded', pid = NULL, exit_code = 0, output_tail = ?, "
                 "bytes_done = COALESCE((SELECT remote_size FROM item WHERE item.id = job.item_id), bytes_done), "
                 "finished_at = ? WHERE id = ?",
-                (finished_at, proc.job_id),
+                (tail[-lftp.OUTPUT_TAIL_BYTES :], finished_at, proc.job_id),
             )
 
             # 2026-08-13 (prompts/2026-08-13-delete-state-truthfulness.md, defect 3's "real
@@ -643,12 +667,52 @@ class TransferQueue:
             top_level = "/" not in proc.rel_path
             settled = (not top_level) or await self._item_is_settled(proc.queue_id, proc.rel_path)
 
-            if settled:
-                # No inference (DESIGN.md §4.3): `cmd:fail-exit true` makes exit 0 mean the
-                # whole transfer succeeded, so the item is DOWNLOADED now, not "probably,
-                # pending the next scan." The engine's own reconcile pass will confirm sizes on
-                # its next cycle; this is what makes the UI update immediately instead of
-                # waiting for it.
+            # The completeness check (this task, 2026-08-14): a filesystem-only read, exactly
+            # what §1.3 already mandates as the source of truth for progress and completion --
+            # never `jobs -v` (§1.2), never trusting the exit code alone. Distinct question
+            # from `settled` above: that one asks "has the remote stopped changing?"; this one
+            # asks "did we actually get it all?" Both must hold before DOWNLOADED.
+            complete, local_bytes, evidence = await self._completeness_on_disk(proc)
+
+            if settled and not complete:
+                # Exit 0, but the disk disagrees: either a leftover lftp temp file/sidecar
+                # (`local_scan.TEMP_FILE_RE`/`find_orphan_sidecars`) or local bytes short of
+                # the remote total known at admission time. Treated as an ordinary incomplete
+                # transfer, not a success -- `PARTIAL` is re-queueable (§3.2), and auto-queue's
+                # existing eligibility (`ELIGIBLE_STATES`) picks it back up exactly the way
+                # job 44 did for real, resuming from what's already on disk (`-c`). Never
+                # DOWNLOADED, never post-processing -- see the `if settled and complete`
+                # trigger guard below.
+                await self.db.execute(
+                    "UPDATE item SET state = 'PARTIAL', substate = NULL, local_size = ?, "
+                    "auto_queue_suppressed = 0, suppressed_reason = NULL, error_class = NULL, error_detail = NULL "
+                    "WHERE id = ?",
+                    (local_bytes, proc.item_id),
+                )
+                await audit.record_event(
+                    self.db,
+                    level="warning",
+                    item_id=proc.item_id,
+                    job_id=proc.job_id,
+                    kind="incomplete_on_exit_zero",
+                    message=(
+                        f"job {proc.job_id} for {proc.rel_path!r} exited 0 but the filesystem "
+                        f"shows only {local_bytes} of {proc.bytes_total} expected bytes"
+                        + (
+                            f"; leftover on disk: {', '.join(evidence)}"
+                            if evidence
+                            else " (no leftover temp file/sidecar found -- short on bytes alone)"
+                        )
+                        + " -- held at PARTIAL instead of DOWNLOADED; post-processing was not"
+                        " triggered (prompts/2026-08-14-exit-zero-is-not-completion.md)"
+                    ),
+                )
+            elif settled:
+                # No inference beyond what lftp actually told us (DESIGN.md §4.3, as amended):
+                # `cmd:fail-exit true` plus a clean filesystem read together mean the whole
+                # transfer succeeded, so the item is DOWNLOADED now, not "probably, pending the
+                # next scan." The engine's own reconcile pass will confirm sizes on its next
+                # cycle; this is what makes the UI update immediately instead of waiting for it.
                 await self.db.execute(
                     "UPDATE item SET state = 'DOWNLOADED', downloaded_at = ?, substate = NULL, "
                     "auto_queue_suppressed = 0, suppressed_reason = NULL, error_class = NULL, error_detail = NULL "
@@ -688,10 +752,11 @@ class TransferQueue:
             await self._publish_item_state(proc.item_id)
             proc.spawned.cleanup()
             # Phase 5 (DESIGN.md §6): "triggered on transition to DOWNLOADED." Only when this
-            # job's item actually reached DOWNLOADED above -- an unsettled item held back by
-            # the branch above must not trigger post-processing (that's the whole point of the
-            # completion gate); it re-enters this same path via a fresh job once it settles.
-            if settled and self.postprocess is not None and top_level:
+            # job's item actually reached DOWNLOADED above -- an item held back by either the
+            # settle branch or the incomplete-on-exit-zero branch above must not trigger
+            # post-processing (that's the whole point of both gates); it re-enters this same
+            # path via a fresh job once it settles/completes.
+            if settled and complete and self.postprocess is not None and top_level:
                 self.postprocess.trigger(proc.item_id)
             return
 
@@ -737,6 +802,109 @@ class TransferQueue:
 
         await self._publish_item_state(proc.item_id)
         proc.spawned.cleanup()
+
+    async def _completeness_on_disk(self, proc: _RunningProcess) -> tuple[bool, int, list[str]]:
+        """Whether `proc`'s target is actually, fully on disk -- the filesystem-only check
+        `_reap_one` runs on exit 0, before an item can reach `DOWNLOADED` (2026-08-14,
+        prompts/2026-08-14-exit-zero-is-not-completion.md). `cmd:fail-exit true`'s exit 0
+        means lftp reported no error; it does not mean every byte arrived (DESIGN.md §4.3, as
+        amended -- see docs/decisions.md for the proposed wording), so this reads the disk the
+        same way `core/local_scan.py`/§4.4 already do for live progress, rather than trusting
+        the exit code alone. This is exactly the "filesystem check" DESIGN.md §1.3 already
+        mandates as the source of truth -- never `jobs -v` (§1.2).
+
+        Two independent things count as incomplete, matching the live incident this closes
+        (job 43: `S.W.A.T.S06E22….mkv.lftp` + its `.lftp-pget-status` sidecar left on disk,
+        the item still marked `DOWNLOADED` anyway):
+
+        - **Any lftp temp file remains anywhere under the item.** Both `.lftp` and lftp's
+          `.lftp~<timestamp>~` fallback (`local_scan.TEMP_FILE_RE`/`find_temp_files`,
+          `find_temp_variants`) -- a temp file's reported size can lie in a way a real,
+          already-renamed file's cannot (`LocalEntry.is_temp`'s own docstring), so its mere
+          presence is disqualifying regardless of what the byte totals below say.
+        - **An orphaned `.lftp-pget-status` sidecar** (`local_scan.find_orphan_sidecars`) --
+          one whose carrier file was renamed away or removed without the sidecar being
+          cleaned up alongside it, invisible to `scan_local`'s own output but real evidence
+          lftp's bookkeeping and the disk disagree.
+        - **Local bytes short of the *relevant* remote total** (`_relevant_remote_total`
+          below) -- measured with the same sidecar-corrected accounting `scan_local`/
+          `effective_file_size` already use, never reimplemented here.
+
+        **Why not just `proc.bytes_total` (`item.remote_size` at spawn) for the byte
+        comparison.** That column is deliberately a raw rollup -- "every remote byte under a
+        directory, irrespective of the completeness predicate" (`core/reconcile.py`'s own
+        docstring) -- so it includes a `file_exclude`d file's bytes even though lftp was
+        handed `--exclude-glob` for exactly that pattern and never fetched it (DESIGN.md
+        §3.2 rule 1's own exclusion clause, §4.7). Comparing local bytes against the raw total
+        would hold a perfectly clean, correctly-excluding transfer at `PARTIAL` forever --
+        the exact infinite-loop failure mode §6's archive-cleanup accounting was written to
+        avoid, reintroduced here if this check used the wrong total. `_relevant_remote_total`
+        is this method's async part for exactly that reason: an `EXCLUDED` descendant's own
+        bytes are subtracted out first, reusing the state a real scan already assigned it
+        rather than re-deriving pattern matches here.
+
+        Returns `(complete, local_bytes, evidence)`. `evidence` lists every leftover temp
+        file/sidecar path found -- exactly what the `incomplete_on_exit_zero` audit event
+        needs to explain the gap at a glance, the row this incident never got.
+
+        `proc.local_root` is the file's own path for a `pget` job, or the item's directory for
+        a `mirror` job (`_RunningProcess.local_root`'s own docstring) -- the same distinction
+        `_flush_child_progress_final` and `core/progress.py` already key off of.
+        """
+        root = Path(proc.local_root)
+        evidence: list[str] = []
+        if proc.kind == "pget":
+            evidence += [str(v) for v in local_scan.find_temp_variants(root.parent, root.name)]
+            sidecar = root.parent / f"{root.name}{local_scan.PGET_STATUS_SUFFIX}"
+            if root.exists() and sidecar.exists():
+                evidence.append(str(sidecar))
+            local_bytes = local_scan.effective_file_size(root)
+            # A `pget` job's target is never itself `EXCLUDED` (an excluded item is never
+            # queued in the first place, manually or by auto-queue), so the raw admission-time
+            # total is already the relevant one -- no child rows to reconcile against.
+            remote_total = proc.bytes_total or 0
+        else:
+            entries = local_scan.scan_local(root)
+            local_bytes = sum(e.size for e in entries.values() if not e.is_dir)
+            # `find_temp_files`, not `entries`' own `is_temp` flag: `scan_local` reports a
+            # still-temp file under its *final*, stripped name (so it can be matched against
+            # its remote counterpart), which is the wrong name for an audit message naming
+            # exactly what's still on disk -- `find_temp_files` returns the real path.
+            evidence += [str(p) for p in local_scan.find_temp_files(root)]
+            evidence += [str(p) for p in local_scan.find_orphan_sidecars(root)]
+            remote_total = await self._relevant_remote_total(proc)
+
+        complete = not evidence and local_bytes >= remote_total
+        return complete, local_bytes, evidence
+
+    async def _relevant_remote_total(self, proc: _RunningProcess) -> int:
+        """The byte total that actually counts toward `proc`'s completeness -- `proc.bytes_total`
+        (the raw `item.remote_size` rollup at spawn) minus every tracked descendant file
+        currently `EXCLUDED` (DESIGN.md §3.2 rule 1's own exclusion clause), the identical
+        accounting a real scan's `core/reconcile.py` rule 1 already uses to decide
+        DOWNLOADED-vs-PARTIAL. Reuses the state a scan already assigned rather than
+        re-deriving pattern matches here -- the same "reuse the existing completeness seam"
+        choice §6's archive-cleanup accounting made for the identical reason.
+
+        Falls back to the raw `proc.bytes_total` when no descendant file rows are tracked yet
+        for this item -- the best information available before this item's first real scan
+        populated them (every production job is preceded by at least one, since auto-queue
+        eligibility and the settle/mount gates all depend on a prior scan's own output; a
+        fallback exists only for the theoretical gap, not the common case).
+        """
+        prefix = f"{proc.rel_path}/"
+        # SQLite LIKE's `%`/`_` are wildcards -- escaped so a literal `%`/`_` in a real
+        # release name can't widen or narrow the match.
+        escaped = prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        cursor = await self.db.execute(
+            "SELECT state, remote_size FROM item WHERE queue_id = ? AND is_dir = 0 "
+            "AND rel_path LIKE ? ESCAPE '\\'",
+            (proc.queue_id, f"{escaped}%"),
+        )
+        rows = await cursor.fetchall()
+        if not rows:
+            return proc.bytes_total or 0
+        return sum(row["remote_size"] or 0 for row in rows if row["state"] != "EXCLUDED")
 
     async def _flush_child_progress_final(self, proc: _RunningProcess) -> None:
         """A final, accurate, un-throttled reading of a `mirror` job's per-child rows, run once
@@ -1296,13 +1464,27 @@ class TransferQueue:
         started_at = _now_iso()
         await self.db.execute(
             "UPDATE job SET state = 'running', pid = ?, started_at = ?, rate_limit_bps = ?, "
-            "forced_full_rate = ?, bytes_start = ? WHERE id = ?",
+            "forced_full_rate = ?, bytes_start = ?, bytes_total = ? WHERE id = ?",
             (
                 spawned.pid,
                 started_at,
                 decision.rate_limit_bps,
                 1 if decision.forced_full_rate else 0,
                 item["local_size"] or 0,
+                # 2026-08-14 (prompts/2026-08-14-exit-zero-is-not-completion.md, defect 4):
+                # `job.bytes_total` was never written here, so it stayed NULL forever and
+                # every API response computed it fresh from the *live* `item.remote_size`
+                # instead (`api/jobs.py`/`api/history.py`) -- a value that can change after
+                # this job spawned (a later scan, a pattern edit) while `job.bytes_done` stays
+                # fixed at whatever `remote_size` was when `_reap_one` wrote it. The two ended
+                # up using different denominators for the same job, so `bytes_done` could
+                # exceed `bytes_total` in the API response even though neither number was
+                # individually wrong -- fixed by freezing this value here, at spawn, the same
+                # "fixed at admission and never re-shaped" invariant DESIGN.md §4.5 already
+                # uses for a job's bandwidth allocation. Matches `proc.bytes_total` exactly
+                # (`_RunningProcess` below), which already carried this same value in memory
+                # for progress sampling -- this is the persisted counterpart.
+                item["remote_size"],
                 decision.job_id,
             ),
         )
@@ -1418,10 +1600,20 @@ class TransferQueue:
         output tail", and a stopped job must be visible as `STOPPED` rather than vanishing
         the instant it's reaped — DESIGN.md names the Transfers page as where both surface,
         distinct from the History page's full `job`/`event` audit trail. So this also
-        includes a `failed`/`cancelled` job when it is that item's *most recent* job (the
-        `MAX(id)` subquery) — a manual retry inserts a new `queued` row for the same item,
-        which is already covered by the first clause and makes the old failed/cancelled row
+        includes a `failed`/`cancelled`/`succeeded` job when it is that item's *most recent*
+        job (the `MAX(id)` subquery) — a manual retry inserts a new `queued` row for the same
+        item, which is already covered by the first clause and makes the old terminal row
         irrelevant (superseded), so this doesn't need to filter it out separately.
+
+        **`succeeded` joined this set 2026-08-14**
+        (prompts/2026-08-14-exit-zero-is-not-completion.md) — before this, a job that finished
+        cleanly simply vanished from Transfers the instant it was reaped, which is what made a
+        real incident so hard to see live: seven minutes of an actual transfer looked, from
+        the UI, like nothing running and 0 B/s in the header. Same `MAX(id)`/`dismissed_at`
+        shape as `failed`/`cancelled` already had — one terminal row per item, dismissible via
+        `dismiss_job` exactly like the other two, so the row set stays bounded by construction
+        (the same boundedness `api/history.py`'s own docstring contrasts against its own
+        unbounded, paginated shape, which is why this method can inline `output_tail` at all).
 
         A terminal job whose `dismissed_at` is set (2026-08-13, `dismiss_job` above) is
         excluded here too — dismissal is exactly "stop counting this as the item's visible
@@ -1442,7 +1634,7 @@ class TransferQueue:
             "JOIN item ON item.id = job.item_id "
             "JOIN path_queue ON path_queue.id = item.queue_id "
             "WHERE job.state IN ('queued','running') "
-            "   OR (job.state IN ('failed','cancelled') "
+            "   OR (job.state IN ('failed','cancelled','succeeded') "
             "       AND job.dismissed_at IS NULL "
             "       AND job.id = (SELECT MAX(j2.id) FROM job j2 WHERE j2.item_id = job.item_id)) "
             "ORDER BY job.rank DESC, job.queued_at ASC"

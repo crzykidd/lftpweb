@@ -1,4 +1,4 @@
-# Open issues — 2026-08-12 / 2026-08-13 session
+# Open issues — 2026-08-12 / 2026-08-13 / 2026-08-14 session
 
 A living list, not a handoff prompt. It never moves to `done/`.
 
@@ -6,6 +6,10 @@ A living list, not a handoff prompt. It never moves to `done/`.
 **489 → 701**. Closed items are kept below with the commit and the reasoning, because the
 *why* is what is worth finding again — one fix was shipped and deliberately reversed the same
 night, and the reasoning for that reversal is more valuable than the diff.
+
+**2026-08-14 added one closed item (exit-0-is-not-completion, see below) and one still open**
+(the `bytes_start` anomaly, "Still open" below) — found and left honest rather than papered
+over.
 
 Almost every item came from the user running the app against a real seedbox and reporting what
 looked wrong. **CI was green before each one was found.** That is the pattern of this project
@@ -99,6 +103,35 @@ Auth tab omits those fields on save — but it is the same pattern that *was* re
 `BackupSettingsIn`/`TransferSettingsIn`/`MetricsSettingsIn` have no defaults and are not
 vulnerable.
 
+### A job spawned with `bytes_start` reading ~18 GB against a directory confirmed empty
+
+2026-08-14 (`prompts/2026-08-14-exit-zero-is-not-completion.md`), live incident: job 43 spawned
+with `bytes_start = 18002714542` against a local directory the user confirms was empty at the
+time. `bytes_start` is written once at spawn from `item["local_size"] or 0`
+(`core/queue.py._spawn_decision`), so `item.local_size` held ~18 GB for a directory with
+nothing in it. Corrupts `core/metrics.py`'s throughput accounting
+(`contribution = max(bytes_done - bytes_start, 0)`), under-counting that transfer's Dashboard
+contribution by the stale amount.
+
+**Not reproduced.** Traced every writer of `item.local_size` (`core/reconcile.py`'s rollup,
+`core/engine.py._persist`'s main loop and its "protected"-row branch, the vanished-row sweep,
+`core/queue.py`'s progress writers) — all recompute or overwrite fresh on every pass; none
+found could latch a stale value across the several scan intervals the 03:59:44→04:06:21
+timeline implies should have occurred before spawn. The one path that *can* freeze a row
+indefinitely — `_persist`'s vanished-row sweep, when a `rel_path` sits in neither the remote
+nor local tree — only ever touches `state`/`first_missing_at`, confirmed never `local_size`,
+and the path re-entering `nodes` the moment new remote content reappears at the same name
+should force a fresh (`NULL`) write well before spawn, not survive it.
+
+**Leading unconfirmed hypothesis:** the queue's actual `scan_interval_s` at incident time may
+have been configured well above the 30s default, so far fewer scans landed in that ~6.5-minute
+window than "several" assumes — possibly just one — or the first post-reappearance scan raced
+a slow/just-remounted volume and transiently misread the directory as non-empty. Confirming
+either needs the real instance's `path_queue.scan_interval_s` for that queue, or a targeted
+repro against the fake seedbox: fully download and move away a release at a given `rel_path`,
+re-seed a new release at the *same* `rel_path`, and watch `item.local_size` across consecutive
+scans with `scan_interval_s` set high.
+
 ### Smaller, and genuinely optional
 
 - **Row lifetime** — nothing deletes `item` rows. [Issue #1](https://github.com/crzykidd/lftpweb/issues/1).
@@ -171,6 +204,14 @@ bugs nobody was looking for: `shutil.rmtree` was blocking the event loop for the
 of a large delete, and **every save from Settings → Post-processing had always silently reset
 `failed_retention_enabled`/`failed_retention_days`**, because those fields have no frontend
 form entry at all and the PUT replaced rather than merged.
+
+---
+
+## Closed — 2026-08-14
+
+| Summary | Commit |
+|---|---|
+| **`lftp` exiting 0 was treated as proof a transfer completed** — a live incident left one file 500 MB short as a `.lftp` temp file and the item still reached `DOWNLOADED`; a filesystem completeness check (exclusion-aware, so a `file_exclude`d file can't hold an item `PARTIAL` forever) now gates `DOWNLOADED`, `output_tail` is retained on every success instead of nulled, and the Transfers page surfaces a recently-succeeded job instead of it vanishing on reap. `bytes_total` is also now frozen at job spawn rather than drifting with a later scan. The `bytes_start` anomaly this same incident surfaced is a separate, unreproduced defect — see "Still open" above. | `prompts/done/2026-08-14-exit-zero-is-not-completion.md` |
 
 ---
 

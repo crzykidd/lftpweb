@@ -6,6 +6,80 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-14 — Exit 0 is not completion: a filesystem completeness gate before DOWNLOADED,
+## output_tail retained on every success, succeeded jobs surfaced on Transfers
+
+**Handoff prompt `prompts/2026-08-14-exit-zero-is-not-completion.md`, executed end to end.**
+Live incident: `cmd:fail-exit true` exited 0 for job 43 having left one file 500 MB short as a
+`.lftp` temp file, and the item was marked `DOWNLOADED` and handed to post-processing anyway
+(§4.3's "no inference" rule was being read as "exit 0 proves every byte arrived," which it
+never promised).
+
+**Proposed `DESIGN.md` §4.3 wording (drafted here, not applied — the user approves the
+wording before it lands in the doc itself, per this repo's own rule that it corrects the doc
+rather than diverging from it):**
+
+> Replace "**Success is exit code 0**, guaranteed by `set cmd:fail-exit true`. No inference
+> needed." with:
+>
+> "**Exit code 0 means lftp reported no error** (`set cmd:fail-exit true`) — it does not by
+> itself mean every byte arrived. Before an item reaches `DOWNLOADED`, `core/queue.py._reap_one`
+> confirms completeness from the filesystem (§1.3's own principle: progress and completion are
+> derived from what's on disk, never inferred from the process) — no lftp temp file
+> (`.lftp`/`.lftp~<timestamp>~`) or orphaned `.lftp-pget-status` sidecar remains under the item,
+> and local bytes meet the relevant remote total (excluding anything `EXCLUDED`, §3.2 rule 1).
+> If either check fails despite exit 0, the item goes `PARTIAL` instead — re-queueable, not a
+> failure — and an `incomplete_on_exit_zero` event names the gap. This is still 'no inference':
+> it reads what's actually on disk rather than guessing from partial progress samples or parsing
+> `jobs -v` (§1.2); it just does not stop at the exit code alone for the one claim the exit code
+> never made."
+
+**Decision: the completeness bar is an *exclusion-aware* remote total, not the raw
+`item.remote_size` rollup.** First implementation compared local bytes against
+`item.remote_size` at spawn (`proc.bytes_total`), exactly as the handoff prompt specified.
+`tests/test_autoqueue_e2e.py`'s existing `file_exclude` e2e test caught the bug immediately:
+`item.remote_size` is `core/reconcile.py`'s deliberately raw display rollup — "every remote
+byte under a directory, irrespective of the completeness predicate" — so it includes a
+pattern-excluded file's bytes even though lftp was handed `--exclude-glob` for exactly that
+pattern and never fetched it. Comparing against the raw total would have held every clean,
+correctly-excluding transfer at `PARTIAL` forever — the identical infinite-loop failure mode
+§6's archive-cleanup accounting was written to avoid, reintroduced here. Fixed by
+`TransferQueue._relevant_remote_total`: sum each tracked descendant file's `remote_size`,
+excluding any currently `EXCLUDED`, reusing the state a real scan already assigned rather than
+re-deriving pattern matches inside the completeness check. Falls back to the raw
+`proc.bytes_total` only when no descendant rows are tracked yet (a `pget` job's single target,
+or a job spawned before any scan ever populated children — not the production path, since
+auto-queue eligibility and the settle/mount gates all already depend on a prior scan).
+
+**Decision: `output_tail` is retained on *every* successful job, not just the incomplete
+case.** The prompt allowed either (retain unconditionally, or null-on-clean-success but keep
+it for the incomplete branch) and asked for whichever is chosen to be justified. Retaining
+unconditionally was simpler to implement correctly (one `UPDATE`, no second write path for the
+incomplete branch) and cheap: 4 KB per job (`lftp.OUTPUT_TAIL_BYTES`) against a `job` table
+`list_jobs()` already bounds by construction and `api/history.py` already paginates. This is
+also the fix for the actual incident's second half: job 43's own output had already been
+captured and was then deliberately thrown away by the unconditional-null `UPDATE`, which is
+exactly why the incident took a long live debugging session to characterise instead of reading
+straight off the row.
+
+**Decision: `succeeded` joined `list_jobs()`'s surfaced states (one per item, `MAX(id)`,
+`dismissed_at`-filtered) rather than a new "recent successes" endpoint.** Reuses the identical
+bounded shape `failed`/`cancelled` already had, dismissible via the existing `dismiss_job`
+mechanism (extended to accept `succeeded`) rather than inventing a second dismissal path. This
+is what makes a completed transfer visible at all — before this, a job that finished cleanly
+vanished from Transfers the instant it was reaped, which is what let seven real minutes of
+transfer read, from the UI, as nothing running and 0 B/s in the header.
+
+**Step 5 (the `bytes_start = 18 GB` anomaly on a confirmed-empty directory): not reproduced.**
+Traced `core/reconcile.py`'s rollup and `core/engine.py._persist`'s write path in full; both
+recompute `local_size` fresh from the local scan on every pass, including for "protected" rows,
+so nothing found there would explain a stale multi-gigabyte value surviving several scan
+intervals before spawn. Recorded in `prompts/open-issues.md` as an open, unreproduced defect
+rather than papered over with a speculative fix — see that file for the leading hypothesis and
+what would be needed to confirm it.
+
+---
+
 ## 2026-08-13 — In-app Docs section: components not Markdown, in-app not README, and one
 ## shared popover primitive instead of a third popup mechanism
 

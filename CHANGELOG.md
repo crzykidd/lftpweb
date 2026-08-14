@@ -798,6 +798,35 @@ alongside this list: several entries below ship with deliberate, documented limi
   window; this also means the figure now counts bytes from attempts that later failed, not only
   fully completed transfers, which is the more honest answer to "how much did this actually move
   in the last day." The "24h" item is now a link to the Dashboard.
+- **`lftp` exiting 0 was treated as proof a transfer completed** *(2026-08-14, live incident: a
+  job exited 0 having left one file 500 MB short as a `.lftp` temp file, and the item was marked
+  `DOWNLOADED` and handed to post-processing anyway)*. `set cmd:fail-exit true`'s exit 0 means
+  lftp reported no error, not that every byte arrived — before an item can now reach
+  `DOWNLOADED`, `core/queue.py._reap_one` confirms completeness from the filesystem: no leftover
+  `.lftp`/`.lftp~<timestamp>~` temp file or orphaned `.lftp-pget-status` sidecar anywhere under
+  the item, and local bytes meeting the relevant remote total (excluding anything `EXCLUDED` by
+  a `file_exclude` pattern, so this can't reintroduce the archive-cleanup infinite-loop failure
+  mode §6 already solved for). **Behaviour change an existing install will notice:** an item that
+  used to reach `DOWNLOADED` off a short transfer now goes `PARTIAL` and re-queues instead —
+  auto-queue's existing eligibility picks it back up and `lftp -c` resumes from what's already on
+  disk, rather than a bad import or (on a `move` queue) a bad remote delete going out on
+  incomplete evidence. A new `incomplete_on_exit_zero` event names the expected-vs-actual byte
+  counts and the leftover file(s) — the row that would have explained the incident at a glance.
+  In the same fix: a successful job's `output_tail` is retained now instead of being nulled (the
+  one job whose success was in doubt had its own explanatory output captured and then thrown
+  away by the same code path), and the Transfers page now surfaces the item's most recent
+  succeeded job (dismissible, same as a failed/cancelled one) instead of a completed transfer
+  vanishing from the page the instant it's reaped — the gap that made the live incident look, for
+  seven real minutes, like nothing was running and the header read 0 B/s.
+- **A job's `bytes_total` could exceed its own `bytes_done`'s denominator** *(2026-08-14, same
+  live incident: the API returned `bytes_total: 31812118603` alongside `bytes_done:
+  38841560420` for one job)*. `job.bytes_total` was never persisted at spawn, so every API
+  response fell back to the *live* `item.remote_size` — a value that can drift after the job
+  spawned (a later scan, a pattern edit) while `bytes_done` stayed fixed at whatever
+  `remote_size` was when the job actually finished. `core/queue.py._spawn_decision` now freezes
+  `job.bytes_total` at spawn, the same "fixed at admission, never re-shaped" invariant §4.5
+  already uses for bandwidth; `api/jobs.py`/`api/history.py` prefer that frozen value over the
+  live column.
 
 ### Security
 
