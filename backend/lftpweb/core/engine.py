@@ -1017,6 +1017,33 @@ class Engine:
             "SELECT item.rel_path FROM item WHERE item.queue_id = ? AND ("
             "  item.auto_queue_suppressed = 1"
             "  OR EXISTS (SELECT 1 FROM job WHERE job.item_id = item.id AND job.state IN ('queued', 'running'))"
+            # **Descendants of an item with an active job are protected too** (2026-08-14).
+            # A `mirror` job is tracked against the *top-level* item alone, so a child file
+            # inside a downloading release has no `job` row of its own and was never caught by
+            # the clause above -- yet `core/queue.py._publish_child_progress` writes exactly
+            # those children's `local_size`/`state` on every progress tick. Two writers, one
+            # unprotected row.
+            #
+            # Reported live: with "folder prefix during transfer" on, children flipped between
+            # PARTIAL and REMOTE_ONLY every few seconds. The prefix makes it reproducible --
+            # `scan_local(extra_dir_prefixes=...)` deliberately hides the in-flight
+            # `.downloading-<name>/` tree, so the reconciler sees no local bytes for those
+            # children and computes REMOTE_ONLY, which the next progress tick overwrites back
+            # to PARTIAL. The 5s active-queue pass (`33db032`) turned a 30s flip into a 5s one
+            # and is what made it obvious, but neither feature is the cause: the subtree simply
+            # was never protected, and `core/queue.py` has owned a running job's item state
+            # since phase 3 (see this method's own second paragraph).
+            #
+            # `instr(...) = 1` rather than `LIKE parent.rel_path || '/%'`: an exact prefix test
+            # with no wildcard semantics, so a release name containing `%` or `_` can't
+            # over-match (SQLite's `_` matches any single character). Bounded by the active job
+            # count, which is a handful by construction.
+            "  OR EXISTS ("
+            "    SELECT 1 FROM item AS parent"
+            "    JOIN job ON job.item_id = parent.id AND job.state IN ('queued', 'running')"
+            "    WHERE parent.queue_id = item.queue_id"
+            "      AND instr(item.rel_path, parent.rel_path || '/') = 1"
+            "  )"
             f"{in_flight_clause}"
             ")",
             (queue_id, *in_flight),

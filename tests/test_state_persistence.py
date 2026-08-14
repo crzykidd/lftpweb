@@ -808,3 +808,145 @@ async def test_a_row_that_leaves_both_trees_and_later_returns_is_published_again
         assert published.get(REL_PATH) == "REMOTE_ONLY", "content returned -- published again"
     finally:
         await db.close()
+
+
+# --- 5. A mirror job's children are protected too (2026-08-14) --------------------------------
+#
+# Reported live: with "folder prefix during transfer" enabled, the files inside a downloading
+# release flipped between PARTIAL and REMOTE_ONLY every few seconds.
+#
+# Two writers, one unprotected row. A `mirror` job is tracked against the *top-level* item only,
+# so a child file has no `job` row of its own and `_protected_rel_paths` never caught it -- while
+# `core/queue.py._publish_child_progress` writes exactly those children's `local_size`/`state` on
+# every progress tick. The prefix is what makes it reproducible rather than theoretical:
+# `scan_local(extra_dir_prefixes=...)` deliberately hides the in-flight `.downloading-<name>/`
+# tree, so the reconciler sees no local bytes for those children and computes REMOTE_ONLY.
+#
+# The 5s active-queue pass turned a 30s flip into a 5s one and is what made it visible, but
+# neither feature is the cause -- the subtree simply was never protected.
+
+
+async def _make_parent_child_engine(tmp_path, monkeypatch, *, child_state: str):
+    """A directory item with a running `mirror` job and one child file, scanned against a local
+    tree that shows *nothing* -- exactly what `scan_local` returns while the prefixed in-flight
+    directory is filtered out.
+    """
+    parent_rel = "Release.Dir"
+    child_rel = f"{parent_rel}/episode.mkv"
+
+    db = await aiosqlite.connect(":memory:")
+    db.row_factory = aiosqlite.Row
+    await db.execute("PRAGMA foreign_keys = ON")
+    await migrate(db)
+
+    cursor = await db.execute(
+        "INSERT INTO host (name, address, port, username, auth_method, known_hosts_policy) "
+        "VALUES ('h', '127.0.0.1', 22, 'u', 'key', 'strict')"
+    )
+    host_id = cursor.lastrowid
+    cursor = await db.execute(
+        "INSERT INTO path_queue (host_id, name, remote_path, local_path, enabled, sync_mode) "
+        "VALUES (?, 'q', '/remote', ?, 1, 'copy')",
+        (host_id, str(tmp_path)),
+    )
+    queue_id = cursor.lastrowid
+
+    cursor = await db.execute(
+        "INSERT INTO item (queue_id, rel_path, is_dir, remote_size, local_size, state) "
+        "VALUES (?, ?, 1, ?, NULL, 'DOWNLOADING')",
+        (queue_id, parent_rel, SIZE),
+    )
+    parent_id = cursor.lastrowid
+    cursor = await db.execute(
+        "INSERT INTO item (queue_id, rel_path, is_dir, remote_size, local_size, state) "
+        "VALUES (?, ?, 0, ?, ?, ?)",
+        (queue_id, child_rel, SIZE, SIZE // 2, child_state),
+    )
+    child_id = cursor.lastrowid
+    await db.execute(
+        "INSERT INTO job (item_id, kind, state, lane) VALUES (?, 'mirror', 'running', 'main')",
+        (parent_id,),
+    )
+    await db.commit()
+
+    await save_settle_settings(db, SettleSettings(enabled=False))
+    # The prefixed in-flight directory is filtered out of the local walk, so the reconciler sees
+    # an empty local tree even though bytes are landing.
+    monkeypatch.setattr(engine_module.local_scan, "scan_local", lambda root, **_kwargs: {})  # noqa: ARG005
+
+    engine = Engine(db, str(tmp_path), EventBus())
+    engine.pool = _FakePool(
+        {
+            parent_rel: RemoteEntry(rel_path=parent_rel, is_dir=True, size=0, mtime=1.0),
+            child_rel: RemoteEntry(rel_path=child_rel, is_dir=False, size=SIZE, mtime=1.0),
+        }
+    )
+    q = QueueConfig(
+        id=queue_id,
+        host_id=host_id,
+        name="q",
+        remote_path="/remote",
+        local_path=str(tmp_path),
+        staging_path=None,
+        enabled=True,
+        sync_mode="copy",
+    )
+    host = HostConfig(
+        id=host_id,
+        address="127.0.0.1",
+        port=22,
+        username="u",
+        auth_method="key",
+        known_hosts_policy="strict",
+    )
+    return engine, q, host, db, parent_id, child_id
+
+
+async def test_a_childs_state_is_not_overwritten_while_its_parent_job_runs(tmp_path, monkeypatch):
+    """The reported bug. `core/queue.py._publish_child_progress` set PARTIAL; the scan used to
+    recompute REMOTE_ONLY off an empty local tree and stomp it, once per pass.
+    """
+    engine, q, host, db, _parent_id, child_id = await _make_parent_child_engine(
+        tmp_path, monkeypatch, child_state="PARTIAL"
+    )
+    try:
+        await engine.scan_queue(q, host)
+        assert (await _state_of(db, child_id))[0] == "PARTIAL"
+        # Repeated passes must not flip it either -- the flip was per-scan, not first-scan-only.
+        await engine.scan_queue(q, host)
+        assert (await _state_of(db, child_id))[0] == "PARTIAL"
+    finally:
+        await db.close()
+
+
+async def test_the_parent_itself_is_still_protected(tmp_path, monkeypatch):
+    """Unchanged behaviour, guarded: the top-level item has its own job row and was already
+    protected before this change.
+    """
+    engine, q, host, db, parent_id, _child_id = await _make_parent_child_engine(
+        tmp_path, monkeypatch, child_state="PARTIAL"
+    )
+    try:
+        await engine.scan_queue(q, host)
+        assert (await _state_of(db, parent_id))[0] == "DOWNLOADING"
+    finally:
+        await db.close()
+
+
+async def test_a_child_is_recomputed_again_once_the_job_finishes(tmp_path, monkeypatch):
+    """Protection must not outlive the job -- otherwise a crashed or completed transfer would
+    wedge every child at whatever the last progress tick wrote, which is the same failure shape
+    `test_a_crashed_worker_does_not_wedge_the_item` guards for the transient states.
+    """
+    engine, q, host, db, _parent_id, child_id = await _make_parent_child_engine(
+        tmp_path, monkeypatch, child_state="PARTIAL"
+    )
+    try:
+        await db.execute("UPDATE job SET state = 'succeeded'")
+        await db.commit()
+        await engine.scan_queue(q, host)
+        assert (await _state_of(db, child_id))[
+            0
+        ] == "REMOTE_ONLY", "no active job -- the structural reading wins again"
+    finally:
+        await db.close()

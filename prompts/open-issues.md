@@ -151,6 +151,40 @@ importing completed episodes mid-`mirror` and deleting the release folder while 
 transferring into it. That one **was** a real gap, and it is what
 `prompts/done/2026-08-14-in-flight-folder-prefix.md` closed.
 
+### The folder prefix and the settle gate's stuck-item recovery don't compose
+
+2026-08-14, found by auditing every caller that builds a local path after two prefix bugs in one
+morning. **Not data loss, and self-recovering when auto-queue is on** — recorded because the
+failure shape is non-obvious and the obvious fix is worse than the problem.
+
+`core/engine.py`'s `unstuck` path (the settle gate's own stuck-item follow-up) rescues an item
+whose job succeeded while the remote was still settling: a later scan computes it structurally
+`DOWNLOADED` and fires post-processing directly. **With "folder prefix during transfer" enabled,
+that can never fire.** `scan_local(extra_dir_prefixes=...)` deliberately hides the in-flight
+`.downloading-<name>/` tree, so the item has no visible local bytes and computes `REMOTE_ONLY`
+however complete the copy on disk actually is.
+
+Same root cause as the two bugs fixed the same morning (the PARTIAL/REMOTE_ONLY flip and delete
+failing on a stopped transfer): **something assumed an item's logical path and its physical path
+are the same thing.** Three defects, one assumption.
+
+**Recovery, and why it is left alone.** With auto-queue on the item recovers by itself: it is
+`REMOTE_ONLY`, eligible, settled and unsuppressed, so it re-queues, lftp resumes into the
+existing prefixed directory, finds everything present, exits 0, and *this* time `settled and
+complete` both hold — so `_reap_one` renames and completes it. That is exactly the path
+`testfolder10`'s job 44 took. With auto-queue **off**, nothing un-sticks it and a human has to
+click Queue on an item that already has a full copy on disk.
+
+The tempting fix — also renaming from the settle-release path — adds a **second owner of the
+prefix rename**, and every bug in this feature so far came from two places disagreeing about a
+path. One owner (`core/queue.py._reap_one`) plus re-queue as the recovery is the smaller blast
+radius. Revisit only if this is actually hit.
+
+**Audited and clear at the same time:** `core/postprocess.py` (its trigger shares the rename's
+`settled and complete` gate, and a failed rename sets `complete = False`), retention deletion (it
+routes through `delete_local`, which resolves the physical root), and the orphan-temp sweeper
+(age-gated at 2 days; a live transfer refreshes mtime constantly).
+
 ### Smaller, and genuinely optional
 
 - **Row lifetime** — nothing deletes `item` rows. [Issue #1](https://github.com/crzykidd/lftpweb/issues/1).

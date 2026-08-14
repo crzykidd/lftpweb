@@ -2239,3 +2239,130 @@ async def test_delete_extracted_archives_no_archives_logs_debug_not_an_event(tmp
         ), "the one withhold that used to leave no trace at all must at least log at debug"
     finally:
         await db.close()
+
+
+# --- "Folder prefix during transfer": delete has to find the bytes where they actually are ----
+#
+# Reported live 2026-08-14: stop a directory transfer mid-stream with the prefix enabled, hit
+# Delete to clean up, and the UI errored. `delete_local` built `root / rel_path` -- the *logical*
+# name -- while the files were still sitting under `<prefix><name>/`, because
+# `core/queue.py._reap_one` only renames a prefixed directory onto its logical name on a
+# successful, complete job (and clears `item.pending_download_prefix` in the same statement).
+# So a stopped item keeps the column set, and that is the signal to follow.
+
+
+async def test_delete_finds_a_stopped_transfers_files_under_the_prefixed_directory(tmp_path):
+    """The reported bug: without the fix this withholds with "does not exist -- nothing to
+    delete" and the user has no way to clean up through the UI.
+    """
+    local_root = tmp_path / "local"
+    local_root.mkdir()
+    prefixed = local_root / ".downloading-Release"
+    prefixed.mkdir()
+    (prefixed / "a.mkv").write_bytes(b"x" * 10)
+    (prefixed / "b.mkv.lftp").write_bytes(b"x" * 5)
+    write_if_needed(str(local_root))
+
+    db = await _make_db()
+    try:
+        queue_id = await _make_queue(db, local_root)
+        item_id = await _make_item(
+            db, queue_id, "Release", is_dir=True, state="STOPPED", local_size=15
+        )
+        await db.execute(
+            "UPDATE item SET pending_download_prefix = '.downloading-' WHERE id = ?", (item_id,)
+        )
+        await db.commit()
+
+        outcome = await local_delete.delete_local(
+            db,
+            item=await _item_row(db, item_id),
+            queue=await _queue_row(db, queue_id),
+            caller="manual",
+            require_nlink_guard=False,
+            in_flight_item_ids=frozenset(),
+        )
+
+        assert outcome.deleted is True, outcome.reason
+        assert not prefixed.exists(), "the prefixed directory is what actually held the bytes"
+    finally:
+        await db.close()
+
+
+async def test_delete_of_a_child_inside_a_prefixed_directory_resolves_through_its_parent(
+    tmp_path,
+):
+    """`pending_download_prefix` is only ever written on the item a job was spawned for -- the
+    top-level one -- so a child row carries NULL while still living under the prefixed parent.
+    Resolution has to go through the first path segment, not the child's own row.
+    """
+    local_root = tmp_path / "local"
+    local_root.mkdir()
+    prefixed = local_root / ".downloading-Release"
+    prefixed.mkdir()
+    (prefixed / "a.mkv").write_bytes(b"x" * 10)
+    (prefixed / "b.mkv").write_bytes(b"x" * 10)
+    write_if_needed(str(local_root))
+
+    db = await _make_db()
+    try:
+        queue_id = await _make_queue(db, local_root)
+        parent_id = await _make_item(
+            db, queue_id, "Release", is_dir=True, state="STOPPED", local_size=20
+        )
+        await db.execute(
+            "UPDATE item SET pending_download_prefix = '.downloading-' WHERE id = ?", (parent_id,)
+        )
+        child_id = await _make_item(db, queue_id, "Release/a.mkv", local_size=10)
+        await db.commit()
+
+        outcome = await local_delete.delete_local(
+            db,
+            item=await _item_row(db, child_id),
+            queue=await _queue_row(db, queue_id),
+            caller="manual",
+            require_nlink_guard=False,
+            in_flight_item_ids=frozenset(),
+        )
+
+        assert outcome.deleted is True, outcome.reason
+        assert not (prefixed / "a.mkv").exists()
+        assert (prefixed / "b.mkv").exists(), "only the named child, not its siblings"
+    finally:
+        await db.close()
+
+
+async def test_a_stale_prefix_column_falls_back_to_the_logical_path(tmp_path):
+    """Safe to call unconditionally: if the prefixed path is not on disk (a prefix changed
+    between spawn and now, or a rename that already happened), resolution must fall back rather
+    than refuse. It can only ever redirect to a path that exists.
+    """
+    local_root = tmp_path / "local"
+    local_root.mkdir()
+    release = local_root / "Release"
+    release.mkdir()
+    (release / "a.mkv").write_bytes(b"x" * 10)
+    write_if_needed(str(local_root))
+
+    db = await _make_db()
+    try:
+        queue_id = await _make_queue(db, local_root)
+        item_id = await _make_item(db, queue_id, "Release", is_dir=True, local_size=10)
+        await db.execute(
+            "UPDATE item SET pending_download_prefix = '.downloading-' WHERE id = ?", (item_id,)
+        )
+        await db.commit()
+
+        outcome = await local_delete.delete_local(
+            db,
+            item=await _item_row(db, item_id),
+            queue=await _queue_row(db, queue_id),
+            caller="manual",
+            require_nlink_guard=False,
+            in_flight_item_ids=frozenset(),
+        )
+
+        assert outcome.deleted is True, outcome.reason
+        assert not release.exists()
+    finally:
+        await db.close()

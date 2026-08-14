@@ -430,6 +430,51 @@ def _all_hardlinked(local_root: Path, resolved: Path) -> bool:
     return True
 
 
+async def _physical_local_root(
+    db: aiosqlite.Connection, *, queue_id: int, root: Path, rel_path: str
+) -> Path:
+    """Where this item's bytes **actually are** on disk, which is not `root / rel_path` whenever
+    "folder prefix during transfer" is in play (2026-08-14, `core/download_prefix.py`).
+
+    **The bug this exists for.** Stop a directory transfer mid-stream with the prefix enabled and
+    its files stay at `<local_path>/<prefix><name>/` -- `core/queue.py._reap_one` renames a
+    prefixed directory onto its logical name only on a *successful, complete* job, and clears
+    `item.pending_download_prefix` in that same statement. Delete then looked for
+    `<local_path>/<name>/`, found nothing, and refused with "does not exist -- nothing to
+    delete", leaving the user no way to clean up through the UI.
+
+    A set `pending_download_prefix` therefore means exactly "the bytes are still under the
+    prefixed name"; `NULL` means there is nothing in flight to account for.
+
+    **Resolved from the top-level ancestor, not from this row.** The column is only ever written
+    on the item a job was spawned for -- the top-level one (`_spawn_decision`) -- so a *child*
+    row inside a prefixed directory carries `NULL` while still physically living under the
+    prefixed parent. Splitting the first path segment off and looking that up covers both shapes
+    with one query; deleting a single file out of a still-prefixed release is a real thing the
+    Files page can ask for.
+
+    Falls back to the logical path whenever the prefixed one is not actually on disk. That covers
+    a stale column (a prefix changed between the spawn and now) and makes this safe to call
+    unconditionally: it can only ever redirect to a path that exists.
+    """
+    top = rel_path.split("/", 1)[0]
+    cursor = await db.execute(
+        "SELECT pending_download_prefix FROM item WHERE queue_id = ? AND rel_path = ?",
+        (queue_id, top),
+    )
+    row = await cursor.fetchone()
+    prefix = row["pending_download_prefix"] if row is not None else None
+    if not prefix:
+        return root / rel_path
+
+    rest = rel_path[len(top) :].lstrip("/")
+    prefixed = root / f"{prefix}{top}"
+    candidate = prefixed / rest if rest else prefixed
+    if candidate.exists() or candidate.is_symlink():
+        return candidate
+    return root / rel_path
+
+
 async def delete_local(
     db: aiosqlite.Connection,
     *,
@@ -501,11 +546,13 @@ async def delete_local(
 
     local_path = queue["local_path"].rstrip("/")
     root = Path(local_path)
-    local_root = root / rel_path
+    local_root = await _physical_local_root(db, queue_id=queue_id, root=root, rel_path=rel_path)
 
     # 1. Path containment (non-negotiable -- prompts/2026-08-12-local-deletion-and-retention.md
     # calls this out by name). A `LOCAL_ONLY` item can be a symlink; refuse to follow one that
-    # would place the real target outside the queue's local root.
+    # would place the real target outside the queue's local root. Deliberately applied to the
+    # *physical* root resolved above, not the logical one -- containment must be checked against
+    # the path this function is actually going to remove.
     resolved = extract.resolve_within_root(local_root, root)
     if resolved is None:
         return await withhold(
