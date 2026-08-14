@@ -39,6 +39,22 @@ DEFAULT_MAX_ATTEMPTS = 3
 DEFAULT_RETRY_BACKOFF_BASE_S = 30.0
 DEFAULT_RETRY_BACKOFF_MAX_S = 15 * 60.0
 
+
+def compute_retry_backoff(base_s: float, attempt: int) -> float:
+    """Seconds to wait before retry number `attempt` (1-based -- the attempt that just failed).
+    Exponential from `base_s`, doubling per attempt, clamped to `DEFAULT_RETRY_BACKOFF_MAX_S`.
+
+    A pure function purely so it can be unit-tested without driving a real job through
+    `_reap_one` (the same shape `core/scheduler.py.admit` and `core/settle.py` already use). It
+    exists because this arithmetic silently ignored `TransferSettings.retry_backoff_base_s` from
+    phase 3a until 2026-08-14 -- the setting round-tripped through the API and the Settings form
+    the whole time while `_reap_one` read the module constant instead, so the field was a live
+    control that did nothing. Nothing tested it, which is exactly how it survived; the fix is
+    paired with the test that would have caught it.
+    """
+    return min(base_s * (2 ** (attempt - 1)), DEFAULT_RETRY_BACKOFF_MAX_S)
+
+
 # Transient vs. permanent (DESIGN.md §4.3) — the same whitelist `core/lftp.py` uses for the
 # same reason (see its module docstring): only retry what we can positively identify as
 # transient, never "everything that isn't in the permanent list."
@@ -793,14 +809,20 @@ class TransferQueue:
             (exit_code, error_class, tail[-lftp.OUTPUT_TAIL_BYTES :], finished_at, proc.job_id),
         )
 
-        max_attempts = (await load_transfer_settings(self.db)).max_attempts
+        transfer_settings = await load_transfer_settings(self.db)
+        max_attempts = transfer_settings.max_attempts
         current_attempt = await self._current_attempt(proc.job_id)
         can_retry = error_class in lftp.TRANSIENT_ERROR_CLASSES and current_attempt < max_attempts
         if can_retry:
-            backoff = min(
-                DEFAULT_RETRY_BACKOFF_BASE_S * (2 ** (current_attempt - 1)),
-                DEFAULT_RETRY_BACKOFF_MAX_S,
-            )
+            # `transfer_settings.retry_backoff_base_s`, not `DEFAULT_RETRY_BACKOFF_BASE_S`
+            # (2026-08-14): the setting round-tripped through `TransferSettings` and Settings ->
+            # Transfer's own form since phase 3a, but this line read the module constant instead,
+            # so changing the field did nothing at all -- a control that looks live and is not.
+            # Found during the FieldHelp sweep while verifying that field's help text against the
+            # code, which is exactly the check that sweep exists to force
+            # (prompts/done/2026-08-13-field-help-sweep.md). The constant remains the dataclass
+            # default, so an install that never touched the setting sees no behavior change.
+            backoff = compute_retry_backoff(transfer_settings.retry_backoff_base_s, current_attempt)
             self._backoff_until[proc.item_id] = time.monotonic() + backoff
             await self._insert_job(
                 proc.item_id, kind=proc.kind, lane=proc.lane, attempt=current_attempt + 1

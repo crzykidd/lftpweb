@@ -653,12 +653,14 @@ export function TransferTab() {
             help={
               <FieldHelp label="Retry backoff base (seconds)">
                 <p>
-                  <strong>This field is currently not applied.</strong> Verified against{' '}
-                  <code>core/queue.py</code>: the retry delay is computed from a hardcoded 30s
-                  base (doubling per attempt, capped at 15 minutes), never from this saved
-                  value. Changing this number has no effect on how long lftpweb actually waits
-                  between retries — a backend defect found while writing this help text, not
-                  yet fixed.
+                  How long lftpweb waits before retrying a transfer that failed with a{' '}
+                  <em>transient</em> error (host unreachable, TLS, or a local filesystem error).
+                  The wait doubles each attempt — 30s, 60s, 120s at the default — and is capped
+                  at 15 minutes regardless of this value.
+                </p>
+                <p>
+                  A permanent failure (auth, permission denied, remote gone, disk full) is never
+                  retried, so this does not apply to those.
                 </p>
               </FieldHelp>
             }
