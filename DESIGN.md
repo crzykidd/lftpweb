@@ -1691,13 +1691,19 @@ state chip already reads (§2.2's one shared projection, never a second read of 
   fingerprint, and its `deleted_archive` bookkeeping together — missing any one of the latter
   two leaves a fresh item at the same path inheriting someone else's settle count, or (the
   named trap) reading `EXCLUDED` immediately because a stale `deleted_archive` row still folds
-  into the reconciler's completeness predicate. Three scopes: **selected items** (multi-select,
-  a violet "Reset item tracking" bulk action beside Delete's red one — the everyday case),
-  **whole queue** (typed queue-name confirmation, the most destructive action in the app), and
-  **purge by filename pattern** (single-queue only; a live preview of every top-level item the
-  pattern would match, reusing the identical `select`/`skip` evaluator — §4.7, §12 — is this
-  scope's own confirmation, since a typed pattern is easier to get wrong than a checkbox
-  selection). Every scope states the real consequence from the queue's own `sync_mode`/
+  into the reconciler's completeness predicate. One unified control (`QueueResetControls.tsx`,
+  2026-08-14 — previously three near-identical panels, one of them living entirely inside
+  `FileTree.tsx`'s own multi-select toolbar) with a scope selector and the identical
+  **choose scope → preview → confirm** flow for every scope: **selected items** (the everyday
+  case — reads the same lifted selection `FileTree.tsx`'s multi-select drives, so the two can
+  never disagree about what's checked), **whole queue** (the clean-slate case — previews every
+  top-level item first, then a typed queue-name confirmation as one deliberately removable final
+  stage, still required server-side; see `docs/decisions.md` for why it is considered borrowed
+  time now that this scope previews too), and **purge by filename pattern** (single-queue only;
+  a live preview of every top-level item the pattern would match, reusing the identical
+  `select`/`skip` evaluator — §4.7, §12 — is this scope's own confirmation, since a typed pattern
+  is easier to get wrong than a checkbox selection). Every scope states the real consequence
+  from the queue's own `sync_mode`/
   `auto_queue_enabled`/`scan_interval_s` rather than a generic warning — "N of M items still
   exist on the seedbox, and auto-queue is on, so they will start downloading again within
   about `scan_interval_s`" — plus two facts stated plainly regardless of counts: local files

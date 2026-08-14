@@ -11,26 +11,46 @@ import { formatRelativeTime } from '../lib/format'
  * the actions phase 2 explicitly deferred (no job engine existed yet): Queue / Stop per row
  * and in bulk via multi-select (`FileTree.tsx`), plus virtualization.
  */
+// A single shared empty `Set` for every queue that has never had anything selected -- avoids a
+// fresh `new Set()` (a new object identity every render) standing in for "nothing selected" in
+// `selectedByQueue`'s lookup below. Never mutated in place -- every writer here and in
+// `FileTree.tsx`/`QueueResetControls.tsx` builds a fresh `Set` and calls `onSelectionChange`,
+// the same immutable-update convention `useState` itself requires.
+const EMPTY_SELECTION: Set<string> = new Set()
+
 export function FilesPage() {
   const { queues, state, scanCompleteSeq, speedByItemId } = useLiveModel()
   const [rescanning, setRescanning] = useState(false)
+
+  // The Files-page multi-select, lifted here from `FileTree.tsx` (2026-08-14,
+  // prompts/2026-08-14-reset-panel-counts-and-layout.md) so `FileTree`'s own selection and
+  // `QueueResetControls`'s unified Selected scope can never disagree about what's selected --
+  // the alternative, letting each track its own copy, is strictly worse than the duplication
+  // this task set out to remove (see that prompt's own "architectural question," and
+  // docs/decisions.md). Keyed by queue id, one independent selection per queue's own section
+  // below -- each `<FileTree>`/`<QueueResetControls>` pair used to get its selection from
+  // `FileTree`'s own per-instance local state, which this preserves the effect of without
+  // hooks-in-a-loop (a single `Record` here, rather than one `useState` per queue).
+  const [selectedByQueue, setSelectedByQueue] = useState<Record<number, Set<string>>>({})
+  const getSelected = (queueId: number): Set<string> => selectedByQueue[queueId] ?? EMPTY_SELECTION
+  const setSelectedForQueue = (queueId: number, next: Set<string>) =>
+    setSelectedByQueue((prev) => ({ ...prev, [queueId]: next }))
 
   // The `path_queue` config this page's own `useLiveModel` reading never carries (`QueueFiles`
   // is deliberately just the tree -- `queue_id`/`queue_name`/nodes; see hooks/useLiveModel.ts's
   // own `QueueState`). Fetched once via the same REST endpoint Settings → Queues uses, and
   // needed here for exactly one thing added 2026-08-13
-  // (`prompts/2026-08-13-reset-item-tracking.md`): `FileTree`'s "Reset selected" and
-  // `QueueResetControls`'s whole-queue/purge-by-pattern panels need `sync_mode`/
-  // `auto_queue_enabled`/`scan_interval_s` to state the real re-download consequence rather
-  // than a generic hedge. Not live-updated over the socket -- these change rarely, and a stale
-  // read for the few seconds after an edit in Settings is a fine trade against a second
+  // (`prompts/2026-08-13-reset-item-tracking.md`): `QueueResetControls`'s every scope needs
+  // `sync_mode`/`auto_queue_enabled`/`scan_interval_s` to state the real re-download consequence
+  // rather than a generic hedge. Not live-updated over the socket -- these change rarely, and a
+  // stale read for the few seconds after an edit in Settings is a fine trade against a second
   // WS-driven cache for config that already has one.
   const [queueConfigs, setQueueConfigs] = useState<Record<number, PathQueueOut>>({})
   useEffect(() => {
     listQueues()
       .then((rows) => setQueueConfigs(Object.fromEntries(rows.map((q) => [q.id, q]))))
       .catch(() => {
-        // Degrades gracefully: FileTree/QueueResetControls below fall back to safe defaults
+        // Degrades gracefully: QueueResetControls below falls back to safe defaults
         // (`copy`/`false`/`null`) when a queue's config hasn't loaded yet, same as
         // `settleSettings`'s own load failure already does elsewhere on this page.
       })
@@ -124,14 +144,17 @@ export function FilesPage() {
             <FileTree
               nodes={queue.nodes}
               connected={state === 'open'}
-              syncMode={config?.sync_mode ?? 'copy'}
-              autoQueueEnabled={config?.auto_queue_enabled ?? false}
-              scanIntervalS={config?.scan_interval_s ?? null}
               speedByItemId={speedByItemId}
+              selected={getSelected(queue.queue_id)}
+              onSelectionChange={(next) => setSelectedForQueue(queue.queue_id, next)}
             />
-            {/* Queue-scoped reset controls (2026-08-13, prompts/2026-08-13-reset-item-tracking.md)
-             * -- the whole-queue and purge-by-pattern scopes, sitting below the tree rather than
-             * inside its toolbar since they act on the queue as a whole, not on a selection. */}
+            {/* The unified "Reset item tracking" control (2026-08-14,
+             * prompts/2026-08-14-reset-panel-counts-and-layout.md) -- one scope selector
+             * (All/Pattern/Selected) replacing the three near-identical panels this used to be
+             * split across (two here, one inside `FileTree.tsx`'s own multi-select toolbar).
+             * Sits below the tree since the All/Pattern scopes act on the queue as a whole, not
+             * just a selection; the Selected scope reads the same lifted `selected` set passed
+             * to `FileTree` above, so the two can never disagree about what's checked. */}
             <QueueResetControls
               queueId={queue.queue_id}
               queueName={queue.queue_name}
@@ -139,6 +162,8 @@ export function FilesPage() {
               autoQueueEnabled={config?.auto_queue_enabled ?? false}
               scanIntervalS={config?.scan_interval_s ?? null}
               nodes={queue.nodes}
+              selected={getSelected(queue.queue_id)}
+              onSelectionChange={(next) => setSelectedForQueue(queue.queue_id, next)}
             />
           </section>
         )

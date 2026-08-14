@@ -2,8 +2,8 @@ import { describe, expect, it } from 'vitest'
 import { resetWarningLines, type ResetQueueContext } from './resetWarning'
 
 const ALWAYS_TRUE_LINES = [
-  'Local files are not deleted -- this only resets tracking, not your data.',
-  "Transfer history for these items goes too: their job records are deleted outright, and any " +
+  'Local files are not deleted — this only resets tracking, not your data.',
+  'Transfer history for these items goes too: their job records are deleted outright, and any ' +
     'audit-log entries about them stay in History but lose the link back to them.',
 ]
 
@@ -98,6 +98,19 @@ describe('resetWarningLines', () => {
     it('says "This item still exists" for a single fully-surviving item', () => {
       const line = resetWarningLines(1, 1, ctx())[0]
       expect(line).toContain('This item still exists')
+    })
+  })
+
+  describe('total zero', () => {
+    it('returns a single plain line, not the always-true lines', () => {
+      const lines = resetWarningLines(0, 0, ctx())
+      expect(lines).toEqual(['Nothing matches this scope, so there is nothing to reset.'])
+    })
+
+    it('never mentions local files or transfer history when nothing matched', () => {
+      const lines = resetWarningLines(0, 0, ctx({ autoQueueEnabled: true }))
+      expect(lines.join(' ')).not.toContain('Local files')
+      expect(lines.join(' ')).not.toContain('Transfer history')
     })
   })
 })

@@ -6,6 +6,60 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-14 — Reset item tracking unified into one control; typed-name confirmation kept, on borrowed time
+
+**Handoff prompt `prompts/done/2026-08-14-reset-panel-counts-and-layout.md`, executed end to
+end.** Replaced three near-identical "Reset item tracking" UIs — whole-queue and
+purge-by-pattern in `QueueResetControls.tsx`, plus a third "selected items" panel that lived
+entirely inside `FileTree.tsx`'s own multi-select toolbar — with one control: a scope selector
+(**All / Pattern / Selected**), a Cancel that is now always present once the box is open (fixes
+a real defect: the old panels' dismiss controls both lived inside `preview &&` branches, so a
+panel opened by mistake could not be closed without running a preview first), and the identical
+**choose scope → preview → confirm** flow for every scope.
+
+**Decision: selection state moved up to `FilesPage.tsx`, not duplicated.** The unified control
+needed to read the Files-page selection (for the Selected scope) and `FileTree.tsx` needed to
+keep driving it (click, shift-range). Rather than give the new control its own second selection
+store — which would let the two disagree about what's checked on a destructive action, strictly
+worse than the panel duplication this task set out to remove — `FilesPage.tsx` now owns one
+`Record<queueId, Set<rel_path>>` and passes the relevant `Set` plus a setter to both
+`<FileTree>` and `<QueueResetControls>`. `FileTree.tsx` still owns every *mechanic* of selecting;
+only the `Set` itself moved. A single `useState` covering every queue, not one `useState` per
+queue, since hooks cannot live inside the `queues.map(...)` loop that renders each queue's
+section.
+
+**Decision: the whole-queue scope's typed-name confirmation stays, explicitly on borrowed
+time, built as one cleanly removable stage.** The user found typing the queue name "a little
+intense" and asked for preview-then-confirm on every scope. The typed name was originally
+justified because whole-queue reset had *no* preview at all — a blind "forget everything" with
+nothing on screen to review, so the keystrokes were the only thing standing between an
+accidental click and the most destructive action in the app. This task adds a preview to that
+scope too, and once the full list is on screen and has to be clicked past, typing the queue name
+adds friction without adding information — the review *is* the confirmation, the same argument
+`api/jobs.py.reset_by_pattern`'s own docstring already makes for the pattern scope. It was kept
+anyway because the server (`QueueResetRequest.confirm_name`, `api/jobs.py.reset_queue_all`)
+still requires it, and weakening a server-side guard was explicitly out of scope for a UI task.
+Implemented as a single `confirmStage: 'preview' | 'typed-name'` branch inside the All scope
+only — not a condition threaded through shared validation or the confirm button's enablement
+logic across scopes — so removing it later (frontend stage plus the backend check) should be a
+small, isolated diff, per the prompt's own instruction.
+
+**Decision: the composition breakdown (`"3 directories and 12 files — 15 items"`) and the
+zero-target branch both live in small, dedicated `lib/` files** (`resetComposition.ts`,
+extending `resetWarning.ts`), not inlined in the component — same reasoning as `resetWarning.ts`
+itself: pure functions that every scope reads identically can never quietly disagree, and they
+are unit-testable without mounting anything.
+
+**Not fixed, not attempted:** no backend change was needed or made — the existing
+`reset_item`/`reset_queue_all`/`reset_preview`/`reset_by_pattern` endpoints already supported
+every scope this UI needed. **This redesign could not be visually confirmed — no browser exists
+in this environment.** The flex-column confirmation-sentence fix (wrap the sentence in one
+`<span>` so the label has two flex children, not one row per text node/inline element) is
+reasoned from the CSS, not observed, and this whole control needs a human to click through
+before anyone trusts it end to end.
+
+---
+
 ## 2026-08-14 — Files page Speed column; column resize handles moved to the left edge
 
 **Handoff prompt `prompts/done/2026-08-14-files-page-speed-column.md`, executed end to end.**

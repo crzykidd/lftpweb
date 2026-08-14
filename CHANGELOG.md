@@ -435,6 +435,22 @@ alongside this list: several entries below ship with deliberate, documented limi
   engine's own in-memory model and republishes over the existing `queue_delta` wire shape (no
   new WebSocket message type needed) — without it, a fully-forgotten item with nothing left on
   either side would be a permanent ghost row no future scan would ever revisit.
+- **"Reset item tracking" unified into one control** *(2026-08-14)* — the three scopes above
+  used to be three near-identical panels (whole-queue and purge-by-pattern in
+  `QueueResetControls.tsx`, plus a third panel for selected items that lived entirely inside
+  `FileTree.tsx`'s own multi-select toolbar) with different ceremony per scope, which is exactly
+  why a live user could not tell them apart. Now one control: a scope selector
+  (**All / Pattern / Selected**), a **Cancel that is always present** once the box is open (the
+  old panels' dismiss controls both lived inside `preview &&` branches, so a panel opened by
+  mistake could not be closed without running a preview first), and the identical
+  **choose scope → preview → confirm** flow for every scope. The preview now reports a real
+  breakdown ("3 directories and 12 files — 15 items") instead of a bare count, with its own
+  explicit zero case rather than the previous "— 0 items" / "None of these 0 items still exist"
+  nonsense at an empty match. The whole-queue scope's typed-name confirmation stays for now (the
+  server still requires it) but moved to *after* the preview, as one cleanly removable stage —
+  see `docs/decisions.md` for why it's considered borrowed time. Selection state moved up to
+  `FilesPage.tsx` so `FileTree.tsx`'s own multi-select and the unified control's Selected scope
+  read the identical `Set`, rather than each tracking its own copy.
 - **A frontend test runner** *(2026-08-13)* — Vitest + happy-dom, `npm test`, wired into CI's
   "Frontend lint + typecheck" job. Until now the backend had 887 tests and the frontend had
   none; unit coverage now pins `lib/format.ts`, `lib/storage.ts`, and `lib/resetWarning.ts` in

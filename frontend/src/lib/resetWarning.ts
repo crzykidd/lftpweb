@@ -75,18 +75,29 @@ function reDownloadLine(total: number, remoteCount: number, ctx: ResetQueueConte
  * rather than a surprise.
  */
 const ALWAYS_TRUE_RESET_LINES = [
-  'Local files are not deleted -- this only resets tracking, not your data.',
-  "Transfer history for these items goes too: their job records are deleted outright, and any " +
+  'Local files are not deleted — this only resets tracking, not your data.',
+  'Transfer history for these items goes too: their job records are deleted outright, and any ' +
     'audit-log entries about them stay in History but lose the link back to them.',
 ]
 
 /** The full warning, in display order: the real-numbers consequence first (the thing most
  * likely to surprise someone), then the two always-true facts.
+ *
+ * `total === 0` (2026-08-14, prompts/2026-08-14-reset-panel-counts-and-layout.md) is its own
+ * branch, not a fall-through into `reDownloadLine`'s own `remoteCount === 0` case -- that case
+ * already reads sensibly ("None of these 3 items still exist…"), but at `total === 0` there are
+ * no items for the two always-true lines to be true *of*, and the old bare-count panel this
+ * function feeds rendered the nonsensical "— 0 items" / "None of these 0 items still exist on
+ * the seedbox, so nothing will be re-downloaded." A single plain line, with neither always-true
+ * line following it, is what actually describes "nothing matched."
  */
 export function resetWarningLines(
   total: number,
   remoteCount: number,
   ctx: ResetQueueContext,
 ): string[] {
+  if (total === 0) {
+    return ['Nothing matches this scope, so there is nothing to reset.']
+  }
   return [reDownloadLine(total, remoteCount, ctx), ...ALWAYS_TRUE_RESET_LINES]
 }

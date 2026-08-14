@@ -181,11 +181,13 @@ export function ConceptsPage() {
           that line; it is accurate.
         </Warn>
         <P>
-          Reset has three scopes: the rows you have selected, a whole queue (which requires
-          typing the queue's name to confirm — the most destructive action in the app), and a
-          filename pattern, which previews exactly what it would match first. Any target that is
-          busy — mid-transfer, mid-post-processing, mid-delete — is skipped and reported rather
-          than raced.
+          Reset lives in one control on the Files page, below the file tree, with a scope
+          selector — the rows you have selected, a whole queue, or a filename pattern — and
+          Cancel always available. Every scope follows the same flow: choose a scope, review a
+          preview of exactly what would be reset, then confirm. The whole-queue scope, the most
+          destructive, additionally asks you to type the queue's name once you have reviewed
+          that preview. Any target that is busy — mid-transfer, mid-post-processing, mid-delete —
+          is skipped and reported rather than raced.
         </P>
       </Section>
 
