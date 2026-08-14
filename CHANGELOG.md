@@ -743,6 +743,15 @@ alongside this list: several entries below ship with deliberate, documented limi
 
 ### Fixed
 
+- **Archive cleanup no longer deletes a release's archives after a failed verification**
+  *(2026-08-14)*. Found live: a release whose `.sfv` no longer matched its files reported
+  `CORRUPT`, extraction still succeeded, and cleanup then removed all twelve rar volumes (2.2 GB)
+  — destroying the only re-extractable source for an item the pipeline had just declared corrupt,
+  on a `move` queue where the remote copy is the only other one. Cleanup was gated on extraction
+  succeeding and never saw the verify result. It now withholds on `CORRUPT` and writes an
+  `archive_cleanup_withheld` event saying so. Deliberately one notch looser than the remote
+  delete's gate — `SKIPPED`/never-ran still cleans up, since requiring positive verification would
+  silently stop cleanup working for the many releases that ship no sidecar.
 - **Shutdown while transfers are running is now survivable in practice, not just in design.**
   `TransferQueue.stop()` SIGTERMs each in-flight lftp child so its `-c` resume state is written
   out cleanly, but it did so *sequentially* with a 10s grace each — up to ~40s with both lanes

@@ -522,7 +522,7 @@ class PostprocessPipeline:
 
         extract_state: str | None = None
         if extract_effective:
-            extract_state = await self._do_extract(item, queue, local_root, settings)
+            extract_state = await self._do_extract(item, queue, local_root, settings, verify_state)
 
         # The rename off the download-prefix ("folder prefix during transfer") is now the
         # pipeline's *last* step on a release nothing along the way flagged bad -- see
@@ -706,7 +706,12 @@ class PostprocessPipeline:
         await self._publish(item_id)
 
     async def _do_extract(
-        self, item: Any, queue: Any, local_root: Path, settings: PostprocessSettings
+        self,
+        item: Any,
+        queue: Any,
+        local_root: Path,
+        settings: PostprocessSettings,
+        verify_state: str | None = None,
     ) -> str | None:
         """Fix, 2026-08-12 (docs/decisions.md): `ok: bool` used to conflate "nothing to
         extract" with "extraction succeeded" -- a plain `.mkv` download on an auto-extract
@@ -802,7 +807,34 @@ class PostprocessPipeline:
         delete_archives_effective = _effective(
             queue["auto_delete_archives"], settings.delete_archives_after_extract
         )
-        if result.state == "EXTRACTED" and delete_archives_effective:
+        # **Never delete anything automatically after a failed verification** (2026-08-14, the
+        # user's own call: "I don't think we want to delete on a failed verification unless the
+        # user deletes"). Found live: a release whose `.sfv` no longer matched reported
+        # `CORRUPT`, extraction still succeeded, and cleanup then removed all twelve rar volumes
+        # (2.2 GB) — destroying the only re-extractable source for an item this codebase had
+        # *just* declared corrupt, on a `move` queue where the remote copy is the only other one.
+        #
+        # This makes archive cleanup consistent with the rule the more dangerous deletion already
+        # follows: `_maybe_delete_remote` above withholds on anything that is not a positive
+        # `VERIFIED`. The bar here is deliberately one notch lower — **`CORRUPT` withholds,
+        # `SKIPPED`/never-ran does not** — because the two deletions are not equivalent: the
+        # remote copy is irreplaceable, while these archives have already been expanded into
+        # content that survives either way, and requiring positive verification would silently
+        # stop cleanup working at all for the many releases that ship no sidecar.
+        if result.state == "EXTRACTED" and verify_state == "CORRUPT":
+            await audit.record_event(
+                self.db,
+                level="warning",
+                item_id=item["id"],
+                kind="archive_cleanup_withheld",
+                message=(
+                    f"delete-archives-after-extract: withheld for {item['rel_path']!r} "
+                    f"(queue {queue['id']} {queue['name']!r}) -- verification result was "
+                    f"{verify_state}, not VERIFIED. The archives are left in place so the "
+                    "release can be re-extracted; delete them by hand once you are satisfied."
+                ),
+            )
+        elif result.state == "EXTRACTED" and delete_archives_effective:
             # Imported locally: `core/local_delete.py` imports `core/mount_sentinel.py`, which
             # imports this module for `OWNED_STATES` -- a top-level import here would be
             # circular (the same reason `core/extract.py.extract_item` imports `move_tree`

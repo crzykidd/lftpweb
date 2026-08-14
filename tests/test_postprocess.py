@@ -2643,3 +2643,69 @@ async def test_extraction_stages_into_unpack_correctly_for_a_prefixed_item(tmp_p
         assert item["pending_download_prefix"] is None
     finally:
         await db.close()
+
+
+# --- Archive cleanup never runs after a failed verification (2026-08-14) ----------------------
+
+
+@pytestmark_unrar
+async def test_pipeline_withholds_archive_cleanup_when_verification_failed(tmp_path):
+    """The user's own call, 2026-08-14: "I don't think we want to delete on a failed verification
+    unless the user deletes."
+
+    Found live. A release whose `.sfv` no longer matched its (renamed) files reported `CORRUPT`;
+    extraction still succeeded, and cleanup then removed all twelve rar volumes -- 2.2 GB, the
+    only re-extractable source for an item the pipeline had *just* declared corrupt, on a `move`
+    queue where the remote copy is the only other one. Cleanup was gated on extraction succeeding
+    and never saw the verify result at all.
+
+    The bar here is deliberately one notch lower than `_maybe_delete_remote`'s: `CORRUPT`
+    withholds, `SKIPPED`/never-ran does not -- see the gate's own comment for why the two
+    deletions are not equivalent.
+    """
+    db = await _make_db()
+    try:
+        local_root = tmp_path / "local"
+        local_root.mkdir()
+        write_if_needed(str(local_root))
+        item_dir = await _make_multivolume_rar_release(local_root)
+        # Break the sidecar the same way the live incident did -- the CRC lines name files that
+        # do not exist, so verification legitimately fails while extraction still succeeds.
+        (item_dir / "checksums.sfv").write_text("some.other.release.rar 00000000\n")
+
+        _, queue_id = await _make_host_and_queue_rows(
+            db, sync_mode="copy", auto_verify=1, auto_extract=1, auto_delete_archives=1
+        )
+        await db.execute(
+            "UPDATE path_queue SET local_path = ? WHERE id = ?", (str(local_root), queue_id)
+        )
+        await db.commit()
+        item_id = await _make_item_row(db, queue_id, "Release", state="DOWNLOADED")
+        await db.execute("UPDATE item SET is_dir = 1 WHERE id = ?", (item_id,))
+        await db.commit()
+
+        pipeline = postprocess.PostprocessPipeline(
+            db=db, events=EventBus(), remote_pool=_FakeRemotePool(), host_provider=_async_host
+        )
+        settings = postprocess.PostprocessSettings(
+            verify_enabled=True, extract_enabled=True, delete_archives_after_extract=True
+        )
+        await pipeline.process_item(item_id, settings)
+
+        # The whole point: the archives are still there to re-extract from.
+        assert (item_dir / "release.rar").exists(), "a CORRUPT item's archives must survive"
+        assert (item_dir / "release.r00").exists()
+        assert (
+            await local_delete.load_deleted_archive_paths(db, queue_id) == set()
+        ), "nothing may be recorded as cleaned up either"
+
+        events = await (
+            await db.execute("SELECT kind, message FROM event WHERE item_id = ?", (item_id,))
+        ).fetchall()
+        kinds = [e["kind"] for e in events]
+        assert "archive_cleanup_withheld" in kinds, kinds
+        assert "archive_cleanup" not in kinds, kinds
+        withheld = next(e for e in events if e["kind"] == "archive_cleanup_withheld")
+        assert "CORRUPT" in withheld["message"]
+    finally:
+        await db.close()
