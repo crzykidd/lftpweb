@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { getPostprocessSettings, putPostprocessSettings } from '../../api/client'
 import type { PostprocessSettingsOut } from '../../api/types'
+import { FieldHelp } from '../../components/FieldHelp'
 
 const inputClasses =
   'w-full rounded-md border border-zinc-300 bg-white px-2.5 py-1.5 text-sm text-zinc-900 outline-none focus:border-zinc-500 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100'
@@ -162,7 +163,21 @@ export function PostProcessingTab() {
             onChange={(e) => update('extract_enabled', e.target.checked)}
           />
           <span className="text-sm text-zinc-700 dark:text-zinc-300">
-            Extract archives (7zz — zip/7z/rar/rar5/tar/gz/bz2/xz)
+            Extract archives (7zz for zip/7z/tar/gz/bz2/xz; unrar for rar/rar5)
+            <FieldHelp label="Extract archives">
+              <p>
+                Alpine's <code>7zz</code> package ships with no RAR codec at all — its RAR
+                decoder derives from unRAR source under a licence that forbids sharing it with
+                an archiver, so distros strip it. This image separately builds a freeware{' '}
+                <code>unrar</code> binary from RARLAB source (see <code>NOTICE</code>) just for
+                <code>.rar</code>/<code>.rar5</code> sets.
+              </p>
+              <p>
+                Dispatch is automatic by file extension — <code>7zz</code> handles
+                zip/7z/tar/gz/bz2/xz, <code>unrar</code> handles rar/rar5. There is nothing to
+                choose here; this one toggle covers both.
+              </p>
+            </FieldHelp>
           </span>
         </label>
         <label className="flex flex-col gap-1">
@@ -198,6 +213,26 @@ export function PostProcessingTab() {
           are never touched. Off by default, like every other capability in this project that
           deletes something.
         </p>
+        <p className="text-xs text-zinc-500 dark:text-zinc-400">
+          A failed extraction leaves its <code>_FAILED_</code> staging directory on disk as
+          diagnostic evidence, kept forever by default. Deleting those after N days (
+          <code>failed_retention_enabled</code>/<code>failed_retention_days</code>, default 14)
+          exists in the API this page already saves to (<code>PUT /api/settings/postprocess</code>
+          ) but has no field here yet — set it with a direct API call if you want it swept
+          automatically.
+        </p>
+      </div>
+
+      <div className="rounded-md border border-zinc-200 p-4 text-xs text-zinc-500 dark:border-zinc-800 dark:text-zinc-400">
+        Two more delete-something capabilities exist only through the API today, both off by
+        default: deleting an item's <em>local copy</em> N days after it finished (
+        <code>PUT /api/settings/retention</code>, with a dry-run preview) and sweeping stale
+        orphaned <code>.lftp</code> temp files (<code>PUT /api/settings/orphan-temp-cleanup</code>
+        ). See{' '}
+        <Link to="/docs/quick-start" className="underline">
+          Docs → Quick start
+        </Link>{' '}
+        for both — this page doesn't have their fields yet.
       </div>
 
       <div className="flex flex-col gap-2 rounded-md border border-zinc-200 p-4 dark:border-zinc-800">

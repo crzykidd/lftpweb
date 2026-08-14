@@ -116,6 +116,11 @@ export function BackupTab() {
             />
           </label>
         </div>
+        <p className="text-xs text-zinc-500 dark:text-zinc-400">
+          Checked hourly, not on a precise timer — a backup runs once at least "Every" days have
+          elapsed since the last one. Immediately after, backups older than the newest "Keep"
+          are deleted from disk, not archived elsewhere.
+        </p>
         <button type="button" disabled={saving} onClick={handleSaveSettings} className={buttonClasses}>
           {saving ? 'Saving…' : 'Save schedule'}
         </button>

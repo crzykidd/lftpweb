@@ -490,6 +490,21 @@ alongside this list: several entries below ship with deliberate, documented limi
   so the text is announced. Demonstrated on three fields here (**Sync mode**, **Patterns-only**,
   and **Known-hosts policy**); a companion task applies it across the rest of the settings
   surface.
+- **`FieldHelp` applied across the rest of Settings** *(2026-08-14)* — the companion task above
+  promised. Added to the fields where a wrong answer costs data or silently does nothing
+  (retention/failed-directory cleanup being API-only, said so rather than pretending there's a
+  UI), where a number's real effect isn't obvious (**Max concurrent jobs** is main-lane only —
+  the fast lane has its own independent budget and consumes none of these slots, so the two add
+  together for the real ceiling, and **Start now** bypasses the cap entirely), and around
+  **Extra lftp settings** (a rejected line can fail silently or with a misleading downstream
+  error — `net:reconnect-interval-base` refusing `5s` is the concrete story). Also fixed a wrong
+  label found in the process: **Extract archives** claimed `7zz` handles rar/rar5; it never has
+  (Alpine's `7zz` ships with no RAR codec) — the image's separately-built `unrar` does, and the
+  label/help now says so in both Settings → Post-processing and Settings → Queues. Found, but
+  deliberately *not* fixed as part of this sweep: **Settings → Transfer's "Retry backoff base"
+  field is inert** — the real retry delay is computed from a hardcoded constant, never from this
+  saved value; its `FieldHelp` says so plainly rather than describing behaviour that isn't real
+  (`docs/decisions.md`).
 - **Adaptive scan cadence: a queue refreshes every ~5 seconds while something is actually
   happening in it** *(2026-08-14)*. Previously every queue polled at one fixed interval
   (default 30s, overridable per queue) regardless of activity, so the Files page could lag

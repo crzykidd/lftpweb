@@ -93,7 +93,7 @@ export function ConceptsPage() {
             ],
             [
               <Code key="c">retries_exhausted</Code>,
-              'The transfer failed and will not be retried again on its own. Only two error classes are ever retried at all (host unreachable, TLS), so this also covers a failure lftpweb could not classify.',
+              'The transfer failed and will not be retried again on its own. Only three error classes are ever retried at all (host unreachable, TLS, and a transient local filesystem error), so this also covers a failure lftpweb could not classify.',
             ],
             [
               <Code key="c">permanent_error</Code>,

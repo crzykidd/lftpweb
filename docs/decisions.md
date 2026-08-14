@@ -6,6 +6,39 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-14 — Field-help sweep found a dead setting (`retry_backoff_base_s`) rather than fixing it
+
+**Handoff prompt `prompts/done/2026-08-13-field-help-sweep.md`, executed end to end.** Applying
+`FieldHelp` across Settings (`ConnectionTab`/`QueuesTab`'s two demonstrations from `dfff677` were
+the only prior usages) required verifying every claim against the code first — the same rule the
+Docs section was built to, and the rule that caught this.
+
+**`Settings → Transfer`'s "Retry backoff base (seconds)" field does nothing.** `core/queue.py`'s
+`TransferSettings.retry_backoff_base_s` is loaded, saved, and round-tripped through the API
+correctly, but the one place a retry delay is actually computed
+(`TransferQueue._reap_one`, near line 800) uses the module-level constant
+`DEFAULT_RETRY_BACKOFF_BASE_S` directly, never the loaded settings value — `retry_backoff_base_s`
+is grepped nowhere else in the backend. `max_attempts`, the field next to it, is read correctly
+from the same settings object two lines above the bug, which is presumably why this went
+unnoticed: the sibling field works, so the section "looks" wired up.
+
+**Not fixed here, on purpose.** The task's brief was explicit that no backend change was
+expected and to stop and report if one seemed required — a scheduler admission/retry change is
+exactly the kind of edit that wants its own review, not a rider on a copy-only sweep. Fixing the
+UI to describe backoff as configurable, knowing it isn't, would have reproduced the exact defect
+class this project keeps finding (the Dockerfile's nine-phase false rar claim, `7zz`'s label
+claiming rar/rar5 it never had) — so the field's `FieldHelp` states plainly that it is currently
+inert, cites the fixed 30s/doubling/15-minute-cap behaviour it actually gets instead, and leaves
+a real fix for a dedicated follow-up.
+
+**Same sweep, smaller catch:** `Docs → Concepts`' suppression table and the new Retry section
+both said "only two error classes are retried" (host unreachable, TLS). `core/lftp.py` added a
+third, `LOCAL_FS_ERROR`, on 2026-08-14 itself
+(`prompts/done/2026-08-14-local-errors-misclassified-as-remote-gone.md`) — the doc line was
+already stale by the time this task started reading it. Corrected in both places.
+
+---
+
 ## 2026-08-14 — "Folder prefix during transfer": reversing part of phase 5's `staging_path` decision, on new evidence, not a re-litigation
 
 **Handoff prompt `prompts/done/2026-08-14-in-flight-folder-prefix.md`, executed end to end.**

@@ -1,10 +1,21 @@
 ---
 name: 2026-08-13-field-help-sweep
-status: pending
+status: done
 created: 2026-08-13
 model: sonnet
-completed:
-result:
+completed: 2026-08-14
+result: >
+  Applied FieldHelp to Auto-queue, Extract archives (both Settings tabs), Max concurrent jobs,
+  Max attempts, Retry backoff base, Extra lftp settings, and Settings → Logs' Level filter.
+  Fixed the false "7zz handles rar/rar5" label in QueuesTab and PostProcessingTab to match
+  README/NOTICE. Added plain-text notes for API-only retention/failed-retention/orphan-cleanup
+  and for Backup's schedule semantics. Found and did NOT fix a backend bug: retry_backoff_base_s
+  is never read by the actual backoff calculation (core/queue.py); documented it truthfully in
+  the field's own help, README's Known gaps, and docs/decisions.md instead. Also corrected a
+  stale "two retryable error classes" claim (now three, since LOCAL_FS_ERROR joined 2026-08-14)
+  in Docs -> Concepts and the new Retry section text. All verification green: npm run lint/test/
+  build, uv run pytest (962 passed), ruff check/format, docker compose config x3. No backend
+  files touched.
 ---
 
 # Task: Per-field help across the settings surface, and one wrong label to fix

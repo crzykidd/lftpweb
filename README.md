@@ -87,8 +87,9 @@ opposed to the unbuilt UI above.
 
 ## Known gaps
 
-Named here rather than fixed silently or left to be rediscovered — each is a deliberate scope
-reduction made during the build, recorded in full in `docs/decisions.md`:
+Named here rather than fixed silently or left to be rediscovered — most are a deliberate scope
+reduction made during the build, recorded in full in `docs/decisions.md`; a few (marked below)
+are defects found but not yet fixed:
 
 - **Post-processing only runs when a job this app spawned succeeds, or when the settle gate
   releases a hold.** A file that arrives another way (a manual `cp`, a restore) is never
@@ -117,6 +118,12 @@ reduction made during the build, recorded in full in `docs/decisions.md`:
   location) only appears from the Files page.** `TransfersPage.tsx` opens the same drawer but
   doesn't have the owning queue's `local_path` loaded, so that one panel simply doesn't render
   there — every other section of the drawer is unaffected.
+- **Bug, not scope: Settings → Transfer's "Retry backoff base (seconds)" field is inert.** It
+  loads, saves, and round-trips through the API correctly, but the code that actually computes a
+  retry delay (`core/queue.py`'s `TransferQueue._reap_one`) reads a hardcoded module constant
+  instead of the saved setting. Every retryable failure backs off from a fixed 30 seconds,
+  doubling per attempt, capped at 15 minutes, regardless of what this field says. Found
+  2026-08-14 while writing that field's `FieldHelp` text; not yet fixed (`docs/decisions.md`).
 
 ## Locked out?
 

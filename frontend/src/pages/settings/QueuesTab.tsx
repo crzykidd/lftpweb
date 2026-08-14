@@ -738,7 +738,30 @@ export function QueuesTab() {
         </label>
 
         <div className="flex flex-col gap-2 rounded-md border border-zinc-200 p-3 dark:border-zinc-800">
-          <span className={labelClasses}>Auto-queue (DESIGN.md §4.7) — off by default</span>
+          <span className={labelClasses}>
+            Auto-queue (DESIGN.md §4.7) — off by default
+            <FieldHelp label="Auto-queue">
+              <p>
+                Runs at the end of every scan of this queue, picking up any new remote item the
+                patterns below select and queuing it for download — no click required.
+              </p>
+              <p>
+                Two things make it hold off even when a pattern matches:{' '}
+                <strong>suppression</strong> (an item that was stopped, permanently failed, or
+                that you deleted locally is never picked up again on its own) and, if the{' '}
+                <Link to="/settings/transfer" className="underline">
+                  settle gate
+                </Link>{' '}
+                is on, an item that's still visibly arriving. A manual <strong>Queue</strong>{' '}
+                click on the Files page bypasses both.
+              </p>
+              <p>
+                <Link to="/docs/concepts#suppression" className="underline">
+                  Suppression and the settle gate, in the docs →
+                </Link>
+              </p>
+            </FieldHelp>
+          </span>
           <label className="flex items-center gap-2">
             <input
               type="checkbox"
@@ -796,7 +819,25 @@ export function QueuesTab() {
             forcedOnMessage="Always runs for this move queue, regardless of the site-wide setting or any per-queue override — verification is the sole gate on the irreversible remote delete (DESIGN.md §6/§7.3)."
           />
           <InheritableToggle
-            label="Extract archives (7zz — zip/7z/rar/rar5/tar/gz/bz2/xz)"
+            label={
+              <>
+                Extract archives (7zz for zip/7z/tar/gz/bz2/xz; unrar for rar/rar5)
+                <FieldHelp label="Extract archives">
+                  <p>
+                    Alpine's <code>7zz</code> package ships with no RAR codec at all — its RAR
+                    decoder derives from unRAR source under a licence that forbids sharing it
+                    with an archiver, so distros strip it. This image separately builds a
+                    freeware <code>unrar</code> binary from RARLAB source (see{' '}
+                    <code>NOTICE</code>) just for <code>.rar</code>/<code>.rar5</code> sets.
+                  </p>
+                  <p>
+                    Dispatch is automatic by file extension — <code>7zz</code> handles
+                    zip/7z/tar/gz/bz2/xz, <code>unrar</code> handles rar/rar5. There is nothing
+                    to choose here; this one toggle covers both.
+                  </p>
+                </FieldHelp>
+              </>
+            }
             value={form.auto_extract}
             onChange={(v) => update('auto_extract', v)}
             siteValue={postprocessSite ? postprocessSite.extract_enabled : null}

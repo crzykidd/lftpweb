@@ -1,3 +1,4 @@
+import type { ReactNode } from 'react'
 import { useEffect, useState } from 'react'
 import {
   getDownloadPrefixSettings,
@@ -139,6 +140,7 @@ function formToBody(f: FormState): TransferSettingsOut {
 
 interface NumberFieldProps {
   label: string
+  help?: ReactNode
   hint?: string
   value: number
   step?: number
@@ -146,10 +148,13 @@ interface NumberFieldProps {
   onChange: (value: number) => void
 }
 
-function NumberField({ label, hint, value, step, min = 0, onChange }: NumberFieldProps) {
+function NumberField({ label, help, hint, value, step, min = 0, onChange }: NumberFieldProps) {
   return (
     <label className="flex flex-col gap-1">
-      <span className={labelClasses}>{label}</span>
+      <span className={labelClasses}>
+        {label}
+        {help}
+      </span>
       <input
         type="number"
         className={`${inputClasses} max-w-40`}
@@ -502,6 +507,27 @@ export function TransferTab() {
         <div className="flex flex-wrap gap-4">
           <NumberField
             label="Max concurrent jobs"
+            help={
+              <FieldHelp label="Max concurrent jobs">
+                <p>
+                  <strong>Main-lane slots only.</strong> The fast lane below has its own,
+                  completely separate concurrency budget (<strong>Fast-lane concurrency</strong>)
+                  and consumes none of these slots — an item under the fast-lane threshold never
+                  waits on this number, and never counts against it.
+                </p>
+                <p>
+                  The real ceiling on transfers running at once is the <strong>sum</strong> of
+                  this field and the fast-lane concurrency below. Setting this to 2 while the
+                  fast lane allows 2 more can genuinely show 3–4 jobs running — that isn't a bug
+                  in this setting, it's the other lane.
+                </p>
+                <p>
+                  <strong>Start now</strong> (Transfers page) bypasses this cap entirely — a
+                  forced item always admits immediately, at full bandwidth, regardless of how
+                  many slots are already in use.
+                </p>
+              </FieldHelp>
+            }
             hint="Main-lane slots — directories in flight at once."
             value={form.maxConcurrentTransfers}
             step={1}
@@ -535,7 +561,9 @@ export function TransferTab() {
         <h3 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">Fast lane</h3>
         <p className={hintClasses}>
           An item under the threshold runs in its own lane, sharing its own reserve — it never
-          waits behind a large release holding the main-lane ceiling (DESIGN.md §4.5).
+          waits behind a large release holding the main-lane ceiling (DESIGN.md §4.5). Its
+          concurrency below is independent of Max concurrent jobs above and consumes none of
+          those slots, so the two add together for the real total in flight at once.
         </p>
         <div className="flex flex-wrap gap-4">
           <NumberField
@@ -597,9 +625,24 @@ export function TransferTab() {
 
       <div className="flex flex-col gap-3 rounded-md border border-zinc-200 p-4 dark:border-zinc-800">
         <h3 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">Retry</h3>
+        <p className={hintClasses}>
+          Only three error classes are ever retried at all: host unreachable, a TLS error, and
+          (since 2026-08-14) a transient local filesystem error. Everything else (auth failure,
+          permission denied, remote path gone, disk full) is permanent and stops on the first
+          attempt regardless of the settings below.
+        </p>
         <div className="flex flex-wrap gap-4">
           <NumberField
             label="Max attempts"
+            help={
+              <FieldHelp label="Max attempts">
+                <p>
+                  How many total attempts a retryable failure gets before it's given up as{' '}
+                  <code>retries_exhausted</code> and auto-queue stops touching it (see Docs →
+                  Concepts for what that suppression means and how to undo it).
+                </p>
+              </FieldHelp>
+            }
             value={form.maxAttempts}
             step={1}
             min={1}
@@ -607,6 +650,18 @@ export function TransferTab() {
           />
           <NumberField
             label="Retry backoff base (seconds)"
+            help={
+              <FieldHelp label="Retry backoff base (seconds)">
+                <p>
+                  <strong>This field is currently not applied.</strong> Verified against{' '}
+                  <code>core/queue.py</code>: the retry delay is computed from a hardcoded 30s
+                  base (doubling per attempt, capped at 15 minutes), never from this saved
+                  value. Changing this number has no effect on how long lftpweb actually waits
+                  between retries — a backend defect found while writing this help text, not
+                  yet fixed.
+                </p>
+              </FieldHelp>
+            }
             value={form.retryBackoffBaseS}
             step={1}
             onChange={(v) => update('retryBackoffBaseS', v)}
@@ -621,6 +676,22 @@ export function TransferTab() {
       <div className="flex flex-col gap-2 rounded-md border border-zinc-200 p-4 dark:border-zinc-800">
         <h3 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">
           Extra lftp settings
+          <FieldHelp label="Extra lftp settings">
+            <p>
+              A rejected line can fail in two different, both confusing, ways. An unrecognised{' '}
+              <code>set</code> key is silently ignored — the line does nothing, with no error
+              anywhere. A recognised key given a value in the wrong format is worse:{' '}
+              <code>net:reconnect-interval-base</code> takes a bare number, not a duration —{' '}
+              <code>5s</code> makes lftp reject that one line with{' '}
+              "5s: invalid unsigned number" while the transfer keeps running on its defaults, so
+              the job fails later with a misleading error that has nothing to do with the typo
+              that caused it. This class of bug cost this project a real debugging session.
+            </p>
+            <p>
+              If a setting here doesn't seem to be taking effect, check the app log (Settings →
+              Logs) for a line like the one above before assuming the field is broken.
+            </p>
+          </FieldHelp>
         </h3>
         <p className={hintClasses}>
           Free text, injected verbatim into every job's rc file (DESIGN.md §9.3) — the escape

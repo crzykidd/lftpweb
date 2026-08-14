@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { getLogFiles, getLogTail, logDownloadUrl } from '../../api/client'
 import type { LogFileOut, LogLevel } from '../../api/types'
+import { FieldHelp } from '../../components/FieldHelp'
 import { formatBytes } from '../../lib/format'
 
 const LEVELS: LogLevel[] = ['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL']
@@ -60,7 +61,22 @@ export function LogsTab() {
 
       <div className="flex flex-wrap items-end gap-3">
         <label className="flex flex-col gap-1">
-          <span className="text-sm font-medium text-zinc-700 dark:text-zinc-300">Level</span>
+          <span className="text-sm font-medium text-zinc-700 dark:text-zinc-300">
+            Level
+            <FieldHelp label="Level">
+              <p>
+                Filters which already-written lines this view shows you. It does not change
+                what gets written to the log file — that's set once, at container start, by the{' '}
+                <code>LFTPWEB_LOG_LEVEL</code> environment variable (default <code>INFO</code>),
+                with <code>LFTPWEB_DEBUG_LIBS</code> for lowering specific noisy libraries. There
+                is no page to change either at runtime yet.
+              </p>
+              <p>
+                Filtering by <code>DEBUG</code> here shows nothing if the app is running at{' '}
+                <code>INFO</code> or above — the lines were never written, not merely hidden.
+              </p>
+            </FieldHelp>
+          </span>
           <select
             className={selectClasses}
             value={level}
