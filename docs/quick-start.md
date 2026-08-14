@@ -107,7 +107,8 @@ next.
   site-wide default for verify, extract, delete-archives-after-extract, and
   move-to-final-destination. Each queue then inherits or overrides those individually.
 - **Folder prefix during transfer** — [Settings → Transfer](/settings/transfer) (site-wide) and
-  Settings → Queues (per-queue override). Off by default. When on, a directory item downloads
+  Settings → Queues (per-queue override). **On by default** — one of the few things in lftpweb
+  that is, because it fixes a defect rather than adding a preference. A directory item downloads
   into a hidden-by-convention folder (`.downloading-<name>` by default, configurable) and is
   renamed to its real name only once the transfer is fully complete, so an importer that skips
   dot-prefixed folders (Sonarr, Radarr, Plex, Jellyfin, ...) can never see a partial multi-file

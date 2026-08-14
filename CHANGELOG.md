@@ -522,7 +522,7 @@ alongside this list: several entries below ship with deliberate, documented limi
   or resets `item_settle`, but still enforces whatever verdict the gate last recorded, so an
   item the real gate hasn't cleared cannot be released early just because local bytes caught up
   to a stale cached remote total.
-- **"Folder prefix during transfer", off by default** *(2026-08-14)*. A directory item can now
+- **"Folder prefix during transfer", on by default** *(2026-08-14)*. A directory item now
   download into a hidden-by-convention folder (`.downloading-<name>` by default, configurable
   site-wide and per-queue, both nullable-for-inherit) and is renamed to its real name only once
   the transfer is fully complete — a `mirror` job renames each file to its final name as that
@@ -564,9 +564,35 @@ alongside this list: several entries below ship with deliberate, documented limi
   never displayed or summed as peers — `mirror_parallel_transfer_count` files in flight sum to
   roughly the parent's own rate, the same bytes counted at two granularities, not extra
   throughput. See `docs/decisions.md` for the gating options considered.
+- **The Files tree's Speed cell now shows an ETA alongside the rate, "34 MB/s · 3m", on both the
+  top-level row and each file inside a mirroring directory** *(2026-08-14)*. The top-level ETA
+  needed no new backend work — `core/progress.py.JobProgress.eta_s` was already computed and
+  already on the wire (`progress` message), just not displayed on the Files page; this only
+  threads it through a new `etaByItemId` map, the same shape `speedByItemId` already established.
+  A **child** file's ETA has no server-computed counterpart (`_publish_child_progress` only ever
+  emits a rate), so it's derived client-side: `remote_size - local_size`, divided by that child's
+  own freshness-gated smoothed rate from the per-file-speed task above. Shows nothing rather than
+  a wrong number in every degenerate case — unknown `remote_size`, a zero or stale rate, or
+  remaining bytes at or below zero (already done) — and is deliberately uncapped on the high end
+  rather than showing a fabricated "> 1h" ceiling. Appended into the existing Speed cell rather
+  than a new column or a hover-only reading; the column still sorts by rate alone. See
+  `docs/decisions.md` for the layout options weighed and why appending won.
 
 ### Changed
 
+- **"Folder prefix during transfer" defaults ON** *(2026-08-14)* — the fourth deliberate
+  exception to this project's "every new capability ships off" rule, after `move`-mode forced
+  verification, the phase 7 scheduled backup, and the settle gate. It shipped off the same
+  morning it was built and was flipped the same day by the same reasoning that flipped the settle
+  gate: this is the fix for a **reproduced** defect, not a preference, and an existing install
+  silently keeps running with that defect live unless the fix defaults on. **An existing install
+  will notice**: a directory item now downloads into `<local_path>/.downloading-<name>/` and is
+  renamed onto its real name only once complete, so anything watching that directory sees a
+  release appear all at once instead of file by file. A transfer already in flight when you
+  upgrade is unaffected — the prefix is resolved at spawn and recorded per item, so an
+  in-progress job keeps whatever it started with. Single-file downloads are unaffected either
+  way. Turn it off at Settings → Transfer, or per queue at Settings → Queues, if nothing watches
+  your download directory.
 - **`sync_mode = 'move'` went from stored-but-inert to fully live** when phase 5 shipped.
   An existing queue already configured for `move` begins deleting verified remote copies
   with no further action — review any stored `move` queue before pulling this.

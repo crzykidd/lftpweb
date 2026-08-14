@@ -250,8 +250,19 @@ async def test_delete_directory_item_mid_transfer_stops_job_and_removes_tree(db,
         await asyncio.sleep(2.0)  # let real bytes accumulate under the cap
 
         pid = (await _job_row(db, job_id))["pid"]
-        target_dir = local_dir / "Movie.Title.2024.2160p"
-        assert target_dir.exists(), "the mirror job must have created its directory by now"
+        # "Folder prefix during transfer" defaults ON as of 2026-08-14, so an in-flight directory
+        # item physically lives under `<prefix><name>/` and its logical name does not exist on
+        # disk at all until the transfer completes. Asserting the prefixed path is the point:
+        # this is now the default shape of a mid-transfer delete, and it exercises
+        # `core/local_delete.py._physical_local_root` end to end (the bug where delete looked for
+        # the logical path, found nothing, and refused with "does not exist -- nothing to
+        # delete").
+        target_dir = local_dir / ".downloading-Movie.Title.2024.2160p"
+        logical_dir = local_dir / "Movie.Title.2024.2160p"
+        assert target_dir.exists(), "the mirror job must have created its prefixed directory by now"
+        assert (
+            not logical_dir.exists()
+        ), "the logical name must not appear until the transfer completes"
 
         result = await jobs.delete_item(item_id, _FakeRequest(db, queue=q))
 
@@ -274,7 +285,8 @@ async def test_delete_directory_item_mid_transfer_stops_job_and_removes_tree(db,
         # `deleted_local` write, not left standing.
         assert item["suppressed_reason"] == "deleted_local"
 
-        assert not target_dir.exists(), "the whole tree must be gone"
+        assert not target_dir.exists(), "the whole prefixed tree must be gone"
+        assert not logical_dir.exists(), "and nothing may be left under the logical name either"
 
         await _assert_never_requeued_by_autoqueue(db, queue_id, local_dir)
     finally:

@@ -199,6 +199,11 @@ def _queue_config(
 async def test_active_download_prefixes_empty_when_disabled_and_nothing_pending(db, tmp_path):
     host_id = await _make_host_row(db)
     queue_id = await _make_queue_row(db, host_id, tmp_path)
+    # Explicitly disabled rather than relying on the dataclass default -- that default flipped to
+    # `True` on 2026-08-14 and this test is about the *disabled* path, so it has to say so.
+    await download_prefix.save_download_prefix_settings(
+        db, download_prefix.DownloadPrefixSettings(enabled=False)
+    )
     engine = Engine(db, str(tmp_path), events=EventBus())
     q = _queue_config(queue_id, local_path=str(tmp_path))
     prefixes = await engine._active_download_prefixes(q)
@@ -232,6 +237,13 @@ async def test_active_download_prefixes_unions_in_every_distinct_pending_value(d
         "UPDATE item SET pending_download_prefix = '.also-old-' WHERE id = ?", (item_b,)
     )
     await db.commit()
+
+    # Explicitly disabled: this asserts the *pending* values are unioned in on their own, so the
+    # currently-resolved site prefix must not be in the set. Stated rather than inherited from
+    # the dataclass default, which flipped to `True` on 2026-08-14.
+    await download_prefix.save_download_prefix_settings(
+        db, download_prefix.DownloadPrefixSettings(enabled=False)
+    )
 
     engine = Engine(db, str(tmp_path), events=EventBus())
     q = _queue_config(queue_id, local_path=str(tmp_path))  # site/queue toggle left off
@@ -486,3 +498,38 @@ async def test_reap_one_unsettled_item_leaves_the_prefixed_directory_untouched(d
     assert item["substate"] == "settling"
     assert prefixed_dir.exists(), "nothing may be renamed while the item hasn't settled"
     assert q.postprocess.triggered == []
+
+
+async def test_the_site_default_is_on(db):
+    """The 2026-08-14 flip, pinned. An absent `setting` row must read `enabled=True` -- an
+    existing install that has never opened Settings -> Transfer is exactly the case this default
+    exists to protect, and a silent revert to `False` would leave that install running with the
+    importer race live again.
+    """
+    settings = await download_prefix.load_download_prefix_settings(db)
+    assert settings.enabled is True
+    assert settings.prefix == download_prefix.DEFAULT_PREFIX
+
+
+async def test_a_stored_row_missing_the_key_reads_the_dataclass_default(db):
+    """`load_*` must not carry its own literal that can drift from the dataclass.
+    `core/settle.py.load_settle_settings` has exactly that split today (absent row -> `True`,
+    stored row missing the key -> `False`); not repeating it here.
+    """
+    await db.execute(
+        "INSERT INTO setting (key, value, updated_at) "
+        "VALUES (?, '{\"prefix\": \".downloading-\"}', STRFTIME('%Y-%m-%dT%H:%M:%fZ','now'))",
+        (download_prefix.SETTING_KEY,),
+    )
+    await db.commit()
+    settings = await download_prefix.load_download_prefix_settings(db)
+    assert settings.enabled is True
+
+
+async def test_it_can_still_be_turned_off(db):
+    """Defaulting on must not make it un-disableable."""
+    await download_prefix.save_download_prefix_settings(
+        db, download_prefix.DownloadPrefixSettings(enabled=False)
+    )
+    settings = await download_prefix.load_download_prefix_settings(db)
+    assert settings.enabled is False

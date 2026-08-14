@@ -42,11 +42,13 @@ section before trusting any live-evidence conclusion in this file.
 - **A `dev` → `main` PR, and the first release.** `dev` is far ahead of `main`; nothing has been
   tagged, and `release-prep`/`release-cut` have never been run. **Planned for 2026-08-14
   afternoon**, after the user click-tests the night's work.
-- **Should "Folder prefix during transfer" default ON?** It shipped **off**, per this project's
-  "every new capability ships off" rule (`342f96c`). But it fixes a *reproduced* data-loss-shaped
-  bug — Sonarr importing a partial release mid-`mirror` and deleting the folder underneath lftp —
-  which is the same argument that got the settle gate flipped to on-by-default after its own
-  follow-up task. Not flipped unilaterally; the user's call.
+- ~~**Should "Folder prefix during transfer" default ON?**~~ — **decided 2026-08-14: yes.** The
+  fourth deliberate exception to "every new capability ships off", after `move`-mode forced
+  verification, the phase 7 scheduled backup, and the settle gate. Same reasoning as the settle
+  gate's own flip: it fixes a *reproduced* defect rather than adding a preference, so an existing
+  install silently keeps running with that defect live unless it defaults on. Flipped hours after
+  it shipped off in `342f96c`. Existing installs will notice — see `CHANGELOG.md`'s `### Changed`
+  entry.
 - **Two `DESIGN.md` §4.3 wordings are drafted and unapplied**, both in `docs/decisions.md`
   awaiting approval: (1) exit 0 means lftp reported no error, not that every byte arrived —
   completion is confirmed from the filesystem; (2) the new `LOCAL_FS_ERROR` class and its place
