@@ -1,4 +1,5 @@
 import { useCallback } from 'react'
+import { Link } from 'react-router-dom'
 import { getHealth, getStats } from '../api/client'
 import { usePoll } from '../hooks/usePoll'
 import { formatBytes, formatRate } from '../lib/format'
@@ -20,7 +21,9 @@ function dotClass(ok: boolean | null): string {
  * Phase 9 adds `host_reachable`/`scheduler_alive` (DESIGN.md §10.3) -- phase 7 extended
  * `/api/health` with both fields but deliberately deferred the UI to this phase (see
  * docs/decisions.md's phase 7 entry, point 16) since its own brief was the Logs/Backup
- * pages, not a health readout.
+ * pages, not a health readout. "24h" (2026-08-13, prompts/2026-08-13-header-24h-from-metrics.md)
+ * links to `/dashboard` -- just that item, not the whole row -- since it's the one figure here
+ * that's history rather than live scheduler state, and the Dashboard is where its detail lives.
  */
 export function StatsHeader() {
   const statsFetcher = useCallback(getStats, [])
@@ -46,7 +49,16 @@ export function StatsHeader() {
         'Queued',
         `${stats?.queued_count ?? 0} (${formatBytes(stats?.queued_bytes ?? 0)})`,
       )}
-      {item('24h', formatBytes(stats?.transferred_24h_bytes ?? 0))}
+      <Link
+        to="/dashboard"
+        className="flex items-baseline gap-1.5 whitespace-nowrap rounded outline-none hover:underline focus-visible:ring-2 focus-visible:ring-zinc-400 dark:focus-visible:ring-zinc-500"
+        title="Bytes actually transferred in the last 24h (metric_sample) -- open the Dashboard for the full breakdown."
+      >
+        <span className="text-zinc-500 dark:text-zinc-400">24h</span>
+        <span className="font-medium text-zinc-900 dark:text-zinc-100">
+          {formatBytes(stats?.transferred_24h_bytes ?? 0)}
+        </span>
+      </Link>
       {health && (
         <div className="ml-auto flex items-center gap-4 whitespace-nowrap text-xs">
           <span

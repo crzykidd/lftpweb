@@ -749,6 +749,16 @@ alongside this list: several entries below ship with deliberate, documented limi
   (`Settings` API only for now, no UI yet) reaps stale orphaned temp files past a configurable
   age. Resume itself was verified working throughout (measured in bytes against the fake seedbox,
   not inferred from filenames) — the bug was duplicate processes, not broken resume.
+- **The header's "24h" figure read `0 B` after Clear History even though the Dashboard showed
+  real usage** *(2026-08-13, user report)*. The two read different tables: the header summed
+  `job.bytes_done` for jobs that finished successfully in the last 24h, while the Dashboard reads
+  `metric_sample`, which Clear History deliberately never touches — both behaved as designed, but
+  the design let a *history* clear zero out a *usage* statistic. The header now reads
+  `metric_sample` too, via the same `core/metrics.py.queue_breakdown` call the Dashboard's own
+  bytes-per-hour chart uses, so the two numbers can no longer structurally disagree for the same
+  window; this also means the figure now counts bytes from attempts that later failed, not only
+  fully completed transfers, which is the more honest answer to "how much did this actually move
+  in the last day." The "24h" item is now a link to the Dashboard.
 
 ### Security
 

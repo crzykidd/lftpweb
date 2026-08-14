@@ -6,6 +6,67 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-13 — Header's "24h" reads `metric_sample`, not `job` — bytes moved, not bytes
+## completed, and the two figures now share one query
+
+**Handoff prompt `prompts/2026-08-13-header-24h-from-metrics.md`, executed end to end.** User
+report: the header showed `24h 0 B` right after Clear History while the Dashboard, on the same
+data, showed real usage. Root cause: the header summed `job.bytes_done` for jobs that finished
+successfully in the last 24h; the Dashboard reads `metric_sample` (migration 005). Clear History
+deletes `job` rows and deliberately never touches `metric_sample` (`48ad72c`) — both endpoints
+behaved exactly as designed, but the design let clearing *history* zero out a *usage* statistic
+that was never supposed to be part of history in the first place.
+
+**Decision: bytes moved (`metric_sample`), not bytes of completed jobs.** The user's own framing
+— "we want to give people a quick glance on usage" — settles which of the two legitimately
+different quantities is correct. `job`-based counts only fully successful transfers, excluding
+partial bytes from attempts that failed or were stopped (deliberately, so a retried transfer's
+bytes aren't double-counted once some later attempt finishes it) — a measure of *completed work*.
+`metric_sample` counts every byte moved over the wire regardless of whether the attempt that
+moved it ever finished — a measure of *usage*, i.e. bandwidth actually spent. Usage is what was
+asked for.
+
+**Decision: share the query with the Dashboard rather than write a second sum.** The whole
+failure mode here was two independently-written aggregates over data that was supposed to mean
+the same thing, drifting apart the moment one of their two backing tables changed shape (Clear
+History landed, only one of the two got the memo). Refusing to reintroduce that shape was the
+most important part of the fix: `api/stats.py` now calls `core/metrics.py.queue_breakdown` —
+the exact function `api/metrics.py.get_throughput` calls for the Dashboard's bytes-per-hour
+chart — with `queue_id=None` (the same "site total" shape) and sums the returned rows itself,
+rather than adding a parallel raw-SQL `SUM(bytes_delta)`. This was closer than it looks: the
+bucket walk in `get_throughput` floor-aligns bucket boundaries for display (so idle buckets can
+render as a real zero rather than being silently absent), but that alignment only affects which
+*epoch labels* appear in the response — the underlying `WHERE ts >= ? AND ts < ?` in
+`queue_breakdown` is untouched by it, so summing `queue_breakdown`'s rows directly is exactly
+equal to summing the Dashboard's own displayed per-bucket totals for the same window, without
+needing to reimplement the bucket walk just to throw the buckets away. Uses
+`idx_metric_sample_ts_queue` (`ts, queue_id, bytes_delta`), the same covering index the
+Dashboard's own site-total query already drives, verified with `EXPLAIN QUERY PLAN` when that
+index was added.
+
+**Decision: delete the stale comment, don't leave it standing next to the new code.** The old
+comment explaining "why only fully-succeeded jobs count" was accurate for the query it
+described and actively wrong once that query was gone — a leftover explanation of removed
+semantics is worse than no comment, since a future reader has no way to tell it's stale from the
+diff alone.
+
+**Verified, not assumed: the header's other stats survive a history clear untouched.**
+`queued_count`/`queued_bytes` read `job WHERE state = 'queued'`; Clear History's own
+`_jobs_where_clause` (`api/history.py`) has a base clause of
+`job.state IN ('succeeded','failed','cancelled')` on every code path, including "clear all," so
+a `queued`/`running` job is unreachable by construction, not by a separate check that could be
+forgotten. `current_speed_bps`/`allocated_bps`/`ceiling_bps` never touch the database at all —
+they're `TransferQueue.stats()`'s own in-memory scheduler state. `tests/test_stats_24h.py`
+proves the queue-depth guard directly against the database (bypassing the live scheduler, which
+otherwise races a directly-inserted `queued` job row by trying to admit it) and proves the
+speed/allocation figures are a pure passthrough of whatever the queue object returns.
+
+**The header's "24h" is now a link to `/dashboard`**, on just that item, not the whole stats row
+— it's the one figure in the header that's history rather than live state, so it's the one that
+benefits from a way to see more.
+
+---
+
 ## 2026-08-13 — "Reset item tracking": a third way to forget a path, deliberately unlike Delete
 ## and Clear History, plus a mid-task addition (purge by pattern)
 

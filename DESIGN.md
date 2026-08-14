@@ -1527,6 +1527,17 @@ to "why hasn't the next item started?" is `9.0 / 10 allocated`, not current spee
 allocated 5 MB/s that is only pulling 2 still *holds* its 5. Without that number on screen the
 scheduler looks broken at exactly the moments it is working correctly.
 
+**"24h" is bytes actually moved, from `metric_sample` (§10.4), not a sum over `job` rows.**
+Queue depth and allocated/ceiling are live scheduler state and finish the moment they're read;
+"24h" is the one header figure that's history — a usage glance, not a status readout — so it
+reads from the same throughput samples the Dashboard's bytes-per-hour chart reads, via the same
+`core/metrics.py` query, rather than a second sum written independently over `job.bytes_done`.
+That both avoids re-deriving the same total two different ways (the two disagreed after a
+history clear before this was fixed: `job` rows are deletable history, `metric_sample` isn't —
+docs/decisions.md) and means the figure includes bytes from attempts that later failed, not only
+completed transfers. The item links to the Dashboard (§10.4) — the header is the glance, the
+Dashboard is the detail.
+
 ### 9.2 Pages
 
 **Files** — virtualized tree (must stay smooth at 10k+ rows), per row: state chip, progress
