@@ -6,6 +6,7 @@ import { StateChip } from '../components/StateChip'
 import { useJobs } from '../hooks/useJobs'
 import { useLiveModel } from '../hooks/useLiveModel'
 import { formatEta, formatPercent, formatRate } from '../lib/format'
+import { averageSpeedBps, elapsedSeconds, isNotableQueuedWait, postprocessNote, queuedWaitSeconds } from '../lib/transferTiming'
 
 const START_NOW_EXPLAINED_KEY = 'lftpweb:startNowExplained'
 
@@ -115,6 +116,26 @@ function Row({
   const speed = running ? (live?.speed_bps ?? job.speed_bps ?? 0) : 0
   const eta = running ? (live?.eta_s ?? job.eta_s) : null
 
+  // Elapsed / average speed / queued wait (2026-08-14,
+  // prompts/2026-08-14-transfer-timing-and-throughput-display.md) -- "how long it took" and
+  // "what speed that works out to," derived from the job's own timestamps rather than left for
+  // a reader to reconstruct by hand from two ISO strings. For a running job, `elapsedSeconds`
+  // measures against `Date.now()` at render time -- no new timer: this row already re-renders
+  // roughly once a second while running, driven by the WS `progress` message that updates
+  // `live` (`useLiveModel.ts`).
+  const elapsed = elapsedSeconds(job.started_at, job.finished_at)
+  // `bytesDone` here (not `job.bytes_done`) so a running job's average uses the same freshest
+  // reading its percentage/ETA already do; `job.bytes_start` has no live counterpart -- it's
+  // fixed at spawn (`core/queue.py`'s admission), so the job's own value is always current.
+  const avgSpeed = averageSpeedBps(bytesDone, job.bytes_start, elapsed)
+  const queuedWait = queuedWaitSeconds(job.queued_at, job.started_at)
+  // The item's own state (`core/postprocess.py`'s VERIFYING/EXTRACTING, published via the same
+  // `item_delta`/`snapshot` WS messages this page already merges into `nodes` -- no new fetch,
+  // no new plumbing) is the honest source for "what is a finished-but-still-working row doing."
+  const itemNode = nodes.find((n) => n.id === job.item_id)
+  const postprocess = postprocessNote(job.state, itemNode?.state)
+  const showTimingRow = elapsed != null || avgSpeed != null || isNotableQueuedWait(queuedWait) || postprocess != null
+
   return (
     <div className="flex flex-col gap-2 border-b border-zinc-200 px-3 py-2.5 text-sm last:border-b-0 dark:border-zinc-800">
       <div className="flex flex-wrap items-center gap-3">
@@ -169,6 +190,38 @@ function Row({
           {job.rate_limit_bps != null ? `${formatRate(job.rate_limit_bps)} alloc.` : '—'}
         </span>
       </div>
+
+      {/* Elapsed / average speed / queued wait / post-processing note (2026-08-14) -- see the
+       * derivations above for what each figure means and why it's guarded the way it is. Only
+       * rendered once there's at least one figure worth showing, e.g. a still-`queued` job with
+       * a trivial wait and no `started_at` yet shows nothing here. */}
+      {showTimingRow && (
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-zinc-500 dark:text-zinc-400">
+          {postprocess && (
+            <span
+              className="font-medium text-amber-700 dark:text-amber-400"
+              title="This job finished transferring; verify/extract is still running against the same item -- not a stalled transfer"
+            >
+              {postprocess}
+            </span>
+          )}
+          {elapsed != null && (
+            <span title="Time this job spent running -- started_at to finished_at, or to now while still running">
+              Elapsed {formatEta(elapsed)}
+            </span>
+          )}
+          {avgSpeed != null && (
+            <span title="This attempt's bytes moved, averaged over its own elapsed time -- distinct from the live rate above, which is an EMA-smoothed instantaneous reading (core/progress.py)">
+              avg {formatRate(avgSpeed)}
+            </span>
+          )}
+          {isNotableQueuedWait(queuedWait) && queuedWait != null && (
+            <span title="Time this job waited in the queue before it started running -- queued_at to started_at, often a sign max_concurrent_transfers (DESIGN.md §4.5) was holding it back">
+              queued {formatEta(queuedWait)}
+            </span>
+          )}
+        </div>
+      )}
 
       <div className="flex flex-wrap items-center gap-2">
         {job.state === 'queued' && (

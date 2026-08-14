@@ -2,7 +2,8 @@ import { useVirtualizer } from '@tanstack/react-virtual'
 import { Fragment, useEffect, useMemo, useRef, useState } from 'react'
 import { getHistoryEvents, getHistoryJobs } from '../api/client'
 import type { FileNode, HistoryEventOut, HistoryJobOut } from '../api/types'
-import { bothSidesRows, formatBytes, formatPercent, formatRelativeTimeIntl } from '../lib/format'
+import { bothSidesRows, formatBytes, formatEta, formatPercent, formatRate, formatRelativeTimeIntl } from '../lib/format'
+import { averageSpeedBps, elapsedSeconds } from '../lib/transferTiming'
 import { StateChip } from './StateChip'
 
 const ROW_HEIGHT_PX = 40
@@ -234,21 +235,49 @@ function HistoryPanel({ itemId }: { itemId: number }) {
         History
       </h3>
       {state.jobs.length > 0 && (
-        <ul className="flex flex-col gap-1">
-          {state.jobs.map((j) => (
-            <li key={`job-${j.id}`} className="flex items-baseline justify-between gap-3 text-xs">
-              <span className="text-zinc-700 dark:text-zinc-300">
-                Transfer {j.state}
-                {j.error_class && ` (${j.error_class})`}
-              </span>
-              <span
-                className="text-zinc-500 dark:text-zinc-400"
-                title={j.finished_at ? new Date(j.finished_at).toLocaleString() : undefined}
-              >
-                {j.finished_at ? formatRelativeTimeIntl(j.finished_at) : '—'}
-              </span>
-            </li>
-          ))}
+        <ul className="flex flex-col gap-1.5">
+          {state.jobs.map((j) => {
+            // Per-attempt elapsed/average speed (2026-08-14,
+            // prompts/2026-08-14-transfer-timing-and-throughput-display.md) -- "a job that
+            // failed after 40 minutes at 2 MB/s tells a very different story from one that
+            // failed in 3 seconds, and today both render identically." `HistoryJobOut`
+            // (`api/history.py`) doesn't carry `bytes_start` the way `JobOut` does
+            // (deliberately -- History's row set is unbounded, so it ships a leaner shape),
+            // so this passes `0` and can overstate the rate for an attempt that resumed a
+            // previous attempt's partial download (`core/metrics.py`'s "non-monotonic trap,"
+            // same reasoning `averageSpeedBps`'s own doc comment spells out) -- flagged in the
+            // figure's own title rather than silently claimed as exact.
+            const elapsed = elapsedSeconds(j.started_at, j.finished_at)
+            const avgSpeed = averageSpeedBps(j.bytes_done, 0, elapsed)
+            return (
+              <li key={`job-${j.id}`} className="flex flex-col gap-0.5 text-xs">
+                <div className="flex items-baseline justify-between gap-3">
+                  <span className="text-zinc-700 dark:text-zinc-300">
+                    Transfer {j.state}
+                    {j.error_class && ` (${j.error_class})`}
+                  </span>
+                  <span
+                    className="text-zinc-500 dark:text-zinc-400"
+                    title={j.finished_at ? new Date(j.finished_at).toLocaleString() : undefined}
+                  >
+                    {j.finished_at ? formatRelativeTimeIntl(j.finished_at) : '—'}
+                  </span>
+                </div>
+                {(elapsed != null || avgSpeed != null) && (
+                  <div className="flex flex-wrap items-center gap-x-2 text-zinc-400 dark:text-zinc-500">
+                    {elapsed != null && <span>{formatEta(elapsed)}</span>}
+                    {avgSpeed != null && (
+                      <span
+                        title="Average for this attempt (bytes_done over elapsed time) -- may be inflated if this attempt resumed a previous one's partial download, since history doesn't carry bytes_start"
+                      >
+                        avg {formatRate(avgSpeed)}
+                      </span>
+                    )}
+                  </div>
+                )}
+              </li>
+            )
+          })}
         </ul>
       )}
       {state.events.length > 0 && (

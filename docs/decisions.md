@@ -6,6 +6,47 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-14 — Transfer timing/throughput display: `bytes_done - bytes_start`, not `bytes_done` alone, for the average
+
+**Handoff prompt `prompts/done/2026-08-14-transfer-timing-and-throughput-display.md`, executed
+end to end.** Added `frontend/src/lib/transferTiming.ts` (`elapsedSeconds`,
+`queuedWaitSeconds`/`isNotableQueuedWait`, `averageSpeedBps`, `postprocessNote`) and wired it into
+`TransfersPage.tsx`'s row and `ItemDrawer.tsx`'s per-attempt history list, so "49 seconds, ~34
+MB/s" reads directly instead of being reconstructed by hand from two ISO timestamps.
+
+**Deliberate deviation from the prompt's literal formula.** The prompt spelled out "average speed
+— `bytes_done / elapsed_seconds`." For `TransfersPage.tsx` (which has the full `JobOut`, carrying
+`bytes_start`), this was changed to `(bytes_done - bytes_start) / elapsed` instead —
+`core/metrics.py`'s own module docstring documents exactly why plain `bytes_done` is wrong for
+this: it's the *absolute* local footprint, not a per-job delta, so a resumed job's `bytes_done`
+already includes whatever an earlier, failed attempt left on disk before this job even started.
+Dividing that by *this* job's own elapsed time would overstate the rate on any resumed transfer —
+the identical "non-monotonic trap" the Dashboard's throughput sampler was built to avoid. Since
+`bytes_start` was already sitting on the same `JobOut` row, using it costs nothing and avoids
+reintroducing a bug this codebase already fixed once elsewhere.
+
+**Where the literal formula was kept, and why.** `ItemDrawer.tsx`'s history list uses
+`HistoryJobOut` (`api/history.py`), which does not carry `bytes_start` — a deliberate,
+already-existing asymmetry (History's row set is unbounded, so it ships a leaner shape than the
+bounded Transfers page's `JobOut`). Backfilling `bytes_start` onto `HistoryJobOut` would be a
+backend change, which this task's own brief said to stop and report rather than make. Judged not
+"genuinely required": the concrete complaint (a 3-second and a 40-minute failure rendering
+identically) is fixed either way, and the imprecision is real only for a retried attempt that
+resumed a prior one's partial download — a real but narrower case, and one flagged directly in
+that figure's own tooltip rather than silently claimed as exact. If `bytes_start` is ever added to
+`HistoryJobOut` for other reasons, `ItemDrawer.tsx`'s call site should switch to it immediately —
+noted in that call site's own comment.
+
+**Item 3 (finished-but-still-post-processing row) needed no new plumbing.** `TransfersPage.tsx`
+already builds `nodesByQueue` from `useLiveModel()`'s `queues` (for the item drawer's file list);
+the same map already carries each item's own `state`, published over the same
+`item_delta`/`snapshot` WebSocket messages `core/postprocess.py` writes VERIFYING/EXTRACTING
+through. Looking up the row's `FileNode` by `job.item_id` and reading `.state` was sufficient —
+no second poll, no new WS message, no backend field, matching the "check first, don't guess" rule
+the prompt itself set for this sub-item.
+
+---
+
 ## 2026-08-14 — Field-help sweep found a dead setting (`retry_backoff_base_s`) rather than fixing it
 
 **Handoff prompt `prompts/done/2026-08-13-field-help-sweep.md`, executed end to end.** Applying
