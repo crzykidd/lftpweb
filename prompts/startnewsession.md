@@ -70,10 +70,44 @@ side effect of shipping.
 
 ## Where we are
 
-> **Read `prompts/open-issues.md` first.** The 2026-08-12/13 session ran to **36 commits**
-> (22 of them on 2026-08-13 alone), and that file carries the reasoning — including one fix
-> that was shipped and deliberately reversed the same night, and one thing the orchestrating
-> session asserted that turned out to be false. Much of this file's older material predates it.
+> **Read `prompts/open-issues.md` first.** It carries the reasoning behind three sessions of
+> live-testing fixes — including one fix shipped and deliberately reversed the same night, one
+> thing the orchestrating session asserted that turned out to be false, and (2026-08-14) three
+> confident diagnoses that were all wrong because a second application was writing into the same
+> directory. Much of this file's older material predates it.
+
+### State at the end of 2026-08-14
+
+**Everything is pushed to `origin/dev`.** Tests **967 backend / 189 frontend**. Migrations run to
+**017**. Both lint gates, `npm test`, `npm run build`, the image build, and all three compose
+files clean.
+
+Eleven commits (`a75dc38`…`d1fe8ca`). The queue of handoff prompts that existed at the start of
+that session is **empty** — every one executed and in `prompts/done/`.
+
+| What | Commit |
+|---|---|
+| **Exit 0 stopped meaning "complete"** — a filesystem completeness check now gates `DOWNLOADED`; `output_tail` is retained on success; a succeeded job stays visible on Transfers instead of vanishing on reap | `0460111` |
+| **A local rename failure was classified `REMOTE_GONE`** and never retried — now `LOCAL_FS_ERROR`, and transient | `fe97fd1` |
+| **Files-page Speed column**, and the column-resize handles moved to the edge that actually moves | `f728373` |
+| **The three reset panels became one** All/Pattern/Selected control with a uniform preview → confirm flow | `4b15fcc` |
+| **A ~5s local-only scan while a queue is active**, restoring §5's original two-cadence design | `33db032` |
+| **Folder prefix during transfer** (off by default) — a directory downloads into `.downloading-<name>` so an importer can't grab a partial release | `342f96c` |
+| **FieldHelp swept across Settings**; the false "7zz handles rar" label corrected | `8dc3c15` |
+| **The retry-backoff-base setting was inert since phase 3a** and now actually applies | `94e2377` |
+| **Transfers show elapsed / average speed / queued wait / post-processing state** | `6e6b217` |
+| **The Docs section's prose moved to `docs/*.md`** — one source, readable on GitHub and rendered in-app | `b4de50a` |
+| The image build needed the repo-root `docs/` copied into the frontend stage | `d1fe8ca` |
+
+**The 2026-08-14 lesson, which outranks any individual fix here:** an old `seedsync` container
+autostarted after an unrelated update and wrote into the same download directory. It produced
+symptoms diagnosed — confidently, in detail, and wrongly — as the settle gate releasing early,
+lftp lying about exit 0, and `item.local_size` latching a stale value. All three writeups were
+retracted. The tell missed for hours: files were actively being written while
+`ps aux | grep [l]ftp` showed **no lftp process in the container**. `prompts/open-issues.md` has
+the full account under the `bytes_start` heading. Two real bugs did come out of it (the
+`REMOTE_GONE` misclassification, and Sonarr importing a partial release mid-`mirror`), so the
+accident was worth having — but read that section before trusting any live-evidence conclusion.
 
 ### State at the end of 2026-08-13
 

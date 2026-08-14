@@ -11,12 +11,13 @@ truth and its sections are numbered for reference. The one decision everything h
 (local bytes vs. known remote size) and each transfer is its own short-lived lftp process. Do
 not reintroduce `jobs -v` parsing as a source of truth (§1.2 explains why).
 
-**Status:** pre-release `0.0.1`, all 9 build phases complete (`DESIGN.md` §13) — it connects,
-scans, reconciles, transfers, auto-queues, post-processes, and has auth, ops (logs/backups/
-health), and Files-page polish. Real gaps remain (no UI has ever been click-tested; Settings →
-Transfer has no UI). `prompts/startnewsession.md` is the current state-of-play brief and the
-canonical source for exactly what's built vs. not — read it on session start rather than
-trusting this summary line, which a future phase updating this file may forget to touch again.
+**Status:** beta `0.0.1`, all 9 build phases complete (`DESIGN.md` §13) plus three sessions of
+fixes driven by real use against a real seedbox — it connects, scans, reconciles, transfers,
+auto-queues, post-processes, and has auth, ops (logs/backups/health), and a Files page that has
+been used in anger. Real gaps remain, named in `README.md`'s "Known gaps."
+`prompts/startnewsession.md` is the current state-of-play brief and the canonical source for
+exactly what's built vs. not — read it on session start rather than trusting this summary line,
+which a future phase updating this file may forget to touch again.
 
 ## Stack
 

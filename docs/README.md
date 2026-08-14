@@ -26,4 +26,8 @@ alternatives, workarounds. Newest entry at top.
 for GitHub" to actually on GitHub with branch protection enforced. Not relevant once that's
 done.
 
+**[`screenshot-plan.md`](screenshot-plan.md)** — the shortlist of README screenshots, what state
+each screen needs to be staged in, and what to check before publishing them. Not yet acted on;
+a human has to take them, since no browser exists where agents run.
+
 Architecture lives in [`../DESIGN.md`](../DESIGN.md), not here.
