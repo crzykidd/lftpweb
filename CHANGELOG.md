@@ -476,10 +476,11 @@ alongside this list: several entries below ship with deliberate, documented limi
   list, delete records, and forget a path — only the last changes future behaviour); the
   lifecycle icons and the presence-versus-milestone distinction that makes a completed `move`
   item's dim remote icon read as success rather than failure; `copy` vs `move` including move's
-  forced verification; and inherit-vs-override on the four post-processing toggles. **Written as
-  React components — no markdown-renderer dependency was added** (`docs/decisions.md`). Every
-  claim on both pages was verified against the code before being written rather than recalled;
-  where something could not be confirmed it was left out.
+  forced verification; and inherit-vs-override on the four post-processing toggles. Originally
+  written as React components with no markdown-renderer dependency; **the prose moved to
+  `docs/*.md` on 2026-08-14** (below) — see that entry for where it lives now. Every claim on
+  both pages was verified against the code before being written rather than recalled; where
+  something could not be confirmed it was left out.
 - **`FieldHelp` — per-field help popups on the settings pages** *(2026-08-13)*. A small info-icon
   button beside a field label that reveals a short explanation of what that field actually does.
   **Not a third popup mechanism**: it reuses the Files-row hover card's portal-and-placement
@@ -539,6 +540,17 @@ alongside this list: several entries below ship with deliberate, documented limi
   prefix is physically in use, not merely today's configured one. See `docs/decisions.md` for
   the full design, including why this reverses part of phase 5's `staging_path` reasoning on new
   evidence.
+- **The Docs section's prose moved to Markdown** *(2026-08-14)* — `docs/quick-start.md` and
+  `docs/concepts.md` are now the only copy of the Quick start/Concepts text; the app reads those
+  same two files (`?raw` import) instead of carrying a parallel copy as hand-written JSX, and
+  they're readable straight from the repo without deploying anything (indexed in
+  `docs/README.md`, linked from `README.md`). Reverses part of the 2026-08-13 Docs section's own
+  "no markdown-renderer dependency" choice: `react-markdown` + `remark-gfm` are now runtime
+  dependencies, justified in `docs/decisions.md` against the rejected alternative of a
+  hand-rolled parser. Content was re-verified against the code while migrating, not just
+  copy-pasted: Quick start gained a step-6 bullet for "Folder prefix during transfer" and a
+  paragraph on the ~5-second active-queue local-only scan pass, both new since the prose was
+  first written; everything else carried over unchanged, already current.
 
 ### Changed
 

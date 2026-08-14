@@ -1,14 +1,17 @@
 import type { ReactNode } from 'react'
 import { Link } from 'react-router-dom'
 
-// The Docs section's shared page furniture (2026-08-13, prompts/2026-08-13-docs-section.md).
+// The Docs section's shared page furniture (2026-08-13, prompts/2026-08-13-docs-section.md;
+// re-scoped 2026-08-14, prompts/2026-08-14-docs-as-markdown-single-source.md).
 //
-// **Deliberately components and Tailwind classes, not Markdown.** The task's own constraint was
-// no markdown-renderer dependency -- this project has added exactly one runtime frontend
-// dependency since phase 1 and flagged it as a deviation, and a docs page is the weakest
-// possible case for adding a second. The upside beyond bundle size is the one a README can
-// never have: `<Where to="/settings/queues">` below is a real router link, so every instruction
-// that names a settings page can *take you there*.
+// **The prose itself now lives in `docs/*.md`, not here** -- `docs/`'s whole point is that
+// someone reading this repo on GitHub can read the user docs without running the app. What
+// stays in this file is styling only: the small vocabulary `MarkdownDoc.tsx` maps Markdown
+// constructs onto (a numbered `Step`, a `Section` with a stable anchor, `Warn`/`Note` asides,
+// `Where` for an internal link that must go through the router instead of a full page load,
+// `Jump` for the in-page nav). `Table`'s old aggregate `{head, rows}` shape is gone --
+// `MarkdownDoc.tsx` renders a GFM table element-by-element (table/thead/tr/th/td), the shape
+// `react-markdown` actually walks, with its own matching Tailwind classes.
 
 const HEADING = 'text-zinc-900 dark:text-zinc-100'
 
@@ -124,37 +127,5 @@ export function Jump({ items }: { items: { id: string; label: string }[] }) {
         </a>
       ))}
     </nav>
-  )
-}
-
-/** A small comparison table. Wrapped in its own horizontal scroller so a narrow viewport
- * scrolls the table, never the page.
- */
-export function Table({ head, rows }: { head: string[]; rows: ReactNode[][] }) {
-  return (
-    <div className="overflow-x-auto">
-      <table className="w-full min-w-[34rem] border-collapse text-left text-sm">
-        <thead className="border-b border-zinc-200 text-xs tracking-wide text-zinc-500 uppercase dark:border-zinc-800 dark:text-zinc-400">
-          <tr>
-            {head.map((cell) => (
-              <th key={cell} className="px-3 py-2 font-medium">
-                {cell}
-              </th>
-            ))}
-          </tr>
-        </thead>
-        <tbody>
-          {rows.map((row, i) => (
-            <tr key={i} className="border-b border-zinc-100 align-top dark:border-zinc-900">
-              {row.map((cell, j) => (
-                <td key={j} className="px-3 py-2 text-zinc-700 dark:text-zinc-300">
-                  {cell}
-                </td>
-              ))}
-            </tr>
-          ))}
-        </tbody>
-      </table>
-    </div>
   )
 }

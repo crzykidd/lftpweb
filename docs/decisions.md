@@ -6,6 +6,82 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-14 — Docs moved to Markdown in `docs/`: took the `react-markdown` dependency, rejected a hand-rolled parser
+
+**Handoff prompt `prompts/done/2026-08-14-docs-as-markdown-single-source.md`, executed end to
+end.** The prose that used to live only as JSX in `frontend/src/pages/docs/QuickStartPage.tsx`/
+`ConceptsPage.tsx` now lives in `docs/quick-start.md`/`docs/concepts.md` — readable straight from
+the repo — and the app renders those same two files (imported via Vite's `?raw` suffix), so
+there is exactly one copy of the prose, not two that can drift apart. `prose.tsx`'s styling
+vocabulary (`DocsPage`, `Section`, `Step`, `P`, `UL`, `Warn`, `Note`, `Code`, `Where`, `Jump`)
+survives unchanged as the thing the new renderer maps Markdown constructs onto; only its old
+`Table({head, rows})` aggregate shape is gone, replaced by per-element table styling (GFM tables
+render element-by-element, not as one object).
+
+**Took the dependency (`react-markdown` + `remark-gfm`), rejected a hand-rolled Markdown→JSX
+transform.** The task's own brief posed this as an open choice and flagged that this project has
+taken exactly one runtime frontend dependency before (`@tanstack/react-virtual`, phase 3b) and
+called it out as a deviation each time — so a second one needs its own justification, not a free
+pass by precedent. The deciding factor was **this session cannot see a browser.** A hand-rolled
+parser's correctness (table parsing, nested inline formatting inside a blockquote callout, GFM
+edge cases) would be exactly as unverifiable as everything else here — "builds and type-checks"
+proves nothing about whether a from-scratch parser mis-renders a real edge case in the actual
+content. A well-tested, widely-used library removes that specific class of risk in exchange for
+~99 packages / ~157 kB gzipped added to the bundle (635 kB total gzipped 183 kB after this
+change, up from clean-checkout current — `npm run build`'s own chunk-size warning now fires;
+noted, not treated as blocking for a docs-only bundle). Given the alternative was trusting
+untested code neither the reader nor I could see rendered, that trade was judged worth making.
+
+**What is *not* delegated to the library: structure.** `frontend/src/lib/docMarkdown.ts` parses
+title/lede/Jump-nav/section-boundaries/anchor-ids as plain string operations, deliberately *not*
+run through a Markdown engine — none of that is prose needing inline formatting, and keeping it
+as pure functions makes it fully unit-testable without rendering anything (`docMarkdown.test.ts`
+exercises it against both synthetic input and the real shipped `docs/*.md` files). Only a
+section's own body text goes through `react-markdown`+`remark-gfm`, plus one small custom remark
+plugin (`lib/remarkCallouts.ts`, ~50 lines) that retags a `> **Warning:**`/`> **Note:**`
+blockquote as `<div data-callout="warn"|"note">` — the marker word is stripped from the source
+before rendering and never appears in output, matching the original components' behaviour of a
+coloured box with no visible label. `MarkdownDoc.test.tsx` renders the actual pipeline against
+the actual shipped Markdown via `renderToStaticMarkup` and asserts on the resulting HTML (ids
+present, internal links resolve to app routes not full-page anchors, the marker word is absent,
+GFM tables render as real `<table>` elements) — real evidence the pipeline works, not just that
+it compiles, which is the closest this session can get to "verified" without a browser.
+
+**Two Markdown-source conventions invented for this, both hand-rolled rather than borrowed from
+an existing remark/rehype plugin ecosystem package, to keep the dependency list to exactly two
+packages:** a fenced ` ```jump ` block (`label|#id` lines) for the hand-authored in-page nav —
+Concepts still owns short, symptom-oriented labels distinct from its own heading text, matching
+the original component's intent ("someone reading this is stuck, not studying") — and a trailing
+`{#id}` on a `## ` heading for a stable anchor slug, since a heading's prose title doesn't
+slugify to `settle`/`suppression`/etc. on its own.
+
+**`server.fs.allow` added to both `vite.config.ts` and `vitest.config.ts`.** The Markdown files
+live in `docs/` at the repo root, outside Vite's default-detected root (`frontend/`, where its
+own `package-lock.json` sits); the dev server (and Vitest's module loader, which enforces the
+same boundary) refused to serve `../../../../docs/*.md?raw` without `fs.allow: ['..']`.
+`vite build` was unaffected either way — confirmed by running it — since fs.allow is dev-server
+request-serving middleware, not a build-time restriction.
+
+**Corrected while migrating, not carried over uncorrected**: Quick start step 6 gained a new
+bullet for **"Folder prefix during transfer"** (`342f96c`) — off by default, `.downloading-`
+default prefix, directory items only, verified directly against
+`backend/lftpweb/core/download_prefix.py` rather than trusted from README's own description of
+the same feature. Step 4 gained one new paragraph on the ~5-second local-only scan pass a queue
+gets while anything in it is active (`33db032`) — verified against `core/engine.py`'s
+`ACTIVE_SCAN_INTERVAL_S`/`_scan_queue_local_only`, including confirming it never advances the
+settle gate's own fingerprint (`fingerprints=None` in that pass's `_persist` call), so the
+settle-gate section's "two consecutive scans" language needed no change. Everything else in both
+files was already current — the concurrent `4b15fcc` (Reset item tracking's one-control
+redesign) and `8dc3c15` (field-help sweep, which fixed a stale "two error classes" claim to
+"three," `LOCAL_FS_ERROR`) had already landed in `ConceptsPage.tsx`'s prose before this task
+started reading it, so that wording carried over as-is. Not investigated further, and flagged
+rather than silently addressed: the field-help sweep's own decisions-record entry mentions "the
+new Retry section" describing a stale retry-backoff claim it fixed — that section lives on
+`TransferTab.tsx`'s `FieldHelp` text, not in the Docs pages this task touched, so it was left
+alone as out of scope.
+
+---
+
 ## 2026-08-14 — Transfer timing/throughput display: `bytes_done - bytes_start`, not `bytes_done` alone, for the average
 
 **Handoff prompt `prompts/done/2026-08-14-transfer-timing-and-throughput-display.md`, executed

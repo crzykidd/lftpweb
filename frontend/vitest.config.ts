@@ -17,6 +17,14 @@ import react from '@vitejs/plugin-react'
 // would just be dead weight in every test run.
 export default defineConfig({
   plugins: [react()],
+  server: {
+    // Same reason as vite.config.ts's identical block (2026-08-14, docs/decisions.md): the
+    // Docs tests import `../../../docs/*.md?raw`, outside Vite's default-allowed root, and
+    // Vitest's module loader enforces the same fs.allow boundary the dev server does.
+    fs: {
+      allow: ['..'],
+    },
+  },
   test: {
     // happy-dom over jsdom (2026-08-13, docs/decisions.md): the suite here is pure-function unit
     // tests -- format/storage/tree-sorting/collapse-preference logic -- that need `localStorage`,

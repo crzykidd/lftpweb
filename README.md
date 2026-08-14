@@ -164,7 +164,10 @@ every step linking to the page it describes. **Docs → Concepts** explains the 
 surprise people (why a transfer waited a minute before starting, why an item won't re-download,
 and what the three different "clear this" actions each actually remove). That lives in the app
 rather than being repeated here on purpose: duplicated prose drifts, and only the in-app copy can
-link you to the setting it's talking about.
+link you to the setting it's talking about. The same two pages are also plain Markdown you can
+read straight from this repo without deploying anything — see
+[`docs/quick-start.md`](docs/quick-start.md) and [`docs/concepts.md`](docs/concepts.md)
+(indexed, alongside the project's engineering records, in [`docs/README.md`](docs/README.md)).
 
 | Volume | Holds |
 |---|---|

@@ -6,6 +6,14 @@ import tailwindcss from '@tailwindcss/vite'
 export default defineConfig({
   plugins: [react(), tailwindcss()],
   server: {
+    // Docs → Quick start/Concepts (2026-08-14, docs/decisions.md) import
+    // `../../../../docs/*.md?raw` -- outside Vite's default served root (`frontend/`, where its
+    // own `package-lock.json` sits) -- so the dev server's fs.allow check needs to know the repo
+    // root is fine to read from. `vite build` isn't affected either way: fs.allow is dev-server
+    // request-serving middleware, not a build-time restriction.
+    fs: {
+      allow: ['..'],
+    },
     host: true,
     // Not 5173: chosen to avoid collisions with other dev stacks on the shared build host
     // (see docs/decisions.md).
