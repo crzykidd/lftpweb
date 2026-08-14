@@ -48,14 +48,38 @@ def _iter_files(root: Path) -> list[Path]:
 
 
 def _find_sidecars(root: Path) -> list[Path]:
-    """`.sfv`/`.md5` files under `root` (or, for a loose top-level file item, its parent --
-    a sidecar for a single file conventionally sits alongside it, not "inside" it).
+    """`.sfv`/`.md5` files for this item.
+
+    **A directory item searches its own subtree; a loose top-level file searches only the single
+    directory it sits in, never recursively.** That asymmetry is the whole point, and getting it
+    wrong is how this function shipped a real defect (2026-08-14, found during a live screenshot
+    session): `root.parent` for a loose file at the queue root *is the queue's entire local root*,
+    and `rglob` from there walked into every sibling release directory. A 4.3 GB single `.mkv` was
+    verified against a twelve-volume rar `.sfv` belonging to an unrelated release two directories
+    away, reported `CORRUPT: 12 of 12 checked file(s) failed ... missing`, and — this queue being
+    `move` mode — correctly withheld the remote delete for entirely the wrong reason.
+
+    That failure happened to land safe (a false `CORRUPT` withholds a delete). The mirror image
+    does not: a loose file whose accidental sidecar happens to list names that *do* exist nearby
+    would report `VERIFIED` on evidence about different bytes entirely, and verification is the
+    only gate on an irreversible remote delete (§6, §7.3). So the fix is not "recurse less
+    eagerly" -- a loose file's sidecar is, by the convention this function's own docstring already
+    named, the one sitting *alongside* it.
+
+    A directory item is unchanged: `rglob` over its own subtree is correct, since a release's
+    sidecar routinely sits one level down (inside `Sample/`, `Subs/`, or beside the archives).
     """
-    search_root = root if root.is_dir() else root.parent
-    if not search_root.is_dir():
+    if root.is_dir():
+        return sorted(
+            p for p in root.rglob("*") if p.is_file() and p.suffix.lower() in (".sfv", ".md5")
+        )
+
+    parent = root.parent
+    if not parent.is_dir():
         return []
+    # `iterdir`, not `rglob`: one directory deep, no descent into siblings.
     return sorted(
-        p for p in search_root.rglob("*") if p.is_file() and p.suffix.lower() in (".sfv", ".md5")
+        p for p in parent.iterdir() if p.is_file() and p.suffix.lower() in (".sfv", ".md5")
     )
 
 
