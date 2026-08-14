@@ -28,6 +28,17 @@ post-phase-9 session on 2026-08-12 (its entries are marked *(2026-08-12)*). Noth
 been released; `0.0.1` remains the in-development version. Read `README.md`'s "Known gaps"
 alongside this list: several entries below ship with deliberate, documented limitations.
 
+- **A "How it works" page** *(2026-08-14)*, in the app under **Docs → How it works** and in the
+  repo as [`docs/how-it-works.md`](docs/how-it-works.md) — the same single source, rendered both
+  places. Two minutes on the one decision the rest of the design follows from (lftp is a transfer
+  engine, not a status API), how an item actually gets queued, where progress comes from, and why
+  polling `jobs -v` was rejected. `README.md` gained a short section summarising it and linking
+  on, rather than repeating it.
+- **A demo-tree generator for screenshots and manual UI work** *(2026-08-14)*,
+  `docker/test-seedbox/make_demo_tree.py` — writes obviously-fake, generically-named releases
+  into the dev seedbox's hand-testing dropbox covering the four shapes worth photographing: a
+  loose file, a single-file directory, a real multi-volume rar set, and a multi-file pack.
+
 - **Phase 1 — skeleton + container.** FastAPI + SQLite backend, `host` / `path_queue`
   schema, `/api/health`, both production and development `docker compose` files, and the
   React + Vite SPA shell (nav, theme, version link).

@@ -31,6 +31,7 @@ export const SETTINGS_TABS: NavItem[] = [
  */
 export const DOCS_TABS: NavItem[] = [
   { path: '/docs/quick-start', label: 'Quick start' },
+  { path: '/docs/how-it-works', label: 'How it works' },
   { path: '/docs/concepts', label: 'Concepts' },
 ]
 

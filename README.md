@@ -13,6 +13,22 @@ progress, auto-queue on patterns, and optionally verify, extract, and relocate f
 > seedbox. No tagged release exists yet and there is no upgrade path — the database schema may
 > still change without notice. See "Known gaps" below before pointing it at anything important.
 
+## How it works
+
+**lftp is a transfer engine, not a status API.** Every transfer is its own short-lived `lftp`
+process, handed one job and left alone. Nothing asks lftp how it is going — progress is derived
+from the filesystem, comparing local bytes against the remote size the last scan recorded.
+
+That one decision is why a wedged transfer cannot lie about its progress, why every transfer
+resumes from its partial bytes, and why restarting the container mid-transfer costs seconds
+rather than a re-download. The obvious alternative — one long-running lftp polled with `jobs -v`
+— was tried and rejected: that output is meant for humans, and it takes the whole queue with it
+when the process dies.
+
+**[How it works](docs/how-it-works.md)** covers the rest in about two minutes: how an item gets
+queued, where status actually comes from, and why. It is also in the running app under
+**Docs → How it works**. [`DESIGN.md`](DESIGN.md) §1.2 and §1.3 have the long version.
+
 ## What works today
 
 - Connect to a seedbox over SSH/SFTP; browse the remote tree alongside the local one
