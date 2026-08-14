@@ -116,9 +116,8 @@ opposed to the unbuilt UI above.
 
 ## Known gaps
 
-Named here rather than fixed silently or left to be rediscovered — most are a deliberate scope
-reduction made during the build, recorded in full in `docs/decisions.md`; a few (marked below)
-are defects found but not yet fixed:
+Named here rather than fixed silently or left to be rediscovered — deliberate scope reductions
+and known limitations, recorded in full in `docs/decisions.md` and `prompts/open-issues.md`:
 
 - **Post-processing only runs when a job this app spawned succeeds, or when the settle gate
   releases a hold.** A file that arrives another way (a manual `cp`, a restore) is never
@@ -140,6 +139,20 @@ are defects found but not yet fixed:
 - **`password` auth mode with no user configured is open access, not a lockout** — see "Locked
   out?" below. Deliberate, since the alternative bricks the instance on a typo, but anyone
   reaching the API while no user row exists is in.
+- **A `move` queue deletes the remote copy before extraction runs.** The order is verify →
+  remote delete → extract, so an extraction that fails does so after the only other copy is gone.
+  Recoverable in practice — the local archives survive, since archive cleanup only runs on a
+  successful extraction — but it is a known, deliberate ordering rather than a reasoned one.
+- **An abandoned `.downloading-` directory with no tracking history can't be deleted from the
+  UI.** It is visible (the scan maps it to its logical name), but "Delete local" resolves the
+  physical path from the item's recorded prefix, and an orphan predating any job has none. The
+  realistic case — a stopped, failed, or `CORRUPT` item — is fully deletable. A directory left by
+  a wiped database is not; remove it by hand. Note dot-prefixed directories are also skipped by
+  `rm -rf *`.
+- **A terminal removed row has no individual reset.** Once a row lands on `REMOVED_BOTH` with
+  nothing in either tree it stops being published, so the Files page has no checkbox for it.
+  Reset item tracking's **All** and **Pattern** scopes both reach it; only the per-item scope
+  cannot target one on its own.
 - **`net:connection-limit` can't be set from the UI.** It lives only in the `host` row's
   `connection_overrides` JSON blob with no write path anywhere, so Settings → Transfer's
   "over the limit" warning can never fire on a current install.

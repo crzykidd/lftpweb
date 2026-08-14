@@ -7,9 +7,13 @@ A living list, not a handoff prompt. It never moves to `done/`.
 *why* is what is worth finding again — one fix was shipped and deliberately reversed the same
 night, and the reasoning for that reversal is more valuable than the diff.
 
-**Everything raised on 2026-08-14 is closed too**, across ten commits (`a75dc38`…`b4de50a`).
-Tests **701 → 967 backend / 189 frontend**. The queue that existed at the start of that session
-is empty.
+**Everything raised on 2026-08-14 is closed too**, across **thirty commits**
+(`a75dc38`…`61f1f1a`). Tests **701 → 1036 backend / 266 frontend**. The queue is empty.
+
+That day split in two: an overnight unattended run through a pre-written queue, then an afternoon
+of the user click-testing a real seedbox. The afternoon produced **eight more defects, none
+reachable by CI** — and **five of them shared one root cause**, the logical-vs-physical path
+assumption, fixed at source in `0e93fab`.
 
 Almost every item came from the user running the app against a real seedbox and reporting what
 looked wrong. **CI was green before each one was found.** That is the pattern of this project
@@ -89,19 +93,29 @@ the WebSocket live model, `@tanstack/react-virtual`, and a portal-based hover ca
 the unit tests already cover directly. That is a deliberate boundary, recorded in
 `README.md`'s Known gaps.
 
-### Almost none of the new UI has been seen by anyone
+### Some of the UI has now been seen — and six screens are photographed
 
-New on 2026-08-13 and unviewed: R/L/V/E lifecycle icons, inline progress bars, column sorting,
-the persisted collapse preference, the "Missing only" filter, the per-row info icon, and the
-generalised item drawer with its both-sides panel, lifecycle chronology, and history.
+**2026-08-14: the first visual review this project has ever had.** The user click-tested a real
+instance and captured six screenshots, now in `docs/images/` and described in
+`docs/screenshots.md`. An agent *reviewed those images* (they can be read, even though no browser
+exists to drive), which is how several of the afternoon's defects were characterised.
 
-**No agent can see any of it** — there is no browser in the environment agents run in. Every
-UI claim in this repo means "builds, type-checks, lints, and the endpoints it calls were
-verified over real HTTP." Never "renders correctly."
+Confirmed by eye and working: the grey `Extracted` chip vs the emerald one, the `Missing · Xm`
+countdown, per-file speed and ETA, the inline progress chip, the item drawer's prefixed-path note,
+and the corrected `7zz`/`unrar` extraction label.
 
-The specific thing to look at first: **progress-bar text contrast at around 50% fill**, where
-the label straddles filled and unfilled background. That is the case that looks fine in a
-mockup and reads badly in practice.
+**Still never viewed:** the Speed column at a narrow viewport (its `defaultWidth` went 88 → 128px
+and has not been checked), the column resize handles (moved to each column's left edge, reasoned
+from CSS only), the unified reset control's three scopes, the effective-lftp-settings `<details>`
+panel, Settings → Queues, and Docs → How it works.
+
+**No agent can drive a browser.** Every UI claim in this repo still means "builds, type-checks,
+lints, and the endpoints it calls were verified over real HTTP" unless a screenshot proves
+otherwise.
+
+Worth a look when convenient: **progress-bar text contrast at around 50% fill**, where the label
+straddles filled and unfilled background — flagged since 2026-08-13 and not yet confirmed either
+way.
 
 ### ~~A cleaned-up archive rests in a different state depending on sync mode~~ — **closed 2026-08-14**
 
@@ -238,12 +252,24 @@ consumer checked.
   `auto_queue_enabled` and `sync_mode` are both already per-queue columns and it only matters
   for `copy` queues. Needs a migration.
 - **`move` deletes the remote *before* extraction runs.** A failed extraction therefore happens
-  after the remote copy is gone. Local archives survive, so it is recoverable. **The user's
-  explicit call on 2026-08-13: leave it, revisit if it bites.** Do not reorder it as a side
-  effect of unrelated work.
+  after the remote copy is gone. Local archives survive, so it is recoverable. The user's call on
+  2026-08-13 was "leave it, revisit if it bites." **It bit on 2026-08-14**: a release verified,
+  its remote was deleted, and extraction then failed on stale leftovers — recoverable only
+  because archive cleanup happens to be gated on extraction *succeeding*. Reordering to
+  verify → extract → delete was offered and not yet decided. Do not reorder it as a side effect
+  of unrelated work.
 - **Encrypted-rar password retry is implemented but untestable** — no compressor exists
   anywhere to build an encrypted fixture. Real-archive rar coverage is old-style `.r00` only,
-  not `.partNN`.
+  not `.partNN`. **The user generated real `.partNN.rar` sets on 2026-08-14** (visible in that
+  day's History screenshot) — capturing one small set as a committed fixture would close the
+  new-style half of this gap.
+- **The `archive_cleanup` event message is a wall of text** — it lists every removed volume path
+  inline, and on the History page a twelve-volume release dominates the panel (visible in
+  `docs/images/history-audit-trail.png`). Wants a count plus an expand.
+- **A `move` queue can run 56 concurrent SFTP sessions without warning.** Settings → Transfer's
+  own readout says so plainly (`2 jobs × 2 parallel × 14 pget-n`), but the "over the limit"
+  warning beside it can never fire, because `net:connection-limit` has no write path (see
+  `README.md`'s Known gaps). The readout is honest; nothing enforces anything.
 - **`DESIGN.md` still has no section of its own** for local delete / retention, and none for
   per-file live child progress.
 

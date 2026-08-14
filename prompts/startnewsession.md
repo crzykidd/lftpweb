@@ -78,12 +78,39 @@ side effect of shipping.
 
 ### State at the end of 2026-08-14
 
-**Everything is pushed to `origin/dev`.** Tests **967 backend / 189 frontend**. Migrations run to
+**Everything is pushed to `origin/dev`.** Tests **1036 backend / 266 frontend**. Migrations run to
 **017**. Both lint gates, `npm test`, `npm run build`, the image build, and all three compose
 files clean.
 
-Eleven commits (`a75dc38`…`d1fe8ca`). The queue of handoff prompts that existed at the start of
-that session is **empty** — every one executed and in `prompts/done/`.
+**Thirty commits on 2026-08-14** (`a75dc38`…`61f1f1a`), and `dev` is ~97 ahead of `main`. The
+handoff-prompt queue is **empty** — every prompt written that day was executed and is in
+`prompts/done/`.
+
+The day split into two halves. The first (overnight, unattended) worked a queue of prompts written
+the night before. The second was the user click-testing a real seedbox and reporting what looked
+wrong — **eight more defects, none of which CI could have caught**, every one found by using the
+app. Three were in code that had full green tests at the time.
+
+**The single most useful thing to know: five of those eight traced to one assumption** — that an
+item's logical path (`local_path + rel_path`) and its physical path
+(`local_path + prefix + rel_path`) are the same thing. See the boxed section further down; the
+root cause was fixed in `0e93fab` by making `scan_local` **map** a `.downloading-` directory to its
+logical name instead of filtering it out, the same thing it already did for `*.lftp` files.
+
+Afternoon commits, on top of the table below:
+
+| What | Commit |
+|---|---|
+| **Archive cleanup no longer deletes archives after a failed verification** — it destroyed the only re-extractable source for an item just declared corrupt | `f0ef53c` |
+| **The All-scope reset preview under-reported** — it read the published tree while the execute path read the `item` table, so it previewed 0 and reset 2 | `95b38e4` |
+| **A cleaned-up archive volume rests at `EXCLUDED` with a grey `Extracted` chip**, never a missing-file countdown | `9975223` |
+| **`scan_local` maps the download prefix instead of filtering it** — the architectural fix behind five defects; closed the settle-gate stuck-item gap and the false 100% progress | `0e93fab` |
+| **Queue is hidden on a row with no remote copy** — a `move`-mode release offered Queue after its remote was deleted | `61f1f1a` |
+| **A loose file's verification picked up a sibling release's `.sfv`** — a 4.3 GB mkv verified against rar checksums | `c7fa6e8` |
+| **Shutdown mid-transfer** — children terminated concurrently, `stop_grace_period: 60s` | `ab7764b` |
+| **A removal-grace countdown** (`Missing · 1m`) so a vanished item says a decision is pending | `3ae2873` |
+| **Per-file speed and ETA** inside a mirroring directory, and on the Transfers page | `25bc33c`, `740acc9` |
+| **The first six screenshots**, a How-it-works doc page, and the effective-lftp-settings readout | `c4c8572`, `a171510`, `de3d97e` |
 
 | What | Commit |
 |---|---|
