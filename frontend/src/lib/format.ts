@@ -51,6 +51,36 @@ export function transferSpeedSortValue(state: string, speedBps: number | null | 
   return speedBps
 }
 
+// A **child** file inside a mirroring directory (2026-08-14, "per-file speed inside a mirror")
+// cannot use the two functions above: `core/reconcile.py`'s leaf rule puts an
+// actively-transferring child at `PARTIAL`, never `DOWNLOADING` -- gating on `state ===
+// 'DOWNLOADING'` the same way the parent row does would hide exactly the rows this exists to
+// show. There is also no per-child `state` transition to gate staleness on the way there is at
+// the job level (a job's `state` genuinely leaves `DOWNLOADING`; a child's `PARTIAL` doesn't
+// change just because the transfer stopped). So gating here is **freshness**, not `state`: the
+// caller (`FileTree.tsx`'s `buildTree`) already resolves `null` for any sample older than
+// `CHILD_SPEED_FRESHNESS_MS`, so by the time a value reaches either function below, "present"
+// already means "should render" -- see docs/decisions.md for the two gating options considered
+// and why freshness (closed by construction: the backend simply stops emitting a sample for a
+// child that stopped changing) was chosen over threading job-liveness through the tree.
+
+/** The Speed column's in-cell text for a child row -- `speedBps` must already be
+ * freshness-filtered by the caller (`null` for a stale/absent sample); see the module comment
+ * above.
+ */
+export function childSpeedLabel(speedBps: number | null | undefined): string {
+  if (speedBps == null || !Number.isFinite(speedBps)) return '—'
+  return formatRate(Math.max(speedBps, 0))
+}
+
+/** The Speed column's sort value for a child row -- same freshness contract as
+ * `childSpeedLabel`, and the same null-last sort behavior `transferSpeedSortValue` documents.
+ */
+export function childSpeedSortValue(speedBps: number | null | undefined): number | null {
+  if (speedBps == null || !Number.isFinite(speedBps)) return null
+  return speedBps
+}
+
 /** `eta_s` from `core/progress.py` -- `null` when speed is 0 or the total is unknown. */
 export function formatEta(etaSeconds: number | null | undefined): string {
   if (etaSeconds == null || !Number.isFinite(etaSeconds)) return '—'

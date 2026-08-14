@@ -1,10 +1,14 @@
 import { describe, expect, it } from 'vitest'
 import type { FileNode, LifecycleFacets } from '../api/types'
+import type { ChildSpeedSample } from '../hooks/useLiveModel'
 import {
   buildTree,
+  CHILD_SPEED_FRESHNESS_MS,
   clampColumnWidth,
   columnMinWidth,
   defaultColumnWidths,
+  effectiveSpeedLabel,
+  effectiveSpeedSortValue,
   flatten,
   isCollapsePreference,
   isColumnWidths,
@@ -110,6 +114,99 @@ describe('buildTree', () => {
   it('defaults speed_bps to null for every row when no speedByItemId argument is passed at all', () => {
     const tree = buildTree([node('a.txt', false, { id: 1 })])
     expect(tree[0].speed_bps).toBeNull()
+  })
+
+  // 2026-08-14 ("per-file speed inside a mirror"): `child_speed_bps` is resolved the same
+  // shape `speed_bps` already is, but gated on freshness (`now - receivedAt`) rather than
+  // passed straight through -- a child never reaches `DOWNLOADING`, so there is no `state`
+  // transition to gate staleness on the way there is for the job-level reading.
+  describe('resolves child_speed_bps from the optional childSpeedByItemId map, gated on freshness', () => {
+    it('a fresh sample resolves to its speed', () => {
+      const nodes = [node('a.txt', false, { id: 1 })]
+      const childSpeedByItemId: Record<number, ChildSpeedSample> = { 1: { speedBps: 42_000, receivedAt: 1_000 } }
+      const tree = buildTree(nodes, {}, childSpeedByItemId, 1_000)
+      expect(tree[0].child_speed_bps).toBe(42_000)
+    })
+
+    it('a sample exactly at the freshness boundary still counts', () => {
+      const nodes = [node('a.txt', false, { id: 1 })]
+      const childSpeedByItemId: Record<number, ChildSpeedSample> = { 1: { speedBps: 5_000, receivedAt: 0 } }
+      const tree = buildTree(nodes, {}, childSpeedByItemId, CHILD_SPEED_FRESHNESS_MS)
+      expect(tree[0].child_speed_bps).toBe(5_000)
+    })
+
+    it('a sample older than the freshness window resolves to null -- the stale-sample case', () => {
+      const nodes = [node('a.txt', false, { id: 1 })]
+      const childSpeedByItemId: Record<number, ChildSpeedSample> = { 1: { speedBps: 5_000, receivedAt: 0 } }
+      const tree = buildTree(nodes, {}, childSpeedByItemId, CHILD_SPEED_FRESHNESS_MS + 1)
+      expect(tree[0].child_speed_bps).toBeNull()
+    })
+
+    it('no entry in the map at all resolves to null, same as speed_bps', () => {
+      const nodes = [node('a.txt', false, { id: 1 })]
+      const tree = buildTree(nodes, {}, {}, 1_000)
+      expect(tree[0].child_speed_bps).toBeNull()
+    })
+
+    it('a node with no id at all can never match, regardless of the map contents', () => {
+      const nodes = [node('a.txt', false, { id: null })]
+      const childSpeedByItemId: Record<number, ChildSpeedSample> = { 1: { speedBps: 5_000, receivedAt: 1_000 } }
+      const tree = buildTree(nodes, {}, childSpeedByItemId, 1_000)
+      expect(tree[0].child_speed_bps).toBeNull()
+    })
+
+    it('defaults to null for every row when no childSpeedByItemId argument is passed at all', () => {
+      const tree = buildTree([node('a.txt', false, { id: 1 })])
+      expect(tree[0].child_speed_bps).toBeNull()
+    })
+  })
+})
+
+// --- effectiveSpeedLabel / effectiveSpeedSortValue: job-level first, child-level fallback ----
+//
+// 2026-08-14 ("per-file speed inside a mirror"). A row's Speed cell and its sort value both
+// prefer the job-level reading (`speed_bps`, gated on `state === 'DOWNLOADING'`) and only fall
+// back to the child-level one (`child_speed_bps`, already freshness-filtered by `buildTree`)
+// when the job-level reading has nothing to show -- never both, never summed, so the two
+// granularities can never read as additive (DESIGN.md §9.2's own bar for this task).
+
+describe('effectiveSpeedLabel / effectiveSpeedSortValue', () => {
+  function entry(overrides: Partial<TreeEntry>): TreeEntry {
+    return {
+      ...node('x', false),
+      name: 'x',
+      depth: 0,
+      children: [],
+      speed_bps: null,
+      child_speed_bps: null,
+      ...overrides,
+    }
+  }
+
+  it('a DOWNLOADING parent row shows its job-level rate, ignoring any child_speed_bps', () => {
+    const e = entry({ state: 'DOWNLOADING', speed_bps: 5_000_000, child_speed_bps: 999 })
+    expect(effectiveSpeedLabel(e)).toBe('4.8 MB/s') // formatBytes is 1024-based, not decimal
+    expect(effectiveSpeedSortValue(e)).toBe(5_000_000)
+  })
+
+  it('a PARTIAL child row with no job-level rate falls back to its own live rate', () => {
+    const e = entry({ state: 'PARTIAL', speed_bps: null, child_speed_bps: 250_000 })
+    expect(effectiveSpeedLabel(e)).toBe('244.1 KB/s') // formatBytes is 1024-based, not decimal
+    expect(effectiveSpeedSortValue(e)).toBe(250_000)
+  })
+
+  it('a PARTIAL child row with a stale (already-nulled) sample shows nothing, not the last value', () => {
+    // buildTree already resolved the stale sample to null before this ever runs -- this pins
+    // that a null child_speed_bps reads as "not transferring", not as a leftover reading.
+    const e = entry({ state: 'PARTIAL', speed_bps: null, child_speed_bps: null })
+    expect(effectiveSpeedLabel(e)).toBe('—')
+    expect(effectiveSpeedSortValue(e)).toBeNull()
+  })
+
+  it('a row that is neither a running job nor a fresh child shows nothing', () => {
+    const e = entry({ state: 'DOWNLOADED', speed_bps: null, child_speed_bps: null })
+    expect(effectiveSpeedLabel(e)).toBe('—')
+    expect(effectiveSpeedSortValue(e)).toBeNull()
   })
 })
 
@@ -248,6 +345,32 @@ describe('sortTree', () => {
       // zero is a lesser value than "unknown", not the same bucket as it.
       expect(sorted).toEqual(['root/stalled.bin', 'root/idle.bin'])
     })
+
+    // 2026-08-14 ("per-file speed inside a mirror"): a mirroring directory's children are never
+    // DOWNLOADING (PARTIAL instead, `core/reconcile.py`'s leaf rule), so their own live rate
+    // only ever reaches this sort key through the childSpeedByItemId fallback -- and a stale
+    // sample (older than CHILD_SPEED_FRESHNESS_MS) must sort exactly like "never transferred",
+    // not linger at its last value.
+    it('a PARTIAL child row sorts by its own child_speed_bps fallback; a stale sample sorts last', () => {
+      const nodes = [
+        node('root', true),
+        node('root/fast.rar', false, { id: 30, state: 'PARTIAL' }),
+        node('root/slow.rar', false, { id: 31, state: 'PARTIAL' }),
+        // A sample old enough to have fallen out of the freshness window at `now` below.
+        node('root/stale.rar', false, { id: 32, state: 'PARTIAL' }),
+        node('root/idle.rar', false, { id: 33, state: 'REMOTE_ONLY' }),
+      ]
+      const now = 100_000
+      const childSpeedByItemId: Record<number, ChildSpeedSample> = {
+        30: { speedBps: 5_000_000, receivedAt: now },
+        31: { speedBps: 1_000_000, receivedAt: now },
+        32: { speedBps: 9_999_999, receivedAt: now - CHILD_SPEED_FRESHNESS_MS - 1 },
+      }
+      const asc = sortTree(buildTree(nodes, {}, childSpeedByItemId, now), 'speed', 'asc')[0].children.map(
+        (c) => c.rel_path,
+      )
+      expect(asc).toEqual(['root/slow.rar', 'root/fast.rar', 'root/idle.rar', 'root/stale.rar'])
+    })
   })
 })
 
@@ -326,6 +449,7 @@ describe('matchesFacetFilter', () => {
     depth: 0,
     children: [],
     speed_bps: null,
+    child_speed_bps: null,
   })
 
   it('"" (All items) matches everything', () => {

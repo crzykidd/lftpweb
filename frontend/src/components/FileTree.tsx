@@ -4,8 +4,11 @@ import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useReducer,
 import { createPortal } from 'react-dom'
 import { deleteItem, getSettleSettings, queueItem, stopItem } from '../api/client'
 import type { FileNode, SettleSettingsOut } from '../api/types'
+import type { ChildSpeedSample } from '../hooks/useLiveModel'
 import {
   bothSidesRows,
+  childSpeedLabel,
+  childSpeedSortValue,
   formatBytes,
   formatPercent,
   hasBothSides,
@@ -34,6 +37,20 @@ const AGE_TICK_INTERVAL_MS = 15_000
 
 const ROW_HEIGHT_PX = 32
 
+/** How long a `child_progress` sample (2026-08-14, "per-file speed inside a mirror") is
+ * trusted before `buildTree` treats it as stale and resolves `child_speed_bps` to `null` --
+ * the frontend half of the freshness-gating decision (see `lib/format.ts`'s module comment
+ * above `childSpeedLabel`, and docs/decisions.md). The backend throttles a live child's own
+ * publish cadence to roughly `CHILD_PROGRESS_THROTTLE_TICKS * tick_s` while it keeps changing
+ * (~3s at the default `tick_s`, `core/queue.py`) but that constant isn't on the wire and
+ * `tick_s` is configurable, so this is a generous, independent multiple of the *default* rather
+ * than a value derived from a setting the frontend can't see -- loose enough to absorb normal
+ * jitter (a slow tick, WS latency) without a value flickering off between two genuinely live
+ * samples, tight enough that a child that actually stopped changing reads as "not transferring"
+ * again within a few seconds, not indefinitely.
+ */
+export const CHILD_SPEED_FRESHNESS_MS = 10_000
+
 const inputClasses =
   'rounded-md border border-zinc-300 bg-white px-2.5 py-1.5 text-sm text-zinc-900 outline-none focus:border-zinc-500 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100'
 
@@ -57,6 +74,20 @@ export interface TreeEntry extends FileNode {
    * average.
    */
   speed_bps: number | null
+  /** A **child** file's own live rate (2026-08-14, "per-file speed inside a mirror") -- from
+   * the `child_progress` WS message (`core/queue.py._publish_child_progress`), looked up by
+   * this row's own `id` from the `childSpeedByItemId` map, and resolved to `null` here (not
+   * just left to the caller) whenever the sample is older than `CHILD_SPEED_FRESHNESS_MS` --
+   * see that constant's own comment for why freshness, not `state`, is what gates a child
+   * (every actively-transferring child sits at `PARTIAL`, never `DOWNLOADING`, so `speed_bps`
+   * above is `null` for it and `transferSpeedLabel` would show nothing). Distinct from
+   * `speed_bps`: a directory's own row can carry both a job-level `speed_bps` (it *is* the
+   * parent of the running job) and, structurally, never a `child_speed_bps` of its own (only
+   * leaf files appear in `core/queue.py.JobProgress.children`) -- see `effectiveSpeedLabel`/
+   * `effectiveSpeedSortValue` below for how a row picks between the two without ever summing
+   * them (§9.2's "don't let the numbers read as additive").
+   */
+  child_speed_bps: number | null
 }
 
 /** What a row's own size column shows. A **file** prefers `local_size` (falling back to
@@ -80,7 +111,44 @@ function nodeDisplaySize(entry: TreeEntry): number | null {
     : (entry.local_size ?? entry.remote_size)
 }
 
-export function buildTree(nodes: FileNode[], speedByItemId: Record<number, number> = {}): TreeEntry[] {
+/** The Speed column's actual text for one row -- prefers the row's own **job-level** rate
+ * (`speed_bps`, gated on `state === 'DOWNLOADING'` by `transferSpeedLabel`) and falls back to
+ * its **child-level** rate (`child_speed_bps`, already freshness-filtered by `buildTree`) only
+ * when the job-level reading has nothing to show. The two can never both apply to the same row
+ * in a way that would read as additive: `speed_bps` is only ever non-null for the parent item
+ * of a currently-running job, `child_speed_bps` is only ever non-null for a leaf file
+ * (`core/queue.py.JobProgress.children` never includes the mirror job's own top-level
+ * directory), and sorting only ever reorders siblings (`sortSiblingsRecursive` below), never
+ * compares a directory against its own children -- so this fallback is a per-row either/or, not
+ * a place two live rates could be shown, compared, or summed as peers (§9.2's own bar for this
+ * task: "no sort that mixes parent and child rates as peers without the tree structure making
+ * the relationship obvious").
+ */
+export function effectiveSpeedLabel(entry: TreeEntry): string {
+  const jobLabel = transferSpeedLabel(entry.state, entry.speed_bps)
+  return jobLabel !== '—' ? jobLabel : childSpeedLabel(entry.child_speed_bps)
+}
+
+/** `effectiveSpeedLabel`'s sort-value counterpart -- same job-level-first, child-level-fallback
+ * shape, both already null-safe/null-last via `compareValues`.
+ */
+export function effectiveSpeedSortValue(entry: TreeEntry): number | null {
+  return transferSpeedSortValue(entry.state, entry.speed_bps) ?? childSpeedSortValue(entry.child_speed_bps)
+}
+
+export function buildTree(
+  nodes: FileNode[],
+  speedByItemId: Record<number, number> = {},
+  /** `useLiveModel.ts`'s `childSpeedByItemId` (2026-08-14, "per-file speed inside a mirror") --
+   * default `{}` keeps every pre-existing 2-arg call site (and test) working unchanged.
+   */
+  childSpeedByItemId: Record<number, ChildSpeedSample> = {},
+  /** Injectable so the freshness check below is deterministic in a test, exactly like
+   * `core/progress.py.ProgressSampler.sample`'s own `now` parameter -- defaults to the real
+   * clock for every production call site.
+   */
+  now: number = Date.now(),
+): TreeEntry[] {
   const byPath = new Map<string, TreeEntry>()
   const roots: TreeEntry[] = []
 
@@ -97,12 +165,17 @@ export function buildTree(nodes: FileNode[], speedByItemId: Record<number, numbe
     const name = lastSlash === -1 ? node.rel_path : node.rel_path.slice(lastSlash + 1)
     const parentPath = lastSlash === -1 ? null : node.rel_path.slice(0, lastSlash)
     const parent = parentPath ? byPath.get(parentPath) : undefined
+    const childSample = node.id != null ? childSpeedByItemId[node.id] : undefined
     const entry: TreeEntry = {
       ...node,
       name,
       depth: parent ? parent.depth + 1 : 0,
       children: [],
       speed_bps: node.id != null ? (speedByItemId[node.id] ?? null) : null,
+      child_speed_bps:
+        childSample != null && now - childSample.receivedAt <= CHILD_SPEED_FRESHNESS_MS
+          ? childSample.speedBps
+          : null,
     }
     byPath.set(node.rel_path, entry)
     if (parent) parent.children.push(entry)
@@ -210,8 +283,10 @@ function sortValue(entry: TreeEntry, key: SortKey): string | number | null {
     case 'speed':
       // Non-transferring rows sort to one end regardless of direction (`compareValues`'s
       // existing null-last rule) rather than interleaving by a coincidental zero -- see
-      // `transferSpeedSortValue`'s own docstring in `lib/format.ts`.
-      return transferSpeedSortValue(entry.state, entry.speed_bps)
+      // `transferSpeedSortValue`'s own docstring in `lib/format.ts`. Falls back to a child's own
+      // rate when the row isn't a running job's parent (`effectiveSpeedSortValue`'s own
+      // docstring) -- 2026-08-14, "per-file speed inside a mirror".
+      return effectiveSpeedSortValue(entry)
     case 'state_changed_at':
       return entry.state_changed_at
     case 'percent':
@@ -1090,17 +1165,22 @@ function Row({
       >
         {size != null ? formatBytes(size) : '—'}
       </span>
-      {/* Speed (2026-08-14, prompts/2026-08-14-files-page-speed-column.md): the live rate from
-          the `progress` WS message, already resolved onto `entry.speed_bps` by `buildTree`.
-          `transferSpeedLabel` is the one place that decides blank-vs-shown -- gated on
+      {/* Speed (2026-08-14, prompts/2026-08-14-files-page-speed-column.md; extended
+          2026-08-14, "per-file speed inside a mirror"): the live rate from the `progress` WS
+          message, already resolved onto `entry.speed_bps` by `buildTree`. `transferSpeedLabel`
+          is the one place that decides blank-vs-shown for that job-level reading -- gated on
           `entry.state === 'DOWNLOADING'`, never on the value itself, so a real `0 B/s` on a
           stalled-but-still-running transfer still shows as `0 B/s`, not blank (see that
-          function's own docstring in `lib/format.ts`). */}
+          function's own docstring in `lib/format.ts`). `effectiveSpeedLabel` adds one fallback
+          on top: a **child** file inside a mirroring directory sits at `PARTIAL`, never
+          `DOWNLOADING`, so it falls through to its own freshness-gated `child_speed_bps`
+          instead (`entry.speed_bps` is `null` for it in the first place -- a leaf file is never
+          the parent of a running job). */}
       <span
         className="shrink-0 overflow-hidden text-right text-zinc-500 dark:text-zinc-400"
         style={fixedColumnStyle('speed')}
       >
-        {transferSpeedLabel(entry.state, entry.speed_bps)}
+        {effectiveSpeedLabel(entry)}
       </span>
       <span className="shrink-0 overflow-hidden text-right" style={fixedColumnStyle('status')}>
         {/* The settle gate's wait (2026-08-13, item 3): was a 6px dot next to the chip
@@ -1229,6 +1309,7 @@ export function FileTree({
   nodes,
   connected = true,
   speedByItemId,
+  childSpeedByItemId,
   selected,
   onSelectionChange,
   queueLocalPath,
@@ -1246,6 +1327,13 @@ export function FileTree({
    * Row cell read it from.
    */
   speedByItemId: Record<number, number>
+  /** `useLiveModel.ts`'s `childSpeedByItemId` (2026-08-14, "per-file speed inside a mirror") --
+   * a live rate per changed file inside a mirroring directory, each sample timestamped so
+   * `buildTree` can gate display on freshness rather than `state` (see that map's own
+   * docstring for why: a child never reaches `DOWNLOADING`). Threaded straight into `buildTree`
+   * below, the same shape `speedByItemId` already established.
+   */
+  childSpeedByItemId: Record<number, ChildSpeedSample>
   /** The Files-page selection, lifted to `FilesPage.tsx` (2026-08-14,
    * `prompts/2026-08-14-reset-panel-counts-and-layout.md`) so `QueueResetControls.tsx`'s unified
    * Selected scope and this component's own multi-select can never disagree about what's
@@ -1270,7 +1358,14 @@ export function FileTree({
   // The shared age ticker (module docstring above): bumping this forces a re-render of
   // whatever rows are currently mounted, which is all `stateAgeLabel` needs to catch up --
   // it's computed fresh from `Date.now()` on every render, not memoized against this value.
-  const [, bumpAgeTick] = useReducer((c: number) => c + 1, 0)
+  // Also (2026-08-14, "per-file speed inside a mirror") the one thing that makes a child's
+  // `CHILD_SPEED_FRESHNESS_MS` staleness check ever re-evaluate on its own: `tree` below is
+  // `useMemo`'d against `childSpeedByItemId`, so a child that simply stops receiving new
+  // `child_progress` samples (finished, or its job stopped) would otherwise keep showing its
+  // last rate forever -- nothing else would trigger a recompute. Piggy-backing on this existing
+  // ticker rather than adding a second interval means the same up-to-15s lag `stateAgeLabel`
+  // already accepts for its own "how long ago" text, not a new tunable.
+  const [ageTick, bumpAgeTick] = useReducer((c: number) => c + 1, 0)
   useEffect(() => {
     const id = setInterval(() => bumpAgeTick(), AGE_TICK_INTERVAL_MS)
     return () => clearInterval(id)
@@ -1312,8 +1407,15 @@ export function FileTree({
   }
 
   const tree = useMemo(
-    () => sortTree(buildTree(nodes, speedByItemId), sortPref.key, sortPref.dir),
-    [nodes, speedByItemId, sortPref],
+    () => sortTree(buildTree(nodes, speedByItemId, childSpeedByItemId), sortPref.key, sortPref.dir),
+    // `ageTick` isn't read inside `buildTree` (it always calls `Date.now()` fresh) -- it's
+    // listed purely to force this memo to recompute periodically (the same ticker
+    // `stateAgeLabel`'s "how long ago" text already rides), which is what makes a child's
+    // `CHILD_SPEED_FRESHNESS_MS` staleness check ever take effect once `childSpeedByItemId`
+    // itself stops changing (a finished/stopped child receives no further `child_progress`
+    // samples, so nothing else here would trigger a recompute).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [nodes, speedByItemId, childSpeedByItemId, sortPref, ageTick],
   )
 
   // Collapse preference (2026-08-13): "default plus exceptions," not a saved set of collapsed

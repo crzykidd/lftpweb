@@ -15,8 +15,11 @@ import asyncio
 
 import pytest
 
+from lftpweb.core.progress import ActiveJob
 from lftpweb.core.queue import CHILD_PROGRESS_THROTTLE_TICKS, _RunningProcess
+from lftpweb.core.settle import SettleSettings, save_settle_settings
 from test_queue import _make_db, _make_host_row, _make_item_row, _make_queue_row, _queue_for
+from test_queue_completeness import _fake_spawned, _resolved_wait_task
 
 
 @pytest.fixture
@@ -52,6 +55,19 @@ def _running_process(
 
 def _item_deltas(messages: list[dict]) -> list[dict]:
     return [m for m in messages if m["type"] == "item_delta"]
+
+
+def _child_progress_items(messages: list[dict]) -> dict[int, float]:
+    """Every `child_progress` message's `items`, flattened to `item_id -> speed_bps` -- this
+    task's own new WS message (2026-08-14, "per-file speed inside a mirror").
+    """
+    out: dict[int, float] = {}
+    for m in messages:
+        if m["type"] != "child_progress":
+            continue
+        for it in m["items"]:
+            out[it["item_id"]] = it["speed_bps"]
+    return out
 
 
 async def _drain(events, queue) -> list[dict]:
@@ -328,3 +344,247 @@ async def test_flush_child_progress_final_is_a_no_op_when_local_root_no_longer_e
     shutil.rmtree(release_dir)
     proc = q._running[1]
     await q._flush_child_progress_final(proc)  # must not raise
+
+
+# --- per-child speed (this task, 2026-08-14: "per-file speed inside a mirror") ----------------
+#
+# `_publish_child_progress` now also emits a third WS message, `child_progress`, carrying a
+# live EMA-smoothed rate per changed child -- these tests exercise it directly (bypassing
+# `_sample_and_publish_progress`'s own `time.monotonic()` call) so the elapsed time between two
+# samples is exactly controlled, the same shape `tests/test_progress.py` already uses for
+# `ProgressSampler.sample`'s own `now` parameter.
+
+
+async def test_child_progress_message_is_published_with_a_zero_rate_on_first_sample(db, tmp_path):
+    q, release_dir, _queue_id, ids = await _setup(db, tmp_path)
+    (release_dir / "a.rar").write_bytes(b"a" * 300)
+
+    active = [ActiveJob(job_id=1, kind="mirror", local_root=str(release_dir), bytes_total=1500)]
+    results = q.progress.sample(active, now=0.0)
+    by_queue: dict = {}
+    events_queue = q.events.subscribe()
+    await q._publish_child_progress(results, by_queue, now=0.0)
+    messages = await _drain(q.events, events_queue)
+
+    speeds = _child_progress_items(messages)
+    assert speeds.get(ids["a"]) == 0.0  # no prior sample to derive a rate from
+
+
+async def test_child_progress_rate_uses_the_real_elapsed_time_between_two_samples(db, tmp_path):
+    q, release_dir, _queue_id, ids = await _setup(db, tmp_path)
+    active = [ActiveJob(job_id=1, kind="mirror", local_root=str(release_dir), bytes_total=1500)]
+
+    (release_dir / "a.rar").write_bytes(b"a" * 300)
+    results1 = q.progress.sample(active, now=0.0)
+    await q._publish_child_progress(results1, {}, now=0.0)
+
+    (release_dir / "a.rar").write_bytes(b"a" * 800)  # +500 bytes
+    results2 = q.progress.sample(active, now=1.0)  # a real 1.0s later
+    events_queue = q.events.subscribe()
+    await q._publish_child_progress(results2, {}, now=1.0)
+    messages = await _drain(q.events, events_queue)
+
+    speeds = _child_progress_items(messages)
+    # ema_step(instantaneous=500/1.0, prev_speed=0.0, alpha=DEFAULT_EMA_ALPHA=0.3)
+    assert speeds[ids["a"]] == pytest.approx(0.3 * 500.0)
+
+
+async def test_child_progress_rate_is_not_derived_from_tick_count_but_a_real_timestamp(
+    db, tmp_path
+):
+    """The denominator is `now - prev_time` (both real `time.monotonic()`-shaped values), never
+    `tick_s * CHILD_PROGRESS_THROTTLE_TICKS` -- a slow pass between two throttled ticks must
+    still produce the correct rate, not one derived from an assumed cadence. Same delta as the
+    test above, but 5 real seconds apart instead of 1 -- a materially different rate proves the
+    elapsed time, not a constant, drove the computation.
+    """
+    q, release_dir, _queue_id, ids = await _setup(db, tmp_path)
+    active = [ActiveJob(job_id=1, kind="mirror", local_root=str(release_dir), bytes_total=1500)]
+
+    (release_dir / "a.rar").write_bytes(b"a" * 300)
+    results1 = q.progress.sample(active, now=0.0)
+    await q._publish_child_progress(results1, {}, now=0.0)
+
+    (release_dir / "a.rar").write_bytes(b"a" * 800)  # +500 bytes, this time over 5s
+    results2 = q.progress.sample(active, now=5.0)
+    events_queue = q.events.subscribe()
+    await q._publish_child_progress(results2, {}, now=5.0)
+    messages = await _drain(q.events, events_queue)
+
+    speeds = _child_progress_items(messages)
+    assert speeds[ids["a"]] == pytest.approx(0.3 * (500.0 / 5.0))
+
+
+async def test_child_progress_zero_delta_reads_as_zero_rate(db, tmp_path):
+    q, release_dir, _queue_id, ids = await _setup(db, tmp_path)
+    active = [ActiveJob(job_id=1, kind="mirror", local_root=str(release_dir), bytes_total=1500)]
+
+    (release_dir / "a.rar").write_bytes(b"a" * 300)
+    results1 = q.progress.sample(active, now=0.0)
+    await q._publish_child_progress(results1, {}, now=0.0)
+
+    (release_dir / "b.rar").write_bytes(b"b" * 500)  # a *different* child changes, not a.rar
+    results2 = q.progress.sample(active, now=1.0)
+    events_queue = q.events.subscribe()
+    await q._publish_child_progress(results2, {}, now=1.0)
+    messages = await _drain(q.events, events_queue)
+
+    # a.rar did not change on this tick, so it is not republished at all (the existing
+    # unchanged-child rule) -- only b.rar, itself a first sample, appears at 0.0.
+    speeds = _child_progress_items(messages)
+    assert ids["a"] not in speeds
+    assert speeds[ids["b"]] == 0.0
+
+
+async def test_child_progress_never_produces_a_negative_rate_when_a_file_shrinks(db, tmp_path):
+    """A file replaced or truncated mid-transfer can report a smaller size than the previous
+    sample -- must read as "no progress", never a negative rate.
+    """
+    q, release_dir, _queue_id, ids = await _setup(db, tmp_path)
+    active = [ActiveJob(job_id=1, kind="mirror", local_root=str(release_dir), bytes_total=1500)]
+
+    (release_dir / "a.rar").write_bytes(b"a" * 800)
+    results1 = q.progress.sample(active, now=0.0)
+    await q._publish_child_progress(results1, {}, now=0.0)
+
+    (release_dir / "a.rar").write_bytes(b"a" * 300)  # shrinks -- replaced/truncated
+    results2 = q.progress.sample(active, now=1.0)
+    events_queue = q.events.subscribe()
+    await q._publish_child_progress(results2, {}, now=1.0)
+    messages = await _drain(q.events, events_queue)
+
+    speeds = _child_progress_items(messages)
+    assert speeds[ids["a"]] >= 0
+
+
+async def test_child_progress_zero_or_sub_second_elapsed_reads_as_zero_not_a_crash(db, tmp_path):
+    q, release_dir, _queue_id, ids = await _setup(db, tmp_path)
+    active = [ActiveJob(job_id=1, kind="mirror", local_root=str(release_dir), bytes_total=1500)]
+
+    (release_dir / "a.rar").write_bytes(b"a" * 300)
+    results1 = q.progress.sample(active, now=0.0)
+    await q._publish_child_progress(results1, {}, now=0.0)
+
+    (release_dir / "a.rar").write_bytes(b"a" * 800)
+    results2 = q.progress.sample(active, now=0.0)  # same instant -- no elapsed time at all
+    events_queue = q.events.subscribe()
+    await q._publish_child_progress(results2, {}, now=0.0)
+    messages = await _drain(q.events, events_queue)
+
+    speeds = _child_progress_items(messages)
+    assert speeds[ids["a"]] == 0.0
+
+
+async def test_child_progress_is_a_third_message_never_folded_into_progress_or_item_delta(
+    db, tmp_path
+):
+    """`progress` (job-centric) and `item_delta` (`item_view()` projections) must keep their
+    existing shapes exactly -- a live per-child rate is neither a job nor a persisted column.
+    """
+    q, release_dir, queue_id, ids = await _setup(db, tmp_path)
+    await q.db.execute(
+        "INSERT INTO job (id, item_id, kind, state, lane, rank, attempt) "
+        "VALUES (1, ?, 'mirror', 'running', 'main', 0, 1)",
+        (ids["parent"],),
+    )
+    await q.db.commit()
+    (release_dir / "a.rar").write_bytes(b"a" * 300)
+
+    events_queue = q.events.subscribe()
+    await _tick_through_throttle(q)
+    messages = await _drain(q.events, events_queue)
+
+    progress_msgs = [m for m in messages if m["type"] == "progress"]
+    assert progress_msgs, "the job-centric progress message must still be published"
+    for job in progress_msgs[0]["jobs"]:
+        assert set(job) == {"job_id", "item_id", "bytes_done", "bytes_total", "speed_bps", "eta_s"}
+        assert "children" not in job  # no per-child pseudo-entries leaking into this message
+
+    item_delta_msgs = _item_deltas(messages)
+    assert item_delta_msgs
+    for node in item_delta_msgs[0]["nodes"]:
+        # `item_view`'s exact projected shape -- a live rate is not one of these keys.
+        assert "speed_bps" not in node
+
+    child_msgs = [m for m in messages if m["type"] == "child_progress"]
+    assert child_msgs, "a.rar's change must have produced a child_progress message too"
+    for m in child_msgs:
+        assert set(m) == {"type", "items"}
+        for it in m["items"]:
+            assert set(it) == {"item_id", "speed_bps"}
+    assert ids["a"] in _child_progress_items(child_msgs)
+
+
+async def test_child_speed_history_is_pruned_when_the_job_reaps(db, tmp_path):
+    """`_reap_one` must clear `_prev_child_times`/`_child_speed` alongside the existing
+    `_prev_child_sizes` prune -- otherwise a future job id reusing job 1 (SQLite `INTEGER
+    PRIMARY KEY` reuse is not guaranteed impossible) could inherit a stale rate history.
+    """
+    q, release_dir, _queue_id, ids = await _setup(db, tmp_path)
+    await save_settle_settings(q.db, SettleSettings(enabled=False))
+    active = [ActiveJob(job_id=1, kind="mirror", local_root=str(release_dir), bytes_total=1500)]
+
+    (release_dir / "a.rar").write_bytes(b"a" * 300)
+    results = q.progress.sample(active, now=0.0)
+    await q._publish_child_progress(results, {}, now=0.0)
+    assert 1 in q._prev_child_sizes
+    assert 1 in q._prev_child_times
+    assert 1 in q._child_speed
+
+    await q.db.execute(
+        "INSERT INTO job (id, item_id, kind, state, lane, rank, attempt) "
+        "VALUES (1, ?, 'mirror', 'running', 'main', 0, 1)",
+        (ids["parent"],),
+    )
+    await q.db.commit()
+
+    old_proc = q._running[1]
+    reaped_proc = _RunningProcess(
+        job_id=1,
+        item_id=old_proc.item_id,
+        queue_id=old_proc.queue_id,
+        rel_path=old_proc.rel_path,
+        is_dir=True,
+        kind="mirror",
+        lane="main",
+        rate_limit_bps=0,
+        forced_full_rate=False,
+        local_root=old_proc.local_root,
+        bytes_total=old_proc.bytes_total,
+        remote_mtime=None,
+        spawned=_fake_spawned(tmp_path, 1),
+        wait_task=_resolved_wait_task(0, "ok"),
+    )
+    q._running[1] = reaped_proc
+    await q._reap_one(reaped_proc)
+
+    assert 1 not in q._prev_child_sizes
+    assert 1 not in q._prev_child_times
+    assert 1 not in q._child_speed
+
+
+async def test_child_progress_disappears_once_the_parent_job_is_no_longer_running(db, tmp_path):
+    """Once a job leaves `self._running` (reaped, stopped, or simply gone from the active set),
+    `_sample_and_publish_progress` no longer includes it in `results` at all, so
+    `_publish_child_progress` has nothing to say about any of its children on the next tick --
+    the freshness-by-construction half of the frontend's gating (`docs/decisions.md`).
+    """
+    q, release_dir, _queue_id, ids = await _setup(db, tmp_path)
+    active = [ActiveJob(job_id=1, kind="mirror", local_root=str(release_dir), bytes_total=1500)]
+
+    (release_dir / "a.rar").write_bytes(b"a" * 300)
+    results1 = q.progress.sample(active, now=0.0)
+    events_queue_first = q.events.subscribe()
+    await q._publish_child_progress(results1, {}, now=0.0)
+    first_messages = await _drain(q.events, events_queue_first)
+    assert ids["a"] in _child_progress_items(first_messages), "sanity: it does show up first"
+
+    # The job is gone from the active set -- `results` no longer has an entry for job_id 1 at
+    # all, exactly what happens once `_reap_one` runs (or the job was never admitted this tick).
+    del q._running[1]
+    results2 = q.progress.sample([], now=1.0)  # nothing active
+    events_queue = q.events.subscribe()
+    await q._publish_child_progress(results2, {}, now=1.0)
+    messages = await _drain(q.events, events_queue)
+
+    assert _child_progress_items(messages) == {}

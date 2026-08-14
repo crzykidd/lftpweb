@@ -6,6 +6,110 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-14 — Per-file speed inside a mirror: a third WS message, freshness-gated on the frontend rather than a `state` check
+
+**Handoff prompt `prompts/done/2026-08-14-per-file-speed-inside-a-mirror.md`, executed end to
+end.** `f728373`'s Speed column only ever lit up the top-level row of a `mirror` job — its
+children (the actual files being transferred) showed nothing, because the byte delta
+`core/queue.py._publish_child_progress` already diffs every throttled tick was computed and
+then discarded, never divided by anything to make a rate. This closes that: a real elapsed-time
+measurement, EMA-smoothed the same way the job-level rate already is, on a new WS message.
+
+**A third message, `child_progress`, not folded into either existing one.** `progress` is
+job-centric (keyed by `job_id`, consumed as `progressByJobId`) — a child has no job of its own,
+so a pseudo-entry there would collide with a real job id and put a fictional row on the
+Transfers page. `item_delta` carries `item_view()` projections of persisted `item` columns only
+(DESIGN.md §2/§9's invariant: nothing goes on the wire that wasn't read back out of `item`) — a
+live rate is a sample, never a column, and was never going to become one. `child_progress` is
+`{item_id, speed_bps}[]`, item-keyed like `speedByItemId` already is, published from
+`_publish_child_progress` on the same throttled pass, bounded by the same
+`MAX_CHILD_PROGRESS_UPDATES_PER_TICK` cap the rest of that method already enforces.
+
+**The gating problem, and why freshness was chosen over threading job-liveness through the
+tree.** The prompt's own bar: do not write `DOWNLOADING` onto a child row to make the existing
+`state === 'DOWNLOADING'` gate (`lib/format.ts.transferSpeedLabel`) pass — that is a lie about
+persisted state, `core/reconcile.py`'s leaf rule (`local >= remote -> DOWNLOADED, else PARTIAL`)
+overwrites it on the very next scan, and this project has already shipped exactly that bug once
+(`_sample_and_publish_progress` used to hand-build `{"state": "DOWNLOADING"}` instead of reading
+`item_view` back; see the 2026-08-12 entry below). An actively-transferring child sits at
+`PARTIAL` forever, by design — there is no `state` transition on it to gate staleness with the
+way there is at the job level (a job's own `state` genuinely leaves `DOWNLOADING` when it stops).
+Two options were on the table: (a) render a child's speed whenever its *parent's* job is live and
+a sample exists, or (b) have the backend simply stop emitting a sample once a child stops
+changing, and gate display on **freshness** — a sample newer than N seconds — closing staleness
+by construction rather than by a state or liveness check. Chose (b). It was already almost free:
+`_publish_child_progress` only ever diffs *changed* children, so a finished/stalled child was
+already falling out of the message on its own; the only gap was the frontend never checking
+whether the value it was holding was still fresh. Threading "is this child's ancestor job live"
+through the tree (option a) would have meant either a second lookup keyed by job_id at every
+leaf, or denormalizing job liveness onto every node — real plumbing for a fact `useLiveModel.ts`
+doesn't otherwise track per-row. `useLiveModel.ts`'s `childSpeedByItemId` map stores each
+sample's own receipt time (`Date.now()` client-side, not a value sent over the wire — no reason
+to reconcile server monotonic time with the browser's clock for a threshold this loose);
+`FileTree.tsx`'s `buildTree` resolves a fresh sample to `child_speed_bps`, a stale or absent one
+to `null`, before either the Speed cell or the `speed` sort key ever sees it. Freshness window:
+`CHILD_SPEED_FRESHNESS_MS = 10_000` (`FileTree.tsx`) — the backend throttles a *live* child's own
+publish cadence to roughly `CHILD_PROGRESS_THROTTLE_TICKS * tick_s` (~3s at the default `tick_s`)
+while it keeps changing, but neither constant is on the wire and `tick_s` is configurable, so
+10s is a generous, independent multiple of the *default* rather than a value derived from a
+setting the frontend can't see.
+
+**Closing the staleness gap actually requires a periodic re-render, not just a fresh WS
+message.** `tree` in `FileTree.tsx` is `useMemo`'d against `childSpeedByItemId`; once a child
+stops receiving new samples (finished, or its job stopped), nothing else would ever force that
+memo to recompute, so a stale rate would sit displayed indefinitely even though `buildTree`
+itself is written to null it out. Rather than add a second `setInterval`, the memo now also
+depends on the row tree's existing `ageTick` (the ticker `stateAgeLabel`'s own "how long ago"
+text already rides, `AGE_TICK_INTERVAL_MS = 15_000`) — one more cheap periodic recompute the
+component already pays for, not a new tunable.
+
+**A row's Speed cell/sort value prefers the job-level reading and only falls back to the
+child-level one when the former has nothing to show** (`FileTree.tsx.effectiveSpeedLabel`/
+`effectiveSpeedSortValue`) — never both, never summed. This falls out of the data shape rather
+than needing an explicit rule: `speed_bps` is only ever non-null for the parent item of a
+currently-running job, `child_speed_bps` is only ever non-null for a leaf file
+(`core/progress.py.JobProgress.children` never includes the mirror job's own top-level
+directory), and `sortSiblingsRecursive` only ever reorders siblings, never compares a directory
+against its own children — so the two rates can never appear as peers in a way that would read
+as additive (the prompt's own bar: `mirror_parallel_transfer_count` files in flight sum to
+roughly the parent's rate; they are the same bytes counted at two granularities, not extra
+throughput).
+
+**EMA smoothing reused, not reinvented — and `ProgressSampler.sample`'s inline formula was
+extracted to make that possible.** `core/progress.py.ema_step(instantaneous, prev_speed, alpha)`
+is the exact two-line blend `ProgressSampler.sample` already computed inline, pulled out so
+`core/queue.py`'s new `child_speed_bps(bytes_delta, seconds_elapsed, prev_speed, alpha)` — itself
+also in `core/progress.py`, a pure function with no I/O — can call it instead of carrying a
+second copy of the same math. `child_speed_bps` also clamps `bytes_delta` non-negative *inside
+itself* (not left to the caller) so "never produces a negative rate" is a property of the rate
+derivation alone, provable without reading `_publish_child_progress` too — a file replaced or
+truncated mid-transfer, or a resumed job's sidecar read mid-write by lftp, can otherwise report a
+lower size than the last sample. `core/queue.py.TransferQueue` gained two new per-child state
+dicts, `_prev_child_times`/`_child_speed` (job_id -> {rel_path -> ...}), alongside the existing
+`_prev_child_sizes`, all three pruned together in `_reap_one` so a future job id can never
+inherit stale rate history. `ProgressSampler` gained a public `alpha` property (previously only
+`_alpha`) so `core/queue.py` reads the sampler's real configured smoothing constant instead of
+either reaching into a private attribute or hardcoding `DEFAULT_EMA_ALPHA` and silently drifting
+from it if the sampler is ever constructed with something else.
+
+**A real timestamp, not `tick_s * CHILD_PROGRESS_THROTTLE_TICKS`.** The prompt called this out by
+name: this project has already shipped one bug from exactly this class of wrong denominator
+(`bytes_done` vs. `bytes_total`, `6e6b217`). `_publish_child_progress` now takes `now: float |
+None = None` (defaulting to `time.monotonic()`, injectable for tests, the same shape
+`ProgressSampler.sample` already used) and `_sample_and_publish_progress` passes one real
+timestamp per throttled tick; the per-child rate divides by `now - prev_time`, both real
+`time.monotonic()` values, never an assumed cadence. `child_speed_bps` also guards
+`seconds_elapsed <= 0` (two throttled ticks close enough together that the clock didn't visibly
+advance — the existing test suite's own back-to-back calls with no sleep between them actually
+exercise this) by returning `0.0` rather than dividing by zero.
+
+**Rejected: summing children into a directory-level "total in-flight rate" display.** Never
+implemented — the parent row already shows the job's own aggregate rate (unchanged), and a
+second, redundantly-computed sum from the children would be the exact "same bytes counted twice"
+confusion §9.2 asked this task to avoid, for no reading the parent row doesn't already give.
+
+---
+
 ## 2026-08-14 — Docs moved to Markdown in `docs/`: took the `react-markdown` dependency, rejected a hand-rolled parser
 
 **Handoff prompt `prompts/done/2026-08-14-docs-as-markdown-single-source.md`, executed end to

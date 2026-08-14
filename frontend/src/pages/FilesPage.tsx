@@ -19,7 +19,7 @@ import { formatRelativeTime } from '../lib/format'
 const EMPTY_SELECTION: Set<string> = new Set()
 
 export function FilesPage() {
-  const { queues, state, scanCompleteSeq, speedByItemId } = useLiveModel()
+  const { queues, state, scanCompleteSeq, speedByItemId, childSpeedByItemId } = useLiveModel()
   const [rescanning, setRescanning] = useState(false)
 
   // The Files-page multi-select, lifted here from `FileTree.tsx` (2026-08-14,
@@ -145,6 +145,7 @@ export function FilesPage() {
               nodes={queue.nodes}
               connected={state === 'open'}
               speedByItemId={speedByItemId}
+              childSpeedByItemId={childSpeedByItemId}
               selected={getSelected(queue.queue_id)}
               onSelectionChange={(next) => setSelectedForQueue(queue.queue_id, next)}
               queueLocalPath={config?.local_path}

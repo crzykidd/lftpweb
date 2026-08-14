@@ -30,7 +30,7 @@ from lftpweb.core.events import EventBus
 from lftpweb.core.itemview import ITEM_VIEW_COLUMNS, ItemView, item_view
 from lftpweb.core.metrics import RunningJobBytes, ThroughputSampler
 from lftpweb.core.postprocess import move_tree
-from lftpweb.core.progress import ActiveJob, JobProgress, ProgressSampler
+from lftpweb.core.progress import ActiveJob, JobProgress, ProgressSampler, child_speed_bps
 from lftpweb.core.remote import HostConfig, parse_connection_limit
 
 logger = logging.getLogger(__name__)
@@ -277,6 +277,21 @@ class TransferQueue:
         # `self.progress.drop`).
         self._progress_tick_count = 0
         self._prev_child_sizes: dict[int, dict[str, int]] = {}
+        # Per-child speed (this task, 2026-08-14, "per-file speed inside a mirror"): a real
+        # timestamp per (job_id, rel_path) -- `_prev_child_sizes` above only ever recorded the
+        # *value* last diffed, never *when*, so there was nothing to divide a byte delta by
+        # except the wrong assumption `tick_s * CHILD_PROGRESS_THROTTLE_TICKS`, which a slow
+        # pass makes silently wrong (this project has already shipped one bug from exactly that
+        # shape of wrong denominator, `6e6b217`). `_prev_child_times` is job_id -> {rel_path ->
+        # `time.monotonic()` at the last tick this method actually diffed that child};
+        # `_child_speed` is job_id -> {rel_path -> its last EMA-smoothed rate}, the per-child
+        # analogue of `ProgressSampler._speed` above, smoothed with the exact same
+        # `core/progress.py.ema_step` formula rather than a second scheme (a raw per-tick delta
+        # on one file is burstier than the job aggregate, per that module's docstring). Both
+        # pruned in `_reap_one` alongside `_prev_child_sizes` so a future job id can never
+        # inherit stale rate history.
+        self._prev_child_times: dict[int, dict[str, float]] = {}
+        self._child_speed: dict[int, dict[str, float]] = {}
 
         self._task: asyncio.Task | None = None
         self._wake = asyncio.Event()
@@ -612,6 +627,8 @@ class TransferQueue:
         self._last_speeds.pop(proc.job_id, None)
         self._last_progress.pop(proc.job_id, None)
         self._prev_child_sizes.pop(proc.job_id, None)
+        self._prev_child_times.pop(proc.job_id, None)
+        self._child_speed.pop(proc.job_id, None)
 
         if not proc.wait_task.done():
             # stop_job() reaps immediately after terminate() returns, before the task's own
@@ -1097,6 +1114,15 @@ class TransferQueue:
           live instead of waiting for the next full engine scan (up to `scan_interval_s`,
           default 30s) — the gap that made "stop it and see it go STOPPED without a page
           refresh" impossible before this phase.
+        - `child_progress` (this task, 2026-08-14, "per-file speed inside a mirror"): a third,
+          item-keyed message, `{item_id, speed_bps}` per changed child of a mirroring
+          directory — deliberately not folded into either message above. It does not belong in
+          `progress`: that message is job-centric and a child has no `job_id` of its own, so a
+          pseudo-entry there would collide in the frontend's `progressByJobId` map and put a
+          fictional row on the Transfers page. It does not belong in `item_delta` either: that
+          message carries `item_view()` projections of persisted `item` columns only
+          (DESIGN.md §2/§9's invariant), and a live rate is a sample, never a persisted one —
+          see `_publish_child_progress`.
 
         The parent item's row is *persisted then read back* through `core/itemview.py` rather
         than hand-built, matching `core/engine.py.scan_queue`'s invariant (DESIGN.md §2/§9):
@@ -1160,7 +1186,11 @@ class TransferQueue:
         # parent's row instead of a second WS round trip.
         self._progress_tick_count += 1
         if self._progress_tick_count % CHILD_PROGRESS_THROTTLE_TICKS == 0:
-            await self._publish_child_progress(results, by_queue)
+            # One real timestamp for every child diffed this pass -- not `tick_s *
+            # CHILD_PROGRESS_THROTTLE_TICKS`, which a slow pass would make silently wrong (see
+            # `child_speed_bps`'s own docstring). `time.monotonic()` matches what
+            # `core/progress.py.ProgressSampler` already keys its own EMA history on.
+            await self._publish_child_progress(results, by_queue, now=time.monotonic())
 
         for queue_id, nodes in by_queue.items():
             self.events.publish({"type": "item_delta", "queue_id": queue_id, "nodes": nodes})
@@ -1183,7 +1213,11 @@ class TransferQueue:
         )
 
     async def _publish_child_progress(
-        self, results: dict[int, JobProgress], by_queue: dict[int, list[dict[str, Any]]]
+        self,
+        results: dict[int, JobProgress],
+        by_queue: dict[int, list[dict[str, Any]]],
+        *,
+        now: float | None = None,
     ) -> None:
         """Live per-file progress for the files inside a mirroring directory -- the fix this
         task exists for.
@@ -1224,11 +1258,32 @@ class TransferQueue:
         `item_view` and only *that* goes on the wire. A child with no matching `item` row (not
         yet persisted by an engine scan) is silently skipped, not invented here -- `_persist`
         in `core/engine.py` is the only writer of new `item` rows.
+
+        **The per-child rate** (this task, 2026-08-14): alongside the `local_size`/`state`
+        write above, each changed child's byte delta is divided by the *real* elapsed time
+        since it was last diffed (`self._prev_child_times`, `now - prev_time`, both
+        `time.monotonic()`) and EMA-smoothed with `core/progress.py.child_speed_bps` --
+        deliberately the same smoothing `ProgressSampler` uses for a job's own aggregate rate,
+        reused rather than reinvented. A child seen for the first time (no `prev_time` yet, the
+        same shape as `ProgressSampler`'s "first sample" branch) reports `0.0`, not a rate
+        derived from zero history. The result is collected into `child_progress_by_key`, keyed
+        by `(queue_id, full_path)` since `full_path` alone is not unique across queues, and
+        turned into the wire's `{item_id, speed_bps}` shape once the read-back below has each
+        child's `item.id` -- `_prev_child_sizes` only ever carried a rel_path string, never the
+        id `item_view` produces.
+
+        `now` is injectable (`time.monotonic()` seconds) purely for testability, matching
+        `ProgressSampler.sample`'s own `now` parameter; `_sample_and_publish_progress` always
+        passes a real one.
         """
+        now = time.monotonic() if now is None else now
         parent_by_job = {p.job_id: p for p in self._running.values()}
         updates_remaining = MAX_CHILD_PROGRESS_UPDATES_PER_TICK
         truncated = False
         to_read_back: dict[int, list[str]] = {}  # queue_id -> full rel_paths to read back
+        # (queue_id, full rel_path) -> this tick's EMA speed for that child, filled in below and
+        # matched up with each child's `item.id` once the read-back has it.
+        speed_by_key: dict[tuple[int, str], float] = {}
 
         for job_id, prog in results.items():
             if prog.children is None:  # pget job: no children to report
@@ -1238,6 +1293,8 @@ class TransferQueue:
                 continue
 
             prev = self._prev_child_sizes.setdefault(job_id, {})
+            prev_times = self._prev_child_times.setdefault(job_id, {})
+            prev_speeds = self._child_speed.setdefault(job_id, {})
             current = {rel: entry.size for rel, entry in prog.children.items() if not entry.is_dir}
             changed = [rel for rel, size in current.items() if prev.get(rel) != size]
             if not changed:
@@ -1253,6 +1310,25 @@ class TransferQueue:
                 size = current[rel]
                 full_path = f"{parent.rel_path}/{rel}"
                 full_paths.append(full_path)
+
+                # The rate, from this child's own previous size/time (both absent on a first
+                # sighting -- see the docstring's "first sample" note) -- computed *before*
+                # `prev`/`prev_times`/`prev_speeds` are overwritten below for this rel.
+                prev_size = prev.get(rel)
+                prev_time = prev_times.get(rel)
+                if prev_size is not None and prev_time is not None and now > prev_time:
+                    speed = child_speed_bps(
+                        max(size - prev_size, 0),
+                        now - prev_time,
+                        prev_speeds.get(rel),
+                        self.progress.alpha,
+                    )
+                else:
+                    speed = 0.0
+                speed_by_key[(parent.queue_id, full_path)] = speed
+                prev_speeds[rel] = speed
+                prev_times[rel] = now
+
                 await self.db.execute(
                     "UPDATE item SET local_size = ?, state = CASE "
                     "WHEN remote_size IS NULL THEN state "
@@ -1272,6 +1348,7 @@ class TransferQueue:
             if updates_remaining <= 0:
                 break
 
+        child_progress_items: list[dict[str, Any]] = []
         if to_read_back:
             await self.db.commit()
             for queue_id, full_paths in to_read_back.items():
@@ -1283,9 +1360,13 @@ class TransferQueue:
                     f"SELECT {ITEM_VIEW_COLUMNS} FROM item WHERE queue_id = ? AND rel_path IN ({placeholders})",  # noqa: S608
                     (queue_id, *full_paths),
                 )
-                by_queue.setdefault(queue_id, []).extend(
-                    item_view(row) for row in await cursor.fetchall()
-                )
+                rows = await cursor.fetchall()
+                nodes = [item_view(row) for row in rows]
+                by_queue.setdefault(queue_id, []).extend(nodes)
+                for node in nodes:
+                    speed = speed_by_key.get((queue_id, node["rel_path"]))
+                    if speed is not None:
+                        child_progress_items.append({"item_id": node["id"], "speed_bps": speed})
 
         if truncated:
             # A silent cap reads as "we published everything this tick" when we did not.
@@ -1294,6 +1375,14 @@ class TransferQueue:
                 "will show on a later tick instead",
                 MAX_CHILD_PROGRESS_UPDATES_PER_TICK,
             )
+
+        # A third, item-keyed message (docstring above) -- never folded into `progress` or
+        # `item_delta`. Bounded the same way the rest of this method is: at most
+        # `len(child_progress_items) <= MAX_CHILD_PROGRESS_UPDATES_PER_TICK` entries, never
+        # proportional to tree size. Omitted entirely on a tick with nothing to report, same as
+        # `item_delta`'s own per-queue publish above only fires for queues that actually changed.
+        if child_progress_items:
+            self.events.publish({"type": "child_progress", "items": child_progress_items})
 
     async def _sample_metrics(self) -> None:
         """Feeds `core/metrics.py`'s 30-tick throughput sampler from the exact same per-job

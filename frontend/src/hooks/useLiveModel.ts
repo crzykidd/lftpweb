@@ -6,6 +6,15 @@ export type SocketState = 'connecting' | 'open' | 'reconnecting'
 
 const RECONNECT_DELAY_MS = 3000
 
+/** One `child_progress` sample, kept with the moment it arrived so a consumer can decide for
+ * itself whether it's still fresh (2026-08-14, "per-file speed inside a mirror") -- see
+ * `childSpeedByItemId` below for why freshness, not `state`, is what gates a child's display.
+ */
+export interface ChildSpeedSample {
+  speedBps: number
+  receivedAt: number
+}
+
 interface QueueState {
   queue_id: number
   queue_name: string
@@ -60,6 +69,21 @@ export function useLiveModel(): {
    * 'DOWNLOADING'`, not on whether a value is present.
    */
   speedByItemId: Record<number, number>
+  /** `child_progress` WS messages (2026-08-14, "per-file speed inside a mirror"), keyed by
+   * `item_id` like `speedByItemId` above -- but unlike that map, each entry also carries when
+   * it arrived (`Date.now()` at receipt), because the gating rule for a child is different from
+   * the parent's. `speedByItemId` is safe to leave unpruned forever because its consumer
+   * (`FileTree.tsx`) gates purely on `state === 'DOWNLOADING'`, which stops being true the
+   * instant a job's own item leaves that state. A mirroring directory's *children* never reach
+   * `DOWNLOADING` at all -- `core/reconcile.py`'s leaf rule puts an actively-transferring child
+   * at `PARTIAL` -- so there is no state transition to gate on, and a value that's simply never
+   * pruned would linger on a finished/stalled child forever. `_publish_child_progress` already
+   * stops emitting an entry for a child the instant it stops changing (a natural consequence of
+   * only diffing *changed* children), so a consumer that gates on "was a sample received
+   * recently" closes the staleness gap by construction rather than needing an explicit prune
+   * message. See docs/decisions.md for the two options considered and why this one was picked.
+   */
+  childSpeedByItemId: Record<number, ChildSpeedSample>
   state: SocketState
   /** Bumped by one on every `scan_complete` message, for any queue. Purely a change signal --
    * a caller (`FilesPage.tsx`'s "Rescan now") that captures this value before triggering a
@@ -71,6 +95,7 @@ export function useLiveModel(): {
   const [queuesById, setQueuesById] = useState<Record<number, QueueState>>({})
   const [progressByJobId, setProgressByJobId] = useState<Record<number, ProgressJob>>({})
   const [speedByItemId, setSpeedByItemId] = useState<Record<number, number>>({})
+  const [childSpeedByItemId, setChildSpeedByItemId] = useState<Record<number, ChildSpeedSample>>({})
   const [state, setState] = useState<SocketState>('connecting')
   const [scanCompleteSeq, setScanCompleteSeq] = useState(0)
 
@@ -188,6 +213,13 @@ export function useLiveModel(): {
             for (const job of msg.jobs) next[job.item_id] = job.speed_bps
             return next
           })
+        } else if (msg.type === 'child_progress') {
+          const receivedAt = Date.now()
+          setChildSpeedByItemId((prev) => {
+            const next = { ...prev }
+            for (const it of msg.items) next[it.item_id] = { speedBps: it.speed_bps, receivedAt }
+            return next
+          })
         }
       }
 
@@ -215,5 +247,5 @@ export function useLiveModel(): {
     .map(toQueueFiles)
     .sort((a, b) => a.queue_id - b.queue_id)
 
-  return { queues, progressByJobId, speedByItemId, state, scanCompleteSeq }
+  return { queues, progressByJobId, speedByItemId, childSpeedByItemId, state, scanCompleteSeq }
 }

@@ -551,6 +551,19 @@ alongside this list: several entries below ship with deliberate, documented limi
   copy-pasted: Quick start gained a step-6 bullet for "Folder prefix during transfer" and a
   paragraph on the ~5-second active-queue local-only scan pass, both new since the prose was
   first written; everything else carried over unchanged, already current.
+- **The Files tree's Speed column now shows a live rate on each file inside a mirroring
+  directory, not just the directory's own row** *(2026-08-14)*. `f728373`'s Speed column only
+  ever lit up a `mirror` job's top-level row — its children, the individual files actually being
+  transferred, showed nothing, because the byte delta already being diffed every throttled tick
+  was computed and then discarded, never divided by an elapsed time. A new `child_progress`
+  WebSocket message (item-keyed, EMA-smoothed the same way the job-level rate already is) closes
+  that gap; a child's own live rate is gated on **freshness of the sample**, not `state`, since
+  an actively-transferring child sits at `PARTIAL` under `core/reconcile.py`'s leaf rule and
+  never reaches `DOWNLOADING`. A row's Speed cell prefers its own job-level rate and only falls
+  back to the child-level one when the former has nothing to show, so the two granularities are
+  never displayed or summed as peers — `mirror_parallel_transfer_count` files in flight sum to
+  roughly the parent's own rate, the same bytes counted at two granularities, not extra
+  throughput. See `docs/decisions.md` for the gating options considered.
 
 ### Changed
 

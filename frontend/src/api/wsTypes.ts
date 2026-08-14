@@ -85,6 +85,29 @@ export interface ProgressMessage {
   jobs: ProgressJob[]
 }
 
+export interface ChildProgressItem {
+  item_id: number
+  speed_bps: number
+}
+
+/** Published by `core/queue.py._publish_child_progress` on the same throttled pass as
+ * `item_delta` (2026-08-14, "per-file speed inside a mirror") -- a live, EMA-smoothed rate for
+ * each changed file inside a mirroring directory. Deliberately a **third** message, not folded
+ * into either existing one: `progress` is job-centric (a child has no `job_id` of its own, so a
+ * pseudo-entry there would collide in `progressByJobId` and put a fictional row on the
+ * Transfers page); `item_delta` carries `item_view()` projections of persisted `item` columns
+ * only, and a live rate is a sample, never a persisted one (DESIGN.md §2/§9's invariant). Never
+ * larger than `core/queue.py.MAX_CHILD_PROGRESS_UPDATES_PER_TICK` entries, and omitted
+ * entirely on a tick with nothing to report -- same bound as `_publish_child_progress`'s other
+ * work, never proportional to tree size. See `useLiveModel.ts`'s `childSpeedByItemId` and
+ * docs/decisions.md for how the frontend gates display on this (freshness, not `state`, since
+ * every actively-transferring child sits at `PARTIAL`, never `DOWNLOADING`).
+ */
+export interface ChildProgressMessage {
+  type: 'child_progress'
+  items: ChildProgressItem[]
+}
+
 export type WsMessage =
   | SnapshotMessage
   | QueueDeltaMessage
@@ -92,3 +115,4 @@ export type WsMessage =
   | ScanErrorMessage
   | ScanCompleteMessage
   | ProgressMessage
+  | ChildProgressMessage
