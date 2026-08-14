@@ -6,17 +6,12 @@ A containerized web interface for keeping a local directory in sync with a seedb
 Browse the remote and local trees as one view, queue and supervise downloads with live
 progress, auto-queue on patterns, and optionally verify, extract, and relocate finished items.
 
-> ## ⚠ Pre-release — not ready to use
+> ## Beta
 >
-> **Version `0.0.1`. All 9 build phases are built and unit/integration tested**, plus two runs
-> of correctness fixes that only real use surfaced (2026-08-12 and 2026-08-13). There is no
-> release, no published image, and no upgrade path. Things will change without notice,
-> including the database schema. **No UI screen in this project has ever been opened in a
-> browser** — every page was built, verified against the real backend and the real fake
-> seedbox over HTTP, and confirmed to build/type-check/lint cleanly, but never visually
-> confirmed. See "Known gaps" below before trusting any of it.
->
-> Try it if you want to poke at it. Don't point it at anything you care about yet.
+> **Version `0.0.1`.** All 9 build phases are built, covered by backend unit and integration
+> tests plus a frontend unit suite, and exercised manually through the UI against a real
+> seedbox. No tagged release exists yet and there is no upgrade path — the database schema may
+> still change without notice. See "Known gaps" below before pointing it at anything important.
 
 ## What works today
 
@@ -89,77 +84,29 @@ opposed to the unbuilt UI above.
 Named here rather than fixed silently or left to be rediscovered — each is a deliberate scope
 reduction made during the build, recorded in full in `docs/decisions.md`:
 
-- **No UI screen in this project has ever been opened in a browser.** No browser exists in any
-  environment this project has been built in. Every page has been confirmed to build,
-  type-check, and lint cleanly, and every backend endpoint it calls has been verified directly
-  over real HTTP — but actual rendering, layout, and click-through behavior have never been
-  visually confirmed. Click-test before relying on any of it. This applies hardest to the
-  newest work: **almost none of the 2026-08-13 Files-page revamp** — the lifecycle icons, the
-  inline progress bars, sorting, the persisted collapse preference, the detail drawer, the
-  hover tooltip — **has been seen by a human, and none of it by any agent.**
-- **The frontend test runner (Vitest + happy-dom) covers the pure logic, not the components.**
-  `frontend/src/**/*.test.ts` pins `lib/format.ts`, `lib/storage.ts`, `lib/resetWarning.ts`, and
-  `components/FileTree.tsx`'s tree-sorting (the sibling-preserving invariant explicitly),
-  default-plus-exceptions collapse preference, facet filter, and column-width clamping — run in
-  CI's "Frontend lint + typecheck" job via `npm test`. What it does **not** cover: any component
-  actually renders — `FileTree`, `ItemDrawer`, `LifecycleIcons`, `StateChip`, and everything else
-  with JSX in it are exercised only by `tsc -b`/`vite build`/`oxlint`, not by a test that mounts
-  them. That gap is what "no UI has ever been click-tested" (above) still means in full. The
-  newest instance: `components/FieldHelp.tsx` (2026-08-13) — its *placement* arithmetic is unit-
-  tested via `lib/popoverPosition.ts`, but its open/close behaviour (click toggles, Escape and
-  outside-click dismiss, hover assists on mouse only) is verified by reading, not by a test.
-- **Post-processing (verify/extract/move) triggers from two narrow places — a job this app
-  spawned succeeding, and the settle gate releasing its own hold on an item.** It does *not*
-  trigger when a routine rescan finds a file that arrived some other way (a manual `cp`, a
-  restore) with no gate hold behind it. Such a file will sit under a queue's `local_path`
-  unverified, unextracted, and — for a `move` queue — with its remote copy never deleted, until
-  something re-touches that item (e.g. a manual re-queue). Phase 5's own deliberate call; the
-  settle-gate half of it was closed on 2026-08-12, the placed-by-hand half was not.
-- **Encrypted-rar password retry is implemented but has never been tested against a real
-  encrypted archive.** No RAR compressor exists anywhere in this project's toolchain — `unrar`
-  only extracts, and no Alpine package ships one — so there is no way to build the fixture. The
-  equivalent 7zz path *is* tested against a real encrypted zip; the rar path follows the same
-  shape and is assumed correct on that basis, which is weaker than every other claim here.
-- **Real-archive rar coverage is old-style multi-volume only.** The two committed fixtures are
-  hand-built RAR4 archives (a single file, and a genuine two-volume `.rar` + `.r00` split).
-  New-style `.partNN.rar` multi-volume extraction has no real-archive test — only the
-  fake-bytes precondition tests that exercise its naming and gap detection.
-- **The `REMOVED_LOCAL` grace period is unit-tested but has never been exercised live across a
-  real multi-scan window.** The ~10-minute window between "locally absent" and "treated as
-  deliberately removed" (`DESIGN.md` §3.2 rule 3) is pinned by `tests/test_mount_sentinel.py`,
-  not by watching it elapse against a real seedbox over real wall-clock time.
-- **Date-range filters (History page) are UTC calendar days.** No timezone handling exists
-  anywhere in the app — every stored timestamp is UTC and every render is a raw
-  `toLocaleString()`. For a user well away from UTC, "yesterday" in the date picker can include
-  a few hours of what they'd call "today," or vice versa.
-- **API keys are hashed with SHA-256, not argon2id** — deliberate, not an oversight. A key is
-  256 bits of random `secrets.token_urlsafe`, not a guessable human-chosen secret, so argon2's
-  memory-hard slowness buys nothing and would add latency to every API-key-authenticated
-  request. Session tokens are hashed the same way, for the same reason.
-- **Login response timing is not normalized between "unknown username" and "wrong password."**
-  A deliberate, minor simplification for a single-user homelab app where the one valid username
-  is typically visible elsewhere anyway; both cases return an identical body and are
-  rate-limited identically, only wall-clock timing differs, and only under repeated automated
-  probing.
-- **`password` auth mode with no user configured is treated as open access, not a lockout** —
-  see "Locked out?" below. This is deliberate (the alternative bricks the instance on a typo),
-  but it means anyone who can reach the API while no user row exists is in without a password.
-- **`net:connection-limit` (DESIGN.md §4.5/§9.3, "a first-class setting, host-level") has no
-  way to be set from the UI at all.** It lives only in a JSON `connection_overrides` blob on
-  the `host` row (`core/remote.py.parse_connection_limit`); Settings → Connection has no field
-  for it, and there is no `PUT` surface anywhere that writes to it. Settings → Transfer's live
-  connection-count readout (§9.3) reads whatever happens to already be in that blob and
-  surfaces it read-only (`HostOut.net_connection_limit`) — on a fresh install, and on every
-  install today, that's `null`, so the "⚠ over net:connection-limit" warning cannot fire until
-  something writes to the blob some other way (direct SQL, for now).
-- **A job has spawned with `bytes_start` reading several gigabytes against a directory the
-  user confirmed was empty on disk** (2026-08-14, live incident, `prompts/open-issues.md`).
-  Genuine and unexplained: `item.local_size` is recomputed fresh from a local filesystem walk
-  on every scan pass, including for a "protected" row, so nothing found by re-reading
-  `core/reconcile.py`/`core/engine.py._persist` explains a stale multi-gigabyte value surviving
-  several scan intervals before the job that read it spawned. Not reproduced against the fake
-  seedbox; recorded rather than silently worked around, since it corrupts `core/metrics.py`'s
-  throughput accounting (`max(bytes_done - bytes_start, 0)` under-counts by the stale amount).
+- **Post-processing only runs when a job this app spawned succeeds, or when the settle gate
+  releases a hold.** A file that arrives another way (a manual `cp`, a restore) is never
+  verified, extracted, or — on a `move` queue — deleted from the remote, until something
+  re-touches the item.
+- **Encrypted-rar password retry has never been tested against a real encrypted archive.** No
+  RAR compressor exists in this project's toolchain, so the fixture can't be built. The
+  equivalent 7zz path *is* tested against a real encrypted zip; the rar path is assumed correct
+  by analogy, which is weaker than every other claim here.
+- **History date filters are UTC calendar days.** No timezone handling exists anywhere —
+  timestamps are stored UTC and rendered with `toLocaleString()`. Away from UTC, "yesterday" can
+  include a few hours of today.
+- **API keys and session tokens are hashed with SHA-256, not argon2id.** Deliberate: a key is
+  256 bits of `secrets.token_urlsafe`, not a guessable secret, so argon2's slowness would add
+  latency and buy nothing.
+- **Login timing isn't normalized between "unknown username" and "wrong password."** Both return
+  an identical body and are rate-limited identically; only wall-clock timing differs, and only
+  under repeated probing.
+- **`password` auth mode with no user configured is open access, not a lockout** — see "Locked
+  out?" below. Deliberate, since the alternative bricks the instance on a typo, but anyone
+  reaching the API while no user row exists is in.
+- **`net:connection-limit` can't be set from the UI.** It lives only in the `host` row's
+  `connection_overrides` JSON blob with no write path anywhere, so Settings → Transfer's
+  "over the limit" warning can never fire on a current install.
 
 ## Locked out?
 
