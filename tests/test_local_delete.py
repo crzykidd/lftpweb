@@ -2219,7 +2219,9 @@ async def test_delete_extracted_archives_no_archives_logs_debug_not_an_event(tmp
         queue_id = await _make_queue(db, local_root)
         item_id = await _make_item(db, queue_id, "Release", is_dir=True)
 
-        with caplog.at_level(logging.DEBUG, logger="lftpweb.core.local_delete"):
+        # delete_extracted_archives moved to core/archive_cleanup.py (audit P3), so its debug
+        # line now comes from that logger -- still reached via the local_delete.* re-export.
+        with caplog.at_level(logging.DEBUG, logger="lftpweb.core.archive_cleanup"):
             result = await local_delete.delete_extracted_archives(
                 db,
                 item=await _item_row(db, item_id),

@@ -93,7 +93,7 @@ than a first. Two things that bit the first time and will bit again:
 | S3+S4 | Input length caps + port bounds; safe security response headers (no CSP/HSTS) | this commit | ✅ done |
 | S2 | Post-extraction path-containment check | this commit | ✅ done |
 | P2 | Split `api/settings.py` into sub-routers (host/queues/postprocess) | this commit | ✅ done |
-| P3 | Split `core/local_delete.py` (retention/archive_cleanup/reset) | — | ⬜ queued |
+| P3 | Split `core/local_delete.py` (retention/archive_cleanup/reset) | this commit | ✅ done |
 | P1 | Split `FileTree.tsx` (pure lib + row/hovercard/columns/bulk) | — | ⬜ queued |
 
 > **Read `prompts/open-issues.md` first.** It carries the reasoning behind three sessions of

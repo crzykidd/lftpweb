@@ -6,6 +6,39 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-14 — Audit P3: `core/local_delete.py` (1649 lines) split into core + retention + archive_cleanup + reset
+
+Four independent features shared the file only by adjacency. Extracted three into their own
+modules — `core/retention.py` (scheduled deletion + orphan-temp sweep), `core/archive_cleanup.py`
+(spent-volume removal), `core/reset.py` (forget-tracking) — leaving `core/local_delete.py` as the
+`delete_local` primitive plus its helpers (`_physical_local_root`, `DeleteInFlight`,
+`reconsider_removed_state`, the subtree helpers). To edit reset logic you now open a ~320-line file,
+not 1649.
+
+**Import surface preserved by re-export.** ~30 external call sites reach these symbols as
+`local_delete.<name>` (attribute access), and several are underscore-prefixed
+(`local_delete._select_expired`, etc.). So `local_delete.py` ends with an explicit re-export block
+(not `import *`, which skips underscore names) pulling every moved symbol back into its namespace.
+Zero call-site churn: `main.py`, `api/settings_postprocess.py`, and every test kept working
+untouched — except one test that captured logs from the `lftpweb.core.local_delete` logger for
+`delete_extracted_archives`, which now logs under `lftpweb.core.archive_cleanup` (its new home); the
+`caplog` logger name was repointed, no behavior change.
+
+**The dependency layering, and why there's no import cycle.** Direction is
+`core ← {retention, archive_cleanup} ← reset`: retention calls `delete_local`, archive_cleanup
+calls `_physical_local_root`, reset calls `_subtree_rows`/`DeleteInFlight`. The children import
+those from `local_delete` at the top; `local_delete` re-imports the children at the **bottom**,
+after the primitive is fully defined. Every real import path enters through `local_delete` (all
+external code imports it, and now via the re-export continues to), so the primitive is always
+defined before a child's top-level `from local_delete import …` runs. `_select_expired`'s
+`SETTING_KEY` constant, orphaned in the core slice by the cut, was moved into `retention.py` where
+it belongs.
+
+**Verified:** `import lftpweb.main` loads cleanly (no cycle), all 26 re-exported symbols resolve via
+`local_delete.<name>`, and the full backend suite passes.
+
+---
+
 ## 2026-08-14 — Audit P2: `api/settings.py` (1068 lines) split into three per-resource routers
 
 The single settings router covered ten resources (host, queues, patterns, postprocess, settle,
