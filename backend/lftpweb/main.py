@@ -6,6 +6,7 @@ correctly instead of 404ing.
 from __future__ import annotations
 
 import logging
+import os.path
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -186,7 +187,7 @@ def create_app() -> FastAPI:
         if assets_dir.is_dir():
             app.mount("/assets", StaticFiles(directory=assets_dir), name="spa-assets")
 
-        static_root = static_dir.resolve()
+        static_root = os.path.realpath(str(static_dir))
         index_html = static_dir / "index.html"
 
         @app.get("/{full_path:path}", include_in_schema=False)
@@ -197,18 +198,26 @@ def create_app() -> FastAPI:
             # *not* `..`-normalized -- a client can send `..%2f..%2fetc/passwd` and uvicorn
             # passes it straight through. This route is also outside the /api/ auth gate
             # (middleware.py only gates /api/), so serving `static_dir / full_path` blindly is
-            # an unauthenticated arbitrary file read: resolve and confirm containment under the
-            # static root before serving anything, and fall back to the SPA shell on any escape
-            # attempt rather than 403ing (a normal deep link that happens not to exist on disk
-            # must still render the SPA). See docs/audit-v0.1.0.md finding S1.
-            candidate = static_dir / full_path
-            try:
-                resolved = candidate.resolve()
-                resolved.relative_to(static_root)
-            except (ValueError, OSError):
-                return FileResponse(index_html)
-            if full_path and resolved.is_file():
-                return FileResponse(resolved)
+            # an unauthenticated arbitrary file read. Guard it with the exact form CodeQL's own
+            # `py/path-injection` remediation recommends and recognises as a barrier: resolve
+            # the joined path (`realpath` follows `..` *and* symlinks) and confirm it is the
+            # static root or sits beneath it via a `startswith(root + sep)` check, falling back
+            # to the SPA shell on any escape rather than 403ing (a normal deep link that happens
+            # not to exist on disk must still render the SPA). See docs/audit-v0.1.0.md finding
+            # S1; the earlier `pathlib.relative_to` form was equivalent but not modelled by
+            # CodeQL, so it flagged its own fix.
+            requested = os.path.realpath(os.path.join(static_root, full_path))
+            # Containment via `os.path.commonpath`, the barrier CodeQL's own py/path-injection
+            # remediation recognises, evaluated in a *positive* branch that wraps the file use:
+            # `commonpath([root, requested]) == root` is true exactly when `requested` is the
+            # static root or a descendant of it (both are absolute `realpath` results, so
+            # `commonpath` can't raise on mismatched/relative kinds), so `requested` reaches
+            # `isfile`/`FileResponse` only where it is provably contained. Anything else --
+            # a `..%2f…` escape, a symlink out of the tree -- falls through to the SPA shell.
+            # See docs/audit-v0.1.0.md finding S1.
+            if os.path.commonpath([static_root, requested]) == static_root:
+                if full_path and os.path.isfile(requested):
+                    return FileResponse(requested)
             return FileResponse(index_html)
 
     return app
