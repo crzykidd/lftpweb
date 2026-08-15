@@ -80,6 +80,32 @@ section before trusting any live-evidence conclusion in this file.
 
 ## Still open — read these first
 
+### Post-`v0.1.0` audit — the deferred items (`docs/audit-v0.1.0.md`)
+
+A full audit landed 2026-08-14 (`docs/audit-v0.1.0.md`): findings **S1–S4** (security),
+**G1–G3** (settings/gating), **P1–P5** (partitioning). An overnight run on the same day closed
+the fixable ones — **S1** (SPA path-traversal file read, `01efac4`), **S3+S4** (input caps +
+security headers, `0a4593a`), **S2** (extraction containment, `65b0618`), **P2** (`api/settings.py`
+split, `90df1ea`), **P3** (`core/local_delete.py` split, `d480885`), and **P1 in part** (pure logic
+→ `lib/fileTree.ts`, `0cb294f`). The full audit doc has every finding's detail and the fix commit.
+**What's left, deliberately, for a session with the user in the loop:**
+
+- **G1 — `move`-mode delete runs before extraction.** This is the same thing as **issue #2**
+  below (a no-sidecar release verifies `SKIPPED`, its remote is deleted, then extraction may
+  fail — the only re-fetchable source already gone). It's a *design call*, not a mechanical fix:
+  either delete after a successful extract, or make the delete gate also require extraction not to
+  have failed (mirroring the download-prefix `release_ok` rule). Don't resolve it unilaterally.
+- **G2 — `net:connection-limit` has no write path.** §4.5 calls it "first-class, host-level," but
+  it lives only in the `host.connection_overrides` JSON blob with no UI/endpoint. Needs a
+  migration (promote to a real column) + a Settings field. A scoped feature, not a one-liner.
+- **Rest of P1 — the `FileTree.tsx` component extractions.** The pure logic is out; the `Row`,
+  hover-card, and column-resize *components* remain (still ~1765 lines). Left deliberately: they
+  have no unit coverage, and a prop/closure slip only shows when rendered — wants a browser to
+  verify, which the coding environment doesn't have.
+- **P4/P5 — `core/queue.py` (1881) and `core/engine.py` (1621) splits.** The deepest stateful
+  code (the transfer god-object; the scan→persist→publish invariant). The audit itself said do
+  these under review, not unattended. Each is a handoff-prompt-sized task on its own.
+
 ### A terminal removed row has no UI path to an individual reset
 
 2026-08-14, found while fixing the All-scope reset preview
