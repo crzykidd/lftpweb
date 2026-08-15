@@ -6,6 +6,33 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-14 — Audit P1 (partial): `FileTree.tsx`'s pure logic extracted to `lib/fileTree.ts`
+
+`FileTree.tsx` was the largest file in the repo (2267 lines). Extracted its pure,
+React-free logic — tree building, sorting, the collapse/sort preferences, facet filtering, and
+the column-width model — into `frontend/src/lib/fileTree.ts` (371 lines). The component drops to
+1765 and keeps every JSX/stateful piece, importing the pure functions back by name. `FileTree.
+test.ts` already targeted exactly these functions, so its import path was repointed from
+`./FileTree` to `../lib/fileTree` and all 266 frontend tests pass unchanged — the test coverage is
+what made this the *safe* first slice.
+
+**Method.** Wrote the lib as a fresh module, deleted the moved definitions from the component by
+line range, added one import, and let `tsc` (with `noUnusedLocals`) drive the trim of imports the
+moved code had used (the seven `lib/format` helpers and two constants only the extracted functions
+referenced). A side benefit: FileTree.tsx no longer trips oxlint's `only-export-components`
+fast-refresh warning, since it no longer exports non-component helpers.
+
+**Deliberately partial — the component-level extractions are deferred, not done.** The audit's P1
+also proposed pulling the `Row`, hover-card, and column-resize *components* into their own files.
+Those were left in place: unlike the pure logic, they have no unit coverage of their own, and a
+mistake in prop/closure threading is exactly the kind of thing that only shows up when rendered —
+which needs a browser this environment doesn't have. That's a reviewed-session change with visual
+verification, not an unattended one. `FileTree.tsx` at 1765 lines is still large; this closed the
+highest-value, lowest-risk part of the split and left the rest named rather than half-done.
+Verified: `tsc -b`, `vitest` (266), `vite build`, and `oxlint` all clean.
+
+---
+
 ## 2026-08-14 — Audit P3: `core/local_delete.py` (1649 lines) split into core + retention + archive_cleanup + reset
 
 Four independent features shared the file only by adjacency. Extracted three into their own

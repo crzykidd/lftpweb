@@ -21,7 +21,7 @@ import {
   rowAction,
   sortTree,
   type TreeEntry,
-} from './FileTree'
+} from '../lib/fileTree'
 
 const DIM: LifecycleFacets = {
   remote: { level: 'dim', reason: 'absent' },

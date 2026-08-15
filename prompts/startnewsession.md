@@ -94,7 +94,7 @@ than a first. Two things that bit the first time and will bit again:
 | S2 | Post-extraction path-containment check | this commit | ✅ done |
 | P2 | Split `api/settings.py` into sub-routers (host/queues/postprocess) | this commit | ✅ done |
 | P3 | Split `core/local_delete.py` (retention/archive_cleanup/reset) | this commit | ✅ done |
-| P1 | Split `FileTree.tsx` (pure lib + row/hovercard/columns/bulk) | — | ⬜ queued |
+| P1 | Split `FileTree.tsx`: pure logic → `lib/fileTree.ts` (2267→1765). Component extractions (Row/HoverCard) deferred to a browser-verified session | this commit | ⏳ partial |
 
 > **Read `prompts/open-issues.md` first.** It carries the reasoning behind three sessions of
 > live-testing fixes — including one fix shipped and deliberately reversed the same night, one
