@@ -91,7 +91,7 @@ than a first. Two things that bit the first time and will bit again:
 |---|---|---|---|
 | S1 | SPA catch-all path traversal (unauthenticated file read) fixed | `01efac4` | ✅ done (pre-run) |
 | S3+S4 | Input length caps + port bounds; safe security response headers (no CSP/HSTS) | this commit | ✅ done |
-| S2 | Post-extraction path-containment check | — | ⬜ queued |
+| S2 | Post-extraction path-containment check | this commit | ✅ done |
 | P2 | Split `api/settings.py` into sub-routers | — | ⬜ queued |
 | P3 | Split `core/local_delete.py` (retention/archive_cleanup/reset) | — | ⬜ queued |
 | P1 | Split `FileTree.tsx` (pure lib + row/hovercard/columns/bulk) | — | ⬜ queued |

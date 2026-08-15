@@ -6,6 +6,31 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-14 — Audit S2: extraction refuses to publish a member that escapes the staging root
+
+`core/extract.py.extract_item` already stages every archive into a `_UNPACK_` sibling and only
+merges into the published tree on full success — but nothing checked *where the extracted members
+landed*. `resolve_within_root` guarded the staging/`_FAILED_` directories and every deletion, yet
+the extraction output itself was trusted to 7zz/unrar's own defenses. Added `find_escaping_path`:
+after a clean extraction, before the merge, walk the staging tree and reject if any entry resolves
+outside it, returning `EXTRACT_FAILED` (which withholds the merge and is surfaced/audited like any
+other extraction failure) and keeping the offending tree as `_FAILED_` evidence.
+
+**Scope, stated honestly.** The realistic residual escape is a **symlink member** pointing out of
+the extraction root — 7zz and unrar both strip literal `../` traversal members themselves, but a
+symlink is content they restore, not a path they rewrite. Walking staging with a symlink-resolving
+containment check catches exactly that. A hypothetical extractor that wrote a file *directly* to an
+outside absolute path (which neither 7zz nor unrar does under `-o<dir>`) would place it beyond the
+staging tree where this walk can't enumerate it — so this is defense-in-depth layered on the
+extractors' own traversal handling, not a claim to replace it. `rglob` never recurses into a
+symlinked directory, so a malicious symlink is inspected here, never followed.
+
+Tested binary-independently (so it runs in CI without 7zz): `find_escaping_path` directly, and
+`extract_item` with a patched per-archive extractor that plants an escaping symlink — asserting the
+merge is withheld and `_FAILED_` evidence is kept.
+
+---
+
 ## 2026-08-14 — Audit S3/S4: input length caps + port bounds, and a *safe* security-header subset (no CSP/HSTS overnight)
 
 Part of the post-`v0.1.0` audit run (`docs/audit-v0.1.0.md`). Two small hardening changes bundled
