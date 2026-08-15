@@ -44,6 +44,12 @@ class FakeArrState:
     # When True, every request 500s -- the "unreachable instance" scenario
     # (`core/arrsync.py._handle_failure`) without actually tearing the server down.
     fail_all: bool = False
+    # Phase B: when True, only `POST /api/v3/command` fails -- `/queue` and `/history` still
+    # succeed normally. `fail_all` fails *everything*, including the queue fetch itself, which
+    # makes `core/arrsync.py._process_instance` back off before it ever reaches a queue's own
+    # notify/cleanup pass -- this is the narrower "the push itself failed" scenario the notify
+    # retry tests (`tests/test_arr_cleanup.py`) need to exercise instead.
+    fail_command: bool = False
 
 
 def create_fake_arr_app(state: FakeArrState) -> FastAPI:
@@ -99,7 +105,9 @@ def create_fake_arr_app(state: FakeArrState) -> FastAPI:
         }
 
     @app.post("/api/v3/command")
-    async def command(body: dict[str, Any]) -> dict[str, Any]:
+    async def command(body: dict[str, Any]) -> Any:
+        if state.fail_command:
+            return JSONResponse(status_code=503, content={"message": "simulated command outage"})
         state.command_calls.append(body)
         return {"id": len(state.command_calls), "name": body.get("name"), "status": "queued"}
 

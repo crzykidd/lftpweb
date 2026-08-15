@@ -90,6 +90,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         events=app.state.events,
         remote_pool=app.state.engine.pool,
         host_provider=_host_provider,
+        config_dir=settings.config_dir,
     )
     app.state.queue.postprocess = app.state.postprocess
     # Engine needs it too, for one read: which items a verify/extract worker is running for
@@ -133,8 +134,17 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # above, default off (every `arr_instance` row starts `enabled = 0`, migration 018 inserts
     # none). `events` wired the same plain-attribute-not-constructor-arg way `postprocess`
     # is above, so an `item_delta` published mid-poll reaches connected browsers.
+    # Phase B (docs/arr-integration-spec.md "Cleanup") adds `in_flight_provider`/
+    # `delete_in_flight` -- the identical seam `RetentionScheduler` above takes, so cleanup's
+    # own filesystem work is shielded from (and shields) a racing scan the same way every other
+    # deleter in this codebase already is. Both `app.state.postprocess` and
+    # `app.state.delete_in_flight` already exist by this point (constructed above).
     app.state.arr_sync = ArrSyncScheduler(
-        db=app.state.db, config_dir=settings.config_dir, events=app.state.events
+        db=app.state.db,
+        config_dir=settings.config_dir,
+        events=app.state.events,
+        in_flight_provider=lambda: app.state.postprocess.in_flight_item_ids(),
+        delete_in_flight=app.state.delete_in_flight,
     )
 
     await app.state.engine.start()

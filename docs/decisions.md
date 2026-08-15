@@ -6,6 +6,41 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-15 — *arr integration phase B: cleanup removes bytes but never writes `item.state`
+
+The spec's "Cleanup" section says "delete the local tree via the existing local-deletion
+machinery (`core/local_delete.py`, resolving through `_physical_local_root`)" — read as "call
+`delete_local()`," that would set `item.state` to `REMOVED_LOCAL`/`REMOVED_BOTH` *immediately*,
+the same instant cleanup runs, because that function's own docstring is explicit that its state
+write is unconditional and instant (correct for its own callers: a human clicking Delete, or
+scheduled retention, both of which already know for certain the removal is deliberate and
+final). But the same spec section also says, two sentences later: "The item then ages into
+`REMOVED_LOCAL` **through the normal grace machinery**" and describes the UX as "downloaded ->
+processed -> **(countdown)** -> gone," explicitly reusing the existing "Missing · Xm" chip
+(`frontend/src/lib/format.ts`'s `isRemovalGracePending`/`REMOVAL_GRACE_ELIGIBLE_STATES`) with
+only a presentational relabel. Traced that chip's actual trigger: it renders *only* while
+`item.state` is **not yet** `REMOVED_LOCAL` (`first_missing_at` set, state still one of the
+pre-removal terminal states) — `delete_local()`'s immediate write would skip past that window
+entirely and the chip could never appear, making the spec's own UX description physically
+impossible if cleanup called `delete_local()` unmodified.
+
+Resolution: `core/arrsync.py._maybe_cleanup` removes the bytes directly (reusing
+`core/local_delete.py._physical_local_root` for resolution — never a second resolver — plus the
+same containment/mount-sentinel guards, and `_do_remove_from_disk` for the actual removal) but
+**never touches `item.state`**, leaving the row exactly as it was. This is the identical pattern
+`core/postprocess.py._do_move` already established for a staging relocation: make the bytes
+disappear from `local_path`, and let the ordinary scan + `core/mount_sentinel.py.resolve_absence`
+grace machinery discover the absence and carry it to `REMOVED_LOCAL` on its own ~10-minute clock
+— "no new timer," and the countdown chip genuinely appears, exactly as the spec describes. Read
+"the existing local-deletion machinery" narrowly: its resolver and its safety guards, not its
+state-writing tail, which belongs to a different, more certain caller. Two other differences
+from `delete_local()` follow from the same reasoning: no `require_nlink_guard` (the *arr's own
+confirmed-import history event is the evidence substitute a hardlink proof would otherwise be
+needed for — cleanup does not call `delete_local()` at all, so this only matters as a note for
+why nlink is never even considered here), and a cleanup attempt against bytes already absent
+(neither `local_path` nor `staging_path` has anything on disk) is treated as success rather than
+withheld — the goal state already holds.
+
 ## 2026-08-15 — *arr integration phase A: cleanup deferred to phase B despite the poller
 ## section literally saying "run cleanup"
 

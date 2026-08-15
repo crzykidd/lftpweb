@@ -78,6 +78,7 @@ from uuid import uuid4
 import aiosqlite
 
 from lftpweb.core import audit, extract, verify
+from lftpweb.core.arrnotify import notify_arr
 from lftpweb.core.events import EventBus
 from lftpweb.core.itemview import item_view
 from lftpweb.core.remote import HostConfig
@@ -390,6 +391,7 @@ class PostprocessPipeline:
         remote_pool: _RemotePool,
         *,
         host_provider: Any = None,
+        config_dir: str | None = None,
     ) -> None:
         self.db = db
         self.events = events
@@ -397,6 +399,13 @@ class PostprocessPipeline:
         # Callable[[], Awaitable[HostConfig | None]] -- the identical seam core/queue.py's
         # TransferQueue uses, so credential decryption still has exactly one implementation.
         self._host_provider = host_provider
+        # Sonarr/Radarr integration, phase B (docs/arr-integration-spec.md "Notify"): needed to
+        # decrypt a bound *arr instance's `api_key_enc` the same way `core/arrsync.py` does.
+        # Optional (`None` default) so every existing construction site -- test fixtures that
+        # never touch the *arr feature -- is unaffected; `_maybe_notify_arr` no-ops without
+        # ever reaching a point that needs it, since a test not wiring up `arr_instance_id`
+        # never has a queue this method treats as configured.
+        self.config_dir = config_dir
 
         self._sem: asyncio.Semaphore | None = None
         self._sem_size = 0
@@ -538,6 +547,16 @@ class PostprocessPipeline:
         # A no-op whenever `pending_prefix` is falsy -- every `pget` job, and a `mirror` job the
         # feature doesn't apply to or that already got renamed by an earlier pass.
         release_ok = verify_state != "CORRUPT" and extract_state != "EXTRACT_FAILED"
+
+        # Sonarr/Radarr integration, phase B (docs/arr-integration-spec.md "Notify"): computed
+        # alongside the rename/move branches below rather than re-derived after them, because
+        # each branch is the only place that knows both "did this actually succeed" and "where
+        # did the bytes end up" -- `notify_ok`/`notify_final_root` are the two facts
+        # `_maybe_notify_arr` needs, set at most once, only on a branch that reaches a stable,
+        # fully-succeeded resting place (never on a withheld-rename or a failed move).
+        notify_ok = False
+        notify_final_root: Path | None = None
+
         if pending_prefix and not release_ok:
             # Never renamed: an importer watching this directory under its real name must never
             # find a release that turned out corrupt or failed to extract -- the exact scenario
@@ -579,6 +598,8 @@ class PostprocessPipeline:
                     "UPDATE item SET pending_download_prefix = NULL WHERE id = ?", (item["id"],)
                 )
                 await self.db.commit()
+                notify_ok = True
+                notify_final_root = self._move_destination(item, queue)
         elif pending_prefix:
             local_root, rename_error = await self._finalize_download_prefix(
                 item, local_root, pending_prefix, verify_state, extract_state
@@ -604,8 +625,58 @@ class PostprocessPipeline:
                     ),
                 )
                 await self._publish(item["id"])
+            else:
+                notify_ok = True
+                notify_final_root = local_root
         elif move_effective:
-            await self._do_move(item, queue, local_root)
+            moved = await self._do_move(item, queue, local_root)
+            if moved:
+                notify_ok = True
+                notify_final_root = self._move_destination(item, queue)
+        else:
+            # Neither a pending download-prefix rename nor a staging move applies -- the item
+            # was already at its final resting place (`local_root`) before this run started, so
+            # "fully succeeded" here is exactly `release_ok` on its own (no further step to
+            # confirm).
+            notify_ok = release_ok
+            notify_final_root = local_root
+
+        if notify_ok and notify_final_root is not None:
+            await self._maybe_notify_arr(item, queue, notify_final_root)
+
+    def _move_destination(self, item: Any, queue: Any) -> Path:
+        """The staging-move target (`_do_move`'s own destination formula, factored out so
+        `_process_item`'s notify computation can name the same final path without
+        re-implementing it)."""
+        return Path(queue["staging_path"].rstrip("/")) / item["rel_path"]
+
+    async def _maybe_notify_arr(self, item: Any, queue: Any, final_local_root: Path) -> None:
+        """Sonarr/Radarr push-notify (docs/arr-integration-spec.md "Notify") -- the primary
+        attempt, fired once, only from here, only after `_process_item` has already confirmed
+        the whole pipeline succeeded and settled at `final_local_root`. Delegates everything
+        else (path translation, the *arr POST, the `arr_notified`/`arr_notify_failed` event, the
+        `arr_status` write) to `core/arrnotify.py.notify_arr` -- the one implementation shared
+        with `core/arrsync.py`'s bounded retry for a failed attempt, so there is exactly one
+        place that builds this request. A failure here writes its own event and returns; nothing
+        further happens on this call -- the retry lives entirely in the poller, per the spec's
+        own "retry on the next poller tick" wording.
+        """
+        if self.config_dir is None:
+            # No `config_dir` wired up (a test fixture that never touches the *arr feature) --
+            # nothing to decrypt an API key against, so there is nothing this call could do
+            # even if a queue somehow had `arr_instance_id` set. Skip rather than pass a bogus
+            # path down to `core/crypto.py`, which would try to read/create an install secret
+            # relative to the process's cwd.
+            return
+
+        await notify_arr(
+            self.db,
+            config_dir=self.config_dir,
+            item=item,
+            queue=queue,
+            final_local_root=final_local_root,
+            events=self.events,
+        )
 
     # --- steps ---------------------------------------------------------------------------
 
@@ -978,7 +1049,7 @@ class PostprocessPipeline:
         physically sitting under the prefix and that bookkeeping column must say so, not be
         cleared as if the relocation-and-implicit-rename had actually happened.
         """
-        dest = Path(queue["staging_path"].rstrip("/")) / item["rel_path"]
+        dest = self._move_destination(item, queue)
         try:
             await asyncio.to_thread(move_tree, local_root, dest)
         except Exception as exc:  # noqa: BLE001 - always recorded, pipeline continues

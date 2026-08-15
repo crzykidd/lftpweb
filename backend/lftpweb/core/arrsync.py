@@ -5,27 +5,38 @@ Radarr instance's `/api/v3/queue` against local items, and watching for import (
 **Not wired into the scan pass** -- scan cadence is per-queue and variable (DESIGN.md §5), and
 *arr polling wants its own clock, independent of it (spec: "not wired into the scan pass").
 
-**Scope of this phase** (`prompts/2026-08-15-arr-integration-backend.md`, phase A of 3): matching
+**Phase A** (`prompts/done/2026-08-15-arr-integration-backend.md`) built matching
 (`(no status) -> detected`) and import/removal detection (`detected/notified -> imported/gone`).
-**Notify and cleanup are phase B** -- this module never POSTs the scan command and never deletes
-anything. That is not a departure from the spec: the spec's own "Build plan" section scopes
-phase 1 to exactly "poller with match + import detection", with "Notify + cleanup" named as
-phase 2 separately. The lifecycle section's step 4 ("For imported items on a
-`arr_delete_completed` queue: run cleanup") describes the *finished* feature once all three
-phases are combined, not what phase A alone builds.
-
-**The "notified" state is unreachable in this phase** for the same reason: it is set only when
-`PostprocessPipeline`'s tail POSTs the scan command (phase B), which does not exist yet. Every
-item this module can produce reads `detected`, `imported`, or `gone`. The import-detection code
-below still checks `state IN ('detected', 'notified')` rather than hardcoding `'detected'`
-alone, so it needs no change once phase B lands.
+**Phase B** (`prompts/2026-08-15-arr-integration-notify-cleanup.md`, this module now) adds the
+two active behaviors on top: a **bounded retry** for a notify push whose primary attempt (fired
+from `core/postprocess.py.PostprocessPipeline`'s own tail, per the spec's "Notify" section) has
+already failed once (`_maybe_retry_notify` -- the actual POST and event-writing live in
+`core/arrnotify.py.notify_arr`, shared by both callers so there is exactly one implementation),
+and **cleanup** (`_maybe_cleanup`) for an `imported` item on an `arr_delete_completed` queue.
 
 **The two-consecutive-passes quiescence guard is in-memory, not persisted** (deliberately: the
 spec's "Data model" section specifies exactly three new `item` columns and no new table for this
-phase, unlike `core/settle.py`'s `item_settle`). A restart loses any pending candidacy and simply
-costs one extra poll interval before a transition commits -- safe, since "wait longer before the
-irreversible step" is the direction restart-loss is allowed to err in for a feature this module's
-own phase does not even reach (cleanup is phase B). See `_PendingVerdict` below.
+feature, unlike `core/settle.py`'s `item_settle`). A restart loses any pending candidacy and
+simply costs one extra poll interval before a transition commits -- safe, since "wait longer
+before the irreversible step" is the direction restart-loss is allowed to err in. The notify
+retry's own bounded-attempt counter (`_notify_attempts`) is in-memory for the identical reason;
+losing it on restart only means a slow-to-notify item gets a few more attempts than the bound
+technically allows, never fewer. See `_PendingVerdict` below.
+
+**Cleanup deliberately never writes `item.state` directly.** Unlike a manual Files-page delete
+(`core/local_delete.py.delete_local`, which sets `REMOVED_LOCAL`/`REMOVED_BOTH` immediately,
+because a human just confirmed the action), `_maybe_cleanup` removes the bytes and leaves
+`item.state` exactly as it was -- the same pattern `core/postprocess.py._do_move` already
+established for a staging relocation ("the next scan finds the item's local copy gone...and
+[mount_sentinel's] REMOVED_LOCAL grace-period machinery takes it from there, the same as any
+other externally-caused move"). This is what makes the spec's own UX description literally true
+("downloaded -> processed -> (countdown) -> gone") rather than aspirational: the existing
+`first_missing_at`/`REMOVAL_GRACE_ELIGIBLE_STATES` countdown chip
+(`frontend/src/lib/format.ts`) only ever renders while a row is *not yet* `REMOVED_LOCAL` --
+`delete_local`'s own immediate write would skip straight past that window and the chip would
+never appear. See `docs/decisions.md` (2026-08-15) for the full reasoning and why this reads
+"the existing local-deletion machinery" narrowly (its resolvers and guards, not its
+state-writing tail).
 """
 
 from __future__ import annotations
@@ -36,13 +47,15 @@ import logging
 import posixpath
 import re
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Literal
 
 import aiosqlite
 
-from lftpweb.core import audit
+from lftpweb.core import audit, extract, mount_sentinel
 from lftpweb.core.arrclient import (
     IMPORT_EVENT_TYPES,
     TRACKED_DOWNLOAD_STATE_IMPORTED,
@@ -51,9 +64,11 @@ from lftpweb.core.arrclient import (
     HistoryEvent,
     QueueRecord,
 )
+from lftpweb.core.arrnotify import notify_arr
 from lftpweb.core.crypto import DecryptionError, decrypt_secret
 from lftpweb.core.events import EventBus
 from lftpweb.core.itemview import item_view
+from lftpweb.core.local_delete import DeleteInFlight, _do_remove_from_disk, _physical_local_root
 
 logger = logging.getLogger(__name__)
 
@@ -132,10 +147,21 @@ def _record_matches_item(record: QueueRecord, item_name: str) -> bool:
 # is never re-matched out from under itself.
 _REMATCHABLE_STATES = frozenset({"gone", "cleaned"})
 
-# States considered "still being watched for import" (spec "The poller" step 3). `notified` is
-# unreachable in this phase (see module docstring) but included so this needs no edit once
-# phase B lands.
+# States considered "still being watched for import" (spec "The poller" step 3).
 _TRACKED_STATES = frozenset({"detected", "notified"})
+
+# `item.state` values a notify-retry attempt is allowed to fire against (spec "Notify":
+# fires "after the whole pipeline succeeds"). An item can be matched (`arr_status == 'detected'`)
+# well before its own download even finishes -- the *arr's queue is populated by its own
+# download client on the seedbox, independently of lftpweb's transfer -- so the retry must not
+# push a scan command for a release that is still `REMOTE_ONLY`/`PARTIAL`/`DOWNLOADING`/mid
+# transient-postprocess-state; only these three terminal, successful outcomes count.
+_NOTIFY_READY_STATES = frozenset({"DOWNLOADED", "VERIFIED", "EXTRACTED"})
+
+# Bounded retry cap (spec "Notify": "bounded retries") -- an instance that is simply down for a
+# long stretch gets this many attempts, roughly this many poll intervals apart, before this
+# module stops trying; CDH may still import the release on its own regardless.
+MAX_NOTIFY_RETRY_ATTEMPTS = 5
 
 
 def _now_iso() -> str:
@@ -190,6 +216,13 @@ class ArrSyncScheduler:
     never outlives the pass that used it. `events` is the same plain-attribute-after-
     construction seam `RetentionScheduler.events` uses; `None` (this module's own tests that
     don't care about the WS side) simply means no `item_delta` is published.
+
+    Phase B (docs/arr-integration-spec.md "Cleanup") adds `in_flight_provider`/
+    `delete_in_flight`, the identical seam `core/local_delete.py.RetentionScheduler` takes:
+    cleanup's own filesystem removal must be shielded from (and must itself shield) a scan
+    racing it, the same "in-memory, protected only while a worker actually holds it" guarantee
+    every other deleter in this codebase gets. Both default to `None` (no-op) so every existing
+    test of this module that never touches cleanup is unaffected.
     """
 
     MIN_POLL_INTERVAL_S = 5.0  # floor against a misconfigured near-zero setting
@@ -199,13 +232,21 @@ class ArrSyncScheduler:
         db: aiosqlite.Connection,
         config_dir: str,
         events: EventBus | None = None,
+        in_flight_provider: Callable[[], frozenset[int]] | None = None,
+        delete_in_flight: DeleteInFlight | None = None,
     ) -> None:
         self.db = db
         self.config_dir = config_dir
         self.events = events
+        self.in_flight_provider = in_flight_provider
+        self.delete_in_flight = delete_in_flight
         self._task: asyncio.Task | None = None
         self._backoff: dict[int, _InstanceBackoff] = {}
         self._pending: dict[int, _PendingVerdict] = {}
+        # Bounded notify-retry attempts, keyed by item id -- in-memory, same "restart loses
+        # pending state, and that is the safe direction" reasoning as `_pending` above (spec:
+        # "Notify failure is non-fatal ... bounded retries on subsequent poller ticks").
+        self._notify_attempts: dict[int, int] = {}
 
     async def start(self) -> None:
         if self._task is None:
@@ -252,9 +293,11 @@ class ArrSyncScheduler:
         if backoff is not None and time.monotonic() < backoff.next_attempt_at:
             return  # still backing off; never blocks other instances (spec)
 
+        # `SELECT *` -- phase B's notify retry and cleanup need `local_path`/`staging_path`/
+        # `arr_visible_path`/`name` alongside `id`/`arr_delete_completed`, and a queue row is
+        # cheap; simpler than growing this column list every time a later phase needs one more.
         cursor = await self.db.execute(
-            "SELECT id, arr_delete_completed FROM path_queue "
-            "WHERE arr_instance_id = ? AND enabled = 1",
+            "SELECT * FROM path_queue WHERE arr_instance_id = ? AND enabled = 1",
             (instance_id,),
         )
         queues = await cursor.fetchall()
@@ -329,8 +372,8 @@ class ArrSyncScheduler:
     ) -> None:
         queue_id = queue["id"]
         cursor = await self.db.execute(
-            "SELECT id, rel_path, arr_status, arr_download_id FROM item "
-            "WHERE queue_id = ? AND instr(rel_path, '/') = 0",
+            "SELECT id, rel_path, arr_status, arr_download_id, state, pending_download_prefix "
+            "FROM item WHERE queue_id = ? AND instr(rel_path, '/') = 0",
             (queue_id,),
         )
         items = await cursor.fetchall()
@@ -339,7 +382,226 @@ class ArrSyncScheduler:
 
         tracked = [i for i in items if i["arr_status"] in _TRACKED_STATES]
         for item in tracked:
+            if item["arr_status"] == "detected":
+                # Phase B (spec "Notify"): the *primary* push already happened, or didn't
+                # happen at all yet, from `PostprocessPipeline`'s own tail -- this is only the
+                # bounded retry for a primary attempt that failed (`notify_arr`'s own
+                # `item.arr_status == 'detected'` gate is what actually decides "notified"
+                # never re-enters this branch, not this `if`).
+                await self._maybe_retry_notify(queue, item)
             await self._check_import(client, queue_id, item, records)
+
+        if queue["arr_delete_completed"]:
+            # A fresh query, not the stale `items` snapshot above -- `_check_import` may have
+            # just committed an item to `imported` this very pass (spec: "Withheld is
+            # re-evaluated on later passes, not terminal" implies the reverse too: a
+            # newly-imported item must not wait an extra pass before cleanup is even
+            # considered).
+            cursor = await self.db.execute(
+                "SELECT * FROM item WHERE queue_id = ? AND arr_status = 'imported'", (queue_id,)
+            )
+            imported_items = await cursor.fetchall()
+            for item in imported_items:
+                await self._maybe_cleanup(queue, item)
+
+    # --- Notify retry (spec "Notify": "retry on the next poller tick (bounded retries)") -----
+
+    async def _maybe_retry_notify(self, queue: aiosqlite.Row, item: aiosqlite.Row) -> None:
+        """Retry a notify push whose primary attempt (`PostprocessPipeline`'s own tail) already
+        failed -- or push for the first time, if the primary attempt never got the chance to
+        (e.g. this instance's `notify_on_complete` was turned on after the item's pipeline run
+        already finished). Gated on the item having reached a stable, successful local outcome
+        (`_NOTIFY_READY_STATES`, no pending download-prefix rename, no active job) -- the *arr's
+        own queue can (and normally does) list a release before lftpweb has even finished
+        pulling it down, so `arr_status == 'detected'` alone is not evidence the pipeline is
+        done.
+        """
+        item_id = item["id"]
+        if item["state"] not in _NOTIFY_READY_STATES or item["pending_download_prefix"] is not None:
+            return
+        if self._notify_attempts.get(item_id, 0) >= MAX_NOTIFY_RETRY_ATTEMPTS:
+            return
+
+        cursor = await self.db.execute(
+            "SELECT 1 FROM job WHERE item_id = ? AND state IN ('queued', 'running') LIMIT 1",
+            (item_id,),
+        )
+        if await cursor.fetchone() is not None:
+            return  # not stable yet -- don't push mid-job
+
+        final_root = await self._resolve_final_physical_root(queue, item["rel_path"])
+        if final_root is None:
+            return  # bytes not found at either known location this pass -- try again later
+
+        outcome = await notify_arr(
+            self.db,
+            config_dir=self.config_dir,
+            item=item,
+            queue=queue,
+            final_local_root=final_root,
+            events=self.events,
+        )
+        if outcome == "failed":
+            self._notify_attempts[item_id] = self._notify_attempts.get(item_id, 0) + 1
+        else:
+            self._notify_attempts.pop(item_id, None)
+
+    # --- Shared path resolution: notify retry and cleanup both need "where are this item's
+    # bytes right now" ---------------------------------------------------------------------
+
+    async def _resolve_final_physical_root(
+        self, queue: aiosqlite.Row, rel_path: str
+    ) -> Path | None:
+        """Where this item's bytes actually are, for a push or a delete that must act on the
+        real location. Always asks `core/local_delete.py._physical_local_root` first -- the one
+        resolver for the download-prefix-in-flight case, never a second one (per this project's
+        own five-defects lesson). That resolver only ever accounts for the download-prefix
+        namespace, never a queue's own `auto_move` relocation to `staging_path`
+        (`core/postprocess.py._do_move`) -- so when its answer doesn't exist on disk, the one
+        other place a finished item's bytes can legitimately be is `staging_path/rel_path`,
+        checked here as a narrow, named fallback specific to this concern, not a general-purpose
+        second resolver for the concern `_physical_local_root` already owns.
+
+        `None` when neither location has anything on disk -- a legitimate outcome (bytes not
+        there yet, or already gone), not an error; every caller treats it as "nothing to do this
+        pass."
+        """
+        root = Path(queue["local_path"].rstrip("/"))
+        candidate = await _physical_local_root(
+            self.db, queue_id=queue["id"], root=root, rel_path=rel_path
+        )
+        if candidate.exists() or candidate.is_symlink():
+            return candidate
+        staging = queue["staging_path"]
+        if staging:
+            candidate2 = Path(staging.rstrip("/")) / rel_path
+            if candidate2.exists() or candidate2.is_symlink():
+                return candidate2
+        return None
+
+    # --- Cleanup (spec "Cleanup") -------------------------------------------------------------
+
+    async def _maybe_cleanup(self, queue: aiosqlite.Row, item: aiosqlite.Row) -> None:
+        """For an item whose association reached `imported` on an `arr_delete_completed` queue:
+        withhold (named reason, re-evaluated next pass -- never terminal) when verification for
+        this item failed or a job is active for it; otherwise suppress re-download, then remove
+        the local bytes, then record `cleaned`.
+
+        **Deliberately never writes `item.state`.** See this module's own docstring for why:
+        the bytes disappearing is left for the ordinary scan + `core/mount_sentinel.py`
+        absence-grace machinery to discover and carry to `REMOVED_LOCAL` on its own clock,
+        exactly as if an external mover (a human, or the *arr's own hardlink pickup) had taken
+        them -- "no new timer," per the spec.
+        """
+        item_id = item["id"]
+        queue_id = queue["id"]
+
+        if item["state"] == "CORRUPT":
+            await self._record_cleanup_withheld(
+                item_id, queue, "verification for this item failed (state=CORRUPT)"
+            )
+            return
+
+        cursor = await self.db.execute(
+            "SELECT 1 FROM job WHERE item_id = ? AND state IN ('queued', 'running') LIMIT 1",
+            (item_id,),
+        )
+        if await cursor.fetchone() is not None:
+            await self._record_cleanup_withheld(
+                item_id, queue, "an active job exists for this item"
+            )
+            return
+
+        # Suppress FIRST, before anything on disk is touched (spec "Cleanup" step 1) --
+        # belt-and-braces against a copy-mode queue's auto-queue re-grabbing the still-present
+        # remote copy while cleanup is in flight.
+        await self.db.execute("UPDATE item SET auto_queue_suppressed = 1 WHERE id = ?", (item_id,))
+        await self.db.commit()
+
+        local_root = await self._resolve_final_physical_root(queue, item["rel_path"])
+        if local_root is not None:
+            local_path_root = Path(queue["local_path"].rstrip("/"))
+            resolved = extract.resolve_within_root(local_root, local_path_root)
+            if resolved is None and queue["staging_path"]:
+                # The candidate may legitimately have come from `staging_path` instead (an
+                # `auto_move` queue) -- re-check containment against *that* root before giving
+                # up, rather than declaring an escape against a root the candidate was never
+                # claiming to be under.
+                resolved = extract.resolve_within_root(
+                    local_root, Path(queue["staging_path"].rstrip("/"))
+                )
+            if resolved is None:
+                await self._record_cleanup_withheld(
+                    item_id,
+                    queue,
+                    f"{local_root} resolves outside the queue's known roots -- refusing",
+                )
+                return
+            if not mount_sentinel.check(queue["local_path"].rstrip("/")):
+                await self._record_cleanup_withheld(
+                    item_id,
+                    queue,
+                    "local root is missing, unreadable, or has not completed a mount-sentinel scan",
+                )
+                return
+
+            in_flight = self.in_flight_provider() if self.in_flight_provider else frozenset()
+            if item_id in in_flight:
+                await self._record_cleanup_withheld(
+                    item_id, queue, "a post-processing worker is currently running for this item"
+                )
+                return
+            if (
+                self.delete_in_flight is not None
+                and item_id in self.delete_in_flight.in_flight_item_ids()
+            ):
+                await self._record_cleanup_withheld(
+                    item_id, queue, "a delete is already in progress for this item"
+                )
+                return
+
+            if self.delete_in_flight is not None:
+                self.delete_in_flight.mark([item_id])
+            try:
+                await asyncio.to_thread(_do_remove_from_disk, local_root, resolved)
+            except OSError as exc:
+                await self._record_cleanup_withheld(item_id, queue, f"local delete failed: {exc}")
+                return
+            finally:
+                if self.delete_in_flight is not None:
+                    self.delete_in_flight.unmark([item_id])
+        # else: nothing found at either known location -- the goal state (no local copy) already
+        # holds, so this proceeds to record `cleaned` rather than withholding forever on an item
+        # that's already gone.
+
+        await self.db.execute(
+            "UPDATE item SET arr_status = 'cleaned', arr_status_at = ? WHERE id = ?",
+            (_now_iso(), item_id),
+        )
+        await self.db.commit()
+        await audit.record_event(
+            self.db,
+            level="info",
+            item_id=item_id,
+            kind="arr_cleanup",
+            message=(
+                f"queue {queue_id} ({queue['name']!r}): local copy removed after confirmed *arr "
+                "import -- item.state left as-is for the normal absence-grace machinery to carry "
+                "it to REMOVED_LOCAL, same as any externally-caused removal"
+            ),
+        )
+        await self._publish_item(queue_id, item_id)
+
+    async def _record_cleanup_withheld(
+        self, item_id: int, queue: aiosqlite.Row, reason: str
+    ) -> None:
+        await audit.record_event(
+            self.db,
+            level="warning",
+            item_id=item_id,
+            kind="arr_cleanup_withheld",
+            message=f"queue {queue['id']} ({queue['name']!r}): cleanup withheld -- {reason}",
+        )
 
     # --- Matching: (no status) | gone | cleaned -> detected ----------------------------------
 

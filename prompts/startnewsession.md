@@ -88,7 +88,7 @@ than a first. Two things that bit the first time and will bit again:
 | Phase | What | Status |
 |---|---|---|
 | A — backend foundation | Migration 018 (`arr_instance` + 3 `path_queue` cols + 3 `item` cols); `core/arrclient.py` (httpx, one class, `kind` switch); `core/arrsync.py` poller (matching + import/gone detection, two-pass quiescence guard, per-instance backoff); `ArrSettings`; `api/settings_arr.py` CRUD + Test; `api/settings_queues.py` extended; `arr_status`/`arr_status_at` joined into `core/itemview.py`'s one projection. No notify, no cleanup, no frontend — those are phases B/C. | ✅ done, this commit |
-| B — notify + cleanup | Postprocess-tail scan-command push, the cleanup path with suppression, withheld events, per-queue columns already in place from phase A | ⏳ not started |
+| B — notify + cleanup | `core/arrnotify.py` (new, shared notify implementation); `PostprocessPipeline._maybe_notify_arr` (primary push, tail of a fully-successful pipeline run); `ArrSyncScheduler._maybe_retry_notify` (bounded retry) + `._maybe_cleanup` (withheld gates, suppression-first, bytes removed without touching `item.state`) | ✅ done, this commit |
 | C — UI | Integrations tab, Queues additions, Files icon + filter, browser-verified | ⏳ not started |
 
 **Phase A verification:** backend lint/format clean, full backend `pytest` green (new tests in
@@ -100,6 +100,21 @@ test's synchronous call blocks the event loop a same-loop fake server would need
 Everything defaults off (`arr_instance.enabled = 0`, migration inserts no rows); the eventType/
 trackedDownloadState vocabulary in `core/arrclient.py` is flagged unverified against a live
 instance, per the spec's own warning.
+
+**Phase B verification:** backend lint/format clean, full backend `pytest` green (new
+`tests/test_arr_notify.py` for the primary push and `tests/test_arr_cleanup.py` for the poller's
+bounded retry + cleanup, both against the fake-*arr fixture; `tests/fake_arr.py` gained
+`FakeArrState.fail_command` so a test can fail only `POST /api/v3/command` without also failing
+`/queue` — `fail_all` fails everything, which never reaches a queue's own notify/cleanup pass).
+Frontend untouched, re-verified anyway. `core/arrnotify.py` is new: one `notify_arr()` shared by
+both callers (postprocess's primary attempt, arrsync's retry) so there is exactly one place that
+builds the *arr POST, translates the path, and writes the `arr_notified`/`arr_notify_failed`
+event. **Cleanup deliberately never writes `item.state`** — it removes the bytes and leaves the
+row exactly as it was, so the existing scan + `core/mount_sentinel.py` absence-grace machinery
+discovers the disappearance and carries it to `REMOVED_LOCAL` on its own ~10-minute clock, the
+same as `core/postprocess.py._do_move` already does for a staging relocation. This is a
+deliberate, spec-driven departure from "just call `core/local_delete.py.delete_local()`" — see
+`docs/decisions.md` (2026-08-15) for the full reasoning.
 
 ### 🌙 Overnight audit run (started 2026-08-14, unattended) — LIVE PROGRESS LOG
 
