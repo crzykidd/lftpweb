@@ -13,11 +13,75 @@ odd-byte filename compare equal without either side needing special-casing.
 from __future__ import annotations
 
 import os
+import re
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from lftpweb.core.extract import FAILED_PREFIX, UNPACK_PREFIX
+from lftpweb.core.mount_sentinel import SENTINEL_NAME
+
 PGET_STATUS_SUFFIX = ".lftp-pget-status"
 TEMP_FILE_SUFFIX = ".lftp"
+
+# 2026-08-13 (prompts/2026-08-13-lftp-timestamped-temp-files.md): lftp normally names an
+# in-flight file `<final>.lftp` (`xfer:temp-file-name "*.lftp"`, `core/lftp.py.build_rc_text`),
+# but when two lftp processes race the same target -- exactly the bug
+# `core/queue.py.enqueue_item`'s active-job guard exists to prevent -- the loser can end up
+# writing (or has previously written) to a *uniquified* variant instead:
+# `foo.mkv.lftp~20260813154311~` (a real example from a user report the same day). Reproduced
+# empirically against the fake seedbox by running two lftp processes concurrently against one
+# target (see docs/decisions.md for what that reproduction actually showed -- the exact
+# trigger for the renamed-variant form specifically, vs. two processes silently sharing the
+# plain `.lftp` name, turned out to be a timing-dependent race inside lftp itself, not
+# something this codebase controls). Both forms mean the same thing -- "not yet the real
+# file" -- so both must be recognised identically everywhere `.lftp` already is, from one
+# place both `core/local_scan.py` and `core/local_delete.py` import, per the task's own
+# instruction not to hardcode `~` handling twice.
+TEMP_FILE_RE = re.compile(r"^(?P<final>.+)\.lftp(?:~\d+~)?$")
+
+
+def strip_temp_suffix(name: str) -> str:
+    """`name` with any lftp temp-file suffix removed -- plain `.lftp`, or the
+    `.lftp~<timestamp>~` variant lftp falls back to when it finds the plain name already
+    spoken for. Returns `name` unchanged when neither suffix is present.
+    """
+    match = TEMP_FILE_RE.match(name)
+    return match.group("final") if match else name
+
+
+def is_temp_name(name: str) -> bool:
+    """Whether `name` is an lftp temp-file name (either form) rather than a finished file's
+    own name.
+    """
+    return TEMP_FILE_RE.match(name) is not None
+
+
+def find_temp_variants(parent: Path, final_name: str) -> list[Path]:
+    """Every on-disk temp-file variant of `final_name` inside `parent` -- the plain
+    `<final_name>.lftp` (checked directly, cheap and exact) plus any
+    `<final_name>.lftp~<timestamp>~` lftp chose instead (found by scanning `parent`, since the
+    timestamp is lftp's own choice, never predictable by us). Used by `core/local_delete.py`
+    (so a delete or a stopped-mid-transfer cleanup removes every variant, not just the plain
+    one) and by orphan-reaping. Empty (not raising) when `parent` isn't a real directory --
+    callers that need it to exist check that themselves.
+    """
+    if not parent.is_dir():
+        return []
+    variants: list[Path] = []
+    plain = parent / f"{final_name}{TEMP_FILE_SUFFIX}"
+    if plain.exists():
+        variants.append(plain)
+    try:
+        with os.scandir(parent) as it:
+            for entry in it:
+                if entry.name == plain.name or entry.is_dir(follow_symlinks=False):
+                    continue
+                if strip_temp_suffix(entry.name) == final_name and entry.name != final_name:
+                    variants.append(Path(entry.path))
+    except OSError:
+        pass
+    return variants
 
 
 @dataclass(frozen=True)
@@ -26,11 +90,33 @@ class LocalEntry:
     root). `size` is the *effective* size for files (§4.4a/b already applied) and is always
     0 for directories — the reconciler computes directory totals by summing children, the
     same way it does for the remote tree, so the two are computed identically.
+
+    `mtime` (2026-08-13, prompts/2026-08-13-files-detail-inspector.md) is the file's own
+    `st_mtime`, epoch seconds — the local-side counterpart to `core/remote.py.RemoteEntry.mtime`
+    that never existed before this task (the gap the item drawer's "modified date, both sides"
+    request exposed directly). Always `0.0` for a directory, mirroring `RemoteEntry` exactly:
+    `core/reconcile.py` only ever reads a file's own mtime, never a directory's, on either side
+    — see that module for why staying consistent with the existing (files-only) convention was
+    the deliberate choice here rather than inventing a directory rule from scratch.
+
+    `is_temp` (2026-08-13, prompts/2026-08-13-lftp-timestamped-temp-files.md) is `True` when
+    this entry's *only* on-disk representation is still a temp-suffixed name (`.lftp` or
+    `.lftp~<timestamp>~`, `TEMP_FILE_RE`) -- lftp has not yet performed the atomic rename onto
+    the real name. `core/reconcile.py` refuses to call an entry with this flag set "complete"
+    regardless of what `size` says, even if it happens to equal or exceed the remote size --
+    a temp file's reported size can be wrong (a missing/mismatched sidecar falls back to a
+    sparse `st_size`, or two processes racing the same target can leave one mid-write) in a way
+    a real, already-renamed file's size cannot, and the one thing lftp's own rename-on-completion
+    convention is *for* is that a name lftpweb hasn't seen renamed is not yet trustworthy. Always
+    `False` for a directory (a directory is never itself temp-suffixed -- only files inside it
+    are) and for a genuinely finished file.
     """
 
     rel_path: str
     is_dir: bool
     size: int = 0
+    mtime: float = 0.0
+    is_temp: bool = False
 
 
 @dataclass(frozen=True)
@@ -105,10 +191,12 @@ def effective_file_size(path: str | Path) -> int:
     without a directory walk — for `core/progress.py`'s single-file (`pget`) active-set
     sampling, where stat-ing one known path beats walking its parent directory.
 
-    Checks, in order: a live `.lftp` temp file (if `path` itself doesn't exist yet), then that
-    file's own `.lftp-pget-status` sidecar (if present, its accounting wins over raw
-    `st_size`), then plain `st_size`. Returns 0 for a path that doesn't exist in any of these
-    forms — a file that hasn't started yet reads as 0 bytes done, not an error.
+    Checks, in order: a live `.lftp` temp file (if `path` itself doesn't exist yet), then any
+    `.lftp~<timestamp>~` variant (`find_temp_variants`, 2026-08-13 -- the largest one, same
+    "keep whichever reports more data" tie-break `scan_local` uses), then that candidate's own
+    `.lftp-pget-status` sidecar (if present, its accounting wins over raw `st_size`), then plain
+    `st_size`. Returns 0 for a path that doesn't exist in any of these forms — a file that
+    hasn't started yet reads as 0 bytes done, not an error.
     """
     path = Path(path)
     candidate = path
@@ -117,7 +205,11 @@ def effective_file_size(path: str | Path) -> int:
         if temp_candidate.exists():
             candidate = temp_candidate
         else:
-            return 0
+            variants = find_temp_variants(path.parent, path.name)
+            if variants:
+                candidate = max(variants, key=lambda p: p.stat().st_size if p.exists() else 0)
+            else:
+                return 0
 
     sidecar_path = candidate.with_name(candidate.name + PGET_STATUS_SUFFIX)
     status = _read_sidecar(sidecar_path)
@@ -129,13 +221,128 @@ def effective_file_size(path: str | Path) -> int:
         return 0
 
 
-def scan_local(root: str | Path) -> dict[str, LocalEntry]:
+def _matching_prefix(name: str, prefixes: tuple[str, ...]) -> str | None:
+    """The longest of `prefixes` that `name` starts with, or `None`. Longest wins so that two
+    configured prefixes sharing a leading substring (an old value and a newly edited one, say)
+    resolve deterministically regardless of `prefixes`' own iteration order -- it is built from
+    a `set` (`core/engine.py.Engine._active_download_prefixes`), which is not itself ordered.
+    """
+    matches = [p for p in prefixes if p and name.startswith(p)]
+    return max(matches, key=len) if matches else None
+
+
+def _resolve_prefixed_dir_names(
+    raw_entries: list[os.DirEntry], extra_dir_prefixes: tuple[str, ...]
+) -> dict[str, str]:
+    """For every directory entry in one `scandir` batch that isn't `_UNPACK_`/`_FAILED_`
+    staging, the name it should be walked and *reported* under (2026-08-14,
+    `prompts/2026-08-14-map-the-download-prefix-not-filter-it.md`): its own on-disk name with
+    a matching `extra_dir_prefixes` entry stripped, mapping it onto the logical name its remote
+    counterpart carries -- the same thing this module already does for an in-flight `*.lftp`
+    file one level down, applied one level up. Entries with no matching prefix are absent from
+    the returned dict; callers fall back to the entry's own raw name for those, unchanged from
+    before this task.
+
+    **Collision rule (docs/decisions.md, this task's own entry -- "hard case 1"), because a
+    real, already-renamed directory and a stale prefixed one can coexist as siblings** (a prior
+    attempt's leftover beside a release that has since completed under a fresh job, say).
+    Exactly one directory may ever claim a given reported name at one level:
+
+    - An already-unprefixed ("plain") sibling always wins over a prefixed one that would
+      strip down to the same name -- it is the item's current, authoritative location, the same
+      "a real, already-renamed file always wins over a temp one" rule `scan_local`'s own
+      same-name file tie-break already applies one level down. Mapping the stale prefixed
+      directory on top of it would silently merge two unrelated subtrees into one `rel_path`,
+      which this design explicitly rejects as the worst available option.
+    - Two prefixed siblings colliding on the same stripped name with no plain sibling present
+      (a stale leftover under an old prefix, say, beside a fresh spawn under a newly edited
+      one) resolve by raw on-disk name, alphabetically first -- arbitrary, but deterministic,
+      since `scandir` order itself is not.
+
+    Every entry that loses a collision is **not** included in the returned mapping, so the
+    caller reports it under its own raw, still-prefixed name -- never silently dropped. Its
+    content is then a directory the reconciler cannot safely attribute to the real item, so it
+    reads as an ordinary local-only leftover: visible in the Files tree, and deletable through
+    the normal path, exactly like any other untracked local directory. This is the one place a
+    `.downloading-`-style name is expected to ever appear in this module's output -- every
+    non-colliding directory, the overwhelming majority, is mapped.
+    """
+    plain_names: set[str] = set()
+    prefixed: list[tuple[str, str]] = []  # (raw_name, stripped_name)
+    for entry in raw_entries:
+        if not entry.is_dir(follow_symlinks=False):
+            continue
+        name = entry.name
+        if name.startswith(UNPACK_PREFIX) or name.startswith(FAILED_PREFIX):
+            continue
+        matched = _matching_prefix(name, extra_dir_prefixes)
+        if matched is None:
+            plain_names.add(name)
+        else:
+            prefixed.append((name, name[len(matched) :]))
+
+    winners: dict[str, str] = {}  # stripped_name -> raw_name of the current winner
+    for raw_name, stripped_name in prefixed:
+        if stripped_name in plain_names:
+            continue  # the plain sibling always wins; this one stays literal (see docstring)
+        current = winners.get(stripped_name)
+        if current is None or raw_name < current:
+            winners[stripped_name] = raw_name
+
+    return {raw_name: stripped_name for stripped_name, raw_name in winners.items()}
+
+
+def scan_local(
+    root: str | Path, *, extra_dir_prefixes: tuple[str, ...] = ()
+) -> dict[str, LocalEntry]:
     """Walk `root` and return every entry keyed by POSIX-style `rel_path`.
 
     `.lftp-pget-status` sidecars never appear as their own entries — they're consumed to
     correct the size of the file they describe. A `*.lftp` temp file is reported under its
     *final* name (suffix stripped), so it matches its remote counterpart directly; if the
     sidecar-adjusted size is also available for that temp file, it wins over raw `st_size`.
+
+    `extra_dir_prefixes` (2026-08-14, "folder prefix during transfer" -- `core/download_prefix.py`;
+    **mapped, not filtered, as of `prompts/2026-08-14-map-the-download-prefix-not-filter-it.md`,
+    reversing this parameter's original behaviour** -- see `docs/decisions.md` for both entries)
+    is every directory-name prefix currently in play for the queue being scanned -- the
+    site/queue-resolved prefix plus every distinct `item.pending_download_prefix` still on
+    record, per `core/engine.py.Engine._active_download_prefixes`. A directory matching one of
+    these is reported under its **logical** (stripped) name and walked in place -- the same
+    "physical detail mapped back to the logical one" this module already does for an in-flight
+    `*.lftp` file, one level up: `<local_path>/.downloading-Release/a.mkv` on disk is reported
+    as `Release/a.mkv`, matching its remote counterpart directly, so the reconciler is never
+    blind to lftpweb's own in-flight working directory. `find_temp_files`'s directory-level
+    counterpart -- something that needs the real, physical path rather than the mapped one --
+    is `core/local_delete.py._physical_local_root`, not this module; nothing here reports a
+    prefixed directory's *physical* path, only its logical one.
+
+    The user's own words for why this must be a mapping, not a filter (2026-08-14): "the
+    .download is a first class citizen ... that is where all directory level downloads happen
+    if set." Importers still cannot see the content -- that was always the on-disk dot-prefixed
+    name's job, never this module's filtering -- so mapping loses no protection while restoring
+    the reconciler's own view of what is actually on disk. `_resolve_prefixed_dir_names` above
+    is where the one real subtlety (a real and a prefixed directory coexisting) is resolved;
+    see its own docstring.
+
+    Unlike the two module-level prefixes (`UNPACK_PREFIX`/`FAILED_PREFIX`, still filtered
+    outright below -- extraction staging, never the item itself), this one **cannot** be a
+    module constant -- it is configurable, site-wide and per-queue -- so every caller that wants
+    it mapped has to pass it in explicitly; the default `()` is exactly "nothing to map" for
+    every caller that doesn't (in particular, every existing test, and both
+    `core/queue.py._completeness_on_disk`/`core/progress.py`'s own `scan_local` calls, which
+    are already rooted *at* the item's physical location and so never encounter the prefixed
+    name as a child in the first place). Checked at any depth, the same as
+    `UNPACK_PREFIX`/`FAILED_PREFIX`, since a directory item being downloaded need not be
+    top-level.
+
+    **Accepted, undecidable edge case**: a genuine remote release whose own name happens to
+    start with an active prefix (e.g. a release literally named `.downloading-Foo` while
+    `.downloading-` is the active prefix) is indistinguishable, from this module alone, from
+    lftpweb's own in-flight directory of the same on-disk name -- it will be mapped (reported as
+    `Foo`) the same as any other match. `scan_local` has no view of the remote tree to
+    disambiguate with, the same accepted limitation `UNPACK_PREFIX`/`FAILED_PREFIX` already
+    carry for an identically-named real release today. Vanishingly unlikely; not solved here.
     """
     root = Path(root)
     entries: dict[str, LocalEntry] = {}
@@ -157,39 +364,273 @@ def scan_local(root: str | Path) -> dict[str, LocalEntry]:
                 if status is not None:
                     sidecars[carrier] = status
 
+        # Resolved once per directory level (never per-entry): every directory in this batch
+        # that maps onto a different, logical on-disk name -- see `_resolve_prefixed_dir_names`'s
+        # own docstring for the collision rule. A directory absent from this dict (the common
+        # case -- nothing to map, or `extra_dir_prefixes` is empty) is walked under its own name,
+        # exactly as before this task.
+        prefixed_dir_names = (
+            _resolve_prefixed_dir_names(raw_entries, extra_dir_prefixes)
+            if extra_dir_prefixes
+            else {}
+        )
+
         for entry in raw_entries:
             name = entry.name
-            rel_path = f"{rel_prefix}{name}" if rel_prefix == "" else f"{rel_prefix}/{name}"
+
+            # `core/mount_sentinel.py` writes this at the queue's local root after every
+            # successful scan (DESIGN.md §7.3). It is lftpweb's own bookkeeping, not content
+            # the user asked for, and it exists only locally — so left in the walk it
+            # reconciles to a permanent LOCAL_ONLY node and shows up in the Files tree as a
+            # file the remote is "missing". Filtered here, at the source, rather than in the
+            # UI: the reconciler, the item table, and every completeness count then all see
+            # the same tree the user sees. Root only, since that is the only place the
+            # sentinel is ever written — an identically-named file deeper in the tree came
+            # from the remote and is real content.
+            if (
+                rel_prefix == ""
+                and name == SENTINEL_NAME
+                and not entry.is_dir(follow_symlinks=False)
+            ):
+                continue
 
             if entry.is_dir(follow_symlinks=False):
-                entries[rel_path] = LocalEntry(rel_path=rel_path, is_dir=True)
-                walk(Path(entry.path), rel_path)
+                # `core/extract.py`'s `_UNPACK_<name>`/`_FAILED_<name>` staging directories
+                # (DESIGN.md §6) are lftpweb's own bookkeeping too, but unlike the sentinel
+                # they're siblings of the item they belong to, not root-only, so an item can
+                # carry one at any depth. Left in the walk, an in-progress `_UNPACK_` dir
+                # would reconcile to a growing LOCAL_ONLY node while extraction runs, and a
+                # `_FAILED_` dir would sit there forever as a permanent LOCAL_ONLY once
+                # extraction stops touching it -- neither is content the user asked for. Checked
+                # first, and on the entry's own raw `name`, before any prefix mapping below --
+                # `_FAILED_.downloading-Show…` (a real production shape: a `_FAILED_` staging
+                # directory for an item that was itself still prefix-downloading) starts with
+                # `_FAILED_`, never with the active prefix, so it is caught here regardless of
+                # mapping order; stated explicitly because getting this backwards would be easy
+                # to get wrong silently.
+                if name.startswith(UNPACK_PREFIX) or name.startswith(FAILED_PREFIX):
+                    continue
+                # "folder prefix during transfer" (2026-08-14, `core/download_prefix.py`; mapped
+                # rather than filtered as of `prompts/2026-08-14-map-the-download-prefix-not-
+                # filter-it.md` -- see this function's own docstring and `_resolve_prefixed_dir_
+                # names`'s for the full reasoning and the same-name-collision rule). A directory
+                # this batch's pre-pass resolved to a logical name is reported and walked under
+                # that name instead of its own; everything else (nothing to map, or this entry
+                # lost a collision and stays literal) keeps its own raw `name`, unchanged from
+                # before this task.
+                dir_name = prefixed_dir_names.get(name, name)
+                dir_rel_path = (
+                    f"{rel_prefix}{dir_name}" if rel_prefix == "" else f"{rel_prefix}/{dir_name}"
+                )
+                entries[dir_rel_path] = LocalEntry(rel_path=dir_rel_path, is_dir=True)
+                walk(Path(entry.path), dir_rel_path)
                 continue
 
             if name.endswith(PGET_STATUS_SUFFIX):
                 continue  # consumed above
 
-            final_name = name[: -len(TEMP_FILE_SUFFIX)] if name.endswith(TEMP_FILE_SUFFIX) else name
+            is_temp = is_temp_name(name)
+            final_name = strip_temp_suffix(name)
             final_rel_path = (
                 f"{rel_prefix}{final_name}" if rel_prefix == "" else f"{rel_prefix}/{final_name}"
             )
+
+            # One `stat()`, used for both `mtime` (always wanted -- a sidecar has no opinion
+            # on it) and `size` (only when there's no sidecar to prefer instead). Missing
+            # entirely on a race (deleted between `scandir` and `stat`) reads as `mtime=0.0`,
+            # the same "nothing better available" fallback `size` already had.
+            try:
+                stat_result = entry.stat(follow_symlinks=False)
+            except OSError:
+                stat_result = None
+            mtime = stat_result.st_mtime if stat_result is not None else 0.0
 
             status = sidecars.get(name)
             if status is not None:
                 size = effective_size(status)
             else:
-                try:
-                    size = entry.stat(follow_symlinks=False).st_size
-                except OSError:
-                    size = 0
+                size = stat_result.st_size if stat_result is not None else 0
 
             existing = entries.get(final_rel_path)
-            if existing is not None and existing.size >= size:
-                # A finished file (no suffix) and a stray `.lftp` temp of the same final name
-                # should not both occur, but if they do, keep whichever reports more data
-                # rather than letting scan order decide.
-                continue
-            entries[final_rel_path] = LocalEntry(rel_path=final_rel_path, is_dir=False, size=size)
+            if existing is not None:
+                # A finished file (no suffix) and a stray temp variant (`.lftp` or
+                # `.lftp~<timestamp>~`, 2026-08-13) of the same final name should not both
+                # occur, but if they do: a real, already-renamed file always wins over a temp
+                # one, regardless of size -- `is_temp` below is what makes that distinction
+                # legible to `core/reconcile.py`, so an orphaned temp file must never be the
+                # entry that survives once the genuine final file exists. Among two entries of
+                # the *same* temp-ness (two temp variants, or -- shouldn't happen -- two real
+                # files), keep whichever reports more data rather than letting scan order
+                # decide, same rule as before this task.
+                if not existing.is_temp and is_temp:
+                    continue
+                if existing.is_temp == is_temp and existing.size >= size:
+                    continue
+            entries[final_rel_path] = LocalEntry(
+                rel_path=final_rel_path, is_dir=False, size=size, mtime=mtime, is_temp=is_temp
+            )
 
     walk(root, "")
     return entries
+
+
+def find_temp_files(root: str | Path) -> list[Path]:
+    """Recursively, every lftp temp file (`.lftp` or `.lftp~<timestamp>~`, `is_temp_name`)
+    anywhere under `root`, by its own real on-disk name.
+
+    Unlike `scan_local`'s output -- which reports a still-temp file under its *final*, stripped
+    name so it can be matched against its remote counterpart -- this is for a caller that needs
+    the actual leftover path itself: an audit message naming exactly what is still sitting on
+    disk (2026-08-14, prompts/2026-08-14-exit-zero-is-not-completion.md's completeness check,
+    `core/queue.py._completeness_on_disk`), the row that would have explained a real incident
+    at a glance instead of one that just says "500 MB short" with no filename.
+
+    `_UNPACK_`/`_FAILED_` staging directories are skipped, matching every other walk in this
+    module.
+    """
+    root = Path(root)
+    found: list[Path] = []
+    if not root.is_dir():
+        return found
+
+    def walk(dir_path: Path) -> None:
+        try:
+            with os.scandir(dir_path) as it:
+                raw_entries = list(it)
+        except OSError:
+            return
+        for entry in raw_entries:
+            if entry.is_dir(follow_symlinks=False):
+                if entry.name.startswith(UNPACK_PREFIX) or entry.name.startswith(FAILED_PREFIX):
+                    continue
+                walk(Path(entry.path))
+                continue
+            if is_temp_name(entry.name):
+                found.append(Path(entry.path))
+
+    walk(root)
+    return found
+
+
+def find_orphan_sidecars(root: str | Path) -> list[Path]:
+    """Recursively, every `.lftp-pget-status` sidecar under `root` whose carrier file -- the
+    same name with the suffix stripped -- is not present in that same directory listing.
+
+    `scan_local`'s own walk only ever *consumes* a sidecar when its carrier is present
+    alongside it (used to correct that carrier's reported size); a sidecar whose carrier was
+    renamed away or removed without the sidecar being cleaned up alongside it never appears
+    anywhere in `scan_local`'s output, so it is otherwise invisible bookkeeping. That is
+    exactly the leftover DESIGN.md §4.3's completeness check (`core/queue.py._reap_one`,
+    2026-08-14, prompts/2026-08-14-exit-zero-is-not-completion.md) needs to name explicitly:
+    a job that exited 0 leaving a stray sidecar behind is evidence lftp's own bookkeeping
+    disagrees with what's actually on disk, whatever the byte totals say.
+
+    `_UNPACK_`/`_FAILED_` staging directories are skipped, matching every other walk in this
+    module -- extraction hasn't run yet at the point this is called, but a stale one from a
+    previous cycle must not be walked into.
+    """
+    root = Path(root)
+    orphans: list[Path] = []
+    if not root.is_dir():
+        return orphans
+
+    def walk(dir_path: Path) -> None:
+        try:
+            with os.scandir(dir_path) as it:
+                raw_entries = list(it)
+        except OSError:
+            return
+        names = {e.name for e in raw_entries}
+        for entry in raw_entries:
+            if entry.is_dir(follow_symlinks=False):
+                if entry.name.startswith(UNPACK_PREFIX) or entry.name.startswith(FAILED_PREFIX):
+                    continue
+                walk(Path(entry.path))
+                continue
+            if not entry.name.endswith(PGET_STATUS_SUFFIX):
+                continue
+            carrier = entry.name[: -len(PGET_STATUS_SUFFIX)]
+            if carrier not in names:
+                orphans.append(Path(entry.path))
+
+    walk(root)
+    return orphans
+
+
+# --- Orphaned temp-file reaping (2026-08-13, prompts/2026-08-13-lftp-timestamped-temp-files.md) --
+
+# Deliberately several days, not hours: the guard is age alone (see `sweep_orphan_temp_files`'s
+# own docstring for why that's safe), and this is the margin against a slow-but-genuinely-alive
+# transfer, not a guess. Shorter than `core/extract.py.FAILED_RETENTION_DEFAULT_DAYS` (14 days)
+# on purpose -- a `_FAILED_` directory is kept as diagnostic evidence someone might want to
+# look at; an orphaned temp file has no diagnostic value at all, just wasted bytes.
+ORPHAN_TEMP_FILE_DEFAULT_MAX_AGE_DAYS = 2.0
+
+
+def sweep_orphan_temp_files(
+    queue_root: str | Path, *, max_age_days: float, now: float | None = None
+) -> list[tuple[Path, float]]:
+    """Remove every stale lftp temp file (`.lftp` or `.lftp~<timestamp>~`, `TEMP_FILE_RE`)
+    found anywhere under `queue_root` whose own mtime is older than `max_age_days` -- the
+    disk-hygiene half of this task (the root cause -- duplicate concurrent processes -- is
+    fixed in `core/queue.py.enqueue_item`/`_admit`; this is for what the bug already left
+    behind, plus anything a future crash still manages to orphan).
+
+    **Age-gated, not job-state-gated, deliberately** -- the same shape
+    `core/extract.py.sweep_failed_dirs` already uses for its own stale-leftover problem. A temp
+    file a live lftp process is actively writing has its mtime refreshed on every write, so it
+    can never look older than a few seconds; `net:timeout`/`net:max-retries`
+    (`core/lftp.py.build_rc_text`) already make a genuinely stalled connection fail within
+    minutes, not days. A multi-day default threshold is therefore a safety margin against a
+    slow-but-alive transfer, not a guess, and this function itself has no DB access (matching
+    every other pure function in this module) -- a caller wanting to additionally cross-check
+    "no active job" can do so with the paths this returns before acting on them.
+
+    Sidecars are removed alongside their own temp file, never independently swept -- an
+    orphaned sidecar with no temp file left is already invisible (`scan_local` only ever reads
+    one via a `TEMP_FILE_RE`-matched carrier name) and harmless dead weight of at most a few
+    hundred bytes. `_UNPACK_`/`_FAILED_` staging directories are skipped, same as `scan_local`'s
+    own walk, so this never reaches into another feature's own bookkeeping; the mount sentinel
+    is never temp-suffixed so it needs no special-casing here.
+
+    Returns `(path, age_days)` for every file actually removed, so the caller can write one
+    `event` row per removal -- the same audit shape `core/extract.py.sweep_failed_dirs` uses.
+    """
+    root = Path(queue_root)
+    if not root.is_dir():
+        return []
+    now_ts = now if now is not None else time.time()
+    removed: list[tuple[Path, float]] = []
+
+    def walk(dir_path: Path) -> None:
+        try:
+            with os.scandir(dir_path) as it:
+                raw_entries = list(it)
+        except OSError:
+            return
+        for entry in raw_entries:
+            name = entry.name
+            if entry.is_dir(follow_symlinks=False):
+                if name.startswith(UNPACK_PREFIX) or name.startswith(FAILED_PREFIX):
+                    continue
+                walk(Path(entry.path))
+                continue
+            if name.endswith(PGET_STATUS_SUFFIX) or not is_temp_name(name):
+                continue
+            try:
+                st = entry.stat(follow_symlinks=False)
+            except OSError:
+                continue
+            age_days = (now_ts - st.st_mtime) / 86400
+            if age_days < max_age_days:
+                continue
+            path = Path(entry.path)
+            path.with_name(path.name + PGET_STATUS_SUFFIX).unlink(missing_ok=True)
+            try:
+                path.unlink()
+            except OSError:
+                continue
+            removed.append((path, age_days))
+
+    walk(root)
+    return removed

@@ -18,6 +18,12 @@
 # username "seeduser", remote_path "/data/pickup".
 # Tear down: docker compose -f docker-compose.test.yml down
 
+# Both containers also bind-mount a host directory at /data/dropbox for hand-testing:
+# drop files into private_data/seedbox-dropbox/ and they appear on the "seedbox" instantly.
+# It is deliberately NOT mounted over /data/pickup — a bind mount there would shadow the
+# image's seeded tree and break every integration test that asserts on its contents. Point
+# a second queue at /data/dropbox to use it.
+
 services:
   seedbox-gnu:
     build:
@@ -26,6 +32,8 @@ services:
     container_name: lftpweb-test-seedbox-gnu
     ports:
       - "2222:22"
+    volumes:
+      - ./private_data/seedbox-dropbox:/data/dropbox
 
   seedbox-busybox:
     build:
@@ -34,3 +42,5 @@ services:
     container_name: lftpweb-test-seedbox-busybox
     ports:
       - "2223:22"
+    volumes:
+      - ./private_data/seedbox-dropbox:/data/dropbox

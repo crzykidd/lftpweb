@@ -51,6 +51,23 @@ export interface ScanErrorMessage {
   message: string
 }
 
+/** Published by `core/engine.py.scan_queue` at the end of *every* pass -- success or
+ * failure, unlike `QueueDeltaMessage` which only fires on success. This is the one signal
+ * a client can actually wait on for "this queue's scan attempt is over", rather than
+ * guessing from a fixed timer (`pages/FilesPage.tsx`'s old 1s `setTimeout`) or inferring it
+ * from a message shape meant for tree deltas. Fixed-size regardless of tree size: four
+ * scalars, never a node list -- same delta-rule shape as every other message here.
+ */
+export interface ScanCompleteMessage {
+  type: 'scan_complete'
+  queue_id: number
+  finished_at: string
+  ok: boolean
+  /** The partial-scan warning text carried by this pass, if any. Only ever set when `ok` is
+   * true -- a pass that failed outright never got far enough to know. */
+  warning: string | null
+}
+
 export interface ProgressJob {
   job_id: number
   item_id: number
@@ -68,9 +85,34 @@ export interface ProgressMessage {
   jobs: ProgressJob[]
 }
 
+export interface ChildProgressItem {
+  item_id: number
+  speed_bps: number
+}
+
+/** Published by `core/queue.py._publish_child_progress` on the same throttled pass as
+ * `item_delta` (2026-08-14, "per-file speed inside a mirror") -- a live, EMA-smoothed rate for
+ * each changed file inside a mirroring directory. Deliberately a **third** message, not folded
+ * into either existing one: `progress` is job-centric (a child has no `job_id` of its own, so a
+ * pseudo-entry there would collide in `progressByJobId` and put a fictional row on the
+ * Transfers page); `item_delta` carries `item_view()` projections of persisted `item` columns
+ * only, and a live rate is a sample, never a persisted one (DESIGN.md §2/§9's invariant). Never
+ * larger than `core/queue.py.MAX_CHILD_PROGRESS_UPDATES_PER_TICK` entries, and omitted
+ * entirely on a tick with nothing to report -- same bound as `_publish_child_progress`'s other
+ * work, never proportional to tree size. See `useLiveModel.ts`'s `childSpeedByItemId` and
+ * docs/decisions.md for how the frontend gates display on this (freshness, not `state`, since
+ * every actively-transferring child sits at `PARTIAL`, never `DOWNLOADING`).
+ */
+export interface ChildProgressMessage {
+  type: 'child_progress'
+  items: ChildProgressItem[]
+}
+
 export type WsMessage =
   | SnapshotMessage
   | QueueDeltaMessage
   | ItemDeltaMessage
   | ScanErrorMessage
+  | ScanCompleteMessage
   | ProgressMessage
+  | ChildProgressMessage

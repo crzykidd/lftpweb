@@ -1,0 +1,27 @@
+-- Settle-progress visibility (2026-08-13, prompts/2026-08-13-settle-progress-visibility.md).
+--
+-- User report: copying a large directory straight onto the seedbox, the settle countdown
+-- (migration 007, `item_settle`) sat at "1 of 2" for the whole copy and conveyed nothing --
+-- every scan found the fingerprint still growing, which reset `matched_scans` right back to
+-- where it started every time. The fix needs two more facts per tracked item that
+-- `matched_scans`/`updated_at` alone can't answer: how long it has been watched at all, and
+-- when it last actually moved.
+--
+-- `first_observed_at`: when this (queue_id, rel_path) first entered the settle tracker. Set
+-- once, on the row's very first INSERT, and never moved by any later scan -- unlike
+-- `updated_at` (`core/settle.py.SettleRecord.first_matched_at`), which resets every time the
+-- fingerprint changes. Answers "how long have we been watching this."
+--
+-- `last_changed_at`: the most recent scan on which the fingerprint differed from what was
+-- already stored -- including the very first sighting, which trivially "changes" from no row
+-- at all. Held across every scan that finds the fingerprint unchanged (a match) or can't fully
+-- confirm one way or the other (a partial-scan hold, `core/settle.py.advance_settle`). Answers
+-- "when did this last actually move."
+--
+-- Both NULL for every row that already existed when this migration runs -- there is no history
+-- to backfill (neither column existed when those rows were last written), and the display
+-- (`core/itemview.py`, `frontend/src/lib/format.ts`) renders a NULL as "unknown" rather than
+-- inventing a time. A pre-existing row only starts carrying real values the next time
+-- `core/engine.py._persist` writes it via `settle.save_settle_records`.
+ALTER TABLE item_settle ADD COLUMN first_observed_at TEXT;
+ALTER TABLE item_settle ADD COLUMN last_changed_at TEXT;

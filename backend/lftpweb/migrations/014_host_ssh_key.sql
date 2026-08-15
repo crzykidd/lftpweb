@@ -1,0 +1,27 @@
+-- Paste-a-private-key option for auth_method='key' (2026-08-13, prompts/2026-08-13-paste-ssh-key.md).
+--
+-- Until now `key_path` was the only way to use key auth: the user had to mount a key file into
+-- the container themselves, and the API checked only that the field was non-empty -- not that
+-- the file exists, is readable, or has sane permissions (OpenSSH refuses a private key with
+-- loose permissions; lftp shells out to `ssh`, which enforces that, while asyncssh scanning is
+-- more lenient -- a wrongly-permissioned key gave working scans and failing transfers with
+-- nothing pointing at the cause).
+--
+-- This adds an alternative: paste the key into Settings -> Connection, encrypted at rest with
+-- the exact same mechanism as `password_enc` (`core/crypto.py`). Weighed against a separate
+-- ciphertext file outside the database, and the database won: one crypto mechanism instead of
+-- two, and -- decisively -- a config backup round-trips the key, where a file excluded from
+-- backups would drop the user into the "credentials need re-entry" state on restore even though
+-- nothing about the key itself changed. Both options leave only ciphertext in a backup either
+-- way (`core/crypto.py`'s `secret.key` is provably absent from `VACUUM INTO` output), so the
+-- security difference between the two is narrow -- see docs/decisions.md for the full reasoning.
+--
+-- NULL for every existing row and for anyone who keeps using `key_path` -- this is an additional
+-- option, not a replacement. `core/engine.py.load_host_config` decrypts it into
+-- `HostConfig.ssh_key` (in-memory plaintext, same pattern as `password`); `core/remote.py` hands
+-- that straight to asyncssh as already-parsed key material, so scanning never writes it to disk
+-- at all; `core/lftp.py.spawn` writes it to a per-job file on the `/run` tmpfs, mode 0600,
+-- unlinked with the job's other credential files the moment the job exits -- it needs a real
+-- path only because lftp shells out to `ssh -i <path>`. A pasted key wins over `key_path` when
+-- both are set (docs/decisions.md has the per-job-vs-per-process reasoning too).
+ALTER TABLE host ADD COLUMN ssh_key_enc TEXT;

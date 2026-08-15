@@ -1,0 +1,233 @@
+"""The mount / sentinel gate and the local-absence grace period (DESIGN.md §7.3).
+
+**Required starting phase 4, not deferred with `sync`** — see docs/decisions.md. DESIGN.md
+§7.3 writes these up as rails on delete propagation, which is unscheduled (`sync`) or phase 5
+(`move`). But auto-queue (this phase) is the first feature that takes *action* — queueing a
+transfer — on local absence, and a dropped NFS mount makes every tracked item look locally
+absent in the very same scan. Both failure directions are destructive:
+
+- items read `REMOTE_ONLY` ⇒ auto-queue re-downloads the entire library off one blip;
+- items read `REMOVED_LOCAL` ⇒ auto-queue permanently skips them (once that detection exists,
+  which this module also provides — see `resolve_absence`).
+
+Two independent mechanisms:
+
+1. **The sentinel gate (`check`/`write_if_needed`).** `core/engine.py` writes
+   `.lftpweb-mount-ok` at a queue's local root after every scan that finds the root present,
+   readable, and writable. `core/autoqueue.py` refuses to act on *anything* for a queue
+   whose root fails `check()` — not deferred item-by-item, the whole queue's auto-queue pass
+   is skipped, surfaced in the log (and, via `AutoQueue.gated`, the API/UI).
+2. **The grace period + `REMOVED_LOCAL` transition (`resolve_absence`).** DESIGN.md §3.2 rule
+   3: an item that had a complete local copy — `DOWNLOADED`, or any of the six post-processing
+   states §6 refines it into — and is now locally absent (remote still present) becomes
+   `REMOVED_LOCAL`, not a fresh `REMOTE_ONLY` — otherwise auto-queue would cheerfully
+   re-fetch something the user (or an *arr import) deliberately removed. Absence must persist
+   across several consecutive scans (default ~10 minutes) before the transition sticks, so a
+   momentary NFS hiccup or an import-in-progress can't trigger it. `resolve_absence` is a pure
+   decision function — `core/engine.py._persist` is the only I/O around it (reading/writing
+   `item.state`/`item.first_missing_at`) — so the state machine is unit-testable without a
+   filesystem or a database.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+from datetime import UTC, datetime
+from pathlib import Path
+
+from lftpweb.core.postprocess import OWNED_STATES as _POSTPROCESS_STATES
+
+logger = logging.getLogger(__name__)
+
+SENTINEL_NAME = ".lftpweb-mount-ok"
+
+# ~10 minutes (DESIGN.md §7.3's own default). Not user-configurable this phase — see
+# docs/decisions.md; a future Settings knob can read from here without changing the
+# function's shape.
+DEFAULT_GRACE_S = 600.0
+
+# States that assert "this item's bytes were all here" — the grace clock can start from any
+# of them. `DOWNLOADED` plus every state `core/postprocess.py` owns: each of the six is only
+# ever written to an item that had already reached `DOWNLOADED`, so absence means the same
+# thing for a `VERIFIED`, `CORRUPT` or half-extracted item as it does for a plain one.
+#
+# Leaving them out (as this set did until it was noticed) is not the safe default it looks
+# like. Post-processing is *why* an item's local copy commonly disappears — a staging move
+# does it deliberately (see `core/postprocess.py`'s module docstring), an *arr importer does
+# it right after — so these are precisely the items whose absence the grace period exists to
+# handle. Without them, a `VERIFIED`/`EXTRACTED` item that an importer moves out is persisted
+# as a fresh `REMOTE_ONLY` and auto-queue re-downloads the whole release on the next pass:
+# §3.2 rule 3 defeated for exactly the items it matters most for.
+_COMPLETE_PREV_STATES = frozenset({"DOWNLOADED"}) | _POSTPROCESS_STATES
+
+# Public alias for the same set (`core/local_delete.py`'s retention query needs "every state
+# that asserts the item's bytes are all here" too, for exactly the same reason -- only these
+# states are eligible for a retention delete at all, since anything else either isn't fully
+# downloaded or has already left one of the trees). Named and exported here rather than
+# duplicated, so the two modules can never drift onto two different definitions of "complete."
+COMPLETE_STATES = _COMPLETE_PREV_STATES
+
+# ...plus `REMOVED_LOCAL`, where the clock has already landed and must stay landed until the
+# item's local copy genuinely reappears.
+_STICKY_PREV_STATES = _COMPLETE_PREV_STATES | frozenset({"REMOVED_LOCAL"})
+
+
+def check(local_path: str) -> bool:
+    """True iff `local_path` exists, is a readable+listable directory, and holds the
+    sentinel. The nastiest case DESIGN.md §14 calls out by name — root exists, is readable,
+    is empty, has no sentinel — reads `False` here, correctly: an empty directory and an
+    unmounted share are indistinguishable by content alone, which is the whole reason the
+    sentinel exists.
+    """
+    root = Path(local_path)
+    try:
+        if not root.is_dir():
+            return False
+        if not os.access(root, os.R_OK | os.X_OK):
+            return False
+        return (root / SENTINEL_NAME).is_file()
+    except OSError:
+        return False
+
+
+def write_if_needed(local_path: str) -> None:
+    """Write the sentinel after a scan finds the local root present, readable, and writable.
+    Idempotent — a no-op once the sentinel exists. Deliberately does **not** create
+    `local_path` itself: a not-yet-mounted root must never earn trust just because we tried
+    to write into it, since `mkdir` would happily create it on whatever filesystem the mount
+    point currently resolves to (which is exactly the failure this file exists to catch).
+    """
+    root = Path(local_path)
+    try:
+        if not root.is_dir() or not os.access(root, os.W_OK | os.X_OK):
+            return
+        sentinel = root / SENTINEL_NAME
+        if sentinel.is_file():
+            return
+        sentinel.write_text(
+            "lftpweb was here — do not delete (DESIGN.md §7.3's mount sentinel).\n"
+            f"Written {datetime.now(UTC).isoformat()}\n"
+        )
+        logger.info("wrote mount sentinel at %s", sentinel)
+    except OSError as exc:
+        logger.warning("could not write mount sentinel at %s: %s", local_path, exc)
+
+
+def resolve_absence(
+    *,
+    prev_state: str | None,
+    prev_first_missing_at: str | None,
+    structural_state: str,
+    mount_ok: bool,
+    now: datetime,
+    grace_s: float = DEFAULT_GRACE_S,
+) -> tuple[str, str | None] | None:
+    """Decide whether a fresh `REMOTE_ONLY` reading from `core/reconcile.py` should instead
+    be persisted as the previous state (grace period still running, or the mount gate refuses
+    to even start the clock) or `REMOVED_LOCAL` (grace period elapsed — DESIGN.md §3.2 rule
+    3).
+
+    Returns `None` when the fresh structural state should be trusted as-is — including every
+    case where the item never reached a complete-local state in the first place, and the
+    case where local presence has returned (the caller's own `structural_state` already
+    reflects that as `PARTIAL`/`DOWNLOADED`, and clears `first_missing_at` by simply not
+    carrying it forward). Otherwise returns `(state, first_missing_at)` to persist instead.
+
+    The state held *during* the grace window is `prev_state` itself, not a hardcoded
+    `DOWNLOADED`: for the post-processing states in `_COMPLETE_PREV_STATES` that is the whole
+    point — an item mid-import must keep reading `CORRUPT`/`EXTRACT_FAILED` for the ten
+    minutes before the transition lands, rather than being quietly downgraded to `DOWNLOADED`
+    first and losing the failure the user needs to see. For `DOWNLOADED` itself this is the
+    same value it always returned.
+
+    `prev_state == 'REMOVED_LOCAL'` is sticky regardless of `mount_ok` — the mount gate's job
+    is to keep a dropped mount from *starting* this transition, not to undo one that was
+    already correctly made while the mount was healthy.
+    """
+    if structural_state != "REMOTE_ONLY" or prev_state not in _STICKY_PREV_STATES:
+        return None
+
+    if prev_state == "REMOVED_LOCAL":
+        return ("REMOVED_LOCAL", prev_first_missing_at)
+
+    # A complete-local previous state: a fresh transition candidate.
+    if not mount_ok:
+        # The mount gate: never start the grace clock on a reading we can't trust to mean
+        # what it appears to mean. Keep showing the last-known-good state.
+        return (prev_state, prev_first_missing_at)
+
+    if prev_first_missing_at is None:
+        return (prev_state, now.strftime("%Y-%m-%dT%H:%M:%S.%fZ"))
+
+    first_missing = datetime.fromisoformat(prev_first_missing_at.replace("Z", "+00:00"))
+    elapsed = (now - first_missing).total_seconds()
+    if elapsed >= grace_s:
+        return ("REMOVED_LOCAL", prev_first_missing_at)
+    return (prev_state, prev_first_missing_at)
+
+
+# `resolve_vanished`'s own eligible set, deliberately narrower than "every prev_state
+# `resolve_absence` has no opinion about". `PARTIAL` (content partway arrived) and `LOCAL_ONLY`
+# (content fully arrived, just never remotely tracked) both assert *some* concrete content was
+# actually here -- the shape "removed" is meant for. `REMOTE_ONLY` (nothing was ever here) and
+# `EXCLUDED` (never going to be here, on purpose, §3.2 rule 8) assert the opposite, and treating
+# their disappearance as a removal would be new, much broader behavior no defect asked for: a
+# `REMOTE_ONLY` item is the single most common row in this system (every remote file lftpweb
+# hasn't fetched yet), and letting it silently rest at `REMOVED_BOTH` the moment it drops off an
+# unrelated remote scan (renamed, expired, pattern changed) would be a real regression, not a
+# fix -- see `tests/test_ws_deltas.py`'s scan-delta tests, which depend on a vanished
+# never-downloaded item being dropped from the published tree, not relabeled.
+_VANISHED_FALLBACK_PREV_STATES = frozenset({"PARTIAL", "LOCAL_ONLY"})
+
+
+def resolve_vanished(prev_state: str) -> str | None:
+    """The resting state for a `rel_path` that has left *both* trees entirely -- absent from
+    this pass's `remote_tree` and `local_tree` alike -- for the narrow set of `prev_state`s
+    above. Every other `prev_state` `resolve_absence` has no opinion about (`REMOTE_ONLY`,
+    `EXCLUDED`, `QUEUED`/`DOWNLOADING`/`STOPPED`/`FAILED` if they ever reached here at all, or
+    `REMOVED_BOTH` already resting here from an earlier pass) returns `None` here too, same as
+    it always has -- such a row is simply left out of this pass's `written` set, exactly the
+    pre-existing "silently drops from the published tree" behavior.
+
+    **Found 2026-08-13** (`prompts/2026-08-13-delete-state-truthfulness.md`), on a `move` queue:
+    `core/queue.py._publish_child_progress` throttles per-child writes
+    (`CHILD_PROGRESS_THROTTLE_TICKS`), so the last write before a small file's job reaps is
+    frequently a mid-transfer `PARTIAL`, not the final `DOWNLOADED` -- and post-processing can
+    relocate the whole release out of both trees (remote deleted after verify, local moved to
+    `staging_path`) before a fresh scan ever gets a chance to correct it. Without this, such a
+    row is simply never written again (`core/engine.py._persist`'s vanished sweep only calls
+    `resolve_absence`, which has nothing to say about a `PARTIAL` `prev_state`) -- frozen on a
+    reading that was only ever true for a fraction of a second, forever: not the sweep (no
+    fresh structural reading exists for a path in neither tree), not a rescan (the row is in
+    neither tree to rescan), not auto-queue (nothing to match against).
+    (`core/queue.py._reap_one`'s own final flush is the fix for the common case -- this is the
+    safety net for whenever a stale reading forms anyway, e.g. a crash between a throttled
+    write and the next one.)
+
+    **Not `REMOVED_LOCAL`** -- that state asserts the remote copy is still present, which this
+    function already knows is false (a `prev_state` in `_STICKY_PREV_STATES` never reaches
+    here; `resolve_absence` handles those itself). **`REMOVED_BOTH`, deliberately, but not the
+    self-delete flavor** -- this codebase did not delete anything here (`local_delete.py` is
+    the only writer that pairs `REMOVED_BOTH` with `auto_queue_suppressed`/`suppressed_reason`,
+    and neither is touched by this function or its caller), so nothing is asserted beyond "not
+    visible on either side right now." `REMOVED_BOTH` is reused rather than a new `state` value
+    invented for this because it is already this project's one "nothing here to compare, don't
+    make up a story" bucket (DESIGN.md §3.2: "deliberately broader than its name") and adding a
+    fourth CHECK-constrained state for a narrow safety-net case is a worse trade than a third,
+    documented reading of one that already exists. Left unsuppressed on purpose (§3.2 rule 6:
+    "if the same rel_path reappears... it is a genuinely new item") -- if remote or local
+    content for this exact path shows up again on a later scan, this row simply re-enters the
+    ordinary per-node path next time, the same as any other absent-then-present transition,
+    with no leftover suppression to clear first.
+
+    Known imprecision, recorded rather than silently taken: `core/itemview.py`'s `REMOVED_BOTH`
+    reading (`_local_facet`/`_remote_facet`) says "removed_by_us"/"deleted_by_us" for *every*
+    `REMOVED_BOTH` row, which is not literally true for one this function produced -- the
+    common real-world cause is a *successful* `move`-mode relocation, not a deletion. Giving
+    this its own reason code would mean threading a new signal through `item_view` for a rare
+    safety-net path; not done here. See docs/decisions.md.
+    """
+    if prev_state not in _VANISHED_FALLBACK_PREV_STATES:
+        return None
+    return "REMOVED_BOTH"

@@ -1,0 +1,23 @@
+-- Let a terminal job be dismissed from the Transfers page without deleting its row
+-- (2026-08-13, prompts/done/2026-08-13-dismiss-terminal-jobs.md).
+--
+-- User report: they deleted files on the seedbox mid-transfer, the job failed
+-- REMOTE_GONE, and the only action `core/queue.py.list_jobs()`'s Transfers-page row set
+-- offered was Retry -- exactly the wrong action, since the remote files really are gone.
+-- `list_jobs()` deliberately keeps a job's most recent failed/cancelled row visible until a
+-- *newer* job for that item supersedes it (DESIGN.md §9.2, phase 3b) -- and only Retry
+-- creates one, so a permanently-failed item had no way off the page short of retrying it.
+--
+-- `dismissed_at` is a display marker on the `job` row, nothing more: `core/queue.py.
+-- list_jobs()` excludes a terminal job once it's set, `api/history.py` still shows it
+-- (History reads the same table -- deleting the row would erase the record of what
+-- happened, the opposite of what History exists for). It never touches `item.state` or
+-- `item.auto_queue_suppressed`/`suppressed_reason` -- see `core/queue.py.dismiss_job`'s own
+-- docstring for why that must stay true.
+--
+-- A plain `ADD COLUMN` (nullable, no rebuild) -- migration 009's precedent for "widen a
+-- table without touching FK-enforced relationships." `db.py.migrate()` disables
+-- `PRAGMA foreign_keys` for the whole pending batch regardless (found needed by migration
+-- 015's rebuild, `3500b3f`), but this migration doesn't rebuild anything, so it never
+-- exercises that question at all.
+ALTER TABLE job ADD COLUMN dismissed_at TEXT;

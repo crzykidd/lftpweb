@@ -89,10 +89,49 @@ class RemoteScanError(Exception):
     """
 
 
+class RemoteDeleteError(Exception):
+    """A remote delete (DESIGN.md §5, §7.4) could not be completed. Never silently swallowed
+    by the caller -- `core/postprocess.py` records it as an `event` row and leaves the
+    item's `remote_deleted_at` unset, exactly like a withheld delete.
+    """
+
+
 class DecryptionNeededError(Exception):
     """Raised when a host's password cannot be decrypted (DESIGN.md §8's "credentials need
     re-entry" state). Caught by the caller, not retried automatically.
     """
+
+
+class InvalidPrivateKeyError(ValueError):
+    """A pasted private key doesn't parse, or is passphrase-protected (migration 014,
+    DESIGN.md §8). Raised by `validate_private_key`; `api/settings.py` catches this at save
+    time and turns it into a 422 rather than letting a bad paste surface as a mystery
+    `AUTH_FAILED` on the next scheduled scan or transfer.
+    """
+
+
+def validate_private_key(pem_text: str) -> None:
+    """Reject at paste time, not at 3am: confirm `pem_text` parses as an SSH private key, and
+    that it isn't passphrase-protected.
+
+    A passphrase-protected key is refused outright rather than accepted with a stored
+    passphrase -- both the asyncssh scanning path and lftp's non-interactive `ssh -i` would
+    otherwise hang or fail waiting on a prompt nothing can answer. The message tells the user
+    the two ways out: strip the passphrase, or fall back to `key_path` (a file they manage
+    themselves, where an agent or an interactive unlock is their own problem to solve).
+
+    Raises `InvalidPrivateKeyError`; returns `None` on a valid, unencrypted key.
+    """
+    try:
+        asyncssh.import_private_key(pem_text)
+    except asyncssh.KeyImportError as exc:
+        if "passphrase" in str(exc).lower():
+            raise InvalidPrivateKeyError(
+                "this key is passphrase-protected -- lftpweb cannot supply a passphrase "
+                "non-interactively. Strip the passphrase (e.g. `ssh-keygen -p`) before "
+                "pasting it, or mount the key file and use Key path instead."
+            ) from exc
+        raise InvalidPrivateKeyError(f"does not parse as a private key: {exc}") from exc
 
 
 @dataclass(frozen=True)
@@ -111,6 +150,44 @@ class HostConfig:
     password: str | None = None
     known_hosts_policy: str = "accept-and-pin"  # 'accept-and-pin' | 'strict' | 'insecure'
     connect_timeout: float = DEFAULT_CONNECT_TIMEOUT_S
+    # DESIGN.md §8, phase 8: set by `core/engine.py.load_host_config` when
+    # `auth_method == "password"` and the stored `password_enc` failed to decrypt with the
+    # current install secret (the restore-to-fresh-install case, §10.2). Distinct from
+    # `password is None`, which is also true for `key`/`agent` auth where no password is
+    # expected at all -- this flag is what `core/queue.py._admit` and `core/engine.py.
+    # scan_queue` check to hold transfers / skip scanning cleanly instead of retrying a
+    # connection that can only ever fail the same way. A pasted key that fails to decrypt
+    # (migration 014) sets this exact same flag -- see `load_host_config` -- rather than a
+    # parallel one, so `_admit`/`scan_queue` don't need to know which credential is missing.
+    credentials_need_reentry: bool = False
+    # migration 014 (docs/decisions.md, 2026-08-13): a pasted-and-encrypted key, already
+    # decrypted into memory by `core/engine.py.load_host_config` -- never written to disk by
+    # this module (see `_resolve_client_keys`). `None` when `auth_method != 'key'`, when no
+    # key was ever pasted, or when decryption failed (`credentials_need_reentry` covers that
+    # case). Wins over `key_path` when both are set -- see `_resolve_client_keys`.
+    ssh_key: str | None = None
+
+
+def parse_connection_limit(connection_overrides_json: str | None) -> int | None:
+    """Pull `net:connection-limit` out of `host.connection_overrides` (DESIGN.md §3.1's
+    free-form JSON blob), or `None` if it's unset/unparseable.
+
+    DESIGN.md §4.5/§9.3 calls `net:connection-limit` "a first-class setting, host-level, not
+    an advanced afterthought" — it isn't (docs/decisions.md, 2026-08-12): it lives only in
+    this JSON blob, and there is no `PUT` surface anywhere (`api/settings.py`'s `HostIn` has
+    no field for it) that lets a user set it. Both `core/queue.py` (spawns lftp with it, if
+    present) and `api/settings.py` (surfaces the current value read-only on `HostOut`, for
+    the Settings → Transfer connection-count warning) read it through this one function so
+    the two never drift on which JSON key wins.
+    """
+    if not connection_overrides_json:
+        return None
+    try:
+        overrides = json.loads(connection_overrides_json)
+    except (ValueError, TypeError):
+        return None
+    value = overrides.get("net:connection-limit") or overrides.get("connection_limit")
+    return int(value) if value else None
 
 
 @dataclass(frozen=True)
@@ -387,6 +464,29 @@ def _make_client_factory(
     return PinningSSHClient
 
 
+def _resolve_client_keys(host: HostConfig) -> list[asyncssh.SSHKey | str]:
+    """What to hand asyncssh's `client_keys=` for `auth_method='key'` (DESIGN.md §8, migration
+    014). A pasted key wins over `key_path` when both are set -- stated explicitly here rather
+    than left to accident, and the one place both this and `core/lftp.py.spawn`'s equivalent
+    resolution have to agree on.
+
+    A pasted key is parsed straight into an in-memory `asyncssh.SSHKey` and handed to asyncssh
+    that way -- confirmed against the installed asyncssh (2.24.0) that `client_keys` accepts
+    already-loaded key objects, not only paths or path-like strings (`load_keypairs`'s
+    `SpecifyingPrivateKeys` reference; verified directly, not assumed, docs/decisions.md). So
+    scanning never writes the plaintext to disk at all -- unlike `core/lftp.py`, which must
+    materialise a file because lftp shells out to `ssh -i <path>`.
+
+    `key_path` (pre-existing, user-mounted) is passed through unchanged -- asyncssh reads it
+    itself. Raises `ValueError` if neither is set, same as the pre-migration-014 behavior.
+    """
+    if host.ssh_key:
+        return [asyncssh.import_private_key(host.ssh_key)]
+    if host.key_path:
+        return [host.key_path]
+    raise ValueError("auth_method 'key' requires key_path or a pasted key")
+
+
 class RemoteConnectionPool:
     """Owns exactly one reused asyncssh connection, serving scanning, *Test connection*, and
     (later) remote deletes — DESIGN.md §5: "the same connection serves scanning, Test
@@ -438,9 +538,7 @@ class RemoteConnectionPool:
             "connect_timeout": host.connect_timeout,
         }
         if host.auth_method == "key":
-            if not host.key_path:
-                raise ValueError("auth_method 'key' requires key_path")
-            kwargs["client_keys"] = [host.key_path]
+            kwargs["client_keys"] = _resolve_client_keys(host)
             kwargs["password"] = None
         elif host.auth_method == "agent":
             kwargs["agent_path"] = None  # use SSH_AUTH_SOCK / platform default
@@ -467,6 +565,16 @@ class RemoteConnectionPool:
                 f"no pinned host key for {host.address}:{host.port} "
                 f"(fingerprint {fingerprint}) and known_hosts_policy is 'strict'"
             ) from exc
+
+    @property
+    def is_connected(self) -> bool:
+        """DESIGN.md §10.3: `/api/health`'s "host reachability" -- read from the pooled
+        connection this class already maintains (via the engine's own periodic scans and
+        *Test connection*) rather than opening a fresh SSH connection on every health poll,
+        which would make the health endpoint itself a load-bearing (and slow) network call on
+        a path the UI hits continuously.
+        """
+        return self._conn is not None and not self._conn.is_closed()
 
     async def get_connection(self, host: HostConfig) -> asyncssh.SSHClientConnection:
         async with self._lock:
@@ -535,6 +643,40 @@ class RemoteConnectionPool:
         if outcome.warning:
             logger.warning("scan of %s: %s", remote_path, outcome.warning)
         return outcome.raw, outcome.warning
+
+    async def delete_path(self, host: HostConfig, remote_path: str) -> None:
+        """Remove a remote file or directory tree (DESIGN.md §5, §7.4) over this same pooled
+        asyncssh connection -- **never** lftp's `mirror --Remove-source-files`. §7.4 gives the
+        full reasoning; the short version is that this is the one place deletion happens, so
+        it is the one place verification gates it and the one place an `event` row is
+        guaranteed.
+
+        Issued as a shell `rm -rf --` over `conn.run`, the identical mechanism
+        `_run_primary`/`_run_fallback` already use for scanning -- not asyncssh's SFTP
+        protocol layer, which has no single call for "remove a possibly-non-empty directory
+        tree" and would need this module to reimplement recursive removal by hand. `--` stops
+        a path that happens to start with `-` from being read as a flag. Idempotent: a path
+        that is already gone is not an error (`rm -rf` never fails on a missing target).
+
+        Deliberately refuses an empty or root-looking path rather than ever asking the remote
+        shell to `rm -rf` something that could expand to "everything" -- the caller
+        (`core/postprocess.py`) always passes `<queue.remote_path>/<item.rel_path>` with a
+        non-empty `rel_path`, so this is defense in depth, not the primary safeguard.
+        """
+        stripped = remote_path.strip()
+        if not stripped or stripped in ("/", ".", ".."):
+            raise ValueError(
+                f"refusing to delete an empty or root-looking remote path: {remote_path!r}"
+            )
+
+        conn = await self.get_connection(host)
+        result = await conn.run(f"rm -rf -- {shlex.quote(stripped)}", check=False, encoding=None)
+        if result.exit_status != 0:
+            stderr = result.stderr if isinstance(result.stderr, (bytes, bytearray)) else b""
+            raise RemoteDeleteError(
+                f"remote delete of {stripped!r} failed (exit {result.exit_status}): "
+                f"{stderr.decode('utf-8', errors='surrogateescape').strip()}"
+            )
 
     async def _run_fallback(self, conn: asyncssh.SSHClientConnection, remote_path: str) -> str:
         remote_tmp = f"/tmp/.lftpweb_scan_fs_{uuid4().hex}.py"

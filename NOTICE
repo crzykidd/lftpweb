@@ -26,9 +26,95 @@ Complete corresponding source for these packages is available from the Alpine Li
 project at https://pkgs.alpinelinux.org/ — the image ships them unmodified, exactly as
 packaged there.
 
+The image also bundles a program built from third-party source, rather than an
+unmodified Alpine package — the distinction matters for where its complete
+corresponding source lives:
+
+  unrar            unRAR licence (freeware; source-derived   https://www.rarlab.com/
+                   restriction below)
+
+`unrar` is compiled by `docker/Dockerfile`'s `unrar-builder` stage directly from
+RARLAB's published unrarsrc release (currently 7.2.3), unmodified apart from the build
+flags recorded in that Dockerfile stage; the source itself is not vendored into this
+repository. It is aggregated with lftpweb the same way the Alpine packages above are —
+invoked as a separate process, not linked into lftpweb — so it remains under its own
+licence. Complete corresponding source is available directly from RARLAB at
+https://www.rarlab.com/rar_add.htm.
+
 Note on lftp: lftpweb runs lftp as a subprocess and communicates with it at arm's
 length. It does not link against lftp, and is not a derivative work of it.
 
 Note on 7zip's RAR support: 7-Zip's RAR decoder derives from the unRAR source, whose
 licence forbids using it to develop a RAR-compatible archiver. lftpweb only extracts
-archives; it never creates them.
+archives; it never creates them. Alpine's own `7zip` package ships without any RAR
+codec at all (verified against the built image, not just read about) — this is why
+`unrar` above exists in this image separately from `7zz`.
+
+Note on unrar: the UnRAR source licence is freeware. It permits using and
+redistributing the UnRAR utility, including inside other software packages, without
+limitation and free of charge, provided this notice accompanies it. It forbids only
+using the UnRAR source to develop a RAR (WinRAR) compatible *archiver* or to
+re-implement RAR's proprietary compression algorithm. lftpweb only extracts archives
+with it; it never creates or re-compresses one, so this restriction does not apply to
+how lftpweb uses it. Full licence text: https://www.rarlab.com/license.htm
+
+
+Third-party source copied into the frontend
+---------------------------------------------
+
+`frontend/src/components/LifecycleIcons.tsx` (2026-08-13) contains SVG path data copied
+verbatim, unmodified, from the Lucide icon set (cloud, hard-drive, shield-check, package,
+info):
+
+  Lucide icons     ISC License   https://lucide.dev / https://github.com/lucide-icons/lucide
+
+  ISC License
+
+  Copyright (c) 2026 Lucide Icons and Contributors
+
+  Permission to use, copy, modify, and/or distribute this software for any purpose
+  with or without fee is hereby granted, provided that the above copyright notice
+  and this permission notice appear in all copies.
+
+  THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES WITH
+  REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY AND
+  FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY SPECIAL, DIRECT,
+  INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM
+  LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR
+  OTHER TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR
+  PERFORMANCE OF THIS SOFTWARE.
+
+Chosen over adding an icon package as a dependency: this project has added exactly
+one frontend dependency since phase 1 (`@tanstack/react-virtual`, itself a flagged
+deviation — see docs/decisions.md), and a handful of small glyphs don't clear that bar.
+Four of the five icons copied here (cloud, hard-drive, shield-check, package) are not
+among the handful of Lucide icons derived from the Feather project — those four are
+ISC-only. The fifth, `info` (added 2026-08-13, prompts/2026-08-13-files-detail-
+inspector.md, the Files-page item drawer's per-row entry point), *is* one of the
+Feather-derived icons, so it carries this additional notice from Lucide's own LICENSE
+file:
+
+  The following Lucide icons are derived from the Feather project: [...long list,
+  including `info`] — https://github.com/lucide-icons/lucide/blob/main/LICENSE
+
+  The MIT License (MIT)
+
+  Copyright (c) 2013-present Cole Bemis
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy
+  of this software and associated documentation files (the "Software"), to deal
+  in the Software without restriction, including without limitation the rights
+  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+  copies of the Software, and to permit persons to whom the Software is
+  furnished to do so, subject to the following conditions:
+
+  The above copyright notice and this permission notice shall be included in all
+  copies or substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+  SOFTWARE.

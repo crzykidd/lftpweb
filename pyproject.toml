@@ -15,6 +15,9 @@ dependencies = [
     # Credential encryption at rest (DESIGN.md §8), moved up from phase 8 to phase 2 because
     # this is the phase where a seedbox password first exists — see docs/decisions.md.
     "cryptography>=43",
+    # Password hashing for AUTH_MODE=password (DESIGN.md §8, phase 8) -- argon2id via the
+    # PasswordHasher default. Anticipated back in §11.1's musllinux-wheel list.
+    "argon2-cffi>=25.1.0",
 ]
 
 [dependency-groups]

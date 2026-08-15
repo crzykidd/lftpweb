@@ -1,13 +1,20 @@
 from __future__ import annotations
 
+import os
+
+from lftpweb.core.extract import FAILED_PREFIX, UNPACK_PREFIX
 from lftpweb.core.local_scan import (
-    LocalEntry,
     PgetStatus,
     effective_file_size,
     effective_size,
+    find_temp_variants,
+    is_temp_name,
     parse_pget_status,
     scan_local,
+    strip_temp_suffix,
+    sweep_orphan_temp_files,
 )
+from lftpweb.core.mount_sentinel import SENTINEL_NAME
 
 
 def test_parse_pget_status_basic():
@@ -71,7 +78,12 @@ def test_scan_local_temp_suffix_matched_to_final_name(tmp_path):
 def test_scan_local_finished_file_has_no_suffix(tmp_path):
     (tmp_path / "done.mkv").write_bytes(b"y" * 42)
     entries = scan_local(tmp_path)
-    assert entries["done.mkv"] == LocalEntry(rel_path="done.mkv", is_dir=False, size=42)
+    # Not a full `LocalEntry(...) ==` comparison -- `mtime` (below) is the real filesystem
+    # timestamp, which this test doesn't control, so it's checked separately rather than
+    # baked into an equality the real value would never satisfy.
+    assert entries["done.mkv"].rel_path == "done.mkv"
+    assert entries["done.mkv"].is_dir is False
+    assert entries["done.mkv"].size == 42
 
 
 def test_scan_local_nested_directories_and_files(tmp_path):
@@ -133,3 +145,287 @@ def test_effective_file_size_temp_suffixed_file_with_sidecar(tmp_path):
         "size=1000\n0.pos=250\n0.limit=1000\n"
     )
     assert effective_file_size(tmp_path / "movie.mkv") == 250
+
+
+def test_scan_local_skips_mount_sentinel_at_root(tmp_path):
+    """The mount sentinel is lftpweb's own bookkeeping (DESIGN.md §7.3), not content.
+
+    Left in the walk it reconciles to a permanent LOCAL_ONLY node and renders in the Files
+    tree as a file the remote is missing.
+    """
+    (tmp_path / SENTINEL_NAME).write_text("")
+    (tmp_path / "movie.mkv").write_bytes(b"z" * 100)
+
+    entries = scan_local(tmp_path)
+
+    assert SENTINEL_NAME not in entries
+    assert entries["movie.mkv"].size == 100
+
+
+def test_scan_local_keeps_sentinel_named_file_below_root(tmp_path):
+    """Only the root copy is ours. The same name deeper in the tree arrived from the
+    remote and is real content — hiding it would make the item permanently PARTIAL.
+    """
+    nested = tmp_path / "Some.Release"
+    nested.mkdir()
+    (nested / SENTINEL_NAME).write_bytes(b"x" * 5)
+
+    entries = scan_local(tmp_path)
+
+    assert f"Some.Release/{SENTINEL_NAME}" in entries
+
+
+# --- core/extract.py's _UNPACK_/_FAILED_ staging dirs (DESIGN.md §6, this task) --------------
+
+
+def test_scan_local_skips_unpack_staging_dir_at_root(tmp_path):
+    """An in-progress (or crashed) extraction's staging dir is lftpweb's own bookkeeping, not
+    content — left in the walk it would reconcile to a growing LOCAL_ONLY node while
+    extraction runs.
+    """
+    (tmp_path / f"{UNPACK_PREFIX}Release").mkdir()
+    (tmp_path / f"{UNPACK_PREFIX}Release" / "movie.mkv").write_bytes(b"x" * 10)
+    (tmp_path / "movie.mkv").write_bytes(b"z" * 100)
+
+    entries = scan_local(tmp_path)
+
+    assert f"{UNPACK_PREFIX}Release" not in entries
+    assert f"{UNPACK_PREFIX}Release/movie.mkv" not in entries
+    assert entries["movie.mkv"].size == 100
+
+
+def test_scan_local_skips_failed_extraction_dir_at_root(tmp_path):
+    """A `_FAILED_` dir is left forever as diagnostic evidence (DESIGN.md §6) — it must never
+    render as a permanent LOCAL_ONLY node in the Files tree.
+    """
+    (tmp_path / f"{FAILED_PREFIX}Release").mkdir()
+    (tmp_path / f"{FAILED_PREFIX}Release" / "partial.mkv").write_bytes(b"x" * 10)
+
+    entries = scan_local(tmp_path)
+
+    assert f"{FAILED_PREFIX}Release" not in entries
+    assert f"{FAILED_PREFIX}Release/partial.mkv" not in entries
+
+
+def test_scan_local_skips_unpack_and_failed_dirs_at_any_depth(tmp_path):
+    """Unlike the mount sentinel, these can appear next to *any* item, not just the queue
+    root — an item can be nested arbitrarily deep under the scan root.
+    """
+    nested = tmp_path / "Show" / "Season 01"
+    nested.mkdir(parents=True)
+    (nested / f"{UNPACK_PREFIX}Episode.01").mkdir()
+    (nested / f"{UNPACK_PREFIX}Episode.01" / "ep.mkv").write_bytes(b"a" * 5)
+    (nested / f"{FAILED_PREFIX}Episode.02").mkdir()
+    (nested / "Episode.03.mkv").write_bytes(b"b" * 5)
+
+    entries = scan_local(tmp_path)
+
+    assert f"Show/Season 01/{UNPACK_PREFIX}Episode.01" not in entries
+    assert f"Show/Season 01/{FAILED_PREFIX}Episode.02" not in entries
+    assert "Show/Season 01/Episode.03.mkv" in entries
+
+
+# --- `mtime` (2026-08-13, prompts/2026-08-13-files-detail-inspector.md): the local-side --------
+# --- counterpart to `core/remote.py.RemoteEntry.mtime` --------------------------------------
+
+
+def test_scan_local_captures_file_mtime(tmp_path):
+    path = tmp_path / "movie.mkv"
+    path.write_bytes(b"x" * 10)
+    known_mtime = 1_700_000_000  # a fixed epoch second, not "whenever this test happened to run"
+    os.utime(path, (known_mtime, known_mtime))
+
+    entries = scan_local(tmp_path)
+
+    assert entries["movie.mkv"].mtime == known_mtime
+
+
+def test_scan_local_directory_mtime_is_always_zero_not_the_inode_mtime(tmp_path):
+    # Files only -- the same convention `core/remote.py.RemoteEntry.mtime` already has, and
+    # `core/reconcile.py.reconcile` never reads a directory's own `mtime` off either side.
+    # `os.scandir` never even statted the directory itself for this, so this is the dataclass
+    # default, not a captured-and-discarded reading.
+    (tmp_path / "Release").mkdir()
+    entries = scan_local(tmp_path)
+    assert entries["Release"].mtime == 0.0
+
+
+def test_scan_local_temp_suffixed_file_reports_its_own_mtime(tmp_path):
+    # A `.lftp` in-progress temp file's mtime is what actually matters (last write, not the
+    # nonexistent final-name file) -- the rename at completion time is what makes the two
+    # converge, but mid-transfer only the temp file's own timestamp exists at all.
+    path = tmp_path / "show.mkv.lftp"
+    path.write_bytes(b"x" * 5)
+    known_mtime = 1_700_000_500
+    os.utime(path, (known_mtime, known_mtime))
+
+    entries = scan_local(tmp_path)
+
+    assert entries["show.mkv"].mtime == known_mtime
+
+
+# --- `~timestamp~` temp-file variant (2026-08-13,
+# prompts/2026-08-13-lftp-timestamped-temp-files.md) -------------------------------------------
+
+
+def test_strip_temp_suffix_recognises_both_forms():
+    assert strip_temp_suffix("movie.mkv.lftp") == "movie.mkv"
+    assert strip_temp_suffix("movie.mkv.lftp~20260813154311~") == "movie.mkv"
+    assert strip_temp_suffix("movie.mkv") == "movie.mkv"
+
+
+def test_is_temp_name_recognises_both_forms():
+    assert is_temp_name("movie.mkv.lftp") is True
+    assert is_temp_name("movie.mkv.lftp~20260813154311~") is True
+    assert is_temp_name("movie.mkv") is False
+
+
+def test_scan_local_recognises_the_timestamped_variant_as_a_temp_file(tmp_path):
+    """The user's own report, verbatim shape: a `~timestamp~` temp file must not appear as its
+    own node -- it must be attributed to the final name, exactly like plain `.lftp`.
+    """
+    (tmp_path / "S.W.A.T.S06E21.mkv.lftp~20260813154311~").write_bytes(b"x" * 900)
+
+    entries = scan_local(tmp_path)
+
+    assert "S.W.A.T.S06E21.mkv" in entries
+    assert "S.W.A.T.S06E21.mkv.lftp~20260813154311~" not in entries
+    assert entries["S.W.A.T.S06E21.mkv"].size == 900
+    assert entries["S.W.A.T.S06E21.mkv"].is_temp is True
+
+
+def test_scan_local_finished_file_is_not_marked_temp(tmp_path):
+    (tmp_path / "movie.mkv").write_bytes(b"z" * 10)
+    entries = scan_local(tmp_path)
+    assert entries["movie.mkv"].is_temp is False
+
+
+def test_scan_local_a_real_finished_file_wins_over_a_stray_temp_variant_regardless_of_size(
+    tmp_path,
+):
+    """A genuinely renamed final file is authoritative -- an orphaned temp variant of the same
+    name (even a larger one) must never be the entry that survives, since `core/reconcile.py`
+    trusts `is_temp is False` to mean "this is real."
+    """
+    (tmp_path / "movie.mkv").write_bytes(b"z" * 100)
+    (tmp_path / "movie.mkv.lftp~20260813154311~").write_bytes(b"x" * 999_999)
+
+    entries = scan_local(tmp_path)
+
+    assert entries["movie.mkv"].size == 100
+    assert entries["movie.mkv"].is_temp is False
+
+
+def test_scan_local_keeps_the_larger_of_two_temp_variants(tmp_path):
+    (tmp_path / "movie.mkv.lftp").write_bytes(b"a" * 100)
+    (tmp_path / "movie.mkv.lftp~20260813154311~").write_bytes(b"b" * 500)
+
+    entries = scan_local(tmp_path)
+
+    assert entries["movie.mkv"].size == 500
+    assert entries["movie.mkv"].is_temp is True
+
+
+def test_find_temp_variants_finds_plain_and_timestamped(tmp_path):
+    (tmp_path / "movie.mkv.lftp").write_bytes(b"a")
+    (tmp_path / "movie.mkv.lftp~20260813154311~").write_bytes(b"b")
+    (tmp_path / "movie.mkv.lftp~20260813160000~").write_bytes(b"c")
+    (tmp_path / "unrelated.mkv.lftp").write_bytes(b"d")
+
+    variants = find_temp_variants(tmp_path, "movie.mkv")
+
+    assert {p.name for p in variants} == {
+        "movie.mkv.lftp",
+        "movie.mkv.lftp~20260813154311~",
+        "movie.mkv.lftp~20260813160000~",
+    }
+
+
+def test_find_temp_variants_empty_when_nothing_matches(tmp_path):
+    assert find_temp_variants(tmp_path, "movie.mkv") == []
+
+
+def test_effective_file_size_finds_the_timestamped_variant_when_plain_lftp_is_absent(tmp_path):
+    (tmp_path / "movie.mkv.lftp~20260813154311~").write_bytes(b"y" * 321)
+    assert effective_file_size(tmp_path / "movie.mkv") == 321
+
+
+def test_effective_file_size_prefers_the_larger_temp_variant(tmp_path):
+    (tmp_path / "movie.mkv.lftp~20260813154311~").write_bytes(b"a" * 100)
+    (tmp_path / "movie.mkv.lftp~20260813160000~").write_bytes(b"b" * 700)
+    assert effective_file_size(tmp_path / "movie.mkv") == 700
+
+
+# --- sweep_orphan_temp_files -------------------------------------------------------------------
+
+
+def test_sweep_orphan_temp_files_removes_stale_ones_only(tmp_path):
+    import os
+
+    stale = tmp_path / "old.mkv.lftp~20260101000000~"
+    stale.write_bytes(b"x" * 10)
+    fresh = tmp_path / "fresh.mkv.lftp"
+    fresh.write_bytes(b"y" * 10)
+
+    now = 2_000_000.0
+    old_mtime = now - (5 * 86400)  # 5 days old
+    fresh_mtime = now - 10  # 10 seconds old -- a live transfer, still being written to
+    os.utime(stale, (old_mtime, old_mtime))
+    os.utime(fresh, (fresh_mtime, fresh_mtime))
+
+    removed = sweep_orphan_temp_files(tmp_path, max_age_days=2.0, now=now)
+
+    assert [p.name for p, _age in removed] == ["old.mkv.lftp~20260101000000~"]
+    assert not stale.exists()
+    assert (
+        fresh.exists()
+    ), "a temp file younger than the threshold must survive -- it may be a live transfer"
+
+
+def test_sweep_orphan_temp_files_removes_the_sidecar_too(tmp_path):
+    import os
+
+    temp = tmp_path / "movie.mkv.lftp"
+    temp.write_bytes(b"x" * 10)
+    sidecar = tmp_path / "movie.mkv.lftp.lftp-pget-status"
+    sidecar.write_text("size=10\n")
+    old_mtime = 0.0
+    os.utime(temp, (old_mtime, old_mtime))
+
+    removed = sweep_orphan_temp_files(tmp_path, max_age_days=2.0, now=1_000_000.0)
+
+    assert len(removed) == 1
+    assert not temp.exists()
+    assert not sidecar.exists()
+
+
+def test_sweep_orphan_temp_files_leaves_finished_files_and_other_bookkeeping_alone(tmp_path):
+    import os
+
+    finished = tmp_path / "done.mkv"
+    finished.write_bytes(b"x" * 10)
+    os.utime(finished, (0.0, 0.0))
+    (tmp_path / f"{UNPACK_PREFIX}Release").mkdir()
+    (tmp_path / f"{UNPACK_PREFIX}Release" / "part.mkv.lftp").write_bytes(b"y")
+    os.utime(tmp_path / f"{UNPACK_PREFIX}Release" / "part.mkv.lftp", (0.0, 0.0))
+
+    removed = sweep_orphan_temp_files(tmp_path, max_age_days=2.0, now=1_000_000.0)
+
+    assert removed == []
+    assert finished.exists()
+
+
+def test_sweep_orphan_temp_files_missing_root_is_a_noop(tmp_path):
+    assert sweep_orphan_temp_files(tmp_path / "nope", max_age_days=2.0) == []
+
+
+def test_scan_local_unpack_prefix_only_hides_directories_not_files(tmp_path):
+    """The prefix match is directories-only (extract.py never produces a file by these names,
+    and a remote release could coincidentally start with the same text) — a file happening to
+    share the prefix is real content and must not be swallowed by the filter.
+    """
+    (tmp_path / f"{UNPACK_PREFIX}notes.txt").write_bytes(b"real remote content")
+
+    entries = scan_local(tmp_path)
+
+    assert f"{UNPACK_PREFIX}notes.txt" in entries

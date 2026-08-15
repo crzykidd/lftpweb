@@ -18,6 +18,11 @@ mode 0600, on the `/run` tmpfs, unlinked the moment the process exits (successfu
 string passed as argv contains only `source <rc-path>` plus the transfer command itself
 (paths, not secrets), so a `ps aux` inside the container never shows a credential.
 
+**A pasted private key (migration 014, DESIGN.md §8) gets the same treatment**, one file
+alongside the rc file rather than folded into it: `spawn()` writes it to its own per-job path,
+also `/run` tmpfs, also mode 0600, also unlinked by `cleanup()`. See `spawn()`'s own docstring
+for why per-job rather than a file held for the process lifetime.
+
 **Host-key verification for the lftp-spawned ssh child — a gap in DESIGN.md §4.2, resolved
 here.** §5/§8's `known_hosts_policy` (accept-and-pin / strict / insecure) is specified for the
 asyncssh scanning connection (`core/remote.py`) but DESIGN.md never says whether the *separate*
@@ -51,7 +56,7 @@ import logging
 import os
 import re
 import stat as stat_module
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Literal
 
@@ -61,6 +66,13 @@ DEFAULT_RUN_DIR = "/run/lftpweb"
 
 # ~4 KB tail kept on the `job` row (DESIGN.md §3.1/§4.3) — enough for a human to see *why*,
 # never the whole transcript (that would start drifting toward "parse this for progress").
+# Bounded so a connection that cannot succeed fails fast instead of retrying forever — see
+# the block in `build_rc_text` for what happened when these were left at lftp's defaults.
+DEFAULT_MIN_CHUNK_SIZE = 1024 * 1024  # 1 MiB — below this, one connection is plenty
+DEFAULT_MAX_RETRIES = 3
+DEFAULT_NET_TIMEOUT_S = 30
+DEFAULT_RECONNECT_INTERVAL_BASE_S = 5
+
 OUTPUT_TAIL_BYTES = 4096
 
 JobKind = Literal["mirror", "pget"]
@@ -83,6 +95,22 @@ ERROR_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ),
     ("PERMISSION_DENIED", re.compile(r"permission denied", re.IGNORECASE)),
     ("DISK_FULL", re.compile(r"no space left on device|disk full", re.IGNORECASE)),
+    # Checked *before* the generic REMOTE_GONE pattern below, even though both match the
+    # substring "no such file" — this one is more specific and must win (DESIGN.md §4.3,
+    # "ordered most-specific-first"). Found three times live, 2026-08-13/14
+    # (prompts/done/2026-08-14-local-errors-misclassified-as-remote-gone.md): lftp's own
+    # `rename(<src>, <dst>): No such file or directory` is what pget/mirror print when the
+    # local `xfer:use-temp-file` rename from `*.lftp` to the final name fails -- both `<src>`
+    # and `<dst>` are always local paths (this rename never touches the remote side; lftp's
+    # sftp backend does not shell a remote `rename` as part of a plain download), so this
+    # shape can never legitimately mean "the remote file is gone." Both live causes were a
+    # transient local condition (another process writing into the target directory, an
+    # importer removing the download folder mid-transfer) -- see LOCAL_FS_ERROR below, not the
+    # never-retry REMOTE_GONE this used to fall into.
+    (
+        "LOCAL_FS_ERROR",
+        re.compile(r"rename\([^)]*\):\s*no such file or directory", re.IGNORECASE),
+    ),
     ("REMOTE_GONE", re.compile(r"no such file|not found on server|file not found", re.IGNORECASE)),
     (
         "HOST_UNREACHABLE",
@@ -102,7 +130,15 @@ ERROR_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
 # non-retryable (not adding it here) is the smaller-blast-radius reading: retrying a failure we
 # failed to even classify risks hammering the seedbox on something a human should look at,
 # rather than losing at most one retry cycle on a transient failure our patterns missed.
-TRANSIENT_ERROR_CLASSES = frozenset({"HOST_UNREACHABLE", "TLS_ERROR"})
+#
+# LOCAL_FS_ERROR joined this set 2026-08-14
+# (prompts/done/2026-08-14-local-errors-misclassified-as-remote-gone.md) — every live instance
+# was a transient local condition outliving the transfer by seconds (another writer in the same
+# directory, an importer mid-move), not a durable local fault like a full or unmounted disk
+# (those already classify as DISK_FULL/get surfaced separately and stay out of this set). This
+# narrows an existing misfire rather than loosening the policy above: it does not touch the
+# whitelist reasoning for UNKNOWN or add a second, looser transient rule.
+TRANSIENT_ERROR_CLASSES = frozenset({"HOST_UNREACHABLE", "TLS_ERROR", "LOCAL_FS_ERROR"})
 
 
 def classify_output(output: str) -> str:
@@ -134,6 +170,14 @@ class HostCreds:
     password: str | None
     known_hosts_policy: str  # 'accept-and-pin' | 'strict' | 'insecure'
     pinned_host_key: str | None = None  # exported OpenSSH pubkey line, if `core/remote.py` has one
+    # migration 014, DESIGN.md §8: a pasted-and-decrypted key (plaintext, in memory only --
+    # never logged, never round-tripped to the API). `None` when auth is not 'key', when no key
+    # was ever pasted, or when it failed to decrypt (`credentials_need_reentry` covers that
+    # case upstream in `core/queue.py._admit`, which never reaches `spawn()` at all then).
+    # `spawn()` is the only place this ever touches a filesystem -- see its docstring on why
+    # per-job, not per-process. Wins over `key_path` when both are set, mirroring
+    # `core/remote.py._resolve_client_keys` so the two auth paths agree.
+    ssh_key: str | None = None
 
 
 class NoHostKeyPinError(Exception):
@@ -177,6 +221,174 @@ def _connect_program(creds: HostCreds, known_hosts_path: Path | None) -> str:
     return " ".join(parts)
 
 
+@dataclass(frozen=True)
+class TuningSetting:
+    """One `set` line lftpweb writes into every job's rc file, carrying no credential.
+
+    This is the entire tuning half of `build_rc_text` — every `set` line except the two
+    credential-bearing ones (`sftp:connect-program`, `open -u ...`). Those two are built
+    directly inside `build_rc_text` and never constructed through `effective_tuning_settings`
+    below, which is what lets the read-only Settings → Transfer "effective settings" endpoint
+    (`api/jobs.py`) call `effective_tuning_settings` for display without a credential ever
+    being reachable through that path — a future credential-bearing setting would have to be
+    deliberately added *here* to leak, not merely added to `build_rc_text` and forgotten about.
+    """
+
+    key: str
+    value: str  # exactly as it appears after the key in the rendered `set` line
+    why: str
+    # True when a `TransferSettings`/admission-time value drives this line's presence or
+    # number; False when lftpweb always writes this exact value regardless of any setting.
+    configurable: bool
+
+
+def effective_tuning_settings(
+    *,
+    rate_limit_bps: int | None,
+    connection_limit: int | None,
+    parallel: int,
+    pget_n: int,
+    save_status_interval_s: int,
+    min_chunk_size: int = DEFAULT_MIN_CHUNK_SIZE,
+    max_retries: int = DEFAULT_MAX_RETRIES,
+    net_timeout_s: int = DEFAULT_NET_TIMEOUT_S,
+    reconnect_interval_base_s: int = DEFAULT_RECONNECT_INTERVAL_BASE_S,
+) -> list[TuningSetting]:
+    """The rc file's tuning half, in the exact order `build_rc_text` renders it — the single
+    source both `build_rc_text` (turns these into rc-file lines) and the read-only effective-
+    settings endpoint (turns these into a UI list) build from, so the two can never drift.
+    """
+    settings: list[TuningSetting] = [
+        TuningSetting(
+            key="pget:save-status",
+            value=f"{save_status_interval_s}s",
+            why=(
+                "How often the .lftp-pget-status sidecar is refreshed. lftp's own default "
+                "(10s) is far too coarse for the ~1 Hz progress sampler (DESIGN.md §4.4) — "
+                "found running a real transfer where the sidecar simply didn't exist yet at "
+                "the 1s/2s/3s marks under the default."
+            ),
+            configurable=False,
+        ),
+        TuningSetting(
+            key="pget:min-chunk-size",
+            value=str(min_chunk_size),
+            why=(
+                "Never fan a file smaller than this across pget_n connections. Without it, "
+                "`pget -n 4` splits a 16-byte file into four chunks and opens four SSH "
+                "connections to move 16 bytes — pointless on its own, and it multiplies any "
+                "connection failure by four (observed against a real seedbox)."
+            ),
+            configurable=False,
+        ),
+        TuningSetting(
+            key="net:max-retries",
+            value=str(max_retries),
+            why=(
+                "Bounded so a connection that cannot succeed (bad host key, refused auth, "
+                "dead route) fails loudly and quickly instead of retrying forever with the "
+                'job stuck at "downloading, 0 bytes" and nothing in the log.'
+            ),
+            configurable=False,
+        ),
+        TuningSetting(
+            key="net:timeout",
+            value=f"{net_timeout_s}s",
+            why="Same reason as net:max-retries — a hung connection must fail, not hang.",
+            configurable=False,
+        ),
+        TuningSetting(
+            key="net:reconnect-interval-base",
+            value=str(reconnect_interval_base_s),
+            why=(
+                "Bare unsigned number, not a duration — unlike net:timeout, a trailing `s` "
+                'here makes lftp reject the line with "invalid unsigned number" while the '
+                "transfer keeps running on its defaults, failing later with a misleading "
+                "HOST_UNREACHABLE."
+            ),
+            configurable=False,
+        ),
+        TuningSetting(
+            key="net:reconnect-interval-multiplier",
+            value="1.5",
+            why="Backoff multiplier applied between successive reconnect attempts.",
+            configurable=False,
+        ),
+        TuningSetting(
+            key="xfer:use-temp-file",
+            value="yes",
+            why=(
+                "In-flight files are written under a temp suffix (see xfer:temp-file-name "
+                "below) so core/local_scan.py can tell a partial download from a finished one."
+            ),
+            configurable=False,
+        ),
+        TuningSetting(
+            key="xfer:temp-file-name",
+            value='"*.lftp"',
+            why="The `.lftp` suffix core/local_scan.py's temp-suffix handling strips (DESIGN.md §4.4b).",
+            configurable=False,
+        ),
+        TuningSetting(
+            key="mirror:parallel-directories",
+            value="yes",
+            why="Lets mirror descend into subdirectories in parallel rather than one at a time.",
+            configurable=False,
+        ),
+    ]
+    if rate_limit_bps is not None:
+        settings.append(
+            TuningSetting(
+                key="net:limit-total-rate",
+                value=str(rate_limit_bps),
+                why=(
+                    "Process-wide bandwidth cap — one number bounds this job's entire subtree "
+                    "of connections (DESIGN.md §4.5). Computed per job at admission time from "
+                    "Max bandwidth and how many jobs currently share the ceiling, so the real "
+                    "number varies job to job rather than being fixed; shown here is what a "
+                    "job admitted alone, at the full ceiling, would receive."
+                ),
+                configurable=True,
+            )
+        )
+    if connection_limit is not None:
+        settings.append(
+            TuningSetting(
+                key="net:connection-limit",
+                value=str(connection_limit),
+                why="Hard cap on concurrent connections this job may open (from the host's connection overrides).",
+                configurable=True,
+            )
+        )
+    if parallel > 1:
+        settings.append(
+            TuningSetting(
+                key="mirror:parallel-transfer-count",
+                value=str(parallel),
+                why='Files transferred at once within one mirror job — Settings → Transfer\'s "Files in parallel per job".',
+                configurable=True,
+            )
+        )
+    if pget_n > 1:
+        settings.append(
+            TuningSetting(
+                key="mirror:use-pget-n",
+                value=str(pget_n),
+                why="Connections per file inside a mirror job.",
+                configurable=True,
+            )
+        )
+        settings.append(
+            TuningSetting(
+                key="pget:default-n",
+                value=str(pget_n),
+                why="Connections per file for a plain (non-mirror) pget job.",
+                configurable=True,
+            )
+        )
+    return settings
+
+
 def build_rc_text(
     creds: HostCreds,
     known_hosts_path: Path | None,
@@ -187,37 +399,38 @@ def build_rc_text(
     pget_n: int,
     save_status_interval_s: int,
     extra_settings: str,
+    min_chunk_size: int = DEFAULT_MIN_CHUNK_SIZE,
+    max_retries: int = DEFAULT_MAX_RETRIES,
+    net_timeout_s: int = DEFAULT_NET_TIMEOUT_S,
+    reconnect_interval_base_s: int = DEFAULT_RECONNECT_INTERVAL_BASE_S,
 ) -> str:
     """The sourced rc file's content — credentials plus per-job tuning. Never starts with a
     blank line (see the module docstring's lftp-quirk note). Every line is a `set` or `open`
     lftp command; no shell metacharacters are interpreted here because this file is `source`d
     by lftp's own parser, not by a shell.
+
+    The tuning lines below are `effective_tuning_settings`'s output, rendered — see that
+    function's own docstring for why the split exists. The two credential-bearing lines
+    (`sftp:connect-program`, `open -u ...`) are built right here, never through that function.
     """
     lines: list[str] = [
         "# lftpweb per-job settings + credentials — mode 0600, /run tmpfs, unlinked on exit.",
         f'set sftp:connect-program "{_connect_program(creds, known_hosts_path)}";',
-        # Sidecar freshness (DESIGN.md §4.4) — lftp's own default is 10s, far too coarse for a
-        # ~1 Hz progress sampler (found running a real transfer against the fake seedbox: the
-        # sidecar simply didn't exist yet at the 1s/2s/3s marks under the default). This is the
-        # one non-obvious tunable this module owns that DESIGN.md doesn't mention.
-        f"set pget:save-status {save_status_interval_s}s;",
-        # DESIGN.md §4.4b: in-flight files carry a `.lftp` suffix so `core/local_scan.py`'s
-        # temp-suffix handling has something to strip. lftp's own defaults are `no` / `.in.*`.
-        "set xfer:use-temp-file yes;",
-        'set xfer:temp-file-name "*.lftp";',
-        "set mirror:parallel-directories yes;",
     ]
-    if rate_limit_bps is not None:
-        # net:limit-total-rate is process-wide (DESIGN.md §4.5) — one number bounds this job's
-        # entire subtree of connections, which is exactly why it's the knob the scheduler uses.
-        lines.append(f"set net:limit-total-rate {rate_limit_bps};")
-    if connection_limit is not None:
-        lines.append(f"set net:connection-limit {connection_limit};")
-    if parallel > 1:
-        lines.append(f"set mirror:parallel-transfer-count {parallel};")
-    if pget_n > 1:
-        lines.append(f"set mirror:use-pget-n {pget_n};")
-        lines.append(f"set pget:default-n {pget_n};")
+    lines += [
+        f"set {ts.key} {ts.value};"
+        for ts in effective_tuning_settings(
+            rate_limit_bps=rate_limit_bps,
+            connection_limit=connection_limit,
+            parallel=parallel,
+            pget_n=pget_n,
+            save_status_interval_s=save_status_interval_s,
+            min_chunk_size=min_chunk_size,
+            max_retries=max_retries,
+            net_timeout_s=net_timeout_s,
+            reconnect_interval_base_s=reconnect_interval_base_s,
+        )
+    ]
     if extra_settings.strip():
         # The free-text "extra lftp settings" box (DESIGN.md §9.3) — injected verbatim, after
         # everything above so a power user can override any of it. Not sanitized: it's a
@@ -255,6 +468,7 @@ def build_transfer_command(
     parallel: int,
     pget_n: int,
     exclude_globs: tuple[str, ...],
+    mirror_rename_target: bool = False,
 ) -> str:
     """The transfer command itself (DESIGN.md §4.1) — paths only, no secrets, safe to place in
     the `-c` argv string. `-c` (continue) on both `pget`/`mirror` is what makes every restart
@@ -269,11 +483,28 @@ def build_transfer_command(
     `<local-parent>/<item>/` as the target — the "obvious" symmetric choice with `pget` —
     produces a doubly-nested `<item>/<item>/...` tree instead. The caller (`core/queue.py`) is
     responsible for passing the *parent* for a `mirror` job.
+
+    **`mirror_rename_target` (2026-08-14, the "folder prefix during transfer" task) is the one
+    exception to the paragraph above.** lftp's `mirror` also supports being handed the *exact*
+    target directory name (no trailing slash, target not pre-existing under a different name):
+    `mirror -c '<remote>/<item>' '<local-parent>/<prefix><item>'` writes straight into
+    `<local-parent>/<prefix><item>/...` with no basename appended — verified against the fake
+    seedbox (both a fresh transfer and a `-c` resume into an already-partially-populated
+    directory of that literal name land flat, never doubly nested). This is what lets
+    `core/queue.py` write a directory item's in-flight bytes into
+    `<prefix><name>` instead of `<name>` without inventing a second transfer mechanism: the
+    caller passes the already-prefixed full path as `local_path` and sets this flag, which
+    simply skips the trailing-slash-forcing below rather than taking the append-basename branch.
+    Never set for `pget` (the branch below never reads it) and never set when the prefix feature
+    is off or the item is a single file — see `core/queue.py._spawn_decision`.
     """
     if kind == "pget":
         cmd = f"pget -c -n {pget_n} {_lftp_quote(remote_path)} -o {_lftp_quote(local_path)}"
     else:
-        local_dir = local_path if local_path.endswith("/") else local_path + "/"
+        if mirror_rename_target:
+            local_dir = local_path
+        else:
+            local_dir = local_path if local_path.endswith("/") else local_path + "/"
         parts = ["mirror", "-c", f"--parallel={parallel}", f"--use-pget-n={pget_n}"]
         for glob in exclude_globs:
             parts.append(f"--exclude-glob {_lftp_quote(glob)}")
@@ -297,6 +528,10 @@ class JobSpec:
     extra_settings: str = ""
     save_status_interval_s: int = 1
     run_dir: str = DEFAULT_RUN_DIR
+    # 2026-08-14 ("folder prefix during transfer"): see `build_transfer_command`'s own docstring
+    # for exactly what this changes. `core/queue.py._spawn_decision` is the only place that ever
+    # sets it `True`, and only for a `mirror` job whose target is already the prefixed directory.
+    mirror_rename_target: bool = False
 
 
 @dataclass
@@ -307,6 +542,10 @@ class SpawnedJob:
     pid: int
     rc_path: Path
     known_hosts_path: Path | None
+    # A pasted-key file this job's own `spawn()` call materialised on `/run` tmpfs (never a
+    # `key_path` the operator mounted themselves -- that file is not ours to delete). `None`
+    # whenever `key_path` (mounted or absent) was used instead of a pasted key.
+    ssh_key_path: Path | None = None
     _stdout_buf: bytearray = field(default_factory=bytearray)
     _stderr_buf: bytearray = field(default_factory=bytearray)
 
@@ -314,7 +553,7 @@ class SpawnedJob:
         """Unlink the credential-bearing files. Idempotent, never raises — a missing file
         (already cleaned up, or a run-dir that vanished) is not an error at this point.
         """
-        for path in (self.rc_path, self.known_hosts_path):
+        for path in (self.rc_path, self.known_hosts_path, self.ssh_key_path):
             if path is None:
                 continue
             try:
@@ -349,30 +588,64 @@ def _known_hosts_line(creds: HostCreds) -> str | None:
 
 
 async def spawn(spec: JobSpec, *, lftp_bin: str = "lftp") -> SpawnedJob:
-    """Build the rc file (+ known_hosts pin, if any), build the `-c` command, and exec lftp
-    with **pipes for stdin/stdout/stderr — never a PTY** (DESIGN.md §4.1): with stdin not a
-    tty, lftp disables readline, so none of §1.2's escape/wrapping problems can occur.
+    """Build the rc file (+ known_hosts pin, if any, + a pasted key, if any), build the `-c`
+    command, and exec lftp with **pipes for stdin/stdout/stderr — never a PTY** (DESIGN.md
+    §4.1): with stdin not a tty, lftp disables readline, so none of §1.2's escape/wrapping
+    problems can occur.
+
+    **Per-job, not per-process, key materialisation (migration 014, DESIGN.md §8).** Only lftp
+    needs a file at all -- asyncssh scanning takes the decrypted key straight into memory
+    (`core/remote.py._resolve_client_keys`) -- and lftp only needs one for as long as *this*
+    job's `ssh` child is running. Writing it here, alongside the rc file this function already
+    creates and tears down per job, means the plaintext exists on the `/run` tmpfs only while a
+    transfer is actually in flight, strictly less exposure than a file held for the whole
+    process lifetime would be. It also sidesteps "materialise on startup and on change"
+    entirely: there is nothing to go stale, because every spawn decrypts fresh from whatever
+    `core/engine.py.load_host_config` most recently read out of the `host` row -- the first job
+    after a container restart (`/run` is empty then) and the five-hundredth job after an
+    unrelated settings change both just work, with no separate re-materialisation step to
+    remember. The trade is one extra small file write/unlink per job when a key is pasted --
+    negligible next to the rc file this function already writes on every single job regardless.
     """
     run_dir = Path(spec.run_dir)
     rc_path = run_dir / f"job-{spec.job_id}.rc"
     known_hosts_path: Path | None = None
+    ssh_key_path: Path | None = None
+    creds = spec.creds
 
     kh_line = _known_hosts_line(spec.creds)
     if kh_line is not None:
         known_hosts_path = run_dir / f"job-{spec.job_id}.known_hosts"
         _write_secret_file(known_hosts_path, kh_line)
 
-    rc_text = build_rc_text(
-        spec.creds,
-        known_hosts_path,
-        rate_limit_bps=spec.rate_limit_bps,
-        connection_limit=spec.connection_limit,
-        parallel=spec.parallel,
-        pget_n=spec.pget_n,
-        save_status_interval_s=spec.save_status_interval_s,
-        extra_settings=spec.extra_settings,
-    )
-    _write_secret_file(rc_path, rc_text)
+    try:
+        if creds.auth_method == "key" and creds.ssh_key:
+            # A pasted key wins over `key_path` when both are set (mirrors
+            # `core/remote.py._resolve_client_keys`, stated explicitly there and here so the
+            # two auth paths can't silently disagree). `key_path` itself is never touched --
+            # it may be a file the operator mounted and manages themselves.
+            ssh_key_path = run_dir / f"job-{spec.job_id}.key"
+            key_text = creds.ssh_key if creds.ssh_key.endswith("\n") else creds.ssh_key + "\n"
+            _write_secret_file(ssh_key_path, key_text)
+            creds = replace(creds, key_path=str(ssh_key_path))
+
+        rc_text = build_rc_text(
+            creds,
+            known_hosts_path,
+            rate_limit_bps=spec.rate_limit_bps,
+            connection_limit=spec.connection_limit,
+            parallel=spec.parallel,
+            pget_n=spec.pget_n,
+            save_status_interval_s=spec.save_status_interval_s,
+            extra_settings=spec.extra_settings,
+        )
+        _write_secret_file(rc_path, rc_text)
+    except BaseException:
+        if ssh_key_path is not None:
+            ssh_key_path.unlink(missing_ok=True)
+        if known_hosts_path is not None:
+            known_hosts_path.unlink(missing_ok=True)
+        raise
 
     transfer_cmd = build_transfer_command(
         spec.kind,
@@ -381,6 +654,7 @@ async def spawn(spec: JobSpec, *, lftp_bin: str = "lftp") -> SpawnedJob:
         parallel=spec.parallel,
         pget_n=spec.pget_n,
         exclude_globs=spec.exclude_globs,
+        mirror_rename_target=spec.mirror_rename_target,
     )
     script = f"source {_lftp_quote(str(rc_path))}; set cmd:fail-exit true; {transfer_cmd}"
 
@@ -397,10 +671,18 @@ async def spawn(spec: JobSpec, *, lftp_bin: str = "lftp") -> SpawnedJob:
         rc_path.unlink(missing_ok=True)
         if known_hosts_path is not None:
             known_hosts_path.unlink(missing_ok=True)
+        if ssh_key_path is not None:
+            ssh_key_path.unlink(missing_ok=True)
         raise
 
     assert proc.pid is not None
-    return SpawnedJob(proc=proc, pid=proc.pid, rc_path=rc_path, known_hosts_path=known_hosts_path)
+    return SpawnedJob(
+        proc=proc,
+        pid=proc.pid,
+        rc_path=rc_path,
+        known_hosts_path=known_hosts_path,
+        ssh_key_path=ssh_key_path,
+    )
 
 
 async def wait_and_capture(job: SpawnedJob) -> tuple[int, str]:

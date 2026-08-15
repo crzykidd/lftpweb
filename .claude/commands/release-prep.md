@@ -12,15 +12,18 @@ Placeholder bindings for this project:
   <VERSION_FILE>             backend/lftpweb/__init__.py
   <VERSION_LITERAL>          __version__ = "<current>"
   <README_BADGE_PATTERN>     none — README.md has no version badge. Instead it carries a
-                              "Version `<current>`. N of 9 build phases complete." line
-                              right under the title; treat that as the badge-equivalent.
+                              "Version `<current>`. All 9 build phases are built and
+                              unit/integration tested." line inside the pre-release banner
+                              under the title; treat that as the badge-equivalent. Match on
+                              the "**Version `" prefix, not the full sentence — the wording
+                              after it has already changed once (all 9 phases completed
+                              2026-08-12) and only `<current>` is yours to touch.
   <README_WHATSNEW_SECTION>  README.md has no "What's New" section yet (pre-first-release).
-                              Until one exists, Step 4 below only updates the version /
-                              phase-count line — it does not invent a What's New section.
-  <DOCS_TO_SYNC>              - README.md: "Version `<current>`. N of 9 build phases
-                                 complete." line (phase count comes from DESIGN.md §13 —
-                                 update it only if phases have actually advanced, never
-                                 just because a release happened)
+                              Until one exists, Step 4 below only updates the version
+                              line — it does not invent a What's New section.
+  <DOCS_TO_SYNC>              - README.md: the "Version `<current>`. …" line in the
+                                 pre-release banner. Only the version is yours to change;
+                                 leave the build-status wording after it alone.
                                - CLAUDE.md: no version-bearing text as of adoption
                                  (2026-08-11) — check for one anyway; if a build-status
                                  block has been added since, sync it here too.
@@ -145,14 +148,14 @@ minor bump past whatever series is active at the time.
 README.md has no version badge and no "What's New" section (pre-first-release
 project). Instead:
 
-1. Update the pre-release banner line:
-   `**Version `<current>`. N of 9 build phases complete.**` → replace
-   `<current>` with `$ARGUMENTS`. **Do not change the phase count** unless you
-   have independent evidence (from the changelog entries you just rolled,
-   cross-checked against `DESIGN.md` §13's phase list) that a phase actually
-   completed as part of this release. If unsure, leave the phase count as-is
-   and flag the uncertainty in the Step 9 report — guessing a phase count is
-   worse than leaving it stale for a human to confirm.
+1. Update the pre-release banner line. As of 2026-08-12 it reads:
+   `**Version `<current>`. All 9 build phases are built and unit/integration tested.**`
+   Replace `<current>` with `$ARGUMENTS` and **leave the rest of the sentence
+   alone** — all nine phases are complete, so there is no longer a phase count
+   to advance. Match on the `**Version \`` prefix rather than the whole
+   sentence, since the wording after it has changed once already and may again.
+   If the line is missing entirely, do not invent one — flag it in the Step 9
+   report.
 2. If a "What's New" section exists by the time this command runs (it may,
    once the project starts shipping), add a
    `### v$ARGUMENTS (<today>)` entry at its top, summarizing this release in

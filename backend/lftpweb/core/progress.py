@@ -17,11 +17,19 @@ than silently skipped: the fake seedbox's directories (a handful of files) never
 and the phase 3 prompt's scope is the process/scheduler mechanics, not a synthetic
 tens-of-thousands-of-files fixture. `JobProgress` and `ProgressSampler` are shaped so that
 degradation is a change to `_bytes_done_for` alone when it's needed.
+
+**The per-file breakdown that walk produces is no longer thrown away.** `JobProgress.children`
+carries it (mirror jobs only) so `core/queue.py._publish_child_progress` can publish live
+per-file progress for the files inside a mirroring directory without a second walk — see that
+function's docstring for why this mattered: without it, a child file's `state`/`local_size`
+only ever changed on the next full engine scan (`scan_interval_s`, default 30s), so a multi-file
+release appeared to sit frozen and then flip to `DOWNLOADED` in one visible batch.
 """
 
 from __future__ import annotations
 
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Literal
 
@@ -55,13 +63,71 @@ class JobProgress:
     bytes_total: int | None
     speed_bps: float  # EMA-smoothed instantaneous rate; 0 on a job's first sample
     eta_s: float | None  # None when speed is 0 or bytes_total is unknown
+    # The per-file breakdown `_bytes_done_for` already walks to build `bytes_done` above, kept
+    # alongside it rather than discarded -- see this module's docstring. `None` for a `pget`
+    # job (a single file has no children); for a `mirror` job, every entry `scan_local` found
+    # under `local_root`, keyed by its `.lftp`-suffix-stripped rel_path (relative to
+    # `local_root`, i.e. relative to the *item's* own directory, not the queue root). Directory
+    # entries are included too (size always 0, per `local_scan.LocalEntry`) -- it's
+    # `core/queue.py`'s job to decide what to do with those, not this module's.
+    children: Mapping[str, local_scan.LocalEntry] | None = None
 
 
-def _bytes_done_for(job: ActiveJob) -> int:
+def ema_step(
+    instantaneous: float, prev_speed: float | None, alpha: float = DEFAULT_EMA_ALPHA
+) -> float:
+    """One exponential-moving-average step -- the smoothing formula `ProgressSampler.sample`
+    already used inline, pulled out so `core/queue.py`'s per-child rate
+    (`_publish_child_progress`, added 2026-08-14 for per-file speed inside a mirroring
+    directory) can share it instead of carrying a second copy of the same math. `prev_speed`
+    of `None` (no history yet for this id) seeds the average at `instantaneous` itself --
+    identical to `ProgressSampler.sample`'s previous inline `self._speed.get(job.job_id,
+    instantaneous)` default.
+    """
+    base = prev_speed if prev_speed is not None else instantaneous
+    return alpha * instantaneous + (1 - alpha) * base
+
+
+def child_speed_bps(
+    bytes_delta: int,
+    seconds_elapsed: float,
+    prev_speed: float | None,
+    alpha: float = DEFAULT_EMA_ALPHA,
+) -> float:
+    """EMA-smoothed instantaneous rate for one child file's byte delta between two samples of
+    `core/queue.py._publish_child_progress` -- reuses `ema_step` above rather than a second
+    smoothing scheme, because a raw per-tick delta on a single file (bursty, small writes) reads
+    as worse flicker than the job-level aggregate `ProgressSampler` already smooths.
+
+    `bytes_delta` is clamped non-negative here, not left to the caller -- the same "never
+    negative" rule `ProgressSampler.sample` applies at the job level: a file replaced or
+    truncated mid-transfer, or a resumed job's sidecar read mid-write by lftp, can momentarily
+    report a lower size than the last sample. That reads as "no progress this tick," never a
+    negative rate. Clamping inside this function (rather than trusting every caller to do it
+    first) is what makes "never a negative rate" a property of the rate derivation itself,
+    provable without reading `_publish_child_progress` too.
+
+    `seconds_elapsed <= 0` -- two throttled ticks close enough together that the monotonic
+    clock didn't visibly advance, which the fake-seedbox test suite's back-to-back calls with
+    no sleep between them actually exercises -- has no meaningful instantaneous rate to derive
+    and returns `0.0` rather than dividing by zero or by a negative denominator into a
+    nonsensical rate. This is deliberately a real elapsed-time measurement, not
+    `tick_s * CHILD_PROGRESS_THROTTLE_TICKS`: a slow pass (DB contention, a large tree walk)
+    would make that assumption silently wrong, the same class of bug this project has already
+    shipped once from a wrong denominator (`bytes_done` vs. `bytes_total`, `6e6b217`).
+    """
+    if seconds_elapsed <= 0:
+        return 0.0
+    instantaneous = max(bytes_delta, 0) / seconds_elapsed
+    return ema_step(instantaneous, prev_speed, alpha)
+
+
+def _bytes_done_for(job: ActiveJob) -> tuple[int, Mapping[str, local_scan.LocalEntry] | None]:
     if job.kind == "pget":
-        return local_scan.effective_file_size(job.local_root)
+        return local_scan.effective_file_size(job.local_root), None
     entries = local_scan.scan_local(job.local_root)
-    return sum(e.size for e in entries.values() if not e.is_dir)
+    total = sum(e.size for e in entries.values() if not e.is_dir)
+    return total, entries
 
 
 class ProgressSampler:
@@ -75,6 +141,16 @@ class ProgressSampler:
         self._prev_bytes: dict[int, int] = {}
         self._prev_time: dict[int, float] = {}
         self._speed: dict[int, float] = {}
+
+    @property
+    def alpha(self) -> float:
+        """The smoothing constant this instance was built with -- exposed so a caller that
+        wants to smooth a *related* rate the same way (`core/queue.py`'s per-child speed) can
+        read the real configured value instead of either reaching into `_alpha` or hardcoding
+        `DEFAULT_EMA_ALPHA` and silently drifting from it if this instance is ever constructed
+        with something else.
+        """
+        return self._alpha
 
     def drop(self, job_id: int) -> None:
         self._prev_bytes.pop(job_id, None)
@@ -92,7 +168,7 @@ class ProgressSampler:
 
         result: dict[int, JobProgress] = {}
         for job in jobs:
-            bytes_done = _bytes_done_for(job)
+            bytes_done, children = _bytes_done_for(job)
             prev_bytes = self._prev_bytes.get(job.job_id)
             prev_time = self._prev_time.get(job.job_id)
 
@@ -101,8 +177,7 @@ class ProgressSampler:
                 # last sample if lftp rewrote it mid-read; treat that as "no progress this
                 # tick" rather than a negative speed.
                 instantaneous = max(bytes_done - prev_bytes, 0) / (now - prev_time)
-                prev_speed = self._speed.get(job.job_id, instantaneous)
-                speed = self._alpha * instantaneous + (1 - self._alpha) * prev_speed
+                speed = ema_step(instantaneous, self._speed.get(job.job_id), self._alpha)
             else:
                 speed = 0.0  # first sample for this job: no history to derive a rate from
 
@@ -121,5 +196,6 @@ class ProgressSampler:
                 bytes_total=job.bytes_total,
                 speed_bps=speed,
                 eta_s=eta_s,
+                children=children,
             )
         return result

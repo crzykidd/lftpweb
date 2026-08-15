@@ -62,6 +62,16 @@ jobs:
         run: npm run lint
         working-directory: frontend
 
+      - name: Unit tests (vitest)
+        # prompts/2026-08-13-frontend-test-runner.md -- the job's own `name:` above is left as
+        # "Frontend lint + typecheck" rather than renamed to mention tests too: it's a required
+        # branch-protection status check on `main` (docs/repo-setup.md step 5), bound to that
+        # exact string, and renaming the job here without also updating GitHub's branch
+        # protection would leave every future PR blocked on a required check that can never
+        # report again. The name undersells what this job does now; it doesn't misstate it.
+        run: npm test
+        working-directory: frontend
+
       - name: Typecheck + build (tsc -b && vite build)
         run: npm run build
         working-directory: frontend
@@ -169,8 +179,43 @@ jobs:
           file: docker/Dockerfile
           target: runtime
           push: false
+          load: true
+          tags: lftpweb:ci
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Smoke-test the image under the production hardening profile
+        if: github.event_name == 'pull_request'
+        # Building the image proves it compiles, not that it *runs*. Two real deployment
+        # bugs got through a green "Image build" check because nothing ever started the
+        # container the way production does: a phantom root-owned /downloads from a `VOLUME`
+        # declaration, and a /run tmpfs the app couldn't write to — which made every transfer
+        # fail at spawn while the UI looked perfectly healthy. Both are invisible to unit
+        # tests and both are caught by simply booting it with the production flags.
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/ci-config
+          docker run --rm --read-only --tmpfs /run \
+            -e PUID=1000 -e PGID=1000 -v /tmp/ci-config:/config \
+            lftpweb:ci sh -c '
+              set -e
+              # Startup must not invent volumes the operator never mounted.
+              if [ -e /downloads ]; then
+                echo "FAIL: /downloads exists but was never mounted (VOLUME declaration back?)" >&2
+                exit 1
+              fi
+              # The per-job rc dir must exist and belong to PUID before privileges drop,
+              # or no transfer can ever spawn (DESIGN.md §4.2).
+              [ -d /run/lftpweb ] || { echo "FAIL: /run/lftpweb missing" >&2; exit 1; }
+              owner=$(stat -c %u:%g /run/lftpweb)
+              [ "$owner" = "1000:1000" ] || { echo "FAIL: /run/lftpweb owned by $owner" >&2; exit 1; }
+              # OpenSSH fatals with "No user exists for uid N" without an NSS entry, so
+              # every lftp transfer dies while scanning still works. Real deployment bug.
+              getent passwd 1000 >/dev/null || { echo "FAIL: no passwd entry for PUID" >&2; exit 1; }
+              ssh -o BatchMode=yes -o ConnectTimeout=2 nonexistent.invalid true 2>&1 \
+                | grep -q "No user exists" && { echo "FAIL: ssh cannot resolve its own uid" >&2; exit 1; }
+              echo "OK: no phantom /downloads; /run/lftpweb owned by PUID; ssh has an identity"
+            '
 
   test:
     name: Test suite (unit + fake-seedbox integration)

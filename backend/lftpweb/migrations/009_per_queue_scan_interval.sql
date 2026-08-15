@@ -1,0 +1,23 @@
+-- Per-queue scan interval (prompts/open-issues.md "11 -- per-queue scan interval",
+-- prompts/done/2026-08-12-per-queue-scan-interval.md). `scan_interval_s` was a single global
+-- (`config.py:33`, default 30s, env-overridable) -- this widens it to an optional per-queue
+-- override so a shared seedbox can be polled less aggressively on some queues and a
+-- low-latency local mirror more aggressively on others, without touching the env var everyone
+-- else keeps using.
+--
+-- NULL -- not a magic number -- means "use the site-wide `scan_interval_s` default"
+-- (`core/engine.py.effective_scan_interval`), so a plain `ADD COLUMN` (no DEFAULT, which
+-- SQLite makes NULL for every existing row) is enough: this migration changes nothing about
+-- what any existing queue does the moment it runs, the same non-negotiable migration 002/003
+-- already followed for auto_queue_patterns_only/auto_move. `0` is the other reserved value,
+-- distinct from NULL -- "no timer at all, on-demand only via `request_rescan()`/the Rescan
+-- button" -- chosen over a second column because the UI only ever offers 10/30/60/none as a
+-- single dropdown and a sentinel keeps that one column expressive enough for all four without
+-- a nullable-bool-plus-nullable-float pair to keep in sync. Any positive value is a literal
+-- interval in seconds. The CHECK below only rules out a negative number reaching the column;
+-- it does not restrict the value to the three dropdown presets, so `PUT
+-- /api/settings/queues/{id}` with an arbitrary positive float (e.g. a curl script wanting 45s)
+-- still works, matching how every other per-queue numeric setting in this table is unconstrained
+-- beyond its own sign.
+ALTER TABLE path_queue ADD COLUMN scan_interval_s REAL
+    CHECK (scan_interval_s IS NULL OR scan_interval_s >= 0);

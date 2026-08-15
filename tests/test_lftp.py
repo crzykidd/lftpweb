@@ -6,14 +6,21 @@ place lftp's actual output is ever read, and only for classification on a non-ze
 
 from __future__ import annotations
 
+import stat
+from pathlib import Path
+
 import pytest
 
 from lftpweb.core.lftp import (
+    TRANSIENT_ERROR_CLASSES,
     HostCreds,
+    JobSpec,
     NoHostKeyPinError,
     build_rc_text,
     build_transfer_command,
     classify_output,
+    spawn,
+    terminate,
 )
 
 
@@ -46,6 +53,22 @@ def _creds(**overrides) -> HostCreds:
             "pget: /data/x.mkv: /downloads/x.mkv: No space left on device",
             "DISK_FULL",
         ),
+        # The three live 2026-08-13/14 incidents this class exists for
+        # (prompts/done/2026-08-14-local-errors-misclassified-as-remote-gone.md) — a local
+        # rename failure, misclassified as REMOTE_GONE before this fix even though both
+        # operands are local paths and the remote side is untouched.
+        (
+            "pget: rename(/mnt/fs02-media/working/box-ar-tv/Some.Show.S01E01.mkv.lftp, "
+            "/mnt/fs02-media/working/box-ar-tv/Some.Show.S01E01.mkv): No such file or directory",
+            "LOCAL_FS_ERROR",
+        ),
+        (
+            "pget: rename(/mnt/data/xpost/S06E21.mkv.lftp, /mnt/data/xpost/S06E21.mkv): "
+            "No such file or directory\n"
+            "pget: rename(/mnt/data/xpost/S06E22.mkv.lftp, /mnt/data/xpost/S06E22.mkv): "
+            "No such file or directory",
+            "LOCAL_FS_ERROR",
+        ),
         (
             "ls: Fatal error: max-retries exceeded (connect to host 127.0.0.1 port 2299: Connection refused)",
             "HOST_UNREACHABLE",
@@ -66,6 +89,42 @@ def test_classify_output_permission_denied_takes_priority_over_generic_host_text
     # "Permission denied" also appears in ssh's own publickey-rejection message; the
     # AUTH_FAILED pattern is checked first specifically for that phrase.
     assert classify_output("Permission denied (publickey).") == "AUTH_FAILED"
+
+
+def test_classify_output_local_rename_failure_is_not_remote_gone():
+    # The exact defect this class exists to fix: both operands of the failing rename() are
+    # local paths (lftp's local xfer:use-temp-file rename from *.lftp to the final name), so
+    # this must never read as "the remote file is gone."
+    output = (
+        "pget: rename(/mnt/fs02-media/working/box-ar-tv/x.mkv.lftp, "
+        "/mnt/fs02-media/working/box-ar-tv/x.mkv): No such file or directory"
+    )
+    assert classify_output(output) == "LOCAL_FS_ERROR"
+    assert classify_output(output) != "REMOTE_GONE"
+
+
+def test_classify_output_genuinely_missing_remote_file_is_still_remote_gone():
+    # Do not delete the REMOTE_GONE pattern outright — a genuinely missing remote file is a
+    # real case it must keep naming correctly. No "rename(...)" shape here, unlike the local
+    # case above.
+    assert (
+        classify_output("pget: /data/pickup/does-not-exist.file: Access failed: No such file")
+        == "REMOTE_GONE"
+    )
+
+
+def test_local_fs_error_is_transient_remote_gone_is_not():
+    # LOCAL_FS_ERROR retries (all three live incidents were transient by nature); REMOTE_GONE
+    # stays in the never-retry set — this narrows a misfire, it does not loosen the policy.
+    assert "LOCAL_FS_ERROR" in TRANSIENT_ERROR_CLASSES
+    assert "REMOTE_GONE" not in TRANSIENT_ERROR_CLASSES
+
+
+def test_classify_output_unknown_still_does_not_retry():
+    # Existing whitelist reasoning, unchanged by this fix: an unrecognized failure is not
+    # assumed transient just because it isn't one of the four permanent classes.
+    assert classify_output("a completely unrecognized error string") == "UNKNOWN"
+    assert "UNKNOWN" not in TRANSIENT_ERROR_CLASSES
 
 
 # --- rc file construction ----------------------------------------------------------------
@@ -299,3 +358,148 @@ def test_quoting_escapes_embedded_single_quotes():
         exclude_globs=(),
     )
     assert cmd == "pget -c -n 1 '/remote/it'\\''s a file.mkv' -o '/downloads/it'\\''s a file.mkv'"
+
+
+def test_rc_always_bounds_retries_and_timeouts():
+    """A connection that cannot succeed must fail fast, not retry forever.
+
+    lftp's defaults retry indefinitely, so a bad host key or refused auth produced a process
+    that never exited: the supervisor never saw a non-zero exit, `classify_output` never ran,
+    and the job sat at DOWNLOADING/0 bytes with nothing in the log. Observed against a real
+    seedbox. These settings are what turn that hang into a reportable failure.
+    """
+    creds = HostCreds(
+        address="h",
+        port=22,
+        username="u",
+        auth_method="password",
+        key_path=None,
+        password="p",
+        known_hosts_policy="insecure",
+        pinned_host_key=None,
+    )
+    rc = build_rc_text(
+        creds,
+        None,
+        rate_limit_bps=None,
+        connection_limit=None,
+        parallel=1,
+        pget_n=1,
+        save_status_interval_s=1,
+        extra_settings="",
+    )
+    assert "set net:max-retries 3;" in rc
+    assert "set net:timeout 30s;" in rc
+    # Bare number, not a time interval — lftp rejects "5s" here even though `net:timeout`
+    # requires the suffix. tests/test_lftp_settings_accepted.py checks this against the
+    # real binary; this line just pins the string.
+    assert "set net:reconnect-interval-base 5;" in rc
+    # One connection for anything under 1 MiB: `pget -n 4` on a 16-byte file otherwise opens
+    # four SSH connections to move 16 bytes, and multiplies any handshake failure by four.
+    assert "set pget:min-chunk-size 1048576;" in rc
+
+
+# --- migration 014: per-job materialisation of a pasted key (DESIGN.md §8) ------------------
+#
+# Real authentication against the fake seedbox with a pasted key (both the asyncssh and lftp
+# paths) is proven end to end in tests/test_ssh_key_e2e.py; these tests use an unreachable
+# host (127.0.0.1:1, matching the "nothing listens here" convention in the classify_output
+# tests above) so lftp's ssh child fails fast, and only check what `spawn()` puts on disk and
+# what `cleanup()` removes -- never an actual transfer outcome.
+
+_FAKE_PEM = "-----BEGIN OPENSSH PRIVATE KEY-----\nFAKEKEYMATERIALFORTESTSONLY\n-----END OPENSSH PRIVATE KEY-----\n"
+
+
+def _key_spec(tmp_path, **creds_overrides) -> JobSpec:
+    base = dict(
+        address="127.0.0.1",
+        port=1,  # nothing listens here -- the ssh child fails immediately
+        auth_method="key",
+        key_path=None,
+        password=None,
+    )
+    base.update(creds_overrides)
+    creds = _creds(**base)
+    return JobSpec(
+        job_id=4242,
+        kind="pget",
+        creds=creds,
+        remote_path="/remote/x",
+        local_path=str(tmp_path / "x"),
+        run_dir=str(tmp_path / "run"),
+    )
+
+
+async def test_spawn_materializes_a_pasted_key_to_a_per_job_tmpfs_file_mode_0600(tmp_path):
+    job = await spawn(_key_spec(tmp_path, ssh_key=_FAKE_PEM))
+    try:
+        assert job.ssh_key_path is not None
+        assert job.ssh_key_path.parent == Path(tmp_path / "run")
+        assert job.ssh_key_path.read_text() == _FAKE_PEM
+        assert stat.S_IMODE(job.ssh_key_path.stat().st_mode) == 0o600
+
+        # The key text lives only in its own file -- never folded into the rc file, which
+        # only references its path via `-i`.
+        rc_text = job.rc_path.read_text()
+        assert _FAKE_PEM not in rc_text
+        assert f"-i {job.ssh_key_path}" in rc_text
+    finally:
+        await terminate(job)
+        job.cleanup()
+
+    assert not job.ssh_key_path.exists()
+    assert not job.rc_path.exists()
+
+
+async def test_spawn_without_a_pasted_key_never_creates_a_key_file(tmp_path):
+    # `key_path` alone (the pre-existing, user-mounted case) must be untouched by this --
+    # spawn() references it as-is and creates nothing of its own.
+    job = await spawn(_key_spec(tmp_path, key_path="/mounted/operator-key"))
+    try:
+        assert job.ssh_key_path is None
+        rc_text = job.rc_path.read_text()
+        assert "-i /mounted/operator-key" in rc_text
+    finally:
+        await terminate(job)
+        job.cleanup()
+
+
+async def test_spawn_pasted_key_wins_over_key_path_and_never_touches_it(tmp_path):
+    job = await spawn(_key_spec(tmp_path, key_path="/mounted/operator-key", ssh_key=_FAKE_PEM))
+    try:
+        assert job.ssh_key_path is not None
+        rc_text = job.rc_path.read_text()
+        # The materialized path is used, not the mounted one -- and the mounted path is
+        # never created, chmod'd, or otherwise touched (it isn't ours to manage).
+        assert f"-i {job.ssh_key_path}" in rc_text
+        assert "/mounted/operator-key" not in rc_text
+        assert not Path("/mounted/operator-key").exists()
+    finally:
+        await terminate(job)
+        job.cleanup()
+
+
+async def test_spawn_recreates_the_key_file_on_a_fresh_run_dir_no_startup_step_needed(tmp_path):
+    """Simulates two spawns of the *same* job across a container restart: `/run` is emptied
+    (a fresh `run_dir` here), and nothing but the encrypted DB row (represented here by
+    `creds.ssh_key`, exactly what `core/engine.py.load_host_config` would hand back after
+    decrypting) is needed to materialise the file again. There is no separate
+    "re-materialise on startup" step to forget, because every spawn decrypts fresh --
+    see `spawn()`'s own docstring.
+    """
+    job1 = await spawn(_key_spec(tmp_path, ssh_key=_FAKE_PEM))
+    try:
+        assert job1.ssh_key_path.exists()
+    finally:
+        await terminate(job1)
+        job1.cleanup()
+    assert not job1.ssh_key_path.exists()  # gone, as if `/run` had been wiped by a restart
+
+    # "Restart": run_dir starts fresh again, same creds (as if freshly decrypted from the DB).
+    job2 = await spawn(_key_spec(tmp_path, ssh_key=_FAKE_PEM))
+    try:
+        assert job2.ssh_key_path.exists()
+        assert job2.ssh_key_path.read_text() == _FAKE_PEM
+    finally:
+        await terminate(job2)
+        job2.cleanup()

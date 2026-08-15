@@ -6,10 +6,11 @@ const POLL_INTERVAL_MS = 2000
 
 /**
  * The Transfers page's job list (DESIGN.md §9.2). `GET /api/jobs` is REST, per the app's
- * existing convention (DESIGN.md §9 calls for TanStack Query here; phases 1-3a never adopted
- * it and used a hand-rolled poll instead -- see the phase 3b report's design-decisions
- * section. This follows the convention already in the codebase rather than introducing a
- * new data-fetching library mid-project) -- `usePoll` isn't reused directly because actions
+ * existing convention: a hand-rolled `fetch` client and poll hook, never TanStack Query.
+ * DESIGN.md §9 called for the library from its first draft and nothing ever adopted it; §9 was
+ * corrected on 2026-08-13 to describe what exists, while recording that actually adopting it
+ * remains an open choice -- if that ever happens it is its own scoped piece of work, not a side
+ * effect of whatever next touches this file. `usePoll` isn't reused directly because actions
  * (queue/stop/move-to-top/start-now/retry) need to force an immediate refetch rather than
  * waiting up to `POLL_INTERVAL_MS` for their own result to show up.
  */
