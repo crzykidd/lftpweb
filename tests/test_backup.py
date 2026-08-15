@@ -209,6 +209,29 @@ async def test_backup_file_path_rejects_path_traversal(tmp_path):
     assert resolved.name == "lftpweb-20260101-000000.db"
 
 
+# `_FILENAME_RE` is the only thing between a request-supplied name and a filesystem path, so
+# its anchoring is a security control, not tidiness. Five CodeQL `py/path-injection` alerts
+# across this endpoint and the log-download one were dismissed as false positives on exactly
+# this reasoning (2026-08-14) -- this test is what keeps that dismissal honest if the pattern
+# is ever loosened. Note the trailing-newline case: `$` would accept it, `\Z` does not.
+@pytest.mark.parametrize(
+    "name",
+    [
+        "../../etc/passwd",
+        "/etc/passwd",
+        "sub/lftpweb-20260101-000000.db",
+        "lftpweb-20260101-000000.db/../../etc/passwd",
+        "lftpweb-20260101-000000.db\n",
+        "lftpweb-20260101-000000.db\x00",
+        "lftpweb-20260101-000000.db.bak",
+        "",
+    ],
+)
+async def test_backup_filename_pattern_is_strictly_anchored(tmp_path, name):
+    with pytest.raises(ValueError):
+        backup_file_path(str(tmp_path), name)
+
+
 async def test_scheduler_run_if_due_takes_and_prunes(tmp_path):
     config_dir = str(tmp_path)
     conn = await _fresh_db(config_dir)

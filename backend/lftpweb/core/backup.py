@@ -47,7 +47,11 @@ BACKUP_DIRNAME = "backups"
 
 # lftpweb-YYYYMMDD-HHMMSS.db, plus an optional -N suffix for the (practically never hit)
 # case of two backups requested within the same wall-clock second.
-_FILENAME_RE = re.compile(r"^lftpweb-(\d{8}-\d{6})(?:-\d+)?\.db$")
+# `\Z`, not `$`: in Python `$` also matches just before a trailing newline, so `$` would let
+# "lftpweb-20260101-000000.db\n" through. Not exploitable on its own, but this pattern is the
+# only thing standing between a request-supplied name and a filesystem path (see
+# `backup_file_path`) -- so it anchors literally, not almost.
+_FILENAME_RE = re.compile(r"^lftpweb-(\d{8}-\d{6})(?:-\d+)?\.db\Z")
 
 SETTING_KEY = "backup_settings"
 
