@@ -80,6 +80,50 @@ section before trusting any live-evidence conclusion in this file.
 
 ## Still open — read these first
 
+### Admission holds the 2nd job because a lone 1st job grabs the whole ceiling (allocation ≠ actual throughput)
+
+2026-08-15, user report against the real seedbox — the pattern that finds every real bug in this
+project. Config: **Max Bandwidth 50 MB/s, Max Concurrent Jobs 2**, files-in-parallel 2,
+connections-per-file 20. Two folders land a few seconds apart. The first starts; the second
+**queues and never auto-starts** until the first finishes, even though a slot is free.
+
+**Root cause — `core/scheduler.py.admit()`.** Admission gates on `if ready > 0 and headroom > 0`,
+where `headroom = ceiling − small_lane_reserve − Σ(running allocations)`. A job admitted *alone*
+gets `share = headroom / ready` with `ready == 1` — i.e. **essentially the entire ceiling**
+(~49 MB/s of 50). That allocation is written to lftp as `net:limit-total-rate`
+(`core/lftp.py`), a **ceiling, not a reservation**, and allocations are never re-shaped for a
+running job (the §4.5 invariant). So when the 2nd folder lands, `headroom = 50 − reserve − 49 ≈ 0`
+and it's parked — despite the free slot.
+
+**Why the user is right that there's real headroom.** A single transfer to their seedbox tops out
+at ~15 MB/s (per-transfer/SSH limit; 20 connections don't beat it), so the 49 MB/s ceiling on job
+A is **inert** — never reached. The link actually has ~35 MB/s idle, but the scheduler accounts
+for *allocated* bandwidth, not *measured* throughput (deliberately — §4.5's "no live control
+channel"), so it can't see it. **No setting fixes this**: raising or lowering Max Bandwidth doesn't
+help, because a lone first job always takes ~all of B whatever B is. The only current escape is
+**"Start now"** on the parked item (runs it, ignoring the cap).
+
+**The real fix (scheduler).** Allocate each job an equal **per-slot slice** —
+`(ceiling − reserve) ÷ max_concurrent_transfers` — instead of `headroom / ready`, so a lone job
+takes at most 1/N and leaves headroom for the other slots. For this user (~22 MB/s cap vs 15
+actual) the cap is inert and both folders simply run. **Tradeoff to decide, not assume:** a *solo*
+transfer that genuinely *can* saturate the link would be capped to 1/N when running alone — so this
+likely wants to be a **toggle** ("split bandwidth evenly across job slots" vs today's greedy first
+job), not a silent change for everyone. Small, well-contained change with a pure-function test
+(`admit()` is already table-tested against every §4.5 worked example — add the staggered-arrival
+case).
+
+**Cheaper interim mitigation (UX) — the user's own suggestion.** The header
+(`StatsHeader.tsx`) already shows **Allocated X / ceiling** and **Queued N**, and its docstring
+even calls allocated-vs-ceiling "the honest answer to why the next item hasn't started." But a user
+seeing **Speed 15 · Allocated 49/50 · Queued 1** doesn't connect the low speed to the full
+allocation. Add a plain-language hint (a `title=` tooltip, or an inline note shown only when
+`queued_count > 0` and `allocated_bps` is near `ceiling_bps` while `current_speed_bps` is well
+below it): "Transfers are admitted against *allocated* bandwidth, not current speed — a running job
+reserves up to the ceiling even if it isn't using it all, so the next item waits until bandwidth
+frees. Use *Start now* to override." Ship this first; its wording will depend on whether the
+scheduler toggle above lands, so do them together or the note before the fix.
+
 ### Post-`v0.1.0` audit — the deferred items (`docs/audit-v0.1.0.md`)
 
 A full audit landed 2026-08-14 (`docs/audit-v0.1.0.md`): findings **S1–S4** (security),
