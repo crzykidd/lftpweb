@@ -53,12 +53,18 @@ section before trusting any live-evidence conclusion in this file.
   install silently keeps running with that defect live unless it defaults on. Flipped hours after
   it shipped off in `342f96c`. Existing installs will notice — see `CHANGELOG.md`'s `### Changed`
   entry.
-- **Two `DESIGN.md` §4.3 wordings are drafted and unapplied**, both in `docs/decisions.md`
-  awaiting approval: (1) exit 0 means lftp reported no error, not that every byte arrived —
-  completion is confirmed from the filesystem; (2) the new `LOCAL_FS_ERROR` class and its place
-  in the transient set. The repo's rule is that a build revealing `DESIGN.md` is wrong gets the
-  doc corrected rather than quietly diverged from, so these should land or be rejected, not
-  linger.
+- ~~**Two `DESIGN.md` §4.3 wordings are drafted and unapplied.**~~ — **both were already applied
+  on 2026-08-14**; this entry was stale and is kept only as a caution. Verified 2026-08-15 by
+  reading `DESIGN.md` §4.3 against the drafted text in `docs/decisions.md`: the exit-0 rewrite
+  is at §4.3's first bullet, `LOCAL_FS_ERROR` is in both the classify list and the transient
+  retry list, all verbatim. `docs/decisions.md` marks each draft **APPLIED 2026-08-14** at the
+  point of the draft itself — that is the authoritative record; this file simply never got the
+  matching edit.
+
+  **The caution, which is the reason this entry survives at all:** a drafted-wording entry here
+  is not evidence the wording is still pending, and it cost a session's worth of "this must land
+  before the release" advice that was already untrue. Check `DESIGN.md` itself before repeating
+  any claim from this list about what the design doc does or doesn't say.
 
 ## Still open — read these first
 
@@ -257,13 +263,18 @@ consumer checked.
 - **`re_download_externally_removed` is site-level, not per-queue**, though
   `auto_queue_enabled` and `sync_mode` are both already per-queue columns and it only matters
   for `copy` queues. Needs a migration.
-- **`move` deletes the remote *before* extraction runs.** A failed extraction therefore happens
-  after the remote copy is gone. Local archives survive, so it is recoverable. The user's call on
-  2026-08-13 was "leave it, revisit if it bites." **It bit on 2026-08-14**: a release verified,
-  its remote was deleted, and extraction then failed on stale leftovers — recoverable only
-  because archive cleanup happens to be gated on extraction *succeeding*. Reordering to
-  verify → extract → delete was offered and not yet decided. Do not reorder it as a side effect
-  of unrelated work.
+- **`move` deletes the remote *before* extraction runs.**
+  [Issue #2](https://github.com/crzykidd/lftpweb/issues/2) — filed 2026-08-15 with the full
+  reasoning, the proposed fix, and the tradeoff. A failed extraction happens after the remote
+  copy is gone; local archives survive, so it is recoverable. The user's call on 2026-08-13 was
+  "leave it, revisit if it bites." **It bit on 2026-08-14.** Deferred again on 2026-08-15 —
+  deliberately, to an issue rather than a prompt.
+
+  **`6883db3` widened its exposure**: a sidecar-less release used to be withheld at the delete
+  gate and never reached this window at all; now it deletes like any other, so the gap between
+  "remote gone" and "archives proven extractable" is exercised on every release. Not a
+  regression from that commit, but the reason this is worth more than it was when first
+  deferred. Do not reorder it as a side effect of unrelated work.
 - **Encrypted-rar password retry is implemented but untestable** — no compressor exists
   anywhere to build an encrypted fixture. Real-archive rar coverage is old-style `.r00` only,
   not `.partNN`. **The user generated real `.partNN.rar` sets on 2026-08-14** (visible in that

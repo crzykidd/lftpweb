@@ -421,14 +421,21 @@ shipped. **Do not action any of them unilaterally.**
    list in `prompts/open-issues.md` is empty for the first time. Still true and still worth
    repeating: **a coding agent cannot see it**, so anything shipped from here starts unviewed
    again, and "viewed once, no obvious defect" is weaker than tested.
-4. **`DESIGN.md` has three proposed wordings pending the user's approval**, all drafted by the
-   tasks that found the gaps, none applied — a build that reveals `DESIGN.md` is wrong gets the
-   doc corrected, it is not quietly diverged from. They are: **§3.2 rule 9** (who wins between
-   the three modules that write `item.state` — its absence is why post-processing states were
-   erased for four phases); **an empty-remote-directory clause** near rule 1/8; and **§2/§9's
-   publish invariant** (what is published is the persisted state, never the structural one).
-   Full text is in `docs/decisions.md`'s 2026-08-12 entries and the matching `prompts/done/`
-   reports.
+4. ~~**`DESIGN.md` has three proposed wordings pending the user's approval.**~~ — **all three
+   were applied in `cad5891`** ("DESIGN.md backlog applied"). Verified 2026-08-15 against the
+   doc itself: **§3.2 rule 9** (who wins between the three modules that write `item.state`) is
+   at §3.2; the **empty-remote-directory clause** is in rule 1/8's neighbourhood; and the
+   **publish invariant** got its own section, **§2.2 "What is published is the persisted state,
+   never the structural one"**. Nothing is pending.
+
+   **Kept as a caution, not as a task.** This entry, and a matching one in
+   `prompts/open-issues.md` about two §4.3 wordings (also long since applied), both sat here
+   claiming work was outstanding after it had shipped — and were repeated as "this must land
+   before the release" advice in a later session before anyone opened `DESIGN.md` to check.
+   **A drafted-wording entry in a tracker is not evidence the wording is still pending.** The
+   authoritative record is `docs/decisions.md`, which marks each draft `APPLIED <date>` at the
+   draft itself, and `DESIGN.md` itself. Read one of those before repeating any claim from a
+   tracker about what the design doc does or doesn't say.
 5. **`net:connection-limit` is not settable from any UI.** §4.5 calls it "a first-class setting,
    host-level, not an advanced afterthought", but it lives only inside the `host`.
    `connection_overrides` JSON blob, with no write path anywhere. Settings → Transfer's live
