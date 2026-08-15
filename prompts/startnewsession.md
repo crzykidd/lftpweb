@@ -53,20 +53,27 @@ re-run. As of phase 9 (verified live via `gh api repos/crzykidd/lftpweb/branches
 protection`, not assumed from an old note): **`main` is branch-protected** — 8 required status
 checks (Backend lint, Frontend lint + typecheck, Config validation, Compose validation, Image
 build, Test suite, and CodeQL for both languages), PR required, force-push and deletion both
-blocked. **As of the 2026-08-12 post-phase-9 session `dev` is 2 commits AHEAD of `origin/dev`
-and deliberately unpushed** — the user asked to work locally without pushing; check
-`git rev-list --left-right --count origin/dev...dev` rather than assuming, and ask before
-pushing. `dev` sits ahead of
+blocked. `dev` sits ahead of
 `main` by design — protection means `main` only advances via a green PR, so `dev` naturally
 runs ahead between release-prep passes; check the actual commit count
 (`git rev-list --left-right --count main...dev`) rather than trusting a specific number here,
-since it moves.
+since it moves. Check `git rev-list --left-right --count origin/dev...dev` too rather than
+assuming everything local is pushed.
 
 Day-to-day work happens on `dev`, pushed freely. `main` only ever moves via a PR from `dev`
-with every required check green — never a direct push, never `--force`. This project has not
-yet cut a `v0.0.1` release (`release-prep-and-cut`'s two-phase prep/cut flow) as of phase 9;
-that's a separate, explicit action for the user to request, not something any phase did as a
-side effect of shipping.
+with every required check green — never a direct push, never `--force`.
+
+**The first release was cut on 2026-08-14: `v0.1.0`, a beta** (PR #3 → `main`, tag `v0.1.0`,
+release notes = the `[0.1.0]` CHANGELOG section verbatim). `release-prep-and-cut`'s two-phase
+flow has now been exercised end to end, so the next release is a repeat of a known path rather
+than a first. Two things that bit the first time and will bit again:
+
+- **A PR body caps at 65,536 characters; a release body at 125,000.** The `[0.1.0]` section is
+  99,959 — it fit the release verbatim but *not* the PR, whose body is a generated list of every
+  entry's headline plus a link. Later releases will be far smaller, so this is likely a one-off.
+- **`/release-prep` is forbidden from touching `DESIGN.md`**, which left four now-false
+  pre-release statements in it. Corrected afterwards on `dev` (`b06cafe`). If a future release
+  changes something `DESIGN.md` asserts, that is a separate follow-up commit by design.
 
 ## Where we are
 
@@ -76,15 +83,53 @@ side effect of shipping.
 > confident diagnoses that were all wrong because a second application was writing into the same
 > directory. Much of this file's older material predates it.
 
-### State at the end of 2026-08-14
+### State at the end of 2026-08-14 — **`v0.1.0` is released**
 
-**Everything is pushed to `origin/dev`.** Tests **1036 backend / 266 frontend**. Migrations run to
-**017**. Both lint gates, `npm test`, `npm run build`, the image build, and all three compose
-files clean.
+**The headline: this project has shipped.** `v0.1.0`, a beta, tagged from `main` on 2026-08-14
+and published with `:latest` / `:0.1.0` / `:0` images on `ghcr.io/crzykidd/lftpweb`. `main` is
+no longer ~100 commits behind — PR #3 brought everything across. Everything is pushed to
+`origin/dev`; the handoff-prompt queue is **empty**.
 
-**Thirty commits on 2026-08-14** (`a75dc38`…`61f1f1a`), and `dev` is ~97 ahead of `main`. The
-handoff-prompt queue is **empty** — every prompt written that day was executed and is in
-`prompts/done/`.
+Tests **1055 backend / 266 frontend**. Migrations run to **017**. Both lint gates, `npm test`,
+`npm run build`, the image build, and all three compose files clean.
+
+**Three things from the release session worth carrying forward:**
+
+1. **CodeQL had never analyzed this codebase until PR #3.** Every prior run was against `main`,
+   which was stuck at roughly the pre-phase-4 state. It raised 5 high-severity Python alerts —
+   4 × `py/path-injection` on the log/backup download endpoints, 1 × weak-hash on
+   `core/auth.py`. **All five were verified false positives and dismissed with written
+   justifications**: the two download endpoints are guarded by fully anchored filename regexes
+   that admit no path separator, and `_hash_token`'s SHA-256 only ever sees 256-bit
+   `secrets.token_urlsafe` values (account passwords use argon2id, pinned by
+   `test_password_hash_is_argon2id`). Verified by reading all 7 call sites and testing the
+   patterns against traversal payloads — not by trusting the docstrings.
+2. **That check found a real, if unexploitable, weakness.** Python's `$` also matches just
+   before a trailing newline, so `"lftpweb.log\n"` passed a pattern documented as "anchored at
+   both ends." Fixed to `\Z` in `b06cafe` with 18 parametrized tests pinning the invariant *at
+   the regex*, because the pre-existing HTTP-level traversal tests could pass for the wrong
+   reason (a router miss 404s identically to the guard working). **Those two patterns are
+   security controls now, not tidiness — five dismissed alerts rest on them.**
+3. **The `move`-mode delete gate was wrong, and the user caught it by using the app.** It
+   withheld the remote delete unless verification returned `VERIFIED`, so any release without a
+   `.sfv`/`.md5` sidecar downloaded fine and never got cleaned up. The rule is **"verification
+   must not have *failed*", not "verification must have *run*"** — `SKIPPED` is not a failure.
+   Fixed in `6883db3`. The clincher: `core/postprocess.py`'s *rename* gate already used that
+   exact rule (`release_ok = verify_state != "CORRUPT" and ...`), so the same item was judged by
+   two different standards a few lines apart — and the strict one guarded the *reversible*
+   action while the permissive one guarded the irreversible one (publishing to an importer).
+
+**Thirty commits on 2026-08-14** (`a75dc38`…`61f1f1a`) before the release session, which added
+`6883db3` (the delete gate), `3281e48` (stale-tracker corrections + issue #2), `7ee11cb` (the
+release prep) and `b06cafe` (the `\Z` anchoring). The handoff-prompt queue is **empty** — every
+prompt written that day was executed and is in `prompts/done/`.
+
+**A diagnostic method that worked, and should be reached for first.** The live instance's audit
+trail is readable over HTTP: `GET /api/history/events` at `https://lftpweb.crzynet.com` answered
+"why wasn't the remote deleted?" in one call, because `core/postprocess.py` writes an `event`
+row on *every* branch — delete, withheld, failed — with the gating condition in the message.
+That beat reading code and it beat theorising. When the user reports "X didn't happen", check
+whether the pipeline already recorded why before reasoning about the source.
 
 The day split into two halves. The first (overnight, unattended) worked a queue of prompts written
 the night before. The second was the user click-testing a real seedbox and reporting what looked
