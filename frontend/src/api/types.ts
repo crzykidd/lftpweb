@@ -127,11 +127,75 @@ export interface PathQueueIn {
   // items only; see Settings -> Transfer's own section for why.
   download_prefix_enabled: boolean | null
   download_prefix: string | null
+  // Sonarr/Radarr integration (migration 018, docs/arr-integration-spec.md "Data model" /
+  // "API surface"). Binding is per-queue, one instance at most -- `null` (the default, and
+  // every existing queue's value after the migration) means "no integration": no icons, no
+  // matching, no *arr behavior at all for this queue. Full-replace fields, like the rest of
+  // this interface (not the four post-processing toggles' merge-on-absence shape) -- Settings
+  // -> Queues' edit form always submits the complete queue state.
+  arr_instance_id: number | null
+  // Default off, per-queue, and only meaningful when `arr_instance_id` is set -- the backend
+  // rejects `true` with no bound instance (`api/settings_queues.py._validate_arr_binding`).
+  arr_delete_completed: boolean
+  // This queue's `local_path`, translated into the bound *arr's own namespace (spec "Path
+  // namespaces") -- `null` means "same namespace, no translation," never an empty-string
+  // sentinel.
+  arr_visible_path: string | null
 }
 
 export interface PathQueueOut extends PathQueueIn {
   id: number
   host_id: number
+}
+
+// --- Settings -> Integrations (migration 018, docs/arr-integration-spec.md) -------------
+//
+// Mirrors `backend/lftpweb/models.py`'s `ArrInstanceIn`/`ArrInstanceOut`/`ArrTestResponse`.
+// Sonarr and Radarr, v3 API, one client with a `kind` switch (spec "Scope"). Binding an
+// instance to a queue happens on `PathQueueIn.arr_instance_id` above, not here -- this is
+// only the instance CRUD + connectivity test.
+
+export type ArrKind = 'sonarr' | 'radarr'
+
+/** A create/update request body. `api_key` is plaintext here -- the only place it ever
+ * appears -- and is encrypted at rest server-side before touching the database, the same
+ * convention `HostIn.password` uses. Omitting it on an update keeps the stored key (the
+ * identical "unchanged must not mean cleared" rule `settings_host.py.put_host` follows) --
+ * `IntegrationsTab.tsx` never pre-fills this field with a real value, only a placeholder.
+ */
+export interface ArrInstanceIn {
+  name: string
+  kind: ArrKind
+  base_url: string
+  api_key?: string | null
+  enabled: boolean
+  notify_on_complete: boolean
+}
+
+export interface ArrInstanceOut {
+  id: number
+  name: string
+  kind: ArrKind
+  base_url: string
+  // Never the key itself (DESIGN.md §9.2's "must never round-trip the stored secret back to
+  // the browser") -- whether one is on file, mirroring `HostOut.has_password`.
+  has_api_key: boolean
+  enabled: boolean
+  notify_on_complete: boolean
+  created_at: string
+  updated_at: string
+}
+
+/** `POST /api/settings/arr/{id}/test` -- the `GET /api/v3/system/status` round trip, the
+ * Settings UI's Test button. Never a non-2xx for a reachable-but-erroring instance; the
+ * failure is reported in `message`/`error_class`, the same "test tells you what's wrong,
+ * doesn't throw" shape `TestConnectionResponse` already uses for the seedbox.
+ */
+export interface ArrTestResponse {
+  ok: boolean
+  error_class: string | null
+  message: string
+  version: string | null
 }
 
 // --- Settings -> Post-processing (phase 5, DESIGN.md §6) -------------------------------
@@ -358,6 +422,17 @@ export interface FileNode {
   // reason (never through the removal-grace clock). `lib/format.ts.isDeletedArchiveVolume` is
   // the one place that turns this into the chip substitution.
   deleted_archive_at: string | null
+  // Sonarr/Radarr integration (migration 018, docs/arr-integration-spec.md): the Files page's
+  // *arr icon reads `arr_status` directly. A facet, not a lifecycle state -- passed through
+  // verbatim from `item.arr_status`/`item.arr_status_at` (`core/itemview.py.item_view`), null
+  // for every item on a queue with no bound instance (or one the poller hasn't matched yet).
+  // `null | 'detected' | 'notified' | 'imported' | 'cleaned' | 'gone'`, kept as `string | null`
+  // here (not a literal union) since this type mirrors the wire shape and the backend's own
+  // `item.arr_status` column is a plain `TEXT`, not a `CHECK`-constrained enum -- see
+  // `lib/fileTree.ts.arrIconVariant` for the one place that switches on the known values and
+  // degrades an unrecognized one to the neutral icon rather than rendering nothing.
+  arr_status: string | null
+  arr_status_at: string | null
   facets: LifecycleFacets
 }
 

@@ -89,7 +89,7 @@ than a first. Two things that bit the first time and will bit again:
 |---|---|---|
 | A — backend foundation | Migration 018 (`arr_instance` + 3 `path_queue` cols + 3 `item` cols); `core/arrclient.py` (httpx, one class, `kind` switch); `core/arrsync.py` poller (matching + import/gone detection, two-pass quiescence guard, per-instance backoff); `ArrSettings`; `api/settings_arr.py` CRUD + Test; `api/settings_queues.py` extended; `arr_status`/`arr_status_at` joined into `core/itemview.py`'s one projection. No notify, no cleanup, no frontend — those are phases B/C. | ✅ done, this commit |
 | B — notify + cleanup | `core/arrnotify.py` (new, shared notify implementation); `PostprocessPipeline._maybe_notify_arr` (primary push, tail of a fully-successful pipeline run); `ArrSyncScheduler._maybe_retry_notify` (bounded retry) + `._maybe_cleanup` (withheld gates, suppression-first, bytes removed without touching `item.state`) | ✅ done, this commit |
-| C — UI | Integrations tab, Queues additions, Files icon + filter, browser-verified | ⏳ not started |
+| C — UI | Integrations tab (instance CRUD + Test), Queues additions (*arr instance dropdown, delete-when-imported, visible-path), Files icon (own resizable column, multi-faceted) + "*arr-tracked"/"gone" filters, DESIGN.md §16 + README + CHANGELOG + Concepts doc section | ✅ done, this commit — **unviewed, no browser in this environment** |
 
 **Phase A verification:** backend lint/format clean, full backend `pytest` green (new tests in
 `tests/test_arrclient.py`, `tests/test_arrsync.py`, `tests/test_settings_arr_api.py`,
@@ -115,6 +115,26 @@ discovers the disappearance and carries it to `REMOVED_LOCAL` on its own ~10-min
 same as `core/postprocess.py._do_move` already does for a staging relocation. This is a
 deliberate, spec-driven departure from "just call `core/local_delete.py.delete_local()`" — see
 `docs/decisions.md` (2026-08-15) for the full reasoning.
+
+**Phase C verification:** frontend lint/test/build all green (new `arrIconVariant`/`arrHoverLabel`
+tests in `components/FileTree.test.ts`, `removalGraceShortLabel`/`removalGraceLabel` "cleaned"
+tests in `lib/format.test.ts`, and a new `pages/settings/QueuesTab.test.ts` for the
+disabled-with-hint pure predicates `arrDeleteCompletedDisabled`/`nextArrDeleteCompleted`).
+Backend untouched, re-verified anyway (ruff check, ruff format --check, full `pytest`). **No
+browser exists in this environment** — every screen this phase shipped (Settings → Integrations,
+the three new Queues fields, the Files-row icon and its hover card, the two new filter options)
+is unviewed until a human opens the app; nothing here should be read as visually confirmed. The
+instance name resolution (`FilesPage.tsx` cross-referencing `listQueues()`'s `arr_instance_id`
+against a new `listArrInstances()` fetch, since the item wire itself only carries
+`arr_status`/`arr_status_at`, never the instance's identity) and the *arr icon's own resizable
+column (kept separate from the R/L/V/E cluster) are both recorded in `docs/decisions.md`
+(2026-08-15).
+
+**Run complete (2026-08-15).** All three phases landed on `dev`, nothing pushed, every gate green
+throughout: backend foundation (phase A), notify + cleanup (phase B), UI + docs (phase C, this
+entry). The feature is off at every level on every existing install (no instance rows, no queue
+bound, nothing polls) and entirely unviewed in a browser — a human should open Settings →
+Integrations, bind a queue, and watch a Files row before trusting the rendered result.
 
 ### 🌙 Overnight audit run (started 2026-08-14, unattended) — LIVE PROGRESS LOG
 

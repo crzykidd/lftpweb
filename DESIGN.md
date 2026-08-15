@@ -2451,3 +2451,84 @@ superseded, and why.
 queues under a single host (§3.1, §9), `copy` and `move` shipping with backwards `sync`
 deferred entirely (§7), no `*arr` integration, and History as its own page grouped by queue
 (§9.2).
+
+---
+
+## 16. Sonarr/Radarr integration
+
+Built 2026-08-15 in three handoff prompts (backend foundation, notify + cleanup, UI + docs).
+Full detail — the data model, the association lifecycle, matching rules, the poller, and the
+resolved design decisions — lives in
+[`docs/arr-integration-spec.md`](docs/arr-integration-spec.md); this section is the
+architectural summary DESIGN.md's own rule requires, not a restatement.
+
+**The shape of it:** a queue's downloads are driven by Sonarr or Radarr sending grabs to a
+torrent client on the seedbox. lftpweb is the piece that lands those bytes locally. Binding a
+queue to a Sonarr/Radarr *instance* (migration `018_arr_integration.sql`, one instance per
+queue, one instance may serve many queues) lets lftpweb ask "is this release in your download
+queue?" — if yes, the Files-row gets an *arr icon, watches the release through import via a
+background poller (`core/arrsync.py`), and optionally cleans up the local copy once the *arr
+confirms it is fully done with it.
+
+**Three namespaces, one rule.** This feature spans the seedbox's own path, lftpweb's local
+path, and the *arr's own view of the synced directory (its Remote Path Mapping, which lftpweb
+never manages). Matching a queue record to an item therefore never compares paths across
+namespaces — it keys on the release **basename**, which is identical in all three — and the one
+path lftpweb ever *sends* to the *arr (the optional "notify on complete" push) is translated
+through a per-queue `arr_visible_path` override, describing the item's **post-move** location
+when a queue's Move step relocates it. Getting this wrong is the feature's most likely bug
+class, one level up from the logical-vs-physical lesson §1's own history already contains.
+
+**`arr_status` is a facet, not a lifecycle state.** It never touches `item.state`, the
+reconciler never writes it, and the delicate §3.2 state machine is untouched by this feature —
+the same "presence icons read the world; milestone icons read timestamps" split this project
+already made deliberately. It rides the one item projection (`core/itemview.py.
+ITEM_VIEW_COLUMNS`, §2.2's publish invariant) alongside every other field, so the WebSocket, the
+snapshot, and `GET /api/files` all agree on it by construction. `arr_download_id` (the *arr
+queue record's `downloadId`, recorded for exact history lookups) deliberately does **not** ride
+the wire — the frontend has no use for it and it is never something a client needs to see.
+
+**Three independent, escalating opt-ins, each defaulting off** — this project's standing rule
+for every new capability applies here as three separate switches, not one:
+
+1. Instance `enabled` — off means nothing polls, nothing matches, no icon ever appears.
+2. Instance `notify_on_complete` — off means lftpweb never pushes an import command; the *arr's
+   own Completed Download Handling may still import on its own schedule if it has a Remote Path
+   Mapping configured.
+3. Queue `arr_delete_completed` — off means lftpweb never deletes anything. The only
+   destructive switch this feature has, per-queue, and gated behind a confirmed import even
+   when on (below).
+
+**The fully-done gate.** "Imported" must mean the *arr is completely finished with a release,
+not merely that it has started — a multi-file release imports file by file, so a single history
+event is a trailing per-file signal, never a whole-release one. Three layered requirements gate
+the transition, all of them required: the *arr's own queue record for the release must be gone
+(a record still reporting `trackedDownloadState: importing` is never "imported," no matter what
+history says), at least one history import event must corroborate the disappearance was a real
+import rather than a removal, and both signals must hold across **two consecutive poller
+passes** roughly a minute apart — a settle-gate-style quiescence guard, the same "unchanged for
+two observations" philosophy §1.3's own settle gate already applies to a remote fingerprint.
+Cleanup (`core/arrsync.py`'s `_maybe_cleanup`) never runs on ambiguity: a queue record simply
+vanishing with no import event maps to `gone` — the icon dims to an amber warning, nothing is
+deleted, ever.
+
+**Cleanup reuses the removal-grace machinery, not a new timer.** When an item is cleaned up, the
+local bytes are removed but `item.state` is deliberately left untouched — the existing
+scan-driven absence-grace machinery (§7.3) discovers the disappearance and carries the row to
+`REMOVED_LOCAL` on its own ~10-minute clock, exactly as if a human had deleted it. The one
+presentational override: the removal-grace countdown chip, which normally reads "Missing · Xm"
+because an *unexplained* absence means a decision is pending, renders "Processed · Xm" for a
+`cleaned` row instead — same clock, different words, because this absence is deliberate and
+fully audited (`core/audit.py` event rows: `arr_matched`, `arr_notified`,
+`arr_notify_failed`, `arr_imported`, `arr_cleanup`, `arr_cleanup_withheld`).
+
+**UI:** a new Settings → Integrations tab (instance CRUD, write-only API key, a Test button
+against `GET /api/v3/system/status`); three additions to each queue's form in Settings → Queues
+(the *arr instance dropdown, the delete-when-imported checkbox — disabled with a hint unless an
+instance is bound — and the visible-path override); and, on the Files page, one icon slot per
+row driven purely by `arr_status`/`arr_status_at` off the wire. The icon is **multi-faceted**
+by deliberate decision (2026-08-15) — "the *arr processed it" (`imported`, green ✓) and "the
+*arr dropped it without importing" (`gone`, amber ⚠) are visually distinct states, not one
+dimmed glyph, and `gone` is independently filterable since it is the one state that usually
+needs a human. See `docs/arr-integration-spec.md`'s own "UI" section for the full icon-state
+table.

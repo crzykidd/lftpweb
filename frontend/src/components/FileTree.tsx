@@ -25,7 +25,7 @@ import {
 } from '../lib/format'
 import { placePopover, POPOVER_EDGE_MARGIN_PX } from '../lib/popoverPosition'
 import { readLocalStorage, writeLocalStorage } from '../lib/storage'
-import { DetailButton, LifecycleIcons } from './LifecycleIcons'
+import { ArrIcon, DetailButton, LifecycleIcons } from './LifecycleIcons'
 import { ItemDrawer } from './ItemDrawer'
 import { StateChip } from './StateChip'
 // Pure tree/sort/collapse/facet/column-width logic, extracted to a plain module (audit P1) --
@@ -445,6 +445,12 @@ const FACET_FILTER_LABELS: Record<FacetFilter, string> = {
   // Names itself, unlike the checkbox it replaces -- the exact behavior the old "Missing only"
   // checkbox had (`downloaded_at` set, `facets.local.reason === 'missing'`), just findable now.
   missing_locally: 'Downloaded but missing locally',
+  // Sonarr/Radarr integration (docs/arr-integration-spec.md "UI"): every row with a non-null
+  // `arr_status` -- "being watched through the pipeline," in the spec's own words.
+  arr_tracked: '*arr-tracked',
+  // Called out on its own, per the spec's explicit instruction: `gone` is the one *arr state
+  // that usually needs a human (a release that left the *arr's queue without ever importing).
+  arr_gone: '*arr: gone (needs attention)',
 }
 
 const FACET_FILTER_VALUES: FacetFilter[] = [
@@ -454,6 +460,8 @@ const FACET_FILTER_VALUES: FacetFilter[] = [
   'extracted',
   'not_extracted',
   'missing_locally',
+  'arr_tracked',
+  'arr_gone',
 ]
 
 
@@ -613,6 +621,15 @@ interface RowProps {
   // The removal grace period's own site-wide constant (2026-08-14) -- same "fetched once,
   // threaded down" shape as `settleSettings` immediately above.
   removalGraceSettings: RemovalGraceSettingsOut | null
+  // Sonarr/Radarr integration (docs/arr-integration-spec.md "UI"): the name of the *arr
+  // instance bound to *this row's own queue*, resolved by `FilesPage.tsx` from
+  // `path_queue.arr_instance_id` -> `GET /api/settings/arr` and threaded down here the same
+  // "fetched once, passed down" way `queueLocalPath` already is on `FileTree` itself --
+  // `arr_status`/`arr_status_at` are the only *arr fields the item projection itself carries
+  // (`entry` already has both, being a `FileNode`), so the instance's own name has to arrive
+  // this way. `null` when the queue has no bound instance, or that fetch hasn't resolved yet --
+  // `ArrIcon` still renders (with a generic "the bound *arr instance" hover) rather than waiting.
+  arrInstanceName: string | null
   // The hover card's imperative controller (2026-08-13) -- a stable ref, not state, so wiring it
   // to every row never itself causes a re-render. See `HoverCardHandle`'s own docstring.
   hoverCardRef: RefObject<HoverCardHandle | null>
@@ -630,6 +647,7 @@ function Row({
   actionBusy,
   settleSettings,
   removalGraceSettings,
+  arrInstanceName,
   hoverCardRef,
 }: RowProps) {
   const size = nodeDisplaySize(entry)
@@ -881,6 +899,13 @@ function Row({
           }
         />
       </span>
+      {/* Sonarr/Radarr integration icon (docs/arr-integration-spec.md "UI"): renders nothing
+          for `arr_status: null` (no bound instance, or not matched yet) -- `ArrIcon`'s own
+          docstring covers the variant mapping and why `arrInstanceName` is threaded in rather
+          than resolved from `entry` alone. */}
+      <span className="flex shrink-0 justify-end overflow-hidden" style={fixedColumnStyle('arr')}>
+        <ArrIcon arrStatus={entry.arr_status} arrStatusAt={entry.arr_status_at} instanceName={arrInstanceName} />
+      </span>
       {/* Lifecycle icons (2026-08-13): R/L/V/E, one glyph per `entry.facets`
           (`core/itemview.py`) -- the accumulated lifecycle, alongside the state chip's current
           verb rather than folded into it. `settle` threads through to `LifecycleIcons`'s own
@@ -978,6 +1003,7 @@ export function FileTree({
   selected,
   onSelectionChange,
   queueLocalPath,
+  arrInstanceName,
 }: {
   nodes: FileNode[]
   /** Whether the WebSocket is open, i.e. whether the connect-time `snapshot` has arrived.
@@ -1025,6 +1051,14 @@ export function FileTree({
    * panel just doesn't render without it; nothing else here is affected.
    */
   queueLocalPath?: string
+  /** Sonarr/Radarr integration (docs/arr-integration-spec.md "UI"): the name of the *arr
+   * instance bound to this queue (via `path_queue.arr_instance_id`), resolved by the caller --
+   * see `RowProps.arrInstanceName`'s own docstring for why this arrives as a prop rather than
+   * being derived from `nodes` here. `undefined`/`null` both read as "not known" and degrade to
+   * `ArrIcon`'s generic hover text; optional so a caller that hasn't wired this up yet (or has
+   * no queue config loaded) doesn't have to pass anything.
+   */
+  arrInstanceName?: string | null
 }) {
   // The shared age ticker (module docstring above): bumping this forces a re-render of
   // whatever rows are currently mounted, which is all `stateAgeLabel` needs to catch up --
@@ -1731,6 +1765,7 @@ export function FileTree({
                     actionBusy={rowBusy.has(entry.rel_path)}
                     settleSettings={settleSettings}
                     removalGraceSettings={removalGraceSettings}
+                    arrInstanceName={arrInstanceName ?? null}
                     hoverCardRef={hoverCardRef}
                   />
                 </div>

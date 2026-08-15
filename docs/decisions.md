@@ -6,6 +6,49 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-15 — *arr integration phase C: instance name resolved client-side, never added to the item wire
+
+The spec's "UI" section says the icon's hover card "names the instance and the timestamp
+(`arr_status_at`)." But phase A's shipped projection (`core/itemview.py.ITEM_VIEW_COLUMNS`) only
+carries `arr_status`/`arr_status_at` on the item — the instance's own identity was deliberately
+left off (the spec's own note: `arr_download_id` "is never published in the item projection,"
+and the same reasoning extends to the instance id/name, which the item row doesn't even store —
+only the *queue* does, via `path_queue.arr_instance_id`). Adding a new wire field just for this
+hover card would be a real backend change mid-UI-only phase, which the phase split explicitly
+rules out.
+
+Resolution: `FilesPage.tsx` resolves the name itself, client-side, from data it already fetches
+for other reasons — `listQueues()` (already fetched for `QueueResetControls`) now carries
+`arr_instance_id` per queue (phase A shipped this on `PathQueueOut`, just unused by the frontend
+until now), and a new one-time `listArrInstances()` fetch supplies the id → name map. `FilesPage`
+computes each queue's own bound instance name once and threads it down as a plain string prop
+(`arrInstanceName`) through `FileTree` → `Row` → `ArrIcon`, exactly the same "fetched once at the
+page, passed down, never re-derived per row" shape `queueLocalPath` already established for the
+item drawer. `lib/fileTree.ts.arrHoverLabel` accepts the resolved name as a parameter rather than
+looking it up itself, so it stays a pure function testable without any fetch machinery. The
+degrade path (name not yet loaded, or genuinely unbound) reads "the bound *arr instance" rather
+than blocking the icon from rendering at all.
+
+## 2026-08-15 — *arr integration phase C: one Files-row icon slot, own resizable column, not folded into the R/L/V/E cluster
+
+The spec's icon-state table describes "one icon slot on the row." The lifecycle icons (R/L/V/E,
+`components/LifecycleIcons.tsx`) already occupy a tight fixed-width column (80px default, 68px
+minimum, sized for exactly four 14px glyphs) — folding a fifth icon into that cluster would mean
+either shrinking all five below a legible size or silently growing a column whose width was
+deliberately sized for four. Considered and rejected: the *arr icon is also **conceptually**
+different from the R/L/V/E set — those four are `core/itemview.py`-derived facets of the same
+underlying reconciliation the whole app already centers on, while the *arr icon reflects a
+separate, optional, per-queue integration that most installs will never turn on. Mixing them
+would make an already-dense row harder to parse for the common case (no integration configured)
+for no gain in the rare case (one configured).
+
+Resolution: a new `arr` entry in `lib/fileTree.ts.RESIZABLE_COLUMNS`, own resizable width (44px
+default, 36px minimum — small, since most rows render nothing there at all), positioned between
+the state chip and the R/L/V/E cluster in both the header and `Row`'s own cell order. Renders
+nothing (`ArrIcon` returns `null`) for `arr_status: null`, which is the common case, so an
+install with no *arr integration configured sees no visual difference at all from before this
+phase — the column exists but is reliably empty.
+
 ## 2026-08-15 — *arr integration phase B: cleanup removes bytes but never writes `item.state`
 
 The spec's "Cleanup" section says "delete the local tree via the existing local-deletion

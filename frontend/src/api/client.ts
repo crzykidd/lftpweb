@@ -2,6 +2,9 @@ import type {
   ApiKeyCreatedOut,
   ApiKeyIn,
   ApiKeyOut,
+  ArrInstanceIn,
+  ArrInstanceOut,
+  ArrTestResponse,
   AuthSessionOut,
   AuthSettingsIn,
   AuthSettingsOut,
@@ -175,6 +178,35 @@ export function previewPatterns(
     'POST',
     body,
   )
+}
+
+// --- Settings -> Integrations (migration 018, docs/arr-integration-spec.md) -------------
+
+export function listArrInstances(): Promise<ArrInstanceOut[]> {
+  return getJson<ArrInstanceOut[]>('/api/settings/arr')
+}
+
+export function createArrInstance(body: ArrInstanceIn): Promise<ArrInstanceOut> {
+  return sendJson<ArrInstanceOut>('/api/settings/arr', 'POST', body)
+}
+
+/** `api_key` omitted (or `null`/`undefined`) keeps the previously stored key -- the browser
+ * never has the plaintext to send back. See `ArrInstanceIn`'s own docstring.
+ */
+export function updateArrInstance(id: number, body: ArrInstanceIn): Promise<ArrInstanceOut> {
+  return sendJson<ArrInstanceOut>(`/api/settings/arr/${id}`, 'PUT', body)
+}
+
+export function deleteArrInstance(id: number): Promise<void> {
+  return sendJson<void>(`/api/settings/arr/${id}`, 'DELETE')
+}
+
+/** The Settings UI's Test button -- `GET /api/v3/system/status` round trip. Never rejects for
+ * a reachable-but-erroring instance (see `ArrTestResponse`'s own docstring); only a genuine
+ * HTTP/network failure against lftpweb's own API throws here.
+ */
+export function testArrInstance(id: number): Promise<ArrTestResponse> {
+  return sendJson<ArrTestResponse>(`/api/settings/arr/${id}/test`, 'POST')
 }
 
 // --- Settings -> Post-processing (phase 5, DESIGN.md §6) --------------------------------

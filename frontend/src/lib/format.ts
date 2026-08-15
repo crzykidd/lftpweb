@@ -563,13 +563,21 @@ export function removalGraceRemainingS(
  * item hasn't been removed yet (that's `REMOVED_LOCAL`, a real, different `state`), and it
  * isn't this codebase doing the removing (that's `REMOVING`, `substate === 'removing'`) --
  * `"Missing"` names what's actually different about this row: presence, not action.
+ *
+ * **`arr_status === 'cleaned'` reads the identical clock as `"Processed"` instead**
+ * (docs/arr-integration-spec.md "Cleanup": a Sonarr/Radarr-driven local cleanup rides the exact
+ * same removal-grace machinery as any other absence -- `core/arrsync.py`'s cleanup step
+ * deliberately never writes `item.state`, only removes bytes, per that module's own docstring
+ * -- but the absence here is deliberate and audited, not an alarm, so the word changes while
+ * the countdown itself does not. Same clock, different words; no new timer.
  */
 export function removalGraceShortLabel(
-  node: { first_missing_at: string | null },
+  node: { first_missing_at: string | null; arr_status?: string | null },
   constants: RemovalGraceConstants | null,
 ): string {
   const remainingS = removalGraceRemainingS(node.first_missing_at, constants?.grace_s ?? null)
-  return remainingS == null ? 'Missing' : `Missing · ${formatEta(remainingS)}`
+  const label = node.arr_status === 'cleaned' ? 'Processed' : 'Missing'
+  return remainingS == null ? label : `${label} · ${formatEta(remainingS)}`
 }
 
 const GRACE_TIME_FORMAT: Intl.DateTimeFormatOptions = { hour: '2-digit', minute: '2-digit' }
@@ -581,20 +589,29 @@ const GRACE_TIME_FORMAT: Intl.DateTimeFormatOptions = { hour: '2-digit', minute:
  * that function's own docstring.
  */
 export function removalGraceLabel(
-  node: { first_missing_at: string | null },
+  node: { first_missing_at: string | null; arr_status?: string | null },
   constants: RemovalGraceConstants | null,
 ): string {
-  if (node.first_missing_at == null) return 'Local copy missing.'
+  const cleaned = node.arr_status === 'cleaned'
+  if (node.first_missing_at == null) {
+    return cleaned ? 'Processed by the *arr; local copy removed.' : 'Local copy missing.'
+  }
   const missingDate = new Date(node.first_missing_at)
   const sinceText = Number.isFinite(missingDate.getTime())
     ? missingDate.toLocaleTimeString([], GRACE_TIME_FORMAT)
     : 'an unknown time'
   const remainingS = removalGraceRemainingS(node.first_missing_at, constants?.grace_s ?? null)
-  const outcome =
-    remainingS != null
+  const outcome = cleaned
+    ? remainingS != null
+      ? `Leaves this view in ${formatEta(remainingS)}.`
+      : 'Leaves this view soon.'
+    : remainingS != null
       ? `Treated as removed in ${formatEta(remainingS)} unless it comes back.`
       : 'Treated as removed soon unless it comes back.'
-  return `Local copy gone since ${sinceText}. ${outcome}`
+  const opening = cleaned
+    ? `Processed by the *arr and cleaned up locally since ${sinceText}.`
+    : `Local copy gone since ${sinceText}.`
+  return `${opening} ${outcome}`
 }
 
 // A spent archive volume, resting (2026-08-14, prompts/2026-08-14-extracted-archives-rest-as-

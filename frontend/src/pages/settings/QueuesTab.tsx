@@ -10,6 +10,7 @@ import {
   getAutoQueueStatus,
   getDownloadPrefixSettings,
   getPostprocessSettings,
+  listArrInstances,
   listPatterns,
   listQueues,
   previewPatterns,
@@ -17,6 +18,7 @@ import {
   updateQueue,
 } from '../../api/client'
 import type {
+  ArrInstanceOut,
   AutoQueueSettingsOut,
   DownloadPrefixSettingsOut,
   PathQueueOut,
@@ -33,6 +35,31 @@ const inputClasses =
   'w-full rounded-md border border-zinc-300 bg-white px-2.5 py-1.5 text-sm text-zinc-900 outline-none focus:border-zinc-500 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100'
 const labelClasses = 'text-sm font-medium text-zinc-700 dark:text-zinc-300'
 const hintClasses = 'text-xs text-zinc-500 dark:text-zinc-400'
+
+// --- Sonarr/Radarr integration form logic (docs/arr-integration-spec.md "UI") --------------
+//
+// Two small pure predicates, exported so `QueuesTab.test.ts` can pin them without a component-
+// render harness -- this project's frontend suite has none for Settings tabs (README.md's
+// "Known gaps"), and `TransfersPage.tsx`'s own exported `chipStateFor`/`isDismissable` are the
+// existing precedent for factoring exactly this much logic out of a page component for testing.
+
+/** "Delete when imported" (`arr_delete_completed`) is disabled, with a hint, unless an *arr
+ * instance is selected -- mirrors the backend's own rule
+ * (`api/settings_queues.py._validate_arr_binding`: `arr_delete_completed` can never be `true`
+ * with no `arr_instance_id` bound) so the checkbox never lies about what a save would accept.
+ */
+export function arrDeleteCompletedDisabled(arrInstanceId: number | null): boolean {
+  return arrInstanceId == null
+}
+
+/** Applied whenever the *arr instance dropdown changes: clearing it force-unchecks "Delete when
+ * imported" too, rather than leaving a checked-but-disabled box that would 400 on save against
+ * the same backend rule `arrDeleteCompletedDisabled` mirrors above. Selecting an instance (or
+ * changing which one) never touches the checkbox's current value either way.
+ */
+export function nextArrDeleteCompleted(arrInstanceId: number | null, current: boolean): boolean {
+  return arrInstanceId == null ? false : current
+}
 
 interface FormState {
   name: string
@@ -56,6 +83,13 @@ interface FormState {
   // string, both, or neither).
   download_prefix_enabled: boolean | null
   download_prefix: string | null
+  // Sonarr/Radarr integration (migration 018, docs/arr-integration-spec.md). `null` = no
+  // integration for this queue -- the default, and every existing queue's value after the
+  // migration. `arr_visible_path` uses `''` (not `null`) as its own form-state empty value,
+  // the same convention `staging_path` above already uses -- converted to `null` at submit time.
+  arr_instance_id: number | null
+  arr_delete_completed: boolean
+  arr_visible_path: string
 }
 
 const EMPTY_FORM: FormState = {
@@ -74,6 +108,9 @@ const EMPTY_FORM: FormState = {
   scan_interval_s: null,
   download_prefix_enabled: null,
   download_prefix: null,
+  arr_instance_id: null,
+  arr_delete_completed: false,
+  arr_visible_path: '',
 }
 
 /** Settings → Transfer's site-wide "folder prefix during transfer" default, fetched here so
@@ -105,6 +142,23 @@ function usePostprocessSiteSettings(): PostprocessSettingsOut | null {
       .catch(() => setSettings(null))
   }, [])
   return settings
+}
+
+/** Settings → Integrations' own instance list, fetched here for the "*arr instance" dropdown
+ * below (docs/arr-integration-spec.md "UI") -- the same "fetch once, feed a per-queue form
+ * field" shape `useDownloadPrefixSiteSettings`/`usePostprocessSiteSettings` above already use,
+ * except this one's an array (there can be many instances) rather than a single settings
+ * object. Empty array on failure, not `null` -- the dropdown degrades to "None" only, which is
+ * always a safe, honest option regardless of why the fetch failed.
+ */
+function useArrInstances(): ArrInstanceOut[] {
+  const [instances, setInstances] = useState<ArrInstanceOut[]>([])
+  useEffect(() => {
+    listArrInstances()
+      .then(setInstances)
+      .catch(() => setInstances([]))
+  }, [])
+  return instances
 }
 
 /** One per-queue post-processing toggle, inherit-or-override (2026-08-13,
@@ -408,6 +462,7 @@ export function QueuesTab() {
   const [moveConfirmed, setMoveConfirmed] = useState(false)
   const postprocessSite = usePostprocessSiteSettings()
   const downloadPrefixSite = useDownloadPrefixSiteSettings()
+  const arrInstances = useArrInstances()
 
   const refresh = () => listQueues().then(setQueues)
 
@@ -418,6 +473,13 @@ export function QueuesTab() {
   const update = <K extends keyof FormState>(key: K, value: FormState[K]) => {
     setForm((prev) => ({ ...prev, [key]: value }))
     if (key === 'sync_mode' && value !== 'move') setMoveConfirmed(false)
+    if (key === 'arr_instance_id') {
+      const nextInstanceId = value as number | null
+      setForm((prev) => ({
+        ...prev,
+        arr_delete_completed: nextArrDeleteCompleted(nextInstanceId, prev.arr_delete_completed),
+      }))
+    }
   }
 
   const startEdit = (queue: PathQueueOut) => {
@@ -439,6 +501,9 @@ export function QueuesTab() {
       scan_interval_s: queue.scan_interval_s,
       download_prefix_enabled: queue.download_prefix_enabled,
       download_prefix: queue.download_prefix,
+      arr_instance_id: queue.arr_instance_id,
+      arr_delete_completed: queue.arr_delete_completed,
+      arr_visible_path: queue.arr_visible_path ?? '',
     })
   }
 
@@ -487,6 +552,9 @@ export function QueuesTab() {
       scan_interval_s: form.scan_interval_s,
       download_prefix_enabled: form.download_prefix_enabled,
       download_prefix: form.download_prefix,
+      arr_instance_id: form.arr_instance_id,
+      arr_delete_completed: form.arr_delete_completed,
+      arr_visible_path: form.arr_visible_path || null,
     }
     try {
       if (editingId != null) {
@@ -898,6 +966,81 @@ export function QueuesTab() {
             onChange={(v) => update('download_prefix', v)}
             siteValue={downloadPrefixSite ? downloadPrefixSite.prefix : null}
           />
+        </div>
+
+        <div className="flex flex-col gap-3 rounded-md border border-zinc-200 p-3 dark:border-zinc-800">
+          <span className={labelClasses}>
+            Sonarr/Radarr integration — off unless an instance is selected below
+            <FieldHelp label="Sonarr/Radarr integration">
+              <p>
+                Binds this queue to a Sonarr or Radarr instance from{' '}
+                <Link to="/settings/integrations" className="underline">
+                  Settings → Integrations
+                </Link>
+                . Once bound (and the instance itself is enabled there), items in this queue get
+                matched against that instance's download queue, and their Files-page row shows
+                the *arr icon once a match is found.
+              </p>
+              <p>
+                <strong>Delete when imported</strong> removes the local copy once the *arr
+                confirms it has fully imported the release — never before. It only ever runs
+                after two independent signals agree (the *arr's own queue record is gone <em>and</em>{' '}
+                its history shows an import event), checked twice, roughly a minute apart, before
+                anything is deleted.
+              </p>
+              <p>
+                <strong>Path as seen by the *arr</strong> only matters if "Notify on complete" is
+                turned on for the bound instance. Leave it blank when lftpweb and the *arr share
+                the exact same path to this queue's files (a common mount, no container path
+                translation). Set it when they don't — e.g. lftpweb sees{' '}
+                <code>/downloads/tv</code> but the *arr's own container sees the same directory
+                as <code>/data/torrents/tv</code>. This describes the queue's{' '}
+                <strong>post-move</strong> location: if "Move to staging path" (above) relocates
+                a finished item, this field is where <em>that</em> destination lands in the
+                *arr's own view, not where downloads first land.
+              </p>
+            </FieldHelp>
+          </span>
+          <label className="flex flex-col gap-1">
+            <span className={labelClasses}>*arr instance</span>
+            <select
+              className={inputClasses}
+              value={form.arr_instance_id ?? ''}
+              onChange={(e) => update('arr_instance_id', e.target.value === '' ? null : Number(e.target.value))}
+            >
+              <option value="">None</option>
+              {arrInstances.map((instance) => (
+                <option key={instance.id} value={instance.id}>
+                  {instance.name} ({instance.kind})
+                </option>
+              ))}
+            </select>
+          </label>
+          <label className="flex items-center gap-2">
+            <input
+              type="checkbox"
+              checked={form.arr_delete_completed}
+              disabled={arrDeleteCompletedDisabled(form.arr_instance_id)}
+              onChange={(e) => update('arr_delete_completed', e.target.checked)}
+            />
+            <span className="text-sm text-zinc-700 dark:text-zinc-300">
+              Delete when imported (only once the *arr confirms it, never on ambiguity)
+            </span>
+          </label>
+          {arrDeleteCompletedDisabled(form.arr_instance_id) && (
+            <p className="text-xs text-amber-600 dark:text-amber-400">
+              Select an *arr instance above first.
+            </p>
+          )}
+          <label className="flex flex-col gap-1">
+            <span className={labelClasses}>Path as seen by the *arr (optional)</span>
+            <input
+              className={`${inputClasses} max-w-64`}
+              value={form.arr_visible_path}
+              onChange={(e) => update('arr_visible_path', e.target.value)}
+              placeholder="same as Local path above -- leave blank"
+            />
+          </label>
         </div>
 
         {error && <p className="text-sm text-red-600 dark:text-red-400">{error}</p>}

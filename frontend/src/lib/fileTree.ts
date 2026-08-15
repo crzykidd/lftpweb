@@ -13,6 +13,7 @@ import {
   childSpeedLabel,
   childSpeedSortValue,
   formatEta,
+  formatRelativeTimeIntl,
   percentValue,
   transferEtaLabel,
   transferSpeedLabel,
@@ -272,7 +273,20 @@ export function rowAction(node: FileNode): 'queue' | 'stop' | 'redownload' | nul
   return 'queue'
 }
 
-export type FacetFilter = '' | 'has_remote' | 'has_local' | 'extracted' | 'not_extracted' | 'missing_locally'
+export type FacetFilter =
+  | ''
+  | 'has_remote'
+  | 'has_local'
+  | 'extracted'
+  | 'not_extracted'
+  | 'missing_locally'
+  // Sonarr/Radarr integration (migration 018, docs/arr-integration-spec.md "UI"): "*arr-tracked"
+  // is every row with a non-null `arr_status` (detected/notified/imported/cleaned/gone) --
+  // "being watched through the pipeline" in the spec's own words. `arr_gone` is called out on
+  // its own, per the spec's explicit instruction, because it's the one state that usually needs
+  // a human -- a release that left the *arr's queue without ever importing.
+  | 'arr_tracked'
+  | 'arr_gone'
 
 /** One predicate per facet-filter option, each keyed off `core/itemview.py`'s own `level`/`reason`
  * codes rather than re-deriving presence from raw bytes here. */
@@ -290,7 +304,74 @@ export function matchesFacetFilter(entry: TreeEntry, filter: FacetFilter): boole
       return entry.facets.extracted.reason !== 'extracted'
     case 'missing_locally':
       return entry.downloaded_at != null && entry.facets.local.reason === 'missing'
+    case 'arr_tracked':
+      return entry.arr_status != null
+    case 'arr_gone':
+      return entry.arr_status === 'gone'
   }
+}
+
+// --- Sonarr/Radarr integration icon (docs/arr-integration-spec.md "UI") -------------------
+//
+// `item.arr_status` (migration 018) rides the wire on `FileNode.arr_status`/`arr_status_at` --
+// a facet, never a lifecycle state (`core/itemview.py`'s own docstring). The instance's own
+// *name* deliberately does **not** ride the item projection (`core/itemview.py.ITEM_VIEW_COLUMNS`
+// carries only `arr_status`/`arr_status_at` -- see that module's comment on why
+// `arr_download_id` stops at the server); a caller that wants to name the instance in a hover
+// resolves it itself from the item's *queue* binding (`path_queue.arr_instance_id` ->
+// `GET /api/settings/arr`), which is exactly what `FilesPage.tsx` does before threading an
+// `arrInstanceName` prop down to `FileTree`/`Row`. Never invented as a new wire field here.
+
+export type ArrIconVariant = 'none' | 'neutral' | 'imported' | 'gone'
+
+const ARR_ICON_VARIANTS: Record<string, ArrIconVariant> = {
+  detected: 'neutral',
+  notified: 'neutral',
+  // `cleaned` keeps the neutral mark on the icon itself -- the spec's icon-state table pairs it
+  // with the removal-grace countdown chip's own re-wording ("Processed · Xm", see
+  // `lib/format.ts.removalGraceShortLabel`), not a distinct icon colour of its own.
+  cleaned: 'neutral',
+  imported: 'imported',
+  gone: 'gone',
+}
+
+/** Maps `item.arr_status` to the Files-row icon's visual variant, per the spec's own
+ * icon-state table (docs/arr-integration-spec.md "UI"): `imported` (green ✓) and `gone`
+ * (amber ⚠) must read as distinct, colored states -- "the *arr processed it" and "the *arr
+ * merely dropped it" are not the same fact and must never collapse to one dimmed glyph
+ * (the spec's own "multi-faceted" requirement). `'none'` means render nothing at all -- an
+ * item on a queue with no bound *arr instance, or one the poller has never matched, carries
+ * `arr_status: null` and gets no icon, per the "everything OFF by default" rule.
+ */
+export function arrIconVariant(arrStatus: string | null): ArrIconVariant {
+  if (arrStatus == null) return 'none'
+  return ARR_ICON_VARIANTS[arrStatus] ?? 'neutral'
+}
+
+const ARR_STATUS_TEXT: Record<string, string> = {
+  detected: 'detected in the *arr queue',
+  notified: 'import requested from the *arr',
+  imported: 'imported by the *arr',
+  gone: "left the *arr's queue without importing",
+  cleaned: 'imported and cleaned up locally',
+}
+
+/** The icon's hover text (spec: "Hover card names the instance and the timestamp
+ * (`arr_status_at`)"). `instanceName` is resolved by the caller (see the module comment above)
+ * -- `null` here means "resolve it anyway, just without a name" rather than showing nothing, so
+ * a queue config that hasn't loaded yet still explains itself. Returns `null` only when there is
+ * genuinely nothing to say (`arr_status` itself is `null`), so callers can skip rendering a
+ * title/tooltip entirely rather than showing an empty one.
+ */
+export function arrHoverLabel(
+  node: { arr_status: string | null; arr_status_at: string | null },
+  instanceName: string | null,
+): string | null {
+  if (node.arr_status == null) return null
+  const statusText = ARR_STATUS_TEXT[node.arr_status] ?? node.arr_status
+  const who = instanceName ?? 'the bound *arr instance'
+  const when = node.arr_status_at != null ? ` (${formatRelativeTimeIntl(node.arr_status_at)})` : ''
+  return `${who}: ${statusText}${when}`
 }
 
 // --- Column widths: one shared definition drives both the header row and `Row`. ----------------
@@ -319,6 +400,14 @@ export const RESIZABLE_COLUMNS: ColumnDef[] = [
     align: 'right',
     sortKey: 'percent',
     title: 'Sort by % complete',
+  },
+  {
+    id: 'arr',
+    label: '*arr',
+    defaultWidth: 44,
+    minWidth: 36,
+    align: 'right',
+    title: 'Sonarr/Radarr integration status, if this queue is bound to an instance',
   },
   { id: 'lifecycle', label: 'R L V E', defaultWidth: 80, minWidth: 68, align: 'right' },
   { id: 'changed', label: 'Changed', defaultWidth: 128, minWidth: 72, align: 'right', sortKey: 'state_changed_at' },

@@ -9,6 +9,7 @@ import { ConnectionTab } from './pages/settings/ConnectionTab'
 import { QueuesTab } from './pages/settings/QueuesTab'
 import { TransferTab } from './pages/settings/TransferTab'
 import { PostProcessingTab } from './pages/settings/PostProcessingTab'
+import { IntegrationsTab } from './pages/settings/IntegrationsTab'
 import { LogsTab } from './pages/settings/LogsTab'
 import { BackupTab } from './pages/settings/BackupTab'
 import { AuthTab } from './pages/settings/AuthTab'
@@ -46,6 +47,7 @@ function App() {
           <Route path="queues" element={<QueuesTab />} />
           <Route path="transfer" element={<TransferTab />} />
           <Route path="post-processing" element={<PostProcessingTab />} />
+          <Route path="integrations" element={<IntegrationsTab />} />
           <Route path="logs" element={<LogsTab />} />
           <Route path="backup" element={<BackupTab />} />
           <Route path="auth" element={<AuthTab />} />

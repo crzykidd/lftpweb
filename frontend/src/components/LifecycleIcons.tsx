@@ -1,5 +1,6 @@
 import type { SVGProps } from 'react'
 import type { FacetLevel, FileNode, SettleSettingsOut } from '../api/types'
+import { arrHoverLabel, arrIconVariant } from '../lib/fileTree'
 import { formatBytes, formatRelativeTimeIntl, settleWaitLabel } from '../lib/format'
 
 // Lifecycle icons (2026-08-13, prompts/2026-08-13-lifecycle-icons.md): R(emote)/L(ocal)/
@@ -267,6 +268,73 @@ export function LifecycleIcons({ node, settle }: { node: FileNode; settle: Settl
       <HardDriveIcon title={localTooltip(node)} className={FACET_LEVEL_CLASSES[local.level]} />
       <ShieldCheckIcon title={verifiedTooltip(node)} className={FACET_LEVEL_CLASSES[verified.level]} />
       <PackageIcon title={extractedTooltip(node)} className={FACET_LEVEL_CLASSES[extracted.level]} />
+    </span>
+  )
+}
+
+// --- Sonarr/Radarr integration icon (docs/arr-integration-spec.md "UI") -------------------
+
+/** The *arr mark itself -- a generic "linked to an external system" glyph (Lucide `link-2`,
+ * ISC License, see NOTICE), deliberately not a Sonarr/Radarr brand mark: this project ships no
+ * third-party logos, and one shared glyph covers both `kind`s (the hover text, not the icon
+ * shape, is what names the specific instance -- `arrHoverLabel`, `lib/fileTree.ts`).
+ */
+function ArrMarkIcon(props: IconProps) {
+  return (
+    <IconBase {...props}>
+      <path d="M9 17H7A5 5 0 0 1 7 7h2" />
+      <path d="M15 7h2a5 5 0 1 1 0 10h-2" />
+      <line x1="8" x2="16" y1="12" y2="12" />
+    </IconBase>
+  )
+}
+
+/** The Files-row *arr icon (docs/arr-integration-spec.md "UI" -- "multi-faceted," the user's
+ * own 2026-08-15 decision): renders nothing at all for `arr_status: null` (a queue with no
+ * bound instance, or an item the poller hasn't matched yet -- everything-off-by-default means
+ * this is the common case on most installs). Otherwise the mark itself plus, for the two states
+ * that need to read as visually distinct from "still being watched," a small colored glyph
+ * beside it -- a green **✓** once the *arr has confirmed import (`imported`), an amber **⚠**
+ * once a release left the *arr's queue without ever importing (`gone`, the one state that
+ * usually needs a human, per the spec's own note). `detected`/`notified`/`cleaned` all render
+ * the plain neutral mark; `cleaned`'s own distinguishing information lives on the removal-grace
+ * countdown chip's re-worded text ("Processed · Xm"), not a second icon color.
+ *
+ * `instanceName` is resolved by the caller from the item's *queue* binding, never invented here
+ * -- see `lib/fileTree.ts.arrHoverLabel`'s own docstring for why the item projection alone
+ * can't name the instance.
+ */
+export function ArrIcon({
+  arrStatus,
+  arrStatusAt,
+  instanceName,
+}: {
+  arrStatus: string | null
+  arrStatusAt: string | null
+  instanceName: string | null
+}) {
+  const variant = arrIconVariant(arrStatus)
+  if (variant === 'none') return null
+  const hoverLabel = arrHoverLabel({ arr_status: arrStatus, arr_status_at: arrStatusAt }, instanceName)
+  const markClass =
+    variant === 'imported'
+      ? 'text-emerald-600 dark:text-emerald-400'
+      : variant === 'gone'
+        ? 'text-amber-500 dark:text-amber-400'
+        : 'text-zinc-400 dark:text-zinc-500'
+  return (
+    <span className="flex shrink-0 items-center gap-0.5" title={hoverLabel ?? undefined}>
+      <ArrMarkIcon title={hoverLabel ?? '*arr'} className={markClass} />
+      {variant === 'imported' && (
+        <span className="text-[10px] leading-none text-emerald-600 dark:text-emerald-400" aria-hidden="true">
+          ✓
+        </span>
+      )}
+      {variant === 'gone' && (
+        <span className="text-[10px] leading-none text-amber-500 dark:text-amber-400" aria-hidden="true">
+          ⚠
+        </span>
+      )}
     </span>
   )
 }

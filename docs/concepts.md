@@ -1,6 +1,6 @@
 # Concepts
 
-The seven things that actually trip people up, and what to do about each.
+The eight things that actually trip people up, and what to do about each.
 
 ```jump
 Nothing downloaded for a minute|#settle
@@ -10,6 +10,7 @@ Dismiss vs Clear vs Reset|#blast-radius
 The lifecycle icons|#icons
 copy vs move|#copy-move
 Inherit vs override|#inherit
+The Sonarr/Radarr icon|#arr-integration
 ```
 
 ## Why nothing downloaded for a minute — the settle gate {#settle}
@@ -242,3 +243,37 @@ Two toggles are conditional, and say so in place:
 > **Note:** Everything post-processing does defaults to off at both levels — a fresh install
 > runs none of it. The one exception in the other direction is `move` mode's forced
 > verification, above.
+
+## What the Sonarr/Radarr icon on a Files row means {#arr-integration}
+
+If a queue is bound to a Sonarr or Radarr instance (**Settings → Integrations**, then the *arr
+instance dropdown on that queue in **Settings → Queues**), a matching release gets a small mark
+on its Files row once lftpweb sees it in that instance's own download queue. It stays off, with
+no icon anywhere, until both an instance exists and enabled and a queue is bound to it —
+three separate, deliberate acts.
+
+The mark itself changes as the release moves through the *arr's own pipeline:
+
+- **Plain mark** — being watched. Detected in the *arr's queue, possibly already told to
+  import, but not confirmed finished yet.
+- **Mark with a green ✓** — the *arr has confirmed the release fully imported. If this queue's
+  "Delete when imported" is off, the files stay right where they are.
+- **Mark with an amber ⚠** — the release left the *arr's queue **without** ever importing.
+  Usually means the grab failed or was removed by hand on the *arr's side. Nothing was deleted
+  — this state is purely informational — but it is usually worth a look, and it has its own
+  entry in the Files page's filter dropdown for exactly that reason.
+- **The removal-grace countdown, reworded** — if "Delete when imported" is on for this queue,
+  lftpweb removes the local copy once import is fully confirmed (never before, and never on an
+  ambiguous signal). That row then runs through the exact same ~ten-minute [removal grace
+  period](#removal-grace) any other locally-deleted item does — except the countdown chip reads
+  **"Processed · Xm"** instead of "Missing · Xm", because this absence was deliberate and
+  audited, not an alarm.
+
+Hover the mark for which instance matched it and when.
+
+> **Note:** "Imported" is checked carefully on purpose. A large multi-file release imports one
+> file at a time on the *arr's side, so a single import event is not proof the whole release is
+> done — lftpweb waits for the *arr's own queue record for the release to disappear *and* for
+> history to confirm an import, and checks both are still true a minute later before treating
+> anything as finished. A release simply vanishing from the *arr's queue with no import evidence
+> is never treated as imported — that is exactly the amber-warning case above.

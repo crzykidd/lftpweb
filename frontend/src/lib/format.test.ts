@@ -601,6 +601,46 @@ describe('removalGraceShortLabel / removalGraceLabel', () => {
   it('full label handles a null first_missing_at without fabricating a time', () => {
     expect(removalGraceLabel({ first_missing_at: null }, grace)).toBe('Local copy missing.')
   })
+
+  // Sonarr/Radarr integration (docs/arr-integration-spec.md "Cleanup"): "Same clock, different
+  // words" -- a `cleaned` item rides the identical removal-grace countdown as any other absent
+  // local copy, but reads as a deliberate, audited outcome rather than an alarm.
+  it('short label reads "Processed" instead of "Missing" when arr_status is cleaned', () => {
+    const firstMissingAt = new Date(Date.now() - 524_000).toISOString()
+    expect(removalGraceShortLabel({ first_missing_at: firstMissingAt, arr_status: 'cleaned' }, grace)).toBe(
+      'Processed · 1m',
+    )
+  })
+
+  it('short label "Processed" also degrades to the bare word once capped', () => {
+    const firstMissingAt = new Date(Date.now() - 600_000).toISOString()
+    expect(removalGraceShortLabel({ first_missing_at: firstMissingAt, arr_status: 'cleaned' }, grace)).toBe(
+      'Processed',
+    )
+  })
+
+  it('short label stays "Missing" for every other arr_status, including gone/imported', () => {
+    const firstMissingAt = new Date(Date.now() - 524_000).toISOString()
+    for (const status of [null, undefined, 'detected', 'notified', 'imported', 'gone']) {
+      expect(removalGraceShortLabel({ first_missing_at: firstMissingAt, arr_status: status }, grace)).toBe(
+        'Missing · 1m',
+      )
+    }
+  })
+
+  it('full label opens with the processed sentence when arr_status is cleaned', () => {
+    const firstMissingAt = new Date(Date.now() - 524_000).toISOString()
+    const expectedSince = new Date(firstMissingAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+    expect(removalGraceLabel({ first_missing_at: firstMissingAt, arr_status: 'cleaned' }, grace)).toBe(
+      `Processed by the *arr and cleaned up locally since ${expectedSince}. Leaves this view in 1m.`,
+    )
+  })
+
+  it('full label handles a null first_missing_at for a cleaned item without fabricating a time', () => {
+    expect(removalGraceLabel({ first_missing_at: null, arr_status: 'cleaned' }, grace)).toBe(
+      'Processed by the *arr; local copy removed.',
+    )
+  })
 })
 
 describe('isDeletedArchiveVolume', () => {

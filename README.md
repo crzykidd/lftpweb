@@ -84,6 +84,13 @@ Every verify outcome, every remote delete, and every delete withheld — with th
   success, is gated on cheap filesystem preconditions first (zero-length head volume, a gap in a
   multi-volume rar set), and can optionally delete a release's spent archive volumes once they
   have extracted — off by default
+- **Optional Sonarr/Radarr integration** (`docs/arr-integration-spec.md`, off at every level by
+  default): bind a queue to a Sonarr or Radarr instance from Settings → Integrations and lftpweb
+  watches that instance's download queue for a matching release, marks the Files row with an
+  *arr icon, and — only once the *arr has *fully* confirmed import, never on ambiguity —
+  optionally cleans up the local copy. The icon is multi-faceted: a plain mark while being
+  watched, a green check once imported, an amber warning if a release left the *arr's queue
+  without ever importing (filterable on its own, since that one usually needs a look)
 - The History page: every completed/failed/cancelled transfer and every audit event
   (including remote deletes and deletes withheld), filterable and grouped by queue
 - Rotating log viewer, on-demand `VACUUM INTO` database backups (scheduled + manual), and a
@@ -93,11 +100,11 @@ Every verify outcome, every remote delete, and every delete withheld — with th
   password login or trust a reverse proxy's identity header, both from Settings → Auth. See
   "Locked out?" below before you flip it on.
 - **In-app user documentation**, under **Docs** in the left nav: a quick start walking the real
-  first-run sequence, and a Concepts page covering the seven things that actually confuse people
+  first-run sequence, and a Concepts page covering the eight things that actually confuse people
   (the settle gate, the removal grace period, auto-queue suppression, the difference between
-  Dismiss / Clear history / Reset item tracking, the lifecycle icons, `copy` vs `move`, and
-  inherit-vs-override on the post-processing toggles). Every step links straight to the settings
-  page it describes.
+  Dismiss / Clear history / Reset item tracking, the lifecycle icons, `copy` vs `move`,
+  inherit-vs-override on the post-processing toggles, and the Sonarr/Radarr icon). Every step
+  links straight to the settings page it describes.
   Per-field help popups (`FieldHelp`) are being applied across the settings surface, starting
   with the fields whose wrong answer costs you data
 
@@ -161,6 +168,10 @@ and known limitations, recorded in full in `docs/decisions.md` and `prompts/open
   location) only appears from the Files page.** `TransfersPage.tsx` opens the same drawer but
   doesn't have the owning queue's `local_path` loaded, so that one panel simply doesn't render
   there — every other section of the drawer is unaffected.
+- **The Sonarr/Radarr integration UI has never been click-tested in a browser.** No agent that
+  built it (backend, notify/cleanup, or this UI pass) can render a page — see `docs/decisions.md`
+  for the standing reason every Settings page in this project carries the same caveat. The item
+  drawer also doesn't surface `arr_status` yet; only the Files-row icon and its hover text do.
 
 ## Locked out?
 

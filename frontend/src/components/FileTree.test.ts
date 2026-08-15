@@ -2,6 +2,8 @@ import { describe, expect, it } from 'vitest'
 import type { FileNode, LifecycleFacets } from '../api/types'
 import type { ChildSpeedSample } from '../hooks/useLiveModel'
 import {
+  arrHoverLabel,
+  arrIconVariant,
   buildTree,
   CHILD_SPEED_FRESHNESS_MS,
   clampColumnWidth,
@@ -56,6 +58,8 @@ function node(rel_path: string, is_dir: boolean, overrides: Partial<FileNode> = 
     remote_deleted_at: null,
     pending_download_prefix: null,
     deleted_archive_at: null,
+    arr_status: null,
+    arr_status_at: null,
     facets: DIM,
     ...overrides,
   }
@@ -579,6 +583,65 @@ describe('matchesFacetFilter', () => {
     // Downloaded but present locally -- nothing missing to report.
     const stillPresent = entry({ local: { level: 'green', reason: 'present' } }, '2026-08-13T00:00:00Z')
     expect(matchesFacetFilter(stillPresent, 'missing_locally')).toBe(false)
+  })
+
+  it('arr_tracked matches any non-null arr_status, and only that', () => {
+    expect(matchesFacetFilter({ ...entry({}), arr_status: null }, 'arr_tracked')).toBe(false)
+    for (const status of ['detected', 'notified', 'imported', 'cleaned', 'gone']) {
+      expect(matchesFacetFilter({ ...entry({}), arr_status: status }, 'arr_tracked')).toBe(true)
+    }
+  })
+
+  it('arr_gone matches only arr_status === "gone"', () => {
+    expect(matchesFacetFilter({ ...entry({}), arr_status: 'gone' }, 'arr_gone')).toBe(true)
+    for (const status of ['detected', 'notified', 'imported', 'cleaned', null]) {
+      expect(matchesFacetFilter({ ...entry({}), arr_status: status }, 'arr_gone')).toBe(false)
+    }
+  })
+})
+
+// --- Sonarr/Radarr integration icon (docs/arr-integration-spec.md "UI") -------------------
+
+describe('arrIconVariant', () => {
+  it('maps all five known arr_status values to the spec\'s icon-state table', () => {
+    expect(arrIconVariant('detected')).toBe('neutral')
+    expect(arrIconVariant('notified')).toBe('neutral')
+    expect(arrIconVariant('imported')).toBe('imported')
+    expect(arrIconVariant('gone')).toBe('gone')
+    expect(arrIconVariant('cleaned')).toBe('neutral')
+  })
+
+  it('is "none" for a null arr_status -- no bound instance, or not yet matched', () => {
+    expect(arrIconVariant(null)).toBe('none')
+  })
+
+  it('degrades an unrecognized status string to the neutral mark rather than nothing', () => {
+    expect(arrIconVariant('some_future_status')).toBe('neutral')
+  })
+})
+
+describe('arrHoverLabel', () => {
+  it('is null when arr_status itself is null -- nothing to show', () => {
+    expect(arrHoverLabel({ arr_status: null, arr_status_at: null }, 'Sonarr')).toBeNull()
+  })
+
+  it('names the instance when one is known', () => {
+    const label = arrHoverLabel({ arr_status: 'imported', arr_status_at: null }, 'Sonarr')
+    expect(label).toContain('Sonarr')
+    expect(label).toContain('imported')
+  })
+
+  it('falls back to a generic name when the instance is not known', () => {
+    const label = arrHoverLabel({ arr_status: 'gone', arr_status_at: null }, null)
+    expect(label).toContain('the bound *arr instance')
+  })
+
+  it('includes a relative time when arr_status_at is set', () => {
+    const label = arrHoverLabel(
+      { arr_status: 'detected', arr_status_at: new Date(Date.now() - 60_000).toISOString() },
+      'Radarr',
+    )
+    expect(label).toMatch(/\(.*\)/)
   })
 })
 

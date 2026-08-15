@@ -25,6 +25,20 @@ Skeleton for the next roll:
 
 ### Added
 
+- **Optional Sonarr/Radarr integration** (`docs/arr-integration-spec.md`), off at every level by
+  default. Bind a queue to a Sonarr or Radarr instance (new Settings → Integrations tab: instance
+  CRUD, write-only API key, a Test button) and lftpweb watches that instance's own download queue
+  for a matching release, marks the Files row with an *arr icon once found, and — only after the
+  *arr has *fully* confirmed import across two consecutive checks, never on an ambiguous signal —
+  can optionally clean up the local copy (a new per-queue "Delete when imported" toggle). The icon
+  is multi-faceted: a plain mark while a release is being watched, a green ✓ once imported, an
+  amber ⚠ if a release left the *arr's queue without ever importing (independently filterable,
+  since that state usually needs a look), and the existing removal-grace countdown chip reads
+  "Processed · Xm" instead of "Missing · Xm" for a row this feature cleaned up itself. A new
+  "*arr-tracked" filter facet covers every tracked row at once. Built across three phases
+  (backend foundation, notify + cleanup, this UI pass); see `DESIGN.md` §16 and
+  `docs/arr-integration-spec.md` for the full design.
+
 ### Changed
 
 ### Fixed
