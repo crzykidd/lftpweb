@@ -94,7 +94,16 @@ than a first. Two things that bit the first time and will bit again:
 | S2 | Post-extraction path-containment check | this commit | ✅ done |
 | P2 | Split `api/settings.py` into sub-routers (host/queues/postprocess) | this commit | ✅ done |
 | P3 | Split `core/local_delete.py` (retention/archive_cleanup/reset) | this commit | ✅ done |
-| P1 | Split `FileTree.tsx`: pure logic → `lib/fileTree.ts` (2267→1765). Component extractions (Row/HoverCard) deferred to a browser-verified session | this commit | ⏳ partial |
+| P1 | Split `FileTree.tsx`: pure logic → `lib/fileTree.ts` (2267→1765). Component extractions (Row/HoverCard) deferred to a browser-verified session | `0cb294f` | ⏳ partial |
+
+**Run complete (2026-08-14 overnight).** Six commits landed on `dev`, nothing pushed, every gate
+green throughout: `01efac4` (S1), `0a4593a` (S3+S4), `65b0618` (S2), `90df1ea` (P2), `d480885`
+(P3), `0cb294f` (P1 partial). Backend **1063 tests**, frontend **266 tests**, both lint gates,
+`vite build`, and the `/api/settings` route-parity check all pass. **Still open for the user:**
+**G1** (move-delete ordering = issue #2 — a design call), **G2** (connection-limit write path —
+migration + UI feature), the **rest of P1** (Row/HoverCard component extraction — wants a browser),
+and **P4/P5** (`queue.py`/`engine.py` splits — deepest stateful code, wants review). See
+`docs/audit-v0.1.0.md` for all of them.
 
 > **Read `prompts/open-issues.md` first.** It carries the reasoning behind three sessions of
 > live-testing fixes — including one fix shipped and deliberately reversed the same night, one
