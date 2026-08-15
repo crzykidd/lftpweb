@@ -6,6 +6,34 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-14 — Audit P2: `api/settings.py` (1068 lines) split into three per-resource routers
+
+The single settings router covered ten resources (host, queues, patterns, postprocess, settle,
+removal-grace, download-prefix, autoqueue, retention, orphan-temp), so any localized change loaded
+the whole file. Split into `api/settings_host.py`, `api/settings_queues.py`, and
+`api/settings_postprocess.py`, each with its own `APIRouter(prefix="/api/settings")` — the same
+per-resource pattern `api/auth.py`/`api/backup.py`/`api/logs.py`/`api/metrics.py` already use.
+`main.py` mounts all three.
+
+**Method — mechanical, not retyped.** The three resource groups were already contiguous in the
+file, so the split sliced exact line ranges into the new modules (each given the full original
+import header) and let `ruff check --fix` strip the now-unused imports per module. This avoids any
+hand-transcription error in 1000+ lines of moved code.
+
+**The one real cross-module coupling:** `settings_queues.create_queue` reads "the" host row via
+`_get_host_row`, which now lives in `settings_host`. Imported explicitly
+(`from lftpweb.api.settings_host import _get_host_row`) rather than duplicated or hoisted into a
+new common module — one genuine shared read doesn't justify a third file, and an explicit import
+names the dependency plainly.
+
+**Verified behavior-preserving, not just tested:** the full `/api/settings` OpenAPI route list
+(43 paths×methods) was captured before and after and is byte-identical, and the settings/delete/
+auth suites plus the full backend suite pass unchanged. `test_delete_api.py`'s direct calls to the
+three retention functions were repointed to `settings_postprocess` (their new home) in the same
+commit.
+
+---
+
 ## 2026-08-14 — Audit S2: extraction refuses to publish a member that escapes the staging root
 
 `core/extract.py.extract_item` already stages every archive into a `_UNPACK_` sibling and only

@@ -15,7 +15,8 @@ import aiosqlite
 import pytest
 from fastapi import HTTPException
 
-from lftpweb.api import jobs, settings as settings_api
+from lftpweb.api import jobs
+from lftpweb.api import settings_postprocess as settings_api
 from lftpweb.core import local_delete
 from lftpweb.core.events import EventBus
 from lftpweb.core.mount_sentinel import write_if_needed
