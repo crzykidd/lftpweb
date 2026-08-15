@@ -4,8 +4,10 @@ All notable changes to this project are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once it starts
-cutting releases (see [`standards.md`](standards.md) — `release-prep-and-cut`). `0.0.1` is the
-in-development version, not a release; nothing has been tagged yet.
+cutting releases (see [`standards.md`](standards.md) — `release-prep-and-cut`). `0.1.0` is the
+first tagged release — a beta. Everything before it was in-development and never released, so
+`0.1.0`'s section below carries the project's whole history to date; later sections will be far
+smaller.
 
 <!--
 Skeleton for the next roll:
@@ -23,10 +25,31 @@ Skeleton for the next roll:
 
 ### Added
 
-Everything below reflects `DESIGN.md` §13 build phases 1–9 — **all nine are built** — plus a
-post-phase-9 session on 2026-08-12 (its entries are marked *(2026-08-12)*). Nothing here has
-been released; `0.0.1` remains the in-development version. Read `README.md`'s "Known gaps"
-alongside this list: several entries below ship with deliberate, documented limitations.
+### Changed
+
+### Fixed
+
+### Security
+
+### Deprecated
+
+### Removed
+
+## [0.1.0] — 2026-08-14
+
+**The first tagged release, and the first beta.** Everything below is the whole of the
+project's development history to date — `DESIGN.md` §13 build phases 1–9, all nine built, plus
+four sessions of fixes driven by real use against a real seedbox. Subsequent releases will be
+very much smaller than this one.
+
+Read `README.md`'s "Known gaps" alongside this list: several entries below ship with
+deliberate, documented limitations. There is **no upgrade path from any earlier state**, since
+no earlier release exists; the database schema may still change between beta releases.
+
+### Added
+
+Entries from the post-phase-9 session on 2026-08-12 are marked *(2026-08-12)*; later sessions
+are dated likewise.
 
 - **A read-only "What lftpweb already sets" readout on Settings → Transfer** *(2026-08-14)*,
   collapsed by default directly above the **Extra lftp settings** box — so far this has been a
