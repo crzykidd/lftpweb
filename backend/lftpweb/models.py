@@ -8,6 +8,19 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
+# Input length caps (audit S3, docs/audit-v0.1.0.md). Chosen deliberately *generous* -- large
+# enough that no legitimate value is ever rejected, small enough that an attacker can't hand the
+# server a multi-megabyte body to chew on (the concrete worry being an argon2-hashed password
+# field on the unauthenticated login path). These bound only absurd inputs, never real ones.
+MAX_SECRET_LEN = 4096  # a password / passphrase -- real ones are tiny; this only stops a DoS body
+MAX_KEY_LEN = (
+    65536  # a pasted PEM private key: a few KB in practice, 64 KB is far past any real key
+)
+MAX_NAME_LEN = 1024  # a display name, username, hostname/address, header name, glob/pattern expr
+MAX_PATH_LEN = 4096  # a filesystem/remote path (PATH_MAX on Linux is 4096)
+MIN_PORT = 1
+MAX_PORT = 65535
+
 
 class HealthResponse(BaseModel):
     status: str
@@ -59,14 +72,14 @@ class HostIn(BaseModel):
     mounting a key file.
     """
 
-    name: str
-    address: str
-    port: int = 22
-    username: str
+    name: str = Field(max_length=MAX_NAME_LEN)
+    address: str = Field(max_length=MAX_NAME_LEN)
+    port: int = Field(default=22, ge=MIN_PORT, le=MAX_PORT)
+    username: str = Field(max_length=MAX_NAME_LEN)
     auth_method: AuthMethod
-    key_path: str | None = None
-    password: str | None = None
-    ssh_key: str | None = None
+    key_path: str | None = Field(default=None, max_length=MAX_PATH_LEN)
+    password: str | None = Field(default=None, max_length=MAX_SECRET_LEN)
+    ssh_key: str | None = Field(default=None, max_length=MAX_KEY_LEN)
     known_hosts_policy: KnownHostsPolicy = "accept-and-pin"
 
 
@@ -102,14 +115,14 @@ class HostTestRequest(BaseModel):
     `ssh_key = None` means the same for a pasted key.
     """
 
-    name: str | None = None
-    address: str | None = None
-    port: int | None = None
-    username: str | None = None
+    name: str | None = Field(default=None, max_length=MAX_NAME_LEN)
+    address: str | None = Field(default=None, max_length=MAX_NAME_LEN)
+    port: int | None = Field(default=None, ge=MIN_PORT, le=MAX_PORT)
+    username: str | None = Field(default=None, max_length=MAX_NAME_LEN)
     auth_method: AuthMethod | None = None
-    key_path: str | None = None
-    password: str | None = None
-    ssh_key: str | None = None
+    key_path: str | None = Field(default=None, max_length=MAX_PATH_LEN)
+    password: str | None = Field(default=None, max_length=MAX_SECRET_LEN)
+    ssh_key: str | None = Field(default=None, max_length=MAX_KEY_LEN)
     known_hosts_policy: KnownHostsPolicy | None = None
 
 
@@ -125,10 +138,10 @@ SyncMode = Literal["copy", "move", "sync"]
 
 
 class PathQueueIn(BaseModel):
-    name: str
-    remote_path: str
-    local_path: str
-    staging_path: str | None = None
+    name: str = Field(max_length=MAX_NAME_LEN)
+    remote_path: str = Field(max_length=MAX_PATH_LEN)
+    local_path: str = Field(max_length=MAX_PATH_LEN)
+    staging_path: str | None = Field(default=None, max_length=MAX_PATH_LEN)
     enabled: bool = True
     sync_mode: SyncMode = "copy"
     # DESIGN.md §4.7, phase 4. Both default off/false -- enabling auto-queue is an explicit
@@ -445,7 +458,7 @@ PatternKind = Literal["select", "skip", "file_exclude"]
 class PatternIn(BaseModel):
     queue_id: int | None = None  # None = global, applies to every queue (§4.7)
     kind: PatternKind
-    expr: str
+    expr: str = Field(max_length=MAX_NAME_LEN)
     enabled: bool = True
 
 
@@ -867,15 +880,15 @@ AuthMode = Literal["none", "password", "proxy"]
 
 class AuthSettingsIn(BaseModel):
     mode: AuthMode
-    proxy_header: str = "Remote-User"
-    proxy_trusted_cidrs: list[str] = Field(default_factory=list)
+    proxy_header: str = Field(default="Remote-User", max_length=MAX_NAME_LEN)
+    proxy_trusted_cidrs: list[str] = Field(default_factory=list, max_length=256)
     # Only meaningful when `mode == "password"`: creates the single local user (if none
     # exists yet) or changes username/password atomically with the mode switch. This is what
     # keeps "switch to password mode" from ever being separable from "someone can actually
     # log in" -- a client can never store `mode: "password"` with nobody able to authenticate
     # (see api/auth.py.put_auth_settings and core/auth.py's module docstring).
-    username: str | None = None
-    new_password: str | None = None
+    username: str | None = Field(default=None, max_length=MAX_NAME_LEN)
+    new_password: str | None = Field(default=None, max_length=MAX_SECRET_LEN)
 
 
 class AuthSettingsOut(BaseModel):
@@ -887,13 +900,13 @@ class AuthSettingsOut(BaseModel):
 
 
 class ChangePasswordIn(BaseModel):
-    current_password: str
-    new_password: str
+    current_password: str = Field(max_length=MAX_SECRET_LEN)
+    new_password: str = Field(max_length=MAX_SECRET_LEN)
 
 
 class LoginIn(BaseModel):
-    username: str
-    password: str
+    username: str = Field(max_length=MAX_NAME_LEN)
+    password: str = Field(max_length=MAX_SECRET_LEN)
 
 
 class AuthSessionOut(BaseModel):
@@ -918,7 +931,7 @@ class ApiKeyOut(BaseModel):
 
 
 class ApiKeyIn(BaseModel):
-    name: str
+    name: str = Field(max_length=MAX_NAME_LEN)
 
 
 class ApiKeyCreatedOut(ApiKeyOut):

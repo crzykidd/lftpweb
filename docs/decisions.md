@@ -6,6 +6,36 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-14 — Audit S3/S4: input length caps + port bounds, and a *safe* security-header subset (no CSP/HSTS overnight)
+
+Part of the post-`v0.1.0` audit run (`docs/audit-v0.1.0.md`). Two small hardening changes bundled
+into one commit, per the audit's own "one input-hardening + headers pass" suggestion.
+
+**S3 — length caps (`models.py`).** The concrete worry was an argon2 DoS: `POST /api/auth/login`
+is unauthenticated and argon2-hashes the submitted password, and no model field had a
+`max_length`, so a multi-megabyte body was hashed on every one of the 5 rate-limited attempts.
+Caps are set on every credential/free-text/path input field, plus `ge=1, le=65535` on both `port`
+fields. **Chosen deliberately generous** (`MAX_SECRET_LEN=4096`, `MAX_KEY_LEN=65536` for pasted
+PEM keys, `MAX_NAME_LEN=1024`, `MAX_PATH_LEN=4096`) so no legitimate value is ever rejected — the
+caps bound only absurd inputs. Rejected the tighter alternative (RFC-accurate limits like DNS-253
+for hostnames) precisely because this ran unattended: a too-tight cap that rejected some real
+value the user relies on is exactly the kind of silent breakage an overnight run must not risk.
+Also deliberately did **not** add `min_length=1` "reject blank name" rules — that *could* reject a
+currently-working edge case, so it's a change for a reviewed session, not this one.
+
+**S4 — security headers (`middleware.py.SecurityHeadersMiddleware`).** Adds `X-Content-Type-
+Options: nosniff`, `X-Frame-Options: SAMEORIGIN`, `Referrer-Policy: same-origin` to every HTTP
+response, via a raw-ASGI middleware wrapping `AuthMiddleware` (so even a 401 the gate produces
+carries them). **A Content-Security-Policy was explicitly rejected for this run:** a wrong CSP
+silently breaks the built SPA (inline styles/scripts, the WebSocket, the assets mount), and there
+is no browser in the build/CI environment to verify one against — it belongs in a reviewed,
+browser-checked change. **HSTS was also rejected:** the session cookie's `Secure` flag is already
+scheme-conditional for plain-HTTP LAN use (`api/auth.py`), and HSTS over such a deployment would
+wedge the browser onto an `https://` the host may not serve. `test_input_hardening.py` pins the
+three headers present *and* CSP/HSTS absent, so a future accidental CSP here trips a test.
+
+---
+
 ## 2026-08-14 — A `move`-mode delete withholds only on `CORRUPT`, not on `SKIPPED`; the rename event stops hardcoding a "verified" it didn't check
 
 `core/postprocess.py._maybe_delete_remote` used to withhold the remote delete whenever

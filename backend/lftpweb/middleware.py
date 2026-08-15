@@ -193,3 +193,52 @@ class AuthMiddleware:
             }
         )
         await send({"type": "http.response.body", "body": body})
+
+
+# Static, request-independent defense-in-depth headers (audit S4, docs/audit-v0.1.0.md).
+# Deliberately the *safe* subset that cannot break a same-origin SPA served over plain HTTP:
+#
+#   * X-Content-Type-Options: nosniff  -- stop a browser MIME-sniffing a response into script.
+#   * X-Frame-Options: SAMEORIGIN      -- clickjacking: no embedding in a cross-origin frame.
+#   * Referrer-Policy: same-origin     -- don't leak the app URL to anything off-origin.
+#
+# A Content-Security-Policy is intentionally NOT set here: getting one wrong silently breaks the
+# built SPA (inline styles/scripts, the WebSocket, the assets mount), and there is no browser in
+# the build/CI environment to verify it against -- so it belongs in a reviewed, browser-checked
+# change, not this blanket pass. HSTS is also omitted on purpose: the session cookie's own
+# `Secure` flag is already scheme-conditional for plain-HTTP LAN use (api/auth.py), and sending
+# HSTS over such a deployment would wedge the browser onto an https:// the host may not serve.
+_SECURITY_HEADERS: tuple[tuple[bytes, bytes], ...] = (
+    (b"x-content-type-options", b"nosniff"),
+    (b"x-frame-options", b"SAMEORIGIN"),
+    (b"referrer-policy", b"same-origin"),
+)
+
+
+class SecurityHeadersMiddleware:
+    """Append the static security headers above to every HTTP response. Raw ASGI (matching
+    `AuthMiddleware`) so it covers streamed file downloads and the SPA/static mount uniformly,
+    which `BaseHTTPMiddleware` cannot do without buffering. WebSocket and lifespan scopes pass
+    through untouched -- these headers are meaningless on either.
+    """
+
+    def __init__(self, app) -> None:
+        self.app = app
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        async def send_with_headers(message):
+            if message["type"] == "http.response.start":
+                # Don't clobber a header a handler set deliberately -- only add ours if absent.
+                existing = {name.lower() for name, _ in message.get("headers", [])}
+                headers = list(message.get("headers", []))
+                for name, value in _SECURITY_HEADERS:
+                    if name not in existing:
+                        headers.append((name, value))
+                message = {**message, "headers": headers}
+            await send(message)
+
+        await self.app(scope, receive, send_with_headers)

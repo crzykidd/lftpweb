@@ -77,6 +77,25 @@ than a first. Two things that bit the first time and will bit again:
 
 ## Where we are
 
+### 🌙 Overnight audit run (started 2026-08-14, unattended) — LIVE PROGRESS LOG
+
+> A post-`v0.1.0` audit landed in `docs/audit-v0.1.0.md` (findings S1–S4, G1–G3, P1–P5). The user
+> authorised working the fixable ones unattended overnight, each as its own commit on `dev`
+> (nothing pushed), gates green before moving on. **This log is updated in the same commit as each
+> item** so that if the session crashes mid-run, the next session knows exactly what shipped and
+> what didn't. Deliberately **not** touched unattended: **G1** (move-delete ordering = the design
+> call in issue #2), **G2** (connection-limit needs a migration + UI feature), **P4/P5**
+> (`queue.py`/`engine.py` splits — deepest stateful code, wants review).
+
+| Item | What | Commit | Status |
+|---|---|---|---|
+| S1 | SPA catch-all path traversal (unauthenticated file read) fixed | `01efac4` | ✅ done (pre-run) |
+| S3+S4 | Input length caps + port bounds; safe security response headers (no CSP/HSTS) | this commit | ✅ done |
+| S2 | Post-extraction path-containment check | — | ⬜ queued |
+| P2 | Split `api/settings.py` into sub-routers | — | ⬜ queued |
+| P3 | Split `core/local_delete.py` (retention/archive_cleanup/reset) | — | ⬜ queued |
+| P1 | Split `FileTree.tsx` (pure lib + row/hovercard/columns/bulk) | — | ⬜ queued |
+
 > **Read `prompts/open-issues.md` first.** It carries the reasoning behind three sessions of
 > live-testing fixes — including one fix shipped and deliberately reversed the same night, one
 > thing the orchestrating session asserted that turned out to be false, and (2026-08-14) three

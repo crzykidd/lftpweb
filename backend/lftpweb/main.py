@@ -32,7 +32,7 @@ from lftpweb.core.postprocess import PostprocessPipeline
 from lftpweb.core.queue import TransferQueue
 from lftpweb.db import connect, migrate
 from lftpweb.logsetup import setup_logging
-from lftpweb.middleware import AuthMiddleware
+from lftpweb.middleware import AuthMiddleware, SecurityHeadersMiddleware
 
 logger = logging.getLogger(__name__)
 
@@ -155,6 +155,11 @@ def create_app() -> FastAPI:
     # why a single ASGI middleware was chosen over a per-router Depends(). Added before any
     # router so a newly mounted router is covered without a second decision at the call site.
     app.add_middleware(AuthMiddleware)
+    # Added after AuthMiddleware so it wraps it (Starlette applies middleware outermost-last):
+    # every response, including a 401/403 the auth gate itself produces and every static/SPA
+    # response, carries the headers. See middleware.py for why this is the safe header subset
+    # and why no CSP/HSTS is set here (audit S4).
+    app.add_middleware(SecurityHeadersMiddleware)
 
     app.include_router(health.router)
     app.include_router(stats.router)
