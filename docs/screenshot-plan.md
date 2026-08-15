@@ -144,15 +144,15 @@ one — it demonstrates the app explaining itself rather than showing stale data
 These are the things nobody has ever seen rendered, so the first person to look is the one who
 finds them:
 
-- **Progress-bar label contrast at ~50% fill**, where the text straddles filled and unfilled
-  background. Flagged unverified since 2026-08-13.
-- **The Speed column at a narrow viewport.** Its `defaultWidth` was widened 88px → 128px to fit
-  `34 MB/s · 3m` and that change has never been looked at.
-- **The column resize handles.** They were moved to each column's left edge (the boundary that
-  actually moves, given `Name` absorbs the slack) — reasoned from the CSS, never observed.
 - **The `Missing` chip vs the `Remote` settling chip.** Both amber, both synthetic substitutions.
   They need to read as *different*, not merely differently worded.
-- **The unified reset control** (All / Pattern / Selected) and the effective-lftp-settings
-  `<details>` panel, both shipped 2026-08-14 and both unviewed.
+
+Everything else that was on this list came off it on 2026-08-14 — the user click-tested each and
+found nothing wrong: the **progress-bar label contrast at ~50% fill** (flagged unverified since
+2026-08-13, now settled as fine), the **Speed column** at its widened 128px `defaultWidth`, the
+**column resize handles** on each column's left edge, the **unified reset control's** three
+scopes, the **effective-lftp-settings `<details>` panel**, **Settings → Queues**, and
+**Docs → How it works**. Add back to this list whatever ships next — the point of the list is
+that the first person to look is the one who finds the problem.
 
 Finding layout problems here is the point, not an interruption.

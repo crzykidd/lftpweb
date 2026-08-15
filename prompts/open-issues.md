@@ -104,18 +104,24 @@ Confirmed by eye and working: the grey `Extracted` chip vs the emerald one, the 
 countdown, per-file speed and ETA, the inline progress chip, the item drawer's prefixed-path note,
 and the corrected `7zz`/`unrar` extraction label.
 
-**Still never viewed:** the Speed column at a narrow viewport (its `defaultWidth` went 88 → 128px
-and has not been checked), the column resize handles (moved to each column's left edge, reasoned
-from CSS only), the unified reset control's three scopes, the effective-lftp-settings `<details>`
-panel, Settings → Queues, and Docs → How it works.
+**Confirmed by eye 2026-08-14 (second pass)** — the user click-tested each and reported no
+defects: the **Speed column** at its widened 128px `defaultWidth`, the **column resize handles**
+on each column's left edge, the **unified reset control's** three scopes (All / Pattern /
+Selected), the **effective-lftp-settings `<details>` panel**, **Settings → Queues**, and
+**Docs → How it works**. The three Files-page items had been reasoned from CSS only until now.
+
+**Progress-bar text contrast at ~50% fill is settled** — the user's call on 2026-08-14 is that
+it's fine. It had been flagged unverified since 2026-08-13. Not a task any more; don't re-raise it
+without a new observation.
+
+**The "never viewed" list is now empty.** Every screen shipped through 2026-08-14 has been looked
+at by a human at least once. That is a first for this project, and it is a floor, not a
+guarantee — "viewed once, no obvious defect" is weaker than tested, and anything shipped after
+this date starts unviewed again unless someone says otherwise.
 
 **No agent can drive a browser.** Every UI claim in this repo still means "builds, type-checks,
-lints, and the endpoints it calls were verified over real HTTP" unless a screenshot proves
-otherwise.
-
-Worth a look when convenient: **progress-bar text contrast at around 50% fill**, where the label
-straddles filled and unfilled background — flagged since 2026-08-13 and not yet confirmed either
-way.
+lints, and the endpoints it calls were verified over real HTTP" unless a human or a screenshot
+proves otherwise.
 
 ### ~~A cleaned-up archive rests in a different state depending on sync mode~~ — **closed 2026-08-14**
 

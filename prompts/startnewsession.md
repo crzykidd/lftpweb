@@ -416,8 +416,11 @@ shipped. **Do not action any of them unilaterally.**
    overnight run's "every new capability defaults off" rule, reasoned in `docs/decisions.md`'s
    phase 7 entry. The user's call whether to reverse it.
 3. ~~No UI screen has ever been opened in a browser.~~ **Resolved 2026-08-12** — the app now
-   runs and the user has used it (see the session section above). Still true and still worth
-   repeating: **a coding agent cannot see it**, and most screens remain unviewed by anyone.
+   runs and the user has used it (see the session section above). **As of 2026-08-14 every
+   screen shipped to date has been looked at by a human at least once** — the "never viewed"
+   list in `prompts/open-issues.md` is empty for the first time. Still true and still worth
+   repeating: **a coding agent cannot see it**, so anything shipped from here starts unviewed
+   again, and "viewed once, no obvious defect" is weaker than tested.
 4. **`DESIGN.md` has three proposed wordings pending the user's approval**, all drafted by the
    tasks that found the gaps, none applied — a build that reveals `DESIGN.md` is wrong gets the
    doc corrected, it is not quietly diverged from. They are: **§3.2 rule 9** (who wins between
