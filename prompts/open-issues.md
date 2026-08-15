@@ -124,6 +124,43 @@ reserves up to the ceiling even if it isn't using it all, so the next item waits
 frees. Use *Start now* to override." Ship this first; its wording will depend on whether the
 scheduler toggle above lands, so do them together or the note before the fix.
 
+**The dynamic-bandwidth option — full fair-sharing via live lftp re-tuning (LOW PRIORITY).** The
+`(ceiling − reserve) ÷ N` static split above is the cheap fix. The *complete* solution to
+"allocation ≠ actual throughput" is to make allocations **dynamic**: re-tune each running job's
+`net:limit-total-rate` as jobs join and leave, so N jobs always fairly split B in real time.
+
+- **Model.** Job admitted alone → full pipe; a 2nd joins → both reshaped to ~B/2 **live**, no
+  restart; one finishes → the survivor reshaped back up. Reshape only at **admission/reap
+  boundaries** (when the running set changes), not continuously — that's the only time the split
+  actually changes, and it keeps stdin round-trips minimal.
+- **Feasibility is already proven.** Phase 3 confirmed that holding lftp's stdin open and sending
+  `set net:limit-total-rate X` mid-transfer works and takes effect; it was deliberately *not* wired
+  in because §4.5 wanted a stateless scheduler ("allocations never re-shaped"). The hard part is
+  de-risked; this reverses that one simplicity choice.
+- **The risks are operational, not correctness.** (a) Control channel: lftp must run *interactive*
+  (stdin held open, the transfer as a background job) instead of spawn-and-wait; a lost `set` write
+  just leaves a job at its old rate — a **soft** failure, never corruption. (b) The scheduler goes
+  **stateful**: per-job stdin handles, intended-vs-acked rate, partial-failure handling — new bug
+  surface beside the currently-pure `admit()`. (c) Oscillation under start/fail/stop churn (want
+  debounce/hysteresis); the `job.rate_limit_bps` column and the header "Allocated" readout must
+  update on every reshape or the UI lies; a missed down-shift is a **transient** overshoot of the
+  ceiling that self-heals next pass.
+- **Stop / requeue / resume / reboot: no correctness risk.** The rate is a pure speed knob
+  (`net:limit-total-rate`), fully decoupled from what makes a resume correct — the `.lftp` temp
+  file, pget's `.lftp-pget-status` sidecar, `-c`, and filesystem-derived progress. Every one of
+  these lifecycle events already **tears down and re-admits**, re-deriving the allocation from
+  scratch. Reboot specifically: `core/queue.py._reconcile_orphaned_jobs` fails the orphaned
+  `running` row, keeps the partial bytes, `-c` resumes, and auto-queue re-picks it — the pre-reboot
+  rate was never load-bearing. The reshape is **idempotent and derived** (allocation = f(current
+  running set)): never persisted, never restored, never migrated across a stop/resume/reboot, which
+  is exactly what makes it safe. Lowering a rate mid-transfer is flow control (throttles reads);
+  raising it lets it speed up — neither drops connections or touches bytes on disk.
+- **Priority: LOW — decide with production data.** Ship the static `(ceiling − reserve) ÷ N` split
+  first and run on it. If real workloads rarely leave a lone job hogging the pipe long enough to
+  matter, the static split is enough and this isn't worth the stateful complexity. Revisit only if
+  production shows sustained under-utilisation the static split doesn't fix (the user's own call,
+  2026-08-15: "more time running in production will help me determine if we need it").
+
 ### Post-`v0.1.0` audit — the deferred items (`docs/audit-v0.1.0.md`)
 
 A full audit landed 2026-08-14 (`docs/audit-v0.1.0.md`): findings **S1–S4** (security),
