@@ -1394,21 +1394,52 @@ them distinguishable, because a bind mount that didn't come up has no sentinel i
   no fresh structural reading for a path in neither tree). `REMOTE_ONLY` and `EXCLUDED` — which
   assert the opposite, that no real content was ever here — are still left exactly as they were,
   and a suppressed or actively-claimed row never reaches either sweep at all.
-- **Verification gate.** `move` deletes only after the item verifies (§6). `sync` propagates only
-  for items that reached a verified-complete state. Never deleted on a stale size rollup alone,
-  and never on a `SKIPPED` verification — "no evidence" is not evidence.
+- **Verification gate.** The rule (revised 2026-08-14, reasoning and residual-risk acceptance
+  in `docs/decisions.md`) is **verification must not have failed, not that it must have run.**
+  `move` withholds the delete only on `CORRUPT` — real evidence the download is bad. A
+  `SKIPPED` verification ("no evidence either way": no `.sfv`/`.md5` sidecar found, and the
+  hash-on-disk fallback is off by default) no longer withholds. Never deleted on a stale size
+  rollup alone — that's a separate, narrower guarantee than verification and is what the
+  three-check chain below stands in for on a `SKIPPED` item.
+  **Why this is safe now, though it would not have been at phase 5 when the stricter rule was
+  written.** By the time this gate runs, the item has already cleared three independent checks
+  that did not all exist when "verified, or nothing" was written: lftp exited 0 under
+  `cmd:fail-exit true`; the settle gate held the remote fingerprint stable for
+  `REQUIRED_SETTLE_SCANS` *and* `SETTLE_MIN_AGE_S`; and a filesystem completeness check
+  (added 2026-08-14, closing the incident where lftp exited 0 while a file sat hundreds of MB
+  short as a `.lftp` temp file) requires no leftover `.lftp`/temp files anywhere in the tree
+  and local bytes at least matching the remote total. Truncation — the main risk the strict
+  gate existed to catch — is caught upstream by that third check now; the gate's own
+  justification moved without the gate being re-examined until this task.
   **What each kind of evidence actually proves**, since the delete rides on it: a `.sfv`/`.md5`
-  sidecar proves per-file content correctness and is the strong case. The hash-on-disk fallback
-  (off by default) proves something weaker and now says so exactly — every file under the item
-  reads end to end without error **and** the total bytes read match the item's known remote
-  size. The size half is not decoration: reading a truncated file to EOF raises nothing, so
-  readability alone once blessed an incomplete item and could authorize deleting the only good
-  copy of it. With both halves the fallback offers precisely the guarantee the rest of the
-  system already runs on — the bytes are all here — and no more: an in-place bit flip with no
-  reference checksum to compare against is undetectable in principle. Demoting the fallback to
-  `SKIPPED` for `move` queues was considered and rejected: it would silently mean a `move`
-  queue can never complete a delete without a sidecar, which is its own surprise for a queue
-  configured for that mode.
+  sidecar proves per-file content correctness and is the strong case; a `VERIFIED` delete says
+  so in its event message. The hash-on-disk fallback (off by default) proves something weaker
+  and says so exactly — every file under the item reads end to end without error **and** the
+  total bytes read match the item's known remote size. The size half is not decoration: reading
+  a truncated file to EOF raises nothing, so readability alone once blessed an incomplete item
+  and could authorize deleting the only good copy of it. With both halves the fallback offers
+  precisely the guarantee the rest of the system already runs on — the bytes are all here — and
+  no more: an in-place bit flip with no reference checksum to compare against is undetectable in
+  principle. Demoting the fallback to `SKIPPED` for `move` queues was considered and rejected:
+  it would silently mean a `move` queue can never complete a delete without a sidecar, which is
+  its own surprise for a queue configured for that mode.
+  **The residual risk, stated plainly and not glossed over:** a release whose bytes arrived
+  intact in *count* but wrong in *content* — no sidecar, hash-on-disk fallback off or not
+  applicable — now has its remote copy deleted on a `SKIPPED` verification. Over SFTP that
+  requires corruption surviving both TCP checksums and SSH's per-packet MAC; it is not zero, but
+  it is a different order of likelihood from the truncation the three-check chain above already
+  catches. The user has decided to accept it rather than require a sidecar or the hash-on-disk
+  fallback before a `move` queue can ever complete a delete. A completeness-only delete is
+  recorded distinctly in its own event message (`core/postprocess.py`'s `_maybe_delete_remote`)
+  precisely so this trade is visible after the fact, not just accepted once in the abstract.
+  This also brings the delete gate in line with a rule the pipeline already followed one branch
+  earlier and inconsistently: the download-prefix rename gate (`_process_item`'s `release_ok`)
+  has always treated only `CORRUPT`/`EXTRACT_FAILED` as failures, publishing a `SKIPPED`-verify
+  release under its real name where an `*arr` importer will see it. The old delete gate was
+  *stricter* than that for the reversible action (a remote copy that can be re-downloaded) while
+  the rename gate stayed permissive for the irreversible one (moving files into a library) — the
+  inconsistency ran in the more alarming direction. Restoring the old delete gate alone would not
+  fix that; the rename gate would still publish the same item it withheld the delete for.
 - **Dry-run mode.** Per queue, logs exactly what *would* be deleted and why, and acts on
   nothing. This is the expected way to turn `sync` on for the first time on a real tree.
 - **Full audit trail.** Every delete — and every delete *withheld*, with the failing

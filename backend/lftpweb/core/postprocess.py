@@ -39,11 +39,18 @@ this shape; brought in line by `prompts/2026-08-13-per-queue-archive-cleanup.md`
 also the most destructive of the four (it can be the last copy of an archive's compressed bytes
 anywhere, on a `move` queue -- see `_do_extract` below).
 
-**Deletion (§7.4).** `move` deletes the remote copy only after verification returns
-`VERIFIED` -- never `CORRUPT`, never `SKIPPED` (no evidence). Every delete and every withheld
-delete writes an `event` row (`core/audit.py`) naming the item, the queue, the mode, and the
-gating condition. Deletion itself always goes through `core/remote.py`'s pooled asyncssh
-connection (`RemoteConnectionPool.delete_path`), never lftp's `--Remove-source-files`.
+**Deletion (§7.4).** `move` deletes the remote copy unless verification returns `CORRUPT` --
+real evidence the download is bad. `SKIPPED` (no `.sfv`/`.md5` sidecar and hash-on-disk
+verification disabled -- "no evidence either way") does **not** withhold: by the time this
+runs, the item has already cleared lftp's own exit-0 check, the settle gate, and a filesystem
+completeness check (`core/queue.py`: no leftover `.lftp`/temp files, local bytes >= remote
+total), so the rule is "verification must not have failed," not "verification must have run"
+(2026-08-14, docs/decisions.md). Every delete and every withheld delete writes an `event` row
+(`core/audit.py`) naming the item, the queue, the mode, and the gating condition -- and a
+delete backed only by that completeness evidence, with no checksum behind it, says so in its
+own message rather than reading identically to a checksum-verified one. Deletion itself always
+goes through `core/remote.py`'s pooled asyncssh connection (`RemoteConnectionPool.delete_path`),
+never lftp's `--Remove-source-files`.
 
 **The staging move and `REMOVED_LOCAL`.** After a successful move-to-staging, this module
 does *not* set a new item state -- it deliberately reuses the machinery phase 4 already built
@@ -574,7 +581,7 @@ class PostprocessPipeline:
                 await self.db.commit()
         elif pending_prefix:
             local_root, rename_error = await self._finalize_download_prefix(
-                item, local_root, pending_prefix
+                item, local_root, pending_prefix, verify_state, extract_state
             )
             if rename_error is not None:
                 # No automatic retry for this one -- unlike a failed transfer (re-queueable) or
@@ -644,23 +651,55 @@ class PostprocessPipeline:
     async def _maybe_delete_remote(self, item: Any, queue: Any, verify_state: str | None) -> None:
         """The `move`-mode delete gate (DESIGN.md §7.3/§7.4). Every branch -- delete or
         withhold -- writes an `event` row before returning; there is no silent path here.
+
+        **Withholds only on `CORRUPT`** -- real evidence the download is bad. `SKIPPED` ("no
+        `.sfv`/`.md5` sidecar and hash-on-disk verification disabled") is *not* a failure and
+        proceeds to delete: by the time this runs, the item has already cleared lftp's own
+        exit-0 check, the settle gate, and `core/queue.py`'s filesystem completeness check
+        (no leftover `.lftp`/temp files, local bytes >= remote total) -- the evidence chain
+        the old "verified, or nothing" rule (DESIGN.md §7.3, phase 5) predates. The rule is
+        "verification must not have failed," not "verification must have run." See
+        `docs/decisions.md` (2026-08-14) for the full reasoning and the residual risk this
+        accepts: bytes present in count but wrong in content, which no amount of completeness
+        evidence can catch and only a checksum sidecar (or the hash-on-disk fallback) can.
         """
         item_id = item["id"]
         queue_id = queue["id"]
 
-        if verify_state != "VERIFIED":
-            reason = (
-                "verification produced no usable result for this move-mode item "
-                "(no .sfv/.md5 evidence and hash-on-disk verification is disabled)"
-                if verify_state in (None, "SKIPPED")
-                else f"verification result was {verify_state}, not VERIFIED"
-            )
+        if verify_state == "CORRUPT":
             await audit.record_event(
                 self.db,
                 level="warning",
                 item_id=item_id,
                 kind="remote_delete_withheld",
-                message=f"queue {queue_id} ('{queue['name']}') mode=move: delete withheld -- {reason}",
+                message=(
+                    f"queue {queue_id} ('{queue['name']}') mode=move: delete withheld -- "
+                    "verification result was CORRUPT, not VERIFIED"
+                ),
+            )
+            await self._publish(item_id)
+            return
+
+        if verify_state is None:
+            # Defensive only, never expected in practice: `verify_effective` is forced true
+            # for every `move` queue (see the module docstring), so `verify_state` is always
+            # set by the time this runs. Arriving here with `None` means a code path changed
+            # underneath this function, not a release with no sidecar -- that reads
+            # `SKIPPED`, not `None`. Kept as its own withholding branch, deliberately not
+            # folded into the `CORRUPT` case above, so a future reader doesn't "simplify" the
+            # two back together: one is evidence of a bad download, the other is evidence
+            # this function's own precondition broke.
+            await audit.record_event(
+                self.db,
+                level="error",
+                item_id=item_id,
+                kind="remote_delete_withheld",
+                message=(
+                    f"queue {queue_id} ('{queue['name']}') mode=move: delete withheld -- "
+                    "verification never ran for this move-mode item, which should be "
+                    "impossible (verification is forced on for every move queue) -- treating "
+                    "as a bug rather than deleting on no information at all"
+                ),
             )
             await self._publish(item_id)
             return
@@ -696,12 +735,29 @@ class PostprocessPipeline:
             "UPDATE item SET remote_deleted_at = ? WHERE id = ?", (_now_iso(), item_id)
         )
         await self.db.commit()
+        # Same `kind="remote_delete"` either way -- History filters and `docs/` reference that
+        # kind, and a completeness-only delete is not a different *kind* of event, just one
+        # with weaker evidence behind it. The message and level are what tell them apart: a
+        # human reading History can see at a glance which deletes had a checksum behind them.
+        if verify_state == "VERIFIED":
+            level = "info"
+            message = (
+                f"queue {queue_id} ('{queue['name']}') mode=move: deleted verified remote copy "
+                f"{remote_full}"
+            )
+        else:  # SKIPPED
+            level = "warning"
+            message = (
+                f"queue {queue_id} ('{queue['name']}') mode=move: deleted remote copy "
+                f"{remote_full} on completeness evidence alone (no .sfv/.md5 sidecar; "
+                "hash-on-disk verification disabled)"
+            )
         await audit.record_event(
             self.db,
-            level="info",
+            level=level,
             item_id=item_id,
             kind="remote_delete",
-            message=f"queue {queue_id} ('{queue['name']}') mode=move: deleted verified remote copy {remote_full}",
+            message=message,
         )
         await self._publish(item_id)
 
@@ -948,7 +1004,12 @@ class PostprocessPipeline:
         return True
 
     async def _finalize_download_prefix(
-        self, item: Any, local_root: Path, prefix: str
+        self,
+        item: Any,
+        local_root: Path,
+        prefix: str,
+        verify_state: str | None,
+        extract_state: str | None,
     ) -> tuple[Path, str | None]:
         """Rename `local_root` from its in-flight, prefixed name back to its real one ("folder
         prefix during transfer," `core/download_prefix.py`) -- the pipeline's own last step on a
@@ -973,6 +1034,17 @@ class PostprocessPipeline:
         atomically from an observer's point of view, same-filesystem fast path plus an EXDEV
         copy-then-rename fallback" implementation already in this module, even though `src`/
         `dst` share a parent directory here and so are always same-filesystem in practice.
+
+        `verify_state`/`extract_state` are this run's own results, passed straight through from
+        `_process_item` rather than re-fetched -- they exist here only so the event message can
+        say what actually happened instead of the fixed, and sometimes false, "downloaded,
+        verified, and extracted" wording it used to carry regardless of whether verification
+        even ran (found live, 2026-08-15: a `SKIPPED`-verify, no-archives-found release got that
+        exact sentence). Callers only reach this method once `release_ok` is already true, so
+        `verify_state` is never `CORRUPT` and `extract_state` is never `EXTRACT_FAILED` here --
+        but either can legitimately be `SKIPPED` or `None` (verification/extraction never ran,
+        or found nothing to do), and the message must say so truthfully rather than claim both
+        always happened.
 
         Returns `(new_local_root, None)` on success -- `pending_download_prefix` is cleared in
         the same breath, committed together so a crash between the two can never leave the
@@ -1004,8 +1076,8 @@ class PostprocessPipeline:
             item_id=item["id"],
             kind="download_prefix_removed",
             message=(
-                f"{item['rel_path']!r}: renamed {local_root} -> {dst} now that it has been "
-                "downloaded, verified, and extracted (folder prefix during transfer)"
+                f"{item['rel_path']!r}: renamed {local_root} -> {dst} (folder prefix during "
+                f"transfer) -- verify={verify_state!r}, extract={extract_state!r}"
             ),
         )
         await self._publish(item["id"])

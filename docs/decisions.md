@@ -6,6 +6,96 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-14 — A `move`-mode delete withholds only on `CORRUPT`, not on `SKIPPED`; the rename event stops hardcoding a "verified" it didn't check
+
+`core/postprocess.py._maybe_delete_remote` used to withhold the remote delete whenever
+`verify_state != "VERIFIED"`, folding two different things into one: verification that
+**failed** (`CORRUPT`, real evidence of a bad download) and verification that **did not apply**
+(`SKIPPED`, no `.sfv`/`.md5` sidecar and hash-on-disk verification off, so there was nothing to
+check against). The user's rule, stated directly: **we require verification to pass where it
+applies; we do not require that it ran.** Confirmed live on production (events 160–167, 145–146,
+2026-08-15T01:34Z/01:40Z): two `ar-tv` WEB-DL releases downloaded correctly and had their remote
+copies withheld indefinitely on `SKIPPED`, while a sidecar-bearing release in the same log
+deleted normally on `VERIFIED`. The machinery works; the gate was simply stricter than the rule
+the user actually wants.
+
+**Why this is safe now, and wasn't obviously safe when the strict rule was written (phase 5).**
+By the time `_maybe_delete_remote` runs, the item has already cleared three independent checks:
+lftp exited 0 under `cmd:fail-exit true`; the settle gate held the remote fingerprint stable for
+`REQUIRED_SETTLE_SCANS` *and* `SETTLE_MIN_AGE_S`; and a filesystem completeness check
+(`core/queue.py`, landed the same day this task ran, in response to the incident where lftp
+exited 0 while a file sat 500 MB short as a `.lftp` temp file) requires no leftover `.lftp`/temp
+files anywhere in the tree and local bytes at least matching the remote total. Truncation — the
+main risk the strict "verified, or nothing" gate existed to catch — is now caught upstream by
+that third check, and the gate itself was never re-examined when its primary justification moved
+out from under it. The residual risk, named rather than glossed: a release whose bytes arrived
+intact in *count* but wrong in *content* will now have its remote copy deleted on `SKIPPED`. Over
+SFTP that requires corruption surviving both TCP checksums and SSH's per-packet MAC — not zero,
+but a different order of likelihood from truncation. The user has decided to accept it.
+
+**The same rule was already in the codebase, one branch earlier, and nobody had reconciled the
+two.** `_process_item`'s `release_ok = verify_state != "CORRUPT" and extract_state !=
+"EXTRACT_FAILED"` — the gate on renaming a release off its download-prefix directory so an
+`*arr` importer can see it — has always treated only `CORRUPT`/`EXTRACT_FAILED` as failures, not
+`SKIPPED`. On the two production `ar-tv` items, the *same item in the same second* was judged by
+two different standards: the rename gate said "not CORRUPT → good, publish it under its real name
+where an importer will see it," while the delete gate said "not VERIFIED → not enough evidence to
+act." The inconsistency ran in the more alarming direction: the strict standard guarded the
+*reversible* action (deleting a remote copy that can be re-downloaded), while the permissive one
+guarded the *irreversible* one (publishing to an importer that will move files into a library).
+This is worth being explicit about for whoever next reads §7.3 and feels the urge to restore the
+strict delete gate: doing that alone buys nothing, because the rename gate would still publish
+the same item the delete gate withheld on. This change makes the delete gate agree with a rule
+the pipeline already followed elsewhere, rather than inventing a new policy. It also explains the
+rename event's dishonest wording below — `_finalize_download_prefix` said "downloaded, verified,
+and extracted" because *its own* gate (`release_ok`) had passed; nobody had reconciled that
+sentence with what verification actually returned.
+
+**Rejected alternative: a settings toggle for "delete without checksum evidence."** Considered
+and rejected. Defaulting it off reproduces exactly the reported complaint (a `move` queue that
+never deletes a no-sidecar release). Defaulting it on is unconditional-with-extra-surface — the
+same behaviour as just fixing the gate, plus a knob nobody needs to turn and one more thing that
+can be misconfigured. The three-check evidence chain above is what makes the unconditional
+version safe; a toggle wouldn't change that reasoning, only hide it behind a setting.
+
+**Event level for a completeness-only delete: `warning`, not `info`.** Both `VERIFIED` and
+`SKIPPED` deletes write `kind="remote_delete"` — History filters and `docs/` reference that kind,
+and a completeness-only delete is not a different *kind* of event, just one with weaker evidence
+behind it. But `level="warning"` for the `SKIPPED` case (vs `info` for `VERIFIED`) so it stands
+out in `api/history.py`'s level filter and in `ItemDrawer.tsx`, which already treats
+`error`/`warning` events as worth surfacing prominently — the message text alone
+("... on completeness evidence alone ...") already says which kind it is, but the level makes it
+scannable without reading every message.
+
+**The defensive `verify_state is None` branch stays, deliberately not folded into `CORRUPT`.**
+For a `move` queue `verify_effective` is forced true (see `core/postprocess.py`'s module
+docstring and the phase-5 decision below, which stays true — this task changes what is done with
+verification's *result*, not whether it runs), so `verify_state` is always set by the time this
+gate runs. `None` arriving here means a code path changed underneath this function, not a release
+without a sidecar (that's `SKIPPED`). Kept as its own withholding branch so a future reader
+doesn't "simplify" the two back together — one is evidence of a bad download, the other is
+evidence this function's own precondition broke.
+
+Also fixed in the same change: `_finalize_download_prefix`'s `download_prefix_removed` event
+hardcoded "downloaded, verified, and extracted" regardless of what verify/extract actually
+returned. `verify_state`/`extract_state` are now threaded through from `_process_item` (the
+smaller change against the existing structure — the alternative, building the message at the
+call site, would have meant duplicating the method's own path-resolution logic) so the message
+names the real per-step outcome.
+
+Tests: `tests/test_postprocess.py` — the old "withholds on no verification evidence" test is
+replaced with one proving the delete *proceeds* on `SKIPPED` with the completeness-only message
+and `warning` level; the `CORRUPT`-withholds and `VERIFIED`-deletes tests gained message/level
+assertions so the two paths stay distinguishable; a new test proves the rename event no longer
+claims "verified" for a `SKIPPED` release with nothing to extract. `DESIGN.md` §7.3 corrected in
+place (the repo rule: a build revealing DESIGN.md is wrong gets the doc corrected, never quietly
+diverged from) with the same evidence chain and residual-risk acceptance. Not touched, per the
+prompt's explicit scope: the verify → delete → extract *ordering* question
+(`prompts/open-issues.md`, "Smaller, and genuinely optional") — a `move` queue still deletes the
+remote before extraction runs, unrelated to this task.
+
+---
+
 ## 2026-08-14 — The Files-page Queue button is hidden, not disabled-with-a-reason, when a row has no remote copy to fetch
 
 **Handoff prompt `prompts/done/2026-08-14-hide-queue-when-there-is-no-remote-copy.md`, executed

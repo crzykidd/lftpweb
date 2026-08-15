@@ -1026,9 +1026,15 @@ async def _make_item_row(db, queue_id, rel_path, *, state="DOWNLOADED", remote_s
     return cursor.lastrowid
 
 
-async def test_move_mode_withholds_delete_when_no_verification_evidence(tmp_path):
-    """The prompt's own required test: an unverified item leaves the remote intact, and the
-    withheld delete is recorded as an event.
+async def test_move_mode_deletes_remote_on_skipped_verification_completeness_evidence_only(
+    tmp_path,
+):
+    """(2026-08-14, prompts/done/2026-08-14-skipped-verification-must-not-withhold-the-move-delete.md)
+    `SKIPPED` -- no `.sfv`/`.md5` sidecar and hash-on-disk verification disabled, "no evidence
+    either way" -- must **not** withhold a `move`-mode delete: we require verification to pass
+    where it applies, not that it ran. The delete proceeds on the completeness evidence the item
+    already cleared to get here (lftp exit 0, the settle gate, the filesystem completeness
+    check), and the event message says so rather than reading like a checksum-backed delete.
     """
     db = await _make_db()
     try:
@@ -1049,17 +1055,26 @@ async def test_move_mode_withholds_delete_when_no_verification_evidence(tmp_path
         pipeline = postprocess.PostprocessPipeline(
             db=db, events=EventBus(), remote_pool=pool, host_provider=lambda: _async_host()
         )
-        settings = postprocess.PostprocessSettings()  # everything off; move forces verify on
+        # Everything off; move forces verify on, but no sidecar and hash-on-disk fallback
+        # disabled means it comes back SKIPPED, not VERIFIED.
+        settings = postprocess.PostprocessSettings()
         await pipeline.process_item(item_id, settings)
 
-        assert pool.calls == [], "no delete should have been issued"
-        item = await (await db.execute("SELECT * FROM item WHERE id = ?", (item_id,))).fetchone()
-        assert item["remote_deleted_at"] is None
+        assert len(pool.calls) == 1, "the delete must proceed on a SKIPPED verification"
+        _, remote_path = pool.calls[0]
+        assert remote_path == f"/data/pickup/{rel_path}"
 
-        events = await (await db.execute("SELECT kind, message FROM event")).fetchall()
+        item = await (await db.execute("SELECT * FROM item WHERE id = ?", (item_id,))).fetchone()
+        assert item["remote_deleted_at"] is not None
+
+        events = await (await db.execute("SELECT kind, level, message FROM event")).fetchall()
         kinds = [e["kind"] for e in events]
-        assert "remote_delete_withheld" in kinds
-        assert "remote_delete" not in kinds
+        assert "remote_delete" in kinds
+        assert "remote_delete_withheld" not in kinds
+        delete_event = next(e for e in events if e["kind"] == "remote_delete")
+        assert delete_event["level"] == "warning"
+        assert "completeness evidence alone" in delete_event["message"]
+        assert "no .sfv/.md5 sidecar" in delete_event["message"]
     finally:
         await db.close()
 
@@ -1099,8 +1114,14 @@ async def test_move_mode_deletes_remote_only_after_verification(tmp_path):
         assert item["remote_deleted_at"] is not None
         assert item["state"] == "VERIFIED"  # unchanged by the delete step itself
 
-        events = await (await db.execute("SELECT kind FROM event")).fetchall()
+        events = await (await db.execute("SELECT kind, level, message FROM event")).fetchall()
         assert "remote_delete" in [e["kind"] for e in events]
+        delete_event = next(e for e in events if e["kind"] == "remote_delete")
+        # Checksum-backed wording, unchanged by this task -- only the SKIPPED path gets the
+        # new "completeness evidence alone" phrasing.
+        assert delete_event["level"] == "info"
+        assert "deleted verified remote copy" in delete_event["message"]
+        assert "completeness evidence" not in delete_event["message"]
     finally:
         await db.close()
 
@@ -1133,6 +1154,13 @@ async def test_move_mode_corrupt_item_withholds_delete(tmp_path):
         item = await (await db.execute("SELECT * FROM item WHERE id = ?", (item_id,))).fetchone()
         assert item["state"] == "CORRUPT"
         assert item["remote_deleted_at"] is None
+
+        events = await (await db.execute("SELECT kind, message FROM event")).fetchall()
+        kinds = [e["kind"] for e in events]
+        assert "remote_delete_withheld" in kinds
+        assert "remote_delete" not in kinds
+        withheld = next(e for e in events if e["kind"] == "remote_delete_withheld")
+        assert "CORRUPT" in withheld["message"]
     finally:
         await db.close()
 
@@ -2307,6 +2335,80 @@ async def test_prefix_renamed_off_only_after_verify_succeeds(tmp_path):
         assert len(events) == 1
         assert str(prefixed_dir) in events[0]["message"]
         assert str(final_dir) in events[0]["message"]
+    finally:
+        await db.close()
+
+
+async def test_rename_message_reflects_skipped_verify_and_no_archives_truthfully(tmp_path):
+    """(2026-08-14, prompts/done/2026-08-14-skipped-verification-must-not-withhold-the-move-delete.md)
+    The `download_prefix_removed` event used to hardcode "downloaded, verified, and extracted"
+    regardless of what actually happened. Found live: a `move`-mode release with no `.sfv`/`.md5`
+    sidecar (verify -> `SKIPPED`) and no archives to unpack (extract -> nothing to do) got that
+    exact sentence in the same second its own `verify`/`extract` events said otherwise. The
+    message must name the real outcome of each step, not a fixed claim of success.
+    """
+    db = await _make_db()
+    try:
+        local_dir = tmp_path / "local"
+        local_dir.mkdir()
+        rel_path = "Release"
+        content = b"a loose file with no sidecar and nothing to extract"
+        # sync_mode="move" forces verify_effective on regardless of the queue's own
+        # auto_verify column (DESIGN.md §7.3) -- and with no .sfv/.md5 sidecar and
+        # verify_hash_on_disk left at its off default, that verification comes back
+        # SKIPPED, not VERIFIED.
+        _, queue_id = await _make_host_and_queue_rows(db, sync_mode="move", auto_extract=1)
+        await db.execute(
+            "UPDATE path_queue SET local_path = ? WHERE id = ?", (str(local_dir), queue_id)
+        )
+        await db.commit()
+        item_id, prefixed_dir = await _make_prefixed_dir_item(
+            db, queue_id, rel_path, local_root_dir=local_dir, remote_size=len(content)
+        )
+        prefixed_dir.mkdir()
+        (prefixed_dir / "a.mkv").write_bytes(content)
+
+        pipeline = postprocess.PostprocessPipeline(
+            db=db, events=EventBus(), remote_pool=_FakeRemotePool(), host_provider=_async_host
+        )
+        settings = postprocess.PostprocessSettings(extract_enabled=True)
+        await pipeline.process_item(item_id, settings)
+
+        final_dir = local_dir / rel_path
+        assert final_dir.is_dir(), "SKIPPED verify and no-archives extract are not failures"
+        assert not prefixed_dir.exists()
+
+        item = await (await db.execute("SELECT * FROM item WHERE id = ?", (item_id,))).fetchone()
+        assert item["state"] == "DOWNLOADED"  # SKIPPED verify never claims VERIFIED
+
+        events = await (
+            await db.execute(
+                "SELECT kind, message FROM event WHERE item_id = ? AND kind = 'verify'",
+                (item_id,),
+            )
+        ).fetchall()
+        assert len(events) == 1 and events[0]["message"].startswith("SKIPPED")
+
+        extract_events = await (
+            await db.execute(
+                "SELECT message FROM event WHERE item_id = ? AND kind = 'extract'", (item_id,)
+            )
+        ).fetchall()
+        assert len(extract_events) == 1
+        assert "no archives" in extract_events[0]["message"]
+
+        rename_events = await (
+            await db.execute(
+                "SELECT message FROM event WHERE item_id = ? AND kind = 'download_prefix_removed'",
+                (item_id,),
+            )
+        ).fetchall()
+        assert len(rename_events) == 1
+        message = rename_events[0]["message"]
+        # The old hardcoded claim must be gone, and the real per-step outcomes present instead.
+        assert "downloaded, verified, and extracted" not in message
+        assert "verify='SKIPPED'" in message
+        assert "extract=None" in message
     finally:
         await db.close()
 

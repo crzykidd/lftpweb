@@ -1120,6 +1120,28 @@ alongside this list: several entries below ship with deliberate, documented limi
   `HOST_UNREACHABLE`/`TLS_ERROR` instead of suppressing the item. A genuinely missing remote
   file — a different message shape, no `rename(...)` wrapper — still classifies `REMOTE_GONE`
   and still never retries.
+- **A `move`-mode remote delete was withheld on `SKIPPED` verification, not only on `CORRUPT`**
+  *(2026-08-14, confirmed live: two `ar-tv` releases with no `.sfv`/`.md5` sidecar downloaded
+  correctly and had their remote copies withheld, while a sidecar-bearing release in the same
+  log deleted normally)*. The rule was "verification must have run and passed"; the correct
+  rule, and the one now implemented, is "verification must not have failed" — `SKIPPED` ("no
+  `.sfv`/`.md5` sidecar found and hash-on-disk verification is disabled") is not a failure, only
+  `CORRUPT` is. **Behaviour change an existing install will notice: a `move` queue's releases
+  with no checksum sidecar will now have their remote copy deleted, where previously it was kept
+  indefinitely.** This is safe now in a way it would not have been when the stricter rule was
+  written (phase 5): by the time this gate runs, the item has already cleared lftp's own exit-0
+  check, the settle gate, and (added earlier the same day) a filesystem completeness check — no
+  leftover `.lftp`/temp files, local bytes at least matching the remote total — which closes the
+  truncation risk the strict gate existed to catch. The residual risk is content that is wrong
+  despite arriving complete, undetectable without a checksum to compare against; accepted, not
+  hidden — a delete backed only by this completeness evidence records a distinct event message
+  ("deleted remote copy ... on completeness evidence alone") rather than reading identically to
+  a checksum-verified one, at `warning` level so it stands out in History. Also fixed in the same
+  change: the download-prefix rename's own event message used to hardcode "downloaded, verified,
+  and extracted" regardless of what verify/extract actually returned — found live, the same two
+  `ar-tv` items got that exact sentence while their own `verify`/`extract` events recorded
+  `SKIPPED`/"no archives found" in the same second. It now names the real `verify_state`/
+  `extract_state`.
 
 ### Security
 
