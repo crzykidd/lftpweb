@@ -410,6 +410,26 @@ def resolve_within_root(candidate: Path, root: Path) -> Path | None:
     return resolved_candidate
 
 
+def find_escaping_path(staging_dir: Path) -> Path | None:
+    """Return the first entry under `staging_dir` that resolves *outside* it, or `None` when
+    every entry is contained (audit S2, docs/audit-v0.1.0.md).
+
+    The realistic residual archive-escape after 7zz/unrar are handed `-o<staging>` is a
+    **symlink member** pointing out of the extraction root (7zz and unrar both strip literal
+    `../` traversal members themselves, but a symlink entry is content, not a path they
+    rewrite): the symlink lands inside staging, and anything written *through* it, or a later
+    move that follows it, escapes. `resolve_within_root` resolves symlinks, so walking staging
+    and rejecting any entry that resolves out of it catches exactly that case -- before a single
+    byte of un-vetted archive content is merged into the published tree. `rglob` does not recurse
+    into a symlinked directory, so a malicious symlink is inspected, never followed, here.
+    """
+    root = staging_dir.resolve()
+    for entry in staging_dir.rglob("*"):
+        if resolve_within_root(entry, root) is None:
+            return entry
+    return None
+
+
 def _staging_dirs(final_dir: Path) -> tuple[Path, Path]:
     """The `_UNPACK_`/`_FAILED_` siblings of `final_dir`. Always siblings, never children --
     a child would sit inside the tree `core/local_scan.py` walks (and inside anything a later
@@ -509,6 +529,24 @@ def extract_item(
                 f"{len(failures)} of {len(archives)} archive(s) failed: "
                 + "; ".join(failures)
                 + f" -- partial output kept at {failed_dir}"
+            ),
+        )
+
+    # Audit S2: never merge un-vetted archive output that escapes the staging root (a symlink
+    # member pointing outside it) into the published tree. Checked here, on the whole staged
+    # result, before the merge -- refusing is `EXTRACT_FAILED` (which withholds the rename and
+    # is surfaced/audited exactly like any other extraction failure), and the offending tree is
+    # kept as `_FAILED_` evidence rather than silently discarded.
+    escaping = find_escaping_path(staging_dir)
+    if escaping is not None:
+        if failed_dir.exists():
+            shutil.rmtree(failed_dir)
+        staging_dir.rename(failed_dir)
+        return ExtractResult(
+            state="EXTRACT_FAILED",
+            detail=(
+                f"extraction produced a path escaping the staging root ({escaping.name!r}) "
+                f"-- refusing to publish it; kept at {failed_dir}"
             ),
         )
 

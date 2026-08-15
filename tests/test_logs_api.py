@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import logging
 
+import pytest
 from fastapi.testclient import TestClient
 
+from lftpweb.api.logs import _ROTATED_RE
 from lftpweb.main import app
 
 
@@ -75,6 +77,36 @@ def test_download_rejects_path_traversal(isolated_config):
     with TestClient(app) as client:
         resp = client.get("/api/logs/..%2F..%2Fetc%2Fpasswd/download")
         assert resp.status_code in (404, 400)
+
+
+# The HTTP test above can pass for the wrong reason -- a 404 from the router failing to match
+# the route at all looks identical to a 404 from the guard doing its job. This one asserts the
+# guard itself. `_ROTATED_RE` is the only thing between a request-supplied name and a
+# filesystem path, so its anchoring is a security control: five CodeQL `py/path-injection`
+# alerts here and on the backup-download endpoint were dismissed as false positives on exactly
+# this reasoning (2026-08-14). Note the trailing newline: `$` would accept it, `\Z` does not.
+@pytest.mark.parametrize(
+    "name",
+    [
+        "../../etc/passwd",
+        "/etc/passwd",
+        "sub/lftpweb.log",
+        "lftpweb.log/../../etc/passwd",
+        "lftpweb.log\n",
+        "lftpweb.log\x00",
+        "lftpweb.log.0",
+        "lftpweb.log.01",
+        "",
+    ],
+)
+def test_rotated_log_pattern_is_strictly_anchored(name):
+    assert _ROTATED_RE.match(name) is None
+
+
+def test_rotated_log_pattern_accepts_the_real_names():
+    assert _ROTATED_RE.match("lftpweb.log")
+    assert _ROTATED_RE.match("lftpweb.log.1")
+    assert _ROTATED_RE.match("lftpweb.log.12")
 
 
 def test_credential_redaction_already_covers_what_the_endpoint_can_expose(isolated_config):

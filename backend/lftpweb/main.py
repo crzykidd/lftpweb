@@ -6,6 +6,7 @@ correctly instead of 404ing.
 from __future__ import annotations
 
 import logging
+import os.path
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -18,8 +19,9 @@ from fastapi.staticfiles import StaticFiles
 from lftpweb import __version__
 from lftpweb.api import auth as auth_api
 from lftpweb.api import backup as backup_api
-from lftpweb.api import files, health, history, jobs, logs, settings as settings_api, stats, ws
+from lftpweb.api import files, health, history, jobs, logs, stats, ws
 from lftpweb.api import metrics as metrics_api
+from lftpweb.api import settings_host, settings_postprocess, settings_queues
 from lftpweb.config import settings
 from lftpweb.core import auth
 from lftpweb.core.autoqueue import AutoQueue
@@ -32,7 +34,7 @@ from lftpweb.core.postprocess import PostprocessPipeline
 from lftpweb.core.queue import TransferQueue
 from lftpweb.db import connect, migrate
 from lftpweb.logsetup import setup_logging
-from lftpweb.middleware import AuthMiddleware
+from lftpweb.middleware import AuthMiddleware, SecurityHeadersMiddleware
 
 logger = logging.getLogger(__name__)
 
@@ -155,10 +157,19 @@ def create_app() -> FastAPI:
     # why a single ASGI middleware was chosen over a per-router Depends(). Added before any
     # router so a newly mounted router is covered without a second decision at the call site.
     app.add_middleware(AuthMiddleware)
+    # Added after AuthMiddleware so it wraps it (Starlette applies middleware outermost-last):
+    # every response, including a 401/403 the auth gate itself produces and every static/SPA
+    # response, carries the headers. See middleware.py for why this is the safe header subset
+    # and why no CSP/HSTS is set here (audit S4).
+    app.add_middleware(SecurityHeadersMiddleware)
 
     app.include_router(health.router)
     app.include_router(stats.router)
-    app.include_router(settings_api.router)
+    # Settings routers, split out of the former monolithic api/settings.py (audit P2). All three
+    # share the /api/settings prefix; order is cosmetic.
+    app.include_router(settings_host.router)
+    app.include_router(settings_queues.router)
+    app.include_router(settings_postprocess.router)
     app.include_router(files.router)
     app.include_router(jobs.router)
     app.include_router(history.router)
@@ -176,14 +187,38 @@ def create_app() -> FastAPI:
         if assets_dir.is_dir():
             app.mount("/assets", StaticFiles(directory=assets_dir), name="spa-assets")
 
+        static_root = os.path.realpath(str(static_dir))
+        index_html = static_dir / "index.html"
+
         @app.get("/{full_path:path}", include_in_schema=False)
         async def spa_fallback(full_path: str) -> FileResponse:
             if full_path.startswith("api/"):
                 raise HTTPException(status_code=404)
-            candidate = static_dir / full_path
-            if full_path and candidate.is_file():
-                return FileResponse(candidate)
-            return FileResponse(static_dir / "index.html")
+            # `full_path` is request-controlled and reaches this handler percent-decoded but
+            # *not* `..`-normalized -- a client can send `..%2f..%2fetc/passwd` and uvicorn
+            # passes it straight through. This route is also outside the /api/ auth gate
+            # (middleware.py only gates /api/), so serving `static_dir / full_path` blindly is
+            # an unauthenticated arbitrary file read. Guard it with the exact form CodeQL's own
+            # `py/path-injection` remediation recommends and recognises as a barrier: resolve
+            # the joined path (`realpath` follows `..` *and* symlinks) and confirm it is the
+            # static root or sits beneath it via a `startswith(root + sep)` check, falling back
+            # to the SPA shell on any escape rather than 403ing (a normal deep link that happens
+            # not to exist on disk must still render the SPA). See docs/audit-v0.1.0.md finding
+            # S1; the earlier `pathlib.relative_to` form was equivalent but not modelled by
+            # CodeQL, so it flagged its own fix.
+            requested = os.path.realpath(os.path.join(static_root, full_path))
+            # Containment via `os.path.commonpath`, the barrier CodeQL's own py/path-injection
+            # remediation recognises, evaluated in a *positive* branch that wraps the file use:
+            # `commonpath([root, requested]) == root` is true exactly when `requested` is the
+            # static root or a descendant of it (both are absolute `realpath` results, so
+            # `commonpath` can't raise on mismatched/relative kinds), so `requested` reaches
+            # `isfile`/`FileResponse` only where it is provably contained. Anything else --
+            # a `..%2f…` escape, a symlink out of the tree -- falls through to the SPA shell.
+            # See docs/audit-v0.1.0.md finding S1.
+            if os.path.commonpath([static_root, requested]) == static_root:
+                if full_path and os.path.isfile(requested):
+                    return FileResponse(requested)
+            return FileResponse(index_html)
 
     return app
 

@@ -7,12 +7,8 @@ import type { FileNode, RemovalGraceSettingsOut, SettleSettingsOut } from '../ap
 import type { ChildSpeedSample } from '../hooks/useLiveModel'
 import {
   bothSidesRows,
-  childEtaS,
-  childSpeedLabel,
-  childSpeedSortValue,
   deletedArchiveLabel,
   formatBytes,
-  formatEta,
   formatPercent,
   hasBothSides,
   isDeletedArchiveVolume,
@@ -26,15 +22,42 @@ import {
   settleWaitLabel,
   settleWaitShortLabel,
   stateAgeLabel,
-  transferEtaLabel,
-  transferSpeedLabel,
-  transferSpeedSortValue,
 } from '../lib/format'
 import { placePopover, POPOVER_EDGE_MARGIN_PX } from '../lib/popoverPosition'
 import { readLocalStorage, writeLocalStorage } from '../lib/storage'
 import { DetailButton, LifecycleIcons } from './LifecycleIcons'
 import { ItemDrawer } from './ItemDrawer'
 import { StateChip } from './StateChip'
+// Pure tree/sort/collapse/facet/column-width logic, extracted to a plain module (audit P1) --
+// the component keeps every JSX/stateful piece and pulls these back in by name.
+import {
+  buildTree,
+  clampColumnWidth,
+  DEFAULT_COLLAPSE_PREFERENCE,
+  DEFAULT_SORT_PREFERENCE,
+  effectiveEtaLabel,
+  effectiveSpeedLabel,
+  fixedColumnStyle,
+  flatten,
+  hasRemoteCopy,
+  isCollapsePreference,
+  isColumnWidths,
+  isSortPreference,
+  matchesFacetFilter,
+  mergeColumnWidths,
+  nodeDisplaySize,
+  RESIZABLE_COLUMNS,
+  resolveCollapsed,
+  rowAction,
+  sortTree,
+  type CollapsePreference,
+  type ColumnDef,
+  type ColumnWidths,
+  type FacetFilter,
+  type SortKey,
+  type SortPreference,
+  type TreeEntry,
+} from '../lib/fileTree'
 
 // One shared ticker per tree, not a `setInterval` per row (migration 006's `state_changed_at`
 // column, DESIGN.md §9.2). This page can hold thousands of rows; a per-row timer would mean
@@ -45,220 +68,12 @@ const AGE_TICK_INTERVAL_MS = 15_000
 
 const ROW_HEIGHT_PX = 32
 
-/** How long a `child_progress` sample (2026-08-14, "per-file speed inside a mirror") is
- * trusted before `buildTree` treats it as stale and resolves `child_speed_bps` to `null` --
- * the frontend half of the freshness-gating decision (see `lib/format.ts`'s module comment
- * above `childSpeedLabel`, and docs/decisions.md). The backend throttles a live child's own
- * publish cadence to roughly `CHILD_PROGRESS_THROTTLE_TICKS * tick_s` while it keeps changing
- * (~3s at the default `tick_s`, `core/queue.py`) but that constant isn't on the wire and
- * `tick_s` is configurable, so this is a generous, independent multiple of the *default* rather
- * than a value derived from a setting the frontend can't see -- loose enough to absorb normal
- * jitter (a slow tick, WS latency) without a value flickering off between two genuinely live
- * samples, tight enough that a child that actually stopped changing reads as "not transferring"
- * again within a few seconds, not indefinitely.
- */
-export const CHILD_SPEED_FRESHNESS_MS = 10_000
 
 const inputClasses =
   'rounded-md border border-zinc-300 bg-white px-2.5 py-1.5 text-sm text-zinc-900 outline-none focus:border-zinc-500 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100'
 
-// Exported (trivial, non-behavioral) so FileTree.test.ts can build fixtures and call the pure
-// tree/collapse/filter/column-width helpers below directly, without rendering the component --
-// prompts/2026-08-13-frontend-test-runner.md's own instruction was to add exports, not to
-// restructure working code, to make this logic reachable from a test.
-export interface TreeEntry extends FileNode {
-  name: string
-  depth: number
-  children: TreeEntry[]
-  /** The live, EMA-smoothed instantaneous rate from the `progress` WS message
-   * (2026-08-14, prompts/2026-08-14-files-page-speed-column.md), looked up by this row's own
-   * `id` from the `speedByItemId` map `FileTree` threads in from `useLiveModel`. Not part of
-   * `FileNode`'s wire shape -- computed here by `buildTree`, the same way `name`/`depth` are,
-   * so it's available wherever a `TreeEntry` is (sorting, the Row cell) without a second prop
-   * drilled down to `Row`. `null` for any row that isn't the parent item of a currently-running
-   * job -- including every child of a mirroring directory, which never gets its own speed on
-   * the wire at all (`core/queue.py._publish_child_progress`'s own docstring). See
-   * `lib/format.ts`'s module comment above `transferSpeedLabel` for why this is never a derived
-   * average.
-   */
-  speed_bps: number | null
-  /** A **child** file's own live rate (2026-08-14, "per-file speed inside a mirror") -- from
-   * the `child_progress` WS message (`core/queue.py._publish_child_progress`), looked up by
-   * this row's own `id` from the `childSpeedByItemId` map, and resolved to `null` here (not
-   * just left to the caller) whenever the sample is older than `CHILD_SPEED_FRESHNESS_MS` --
-   * see that constant's own comment for why freshness, not `state`, is what gates a child
-   * (every actively-transferring child sits at `PARTIAL`, never `DOWNLOADING`, so `speed_bps`
-   * above is `null` for it and `transferSpeedLabel` would show nothing). Distinct from
-   * `speed_bps`: a directory's own row can carry both a job-level `speed_bps` (it *is* the
-   * parent of the running job) and, structurally, never a `child_speed_bps` of its own (only
-   * leaf files appear in `core/queue.py.JobProgress.children`) -- see `effectiveSpeedLabel`/
-   * `effectiveSpeedSortValue` below for how a row picks between the two without ever summing
-   * them (§9.2's "don't let the numbers read as additive").
-   */
-  child_speed_bps: number | null
-  /** The **job-level** ETA (2026-08-14, "ETA on Files rows") -- `core/progress.py.JobProgress.
-   * eta_s`, already fully computed server-side and threaded onto the wire on the same
-   * `progress` message `speed_bps` rides, looked up here by this row's own `id` from the
-   * `etaByItemId` map exactly the way `speed_bps` is looked up from `speedByItemId`. `null` for
-   * the same set of rows `speed_bps` is `null` for, plus whenever the backend itself has no ETA
-   * to report (unknown `bytes_total`, or a zero smoothed speed) -- see `transferEtaLabel`
-   * (`lib/format.ts`) for the display gate. There is no `child_eta_s` field alongside this one:
-   * a child's ETA isn't carried on the wire at all (`_publish_child_progress` only ever emits a
-   * rate), so it's derived on demand from `remote_size`/`local_size`/`child_speed_bps` by
-   * `effectiveEtaLabel` below rather than pre-computed and stored per row.
-   */
-  eta_s: number | null
-}
 
-/** What a row's own size column shows. A **file** prefers `local_size` (falling back to
- * `remote_size` only when local is unknown) so an in-progress download's cell reads as live
- * progress, not the eventual total. A **directory** is the opposite: `remote_size` first --
- * it's the rollup total for the whole subtree while anything is still incomplete, which is the
- * more useful "how big is this" reading -- falling back to `local_size` only when
- * `remote_size` is unknown. That fallback used to not exist at all (2026-08-13,
- * `prompts/2026-08-13-delete-state-truthfulness.md` defect 4): a completed directory on a
- * `move` queue has `remote_size` go `NULL` the moment its verified remote copy is deleted
- * (DESIGN.md §6/§7.4), so every file inside it kept showing a size (their own fallback already
- * covered that) while the directory row wrapping them went blank. Both sizes are already
- * rollups from `core/reconcile.py`, so there's nothing new to compute, just the same shape of
- * fallback files already had. Named and shared so `Row`, the hover tooltip, and the `size`
- * sort key (`sortValue` below) all read this one function and can never quietly disagree about
- * what "size" means for a node.
- */
-function nodeDisplaySize(entry: TreeEntry): number | null {
-  return entry.is_dir
-    ? (entry.remote_size ?? entry.local_size)
-    : (entry.local_size ?? entry.remote_size)
-}
 
-/** The Speed column's actual text for one row -- prefers the row's own **job-level** rate
- * (`speed_bps`, gated on `state === 'DOWNLOADING'` by `transferSpeedLabel`) and falls back to
- * its **child-level** rate (`child_speed_bps`, already freshness-filtered by `buildTree`) only
- * when the job-level reading has nothing to show. The two can never both apply to the same row
- * in a way that would read as additive: `speed_bps` is only ever non-null for the parent item
- * of a currently-running job, `child_speed_bps` is only ever non-null for a leaf file
- * (`core/queue.py.JobProgress.children` never includes the mirror job's own top-level
- * directory), and sorting only ever reorders siblings (`sortSiblingsRecursive` below), never
- * compares a directory against its own children -- so this fallback is a per-row either/or, not
- * a place two live rates could be shown, compared, or summed as peers (§9.2's own bar for this
- * task: "no sort that mixes parent and child rates as peers without the tree structure making
- * the relationship obvious").
- */
-export function effectiveSpeedLabel(entry: TreeEntry): string {
-  const jobLabel = transferSpeedLabel(entry.state, entry.speed_bps)
-  return jobLabel !== '—' ? jobLabel : childSpeedLabel(entry.child_speed_bps)
-}
-
-/** `effectiveSpeedLabel`'s sort-value counterpart -- same job-level-first, child-level-fallback
- * shape, both already null-safe/null-last via `compareValues`.
- */
-export function effectiveSpeedSortValue(entry: TreeEntry): number | null {
-  return transferSpeedSortValue(entry.state, entry.speed_bps) ?? childSpeedSortValue(entry.child_speed_bps)
-}
-
-/** The Speed cell's ETA text for one row (2026-08-14, "ETA on Files rows") -- same job-level-
- * first, child-level-fallback shape as `effectiveSpeedLabel` right above, and for the identical
- * reason: `entry.eta_s` is only ever non-null for the parent item of a currently-running job,
- * `childEtaS(...)` only ever produces something for a leaf file with a fresh
- * `child_speed_bps`, and the two can never both apply to the same row. Deliberately **not**
- * given its own sort key -- see the `speed` column's own comment (`RESIZABLE_COLUMNS` below) for
- * why the Speed column keeps sorting by rate even though its cell now shows both.
- */
-export function effectiveEtaLabel(entry: TreeEntry): string {
-  const jobLabel = transferEtaLabel(entry.state, entry.eta_s)
-  return jobLabel !== '—'
-    ? jobLabel
-    : formatEta(childEtaS(entry.remote_size, entry.local_size, entry.child_speed_bps))
-}
-
-export function buildTree(
-  nodes: FileNode[],
-  speedByItemId: Record<number, number> = {},
-  /** `useLiveModel.ts`'s `childSpeedByItemId` (2026-08-14, "per-file speed inside a mirror") --
-   * default `{}` keeps every pre-existing 2-arg call site (and test) working unchanged.
-   */
-  childSpeedByItemId: Record<number, ChildSpeedSample> = {},
-  /** `useLiveModel.ts`'s `etaByItemId` (2026-08-14, "ETA on Files rows") -- same shape and same
-   * default as `speedByItemId` above, resolved onto `eta_s` the same way `speed_bps` is.
-   */
-  etaByItemId: Record<number, number | null> = {},
-  /** Injectable so the freshness check below is deterministic in a test, exactly like
-   * `core/progress.py.ProgressSampler.sample`'s own `now` parameter -- defaults to the real
-   * clock for every production call site.
-   */
-  now: number = Date.now(),
-): TreeEntry[] {
-  const byPath = new Map<string, TreeEntry>()
-  const roots: TreeEntry[] = []
-
-  // Parents always sort before children by path-segment count (DESIGN.md §5/§9.2's model
-  // persists a row for every node, file or directory, so every ancestor is guaranteed to be
-  // present in `nodes` — this doesn't need to tolerate a missing parent, but does so
-  // defensively rather than dropping an orphaned node from the view).
-  const sorted = [...nodes].sort(
-    (a, b) => a.rel_path.split('/').length - b.rel_path.split('/').length,
-  )
-
-  for (const node of sorted) {
-    const lastSlash = node.rel_path.lastIndexOf('/')
-    const name = lastSlash === -1 ? node.rel_path : node.rel_path.slice(lastSlash + 1)
-    const parentPath = lastSlash === -1 ? null : node.rel_path.slice(0, lastSlash)
-    const parent = parentPath ? byPath.get(parentPath) : undefined
-    const childSample = node.id != null ? childSpeedByItemId[node.id] : undefined
-    const entry: TreeEntry = {
-      ...node,
-      name,
-      depth: parent ? parent.depth + 1 : 0,
-      children: [],
-      speed_bps: node.id != null ? (speedByItemId[node.id] ?? null) : null,
-      child_speed_bps:
-        childSample != null && now - childSample.receivedAt <= CHILD_SPEED_FRESHNESS_MS
-          ? childSample.speedBps
-          : null,
-      eta_s: node.id != null ? (etaByItemId[node.id] ?? null) : null,
-    }
-    byPath.set(node.rel_path, entry)
-    if (parent) parent.children.push(entry)
-    else roots.push(entry)
-  }
-
-  const byNameThenDir = (a: TreeEntry, b: TreeEntry) =>
-    a.is_dir === b.is_dir ? a.name.localeCompare(b.name) : a.is_dir ? -1 : 1
-  const sortRecursive = (entries: TreeEntry[]) => {
-    entries.sort(byNameThenDir)
-    for (const e of entries) sortRecursive(e.children)
-  }
-  sortRecursive(roots)
-  return roots
-}
-
-/** Depth-first, respecting `isCollapsed` -- this is what gets virtualized. A collapsed
- * directory's children simply never enter the flat list, so scroll math stays correct
- * without the virtualizer needing to know anything about tree structure. A predicate rather
- * than a `Set` of collapsed paths (2026-08-13) -- the persisted collapse preference below is
- * "default plus exceptions," not an enumerable set of collapsed paths, and a predicate is the
- * one shape that works for both that and the old plain-`Set` caller.
- */
-export function flatten(roots: TreeEntry[], isCollapsed: (path: string) => boolean): TreeEntry[] {
-  const out: TreeEntry[] = []
-  const walk = (entries: TreeEntry[]) => {
-    for (const entry of entries) {
-      out.push(entry)
-      if (entry.is_dir && !isCollapsed(entry.rel_path)) walk(entry.children)
-    }
-  }
-  walk(roots)
-  return out
-}
-
-// --- Sorting (2026-08-13): reorders siblings within each parent, never the flattened array --
-// flattening is what the virtualizer walks, and sorting it directly would tear children away
-// from their parents. `sortTree` below runs on the built tree, before `flatten`.
-
-export type SortKey = 'name' | 'size' | 'speed' | 'state_changed_at' | 'percent'
-export type SortDir = 'asc' | 'desc'
-
-const SORT_KEYS: SortKey[] = ['name', 'size', 'speed', 'state_changed_at', 'percent']
 const SORT_LABELS: Record<SortKey, string> = {
   name: 'Name',
   size: 'Size',
@@ -314,160 +129,8 @@ function SortHeaderButton({
   )
 }
 
-function sortValue(entry: TreeEntry, key: SortKey): string | number | null {
-  switch (key) {
-    case 'name':
-      return entry.name.toLowerCase()
-    case 'size':
-      return nodeDisplaySize(entry)
-    case 'speed':
-      // Non-transferring rows sort to one end regardless of direction (`compareValues`'s
-      // existing null-last rule) rather than interleaving by a coincidental zero -- see
-      // `transferSpeedSortValue`'s own docstring in `lib/format.ts`. Falls back to a child's own
-      // rate when the row isn't a running job's parent (`effectiveSpeedSortValue`'s own
-      // docstring) -- 2026-08-14, "per-file speed inside a mirror".
-      return effectiveSpeedSortValue(entry)
-    case 'state_changed_at':
-      return entry.state_changed_at
-    case 'percent':
-      return percentValue(entry.local_size, entry.remote_size)
-  }
-}
 
-/** Null/absent values always sort last, regardless of direction -- an "unknown" reading
- * (no `remote_size`, no `state_changed_at` yet) staying put rather than jumping to the top the
- * moment a user flips to descending is the less surprising behavior of the two.
- */
-export function compareValues(a: string | number | null, b: string | number | null, dir: SortDir): number {
-  if (a == null && b == null) return 0
-  if (a == null) return 1
-  if (b == null) return -1
-  const cmp = typeof a === 'string' && typeof b === 'string' ? a.localeCompare(b) : (a as number) - (b as number)
-  return dir === 'asc' ? cmp : -cmp
-}
 
-function sortSiblingsRecursive(entries: TreeEntry[], key: SortKey, dir: SortDir): void {
-  entries.sort((a, b) => {
-    if (key === 'name') {
-      // Preserves the tree's existing default look (directories grouped before files) --
-      // direction flips the name ordering within each group, not the grouping itself.
-      if (a.is_dir !== b.is_dir) return a.is_dir ? -1 : 1
-      const cmp = a.name.localeCompare(b.name)
-      return dir === 'asc' ? cmp : -cmp
-    }
-    const cmp = compareValues(sortValue(a, key), sortValue(b, key), dir)
-    if (cmp !== 0) return cmp
-    // Tie-break so equal values don't jitter across renders: directories first, then name.
-    if (a.is_dir !== b.is_dir) return a.is_dir ? -1 : 1
-    return a.name.localeCompare(b.name)
-  })
-  for (const entry of entries) sortSiblingsRecursive(entry.children, key, dir)
-}
-
-/** Sorts every level of the tree by `key`/`dir`, siblings only -- a directory's own position
- * among its siblings is decided by its rollup size/percent/`state_changed_at` (already computed
- * by `core/reconcile.py`/`core/itemview.py`, nothing derived here), and its children are sorted
- * the same way one level down. Returns a fresh tree (deep-cloned) rather than mutating `roots`
- * in place, so this stays a pure function of its inputs -- safe to call from a `useMemo`.
- */
-export function sortTree(roots: TreeEntry[], key: SortKey, dir: SortDir): TreeEntry[] {
-  const clone = (entries: TreeEntry[]): TreeEntry[] =>
-    entries.map((entry) => ({ ...entry, children: clone(entry.children) }))
-  const cloned = clone(roots)
-  sortSiblingsRecursive(cloned, key, dir)
-  return cloned
-}
-
-// --- Collapse preference (2026-08-13): "default plus exceptions," not a saved set of ---------
-// collapsed paths -- a directory that appears later (over the WebSocket) inherits the current
-// default automatically; only per-row overrides are tracked explicitly.
-
-export interface CollapsePreference {
-  defaultCollapsed: boolean
-  exceptions: string[]
-}
-
-const DEFAULT_COLLAPSE_PREFERENCE: CollapsePreference = { defaultCollapsed: false, exceptions: [] }
-
-export function isCollapsePreference(value: unknown): value is CollapsePreference {
-  if (typeof value !== 'object' || value == null) return false
-  const v = value as Record<string, unknown>
-  return (
-    typeof v.defaultCollapsed === 'boolean' &&
-    Array.isArray(v.exceptions) &&
-    v.exceptions.every((p) => typeof p === 'string')
-  )
-}
-
-/** The default-plus-exceptions model itself, in one place (2026-08-13,
- * prompts/2026-08-13-frontend-test-runner.md) -- pulled out of the `isPathCollapsed` closure
- * below purely so it's callable from a test without rendering the component; behavior is
- * unchanged. A path in `exceptions` reads as the *opposite* of the default; every other path --
- * including one that has never been seen before, e.g. a directory that just arrived over the
- * WebSocket -- reads as the default itself. That "unknown path falls through to the default"
- * behavior, not any explicit per-path bookkeeping, is what makes a newly-arrived directory
- * inherit the current default automatically.
- */
-export function resolveCollapsed(defaultCollapsed: boolean, exceptions: Set<string>, path: string): boolean {
-  return exceptions.has(path) ? !defaultCollapsed : defaultCollapsed
-}
-
-export interface SortPreference {
-  key: SortKey
-  dir: SortDir
-}
-
-const DEFAULT_SORT_PREFERENCE: SortPreference = { key: 'name', dir: 'asc' }
-
-export function isSortPreference(value: unknown): value is SortPreference {
-  if (typeof value !== 'object' || value == null) return false
-  const v = value as Record<string, unknown>
-  return (
-    typeof v.key === 'string' &&
-    (SORT_KEYS as string[]).includes(v.key) &&
-    (v.dir === 'asc' || v.dir === 'desc')
-  )
-}
-
-/** What this row's own action button offers, if anything (DESIGN.md §9.2, §4.7). Manual
- * queueing always wins over auto-queue suppression and is never filtered by the UI based on
- * state (STOPPED/FAILED included) -- the one exception is a node with nothing remote to fetch
- * at all (`!hasRemoteCopy(node)`, defined below), where there is nothing a "Queue" action could
- * mean.
- *
- * **Gated on the fact, not a state string** (2026-08-14, reported live: after a `move`-mode
- * release completed and its remote copy was deleted, this still offered "Queue" on the parent
- * folder and on every removed child). `LOCAL_ONLY` used to be the only state tested here, but
- * it's just one way a node can have no remote copy -- a `REMOVED_BOTH` child, or a move-mode
- * parent whose remote *this codebase* deleted on purpose (`remote_deleted_at` set, `remote_size`
- * NULL, state left at `VERIFIED`/`EXTRACTED`), both used to fall through to `'queue'` even
- * though clicking it would spawn a job against a remote path that no longer exists. `remote_size
- * != null` (`hasRemoteCopy`) is never null for a node that genuinely has a remote copy --
- * `core/reconcile.py` sets it the moment a remote scan sees the path, and
- * `core/itemview.py._remote_facet`'s own docstring establishes presence, not "not yet
- * measured," as the one reading of this column -- so this gate can't hide a button that should
- * be there.
- *
- * `'redownload'` (2026-08-13, `prompts/2026-08-13-delete-state-truthfulness.md` defect 2) is
- * the same click as `'queue'` -- `Row` below dispatches both through the identical `onAction`
- * handler -- just a different label for one specific case: a row *we* deleted
- * (`suppressed_reason === 'deleted_local'`) whose remote copy has since come back
- * (`hasRemoteCopy`). Its own branch already requires `hasRemoteCopy`, and now sits *after* the
- * general no-remote-copy gate above, so that gate can never shadow it -- a row we deleted
- * locally, whose remote copy has since come back, still reaches `'redownload'`. Derived from
- * the suppression reason plus remote presence, never from the state string alone, because
- * `REMOVED_LOCAL`/`REMOVED_BOTH` can also be produced with no suppression at all
- * (`core/mount_sentinel.py.resolve_vanished`, defect 3) -- that row is a plain "Queue", not a
- * "Re-Download". "Queue" reads like a brand-new item; "Re-Download" tells the user this is the
- * release they already had, back again, and nothing fetches it automatically.
- */
-export function rowAction(node: FileNode): 'queue' | 'stop' | 'redownload' | null {
-  if (node.id == null) return null
-  if (node.state === 'QUEUED' || node.state === 'DOWNLOADING') return 'stop'
-  if (!hasRemoteCopy(node)) return null
-  if (node.suppressed_reason === 'deleted_local' && hasRemoteCopy(node)) return 'redownload'
-  return 'queue'
-}
 
 /** Whether "Delete local" (DESIGN.md §9.2; prompts/open-issues.md "7 + 8") makes sense to
  * offer at all -- a node with no local content has nothing this action could do. `DOWNLOADING`/
@@ -493,25 +156,6 @@ function localBytes(node: FileNode): number {
   return node.local_size ?? node.remote_size ?? 0
 }
 
-/** Whether this node still has a remote copy -- `remote_size` is `null` for `LOCAL_ONLY` (never
- * tracked remotely), for `REMOVED_BOTH`/a vanished row (`core/engine.py`'s vanished-row path
- * writes `remote_size = NULL` explicitly), and for a `move`-mode item whose verified remote copy
- * this codebase deleted on purpose (`remote_deleted_at` set, state left at
- * `VERIFIED`/`EXTRACTED`) -- every other node was seen on a scan and has it set, per
- * `core/itemview.py._remote_facet`'s own docstring ("`remote_size IS NOT NULL` is the whole
- * rule"). Drives the delete confirmation's "what happens to this after I delete it" wording (a
- * remote copy surviving means `delete_local` writes `REMOVED_LOCAL`, not `REMOVED_BOTH` --
- * `core/local_delete.py._removed_state_for`), since 2026-08-13 `rowAction`'s "Re-Download" label,
- * and since 2026-08-14 `rowAction`'s general "nothing to queue" gate above (there is no reading
- * of "not measured yet" this column can be confused with -- see that gate's own docstring).
- * Either way lftpweb will never re-fetch what it deleted itself on its own: `delete_local` always
- * sets `auto_queue_suppressed`, which auto-queue excludes unconditionally regardless of the
- * `re_download_externally_removed` setting -- that setting only ever governs an item
- * *something else* removed, never one this app just deleted.
- */
-function hasRemoteCopy(node: FileNode): boolean {
-  return node.remote_size != null
-}
 
 /** Whether this node currently has an active job -- the identical presence test `rowAction`
  * above already uses to decide whether to show "Stop" instead of "Queue". Drives the delete
@@ -791,7 +435,6 @@ function HoverCardHost({ controllerRef }: { controllerRef: RefObject<HoverCardHa
 // exist (`core/itemview.py`, `LifecycleIcons.tsx`) instead of a second, parallel filtering
 // mechanism -- composes with the text/state filters through the same `visiblePaths` set below.
 
-export type FacetFilter = '' | 'has_remote' | 'has_local' | 'extracted' | 'not_extracted' | 'missing_locally'
 
 const FACET_FILTER_LABELS: Record<FacetFilter, string> = {
   '': 'All items',
@@ -813,97 +456,8 @@ const FACET_FILTER_VALUES: FacetFilter[] = [
   'missing_locally',
 ]
 
-/** One predicate per facet-filter option, each keyed off `core/itemview.py`'s own
- * `level`/`reason` codes rather than re-deriving presence from raw bytes here -- the frontend
- * composes what the backend already classified, it doesn't reclassify.
- */
-export function matchesFacetFilter(entry: TreeEntry, filter: FacetFilter): boolean {
-  switch (filter) {
-    case '':
-      return true
-    case 'has_remote':
-      return entry.facets.remote.reason === 'present'
-    case 'has_local':
-      return entry.facets.local.level !== 'dim'
-    case 'extracted':
-      return entry.facets.extracted.reason === 'extracted'
-    case 'not_extracted':
-      return entry.facets.extracted.reason !== 'extracted'
-    case 'missing_locally':
-      return entry.downloaded_at != null && entry.facets.local.reason === 'missing'
-  }
-}
 
-// --- Column widths (2026-08-13, prompts/2026-08-13-resizable-file-columns.md): one shared -----
-// definition drives both the header row and `Row` -- previously the header hardcoded Tailwind
-// widths (`w-24`/`w-28`/`w-20`/`w-32`) and `Row` hardcoded a second, matching set, kept in sync
-// by hand with nothing stopping them drifting apart. `ColumnDef` below is that one definition;
-// both callers read it (`RESIZABLE_COLUMNS`, `fixedColumnStyle`), so a header and its column
-// can never disagree on width again, and it's also what makes resizing possible at all.
 
-interface ColumnDef {
-  id: string
-  label: string
-  defaultWidth: number
-  minWidth: number
-  align: 'right' | 'left'
-  sortKey?: SortKey
-  /** Overrides the header's own hover text -- only "Status" needs one today, to spell out that
-   * it sorts by % complete despite its shorter visible label (unchanged from before this task).
-   */
-  title?: string
-}
-
-/** The five fixed-width columns, in render order. **Name is not here** -- it keeps flexing
- * (`flex-1`, a floor of `NAME_MIN_WIDTH_PX`) and absorbs whatever space these five don't claim,
- * which is also why only these five get a drag handle: Name's width is derived from the
- * container and the other five, never set directly. Resizing one of these five just changes how
- * much of the remaining space Name gets -- the model already implied by "Name flexes, the rest
- * are fixed" before this task, kept rather than switched to a two-column paired resize, per the
- * task's own instruction to keep it unless there's a reason not to (there wasn't one).
- */
-export const RESIZABLE_COLUMNS: ColumnDef[] = [
-  { id: 'size', label: 'Size', defaultWidth: 96, minWidth: 56, align: 'right', sortKey: 'size' },
-  // Speed (2026-08-14, prompts/2026-08-14-files-page-speed-column.md), between Size and Status
-  // per that task's own placement. Blank/dash for anything not actively downloading -- never
-  // `0 B/s` for a row that simply isn't transferring (`lib/format.ts.transferSpeedLabel`) -- so
-  // this column reads mostly empty at a glance, which is correct: most rows aren't transferring
-  // at any given moment.
-  //
-  // **ETA appended in the same cell (2026-08-14, "ETA on Files rows"), not a new column.** The
-  // task's own brief weighed three placements: a dedicated ETA column (cleanest semantically,
-  // but this is already the sixth fixed-width column squeezing the flexing Name column, and a
-  // seventh would squeeze it further); hover/drawer only (cheapest, but defeats the point of an
-  // at-a-glance answer to "how long left"); and appending it here, "34 MB/s · 3m", since rate
-  // and ETA read as one thought and this reuses width that already exists rather than claiming
-  // more. Took the third option -- see docs/decisions.md for the fuller reasoning and the
-  // rejected alternatives. Sorting is **still by rate alone** (`sortKey: 'speed'`, unchanged) --
-  // the cell showing two numbers doesn't make the sort ambiguous, because only one of them
-  // (`speed_bps`/`child_speed_bps`) was ever the sort key.
-  //
-  // `minWidth` matches `size`'s own floor; `defaultWidth` widened from the original 88px (rate
-  // alone) to fit "12.3 MB/s · 45m" without truncating -- unverified against a real browser (no
-  // UI access in this environment) but reasoned from the longest realistic combined string this
-  // format produces. A human should check this column, and the Name column's remaining width,
-  // at a narrow browser window.
-  { id: 'speed', label: 'Speed', defaultWidth: 128, minWidth: 64, align: 'right', sortKey: 'speed' },
-  {
-    id: 'status',
-    label: 'Status',
-    // Was 112px (`w-28`), widened by 16px in the same audit that shortened the settle-wait
-    // text below -- a comfortable margin for the longest bare state names this chip ever
-    // shows verbatim ("EXTRACT_FAILED", "DOWNLOADING 100%"), unverified against a real
-    // browser (no UI access in this environment) but a reasoned default, not a guess.
-    defaultWidth: 128,
-    minWidth: 72,
-    align: 'right',
-    sortKey: 'percent',
-    title: 'Sort by % complete',
-  },
-  { id: 'lifecycle', label: 'R L V E', defaultWidth: 80, minWidth: 68, align: 'right' },
-  { id: 'changed', label: 'Changed', defaultWidth: 128, minWidth: 72, align: 'right', sortKey: 'state_changed_at' },
-  { id: 'actions', label: 'Actions', defaultWidth: 128, minWidth: 88, align: 'right' },
-]
 
 /** Name's own floor -- not a `ColumnDef` entry since nothing ever sets Name's width directly
  * (see the comment above), but it still needs a minimum so an aggressively widened neighbor
@@ -919,64 +473,8 @@ const NAME_MIN_WIDTH_PX = 160
 const RESIZE_STEP_PX = 8
 const RESIZE_STEP_LARGE_PX = 32
 
-export type ColumnWidths = Record<string, number>
 
-export function defaultColumnWidths(): ColumnWidths {
-  return Object.fromEntries(RESIZABLE_COLUMNS.map((c) => [c.id, c.defaultWidth]))
-}
 
-export function columnMinWidth(id: string): number {
-  return RESIZABLE_COLUMNS.find((c) => c.id === id)?.minWidth ?? 40
-}
-
-/** No maximum -- growing a column just eats into Name's share (down to `NAME_MIN_WIDTH_PX`) or,
- * past that, widens the row past the scroll container, which picks up its own horizontal
- * scrollbar (see `NAME_MIN_WIDTH_PX`'s own comment). A ceiling would just be one more number to
- * justify with no real failure mode it prevents -- a column dragged absurdly wide is recoverable
- * with one double-click, unlike one dragged to zero.
- */
-export function clampColumnWidth(id: string, width: number): number {
-  return Math.max(columnMinWidth(id), Math.round(width))
-}
-
-export function isColumnWidths(value: unknown): value is ColumnWidths {
-  if (typeof value !== 'object' || value == null) return false
-  return Object.entries(value as Record<string, unknown>).every(
-    ([, v]) => typeof v === 'number' && Number.isFinite(v),
-  )
-}
-
-/** Saved widths merged onto the defaults -- an id no longer in `RESIZABLE_COLUMNS` (a column
- * removed or renamed later) is silently dropped rather than applied to whatever now occupies
- * that slot, per the task's own instruction to store and read by id, never by position, and to
- * ignore unknown ids on read. Re-clamps every surviving value in case its `minWidth` changed
- * since it was saved.
- */
-export function mergeColumnWidths(saved: ColumnWidths | null): ColumnWidths {
-  const widths = defaultColumnWidths()
-  if (saved == null) return widths
-  for (const col of RESIZABLE_COLUMNS) {
-    const savedWidth = saved[col.id]
-    if (typeof savedWidth === 'number' && Number.isFinite(savedWidth)) {
-      widths[col.id] = clampColumnWidth(col.id, savedWidth)
-    }
-  }
-  return widths
-}
-
-/** Both the header cell and the matching `Row` cell size themselves off the same CSS custom
- * property, `--col-size-<id>`, rather than off `widths` state directly -- that indirection is
- * the whole mechanism that keeps a drag off the React render path (see `ColumnResizeHandle`
- * below): the property is written straight to the DOM on every `pointermove` frame via a ref,
- * with no `setState` and so no re-render of the virtualized list, which can hold thousands of
- * rows. `width`/`minWidth`/`maxWidth` are all pinned to the same value so a flex child can never
- * grow past it to fit its own content (e.g. a long state name) -- that used to be how a cell's
- * content could bleed into its neighbor instead of clipping to its own column.
- */
-function fixedColumnStyle(id: string): CSSProperties {
-  const v = `var(--col-size-${id})`
-  return { width: v, minWidth: v, maxWidth: v }
-}
 
 /** The drag handle living at the **left** edge of one resizable header cell (a sibling of the
  * header's label/`SortHeaderButton`, never nested inside it -- clicks on the handle can

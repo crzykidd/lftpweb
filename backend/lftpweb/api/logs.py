@@ -26,7 +26,11 @@ router = APIRouter(prefix="/api/logs")
 # lftpweb.log (current) or lftpweb.log.N (a rotation) -- RotatingFileHandler's own naming.
 # Anchoring the download/tail endpoints to this exact pattern is what keeps a filename from
 # a request from ever resolving outside the logs directory.
-_ROTATED_RE = re.compile(r"^lftpweb\.log(?:\.(?P<n>[1-9][0-9]*))?$")
+# `\Z`, not `$`: in Python `$` also matches just before a trailing newline, so `$` would let
+# "lftpweb.log\n" through. Not exploitable on its own (no such file exists, and a newline
+# cannot traverse a directory), but this pattern is the *only* thing standing between a
+# request-supplied name and a filesystem path -- so it anchors literally, not almost.
+_ROTATED_RE = re.compile(r"^lftpweb\.log(?:\.(?P<n>[1-9][0-9]*))?\Z")
 
 
 def _log_dir(config_dir: str) -> Path:

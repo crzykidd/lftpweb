@@ -6,6 +6,149 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-14 — Audit P1 (partial): `FileTree.tsx`'s pure logic extracted to `lib/fileTree.ts`
+
+`FileTree.tsx` was the largest file in the repo (2267 lines). Extracted its pure,
+React-free logic — tree building, sorting, the collapse/sort preferences, facet filtering, and
+the column-width model — into `frontend/src/lib/fileTree.ts` (371 lines). The component drops to
+1765 and keeps every JSX/stateful piece, importing the pure functions back by name. `FileTree.
+test.ts` already targeted exactly these functions, so its import path was repointed from
+`./FileTree` to `../lib/fileTree` and all 266 frontend tests pass unchanged — the test coverage is
+what made this the *safe* first slice.
+
+**Method.** Wrote the lib as a fresh module, deleted the moved definitions from the component by
+line range, added one import, and let `tsc` (with `noUnusedLocals`) drive the trim of imports the
+moved code had used (the seven `lib/format` helpers and two constants only the extracted functions
+referenced). A side benefit: FileTree.tsx no longer trips oxlint's `only-export-components`
+fast-refresh warning, since it no longer exports non-component helpers.
+
+**Deliberately partial — the component-level extractions are deferred, not done.** The audit's P1
+also proposed pulling the `Row`, hover-card, and column-resize *components* into their own files.
+Those were left in place: unlike the pure logic, they have no unit coverage of their own, and a
+mistake in prop/closure threading is exactly the kind of thing that only shows up when rendered —
+which needs a browser this environment doesn't have. That's a reviewed-session change with visual
+verification, not an unattended one. `FileTree.tsx` at 1765 lines is still large; this closed the
+highest-value, lowest-risk part of the split and left the rest named rather than half-done.
+Verified: `tsc -b`, `vitest` (266), `vite build`, and `oxlint` all clean.
+
+---
+
+## 2026-08-14 — Audit P3: `core/local_delete.py` (1649 lines) split into core + retention + archive_cleanup + reset
+
+Four independent features shared the file only by adjacency. Extracted three into their own
+modules — `core/retention.py` (scheduled deletion + orphan-temp sweep), `core/archive_cleanup.py`
+(spent-volume removal), `core/reset.py` (forget-tracking) — leaving `core/local_delete.py` as the
+`delete_local` primitive plus its helpers (`_physical_local_root`, `DeleteInFlight`,
+`reconsider_removed_state`, the subtree helpers). To edit reset logic you now open a ~320-line file,
+not 1649.
+
+**Import surface preserved by re-export.** ~30 external call sites reach these symbols as
+`local_delete.<name>` (attribute access), and several are underscore-prefixed
+(`local_delete._select_expired`, etc.). So `local_delete.py` ends with an explicit re-export block
+(not `import *`, which skips underscore names) pulling every moved symbol back into its namespace.
+Zero call-site churn: `main.py`, `api/settings_postprocess.py`, and every test kept working
+untouched — except one test that captured logs from the `lftpweb.core.local_delete` logger for
+`delete_extracted_archives`, which now logs under `lftpweb.core.archive_cleanup` (its new home); the
+`caplog` logger name was repointed, no behavior change.
+
+**The dependency layering, and why there's no import cycle.** Direction is
+`core ← {retention, archive_cleanup} ← reset`: retention calls `delete_local`, archive_cleanup
+calls `_physical_local_root`, reset calls `_subtree_rows`/`DeleteInFlight`. The children import
+those from `local_delete` at the top; `local_delete` re-imports the children at the **bottom**,
+after the primitive is fully defined. Every real import path enters through `local_delete` (all
+external code imports it, and now via the re-export continues to), so the primitive is always
+defined before a child's top-level `from local_delete import …` runs. `_select_expired`'s
+`SETTING_KEY` constant, orphaned in the core slice by the cut, was moved into `retention.py` where
+it belongs.
+
+**Verified:** `import lftpweb.main` loads cleanly (no cycle), all 26 re-exported symbols resolve via
+`local_delete.<name>`, and the full backend suite passes.
+
+---
+
+## 2026-08-14 — Audit P2: `api/settings.py` (1068 lines) split into three per-resource routers
+
+The single settings router covered ten resources (host, queues, patterns, postprocess, settle,
+removal-grace, download-prefix, autoqueue, retention, orphan-temp), so any localized change loaded
+the whole file. Split into `api/settings_host.py`, `api/settings_queues.py`, and
+`api/settings_postprocess.py`, each with its own `APIRouter(prefix="/api/settings")` — the same
+per-resource pattern `api/auth.py`/`api/backup.py`/`api/logs.py`/`api/metrics.py` already use.
+`main.py` mounts all three.
+
+**Method — mechanical, not retyped.** The three resource groups were already contiguous in the
+file, so the split sliced exact line ranges into the new modules (each given the full original
+import header) and let `ruff check --fix` strip the now-unused imports per module. This avoids any
+hand-transcription error in 1000+ lines of moved code.
+
+**The one real cross-module coupling:** `settings_queues.create_queue` reads "the" host row via
+`_get_host_row`, which now lives in `settings_host`. Imported explicitly
+(`from lftpweb.api.settings_host import _get_host_row`) rather than duplicated or hoisted into a
+new common module — one genuine shared read doesn't justify a third file, and an explicit import
+names the dependency plainly.
+
+**Verified behavior-preserving, not just tested:** the full `/api/settings` OpenAPI route list
+(43 paths×methods) was captured before and after and is byte-identical, and the settings/delete/
+auth suites plus the full backend suite pass unchanged. `test_delete_api.py`'s direct calls to the
+three retention functions were repointed to `settings_postprocess` (their new home) in the same
+commit.
+
+---
+
+## 2026-08-14 — Audit S2: extraction refuses to publish a member that escapes the staging root
+
+`core/extract.py.extract_item` already stages every archive into a `_UNPACK_` sibling and only
+merges into the published tree on full success — but nothing checked *where the extracted members
+landed*. `resolve_within_root` guarded the staging/`_FAILED_` directories and every deletion, yet
+the extraction output itself was trusted to 7zz/unrar's own defenses. Added `find_escaping_path`:
+after a clean extraction, before the merge, walk the staging tree and reject if any entry resolves
+outside it, returning `EXTRACT_FAILED` (which withholds the merge and is surfaced/audited like any
+other extraction failure) and keeping the offending tree as `_FAILED_` evidence.
+
+**Scope, stated honestly.** The realistic residual escape is a **symlink member** pointing out of
+the extraction root — 7zz and unrar both strip literal `../` traversal members themselves, but a
+symlink is content they restore, not a path they rewrite. Walking staging with a symlink-resolving
+containment check catches exactly that. A hypothetical extractor that wrote a file *directly* to an
+outside absolute path (which neither 7zz nor unrar does under `-o<dir>`) would place it beyond the
+staging tree where this walk can't enumerate it — so this is defense-in-depth layered on the
+extractors' own traversal handling, not a claim to replace it. `rglob` never recurses into a
+symlinked directory, so a malicious symlink is inspected here, never followed.
+
+Tested binary-independently (so it runs in CI without 7zz): `find_escaping_path` directly, and
+`extract_item` with a patched per-archive extractor that plants an escaping symlink — asserting the
+merge is withheld and `_FAILED_` evidence is kept.
+
+---
+
+## 2026-08-14 — Audit S3/S4: input length caps + port bounds, and a *safe* security-header subset (no CSP/HSTS overnight)
+
+Part of the post-`v0.1.0` audit run (`docs/audit-v0.1.0.md`). Two small hardening changes bundled
+into one commit, per the audit's own "one input-hardening + headers pass" suggestion.
+
+**S3 — length caps (`models.py`).** The concrete worry was an argon2 DoS: `POST /api/auth/login`
+is unauthenticated and argon2-hashes the submitted password, and no model field had a
+`max_length`, so a multi-megabyte body was hashed on every one of the 5 rate-limited attempts.
+Caps are set on every credential/free-text/path input field, plus `ge=1, le=65535` on both `port`
+fields. **Chosen deliberately generous** (`MAX_SECRET_LEN=4096`, `MAX_KEY_LEN=65536` for pasted
+PEM keys, `MAX_NAME_LEN=1024`, `MAX_PATH_LEN=4096`) so no legitimate value is ever rejected — the
+caps bound only absurd inputs. Rejected the tighter alternative (RFC-accurate limits like DNS-253
+for hostnames) precisely because this ran unattended: a too-tight cap that rejected some real
+value the user relies on is exactly the kind of silent breakage an overnight run must not risk.
+Also deliberately did **not** add `min_length=1` "reject blank name" rules — that *could* reject a
+currently-working edge case, so it's a change for a reviewed session, not this one.
+
+**S4 — security headers (`middleware.py.SecurityHeadersMiddleware`).** Adds `X-Content-Type-
+Options: nosniff`, `X-Frame-Options: SAMEORIGIN`, `Referrer-Policy: same-origin` to every HTTP
+response, via a raw-ASGI middleware wrapping `AuthMiddleware` (so even a 401 the gate produces
+carries them). **A Content-Security-Policy was explicitly rejected for this run:** a wrong CSP
+silently breaks the built SPA (inline styles/scripts, the WebSocket, the assets mount), and there
+is no browser in the build/CI environment to verify one against — it belongs in a reviewed,
+browser-checked change. **HSTS was also rejected:** the session cookie's `Secure` flag is already
+scheme-conditional for plain-HTTP LAN use (`api/auth.py`), and HSTS over such a deployment would
+wedge the browser onto an `https://` the host may not serve. `test_input_hardening.py` pins the
+three headers present *and* CSP/HSTS absent, so a future accidental CSP here trips a test.
+
+---
+
 ## 2026-08-14 — A `move`-mode delete withholds only on `CORRUPT`, not on `SKIPPED`; the rename event stops hardcoding a "verified" it didn't check
 
 `core/postprocess.py._maybe_delete_remote` used to withhold the remote delete whenever

@@ -1,4 +1,10 @@
-# Open issues — 2026-08-12 / 2026-08-13 / 2026-08-14 session
+# Open issues — 2026-08-12 / 2026-08-13 / 2026-08-14 sessions
+
+> **2026-08-14: `v0.1.0` shipped.** The first tagged release, a beta. Everything below that is
+> not struck through is post-release work. The three items most worth a fresh session's
+> attention are **issue #2** (`move` deletes the remote before extraction runs — now exercised
+> on every release, not just checksummed ones), **`AuthSettingsIn`'s silent-reset shape** (a
+> trusted-CIDR list that can quietly empty itself), and **row lifetime / issue #1**.
 
 A living list, not a handoff prompt. It never moves to `done/`.
 
@@ -43,9 +49,15 @@ section before trusting any live-evidence conclusion in this file.
   and every published release, with the comment corrected (it still claimed no GitHub remote
   existed). A copied compose file now resolves to the newest published build instead of a
   version tag that does not exist yet.
-- **A `dev` → `main` PR, and the first release.** `dev` is far ahead of `main`; nothing has been
-  tagged, and `release-prep`/`release-cut` have never been run. **Planned for 2026-08-14
-  afternoon**, after the user click-tests the night's work.
+- ~~**A `dev` → `main` PR, and the first release.**~~ — **done 2026-08-14: `v0.1.0`, a beta.**
+  PR #3 merged, tag `v0.1.0` cut from `main`, images published. `release-prep`/`release-cut`
+  have now both been exercised end to end. See `prompts/startnewsession.md`'s branch section for
+  the two things that tripped the first run (the PR-body character limit, and `/release-prep`
+  being forbidden from touching `DESIGN.md`).
+- **Should the GitHub release be flagged as a prerelease?** `v0.1.0` was published with
+  `prerelease=false`. It *is* a beta — `README.md` says so and the changelog says so — but `0.x`
+  already signals pre-1.0 under semver, so this is defensible either way. Raised and not decided;
+  it is a one-line flip if wanted, and the same question will recur at `0.2.0`.
 - ~~**Should "Folder prefix during transfer" default ON?**~~ — **decided 2026-08-14: yes.** The
   fourth deliberate exception to "every new capability ships off", after `move`-mode forced
   verification, the phase 7 scheduled backup, and the settle gate. Same reasoning as the settle
@@ -67,6 +79,32 @@ section before trusting any live-evidence conclusion in this file.
   any claim from this list about what the design doc does or doesn't say.
 
 ## Still open — read these first
+
+### Post-`v0.1.0` audit — the deferred items (`docs/audit-v0.1.0.md`)
+
+A full audit landed 2026-08-14 (`docs/audit-v0.1.0.md`): findings **S1–S4** (security),
+**G1–G3** (settings/gating), **P1–P5** (partitioning). An overnight run on the same day closed
+the fixable ones — **S1** (SPA path-traversal file read, `01efac4`), **S3+S4** (input caps +
+security headers, `0a4593a`), **S2** (extraction containment, `65b0618`), **P2** (`api/settings.py`
+split, `90df1ea`), **P3** (`core/local_delete.py` split, `d480885`), and **P1 in part** (pure logic
+→ `lib/fileTree.ts`, `0cb294f`). The full audit doc has every finding's detail and the fix commit.
+**What's left, deliberately, for a session with the user in the loop:**
+
+- **G1 — `move`-mode delete runs before extraction.** This is the same thing as **issue #2**
+  below (a no-sidecar release verifies `SKIPPED`, its remote is deleted, then extraction may
+  fail — the only re-fetchable source already gone). It's a *design call*, not a mechanical fix:
+  either delete after a successful extract, or make the delete gate also require extraction not to
+  have failed (mirroring the download-prefix `release_ok` rule). Don't resolve it unilaterally.
+- **G2 — `net:connection-limit` has no write path.** §4.5 calls it "first-class, host-level," but
+  it lives only in the `host.connection_overrides` JSON blob with no UI/endpoint. Needs a
+  migration (promote to a real column) + a Settings field. A scoped feature, not a one-liner.
+- **Rest of P1 — the `FileTree.tsx` component extractions.** The pure logic is out; the `Row`,
+  hover-card, and column-resize *components* remain (still ~1765 lines). Left deliberately: they
+  have no unit coverage, and a prop/closure slip only shows when rendered — wants a browser to
+  verify, which the coding environment doesn't have.
+- **P4/P5 — `core/queue.py` (1881) and `core/engine.py` (1621) splits.** The deepest stateful
+  code (the transfer god-object; the scan→persist→publish invariant). The audit itself said do
+  these under review, not unattended. Each is a handoff-prompt-sized task on its own.
 
 ### A terminal removed row has no UI path to an individual reset
 
@@ -350,6 +388,9 @@ form entry at all and the PUT replaced rather than merged.
 
 | Summary | Commit |
 |---|---|
+| **A `move`-mode delete was withheld on `SKIPPED` verification, not only on `CORRUPT`** — two `ar-tv` WEB-DL releases downloaded correctly and their remote copies were never cleaned up, because with no `.sfv`/`.md5` sidecar and hash-on-disk off, verification returns `SKIPPED` and the gate required `VERIFIED`. The rule is now "verification must not have *failed*". Found by the user using the app; diagnosed in one call to `GET /api/history/events`, which had already recorded the reason. `core/postprocess.py`'s rename gate had used the correct rule all along, on the *more* dangerous side of the decision. | `6883db3` |
+| **Both filename-guard regexes anchored with `\Z` instead of `$`**, after five CodeQL `py/path-injection`/weak-hash alerts on PR #3 were verified as false positives and dismissed. `$` also matches before a trailing newline, so `"lftpweb.log\n"` passed a pattern documented as anchored at both ends. Unexploitable, but those patterns are what the dismissals rest on. +18 parametrized tests at the regex itself. | `b06cafe` |
+| **Two stale trackers** claimed `DESIGN.md` wordings were still pending after they had shipped — and the claim was repeated as pre-release advice before anyone opened the doc. Both corrected and kept as cautions. | `3281e48` |
 | **`lftp` exiting 0 was treated as proof a transfer completed** — a live incident left one file 500 MB short as a `.lftp` temp file and the item still reached `DOWNLOADED`; a filesystem completeness check (exclusion-aware, so a `file_exclude`d file can't hold an item `PARTIAL` forever) now gates `DOWNLOADED`, `output_tail` is retained on every success instead of nulled, and the Transfers page surfaces a recently-succeeded job instead of it vanishing on reap. `bytes_total` is also now frozen at job spawn rather than drifting with a later scan. The `bytes_start` anomaly this same incident surfaced is a separate, unreproduced defect — see "Still open" above. | `prompts/done/2026-08-14-exit-zero-is-not-completion.md` |
 
 ---

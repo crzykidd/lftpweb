@@ -184,6 +184,54 @@ def test_extract_zip_in_place(tmp_path):
     assert (item / "inner.txt").read_text() == "zip contents"
 
 
+def test_find_escaping_path_flags_a_symlink_pointing_out_of_staging(tmp_path):
+    """Audit S2: the containment helper returns None for a fully-contained tree and the
+    offending entry for a symlink whose target is outside the staging root. No archive tooling
+    needed -- this pins the security predicate directly.
+    """
+    staging = tmp_path / "staging"
+    (staging / "sub").mkdir(parents=True)
+    (staging / "sub" / "normal.txt").write_text("fine")
+    assert extract.find_escaping_path(staging) is None
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (staging / "evil").symlink_to(outside)
+    escaping = extract.find_escaping_path(staging)
+    assert escaping is not None
+    assert escaping.name == "evil"
+
+
+def test_extract_item_refuses_to_publish_an_escaping_symlink(tmp_path, monkeypatch):
+    """Audit S2: extraction that plants a symlink escaping the staging root fails
+    EXTRACT_FAILED, withholds the merge into the final tree, and keeps the offending output as
+    `_FAILED_` evidence. Verified without a real malicious archive by patching the per-archive
+    extractor to plant the symlink a hostile archive member would.
+    """
+    item = tmp_path / "Release"
+    item.mkdir()
+    (item / "payload.zip").write_bytes(b"PK\x05\x06" + b"\x00" * 18)  # find_archives sees a .zip
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.txt").write_text("must not be reachable")
+
+    def fake_extract_archive(archive, target_dir, **kwargs):
+        target_dir.mkdir(parents=True, exist_ok=True)
+        (target_dir / "escape").symlink_to(outside)  # a symlink member pointing outside staging
+        return extract.ExtractResult(state="EXTRACTED", detail="faked")
+
+    monkeypatch.setattr(extract, "extract_archive", fake_extract_archive)
+    monkeypatch.setattr(extract, "check_extract_preconditions", lambda a: None)
+
+    result = extract.extract_item(item, binary="unused")
+    assert not result.ok
+    assert result.state == "EXTRACT_FAILED"
+    assert "escaping the staging root" in result.detail
+    # The escape never reached the published tree; evidence is kept as _FAILED_.
+    assert not (item / "escape").exists()
+    assert (item.parent / f"{extract.FAILED_PREFIX}{item.name}").is_dir()
+
+
 @pytestmark_7z
 def test_extract_7z_format_round_trip(tmp_path):
     """DESIGN.md §6/NOTICE: 7zz is the only archive tool -- exercise the native .7z format

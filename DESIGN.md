@@ -6,9 +6,10 @@ lftp as the transfer engine.*
 Sections are numbered so feedback can be given by reference (e.g. "§4.3 — no, do it this way").
 
 **Status:** all nine build phases are built (§13), plus the post-phase-9 corrections real use
-surfaced. Still pre-release — nothing has been tagged, and the first version will be **`0.0.1`**.
-This line said "nothing implemented yet" until 2026-08-13; §13 is the authoritative record of
-what is actually built and what is still open.
+surfaced. **First release cut 2026-08-14: `v0.1.0`, a beta.** This line said "nothing
+implemented yet" until 2026-08-13 and "still pre-release, the first version will be `0.0.1`"
+until the tag existed; §13 is the authoritative record of what is actually built and what is
+still open.
 
 ---
 
@@ -2190,7 +2191,9 @@ boundaries are load-bearing rather than tidy:
   of `api/logs.py` so "read the last N lines of a possibly-5 MB file" is unit-testable.
 
 **Versioning.** `backend/lftpweb/__init__.py` holds `__version__` as a bare string (no `v`
-prefix) and is the only place the version is written. First release is **`0.0.1`**. The API
+prefix) and is the only place the version is written. The first release was **`0.1.0`** (a
+beta, cut 2026-08-14); the `v` prefix appears only on the git tag and the matching GitHub
+release, never in code. The API
 exposes it at `/api/health` — along with `repo_url`, because `LFTPWEB_REPO_URL` is a *runtime*
 container env var while the SPA is built into static files long before that env exists, so a
 Vite build-time constant cannot carry it. The UI renders the version bottom-left (§9.1) and
@@ -2274,9 +2277,10 @@ Each phase ends at something that can actually be looked at and judged.
    codebase remains `move` mode's verification-gated pipeline (§7.4), and a manual button is a
    materially larger safety conversation, deferred rather than forgotten.
 
-That is the whole of v1. `0.0.1` is the first version (§12).
+That is the whole of v1. `0.1.0` is the first released version (§12) — a beta, tagged
+2026-08-14. `0.0.1` was the in-development version that preceded it and was never released.
 
-**Since phase 9 (2026-08-12), still pre-release.** Real use surfaced a set of correctness gaps
+**Since phase 9 (2026-08-12), through to the `v0.1.0` beta.** Real use surfaced a set of correctness gaps
 that the nine phases' green CI never touched, and the fixes are documented in the sections
 above rather than as a tenth phase: the settle gate (§3.3, on by default), the publish
 invariant and the single item-view projection (§2.2), state ownership between the three writers
