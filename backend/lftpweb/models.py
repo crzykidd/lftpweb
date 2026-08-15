@@ -190,6 +190,23 @@ class PathQueueIn(BaseModel):
     # whatever the default happened to be when the queue was created.
     download_prefix_enabled: bool | None = None
     download_prefix: str | None = None
+    # Sonarr/Radarr integration (migration 018, docs/arr-integration-spec.md "Data model" /
+    # "API surface"). Binding is per-queue, one instance at most -- `None` (the default, and
+    # every existing queue's value after the migration) means "no integration": no icons, no
+    # matching, no *arr behavior at all for this queue. Full-replace fields like the rest of
+    # this model (not the four post-processing toggles' merge-on-absence shape) -- Settings ->
+    # Queues' edit form always submits the complete queue state, same reasoning
+    # `update_queue`'s own docstring already gives for every other plain field here.
+    arr_instance_id: int | None = None
+    # Default off, per-queue, and only meaningful when `arr_instance_id` is set --
+    # `api/settings_queues.py` rejects `True` with no bound instance (spec: "the Settings UI's
+    # 'Delete when imported' checkbox, disabled with a hint unless an instance is selected").
+    arr_delete_completed: bool = False
+    # This queue's `local_path`, translated into the bound *arr's own namespace (spec "Path
+    # namespaces") -- `None` means "same namespace, no translation," never an empty-string
+    # sentinel. Optional even when an instance is bound: it is only read by phase B's notify
+    # push, not by matching.
+    arr_visible_path: str | None = Field(default=None, max_length=MAX_PATH_LEN)
 
 
 class PathQueueOut(PathQueueIn):
@@ -614,6 +631,13 @@ class FileNode(BaseModel):
     # what lets the Files page tell that apart from an ordinary pattern-`EXCLUDED` file and
     # render a greyed-out "Extracted" chip instead of "Excluded".
     deleted_archive_at: str | None = None
+    # Sonarr/Radarr integration (migration 018, docs/arr-integration-spec.md): the Files page's
+    # *arr icon reads this directly. A facet, not a lifecycle state -- passed through verbatim
+    # from `item.arr_status`/`item.arr_status_at` (`core/itemview.py.item_view`), never derived
+    # from `state`. `arr_download_id` is deliberately absent here too -- see that column's own
+    # comment in migration 018 ("not published in the item projection").
+    arr_status: str | None = None
+    arr_status_at: str | None = None
     facets: LifecycleFacets
 
 
@@ -961,3 +985,51 @@ class LogTailResponse(BaseModel):
     # what's actually in the file, because this endpoint never reads the whole thing to find
     # out. See core/logtail.py's module docstring.
     truncated: bool
+
+
+# --- Settings -> Integrations (migration 018, docs/arr-integration-spec.md) -------------
+
+ArrKind = Literal["sonarr", "radarr"]
+
+
+class ArrInstanceIn(BaseModel):
+    """A create/update request for one Sonarr/Radarr instance. `api_key` is plaintext here --
+    the only place it ever appears in a request body -- and is encrypted at rest
+    (`core/crypto.py`) before it touches the database, the identical convention `HostIn.password`
+    uses; it is never included in any response. Omitting it on an update keeps the stored key
+    (same "unchanged must not mean cleared" rule `settings_host.py.put_host` follows).
+    """
+
+    name: str = Field(max_length=MAX_NAME_LEN)
+    kind: ArrKind
+    base_url: str = Field(max_length=MAX_NAME_LEN)
+    api_key: str | None = Field(default=None, max_length=MAX_SECRET_LEN)
+    enabled: bool = False
+    notify_on_complete: bool = False
+
+
+class ArrInstanceOut(BaseModel):
+    id: int
+    name: str
+    kind: ArrKind
+    base_url: str
+    # Never the key itself (DESIGN.md §9.2's "must never round-trip the stored secret back to
+    # the browser") -- whether one is on file, mirroring `HostOut.has_password`.
+    has_api_key: bool
+    enabled: bool
+    notify_on_complete: bool
+    created_at: str
+    updated_at: str
+
+
+class ArrTestResponse(BaseModel):
+    """`POST /api/settings/arr/{id}/test` -- the `GET /api/v3/system/status` round trip
+    (docs/arr-integration-spec.md "API surface"), the Settings UI's Test button. Same shape as
+    `TestConnectionResponse` plus the instance's own reported version, which only this endpoint
+    (not the generic `ok`/`error_class`/`message` triple) has anything to say about.
+    """
+
+    ok: bool
+    error_class: str | None
+    message: str
+    version: str | None = None

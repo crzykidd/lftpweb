@@ -6,6 +6,55 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-15 — *arr integration phase A: cleanup deferred to phase B despite the poller
+## section literally saying "run cleanup"
+
+`docs/arr-integration-spec.md`'s "The poller" section step 4 reads "For imported items on a
+`arr_delete_completed` queue: run cleanup (below)" — read in isolation, that sentence is in
+scope for `core/arrsync.py`. It isn't: the same spec's own "Build plan" section explicitly
+scopes phase 1 ("Backend foundation") to "poller with match + import detection" only, and
+names "Notify + cleanup" as a separate phase 2. The handoff prompt
+(`prompts/2026-08-15-arr-integration-backend.md`) says the same thing directly ("No notify
+push, no cleanup/deletion, no frontend in this phase"). Treated as the full-feature
+description (what the poller does once all three phases exist), not a phase-A requirement —
+`core/arrsync.py` transitions `(no status) -> detected` and `detected/notified -> imported |
+gone`, and stops there; nothing in phase A calls `core/local_delete.py` or sets
+`auto_queue_suppressed`. Recorded because a literal read of one section without the other
+would have over-built this phase.
+
+## 2026-08-15 — *arr integration phase A: two-pass quiescence guard is in-memory, not a new table
+
+The lifecycle's "confirmed on two consecutive poller passes" requirement (the guard against
+committing `imported`/`gone` on a single, possibly-racy observation) needed somewhere to keep
+"was this candidacy also true last pass." `core/settle.py`'s `item_settle` table does the
+analogous job for the remote-fingerprint settle gate, by persisting to survive a restart —
+but migration 018's own "Data model" section specifies *exactly* three new `item` columns and
+no new table for this feature, and the prompt says to build exactly that schema. Adding a
+persistence table here would be scope creep not asked for. The guard lives in
+`ArrSyncScheduler._pending`, an in-process dict keyed by item id, keyed further by the
+candidate `downloadId` so a restart or a regrab can't accidentally confirm the wrong
+association. A restart loses any pending candidacy and costs one extra poll interval before a
+transition can commit — the safe direction to err in for a feature that, in phase A, doesn't
+even reach the irreversible step (cleanup is phase B).
+
+## 2026-08-15 — *arr integration phase A: the fake-*arr test server runs on its own thread
+
+The first cut of `tests/fake_arr.py` scheduled the fake `uvicorn` server's `serve()` coroutine
+with `asyncio.create_task` on the *calling* test's own event loop — modeled on `pytest-
+asyncio`'s usual "just create a task" idiom. It hung every test that drove the app through
+`fastapi.testclient.TestClient`: `TestClient.post(...)` is a synchronous, blocking call from
+the calling coroutine's frame, and a coroutine mid-synchronous-call never yields control back
+to its own event loop, so the fake server's task — scheduled on that same loop — never got to
+read the incoming request or write a response. Every such request hung until
+`core/arrclient.py`'s own 10s timeout fired, and the test then failed on `ok is False` instead
+of erroring outright, which made the first diagnosis slower than it should have been. Fixed by
+running the fake server in a dedicated OS thread with `asyncio.run()`, decoupling its
+scheduling entirely from whatever the calling test happens to be blocked on — the same thing a
+real out-of-process fake seedbox container gets for free. `tests/fake_arr.py`'s
+`run_fake_arr_server` docstring carries the full reasoning; recorded here too since it's the
+kind of thing a future async-fixture-over-real-HTTP pattern in this repo will want to copy
+correctly the first time.
+
 ## 2026-08-14 — Audit P1 (partial): `FileTree.tsx`'s pure logic extracted to `lib/fileTree.ts`
 
 `FileTree.tsx` was the largest file in the repo (2267 lines). Extracted its pure,

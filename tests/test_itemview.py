@@ -327,6 +327,32 @@ def test_item_view_passes_settle_fields_through_when_present_and_settling():
     assert view["settle_first_matched_at"] == "2026-08-13T00:00:00Z"
 
 
+# --- arr_status / arr_status_at (migration 018, docs/arr-integration-spec.md) ----------------
+
+
+def test_item_view_arr_status_defaults_none_when_row_lacks_it():
+    # `_row()`'s base dict has no arr_status columns at all -- the exact shape of a pre-018
+    # hand-built row this file's other tests already rely on; must not KeyError.
+    view = item_view(_row())
+    assert view["arr_status"] is None
+    assert view["arr_status_at"] is None
+
+
+def test_item_view_passes_arr_status_through_verbatim():
+    row = _row(arr_status="imported", arr_status_at="2026-08-15T00:00:00.000000Z")
+    view = item_view(row)
+    assert view["arr_status"] == "imported"
+    assert view["arr_status_at"] == "2026-08-15T00:00:00.000000Z"
+
+
+def test_item_view_never_publishes_arr_download_id():
+    # spec (migration 018's "Data model"): "Not published in the item projection." Even when
+    # the underlying row carries it (a real `SELECT *`), item_view's output must not.
+    row = _row()
+    row["arr_download_id"] = "some-infohash"
+    assert "arr_download_id" not in item_view(row)
+
+
 def test_item_view_deleted_archive_at_defaults_none_when_row_lacks_it():
     # `_row()`'s base dict has no `deleted_archive_at` column at all -- the exact shape of a
     # bare `SELECT * FROM item` row, which never joins `deleted_archive`.
@@ -629,6 +655,25 @@ async def test_engine_project_deleted_archive_at_none_without_a_deleted_archive_
     node = published["Release.One"]
 
     assert node["deleted_archive_at"] is None
+
+
+async def test_get_files_carries_arr_status(db):
+    """`FileNode` must declare `arr_status`/`arr_status_at` fields, not just `item_view` --
+    `api/files.py.get_files` constructs `FileNode(**item_view(row))`, and a pydantic model
+    silently drops any key that isn't one of its own declared fields, so this is the one test
+    that would catch a projection change that updated `item_view` but not `FileNode` (exactly
+    the "REST + WebSocket both carry them" requirement docs/arr-integration-spec.md and the
+    handoff prompt both name).
+    """
+    queue_id, _item_id = await _seed_item(
+        db, arr_status="imported", arr_status_at="2026-08-15T00:00:00.000000Z"
+    )
+    request = Request(scope={"type": "http", "app": _FakeApp(db, queue_id)})
+
+    response = await get_files(request)
+    node = response.queues[0].nodes[0]
+    assert node.arr_status == "imported"
+    assert node.arr_status_at == "2026-08-15T00:00:00.000000Z"
 
 
 async def test_get_files_joins_deleted_archive_at(db):

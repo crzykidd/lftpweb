@@ -35,7 +35,8 @@ router = APIRouter(prefix="/api/settings")
 _QUEUE_SELECT_COLUMNS = (
     "id, host_id, name, remote_path, local_path, staging_path, enabled, sync_mode, "
     "auto_queue_enabled, auto_queue_patterns_only, auto_verify, auto_extract, auto_move, "
-    "auto_delete_archives, scan_interval_s, download_prefix_enabled, download_prefix"
+    "auto_delete_archives, scan_interval_s, download_prefix_enabled, download_prefix, "
+    "arr_instance_id, arr_delete_completed, arr_visible_path"
 )
 
 
@@ -68,6 +69,9 @@ def _queue_out_from_row(row) -> PathQueueOut:
         scan_interval_s=row["scan_interval_s"],
         download_prefix_enabled=_nullable_bool(row["download_prefix_enabled"]),
         download_prefix=row["download_prefix"],
+        arr_instance_id=row["arr_instance_id"],
+        arr_delete_completed=bool(row["arr_delete_completed"]),
+        arr_visible_path=row["arr_visible_path"],
     )
 
 
@@ -150,6 +154,29 @@ def _reject_invalid_download_prefix(body: PathQueueIn) -> None:
         raise HTTPException(status_code=400, detail=error)
 
 
+async def _validate_arr_binding(
+    db, arr_instance_id: int | None, arr_delete_completed: bool
+) -> None:
+    """migration 018 / docs/arr-integration-spec.md "API surface": `arr_instance_id` must
+    reference an existing `arr_instance` row or be `None`, and `arr_delete_completed` -- the
+    only destructive switch this feature has -- can never be `True` on a queue with no bound
+    instance (spec "Defaults & safety": "gated behind a confirmed import event even when on,"
+    which presupposes an instance to confirm an import *against*). Shared by create and update
+    so there is exactly one place this pair of rules is enforced.
+    """
+    if arr_instance_id is not None:
+        cursor = await db.execute("SELECT id FROM arr_instance WHERE id = ?", (arr_instance_id,))
+        if await cursor.fetchone() is None:
+            raise HTTPException(
+                status_code=400, detail=f"arr_instance_id {arr_instance_id} does not exist"
+            )
+    if arr_delete_completed and arr_instance_id is None:
+        raise HTTPException(
+            status_code=400,
+            detail="arr_delete_completed requires an arr_instance_id",
+        )
+
+
 @router.get("/queues", response_model=list[PathQueueOut])
 async def list_queues(request: Request) -> list[PathQueueOut]:
     cursor = await request.app.state.db.execute(
@@ -165,6 +192,7 @@ async def create_queue(body: PathQueueIn, request: Request) -> PathQueueOut:
     _reject_invalid_scan_interval(body.scan_interval_s)
     _reject_invalid_download_prefix(body)
     db = request.app.state.db
+    await _validate_arr_binding(db, body.arr_instance_id, body.arr_delete_completed)
     host_row = await _get_host_row(db)
     if host_row is None:
         raise HTTPException(status_code=409, detail="configure a host before creating a queue")
@@ -173,8 +201,9 @@ async def create_queue(body: PathQueueIn, request: Request) -> PathQueueOut:
         "INSERT INTO path_queue (host_id, name, remote_path, local_path, staging_path, "
         "enabled, sync_mode, auto_queue_enabled, auto_queue_patterns_only, "
         "auto_verify, auto_extract, auto_move, auto_delete_archives, scan_interval_s, "
-        "download_prefix_enabled, download_prefix) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "download_prefix_enabled, download_prefix, "
+        "arr_instance_id, arr_delete_completed, arr_visible_path) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             host_row["id"],
             body.name,
@@ -192,6 +221,9 @@ async def create_queue(body: PathQueueIn, request: Request) -> PathQueueOut:
             body.scan_interval_s,
             _sql_bool(body.download_prefix_enabled),
             body.download_prefix,
+            body.arr_instance_id,
+            1 if body.arr_delete_completed else 0,
+            body.arr_visible_path,
         ),
     )
     await db.commit()
@@ -260,6 +292,7 @@ async def update_queue(queue_id: int, body: PathQueueIn, request: Request) -> Pa
     _reject_unimplemented_sync_mode(body.sync_mode)
     _reject_invalid_scan_interval(body.scan_interval_s)
     db = request.app.state.db
+    await _validate_arr_binding(db, body.arr_instance_id, body.arr_delete_completed)
 
     cursor = await db.execute(
         "SELECT auto_verify, auto_extract, auto_move, auto_delete_archives, "
@@ -299,7 +332,8 @@ async def update_queue(queue_id: int, body: PathQueueIn, request: Request) -> Pa
         "UPDATE path_queue SET name = ?, remote_path = ?, local_path = ?, staging_path = ?, "
         "enabled = ?, sync_mode = ?, auto_queue_enabled = ?, auto_queue_patterns_only = ?, "
         "auto_verify = ?, auto_extract = ?, auto_move = ?, auto_delete_archives = ?, "
-        "scan_interval_s = ?, download_prefix_enabled = ?, download_prefix = ? WHERE id = ?",
+        "scan_interval_s = ?, download_prefix_enabled = ?, download_prefix = ?, "
+        "arr_instance_id = ?, arr_delete_completed = ?, arr_visible_path = ? WHERE id = ?",
         (
             body.name,
             body.remote_path,
@@ -318,6 +352,9 @@ async def update_queue(queue_id: int, body: PathQueueIn, request: Request) -> Pa
             body.scan_interval_s,
             download_prefix_enabled_value,
             download_prefix_value,
+            body.arr_instance_id,
+            1 if body.arr_delete_completed else 0,
+            body.arr_visible_path,
             queue_id,
         ),
     )

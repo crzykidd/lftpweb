@@ -77,6 +77,30 @@ than a first. Two things that bit the first time and will bit again:
 
 ## Where we are
 
+### *arr integration build run (2026-08-15, unattended) — LIVE PROGRESS LOG
+
+> `docs/arr-integration-spec.md` (approved 2026-08-15) specs a Sonarr/Radarr integration in
+> three handoff prompts: `prompts/2026-08-15-arr-integration-{backend,notify-cleanup,ui-and-docs}.md`.
+> The icon reads a bound instance's queue to prove a Files-page item is *arr-driven, watches it
+> through import, and optionally cleans up the local copy once the *arr is done with it. This
+> log tracks each phase as it lands, same convention as the 2026-08-14 overnight audit run below.
+
+| Phase | What | Status |
+|---|---|---|
+| A — backend foundation | Migration 018 (`arr_instance` + 3 `path_queue` cols + 3 `item` cols); `core/arrclient.py` (httpx, one class, `kind` switch); `core/arrsync.py` poller (matching + import/gone detection, two-pass quiescence guard, per-instance backoff); `ArrSettings`; `api/settings_arr.py` CRUD + Test; `api/settings_queues.py` extended; `arr_status`/`arr_status_at` joined into `core/itemview.py`'s one projection. No notify, no cleanup, no frontend — those are phases B/C. | ✅ done, this commit |
+| B — notify + cleanup | Postprocess-tail scan-command push, the cleanup path with suppression, withheld events, per-queue columns already in place from phase A | ⏳ not started |
+| C — UI | Integrations tab, Queues additions, Files icon + filter, browser-verified | ⏳ not started |
+
+**Phase A verification:** backend lint/format clean, full backend `pytest` green (new tests in
+`tests/test_arrclient.py`, `tests/test_arrsync.py`, `tests/test_settings_arr_api.py`,
+`tests/test_settings_queues_arr.py`, plus additions to `tests/test_itemview.py`), frontend
+untouched and re-verified anyway. The fake-*arr fixture (`tests/fake_arr.py`) runs a real
+`uvicorn` server on its own thread — see that file's docstring for why (a `TestClient`-driven
+test's synchronous call blocks the event loop a same-loop fake server would need to respond).
+Everything defaults off (`arr_instance.enabled = 0`, migration inserts no rows); the eventType/
+trackedDownloadState vocabulary in `core/arrclient.py` is flagged unverified against a live
+instance, per the spec's own warning.
+
 ### 🌙 Overnight audit run (started 2026-08-14, unattended) — LIVE PROGRESS LOG
 
 > A post-`v0.1.0` audit landed in `docs/audit-v0.1.0.md` (findings S1–S4, G1–G3, P1–P5). The user

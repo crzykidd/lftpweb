@@ -21,9 +21,10 @@ from lftpweb.api import auth as auth_api
 from lftpweb.api import backup as backup_api
 from lftpweb.api import files, health, history, jobs, logs, stats, ws
 from lftpweb.api import metrics as metrics_api
-from lftpweb.api import settings_host, settings_postprocess, settings_queues
+from lftpweb.api import settings_arr, settings_host, settings_postprocess, settings_queues
 from lftpweb.config import settings
 from lftpweb.core import auth
+from lftpweb.core.arrsync import ArrSyncScheduler
 from lftpweb.core.autoqueue import AutoQueue
 from lftpweb.core.backup import BackupScheduler
 from lftpweb.core.local_delete import DeleteInFlight, RetentionScheduler
@@ -127,17 +128,27 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         in_flight_provider=lambda: app.state.postprocess.in_flight_item_ids(),
         delete_in_flight=app.state.delete_in_flight,
     )
+    # Sonarr/Radarr integration, phase A (docs/arr-integration-spec.md "The poller"): its own
+    # clock, independent of the scan pass -- same background-loop shape as the schedulers
+    # above, default off (every `arr_instance` row starts `enabled = 0`, migration 018 inserts
+    # none). `events` wired the same plain-attribute-not-constructor-arg way `postprocess`
+    # is above, so an `item_delta` published mid-poll reaches connected browsers.
+    app.state.arr_sync = ArrSyncScheduler(
+        db=app.state.db, config_dir=settings.config_dir, events=app.state.events
+    )
 
     await app.state.engine.start()
     await app.state.queue.start()
     await app.state.backup_scheduler.start()
     await app.state.metrics_retention.start()
     await app.state.retention_scheduler.start()
+    await app.state.arr_sync.start()
 
     logger.info("lftpweb %s started", __version__)
     try:
         yield
     finally:
+        await app.state.arr_sync.stop()
         await app.state.retention_scheduler.stop()
         await app.state.metrics_retention.stop()
         await app.state.backup_scheduler.stop()
@@ -170,6 +181,7 @@ def create_app() -> FastAPI:
     app.include_router(settings_host.router)
     app.include_router(settings_queues.router)
     app.include_router(settings_postprocess.router)
+    app.include_router(settings_arr.router)
     app.include_router(files.router)
     app.include_router(jobs.router)
     app.include_router(history.router)
