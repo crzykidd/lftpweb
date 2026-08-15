@@ -35,6 +35,51 @@ Skeleton for the next roll:
 
 ### Removed
 
+## [0.1.1] — 2026-08-15
+
+A maintenance release driven entirely by a **full post-`v0.1.0` audit of the codebase performed
+by Claude (Fable)** — a sweep for security flaws, a look at how the code is partitioned, and a
+fresh pass over the settings and gating rules. The audit and its full findings are recorded in
+[`docs/audit-v0.1.0.md`](docs/audit-v0.1.0.md); this release closes the fixable ones. Four were
+security fixes (one of them a real unauthenticated file-read) and three were internal,
+behaviour-preserving refactors that make the largest files far cheaper to work in. The audit
+items that remain — a `move`-mode delete-ordering design question, a missing connection-limit
+setting, and two deeper module splits — are named in `docs/audit-v0.1.0.md` and tracked in
+`prompts/open-issues.md` for a later, reviewed session rather than rushed into this release.
+
+### Security
+
+- **Fixed an unauthenticated arbitrary-file read in the single-page-app fallback route** (audit
+  S1). The catch-all route that serves the built UI joined a request-controlled, percent-decoded
+  path onto the static directory with no containment check, and sat outside the API auth gate —
+  so a crafted `..%2f…`-style request could read any file the container's user could, including
+  the credential-encryption key and the database. It now resolves the path and confirms it stays
+  under the static root before serving anything, falling back to the app shell on any escape.
+  Verified exploitable before the fix and blocked after, with regression tests pinning both.
+- **Archive extraction now refuses to publish a member that escapes its staging directory**
+  (audit S2). A malicious archive whose symlink member points outside the extraction root is
+  caught before the extracted release is merged into the directory an importer watches, rather
+  than relying solely on the archiver's own traversal defences.
+- **Capped the length of every credential and free-text API input, and bounded port numbers**
+  (audit S3) — closing a request-body denial-of-service on the unauthenticated login path, which
+  would otherwise argon2-hash an arbitrarily large password. The caps are generous enough that no
+  legitimate value is ever rejected.
+- **Added baseline security response headers** — `X-Content-Type-Options: nosniff`,
+  `X-Frame-Options: SAMEORIGIN`, and `Referrer-Policy: same-origin` — on every response (audit
+  S4). A Content-Security-Policy and HSTS were deliberately left out for now: both need
+  browser verification before they can be enabled without risking the UI or plain-HTTP LAN use.
+
+### Changed
+
+- **Internal code partitioning, with no change to behaviour** (audit P1–P3). Three of the
+  largest files were split along the seams they already had, so a localized change no longer
+  means reading thousands of lines: `api/settings.py` (1068 lines) became three per-resource
+  routers; `core/local_delete.py` (1649 lines) split into focused `retention`, `archive_cleanup`,
+  and `reset` modules with its import surface preserved; and `FileTree.tsx`'s pure logic moved to
+  a standalone `lib/fileTree.ts` (the component dropped from 2267 to ~1765 lines). Each was
+  verified behaviour-preserving — the `/api/settings` route list is byte-identical, and the full
+  test suite (1063 backend, 266 frontend) passes unchanged.
+
 ## [0.1.0] — 2026-08-14
 
 **The first tagged release, and the first beta.** Everything below is the whole of the
