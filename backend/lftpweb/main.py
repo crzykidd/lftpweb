@@ -176,14 +176,30 @@ def create_app() -> FastAPI:
         if assets_dir.is_dir():
             app.mount("/assets", StaticFiles(directory=assets_dir), name="spa-assets")
 
+        static_root = static_dir.resolve()
+        index_html = static_dir / "index.html"
+
         @app.get("/{full_path:path}", include_in_schema=False)
         async def spa_fallback(full_path: str) -> FileResponse:
             if full_path.startswith("api/"):
                 raise HTTPException(status_code=404)
+            # `full_path` is request-controlled and reaches this handler percent-decoded but
+            # *not* `..`-normalized -- a client can send `..%2f..%2fetc/passwd` and uvicorn
+            # passes it straight through. This route is also outside the /api/ auth gate
+            # (middleware.py only gates /api/), so serving `static_dir / full_path` blindly is
+            # an unauthenticated arbitrary file read: resolve and confirm containment under the
+            # static root before serving anything, and fall back to the SPA shell on any escape
+            # attempt rather than 403ing (a normal deep link that happens not to exist on disk
+            # must still render the SPA). See docs/audit-v0.1.0.md finding S1.
             candidate = static_dir / full_path
-            if full_path and candidate.is_file():
-                return FileResponse(candidate)
-            return FileResponse(static_dir / "index.html")
+            try:
+                resolved = candidate.resolve()
+                resolved.relative_to(static_root)
+            except (ValueError, OSError):
+                return FileResponse(index_html)
+            if full_path and resolved.is_file():
+                return FileResponse(resolved)
+            return FileResponse(index_html)
 
     return app
 
