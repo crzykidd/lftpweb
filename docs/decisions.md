@@ -6,6 +6,37 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-16 — The *arr poller's `gone` commit no longer publishes a `REMOVED_BOTH` row (the resurrected-zombie fix)
+
+Found live, post-v0.2.0: the user deleted two Sonarr-tracked items' files by hand (rows rode
+the grace to `REMOVED_BOTH` and left the Files page), then removed them from Sonarr's queue.
+Two poller passes later `_commit_terminal` wrote `arr_status = 'gone'` and
+`ArrSyncScheduler._publish_item` pushed an `item_delta` for each — resurrecting dead nodes in
+every connected client. The rows were visible but un-actionable (`canDeleteLocal` correctly
+hides Delete for `REMOVED_BOTH`; `rowAction` correctly hides Queue with no remote copy) and
+only cleared when the user happened to navigate away and back, whose fresh connect-time
+snapshot re-read through `core/engine.py._project`'s rel_paths filter. The database was never
+wrong; the defect was purely a client-view resurrection — exactly the bug class the
+"`_project`'s rel_paths filter is load-bearing" warning describes, arriving through a publish
+path that didn't exist when the warning was written.
+
+**Fix: gate the publish, not the poller.** `_publish_item` now returns without publishing when
+the read-back row's `state == 'REMOVED_BOTH'`; the state write and the `arr_gone` audit event
+still happen unchanged. `REMOVED_LOCAL` still publishes — its remote copy keeps it in the
+projection, so its deltas are legitimate.
+
+**Rejected alternative: skip import-detection for `REMOVED_BOTH` rows entirely** (filter them
+out of `_process_queue`'s item query). Narrower-looking, but wrong twice over: the association
+still deserves its terminal `gone`/`imported` verdict and audit row even when the files are
+already gone (the audit trail is how "what did the *arr do?" gets answered later), and an item
+could reach `REMOVED_BOTH` *between* the two quiescence passes, which would freeze a
+half-confirmed candidacy in `_pending` forever instead of letting it commit. Gating only the
+WS publish keeps every state machine unchanged and touches the one thing that was actually
+wrong: the wire.
+
+Regression test: `tests/test_arrsync.py.test_gone_commit_on_a_removed_both_row_does_not_
+publish_an_item_delta` — verified to fail against the unfixed code.
+
 ## 2026-08-16 — Manual delete gains an independent Source scope: defaults, §7.1 interplay, and why partial failure doesn't 409
 
 `prompts/done/2026-08-16-manual-delete-local-and-remote.md`, the move-delete ladder's own
