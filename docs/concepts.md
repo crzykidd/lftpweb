@@ -108,7 +108,7 @@ that was fetched and unpacked before this codebase cleaned it up.
 
 ## Why an item will not re-download — auto-queue suppression {#suppression}
 
-Auto-queue deliberately refuses to pick an item up again once one of four things has happened to
+Auto-queue deliberately refuses to pick an item up again once one of five things has happened to
 it. This is the single most common "why is it ignoring this" and it is almost always working as
 intended.
 
@@ -117,7 +117,8 @@ intended.
 | `user_stopped` | You stopped the transfer — either before it started or while it was running. |
 | `retries_exhausted` | The transfer failed and will not be retried again on its own. Only three error classes are ever retried at all (host unreachable, TLS, and a transient local filesystem error), so this also covers a failure lftpweb could not classify. |
 | `permanent_error` | The failure was one that will recur identically: auth failed, permission denied, the remote path is gone, or the disk is full. |
-| `deleted_local` | lftpweb deleted the local copy itself — a manual delete from Files, or the retention sweep. |
+| `deleted_local` | lftpweb deleted the local copy itself — a manual delete from Files (Delete local copy), or the retention sweep. |
+| `deleted_source` | You manually deleted the seedbox copy from the Files page's delete dialog (Delete source), without also deleting the local copy — so a release that later reappears under the same path is not silently fetched right back. A combined delete (both boxes checked) is recorded as `deleted_local` instead, the more complete fact about a row whose local copy is also gone. |
 
 **Suppression only ever stops auto-queue.** A manual **Queue** click on the
 [Files](/files) page is never filtered by it, and using **Retry** on a failed job from

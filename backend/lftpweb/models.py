@@ -399,17 +399,45 @@ class RetentionPreviewResponse(BaseModel):
     items: list[RetentionPreviewItem]
 
 
+class DeleteItemRequest(BaseModel):
+    """`POST /api/items/{item_id}/delete`'s optional body (2026-08-16, the manual delete
+    dialog's independent Local/Source scopes,
+    `prompts/2026-08-16-manual-delete-local-and-remote.md`). Omitted entirely (no body at all)
+    means exactly today's pre-existing behavior -- `local=True, source=False`, a local-only
+    delete -- so every caller that predates this task (including every existing test that calls
+    `delete_item` with no body) is unaffected. `source=True` is the first *manual* remote-delete
+    path in the API; the endpoint itself raises 400 if both are `False` -- "at least one" is a
+    cross-field rule a plain check in the handler expresses more legibly than a Pydantic
+    validator would.
+    """
+
+    local: bool = True
+    source: bool = False
+
+
 class DeleteItemResponse(BaseModel):
     """`POST /api/items/{item_id}/delete` -- the first delete endpoint in this API (DESIGN.md
     §9.2's Files-page "Delete local"). A withheld guard raises `HTTPException` instead of
     returning `deleted=False` here, so the existing `Promise.allSettled` bulk-action shape
     (`FileTree.tsx`, phase 9) reports it as a per-item failure without any new frontend
     plumbing.
+
+    `deleted`/`reason`/`bytes_freed` describe the **local** scope exactly as before this task
+    (`True`/`"deleted"`/bytes when `local=True` was requested and succeeded; unchanged shape for
+    every caller that predates the source scope). `source_deleted`/`source_reason` are `None`
+    when `source` was not requested, and otherwise describe that independent outcome -- a
+    combined request where local succeeds but source then fails is reported as `deleted=True`
+    with `source_deleted=False` (200, not 409): the local side effect already happened and
+    cannot be un-happened, so the response says exactly what did and did not occur rather than
+    a single flag flattening the two into a misleading pass/fail. The endpoint only raises 409
+    when *nothing* requested actually succeeded -- see `api/jobs.py.delete_item`'s own docstring.
     """
 
     deleted: bool
     reason: str
     bytes_freed: int | None = None
+    source_deleted: bool | None = None
+    source_reason: str | None = None
 
 
 # --- Reset item tracking (2026-08-13, prompts/2026-08-13-reset-item-tracking.md) -----------

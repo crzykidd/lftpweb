@@ -47,11 +47,17 @@ Every verify outcome, every remote delete, and every delete withheld — with th
 - Connect to a seedbox over SSH/SFTP; browse the remote tree alongside the local one
 - Named **path queues** — one remote → local mapping each, with their own settings
 - Queue transfers manually, watch live progress, stop them, resume from the partial;
-  multi-select with shift-range and bulk Queue/Stop/Delete-local that reports partial failure
+  multi-select with shift-range and bulk Queue/Stop/Delete that reports partial failure
   honestly ("7 of 10 queued, these 3 failed because …"), plus text/state/"missing only" filters,
-  on the Files page. Deleting local files is guarded (path containment, no active job, mount
-  sentinel) and confirmed before it runs — irreversible, unlike Queue/Stop. A delete marks the
-  whole subtree, and picks each row's state from whether a remote copy actually survives
+  on the Files page. The delete dialog offers two independent, checkbox-driven scopes — Delete
+  local copy, and (2026-08-16) Delete source (seedbox), the first manual remote-delete in the
+  app, for cleaning up a failed or never-imported item without SSHing into the seedbox by hand.
+  Local defaults on and Source defaults on for a `move` queue (off for `copy`, with a warning if
+  checked anyway — its remote path isn't guaranteed to be a hardlink pickup directory). Every
+  scope is guarded (path containment, no active job, mount sentinel; a manual source delete
+  refuses rather than stopping a live transfer) and confirmed before it runs — irreversible,
+  unlike Queue/Stop. A local delete marks the whole subtree, and picks each row's state from
+  whether a remote copy actually survives
 - Files rows carry four lifecycle icons (**R**emote / **L**ocal / **V**erified / **E**xtracted —
   presence facets may go dark, milestones stay lit), an inline progress bar inside the state
   chip, when the row last changed state, and an info icon that opens a detail drawer with both
@@ -115,8 +121,7 @@ and how it was verified), but real gaps remain:
 
 | | Notes |
 |---|---|
-| Files page has no "Delete remote" | §9.2 lists it alongside "Delete local" (which now exists, per-item and bulk, with a confirmation dialog — 2026-08-12). Deliberately deferred, not forgotten: the only remote deletion is still `move` mode's verification-gated pipeline; a manual remote-delete button is a materially larger safety conversation. |
-| Propagating local deletes to the seedbox (`sync` mode) | Designed (`DESIGN.md` §7) but **not scheduled** — built only if it proves wanted. |
+| Propagating local deletes to the seedbox (`sync` mode) | Designed (`DESIGN.md` §7) but **not scheduled** — built only if it proves wanted. `sync`'s own primary use case ("the importer took it, clean up the source") is now served without building it: `move`-with-the-delete-ladder plus the Files page's manual delete dialog (Delete source, above) cover it — see `DESIGN.md` §7's own note. |
 | Local retention (delete-local-files-older-than-N-days) has no Settings-page UI | Backend, API (including a dry-run preview), and the background scheduler all exist (2026-08-12) and default off; only the settings screen to turn it on hasn't shipped yet — same "backend first" gap as the settle gate and Settings → Transfer before it. |
 
 See "Known gaps" below for the rest — behavioral limitations and deliberate trade-offs, as

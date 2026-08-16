@@ -333,13 +333,20 @@ export function stopItem(itemId: number): Promise<{ applied: boolean }> {
   return sendJson<{ applied: boolean }>(`/api/items/${itemId}/stop`, 'POST')
 }
 
-/** Delete-by-item (DESIGN.md §9.2's Files-page "Delete local"; prompts/open-issues.md
- * "7 + 8"). A withheld guard responds non-2xx, so `sendJson` throws -- this rejects exactly
- * the way `queueItem`/`stopItem` already do on failure, which is what lets `FileTree.tsx`'s
- * existing `Promise.allSettled` bulk-action reporting cover Delete with no new mechanism.
+/** Delete-by-item (DESIGN.md §9.2's Files-page delete dialog; prompts/open-issues.md "7 + 8").
+ * A request that accomplishes nothing at all responds non-2xx, so `sendJson` throws -- this
+ * rejects exactly the way `queueItem`/`stopItem` already do on failure, which is what lets
+ * `FileTree.tsx`'s existing `Promise.allSettled` bulk-action reporting cover Delete with no new
+ * mechanism (a combined request that partially succeeds resolves instead -- see
+ * `DeleteItemResponse`'s own comment).
+ *
+ * `local`/`source` are both explicit, required parameters (2026-08-16, the dialog's independent
+ * Local/Source checkboxes, prompts/2026-08-16-manual-delete-local-and-remote.md) -- every call
+ * site says what it means rather than relying on the backend's own local-only default for an
+ * omitted body.
  */
-export function deleteItem(itemId: number): Promise<DeleteItemResponse> {
-  return sendJson<DeleteItemResponse>(`/api/items/${itemId}/delete`, 'POST')
+export function deleteItem(itemId: number, local: boolean, source: boolean): Promise<DeleteItemResponse> {
+  return sendJson<DeleteItemResponse>(`/api/items/${itemId}/delete`, 'POST', { local, source })
 }
 
 // --- Reset item tracking (2026-08-13, prompts/2026-08-13-reset-item-tracking.md) -----------

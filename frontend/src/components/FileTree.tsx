@@ -3,7 +3,7 @@ import type { CSSProperties, KeyboardEvent as ReactKeyboardEvent, PointerEvent a
 import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useReducer, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { deleteItem, getRemovalGraceSettings, getSettleSettings, queueItem, stopItem } from '../api/client'
-import type { FileNode, RemovalGraceSettingsOut, SettleSettingsOut } from '../api/types'
+import type { DeleteItemResponse, FileNode, RemovalGraceSettingsOut, SettleSettingsOut, SyncMode } from '../api/types'
 import type { ChildSpeedSample } from '../hooks/useLiveModel'
 import {
   bothSidesRows,
@@ -32,9 +32,11 @@ import { StateChip } from './StateChip'
 // the component keeps every JSX/stateful piece and pulls these back in by name.
 import {
   buildTree,
+  canConfirmDelete,
   clampColumnWidth,
   DEFAULT_COLLAPSE_PREFERENCE,
   DEFAULT_SORT_PREFERENCE,
+  defaultSourceChecked,
   effectiveEtaLabel,
   effectiveSpeedLabel,
   fixedColumnStyle,
@@ -49,6 +51,8 @@ import {
   RESIZABLE_COLUMNS,
   resolveCollapsed,
   rowAction,
+  shouldOfferSourceScope,
+  showsCopyQueueSourceWarning,
   sortTree,
   type CollapsePreference,
   type ColumnDef,
@@ -1020,6 +1024,7 @@ export function FileTree({
   selected,
   onSelectionChange,
   queueLocalPath,
+  queueSyncMode = 'copy',
   arrInstanceName,
   arrInstanceKind,
 }: {
@@ -1069,6 +1074,15 @@ export function FileTree({
    * panel just doesn't render without it; nothing else here is affected.
    */
   queueLocalPath?: string
+  /** This queue's `path_queue.sync_mode` (2026-08-16, the delete dialog's independent
+   * Local/Source scopes, `prompts/2026-08-16-manual-delete-local-and-remote.md`) -- drives the
+   * Source checkbox's default (`defaultSourceChecked`) and whether the dialog shows §7.1's
+   * copy-queue warning (`showsCopyQueueSourceWarning`). Defaults to `'copy'`, the safer
+   * (unchecked-by-default) reading, for the same "queue config not loaded yet" reason
+   * `queueLocalPath` above is optional -- `FilesPage.tsx` always resolves the real value once
+   * its own queue-config fetch lands.
+   */
+  queueSyncMode?: SyncMode
   /** Sonarr/Radarr integration (docs/arr-integration-spec.md "UI"): the name of the *arr
    * instance bound to this queue (via `path_queue.arr_instance_id`), resolved by the caller --
    * see `RowProps.arrInstanceName`'s own docstring for why this arrives as a prop rather than
@@ -1192,6 +1206,12 @@ export function FileTree({
   // action. `null` = no pending confirmation; otherwise the exact entries about to be deleted,
   // so the dialog's count/byte total is read from the same list the delete itself will use.
   const [pendingDelete, setPendingDelete] = useState<TreeEntry[] | null>(null)
+  // The dialog's independent Local/Source checkboxes (2026-08-16,
+  // `prompts/2026-08-16-manual-delete-local-and-remote.md`) -- seeded to their per-queue
+  // defaults (`defaultSourceChecked`) every time a new delete is requested (`requestDeleteRow`/
+  // `requestDeleteSelected` below), then freely toggleable by the user before confirming.
+  const [deleteLocalChecked, setDeleteLocalChecked] = useState(true)
+  const [deleteSourceChecked, setDeleteSourceChecked] = useState(false)
 
   // "Reset item tracking" no longer has a bulk panel of its own here (2026-08-13,
   // prompts/2026-08-13-reset-item-tracking.md shipped it as a bulk action beside Delete;
@@ -1412,25 +1432,61 @@ export function FileTree({
    * `targets` is explicit (not always `selectedEntries`) so this same runner covers a
    * single-row Delete confirmation, not just the multi-select bulk bar -- one mechanism for
    * both, per the task's own instruction not to build a parallel one.
+   *
+   * `deleteScope` (2026-08-16, the dialog's independent Local/Source checkboxes) is only read
+   * for `action === 'delete'`. Per-entry, not a blanket flag across the whole bulk call: Source
+   * is only ever actually requested for an entry that `hasRemoteCopy` (an entry with none has
+   * nothing there to delete, matching the dialog's own "the Source checkbox only renders when
+   * a remote copy exists" rule at the bulk level too), so `deleteScope.source` alone can't tell
+   * "was source requested for *this* entry" apart from "the checkbox happened to be checked" --
+   * `sourceRequestedFor` below is that per-entry answer, computed once and reused for both the
+   * request itself and reading its response honestly afterward.
+   *
+   * **Honest partial-failure reporting** (the task's own instruction for a bulk delete): a
+   * combined request that deletes the local copy but fails to delete the source resolves
+   * (`api/jobs.py.delete_item`'s own docstring: the local side effect already happened, so the
+   * endpoint reports 200 with `source_deleted: false` rather than throwing) -- `Promise.
+   * allSettled` alone would read that as a plain success. Reading `source_deleted` out of a
+   * fulfilled delete response is what keeps that partial outcome from disappearing into the
+   * bulk summary's "succeeded" count.
    */
-  const runAction = async (action: BulkOutcome['action'], targets: TreeEntry[]) => {
+  const runAction = async (
+    action: BulkOutcome['action'],
+    targets: TreeEntry[],
+    deleteScope?: { local: boolean; source: boolean },
+  ) => {
     if (targets.length === 0) return
     setBulkBusy(true)
     setBulkOutcome(null)
     try {
+      const sourceRequestedFor = (e: TreeEntry) => (deleteScope?.source ?? false) && hasRemoteCopy(e)
       const results = await Promise.allSettled(
         targets.map((e) => {
           if (action === 'queue') return queueItem(e.id as number)
           if (action === 'stop') return stopItem(e.id as number)
-          return deleteItem(e.id as number)
+          return deleteItem(e.id as number, deleteScope?.local ?? true, sourceRequestedFor(e))
         }),
       )
       const failures: BulkFailure[] = []
       const succeededPaths = new Set<string>()
       results.forEach((result, i) => {
         const entry = targets[i]
-        if (result.status === 'fulfilled') succeededPaths.add(entry.rel_path)
-        else failures.push({ rel_path: entry.rel_path, name: entry.name, error: errorMessage(result.reason) })
+        if (result.status !== 'fulfilled') {
+          failures.push({ rel_path: entry.rel_path, name: entry.name, error: errorMessage(result.reason) })
+          return
+        }
+        if (action === 'delete' && sourceRequestedFor(entry)) {
+          const response = result.value as DeleteItemResponse
+          if (response.source_deleted === false) {
+            failures.push({
+              rel_path: entry.rel_path,
+              name: entry.name,
+              error: response.source_reason ?? 'source delete failed',
+            })
+            return
+          }
+        }
+        succeededPaths.add(entry.rel_path)
       })
       const nextSelection = new Set(selected)
       for (const path of succeededPaths) nextSelection.delete(path)
@@ -1460,14 +1516,26 @@ export function FileTree({
   const bulkStop = () => runAction('stop', selectedEntries)
 
   const deletableSelected = useMemo(() => selectedEntries.filter(canDeleteLocal), [selectedEntries])
-  const requestDeleteRow = (entry: TreeEntry) => setPendingDelete([entry])
+  // Seeds the dialog's Local/Source checkboxes to their per-queue defaults every time a new
+  // delete is requested (2026-08-16, `defaultSourceChecked`'s own docstring) -- Local always
+  // starts checked (the pre-existing behavior), Source only when the queue is `move` *and* at
+  // least one target actually has a remote copy for it to act on.
+  const requestDeleteRow = (entry: TreeEntry) => {
+    setPendingDelete([entry])
+    setDeleteLocalChecked(true)
+    setDeleteSourceChecked(defaultSourceChecked(queueSyncMode, hasRemoteCopy(entry)))
+  }
   const requestDeleteSelected = () => {
-    if (deletableSelected.length > 0) setPendingDelete(deletableSelected)
+    if (deletableSelected.length === 0) return
+    setPendingDelete(deletableSelected)
+    setDeleteLocalChecked(true)
+    setDeleteSourceChecked(defaultSourceChecked(queueSyncMode, deletableSelected.some(hasRemoteCopy)))
   }
   const confirmDelete = async () => {
     const targets = pendingDelete
+    const scope = { local: deleteLocalChecked, source: deleteSourceChecked }
     setPendingDelete(null)
-    if (targets) await runAction('delete', targets)
+    if (targets) await runAction('delete', targets, scope)
   }
   const pendingDeleteBytes = useMemo(
     () => (pendingDelete ?? []).reduce((sum, e) => sum + localBytes(e), 0),
@@ -1475,9 +1543,15 @@ export function FileTree({
   )
   // Split by whether a remote copy survives the delete -- entirely different outcomes worth
   // telling the user apart (see `hasRemoteCopy`'s own docstring for why "will this come back"
-  // is always answerable from `remote_size` alone, never a guess).
+  // is always answerable from `remote_size` alone, never a guess). Also what
+  // `shouldOfferSourceScope` below is built from, at the granularity the dialog actually needs
+  // (a count worth reporting, not just a boolean).
   const pendingDeleteRemoteCount = useMemo(
     () => (pendingDelete ?? []).filter(hasRemoteCopy).length,
+    [pendingDelete],
+  )
+  const pendingDeleteOffersSource = useMemo(
+    () => shouldOfferSourceScope(pendingDelete ?? []),
     [pendingDelete],
   )
   // How many of the pending selection are actively transferring right now (2026-08-13,
@@ -1627,36 +1701,89 @@ export function FileTree({
         </div>
       )}
 
-      {/* Delete is irreversible (Queue/Stop are not) -- a confirmation dialog with the count
-          and total bytes, per the task's own bar ("meet `move` mode": two-layer opt-in, a UI
-          confirmation), sits between the request above and `runAction('delete', ...)`. One
-          dialog, not two (2026-08-13, prompts/2026-08-13-delete-during-transfer.md): the user
-          asked for a confirmation that says an active transfer will be cancelled, not a second
-          confirmation step stacked on this one, so the active-transfer fact is a line inside
-          the same panel, right alongside (never replacing) the remote-copy line -- a selection
-          can be transferring *and* have a surviving remote copy at once, and both are true
-          statements the user should see together. */}
+      {/* Delete is irreversible (Queue/Stop are not) -- a confirmation dialog sits between the
+          request above and `runAction('delete', ...)`. Two independent scopes (2026-08-16, the
+          delete dialog's own checkboxes, `prompts/2026-08-16-manual-delete-local-and-remote.md`,
+          settled design): Local (the pre-existing behavior) and Source, the first manual
+          remote-delete in the app -- the Source checkbox only renders when at least one pending
+          entry actually has a remote copy (`pendingDeleteOffersSource`), defaults per queue mode
+          (`defaultSourceChecked` -- checked for `move`, unchecked for `copy`/`sync`), and at
+          least one scope must stay checked to confirm (`canConfirmDelete`). One dialog, not two
+          (2026-08-13, prompts/2026-08-13-delete-during-transfer.md): the active-transfer fact is
+          a line inside the same panel, right alongside (never replacing) the remote-copy line --
+          a selection can be transferring *and* have a surviving remote copy at once, and both
+          are true statements the user should see together. */}
       {pendingDelete && (
         <div className="flex flex-col gap-2 rounded-md border border-red-300 bg-red-50 px-3 py-2 text-sm dark:border-red-900 dark:bg-red-950/40">
           <p className="text-red-900 dark:text-red-200">
-            Delete the local copy of <strong>{pendingDelete.length}</strong>{' '}
-            {pendingDelete.length === 1 ? 'item' : 'items'} ({formatBytes(pendingDeleteBytes)})?
-            This only removes the local copy -- nothing remote is touched -- and cannot be
+            Delete <strong>{pendingDelete.length}</strong>{' '}
+            {pendingDelete.length === 1 ? 'item' : 'items'}
+            {deleteLocalChecked && ` (${formatBytes(pendingDeleteBytes)} local)`}? This cannot be
             undone.
           </p>
+          <label className="flex items-center gap-2 text-red-900 dark:text-red-200">
+            <input
+              type="checkbox"
+              checked={deleteLocalChecked}
+              onChange={(e) => setDeleteLocalChecked(e.target.checked)}
+            />
+            Delete local copy
+          </label>
+          {pendingDeleteOffersSource && (
+            <label className="flex items-center gap-2 text-red-900 dark:text-red-200">
+              <input
+                type="checkbox"
+                checked={deleteSourceChecked}
+                onChange={(e) => setDeleteSourceChecked(e.target.checked)}
+              />
+              Delete source (seedbox)
+              {pendingDeleteRemoteCount < pendingDelete.length &&
+                ` -- ${pendingDeleteRemoteCount} of ${pendingDelete.length} have a remote copy`}
+            </label>
+          )}
           {pendingDeleteActiveCount > 0 && (
             <p className="font-medium text-red-900 dark:text-red-200">
-              {activeTransferNote(pendingDelete.length, pendingDeleteActiveCount)}
+              {deleteLocalChecked
+                ? activeTransferNote(pendingDelete.length, pendingDeleteActiveCount)
+                : `${pendingDeleteActiveCount} of ${pendingDelete.length} ${
+                    pendingDeleteActiveCount === 1 ? 'is' : 'are'
+                  } transferring right now -- a source-only delete refuses until the transfer is stopped (check Delete local copy too, which stops it for you).`}
             </p>
           )}
-          <p className="text-red-900 dark:text-red-200">
-            {remoteCopyNote(pendingDelete.length, pendingDeleteRemoteCount)}
-          </p>
+          {!deleteSourceChecked ? (
+            <p className="text-red-900 dark:text-red-200">
+              {remoteCopyNote(pendingDelete.length, pendingDeleteRemoteCount)}
+            </p>
+          ) : (
+            <p className="font-medium text-red-900 dark:text-red-200">
+              {pendingDeleteRemoteCount === pendingDelete.length
+                ? pendingDelete.length === 1
+                  ? 'Its remote copy will also be deleted from the seedbox -- irreversible.'
+                  : 'Their remote copies will also be deleted from the seedbox -- irreversible.'
+                : `${pendingDeleteRemoteCount} of ${pendingDelete.length} remote ${
+                    pendingDeleteRemoteCount === 1 ? 'copy' : 'copies'
+                  } will also be deleted from the seedbox -- irreversible.`}
+            </p>
+          )}
+          {showsCopyQueueSourceWarning(queueSyncMode, deleteSourceChecked) && (
+            <p className="rounded-md border border-amber-400 bg-amber-50 px-2 py-1.5 text-amber-900 dark:border-amber-800 dark:bg-amber-900/30 dark:text-amber-200">
+              ⚠ This queue is <strong>copy</strong> mode -- its remote path is not required to be
+              a hardlink pickup directory the way a <strong>move</strong> queue's is. If it
+              points at live torrent data instead, deleting the source here can destroy a seed
+              (DESIGN.md §7.1).
+            </p>
+          )}
           <div className="flex gap-2">
             <button
               type="button"
               onClick={confirmDelete}
-              className="rounded-md bg-red-700 px-2 py-1 text-xs font-medium text-white hover:bg-red-800 dark:bg-red-800 dark:hover:bg-red-700"
+              disabled={!canConfirmDelete(deleteLocalChecked, deleteSourceChecked)}
+              title={
+                canConfirmDelete(deleteLocalChecked, deleteSourceChecked)
+                  ? undefined
+                  : 'Check at least one of Delete local copy / Delete source'
+              }
+              className="rounded-md bg-red-700 px-2 py-1 text-xs font-medium text-white hover:bg-red-800 disabled:cursor-not-allowed disabled:opacity-50 dark:bg-red-800 dark:hover:bg-red-700"
             >
               Delete
             </button>

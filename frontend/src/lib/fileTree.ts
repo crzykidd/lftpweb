@@ -6,7 +6,7 @@
 // component keeps every JSX/stateful piece and imports these back by name.
 
 import type { CSSProperties } from 'react'
-import type { FileNode } from '../api/types'
+import type { FileNode, SyncMode } from '../api/types'
 import type { ChildSpeedSample } from '../hooks/useLiveModel'
 import {
   childEtaS,
@@ -272,6 +272,50 @@ export function rowAction(node: FileNode): 'queue' | 'stop' | 'redownload' | nul
   if (!hasRemoteCopy(node)) return null
   if (node.suppressed_reason === 'deleted_local' && hasRemoteCopy(node)) return 'redownload'
   return 'queue'
+}
+
+// --- The delete dialog's Local/Source scopes (2026-08-16, the independent checkboxes,
+// prompts/2026-08-16-manual-delete-local-and-remote.md, settled design) -- pure functions so
+// the defaults/validation/visibility rules are testable without rendering `FileTree.tsx`'s own
+// dialog JSX, the same reasoning every other pure helper in this module already follows.
+
+/** The delete dialog's Source checkbox default: a `move` queue checks it -- the queue is
+ * already configured to have lftpweb delete the remote copy itself, so completing that by hand
+ * for a stuck/deferred item is the expected action. A `copy` (or the unbuilt `sync`) queue
+ * leaves it unchecked -- DESIGN.md §7.1's own warning is that a `copy` queue's remote path may
+ * point at live torrent data rather than a hardlink pickup directory, so deleting source there
+ * can destroy a seed, and nothing in this codebase assumes that's safe without the user opting
+ * in explicitly. `hasRemote` gates both ways -- moot when `false`, since
+ * `shouldOfferSourceScope` below means the checkbox never even renders in that case.
+ */
+export function defaultSourceChecked(syncMode: SyncMode, hasRemote: boolean): boolean {
+  return hasRemote && syncMode === 'move'
+}
+
+/** Whether the delete dialog's Source checkbox should render at all -- only when at least one
+ * pending entry actually has a remote copy (`hasRemoteCopy`) for a remote scope to act on;
+ * local-only junk has nothing there to delete.
+ */
+export function shouldOfferSourceScope(entries: FileNode[]): boolean {
+  return entries.some(hasRemoteCopy)
+}
+
+/** The delete dialog's own validation rule (settled design): at least one scope must be
+ * checked to proceed. Local-only keeps the pre-existing behavior; source-only is now possible;
+ * neither checked is never a valid delete request.
+ */
+export function canConfirmDelete(local: boolean, source: boolean): boolean {
+  return local || source
+}
+
+/** Whether the delete dialog shows DESIGN.md §7.1's misconfiguration warning -- a `copy`
+ * queue's remote path is not required to be a hardlink pickup directory the way a `move`
+ * queue's is, so checking Source there can destroy a live torrent's seeding data. Shown only
+ * when Source is actually checked; an unchecked, hidden, or not-applicable checkbox has
+ * nothing to warn about.
+ */
+export function showsCopyQueueSourceWarning(syncMode: SyncMode, sourceChecked: boolean): boolean {
+  return sourceChecked && syncMode !== 'move'
 }
 
 export type FacetFilter =

@@ -106,6 +106,26 @@ Skeleton for the next roll:
   `arr_instance_name`. Logo path data copied from the simple-icons dataset (CC0), itself sourced
   from Sonarr's/Radarr's own repositories — see `NOTICE`.
 
+- **The Files page delete dialog gained an independent Source (seedbox) scope — the first
+  manual remote-delete path in the app.** Two checkboxes, Delete local copy and Delete source,
+  can be ticked independently (at least one is required); the Source checkbox only appears when
+  a remote copy actually exists. Defaults follow the queue's sync mode: both checked for `move`
+  (the queue is already configured to have lftpweb delete the source itself, so finishing that
+  by hand for a stuck/deferred item is the expected action), source left unchecked for `copy`
+  with a warning if checked anyway — a `copy` queue's remote path isn't required to be a
+  hardlink pickup directory, so deleting the source there can destroy a seed (DESIGN.md §7.1).
+  A combined request runs local's existing stop-then-delete first; a source-only request
+  refuses (409) rather than stopping a live transfer itself. `POST /api/items/{id}/delete`
+  reuses `RemoteConnectionPool.delete_path` (never a second SSH-delete implementation) and
+  writes the same `remote_delete`/`remote_delete_failed` events the automatic `move`-mode ladder
+  writes, tagged "manual" so History can tell the two apart; it's idempotent against a remote
+  copy that's already gone (including one the ladder deleted itself, or a mid-ladder deferred
+  item — a source-only delete on one of those simply completes the ladder early) and marks a
+  source-only success `auto_queue_suppressed` (migration 020, `suppressed_reason =
+  'deleted_source'`) so a release that later reappears under the same path isn't silently
+  auto-queued right back. This closes the gap `sync` mode would otherwise have existed to cover
+  — see `DESIGN.md` §7's own note, added alongside the move-mode delete ladder.
+
 ### Changed
 
 - **`move`-mode remote delete is now the last gate on a ladder, not the second step.**

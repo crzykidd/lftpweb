@@ -6,6 +6,90 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-16 — Manual delete gains an independent Source scope: defaults, §7.1 interplay, and why partial failure doesn't 409
+
+`prompts/done/2026-08-16-manual-delete-local-and-remote.md`, the move-delete ladder's own
+follow-on task (see the entry immediately below) — resolving §7's forward note that `sync`
+mode's primary use case ("the importer took it, clean up the source") is now fully served
+without building `sync`. User-approved design, settled 2026-08-16.
+
+**The problem.** The ladder closes the *automatic* gap (source no longer deletes before
+extraction/`*arr` import can fail), but it deliberately has no timeout and no automatic
+fallback for a withheld or deferred item — by design, so a failure stays inspectable on both
+sides. That leaves no way to finish cleaning up a stuck item (a `CORRUPT` verify, a release the
+*arr never imported, a queue whose *arr integration isn't even configured) without SSHing into
+the seedbox by hand. `POST /api/items/{id}/delete` also could not touch the remote at all —
+it was local-only from the day it shipped.
+
+**The settled design.**
+
+- **Two independent, checkbox-driven scopes, not two buttons.** Local (the pre-existing
+  behavior, byte-for-byte unchanged when only it is requested) and Source (new). At least one
+  must be checked — enforced both in the dialog (`canConfirmDelete`) and the endpoint (400).
+  The Source checkbox itself only renders when a remote copy actually exists
+  (`shouldOfferSourceScope`) — nothing for a remote scope to act on otherwise.
+- **Defaults follow the queue's `sync_mode`, not a global default.** Both checked for `move`:
+  the queue is already configured to have lftpweb delete the source itself, so completing that
+  by hand for a stuck item is exactly the expected action, and defaulting it off would make the
+  common case two clicks instead of one. Source defaults *unchecked* for `copy` (and the unbuilt
+  `sync`) — §7.1's own warning is the reason: a `copy` queue's `remote_path` is never required
+  to be a hardlink pickup directory the way a `move` queue's is, so a `copy` queue may point
+  straight at live torrent data, and deleting "source" there can destroy a seed. The dialog
+  shows §7.1's warning text whenever Source is checked on a non-`move` queue, whether by the
+  user or (impossible by default, but checked anyway) some future default change.
+- **A source-only request refuses (409) rather than stopping a live transfer itself.** Local
+  already has its own stop-then-delete two-step (2026-08-13); a bare Source request has no
+  "delete" of its own that would justify silently killing a transfer, so it simply declines
+  when one is running and names the job. A combined request needs no separate check — local's
+  own stop-then-delete already satisfies the guard before source ever runs.
+- **Partial failure is a 200 with honest per-scope reporting, not a 409.** If local is
+  requested and fails, this raises 409 immediately (source is never attempted) — the
+  pre-existing single-scope behavior, unchanged. But if local *succeeds* (or wasn't requested)
+  and source then fails, raising 409 would misrepresent a request that already, irreversibly,
+  did something: the local bytes are already gone. `DeleteItemResponse` gained
+  `source_deleted`/`source_reason` (both `null` when source wasn't requested) precisely so the
+  two outcomes can be reported independently — 409 is reserved for a request that accomplished
+  *nothing at all*. The bulk delete flow (`FileTree.tsx.runAction`) reads these fields back out
+  of an otherwise-`fulfilled` promise so a partial failure can't quietly count as a success in
+  the "N of M succeeded" summary — the one place `Promise.allSettled`'s fulfilled/rejected
+  binary alone would have hidden it.
+- **Reuses `perform_remote_delete`, extended with a `caller` parameter, rather than a second
+  delete implementation.** `caller="pipeline"` (the default) keeps every existing message/level
+  byte-for-byte; `caller="manual"` gets a short, distinctly-tagged message ("deleted by user
+  request") on the *same* `remote_delete`/`remote_delete_failed` event kinds — History can tell
+  a ladder-authorized delete apart from a user-requested one without a new kind to filter on.
+  `PostprocessPipeline` gained a public `resolve_host()` wrapping its existing `_host_provider`
+  closure, so the manual endpoint reuses the identical host/`remote_pool` seam `main.py` already
+  wires for the automatic pipeline and `ArrSyncScheduler`, rather than a third
+  `load_host_config(db, config_dir)` call built fresh at the API layer.
+- **Idempotent, and clears a stale ladder handoff.** `item.remote_deleted_at` already set (the
+  ladder beat this request to it, or an earlier manual call already ran) short-circuits to a
+  no-op success without an SSH round trip — matches `delete_path`'s own idempotence, just
+  skipping the ask. A genuine manual delete also clears `item.remote_delete_pending`, so
+  "delete source for an item mid-ladder" really does complete the ladder early:
+  `core/arrsync.py._maybe_delete_remote_on_import`'s own `remote_deleted_at`/
+  `remote_delete_pending` guards were already correct for this (added by the ladder task,
+  written generally enough to cover any writer, not just itself) — no change needed there.
+- **Suppression: `deleted_source`, a new `suppressed_reason` (migration 020), written only on a
+  source-*only* success.** The dialog's own stated use case — a failed or never-imported item —
+  is exactly the shape most likely to still sit in an auto-queue-*eligible* state
+  (`REMOTE_ONLY`/`PARTIAL`); without marking it, a release that later reappeared under the same
+  `rel_path` would simply be auto-queued right back, undoing a deliberate cleanup action. A
+  *combined* request deliberately does **not** write this — `core/local_delete.py.delete_local`
+  already suppresses the row with `suppressed_reason = 'deleted_local'`, which is the more
+  complete fact about a row whose local copy is also gone, and the source step must not stomp
+  it back to a less-complete reason afterward. (The *automatic* ladder's own delete never needed
+  this: by the time it fires, `item.state` has already moved on past `REMOTE_ONLY`/`PARTIAL`, so
+  `core/autoqueue.py.ELIGIBLE_STATES` was never going to re-pick it up regardless.)
+- **Rejected: a `remote_size` existence check before attempting the SSH delete.** Considered and
+  rejected — every other delete in this codebase (`RemoteConnectionPool.delete_path` itself,
+  `perform_remote_delete`) is unconditional-and-idempotent rather than probe-first, and the
+  frontend already gates the checkbox's visibility on `hasRemoteCopy`. Adding a second way to
+  answer "does this have a remote copy" here would be exactly the kind of duplicate logic this
+  codebase tries to avoid, for a case the UI already prevents in the ordinary path.
+
+---
+
 ## 2026-08-16 — The move-delete ladder: source deletes last, not second, and waits on *arr import
 
 `prompts/done/2026-08-16-move-delete-gate-ladder.md`, resolving open issue #2 /

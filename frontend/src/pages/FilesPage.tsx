@@ -176,6 +176,7 @@ export function FilesPage() {
               selected={getSelected(queue.queue_id)}
               onSelectionChange={(next) => setSelectedForQueue(queue.queue_id, next)}
               queueLocalPath={config?.local_path}
+              queueSyncMode={config?.sync_mode ?? 'copy'}
               arrInstanceName={arrInstanceName}
               arrInstanceKind={arrInstanceKind}
             />

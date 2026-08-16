@@ -1305,9 +1305,10 @@ mostly about why that is acceptable here and what keeps it acceptable.
 > source" — is exactly what `move`-with-the-ladder covers automatically, plus the Files page's
 > manual delete dialog for anything the ladder deliberately declines to resolve on its own (a
 > withheld or deferred item — no timeout, no automatic fallback, by design): the ladder's own
-> follow-on task (`prompts/2026-08-16-manual-delete-local-and-remote.md`) gives that dialog an
-> independent source-delete scope so a stuck item can be cleaned up entirely from the app.
-> `sync`'s own distinguishing feature would only be propagating a *local* delete the user (or
+> follow-on task, `prompts/done/2026-08-16-manual-delete-local-and-remote.md`, gave that dialog
+> an independent Source scope (§9.2, §7.4) so a stuck item can be cleaned up entirely from the
+> app, without SSHing into the seedbox by hand. `sync`'s own distinguishing feature would only
+> be propagating a *local* delete the user (or
 > something other than lftpweb) performed by hand — a narrower, still-unbuilt case. **A future
 > session should not build `sync` "for tidiness"**; the workflow gap it would close is already
 > closed.
@@ -1676,9 +1677,12 @@ Dashboard is the detail.
 
 **Files** — virtualized tree (must stay smooth at 10k+ rows), per row: state chip, progress
 bar, size, speed, ETA. Grouped by queue, collapsible per queue. Expand/collapse, multi-select
-with shift-range, bulk *Queue / Stop / Delete local / Delete remote*, text search, state
-filter, and a lifecycle facet filter (below) — composed together, never a second filtering
-path.
+with shift-range, bulk *Queue / Stop / Delete*, text search, state filter, and a lifecycle
+facet filter (below) — composed together, never a second filtering path. Delete's own dialog
+carries two independent scopes, Local and Source (2026-08-16,
+`prompts/2026-08-16-manual-delete-local-and-remote.md` — §7's own note and §7.4) — not two
+separate buttons as originally sketched here, since a combined delete (both scopes, one
+confirmation) is the common case for a `move` queue's stuck item.
 
 Four further row-level readings, all of them projections of the same persisted `item` row the
 state chip already reads (§2.2's one shared projection, never a second read of it):

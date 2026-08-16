@@ -409,15 +409,29 @@ async def perform_remote_delete(
     queue_id: int,
     queue_name: str,
     remote_full: str,
-    verify_state: str,
+    verify_state: str | None = None,
+    caller: str = "pipeline",
 ) -> bool:
     """Do the actual asyncssh delete and record the outcome (DESIGN.md §7.4) -- the one
     implementation, shared by `PostprocessPipeline._maybe_delete_remote` (the common case: an
-    item that isn't *arr-tracked, deleting at rung 3) and `core/arrsync.py`'s rung-4 handoff (an
-    *arr-tracked item, deleting on the confirmed `imported` transition) -- per this task's own
-    instruction not to write a second delete implementation. The caller has already decided
-    every applicable rung passed; this function's only job is "do it and write the event,"
-    exactly the same way regardless of which rung authorized it.
+    item that isn't *arr-tracked, deleting at rung 3), `core/arrsync.py`'s rung-4 handoff (an
+    *arr-tracked item, deleting on the confirmed `imported` transition), and (2026-08-16,
+    `prompts/2026-08-16-manual-delete-local-and-remote.md`) `api/jobs.py.delete_item`'s manual
+    source scope -- per this task's own instruction not to write a second delete implementation.
+    The caller has already decided every applicable rung passed (or, for the manual case, that
+    the user asked for this directly); this function's only job is "do it and write the event,"
+    exactly the same way regardless of who authorized it.
+
+    `caller` (`"pipeline"` by default, unchanged for both existing call sites -- neither passes
+    it explicitly) selects the event message: the pipeline's own verify-evidence-based wording
+    below is untouched, while a non-`"pipeline"` caller (`"manual"`, so far) gets a short,
+    caller-prefixed message instead -- the same `caller`-in-the-message idiom
+    `core/local_delete.py.delete_local` already uses, so History can tell a ladder-authorized
+    delete apart from one the user asked for directly. `kind` is always `remote_delete`/
+    `remote_delete_failed` regardless of `caller` -- History filters and `docs/` reference those
+    two kinds, and a manual delete is not a different *kind* of event, just one with a different
+    story behind it. `verify_state` is only meaningful for `caller="pipeline"` (`None` is fine
+    for a manual delete, which has no verify evidence to cite).
 
     Returns whether the delete succeeded. Never raises -- a failed delete is recorded
     (`remote_delete_failed`) and reported false, not propagated, the same "always recorded,
@@ -426,13 +440,19 @@ async def perform_remote_delete(
     try:
         await remote_pool.delete_path(host, remote_full)
     except Exception as exc:  # noqa: BLE001 - always recorded, never re-raised
-        logger.exception("move-mode delete failed for item %s (%s)", item_id, remote_full)
+        logger.exception("%s delete failed for item %s (%s)", caller, item_id, remote_full)
+        if caller == "pipeline":
+            fail_message = f"queue {queue_id} ('{queue_name}') mode=move: delete of {remote_full} failed: {exc}"
+        else:
+            fail_message = (
+                f"{caller}: delete of {remote_full} (queue {queue_id} '{queue_name}') failed: {exc}"
+            )
         await audit.record_event(
             db,
             level="error",
             item_id=item_id,
             kind="remote_delete_failed",
-            message=f"queue {queue_id} ('{queue_name}') mode=move: delete of {remote_full} failed: {exc}",
+            message=fail_message,
         )
         return False
 
@@ -441,15 +461,22 @@ async def perform_remote_delete(
     # Same `kind="remote_delete"` either way -- History filters and `docs/` reference that kind,
     # and a completeness-only delete is not a different *kind* of event, just one with weaker
     # evidence behind it. The message and level are what tell them apart.
-    if verify_state == "VERIFIED":
+    if caller == "pipeline":
+        if verify_state == "VERIFIED":
+            level = "info"
+            message = f"queue {queue_id} ('{queue_name}') mode=move: deleted verified remote copy {remote_full}"
+        else:  # SKIPPED
+            level = "warning"
+            message = (
+                f"queue {queue_id} ('{queue_name}') mode=move: deleted remote copy {remote_full} "
+                "on completeness evidence alone (no .sfv/.md5 sidecar; hash-on-disk verification "
+                "disabled)"
+            )
+    else:
         level = "info"
-        message = f"queue {queue_id} ('{queue_name}') mode=move: deleted verified remote copy {remote_full}"
-    else:  # SKIPPED
-        level = "warning"
         message = (
-            f"queue {queue_id} ('{queue_name}') mode=move: deleted remote copy {remote_full} "
-            "on completeness evidence alone (no .sfv/.md5 sidecar; hash-on-disk verification "
-            "disabled)"
+            f"{caller}: deleted remote copy of {remote_full} (queue {queue_id} '{queue_name}') "
+            "-- deleted by user request"
         )
     await audit.record_event(
         db, level=level, item_id=item_id, kind="remote_delete", message=message
@@ -505,6 +532,19 @@ class PostprocessPipeline:
         )
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
+
+    async def resolve_host(self) -> HostConfig | None:
+        """The one already-decrypted way to get the currently configured host (2026-08-16,
+        `api/jobs.py.delete_item`'s manual source-delete scope,
+        `prompts/2026-08-16-manual-delete-local-and-remote.md`) -- a thin public wrapper around
+        `self._host_provider`, the identical closure `main.py` hands every other consumer of the
+        host (`core/queue.py.TransferQueue`, `core/arrsync.py.ArrSyncScheduler`, and this
+        pipeline's own `_maybe_delete_remote` a few lines below). Reused rather than a second
+        `core/engine.py.load_host_config(db, config_dir)` call built fresh at the API layer,
+        which would need `config_dir` threaded to `api/jobs.py` for no reason -- this instance
+        already has the closure that answers the same question.
+        """
+        return await self._host_provider() if self._host_provider else None
 
     def in_flight_item_ids(self) -> frozenset[int]:
         """Items a worker is running for at this instant -- read by `core/engine.py`'s scan

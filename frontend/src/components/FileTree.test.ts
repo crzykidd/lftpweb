@@ -6,10 +6,12 @@ import {
   arrHoverLabel,
   arrIconVariant,
   buildTree,
+  canConfirmDelete,
   CHILD_SPEED_FRESHNESS_MS,
   clampColumnWidth,
   columnMinWidth,
   defaultColumnWidths,
+  defaultSourceChecked,
   effectiveEtaLabel,
   effectiveSpeedLabel,
   effectiveSpeedSortValue,
@@ -22,6 +24,8 @@ import {
   RESIZABLE_COLUMNS,
   resolveCollapsed,
   rowAction,
+  shouldOfferSourceScope,
+  showsCopyQueueSourceWarning,
   sortTree,
   type TreeEntry,
 } from '../lib/fileTree'
@@ -833,5 +837,87 @@ describe('rowAction', () => {
 
   it('offers nothing for a row with no id', () => {
     expect(rowAction(node('unpersisted.iso', false, { id: null, remote_size: 1000 }))).toBeNull()
+  })
+})
+
+// --- The delete dialog's Local/Source scopes ------------------------------------------------
+// 2026-08-16 (prompts/2026-08-16-manual-delete-local-and-remote.md, settled design): the
+// first manual remote-delete path in the app. Pure functions only -- the JSX/state wiring
+// (checkboxes, the §7.1 warning banner) lives in `FileTree.tsx` itself and isn't exercised
+// here, per this module's own "no React, no hooks, no DOM" scope.
+
+describe('defaultSourceChecked', () => {
+  it('checks Source by default for a move queue with a remote copy', () => {
+    expect(defaultSourceChecked('move', true)).toBe(true)
+  })
+
+  it('leaves Source unchecked for a move queue with no remote copy at all', () => {
+    expect(defaultSourceChecked('move', false)).toBe(false)
+  })
+
+  it('leaves Source unchecked by default for a copy queue, even with a remote copy (§7.1)', () => {
+    expect(defaultSourceChecked('copy', true)).toBe(false)
+  })
+
+  it('leaves Source unchecked by default for the unbuilt sync mode', () => {
+    expect(defaultSourceChecked('sync', true)).toBe(false)
+  })
+})
+
+describe('shouldOfferSourceScope', () => {
+  it('offers the Source checkbox when at least one pending entry has a remote copy', () => {
+    const entries = [
+      node('a', false, { remote_size: null }),
+      node('b', false, { remote_size: 1000 }),
+    ]
+    expect(shouldOfferSourceScope(entries)).toBe(true)
+  })
+
+  it('hides the Source checkbox when nothing pending has a remote copy', () => {
+    const entries = [
+      node('a', false, { remote_size: null }),
+      node('b', false, { remote_size: null }),
+    ]
+    expect(shouldOfferSourceScope(entries)).toBe(false)
+  })
+
+  it('hides the Source checkbox for an empty selection', () => {
+    expect(shouldOfferSourceScope([])).toBe(false)
+  })
+})
+
+describe('canConfirmDelete', () => {
+  it('allows local-only, the pre-existing behavior', () => {
+    expect(canConfirmDelete(true, false)).toBe(true)
+  })
+
+  it('allows source-only, the new behavior', () => {
+    expect(canConfirmDelete(false, true)).toBe(true)
+  })
+
+  it('allows both checked', () => {
+    expect(canConfirmDelete(true, true)).toBe(true)
+  })
+
+  it('refuses neither checked', () => {
+    expect(canConfirmDelete(false, false)).toBe(false)
+  })
+})
+
+describe('showsCopyQueueSourceWarning', () => {
+  it('warns on a copy queue when Source is checked', () => {
+    expect(showsCopyQueueSourceWarning('copy', true)).toBe(true)
+  })
+
+  it('does not warn on a copy queue when Source is unchecked', () => {
+    expect(showsCopyQueueSourceWarning('copy', false)).toBe(false)
+  })
+
+  it('does not warn on a move queue even when Source is checked', () => {
+    expect(showsCopyQueueSourceWarning('move', true)).toBe(false)
+  })
+
+  it('warns for the unbuilt sync mode too, same as copy', () => {
+    expect(showsCopyQueueSourceWarning('sync', true)).toBe(true)
   })
 })

@@ -441,13 +441,30 @@ export interface FileNode {
   facets: LifecycleFacets
 }
 
+// `POST /api/items/{item_id}/delete`'s optional body (2026-08-16, the delete dialog's
+// independent Local/Source scopes, prompts/2026-08-16-manual-delete-local-and-remote.md).
+// Omitted entirely means exactly the pre-existing behavior (`local=True, source=False`);
+// `client.ts.deleteItem` always sends both explicitly instead, so every call site says what it
+// means rather than relying on the backend's own default.
+export interface DeleteItemRequest {
+  local: boolean
+  source: boolean
+}
+
 // `POST /api/items/{item_id}/delete` (prompts/open-issues.md "7 + 8" -- the first delete
-// endpoint in this API). A withheld guard is a non-2xx response (client.ts's `sendJson`
-// throws), not `deleted: false` -- this shape only ever describes a successful delete.
+// endpoint in this API). A request that accomplishes *nothing at all* is a non-2xx response
+// (client.ts's `sendJson` throws) -- this shape describes every request that succeeded at
+// least partially. `deleted`/`reason`/`bytes_freed` describe the **local** scope, unchanged
+// from before the Source scope existed; `source_deleted`/`source_reason` are `null` when
+// `source` was not requested, and otherwise describe that independent outcome -- see
+// `api/jobs.py.DeleteItemResponse`'s own docstring for why a combined request can report
+// `deleted: true` alongside `source_deleted: false` rather than throwing.
 export interface DeleteItemResponse {
   deleted: boolean
   reason: string
   bytes_freed: number | null
+  source_deleted: boolean | null
+  source_reason: string | null
 }
 
 // --- Reset item tracking (2026-08-13, prompts/2026-08-13-reset-item-tracking.md) -----------
