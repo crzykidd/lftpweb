@@ -726,6 +726,13 @@ class JobOut(BaseModel):
     # hasArrGroup`). Never `arr_download_id` -- that column stays server-side only, same as the
     # item projection's own convention (`lib/fileTree.ts`'s comment on why).
     arr_instance_name: str | None = None
+    # The bound instance's `kind` ('sonarr'/'radarr', migration 018's CHECK constraint) -- added
+    # 2026-08-16 (prompts/2026-08-16-arr-chip-on-row-lines.md) alongside `arr_instance_name` for
+    # the Transfers/History row chip's brand-logo choice. `arr_instance_name` is free-text (the
+    # user can rename an instance to anything), so it can't drive which logo to draw; `kind` is
+    # the one field that reliably says "this is a Sonarr instance" vs. "this is a Radarr
+    # instance". `null` under the same condition `arr_instance_name` is null.
+    arr_instance_kind: str | None = None
 
 
 class JobsResponse(BaseModel):
@@ -854,6 +861,18 @@ class HistoryJobOut(BaseModel):
     # Transfers -- but surfacing it here answers "did I dismiss this, or did it just age off
     # the other page" without making the row set itself conditional on the answer.
     dismissed_at: str | None
+    # `item.arr_status`/`item.arr_status_at` plus the bound instance's `name`/`kind` (2026-08-16,
+    # prompts/2026-08-16-arr-chip-on-row-lines.md) -- the same two scalar columns `JobOut` above
+    # already carries for the Transfers row chip, joined here via the same `path_queue.
+    # arr_instance_id -> arr_instance` `LEFT JOIN` so the History job row can draw the identical
+    # chip. Two scalar columns on an already-paginated list, not a blob -- the phase-6
+    # unbounded-list trap this module's own docstring warns about does not apply to a handful of
+    # short strings per row. `null` whenever this job's queue has no bound *arr instance, or the
+    # poller never matched this item.
+    arr_status: str | None = None
+    arr_status_at: str | None = None
+    arr_instance_name: str | None = None
+    arr_instance_kind: str | None = None
 
 
 class HistoryQueueSummaryOut(BaseModel):

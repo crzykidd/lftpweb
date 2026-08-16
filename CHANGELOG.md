@@ -91,6 +91,21 @@ Skeleton for the next roll:
   linking to the commit on GitHub instead of the release tag; a release build (or anything run
   without baked args — local `uv run`, the compose dev stack) renders exactly as before.
 
+- **Transfers and History job rows now carry a Sonarr/Radarr brand-logo chip with a status
+  overlay**, distinct from the Files page's own generic *arr mark. The collapsed Transfers row
+  and each History job row show the real Sonarr (blue) or Radarr (gold) logo — recognition at a
+  glance was the point, per the user's own decision — with a small green check once the *arr has
+  processed the item (`imported`/`cleaned`), a small red dot once a release left the *arr's queue
+  without importing (`gone`), the logo alone while still mid-flight (`detected`/`notified`), and
+  no chip at all for an item that isn't *arr-tracked. An unrecognized/future instance `kind`
+  falls back to a text chip of the instance name in the same status colors, so a tracked item
+  never renders nothing just because a logo is missing. `GET /api/history/jobs` rows gained
+  `arr_status`/`arr_status_at`/`arr_instance_name`/`arr_instance_kind` (the same
+  `path_queue.arr_instance_id -> arr_instance` join `core/queue.py.list_jobs()` already used for
+  the Transfers panel); `JobOut` gained `arr_instance_kind` alongside its existing
+  `arr_instance_name`. Logo path data copied from the simple-icons dataset (CC0), itself sourced
+  from Sonarr's/Radarr's own repositories — see `NOTICE`.
+
 ### Changed
 
 - **Job speed and per-file speed now sample on one shared 5-second cadence, instead of two that

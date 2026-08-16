@@ -9,7 +9,7 @@ import {
   stopJob,
 } from '../api/client'
 import type { FileNode, ItemEventOut, JobOut } from '../api/types'
-import { ArrIcon } from '../components/LifecycleIcons'
+import { ArrIcon, ArrRowChip } from '../components/LifecycleIcons'
 import { ItemDrawer } from '../components/ItemDrawer'
 import { StateChip } from '../components/StateChip'
 import { useJobs } from '../hooks/useJobs'
@@ -172,6 +172,15 @@ function Row({
           {itemName(job.rel_path)}
         </button>
         <StateChip state={chipStateFor(job)} />
+        {/* The *arr brand-logo chip (2026-08-16, prompts/2026-08-16-arr-chip-on-row-lines.md)
+         * -- sits right beside the state chip, in the same compact cluster; renders nothing
+         * when this item isn't *arr-tracked (`job.arr_status === null`). */}
+        <ArrRowChip
+          arrStatus={job.arr_status}
+          arrStatusAt={job.arr_status_at}
+          instanceName={job.arr_instance_name}
+          instanceKind={job.arr_instance_kind}
+        />
         {/* Completed time (2026-08-16, user report from live use): "each terminal row should
          * show when it completed" -- compact relative form, exact timestamp on hover, same
          * value/title split every other timestamp on this page uses. `null` (nothing rendered)

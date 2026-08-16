@@ -298,6 +298,30 @@ deleted here → the release is fully gone once the *arr has it, which is the po
   actionable one. (As always: an agent cannot see this render; it ships unviewed until the
   user opens it.)
 
+- **Transfers row + History job row** (2026-08-16, prompts/2026-08-16-arr-chip-on-row-
+  lines.md): a second, deliberately distinct chip, sitting beside the state chip on the
+  collapsed/main row line. Unlike the Files icon above, this one is the **real** Sonarr/Radarr
+  brand logo (user decision, refined same day — recognition is the point), in the mark's own
+  brand colour (Sonarr blue `#2596be`, Radarr gold `#ffcb3d`), never tinted by status. The
+  outcome rides a small overlay badge instead:
+
+  | `arr_status` | Overlay | Meaning |
+  |---|---|---|
+  | `null` | *(no chip at all)* | not *arr-tracked |
+  | `detected` / `notified` | none | mid-flight, being watched |
+  | `imported` / `cleaned` | green ✓ badge | the *arr processed it |
+  | `gone` | red dot badge | left the queue without importing |
+
+  `gone` reads **red** here, not the Files icon's amber — two different specs for two
+  different affordances, not a drift between them. An unrecognized/future instance `kind`
+  falls back to a text chip of the instance name, in the same green/red/neutral status
+  colours, rather than rendering nothing for a tracked item. `core/queue.py.list_jobs()` and
+  `api/history.py.list_history_jobs()` both join `arr_instance.kind` alongside the existing
+  `arr_instance.name` so the chip knows which logo to draw (`JobOut`/`HistoryJobOut.
+  arr_instance_kind`); `HistoryJobOut` also gained the `arr_status`/`arr_status_at`/
+  `arr_instance_name` fields the Transfers panel already had. Logo path data: simple-icons
+  dataset (CC0), itself citing Sonarr's/Radarr's own repositories — see `NOTICE`.
+
 ## Defaults & safety (the standing rule: everything OFF)
 
 Three independent, escalating opt-ins, each defaulting off:

@@ -68,6 +68,23 @@ async def _make_item(db, queue_id: int, rel_path: str, *, state: str = "DOWNLOAD
     return cursor.lastrowid
 
 
+# --- *arr join (2026-08-16, prompts/2026-08-16-arr-chip-on-row-lines.md) -- the same
+# `item.arr_status`/`arr_instance.name`/`arr_instance.kind` join `core/queue.py.list_jobs()`
+# already carries, added here so the History job row can draw the identical *arr chip. ----------
+
+
+async def _seed_arr_instance(db, *, name: str = "Sonarr", kind: str = "sonarr") -> int:
+    now = "2026-08-16T00:00:00.000000Z"
+    cursor = await db.execute(
+        "INSERT INTO arr_instance (name, kind, base_url, api_key_enc, enabled, "
+        "notify_on_complete, created_at, updated_at) VALUES (?, ?, 'https://arr.test', "
+        "'enc', 1, 0, ?, ?)",
+        (name, kind, now, now),
+    )
+    await db.commit()
+    return cursor.lastrowid
+
+
 async def _make_job(
     db,
     item_id: int,
@@ -155,6 +172,43 @@ async def test_output_tail_never_appears_in_the_list_payload(db):
     assert job.error_class == "AUTH_FAILED"
     assert job.has_output_tail is True
     assert not hasattr(job, "output_tail")
+
+
+async def test_history_job_carries_arr_facts_when_queue_is_bound(db):
+    queue_id = await _make_queue(db)
+    instance_id = await _seed_arr_instance(db, name="Radarr 4K", kind="radarr")
+    await db.execute(
+        "UPDATE path_queue SET arr_instance_id = ? WHERE id = ?", (instance_id, queue_id)
+    )
+    item = await _make_item(db, queue_id, "movie.mkv")
+    await db.execute(
+        "UPDATE item SET arr_status = 'imported', arr_status_at = ? WHERE id = ?",
+        ("2026-08-16T01:00:00.000000Z", item),
+    )
+    await db.commit()
+    await _make_job(db, item, state="succeeded")
+
+    resp = await history.list_history_jobs(_FakeRequest(db))
+    assert len(resp.jobs) == 1
+    job = resp.jobs[0]
+    assert job.arr_status == "imported"
+    assert job.arr_status_at == "2026-08-16T01:00:00.000000Z"
+    assert job.arr_instance_name == "Radarr 4K"
+    assert job.arr_instance_kind == "radarr"
+
+
+async def test_history_job_arr_fields_are_null_when_queue_has_no_bound_instance(db):
+    queue_id = await _make_queue(db)
+    item = await _make_item(db, queue_id, "movie.mkv")
+    await _make_job(db, item, state="succeeded")
+
+    resp = await history.list_history_jobs(_FakeRequest(db))
+    assert len(resp.jobs) == 1
+    job = resp.jobs[0]
+    assert job.arr_status is None
+    assert job.arr_status_at is None
+    assert job.arr_instance_name is None
+    assert job.arr_instance_kind is None
 
 
 async def test_job_output_fetched_on_demand(db):

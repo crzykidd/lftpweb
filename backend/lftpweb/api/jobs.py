@@ -125,15 +125,18 @@ def _job_out(row: dict) -> JobOut:
         output_tail=row["output_tail"],
         # 2026-08-15 (prompts/2026-08-15-transfers-single-line-rows-with-detail.md): the
         # item-level facts the Transfers row's expand panel needs -- see `TransferQueue.
-        # list_jobs()`'s own docstring for the join these come from. `arr_instance_name` is
-        # always projected (`NULL` when the `LEFT JOIN arr_instance` finds no match), never
-        # absent from the row, so plain `row[...]` is safe here too.
+        # list_jobs()`'s own docstring for the join these come from. `arr_instance_name`/
+        # `arr_instance_kind` (the latter added 2026-08-16 for the row chip's brand-logo choice,
+        # prompts/2026-08-16-arr-chip-on-row-lines.md) are always projected (`NULL` when the
+        # `LEFT JOIN arr_instance` finds no match), never absent from the row, so plain `row[...]`
+        # is safe here too.
         verified_at=row["verified_at"],
         extracted_at=row["extracted_at"],
         remote_deleted_at=row["remote_deleted_at"],
         arr_status=row["arr_status"],
         arr_status_at=row["arr_status_at"],
         arr_instance_name=row["arr_instance_name"],
+        arr_instance_kind=row["arr_instance_kind"],
     )
 
 

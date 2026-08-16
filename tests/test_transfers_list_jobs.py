@@ -214,6 +214,9 @@ def _job_out_row(**overrides) -> dict:
         arr_status=None,
         arr_status_at=None,
         arr_instance_name=None,
+        # 2026-08-16 (prompts/2026-08-16-arr-chip-on-row-lines.md): the row chip's brand-logo
+        # choice -- see test_list_jobs_carries_item_processing_and_arr_facts below.
+        arr_instance_kind=None,
     )
     base.update(overrides)
     return base
@@ -500,10 +503,14 @@ async def test_list_jobs_carries_item_processing_and_arr_facts(db):
     assert row["arr_status"] == "imported"
     assert row["arr_status_at"] == "2026-08-15T01:07:00.000000Z"
     assert row["arr_instance_name"] == "Sonarr"
+    # 2026-08-16 (prompts/2026-08-16-arr-chip-on-row-lines.md): `kind` drives the row chip's
+    # brand-logo choice -- `arr_instance_name` alone (free text) can't.
+    assert row["arr_instance_kind"] == "sonarr"
 
     out = _job_out(row)
     assert out.verified_at == "2026-08-15T01:00:00.000000Z"
     assert out.arr_instance_name == "Sonarr"
+    assert out.arr_instance_kind == "sonarr"
 
 
 async def test_list_jobs_arr_instance_name_is_null_when_queue_has_no_bound_instance(db):
@@ -514,10 +521,12 @@ async def test_list_jobs_arr_instance_name_is_null_when_queue_has_no_bound_insta
     jobs = await _queue(db).list_jobs()
     assert len(jobs) == 1
     assert jobs[0]["arr_instance_name"] is None
+    assert jobs[0]["arr_instance_kind"] is None
     assert jobs[0]["arr_status"] is None
 
     out = _job_out(jobs[0])
     assert out.arr_instance_name is None
+    assert out.arr_instance_kind is None
     assert out.arr_status is None
 
 

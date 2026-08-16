@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import type { FileNode, LifecycleFacets } from '../api/types'
 import type { ChildSpeedSample } from '../hooks/useLiveModel'
 import {
+  arrChipOverlay,
   arrHoverLabel,
   arrIconVariant,
   buildTree,
@@ -655,6 +656,31 @@ describe('arrHoverLabel', () => {
     const cleaned = arrHoverLabel({ arr_status: 'cleaned', arr_status_at: null }, 'Sonarr')
     expect(imported).not.toBe(cleaned)
     expect(cleaned).toContain('cleaned up')
+  })
+})
+
+// --- Sonarr/Radarr row chip (Transfers + History, 2026-08-16,
+// prompts/2026-08-16-arr-chip-on-row-lines.md) -----------------------------------------------
+
+describe('arrChipOverlay', () => {
+  it('all five arr_status values (via arrIconVariant) map to the row chip\'s overlay per the spec', () => {
+    // detected/notified -- mid-flight, logo alone, no overlay
+    expect(arrChipOverlay(arrIconVariant('detected'))).toBeNull()
+    expect(arrChipOverlay(arrIconVariant('notified'))).toBeNull()
+    // imported/cleaned -- the *arr processed it: green check
+    expect(arrChipOverlay(arrIconVariant('imported'))).toBe('check')
+    expect(arrChipOverlay(arrIconVariant('cleaned'))).toBe('check')
+    // gone -- left the queue without importing: red warn
+    expect(arrChipOverlay(arrIconVariant('gone'))).toBe('warn')
+  })
+
+  it('a null arr_status resolves to the "none" variant, which the caller uses to render no chip at all', () => {
+    expect(arrIconVariant(null)).toBe('none')
+    expect(arrChipOverlay(arrIconVariant(null))).toBeNull()
+  })
+
+  it('an unrecognized future status degrades to the neutral variant -- logo alone, no overlay', () => {
+    expect(arrChipOverlay(arrIconVariant('some_future_status'))).toBeNull()
   })
 })
 

@@ -41,6 +41,7 @@ function job(state: JobState, overrides: Partial<JobOut> = {}): JobOut {
     arr_status: null,
     arr_status_at: null,
     arr_instance_name: null,
+    arr_instance_kind: null,
     ...overrides,
   }
 }

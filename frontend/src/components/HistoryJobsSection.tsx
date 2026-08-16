@@ -14,6 +14,7 @@ import {
   withQueueCollapsed,
   writeHistoryCollapsedQueues,
 } from '../lib/transferPanel'
+import { ArrRowChip } from './LifecycleIcons'
 import { StateChip } from './StateChip'
 
 const inputClasses =
@@ -123,6 +124,15 @@ function JobRow({ job, onClearRequest }: { job: HistoryJobOut; onClearRequest: (
         </span>
         <span className="w-14 shrink-0 text-xs text-zinc-500 dark:text-zinc-400">{job.kind}</span>
         <StateChip state={chipStateFor(job.state)} />
+        {/* The *arr brand-logo chip (2026-08-16, prompts/2026-08-16-arr-chip-on-row-lines.md)
+         * -- same shared component and status vocabulary as the Transfers row's own chip
+         * (`TransfersPage.tsx`); renders nothing when this job isn't *arr-tracked. */}
+        <ArrRowChip
+          arrStatus={job.arr_status}
+          arrStatusAt={job.arr_status_at}
+          instanceName={job.arr_instance_name}
+          instanceKind={job.arr_instance_kind}
+        />
         {job.attempt > 1 && (
           <span className="shrink-0 text-xs text-zinc-500 dark:text-zinc-400">attempt {job.attempt}</span>
         )}

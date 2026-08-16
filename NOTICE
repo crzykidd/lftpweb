@@ -118,3 +118,36 @@ file:
   LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
   OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
   SOFTWARE.
+
+`frontend/src/components/LifecycleIcons.tsx` (2026-08-16, prompts/2026-08-16-arr-chip-on-
+row-lines.md) also contains SVG path data for the Sonarr and Radarr brand marks
+(`SonarrLogo`/`RadarrLogo`), used by the Transfers/History row chip. Copied verbatim,
+unmodified, from the simple-icons dataset (icon data released CC0 1.0 Universal), which
+itself records each mark as sourced from the project's own repository:
+
+  Sonarr icon   CC0 1.0 Universal (simple-icons)   https://simple-icons.org /
+                https://github.com/simple-icons/simple-icons/blob/develop/icons/sonarr.svg
+                Upstream source recorded by simple-icons: https://github.com/Sonarr/Sonarr/
+                blob/5f624a147bb62d37b731d9a0ae02bfd338793962/Logo/Sonarr.svg
+                Brand colour: #2596be
+
+  Radarr icon   CC0 1.0 Universal (simple-icons)   https://simple-icons.org /
+                https://github.com/simple-icons/simple-icons/blob/develop/icons/radarr.svg
+                Upstream source recorded by simple-icons: https://github.com/Radarr/Radarr/
+                blob/5f624a147bb62d37b731d9a0ae02bfd338793962/Logo/Radarr.svg
+                Brand colour: #ffcb3d
+
+  CC0 1.0 Universal — https://creativecommons.org/publicdomain/zero/1.0/legalcode. The
+  simple-icons project releases icon SVG path data under CC0 (its brand icons; the
+  project's own code is separately MIT-licensed, not implicated here since only the path
+  data was copied).
+
+Chosen over the earlier "no third-party logos" line `ArrIcon` in this same file still
+follows (a generic linked-system glyph, kept unmodified for the Files page): the user's own
+2026-08-16 decision for this specific row chip was that the *real* Sonarr/Radarr mark, in
+its own brand colour, is the point — recognition at a glance — so this one slot is a
+deliberate, recorded exception to that earlier choice, not a reversal of it.
+
+"Sonarr" and "Radarr" are trademarks of their respective projects; their inclusion here
+is solely to identify which *arr instance a row is bound to and does not imply
+endorsement by, or affiliation with, either project.

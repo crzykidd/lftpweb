@@ -562,6 +562,15 @@ export interface JobOut {
   // `null` whenever this job's queue has no bound *arr instance -- the signal
   // `lib/transferPanel.ts.hasArrGroup` gates the panel's *arr group on.
   arr_instance_name: string | null
+  // The bound instance's `kind` ('sonarr' | 'radarr', migration 018's CHECK constraint) --
+  // added 2026-08-16 (prompts/2026-08-16-arr-chip-on-row-lines.md) for the row chip's
+  // brand-logo choice (`components/LifecycleIcons.tsx.ArrRowChip`). `arr_instance_name` is
+  // free text the user can rename to anything, so it can't drive which logo to draw; `kind` is
+  // the one field that reliably says which. `null` under the same condition
+  // `arr_instance_name` is null. Kept as `string | null` (not a literal union), same reasoning
+  // `FileNode.arr_status`'s own comment gives -- an unrecognized value degrades to a text chip
+  // rather than being rejected at the type level.
+  arr_instance_kind: string | null
 }
 
 export interface JobsResponse {
@@ -664,6 +673,15 @@ export interface HistoryJobOut {
   // `null` if it never was. History shows every terminal job either way (dismissal only ever
   // hides a Transfers row); this just answers "did I dismiss this."
   dismissed_at: string | null
+  // The same *arr facts `JobOut` carries (2026-08-16, prompts/2026-08-16-arr-chip-on-row-lines.md)
+  // -- `item.arr_status`/`item.arr_status_at` plus the bound instance's `name`/`kind`, joined by
+  // `api/history.py.list_history_jobs` the identical way `core/queue.py.list_jobs()` does, so
+  // `HistoryJobsSection.tsx` can render the same `ArrRowChip`. `null` whenever this job's queue
+  // has no bound *arr instance.
+  arr_status: string | null
+  arr_status_at: string | null
+  arr_instance_name: string | null
+  arr_instance_kind: string | null
 }
 
 /** One queue's honest aggregate over the whole filtered set, not just the loaded page

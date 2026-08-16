@@ -354,6 +354,30 @@ export function arrIconVariant(arrStatus: string | null): ArrIconVariant {
   return ARR_ICON_VARIANTS[arrStatus] ?? 'neutral'
 }
 
+// --- Sonarr/Radarr row chip (Transfers + History, 2026-08-16,
+// prompts/2026-08-16-arr-chip-on-row-lines.md) -- the collapsed/main row line's brand-logo
+// chip with a status overlay, distinct from the Files-row `ArrIcon` above (generic mark, amber
+// ⚠ for `gone`). This chip renders the *real* Sonarr/Radarr logo in its own brand colour and
+// overlays a small green check or red dot -- "green when the *arr processed it, red when it
+// failed out" (the task's own wording), which is why `gone` reads red here rather than the
+// Files icon's amber. Both consume the same `arrIconVariant` categorization above -- "one
+// mapping, consumed everywhere" -- rather than re-deriving it from `arrStatus` a second time.
+
+export type ArrChipOverlay = 'check' | 'warn' | null
+
+/** `imported`/`cleaned` (variant `'imported'`) -> green check ("processed"); `gone` -> red warn
+ * dot ("left the *arr's queue without importing"); `detected`/`notified` (variant `'neutral'`)
+ * -> the logo alone, no overlay -- the *arr is watching, mid-flight, no outcome yet to show.
+ * `variant === 'none'` (arr_status null) is the caller's own cue to render no chip at all; this
+ * function is never even called for that case by `ArrRowChip` below, but returns `null` for it
+ * too, defensively.
+ */
+export function arrChipOverlay(variant: ArrIconVariant): ArrChipOverlay {
+  if (variant === 'imported') return 'check'
+  if (variant === 'gone') return 'warn'
+  return null
+}
+
 const ARR_STATUS_TEXT: Record<string, string> = {
   detected: 'detected in the *arr queue',
   notified: 'import requested from the *arr',

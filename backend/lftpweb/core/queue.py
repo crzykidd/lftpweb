@@ -1918,12 +1918,18 @@ class TransferQueue:
         default"), for the Transfers row's new expand panel (`api/jobs.py._job_out`). Same
         bounded-by-construction reasoning as `queue_name` above — this is not the phase-6
         unbounded-list trap `api/history.py`'s own docstring warns against.
+
+        **2026-08-16** (prompts/2026-08-16-arr-chip-on-row-lines.md): also joins
+        `arr_instance.kind` (`'sonarr'`/`'radarr'`) — the collapsed row's new brand-logo chip
+        needs to know *which* logo to draw; `arr_instance_name` alone is free-text the user can
+        rename to anything, so it can't drive that choice on its own.
         """
         cursor = await self.db.execute(
             "SELECT job.*, item.rel_path, item.is_dir, item.queue_id, item.remote_size, "
             "       item.verified_at, item.extracted_at, item.remote_deleted_at, "
             "       item.arr_status, item.arr_status_at, "
-            "       path_queue.name AS queue_name, arr_instance.name AS arr_instance_name "
+            "       path_queue.name AS queue_name, arr_instance.name AS arr_instance_name, "
+            "       arr_instance.kind AS arr_instance_kind "
             "FROM job "
             "JOIN item ON item.id = job.item_id "
             "JOIN path_queue ON path_queue.id = item.queue_id "

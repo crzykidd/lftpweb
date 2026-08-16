@@ -1,6 +1,6 @@
 import type { SVGProps } from 'react'
 import type { FacetLevel, FileNode, SettleSettingsOut } from '../api/types'
-import { arrHoverLabel, arrIconVariant } from '../lib/fileTree'
+import { arrChipOverlay, type ArrChipOverlay, arrHoverLabel, arrIconVariant } from '../lib/fileTree'
 import { formatBytes, formatRelativeTimeIntl, settleWaitLabel } from '../lib/format'
 
 // Lifecycle icons (2026-08-13, prompts/2026-08-13-lifecycle-icons.md): R(emote)/L(ocal)/
@@ -339,6 +339,176 @@ export function ArrIcon({
           ⚠
         </span>
       )}
+    </span>
+  )
+}
+
+// --- Sonarr/Radarr row chip (Transfers + History, 2026-08-16,
+// prompts/2026-08-16-arr-chip-on-row-lines.md) -------------------------------------------------
+//
+// A *second*, deliberately distinct *arr indicator from `ArrIcon` above -- that one is a
+// generic "linked to an external system" mark shared by both kinds (this codebase's original
+// choice not to ship third-party brand logos). This one is the user's own later decision
+// (2026-08-16, refined same day): the Transfers/History row line shows the **real** Sonarr/
+// Radarr logo, in its own brand colour, with the outcome layered on as a small status-overlay
+// badge -- "green when the *arr processed it, red when it failed out" -- rather than folded
+// into the mark's own colour the way `ArrIcon`'s ✓/⚠ text glyphs are. That's also why `gone`
+// reads **red** here and amber on the Files row: two different specs for two different
+// affordances, not a drift between them.
+
+const ARR_LOGO_SIZE_PX = 16
+
+/** Sonarr's own brand mark -- path data copied verbatim, unmodified, from the simple-icons
+ * dataset (CC0 License, https://github.com/simple-icons/simple-icons), itself sourced from
+ * Sonarr's own repository (https://github.com/Sonarr/Sonarr/blob/main/Logo/Sonarr.svg) -- see
+ * NOTICE for the full record and the exact commit simple-icons pins. Rendered in Sonarr's own
+ * brand blue (`#2596be`, simple-icons' own recorded hex) unconditionally -- recognition is the
+ * whole point of using the real logo, so this colour is never tinted by the row's own *arr
+ * status; the status reads through `ArrChipOverlayBadge` layered on top instead.
+ */
+function SonarrLogo({ title }: { title: string }) {
+  return (
+    <svg
+      xmlns="http://www.w3.org/2000/svg"
+      width={ARR_LOGO_SIZE_PX}
+      height={ARR_LOGO_SIZE_PX}
+      viewBox="0 0 24 24"
+      role="img"
+      aria-label={title}
+      className="shrink-0"
+    >
+      <title>{title}</title>
+      <path
+        fill="#2596be"
+        d="M21.212 4.282c1.851 2.204 2.777 4.776 2.777 7.718 0 2.848-.867 5.344-2.602 7.489a934.355 934.355 0 0 1-2.101-2.095c-1.477-1.477-1.792-3.293-1.792-5.278 0-2.224.127-3.486 1.577-4.935l2.478-2.478a13.209 13.209 0 0 0-.337-.421Zm-17.7 16.193C1.708 18.678.6 16.59.188 14.213A11.84 11.84 0 0 1 .011 12c0-.28.006-.548.017-.802 0-.026.007-.052.022-.078.153-2.601 1.076-4.889 2.767-6.865-.108.127-.214.256-.316.387 0 0 1.351 1.346 2.329 2.323 1.408 1.409 1.726 3.215 1.726 5.151 0 1.985-.249 3.762-1.781 5.295-1.035 1.035-2.119 2.124-2.119 2.124.112.136.229.271.349.404.029-.027 1.297-1.348 2.123-2.175 1.638-1.637 1.928-3.528 1.928-5.648 0-2.072-.365-3.997-1.873-5.504a620.045 620.045 0 0 0-2.366-2.357c.168-.196.342-.388.523-.576l3.117 3.106-.194.195 1.903 1.898.547-.549L6.81 6.432l-.196.196L3.495 3.52c.01-.009.436-.416.643-.597.009.011 2.28 2.283 2.28 2.283 1.538 1.537 3.5 1.955 5.621 1.955 2.18 0 4.134-.442 5.731-2.038.907-.908 2.153-2.149 2.162-2.16.17.151.491.461.56.528l.013.013-3.111 3.028-.001.002-.197-.194-1.876 1.903.552.543 1.875-1.903-.197-.194 3.109-3.026c.193.203.377.41.553.619-.03.025-2.495 2.546-2.495 2.546-1.556 1.556-1.723 2.9-1.723 5.288 0 2.121.361 4.054 1.939 5.632a576.91 576.91 0 0 0 2.133 2.124c-.183.208-.599.645-.613.66l-3.066-3.174.195-.196-1.995-1.986-.546.549 1.995 1.986.195-.196 3.065 3.172c-.021.019-.385.362-.552.506-.01-.013-1.974-1.978-1.974-1.978-1.842-1.842-3.299-2.039-5.731-2.039-2.338 0-3.92.239-5.632 1.95-.944.944-2.078 2.085-2.089 2.099-.275-.23-.649-.594-.649-.594l3.019-3.024.199.192 1.854-1.925-.558-.538-1.854 1.926.199.191-3.016 3.022ZM12 8.672A3.33 3.33 0 0 0 8.672 12 3.33 3.33 0 0 0 12 15.328 3.33 3.33 0 0 0 15.328 12 3.33 3.33 0 0 0 12 8.672ZM4.52 2.6C6.665.867 9.162 0 12.011 0c2.88 0 5.394.88 7.541 2.639 0 0-1.215 1.209-2.136 2.13-1.496 1.496-3.334 1.892-5.377 1.892-1.985 0-3.829-.37-5.267-1.809L4.52 2.6Zm14.837 18.909a9.507 9.507 0 0 1-.342.256C16.994 23.255 14.659 24 12.011 24c-2.652 0-4.983-.745-6.993-2.235-.104-.074-.208-.15-.31-.227 0 0 1.096-1.101 2.053-2.058 1.602-1.602 3.09-1.804 5.278-1.804 2.28 0 3.651.166 5.377 1.892l1.941 1.941Z"
+      />
+    </svg>
+  )
+}
+
+/** Radarr's own brand mark -- same provenance and licence as `SonarrLogo` above, sourced from
+ * Radarr's own repository (https://github.com/Radarr/Radarr/blob/develop/Logo/Radarr.svg) via
+ * the simple-icons dataset (CC0). Rendered in Radarr's own brand gold (`#ffcb3d`).
+ */
+function RadarrLogo({ title }: { title: string }) {
+  return (
+    <svg
+      xmlns="http://www.w3.org/2000/svg"
+      width={ARR_LOGO_SIZE_PX}
+      height={ARR_LOGO_SIZE_PX}
+      viewBox="0 0 24 24"
+      role="img"
+      aria-label={title}
+      className="shrink-0"
+    >
+      <title>{title}</title>
+      <path
+        fill="#ffcb3d"
+        d="M5.274 0C3.189.039 1.19 1.547 1.19 4.705l.184 14.518c0 1.47 1.103 2.205 2.573 2.021L3.764 3.786c0-1.654.919-1.838 2.022-1.103l14.7 8.27c1.103.734 1.655 1.47 1.838 2.756.92-1.654.552-4.043-1.286-5.33L7.991.846A4.559 4.559 0 0 0 5.274.001zm1.982 6.91-.184 10.107 9.004-5.146Zm13.598 6.064-15.068 8.82c-.92.552-2.022.736-3.124.368.918 1.47 3.307 2.389 5.145 1.47l12.68-7.35c1.102-.736 1.286-2.022.367-3.308z"
+      />
+    </svg>
+  )
+}
+
+/** The unknown/future-`kind` fallback (this task's own instruction: "never render nothing for a
+ * tracked item just because the logo is missing") -- a small text chip of the instance's own
+ * name, colour-coded with the same status vocabulary the logo's overlay badge uses
+ * (green/red/neutral) since there is no separate logo here to layer a badge onto.
+ */
+function ArrTextChip({
+  instanceName,
+  overlay,
+  title,
+}: {
+  instanceName: string | null
+  overlay: ArrChipOverlay
+  title: string | null
+}) {
+  const colorClass =
+    overlay === 'check'
+      ? 'border-emerald-300 text-emerald-700 dark:border-emerald-800 dark:text-emerald-400'
+      : overlay === 'warn'
+        ? 'border-red-300 text-red-700 dark:border-red-800 dark:text-red-400'
+        : 'border-zinc-300 text-zinc-500 dark:border-zinc-700 dark:text-zinc-400'
+  return (
+    <span
+      className={`rounded border px-1 text-[9px] leading-tight font-semibold uppercase ${colorClass}`}
+      title={title ?? undefined}
+    >
+      {instanceName ?? '*arr'}
+    </span>
+  )
+}
+
+/** The row chip's status-overlay badge -- green check ("processed") or red dot ("gone"),
+ * absolutely positioned over the bottom-right corner of the logo/text-chip beside it. `null`
+ * renders nothing, for the `detected`/`notified` mid-flight case (`arrChipOverlay`,
+ * `lib/fileTree.ts`).
+ */
+function ArrChipOverlayBadge({ overlay }: { overlay: ArrChipOverlay }) {
+  if (overlay === 'check') {
+    return (
+      <span
+        className="absolute -right-1 -bottom-1 flex h-2.5 w-2.5 items-center justify-center rounded-full bg-emerald-600 text-[7px] leading-none text-white ring-1 ring-white dark:bg-emerald-500 dark:ring-zinc-900"
+        aria-hidden="true"
+      >
+        ✓
+      </span>
+    )
+  }
+  if (overlay === 'warn') {
+    return (
+      <span
+        className="absolute -right-1 -bottom-1 h-2 w-2 rounded-full bg-red-600 ring-1 ring-white dark:bg-red-500 dark:ring-zinc-900"
+        aria-hidden="true"
+      />
+    )
+  }
+  return null
+}
+
+/** The Transfers/History row-line *arr chip (2026-08-16, prompts/2026-08-16-arr-chip-on-row-
+ * lines.md) -- the real Sonarr/Radarr brand logo, in its own brand colour, with the outcome as
+ * a small status overlay: green check once the *arr processed it (`imported`/`cleaned`), red
+ * dot once a release left the *arr's queue without importing (`gone`), the logo alone while
+ * still mid-flight (`detected`/`notified`), and **nothing at all** when `arrStatus` is null --
+ * the item isn't *arr-tracked, per this integration's "everything off by default" rule.
+ *
+ * `instanceKind` selects the logo (`'sonarr'` | `'radarr'`, `JobOut.arr_instance_kind`/
+ * `HistoryJobOut.arr_instance_kind`); any other value -- `null` (no bound instance, or a row
+ * whose queue's instance predates this field... though it never does, since `arr_status` itself
+ * would also be null then) or an unrecognized future kind -- falls back to `ArrTextChip` rather
+ * than rendering nothing for a tracked item. Reuses `arrIconVariant`/`arrChipOverlay`
+ * (`lib/fileTree.ts`) for the status categorization -- one mapping, consumed by `ArrIcon` above
+ * and this component both -- and `arrHoverLabel` for the hover text, unchanged from `ArrIcon`.
+ */
+export function ArrRowChip({
+  arrStatus,
+  arrStatusAt,
+  instanceName,
+  instanceKind,
+}: {
+  arrStatus: string | null
+  arrStatusAt: string | null
+  instanceName: string | null
+  instanceKind: string | null
+}) {
+  const variant = arrIconVariant(arrStatus)
+  if (variant === 'none') return null
+  const overlay = arrChipOverlay(variant)
+  const hoverLabel = arrHoverLabel({ arr_status: arrStatus, arr_status_at: arrStatusAt }, instanceName)
+  const title = hoverLabel ?? instanceName ?? '*arr'
+
+  return (
+    <span className="relative inline-flex shrink-0 items-center" title={hoverLabel ?? undefined}>
+      {instanceKind === 'sonarr' ? (
+        <SonarrLogo title={title} />
+      ) : instanceKind === 'radarr' ? (
+        <RadarrLogo title={title} />
+      ) : (
+        <ArrTextChip instanceName={instanceName} overlay={overlay} title={title} />
+      )}
+      <ArrChipOverlayBadge overlay={overlay} />
     </span>
   )
 }

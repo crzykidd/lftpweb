@@ -62,6 +62,7 @@ function job(state: JobState, overrides: Partial<JobOut> = {}): JobOut {
     arr_status: null,
     arr_status_at: null,
     arr_instance_name: null,
+    arr_instance_kind: null,
     ...overrides,
   }
 }
@@ -583,6 +584,10 @@ function historyJob(state: HistoryJobOut['state'], overrides: Partial<HistoryJob
     error_class: null,
     has_output_tail: false,
     dismissed_at: null,
+    arr_status: null,
+    arr_status_at: null,
+    arr_instance_name: null,
+    arr_instance_kind: null,
     ...overrides,
   }
 }
