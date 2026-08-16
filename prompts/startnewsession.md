@@ -215,7 +215,9 @@ change, since the backend now feeds it a state (`DOWNLOADED`) it was already bui
 green throughout: `01efac4` (S1), `0a4593a` (S3+S4), `65b0618` (S2), `90df1ea` (P2), `d480885`
 (P3), `0cb294f` (P1 partial). Backend **1063 tests**, frontend **266 tests**, both lint gates,
 `vite build`, and the `/api/settings` route-parity check all pass. **Still open for the user:**
-**G1** (move-delete ordering = issue #2 — a design call), **G2** (connection-limit write path —
+~~**G1** (move-delete ordering = issue #2 — a design call)~~ **← closed in v0.2.0** (the
+move-delete gate ladder, row P in the build-run table above; GitHub issue #2 closed
+2026-08-16), **G2** (connection-limit write path —
 migration + UI feature), the **rest of P1** (Row/HoverCard component extraction — wants a browser),
 and **P4/P5** (`queue.py`/`engine.py` splits — deepest stateful code, wants review). See
 `docs/audit-v0.1.0.md` for all of them.
@@ -467,7 +469,10 @@ doesn't yet" and "Known gaps" sections for the consolidated, canonical list** (t
 doesn't duplicate it). Two headline items from phase 9 are now **closed** by the 2026-08-12
 post-phase-9 session below — Settings → Transfer has a UI, and the app has been run in a real
 browser — but Files still has no bulk "Delete local"/"Delete remote" (Queue/Stop only, per
-phase 9's own scope), and no manual delete endpoint exists anywhere in the API.
+phase 9's own scope), ~~and no manual delete endpoint exists anywhere in the API~~ — **no
+longer true as of v0.2.0**: per-item manual deletion exists with independent Local and
+Source (seedbox) scopes (`POST /api/items/{id}/delete`, the first manual remote-delete in
+the API). Bulk delete is still absent.
 
 ## 2026-08-12, post-phase-9 session — the dev environment became real, and the UI was opened
 
@@ -589,7 +594,12 @@ pull a fresh image to pick up the fix.
 They stay in this file until the user resolves them, not until the phase that raised them
 shipped. **Do not action any of them unilaterally.**
 
-1. **The user's live queue still has `sync_mode = 'move'` stored, and `move` works.** The row
+1. **The user's live queue still has `sync_mode = 'move'` stored, and `move` works.**
+   **RESOLVED by deliberate adoption** — as of 2026-08-15/16 the user runs `move` mode
+   knowingly on both test queues (`ar-tv`, `ar-movies`) against a genuine hardlink pickup
+   directory, exercised it live through the v0.2.0 delete-ladder testing, and designed the
+   ladder around it. No longer a pending decision. Original entry kept below for history:
+   The row
    has been in the database since before phase 4's guard existed, inert the whole time because
    nothing implemented `move` or read `sync_mode` to act on it. As of phase 5 it **deletes the
    verified remote copy after every download that queue completes.** Deliberately **not**
@@ -634,10 +644,11 @@ shipped. **Do not action any of them unilaterally.**
    the WebSocket published 6, the difference being paths that had left both trees during
    testing. Row *lifetime* is an unanswered design question distinct from state ownership —
    when, if ever, may a row be deleted, and what does History/audit need to keep?
-7. **Per-queue rescan interval** was requested and is not built. `scan_interval_s` is a single
-   global (30s, env-overridable); phase 2 collapsed §5's separate 30s remote / 10s local
-   cadences into it. Needs a migration, a per-queue next-due in the engine loop, and a field in
-   Settings → Queues.
+7. ~~**Per-queue rescan interval** was requested and is not built.~~ **Built 2026-08-13**
+   (`c8d3e8b`, migration 009 — per-queue 10/30/60/none dropdown in Settings → Queues, a
+   multi-cadence overrun-safe engine loop). This entry sat stale for three days after the
+   work shipped — the same trap as the drafted-wordings entry above: a tracker line is not
+   evidence of current state.
 
 Also open, but not a decision so much as a next step: **`dev` is ahead of `main` by every
 phase 4–9 commit plus the two 2026-08-12 commits, and no PR has been opened.** `main` is
