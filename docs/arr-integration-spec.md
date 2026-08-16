@@ -284,7 +284,14 @@ deleted here → the release is fully gone once the *arr has it, which is the po
   | `detected` / `notified` | *arr mark, neutral | Sonarr/Radarr queued this; it's being watched through the pipeline |
   | `imported` | *arr mark + green ✓ | the *arr confirmed import; files kept (delete-completed off) |
   | `gone` | *arr mark + amber ⚠ | left the *arr's queue **without** importing — likely a failed/removed grab, may need attention |
-  | `cleaned` | *arr mark + "Processed · Xm" countdown | imported and locally cleaned up; visible through the ~10m removal grace, then leaves via the normal `REMOVED_LOCAL` flow |
+  | `cleaned` | *arr mark + green ✓ + "Processed · Xm" countdown | imported and locally cleaned up; visible through the ~10m removal grace, then leaves via the normal `REMOVED_LOCAL` flow |
+
+  `cleaned` shares the `imported` row's green ✓ (decision, 2026-08-16, first live Radarr
+  run): with "Delete when imported" on, `imported` is a seconds-long transient — cleanup
+  runs on the very next poller beat — so a green check that only lived on `imported` would
+  flash and vanish before it was ever seen. The hover text still says "imported" vs.
+  "imported and cleaned up locally" so the two states stay tellable apart despite sharing
+  an icon.
 
   Hover card names the instance and the timestamp (`arr_status_at`). Text/state filters
   gain an "*arr-tracked" facet, and `gone` is filterable on its own since it's the

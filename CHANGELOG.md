@@ -124,6 +124,13 @@ Skeleton for the next roll:
   verify-skipped `move`-mode item's `LOCAL_ONLY` resting state fell straight to an instant,
   grace-free removal once unprotected. Fixed narrowly — `core/mount_sentinel.py` itself is
   untouched — so a genuinely externally-vanished item still behaves exactly as before.
+- **The *arr success check no longer disappears the moment cleanup runs.** With "Delete when
+  imported" on, `imported` is a seconds-long transient — cleanup runs on the very next poller
+  beat — so the green ✓ flashed and was immediately replaced by the `cleaned` presentation
+  (the *arr mark plus the "Processed · Xm" countdown, no check), which meant the success
+  indicator effectively never got seen on a real run. `cleaned` now renders the same green-✓
+  icon variant as `imported`, alongside the existing countdown chip; the hover text still
+  reads "imported" vs. "imported and cleaned up locally" so the two states stay tellable apart.
 
 ### Security
 

@@ -292,13 +292,17 @@ function ArrMarkIcon(props: IconProps) {
 /** The Files-row *arr icon (docs/arr-integration-spec.md "UI" -- "multi-faceted," the user's
  * own 2026-08-15 decision): renders nothing at all for `arr_status: null` (a queue with no
  * bound instance, or an item the poller hasn't matched yet -- everything-off-by-default means
- * this is the common case on most installs). Otherwise the mark itself plus, for the two states
+ * this is the common case on most installs). Otherwise the mark itself plus, for the states
  * that need to read as visually distinct from "still being watched," a small colored glyph
- * beside it -- a green **✓** once the *arr has confirmed import (`imported`), an amber **⚠**
- * once a release left the *arr's queue without ever importing (`gone`, the one state that
- * usually needs a human, per the spec's own note). `detected`/`notified`/`cleaned` all render
- * the plain neutral mark; `cleaned`'s own distinguishing information lives on the removal-grace
- * countdown chip's re-worded text ("Processed · Xm"), not a second icon color.
+ * beside it -- a green **✓** once the *arr has confirmed import (`imported`, and `cleaned`,
+ * 2026-08-16: with "Delete when imported" on, `imported` is a seconds-long transient before
+ * the next poller beat cleans it up, so the green check would flash and never actually be
+ * seen if `cleaned` dimmed back to neutral -- it keeps the same green ✓ instead, alongside the
+ * removal-grace countdown chip), an amber **⚠** once a release left the *arr's queue without
+ * ever importing (`gone`, the one state that usually needs a human, per the spec's own note).
+ * `detected`/`notified` render the plain neutral mark. The hover text (`arrHoverLabel`) still
+ * distinguishes "imported" from "imported and cleaned up locally," so the two states stay
+ * tellable apart despite sharing an icon.
  *
  * `instanceName` is resolved by the caller from the item's *queue* binding, never invented here
  * -- see `lib/fileTree.ts.arrHoverLabel`'s own docstring for why the item projection alone

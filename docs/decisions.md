@@ -6,6 +6,31 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-16 — `cleaned` shares `imported`'s green-check icon instead of dimming to neutral
+
+`prompts/2026-08-16-cleaned-icon-keeps-green-check.md`. First live Radarr run with "Delete when
+imported" on: the original design (`docs/arr-integration-spec.md`'s icon-state table, user
+decision 2026-08-15) had `cleaned` render the plain neutral *arr mark, on the theory that its
+own distinguishing information belonged on the removal-grace countdown chip's re-worded text
+("Processed · Xm") rather than a second icon color. In practice, `imported` is a seconds-long
+transient when delete-on-import is on — cleanup runs on the very next poller beat — so the green
+✓ flashed and was immediately replaced by the dimmed `cleaned` mark. The success indicator
+effectively never got seen.
+
+**The fix:** `lib/fileTree.ts.ARR_ICON_VARIANTS['cleaned']` now maps to `'imported'` (the same
+green-check variant), not its own `'neutral'` entry. `LifecycleIcons.tsx.ArrIcon` and
+`TransfersPage.tsx`'s *arr expand-panel group both switch purely on the shared `arrIconVariant`/
+`arrHoverLabel` helpers, so both inherited the change with no per-consumer edit. The hover text
+(`ARR_STATUS_TEXT`) already read differently for the two statuses ("imported by the *arr" vs.
+"imported and cleaned up locally") and needed no change to keep the states tellable apart.
+
+**Rejected: keeping `cleaned` neutral and instead recoloring the countdown chip green.** Would
+have fixed the same visibility gap but diverges the chip from `gone`'s and every other
+removal-grace row's neutral countdown styling, and still leaves the *icon* itself lying about
+whether the *arr succeeded — the icon is the thing a user scans a row for first.
+
+---
+
 ## 2026-08-16 — Progress cadence unified: job and per-file speed now sample on the same 5s tick
 
 `prompts/2026-08-16-unify-progress-cadence-5s.md`. The user, watching a live transfer, saw a

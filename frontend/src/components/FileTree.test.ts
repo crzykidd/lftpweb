@@ -608,7 +608,13 @@ describe('arrIconVariant', () => {
     expect(arrIconVariant('notified')).toBe('neutral')
     expect(arrIconVariant('imported')).toBe('imported')
     expect(arrIconVariant('gone')).toBe('gone')
-    expect(arrIconVariant('cleaned')).toBe('neutral')
+    expect(arrIconVariant('cleaned')).toBe('imported')
+  })
+
+  it('"cleaned" shares the green-check variant with "imported" (2026-08-16: with "Delete when '
+    + 'imported" on, "imported" is a seconds-long transient, so the success check must survive '
+    + 'into "cleaned" to ever be seen)', () => {
+    expect(arrIconVariant('cleaned')).toBe(arrIconVariant('imported'))
   })
 
   it('is "none" for a null arr_status -- no bound instance, or not yet matched', () => {
@@ -642,6 +648,13 @@ describe('arrHoverLabel', () => {
       'Radarr',
     )
     expect(label).toMatch(/\(.*\)/)
+  })
+
+  it('"imported" and "cleaned" share an icon variant but keep distinct hover text', () => {
+    const imported = arrHoverLabel({ arr_status: 'imported', arr_status_at: null }, 'Sonarr')
+    const cleaned = arrHoverLabel({ arr_status: 'cleaned', arr_status_at: null }, 'Sonarr')
+    expect(imported).not.toBe(cleaned)
+    expect(cleaned).toContain('cleaned up')
   })
 })
 

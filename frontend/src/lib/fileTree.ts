@@ -328,10 +328,15 @@ export type ArrIconVariant = 'none' | 'neutral' | 'imported' | 'gone'
 const ARR_ICON_VARIANTS: Record<string, ArrIconVariant> = {
   detected: 'neutral',
   notified: 'neutral',
-  // `cleaned` keeps the neutral mark on the icon itself -- the spec's icon-state table pairs it
-  // with the removal-grace countdown chip's own re-wording ("Processed · Xm", see
-  // `lib/format.ts.removalGraceShortLabel`), not a distinct icon colour of its own.
-  cleaned: 'neutral',
+  // `cleaned` renders the same green-check variant as `imported`. With "Delete when
+  // imported" on, `imported` is a seconds-long transient (cleanup runs on the very next
+  // poller beat), so the green check would flash and vanish before anyone saw it -- the
+  // success indicator never actually gets seen. `cleaned` keeps the same green ✓ alongside
+  // the removal-grace countdown chip ("Processed · Xm", see
+  // `lib/format.ts.removalGraceShortLabel`); the hover text (`ARR_STATUS_TEXT` below) still
+  // distinguishes "imported" from "imported and cleaned up" so the two states stay tellable
+  // apart.
+  cleaned: 'imported',
   imported: 'imported',
   gone: 'gone',
 }
