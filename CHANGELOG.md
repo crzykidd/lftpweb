@@ -77,6 +77,15 @@ Skeleton for the next roll:
   sidecar-less release already gets — while any referenced file actually present (including a
   half-deleted archive set) still reports `CORRUPT` exactly as before, and a sidecar with no other
   content at all still reports `CORRUPT` too.
+- **An *arr-cleaned item no longer vanishes from the Files page the instant cleanup runs.** It
+  now rides the existing ~10-minute removal grace as "Processed · Xm", exactly as the spec always
+  promised, before leaving through the normal `REMOVED_LOCAL`/`REMOVED_BOTH` transition. Two
+  stacked bugs, both in `core/engine.py._persist`: the row's own `auto_queue_suppressed = 1`
+  (set deliberately, to keep a copy-mode queue from re-grabbing the still-present remote copy)
+  was also excluding it from the scan machinery that starts the grace clock at all; and a
+  verify-skipped `move`-mode item's `LOCAL_ONLY` resting state fell straight to an instant,
+  grace-free removal once unprotected. Fixed narrowly — `core/mount_sentinel.py` itself is
+  untouched — so a genuinely externally-vanished item still behaves exactly as before.
 
 ### Security
 

@@ -93,6 +93,7 @@ than a first. Two things that bit the first time and will bit again:
 | D — live-testing fixes | First real Sonarr run (`v0.1.1`+arr build) against the user's seedbox: `eventType` fixed to match the *arr v3 wire format (string in response bodies, `core/arrclient.py`/`core/arrsync.py`, `docs/decisions.md` 2026-08-15); auto-queue now excludes remote `_UNPACK_`/`_FAILED_` SAB staging dirs by eligibility, not visibility ("show it, don't grab it," same date) | ✅ done, `prompts/done/2026-08-15-arr-eventtype-and-unpack-autoqueue.md` |
 | E — live-testing fix, verify | Same live-test session: an upstream-extracted release (rar'd at origin, unpacked+deleted by SABnzbd before reaching local disk) verified `CORRUPT` and wedged its `move` queue's remote delete forever. `core/verify.py` now reads "every sidecar-referenced file absent + other content present" as `SKIPPED`, narrowly — any referenced file present (including a half-deleted set) still stays `CORRUPT`; the broader pipeline-ordering question stays open (`prompts/open-issues.md` #2 / G1) | ✅ done, `prompts/done/2026-08-15-verify-skip-when-sidecar-targets-all-absent.md` |
 | F — live-testing fix, Transfers UX | Session follow-on: real-use feedback that a Transfers row had grown too many inline figures (queue position, file count, percent, rate, ETA, allocated, elapsed, average speed, queued wait, post-processing note). Rows now collapse to name/queue/state/one live number, with a chevron expanding a Transfer/Processing/*arr detail panel — the *arr group is the first place `arr_status`/`arr_instance_name` surface outside the Files page, reusing `lib/fileTree.ts`'s existing variant helpers. New bounded `GET /api/items/{id}/events` (item-scoped, capped, newest-first) feeds the Processing group with the pipeline's own recorded event messages on expand. New `POST /api/jobs/dismiss-all` + a "Dismiss all" control at the top of the page (user addition mid-task) | ✅ done, `prompts/done/2026-08-15-transfers-single-line-rows-with-detail.md` |
+| G — live-testing fix, cleaned-item grace visibility | First real *arr delete-completed run (`move` queue): a cleaned item vanished from the Files page instantly instead of riding the ~10-minute removal grace as "Processed · Xm". Two stacked bugs, both in `core/engine.py._persist`: `_protected_rel_paths` treated *any* `auto_queue_suppressed = 1` row (cleanup sets this first, before touching disk) as frozen, excluding it from the "vanished from both trees" sweep entirely — `first_missing_at` never started; and even once unprotected, a verify-skipped move-mode item rests at `state == "LOCAL_ONLY"`, which `resolve_absence` has no opinion about, so it fell straight to the instant-`REMOVED_BOTH` fallback with no grace at all. Fixed narrowly: `_protected_rel_paths` now exempts `arr_status = 'cleaned'` rows, and the vanished sweep remaps that one combination (`LOCAL_ONLY` + `arr_status == 'cleaned'`) to `"DOWNLOADED"` before consulting `resolve_absence`, reusing its existing grace machinery unmodified. `core/mount_sentinel.py` itself untouched. | ✅ done, `prompts/done/2026-08-15-cleaned-item-grace-visibility.md` |
 
 **Phase A verification:** backend lint/format clean, full backend `pytest` green (new tests in
 `tests/test_arrclient.py`, `tests/test_arrsync.py`, `tests/test_settings_arr_api.py`,
@@ -149,6 +150,22 @@ backend `pytest` green, frontend untouched and re-verified anyway. Already-`gone
 the live instance are terminal by design and stay `gone` — this fix only changes classification
 for associations checked from now on; a human still needs to re-bind/re-watch anything that was
 misclassified before the fix landed if they want it corrected.
+
+**Phase G verification (live-testing fix, cleaned-item grace visibility, 2026-08-15):**
+diagnosed read-only against `GET /api/files`'s own disagreement with the live WS-driven Files
+page (REST kept showing the row, `state: LOCAL_ONLY`/`arr_status: "cleaned"`/`first_missing_at:
+null`, minutes and several scan passes after cleanup; the WS view had already dropped it) —
+exactly the split the publish invariant exists to prevent. Three new tests in
+`tests/test_state_persistence.py` pin the mechanism: a direct regression on the
+`_protected_rel_paths` SQL exemption, and a full engine-level reproduction (grace starts, ticks,
+survives a second pass, then expires into `REMOVED_BOTH` and leaves `engine.models`, mirroring
+the existing `test_move_mode_item_that_leaves_both_trees_reaches_removed_both`/`test_a_vanished_
+local_only_row_rests_at_removed_both_not_left_alone` tests this fix sits alongside — both still
+pass unmodified, proving a *generic* move-mode `LOCAL_ONLY` vanish (no arr cleanup) still lands
+on `REMOVED_BOTH` instantly, as designed). Backend lint/format clean, full backend `pytest`
+green, frontend untouched and re-verified anyway — the frontend's own `REMOVAL_GRACE_ELIGIBLE_
+STATES`/`removalGraceShortLabel` "Processed" wording already shipped in phase C and needed no
+change, since the backend now feeds it a state (`DOWNLOADED`) it was already built to expect.
 
 ### 🌙 Overnight audit run (started 2026-08-14, unattended) — LIVE PROGRESS LOG
 

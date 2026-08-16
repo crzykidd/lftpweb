@@ -618,6 +618,142 @@ async def test_a_vanished_remote_only_row_is_still_left_alone(tmp_path, monkeypa
         await db.close()
 
 
+# --- An arr-cleaned item stays visible through the removal grace, not vanish instantly --------
+#
+# 2026-08-15 (prompts/2026-08-15-cleaned-item-grace-visibility.md), live defect: the first real
+# run of the *arr delete-completed flow on a `move` queue -- matched, notified, imported,
+# cleanup deleted the local copy -- and the row vanished from the Files page *instantly* instead
+# of riding the ~10-minute removal grace as "Processed · Xm" (docs/arr-integration-spec.md
+# "Cleanup"). `GET /api/files` kept showing the row (`state: LOCAL_ONLY`, `arr_status:
+# "cleaned"`, `first_missing_at: null`) minutes and several scans later; the WS-driven Files
+# page dropped it immediately -- REST and the published view disagreeing, the exact split the
+# publish invariant (`core/itemview.py`, `core/engine.py._project`'s own docstring) exists to
+# prevent.
+#
+# Two bugs stacked to produce it:
+#
+# 1. `core/arrsync.py`'s cleanup sets `auto_queue_suppressed = 1` *before* touching disk (spec
+#    "Cleanup" step 1 -- belt-and-braces against a copy-mode queue's re-download toggle
+#    re-grabbing the still-present remote copy while cleanup is in flight). `_protected_rel_
+#    paths` treated *any* `auto_queue_suppressed = 1` row as frozen -- correct for `deleted_
+#    local()`'s own terminal write and for STOPPED/FAILED, which have nowhere else to go, but
+#    wrong for an arr-cleaned row, which still needs the ordinary "vanished from both trees"
+#    sweep to run so the grace clock can start. Excluded from `_protected_rel_paths`'s query
+#    (this fix) only when `arr_status = 'cleaned'` -- every other suppressed row (including a
+#    mid-cleanup row that hasn't reached `arr_status = 'cleaned'` yet) stays exactly as
+#    protected as it always was.
+# 2. Even once unprotected, a plain (verify-skipped -- the common case: no per-release .sfv/.md5
+#    sidecar) `move`-mode item rests at `state == "LOCAL_ONLY"` once its own remote-delete step
+#    runs, at download time, well before cleanup -- not one of `resolve_absence`'s `_STICKY_
+#    PREV_STATES`, so once vanished it would fall straight to `resolve_vanished`'s fallback and
+#    land on `REMOVED_BOTH` *instantly*, no grace at all (matching the earlier `REMOVED_BOTH`
+#    rows the same live incident saw in the same queue -- correct for a genuinely externally-
+#    vanished `LOCAL_ONLY` row, wrong for one this codebase's own cleanup just marked). `_persist`
+#    now remaps this one specific combination (`LOCAL_ONLY` + `arr_status == 'cleaned'`) to
+#    `"DOWNLOADED"` before calling `resolve_absence` -- reusing its existing "hold `prev_state`
+#    during grace, land on `REMOVED_LOCAL` at expiry" shape completely unmodified, and matching
+#    what `core/itemview.py._local_facet`/`frontend/src/lib/format.ts.
+#    REMOVAL_GRACE_ELIGIBLE_STATES` already require paired with a ticking `first_missing_at` for
+#    the dim icon / "Processed · Xm" chip to render at all. A *generic* move-mode `LOCAL_ONLY`
+#    vanish (no arr cleanup involved) is deliberately untouched -- see
+#    `test_a_vanished_local_only_row_rests_at_removed_both_not_left_alone` above, still passing.
+
+
+async def test_arr_cleaned_row_is_exempt_from_protection_an_ordinary_suppressed_row_is_not(
+    tmp_path, monkeypatch
+):
+    """Direct pin on the `_protected_rel_paths` SQL change: `auto_queue_suppressed = 1` alone
+    still freezes a row -- only the `arr_status = 'cleaned'` combination is exempted, so the
+    STOPPED/FAILED/`deleted_local()` cases this query exists for are unaffected.
+    """
+    engine, q, host, db, item_id = await _make_move_engine(
+        tmp_path, monkeypatch, local_size=None, state="LOCAL_ONLY", remote_deleted_at=None
+    )
+    await db.execute(
+        "UPDATE item SET auto_queue_suppressed = 1, arr_status = 'cleaned' WHERE id = ?",
+        (item_id,),
+    )
+    await db.commit()
+    try:
+        assert REL_PATH not in await engine._protected_rel_paths(q.id)
+    finally:
+        await db.close()
+
+
+async def test_an_ordinary_suppressed_row_stays_protected(tmp_path, monkeypatch):
+    engine, q, host, db, item_id = await _make_move_engine(
+        tmp_path, monkeypatch, local_size=None, state="REMOVED_LOCAL", remote_deleted_at=None
+    )
+    await db.execute(
+        "UPDATE item SET auto_queue_suppressed = 1, suppressed_reason = 'deleted_local' "
+        "WHERE id = ?",
+        (item_id,),
+    )
+    await db.commit()
+    try:
+        assert REL_PATH in await engine._protected_rel_paths(q.id)
+    finally:
+        await db.close()
+
+
+async def test_arr_cleaned_move_mode_item_gets_the_removal_grace_not_instant_removed_both(
+    tmp_path, monkeypatch
+):
+    """The full reproduction, end to end: a `move`-mode item `core/arrsync.py`'s cleanup step
+    just removed the local copy of (remote already gone at download time, same as any move-mode
+    item; `auto_queue_suppressed = 1` set first per the spec's own step 1, `arr_status =
+    'cleaned'` set last, `state` left exactly as arrsync.py leaves it -- untouched) must stay in
+    the *published* view through the ~10-minute removal grace, carrying `arr_status: "cleaned"`
+    so the frontend renders "Processed · Xm", then leave through the normal `REMOVED_BOTH`
+    transition -- no new timer, no special-case lifetime.
+    """
+    engine, q, host, db, item_id = await _make_move_engine(
+        tmp_path, monkeypatch, local_size=None, state="LOCAL_ONLY", remote_deleted_at=None
+    )
+    await db.execute(
+        "UPDATE item SET auto_queue_suppressed = 1, arr_status = 'cleaned', "
+        "arr_status_at = '2026-08-16T04:29:00.000000Z' WHERE id = ?",
+        (item_id,),
+    )
+    await db.commit()
+    try:
+        # 1. First scan after cleanup: the row is absent from both trees (move mode already
+        #    deleted the remote; the local bytes are what cleanup just removed). It must stay
+        #    published, still carrying arr_status=cleaned, with the grace clock now running --
+        #    not vanish instantly, and not land on REMOVED_BOTH with no grace at all.
+        await engine.scan_queue(q, host)
+        state, first_missing_at = await _state_of(db, item_id)
+        assert state == "DOWNLOADED", "LOCAL_ONLY remapped into the grace-eligible set"
+        assert first_missing_at is not None, "the grace clock must actually start"
+
+        published = engine.models[q.id]
+        assert REL_PATH in published, "must stay in the published view, not vanish instantly"
+        assert published[REL_PATH]["arr_status"] == "cleaned"
+        assert published[REL_PATH]["first_missing_at"] == first_missing_at
+
+        # 2. A second pass inside the window changes nothing and does not restart the clock.
+        await engine.scan_queue(q, host)
+        assert (await _state_of(db, item_id)) == ("DOWNLOADED", first_missing_at)
+        assert REL_PATH in engine.models[q.id]
+
+        # 3. Backdate the clock past the grace window rather than sleeping ten minutes.
+        await db.execute(
+            "UPDATE item SET first_missing_at = STRFTIME('%Y-%m-%dT%H:%M:%fZ', 'now', ?) "
+            "WHERE id = ?",
+            (f"-{int(DEFAULT_GRACE_S) + 60} seconds", item_id),
+        )
+        await db.commit()
+
+        # 4. Grace expires: the normal machinery lands it on REMOVED_BOTH (the remote is
+        #    genuinely gone too, on a move queue) and it leaves the published view through the
+        #    ordinary `removed` delta -- no special-case lifetime.
+        await engine.scan_queue(q, host)
+        assert (await _state_of(db, item_id))[0] == "REMOVED_BOTH"
+        assert REL_PATH not in engine.models[q.id], "must leave the projection once terminal"
+    finally:
+        await db.close()
+
+
 # --- A cleaned-up archive volume rests at EXCLUDED, never through the grace clock -------------
 #
 # 2026-08-14 (prompts/2026-08-14-extracted-archives-rest-as-extracted.md), live evidence: nine

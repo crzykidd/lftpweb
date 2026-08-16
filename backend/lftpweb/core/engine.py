@@ -1050,7 +1050,24 @@ class Engine:
         )
         cursor = await self.db.execute(
             "SELECT item.rel_path FROM item WHERE item.queue_id = ? AND ("
-            "  item.auto_queue_suppressed = 1"
+            # 2026-08-15 (prompts/2026-08-15-cleaned-item-grace-visibility.md): an
+            # arr-cleaned row (`core/arrsync.py`'s cleanup step sets `auto_queue_suppressed
+            # = 1` *before* touching disk -- spec "Cleanup" step 1 -- purely to keep a
+            # copy-mode queue's re-download toggle from re-grabbing the still-present remote
+            # copy) must NOT inherit this clause's *other* meaning, "freeze `state`,
+            # never let a scan touch it again" -- that's exactly right for a
+            # `deleted_local()`/STOPPED/FAILED row (which sets its own terminal state
+            # directly, or is a job-lifecycle hold with nowhere else to go), but it is
+            # precisely the machinery an arr-cleaned row needs to run: `state`/
+            # `first_missing_at` must keep flowing through the ordinary per-node and
+            # "vanished from both trees" paths below so the ~10-minute removal grace can
+            # start and expire normally (docs/arr-integration-spec.md "Cleanup"). Without
+            # this exemption the row is simply never revisited by `_persist` again --
+            # `first_missing_at` stays NULL forever and the row silently drops out of
+            # `written`/`_project`'s published set the instant it leaves both trees. `IS
+            # NOT` (not `!=`) so a NULL `arr_status` -- every ordinary suppressed row --
+            # still reads protected, exactly as before this exemption existed.
+            "  (item.auto_queue_suppressed = 1 AND item.arr_status IS NOT 'cleaned')"
             "  OR EXISTS (SELECT 1 FROM job WHERE job.item_id = item.id AND job.state IN ('queued', 'running'))"
             # **Descendants of an item with an active job are protected too** (2026-08-14).
             # A `mirror` job is tracked against the *top-level* item alone, so a child file
@@ -1089,17 +1106,22 @@ class Engine:
 
     async def _previous_states(
         self, queue_id: int
-    ) -> dict[str, tuple[str, str | None, str | None, str | None]]:
-        """`rel_path -> (state, substate, first_missing_at, remote_deleted_at)` as currently
-        persisted, for the grace-period decision below, (prompts/open-issues.md #2's stuck-item
-        follow-up) the settle-gate release check, and (2026-08-13,
+    ) -> dict[str, tuple[str, str | None, str | None, str | None, str | None]]:
+        """`rel_path -> (state, substate, first_missing_at, remote_deleted_at, arr_status)` as
+        currently persisted, for the grace-period decision below, (prompts/open-issues.md #2's
+        stuck-item follow-up) the settle-gate release check, and (2026-08-13,
         `prompts/2026-08-13-move-mode-outcome-survives-local-only.md`)
         `postprocess.outcome_survives_rescan`'s `LOCAL_ONLY` refinement, which needs to tell "a
         never-tracked local file" from "the remote copy this codebase deleted on purpose" apart.
         One query per scan, same shape as `_protected_rel_paths`.
+
+        `arr_status` (2026-08-15, prompts/2026-08-15-cleaned-item-grace-visibility.md) is the
+        "vanished from both trees" sweep's own signal, alongside `remote_deleted_at`, to tell a
+        `move`-queue arr-cleaned item's `LOCAL_ONLY` resting state apart from a genuinely
+        never-tracked local file's -- see that sweep's own comment for why.
         """
         cursor = await self.db.execute(
-            "SELECT rel_path, state, substate, first_missing_at, remote_deleted_at "
+            "SELECT rel_path, state, substate, first_missing_at, remote_deleted_at, arr_status "
             "FROM item WHERE queue_id = ?",
             (queue_id,),
         )
@@ -1110,6 +1132,7 @@ class Engine:
                 row["substate"],
                 row["first_missing_at"],
                 row["remote_deleted_at"],
+                row["arr_status"],
             )
             for row in rows
         }
@@ -1213,7 +1236,7 @@ class Engine:
                 # exactly as absolute as it always was. `auto_queue_suppressed` itself is never
                 # touched by this branch -- see that function's own docstring for why the
                 # eligibility flag and the state text are deliberately two separate questions.
-                prev_state, _, _, _ = previous.get(rel_path, (None, None, None, None))
+                prev_state, _, _, _, _ = previous.get(rel_path, (None, None, None, None, None))
                 corrected_state = (
                     local_delete.reconsider_removed_state(
                         prev_state,
@@ -1257,9 +1280,13 @@ class Engine:
             # history and the mount gate first. The branch above it is the same arbitration
             # for the opposite reading, presence rather than absence. Every other node's
             # freshly-computed state is trusted as-is, exactly like phase 2/3.
-            prev_state, prev_substate, prev_first_missing_at, prev_remote_deleted_at = previous.get(
-                rel_path, (None, None, None, None)
-            )
+            (
+                prev_state,
+                prev_substate,
+                prev_first_missing_at,
+                prev_remote_deleted_at,
+                _prev_arr_status,
+            ) = previous.get(rel_path, (None, None, None, None, None))
             if postprocess.outcome_survives_rescan(
                 prev_state, node.structural_state, remote_deleted_at=prev_remote_deleted_at
             ):
@@ -1398,9 +1425,46 @@ class Engine:
         # loop either -- consistent with rule 6's "never rescanned".
         vanished = set(previous) - written - protected
         for rel_path in sorted(vanished):
-            prev_state, _prev_substate, prev_first_missing_at, _prev_remote_deleted_at = previous[
-                rel_path
-            ]
+            (
+                prev_state,
+                _prev_substate,
+                prev_first_missing_at,
+                _prev_remote_deleted_at,
+                prev_arr_status,
+            ) = previous[rel_path]
+            # 2026-08-15 (prompts/2026-08-15-cleaned-item-grace-visibility.md): a `move`-queue
+            # item this codebase's own arr cleanup just cleaned rests at `prev_state ==
+            # "LOCAL_ONLY"` here, not one of `resolve_absence`'s `_STICKY_PREV_STATES` --
+            # `move` mode's remote-delete step already took the remote copy at download time
+            # (`postprocess._maybe_delete_remote`), so a verify-skipped item's `state` reads
+            # `LOCAL_ONLY` even before cleanup touches it (the honest "content complete,
+            # nothing to compare against remotely" byte reading -- see
+            # `postprocess.outcome_survives_rescan`'s own `remote_deleted_at`-gated `LOCAL_ONLY`
+            # branch, the present-side twin of this one). Fed to `resolve_absence` as-is,
+            # `LOCAL_ONLY` is invisible to it (`None` is returned, same as `resolve_vanished`
+            # below always resolving it straight to a terminal `REMOVED_BOTH` -- correct for a
+            # genuinely never-tracked local file's disappearance, the case that fallback exists
+            # for) -- no grace period, `first_missing_at` never set, and per
+            # `core/itemview.py._local_facet`/`frontend/src/lib/format.ts.
+            # REMOVAL_GRACE_ELIGIBLE_STATES` a bare `LOCAL_ONLY` isn't grace-eligible either way
+            # (both read it as unconditionally present). Remapping to `"DOWNLOADED"` -- only for
+            # a row this codebase's own cleanup just marked `arr_status = 'cleaned'`, never a
+            # generic move-mode `LOCAL_ONLY` vanish, which must keep resolving straight to
+            # `REMOVED_BOTH` exactly as before -- reuses `resolve_absence`'s existing "hold
+            # `prev_state` during grace, land on `REMOVED_LOCAL` at expiry" shape unmodified:
+            # `DOWNLOADED` is `_STICKY_PREV_STATES`-eligible, is what the frontend/`_local_facet`
+            # already expect paired with a ticking `first_missing_at` (the "Processed · Xm"
+            # chip's own eligibility set), and loses no information `LOCAL_ONLY` still carried --
+            # by the time a row rests at bare `LOCAL_ONLY` rather than a postprocess outcome,
+            # verify/extract already left nothing more specific to preserve
+            # (`outcome_survives_rescan` would have kept a `TERMINAL_STATES` outcome showing
+            # instead). The `REMOVED_LOCAL` -> `REMOVED_BOTH` remap a few lines below still fires
+            # at grace expiry, same as any other row this loop resolves.
+            resolve_prev_state = (
+                "DOWNLOADED"
+                if prev_state == "LOCAL_ONLY" and prev_arr_status == "cleaned"
+                else prev_state
+            )
             if rel_path in deleted_archive_paths:
                 # 2026-08-14 (prompts/2026-08-14-extracted-archives-rest-as-extracted.md): this
                 # codebase deleted this file itself -- the successful conclusion of extraction
@@ -1426,7 +1490,7 @@ class Engine:
                 vanished_state, vanished_first_missing_at = "EXCLUDED", None
             elif (
                 override := mount_sentinel.resolve_absence(
-                    prev_state=prev_state,
+                    prev_state=resolve_prev_state,
                     prev_first_missing_at=prev_first_missing_at,
                     structural_state="REMOTE_ONLY",
                     mount_ok=mount_ok,

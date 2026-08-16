@@ -6,6 +6,91 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-15 — Cleaned-item grace visibility: narrowing `_protected_rel_paths`, not
+`resolve_absence`
+
+`prompts/2026-08-15-cleaned-item-grace-visibility.md`, live defect: the first real run of the
+*arr delete-completed flow on a `move` queue (matched → notified → imported → cleanup deleted the
+local copy) dropped the row from the Files page *instantly* instead of riding the existing
+~10-minute removal grace as "Processed · Xm" (`docs/arr-integration-spec.md` "Cleanup" —
+`core/arrsync.py`'s cleanup step deliberately never writes `item.state`, leaving the row for the
+"existing scan + `core/mount_sentinel.py` absence-grace machinery" to carry to `REMOVED_LOCAL`,
+per the 2026-08-15 phase B entry above). `GET /api/files` kept showing the row
+(`state: LOCAL_ONLY`, `arr_status: "cleaned"`, `first_missing_at: null`) minutes and several scan
+passes later; the WS-driven Files page had already dropped it — REST and the published view
+disagreeing, the exact split the publish invariant (`core/itemview.py`) exists to prevent.
+
+**Two bugs stacked, both inside `core/engine.py._persist`, neither in `core/mount_sentinel.py`:**
+
+1. **`_protected_rel_paths` treated *any* `auto_queue_suppressed = 1` row as fully frozen.**
+   Cleanup sets that flag *first*, before touching disk (spec step 1 — belt-and-braces against a
+   copy-mode queue's re-download toggle re-grabbing the still-present remote copy while cleanup
+   runs). That flag's *other* meaning — "a scan pass must never touch this row's `state` again"
+   — is exactly right for `core/local_delete.py.delete_local()`'s own terminal write and for
+   STOPPED/FAILED (job-lifecycle holds with nowhere else to go), but wrong for an arr-cleaned
+   row, which still needs the ordinary per-node/vanished-sweep machinery to run so the grace
+   clock can start. Left unfixed, the row is simply excluded from `_persist`'s `vanished` set
+   forever — `first_missing_at` never gets touched, and the row silently drops out of `written`,
+   hence `_project`'s published set, on the very next scan.
+2. **Even once unprotected, a verify-skipped `move`-mode item rests at `state == "LOCAL_ONLY"`**
+   — `move` mode's own remote-delete step (`postprocess._maybe_delete_remote`) already removed
+   the remote copy at download time, well before cleanup, and with no `.sfv`/`.md5` sidecar
+   (the common case for TV/movie releases) `core/postprocess.py._do_verify`'s `SKIPPED` branch
+   leaves `state = "DOWNLOADED"`, which the very next scan overwrites to `LOCAL_ONLY` (an
+   intentional, correct reading — see `outcome_survives_rescan`'s own `remote_deleted_at`-gated
+   `LOCAL_ONLY` docstring). `LOCAL_ONLY` is not in `resolve_absence`'s `_STICKY_PREV_STATES`, so
+   once vanished from both trees it falls straight to `resolve_vanished`'s fallback and lands on
+   `REMOVED_BOTH` *instantly* — correct for a genuinely never-tracked local file's disappearance
+   (and it's exactly what produced the "earlier `REMOVED_BOTH` rows in the same queue" the live
+   evidence also showed), wrong for a row this codebase's own cleanup just marked.
+
+**The fix widens `_protected_rel_paths`'s SQL by one clause** (`auto_queue_suppressed = 1 AND
+arr_status IS NOT 'cleaned'`, `IS NOT` rather than `!=` so a NULL `arr_status` — every ordinary
+suppressed row — still reads protected) **and remaps one specific combination inside the vanished
+sweep**: `prev_state == "LOCAL_ONLY" and arr_status == "cleaned"` is fed to `resolve_absence` as
+`"DOWNLOADED"` instead of literally `"LOCAL_ONLY"`. Both changes live entirely in
+`core/engine.py._persist`; `core/mount_sentinel.py.resolve_absence`/`resolve_vanished` are
+untouched, and so is `postprocess.outcome_survives_rescan`.
+
+**Why `"DOWNLOADED"`, not a new sticky state or a `mount_sentinel.py` signature change:**
+`resolve_absence` already holds `prev_state` verbatim throughout the grace window and only
+resolves it at expiry — the frontend/`_local_facet` grace-eligibility check
+(`core/itemview.py._local_facet`, `frontend/src/lib/format.ts.REMOVAL_GRACE_ELIGIBLE_STATES`,
+kept in sync with `core/mount_sentinel.py.COMPLETE_STATES` and pinned equal by
+`tests/test_settings_api.py`) requires the *held* state to be one of `_COMPLETE_PREV_STATES` for
+the dim icon / "Processed · Xm" chip to render at all — literally holding `"LOCAL_ONLY"` would
+have rendered green/"present" throughout the entire grace window (`_local_facet`'s unconditional
+`LOCAL_ONLY → green` branch), the opposite of the intended effect. `"DOWNLOADED"` is exactly what
+that same state would have been had verify not been skipped and `outcome_survives_rescan`'s own
+`remote_deleted_at`-gated protection not intervened — it is the generic "content complete"
+reading `LOCAL_ONLY` is itself a refinement of, so the remap loses no information: by the time a
+row rests at bare `LOCAL_ONLY` rather than a postprocess outcome, verify/extract already left
+nothing more specific to preserve. The existing `REMOVED_LOCAL → REMOVED_BOTH` remap the vanished
+sweep already applies at grace expiry (2026-08-13, "vanished rows should leave the tree") fires
+unmodified on top of this, so the terminal state is still correctly `REMOVED_BOTH` (remote is
+genuinely gone too), never `REMOVED_LOCAL`.
+
+**Deliberately not generalized to every move-mode `LOCAL_ONLY` vanish.** The remap only fires
+when `arr_status == 'cleaned'` — a row this codebase's own cleanup marked. A move-mode item that
+vanishes from local for any *other* reason (an importer takes it via hardlink/copy outside
+lftpweb's own tracking, a user deletes it by hand outside the app) still resolves straight to
+`REMOVED_BOTH` with no grace, exactly as before this fix —
+`test_a_vanished_local_only_row_rests_at_removed_both_not_left_alone` (unmodified) pins this.
+Extending the grace period to *every* `LOCAL_ONLY` disappearance would be a real, if arguably
+reasonable, generalization of absence handling that this task's own scope explicitly excludes
+("do not redesign absence handling generally").
+
+**Not addressed, and not this bug's mechanism:** the `DOWNLOADED → LOCAL_ONLY` rewrite itself
+(a verify-skipped move-mode item's `state` changing from `"DOWNLOADED"` to `"LOCAL_ONLY"` the
+scan after its remote copy is deleted) is intentional, existing behavior — `outcome_survives_
+rescan` only protects the four `TERMINAL_STATES` outcomes, by design, and `"DOWNLOADED"` itself
+carries no information `"LOCAL_ONLY"` doesn't already convey more accurately (remote genuinely
+absent). It is the reason the live item was at `LOCAL_ONLY` rather than `DOWNLOADED` going into
+cleanup, but it is not a bug in its own right, and the fix above works correctly regardless of
+which of the two the row rests at when cleanup runs.
+
+---
+
 ## 2026-08-15 — Transfers row collapse: what stays inline, what moves to the panel, and two
 kept judgment calls
 
