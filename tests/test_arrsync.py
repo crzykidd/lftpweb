@@ -132,7 +132,13 @@ def _queue_record(
 
 
 def _import_event(*, download_id: str, source_title: str | None = None):
-    return {"eventType": 3, "downloadId": download_id, "sourceTitle": source_title}
+    # `"downloadFolderImported"` -- the camelCase **string** a real Sonarr v3 response body
+    # actually serializes `eventType` as (verified against a live instance, 2026-08-15). The
+    # numeric form (`3`) is a fixture bug this codebase shipped with: modeling the wire format
+    # wrongly is exactly why two real Sonarr imports were misclassified `gone` on the first
+    # live run before this fix -- see `test_imported_also_confirmed_via_legacy_numeric_event_type`
+    # below for the (separate, tolerance-only) numeric case.
+    return {"eventType": "downloadFolderImported", "downloadId": download_id, "sourceTitle": source_title}
 
 
 # --- Matching ----------------------------------------------------------------------------
@@ -364,6 +370,81 @@ async def test_imported_requires_record_gone_and_history_and_two_passes(
     assert row["arr_status"] == "detected", "must not commit on the first observing pass"
     assert await _event_kinds(db, item_id) == []
 
+    await scheduler.run_once()
+    row = await _item_row(db, item_id)
+    assert row["arr_status"] == "imported"
+    assert await _event_kinds(db, item_id) == ["arr_imported"]
+
+
+async def test_imported_confirmed_via_string_event_type_end_to_end(db, fake_arr_server, tmp_path):
+    """Pins the actual fix (2026-08-15): `eventType` arrives as the camelCase **string**
+    `"downloadFolderImported"` in a real response body, spelled out literally here (not via the
+    `_import_event` helper, which every other test in this file already uses) so this test
+    fails loudly if a future change ever reverts the wire-format assumption back to the numeric
+    code that shipped wrong the first time and misclassified two real Sonarr imports as `gone`.
+    """
+    host_id = await _seed_host(db)
+    instance_id = await _seed_instance(
+        db,
+        str(tmp_path),
+        base_url=fake_arr_server.base_url,
+        api_key=fake_arr_server.state.api_key,
+    )
+    queue_id = await _seed_queue(db, host_id, arr_instance_id=instance_id)
+    item_id = await _seed_item(
+        db,
+        queue_id,
+        "Show.S01E05.1080p-GRP",
+        state="DOWNLOADED",
+        arr_status="detected",
+        arr_download_id="abc123",
+    )
+    fake_arr_server.state.queue_records = []
+    fake_arr_server.state.history_events = [
+        {
+            "eventType": "downloadFolderImported",
+            "downloadId": "abc123",
+            "sourceTitle": "Show S01E05 1080p GRP",
+        }
+    ]
+
+    scheduler = ArrSyncScheduler(db=db, config_dir=str(tmp_path))
+    await scheduler.run_once()
+    await scheduler.run_once()
+    row = await _item_row(db, item_id)
+    assert row["arr_status"] == "imported"
+    assert await _event_kinds(db, item_id) == ["arr_imported"]
+
+
+async def test_imported_also_confirmed_via_legacy_numeric_event_type(db, fake_arr_server, tmp_path):
+    """The tolerance fallback (`HistoryEvent.is_import_event`'s numeric branch), proven
+    end-to-end through the same poller path as the string case above, not just at the
+    `HistoryEvent` unit level -- an *arr version or serializer setting that still emits the
+    pre-fix numeric `eventType` must not regress to `gone`.
+    """
+    host_id = await _seed_host(db)
+    instance_id = await _seed_instance(
+        db,
+        str(tmp_path),
+        base_url=fake_arr_server.base_url,
+        api_key=fake_arr_server.state.api_key,
+    )
+    queue_id = await _seed_queue(db, host_id, arr_instance_id=instance_id)
+    item_id = await _seed_item(
+        db,
+        queue_id,
+        "Show.S01E05.1080p-GRP",
+        state="DOWNLOADED",
+        arr_status="detected",
+        arr_download_id="abc123",
+    )
+    fake_arr_server.state.queue_records = []
+    fake_arr_server.state.history_events = [
+        {"eventType": 3, "downloadId": "abc123", "sourceTitle": "Show S01E05 1080p GRP"}
+    ]
+
+    scheduler = ArrSyncScheduler(db=db, config_dir=str(tmp_path))
+    await scheduler.run_once()
     await scheduler.run_once()
     row = await _item_row(db, item_id)
     assert row["arr_status"] == "imported"

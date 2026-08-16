@@ -6,6 +6,60 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-15 — auto-queue excludes `_UNPACK_`/`_FAILED_` remote staging: "show it, don't grab it"
+
+First real Sonarr live-testing run also surfaced this: the user's seedbox runs SABnzbd, which
+stages an in-progress unpack into a `_UNPACK_<name>` directory *on the remote* while unzipping,
+then renames it to the release's final name once done — coincidentally the identical
+`_UNPACK_`/`_FAILED_` prefix convention `core/extract.py` already uses for lftpweb's own *local*
+extraction staging, but this instance of it is SAB's, on the remote, and lftpweb has no control
+over it. The live instance showed 16 such remote directories (~34 GB) reconciling to ordinary
+`REMOTE_ONLY` items, real auto-queue candidates held back only by the settle gate (which will
+eventually let one through once SAB's rewriting looks quiescent for long enough — not a safe bet
+for a directory actively being unzipped).
+
+Two options considered: filter them out of the remote scan entirely (the same treatment
+`core/local_scan.py` already gives lftpweb's own local `_UNPACK_`/`_FAILED_` staging), or leave
+them visible and only block auto-queue. **User decision: leave them visible.** They exist on the
+remote and represent real, real-sized content someone might reasonably want to look at (or
+manually queue mid-unpack, if they know what they're doing) — hiding a 34 GB item from the tree
+entirely was judged worse than showing it in a state that just isn't auto-queued. This is a
+deliberate divergence from `local_scan.py`'s own filter, which hides lftpweb's *own* bookkeeping
+because it is never content the user asked for; a SAB unpack in progress, by contrast, unarguably
+is content, just not-yet-safe-to-grab content.
+
+Resolution: the exclusion lives in `core/autoqueue.py.AutoQueue.on_scan`, not `core/local_scan.py`
+or the reconciler — eligibility, not visibility. A top-level item whose name starts with
+`UNPACK_PREFIX`/`FAILED_PREFIX` (imported from `core/extract.py`, not duplicated) is skipped
+before pattern matching, unconditionally, regardless of `state`. Manual queueing
+(`core/queue.py.enqueue_item`) is untouched — consistent with every other auto-queue-only gate in
+this module (the settle gate, the mount gate): an explicit user action beats a heuristic.
+
+## 2026-08-15 — *arr `eventType` is a camelCase string in response bodies, not the numeric code
+
+The first real Sonarr live-testing run against the v0.1.1+arr build caught this directly: two
+releases (Gold Rush S16, NCIS New Orleans S07) were matched, transferred, notified, and genuinely
+imported by Sonarr — and both were classified `gone` by `core/arrsync.py`, the terminal-but-safe
+"queue record vanished with no import event" outcome, because `core/arrclient.py`'s
+`IMPORT_EVENT_TYPES = {3}` never matched a real history record. Root cause, confirmed against the
+live instance's actual response bodies: the *arr v3 API serializes `eventType` as a **camelCase
+string** (`"downloadFolderImported"`, `"grabbed"`, ...) in every response body; the numeric codes
+this codebase was built against exist only as *query-parameter* values on request-side filters,
+never as a response field's actual type. The fake-*arr test fixture's own test data encoded the
+same wrong assumption (`{"eventType": 3, ...}`), which is exactly why every test stayed green
+while the live run silently misclassified two real imports — the spec's own "Failure modes"
+section had flagged this vocabulary as unverified against a live instance for precisely this
+reason, and it turned out to be wrong in the one place (`eventType`) that mattered;
+`trackedDownloadState`'s strings (`"importing"`, `"imported"`) were already correct.
+
+Resolution: `IMPORT_EVENT_TYPES` is now string-keyed (`{"downloadFolderImported"}`), and the
+comparison is normalized in exactly one place — a new `HistoryEvent.is_import_event()` method,
+not at either call site — so a numeric `event_type` (never seen live, but cheap to tolerate for
+an *arr version or serializer setting this codebase hasn't encountered) still matches via a kept
+legacy-numeric fallback rather than being silently unsupported. Already-`gone` associations on
+the live instance are terminal by design and stay `gone`; this fix only changes classification
+for associations checked from now on.
+
 ## 2026-08-15 — *arr integration phase C: instance name resolved client-side, never added to the item wire
 
 The spec's "UI" section says the icon's hover card "names the instance and the timestamp

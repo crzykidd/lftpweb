@@ -5,14 +5,18 @@ codebase touches (`system/status`, `queue`, `history`, `command`); only the comm
 media noun differ, so `kind` is a constructor argument, not a subclass split. `X-Api-Key` header,
 10s timeout, matching `docs/arr-integration-spec.md`'s "The poller" section verbatim.
 
-**The numeric `eventType` codes and the `trackedDownloadState` string vocabulary below are
-data-driven constants sourced from the public v3 API's community documentation, not confirmed
-against a live Sonarr/Radarr instance** (this build had none available) -- the spec's own
-"Failure modes" section flags this explicitly, the same lesson
-`tests/test_lftp_settings_accepted.py` teaches for lftp's rc grammar: assert against the real
-program, not the docs, at the first opportunity a live instance exists. Until then, everything
-that reads `eventType`/`trackedDownloadState` reads it through the two module-level lookups
-below so a correction is a one-place edit.
+**The `eventType`/`trackedDownloadState` vocabulary below is now verified against a live Sonarr
+v3 instance** (2026-08-15, via the lftpweb audit trail on a real run + this fix -- see
+`docs/decisions.md`), superseding the community-documentation-only constants this module
+shipped with. `trackedDownloadState`'s strings (`"importing"`, `"imported"`) were already
+correct. `eventType` was not: the v3 API serializes it in **response bodies as a camelCase
+string** (`"downloadFolderImported"`, `"grabbed"`, ...) -- the numeric codes exist only as
+*query-parameter* values, never as a response body field's actual type, so a numeric
+`IMPORT_EVENT_TYPES` could never match a real history record (two live Sonarr imports were
+misclassified `gone` on the first real run before this was caught). `IMPORT_EVENT_TYPES` is
+therefore string-keyed; the historical numeric code is kept as a defensive fallback only (see
+`HistoryEvent.is_import_event`), for a serializer setting or *arr version this codebase hasn't
+seen, at effectively zero cost.
 """
 
 from __future__ import annotations
@@ -34,26 +38,35 @@ DEFAULT_TIMEOUT_S = 10.0
 # an unbounded response body.
 PAGE_SIZE = 250
 
-# *arr v3 history `eventType` values -- **unverified against a live instance, see module
-# docstring.** `downloadFolderImported` (3) is the one this codebase cares about: it is the
-# per-file trailing signal a completed import leaves behind (docs/arr-integration-spec.md "The
-# association lifecycle" -- "one history import event lands *after each file's copy
-# completes*"). `grabbed` (1) and `downloadFailed` (4) are recorded here for completeness/future
-# use, not read by `core/arrsync.py` in this phase.
-EVENT_TYPE_GRABBED = 1
-EVENT_TYPE_DOWNLOAD_FOLDER_IMPORTED = 3
-EVENT_TYPE_DOWNLOAD_FAILED = 4
+# *arr v3 history `eventType` values -- **verified against a live Sonarr v3 instance,
+# 2026-08-15, see module docstring.** `downloadFolderImported` is the one this codebase cares
+# about: it is the per-file trailing signal a completed import leaves behind
+# (docs/arr-integration-spec.md "The association lifecycle" -- "one history import event lands
+# *after each file's copy completes*"). `grabbed` and `downloadFailed` are recorded here for
+# completeness/future use, not read by `core/arrsync.py` in this phase.
+EVENT_TYPE_GRABBED = "grabbed"
+EVENT_TYPE_DOWNLOAD_FOLDER_IMPORTED = "downloadFolderImported"
+EVENT_TYPE_DOWNLOAD_FAILED = "downloadFailed"
 
 # The only event type(s) that count as "this release was imported" for the lifecycle's
 # requirement 2 (docs/arr-integration-spec.md). A `frozenset` (not a single constant) because a
 # future correction against a live instance may find more than one event type qualifies (e.g. a
-# per-episode vs. per-season variant) without every caller changing shape.
-IMPORT_EVENT_TYPES: frozenset[int] = frozenset({EVENT_TYPE_DOWNLOAD_FOLDER_IMPORTED})
+# per-episode vs. per-season variant) without every caller changing shape. String-keyed --
+# `HistoryEvent.is_import_event` is where this is actually consulted; nothing compares
+# `event_type` to this set directly, so a future addition here needs no call-site changes.
+IMPORT_EVENT_TYPES: frozenset[str] = frozenset({EVENT_TYPE_DOWNLOAD_FOLDER_IMPORTED})
 
-# *arr v3 queue record `trackedDownloadState` vocabulary -- **unverified against a live
-# instance, see module docstring.** `importing` is the value the spec's lifecycle section leans
-# on directly: a record still reporting it is *never* `imported`, no matter what history says
-# (requirement 1's "not yet" case for a slow multi-file import).
+# Pre-2026-08-15 assumption, kept only as `HistoryEvent.is_import_event`'s numeric fallback --
+# **never** compared against directly elsewhere. The wire format is a string (see module
+# docstring); this exists solely so an *arr version or serializer setting that somehow still
+# emits the historical numeric code in a response body is tolerated too, cheaply.
+_LEGACY_EVENT_TYPE_DOWNLOAD_FOLDER_IMPORTED = 3
+
+# *arr v3 queue record `trackedDownloadState` vocabulary -- **verified against a live Sonarr v3
+# instance, 2026-08-15, see module docstring** (this vocabulary was already correct pre-fix).
+# `importing` is the value the spec's lifecycle section leans on directly: a record still
+# reporting it is *never* `imported`, no matter what history says (requirement 1's "not yet"
+# case for a slow multi-file import).
 TRACKED_DOWNLOAD_STATE_IMPORTING = "importing"
 TRACKED_DOWNLOAD_STATE_IMPORTED = "imported"
 
@@ -92,12 +105,36 @@ class QueueRecord:
 
 @dataclass(frozen=True)
 class HistoryEvent:
-    """One `/api/v3/history` record -- same "narrow projection + raw" shape as `QueueRecord`."""
+    """One `/api/v3/history` record -- same "narrow projection + raw" shape as `QueueRecord`.
 
-    event_type: int | None
+    `event_type` is typed `str | int | None` rather than narrowed to `str` because the raw
+    field is stored exactly as the response body serialized it -- normally a camelCase string
+    (`"downloadFolderImported"`), but `is_import_event` below also tolerates the legacy numeric
+    form, so the type here has to admit both rather than lying about what `raw.get("eventType")`
+    can actually hand back.
+    """
+
+    event_type: str | int | None
     download_id: str | None
     source_title: str | None
     raw: dict[str, Any] = field(repr=False)
+
+    def is_import_event(self) -> bool:
+        """Whether this event counts as "this release was imported"
+        (docs/arr-integration-spec.md "The association lifecycle", requirement 2) -- the one
+        place this comparison happens, so callers (`core/arrsync.py`) never compare
+        `event_type` against `IMPORT_EVENT_TYPES` (or the legacy numeric code) directly.
+
+        The real wire format is the camelCase string form (verified against a live Sonarr v3
+        instance, 2026-08-15 -- see module docstring); a numeric `event_type` -- never seen live,
+        kept only for tolerance -- is compared against the pre-fix numeric assumption instead,
+        cheaply, so any *arr version or serializer setting that emits it is still handled
+        correctly rather than silently misclassified as `gone` the way the numeric-only
+        comparison this replaces was.
+        """
+        if isinstance(self.event_type, str):
+            return self.event_type in IMPORT_EVENT_TYPES
+        return self.event_type == _LEGACY_EVENT_TYPE_DOWNLOAD_FOLDER_IMPORTED
 
 
 class ArrClient:

@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from fake_arr import run_fake_arr_server
 
-from lftpweb.core.arrclient import ArrClient, ArrClientError
+from lftpweb.core.arrclient import ArrClient, ArrClientError, HistoryEvent
 
 
 async def test_system_status_round_trip(fake_arr_server):
@@ -63,12 +63,16 @@ async def test_queue_records_empty_when_no_records(fake_arr_server):
 
 
 async def test_import_events_walks_every_page_and_filters_by_download_id(fake_arr_server):
+    """`eventType` served as the camelCase **string** a real Sonarr v3 response body actually
+    uses (verified against a live instance, 2026-08-15) -- not the numeric code the fixture
+    wrongly modeled before this fix, which is why real imports were misclassified `gone`.
+    """
     fake_arr_server.state.page_size_override = 2
     fake_arr_server.state.history_events = [
-        {"eventType": 3, "downloadId": "dl0", "sourceTitle": "Release 0"},
-        {"eventType": 1, "downloadId": "dl0", "sourceTitle": "Release 0"},
-        {"eventType": 3, "downloadId": "dl0", "sourceTitle": "Release 0"},
-        {"eventType": 3, "downloadId": "other", "sourceTitle": "Unrelated"},
+        {"eventType": "downloadFolderImported", "downloadId": "dl0", "sourceTitle": "Release 0"},
+        {"eventType": "grabbed", "downloadId": "dl0", "sourceTitle": "Release 0"},
+        {"eventType": "downloadFolderImported", "downloadId": "dl0", "sourceTitle": "Release 0"},
+        {"eventType": "downloadFolderImported", "downloadId": "other", "sourceTitle": "Unrelated"},
     ]
     async with ArrClient(
         kind="sonarr", base_url=fake_arr_server.base_url, api_key=fake_arr_server.state.api_key
@@ -76,14 +80,42 @@ async def test_import_events_walks_every_page_and_filters_by_download_id(fake_ar
         events = await client.import_events(download_id="dl0")
     assert len(events) == 3
     assert all(e.download_id == "dl0" for e in events)
+    assert sum(1 for e in events if e.is_import_event()) == 2
 
 
 async def test_import_events_returns_empty_without_a_filter(fake_arr_server):
-    fake_arr_server.state.history_events = [{"eventType": 3, "downloadId": "dl0"}]
+    fake_arr_server.state.history_events = [
+        {"eventType": "downloadFolderImported", "downloadId": "dl0"}
+    ]
     async with ArrClient(
         kind="sonarr", base_url=fake_arr_server.base_url, api_key=fake_arr_server.state.api_key
     ) as client:
         assert await client.import_events() == []
+
+
+def test_history_event_is_import_event_accepts_the_string_wire_format():
+    """The wire format this codebase now trusts, per the module docstring's live-verification
+    note (2026-08-15): a real *arr response body serializes `eventType` as a camelCase string.
+    """
+    event = HistoryEvent(
+        event_type="downloadFolderImported", download_id="dl0", source_title=None, raw={}
+    )
+    assert event.is_import_event()
+
+    unrelated = HistoryEvent(event_type="grabbed", download_id="dl0", source_title=None, raw={})
+    assert not unrelated.is_import_event()
+
+
+def test_history_event_is_import_event_tolerates_legacy_numeric_event_type():
+    """The fallback this fix keeps deliberately, for any *arr version or serializer setting
+    that still emits the pre-fix numeric code (`3`) instead of the string -- cheap tolerance,
+    never the primary comparison path.
+    """
+    event = HistoryEvent(event_type=3, download_id="dl0", source_title=None, raw={})
+    assert event.is_import_event()
+
+    unrelated = HistoryEvent(event_type=1, download_id="dl0", source_title=None, raw={})
+    assert not unrelated.is_import_event()
 
 
 async def test_post_scan_command_uses_kind_specific_name(fake_arr_server):

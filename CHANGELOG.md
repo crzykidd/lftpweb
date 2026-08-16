@@ -43,6 +43,18 @@ Skeleton for the next roll:
 
 ### Fixed
 
+- **Fixed *arr import detection against a real Sonarr run.** The Sonarr/Radarr v3 API returns
+  history `eventType` in response bodies as a camelCase **string** (`"downloadFolderImported"`),
+  not the numeric code the integration was built against — the numeric codes are only meaningful
+  as query-parameter values. Two releases that were genuinely matched, transferred, and imported
+  on the first live run were misclassified `gone` as a result. Import detection now matches the
+  string form, with the legacy numeric code tolerated as a fallback so no *arr version regresses.
+- **Auto-queue no longer grabs a SABnzbd `_UNPACK_`/`_FAILED_` staging directory on the remote.**
+  The user's seedbox stages an in-progress unpack under `_UNPACK_<name>` before renaming it to
+  the release's final name; these still show up as ordinary items in the Files tree (visible on
+  purpose — "show it, don't grab it"), but are now excluded from auto-queue eligibility
+  regardless of state or matching patterns. Manual queueing is unaffected.
+
 ### Security
 
 ### Deprecated

@@ -90,6 +90,7 @@ than a first. Two things that bit the first time and will bit again:
 | A — backend foundation | Migration 018 (`arr_instance` + 3 `path_queue` cols + 3 `item` cols); `core/arrclient.py` (httpx, one class, `kind` switch); `core/arrsync.py` poller (matching + import/gone detection, two-pass quiescence guard, per-instance backoff); `ArrSettings`; `api/settings_arr.py` CRUD + Test; `api/settings_queues.py` extended; `arr_status`/`arr_status_at` joined into `core/itemview.py`'s one projection. No notify, no cleanup, no frontend — those are phases B/C. | ✅ done, this commit |
 | B — notify + cleanup | `core/arrnotify.py` (new, shared notify implementation); `PostprocessPipeline._maybe_notify_arr` (primary push, tail of a fully-successful pipeline run); `ArrSyncScheduler._maybe_retry_notify` (bounded retry) + `._maybe_cleanup` (withheld gates, suppression-first, bytes removed without touching `item.state`) | ✅ done, this commit |
 | C — UI | Integrations tab (instance CRUD + Test), Queues additions (*arr instance dropdown, delete-when-imported, visible-path), Files icon (own resizable column, multi-faceted) + "*arr-tracked"/"gone" filters, DESIGN.md §16 + README + CHANGELOG + Concepts doc section | ✅ done, this commit — **unviewed, no browser in this environment** |
+| D — live-testing fixes | First real Sonarr run (`v0.1.1`+arr build) against the user's seedbox: `eventType` fixed to match the *arr v3 wire format (string in response bodies, `core/arrclient.py`/`core/arrsync.py`, `docs/decisions.md` 2026-08-15); auto-queue now excludes remote `_UNPACK_`/`_FAILED_` SAB staging dirs by eligibility, not visibility ("show it, don't grab it," same date) | ✅ done, `prompts/done/2026-08-15-arr-eventtype-and-unpack-autoqueue.md` |
 
 **Phase A verification:** backend lint/format clean, full backend `pytest` green (new tests in
 `tests/test_arrclient.py`, `tests/test_arrsync.py`, `tests/test_settings_arr_api.py`,
@@ -130,11 +131,22 @@ against a new `listArrInstances()` fetch, since the item wire itself only carrie
 column (kept separate from the R/L/V/E cluster) are both recorded in `docs/decisions.md`
 (2026-08-15).
 
-**Run complete (2026-08-15).** All three phases landed on `dev`, nothing pushed, every gate green
-throughout: backend foundation (phase A), notify + cleanup (phase B), UI + docs (phase C, this
-entry). The feature is off at every level on every existing install (no instance rows, no queue
-bound, nothing polls) and entirely unviewed in a browser — a human should open Settings →
-Integrations, bind a queue, and watch a Files row before trusting the rendered result.
+**Run complete (2026-08-15, phases A-C).** All three phases landed on `dev`, nothing pushed,
+every gate green throughout: backend foundation (phase A), notify + cleanup (phase B), UI + docs
+(phase C, this entry). The feature is off at every level on every existing install (no instance
+rows, no queue bound, nothing polls) and entirely unviewed in a browser — a human should open
+Settings → Integrations, bind a queue, and watch a Files row before trusting the rendered result.
+
+**Phase D verification (live-testing fixes, 2026-08-15):** the two fixes above were diagnosed
+read-only against the user's live instance's audit trail (a real Sonarr run), then built and
+verified against the fake-*arr fixture and `core/autoqueue.py`'s own test suite —
+`tests/test_arrclient.py`/`tests/test_arrsync.py`/`tests/test_arr_cleanup.py` (eventType, string
++ legacy-numeric-tolerance coverage) and `tests/test_autoqueue.py` (`_UNPACK_`/`_FAILED_`
+exclusion, plus the renamed-item-becomes-eligible-again case). Backend lint/format clean, full
+backend `pytest` green, frontend untouched and re-verified anyway. Already-`gone` associations on
+the live instance are terminal by design and stay `gone` — this fix only changes classification
+for associations checked from now on; a human still needs to re-bind/re-watch anything that was
+misclassified before the fix landed if they want it corrected.
 
 ### 🌙 Overnight audit run (started 2026-08-14, unattended) — LIVE PROGRESS LOG
 
@@ -986,8 +998,22 @@ them and the ordering resolves itself.
 These are the places where the obvious implementation is wrong. Each is written up in
 `DESIGN.md`; this list exists so a fresh session knows to go read it.
 
-**Added 2026-08-12 (post-phase-9 session) — read these first, they are the newest and the
-most likely to be re-broken:**
+**Added 2026-08-15 (first real Sonarr live-testing run) — read this one first, it's the newest:**
+
+- ***arr enums are strings in bodies, ints in query params — the fixture must model the wire,
+  not the assumption.*** The Sonarr/Radarr v3 API serializes `eventType` as a camelCase
+  **string** (`"downloadFolderImported"`) in every response body; the numeric codes this
+  integration was originally built against exist only as query-parameter values. Two genuine
+  live imports were misclassified `gone` because `IMPORT_EVENT_TYPES = {3}` could never match a
+  real record — and every test stayed green because the fake-*arr test data encoded the same
+  wrong numeric assumption instead of the real wire shape. `docs/decisions.md` (2026-08-15) has
+  the full account; `core/arrclient.py.HistoryEvent.is_import_event()` is the one place the
+  comparison now happens, with a numeric fallback kept for tolerance only. **The general lesson:
+  when a spec flags a vocabulary "unverified against a live instance," the test fixture that
+  data drives must not itself be trusted as ground truth for that vocabulary — it can encode the
+  identical wrong guess the production code does, and then prove nothing.**
+
+**Added 2026-08-12 (post-phase-9 session):**
 
 - **`relevant == 0` on a directory means two different things**, and only one of them is
   `DOWNLOADED`. Every child excluded by a `file_exclude` pattern → vacuously `DOWNLOADED`, and

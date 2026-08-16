@@ -387,6 +387,81 @@ async def test_global_pattern_queue_id_null_applies_to_every_queue(db, tmp_path)
     assert await aq.on_scan(_mounted_config(queue_id, tmp_path)) == 0
 
 
+# --- `_UNPACK_`/`_FAILED_` exclusion (2026-08-15, "show it, don't grab it," docs/decisions.md) --
+
+
+async def test_unpack_prefixed_item_is_never_auto_queued_even_with_a_matching_pattern(
+    db, tmp_path
+):
+    """The user's seedbox runs SABnzbd, which stages an in-progress unpack on the *remote*
+    side under `_UNPACK_<name>` before renaming it to the release's final name -- this shows
+    up as an ordinary `REMOTE_ONLY` item (this module never filters scan visibility; see
+    `core/local_scan.py` for the *local*, on-disk counterpart of this same prefix, which does
+    filter, at scan time, for a different reason). A broad `*` select pattern still must never
+    grab it -- the exclusion is checked before pattern matching, unconditionally.
+    """
+    from lftpweb.core.extract import UNPACK_PREFIX
+    from lftpweb.core.mount_sentinel import write_if_needed
+
+    write_if_needed(str(tmp_path))
+    queue_id = await _make_queue(db, tmp_path)
+    await db.execute(
+        "INSERT INTO pattern (queue_id, kind, expr) VALUES (?, 'select', '*')", (queue_id,)
+    )
+    await db.commit()
+    await _make_item(db, queue_id, f"{UNPACK_PREFIX}Release.One")
+    recorder = _Recorder()
+    aq = AutoQueue(db, recorder)
+
+    queued = await aq.on_scan(_mounted_config(queue_id, tmp_path))
+    assert queued == 0
+    assert recorder.enqueued == []
+
+
+async def test_failed_prefixed_item_is_never_auto_queued_either(db, tmp_path):
+    """Same exclusion, same rationale, for a `_FAILED_` leftover -- `core/extract.py`'s other
+    staging prefix.
+    """
+    from lftpweb.core.extract import FAILED_PREFIX
+    from lftpweb.core.mount_sentinel import write_if_needed
+
+    write_if_needed(str(tmp_path))
+    queue_id = await _make_queue(db, tmp_path)
+    await db.execute(
+        "INSERT INTO pattern (queue_id, kind, expr) VALUES (?, 'select', '*')", (queue_id,)
+    )
+    await db.commit()
+    await _make_item(db, queue_id, f"{FAILED_PREFIX}Release.One")
+    recorder = _Recorder()
+    aq = AutoQueue(db, recorder)
+
+    queued = await aq.on_scan(_mounted_config(queue_id, tmp_path))
+    assert queued == 0
+    assert recorder.enqueued == []
+
+
+async def test_same_item_renamed_off_the_unpack_prefix_is_auto_queued(db, tmp_path):
+    """Once SAB finishes and renames `_UNPACK_<name>` to `<name>`, the release is an ordinary,
+    eligible `REMOTE_ONLY` item again -- proving the exclusion is scoped to the still-prefixed
+    name, not a permanent block on the release itself.
+    """
+    from lftpweb.core.mount_sentinel import write_if_needed
+
+    write_if_needed(str(tmp_path))
+    queue_id = await _make_queue(db, tmp_path)
+    await db.execute(
+        "INSERT INTO pattern (queue_id, kind, expr) VALUES (?, 'select', '*')", (queue_id,)
+    )
+    await db.commit()
+    item_id = await _make_item(db, queue_id, "Release.One")
+    recorder = _Recorder()
+    aq = AutoQueue(db, recorder)
+
+    queued = await aq.on_scan(_mounted_config(queue_id, tmp_path))
+    assert queued == 1
+    assert recorder.enqueued == [item_id]
+
+
 # --- the settle gate's eligibility half (prompts/open-issues.md #2, `core/settle.py`) -----
 
 

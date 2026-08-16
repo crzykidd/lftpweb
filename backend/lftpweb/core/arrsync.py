@@ -57,7 +57,6 @@ import aiosqlite
 
 from lftpweb.core import audit, extract, mount_sentinel
 from lftpweb.core.arrclient import (
-    IMPORT_EVENT_TYPES,
     TRACKED_DOWNLOAD_STATE_IMPORTED,
     ArrClient,
     ArrClientError,
@@ -696,7 +695,7 @@ class ArrSyncScheduler:
             download_id=download_id,
             source_title=None if download_id else item["rel_path"],
         )
-        has_import_event = any(e.event_type in IMPORT_EVENT_TYPES for e in history)
+        has_import_event = any(e.is_import_event() for e in history)
         candidate_verdict: Literal["imported", "gone"] = "imported" if has_import_event else "gone"
 
         # Requirement 3: both signals held on two consecutive passes.
