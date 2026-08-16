@@ -85,6 +85,14 @@ Skeleton for the next roll:
 
 ### Changed
 
+- **Job speed and per-file speed now sample on one shared 5-second cadence, instead of two that
+  drifted apart.** Watching a live transfer showed a one-file directory reporting two different
+  speeds at once (46 vs. 40 MB/s) because job-level speed sampled roughly every second while
+  per-file speed sampled every third tick, each smoothed independently. Both now sample every 5th
+  tick of the underlying 1-second loop, which itself is unchanged — admission, reaping, and
+  Stop/Cancel still act within about a second. The one visible side effect: a freshly started
+  job's speed reads 0 for a little longer (up to ~10s, was ~2s) before its first real sample.
+
 ### Fixed
 
 - **Fixed *arr import detection against a real Sonarr run.** The Sonarr/Radarr v3 API returns

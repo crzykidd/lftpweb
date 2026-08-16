@@ -192,7 +192,8 @@ def resolve_vanished(prev_state: str) -> str | None:
 
     **Found 2026-08-13** (`prompts/2026-08-13-delete-state-truthfulness.md`), on a `move` queue:
     `core/queue.py._publish_child_progress` throttles per-child writes
-    (`CHILD_PROGRESS_THROTTLE_TICKS`), so the last write before a small file's job reaps is
+    (`PROGRESS_SAMPLE_TICKS`, unified with job-level sampling 2026-08-16 -- was
+    `CHILD_PROGRESS_THROTTLE_TICKS`), so the last write before a small file's job reaps is
     frequently a mid-transfer `PARTIAL`, not the final `DOWNLOADED` -- and post-processing can
     relocate the whole release out of both trees (remote deleted after verify, local moved to
     `staging_path`) before a fresh scan ever gets a chance to correct it. Without this, such a

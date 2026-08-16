@@ -6,6 +6,59 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-16 — Progress cadence unified: job and per-file speed now sample on the same 5s tick
+
+`prompts/2026-08-16-unify-progress-cadence-5s.md`. The user, watching a live transfer, saw a
+one-file directory report two different speeds at once (46 vs. 40 MB/s) for the same download.
+Root cause: job-level speed (`core/progress.py.ProgressSampler.sample`, called from
+`core/queue.py._sample_and_publish_progress`) sampled on *every* tick of the 1s loop, while
+per-file (child) speed was throttled to every 3rd tick (`CHILD_PROGRESS_THROTTLE_TICKS = 3`,
+added 2026-08-14 for "per-file speed inside a mirror") purely to bound DB write pressure. Both
+used the exact same EMA formula (`α = 0.3`, `core/progress.py.ema_step`) and both derive their
+instantaneous rate from real elapsed time (`now - prev_time`, never `tick_s * N`) — but two
+independent sample instants, each smoothed on its own schedule, produce two different numbers
+for what is, for a one-file directory, the identical underlying transfer. Neither reading was
+wrong; they were just never going to agree, by construction.
+
+**The fix:** one constant, `core/queue.py.PROGRESS_SAMPLE_TICKS = 5` (replacing
+`CHILD_PROGRESS_THROTTLE_TICKS`), gates the *entire* body of `_sample_and_publish_progress` —
+job-level `ProgressSampler.sample`, the per-tick `item_delta` publish for the parent item, and
+`_publish_child_progress` alike. All three now run on the exact same tick, every 5th call
+(~5s at the default `tick_s`), instead of two of them running on independent schedules.
+
+**Why the tick loop itself stays at 1s, not 5s:** `TransferQueue.tick()` also drives admission,
+reaping, and stop handling (`_reap_finished`, `_admit`) — slowing the whole loop down would make
+a Stop click take up to 5s to act on a running process, not the ~1s it takes today. Only the
+*progress-sampling* work inside one tick's call to `_sample_and_publish_progress` moved; the
+gate is an early return at the top of that method, checked every tick, acted on every 5th.
+Verified this doesn't silently corrupt anything: `_sample_metrics` (throughput/dashboard feed)
+already tolerated a stale `self._last_progress` between ticks by design (falls back to
+`p.bytes_start` if a job has no entry yet) and just reuses the same cached bytes_done on the
+in-between ticks now, which `ThroughputSampler`'s own 30-tick averaging window already smooths
+over — no change needed there.
+
+**Why 5, not something else:** matches the prompt's explicit user decision, not derived from
+first principles — but it's not arbitrary either. Longer than 3 gives the underlying rate a
+wider delta window to average over (a real, if secondary, benefit); short enough that the Files/
+Transfers pages still read as "live" to a human watching. The one accepted cost: a freshly
+started job's speed now reads 0 until its *second* sample, ~5–10s in rather than ~1–2s (first
+sample has no history to derive a rate from — pre-existing behavior at a longer delay, not a new
+special case).
+
+**Rejected: giving child progress its own faster path back to 1 Hz instead of slowing job
+progress down.** Would have kept the write-pressure problem `CHILD_PROGRESS_THROTTLE_TICKS`
+existed to solve in the first place (§ the throttle's own original comment: a 50-file release
+recomputing every tick is up to 50 `UPDATE`s/s, the exact pattern that turned the `VACUUM INTO`
+backup race from rare to routine, `209928d`). Unifying downward (job onto child's cadence, not
+child onto job's) was the only option that didn't reopen that.
+
+**Deferred, not addressed here:** a dynamic/live-retune sampling cadence (faster while a
+transfer is young or bursty, slower once steady) — not proposed or logged anywhere yet, and
+out of scope for this task; the fixed 5s cadence is deliberately the simple first cut. (Not to
+be confused with `prompts/open-issues.md`'s separate, already-logged low-priority idea about
+*bandwidth* re-tuning a running job's `net:limit-total-rate` live — a different mechanism
+entirely, §4.5's admission-time allocation, untouched by this change.)
+
 ## 2026-08-16 — History group summary: inlined onto `GET /api/history/jobs`, not a second endpoint
 
 `prompts/2026-08-16-history-jobs-group-collapse.md` left the endpoint-vs-inlined choice open,

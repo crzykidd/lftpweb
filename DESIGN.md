@@ -112,7 +112,7 @@ SQLite for state, React SPA served as static files from the same origin.
      │
      ├── RemoteScanner   (core/remote.py)      asyncssh → remote tree; also remote deletes
      ├── LocalScanner    (core/local_scan.py)  os.scandir → local tree
-     ├── ProgressSampler (core/progress.py)    ~1 Hz stat of active files only
+     ├── ProgressSampler (core/progress.py)    sampled ~5s (§4.4), stat of active files only
      ├── Metrics         (core/metrics.py)     ~30 s throughput samples + liveness heartbeat
      ├── Scheduler       (core/scheduler.py)   admission control: who starts, at what rate
      ├── TransferQueue   (core/queue.py)       the job queue: one lftp process per job
@@ -129,7 +129,7 @@ SQLite for state, React SPA served as static files from the same origin.
 | Concern | SeedSync | lftpweb |
 |---|---|---|
 | lftp process model | 1 long-lived PTY per pair, shared `queue` | 1 short-lived process **per job**, plain pipes — no PTY, no readline, no ANSI, no wrapping |
-| Progress source | regex over `jobs -v` | local sizes vs remote sizes, sampled ~1 Hz |
+| Progress source | regex over `jobs -v` | local sizes vs remote sizes, sampled ~5s (§4.4) |
 | Job liveness | inferred from diffing the job list | process exit code |
 | Stopping a job | `kill <id>`, with an id race | SIGTERM to one PID |
 | Job queue & concurrency | delegated to lftp `cmd:queue-parallel` | owned in Python (asyncio semaphore) → reorder, priority, per-job settings |
@@ -679,9 +679,24 @@ the captured error text clean.
 
 ### 4.4 Progress without parsing
 
-`ProgressSampler` ticks at ~1 Hz and stats **only the active file set** — the files under
-currently-running jobs — never a full tree walk. From that it computes transferred bytes,
-instantaneous speed, and ETA, with EMA smoothing (α ≈ 0.3) so the UI doesn't jitter.
+`ProgressSampler` stats **only the active file set** — the files under currently-running jobs —
+never a full tree walk. From that it computes transferred bytes, instantaneous speed, and ETA,
+with EMA smoothing (α ≈ 0.3) so the UI doesn't jitter.
+
+**The tick loop and the progress-sampling cadence are two different things** (unified
+2026-08-16, user decision from watching a live transfer — this corrects an earlier ~1 Hz
+sampling claim in this section). `TransferQueue`'s tick loop (`transfer_tick_s`) still runs at
+~1 Hz — admission, reaping, and stop handling all stay on it, so a Stop click still takes
+effect in ~1 s. Progress sampling — job-level speed (`ProgressSampler.sample`), the per-tick
+`item_delta` publish for a downloading item's own row, and per-file (child) progress inside a
+mirroring directory — only actually runs every `PROGRESS_SAMPLE_TICKS`-th tick (5, ~5 s at the
+default), all three gated on the same counter so job and child speeds are measured over the
+identical interval. Before this, job speed sampled every tick while per-file speed sampled
+every 3rd tick, each with its own independent EMA lag — the two never agreed for a single-file
+directory (46 vs. 40 MB/s live, the case that prompted the fix). One shared, longer cadence
+fixes the disagreement and gives the underlying rate a longer delta window to average over. The
+cost: a freshly-started job's speed reads 0 until its second sample, ~5–10 s in, rather than
+~1–2 s — accepted as-is, not special-cased.
 
 Two on-disk conventions must be honored, because raw `st_size` lies. Both are **lftp's**, not
 SeedSync's — any program that lets lftp move the bytes inherits them, whatever inspired the
@@ -1067,8 +1082,9 @@ script; deleting the script deletes the machinery.
 script over SFTP and run it, emitting the same records. Kept small and only used on demand.
 
 **Cadence:** every 30 s by default, plus a forced rescan after any queue/stop/delete and on
-job completion. Local full walk every 10 s; the 1 Hz active-set poll (§4.4) covers the hot set
-in between. The scan interval is also the settle gate's unit of time (§3.3 counts *scans*, not
+job completion. Local full walk every 10 s; the active-set progress sampler (§4.4, ~5 s as of
+2026-08-16) covers the hot set in between. The scan interval is also the settle gate's unit of
+time (§3.3 counts *scans*, not
 seconds), so changing it changes how long an arriving item is held — which is why §3.3's gate
 also enforces its own wall-clock floor (`SETTLE_MIN_AGE_S`) independent of scan count, so a
 faster queue (below) is held to the same real-time guarantee rather than a weaker one.

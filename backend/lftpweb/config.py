@@ -37,8 +37,10 @@ class Settings(BaseSettings):
     # container; overridable for local dev, where bare `/run` isn't writable by a non-root uid.
     run_dir: str = "/run/lftpweb"
 
-    # DESIGN.md §4.5: the transfer engine's scheduling pass and progress sampler cadence.
-    # "~1 Hz" per §4.4.
+    # DESIGN.md §4.5: the transfer engine's scheduling/reap/admit loop cadence -- "~1 Hz" per
+    # §4.4. As of 2026-08-16 (§4.4), progress sampling (job and per-file speed alike) runs on a
+    # derived, slower cadence -- `core/queue.py.PROGRESS_SAMPLE_TICKS` ticks of this value
+    # (~5s at the default) -- not every tick.
     transfer_tick_s: float = 1.0
 
     # DESIGN.md §8, phase 8. Day-to-day auth configuration (mode, proxy header, trusted

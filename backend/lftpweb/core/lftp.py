@@ -264,9 +264,9 @@ def effective_tuning_settings(
             value=f"{save_status_interval_s}s",
             why=(
                 "How often the .lftp-pget-status sidecar is refreshed. lftp's own default "
-                "(10s) is far too coarse for the ~1 Hz progress sampler (DESIGN.md §4.4) — "
-                "found running a real transfer where the sidecar simply didn't exist yet at "
-                "the 1s/2s/3s marks under the default."
+                "(10s) is far too coarse for the progress sampler to read a fresh value from "
+                "(DESIGN.md §4.4) — found running a real transfer where the sidecar simply "
+                "didn't exist yet at the 1s/2s/3s marks under the default."
             ),
             configurable=False,
         ),

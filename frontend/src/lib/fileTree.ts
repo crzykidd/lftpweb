@@ -23,14 +23,15 @@ import {
 /** How long a `child_progress` sample (2026-08-14, "per-file speed inside a mirror") is
  * trusted before `buildTree` treats it as stale and resolves `child_speed_bps` to `null` --
  * the frontend half of the freshness-gating decision (see `lib/format.ts`'s module comment
- * above `childSpeedLabel`, and docs/decisions.md). The backend throttles a live child's own
- * publish cadence to roughly `CHILD_PROGRESS_THROTTLE_TICKS * tick_s` while it keeps changing
- * (~3s at the default `tick_s`, `core/queue.py`) but that constant isn't on the wire and
- * `tick_s` is configurable, so this is a generous, independent multiple of the *default* rather
- * than a value derived from a setting the frontend can't see -- loose enough to absorb normal
- * jitter (a slow tick, WS latency) without a value flickering off between two genuinely live
- * samples, tight enough that a child that actually stopped changing reads as "not transferring"
- * again within a few seconds, not indefinitely.
+ * above `childSpeedLabel`, and docs/decisions.md). The backend samples a live child's own
+ * publish cadence at `PROGRESS_SAMPLE_TICKS * tick_s` (~5s at the default `tick_s`,
+ * `core/queue.py` -- unified with job-level sampling 2026-08-16, was `3 *
+ * CHILD_PROGRESS_THROTTLE_TICKS` ~3s) but that constant isn't on the wire and `tick_s` is
+ * configurable, so this is a generous, independent multiple of the *default* rather than a
+ * value derived from a setting the frontend can't see -- loose enough to absorb normal jitter
+ * (a slow tick, WS latency) without a value flickering off between two genuinely live samples,
+ * tight enough that a child that actually stopped changing reads as "not transferring" again
+ * within a few seconds, not indefinitely.
  */
 export const CHILD_SPEED_FRESHNESS_MS = 10_000
 

@@ -3,7 +3,9 @@
 // once, on connect; every message after that is a delta proportional to what changed, never
 // to the size of a queue's tree -- see docs/decisions.md's phase 3b entry ("the WebSocket
 // delta fix") for why phase 2's per-queue full-snapshot shape couldn't survive phase 3a's
-// ~1 Hz progress sampler.
+// progress sampler (job- and per-file speed alike now sampled every ~5s, unified 2026-08-16
+// -- `core/queue.py.PROGRESS_SAMPLE_TICKS`; the underlying tick loop itself stays ~1 Hz for
+// admission/reap/stop).
 
 import type { FileNode } from './types'
 
@@ -35,8 +37,9 @@ export interface QueueDeltaMessage {
 }
 
 /** Published by `core/queue.py` (`_publish_item_state`, `_sample_and_publish_progress`)
- * whenever a job's lifecycle changes an item's state, or once per ~1 Hz tick for the items
- * currently downloading -- bounded by the active set, never the tree.
+ * whenever a job's lifecycle changes an item's state, or once per sampled progress tick
+ * (~5s, `PROGRESS_SAMPLE_TICKS`) for the items currently downloading -- bounded by the active
+ * set, never the tree.
  */
 export interface ItemDeltaMessage {
   type: 'item_delta'
@@ -77,8 +80,9 @@ export interface ProgressJob {
   eta_s: number | null
 }
 
-/** Published by `core/queue.py._sample_and_publish_progress` every ~1 Hz tick -- job-level
- * (Transfers page), bounded by how many jobs are currently running.
+/** Published by `core/queue.py._sample_and_publish_progress` every sampled tick (~5s,
+ * `PROGRESS_SAMPLE_TICKS`) -- job-level (Transfers page), bounded by how many jobs are
+ * currently running.
  */
 export interface ProgressMessage {
   type: 'progress'
