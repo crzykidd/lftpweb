@@ -11,7 +11,7 @@
 // ("crowding the row") is about. None of that information is dropped: it moves into the expand
 // panel's three groups (Transfer / Processing / *arr), assembled here.
 
-import type { JobOut } from '../api/types'
+import type { HistoryJobOut, HistoryQueueSummaryOut, JobOut } from '../api/types'
 import { formatBytes, formatEta, formatPercent, formatRate, formatRelativeTimeIntl } from './format'
 import { readLocalStorage, writeLocalStorage } from './storage'
 import { averageSpeedBps, elapsedSeconds, isNotableQueuedWait, queuedWaitSeconds } from './transferTiming'
@@ -369,8 +369,18 @@ export function formatQueueGroupCounts(counts: QueueGroupCounts): string {
 // and a queue's own temporary disappearance from the payload (the task's own instruction: a
 // collapsed queue that scans to zero visible jobs and drops out keeps its stored preference for
 // when it returns, since this map is never pruned against the currently-live queue list). ---
+//
+// 2026-08-16 (prompts/2026-08-16-history-jobs-group-collapse.md): the History page's jobs
+// section reuses this exact map shape and read/write logic for its own per-queue collapse, but
+// under a *different* storage key -- "a queue collapsed on Transfers is not implicitly collapsed
+// on History" (the task's own instruction; the two pages' groups aren't even the same rows --
+// Transfers is active+queued, History is terminal-only). `readCollapsedQueues`/
+// `writeCollapsedQueues` below stay as the Transfers-specific names already wired into
+// `TransfersPage.tsx`; `readCollapsedQueuesFor`/`writeCollapsedQueuesFor` below take the storage
+// key explicitly so both pages share one implementation rather than two copies.
 
-const COLLAPSED_QUEUES_KEY = 'transfers.collapsedQueues'
+const TRANSFERS_COLLAPSED_QUEUES_KEY = 'transfers.collapsedQueues'
+export const HISTORY_COLLAPSED_QUEUES_KEY = 'history.collapsedQueues'
 
 /** JSON object keys are always strings on the wire/in storage (same fact `useLiveModel.ts`'s own
  * per-queue-bytes map comment notes) -- so this is keyed by `String(queueId)`, not `queueId`
@@ -400,10 +410,109 @@ export function withQueueCollapsed(map: QueueCollapseMap, queueId: number, colla
   return next
 }
 
+function readCollapsedQueuesFor(key: string): QueueCollapseMap {
+  return readLocalStorage(key, isQueueCollapseMap) ?? {}
+}
+
+function writeCollapsedQueuesFor(key: string, map: QueueCollapseMap): void {
+  writeLocalStorage(key, map)
+}
+
 export function readCollapsedQueues(): QueueCollapseMap {
-  return readLocalStorage(COLLAPSED_QUEUES_KEY, isQueueCollapseMap) ?? {}
+  return readCollapsedQueuesFor(TRANSFERS_COLLAPSED_QUEUES_KEY)
 }
 
 export function writeCollapsedQueues(map: QueueCollapseMap): void {
-  writeLocalStorage(COLLAPSED_QUEUES_KEY, map)
+  writeCollapsedQueuesFor(TRANSFERS_COLLAPSED_QUEUES_KEY, map)
+}
+
+export function readHistoryCollapsedQueues(): QueueCollapseMap {
+  return readCollapsedQueuesFor(HISTORY_COLLAPSED_QUEUES_KEY)
+}
+
+export function writeHistoryCollapsedQueues(map: QueueCollapseMap): void {
+  writeCollapsedQueuesFor(HISTORY_COLLAPSED_QUEUES_KEY, map)
+}
+
+// --- History jobs section's own group header aggregate (2026-08-16) -- the server-computed,
+// filter-honest `HistoryQueueSummaryOut` (api/history.py._queue_summaries), formatted for the
+// group header the same way `formatQueueGroupCounts` already formats Transfers' client-computed
+// `QueueGroupCounts`. Reuses that exact function rather than a parallel formatter -- History's
+// three outcome buckets (succeeded/failed/cancelled) are a subset of Transfers' five, so mapping
+// onto `QueueGroupCounts` with `active`/`queued` pinned at 0 (never rendered, since
+// `formatQueueGroupCounts` omits zero counts) gets identical output for identical meaning with no
+// new formatting logic to maintain in parallel. -----------------------------------------------
+
+/** `HistoryQueueSummaryOut`'s counts, reshaped onto `QueueGroupCounts` so
+ * `formatQueueGroupCounts` can render them -- `cancelled` maps to the `stopped` bucket, matching
+ * `HistoryJobsSection.tsx.chipStateFor`'s own `cancelled -> STOPPED` reading. `active`/`queued`
+ * are always 0: History's whole domain is terminal jobs (`_TERMINAL_JOB_STATES`), so those two
+ * buckets never apply here and never render (zero counts are omitted).
+ */
+export function historyQueueGroupCounts(summary: HistoryQueueSummaryOut): QueueGroupCounts {
+  return {
+    active: 0,
+    queued: 0,
+    succeeded: summary.succeeded,
+    failed: summary.failed,
+    stopped: summary.cancelled,
+  }
+}
+
+// --- History jobs section: flattened-array grouping + collapse filtering, and the local
+// summary update a single-row clear applies without a full reload (2026-08-16). Pulled out of
+// `HistoryJobsSection.tsx` into this module -- the same "reuse them; extend a helper if History
+// needs a variant, in place" instruction the task itself gives, and this project's whole
+// component-testing story is pure functions in `lib/*.test.ts` (README.md's Known gaps: no
+// component rendering is tested), so this logic has to be reachable without mounting anything,
+// same as everything else in this file. ---------------------------------------------------
+
+export type HistoryVirtualRow =
+  | { kind: 'header'; queueId: number; queueName: string }
+  | { kind: 'job'; job: HistoryJobOut }
+
+/** Flattens the already-filtered/paginated History jobs page into queue-grouped sections
+ * (DESIGN.md §9.2: "grouped by queue") as one array `HistoryJobsSection.tsx`'s virtualizer can
+ * walk -- see docs/decisions.md for why header rows interleaved into one flat, virtualized list
+ * was chosen over nested per-queue virtualizers. `collapsedQueues` filters a collapsed queue's
+ * *job* rows out of the array -- the header row itself always stays (it's the only remaining way
+ * to expand the group again), so the virtualizer never has to know collapse exists: it just sees
+ * a shorter array, the same trick `TransfersPage.tsx`'s own (non-virtualized) `groups.map` uses.
+ */
+export function groupHistoryJobsByQueue(
+  jobs: HistoryJobOut[],
+  collapsedQueues: QueueCollapseMap,
+): HistoryVirtualRow[] {
+  const rows: HistoryVirtualRow[] = []
+  let currentQueueId: number | null = null
+  let currentCollapsed = false
+  for (const job of jobs) {
+    if (job.queue_id !== currentQueueId) {
+      currentQueueId = job.queue_id
+      currentCollapsed = isQueueCollapsed(collapsedQueues, job.queue_id)
+      rows.push({ kind: 'header', queueId: job.queue_id, queueName: job.queue_name })
+    }
+    if (!currentCollapsed) rows.push({ kind: 'job', job })
+  }
+  return rows
+}
+
+/** The local-update counterpart to the `jobs`/`total` state trimming `HistoryJobsSection.tsx`'s
+ * `confirmClear` already does for a single-row clear -- keeps a just-cleared job's queue summary
+ * in sync without a full reload, decrementing exactly the one outcome bucket that job belonged to
+ * and its `total_bytes_done`. `Math.max(0, ...)` guards against a summary that's already stale
+ * (e.g. a second tab cleared the same row first) producing a negative count.
+ */
+export function decrementHistoryQueueSummary(
+  summaries: HistoryQueueSummaryOut[],
+  job: HistoryJobOut,
+): HistoryQueueSummaryOut[] {
+  return summaries.map((s) => {
+    if (s.queue_id !== job.queue_id) return s
+    const next = { ...s, total_bytes_done: Math.max(0, s.total_bytes_done - job.bytes_done) }
+    if (job.state === 'succeeded') next.succeeded = Math.max(0, next.succeeded - 1)
+    else if (job.state === 'failed') next.failed = Math.max(0, next.failed - 1)
+    else if (job.state === 'cancelled') next.cancelled = Math.max(0, next.cancelled - 1)
+    return next
+  })
 }

@@ -6,6 +6,35 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-16 — History group summary: inlined onto `GET /api/history/jobs`, not a second endpoint
+
+`prompts/2026-08-16-history-jobs-group-collapse.md` left the endpoint-vs-inlined choice open,
+asking only that it fit `api/history.py`'s own conventions and that the choice be explained.
+Went with inlining a `queue_summaries` block onto the existing `HistoryJobsResponse`
+(`HistoryQueueSummaryOut`, `api/history.py._queue_summaries`) rather than a new `GET
+/api/history/jobs/summary` endpoint.
+
+**Why inlined:** `HistoryJobsSection.tsx` already refetches the jobs list on every filter change
+(queue/state/error class/date range, or the Refresh button) and on every "load more" — a separate
+summary endpoint would be a second round trip, computed from the *identical* filter, on every one
+of those triggers. Inlining costs one extra `GROUP BY` query per existing request instead, and
+keeps the two pieces of data — the page and its own totals — impossible to have drift apart from
+mismatched request timing (a summary fetched a beat after/before the page, mid-filter-change,
+could describe a different filter than what's on screen).
+
+**Why this couldn't just be a client-side sum, unlike Transfers' identical-looking queue-group
+header (`lib/transferPanel.ts.queueGroupSummary`):** Transfers' job list is unpaginated (`GET
+/api/jobs` returns the whole active+recently-terminal set by construction — `core/queue.py.
+list_jobs`'s own docstring), so summing the loaded rows *is* summing the true set. History's
+`jobs` list is `LIMIT`/`OFFSET` paginated (a busy install accumulates thousands of terminal jobs,
+well past `MAX_LIMIT`) — a client-side sum over `jobs` would be quietly wrong the instant a
+queue has more matching rows than are currently loaded, or before the first page has loaded at
+all. `_queue_summaries` runs one bounded `GROUP BY item.queue_id, path_queue.name, job.state`
+query against the exact same `_jobs_where_clause` output as the `jobs` list beside it — one row
+per `(queue, state)` combination (at most 3 per queue, since the WHERE clause's terminal-state
+base clause is never optional), so the query cost is bounded by queue count, not job count,
+regardless of how many rows match the filter.
+
 ## 2026-08-16 — Transfers group header: added a `stopped` count beyond the prompt's literal four
 
 `prompts/2026-08-16-transfers-group-by-queue.md` named exactly four outcome buckets for a queue

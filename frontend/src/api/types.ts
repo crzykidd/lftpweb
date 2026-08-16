@@ -661,11 +661,29 @@ export interface HistoryJobOut {
   dismissed_at: string | null
 }
 
+/** One queue's honest aggregate over the whole filtered set, not just the loaded page
+ * (2026-08-16, prompts/2026-08-16-history-jobs-group-collapse.md) -- `HistoryJobsResponse.jobs`
+ * is one `LIMIT`/`OFFSET` page, so a client-side sum over it would be wrong whenever more rows
+ * match the filter than are loaded. `backend/lftpweb/api/history.py._queue_summaries` computes
+ * this with a bounded `GROUP BY` against the exact same filter as the `jobs` list beside it.
+ * History's job domain is terminal-only, so unlike the Transfers page's `QueueGroupCounts`
+ * (`lib/transferPanel.ts`) there is no `active`/`queued` bucket here.
+ */
+export interface HistoryQueueSummaryOut {
+  queue_id: number
+  queue_name: string
+  succeeded: number
+  failed: number
+  cancelled: number
+  total_bytes_done: number
+}
+
 export interface HistoryJobsResponse {
   jobs: HistoryJobOut[]
   total: number
   limit: number
   offset: number
+  queue_summaries: HistoryQueueSummaryOut[]
 }
 
 export interface HistoryJobOutputOut {

@@ -73,6 +73,16 @@ Skeleton for the next roll:
   preference is still there when it returns. "Dismiss all" is unchanged, still global at the top
   of the page.
 
+- **History's jobs section now groups by queue the same way, collapsible and remembered
+  separately from Transfers.** Same single-click-anywhere header, same default-expanded
+  `localStorage` persistence, but under its own storage key — collapsing a queue on one page
+  never collapses it on the other. Because History's job list is paginated, the header's outcome
+  counts (succeeded / failed / cancelled) and total size are computed **server-side** over the
+  whole filtered set, not just the currently-loaded page, so they stay correct regardless of how
+  many rows are actually loaded — a new `queue_summaries` block riding alongside `GET
+  /api/history/jobs`'s existing response, honoring the same queue/state/error-class/date filters
+  as the list itself.
+
 ### Changed
 
 ### Fixed

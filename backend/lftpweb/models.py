@@ -847,11 +847,37 @@ class HistoryJobOut(BaseModel):
     dismissed_at: str | None
 
 
+class HistoryQueueSummaryOut(BaseModel):
+    """One queue's honest aggregate over the *whole filtered set*, not just the loaded page
+    (2026-08-16, prompts/2026-08-16-history-jobs-group-collapse.md) -- History's jobs list is
+    `LIMIT`/`OFFSET` paginated, so a client-side sum over `HistoryJobsResponse.jobs` would be
+    wrong the moment more rows match the filter than are loaded. This is a single bounded
+    `GROUP BY` (one row per queue, api/history.py's `_queue_summaries`), never a per-row blob,
+    and it honors the exact same filter as the `jobs` list it rides alongside -- same
+    `_jobs_where_clause` call, so the two can never drift apart. History's job domain is
+    terminal-only (`succeeded`/`failed`/`cancelled` -- see `_TERMINAL_JOB_STATES`), so unlike
+    the Transfers page's queue-group header (`lib/transferPanel.ts.QueueGroupCounts`) there is
+    no `active`/`queued` bucket here to count.
+    """
+
+    queue_id: int
+    queue_name: str
+    succeeded: int
+    failed: int
+    cancelled: int
+    total_bytes_done: int
+
+
 class HistoryJobsResponse(BaseModel):
     jobs: list[HistoryJobOut]
     total: int  # count matching the filter, ignoring limit/offset -- what "load more" needs
     limit: int
     offset: int
+    # Inlined rather than a second `GET /api/history/jobs/summary` endpoint (2026-08-16): the
+    # frontend already refetches this list on every filter change, so a second request would
+    # just be a second round trip for data derived from the identical filter -- see the
+    # module docstring in api/history.py for the fuller comparison.
+    queue_summaries: list[HistoryQueueSummaryOut]
 
 
 class HistoryJobOutputOut(BaseModel):
