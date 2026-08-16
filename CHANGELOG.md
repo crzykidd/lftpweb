@@ -24,6 +24,15 @@ Skeleton for the next roll:
 ## [Unreleased]
 
 ### Added
+### Changed
+### Fixed
+### Security
+### Deprecated
+### Removed
+
+## [0.2.1] — 2026-08-16
+
+### Added
 
 - **Browse dialog for Settings → Queues' path fields** (GitHub issue #4). `Remote path`,
   `Local path`, and `Final destination` each gain a `Browse…` button that opens a directory
