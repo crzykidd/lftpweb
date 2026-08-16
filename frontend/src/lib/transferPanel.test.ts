@@ -3,11 +3,18 @@ import type { JobOut, JobState } from '../api/types'
 import {
   type LiveProgress,
   completedTimeLabel,
+  formatQueueGroupCounts,
+  groupJobsByQueue,
   hasArrGroup,
+  isQueueCollapsed,
   processingGroupFields,
+  queueGroupSummary,
+  readCollapsedQueues,
   sortTransferRows,
   transferGroupFields,
   transferLineValue,
+  withQueueCollapsed,
+  writeCollapsedQueues,
 } from './transferPanel'
 
 // 2026-08-15 (prompts/2026-08-15-transfers-single-line-rows-with-detail.md): "one line per
@@ -283,5 +290,147 @@ describe('sortTransferRows -- the Transfers page\'s row order', () => {
     const input = [succeeded, running]
     sortTransferRows(input)
     expect(input.map((j) => j.id)).toEqual([2, 1])
+  })
+})
+
+// 2026-08-16 (prompts/2026-08-16-transfers-group-by-queue.md): "group rows by queue,
+// collapsible with remembered state" -- grouping, header aggregates, and collapse persistence,
+// all as pure functions per the task's own instruction.
+
+describe('groupJobsByQueue', () => {
+  it('groups jobs by queue id, one group per queue with at least one visible job', () => {
+    const a1 = job('running', { id: 1, queue_id: 1, queue_name: 'Alpha' })
+    const b1 = job('queued', { id: 2, queue_id: 2, queue_name: 'Bravo' })
+    const a2 = job('failed', { id: 3, queue_id: 1, queue_name: 'Alpha' })
+
+    const groups = groupJobsByQueue([a1, b1, a2])
+    expect(groups).toHaveLength(2)
+    expect(groups.find((g) => g.queueId === 1)?.jobs.map((j) => j.id)).toEqual([1, 3])
+    expect(groups.find((g) => g.queueId === 2)?.jobs.map((j) => j.id)).toEqual([2])
+  })
+
+  it('orders groups by queue name, not by first-seen order', () => {
+    const zulu = job('running', { id: 1, queue_id: 9, queue_name: 'Zulu' })
+    const alpha = job('running', { id: 2, queue_id: 1, queue_name: 'Alpha' })
+
+    const groups = groupJobsByQueue([zulu, alpha])
+    expect(groups.map((g) => g.queueName)).toEqual(['Alpha', 'Zulu'])
+  })
+
+  it('keeps each group\'s within-group order exactly as passed in', () => {
+    const running = job('running', { id: 1, queue_id: 1, queue_name: 'Alpha' })
+    const queued = job('queued', { id: 2, queue_id: 1, queue_name: 'Alpha' })
+    const terminal = job('succeeded', { id: 3, queue_id: 1, queue_name: 'Alpha' })
+
+    // Callers always pass `sortTransferRows`'s own output -- passing an already-decided order
+    // here and asserting it survives untouched is the contract this function must not break.
+    const groups = groupJobsByQueue([running, queued, terminal])
+    expect(groups[0].jobs.map((j) => j.id)).toEqual([1, 2, 3])
+  })
+
+  it('returns no groups for an empty job list', () => {
+    expect(groupJobsByQueue([])).toEqual([])
+  })
+})
+
+describe('queueGroupSummary', () => {
+  it('counts each state into its outcome bucket, including cancelled as stopped', () => {
+    const jobs = [
+      job('running', { id: 1 }),
+      job('queued', { id: 2 }),
+      job('queued', { id: 3 }),
+      job('succeeded', { id: 4 }),
+      job('failed', { id: 5 }),
+      job('cancelled', { id: 6 }),
+    ]
+    const summary = queueGroupSummary(jobs, {})
+    expect(summary.counts).toEqual({ active: 1, queued: 2, succeeded: 1, failed: 1, stopped: 1 })
+  })
+
+  it('sums bytes_done across the group, preferring the live reading for a running job', () => {
+    const running = job('running', { id: 1, bytes_done: 100 })
+    const queued = job('queued', { id: 2, bytes_done: 50 })
+    const live: Record<number, LiveProgress> = {
+      1: { bytes_done: 400, bytes_total: 1000, speed_bps: 0, eta_s: null },
+    }
+    const summary = queueGroupSummary([running, queued], live)
+    expect(summary.totalBytesDone).toBe(450) // 400 (live) + 50 (queued's own bytes_done)
+  })
+
+  it('falls back to the job\'s own bytes_done when no live sample has arrived for it yet', () => {
+    const running = job('running', { id: 1, bytes_done: 100 })
+    const summary = queueGroupSummary([running], {})
+    expect(summary.totalBytesDone).toBe(100)
+  })
+
+  it('combines the current rate only across running jobs, summing live over polled speed_bps', () => {
+    const runningWithLive = job('running', { id: 1, speed_bps: 999 })
+    const runningNoLive = job('running', { id: 2, speed_bps: 2048 })
+    const queued = job('queued', { id: 3, speed_bps: null })
+    const live: Record<number, LiveProgress> = {
+      1: { bytes_done: 0, bytes_total: null, speed_bps: 1024, eta_s: null },
+    }
+    const summary = queueGroupSummary([runningWithLive, runningNoLive, queued], live)
+    expect(summary.combinedRateBps).toBe(1024 + 2048)
+  })
+
+  it('reports no combined rate when nothing in the group is running', () => {
+    const queued = job('queued', { id: 1 })
+    const succeeded = job('succeeded', { id: 2 })
+    const summary = queueGroupSummary([queued, succeeded], {})
+    expect(summary.combinedRateBps).toBeNull()
+  })
+})
+
+describe('formatQueueGroupCounts', () => {
+  it('lists every non-zero bucket in a fixed order', () => {
+    const text = formatQueueGroupCounts({ active: 1, queued: 2, succeeded: 3, failed: 0, stopped: 1 })
+    expect(text).toBe('1 active, 2 queued, 3 succeeded, 1 stopped')
+  })
+
+  it('omits every zero-count bucket -- "to keep it quiet"', () => {
+    const text = formatQueueGroupCounts({ active: 0, queued: 0, succeeded: 5, failed: 0, stopped: 0 })
+    expect(text).toBe('5 succeeded')
+  })
+
+  it('renders an empty string when every bucket is zero', () => {
+    expect(formatQueueGroupCounts({ active: 0, queued: 0, succeeded: 0, failed: 0, stopped: 0 })).toBe('')
+  })
+})
+
+describe('per-queue collapse persistence', () => {
+  afterEach(() => {
+    localStorage.clear()
+  })
+
+  it('reads a queue with no stored preference as expanded (not collapsed) by default', () => {
+    expect(isQueueCollapsed({}, 42)).toBe(false)
+  })
+
+  it('withQueueCollapsed(..., true) marks a queue collapsed; (..., false) clears it back out', () => {
+    const collapsed = withQueueCollapsed({}, 1, true)
+    expect(isQueueCollapsed(collapsed, 1)).toBe(true)
+
+    const expanded = withQueueCollapsed(collapsed, 1, false)
+    expect(isQueueCollapsed(expanded, 1)).toBe(false)
+    // Expanded is the default -- clearing back to it drops the entry rather than storing `false`.
+    expect(expanded).toEqual({})
+  })
+
+  it('round-trips a collapse map through the actual localStorage read/write helpers', () => {
+    expect(readCollapsedQueues()).toEqual({})
+    const map = withQueueCollapsed({}, 7, true)
+    writeCollapsedQueues(map)
+    expect(readCollapsedQueues()).toEqual({ '7': true })
+    expect(isQueueCollapsed(readCollapsedQueues(), 7)).toBe(true)
+  })
+
+  it('a queue that disappears from the payload keeps its stored preference for when it returns', () => {
+    // Nothing about `withQueueCollapsed`/`isQueueCollapsed` reads the current job list -- the
+    // map is only ever consulted by queue id, so a queue with zero visible jobs right now still
+    // reads its previously-stored preference exactly like one that's still present.
+    writeCollapsedQueues(withQueueCollapsed({}, 3, true))
+    const storedLater = readCollapsedQueues()
+    expect(isQueueCollapsed(storedLater, 3)).toBe(true)
   })
 })

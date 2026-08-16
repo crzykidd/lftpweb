@@ -15,16 +15,24 @@ import { StateChip } from '../components/StateChip'
 import { useJobs } from '../hooks/useJobs'
 import { useLiveModel } from '../hooks/useLiveModel'
 import { arrHoverLabel } from '../lib/fileTree'
-import { formatRelativeTimeIntl } from '../lib/format'
+import { formatBytes, formatRate, formatRelativeTimeIntl } from '../lib/format'
 import {
   type LiveProgress,
   type PanelField,
+  type QueueGroup,
   completedTimeLabel,
+  formatQueueGroupCounts,
+  groupJobsByQueue,
   hasArrGroup,
+  isQueueCollapsed,
   processingGroupFields,
+  queueGroupSummary,
+  readCollapsedQueues,
   sortTransferRows,
   transferGroupFields,
   transferLineValue,
+  withQueueCollapsed,
+  writeCollapsedQueues,
 } from '../lib/transferPanel'
 
 const START_NOW_EXPLAINED_KEY = 'lftpweb:startNowExplained'
@@ -155,15 +163,6 @@ function Row({
             #{queuePosition}
           </span>
         )}
-        {/* Which queue this row belongs to (DESIGN.md §9.2) -- deliberately a plain muted
-         * tag, not a StateChip, so it never competes with the state color for attention;
-         * with more than one active queue this is the only thing that tells rows apart. */}
-        <span
-          className="shrink-0 rounded bg-zinc-100 px-1.5 py-0.5 text-xs font-medium whitespace-nowrap text-zinc-500 dark:bg-zinc-800 dark:text-zinc-400"
-          title={`Queue: ${job.queue_name}`}
-        >
-          {job.queue_name}
-        </span>
         <button
           type="button"
           onClick={() => onOpenDrawer(job)}
@@ -407,6 +406,46 @@ function RowDetailPanel({ job, live, fileCount }: { job: JobOut; live: LiveProgr
   )
 }
 
+/** A queue group's header line (2026-08-16) -- queue name, outcome counts, and total/combined-
+ * rate, all in one clickable line that toggles the group's collapse state. The queue name used to
+ * repeat on every row (`Row` above, before this task); it lives here exactly once per group now.
+ */
+function GroupHeader({
+  group,
+  collapsed,
+  onToggle,
+  liveByJobId,
+}: {
+  group: QueueGroup
+  collapsed: boolean
+  onToggle: () => void
+  liveByJobId: Record<number, LiveProgress>
+}) {
+  const summary = useMemo(() => queueGroupSummary(group.jobs, liveByJobId), [group.jobs, liveByJobId])
+  const countsText = formatQueueGroupCounts(summary.counts)
+  return (
+    <button
+      type="button"
+      onClick={onToggle}
+      aria-expanded={!collapsed}
+      title={collapsed ? 'Expand this queue' : 'Collapse this queue'}
+      className="flex w-full flex-wrap items-center gap-3 border-b border-zinc-200 bg-zinc-50 px-3 py-2 text-left text-sm hover:bg-zinc-100 dark:border-zinc-800 dark:bg-zinc-900/60 dark:hover:bg-zinc-900"
+    >
+      <span className="shrink-0 text-zinc-400 dark:text-zinc-600" aria-hidden="true">
+        {collapsed ? '▸' : '▾'}
+      </span>
+      <span className="min-w-0 flex-1 truncate font-semibold text-zinc-900 dark:text-zinc-100">
+        {group.queueName}
+      </span>
+      {countsText && <span className="shrink-0 text-xs text-zinc-500 dark:text-zinc-400">{countsText}</span>}
+      <span className="shrink-0 text-right text-xs text-zinc-500 dark:text-zinc-400">
+        {formatBytes(summary.totalBytesDone)}
+        {summary.combinedRateBps != null && ` · ${formatRate(summary.combinedRateBps)}`}
+      </span>
+    </button>
+  )
+}
+
 /** DESIGN.md §9.2 Transfers page -- the job queue. Rows stay deliberately plain (queued /
  * downloading / downloaded, with STOPPED/FAILED surfacing only where they apply); the item
  * drawer opens per row for the full per-file breakdown.
@@ -437,6 +476,22 @@ export function TransfersPage() {
   // view -- a queue position is about the real future run order, unaffected by how terminal rows
   // happen to be displayed.
   const sortedJobs = useMemo(() => sortTransferRows(jobs), [jobs])
+
+  // Group by queue (2026-08-16, prompts/2026-08-16-transfers-group-by-queue.md): "per-row queue
+  // labels make the page busy" -- one collapsible group per queue, ordered by queue name, each
+  // row's within-group order untouched from `sortedJobs` above (`groupJobsByQueue`'s own
+  // docstring). Collapse state is per-queue, persisted, and read once on mount -- a queue that
+  // temporarily drops out of `jobs` (no visible rows right now) simply produces no group, but its
+  // stored preference is never pruned, so it's there again when the queue returns.
+  const groups = useMemo(() => groupJobsByQueue(sortedJobs), [sortedJobs])
+  const [collapsedQueues, setCollapsedQueues] = useState(readCollapsedQueues)
+  const toggleQueueCollapsed = (queueId: number) => {
+    setCollapsedQueues((prev) => {
+      const next = withQueueCollapsed(prev, queueId, !isQueueCollapsed(prev, queueId))
+      writeCollapsedQueues(next)
+      return next
+    })
+  }
 
   // Queue position (2026-08-13, item 4): `jobs` (`useJobs`/`GET /api/jobs`) already comes back
   // in the real run order (`core/queue.py.list_jobs`'s `ORDER BY job.rank DESC, job.queued_at
@@ -680,23 +735,40 @@ export function TransfersPage() {
       )}
 
       {jobs.length > 0 && (
-        <div className="overflow-hidden rounded-md border border-zinc-200 dark:border-zinc-800">
-          {sortedJobs.map((job) => (
-            <Row
-              key={job.id}
-              job={job}
-              nodes={nodesByQueue.get(job.queue_id) ?? []}
-              live={progressByJobId[job.id]}
-              queuePosition={queuePositions.get(job.id)}
-              onOpenDrawer={setDrawerJob}
-              onMoveToTop={handleMoveToTop}
-              onStartNow={handleStartNow}
-              onStop={handleStop}
-              onRetry={handleRetry}
-              onDismiss={handleDismiss}
-              busy={busyIds.has(job.id)}
-            />
-          ))}
+        <div className="flex flex-col gap-3">
+          {groups.map((group) => {
+            const collapsed = isQueueCollapsed(collapsedQueues, group.queueId)
+            return (
+              <div
+                key={group.queueId}
+                className="overflow-hidden rounded-md border border-zinc-200 dark:border-zinc-800"
+              >
+                <GroupHeader
+                  group={group}
+                  collapsed={collapsed}
+                  onToggle={() => toggleQueueCollapsed(group.queueId)}
+                  liveByJobId={progressByJobId}
+                />
+                {!collapsed &&
+                  group.jobs.map((job) => (
+                    <Row
+                      key={job.id}
+                      job={job}
+                      nodes={nodesByQueue.get(job.queue_id) ?? []}
+                      live={progressByJobId[job.id]}
+                      queuePosition={queuePositions.get(job.id)}
+                      onOpenDrawer={setDrawerJob}
+                      onMoveToTop={handleMoveToTop}
+                      onStartNow={handleStartNow}
+                      onStop={handleStop}
+                      onRetry={handleRetry}
+                      onDismiss={handleDismiss}
+                      busy={busyIds.has(job.id)}
+                    />
+                  ))}
+              </div>
+            )
+          })}
         </div>
       )}
 

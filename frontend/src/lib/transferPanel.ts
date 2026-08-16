@@ -13,6 +13,7 @@
 
 import type { JobOut } from '../api/types'
 import { formatBytes, formatEta, formatPercent, formatRate, formatRelativeTimeIntl } from './format'
+import { readLocalStorage, writeLocalStorage } from './storage'
 import { averageSpeedBps, elapsedSeconds, isNotableQueuedWait, queuedWaitSeconds } from './transferTiming'
 
 /** The live progress reading `useLiveModel.ts`'s `progressByJobId` carries for a running job --
@@ -240,4 +241,169 @@ export function sortTransferRows(jobs: JobOut[]): JobOut[] {
  */
 export function hasArrGroup(job: JobOut): boolean {
   return job.arr_instance_name != null
+}
+
+// --- Group by queue (2026-08-16, prompts/2026-08-16-transfers-group-by-queue.md): "per-row
+// queue labels make the page busy" -- the queue name/summary moves to a collapsible group
+// header, one per queue, so individual rows can stop repeating it. ------------------------
+
+/** One queue's rows, in the order the caller passed them in -- always call this on
+ * `sortTransferRows`'s own output, so a group's `jobs` keep that exact within-group order
+ * (active rows in scheduler order, terminal rows newest-completed-first) without this function
+ * re-deriving or disturbing it. Only queues with at least one visible job produce a group, and
+ * groups themselves are ordered by queue name -- both per the task's own instruction.
+ */
+export interface QueueGroup {
+  queueId: number
+  queueName: string
+  jobs: JobOut[]
+}
+
+export function groupJobsByQueue(jobs: JobOut[]): QueueGroup[] {
+  const groups = new Map<number, QueueGroup>()
+  for (const job of jobs) {
+    let group = groups.get(job.queue_id)
+    if (!group) {
+      group = { queueId: job.queue_id, queueName: job.queue_name, jobs: [] }
+      groups.set(job.queue_id, group)
+    }
+    group.jobs.push(job)
+  }
+  return [...groups.values()].sort((a, b) => a.queueName.localeCompare(b.queueName))
+}
+
+/** A group header's job counts by outcome. The task's own instruction names four buckets --
+ * active (running), queued, succeeded, failed -- but a `cancelled` (Stopped) row is a real fifth
+ * outcome `isDismissable`/`chipStateFor` already both treat as first-class (a stopped job sits in
+ * this same group until dismissed); dropping it from the header's counts would make them not sum
+ * to the group's own row count, silently hiding rather than naming it (docs/decisions.md). It
+ * follows `failed` in `formatQueueGroupCounts`'s enumeration order below and is omitted at zero
+ * exactly like every other bucket.
+ */
+export interface QueueGroupCounts {
+  active: number
+  queued: number
+  succeeded: number
+  failed: number
+  stopped: number
+}
+
+function outcomeCounts(jobs: JobOut[]): QueueGroupCounts {
+  const counts: QueueGroupCounts = { active: 0, queued: 0, succeeded: 0, failed: 0, stopped: 0 }
+  for (const job of jobs) {
+    switch (job.state) {
+      case 'running':
+        counts.active += 1
+        break
+      case 'queued':
+        counts.queued += 1
+        break
+      case 'succeeded':
+        counts.succeeded += 1
+        break
+      case 'failed':
+        counts.failed += 1
+        break
+      case 'cancelled':
+        counts.stopped += 1
+        break
+    }
+  }
+  return counts
+}
+
+/** A group header's aggregate figures -- counts by outcome, the group's total size (sum of
+ * `bytes_done`, per the task's own instruction), and its combined current rate while anything in
+ * the group is downloading (`null` otherwise, so the header can omit the rate entirely rather
+ * than show a stale/zero one). Reads live progress the same way `transferLineValue`/
+ * `transferGroupFields` already do for a single row -- `liveByJobId[job.id]`'s reading takes
+ * priority over the job's own last-polled figures while `running`, falling back to the job's own
+ * figures for every other state (or if no live sample has arrived yet).
+ */
+export interface QueueGroupSummary {
+  counts: QueueGroupCounts
+  totalBytesDone: number
+  combinedRateBps: number | null
+}
+
+export function queueGroupSummary(
+  jobs: JobOut[],
+  liveByJobId: Record<number, LiveProgress | undefined>,
+): QueueGroupSummary {
+  let totalBytesDone = 0
+  let combinedRateBps = 0
+  let anyRunning = false
+  for (const job of jobs) {
+    const live = liveByJobId[job.id]
+    const running = job.state === 'running'
+    totalBytesDone += running ? (live?.bytes_done ?? job.bytes_done) : job.bytes_done
+    if (running) {
+      anyRunning = true
+      combinedRateBps += live?.speed_bps ?? job.speed_bps ?? 0
+    }
+  }
+  return { counts: outcomeCounts(jobs), totalBytesDone, combinedRateBps: anyRunning ? combinedRateBps : null }
+}
+
+const COUNT_LABELS: ReadonlyArray<[keyof QueueGroupCounts, string]> = [
+  ['active', 'active'],
+  ['queued', 'queued'],
+  ['succeeded', 'succeeded'],
+  ['failed', 'failed'],
+  ['stopped', 'stopped'],
+]
+
+/** The counts half of a group header's one line -- e.g. `"2 active, 3 queued"` -- omitting any
+ * bucket that's zero (the task's own instruction, "to keep it quiet"). `''` when every bucket is
+ * zero (a queue with no visible jobs never produces a group in the first place, per
+ * `groupJobsByQueue`, so this is mostly a defensive empty string rather than a case that occurs
+ * in practice).
+ */
+export function formatQueueGroupCounts(counts: QueueGroupCounts): string {
+  return COUNT_LABELS.filter(([key]) => counts[key] > 0)
+    .map(([key, label]) => `${counts[key]} ${label}`)
+    .join(', ')
+}
+
+// --- Per-queue collapse persistence -- keyed by queue id, default expanded, survives reload
+// and a queue's own temporary disappearance from the payload (the task's own instruction: a
+// collapsed queue that scans to zero visible jobs and drops out keeps its stored preference for
+// when it returns, since this map is never pruned against the currently-live queue list). ---
+
+const COLLAPSED_QUEUES_KEY = 'transfers.collapsedQueues'
+
+/** JSON object keys are always strings on the wire/in storage (same fact `useLiveModel.ts`'s own
+ * per-queue-bytes map comment notes) -- so this is keyed by `String(queueId)`, not `queueId`
+ * itself. Presence with `true` means collapsed; anything else (absent key, or a stray `false`
+ * left over from an older write) reads as expanded -- the task's own stated default.
+ */
+export type QueueCollapseMap = Record<string, boolean>
+
+export function isQueueCollapseMap(value: unknown): value is QueueCollapseMap {
+  if (typeof value !== 'object' || value == null) return false
+  return Object.values(value as Record<string, unknown>).every((v) => typeof v === 'boolean')
+}
+
+export function isQueueCollapsed(map: QueueCollapseMap, queueId: number): boolean {
+  return map[String(queueId)] === true
+}
+
+/** Never stores an explicit `false` -- an expanded (the default) queue simply has no entry, same
+ * "default plus exceptions" shape `fileTree.ts`'s own `CollapsePreference` uses for the Files
+ * page, just without that one's separate default flag (every queue defaults expanded here, so a
+ * plain per-id exception set is enough).
+ */
+export function withQueueCollapsed(map: QueueCollapseMap, queueId: number, collapsed: boolean): QueueCollapseMap {
+  const next = { ...map }
+  if (collapsed) next[String(queueId)] = true
+  else delete next[String(queueId)]
+  return next
+}
+
+export function readCollapsedQueues(): QueueCollapseMap {
+  return readLocalStorage(COLLAPSED_QUEUES_KEY, isQueueCollapseMap) ?? {}
+}
+
+export function writeCollapsedQueues(map: QueueCollapseMap): void {
+  writeLocalStorage(COLLAPSED_QUEUES_KEY, map)
 }

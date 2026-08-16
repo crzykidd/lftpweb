@@ -62,6 +62,17 @@ Skeleton for the next roll:
   scheduler order active rows use, which said nothing about when a finished job actually
   finished).
 
+- **Transfers rows are now grouped by queue, each group collapsible and remembered.** Real-use
+  follow-on to the two passes above: with more than one active queue, a per-row queue tag on
+  every line made the page busy. Rows now sit under one collapsible header per queue (ordered by
+  queue name, click anywhere on the header to toggle), and the header carries what the row tag
+  used to: the queue name, job counts by outcome (active / queued / succeeded / failed / stopped
+  — zero counts omitted), the group's total size (summed `bytes_done`), and its combined current
+  rate while anything in it is downloading. Collapse state persists per queue in `localStorage`
+  (default expanded), including for a queue that temporarily has no visible jobs — its
+  preference is still there when it returns. "Dismiss all" is unchanged, still global at the top
+  of the page.
+
 ### Changed
 
 ### Fixed

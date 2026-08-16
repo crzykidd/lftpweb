@@ -6,6 +6,20 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-16 — Transfers group header: added a `stopped` count beyond the prompt's literal four
+
+`prompts/2026-08-16-transfers-group-by-queue.md` named exactly four outcome buckets for a queue
+group's header line — "active / queued / succeeded / failed" — but `JobOut.state` has a fifth
+value, `cancelled`, that both `isDismissable` and `chipStateFor` (`TransfersPage.tsx`) already
+treat as first-class: a stopped job sits in the same group, visible, until dismissed, exactly
+like a failed one. Counting only the named four would have made a group header's counts not sum
+to its own row count whenever a stopped job was present — silently *hiding* it from the one
+summary line meant to replace the per-row detail, rather than naming it. `queueGroupSummary`
+(`lib/transferPanel.ts`) adds a fifth `stopped` bucket for `cancelled`, following `failed` in
+`formatQueueGroupCounts`'s enumeration order and omitted at zero exactly like every other
+bucket — same "zero counts omitted to keep it quiet" rule the prompt itself specified for the
+other four.
+
 ## 2026-08-15 — Cleaned-item grace visibility: narrowing `_protected_rel_paths`, not
 `resolve_absence`
 
