@@ -147,10 +147,6 @@ and known limitations, recorded in full in `docs/decisions.md` and `prompts/open
 - **`password` auth mode with no user configured is open access, not a lockout** — see "Locked
   out?" below. Deliberate, since the alternative bricks the instance on a typo, but anyone
   reaching the API while no user row exists is in.
-- **A `move` queue deletes the remote copy before extraction runs.** The order is verify →
-  remote delete → extract, so an extraction that fails does so after the only other copy is gone.
-  Recoverable in practice — the local archives survive, since archive cleanup only runs on a
-  successful extraction — but it is a known, deliberate ordering rather than a reasoned one.
 - **An abandoned `.downloading-` directory with no tracking history can't be deleted from the
   UI.** It is visible (the scan maps it to its logical name), but "Delete local" resolves the
   physical path from the item's recorded prefix, and an orphan predating any job has none. The

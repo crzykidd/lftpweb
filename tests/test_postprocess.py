@@ -1311,6 +1311,299 @@ async def test_move_mode_corrupt_item_withholds_delete(tmp_path):
         await db.close()
 
 
+# --- The move-delete ladder (2026-08-16, prompts/done/2026-08-16-move-delete-gate-ladder.md,
+# resolving open issue #2 / docs/audit-v0.1.0.md G1): the delete now waits on extraction and,
+# for an *arr-tracked item, on *arr import too -- these tests are the point of that task. -------
+
+
+@pytestmark_unrar
+async def test_move_mode_extraction_failure_defers_delete_not_withholds(tmp_path):
+    """Rung 3: an archive release whose extraction fails must not have already lost its remote
+    copy -- the exact bug this task closes (before it, the delete ran between verify and
+    extract, so this state was unreachable with the remote copy still present). The deferral is
+    named (`remote_delete_deferred`, not `remote_delete_withheld`), and fixing the archive set
+    and letting the pipeline re-run delivers the delete -- there is no automatic retry.
+    """
+    db = await _make_db()
+    try:
+        local_root = tmp_path / "local"
+        local_root.mkdir()
+        write_if_needed(str(local_root))
+        rel_path = "Release"
+        item_dir = local_root / rel_path
+        item_dir.mkdir()
+        (item_dir / "release.rar").write_bytes(_RAR_MULTIVOL_VOL1)
+        # release.r00 (the second, completing volume) intentionally withheld -- the set is
+        # incomplete, so extraction must fail. No sidecar, so verify comes back SKIPPED, not
+        # CORRUPT -- this test is specifically about the extraction rung, not the verify one.
+        # `check_rar_volume_set`'s own docstring: a wholly-absent *final* volume can't be
+        # detected from filenames alone, so this fails as a genuine `unrar` extraction error,
+        # not the precondition check -- still a real `EXTRACT_FAILED`, which is all this test
+        # needs.
+
+        _, queue_id = await _make_host_and_queue_rows(db, sync_mode="move", auto_extract=1)
+        await db.execute(
+            "UPDATE path_queue SET local_path = ? WHERE id = ?", (str(local_root), queue_id)
+        )
+        await db.commit()
+        item_id = await _make_item_row(db, queue_id, rel_path)
+        await db.execute("UPDATE item SET is_dir = 1 WHERE id = ?", (item_id,))
+        await db.commit()
+
+        pool = _FakeRemotePool()
+        pipeline = postprocess.PostprocessPipeline(
+            db=db, events=EventBus(), remote_pool=pool, host_provider=lambda: _async_host()
+        )
+        await pipeline.process_item(item_id, postprocess.PostprocessSettings(extract_enabled=True))
+
+        assert pool.calls == [], "extraction failed -- the source must not be deleted"
+        item = await (await db.execute("SELECT * FROM item WHERE id = ?", (item_id,))).fetchone()
+        assert item["state"] == "EXTRACT_FAILED"
+        assert item["remote_deleted_at"] is None
+        assert item["remote_delete_pending"] is None
+
+        events = await (
+            await db.execute("SELECT kind, level, message FROM event WHERE item_id = ?", (item_id,))
+        ).fetchall()
+        kinds = [e["kind"] for e in events]
+        assert "remote_delete_deferred" in kinds
+        assert "remote_delete_withheld" not in kinds
+        assert "remote_delete" not in kinds
+        deferred = next(e for e in events if e["kind"] == "remote_delete_deferred")
+        assert deferred["level"] == "warning"
+        assert "awaiting extraction" in deferred["message"]
+
+        # Fix the archive set (add the completing volume) and let the pipeline re-run (a fresh
+        # DOWNLOADED, the same shape a re-queue produces) -- the delete fires now that rung 3
+        # clears.
+        (item_dir / "release.r00").write_bytes(_RAR_MULTIVOL_VOL2)
+        await db.execute("UPDATE item SET state = 'DOWNLOADED' WHERE id = ?", (item_id,))
+        await db.commit()
+        await pipeline.process_item(item_id, postprocess.PostprocessSettings(extract_enabled=True))
+
+        assert len(pool.calls) == 1
+        item = await (await db.execute("SELECT * FROM item WHERE id = ?", (item_id,))).fetchone()
+        assert item["state"] == "EXTRACTED"
+        assert item["remote_deleted_at"] is not None
+        assert item["remote_delete_pending"] is None
+    finally:
+        await db.close()
+
+
+async def test_move_mode_arr_tracked_item_defers_delete_to_arrsync(tmp_path):
+    """Rung 4: an item that is already *arr-tracked (`arr_status` non-null) by the time the
+    pipeline's delete gate runs must not have its source deleted here at all -- rungs 1-3 having
+    cleared hands the decision to `core/arrsync.py` instead (`item.remote_delete_pending`
+    records the handoff, carrying the verify evidence forward).
+    """
+    db = await _make_db()
+    try:
+        local_root = tmp_path / "local"
+        local_root.mkdir()
+        rel_path = "Show.S01E01.mkv"
+        content = b"an episode, already matched by the bound *arr instance"
+        (local_root / rel_path).write_bytes(content)
+
+        _, queue_id = await _make_host_and_queue_rows(db, sync_mode="move")
+        await db.execute(
+            "UPDATE path_queue SET local_path = ? WHERE id = ?", (str(local_root), queue_id)
+        )
+        await db.commit()
+        item_id = await _make_item_row(db, queue_id, rel_path, remote_size=len(content))
+        # The poller runs on its own clock and matched this item before postprocess got here.
+        await db.execute(
+            "UPDATE item SET arr_status = 'detected', arr_status_at = ? WHERE id = ?",
+            ("2026-08-16T00:00:00.000000Z", item_id),
+        )
+        await db.commit()
+
+        pool = _FakeRemotePool()
+        pipeline = postprocess.PostprocessPipeline(
+            db=db, events=EventBus(), remote_pool=pool, host_provider=lambda: _async_host()
+        )
+        settings = postprocess.PostprocessSettings(verify_hash_on_disk=True)
+        await pipeline.process_item(item_id, settings)
+
+        assert pool.calls == [], "an *arr-tracked item must not delete here -- arrsync owns it"
+        item = await (await db.execute("SELECT * FROM item WHERE id = ?", (item_id,))).fetchone()
+        assert item["state"] == "VERIFIED"
+        assert item["remote_deleted_at"] is None
+        assert item["remote_delete_pending"] == "VERIFIED"
+
+        events = await (
+            await db.execute("SELECT kind, level, message FROM event WHERE item_id = ?", (item_id,))
+        ).fetchall()
+        kinds = [e["kind"] for e in events]
+        assert "remote_delete_deferred" in kinds
+        assert "remote_delete" not in kinds
+        deferred = next(e for e in events if e["kind"] == "remote_delete_deferred")
+        assert deferred["level"] == "info"
+        assert "awaiting *arr import" in deferred["message"]
+    finally:
+        await db.close()
+
+
+async def test_move_mode_unmatched_item_on_a_bound_queue_still_deletes_at_rung_3(tmp_path):
+    """The gate keys on `item.arr_status`, never on whether the *queue* is bound
+    (`arr_instance_id`) -- a queue bound to a real instance can still contain an item the
+    instance never heard of (a hand-dropped file, a replaced grab), and that item must not wait
+    forever on an *arr that will never match it.
+    """
+    db = await _make_db()
+    try:
+        local_root = tmp_path / "local"
+        local_root.mkdir()
+        rel_path = "loose.txt"
+        content = b"never matched by the bound *arr instance"
+        (local_root / rel_path).write_bytes(content)
+
+        _, queue_id = await _make_host_and_queue_rows(db, sync_mode="move")
+        await db.execute(
+            "UPDATE path_queue SET local_path = ? WHERE id = ?", (str(local_root), queue_id)
+        )
+        await db.commit()
+        cursor = await db.execute(
+            "INSERT INTO arr_instance (name, kind, base_url, api_key_enc, enabled, "
+            "notify_on_complete, created_at, updated_at) VALUES "
+            "('Sonarr', 'sonarr', 'http://arr.invalid', 'enc', 1, 0, "
+            "'2026-08-16T00:00:00.000000Z', '2026-08-16T00:00:00.000000Z')"
+        )
+        instance_id = cursor.lastrowid
+        await db.execute(
+            "UPDATE path_queue SET arr_instance_id = ? WHERE id = ?", (instance_id, queue_id)
+        )
+        await db.commit()
+        # arr_status left NULL -- this item was never matched by the bound instance.
+        item_id = await _make_item_row(db, queue_id, rel_path, remote_size=len(content))
+
+        pool = _FakeRemotePool()
+        pipeline = postprocess.PostprocessPipeline(
+            db=db, events=EventBus(), remote_pool=pool, host_provider=lambda: _async_host()
+        )
+        settings = postprocess.PostprocessSettings(verify_hash_on_disk=True)
+        await pipeline.process_item(item_id, settings)
+
+        assert len(pool.calls) == 1, "an unmatched item must delete at rung 3, not wait"
+        item = await (await db.execute("SELECT * FROM item WHERE id = ?", (item_id,))).fetchone()
+        assert item["remote_deleted_at"] is not None
+        assert item["remote_delete_pending"] is None
+    finally:
+        await db.close()
+
+
+async def test_move_mode_corrupt_vetoes_even_when_the_item_is_arr_tracked(tmp_path):
+    """CORRUPT is a hard veto at every rung -- including rung 4. An *arr-tracked item that
+    verifies CORRUPT must be withheld outright, never deferred to `core/arrsync.py`: a stale
+    `remote_delete_pending` would let a later confirmed `imported` transition delete a copy this
+    same run just found reason to keep.
+    """
+    db = await _make_db()
+    try:
+        local_root = tmp_path / "local"
+        local_root.mkdir()
+        rel_path = "Release"
+        item_dir = local_root / rel_path
+        item_dir.mkdir()
+        (item_dir / "a.txt").write_bytes(b"hello world")
+        (item_dir / "checksums.sfv").write_text("a.txt deadbeef\n")  # deliberately wrong
+
+        _, queue_id = await _make_host_and_queue_rows(db, sync_mode="move")
+        await db.execute(
+            "UPDATE path_queue SET local_path = ? WHERE id = ?", (str(local_root), queue_id)
+        )
+        await db.commit()
+        item_id = await _make_item_row(db, queue_id, rel_path, remote_size=11)
+        await db.execute(
+            "UPDATE item SET arr_status = 'detected', arr_status_at = ? WHERE id = ?",
+            ("2026-08-16T00:00:00.000000Z", item_id),
+        )
+        await db.commit()
+
+        pool = _FakeRemotePool()
+        pipeline = postprocess.PostprocessPipeline(
+            db=db, events=EventBus(), remote_pool=pool, host_provider=lambda: _async_host()
+        )
+        await pipeline.process_item(item_id, postprocess.PostprocessSettings())
+
+        assert pool.calls == []
+        item = await (await db.execute("SELECT * FROM item WHERE id = ?", (item_id,))).fetchone()
+        assert item["state"] == "CORRUPT"
+        assert item["remote_deleted_at"] is None
+        assert item["remote_delete_pending"] is None
+
+        events = await (
+            await db.execute("SELECT kind FROM event WHERE item_id = ?", (item_id,))
+        ).fetchall()
+        kinds = [e["kind"] for e in events]
+        assert "remote_delete_withheld" in kinds
+        assert "remote_delete_deferred" not in kinds
+    finally:
+        await db.close()
+
+
+async def test_move_mode_deferred_item_is_scan_stable_while_both_copies_exist(tmp_path):
+    """An item deferred at rung 4 keeps its remote copy -- both trees genuinely have content --
+    so a real scan pass must read it exactly like any other complete `move`-mode item, not flap
+    it toward `PARTIAL`/`DOWNLOADED` or start the absence-grace clock. Three passes in a row, the
+    same "not just the first" discipline other scan-stability tests in this file use.
+    """
+    db = await _make_db()
+    try:
+        local_root = tmp_path / "local"
+        local_root.mkdir()
+        write_if_needed(str(local_root))
+        rel_path = "Show.S01E01.mkv"
+        content = b"an episode, already matched by the bound *arr instance"
+        (local_root / rel_path).write_bytes(content)
+
+        host_id, queue_id = await _make_host_and_queue_rows(db, sync_mode="move")
+        await db.execute(
+            "UPDATE path_queue SET local_path = ? WHERE id = ?", (str(local_root), queue_id)
+        )
+        await db.commit()
+        item_id = await _make_item_row(db, queue_id, rel_path, remote_size=len(content))
+        await db.execute(
+            "UPDATE item SET arr_status = 'detected', arr_status_at = ? WHERE id = ?",
+            ("2026-08-16T00:00:00.000000Z", item_id),
+        )
+        await db.commit()
+
+        pipeline = postprocess.PostprocessPipeline(
+            db=db, events=EventBus(), remote_pool=_FakeRemotePool(), host_provider=_async_host
+        )
+        settings = postprocess.PostprocessSettings(verify_hash_on_disk=True)
+        await pipeline.process_item(item_id, settings)
+
+        item = await (await db.execute("SELECT * FROM item WHERE id = ?", (item_id,))).fetchone()
+        assert item["state"] == "VERIFIED", "setup did not actually verify -- test is void"
+        assert item["remote_delete_pending"] == "VERIFIED"
+        assert item["remote_deleted_at"] is None
+
+        remote_tree = {
+            rel_path: RemoteEntry(rel_path=rel_path, is_dir=False, size=len(content), mtime=1.0),
+        }
+        engine = Engine(db, str(tmp_path), EventBus())
+        engine.pool = _FakeScanPool(remote_tree)
+        q, host = _queue_and_host(host_id, queue_id, local_root)
+
+        for _ in range(3):
+            await engine.scan_queue(q, host)
+            row = await (
+                await db.execute(
+                    "SELECT state, first_missing_at, remote_delete_pending, remote_deleted_at "
+                    "FROM item WHERE id = ?",
+                    (item_id,),
+                )
+            ).fetchone()
+            assert row["state"] == "VERIFIED", "must not flap while both copies genuinely exist"
+            assert row["state"] not in ELIGIBLE_STATES, "must never become auto-queue eligible"
+            assert row["first_missing_at"] is None, "content is not absent, nothing should start"
+            assert row["remote_delete_pending"] == "VERIFIED", "scan must not touch the handoff"
+            assert row["remote_deleted_at"] is None
+    finally:
+        await db.close()
+
+
 async def test_every_step_defaults_off_for_a_copy_mode_queue(tmp_path):
     """DESIGN.md §6's non-negotiable, exercised end to end through the pipeline: with global
     settings and queue toggles all at their defaults (off, off, off, copy mode), processing a
@@ -2126,14 +2419,15 @@ async def test_pipeline_never_deletes_a_loose_top_level_archive_file(tmp_path):
 
 
 @pytestmark_unrar
-async def test_move_mode_cleanup_runs_even_though_the_remote_copy_is_already_gone(tmp_path):
-    """§5's own required check: on a `move` queue the remote copy is deleted *before*
-    extraction runs (`_process_item`'s fixed verify -> delete-remote -> extract -> move order,
-    unchanged by this task). By the time cleanup runs, the compressed archive bytes it is about
-    to remove are already the last copy anywhere -- deliberately not gated further (see
-    docs/decisions.md): a successful extraction has already decoded the payload onto disk as
-    ordinary files, so the archive volumes are a spent intermediate nobody re-reads, not the
-    release itself.
+async def test_move_mode_archive_cleanup_runs_before_the_ladders_own_delete(tmp_path):
+    """§5's own required check, updated for the ladder (2026-08-16,
+    prompts/done/2026-08-16-move-delete-gate-ladder.md): on a `move` queue the remote delete is
+    now the pipeline's *last* step, so extraction -- and this feature's own archive cleanup,
+    which rides `_do_extract`'s success path -- runs *before* the remote copy is gone, not after
+    it as before this task. Archive cleanup is still deliberately not gated on the remote delete
+    (see docs/decisions.md): a successful extraction has already decoded the payload onto disk
+    as ordinary files, so the archive volumes are a spent intermediate nobody re-reads, not the
+    release itself -- true regardless of which order the two deletions happen in.
     """
     db = await _make_db()
     try:
@@ -2182,7 +2476,7 @@ async def test_move_mode_cleanup_runs_even_though_the_remote_copy_is_already_gon
         assert len(pool.calls) == 1
         item = await (await db.execute("SELECT * FROM item WHERE id = ?", (item_id,))).fetchone()
         assert item["remote_deleted_at"] is not None
-        # ...and cleanup still ran on top of that, unimpeded.
+        # ...and cleanup still ran, this time *before* it rather than after.
         assert item["state"] == "EXTRACTED"
         assert not (item_dir / "release.rar").exists()
         assert not (item_dir / "release.r00").exists()
@@ -2190,6 +2484,14 @@ async def test_move_mode_cleanup_runs_even_though_the_remote_copy_is_already_gon
 
         deleted = await local_delete.load_deleted_archive_paths(db, queue_id)
         assert deleted == {"Release/release.rar", "Release/release.r00"}
+
+        events = await (
+            await db.execute("SELECT kind FROM event WHERE item_id = ? ORDER BY id", (item_id,))
+        ).fetchall()
+        kinds = [e["kind"] for e in events]
+        assert kinds.index("archive_cleanup") < kinds.index(
+            "remote_delete"
+        ), "the ladder's own delete must be the pipeline's last step, after archive cleanup"
     finally:
         await db.close()
 

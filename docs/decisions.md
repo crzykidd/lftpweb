@@ -6,6 +6,100 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-16 — The move-delete ladder: source deletes last, not second, and waits on *arr import
+
+`prompts/done/2026-08-16-move-delete-gate-ladder.md`, resolving open issue #2 /
+`docs/audit-v0.1.0.md` G1 (the "`move`-mode delete runs before extraction" design call flagged
+in the post-`v0.1.0` audit and deferred twice since). User-approved design, discussed and
+settled 2026-08-16.
+
+**The problem.** `core/postprocess.py._process_item` ran the `move`-mode remote delete
+*between* verify and extract. `SKIPPED` verification (no `.sfv`/`.md5` sidecar — the common
+case, and every case since the 2026-08-14 verification-gate revision that let `SKIPPED` proceed
+to delete) does not withhold, so a sidecar-less release's remote copy was gone before extraction
+— the step most likely to still fail — ever ran. A failed extraction then had no other copy to
+recover from. Separately, the newer Sonarr/Radarr integration (§16) can match, track, and later
+report an item `gone` from the *arr's own queue without ever importing it — a case the old gate
+had no way to account for at all, because it ran at `DOWNLOADED` time, long before the *arr
+poller could possibly know anything.
+
+**The settled design: a four-rung ladder, evaluated in order, delete only once every applicable
+rung passes.**
+
+1. **Completeness** (always) — unchanged, already true by the time the gate runs.
+2. **Verify** — `CORRUPT` is a hard veto at every rung, exactly as before; `SKIPPED` still
+   passes (2026-08-14's rule stands: "verification must not have failed," not "must have run").
+3. **Extract** — if archives were present and extraction is enabled, extraction must have
+   succeeded. `EXTRACT_FAILED` *defers* the delete (`remote_delete_deferred`) rather than the
+   delete having already happened, which is the whole point of this task.
+4. ***arr import*** — only if the item is *arr-tracked (`item.arr_status` non-null) by the time
+   the pipeline's delete gate runs. `core/postprocess.py` hands the decision to `core/arrsync.py`
+   instead of deleting (`item.remote_delete_pending` records the handoff, carrying the verify
+   evidence forward so the eventual delete event reads exactly as informative as an immediate
+   one); `core/arrsync.py` performs the delete the moment an association is confirmed `imported`
+   (the existing three-layer, two-pass-confirmed signal), never on `gone`. An item on a bound
+   queue that never matched (`arr_status` stays `NULL` forever) is *not* made to wait on an *arr
+   that has never heard of it — it deletes at rung 3 instead, same as any other queue.
+
+**Settled behaviors, stated explicitly because they were the actual points of disagreement to
+resolve, not implementation detail:**
+
+- **No timeout, no automatic fallback.** A withheld or deferred item keeps its source on both
+  sides until the user acts — fix the failing step and let the pipeline re-run (a fresh
+  `DOWNLOADED`, e.g. via re-queue), or the manual-delete dialog (`prompts/2026-08-16-manual-
+  delete-local-and-remote.md`, this ladder's own follow-on task). Deliberate: a failure state
+  must stay inspectable on both sides, not quietly resolve itself in either direction.
+- **Not a toggle.** This is simply how `move` works now, in the strictly later/safer direction
+  for every existing install. No new setting, no migration flag to opt out.
+- **Every deferral writes its own event** (`remote_delete_deferred`, naming the rung) distinct
+  from a permanent withhold (`remote_delete_withheld`, `CORRUPT` only) — History must be able to
+  answer "why is this still on the seedbox" without guessing which kind of "not yet" it is.
+
+**Rejected alternative: keep the early delete, add a toggle.** Discussed and rejected. A toggle
+would mean the *default* behavior for existing installs stays the one this task exists to fix,
+with the safer behavior opt-in — backwards from this project's own "a new capability defaults
+off, a safety fix defaults on" instinct. The redesign is strictly safer in every case (delete
+happens later, never earlier, than before), so there is no configuration for which the old
+behavior is actually wanted; a toggle would just be a way to keep shipping the bug.
+
+**Why the *arr-tracked check is `item.arr_status is not None`, not `queue.arr_instance_id is
+not None`.** The queue-bound check would wait on *every* item in a bound queue, including one
+the *arr will never hear about (a hand-dropped file, a replaced grab) — exactly the "wait
+forever" failure mode the settled rules explicitly rule out. Keying on the item's own match
+state means only an item the *arr actually knows about waits on it.
+
+**Why a durable `item.remote_delete_pending` column, not an inferred signal.** `core/arrsync.py`
+makes its delete decision at a completely different time than the postprocess run that
+determined verify/extract passed — often much later, on the *arr's own clock, not lftpweb's.
+`item.state` alone cannot stand in for "verify/extract passed": a later, unrelated step in the
+*same* pipeline run (e.g. a successful extraction) overwrites `item.state` to `EXTRACTED`, which
+would silently mask an earlier `CORRUPT` verify if anything downstream re-derived readiness from
+the state string instead of the fresh local variable each step actually produced. Migration
+`019_move_delete_ladder.sql` adds the column instead: `_maybe_delete_remote` writes it (as the
+verify evidence itself — `'VERIFIED'` or `'SKIPPED'` — doing double duty as both "ready" and
+"what to say when the delete finally fires") only on the one branch where rungs 1-3 are known,
+by fresh computation, to have passed, and explicitly clears it back to `NULL` on every
+withhold/defer branch — so a stale `'VERIFIED'` from an earlier successful pass can never
+authorize a delete for a release a later retry found `CORRUPT`.
+
+**Reuse, not a second delete implementation.** The actual asyncssh call plus its
+`remote_deleted_at`/event bookkeeping was factored out of `_maybe_delete_remote` into a
+module-level `perform_remote_delete` (`core/postprocess.py`), imported by `core/arrsync.py` for
+its rung-4 handoff. Per this project's own "one code path for an irreversible delete" rule
+(DESIGN.md §7.4) — `core/arrsync.py` gained the identical `remote_pool`/`host_provider`
+constructor seam `PostprocessPipeline` already has (both optional, `None`-safe, wired in
+`main.py` from the same `app.state.engine.pool`/`_host_provider`) rather than either module
+reaching into the other's internals.
+
+**`sync` mode's remaining rationale narrows further.** DESIGN.md §7 already argued `sync`'s own
+distinguishing feature (propagating a *local* delete performed by hand) is niche; this task
+closes the other half — `sync`'s most commonly imagined use, "the importer took it, clean up the
+source," is now `move`-with-the-ladder's job automatically, no `sync` required. Noted in DESIGN.md
+so a future session doesn't rebuild `sync` "for tidiness" without re-reading why it's still
+unscheduled.
+
+---
+
 ## 2026-08-16 — `/api/health` carries `build_sha`/`build_channel`, beyond §12's shape again
 
 `prompts/done/2026-08-16-dev-build-version-badge.md`. User request: a `:dev` image should

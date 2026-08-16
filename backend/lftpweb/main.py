@@ -139,12 +139,18 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # own filesystem work is shielded from (and shields) a racing scan the same way every other
     # deleter in this codebase already is. Both `app.state.postprocess` and
     # `app.state.delete_in_flight` already exist by this point (constructed above).
+    # Rung 4 of the move-mode delete ladder (prompts/done/2026-08-16-move-delete-gate-ladder.md):
+    # `remote_pool`/`host_provider` are the identical seam `app.state.postprocess` above already
+    # gets, for the identical reason -- `core/arrsync.py`'s deferred delete on a confirmed
+    # `imported` transition needs the same pooled asyncssh connection and host config.
     app.state.arr_sync = ArrSyncScheduler(
         db=app.state.db,
         config_dir=settings.config_dir,
         events=app.state.events,
         in_flight_provider=lambda: app.state.postprocess.in_flight_item_ids(),
         delete_in_flight=app.state.delete_in_flight,
+        remote_pool=app.state.engine.pool,
+        host_provider=_host_provider,
     )
 
     await app.state.engine.start()

@@ -580,6 +580,147 @@ async def test_gone_when_record_vanishes_with_no_import_event(db, fake_arr_serve
     assert await _event_kinds(db, item_id) == ["arr_gone"]
 
 
+# --- Rung 4 of the move-mode delete ladder (2026-08-16,
+# prompts/done/2026-08-16-move-delete-gate-ladder.md, resolving open issue #2 /
+# docs/audit-v0.1.0.md G1) -------------------------------------------------------------------
+
+
+class _FakeRemotePool:
+    """Stands in for `core/remote.py`'s `RemoteConnectionPool` -- same shape as
+    `tests/test_postprocess.py`'s own fake, kept local to this file rather than imported so
+    this module's tests don't reach across test files for a fixture.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[object, str]] = []
+
+    async def delete_path(self, host, remote_path: str) -> None:
+        self.calls.append((host, remote_path))
+
+
+async def _async_host():
+    from lftpweb.core.remote import HostConfig
+
+    return HostConfig(
+        id=1, address="seedbox.invalid", port=22, username="u", auth_method="key", key_path="/k"
+    )
+
+
+async def test_move_mode_delete_survives_detected_and_notified_fires_only_on_imported(
+    db, fake_arr_server, tmp_path
+):
+    """An *arr-tracked, `move`-mode item that `core/postprocess.py` already deferred
+    (`item.remote_delete_pending` set, rungs 1-3 already cleared) must keep its source through
+    `detected`/`notified` and delete only on the confirmed `imported` transition -- never a
+    poll interval earlier, and not before the second confirming pass.
+    """
+    host_id = await _seed_host(db)
+    instance_id = await _seed_instance(
+        db,
+        str(tmp_path),
+        base_url=fake_arr_server.base_url,
+        api_key=fake_arr_server.state.api_key,
+    )
+    queue_id = await _seed_queue(db, host_id, arr_instance_id=instance_id)
+    await db.execute("UPDATE path_queue SET sync_mode = 'move' WHERE id = ?", (queue_id,))
+    await db.commit()
+    item_id = await _seed_item(
+        db,
+        queue_id,
+        "Show.S01E05.1080p-GRP",
+        state="VERIFIED",
+        arr_status="detected",
+        arr_download_id="abc123",
+    )
+    await db.execute("UPDATE item SET remote_delete_pending = 'VERIFIED' WHERE id = ?", (item_id,))
+    await db.commit()
+
+    pool = _FakeRemotePool()
+    scheduler = ArrSyncScheduler(
+        db=db, config_dir=str(tmp_path), remote_pool=pool, host_provider=_async_host
+    )
+
+    # Still sitting in the *arr's own queue -- source must stay untouched through `detected`.
+    fake_arr_server.state.queue_records = [
+        _queue_record(
+            download_id="abc123",
+            title="Show S01E05 1080p GRP",
+            output_path="/data/torrents/complete/Show.S01E05.1080p-GRP",
+            tracked_download_state="downloading",
+        )
+    ]
+    await scheduler.run_once()
+    row = await _item_row(db, item_id)
+    assert row["arr_status"] == "detected"
+    assert pool.calls == []
+    assert row["remote_deleted_at"] is None
+
+    # Now confirm import: record gone, history has the import event -- two consecutive passes.
+    fake_arr_server.state.queue_records = []
+    fake_arr_server.state.history_events = [_import_event(download_id="abc123")]
+    await scheduler.run_once()
+    row = await _item_row(db, item_id)
+    assert row["arr_status"] == "detected", "first observing pass -- not yet confirmed"
+    assert pool.calls == []
+
+    await scheduler.run_once()
+    row = await _item_row(db, item_id)
+    assert row["arr_status"] == "imported"
+    assert len(pool.calls) == 1
+    _, remote_path = pool.calls[0]
+    assert remote_path == "/r/Show.S01E05.1080p-GRP"
+    assert row["remote_deleted_at"] is not None
+    assert row["remote_delete_pending"] is None
+    kinds = await _event_kinds(db, item_id)
+    assert "remote_delete" in kinds
+    assert kinds.index("arr_imported") < kinds.index("remote_delete")
+
+
+async def test_move_mode_delete_never_fires_on_gone(db, fake_arr_server, tmp_path):
+    """`gone` -- the *arr's queue record disappeared with no import history event -- must never
+    delete the source. A deferred item stays deferred exactly as the ladder promises: no
+    timeout, no automatic fallback.
+    """
+    host_id = await _seed_host(db)
+    instance_id = await _seed_instance(
+        db,
+        str(tmp_path),
+        base_url=fake_arr_server.base_url,
+        api_key=fake_arr_server.state.api_key,
+    )
+    queue_id = await _seed_queue(db, host_id, arr_instance_id=instance_id)
+    await db.execute("UPDATE path_queue SET sync_mode = 'move' WHERE id = ?", (queue_id,))
+    await db.commit()
+    item_id = await _seed_item(
+        db,
+        queue_id,
+        "Show.S01E05.1080p-GRP",
+        state="VERIFIED",
+        arr_status="detected",
+        arr_download_id="abc123",
+    )
+    await db.execute("UPDATE item SET remote_delete_pending = 'VERIFIED' WHERE id = ?", (item_id,))
+    await db.commit()
+
+    pool = _FakeRemotePool()
+    scheduler = ArrSyncScheduler(
+        db=db, config_dir=str(tmp_path), remote_pool=pool, host_provider=_async_host
+    )
+
+    fake_arr_server.state.queue_records = []
+    fake_arr_server.state.history_events = []  # no import event at all -- removed, not imported
+    await scheduler.run_once()
+    await scheduler.run_once()
+
+    row = await _item_row(db, item_id)
+    assert row["arr_status"] == "gone"
+    assert pool.calls == []
+    assert row["remote_deleted_at"] is None
+    assert row["remote_delete_pending"] == "VERIFIED", "left exactly as it was -- no fallback"
+    kinds = await _event_kinds(db, item_id)
+    assert "remote_delete" not in kinds
+
+
 # --- Upgrade-regrab: a fresh association on a different downloadId ------------------------
 
 

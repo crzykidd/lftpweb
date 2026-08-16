@@ -200,7 +200,12 @@ every other settings dataclass):
    two-consecutive-passes quiescence guard (see the lifecycle section) confirms the *arr
    is fully done — a record still showing `trackedDownloadState: importing` always means
    "not yet".
-4. For `imported` items on a `arr_delete_completed` queue: run cleanup (below).
+4. Immediately on committing `imported`: on a `move`-mode queue, if `core/postprocess.py`
+   deferred this item's remote delete (`item.remote_delete_pending` set — rung 4 of the delete
+   ladder, `prompts/done/2026-08-16-move-delete-gate-ladder.md`), perform it now, before
+   anything else this pass touches the item. Never on `gone`.
+5. For `imported` items on a `arr_delete_completed` queue: run cleanup (below) — after step 4,
+   so a `move`-mode item's remote copy is already gone before local cleanup ever runs.
 
 An unreachable instance logs once at WARNING, writes one event row, and backs off
 (exponential, capped); it must never block or slow the loop for other instances, and never
@@ -254,8 +259,13 @@ the *arr mark), not as an alarm. Same clock, different words.
 
 Cleanup is **withheld** (with an `arr_cleanup_withheld` event naming why) when: the item is
 not `imported`; verification for the item had failed; or a job for the item is active. On a
-`move`-mode queue this composes naturally: remote already deleted by the delete gate, local
-deleted here → the release is fully gone once the *arr has it, which is the point.
+`move`-mode queue this composes with the delete ladder (`core/postprocess.py`/`core/arrsync.py`,
+`prompts/done/2026-08-16-move-delete-gate-ladder.md`), not before it: an *arr-tracked item's
+remote copy is deliberately still there when it reaches `imported` (the pipeline defers rung 4
+to this poller rather than deleting at `DOWNLOADED` time), so `_commit_terminal` performs that
+deferred delete itself, in the same pass, **before** the `arr_delete_completed` sweep below ever
+runs — "import green → delete source → delete local," never the reverse. The release is fully
+gone once the *arr has it, which is the point.
 
 ## API surface
 

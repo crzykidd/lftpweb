@@ -108,6 +108,21 @@ Skeleton for the next roll:
 
 ### Changed
 
+- **`move`-mode remote delete is now the last gate on a ladder, not the second step.**
+  Previously a `move` queue deleted the seedbox copy right after verification, *before*
+  extraction ran — so an extraction failure (or an *arr that never actually imports) could
+  discover a problem after the only other copy was already gone. The source is now deleted
+  only once every applicable rung has passed, in order: completeness (unchanged), verification
+  (`CORRUPT` still vetoes at every rung; `SKIPPED` still passes, unchanged), extraction (an
+  archive release must have extracted successfully — a failure now *withholds* the delete
+  instead of it having already happened), and, only for an item the optional Sonarr/Radarr
+  integration is already tracking, confirmed *arr import. Every deferral writes a
+  `remote_delete_deferred` event naming the rung it's waiting on. There is no timeout and no
+  automatic fallback — a withheld or deferred item keeps its source on both sides until the
+  user acts (fix the failing step and let it re-run, or the manual-delete dialog — a follow-on
+  task), by design.
+  This is strictly in the later/safer direction for every existing install; not a new setting.
+  See `docs/decisions.md` and `prompts/done/2026-08-16-move-delete-gate-ladder.md`.
 - **Job speed and per-file speed now sample on one shared 5-second cadence, instead of two that
   drifted apart.** Watching a live transfer showed a one-file directory reporting two different
   speeds at once (46 vs. 40 MB/s) because job-level speed sampled roughly every second while

@@ -17,7 +17,7 @@ we can pick an order together. Where a claim was *verified* (not just read), it 
 | S2 | Security | Archive extraction does not containment-check member paths (zip-slip relies entirely on 7zz/unrar) | 🟠 Medium | S |
 | S3 | Security | No input length caps on credentials/free-text; no `port` bounds → argon2/body-size DoS surface | 🟡 Low–Med | S |
 | S4 | Security | No security response headers (CSP, X-Content-Type-Options, X-Frame-Options) | 🟡 Low | XS |
-| G1 | Gating | `move`-mode remote delete runs **before** extraction — a `SKIPPED`-verify release whose extract later fails is already deleted (this is open issue #2) | 🟠 Medium | M (design call) |
+| G1 | Gating | ~~`move`-mode remote delete runs **before** extraction~~ — **resolved by design, 2026-08-16** (`docs/decisions.md`, `prompts/done/2026-08-16-move-delete-gate-ladder.md`): the delete is now the last gate on a rung-ordered ladder (completeness, verify, extract, *arr import), not the second step. Was open issue #2. | 🟠 Medium | M (design call) |
 | G2 | Gating | `net:connection-limit` still has no write path (known gap) — the one §4.5 "first-class setting" unreachable from any UI | 🟡 Low–Med | M |
 | G3 | Gating | Several settings lack server-side bounds/validation (retention counts, ports, blank names) | 🟡 Low | S |
 | P1 | Partition | `FileTree.tsx` is **2267 lines** — the worst "read everything to change one thing" file in the repo | 🟠 High value | M |
@@ -153,14 +153,17 @@ a deliberate, documented weakening for plain-HTTP LAN use. Leave as-is.)*
 
 ### 🟠 G1 — `move`-mode delete happens before extraction (open issue #2)
 
-In `postprocess._process_item` the order for a `move` queue is **verify → delete remote →
-extract**. The delete gate withholds only on `CORRUPT` (correct — `6883db3`). But a release with
-**no sidecar** verifies `SKIPPED`, so the remote is deleted, and *then* extraction runs — if
-extraction fails (`EXTRACT_FAILED`), the only re-fetchable source is already gone. This is exactly
-the question already filed as **issue #2**; flagging it here so it's on the consolidated list. The
-design call: either move the remote delete to *after* a successful extract, or make the delete gate
-also require extraction not to have failed (mirroring the download-prefix `release_ok` rule, which
-already ANDs both). Effort: M, mostly deciding.
+**Resolved by design, 2026-08-16** (`docs/decisions.md`, `prompts/done/
+2026-08-16-move-delete-gate-ladder.md`). What follows is the original finding, kept for context.
+
+In `postprocess._process_item` the order for a `move` queue used to be **verify → delete remote
+→ extract**. The delete gate withheld only on `CORRUPT` (correct — `6883db3`). But a release with
+**no sidecar** verified `SKIPPED`, so the remote was deleted, and *then* extraction ran — if
+extraction failed (`EXTRACT_FAILED`), the only re-fetchable source was already gone. The design
+call this row asked for — move the delete to after a successful extract, or make the delete gate
+also require extraction not to have failed — landed as the wider of the two: the delete is now the
+*last* gate on a four-rung ladder (completeness, verify, extract, and a new rung for an *arr-tracked
+item, *arr import), not just extraction-aware.
 
 ### 🟡 G2 — `net:connection-limit` has no write path (known gap #5)
 
@@ -279,7 +282,8 @@ inside `QueuesTab` is the one candidate (`QueuePatternsEditor.tsx`) if we're in 
 2. **P2** then **P1** — the two biggest token-cost reductions, lowest behavioral risk. Pure moves,
    tests green throughout.
 3. **S3 + G3 + S4** — one "input hardening + headers" pass (`fix:`), cheap and cohesive.
-4. **G1** — decide the delete-order question (issue #2); implement whichever way we choose.
+4. ~~**G1** — decide the delete-order question (issue #2); implement whichever way we choose.~~
+   Done, 2026-08-16.
 5. **P3**, then **P4/P5** — the deeper backend splits, one at a time, each its own commit.
 6. **S2**, **G2** — extraction containment and the connection-limit write path, as scoped features.
 

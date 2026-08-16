@@ -198,25 +198,37 @@ The worked example, because it looks alarming and is not:
 ## copy vs move {#copy-move}
 
 `copy` downloads and never touches the seedbox. `move` does one extra thing, once, at the very
-end of post-processing: it deletes the item's remote copy. Nothing else about a `move` queue
-behaves differently — not the transfer, not extraction, not relocation.
+end of post-processing — after verify *and* extract have both already run — it deletes the
+item's remote copy. Nothing else about a `move` queue behaves differently — not the transfer,
+not extraction, not relocation.
 
 **`move` forces verification on, regardless of the site-wide setting and regardless of any
-per-queue override.** Verification is the sole gate on that irreversible delete, so it is not
+per-queue override.** Verification is one of the gates on that irreversible delete, so it is not
 something a toggle elsewhere can switch off underneath you. In the queue form the Verify
 checkbox shows as ticked and locked, with the reason stated on it.
 
-If verification cannot produce evidence — no `.sfv`/`.md5` sidecar, and the whole-file-read
-fallback turned off — the remote delete is **withheld and audited**, not silently skipped. You
-will find it on the [History](/history) page as a warning event.
+The delete only fires once every applicable check has passed, in order — this is the "delete
+ladder":
+
+1. **Verify.** A checksum mismatch (`CORRUPT`) withholds the delete outright, always, and is
+   audited on [History](/history) as a warning event. If verification simply has no evidence to
+   go on — no `.sfv`/`.md5` sidecar, and the whole-file-read fallback turned off — the delete
+   **proceeds anyway** on the completeness checks the item already cleared; the History event
+   says so plainly rather than reading like a checksum-backed delete.
+2. **Extract.** If the release had archives and extraction is enabled, extraction must have
+   succeeded. A failed extraction *defers* the delete instead — you'll see a "source retained"
+   event, and the seedbox copy stays put until you fix the archive set and let the item's
+   pipeline re-run, or delete it by hand.
+3. ***arr import***, only if [Sonarr/Radarr integration](#arr-integration) has already matched
+   this item. The delete then waits for the *arr to confirm it actually imported the release —
+   never sooner, and never at all if the *arr's queue record disappears without an import
+   (`gone`). An item on a bound queue the *arr never matched isn't held up by this at all.
+
+There is no timeout on any of this: a withheld or deferred item keeps its seedbox copy until you
+act.
 
 > **Warning:** A `move` queue's remote path must be a hardlink pickup directory, never your
 > torrent client's live seeding data. The delete is real and there is no undo.
-
-> **Note:** One ordering quirk worth knowing: on a `move` queue the remote copy is deleted
-> before extraction runs. A failed extraction therefore happens after the remote copy is gone.
-> The downloaded archives are still on disk, so it is recoverable — but you recover it locally,
-> not by re-downloading.
 
 ## Inherit vs override on the post-processing toggles {#inherit}
 

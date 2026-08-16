@@ -1276,7 +1276,7 @@ lftpweb ever touches the remote side.
 | Mode | Behavior | Ships |
 |---|---|---|
 | `copy` | Download; **never** touch the remote. Local deletes do not propagate. **Default.** | v1 |
-| `move` | Download, verify, then delete the remote copy. | v1 |
+| `move` | Download, then delete the remote copy once every applicable rung of §7.3's ladder passes (verify, extract, *arr import if tracked). | v1 |
 | `sync` | Copy, plus propagate *local* deletes back to the remote. | **not scheduled** |
 
 `copy` is the default and is the only mode that is safe under every deployment shape. The other
@@ -1298,6 +1298,19 @@ mostly about why that is acceptable here and what keeps it acceptable.
 > mode, and the rate-based backstop (§7.3). **Not deferred:** `move` deletes remote data too, so
 > verification before deletion, deletes through our own asyncssh path (§7.4), and the full
 > `event` audit trail are all v1.
+>
+> **`sync`'s primary use case is now served without building it** (added 2026-08-16, alongside
+> §7.3's delete-ladder redesign, `prompts/done/2026-08-16-move-delete-gate-ladder.md`). The
+> workflow a reader would reach for `sync` to get — "the importer took it, now clean up the
+> source" — is exactly what `move`-with-the-ladder covers automatically, plus the Files page's
+> manual delete dialog for anything the ladder deliberately declines to resolve on its own (a
+> withheld or deferred item — no timeout, no automatic fallback, by design): the ladder's own
+> follow-on task (`prompts/2026-08-16-manual-delete-local-and-remote.md`) gives that dialog an
+> independent source-delete scope so a stuck item can be cleaned up entirely from the app.
+> `sync`'s own distinguishing feature would only be propagating a *local* delete the user (or
+> something other than lftpweb) performed by hand — a narrower, still-unbuilt case. **A future
+> session should not build `sync` "for tidiness"**; the workflow gap it would close is already
+> closed.
 
 ### 7.1 Why remote deletion is safe here: the hardlink pickup directory
 
@@ -1459,6 +1472,33 @@ them distinguishable, because a bind mount that didn't come up has no sentinel i
   the rename gate stayed permissive for the irreversible one (moving files into a library) — the
   inconsistency ran in the more alarming direction. Restoring the old delete gate alone would not
   fix that; the rename gate would still publish the same item it withheld the delete for.
+- **The delete is the last gate on the ladder, not the second-to-last** (redesigned
+  2026-08-16, `prompts/done/2026-08-16-move-delete-gate-ladder.md`, resolving open issue #2 /
+  `docs/audit-v0.1.0.md` G1 — a sanctioned design change, not an extension of the verification
+  gate above). Before this task, `core/postprocess.py._process_item` ran the `move`-mode delete
+  *between* verify and extract, so a `SKIPPED`-verify release (the common, sidecar-less case,
+  widened to every release by the 2026-08-14 verification-gate revision above) had its only
+  other copy deleted before extraction — the step most likely to still fail — ever ran. The
+  fix moves the delete to the *end* of the pipeline and adds the two rungs extraction and *arr
+  import were missing:
+  - **Extract.** If archives were present and extraction is enabled, extraction must have
+    succeeded; `EXTRACT_FAILED` *defers* the delete (event `remote_delete_deferred`, naming the
+    rung) rather than never reaching a state where it could withhold it, as before.
+  - ***arr import**, only for an item that is *arr-tracked (`item.arr_status` non-null) by the
+    time its pipeline run reaches the delete gate. `core/postprocess.py` hands the decision to
+    `core/arrsync.py` at that point (`item.remote_delete_pending` records the handoff, carrying
+    the verify evidence forward) rather than deleting; `core/arrsync.py` performs the delete —
+    through the same `perform_remote_delete`, never a second implementation — the moment an
+    association is confirmed `imported` (the existing three-layer, two-pass-confirmed signal),
+    and never on `gone`. An item on a bound queue that never matched (`arr_status` stays `NULL`
+    forever — a hand-dropped file, a replaced grab) is not made to wait on an *arr that has
+    never heard of it; it deletes at the extraction rung instead.
+
+  `CORRUPT` remains a hard veto at every rung, unchanged. There is no timeout and no automatic
+  fallback for a withheld or deferred item — it keeps its source until the user acts (fix
+  verify/extract and let the pipeline re-run, or the manual-delete dialog); every deferral
+  writes its own `remote_delete_deferred` event naming the rung, so History can answer "why is
+  this still on the seedbox" in one call.
 - **Dry-run mode.** Per queue, logs exactly what *would* be deleted and why, and acts on
   nothing. This is the expected way to turn `sync` on for the first time on a real tree.
 - **Full audit trail.** Every delete — and every delete *withheld*, with the failing

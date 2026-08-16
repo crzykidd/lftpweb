@@ -1435,8 +1435,13 @@ class Engine:
             # 2026-08-15 (prompts/2026-08-15-cleaned-item-grace-visibility.md): a `move`-queue
             # item this codebase's own arr cleanup just cleaned rests at `prev_state ==
             # "LOCAL_ONLY"` here, not one of `resolve_absence`'s `_STICKY_PREV_STATES` --
-            # `move` mode's remote-delete step already took the remote copy at download time
-            # (`postprocess._maybe_delete_remote`), so a verify-skipped item's `state` reads
+            # `move` mode's remote-delete step already took the remote copy before this cleanup
+            # ever ran -- `postprocess._maybe_delete_remote`'s rung-3 delete for an item that
+            # isn't *arr-tracked, or `core/arrsync.py`'s rung-4 handoff on the confirmed
+            # `imported` transition for one that is (prompts/done/
+            # 2026-08-16-move-delete-gate-ladder.md); either way, `_process_queue`'s own
+            # ordering runs the delete before the `arr_delete_completed` sweep that produces
+            # this `cleaned` row, by construction -- so a verify-skipped item's `state` reads
             # `LOCAL_ONLY` even before cleanup touches it (the honest "content complete,
             # nothing to compare against remotely" byte reading -- see
             # `postprocess.outcome_survives_rescan`'s own `remote_deleted_at`-gated `LOCAL_ONLY`
@@ -1474,10 +1479,13 @@ class Engine:
                 # never reaches this sweep at all: it is still in `all_paths` (the surviving
                 # remote entry), and `reconcile()`'s own predicate check -- fed this exact set
                 # via `build_scan_counts_predicate` -- already marks it `EXCLUDED` directly,
-                # before `_persist` ever sees it. A `move` queue has *already* deleted the
-                # remote copy too (`postprocess._maybe_delete_remote`, before extraction even
-                # runs), so this rel_path is absent from *both* trees and lands here instead --
-                # the live bug this closes: nine seconds after deletion, `resolve_absence` would
+                # before `_persist` ever sees it. A `move` queue usually deletes the remote copy
+                # too well within the same postprocess run (`postprocess._maybe_delete_remote`,
+                # now the pipeline's *last* step rather than running between verify and extract
+                # -- prompts/done/2026-08-16-move-delete-gate-ladder.md -- unless the item is
+                # *arr-tracked and rung 4 defers it), so this rel_path is usually absent from
+                # *both* trees and lands here instead -- the live bug this closes: nine seconds
+                # after deletion, `resolve_absence` would
                 # read the fresh "REMOTE_ONLY" as a disappearance and start a ten-minute
                 # `first_missing_at` countdown for a file removed on purpose, eventually
                 # resolving to `REMOVED_BOTH`. Resolving straight to `EXCLUDED` here instead

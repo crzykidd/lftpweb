@@ -14,6 +14,20 @@ already failed once (`_maybe_retry_notify` -- the actual POST and event-writing 
 `core/arrnotify.py.notify_arr`, shared by both callers so there is exactly one implementation),
 and **cleanup** (`_maybe_cleanup`) for an `imported` item on an `arr_delete_completed` queue.
 
+**Rung 4 of the move-mode delete ladder** (`_maybe_delete_remote_on_import`, added 2026-08-16,
+`prompts/done/2026-08-16-move-delete-gate-ladder.md`, resolving open issue #2 /
+`docs/audit-v0.1.0.md` G1): `core/postprocess.py._maybe_delete_remote` defers a `move`-mode
+item's remote delete here, rather than performing it, whenever the item is *arr-tracked
+(`arr_status` non-null) by the time its own pipeline run reaches the delete gate -- recorded in
+`item.remote_delete_pending`. This module performs the deferred delete (via
+`perform_remote_delete`, the one implementation, never a second one) the moment `_commit_terminal`
+confirms `imported`, and *before* this poller pass's own `arr_delete_completed` cleanup sweep --
+so "import green -> delete source -> (optionally) delete local" holds even within a single pass.
+Never on `gone`. `remote_pool`/`host_provider` are optional, plain-attribute-after-construction
+seams (like `in_flight_provider`/`delete_in_flight` below) -- `None` (a test fixture that doesn't
+wire them) simply leaves a deferred item deferred for a later pass, the same "no-op until wired"
+shape `_maybe_notify_arr` uses for a missing `config_dir`.
+
 **The two-consecutive-passes quiescence guard is in-memory, not persisted** (deliberately: the
 spec's "Data model" section specifies exactly three new `item` columns and no new table for this
 feature, unlike `core/settle.py`'s `item_settle`). A restart loses any pending candidacy and
@@ -51,7 +65,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 import aiosqlite
 
@@ -68,6 +82,7 @@ from lftpweb.core.crypto import DecryptionError, decrypt_secret
 from lftpweb.core.events import EventBus
 from lftpweb.core.itemview import item_view
 from lftpweb.core.local_delete import DeleteInFlight, _do_remove_from_disk, _physical_local_root
+from lftpweb.core.postprocess import perform_remote_delete
 
 logger = logging.getLogger(__name__)
 
@@ -222,6 +237,14 @@ class ArrSyncScheduler:
     racing it, the same "in-memory, protected only while a worker actually holds it" guarantee
     every other deleter in this codebase gets. Both default to `None` (no-op) so every existing
     test of this module that never touches cleanup is unaffected.
+
+    Rung 4 of the move-mode delete ladder (this module's own docstring, 2026-08-16) adds
+    `remote_pool`/`host_provider` -- the identical seam `core/postprocess.py.PostprocessPipeline`
+    takes for the same job (`RemoteConnectionPool.delete_path`, and the callable that decrypts
+    the seedbox host config), loosely typed (`Any`) for the same reason that constructor leaves
+    `host_provider` loose. Both default to `None` so every existing test of this module is
+    unaffected; production wiring (`main.py`) passes `app.state.engine.pool` and the same
+    `_host_provider` closure `PostprocessPipeline` gets.
     """
 
     MIN_POLL_INTERVAL_S = 5.0  # floor against a misconfigured near-zero setting
@@ -233,12 +256,16 @@ class ArrSyncScheduler:
         events: EventBus | None = None,
         in_flight_provider: Callable[[], frozenset[int]] | None = None,
         delete_in_flight: DeleteInFlight | None = None,
+        remote_pool: Any = None,
+        host_provider: Any = None,
     ) -> None:
         self.db = db
         self.config_dir = config_dir
         self.events = events
         self.in_flight_provider = in_flight_provider
         self.delete_in_flight = delete_in_flight
+        self.remote_pool = remote_pool
+        self.host_provider = host_provider
         self._task: asyncio.Task | None = None
         self._backoff: dict[int, _InstanceBackoff] = {}
         self._pending: dict[int, _PendingVerdict] = {}
@@ -388,14 +415,17 @@ class ArrSyncScheduler:
                 # `item.arr_status == 'detected'` gate is what actually decides "notified"
                 # never re-enters this branch, not this `if`).
                 await self._maybe_retry_notify(queue, item)
-            await self._check_import(client, queue_id, item, records)
+            await self._check_import(client, queue, item, records)
 
         if queue["arr_delete_completed"]:
             # A fresh query, not the stale `items` snapshot above -- `_check_import` may have
             # just committed an item to `imported` this very pass (spec: "Withheld is
             # re-evaluated on later passes, not terminal" implies the reverse too: a
             # newly-imported item must not wait an extra pass before cleanup is even
-            # considered).
+            # considered). It also runs *after* `_check_import`'s own rung-4 remote delete
+            # (`_commit_terminal` -> `_maybe_delete_remote_on_import`), so an imported item this
+            # very pass already has its remote copy gone before this sweep even queries --
+            # "import green -> delete source -> (optionally) delete local," per the ladder.
             cursor = await self.db.execute(
                 "SELECT * FROM item WHERE queue_id = ? AND arr_status = 'imported'", (queue_id,)
             )
@@ -663,7 +693,7 @@ class ArrSyncScheduler:
     async def _check_import(
         self,
         client: ArrClient,
-        queue_id: int,
+        queue: aiosqlite.Row,
         item: aiosqlite.Row,
         records: list[QueueRecord],
     ) -> None:
@@ -705,7 +735,7 @@ class ArrSyncScheduler:
             and prior.verdict == candidate_verdict
             and prior.download_id == download_id
         ):
-            await self._commit_terminal(queue_id, item, candidate_verdict, len(history))
+            await self._commit_terminal(queue, item, candidate_verdict, len(history))
             self._pending.pop(item_id, None)
         else:
             self._pending[item_id] = _PendingVerdict(
@@ -714,11 +744,12 @@ class ArrSyncScheduler:
 
     async def _commit_terminal(
         self,
-        queue_id: int,
+        queue: aiosqlite.Row,
         item: aiosqlite.Row,
         verdict: Literal["imported", "gone"],
         import_event_count: int,
     ) -> None:
+        queue_id = queue["id"]
         await self.db.execute(
             "UPDATE item SET arr_status = ?, arr_status_at = ? WHERE id = ?",
             (verdict, _now_iso(), item["id"]),
@@ -740,6 +771,84 @@ class ArrSyncScheduler:
             self.db, level="info", kind=kind, item_id=item["id"], message=message
         )
         await self._publish_item(queue_id, item["id"])
+
+        if verdict == "imported":
+            # Rung 4 of the move-mode delete ladder (this module's own docstring) -- runs
+            # before this pass's `arr_delete_completed` cleanup sweep (`_process_queue`'s own
+            # ordering: `_check_import` -> here -> the cleanup loop), so "import green -> delete
+            # source -> (optionally) delete local" holds even within a single poller pass.
+            # Never called on `gone`.
+            await self._maybe_delete_remote_on_import(queue, item["id"])
+
+    # --- Rung 4 of the move-mode delete ladder (this module's own docstring, 2026-08-16) -----
+
+    async def _maybe_delete_remote_on_import(self, queue: aiosqlite.Row, item_id: int) -> None:
+        """`core/postprocess.py._maybe_delete_remote` defers a `move`-mode item's delete here
+        (`item.remote_delete_pending` non-null) the moment it discovers, at the tail of its own
+        pipeline run, that the item is *arr-tracked -- rungs 1-3 (completeness, verify, extract)
+        had already cleared *then*, which is exactly what authorizes performing the delete now,
+        unconditionally, once `_commit_terminal` confirms `imported`. No re-derivation of
+        verify/extract state happens here: `remote_delete_pending` carries the verify evidence
+        forward (`'VERIFIED'` or `'SKIPPED'`) so the eventual delete event reads exactly as
+        informative as an immediate rung-3 delete's, via the same `perform_remote_delete`.
+
+        A no-op, deliberately, for: a `copy`/`sync` queue (`remote_delete_pending` is never set
+        for those); an item that was never deferred, including one `_maybe_delete_remote` found
+        `CORRUPT`/`EXTRACT_FAILED` (that function clears the column on those branches rather
+        than setting it, so "CORRUPT vetoes at every rung" holds all the way out here too); an
+        item whose remote copy is already gone (`remote_deleted_at` set -- idempotent against a
+        queue record briefly reappearing); and a process that never wired `remote_pool`/
+        `host_provider` (a test fixture that doesn't exercise this feature -- the item simply
+        stays deferred for a later pass, the same as a missing host in the immediate rung-3
+        case).
+        """
+        if queue["sync_mode"] != "move" or self.remote_pool is None or self.host_provider is None:
+            return
+
+        cursor = await self.db.execute(
+            "SELECT rel_path, remote_delete_pending, remote_deleted_at FROM item WHERE id = ?",
+            (item_id,),
+        )
+        row = await cursor.fetchone()
+        if (
+            row is None
+            or row["remote_delete_pending"] is None
+            or row["remote_deleted_at"] is not None
+        ):
+            return
+
+        queue_id = queue["id"]
+        host = await self.host_provider()
+        if host is None:
+            await audit.record_event(
+                self.db,
+                level="error",
+                item_id=item_id,
+                kind="remote_delete_withheld",
+                message=(
+                    f"queue {queue_id} ({queue['name']!r}) mode=move: delete withheld -- "
+                    "no host configured"
+                ),
+            )
+            return
+
+        remote_full = queue["remote_path"].rstrip("/") + "/" + row["rel_path"]
+        ok = await perform_remote_delete(
+            self.db,
+            self.remote_pool,
+            host,
+            item_id=item_id,
+            queue_id=queue_id,
+            queue_name=queue["name"],
+            remote_full=remote_full,
+            verify_state=row["remote_delete_pending"],
+        )
+        if ok:
+            await self.db.execute(
+                "UPDATE item SET remote_delete_pending = NULL WHERE id = ?", (item_id,)
+            )
+            await self.db.commit()
+        await self._publish_item(queue_id, item_id)
 
     # --- Publish (persist -> read back -> publish, DESIGN.md §2.2) ---------------------------
 

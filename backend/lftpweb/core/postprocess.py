@@ -39,18 +39,41 @@ this shape; brought in line by `prompts/2026-08-13-per-queue-archive-cleanup.md`
 also the most destructive of the four (it can be the last copy of an archive's compressed bytes
 anywhere, on a `move` queue -- see `_do_extract` below).
 
-**Deletion (§7.4).** `move` deletes the remote copy unless verification returns `CORRUPT` --
-real evidence the download is bad. `SKIPPED` (no `.sfv`/`.md5` sidecar and hash-on-disk
-verification disabled -- "no evidence either way") does **not** withhold: by the time this
-runs, the item has already cleared lftp's own exit-0 check, the settle gate, and a filesystem
-completeness check (`core/queue.py`: no leftover `.lftp`/temp files, local bytes >= remote
-total), so the rule is "verification must not have failed," not "verification must have run"
-(2026-08-14, docs/decisions.md). Every delete and every withheld delete writes an `event` row
-(`core/audit.py`) naming the item, the queue, the mode, and the gating condition -- and a
-delete backed only by that completeness evidence, with no checksum behind it, says so in its
-own message rather than reading identically to a checksum-verified one. Deletion itself always
-goes through `core/remote.py`'s pooled asyncssh connection (`RemoteConnectionPool.delete_path`),
-never lftp's `--Remove-source-files`.
+**Deletion is a ladder (§7.3/§7.4; redesigned 2026-08-16,
+prompts/done/2026-08-16-move-delete-gate-ladder.md, resolving open issue #2 /
+docs/audit-v0.1.0.md G1).** `move` deletes the remote copy only once every applicable rung has
+passed, in order, and not before -- so the source stays inspectable on both sides for as long
+as any later step could still fail:
+
+1. **Completeness** (always) -- already true by the time this runs (`core/queue.py`'s own gate:
+   no leftover `.lftp`/temp files, local bytes >= remote total).
+2. **Verify** -- `CORRUPT` (real evidence the download is bad) withholds permanently; `SKIPPED`
+   (no `.sfv`/`.md5` sidecar and hash-on-disk verification disabled -- "no evidence either way")
+   does **not** withhold, so the rule is "verification must not have failed," not "verification
+   must have run" (2026-08-14, docs/decisions.md).
+3. **Extract** -- if archives were present and extraction is enabled, extraction must have
+   succeeded; `EXTRACT_FAILED` *defers* the delete (event `remote_delete_deferred`) rather than
+   letting it fire before the failure could even be observed, which is exactly the bug this
+   redesign closes: extraction used to run *after* the delete, so a `SKIPPED`-verify release
+   whose extract later failed had already lost its only other copy.
+4. ***arr import* -- only when the item is *arr-tracked (`item.arr_status` non-null) by the
+   time this runs. Rungs 1-3 clearing hands the decision to `core/arrsync.py` instead of
+   deleting here (`item.remote_delete_pending` records that handoff, per migration
+   `019_move_delete_ladder.sql`); the actual delete fires on the confirmed `imported`
+   transition, never on `gone`. An item on a bound queue that never matched (`arr_status`
+   stays `NULL`) is not made to wait on an *arr that has never heard of it -- it deletes right
+   here, at rung 3.
+
+There is no timeout and no automatic fallback: a withheld or deferred item keeps its source
+until the user acts (fix verify/extract and let the pipeline re-run, or the manual-delete
+dialog). Every delete, every permanent withhold, and every deferral writes an `event` row
+(`core/audit.py`) naming the item, the queue, the mode, and the gating condition -- so History
+can answer "why is this still on the seedbox" in one call -- and a delete backed only by
+completeness evidence, with no checksum behind it, says so in its own message rather than
+reading identically to a checksum-verified one. Deletion itself always goes through
+`core/remote.py`'s pooled asyncssh connection (`RemoteConnectionPool.delete_path`) via this
+module's `perform_remote_delete` -- the one implementation, reused by `core/arrsync.py`'s rung-4
+handoff rather than duplicated -- never lftp's `--Remove-source-files`.
 
 **The staging move and `REMOVED_LOCAL`.** After a successful move-to-staging, this module
 does *not* set a new item state -- it deliberately reuses the machinery phase 4 already built
@@ -377,6 +400,63 @@ class _RemotePool(Protocol):
     async def delete_path(self, host: HostConfig, remote_path: str) -> None: ...
 
 
+async def perform_remote_delete(
+    db: aiosqlite.Connection,
+    remote_pool: _RemotePool,
+    host: HostConfig,
+    *,
+    item_id: int,
+    queue_id: int,
+    queue_name: str,
+    remote_full: str,
+    verify_state: str,
+) -> bool:
+    """Do the actual asyncssh delete and record the outcome (DESIGN.md §7.4) -- the one
+    implementation, shared by `PostprocessPipeline._maybe_delete_remote` (the common case: an
+    item that isn't *arr-tracked, deleting at rung 3) and `core/arrsync.py`'s rung-4 handoff (an
+    *arr-tracked item, deleting on the confirmed `imported` transition) -- per this task's own
+    instruction not to write a second delete implementation. The caller has already decided
+    every applicable rung passed; this function's only job is "do it and write the event,"
+    exactly the same way regardless of which rung authorized it.
+
+    Returns whether the delete succeeded. Never raises -- a failed delete is recorded
+    (`remote_delete_failed`) and reported false, not propagated, the same "always recorded,
+    never re-raised" rule the pipeline follows everywhere else it touches the network.
+    """
+    try:
+        await remote_pool.delete_path(host, remote_full)
+    except Exception as exc:  # noqa: BLE001 - always recorded, never re-raised
+        logger.exception("move-mode delete failed for item %s (%s)", item_id, remote_full)
+        await audit.record_event(
+            db,
+            level="error",
+            item_id=item_id,
+            kind="remote_delete_failed",
+            message=f"queue {queue_id} ('{queue_name}') mode=move: delete of {remote_full} failed: {exc}",
+        )
+        return False
+
+    await db.execute("UPDATE item SET remote_deleted_at = ? WHERE id = ?", (_now_iso(), item_id))
+    await db.commit()
+    # Same `kind="remote_delete"` either way -- History filters and `docs/` reference that kind,
+    # and a completeness-only delete is not a different *kind* of event, just one with weaker
+    # evidence behind it. The message and level are what tell them apart.
+    if verify_state == "VERIFIED":
+        level = "info"
+        message = f"queue {queue_id} ('{queue_name}') mode=move: deleted verified remote copy {remote_full}"
+    else:  # SKIPPED
+        level = "warning"
+        message = (
+            f"queue {queue_id} ('{queue_name}') mode=move: deleted remote copy {remote_full} "
+            "on completeness evidence alone (no .sfv/.md5 sidecar; hash-on-disk verification "
+            "disabled)"
+        )
+    await audit.record_event(
+        db, level=level, item_id=item_id, kind="remote_delete", message=message
+    )
+    return True
+
+
 class PostprocessPipeline:
     """Owns scheduling (one asyncio task per triggered item, bounded by
     `PostprocessSettings.concurrency`) and the verify/delete/extract/move sequence for one
@@ -533,9 +613,6 @@ class PostprocessPipeline:
         if verify_effective:
             verify_state = await self._do_verify(item, local_root, settings)
 
-        if sync_mode == "move":
-            await self._maybe_delete_remote(item, queue, verify_state)
-
         extract_state: str | None = None
         if extract_effective:
             extract_state = await self._do_extract(item, queue, local_root, settings, verify_state)
@@ -644,6 +721,13 @@ class PostprocessPipeline:
         if notify_ok and notify_final_root is not None:
             await self._maybe_notify_arr(item, queue, notify_final_root)
 
+        # The move-mode delete ladder (DESIGN.md §7.3/§7.4; redesigned 2026-08-16, see the
+        # module docstring) -- deliberately the *last* thing this run does: it must see
+        # whatever `_maybe_notify_arr` just did (an *arr match can land between this pipeline
+        # starting and here) and every other step's outcome, not just verify's.
+        if sync_mode == "move":
+            await self._maybe_delete_remote(item, queue, verify_state, extract_state)
+
     def _move_destination(self, item: Any, queue: Any) -> Path:
         """The staging-move target (`_do_move`'s own destination formula, factored out so
         `_process_item`'s notify computation can name the same final path without
@@ -719,25 +803,32 @@ class PostprocessPipeline:
         await self._publish(item["id"])
         return result.state
 
-    async def _maybe_delete_remote(self, item: Any, queue: Any, verify_state: str | None) -> None:
-        """The `move`-mode delete gate (DESIGN.md §7.3/§7.4). Every branch -- delete or
-        withhold -- writes an `event` row before returning; there is no silent path here.
+    async def _maybe_delete_remote(
+        self, item: Any, queue: Any, verify_state: str | None, extract_state: str | None
+    ) -> None:
+        """The `move`-mode delete ladder (DESIGN.md §7.3/§7.4; redesigned 2026-08-16, see the
+        module docstring's "Deletion is a ladder" paragraph for the full rung-by-rung account --
+        `prompts/done/2026-08-16-move-delete-gate-ladder.md`, resolving open issue #2 /
+        `docs/audit-v0.1.0.md` G1). Every branch -- delete, permanent withhold, or defer --
+        writes an `event` row before returning; there is no silent path here, and there is no
+        timeout or automatic fallback for a withheld/deferred item: it keeps its source until
+        the user acts.
 
-        **Withholds only on `CORRUPT`** -- real evidence the download is bad. `SKIPPED` ("no
-        `.sfv`/`.md5` sidecar and hash-on-disk verification disabled") is *not* a failure and
-        proceeds to delete: by the time this runs, the item has already cleared lftp's own
-        exit-0 check, the settle gate, and `core/queue.py`'s filesystem completeness check
-        (no leftover `.lftp`/temp files, local bytes >= remote total) -- the evidence chain
-        the old "verified, or nothing" rule (DESIGN.md §7.3, phase 5) predates. The rule is
-        "verification must not have failed," not "verification must have run." See
-        `docs/decisions.md` (2026-08-14) for the full reasoning and the residual risk this
-        accepts: bytes present in count but wrong in content, which no amount of completeness
-        evidence can catch and only a checksum sidecar (or the hash-on-disk fallback) can.
+        Called once, at the tail of `_process_item`, after verify *and* extract have both
+        already run (unlike the pre-2026-08-16 shape, which ran this between them) -- so
+        `verify_state`/`extract_state` are this run's final results, not a partial view.
         """
         item_id = item["id"]
         queue_id = queue["id"]
 
         if verify_state == "CORRUPT":
+            # Rung 2, hard veto -- real evidence the download is bad, at every rung, forever.
+            # Clears any stale rung-4 handoff from an earlier pass so a later *arr import can
+            # never authorize a delete this run just found reason to withhold.
+            await self.db.execute(
+                "UPDATE item SET remote_delete_pending = NULL WHERE id = ?", (item_id,)
+            )
+            await self.db.commit()
             await audit.record_event(
                 self.db,
                 level="warning",
@@ -760,6 +851,10 @@ class PostprocessPipeline:
             # folded into the `CORRUPT` case above, so a future reader doesn't "simplify" the
             # two back together: one is evidence of a bad download, the other is evidence
             # this function's own precondition broke.
+            await self.db.execute(
+                "UPDATE item SET remote_delete_pending = NULL WHERE id = ?", (item_id,)
+            )
+            await self.db.commit()
             await audit.record_event(
                 self.db,
                 level="error",
@@ -770,6 +865,59 @@ class PostprocessPipeline:
                     "verification never ran for this move-mode item, which should be "
                     "impossible (verification is forced on for every move queue) -- treating "
                     "as a bug rather than deleting on no information at all"
+                ),
+            )
+            await self._publish(item_id)
+            return
+
+        if extract_state == "EXTRACT_FAILED":
+            # Rung 3: an archive release whose extraction just failed is *deferred*, not
+            # withheld -- the exact gap this redesign closes (extraction used to run after the
+            # delete, so this state was unreachable with the remote copy still present). Fixing
+            # extraction and letting the pipeline re-run re-evaluates this from scratch.
+            await self.db.execute(
+                "UPDATE item SET remote_delete_pending = NULL WHERE id = ?", (item_id,)
+            )
+            await self.db.commit()
+            await audit.record_event(
+                self.db,
+                level="warning",
+                item_id=item_id,
+                kind="remote_delete_deferred",
+                message=(
+                    f"queue {queue_id} ('{queue['name']}') mode=move: source retained -- "
+                    "awaiting extraction (last attempt failed); no automatic retry -- fix "
+                    "extraction and re-run this item's pipeline, or delete by hand"
+                ),
+            )
+            await self._publish(item_id)
+            return
+
+        # Rung 4: *arr import, only for an *arr-tracked item. A fresh read, not `item["arr_status"]`
+        # from the row `_process_item` fetched at the top of this run -- `core/arrsync.py`'s
+        # poller runs on its own clock (docs/arr-integration-spec.md "The poller": "not wired
+        # into the scan pass") and can have matched this item after this pipeline started.
+        current = await self._fetch_item(item_id)
+        arr_status = current["arr_status"] if current is not None else item["arr_status"]
+        if arr_status is not None:
+            # Rungs 1-3 have all cleared -- record that (carrying `verify_state` forward as the
+            # evidence a later rung-4 delete will cite) and hand the decision to
+            # `core/arrsync.py`, which performs the delete on the confirmed `imported`
+            # transition, never on `gone`.
+            await self.db.execute(
+                "UPDATE item SET remote_delete_pending = ? WHERE id = ?", (verify_state, item_id)
+            )
+            await self.db.commit()
+            await audit.record_event(
+                self.db,
+                level="info",
+                item_id=item_id,
+                kind="remote_delete_deferred",
+                message=(
+                    f"queue {queue_id} ('{queue['name']}') mode=move: source retained -- "
+                    f"awaiting *arr import (arr_status={arr_status!r}); deletes once "
+                    "core/arrsync.py confirms the import, never while the *arr has not "
+                    "reported it"
                 ),
             )
             await self._publish(item_id)
@@ -788,47 +936,15 @@ class PostprocessPipeline:
             return
 
         remote_full = queue["remote_path"].rstrip("/") + "/" + item["rel_path"]
-        try:
-            await self.remote_pool.delete_path(host, remote_full)
-        except Exception as exc:  # noqa: BLE001 - always recorded, never re-raised
-            logger.exception("move-mode delete failed for item %s (%s)", item_id, remote_full)
-            await audit.record_event(
-                self.db,
-                level="error",
-                item_id=item_id,
-                kind="remote_delete_failed",
-                message=f"queue {queue_id} ('{queue['name']}') mode=move: delete of {remote_full} failed: {exc}",
-            )
-            await self._publish(item_id)
-            return
-
-        await self.db.execute(
-            "UPDATE item SET remote_deleted_at = ? WHERE id = ?", (_now_iso(), item_id)
-        )
-        await self.db.commit()
-        # Same `kind="remote_delete"` either way -- History filters and `docs/` reference that
-        # kind, and a completeness-only delete is not a different *kind* of event, just one
-        # with weaker evidence behind it. The message and level are what tell them apart: a
-        # human reading History can see at a glance which deletes had a checksum behind them.
-        if verify_state == "VERIFIED":
-            level = "info"
-            message = (
-                f"queue {queue_id} ('{queue['name']}') mode=move: deleted verified remote copy "
-                f"{remote_full}"
-            )
-        else:  # SKIPPED
-            level = "warning"
-            message = (
-                f"queue {queue_id} ('{queue['name']}') mode=move: deleted remote copy "
-                f"{remote_full} on completeness evidence alone (no .sfv/.md5 sidecar; "
-                "hash-on-disk verification disabled)"
-            )
-        await audit.record_event(
+        await perform_remote_delete(
             self.db,
-            level=level,
+            self.remote_pool,
+            host,
             item_id=item_id,
-            kind="remote_delete",
-            message=message,
+            queue_id=queue_id,
+            queue_name=queue["name"],
+            remote_full=remote_full,
+            verify_state=verify_state,
         )
         await self._publish(item_id)
 

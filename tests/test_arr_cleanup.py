@@ -403,6 +403,102 @@ async def test_gone_items_are_never_cleaned(db, fake_arr_server, tmp_path):
     assert "arr_cleanup_withheld" not in await _event_kinds(db, item_id)
 
 
+# --- The move-delete ladder composes with cleanup: source first, then local (2026-08-16,
+# prompts/done/2026-08-16-move-delete-gate-ladder.md, resolving open issue #2 /
+# docs/audit-v0.1.0.md G1) -----------------------------------------------------------------
+
+
+class _FakeRemotePool:
+    """Same shape as `tests/test_postprocess.py`'s own fake -- kept local to this file rather
+    than imported, same reasoning as `tests/test_arrsync.py`'s copy.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[object, str]] = []
+
+    async def delete_path(self, host, remote_path: str) -> None:
+        self.calls.append((host, remote_path))
+
+
+async def _async_host():
+    from lftpweb.core.remote import HostConfig
+
+    return HostConfig(
+        id=1, address="seedbox.invalid", port=22, username="u", auth_method="key", key_path="/k"
+    )
+
+
+async def test_cleanup_composes_with_the_move_mode_delete_ladder_source_then_local(
+    db, fake_arr_server, tmp_path
+):
+    """Rung 4 of the move-mode delete ladder (`core/arrsync.py._maybe_delete_remote_on_import`)
+    must fire *before* this same poller pass's `arr_delete_completed` cleanup sweep -- "import
+    green -> delete source -> (optionally) delete local," even within a single pass, never the
+    reverse.
+    """
+    local_root = tmp_path / "local"
+    local_root.mkdir()
+    rel_path = "Release.File.mkv"
+    (local_root / rel_path).write_bytes(b"the release")
+
+    host_id = await _seed_host(db)
+    instance_id = await _seed_instance(
+        db, str(tmp_path), base_url=fake_arr_server.base_url, api_key=fake_arr_server.state.api_key
+    )
+    queue_id = await _seed_queue(
+        db,
+        host_id,
+        local_path=str(local_root),
+        arr_instance_id=instance_id,
+        arr_delete_completed=True,
+    )
+    await db.execute("UPDATE path_queue SET sync_mode = 'move' WHERE id = ?", (queue_id,))
+    await db.commit()
+    item_id = await _seed_item(
+        db,
+        queue_id,
+        rel_path,
+        state="DOWNLOADED",
+        arr_status="detected",
+        arr_download_id="abc123",
+    )
+    # Simulates `core/postprocess.py`'s own rung-1-3 handoff: verify+extract already cleared for
+    # this item, deferred here only because it was already *arr-tracked when the pipeline's
+    # delete gate ran.
+    await db.execute("UPDATE item SET remote_delete_pending = 'VERIFIED' WHERE id = ?", (item_id,))
+    await db.commit()
+
+    write_if_needed(str(local_root))
+    fake_arr_server.state.queue_records = []
+    fake_arr_server.state.history_events = [_import_event(download_id="abc123")]
+
+    pool = _FakeRemotePool()
+    scheduler = ArrSyncScheduler(
+        db=db,
+        config_dir=str(tmp_path),
+        remote_pool=pool,
+        host_provider=_async_host,
+    )
+    await scheduler.run_once()  # first observing pass -- not yet confirmed
+    assert pool.calls == []
+    assert (local_root / rel_path).exists()
+
+    await scheduler.run_once()  # second consecutive pass -- confirmed
+    row = await _item_row(db, item_id)
+    assert row["arr_status"] == "cleaned"
+    assert row["remote_deleted_at"] is not None
+    assert row["remote_delete_pending"] is None
+    assert not (local_root / rel_path).exists()
+
+    assert len(pool.calls) == 1
+    _, remote_path = pool.calls[0]
+    assert remote_path == f"/r/{rel_path}"
+
+    kinds = await _event_kinds(db, item_id)
+    assert kinds.index("remote_delete") < kinds.index("arr_cleanup")
+    assert "arr_imported" in kinds
+
+
 # --- Notify retry (spec "Notify": "retry on the next poller tick (bounded retries)") --------
 
 

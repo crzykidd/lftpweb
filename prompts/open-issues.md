@@ -1,10 +1,11 @@
 # Open issues — 2026-08-12 / 2026-08-13 / 2026-08-14 sessions
 
 > **2026-08-14: `v0.1.0` shipped.** The first tagged release, a beta. Everything below that is
-> not struck through is post-release work. The three items most worth a fresh session's
-> attention are **issue #2** (`move` deletes the remote before extraction runs — now exercised
-> on every release, not just checksummed ones), **`AuthSettingsIn`'s silent-reset shape** (a
-> trusted-CIDR list that can quietly empty itself), and **row lifetime / issue #1**.
+> not struck through is post-release work. **Issue #2** (`move` deletes the remote before
+> extraction runs) was resolved by design on 2026-08-16 — see that entry below and
+> `docs/decisions.md`. The two items most worth a fresh session's attention now are
+> **`AuthSettingsIn`'s silent-reset shape** (a trusted-CIDR list that can quietly empty itself)
+> and **row lifetime / issue #1**.
 
 A living list, not a handoff prompt. It never moves to `done/`.
 
@@ -171,11 +172,9 @@ split, `90df1ea`), **P3** (`core/local_delete.py` split, `d480885`), and **P1 in
 → `lib/fileTree.ts`, `0cb294f`). The full audit doc has every finding's detail and the fix commit.
 **What's left, deliberately, for a session with the user in the loop:**
 
-- **G1 — `move`-mode delete runs before extraction.** This is the same thing as **issue #2**
-  below (a no-sidecar release verifies `SKIPPED`, its remote is deleted, then extraction may
-  fail — the only re-fetchable source already gone). It's a *design call*, not a mechanical fix:
-  either delete after a successful extract, or make the delete gate also require extraction not to
-  have failed (mirroring the download-prefix `release_ok` rule). Don't resolve it unilaterally.
+- ~~**G1 — `move`-mode delete runs before extraction.**~~ **Resolved by design, 2026-08-16** —
+  same item as **issue #2** below; see that entry and `docs/decisions.md` for the settled
+  four-rung ladder.
 - **G2 — `net:connection-limit` has no write path.** §4.5 calls it "first-class, host-level," but
   it lives only in the `host.connection_overrides` JSON blob with no UI/endpoint. Needs a
   migration (promote to a real column) + a Settings field. A scoped feature, not a one-liner.
@@ -382,18 +381,18 @@ consumer checked.
 - **`re_download_externally_removed` is site-level, not per-queue**, though
   `auto_queue_enabled` and `sync_mode` are both already per-queue columns and it only matters
   for `copy` queues. Needs a migration.
-- **`move` deletes the remote *before* extraction runs.**
+- ~~**`move` deletes the remote *before* extraction runs.**~~ **Resolved by design, 2026-08-16.**
   [Issue #2](https://github.com/crzykidd/lftpweb/issues/2) — filed 2026-08-15 with the full
-  reasoning, the proposed fix, and the tradeoff. A failed extraction happens after the remote
-  copy is gone; local archives survive, so it is recoverable. The user's call on 2026-08-13 was
-  "leave it, revisit if it bites." **It bit on 2026-08-14.** Deferred again on 2026-08-15 —
-  deliberately, to an issue rather than a prompt.
+  reasoning, the proposed fix, and the tradeoff; deferred twice (2026-08-13, 2026-08-15) before
+  being resolved. The fix: the delete is now the *last* gate on a four-rung ladder
+  (completeness, verify, extract, and — new — *arr import for a tracked item), not the second
+  step. See `docs/decisions.md` (2026-08-16) and
+  `prompts/done/2026-08-16-move-delete-gate-ladder.md` for the full settled design and the
+  rejected alternative (an early-delete toggle). Also closes `docs/audit-v0.1.0.md` G1.
 
   **`6883db3` widened its exposure**: a sidecar-less release used to be withheld at the delete
-  gate and never reached this window at all; now it deletes like any other, so the gap between
-  "remote gone" and "archives proven extractable" is exercised on every release. Not a
-  regression from that commit, but the reason this is worth more than it was when first
-  deferred. Do not reorder it as a side effect of unrelated work.
+  gate and never reached this window at all; the ladder is what re-narrowed it back down,
+  permanently, rather than reverting that commit.
 - **Encrypted-rar password retry is implemented but untestable** — no compressor exists
   anywhere to build an encrypted fixture. Real-archive rar coverage is old-style `.r00` only,
   not `.partNN`. **The user generated real `.partNN.rar` sets on 2026-08-14** (visible in that

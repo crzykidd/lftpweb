@@ -760,7 +760,7 @@ class TransferQueue:
 
             # 2026-08-13 (prompts/2026-08-13-delete-state-truthfulness.md, defect 3's "real
             # fix"): a final, accurate, un-throttled reading of every child row before anything
-            # downstream (post-processing's verify/delete/extract/move) can touch this job's
+            # downstream (post-processing's verify/extract/move/delete) can touch this job's
             # files -- see `_flush_child_progress_final`'s own docstring for the bug this
             # closes. A no-op for a `pget` job (single file, no children) and cheap for a
             # `mirror` job either way (bounded by the release's own file count, the same walk
