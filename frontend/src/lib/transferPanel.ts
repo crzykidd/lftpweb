@@ -90,6 +90,15 @@ export function transferGroupFields(
       title: 'Time this job spent running -- started_at to finished_at, or to now while still running',
     })
   }
+  // 2026-08-16: the panel half of "exact timestamp on hover/in the panel" -- the collapsed
+  // line's `completedTimeLabel` reading, repeated here since a terminal job's `finished_at`
+  // itself was otherwise only *implied* by `Elapsed` (a duration, not a point in time), unlike
+  // every other milestone this panel shows (`processingGroupFields`' Verified/Extracted/
+  // Remote-deleted, all label/relative-value/exact-title triples).
+  const completed = completedTimeLabel(job)
+  if (completed != null) {
+    fields.push({ label: 'Completed', value: completed.value, title: completed.title })
+  }
   if (avgSpeed != null) {
     fields.push({
       label: 'Average speed',
@@ -157,6 +166,68 @@ export function processingGroupFields(job: JobOut): PanelField[] {
     })
   }
   return fields
+}
+
+/** The states `completedTimeLabel`/`sortTransferRows` below treat as "this job is done, not
+ * still moving through the queue" -- the same three terminal states `isDismissable` above
+ * already names, kept as its own set here since the two functions' callers (a row's collapsed
+ * line, and the whole list's ordering) don't otherwise share an import.
+ */
+const TERMINAL_JOB_STATES: ReadonlySet<JobOut['state']> = new Set(['succeeded', 'failed', 'cancelled'])
+
+/** A terminal row's completed-time reading for the collapsed line (2026-08-16, user report from
+ * live use of the single-line rows this file already builds: "each terminal row should show when
+ * it completed"). `value` is the compact relative form (`formatRelativeTimeIntl`, the same
+ * reading `processingGroupFields`' Verified/Extracted/Remote-deleted fields already use), `title`
+ * the exact timestamp for hover -- same value/title split as every other timestamp on this page.
+ * `null` for an active job (queued/running show what they show today, per the task's own
+ * instruction -- nothing to add here) and for a terminal job that somehow has no `finished_at`
+ * yet (a job reaped without the column being set would be a backend bug, not something to paper
+ * over with a fabricated time).
+ */
+export function completedTimeLabel(job: JobOut): { value: string; title: string } | null {
+  if (!TERMINAL_JOB_STATES.has(job.state) || job.finished_at == null) return null
+  return {
+    value: formatRelativeTimeIntl(job.finished_at),
+    title: new Date(job.finished_at).toLocaleString(),
+  }
+}
+
+/** The Transfers page's row order (2026-08-16, same user report as `completedTimeLabel` above:
+ * "the list should sort by that"). **Replaces the previous implicit order for terminal rows**:
+ * before this, the whole list -- active and terminal alike -- came straight off `GET /api/jobs`
+ * in `core/queue.py.list_jobs`'s own `ORDER BY job.rank DESC, job.queued_at ASC`, which is the
+ * *scheduler's* run order and says nothing about when a terminal job actually finished; a job
+ * that failed hours ago could sit above one that just succeeded, if the failed one happened to
+ * have a higher `rank` or an earlier `queued_at`. This still trusts that same input order for
+ * *active* rows (running, then queued in scheduler order) -- untouched, since that ordering is
+ * exactly the run order the page's "Queued jobs run in the order shown" copy and Move-to-top
+ * button promise -- but terminal rows now sort newest-completed-first instead.
+ *
+ * A plain `Array.prototype.sort` on the terminal partition is enough for the "stable for
+ * ties/missing timestamps" requirement: engines have guaranteed a stable sort since ES2019, so
+ * two terminal jobs with the same `finished_at` (or both missing one) keep their relative
+ * position from the input array, i.e. `list_jobs`'s own `rank`/`queued_at` order -- a reasonable
+ * fallback, and never a re-shuffle on every poll for jobs that didn't actually move.
+ */
+export function sortTransferRows(jobs: JobOut[]): JobOut[] {
+  const running: JobOut[] = []
+  const queued: JobOut[] = []
+  const terminal: JobOut[] = []
+  for (const job of jobs) {
+    if (job.state === 'running') running.push(job)
+    else if (job.state === 'queued') queued.push(job)
+    else terminal.push(job)
+  }
+  const newestFirst = [...terminal].sort((a, b) => {
+    const aTime = a.finished_at != null ? new Date(a.finished_at).getTime() : null
+    const bTime = b.finished_at != null ? new Date(b.finished_at).getTime() : null
+    if (aTime == null && bTime == null) return 0
+    if (aTime == null) return 1 // missing sorts last
+    if (bTime == null) return -1
+    return bTime - aTime // newest first
+  })
+  return [...running, ...queued, ...newestFirst]
 }
 
 /** Whether the panel's ***arr** group should render at all -- "hidden entirely when the queue

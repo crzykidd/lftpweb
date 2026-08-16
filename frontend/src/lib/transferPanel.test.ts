@@ -1,9 +1,11 @@
-import { describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { JobOut, JobState } from '../api/types'
 import {
   type LiveProgress,
+  completedTimeLabel,
   hasArrGroup,
   processingGroupFields,
+  sortTransferRows,
   transferGroupFields,
   transferLineValue,
 } from './transferPanel'
@@ -76,6 +78,33 @@ describe('transferLineValue -- the row-collapse decision', () => {
   })
 })
 
+describe('completedTimeLabel -- the collapsed line\'s completed-time reading', () => {
+  beforeEach(() => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-08-15T00:03:00.000Z'))
+  })
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  it('is null for an active job (queued or running), even with a finished_at on the row', () => {
+    expect(completedTimeLabel(job('queued', { finished_at: '2026-08-15T00:00:00.000Z' }))).toBeNull()
+    expect(completedTimeLabel(job('running', { finished_at: '2026-08-15T00:00:00.000Z' }))).toBeNull()
+  })
+
+  it('is null for a terminal job with no finished_at yet', () => {
+    expect(completedTimeLabel(job('succeeded', { finished_at: null }))).toBeNull()
+  })
+
+  it('renders a relative value and an exact-timestamp title for a terminal job', () => {
+    const finishedAt = '2026-08-15T00:00:00.000Z'
+    for (const state of ['succeeded', 'failed', 'cancelled'] as const) {
+      const label = completedTimeLabel(job(state, { finished_at: finishedAt }))
+      expect(label).toEqual({ value: '3m ago', title: new Date(finishedAt).toLocaleString() })
+    }
+  })
+})
+
 describe('transferGroupFields -- the panel\'s Transfer group assembly', () => {
   it('always includes Bytes and Files, even for a bare queued job', () => {
     const fields = transferGroupFields(job('queued', { bytes_total: 1000 }), { fileCount: 3 })
@@ -135,6 +164,30 @@ describe('transferGroupFields -- the panel\'s Transfer group assembly', () => {
     )
     expect(trivial.map((f) => f.label)).not.toContain('Queued wait')
   })
+
+  it('adds Completed for a terminal job with finished_at, matching completedTimeLabel', () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-08-15T00:03:00.000Z'))
+    try {
+      const finishedAt = '2026-08-15T00:00:00.000Z'
+      const fields = transferGroupFields(job('succeeded', { finished_at: finishedAt }), { fileCount: 1 })
+      expect(fields.find((f) => f.label === 'Completed')).toEqual({
+        label: 'Completed',
+        value: '3m ago',
+        title: new Date(finishedAt).toLocaleString(),
+      })
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('omits Completed for an active job (queued or running)', () => {
+    const queued = transferGroupFields(job('queued'), { fileCount: 1 })
+    expect(queued.map((f) => f.label)).not.toContain('Completed')
+
+    const running = transferGroupFields(job('running', { finished_at: null }), { fileCount: 1 })
+    expect(running.map((f) => f.label)).not.toContain('Completed')
+  })
 })
 
 describe('processingGroupFields -- the panel\'s Processing group assembly', () => {
@@ -174,5 +227,61 @@ describe('hasArrGroup -- the *arr group\'s hidden/shown logic', () => {
 
   it('shows with a bound instance and a real arr_status', () => {
     expect(hasArrGroup(job('succeeded', { arr_instance_name: 'Sonarr', arr_status: 'imported' }))).toBe(true)
+  })
+})
+
+describe('sortTransferRows -- the Transfers page\'s row order', () => {
+  it('keeps every active row (running, then queued) ahead of every terminal row', () => {
+    const running = job('running', { id: 1 })
+    const queued = job('queued', { id: 2 })
+    const succeeded = job('succeeded', { id: 3, finished_at: '2026-08-15T00:00:00.000000Z' })
+    const failed = job('failed', { id: 4, finished_at: '2026-08-15T00:05:00.000000Z' })
+
+    const sorted = sortTransferRows([succeeded, queued, failed, running])
+    expect(sorted.map((j) => j.id)).toEqual([1, 2, 4, 3])
+  })
+
+  it('preserves the input\'s own relative order within running and within queued (scheduler order untouched)', () => {
+    const runningA = job('running', { id: 1 })
+    const runningB = job('running', { id: 2 })
+    const queuedA = job('queued', { id: 3 })
+    const queuedB = job('queued', { id: 4 })
+
+    const sorted = sortTransferRows([queuedB, runningB, queuedA, runningA])
+    expect(sorted.map((j) => j.id)).toEqual([2, 1, 4, 3])
+  })
+
+  it('sorts terminal rows newest-completed-first', () => {
+    const oldest = job('succeeded', { id: 1, finished_at: '2026-08-15T00:00:00.000000Z' })
+    const newest = job('failed', { id: 2, finished_at: '2026-08-15T00:10:00.000000Z' })
+    const middle = job('cancelled', { id: 3, finished_at: '2026-08-15T00:05:00.000000Z' })
+
+    const sorted = sortTransferRows([oldest, newest, middle])
+    expect(sorted.map((j) => j.id)).toEqual([2, 3, 1])
+  })
+
+  it('sorts a terminal row with no finished_at last, stable relative to other missing ones', () => {
+    const dated = job('succeeded', { id: 1, finished_at: '2026-08-15T00:00:00.000000Z' })
+    const missingA = job('failed', { id: 2, finished_at: null })
+    const missingB = job('cancelled', { id: 3, finished_at: null })
+
+    const sorted = sortTransferRows([missingA, dated, missingB])
+    expect(sorted.map((j) => j.id)).toEqual([1, 2, 3])
+  })
+
+  it('is stable for terminal rows sharing the same finished_at', () => {
+    const a = job('succeeded', { id: 1, finished_at: '2026-08-15T00:00:00.000000Z' })
+    const b = job('failed', { id: 2, finished_at: '2026-08-15T00:00:00.000000Z' })
+    const c = job('cancelled', { id: 3, finished_at: '2026-08-15T00:00:00.000000Z' })
+
+    expect(sortTransferRows([a, b, c]).map((j) => j.id)).toEqual([1, 2, 3])
+  })
+
+  it('does not mutate the input array', () => {
+    const running = job('running', { id: 1 })
+    const succeeded = job('succeeded', { id: 2, finished_at: '2026-08-15T00:00:00.000000Z' })
+    const input = [succeeded, running]
+    sortTransferRows(input)
+    expect(input.map((j) => j.id)).toEqual([2, 1])
   })
 })

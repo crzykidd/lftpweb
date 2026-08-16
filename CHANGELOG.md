@@ -53,6 +53,15 @@ Skeleton for the next roll:
   (terminal, not-yet-dismissed) row in one server-side call (`POST /api/jobs/dismiss-all`),
   alongside the existing failed-only "Clear all failed".
 
+- **Transfers rows show when a terminal job completed, and the list sorts by it.** Real-use
+  follow-on to the single-line row pass above: a succeeded/failed/cancelled row now carries a
+  compact "3m ago"-style reading next to its state chip (exact timestamp on hover, and as a new
+  "Completed" field in the expand panel's Transfer group). Active rows (running, then queued)
+  still sort first in scheduler order exactly as before; terminal rows below them now sort
+  newest-completed-first, replacing the previous implicit order (the same `rank`/`queued_at`
+  scheduler order active rows use, which said nothing about when a finished job actually
+  finished).
+
 ### Changed
 
 ### Fixed

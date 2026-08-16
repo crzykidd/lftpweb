@@ -19,8 +19,10 @@ import { formatRelativeTimeIntl } from '../lib/format'
 import {
   type LiveProgress,
   type PanelField,
+  completedTimeLabel,
   hasArrGroup,
   processingGroupFields,
+  sortTransferRows,
   transferGroupFields,
   transferLineValue,
 } from '../lib/transferPanel'
@@ -135,6 +137,7 @@ function Row({
   // number (`transferLineValue`).
   const [expanded, setExpanded] = useState(false)
   const fileCount = fileCountFor(nodes, job)
+  const completed = completedTimeLabel(job)
 
   return (
     <div className="flex flex-col gap-1.5 border-b border-zinc-200 px-3 py-2 text-sm last:border-b-0 dark:border-zinc-800">
@@ -170,6 +173,19 @@ function Row({
           {itemName(job.rel_path)}
         </button>
         <StateChip state={chipStateFor(job)} />
+        {/* Completed time (2026-08-16, user report from live use): "each terminal row should
+         * show when it completed" -- compact relative form, exact timestamp on hover, same
+         * value/title split every other timestamp on this page uses. `null` (nothing rendered)
+         * for an active row -- queued/running show what they show today, per the task's own
+         * instruction. */}
+        {completed && (
+          <span
+            className="w-20 shrink-0 text-right text-xs text-zinc-500 dark:text-zinc-400"
+            title={completed.title}
+          >
+            {completed.value}
+          </span>
+        )}
         {/* The one live number this line keeps -- percent + current rate while downloading,
          * final size otherwise. Everything else that used to sit here lives in the panel. */}
         <span className="w-32 shrink-0 text-right text-zinc-500 dark:text-zinc-400">
@@ -412,6 +428,15 @@ export function TransfersPage() {
     for (const q of queues) map.set(q.queue_id, q.nodes)
     return map
   }, [queues])
+
+  // Row order (2026-08-16, `lib/transferPanel.ts.sortTransferRows`'s own docstring): active rows
+  // keep `jobs`' own scheduler order untouched, terminal rows sort newest-completed-first --
+  // **replaces** the previous implicit order for terminal rows, which was the same `rank DESC,
+  // queued_at ASC` scheduler order active rows still use (meaningless for a row that's already
+  // finished). `queuePositions` below deliberately keeps reading `jobs` itself, not this sorted
+  // view -- a queue position is about the real future run order, unaffected by how terminal rows
+  // happen to be displayed.
+  const sortedJobs = useMemo(() => sortTransferRows(jobs), [jobs])
 
   // Queue position (2026-08-13, item 4): `jobs` (`useJobs`/`GET /api/jobs`) already comes back
   // in the real run order (`core/queue.py.list_jobs`'s `ORDER BY job.rank DESC, job.queued_at
@@ -656,7 +681,7 @@ export function TransfersPage() {
 
       {jobs.length > 0 && (
         <div className="overflow-hidden rounded-md border border-zinc-200 dark:border-zinc-800">
-          {jobs.map((job) => (
+          {sortedJobs.map((job) => (
             <Row
               key={job.id}
               job={job}
