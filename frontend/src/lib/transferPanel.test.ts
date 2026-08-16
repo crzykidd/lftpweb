@@ -17,6 +17,7 @@ import {
   sortTransferRows,
   transferGroupFields,
   transferLineValue,
+  transferredSummary,
   withQueueCollapsed,
   writeCollapsedQueues,
   writeHistoryCollapsedQueues,
@@ -117,6 +118,20 @@ describe('completedTimeLabel -- the collapsed line\'s completed-time reading', (
   })
 })
 
+describe('transferredSummary -- the terminal-job "X in Y (Z avg)" reading', () => {
+  it('composes bytes/elapsed/average speed into one sentence in the normal case', () => {
+    expect(transferredSummary(1024 * 1024, 1, 1024 * 1024)).toBe('1.0 MB in 1s (1.0 MB/s avg)')
+  })
+
+  it('omits the average-speed clause, without dividing by zero, once elapsed is under the rate guard', () => {
+    expect(transferredSummary(500, 0, null)).toBe('500 B in 0s')
+  })
+
+  it('is null when there is no elapsed time to report at all (the job never started)', () => {
+    expect(transferredSummary(0, null, null)).toBeNull()
+  })
+})
+
 describe('transferGroupFields -- the panel\'s Transfer group assembly', () => {
   it('always includes Bytes and Files, even for a bare queued job', () => {
     const fields = transferGroupFields(job('queued', { bytes_total: 1000 }), { fileCount: 3 })
@@ -131,19 +146,61 @@ describe('transferGroupFields -- the panel\'s Transfer group assembly', () => {
     expect(fields.find((f) => f.label === 'Files')?.value).toBe('1 file')
   })
 
-  it('adds Elapsed and Average speed once a job has started', () => {
-    const started = job('succeeded', {
+  it('adds Elapsed and Average speed, never Transferred, for a running job that has started', () => {
+    const running = job('running', {
       started_at: '2026-08-15T00:00:00.000000Z',
-      finished_at: '2026-08-15T00:01:00.000000Z',
       bytes_start: 0,
       bytes_done: 6_000_000,
       bytes_total: 6_000_000,
     })
-    const fields = transferGroupFields(started, { fileCount: 1 })
+    const fields = transferGroupFields(running, { fileCount: 1, nowMs: new Date('2026-08-15T00:01:00.000000Z').getTime() })
     const labels = fields.map((f) => f.label)
     expect(labels).toContain('Elapsed')
     expect(labels).toContain('Average speed')
+    expect(labels).not.toContain('Transferred')
     expect(fields.find((f) => f.label === 'Elapsed')?.value).toBe('1m')
+  })
+
+  it('collapses Elapsed and Average speed into one Transferred field for a terminal job', () => {
+    const started = job('succeeded', {
+      started_at: '2026-08-15T00:00:00.000000Z',
+      finished_at: '2026-08-15T00:00:01.000000Z',
+      bytes_start: 0,
+      bytes_done: 1024 * 1024,
+      bytes_total: 1024 * 1024,
+    })
+    const fields = transferGroupFields(started, { fileCount: 1 })
+    const labels = fields.map((f) => f.label)
+    expect(labels).toContain('Transferred')
+    expect(labels).not.toContain('Elapsed')
+    expect(labels).not.toContain('Average speed')
+    expect(fields.find((f) => f.label === 'Transferred')?.value).toBe('1.0 MB in 1s (1.0 MB/s avg)')
+  })
+
+  it('the Transferred field still composes correctly when bytes_total is missing entirely', () => {
+    const started = job('failed', {
+      started_at: '2026-08-15T00:00:00.000000Z',
+      finished_at: '2026-08-15T00:00:01.000000Z',
+      bytes_start: 0,
+      bytes_done: 1024 * 1024,
+      bytes_total: null,
+    })
+    const fields = transferGroupFields(started, { fileCount: 1 })
+    expect(fields.find((f) => f.label === 'Transferred')?.value).toBe('1.0 MB in 1s (1.0 MB/s avg)')
+    expect(fields.find((f) => f.label === 'Bytes')?.value).toBe('1.0 MB / ? (—)')
+  })
+
+  it('the Transferred field omits the average-speed clause under the zero-elapsed guard, never divides by zero', () => {
+    const instant = job('cancelled', {
+      started_at: '2026-08-15T00:00:00.000000Z',
+      finished_at: '2026-08-15T00:00:00.000000Z',
+      bytes_start: 0,
+      bytes_done: 500,
+      bytes_total: 500,
+    })
+    const fields = transferGroupFields(instant, { fileCount: 1 })
+    expect(fields.find((f) => f.label === 'Transferred')?.value).toBe('500 B in 0s')
+    expect(fields.map((f) => f.label)).not.toContain('Average speed')
   })
 
   it('adds Current speed only while running, never for a terminal job', () => {

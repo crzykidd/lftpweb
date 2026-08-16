@@ -131,6 +131,12 @@ Skeleton for the next roll:
   indicator effectively never got seen on a real run. `cleaned` now renders the same green-✓
   icon variant as `imported`, alongside the existing countdown chip; the hover text still
   reads "imported" vs. "imported and cleaned up locally" so the two states stay tellable apart.
+- **The Transfers expand panel now shows total bytes transferred, not just elapsed time and
+  average speed.** Real-use feedback: a terminal job's Transfer group showed "Elapsed" and
+  "Average speed" as two separate figures, but never the reading a user actually wants — "14.8 GB
+  in 6m 12s (40 MB/s avg)." A terminal job's `Elapsed` and `Average speed` fields now collapse
+  into one `Transferred` field composing exactly that sentence; a still-running job's fields are
+  unchanged.
 
 ### Security
 

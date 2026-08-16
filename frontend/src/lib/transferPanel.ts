@@ -56,12 +56,39 @@ export interface PanelField {
   title?: string
 }
 
-/** The panel's **Transfer** group -- bytes done/total, elapsed, average + current/allocated
- * speed, queued wait (only when notable), and file count: every figure the row used to show
- * inline before this task (`6e6b217`'s elapsed/average-speed/queued-wait addition, and the file
- * count `Row` always had). Failed-job error class + output tail are deliberately not part of
+/** The panel's terminal-job answer to "how much did this transfer actually move" (2026-08-16,
+ * user feedback from live use: the panel showed elapsed time and average speed but never the
+ * total bytes moved -- the natural reading they asked for is "14.8 GB in 6m 12s (40 MB/s avg)").
+ * Composed from the exact figures `transferGroupFields` below already computes -- `bytesDone`,
+ * `elapsed` (`elapsedSeconds`), `avgSpeed` (`averageSpeedBps`) -- through the same
+ * `formatBytes`/`formatEta`/`formatRate` every other figure on this page already uses; no new
+ * formatter. `null` whenever `elapsed` itself is `null` (the job never started, so there is no
+ * duration to report a "bytes in duration" sentence against) -- callers fall back to the plain
+ * `Elapsed` field for that case, same as before this task. The trailing "(Z avg)" clause is
+ * omitted, not rendered as "(0 B/s avg)", whenever `avgSpeed` is `null` -- `averageSpeedBps`'s own
+ * guard against a sub-one-second elapsed time (`MIN_ELAPSED_FOR_RATE_S`), so this function never
+ * needs a second divide-by-zero check of its own.
+ */
+export function transferredSummary(bytesDone: number, elapsed: number | null, avgSpeed: number | null): string | null {
+  if (elapsed == null) return null
+  const base = `${formatBytes(bytesDone)} in ${formatEta(elapsed)}`
+  return avgSpeed != null ? `${base} (${formatRate(avgSpeed)} avg)` : base
+}
+
+/** The panel's **Transfer** group -- bytes done/total, elapsed/transferred, average + current/
+ * allocated speed, queued wait (only when notable), and file count: every figure the row used to
+ * show inline before this task (`6e6b217`'s elapsed/average-speed/queued-wait addition, and the
+ * file count `Row` always had). Failed-job error class + output tail are deliberately not part of
  * this list -- `output_tail` can be many lines of captured lftp output, which does not fit a
  * label/value row; the caller renders that block separately, exactly as the row used to.
+ *
+ * **A terminal job's `Elapsed` and `Average speed` fields collapse into one `Transferred` field**
+ * (2026-08-16, `transferredSummary` above) -- once the job is done, "14.8 GB in 6m 12s (40 MB/s
+ * avg)" says everything those two separate rows said, without making the reader do the
+ * bytes-over-time division themselves. A **running** job keeps the two fields exactly as they
+ * were: `Elapsed` is still ticking and `Average speed` is still a live, changing reading, not a
+ * settled fact worth folding into one sentence yet (the task's own instruction: "active jobs'
+ * fields stay as they are").
  */
 export function transferGroupFields(
   job: JobOut,
@@ -76,6 +103,7 @@ export function transferGroupFields(
   const elapsed = elapsedSeconds(job.started_at, job.finished_at, opts.nowMs)
   const avgSpeed = averageSpeedBps(bytesDone, job.bytes_start, elapsed)
   const queuedWait = queuedWaitSeconds(job.queued_at, job.started_at)
+  const transferred = running ? null : transferredSummary(bytesDone, elapsed, avgSpeed)
 
   const fields: PanelField[] = [
     {
@@ -84,7 +112,14 @@ export function transferGroupFields(
     },
     { label: 'Files', value: `${opts.fileCount} file${opts.fileCount === 1 ? '' : 's'}` },
   ]
-  if (elapsed != null) {
+  if (transferred != null) {
+    fields.push({
+      label: 'Transferred',
+      value: transferred,
+      title:
+        "This attempt's total bytes moved, over its own elapsed time, with the average speed folded in -- distinct from the live rate below, which is an EMA-smoothed instantaneous reading (core/progress.py)",
+    })
+  } else if (elapsed != null) {
     fields.push({
       label: 'Elapsed',
       value: formatEta(elapsed),
@@ -100,7 +135,7 @@ export function transferGroupFields(
   if (completed != null) {
     fields.push({ label: 'Completed', value: completed.value, title: completed.title })
   }
-  if (avgSpeed != null) {
+  if (transferred == null && avgSpeed != null) {
     fields.push({
       label: 'Average speed',
       value: formatRate(avgSpeed),
