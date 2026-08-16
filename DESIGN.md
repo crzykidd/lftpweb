@@ -1325,10 +1325,12 @@ that disappearance is precisely the intended trigger for propagating a remote de
 mode. The pipeline is: lftpweb pulls it down → *arr moves it into the library → lftpweb notices
 it's gone → lftpweb removes the seedbox copy so the pickup dir doesn't grow forever.
 
-Worth stating because a reader will expect an integration here: **this serves the *arr workflow
-without talking to Sonarr or Radarr at all.** There is no *arr integration in v1 or on the near
-roadmap; the filesystem observation is the whole interface, and it works with any importer that
-moves files, or with a human doing it by hand.
+Worth stating because a reader will expect an integration here: **this flow serves the *arr
+workflow without talking to Sonarr or Radarr at all** — the filesystem observation is the whole
+interface, and it works with any importer that moves files, or with a human doing it by hand.
+(An *optional* API-level integration does now exist — §16, added post-v0.1.1 — but it layers on
+top of this flow rather than replacing it: everything in this section holds with the
+integration disabled, which is every instance's default.)
 
 This inverts the usual safety design, and the inversion has to be respected:
 
