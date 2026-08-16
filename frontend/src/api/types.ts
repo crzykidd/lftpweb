@@ -10,6 +10,11 @@ export interface HealthResponse {
   // host exists but the pooled connection last failed").
   host_reachable: boolean | null
   scheduler_alive: boolean
+  // 2026-08-16 (docs/decisions.md): baked at image build time, `null` for every build that
+  // never baked them (local dev, compose dev stack, a manual `docker build` with no
+  // `--build-arg`) -- see `lib/versionBadge.ts` for how the nav's version readout uses them.
+  build_sha: string | null
+  build_channel: 'dev' | 'release' | null
 }
 
 export interface StatsResponse {

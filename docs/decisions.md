@@ -6,6 +6,43 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-16 — `/api/health` carries `build_sha`/`build_channel`, beyond §12's shape again
+
+`prompts/done/2026-08-16-dev-build-version-badge.md`. User request: a `:dev` image should
+identify itself in the UI (`DEV: v0.1.1 · <short-sha>`) so a test instance is never mistaken
+for a release. Same shape question as `repo_url` (2026-08-11, below): the container has no git
+tree at runtime to ask what commit it was built from, and the SPA is built into static files
+long before the image's build args exist, so nothing but the backend can carry this to the UI.
+
+**Decision:** two more fields on `HealthResponse` — `build_sha` (short commit SHA) and
+`build_channel` (`"dev" | "release"`), both `None` unless baked. Same precedent as `repo_url`:
+smallest change that satisfies the requirement, flagged here rather than silently diverging
+from §12's literal shape a second time.
+
+**Baked, not read from the environment at request time the way `repo_url` is.** `repo_url` is a
+genuine runtime setting — an operator sets `LFTPWEB_REPO_URL` in their own compose file.
+`build_sha`/`build_channel` are facts about the *image*, not the deployment, so they're set via
+`ARG`/`ENV` in `docker/Dockerfile`'s `runtime` stage from `.github/workflows/publish.yml`'s
+`docker/build-push-action` `build-args:`, not documented as an operator-facing env var. They
+still flow through `config.Settings` (env-prefix `LFTPWEB_*`) like every other setting, because
+that's already the one mechanism this app has for getting a build-time value into a running
+process — introducing a second (e.g. a baked JSON file) for two strings wasn't worth it.
+
+**The empty-string-vs-`None` wrinkle.** Docker bakes an unset `ARG`'s declared default into
+`ENV` regardless of whether `--build-arg` was passed — so a `runtime` image built without the
+new build args (a manual `docker build docker/Dockerfile`, say) still gets
+`LFTPWEB_BUILD_SHA=""` as a real env var, not an absent one. Pydantic-settings would otherwise
+read that as the value `""`, distinct from the field's own `None` default — a
+`build_channel == ""` a frontend author could plausibly forget to guard against, on top of the
+`None` case. `config.Settings` gained a `field_validator` (`mode="before"`) on both fields that
+folds a blank string back to `None`, so there is exactly one "unbaked" value, not two.
+
+**Only the `runtime` stage declares the ARGs** — `dev`/`frontend-dev` don't, so
+`docker-compose.dev.yml`'s build never sets these env vars at all (not even blank), matching
+"local `uv run`" exactly rather than needing its own case in the frontend badge logic.
+
+---
+
 ## 2026-08-16 — `cleaned` shares `imported`'s green-check icon instead of dimming to neutral
 
 `prompts/2026-08-16-cleaned-icon-keeps-green-check.md`. First live Radarr run with "Delete when

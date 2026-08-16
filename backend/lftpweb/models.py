@@ -39,6 +39,15 @@ class HealthResponse(BaseModel):
     # yet (a fresh install), distinct from `False` (a host is configured but unreachable).
     host_reachable: bool | None = None
     scheduler_alive: bool = True
+    # 2026-08-16 (docs/decisions.md): also not in §12's literal shape, same reasoning as
+    # `repo_url` above -- `config.Settings.build_sha`/`.build_channel` are baked at image
+    # *build* time (docker/Dockerfile's `runtime` stage, .github/workflows/publish.yml), and
+    # this endpoint is already how the nav's version readout learns runtime-only facts about
+    # itself. `None` for every build that never baked them (local dev, compose dev stack, a
+    # manual `docker build` with no `--build-arg`) -- the frontend badge degrades to today's
+    # plain `v<version>` rendering in that case, never a lie about the channel.
+    build_sha: str | None = None
+    build_channel: str | None = None
 
 
 class StatsResponse(BaseModel):

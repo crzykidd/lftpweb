@@ -49,6 +49,21 @@ jobs:
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}
 
+      # 2026-08-16 (docs/decisions.md): the two build args docker/Dockerfile's `runtime`
+      # stage bakes into `LFTPWEB_BUILD_SHA`/`LFTPWEB_BUILD_CHANNEL`, so a running container
+      # can identify itself in the UI without a git tree. `dev` is only the dev-push leg of
+      # this matrix (see the header comment above); a push to `main` and a published Release
+      # both count as `release` -- neither is ever mistaken for a test build.
+      - name: Determine build channel and short SHA
+        id: buildinfo
+        run: |
+          if [ "${{ github.ref }}" = "refs/heads/dev" ]; then
+            echo "channel=dev" >> "$GITHUB_OUTPUT"
+          else
+            echo "channel=release" >> "$GITHUB_OUTPUT"
+          fi
+          echo "sha=$(echo "${{ github.sha }}" | cut -c1-7)" >> "$GITHUB_OUTPUT"
+
       - uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
         with:
           context: .
@@ -57,5 +72,8 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            BUILD_SHA=${{ steps.buildinfo.outputs.sha }}
+            BUILD_CHANNEL=${{ steps.buildinfo.outputs.channel }}
           cache-from: type=gha
           cache-to: type=gha,mode=max

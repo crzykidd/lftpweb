@@ -83,6 +83,14 @@ Skeleton for the next roll:
   /api/history/jobs`'s existing response, honoring the same queue/state/error-class/date filters
   as the list itself.
 
+- **A `:dev` image now identifies itself in the nav, so a test instance is never mistaken for a
+  release.** `docker/Dockerfile`'s `runtime` stage bakes the commit SHA and a build channel
+  (`dev` / `release`) at image-build time — the container has no git tree to ask at runtime —
+  and `/api/health` now carries them (`build_sha`, `build_channel`, both `null` when unbaked).
+  The bottom-left version readout renders `DEV: v0.1.1 · <short-sha>` in amber for a dev build,
+  linking to the commit on GitHub instead of the release tag; a release build (or anything run
+  without baked args — local `uv run`, the compose dev stack) renders exactly as before.
+
 ### Changed
 
 - **Job speed and per-file speed now sample on one shared 5-second cadence, instead of two that
