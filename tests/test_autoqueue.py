@@ -390,9 +390,7 @@ async def test_global_pattern_queue_id_null_applies_to_every_queue(db, tmp_path)
 # --- `_UNPACK_`/`_FAILED_` exclusion (2026-08-15, "show it, don't grab it," docs/decisions.md) --
 
 
-async def test_unpack_prefixed_item_is_never_auto_queued_even_with_a_matching_pattern(
-    db, tmp_path
-):
+async def test_unpack_prefixed_item_is_never_auto_queued_even_with_a_matching_pattern(db, tmp_path):
     """The user's seedbox runs SABnzbd, which stages an in-progress unpack on the *remote*
     side under `_UNPACK_<name>` before renaming it to the release's final name -- this shows
     up as an ordinary `REMOTE_ONLY` item (this module never filters scan visibility; see

@@ -161,7 +161,11 @@ def _queue_record(
 def _import_event(*, download_id: str, source_title: str | None = None):
     # Camelcase string, per the live-verified wire format (2026-08-15) -- see
     # `tests/test_arrsync.py`'s own `_import_event` for the full history of why this isn't `3`.
-    return {"eventType": "downloadFolderImported", "downloadId": download_id, "sourceTitle": source_title}
+    return {
+        "eventType": "downloadFolderImported",
+        "downloadId": download_id,
+        "sourceTitle": source_title,
+    }
 
 
 # --- The headline test: cleanup must never fire during a slow multi-file import -------------

@@ -138,7 +138,11 @@ def _import_event(*, download_id: str, source_title: str | None = None):
     # wrongly is exactly why two real Sonarr imports were misclassified `gone` on the first
     # live run before this fix -- see `test_imported_also_confirmed_via_legacy_numeric_event_type`
     # below for the (separate, tolerance-only) numeric case.
-    return {"eventType": "downloadFolderImported", "downloadId": download_id, "sourceTitle": source_title}
+    return {
+        "eventType": "downloadFolderImported",
+        "downloadId": download_id,
+        "sourceTitle": source_title,
+    }
 
 
 # --- Matching ----------------------------------------------------------------------------
