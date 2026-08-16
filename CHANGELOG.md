@@ -39,6 +39,20 @@ Skeleton for the next roll:
   (backend foundation, notify + cleanup, this UI pass); see `DESIGN.md` §16 and
   `docs/arr-integration-spec.md` for the full design.
 
+- **Transfers rows collapse to one line, with an expand panel for the rest of the story.**
+  Real-use feedback: the row had grown a queue position, file count, percent, live rate, ETA,
+  allocated rate, elapsed time, average speed, queued wait, and a post-processing note, all
+  inline — a wall of numbers rather than a scannable list. Each row now shows just name / queue /
+  state / one live number (progress + current speed while downloading, final size once
+  terminal); a chevron expands a detail panel with three groups: **Transfer** (every figure the
+  row used to show, plus the failed-job error/output block), **Processing** (verify/extract/
+  remote-delete timestamps, enriched on expand by the pipeline's own recorded event messages —
+  new bounded `GET /api/items/{id}/events`), and ***arr** (instance name, status, and timestamp,
+  reusing the Files page's own icon/vocabulary — hidden entirely on a queue with no bound
+  instance). A new "Dismiss all" control at the top of the page clears every dismissable
+  (terminal, not-yet-dismissed) row in one server-side call (`POST /api/jobs/dismiss-all`),
+  alongside the existing failed-only "Clear all failed".
+
 ### Changed
 
 ### Fixed

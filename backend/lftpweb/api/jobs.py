@@ -24,9 +24,12 @@ from lftpweb.core.queue import (
 from lftpweb.core.remote import parse_connection_limit
 from lftpweb.models import (
     DeleteItemResponse,
+    DismissAllResponse,
     EffectiveLftpJobKind,
     EffectiveLftpSetting,
     EffectiveLftpSettingsOut,
+    ItemEventOut,
+    ItemEventsResponse,
     JobOut,
     JobsResponse,
     QueueItemRequest,
@@ -120,6 +123,17 @@ def _job_out(row: dict) -> JobOut:
         exit_code=row["exit_code"],
         error_class=row["error_class"],
         output_tail=row["output_tail"],
+        # 2026-08-15 (prompts/2026-08-15-transfers-single-line-rows-with-detail.md): the
+        # item-level facts the Transfers row's expand panel needs -- see `TransferQueue.
+        # list_jobs()`'s own docstring for the join these come from. `arr_instance_name` is
+        # always projected (`NULL` when the `LEFT JOIN arr_instance` finds no match), never
+        # absent from the row, so plain `row[...]` is safe here too.
+        verified_at=row["verified_at"],
+        extracted_at=row["extracted_at"],
+        remote_deleted_at=row["remote_deleted_at"],
+        arr_status=row["arr_status"],
+        arr_status_at=row["arr_status_at"],
+        arr_instance_name=row["arr_instance_name"],
     )
 
 
@@ -170,6 +184,71 @@ async def dismiss_job(job_id: int, request: Request) -> None:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except JobNotDismissableError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.post("/api/jobs/dismiss-all", response_model=DismissAllResponse)
+async def dismiss_all_jobs(request: Request) -> DismissAllResponse:
+    """ "Dismiss all" at the top of the Transfers page (2026-08-15, user addition to
+    prompts/2026-08-15-transfers-single-line-rows-with-detail.md) -- the bulk counterpart to
+    `dismiss_job` above. A single server-side `UPDATE` (`TransferQueue.dismiss_all_terminal`'s
+    own docstring), not a client-side loop over every dismissable row's own `/dismiss` call --
+    the task's own stated preference, and it means there is no per-row network round trip to
+    partially fail the way `Promise.allSettled` bulk actions elsewhere in this app (Files page's
+    Queue/Stop, Transfers' own "Clear all failed") have to account for. Never touches a `queued`/
+    `running` job, by construction of the `UPDATE`'s own `WHERE` -- see that method's docstring.
+    """
+    dismissed = await request.app.state.queue.dismiss_all_terminal()
+    return DismissAllResponse(dismissed=dismissed)
+
+
+# --- Item events (2026-08-15, prompts/2026-08-15-transfers-single-line-rows-with-detail.md)
+# ---------------------------------------------------------------------------------------------
+#
+# The Transfers panel's "processing story" -- `core/postprocess.py`/`core/arrsync.py` already
+# write every branch's reasoning as `event` rows (`core/audit.py`), keyed directly by
+# `event.item_id` (an ON DELETE SET NULL column, migration 001). Bounded and on-demand, the same
+# shape `api/history.py`'s own endpoints already establish: never fetched inline on the jobs
+# list (which is bounded by row count, not by how much *history* each row could accumulate), and
+# capped regardless of what a caller asks for.
+
+ITEM_EVENTS_DEFAULT_LIMIT = 50
+ITEM_EVENTS_MAX_LIMIT = 200
+
+
+@router.get("/api/items/{item_id}/events", response_model=ItemEventsResponse)
+async def item_events(
+    item_id: int, request: Request, limit: int = ITEM_EVENTS_DEFAULT_LIMIT
+) -> ItemEventsResponse:
+    """The Transfers panel's Processing group, enriched (module comment above): every `event`
+    row for this one item, newest first, capped at `ITEM_EVENTS_MAX_LIMIT` regardless of what
+    `limit` asks for -- the same clamp shape `api/history.py._clamp_paging` uses, kept as a
+    simple `min()` here since this endpoint has no `offset` to clamp alongside it (the panel
+    wants "the recent story," not a paginated archive; `api/history.py` already is that for
+    anyone who wants the full trail). No existence check on `item_id` itself -- an unknown or
+    since-forgotten item (`api/jobs.py.reset_item`, "reset item tracking") simply yields an
+    empty list, which is indistinguishable from, and just as correct a response as, "this item
+    exists but nothing happened to it yet."
+    """
+    capped_limit = max(1, min(limit, ITEM_EVENTS_MAX_LIMIT))
+    cursor = await request.app.state.db.execute(
+        "SELECT id, ts, level, kind, message, job_id FROM event "
+        "WHERE item_id = ? ORDER BY ts DESC, id DESC LIMIT ?",
+        (item_id, capped_limit),
+    )
+    rows = await cursor.fetchall()
+    return ItemEventsResponse(
+        events=[
+            ItemEventOut(
+                id=row["id"],
+                ts=row["ts"],
+                level=row["level"],
+                kind=row["kind"],
+                message=row["message"],
+                job_id=row["job_id"],
+            )
+            for row in rows
+        ]
+    )
 
 
 @router.post("/api/jobs/{job_id}/move-to-top", status_code=204)

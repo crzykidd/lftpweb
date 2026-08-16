@@ -696,10 +696,60 @@ class JobOut(BaseModel):
     error_class: str | None = None
     # DESIGN.md §9.2: "Failed rows show the error class and the captured lftp output tail."
     output_tail: str | None = None
+    # 2026-08-15 (prompts/2026-08-15-transfers-single-line-rows-with-detail.md): the item-level
+    # facts the Transfers row's new expand panel needs for its Processing/*arr groups. Inlined
+    # here rather than fetched separately -- `list_jobs()`'s row set is bounded by construction
+    # (one row per active/recently-terminal item, `core/queue.py.list_jobs`'s own docstring), so
+    # joining these onto every row costs nothing the endpoint doesn't already pay for `rel_path`/
+    # `queue_name`. All three below mirror `item.verified_at`/`item.extracted_at`/
+    # `item.remote_deleted_at` (migration 001) -- the same milestones `ItemDrawer.tsx`'s
+    # `lifecycleChronology` already reads off `FileNode`.
+    verified_at: str | None = None
+    extracted_at: str | None = None
+    remote_deleted_at: str | None = None
+    # `item.arr_status`/`item.arr_status_at` (migration 018, docs/arr-integration-spec.md) --
+    # same facet the Files page's row icon already reads off the item projection.
+    arr_status: str | None = None
+    arr_status_at: str | None = None
+    # The bound instance's own display name, resolved via `path_queue.arr_instance_id ->
+    # arr_instance.name` -- `null` whenever this job's queue has no bound *arr instance, the one
+    # signal the panel's *arr group gates its own visibility on (`lib/transferPanel.ts.
+    # hasArrGroup`). Never `arr_download_id` -- that column stays server-side only, same as the
+    # item projection's own convention (`lib/fileTree.ts`'s comment on why).
+    arr_instance_name: str | None = None
 
 
 class JobsResponse(BaseModel):
     jobs: list[JobOut]
+
+
+class DismissAllResponse(BaseModel):
+    """`POST /api/jobs/dismiss-all` (2026-08-15) -- the bulk counterpart to `POST
+    /api/jobs/{id}/dismiss`. `dismissed` is the actual row count the bulk `UPDATE` affected
+    (`cursor.rowcount`), the same "report the real number, not a guess" convention
+    `HistoryClearResponse.deleted` already uses.
+    """
+
+    dismissed: int
+
+
+class ItemEventOut(BaseModel):
+    """One `event` row, scoped to a single item (2026-08-15) -- the Transfers panel's on-demand
+    "processing story" fetch. Deliberately leaner than `api/history.py.HistoryEventOut`: this
+    endpoint is already scoped to one known item (the caller supplies `item_id` in the URL), so
+    there is no need to resolve or carry `queue_id`/`queue_name`/`rel_path` a second time.
+    """
+
+    id: int
+    ts: str
+    level: str
+    kind: str
+    message: str
+    job_id: int | None
+
+
+class ItemEventsResponse(BaseModel):
+    events: list[ItemEventOut]
 
 
 class TransferSettingsOut(BaseModel):

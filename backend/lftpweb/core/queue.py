@@ -616,6 +616,31 @@ class TransferQueue:
         await self.db.execute("UPDATE job SET dismissed_at = ? WHERE id = ?", (_now_iso(), job_id))
         await self.db.commit()
 
+    async def dismiss_all_terminal(self) -> int:
+        """The bulk counterpart to `dismiss_job` above (2026-08-15, "Dismiss all" at the top of
+        the Transfers page) -- one `UPDATE`, not a per-job loop, per the task's own preference
+        for a bulk endpoint over a client-side `Promise.allSettled` fan-out.
+
+        Same guard as `dismiss_job`, just applied to every row at once: only `failed`/
+        `cancelled`/`succeeded` rows with `dismissed_at IS NULL` are touched -- a `queued`/
+        `running` job is never matched by this `WHERE`, so there is no active-job case to reject
+        the way `dismiss_job` raises `JobNotDismissableError` for one. Unlike that method, this
+        doesn't restrict itself to each item's *most recent* job (`list_jobs()`'s `MAX(id)`
+        superseding rule) -- an older, already-superseded terminal row is never shown on
+        Transfers regardless of its `dismissed_at`, so dismissing it too is harmless and keeps
+        this one plain `UPDATE ... WHERE` rather than a second copy of that subquery.
+
+        Returns the actual row count affected (`cursor.rowcount`), the same "report the real
+        number" convention `api/history.py`'s clear-history endpoints already use.
+        """
+        cursor = await self.db.execute(
+            "UPDATE job SET dismissed_at = ? "
+            "WHERE state IN ('failed','cancelled','succeeded') AND dismissed_at IS NULL",
+            (_now_iso(),),
+        )
+        await self.db.commit()
+        return cursor.rowcount
+
     async def _item_is_settled(self, queue_id: int, rel_path: str) -> bool:
         """The completion half of the settle gate (prompts/open-issues.md #2,
         `core/settle.py`), consulted from `_reap_one` on job success. Returns `True`
@@ -1846,13 +1871,24 @@ class TransferQueue:
         bounded by construction (the docstring above), unlike `api/history.py`'s unbounded,
         paginated endpoint — that's why this can inline the join instead of shipping
         `queue_id` alone and making the client resolve it.
+
+        **2026-08-15** (prompts/2026-08-15-transfers-single-line-rows-with-detail.md): also
+        joins `item.verified_at`/`item.extracted_at`/`item.remote_deleted_at`/`item.arr_status`/
+        `item.arr_status_at`, plus `arr_instance.name` via `path_queue.arr_instance_id` (`LEFT
+        JOIN` — most queues have no bound instance, migration 018's "everything OFF by
+        default"), for the Transfers row's new expand panel (`api/jobs.py._job_out`). Same
+        bounded-by-construction reasoning as `queue_name` above — this is not the phase-6
+        unbounded-list trap `api/history.py`'s own docstring warns against.
         """
         cursor = await self.db.execute(
             "SELECT job.*, item.rel_path, item.is_dir, item.queue_id, item.remote_size, "
-            "       path_queue.name AS queue_name "
+            "       item.verified_at, item.extracted_at, item.remote_deleted_at, "
+            "       item.arr_status, item.arr_status_at, "
+            "       path_queue.name AS queue_name, arr_instance.name AS arr_instance_name "
             "FROM job "
             "JOIN item ON item.id = job.item_id "
             "JOIN path_queue ON path_queue.id = item.queue_id "
+            "LEFT JOIN arr_instance ON arr_instance.id = path_queue.arr_instance_id "
             "WHERE job.state IN ('queued','running') "
             "   OR (job.state IN ('failed','cancelled','succeeded') "
             "       AND job.dismissed_at IS NULL "

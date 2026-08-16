@@ -542,10 +542,46 @@ export interface JobOut {
   exit_code: number | null
   error_class: string | null
   output_tail: string | null
+  // 2026-08-15 (prompts/2026-08-15-transfers-single-line-rows-with-detail.md): the item-level
+  // facts the Transfers row's expand panel needs -- see `api/jobs.py._job_out`/`core/queue.py.
+  // list_jobs`'s own comments for the join these ride on. Mirrors `FileNode.verified_at`/
+  // `extracted_at`/`remote_deleted_at`/`arr_status`/`arr_status_at` (`lib/fileTree.ts`) exactly,
+  // plus `arr_instance_name` -- resolved server-side here (unlike the Files page, which resolves
+  // it client-side from `GET /api/settings/arr` -- see `lib/fileTree.ts`'s own comment on why
+  // that page does it differently) since `JobOut`'s row set is already bounded.
+  verified_at: string | null
+  extracted_at: string | null
+  remote_deleted_at: string | null
+  arr_status: string | null
+  arr_status_at: string | null
+  // `null` whenever this job's queue has no bound *arr instance -- the signal
+  // `lib/transferPanel.ts.hasArrGroup` gates the panel's *arr group on.
+  arr_instance_name: string | null
 }
 
 export interface JobsResponse {
   jobs: JobOut[]
+}
+
+/** `POST /api/jobs/dismiss-all` (2026-08-15) -- the bulk counterpart to `dismissJob`. */
+export interface DismissAllResponse {
+  dismissed: number
+}
+
+/** `GET /api/items/{id}/events` (2026-08-15) -- the Transfers panel's on-demand "processing
+ * story" fetch, one `event` row per entry, newest first, server-capped.
+ */
+export interface ItemEventOut {
+  id: number
+  ts: string
+  level: string
+  kind: string
+  message: string
+  job_id: number | null
+}
+
+export interface ItemEventsResponse {
+  events: ItemEventOut[]
 }
 
 export interface QueueItemRequest {

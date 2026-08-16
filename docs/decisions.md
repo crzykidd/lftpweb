@@ -6,6 +6,58 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-15 — Transfers row collapse: what stays inline, what moves to the panel, and two
+kept judgment calls
+
+`prompts/2026-08-15-transfers-single-line-rows-with-detail.md`, driven by live-use feedback: the
+Transfers row had accreted queue position, file count, percent, live rate, ETA, allocated rate,
+elapsed, average speed, queued wait, and a post-processing note across three prior sessions
+(`6e6b217`, `25bc33c`, plus the original phase-3b/2026-08-13 row) — a wall of numbers rather than
+a scannable list. The fix: one line (name / queue / state word / one live number), a chevron
+expanding a three-group panel (Transfer / Processing / *arr).
+
+**Two deliberate departures from the prompt's most literal reading, both kept for parity with
+existing behaviour rather than escalated:**
+
+1. **Queue position and every action button (Move to top / Start now / Stop / Retry / Dismiss)
+   stay on the collapsed line**, not moved into the panel, even though the prompt's own line-up
+   names only "name, queue, state word, and the one most relevant live number." Reasoning: the
+   task's own "before you start" section frames the *crowding* as the 2026-08-14 timing/
+   post-processing additions specifically, not the pre-existing position badge or action row; and
+   "keep every existing action working" reads more naturally as "stays one click away," not
+   "now requires an expand first." Both a small badge (position) and small buttons (actions) fit
+   comfortably on one `flex-wrap` line alongside the trimmed metric, so nothing crowds the line
+   the way the removed figures did.
+2. **The Transfer group's "per-file mirror progress" is the existing file count** (`fileCountFor`,
+   unchanged), not a rebuild of `ItemDrawer.tsx`'s own virtualized per-file table. That table
+   already exists, already opens from the same row (clicking the item name, unchanged), and
+   duplicating a virtualized per-file breakdown inside a second, smaller surface would drift from
+   it eventually — the same "one place shows this, not two" reasoning `ItemDrawer.tsx`'s own
+   module comment gives for why it absorbed the Files-row info icon in the first place, applied
+   here to avoid re-forking it a second time.
+
+**Bulk "Dismiss all" reports failure honestly, but only at the request level.** The task's own
+phase-9 `Promise.allSettled` precedent is for a client-side loop over N independent calls that
+can each fail differently; `dismiss-all` is one server-side `UPDATE ... WHERE`, so there is no
+per-row result to report — only "the request succeeded with count N" or "the request itself
+failed" (network/HTTP), which is what `TransfersPage.tsx`'s `handleDismissAll` actually surfaces.
+This is not a gap relative to the instruction, since a single atomic `UPDATE` genuinely has no
+partial-row failure mode to hide — named here so a future reader doesn't go looking for one.
+
+**Item-events endpoint takes no `item_id` existence check.** `event.item_id` was already a real
+column (`ON DELETE SET NULL`, migration 001) rather than something inferred from message text, so
+the "check how events reference items" question the prompt raised was already answered by the
+schema — no migration needed, no message-text parsing. `GET /api/items/{id}/events` for an
+unknown or since-`reset_item`-forgotten item simply returns an empty list rather than 404ing: an
+empty "nothing happened here" and "this id never existed" are indistinguishable in a read-only,
+already-scoped endpoint, and treating them the same keeps the handler a single query.
+
+**No agent can see the rendered UI in this environment** — the row/panel layout, the ▼/▲
+chevron affordance (`HistoryJobsSection.tsx`'s own precedent, reused rather than forked), and the
+*arr group's `ArrIcon` reuse are all unviewed; a human should open Transfers and expand a few
+rows of different states (queued/running/failed/succeeded, with and without a bound *arr
+instance) before trusting the rendered result.
+
 ## 2026-08-15 — verify: an upstream-extracted release reads `SKIPPED`, not `CORRUPT`
 
 Same live-test session, next item: `National.Lampoons.Animal.House.1978.iNTERNAL.1080p.BluRay

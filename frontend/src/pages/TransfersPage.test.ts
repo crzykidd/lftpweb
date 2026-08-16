@@ -35,6 +35,12 @@ function job(state: JobState, overrides: Partial<JobOut> = {}): JobOut {
     exit_code: null,
     error_class: null,
     output_tail: null,
+    verified_at: null,
+    extracted_at: null,
+    remote_deleted_at: null,
+    arr_status: null,
+    arr_status_at: null,
+    arr_instance_name: null,
     ...overrides,
   }
 }

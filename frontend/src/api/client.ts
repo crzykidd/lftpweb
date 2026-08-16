@@ -16,6 +16,7 @@ import type {
   BackupSettingsIn,
   BackupSettingsOut,
   DeleteItemResponse,
+  DismissAllResponse,
   DownloadPrefixSettingsIn,
   DownloadPrefixSettingsOut,
   EffectiveLftpSettingsOut,
@@ -30,6 +31,7 @@ import type {
   HostIn,
   HostOut,
   HostTestRequest,
+  ItemEventsResponse,
   JobOut,
   JobsResponse,
   LoginIn,
@@ -297,6 +299,23 @@ export function moveJobToTop(jobId: number): Promise<void> {
  */
 export function dismissJob(jobId: number): Promise<void> {
   return sendJson<void>(`/api/jobs/${jobId}/dismiss`, 'POST')
+}
+
+/** "Dismiss all" at the top of the Transfers page (2026-08-15, user addition to
+ * prompts/2026-08-15-transfers-single-line-rows-with-detail.md) -- one server-side bulk call
+ * (`core/queue.py.dismiss_all_terminal`), not a client-side loop over `dismissJob` for every
+ * dismissable row.
+ */
+export function dismissAllJobs(): Promise<DismissAllResponse> {
+  return sendJson<DismissAllResponse>('/api/jobs/dismiss-all', 'POST')
+}
+
+/** The Transfers panel's on-demand "processing story" (2026-08-15) -- one item's `event` rows,
+ * newest first, server-capped. Fetched only when a row's panel is expanded, never eagerly for
+ * the whole jobs list (`api/jobs.py.item_events`'s own docstring).
+ */
+export function getItemEvents(itemId: number, limit?: number): Promise<ItemEventsResponse> {
+  return getJson<ItemEventsResponse>(`/api/items/${itemId}/events${limit != null ? `?limit=${limit}` : ''}`)
 }
 
 export function startJobNow(jobId: number): Promise<{ applied: boolean }> {
