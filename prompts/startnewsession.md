@@ -77,6 +77,20 @@ than a first. Two things that bit the first time and will bit again:
 
 ## Where we are
 
+### 🚀 v0.2.0 released 2026-08-16 — the Sonarr/Radarr release
+
+PR #6 (`dev` → `main`, merged `013bf7a`), tag `v0.2.0`, release notes = the `[0.2.0]`
+CHANGELOG section verbatim; `:latest`/`:0.2.0`/`:0` images published on the release event.
+The headline is the **optional *arr integration** plus the **move-delete gate ladder**
+(issue #2/G1 closed: source deletes only after the last enabled check — completeness →
+verify → extract → *arr import when tracked) and the **manual Local/Source delete dialog**
+(first manual remote-delete in the API). The whole pipeline was verified live before the
+cut — a 46-file Sonarr season pack and a single-file Radarr remux each ran
+match → notify → two-pass import confirm → source delete → cleanup → grace countdown, in
+order, on the first attempt. The build-run table below (rows A–R) is the full item log.
+Tests at release: **1186 backend / 378 frontend, 0 skipped.** The per-minor changelog
+archive was deliberately NOT performed (user call: leave 0.1.x in `CHANGELOG.md`).
+
 ### *arr integration build run (2026-08-15, unattended) — LIVE PROGRESS LOG
 
 > `docs/arr-integration-spec.md` (approved 2026-08-15) specs a Sonarr/Radarr integration in
