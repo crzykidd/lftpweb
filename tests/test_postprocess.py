@@ -168,6 +168,104 @@ def test_verify_single_loose_file_item(tmp_path):
     assert verify.verify_item(target).state == "VERIFIED"
 
 
+# --- core/verify.py: upstream-extracted releases (fix, 2026-08-15, docs/decisions.md) --------
+#
+# A release rar'd at origin but extracted *upstream* (the seedbox's own SABnzbd unpacks it,
+# deletes the rars, keeps the `.sfv`) arrives locally as e.g. `movie.mkv` + `movie.sfv`, where
+# the sidecar lists rar volumes that were never local to begin with. Live case:
+# National.Lampoons.Animal.House.1978.iNTERNAL.1080p.BluRay.x264-EwDp on the ar-movies queue.
+# The rule (narrow on purpose -- this is the one gate ahead of an irreversible remote delete):
+# every referenced file absent + other content present -> SKIPPED; any referenced file present
+# (including a half-deleted set) -> unchanged, stays CORRUPT; sidecar and nothing else ->
+# stays CORRUPT (degenerate, nothing the sidecar could have been vouching for).
+
+
+def test_verify_sfv_all_referenced_files_absent_with_content_present_is_skipped(tmp_path):
+    """The Animal House shape: an `.sfv` listing several rar volumes, none of them present,
+    alongside the one file that *is* present -- the mkv the archives were extracted to,
+    upstream, before this ever reached the local disk.
+    """
+    item = tmp_path / "National.Lampoons.Animal.House.1978.iNTERNAL.1080p.BluRay.x264-EwDp"
+    item.mkdir()
+    (item / "ewdp-animalhouse.mkv").write_bytes(b"movie bytes")
+    (item / "ewdp-animalhouse.sfv").write_text(
+        "ewdp-animalhouse.r00 deadbeef\n"
+        "ewdp-animalhouse.r01 deadbeef\n"
+        "ewdp-animalhouse.rar deadbeef\n"
+    )
+
+    result = verify.verify_item(item)
+    assert result.state == "SKIPPED"
+    assert "extracted upstream" in result.detail
+    assert "3" in result.detail
+
+
+def test_verify_sfv_mixed_presence_stays_corrupt(tmp_path):
+    """Rule 2: not every referenced entry absent -- some rars present (and passing), some
+    absent (a half-deleted archive set). By the time extraction would notice the gap, the
+    remote copy is already gone under `move`, so this must not be relaxed to `SKIPPED`.
+    """
+    item = tmp_path / "Release"
+    item.mkdir()
+    (item / "a.rar").write_bytes(b"hello world")
+    import zlib
+
+    crc = zlib.crc32(b"hello world") & 0xFFFFFFFF
+    (item / "checksums.sfv").write_text(f"a.rar {crc:08x}\nb.rar deadbeef\n")
+
+    result = verify.verify_item(item)
+    assert result.state == "CORRUPT"
+    assert "b.rar" in result.detail
+
+
+def test_verify_sfv_present_and_corrupt_stays_corrupt(tmp_path):
+    """Every referenced file is present, but one fails its checksum -- unaffected by the new
+    all-absent rule, since not everything is absent.
+    """
+    item = tmp_path / "Release"
+    item.mkdir()
+    (item / "a.rar").write_bytes(b"hello world")
+    (item / "b.rar").write_bytes(b"corrupted")
+    import zlib
+
+    good_crc = zlib.crc32(b"hello world") & 0xFFFFFFFF
+    (item / "checksums.sfv").write_text(f"a.rar {good_crc:08x}\nb.rar deadbeef\n")
+
+    result = verify.verify_item(item)
+    assert result.state == "CORRUPT"
+    assert "b.rar" in result.detail
+
+
+def test_verify_sfv_only_sidecar_and_nothing_else_stays_corrupt(tmp_path):
+    """Rule 3, the degenerate case: the item *is* the sidecar, no other content at all. All
+    referenced entries are absent, but there's nothing the sidecar could have been vouching
+    for -- this is not an upstream-extraction signal, it's an empty release.
+    """
+    item = tmp_path / "Release"
+    item.mkdir()
+    (item / "checksums.sfv").write_text("a.rar deadbeef\nb.rar deadbeef\n")
+
+    result = verify.verify_item(item)
+    assert result.state == "CORRUPT"
+
+
+def test_verify_md5_all_referenced_files_absent_with_content_present_is_skipped(tmp_path):
+    """md5-flavored twin of the Animal House case -- the rule applies to both sidecar
+    formats.
+    """
+    item = tmp_path / "Release"
+    item.mkdir()
+    (item / "movie.mkv").write_bytes(b"movie bytes")
+    (item / "checksums.md5").write_text(
+        "deadbeefdeadbeefdeadbeefdeadbeef  a.rar\nfeedfacefeedfacefeedfacefeedface  b.rar\n"
+    )
+
+    result = verify.verify_item(item)
+    assert result.state == "SKIPPED"
+    assert "extracted upstream" in result.detail
+    assert "2" in result.detail
+
+
 # --- core/extract.py -------------------------------------------------------------------------
 
 
@@ -1699,6 +1797,33 @@ def test_archive_volume_paths_single_volume_rar_is_just_the_head(tmp_path):
     head = tmp_path / "release.rar"
     head.write_bytes(_RAR_SINGLE)
     assert extract.archive_volume_paths(head) == [head]
+
+
+# --- core/extract.py.is_archive_member (fix, 2026-08-15, docs/decisions.md) -------------------
+# Reused by `core/verify.py` so a leftover archive volume never counts as the non-sidecar
+# content that makes "every sidecar entry absent" read as an upstream extraction.
+
+
+def test_is_archive_member_true_for_a_rar_head():
+    assert extract.is_archive_member(Path("release.rar")) is True
+
+
+def test_is_archive_member_true_for_an_old_style_continuation_volume():
+    assert extract.is_archive_member(Path("release.r00")) is True
+
+
+def test_is_archive_member_true_for_a_new_style_part_volume():
+    assert extract.is_archive_member(Path("release.part2.rar")) is True
+
+
+def test_is_archive_member_true_for_simple_and_compound_suffixes():
+    assert extract.is_archive_member(Path("payload.zip")) is True
+    assert extract.is_archive_member(Path("payload.tar.gz")) is True
+
+
+def test_is_archive_member_false_for_ordinary_content():
+    assert extract.is_archive_member(Path("movie.mkv")) is False
+    assert extract.is_archive_member(Path("readme.nfo")) is False
 
 
 # --- core/engine.py.build_scan_counts_predicate -- pure composition, no DB/filesystem ----------

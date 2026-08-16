@@ -149,6 +149,27 @@ def find_archives(root: Path) -> list[Path]:
     return out
 
 
+def is_archive_member(path: Path) -> bool:
+    """True if `path`'s name matches any archive shape this module knows how to extract --
+    a first volume (what `find_archives` would return), a continuation volume it deliberately
+    excludes (`.r00`/`.r01`/..., a `.partNN.rar` beyond part 1), or a simple/compound archive
+    suffix. Unlike `find_archives`, this doesn't filter to first-volumes-only or walk a
+    directory -- it classifies one path already in hand.
+
+    Exposed for `core/verify.py`'s "does this item have real, non-archive content" check
+    (2026-08-15 fix, docs/decisions.md): a leftover archive volume must never count as the
+    non-sidecar content that makes "every sidecar entry absent" look like an upstream
+    extraction -- an archive that's still sitting there hasn't been extracted at all, so its
+    presence is not evidence of anything the sidecar's now-unmatched entries could explain.
+    """
+    name_lower = path.name.lower()
+    if _RAR_OLD_VOLUME_RE.search(name_lower):
+        return True
+    if name_lower.endswith(".rar"):
+        return True
+    return _is_compound_tar(name_lower) or name_lower.endswith(_SIMPLE_SUFFIXES)
+
+
 def _rar_volume_number(name_lower: str, head_name_lower: str) -> int | None:
     """This file's 1-based position in `head`'s multi-volume set, or `None` if it isn't a
     member of the set at all. Shared numbering for both conventions so

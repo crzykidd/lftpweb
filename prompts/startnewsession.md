@@ -91,6 +91,7 @@ than a first. Two things that bit the first time and will bit again:
 | B — notify + cleanup | `core/arrnotify.py` (new, shared notify implementation); `PostprocessPipeline._maybe_notify_arr` (primary push, tail of a fully-successful pipeline run); `ArrSyncScheduler._maybe_retry_notify` (bounded retry) + `._maybe_cleanup` (withheld gates, suppression-first, bytes removed without touching `item.state`) | ✅ done, this commit |
 | C — UI | Integrations tab (instance CRUD + Test), Queues additions (*arr instance dropdown, delete-when-imported, visible-path), Files icon (own resizable column, multi-faceted) + "*arr-tracked"/"gone" filters, DESIGN.md §16 + README + CHANGELOG + Concepts doc section | ✅ done, this commit — **unviewed, no browser in this environment** |
 | D — live-testing fixes | First real Sonarr run (`v0.1.1`+arr build) against the user's seedbox: `eventType` fixed to match the *arr v3 wire format (string in response bodies, `core/arrclient.py`/`core/arrsync.py`, `docs/decisions.md` 2026-08-15); auto-queue now excludes remote `_UNPACK_`/`_FAILED_` SAB staging dirs by eligibility, not visibility ("show it, don't grab it," same date) | ✅ done, `prompts/done/2026-08-15-arr-eventtype-and-unpack-autoqueue.md` |
+| E — live-testing fix, verify | Same live-test session: an upstream-extracted release (rar'd at origin, unpacked+deleted by SABnzbd before reaching local disk) verified `CORRUPT` and wedged its `move` queue's remote delete forever. `core/verify.py` now reads "every sidecar-referenced file absent + other content present" as `SKIPPED`, narrowly — any referenced file present (including a half-deleted set) still stays `CORRUPT`; the broader pipeline-ordering question stays open (`prompts/open-issues.md` #2 / G1) | ✅ done, `prompts/done/2026-08-15-verify-skip-when-sidecar-targets-all-absent.md` |
 
 **Phase A verification:** backend lint/format clean, full backend `pytest` green (new tests in
 `tests/test_arrclient.py`, `tests/test_arrsync.py`, `tests/test_settings_arr_api.py`,
@@ -1012,6 +1013,24 @@ These are the places where the obvious implementation is wrong. Each is written 
   when a spec flags a vocabulary "unverified against a live instance," the test fixture that
   data drives must not itself be trusted as ground truth for that vocabulary — it can encode the
   identical wrong guess the production code does, and then prove nothing.**
+- ***Missing-vs-the-sidecar at verify time always means the remote lacked it too, never "still
+  arriving."*** `core/verify.py` only runs from `core/postprocess.py`, which only fires after
+  `core/queue.py`'s local-vs-remote completeness gate has already passed — so a file a
+  `.sfv`/`.md5` references but can't find locally was *also* absent on the remote by the time
+  completeness was measured. That's what makes "every referenced file absent" a safe signal for
+  an upstream anomaly (a release rar'd at origin, extracted upstream, rars deleted before this
+  ever reached local disk) rather than a partial transfer — see the fix below and
+  `docs/decisions.md` (2026-08-15).
+- ***An upstream-extracted release verifies `SKIPPED`, not `CORRUPT` — but only when nothing
+  is provably missing.*** Live case: `National.Lampoons.Animal.House.1978.iNTERNAL.1080p.BluRay
+  .x264-EwDp` on the ar-movies queue arrived `movie.mkv` + `.sfv`, the `.sfv` still listing the
+  rar volumes SABnzbd had already extracted and deleted upstream. Treating every sidecar entry
+  as "missing" reported `CORRUPT` and permanently withheld the `move`-mode delete. The fix
+  (`core/verify.py`) narrows on purpose: every referenced entry absent **and** other content
+  present → `SKIPPED`; *any* referenced entry present (including a half-deleted archive set) →
+  unchanged, stays `CORRUPT`; sidecar and nothing else → stays `CORRUPT` (nothing to have been
+  vouching for). Don't widen the relaxation to mixed presence — that's the still-open pipeline-
+  ordering question, `prompts/open-issues.md` #2 / G1.
 
 **Added 2026-08-12 (post-phase-9 session):**
 

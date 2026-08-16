@@ -6,6 +6,56 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-15 — verify: an upstream-extracted release reads `SKIPPED`, not `CORRUPT`
+
+Same live-test session, next item: `National.Lampoons.Animal.House.1978.iNTERNAL.1080p.BluRay
+.x264-EwDp` on the ar-movies queue. The seedbox's SABnzbd had already extracted the rar set
+upstream and deleted the volumes, keeping only the `.sfv`, so the release arrived locally as
+`movie.mkv` + a `.sfv` listing rar volumes that were never local to begin with.
+`core/verify.py` counted every sidecar-referenced name as "missing" → `CORRUPT`, and on this
+`move` queue that permanently withheld the remote delete — a false positive with the exact same
+shape as the two prior incidents already documented in that module's own docstring.
+
+**Why this is safe to relax, and why only this narrow shape.** Verification is the one gate
+ahead of an irreversible remote delete (`core/postprocess.py._maybe_delete_remote`, pipeline
+order verify → delete gate → extract → move). The user-approved rule: every sidecar-referenced
+file absent *and* other real content present → `SKIPPED` (zero files were verified, so
+`SKIPPED` — not `VERIFIED` — is the honest state; it's exactly the trust level a sidecar-less
+release already gets, and `SKIPPED` already permits the move-mode delete). Any referenced file
+present, including a half-deleted archive set, is unchanged and stays `CORRUPT` — by the time
+extraction would notice a missing volume the remote copy is already gone, and widening the
+relaxation to partial presence is a different, harder question tracked separately as
+`prompts/open-issues.md` #2 / **G1** (should the delete gate run after extraction instead).
+Sidecar-and-nothing-else also stays `CORRUPT` — there's no content the sidecar could have been
+vouching for.
+
+**Also relevant, worth stating plainly: "missing vs. the sidecar" at verify time can only mean
+an upstream anomaly, never a partial transfer.** `core/postprocess.py` only fires after
+`core/queue.py`'s local-vs-remote completeness gate has already passed (local bytes ≥ the
+item's known remote size, no leftover temp files) — so a file the sidecar names but this module
+can't find locally was *also* absent on the remote by the time completeness was measured.
+
+**Deviation from the literal prompt text, found during implementation, not pre-planned:** the
+rule as written ("at least one non-sidecar content file exists") turned out to also match an
+unrelated, already-fixed incident's regression test —
+`tests/test_postprocess.py::test_pipeline_withholds_archive_cleanup_when_verification_failed`
+(2026-08-14): a `.sfv` whose one entry names a *renamed* file (so that entry reads "absent")
+sitting beside the *real*, still-present, still-archived rar volumes under their actual names.
+By the literal rule, "other content exists" (the real archives) would flip this to `SKIPPED`,
+and since the archive_cleanup gate withholds only on `CORRUPT` (a deliberately lower bar than
+the remote-delete gate — see that gate's own comment), `SKIPPED` would let cleanup discard the
+very volumes verification never actually checked, reopening the exact incident the 2026-08-14 fix
+closed. Resolution: `_has_non_sidecar_content` (`core/verify.py`) excludes files that are
+themselves archive volumes, via a new `core/extract.py.is_archive_member()` (a plain per-file
+boolean classifier, factored alongside `find_archives` without changing that function's existing
+behavior). Rationale: a leftover archive volume is not evidence of an upstream extraction — it
+hasn't been extracted, it's still sitting there — so its presence must not be read as "nothing
+left to verify." This narrows the new rule's reach relative to a literal reading of the prompt
+text (deliberately, in the conservative direction — it makes `SKIPPED` fire in *fewer* cases, not
+more) and was applied rather than escalated because it fully resolves the conflict without
+touching rule 2's mixed-presence guarantee or rule 3's degenerate case, and is small enough to
+review inline; flagged here for visibility per the standing "name gaps, don't hide them" rule.
+
 ## 2026-08-15 — auto-queue excludes `_UNPACK_`/`_FAILED_` remote staging: "show it, don't grab it"
 
 First real Sonarr live-testing run also surfaced this: the user's seedbox runs SABnzbd, which

@@ -54,6 +54,15 @@ Skeleton for the next roll:
   the release's final name; these still show up as ordinary items in the Files tree (visible on
   purpose — "show it, don't grab it"), but are now excluded from auto-queue eligibility
   regardless of state or matching patterns. Manual queueing is unaffected.
+- **Verification no longer reports `CORRUPT` for a release extracted upstream.** A release rar'd
+  at origin but unpacked by the seedbox itself (rars deleted, `.sfv` kept) arrives locally as e.g.
+  `movie.mkv` + `movie.sfv`, with the sidecar listing rar volumes that were never local to begin
+  with. Every referenced entry read as "missing," and on a `move` queue this permanently withheld
+  the remote delete. Verification now reads "every sidecar-referenced file absent, with other
+  real content present" as `SKIPPED` — no evidence either way, the same trust level a
+  sidecar-less release already gets — while any referenced file actually present (including a
+  half-deleted archive set) still reports `CORRUPT` exactly as before, and a sidecar with no other
+  content at all still reports `CORRUPT` too.
 
 ### Security
 
