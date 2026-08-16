@@ -341,27 +341,32 @@ const ARR_ICON_VARIANTS: Record<string, ArrIconVariant> = {
   gone: 'gone',
 }
 
-/** Maps `item.arr_status` to the Files-row icon's visual variant, per the spec's own
- * icon-state table (docs/arr-integration-spec.md "UI"): `imported` (green ✓) and `gone`
- * (amber ⚠) must read as distinct, colored states -- "the *arr processed it" and "the *arr
- * merely dropped it" are not the same fact and must never collapse to one dimmed glyph
- * (the spec's own "multi-faceted" requirement). `'none'` means render nothing at all -- an
- * item on a queue with no bound *arr instance, or one the poller has never matched, carries
- * `arr_status: null` and gets no icon, per the "everything OFF by default" rule.
+/** Maps `item.arr_status` to the *arr indicator's visual variant, per the spec's own
+ * icon-state table (docs/arr-integration-spec.md "UI"): `imported` (green ✓/check) and `gone`
+ * (amber ⚠ on `ArrIcon`, red dot on `ArrRowChip`) must read as distinct, colored states -- "the
+ * *arr processed it" and "the *arr merely dropped it" are not the same fact and must never
+ * collapse to one dimmed glyph (the spec's own "multi-faceted" requirement). `'none'` means
+ * render nothing at all -- an item on a queue with no bound *arr instance, or one the poller has
+ * never matched, carries `arr_status: null` and gets no icon/chip, per the "everything OFF by
+ * default" rule. One mapping, consumed by both `LifecycleIcons.tsx.ArrIcon` (the job-detail-
+ * drawer mark) and `.ArrRowChip` (the Files/Transfers/History row-line chip) -- see each
+ * component's own docstring for why they colour `gone` differently.
  */
 export function arrIconVariant(arrStatus: string | null): ArrIconVariant {
   if (arrStatus == null) return 'none'
   return ARR_ICON_VARIANTS[arrStatus] ?? 'neutral'
 }
 
-// --- Sonarr/Radarr row chip (Transfers + History, 2026-08-16,
-// prompts/2026-08-16-arr-chip-on-row-lines.md) -- the collapsed/main row line's brand-logo
-// chip with a status overlay, distinct from the Files-row `ArrIcon` above (generic mark, amber
-// ⚠ for `gone`). This chip renders the *real* Sonarr/Radarr logo in its own brand colour and
-// overlays a small green check or red dot -- "green when the *arr processed it, red when it
-// failed out" (the task's own wording), which is why `gone` reads red here rather than the
-// Files icon's amber. Both consume the same `arrIconVariant` categorization above -- "one
-// mapping, consumed everywhere" -- rather than re-deriving it from `arrStatus` a second time.
+// --- Sonarr/Radarr row chip (Files + Transfers + History, 2026-08-16,
+// prompts/2026-08-16-arr-chip-on-row-lines.md, prompts/2026-08-16-files-brand-logo-icons.md) --
+// the row line's brand-logo chip with a status overlay, distinct from the job-detail-drawer
+// `ArrIcon` above (generic mark, amber ⚠ for `gone`) -- introduced for Transfers/History first,
+// then adopted by the Files tree the same day ("one visual language everywhere"). This chip
+// renders the *real* Sonarr/Radarr logo in its own brand colour and overlays a small green check
+// or red dot -- "green when the *arr processed it, red when it failed out" (the task's own
+// wording), which is why `gone` reads red on every row line rather than `ArrIcon`'s amber. Both
+// consume the same `arrIconVariant` categorization above -- "one mapping, consumed everywhere"
+// -- rather than re-deriving it from `arrStatus` a second time.
 
 export type ArrChipOverlay = 'check' | 'warn' | null
 

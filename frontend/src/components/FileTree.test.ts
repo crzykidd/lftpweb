@@ -659,8 +659,11 @@ describe('arrHoverLabel', () => {
   })
 })
 
-// --- Sonarr/Radarr row chip (Transfers + History, 2026-08-16,
-// prompts/2026-08-16-arr-chip-on-row-lines.md) -----------------------------------------------
+// --- Sonarr/Radarr row chip (Files + Transfers + History, 2026-08-16,
+// prompts/2026-08-16-arr-chip-on-row-lines.md, prompts/2026-08-16-files-brand-logo-icons.md) --
+// `ArrRowChip` (`LifecycleIcons.tsx`) is the one component all three surfaces render on their
+// row line; `arrChipOverlay` is its status-to-overlay mapping, shared verbatim -- no per-surface
+// branch anywhere in this function, so a color asserted here is the color every surface shows.
 
 describe('arrChipOverlay', () => {
   it('all five arr_status values (via arrIconVariant) map to the row chip\'s overlay per the spec', () => {
@@ -681,6 +684,13 @@ describe('arrChipOverlay', () => {
 
   it('an unrecognized future status degrades to the neutral variant -- logo alone, no overlay', () => {
     expect(arrChipOverlay(arrIconVariant('some_future_status'))).toBeNull()
+  })
+
+  it('"gone" resolves to the red "warn" overlay, not the job-detail drawer icon\'s amber -- ' +
+    'the Files row chip (2026-08-16, prompts/2026-08-16-files-brand-logo-icons.md) reads this ' +
+    'exact value, same as Transfers/History, so "gone" is red on all three surfaces now', () => {
+    expect(arrChipOverlay(arrIconVariant('gone'))).toBe('warn')
+    expect(arrChipOverlay(arrIconVariant('gone'))).not.toBeNull()
   })
 })
 

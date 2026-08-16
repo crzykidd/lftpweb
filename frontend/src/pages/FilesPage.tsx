@@ -56,19 +56,22 @@ export function FilesPage() {
       })
   }, [])
 
-  // Sonarr/Radarr integration (docs/arr-integration-spec.md "UI"): the Files-row *arr icon's
-  // hover text names the bound instance, but the item projection itself carries only
-  // `arr_status`/`arr_status_at` (`core/itemview.py` -- see `lib/fileTree.ts.arrHoverLabel`'s
-  // own docstring for why). Fetched once, the same "site-wide-ish, doesn't change per second"
-  // shape `queueConfigs` above already uses, and resolved to a per-queue name below via each
-  // queue's own `arr_instance_id` -- never a second, parallel lookup inside `FileTree.tsx`.
+  // Sonarr/Radarr integration (docs/arr-integration-spec.md "UI"): the Files-row *arr chip's
+  // hover text names the bound instance, and (2026-08-16, prompts/2026-08-16-files-brand-logo-
+  // icons.md) its `kind` selects which brand logo to draw -- but the item projection itself
+  // carries only `arr_status`/`arr_status_at` (`core/itemview.py` -- see
+  // `lib/fileTree.ts.arrHoverLabel`'s own docstring for why). Fetched once, the same
+  // "site-wide-ish, doesn't change per second" shape `queueConfigs` above already uses, and
+  // resolved to a per-queue name/kind below via each queue's own `arr_instance_id` -- never a
+  // second, parallel lookup inside `FileTree.tsx`.
   const [arrInstances, setArrInstances] = useState<Record<number, ArrInstanceOut>>({})
   useEffect(() => {
     listArrInstances()
       .then((rows) => setArrInstances(Object.fromEntries(rows.map((i) => [i.id, i]))))
       .catch(() => {
-        // Degrades gracefully -- `ArrIcon` falls back to a generic "the bound *arr instance"
-        // hover when the name can't be resolved, same shape as `queueConfigs`'s own failure.
+        // Degrades gracefully -- `ArrRowChip` falls back to a generic "the bound *arr instance"
+        // hover and its `ArrTextChip` fallback (no `kind` to pick a logo) when this can't be
+        // resolved, same shape as `queueConfigs`'s own failure.
       })
   }, [])
   // The sequence value seen right before this rescan was requested -- `POST
@@ -132,8 +135,13 @@ export function FilesPage() {
 
       {queues.map((queue) => {
         const config = queueConfigs[queue.queue_id]
-        const arrInstanceName =
-          config?.arr_instance_id != null ? (arrInstances[config.arr_instance_id]?.name ?? null) : null
+        const boundArrInstance = config?.arr_instance_id != null ? arrInstances[config.arr_instance_id] : undefined
+        const arrInstanceName = boundArrInstance?.name ?? null
+        // The bound instance's `kind` (2026-08-16, prompts/2026-08-16-files-brand-logo-icons.md)
+        // -- same lookup as `arrInstanceName` above, threaded to `FileTree` so its *arr chip
+        // (`ArrRowChip`) knows which brand logo to draw, the same way Transfers/History already
+        // get it off `JobOut`/`HistoryJobOut.arr_instance_kind`.
+        const arrInstanceKind = boundArrInstance?.kind ?? null
         return (
           <section key={queue.queue_id} className="flex flex-col gap-2">
             <div className="flex items-baseline gap-2">
@@ -169,6 +177,7 @@ export function FilesPage() {
               onSelectionChange={(next) => setSelectedForQueue(queue.queue_id, next)}
               queueLocalPath={config?.local_path}
               arrInstanceName={arrInstanceName}
+              arrInstanceKind={arrInstanceKind}
             />
             {/* The unified "Reset item tracking" control (2026-08-14,
              * prompts/2026-08-14-reset-panel-counts-and-layout.md) -- one scope selector

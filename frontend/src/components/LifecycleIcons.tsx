@@ -289,20 +289,26 @@ function ArrMarkIcon(props: IconProps) {
   )
 }
 
-/** The Files-row *arr icon (docs/arr-integration-spec.md "UI" -- "multi-faceted," the user's
- * own 2026-08-15 decision): renders nothing at all for `arr_status: null` (a queue with no
- * bound instance, or an item the poller hasn't matched yet -- everything-off-by-default means
- * this is the common case on most installs). Otherwise the mark itself plus, for the states
- * that need to read as visually distinct from "still being watched," a small colored glyph
- * beside it -- a green **✓** once the *arr has confirmed import (`imported`, and `cleaned`,
- * 2026-08-16: with "Delete when imported" on, `imported` is a seconds-long transient before
- * the next poller beat cleans it up, so the green check would flash and never actually be
- * seen if `cleaned` dimmed back to neutral -- it keeps the same green ✓ instead, alongside the
- * removal-grace countdown chip), an amber **⚠** once a release left the *arr's queue without
- * ever importing (`gone`, the one state that usually needs a human, per the spec's own note).
- * `detected`/`notified` render the plain neutral mark. The hover text (`arrHoverLabel`) still
- * distinguishes "imported" from "imported and cleaned up locally," so the two states stay
- * tellable apart despite sharing an icon.
+/** The generic *arr mark (docs/arr-integration-spec.md "UI") -- originally the Files-row icon,
+ * until the Files tree unified onto the real-brand-logo `ArrRowChip` below (2026-08-16,
+ * prompts/2026-08-16-files-brand-logo-icons.md, "one visual language everywhere" -- user
+ * feedback that the real Sonarr/Radarr logos already shown on Transfers/History should show on
+ * Files too). Still used for exactly one remaining spot: the Transfers/History job-detail
+ * drawer's own "*arr" section (`TransfersPage.tsx`'s expand panel), which pairs the icon with a
+ * full sentence of its own rather than needing brand recognition or an overlay badge.
+ *
+ * Renders nothing at all for `arr_status: null` (a queue with no bound instance, or an item the
+ * poller hasn't matched yet -- everything-off-by-default means this is the common case on most
+ * installs). Otherwise the mark itself plus, for the states that need to read as visually
+ * distinct from "still being watched," a small colored glyph beside it -- a green **✓** once the
+ * *arr has confirmed import (`imported`, and `cleaned`, 2026-08-16: with "Delete when imported"
+ * on, `imported` is a seconds-long transient before the next poller beat cleans it up, so the
+ * green check would flash and never actually be seen if `cleaned` dimmed back to neutral -- it
+ * keeps the same green ✓ instead, alongside the removal-grace countdown chip), an amber **⚠**
+ * once a release left the *arr's queue without ever importing (`gone`, the one state that
+ * usually needs a human, per the spec's own note). `detected`/`notified` render the plain
+ * neutral mark. The hover text (`arrHoverLabel`) still distinguishes "imported" from "imported
+ * and cleaned up locally," so the two states stay tellable apart despite sharing an icon.
  *
  * `instanceName` is resolved by the caller from the item's *queue* binding, never invented here
  * -- see `lib/fileTree.ts.arrHoverLabel`'s own docstring for why the item projection alone
@@ -343,18 +349,23 @@ export function ArrIcon({
   )
 }
 
-// --- Sonarr/Radarr row chip (Transfers + History, 2026-08-16,
-// prompts/2026-08-16-arr-chip-on-row-lines.md) -------------------------------------------------
+// --- Sonarr/Radarr row chip (Files + Transfers + History, 2026-08-16,
+// prompts/2026-08-16-arr-chip-on-row-lines.md; Files unified onto it the same day,
+// prompts/2026-08-16-files-brand-logo-icons.md) --------------------------------------------------
 //
-// A *second*, deliberately distinct *arr indicator from `ArrIcon` above -- that one is a
-// generic "linked to an external system" mark shared by both kinds (this codebase's original
-// choice not to ship third-party brand logos). This one is the user's own later decision
-// (2026-08-16, refined same day): the Transfers/History row line shows the **real** Sonarr/
-// Radarr logo, in its own brand colour, with the outcome layered on as a small status-overlay
-// badge -- "green when the *arr processed it, red when it failed out" -- rather than folded
-// into the mark's own colour the way `ArrIcon`'s ✓/⚠ text glyphs are. That's also why `gone`
-// reads **red** here and amber on the Files row: two different specs for two different
-// affordances, not a drift between them.
+// Originally a *second*, deliberately distinct *arr indicator from `ArrIcon` above, introduced
+// for the Transfers/History row line only -- `ArrIcon` is a generic "linked to an external
+// system" mark shared by both kinds (this codebase's original choice not to ship third-party
+// brand logos). This one was the user's own later decision (2026-08-16, refined same day): the
+// row line shows the **real** Sonarr/Radarr logo, in its own brand colour, with the outcome
+// layered on as a small status-overlay badge -- "green when the *arr processed it, red when it
+// failed out" -- rather than folded into the mark's own colour the way `ArrIcon`'s ✓/⚠ text
+// glyphs are. Same day, user feedback asked for "one visual language everywhere": the Files tree
+// now renders this exact component too (`FileTree.tsx`'s *arr column), so `gone` reads **red**
+// on all three surfaces -- Files, Transfers, History -- not the amber `ArrIcon` used to show on
+// Files. `ArrIcon`'s amber survives only in the Transfers/History job-detail drawer's own "*arr"
+// section, a different affordance (full sentence beside a plain mark, no brand recognition or
+// overlay needed there).
 
 const ARR_LOGO_SIZE_PX = 16
 
@@ -467,20 +478,29 @@ function ArrChipOverlayBadge({ overlay }: { overlay: ArrChipOverlay }) {
   return null
 }
 
-/** The Transfers/History row-line *arr chip (2026-08-16, prompts/2026-08-16-arr-chip-on-row-
- * lines.md) -- the real Sonarr/Radarr brand logo, in its own brand colour, with the outcome as
- * a small status overlay: green check once the *arr processed it (`imported`/`cleaned`), red
- * dot once a release left the *arr's queue without importing (`gone`), the logo alone while
- * still mid-flight (`detected`/`notified`), and **nothing at all** when `arrStatus` is null --
- * the item isn't *arr-tracked, per this integration's "everything off by default" rule.
+/** The Files/Transfers/History row-line *arr chip (2026-08-16, prompts/2026-08-16-arr-chip-on-
+ * row-lines.md, prompts/2026-08-16-files-brand-logo-icons.md) -- the real Sonarr/Radarr brand
+ * logo, in its own brand colour, with the outcome as a small status overlay: green check once
+ * the *arr processed it (`imported`/`cleaned`), red dot once a release left the *arr's queue
+ * without importing (`gone`), the logo alone while still mid-flight (`detected`/`notified`), and
+ * **nothing at all** when `arrStatus` is null -- the item isn't *arr-tracked, per this
+ * integration's "everything off by default" rule. One component, one visual language, across
+ * all three surfaces.
  *
- * `instanceKind` selects the logo (`'sonarr'` | `'radarr'`, `JobOut.arr_instance_kind`/
- * `HistoryJobOut.arr_instance_kind`); any other value -- `null` (no bound instance, or a row
- * whose queue's instance predates this field... though it never does, since `arr_status` itself
- * would also be null then) or an unrecognized future kind -- falls back to `ArrTextChip` rather
- * than rendering nothing for a tracked item. Reuses `arrIconVariant`/`arrChipOverlay`
- * (`lib/fileTree.ts`) for the status categorization -- one mapping, consumed by `ArrIcon` above
- * and this component both -- and `arrHoverLabel` for the hover text, unchanged from `ArrIcon`.
+ * `instanceKind` selects the logo (`'sonarr'` | `'radarr'`). Transfers/History read it straight
+ * off the wire (`JobOut.arr_instance_kind`/`HistoryJobOut.arr_instance_kind`, joined server-side
+ * alongside `arr_instance_name`); the Files tree has no such per-item field (`arr_status`/
+ * `arr_status_at` are the only *arr fields `FileNode` carries -- see
+ * `lib/fileTree.ts.arrHoverLabel`'s own docstring for why), so `FilesPage.tsx` resolves it the
+ * same way it already resolves `arrInstanceName`: from the item's *queue* binding
+ * (`path_queue.arr_instance_id` -> `GET /api/settings/arr`), threaded down through
+ * `FileTree`/`Row` as a prop. Any other value -- `null` (no bound instance, a fetch that hasn't
+ * resolved yet, or a row whose queue's instance predates this field... though it never does,
+ * since `arr_status` itself would also be null then) or an unrecognized future kind -- falls
+ * back to `ArrTextChip` rather than rendering nothing for a tracked item. Reuses
+ * `arrIconVariant`/`arrChipOverlay` (`lib/fileTree.ts`) for the status categorization -- one
+ * mapping, consumed by `ArrIcon` above and this component both -- and `arrHoverLabel` for the
+ * hover text, unchanged from `ArrIcon`.
  */
 export function ArrRowChip({
   arrStatus,

@@ -285,52 +285,56 @@ gone once the *arr has it, which is the point.
   checkbox (disabled with a hint unless an instance is selected), and the "Path as seen by
   the *arr" field (`arr_visible_path`, optional, with FieldHelp explaining the namespace
   translation and that it describes the *post-move* location for a queue that relocates).
-- **Files page**: one icon slot on the row, driven purely by `arr_status` from the WS
-  stream, **multi-faceted** (user decision, 2026-08-15) — "the *arr processed it" and "the
-  *arr merely dropped it" must be visually distinct states, not one dimmed glyph:
+- **Files row + Transfers row + History job row** — one shared chip, `ArrRowChip`
+  (`LifecycleIcons.tsx`), driven purely by `arr_status` from the WS stream / REST projection.
+  Introduced for the Transfers/History row line first (2026-08-16,
+  prompts/2026-08-16-arr-chip-on-row-lines.md), then adopted by the Files tree the same day
+  (prompts/2026-08-16-files-brand-logo-icons.md — user feedback: "one visual language
+  everywhere," after the Files page had shipped a day earlier with its own, separate generic
+  mark). Renders the **real** Sonarr/Radarr brand logo (user decision — recognition is the
+  point), in the mark's own brand colour (Sonarr blue `#2596be`, Radarr gold `#ffcb3d`), never
+  tinted by status; the outcome rides a small overlay badge instead, **multi-faceted** (original
+  Files decision, 2026-08-15, carried into this shared chip) — "the *arr processed it" and "the
+  *arr merely dropped it" must be visually distinct states, never one dimmed glyph:
 
-  | `arr_status` | Icon | Meaning at a glance |
+  | `arr_status` | Overlay | Meaning at a glance |
   |---|---|---|
-  | `detected` / `notified` | *arr mark, neutral | Sonarr/Radarr queued this; it's being watched through the pipeline |
-  | `imported` | *arr mark + green ✓ | the *arr confirmed import; files kept (delete-completed off) |
-  | `gone` | *arr mark + amber ⚠ | left the *arr's queue **without** importing — likely a failed/removed grab, may need attention |
-  | `cleaned` | *arr mark + green ✓ + "Processed · Xm" countdown | imported and locally cleaned up; visible through the ~10m removal grace, then leaves via the normal `REMOVED_LOCAL` flow |
+  | `null` | *(no chip at all)* | not *arr-tracked |
+  | `detected` / `notified` | none | Sonarr/Radarr queued this; it's being watched through the pipeline |
+  | `imported` | green ✓ badge | the *arr confirmed import; files kept (delete-completed off) |
+  | `gone` | red dot badge | left the *arr's queue **without** importing — likely a failed/removed grab, may need attention |
+  | `cleaned` | green ✓ badge + (Files only) "Processed · Xm" countdown | imported and locally cleaned up; visible through the ~10m removal grace, then leaves via the normal `REMOVED_LOCAL` flow |
 
   `cleaned` shares the `imported` row's green ✓ (decision, 2026-08-16, first live Radarr
   run): with "Delete when imported" on, `imported` is a seconds-long transient — cleanup
   runs on the very next poller beat — so a green check that only lived on `imported` would
   flash and vanish before it was ever seen. The hover text still says "imported" vs.
   "imported and cleaned up locally" so the two states stay tellable apart despite sharing
-  an icon.
+  a chip.
 
-  Hover card names the instance and the timestamp (`arr_status_at`). Text/state filters
-  gain an "*arr-tracked" facet, and `gone` is filterable on its own since it's the
+  An unrecognized/future instance `kind` falls back to a text chip of the instance name, in
+  the same green/red/neutral status colours (`ArrTextChip`), rather than rendering nothing for
+  a tracked item. Transfers/History read `kind` straight off the wire — `core/queue.py.
+  list_jobs()` and `api/history.py.list_history_jobs()` both join `arr_instance.kind` alongside
+  `arr_instance.name` (`JobOut`/`HistoryJobOut.arr_instance_kind`; `HistoryJobOut` also gained
+  the `arr_status`/`arr_status_at`/`arr_instance_name` fields the Transfers panel already had).
+  The Files tree has no such per-item field — `FilesPage.tsx` resolves both `name` and `kind`
+  itself, from each queue's own `path_queue.arr_instance_id` against `GET /api/settings/arr`,
+  and threads them down through `FileTree`/`Row` as props, the same "fetched once, passed down"
+  shape it already used for the instance name alone. Logo path data: simple-icons dataset
+  (CC0), itself citing Sonarr's/Radarr's own repositories — see `NOTICE`.
+
+  Hover card names the instance and the timestamp (`arr_status_at`). Files' text/state
+  filters gain an "*arr-tracked" facet, and `gone` is filterable on its own since it's the
   actionable one. (As always: an agent cannot see this render; it ships unviewed until the
   user opens it.)
 
-- **Transfers row + History job row** (2026-08-16, prompts/2026-08-16-arr-chip-on-row-
-  lines.md): a second, deliberately distinct chip, sitting beside the state chip on the
-  collapsed/main row line. Unlike the Files icon above, this one is the **real** Sonarr/Radarr
-  brand logo (user decision, refined same day — recognition is the point), in the mark's own
-  brand colour (Sonarr blue `#2596be`, Radarr gold `#ffcb3d`), never tinted by status. The
-  outcome rides a small overlay badge instead:
-
-  | `arr_status` | Overlay | Meaning |
-  |---|---|---|
-  | `null` | *(no chip at all)* | not *arr-tracked |
-  | `detected` / `notified` | none | mid-flight, being watched |
-  | `imported` / `cleaned` | green ✓ badge | the *arr processed it |
-  | `gone` | red dot badge | left the queue without importing |
-
-  `gone` reads **red** here, not the Files icon's amber — two different specs for two
-  different affordances, not a drift between them. An unrecognized/future instance `kind`
-  falls back to a text chip of the instance name, in the same green/red/neutral status
-  colours, rather than rendering nothing for a tracked item. `core/queue.py.list_jobs()` and
-  `api/history.py.list_history_jobs()` both join `arr_instance.kind` alongside the existing
-  `arr_instance.name` so the chip knows which logo to draw (`JobOut`/`HistoryJobOut.
-  arr_instance_kind`); `HistoryJobOut` also gained the `arr_status`/`arr_status_at`/
-  `arr_instance_name` fields the Transfers panel already had. Logo path data: simple-icons
-  dataset (CC0), itself citing Sonarr's/Radarr's own repositories — see `NOTICE`.
+  A second, generic "linked to an external system" mark (`ArrIcon`, Lucide `link-2` — this
+  codebase's original choice not to ship third-party brand logos, before the brand-logo chip
+  above existed) still exists for exactly one remaining spot: the Transfers/History **job
+  detail drawer**'s own "*arr" section (icon + a full sentence, not a row-line chip) — `gone`
+  reads **amber** there, the one place the two specs still differ, since that surface never
+  needed brand recognition or an overlay badge, just the plain mark beside its own text.
 
 ## Defaults & safety (the standing rule: everything OFF)
 
@@ -387,5 +391,8 @@ Three independent, escalating opt-ins, each defaulting off:
    paths in practice (they'd confuse each other otherwise), so many-to-many binding is not
    built.
 3. **The icon is multi-faceted** — "the *arr processed it" (`imported`, green ✓) and "the
-   *arr removed it without importing" (`gone`, amber ⚠) are distinct visual states, and
-   `gone` is independently filterable since it's the one that usually needs a human.
+   *arr removed it without importing" (`gone`, amber ⚠ at the time of this decision — the
+   row-line chip all three surfaces now share reads `gone` as a red dot instead, per the "UI"
+   section above; amber survives only on the job-detail drawer's plain mark) are distinct
+   visual states, and `gone` is independently filterable since it's the one that usually needs
+   a human.

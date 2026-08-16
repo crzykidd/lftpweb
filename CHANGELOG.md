@@ -175,6 +175,18 @@ Skeleton for the next roll:
   in 6m 12s (40 MB/s avg)." A terminal job's `Elapsed` and `Average speed` fields now collapse
   into one `Transferred` field composing exactly that sentence; a still-running job's fields are
   unchanged.
+- **The Files page's *arr indicator now renders the same real Sonarr/Radarr brand-logo chip as
+  Transfers and History, instead of its own generic mark.** User feedback: the real logos shipped
+  on Transfers/History rows the same day, but the Files tree still showed the older generic *arr
+  mark — one visual language everywhere was the point. The Files tree's *arr column now renders
+  `ArrRowChip` (`LifecycleIcons.tsx`), resolving each row's bound instance `kind` the same way it
+  already resolved the instance name (`FilesPage.tsx`, from `path_queue.arr_instance_id` against
+  `GET /api/settings/arr`), with the existing `ArrTextChip` fallback for an unrecognized/future
+  `kind`. Status colors now unify on the chip's own mapping too — `gone` reads a **red** dot on
+  Files, same as Transfers/History, replacing the old amber ⚠; the "Processed · Xm" countdown
+  chip, filters, and the removal-grace machinery are unchanged. The older generic mark (`ArrIcon`)
+  is unchanged and still renders in the Transfers/History job-detail drawer's own "*arr" section,
+  the one remaining place it's used.
 
 ### Security
 
