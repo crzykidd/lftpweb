@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -37,8 +38,10 @@ class Settings(BaseSettings):
     # container; overridable for local dev, where bare `/run` isn't writable by a non-root uid.
     run_dir: str = "/run/lftpweb"
 
-    # DESIGN.md §4.5: the transfer engine's scheduling pass and progress sampler cadence.
-    # "~1 Hz" per §4.4.
+    # DESIGN.md §4.5: the transfer engine's scheduling/reap/admit loop cadence -- "~1 Hz" per
+    # §4.4. As of 2026-08-16 (§4.4), progress sampling (job and per-file speed alike) runs on a
+    # derived, slower cadence -- `core/queue.py.PROGRESS_SAMPLE_TICKS` ticks of this value
+    # (~5s at the default) -- not every tick.
     transfer_tick_s: float = 1.0
 
     # DESIGN.md §8, phase 8. Day-to-day auth configuration (mode, proxy header, trusted
@@ -51,6 +54,26 @@ class Settings(BaseSettings):
     # docs/decisions.md. Unset (the default) means "use whatever Settings -> Auth has
     # stored," which itself defaults to `none` for a fresh install.
     auth_mode: str | None = None
+
+    # 2026-08-16 (docs/decisions.md): baked at image *build* time, not runtime -- unlike
+    # every other setting here, these come from `docker build --build-arg` in
+    # .github/workflows/publish.yml, landed as `ENV` in docker/Dockerfile's `runtime` stage,
+    # so a container has no git tree to ask and still knows what it is. `build_sha` is the
+    # short (7-char) commit SHA; `build_channel` is `"dev"` (pushes to `dev`) or `"release"`
+    # (pushes to `main` / a published GitHub Release). Both are `None` for every path that
+    # never baked them: local `uv run`, `docker-compose.dev.yml`'s `dev`/`frontend-dev`
+    # targets (the ARGs are declared only in `runtime`), and a manual `docker build` with no
+    # `--build-arg`. That last case still sets the env var (Docker bakes an unset ARG's
+    # empty-string default into `ENV` regardless), so the validator below normalizes an
+    # empty string back to `None` rather than pydantic-settings treating "" as a real value
+    # distinct from "unset".
+    build_sha: str | None = None
+    build_channel: str | None = None
+
+    @field_validator("build_sha", "build_channel", mode="before")
+    @classmethod
+    def _blank_build_field_is_unset(cls, value: str | None) -> str | None:
+        return value or None
 
 
 settings = Settings()

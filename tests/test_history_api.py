@@ -68,6 +68,23 @@ async def _make_item(db, queue_id: int, rel_path: str, *, state: str = "DOWNLOAD
     return cursor.lastrowid
 
 
+# --- *arr join (2026-08-16, prompts/2026-08-16-arr-chip-on-row-lines.md) -- the same
+# `item.arr_status`/`arr_instance.name`/`arr_instance.kind` join `core/queue.py.list_jobs()`
+# already carries, added here so the History job row can draw the identical *arr chip. ----------
+
+
+async def _seed_arr_instance(db, *, name: str = "Sonarr", kind: str = "sonarr") -> int:
+    now = "2026-08-16T00:00:00.000000Z"
+    cursor = await db.execute(
+        "INSERT INTO arr_instance (name, kind, base_url, api_key_enc, enabled, "
+        "notify_on_complete, created_at, updated_at) VALUES (?, ?, 'https://arr.test', "
+        "'enc', 1, 0, ?, ?)",
+        (name, kind, now, now),
+    )
+    await db.commit()
+    return cursor.lastrowid
+
+
 async def _make_job(
     db,
     item_id: int,
@@ -155,6 +172,43 @@ async def test_output_tail_never_appears_in_the_list_payload(db):
     assert job.error_class == "AUTH_FAILED"
     assert job.has_output_tail is True
     assert not hasattr(job, "output_tail")
+
+
+async def test_history_job_carries_arr_facts_when_queue_is_bound(db):
+    queue_id = await _make_queue(db)
+    instance_id = await _seed_arr_instance(db, name="Radarr 4K", kind="radarr")
+    await db.execute(
+        "UPDATE path_queue SET arr_instance_id = ? WHERE id = ?", (instance_id, queue_id)
+    )
+    item = await _make_item(db, queue_id, "movie.mkv")
+    await db.execute(
+        "UPDATE item SET arr_status = 'imported', arr_status_at = ? WHERE id = ?",
+        ("2026-08-16T01:00:00.000000Z", item),
+    )
+    await db.commit()
+    await _make_job(db, item, state="succeeded")
+
+    resp = await history.list_history_jobs(_FakeRequest(db))
+    assert len(resp.jobs) == 1
+    job = resp.jobs[0]
+    assert job.arr_status == "imported"
+    assert job.arr_status_at == "2026-08-16T01:00:00.000000Z"
+    assert job.arr_instance_name == "Radarr 4K"
+    assert job.arr_instance_kind == "radarr"
+
+
+async def test_history_job_arr_fields_are_null_when_queue_has_no_bound_instance(db):
+    queue_id = await _make_queue(db)
+    item = await _make_item(db, queue_id, "movie.mkv")
+    await _make_job(db, item, state="succeeded")
+
+    resp = await history.list_history_jobs(_FakeRequest(db))
+    assert len(resp.jobs) == 1
+    job = resp.jobs[0]
+    assert job.arr_status is None
+    assert job.arr_status_at is None
+    assert job.arr_instance_name is None
+    assert job.arr_instance_kind is None
 
 
 async def test_job_output_fetched_on_demand(db):
@@ -283,6 +337,86 @@ async def test_row_cap_enforced_even_when_a_larger_limit_is_requested(db):
     # cap is non-negotiable regardless of what the client requests.
     resp_over = await history.list_history_jobs(_FakeRequest(db), limit=100_000)
     assert resp_over.limit == history.MAX_LIMIT
+
+
+# --- `queue_summaries` (2026-08-16, prompts/2026-08-16-history-jobs-group-collapse.md) --------
+#
+# The honest, filter-scoped aggregate `HistoryJobsSection.tsx`'s queue group headers need --
+# History's `jobs` list is `LIMIT`/`OFFSET` paginated, so these have to be computed server-side
+# over the *whole* filtered set, not just the loaded page (module docstring).
+
+
+async def test_queue_summary_counts_by_outcome_and_sums_bytes(db):
+    queue_id = await _make_queue(db, name="tv")
+    ok1 = await _make_item(db, queue_id, "ok1.txt")
+    await _make_job(db, ok1, state="succeeded")
+    ok2 = await _make_item(db, queue_id, "ok2.txt")
+    await _make_job(db, ok2, state="succeeded")
+    bad = await _make_item(db, queue_id, "bad.txt", state="FAILED")
+    await _make_job(db, bad, state="failed", error_class="AUTH_FAILED")
+    stopped = await _make_item(db, queue_id, "stopped.txt", state="STOPPED")
+    await _make_job(db, stopped, state="cancelled")
+
+    resp = await history.list_history_jobs(_FakeRequest(db))
+    assert len(resp.queue_summaries) == 1
+    summary = resp.queue_summaries[0]
+    assert summary.queue_id == queue_id
+    assert summary.queue_name == "tv"
+    assert summary.succeeded == 2
+    assert summary.failed == 1
+    assert summary.cancelled == 1
+    assert summary.total_bytes_done == 4000  # 1000 bytes_done per _make_job call, x4
+
+
+async def test_queue_summary_one_row_per_queue_ordered_by_name(db):
+    q_movies = await _make_queue(db, name="movies")
+    q_tv = await _make_queue(db, name="tv")
+    movie_item = await _make_item(db, q_movies, "film.mkv")
+    await _make_job(db, movie_item, state="succeeded")
+    tv_item = await _make_item(db, q_tv, "show.mkv")
+    await _make_job(db, tv_item, state="succeeded")
+
+    resp = await history.list_history_jobs(_FakeRequest(db))
+    assert [s.queue_name for s in resp.queue_summaries] == ["movies", "tv"]
+
+
+async def test_queue_summary_honors_the_same_filters_as_the_jobs_list(db):
+    q1 = await _make_queue(db, name="q1")
+    q2 = await _make_queue(db, name="q2")
+    q1_item = await _make_item(db, q1, "q1.txt")
+    await _make_job(db, q1_item, state="succeeded")
+    q2_item = await _make_item(db, q2, "q2.txt")
+    await _make_job(db, q2_item, state="succeeded")
+
+    resp = await history.list_history_jobs(_FakeRequest(db), queue_id=q1)
+    assert [s.queue_id for s in resp.queue_summaries] == [q1]
+    assert resp.queue_summaries[0].succeeded == 1
+
+    resp_state = await history.list_history_jobs(_FakeRequest(db), state="failed")
+    assert resp_state.queue_summaries == []
+
+
+async def test_queue_summary_stays_bounded_regardless_of_row_cap(db):
+    """The whole point: a queue's *true* total spans more jobs than the paginated `jobs` list
+    returns. `limit=1` still reports the queue's real 5-job total, not just the one loaded row.
+    """
+    queue_id = await _make_queue(db)
+    for i in range(5):
+        item = await _make_item(db, queue_id, f"file{i}.txt")
+        await _make_job(
+            db, item, state="succeeded", finished_at=f"2026-08-11T00:00:{i:02d}.000000Z"
+        )
+
+    resp = await history.list_history_jobs(_FakeRequest(db), limit=1)
+    assert len(resp.jobs) == 1
+    assert len(resp.queue_summaries) == 1
+    assert resp.queue_summaries[0].succeeded == 5
+    assert resp.queue_summaries[0].total_bytes_done == 5000
+
+
+async def test_queue_summary_empty_when_nothing_matches(db):
+    resp = await history.list_history_jobs(_FakeRequest(db))
+    assert resp.queue_summaries == []
 
 
 async def test_pagination_offset_walks_through_results_newest_first(db):

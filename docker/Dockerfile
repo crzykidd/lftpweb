@@ -130,6 +130,17 @@ EXPOSE 8087
 CMD ["uvicorn", "lftpweb.main:app", "--host", "0.0.0.0", "--port", "8087", "--reload", "--reload-dir", "/app/backend"]
 
 FROM python:3.13-alpine@sha256:540c7d91f98ff6880174c40e99067bf5941eb54d818a7a5e094d188b196a934d AS runtime
+# Bake the commit and channel a *dev* image was built from (2026-08-16, docs/decisions.md) so
+# a `:dev` container can identify itself in the UI as never mistaken for a release -- the
+# container has no git tree to ask at runtime. Declared only in this stage: `dev`/
+# `frontend-dev` (above) never receive these ARGs, so a `docker-compose.dev.yml` build stays
+# unbaked (`LFTPWEB_BUILD_SHA`/`LFTPWEB_BUILD_CHANNEL` absent -> `config.Settings` defaults to
+# `None`) exactly like a plain `uv run`. .github/workflows/publish.yml passes both only for the
+# `runtime`-target image it actually publishes; an unbaked ARG still lands here as an empty
+# string (Docker's own behavior), which `config.Settings`'s validator normalizes back to
+# `None` rather than a spurious "" value reaching `/api/health`.
+ARG BUILD_SHA=""
+ARG BUILD_CHANNEL=""
 # lftp: the transfer engine. openssh-client: ssh/sftp. 7zip: 7zz, zip/7z/tar/gz/bz2/xz — NOT
 # rar (Alpine's build has no RAR codec; see the unrar-builder stage above and
 # docs/decisions.md). su-exec: privilege drop after the entrypoint fixes ownership. tini:
@@ -147,7 +158,9 @@ RUN chmod +x /entrypoint.sh
 ENV PATH="/app/.venv/bin:${PATH}" \
     LFTPWEB_STATIC_DIR=/app/static \
     LFTPWEB_CONFIG_DIR=/config \
-    LFTPWEB_PORT=8087
+    LFTPWEB_PORT=8087 \
+    LFTPWEB_BUILD_SHA=${BUILD_SHA} \
+    LFTPWEB_BUILD_CHANNEL=${BUILD_CHANNEL}
 
 # Deliberately NO `VOLUME` declaration.
 #

@@ -8,7 +8,7 @@ progress, auto-queue on patterns, and optionally verify, extract, and relocate f
 
 > ## Beta
 >
-> **Version `0.1.1`.** All 9 build phases are built, covered by backend unit and integration
+> **Version `0.2.0`.** All 9 build phases are built, covered by backend unit and integration
 > tests plus a frontend unit suite, and exercised manually through the UI against a real
 > seedbox. This is a **beta** — there is no upgrade path guaranteed between beta releases,
 > and the database schema may still change between them. See
@@ -47,11 +47,17 @@ Every verify outcome, every remote delete, and every delete withheld — with th
 - Connect to a seedbox over SSH/SFTP; browse the remote tree alongside the local one
 - Named **path queues** — one remote → local mapping each, with their own settings
 - Queue transfers manually, watch live progress, stop them, resume from the partial;
-  multi-select with shift-range and bulk Queue/Stop/Delete-local that reports partial failure
+  multi-select with shift-range and bulk Queue/Stop/Delete that reports partial failure
   honestly ("7 of 10 queued, these 3 failed because …"), plus text/state/"missing only" filters,
-  on the Files page. Deleting local files is guarded (path containment, no active job, mount
-  sentinel) and confirmed before it runs — irreversible, unlike Queue/Stop. A delete marks the
-  whole subtree, and picks each row's state from whether a remote copy actually survives
+  on the Files page. The delete dialog offers two independent, checkbox-driven scopes — Delete
+  local copy, and (2026-08-16) Delete source (seedbox), the first manual remote-delete in the
+  app, for cleaning up a failed or never-imported item without SSHing into the seedbox by hand.
+  Local defaults on and Source defaults on for a `move` queue (off for `copy`, with a warning if
+  checked anyway — its remote path isn't guaranteed to be a hardlink pickup directory). Every
+  scope is guarded (path containment, no active job, mount sentinel; a manual source delete
+  refuses rather than stopping a live transfer) and confirmed before it runs — irreversible,
+  unlike Queue/Stop. A local delete marks the whole subtree, and picks each row's state from
+  whether a remote copy actually survives
 - Files rows carry four lifecycle icons (**R**emote / **L**ocal / **V**erified / **E**xtracted —
   presence facets may go dark, milestones stay lit), an inline progress bar inside the state
   chip, when the row last changed state, and an info icon that opens a detail drawer with both
@@ -79,11 +85,28 @@ Every verify outcome, every remote delete, and every delete withheld — with th
   partial window for that shape. See Settings → Transfer
 - Post-processing: verify (sidecar or hash-on-disk, which now also checks total bytes so it
   cannot bless a truncated file), extract (`7zz` for zip/7z/tar/gz/bz2/xz, `unrar` for rar/rar5
-  — see `NOTICE`), and `move` mode's verification-gated remote delete, all with an audited trail
+  — see `NOTICE`), and `move` mode's remote delete — fired only after the *last* enabled check
+  passes (completeness → verify → extract → *arr import when tracked), all with an audited trail
   on the History page. Extraction stages into `_UNPACK_` and merges into place only on full
   success, is gated on cheap filesystem preconditions first (zero-length head volume, a gap in a
   multi-volume rar set), and can optionally delete a release's spent archive volumes once they
   have extracted — off by default
+- **Optional Sonarr/Radarr integration** (`docs/arr-integration-spec.md`, off at every level by
+  default): bind a queue to a Sonarr or Radarr instance from Settings → Integrations and lftpweb
+  closes the whole loop — it watches that instance's download queue for a matching release,
+  badges the row with the real Sonarr/Radarr logo while the release moves through download,
+  verify, and extract, tells the *arr "your files are here, import now" once post-processing
+  succeeds, and then waits for the *arr to *fully* confirm the import (its own queue record
+  finished plus import history, held for two consecutive checks — never on an ambiguous signal)
+  before doing any cleanup. On a `move` queue the **seedbox source is deleted only after that
+  confirmed import** — files exist on both sides until the *arr has the release, so any failure
+  is inspectable on both ends — and the optional per-queue "Delete when imported" toggle then
+  removes the local working copy too, leaving the row visible with a "Processed" countdown
+  before it ages out. The logo chip carries the outcome everywhere (Files, Transfers, History):
+  green check once imported, red mark if a release left the *arr's queue without ever importing
+  (filterable on its own, since that one usually needs a look). Stragglers are cleaned up from
+  the app: the delete dialog offers independent **Local** and **Source (seedbox)** scopes, so
+  failed or abandoned releases can be cleared from both sides without ever SSHing in
 - The History page: every completed/failed/cancelled transfer and every audit event
   (including remote deletes and deletes withheld), filterable and grouped by queue
 - Rotating log viewer, on-demand `VACUUM INTO` database backups (scheduled + manual), and a
@@ -93,11 +116,11 @@ Every verify outcome, every remote delete, and every delete withheld — with th
   password login or trust a reverse proxy's identity header, both from Settings → Auth. See
   "Locked out?" below before you flip it on.
 - **In-app user documentation**, under **Docs** in the left nav: a quick start walking the real
-  first-run sequence, and a Concepts page covering the seven things that actually confuse people
+  first-run sequence, and a Concepts page covering the eight things that actually confuse people
   (the settle gate, the removal grace period, auto-queue suppression, the difference between
-  Dismiss / Clear history / Reset item tracking, the lifecycle icons, `copy` vs `move`, and
-  inherit-vs-override on the post-processing toggles). Every step links straight to the settings
-  page it describes.
+  Dismiss / Clear history / Reset item tracking, the lifecycle icons, `copy` vs `move`,
+  inherit-vs-override on the post-processing toggles, and the Sonarr/Radarr icon). Every step
+  links straight to the settings page it describes.
   Per-field help popups (`FieldHelp`) are being applied across the settings surface, starting
   with the fields whose wrong answer costs you data
 
@@ -108,8 +131,7 @@ and how it was verified), but real gaps remain:
 
 | | Notes |
 |---|---|
-| Files page has no "Delete remote" | §9.2 lists it alongside "Delete local" (which now exists, per-item and bulk, with a confirmation dialog — 2026-08-12). Deliberately deferred, not forgotten: the only remote deletion is still `move` mode's verification-gated pipeline; a manual remote-delete button is a materially larger safety conversation. |
-| Propagating local deletes to the seedbox (`sync` mode) | Designed (`DESIGN.md` §7) but **not scheduled** — built only if it proves wanted. |
+| Propagating local deletes to the seedbox (`sync` mode) | Designed (`DESIGN.md` §7) but **not scheduled** — built only if it proves wanted. `sync`'s own primary use case ("the importer took it, clean up the source") is now served without building it: `move`-with-the-delete-ladder plus the Files page's manual delete dialog (Delete source, above) cover it — see `DESIGN.md` §7's own note. |
 | Local retention (delete-local-files-older-than-N-days) has no Settings-page UI | Backend, API (including a dry-run preview), and the background scheduler all exist (2026-08-12) and default off; only the settings screen to turn it on hasn't shipped yet — same "backend first" gap as the settle gate and Settings → Transfer before it. |
 
 See "Known gaps" below for the rest — behavioral limitations and deliberate trade-offs, as
@@ -140,10 +162,6 @@ and known limitations, recorded in full in `docs/decisions.md` and `prompts/open
 - **`password` auth mode with no user configured is open access, not a lockout** — see "Locked
   out?" below. Deliberate, since the alternative bricks the instance on a typo, but anyone
   reaching the API while no user row exists is in.
-- **A `move` queue deletes the remote copy before extraction runs.** The order is verify →
-  remote delete → extract, so an extraction that fails does so after the only other copy is gone.
-  Recoverable in practice — the local archives survive, since archive cleanup only runs on a
-  successful extraction — but it is a known, deliberate ordering rather than a reasoned one.
 - **An abandoned `.downloading-` directory with no tracking history can't be deleted from the
   UI.** It is visible (the scan maps it to its logical name), but "Delete local" resolves the
   physical path from the item's recorded prefix, and an orphan predating any job has none. The
@@ -161,6 +179,10 @@ and known limitations, recorded in full in `docs/decisions.md` and `prompts/open
   location) only appears from the Files page.** `TransfersPage.tsx` opens the same drawer but
   doesn't have the owning queue's `local_path` loaded, so that one panel simply doesn't render
   there — every other section of the drawer is unaffected.
+- **The Sonarr/Radarr integration UI has never been click-tested in a browser.** No agent that
+  built it (backend, notify/cleanup, or this UI pass) can render a page — see `docs/decisions.md`
+  for the standing reason every Settings page in this project carries the same caveat. The item
+  drawer also doesn't surface `arr_status` yet; only the Files-row icon and its hover text do.
 
 ## Locked out?
 

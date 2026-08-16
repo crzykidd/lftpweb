@@ -5,7 +5,7 @@ split DESIGN.md §12 calls for explicitly. Owned alongside `Engine`/`TransferQue
 `app.state` (DESIGN.md §2) and invoked once per queue at the end of every successful scan
 (`Engine.scan_queue`).
 
-Three things this module must get right, in order of consequence:
+Five things this module must get right, in order of consequence:
 
 1. **Default off, per queue.** `QueueAutoConfig.auto_queue_enabled` mirrors
    `path_queue.auto_queue_enabled`, which defaults to `0` in the schema (migration 001) and
@@ -31,6 +31,23 @@ Three things this module must get right, in order of consequence:
    *manual* Queue click bypasses this check entirely (`core/queue.py.enqueue_item` doesn't
    consult it) -- an explicit user action beats a heuristic -- but still can't reach
    `DOWNLOADED` early, because the gate's other half lives in `core/queue.py._reap_one`.
+5. **`_UNPACK_`/`_FAILED_` top-level items are never auto-queued** (2026-08-15,
+   `prompts/done/2026-08-15-arr-eventtype-and-unpack-autoqueue.md`; "show it, don't grab it,"
+   user decision same date, `docs/decisions.md`). The user's seedbox runs SABnzbd, which stages
+   an in-progress unpack into a `_UNPACK_<name>` directory on the *remote* side before renaming
+   it to the release's final name -- the same `_UNPACK_`/`_FAILED_` prefixes
+   `core/extract.py`/`core/local_scan.py` already use for lftpweb's own local extraction
+   staging, reused here (`UNPACK_PREFIX`/`FAILED_PREFIX`, imported from `core/extract.py`
+   rather than duplicated) because they happen to name the identical convention on the wire.
+   Unlike `local_scan.py`'s filter, this is **not** scan-side: these show up as ordinary
+   `REMOTE_ONLY` items in the Files tree on purpose -- "someone's staging is not content" still
+   holds, but the user wants to *see* a 34 GB in-flight unpack sitting there, just never have
+   auto-queue grab it while SAB might still be rewriting it underneath. The exclusion is
+   therefore applied at eligibility, in this module, not at scan visibility -- a top-level
+   item's name starting with either prefix is skipped outright, before pattern matching and
+   regardless of `state`. A *manual* Queue click is untouched (same "explicit
+   action beats a heuristic" reasoning as the settle gate above) -- once SAB finishes and
+   renames the directory, the plain name becomes eligible normally, no special-casing needed.
 
 **Retroactive by construction.** DESIGN.md §4.7: "adding a pattern re-evaluates the whole
 known model, not just future scans." This module re-queries every eligible top-level item in
@@ -50,6 +67,7 @@ from dataclasses import dataclass
 import aiosqlite
 
 from lftpweb.core import mount_sentinel, patterns, settle
+from lftpweb.core.extract import FAILED_PREFIX, UNPACK_PREFIX
 
 logger = logging.getLogger(__name__)
 
@@ -223,6 +241,16 @@ class AutoQueue:
 
         queued = 0
         for row in rows:
+            # "Show it, don't grab it" (user decision, 2026-08-15, docs/decisions.md): a SAB
+            # in-progress unpack staged under `_UNPACK_<name>` (or a `_FAILED_` leftover) on
+            # the *remote* side stays visible as an ordinary REMOTE_ONLY item in the Files
+            # tree -- this is eligibility, not scan filtering -- but is never a valid
+            # auto-queue target, regardless of state or matching patterns. Checked before
+            # pattern matching so a broad `*` select pattern can never override it.
+            if row["rel_path"].startswith(UNPACK_PREFIX) or row["rel_path"].startswith(
+                FAILED_PREFIX
+            ):
+                continue
             if not compiled.item_matches(row["rel_path"], is_file=not bool(row["is_dir"])):
                 continue
             # The settle gate's eligibility half (prompts/open-issues.md #2): skip -- not

@@ -39,6 +39,15 @@ class HealthResponse(BaseModel):
     # yet (a fresh install), distinct from `False` (a host is configured but unreachable).
     host_reachable: bool | None = None
     scheduler_alive: bool = True
+    # 2026-08-16 (docs/decisions.md): also not in §12's literal shape, same reasoning as
+    # `repo_url` above -- `config.Settings.build_sha`/`.build_channel` are baked at image
+    # *build* time (docker/Dockerfile's `runtime` stage, .github/workflows/publish.yml), and
+    # this endpoint is already how the nav's version readout learns runtime-only facts about
+    # itself. `None` for every build that never baked them (local dev, compose dev stack, a
+    # manual `docker build` with no `--build-arg`) -- the frontend badge degrades to today's
+    # plain `v<version>` rendering in that case, never a lie about the channel.
+    build_sha: str | None = None
+    build_channel: str | None = None
 
 
 class StatsResponse(BaseModel):
@@ -190,6 +199,23 @@ class PathQueueIn(BaseModel):
     # whatever the default happened to be when the queue was created.
     download_prefix_enabled: bool | None = None
     download_prefix: str | None = None
+    # Sonarr/Radarr integration (migration 018, docs/arr-integration-spec.md "Data model" /
+    # "API surface"). Binding is per-queue, one instance at most -- `None` (the default, and
+    # every existing queue's value after the migration) means "no integration": no icons, no
+    # matching, no *arr behavior at all for this queue. Full-replace fields like the rest of
+    # this model (not the four post-processing toggles' merge-on-absence shape) -- Settings ->
+    # Queues' edit form always submits the complete queue state, same reasoning
+    # `update_queue`'s own docstring already gives for every other plain field here.
+    arr_instance_id: int | None = None
+    # Default off, per-queue, and only meaningful when `arr_instance_id` is set --
+    # `api/settings_queues.py` rejects `True` with no bound instance (spec: "the Settings UI's
+    # 'Delete when imported' checkbox, disabled with a hint unless an instance is selected").
+    arr_delete_completed: bool = False
+    # This queue's `local_path`, translated into the bound *arr's own namespace (spec "Path
+    # namespaces") -- `None` means "same namespace, no translation," never an empty-string
+    # sentinel. Optional even when an instance is bound: it is only read by phase B's notify
+    # push, not by matching.
+    arr_visible_path: str | None = Field(default=None, max_length=MAX_PATH_LEN)
 
 
 class PathQueueOut(PathQueueIn):
@@ -373,17 +399,45 @@ class RetentionPreviewResponse(BaseModel):
     items: list[RetentionPreviewItem]
 
 
+class DeleteItemRequest(BaseModel):
+    """`POST /api/items/{item_id}/delete`'s optional body (2026-08-16, the manual delete
+    dialog's independent Local/Source scopes,
+    `prompts/2026-08-16-manual-delete-local-and-remote.md`). Omitted entirely (no body at all)
+    means exactly today's pre-existing behavior -- `local=True, source=False`, a local-only
+    delete -- so every caller that predates this task (including every existing test that calls
+    `delete_item` with no body) is unaffected. `source=True` is the first *manual* remote-delete
+    path in the API; the endpoint itself raises 400 if both are `False` -- "at least one" is a
+    cross-field rule a plain check in the handler expresses more legibly than a Pydantic
+    validator would.
+    """
+
+    local: bool = True
+    source: bool = False
+
+
 class DeleteItemResponse(BaseModel):
     """`POST /api/items/{item_id}/delete` -- the first delete endpoint in this API (DESIGN.md
     §9.2's Files-page "Delete local"). A withheld guard raises `HTTPException` instead of
     returning `deleted=False` here, so the existing `Promise.allSettled` bulk-action shape
     (`FileTree.tsx`, phase 9) reports it as a per-item failure without any new frontend
     plumbing.
+
+    `deleted`/`reason`/`bytes_freed` describe the **local** scope exactly as before this task
+    (`True`/`"deleted"`/bytes when `local=True` was requested and succeeded; unchanged shape for
+    every caller that predates the source scope). `source_deleted`/`source_reason` are `None`
+    when `source` was not requested, and otherwise describe that independent outcome -- a
+    combined request where local succeeds but source then fails is reported as `deleted=True`
+    with `source_deleted=False` (200, not 409): the local side effect already happened and
+    cannot be un-happened, so the response says exactly what did and did not occur rather than
+    a single flag flattening the two into a misleading pass/fail. The endpoint only raises 409
+    when *nothing* requested actually succeeded -- see `api/jobs.py.delete_item`'s own docstring.
     """
 
     deleted: bool
     reason: str
     bytes_freed: int | None = None
+    source_deleted: bool | None = None
+    source_reason: str | None = None
 
 
 # --- Reset item tracking (2026-08-13, prompts/2026-08-13-reset-item-tracking.md) -----------
@@ -614,6 +668,13 @@ class FileNode(BaseModel):
     # what lets the Files page tell that apart from an ordinary pattern-`EXCLUDED` file and
     # render a greyed-out "Extracted" chip instead of "Excluded".
     deleted_archive_at: str | None = None
+    # Sonarr/Radarr integration (migration 018, docs/arr-integration-spec.md): the Files page's
+    # *arr icon reads this directly. A facet, not a lifecycle state -- passed through verbatim
+    # from `item.arr_status`/`item.arr_status_at` (`core/itemview.py.item_view`), never derived
+    # from `state`. `arr_download_id` is deliberately absent here too -- see that column's own
+    # comment in migration 018 ("not published in the item projection").
+    arr_status: str | None = None
+    arr_status_at: str | None = None
     facets: LifecycleFacets
 
 
@@ -672,10 +733,67 @@ class JobOut(BaseModel):
     error_class: str | None = None
     # DESIGN.md §9.2: "Failed rows show the error class and the captured lftp output tail."
     output_tail: str | None = None
+    # 2026-08-15 (prompts/2026-08-15-transfers-single-line-rows-with-detail.md): the item-level
+    # facts the Transfers row's new expand panel needs for its Processing/*arr groups. Inlined
+    # here rather than fetched separately -- `list_jobs()`'s row set is bounded by construction
+    # (one row per active/recently-terminal item, `core/queue.py.list_jobs`'s own docstring), so
+    # joining these onto every row costs nothing the endpoint doesn't already pay for `rel_path`/
+    # `queue_name`. All three below mirror `item.verified_at`/`item.extracted_at`/
+    # `item.remote_deleted_at` (migration 001) -- the same milestones `ItemDrawer.tsx`'s
+    # `lifecycleChronology` already reads off `FileNode`.
+    verified_at: str | None = None
+    extracted_at: str | None = None
+    remote_deleted_at: str | None = None
+    # `item.arr_status`/`item.arr_status_at` (migration 018, docs/arr-integration-spec.md) --
+    # same facet the Files page's row icon already reads off the item projection.
+    arr_status: str | None = None
+    arr_status_at: str | None = None
+    # The bound instance's own display name, resolved via `path_queue.arr_instance_id ->
+    # arr_instance.name` -- `null` whenever this job's queue has no bound *arr instance, the one
+    # signal the panel's *arr group gates its own visibility on (`lib/transferPanel.ts.
+    # hasArrGroup`). Never `arr_download_id` -- that column stays server-side only, same as the
+    # item projection's own convention (`lib/fileTree.ts`'s comment on why).
+    arr_instance_name: str | None = None
+    # The bound instance's `kind` ('sonarr'/'radarr', migration 018's CHECK constraint) -- added
+    # 2026-08-16 (prompts/2026-08-16-arr-chip-on-row-lines.md) alongside `arr_instance_name` for
+    # the Transfers/History row chip's brand-logo choice. `arr_instance_name` is free-text (the
+    # user can rename an instance to anything), so it can't drive which logo to draw; `kind` is
+    # the one field that reliably says "this is a Sonarr instance" vs. "this is a Radarr
+    # instance". `null` under the same condition `arr_instance_name` is null.
+    arr_instance_kind: str | None = None
 
 
 class JobsResponse(BaseModel):
     jobs: list[JobOut]
+
+
+class DismissAllResponse(BaseModel):
+    """`POST /api/jobs/dismiss-all` (2026-08-15) -- the bulk counterpart to `POST
+    /api/jobs/{id}/dismiss`. `dismissed` is the actual row count the bulk `UPDATE` affected
+    (`cursor.rowcount`), the same "report the real number, not a guess" convention
+    `HistoryClearResponse.deleted` already uses.
+    """
+
+    dismissed: int
+
+
+class ItemEventOut(BaseModel):
+    """One `event` row, scoped to a single item (2026-08-15) -- the Transfers panel's on-demand
+    "processing story" fetch. Deliberately leaner than `api/history.py.HistoryEventOut`: this
+    endpoint is already scoped to one known item (the caller supplies `item_id` in the URL), so
+    there is no need to resolve or carry `queue_id`/`queue_name`/`rel_path` a second time.
+    """
+
+    id: int
+    ts: str
+    level: str
+    kind: str
+    message: str
+    job_id: int | None
+
+
+class ItemEventsResponse(BaseModel):
+    events: list[ItemEventOut]
 
 
 class TransferSettingsOut(BaseModel):
@@ -771,6 +889,39 @@ class HistoryJobOut(BaseModel):
     # Transfers -- but surfacing it here answers "did I dismiss this, or did it just age off
     # the other page" without making the row set itself conditional on the answer.
     dismissed_at: str | None
+    # `item.arr_status`/`item.arr_status_at` plus the bound instance's `name`/`kind` (2026-08-16,
+    # prompts/2026-08-16-arr-chip-on-row-lines.md) -- the same two scalar columns `JobOut` above
+    # already carries for the Transfers row chip, joined here via the same `path_queue.
+    # arr_instance_id -> arr_instance` `LEFT JOIN` so the History job row can draw the identical
+    # chip. Two scalar columns on an already-paginated list, not a blob -- the phase-6
+    # unbounded-list trap this module's own docstring warns about does not apply to a handful of
+    # short strings per row. `null` whenever this job's queue has no bound *arr instance, or the
+    # poller never matched this item.
+    arr_status: str | None = None
+    arr_status_at: str | None = None
+    arr_instance_name: str | None = None
+    arr_instance_kind: str | None = None
+
+
+class HistoryQueueSummaryOut(BaseModel):
+    """One queue's honest aggregate over the *whole filtered set*, not just the loaded page
+    (2026-08-16, prompts/2026-08-16-history-jobs-group-collapse.md) -- History's jobs list is
+    `LIMIT`/`OFFSET` paginated, so a client-side sum over `HistoryJobsResponse.jobs` would be
+    wrong the moment more rows match the filter than are loaded. This is a single bounded
+    `GROUP BY` (one row per queue, api/history.py's `_queue_summaries`), never a per-row blob,
+    and it honors the exact same filter as the `jobs` list it rides alongside -- same
+    `_jobs_where_clause` call, so the two can never drift apart. History's job domain is
+    terminal-only (`succeeded`/`failed`/`cancelled` -- see `_TERMINAL_JOB_STATES`), so unlike
+    the Transfers page's queue-group header (`lib/transferPanel.ts.QueueGroupCounts`) there is
+    no `active`/`queued` bucket here to count.
+    """
+
+    queue_id: int
+    queue_name: str
+    succeeded: int
+    failed: int
+    cancelled: int
+    total_bytes_done: int
 
 
 class HistoryJobsResponse(BaseModel):
@@ -778,6 +929,11 @@ class HistoryJobsResponse(BaseModel):
     total: int  # count matching the filter, ignoring limit/offset -- what "load more" needs
     limit: int
     offset: int
+    # Inlined rather than a second `GET /api/history/jobs/summary` endpoint (2026-08-16): the
+    # frontend already refetches this list on every filter change, so a second request would
+    # just be a second round trip for data derived from the identical filter -- see the
+    # module docstring in api/history.py for the fuller comparison.
+    queue_summaries: list[HistoryQueueSummaryOut]
 
 
 class HistoryJobOutputOut(BaseModel):
@@ -961,3 +1117,51 @@ class LogTailResponse(BaseModel):
     # what's actually in the file, because this endpoint never reads the whole thing to find
     # out. See core/logtail.py's module docstring.
     truncated: bool
+
+
+# --- Settings -> Integrations (migration 018, docs/arr-integration-spec.md) -------------
+
+ArrKind = Literal["sonarr", "radarr"]
+
+
+class ArrInstanceIn(BaseModel):
+    """A create/update request for one Sonarr/Radarr instance. `api_key` is plaintext here --
+    the only place it ever appears in a request body -- and is encrypted at rest
+    (`core/crypto.py`) before it touches the database, the identical convention `HostIn.password`
+    uses; it is never included in any response. Omitting it on an update keeps the stored key
+    (same "unchanged must not mean cleared" rule `settings_host.py.put_host` follows).
+    """
+
+    name: str = Field(max_length=MAX_NAME_LEN)
+    kind: ArrKind
+    base_url: str = Field(max_length=MAX_NAME_LEN)
+    api_key: str | None = Field(default=None, max_length=MAX_SECRET_LEN)
+    enabled: bool = False
+    notify_on_complete: bool = False
+
+
+class ArrInstanceOut(BaseModel):
+    id: int
+    name: str
+    kind: ArrKind
+    base_url: str
+    # Never the key itself (DESIGN.md §9.2's "must never round-trip the stored secret back to
+    # the browser") -- whether one is on file, mirroring `HostOut.has_password`.
+    has_api_key: bool
+    enabled: bool
+    notify_on_complete: bool
+    created_at: str
+    updated_at: str
+
+
+class ArrTestResponse(BaseModel):
+    """`POST /api/settings/arr/{id}/test` -- the `GET /api/v3/system/status` round trip
+    (docs/arr-integration-spec.md "API surface"), the Settings UI's Test button. Same shape as
+    `TestConnectionResponse` plus the instance's own reported version, which only this endpoint
+    (not the generic `ok`/`error_class`/`message` triple) has anything to say about.
+    """
+
+    ok: bool
+    error_class: str | None
+    message: str
+    version: str | None = None

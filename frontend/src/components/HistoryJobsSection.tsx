@@ -1,8 +1,20 @@
 import { useVirtualizer } from '@tanstack/react-virtual'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { clearHistoryJob, clearHistoryJobs, getHistoryJobOutput, getHistoryJobs } from '../api/client'
-import type { HistoryJobOut, HistoryJobsFilter, PathQueueOut } from '../api/types'
+import type { HistoryJobOut, HistoryJobsFilter, HistoryQueueSummaryOut, PathQueueOut } from '../api/types'
 import { formatBytes, formatPercent } from '../lib/format'
+import {
+  decrementHistoryQueueSummary,
+  formatQueueGroupCounts,
+  groupHistoryJobsByQueue,
+  historyQueueGroupCounts,
+  isQueueCollapsed,
+  readHistoryCollapsedQueues,
+  type QueueCollapseMap,
+  withQueueCollapsed,
+  writeHistoryCollapsedQueues,
+} from '../lib/transferPanel'
+import { ArrRowChip } from './LifecycleIcons'
 import { StateChip } from './StateChip'
 
 const inputClasses =
@@ -37,26 +49,51 @@ function formatTs(ts: string | null): string {
   return Number.isNaN(d.getTime()) ? ts : d.toLocaleString()
 }
 
-type VirtualRow =
-  | { kind: 'header'; queueId: number; queueName: string }
-  | { kind: 'job'; job: HistoryJobOut }
-
-/** Flattens the already-filtered/paginated page into queue-grouped sections (DESIGN.md §9.2:
- * "grouped by queue") as one array a single virtualizer can walk -- see the module's own
- * approach note in docs/decisions.md for why this (header rows interleaved into one flat,
- * virtualized list) was chosen over nested per-queue virtualizers.
+/** A queue group's header line (2026-08-16) -- queue name, outcome counts, and total size, all
+ * in one clickable line that toggles the group's collapse state. Mirrors
+ * `TransfersPage.tsx.GroupHeader`'s own idiom (single-click-anywhere toggle, chevron + name +
+ * counts + size), but reads the server-computed `HistoryQueueSummaryOut` instead of computing an
+ * aggregate client-side over the loaded page -- see `groupHistoryJobsByQueue`'s and the `queueSummaries`
+ * state's own comments for why. `summary` is only `undefined` for a queue whose rows just loaded
+ * but whose summary response hasn't landed yet (the two arrive on the exact same response, so in
+ * practice this is only a one-render gap) -- the header still renders, just without the counts/
+ * size text until it does.
  */
-function groupByQueue(jobs: HistoryJobOut[]): VirtualRow[] {
-  const rows: VirtualRow[] = []
-  let currentQueueId: number | null = null
-  for (const job of jobs) {
-    if (job.queue_id !== currentQueueId) {
-      rows.push({ kind: 'header', queueId: job.queue_id, queueName: job.queue_name })
-      currentQueueId = job.queue_id
-    }
-    rows.push({ kind: 'job', job })
-  }
-  return rows
+function QueueGroupHeader({
+  queueId,
+  queueName,
+  summary,
+  collapsed,
+  onToggle,
+}: {
+  queueId: number
+  queueName: string
+  summary: HistoryQueueSummaryOut | undefined
+  collapsed: boolean
+  onToggle: () => void
+}) {
+  const countsText = summary ? formatQueueGroupCounts(historyQueueGroupCounts(summary)) : ''
+  return (
+    <button
+      type="button"
+      onClick={onToggle}
+      aria-expanded={!collapsed}
+      title={collapsed ? 'Expand this queue' : 'Collapse this queue'}
+      data-queue-id={queueId}
+      className="flex w-full flex-wrap items-center gap-3 border-b border-zinc-200 bg-zinc-50 px-3 py-1.5 text-left text-xs font-semibold text-zinc-600 hover:bg-zinc-100 dark:border-zinc-800 dark:bg-zinc-900/60 dark:text-zinc-300 dark:hover:bg-zinc-900"
+    >
+      <span className="shrink-0 text-zinc-400 dark:text-zinc-600" aria-hidden="true">
+        {collapsed ? '▸' : '▾'}
+      </span>
+      <span className="min-w-0 flex-1 truncate">{queueName}</span>
+      {countsText && <span className="shrink-0 font-normal text-zinc-500 dark:text-zinc-400">{countsText}</span>}
+      {summary && (
+        <span className="shrink-0 font-normal text-zinc-500 dark:text-zinc-400">
+          {formatBytes(summary.total_bytes_done)}
+        </span>
+      )}
+    </button>
+  )
 }
 
 function JobRow({ job, onClearRequest }: { job: HistoryJobOut; onClearRequest: (job: HistoryJobOut) => void }) {
@@ -87,6 +124,15 @@ function JobRow({ job, onClearRequest }: { job: HistoryJobOut; onClearRequest: (
         </span>
         <span className="w-14 shrink-0 text-xs text-zinc-500 dark:text-zinc-400">{job.kind}</span>
         <StateChip state={chipStateFor(job.state)} />
+        {/* The *arr brand-logo chip (2026-08-16, prompts/2026-08-16-arr-chip-on-row-lines.md)
+         * -- same shared component and status vocabulary as the Transfers row's own chip
+         * (`TransfersPage.tsx`); renders nothing when this job isn't *arr-tracked. */}
+        <ArrRowChip
+          arrStatus={job.arr_status}
+          arrStatusAt={job.arr_status_at}
+          instanceName={job.arr_instance_name}
+          instanceKind={job.arr_instance_kind}
+        />
         {job.attempt > 1 && (
           <span className="shrink-0 text-xs text-zinc-500 dark:text-zinc-400">attempt {job.attempt}</span>
         )}
@@ -176,6 +222,13 @@ export function HistoryJobsSection({ queues }: HistoryJobsSectionProps) {
 
   const [jobs, setJobs] = useState<HistoryJobOut[]>([])
   const [total, setTotal] = useState(0)
+  // The server-computed, filter-honest per-queue aggregate (2026-08-16,
+  // prompts/2026-08-16-history-jobs-group-collapse.md) -- `GET /api/history/jobs`'s
+  // `queue_summaries`, riding alongside `jobs` on the same response. Deliberately not derived
+  // from `jobs` client-side: this list is `LIMIT`/`OFFSET` paginated, so a client-side sum would
+  // be wrong the instant a queue has more matching rows than are currently loaded (the task's
+  // own "key difference from Transfers"; see api/history.py's module docstring).
+  const [queueSummaries, setQueueSummaries] = useState<HistoryQueueSummaryOut[]>([])
   const [loading, setLoading] = useState(false)
   const scrollRef = useRef<HTMLDivElement>(null)
 
@@ -196,6 +249,7 @@ export function HistoryJobsSection({ queues }: HistoryJobsSectionProps) {
       const res = await getHistoryJobs({ ...filter, offset, limit: 200 })
       setTotal(res.total)
       setJobs((prev) => (replace ? res.jobs : [...prev, ...res.jobs]))
+      setQueueSummaries(res.queue_summaries)
     } finally {
       setLoading(false)
     }
@@ -231,6 +285,10 @@ export function HistoryJobsSection({ queues }: HistoryJobsSectionProps) {
         await clearHistoryJob(pending.job.id)
         setJobs((prev) => prev.filter((j) => j.id !== pending.job.id))
         setTotal((t) => Math.max(0, t - 1))
+        // Applied locally for the same reason `jobs`/`total` are above -- one row's server
+        // truth is already known (it's the row just cleared), no need for a full reload just to
+        // pick up a single-bucket, single-queue change to `queue_summaries`.
+        setQueueSummaries((prev) => decrementHistoryQueueSummary(prev, pending.job))
       } else {
         await clearHistoryJobs(filter)
         await load(0, true)
@@ -243,7 +301,27 @@ export function HistoryJobsSection({ queues }: HistoryJobsSectionProps) {
     }
   }
 
-  const rows = useMemo(() => groupByQueue(jobs), [jobs])
+  // Per-queue collapse (2026-08-16, prompts/2026-08-16-history-jobs-group-collapse.md) -- same
+  // map shape and persistence as Transfers' own queue groups (`TransfersPage.tsx`), but under
+  // `history.*`'s own storage key (`readHistoryCollapsedQueues`/`writeHistoryCollapsedQueues` in
+  // `lib/transferPanel.ts`) so collapsing a queue here never implicitly collapses it there, or
+  // vice versa -- the task's own instruction. Default expanded, read once on mount.
+  const [collapsedQueues, setCollapsedQueues] = useState<QueueCollapseMap>(readHistoryCollapsedQueues)
+  const toggleQueueCollapsed = (queueId: number) => {
+    setCollapsedQueues((prev) => {
+      const next = withQueueCollapsed(prev, queueId, !isQueueCollapsed(prev, queueId))
+      writeHistoryCollapsedQueues(next)
+      return next
+    })
+  }
+
+  const summaryByQueueId = useMemo(() => {
+    const map = new Map<number, HistoryQueueSummaryOut>()
+    for (const s of queueSummaries) map.set(s.queue_id, s)
+    return map
+  }, [queueSummaries])
+
+  const rows = useMemo(() => groupHistoryJobsByQueue(jobs, collapsedQueues), [jobs, collapsedQueues])
 
   const virtualizer = useVirtualizer({
     count: rows.length,
@@ -383,9 +461,13 @@ export function HistoryJobsSection({ queues }: HistoryJobsSectionProps) {
                   }}
                 >
                   {row.kind === 'header' ? (
-                    <div className="border-b border-zinc-200 bg-zinc-50 px-3 py-1.5 text-xs font-semibold text-zinc-600 dark:border-zinc-800 dark:bg-zinc-900/60 dark:text-zinc-300">
-                      {row.queueName}
-                    </div>
+                    <QueueGroupHeader
+                      queueId={row.queueId}
+                      queueName={row.queueName}
+                      summary={summaryByQueueId.get(row.queueId)}
+                      collapsed={isQueueCollapsed(collapsedQueues, row.queueId)}
+                      onToggle={() => toggleQueueCollapsed(row.queueId)}
+                    />
                   ) : (
                     <JobRow job={row.job} onClearRequest={(job) => setPendingClear({ kind: 'row', job })} />
                   )}

@@ -45,4 +45,6 @@ async def health(request: Request) -> HealthResponse:
         repo_url=settings.repo_url,
         host_reachable=host_reachable,
         scheduler_alive=scheduler_alive,
+        build_sha=settings.build_sha,
+        build_channel=settings.build_channel,
     )

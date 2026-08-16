@@ -15,8 +15,8 @@ import asyncio
 
 import pytest
 
-from lftpweb.core.progress import ActiveJob
-from lftpweb.core.queue import CHILD_PROGRESS_THROTTLE_TICKS, _RunningProcess
+from lftpweb.core.progress import DEFAULT_EMA_ALPHA, ActiveJob
+from lftpweb.core.queue import PROGRESS_SAMPLE_TICKS, _RunningProcess
 from lftpweb.core.settle import SettleSettings, save_settle_settings
 from test_queue import _make_db, _make_host_row, _make_item_row, _make_queue_row, _queue_for
 from test_queue_completeness import _fake_spawned, _resolved_wait_task
@@ -112,8 +112,13 @@ async def _setup(db, tmp_path):
 
 
 async def _tick_through_throttle(q) -> None:
-    """Enough calls to reach the next tick that actually runs child publishing."""
-    for _ in range(CHILD_PROGRESS_THROTTLE_TICKS):
+    """Enough calls to `_sample_and_publish_progress` to reach the next tick that actually
+    samples and publishes anything at all -- 2026-08-16, job-level sampling, the parent's
+    `item_delta`, and child publishing all gate on the same `PROGRESS_SAMPLE_TICKS` counter now
+    (previously only child publishing was throttled this way), so one shared helper drives all
+    three instead of a child-only one.
+    """
+    for _ in range(PROGRESS_SAMPLE_TICKS):
         await q._sample_and_publish_progress()
 
 
@@ -234,12 +239,17 @@ async def test_cap_truncates_and_logs(db, tmp_path, monkeypatch, caplog):
     assert all(r["local_size"] for r in rows2), "the deferred child must catch up"
 
 
-# --- the parent's aggregate progress (job.bytes_done, item.local_size) is unaffected ----------
+# --- the parent's aggregate progress (job.bytes_done, item.local_size) is gated with children -
 
 
-async def test_parent_aggregate_progress_still_updates_every_tick_not_just_throttled_ones(
-    db, tmp_path
-):
+async def test_parent_aggregate_progress_is_gated_on_the_same_counter_as_children(db, tmp_path):
+    """2026-08-16 unification: job-level sampling (`job.bytes_done`, `item.local_size`) used to
+    run on *every* call to `_sample_and_publish_progress`, independently of the child-progress
+    throttle -- exactly the split cadence (job ~1 Hz, child every 3rd tick) that produced two
+    disagreeing EMA-smoothed speeds for a one-file directory. Now both gate on
+    `PROGRESS_SAMPLE_TICKS`: a single call (not the Nth) must do nothing at all, and the Nth
+    call must move both aggregates together.
+    """
     q, release_dir, _queue_id, ids = await _setup(db, tmp_path)
     await db.execute(
         "INSERT INTO job (id, item_id, kind, state, lane, rank, attempt) "
@@ -251,23 +261,157 @@ async def test_parent_aggregate_progress_still_updates_every_tick_not_just_throt
     (release_dir / "a.rar").write_bytes(b"a" * 100)
     (release_dir / "b.rar").write_bytes(b"b" * 50)
 
-    # A single tick -- not a multiple of CHILD_PROGRESS_THROTTLE_TICKS in general -- must still
-    # move the job-centric and parent-item-centric aggregates; only the *child* path is
-    # throttled.
+    # A single call -- not the PROGRESS_SAMPLE_TICKS-th -- must move neither aggregate now.
     await q._sample_and_publish_progress()
+    job_row = await (await db.execute("SELECT bytes_done FROM job WHERE id = 1")).fetchone()
+    assert job_row["bytes_done"] == 0, "job-level sampling must not run before the gate opens"
+    parent_row = await _item_row(db, ids["parent"])
+    assert parent_row["local_size"] == 0
+
+    # The remaining calls up to PROGRESS_SAMPLE_TICKS open the gate; both aggregates move
+    # together, on the exact same call as the children (see `_tick_through_throttle`).
+    for _ in range(PROGRESS_SAMPLE_TICKS - 1):
+        await q._sample_and_publish_progress()
 
     job_row = await (await db.execute("SELECT bytes_done FROM job WHERE id = 1")).fetchone()
-    assert job_row["bytes_done"] == 150  # 100 + 50, summed by core/progress.py, every tick
+    assert job_row["bytes_done"] == 150  # 100 + 50, summed by core/progress.py
 
     parent_row = await _item_row(db, ids["parent"])
     assert parent_row["local_size"] == 150
     assert parent_row["state"] == "DOWNLOADING"  # read back from `item`, not hardcoded
 
 
+async def test_job_and_child_progress_publish_on_the_same_gated_tick(db, tmp_path):
+    """The mechanism the unification exists for: a `progress` (job-level) message and a
+    `child_progress` message must come out of the *same* `_sample_and_publish_progress` call --
+    never one a few ticks ahead of the other, which is what let a one-file directory's job speed
+    and child speed disagree before 2026-08-16. The first `PROGRESS_SAMPLE_TICKS - 1` calls
+    below publish nothing at all (proven separately by the "is gated" test above); only the
+    final, gate-opening call can have produced either message, so both landing in the same
+    drain -- taken only after all `PROGRESS_SAMPLE_TICKS` calls -- proves they came out of that
+    one call together.
+    """
+    q, release_dir, _queue_id, ids = await _setup(db, tmp_path)
+    await q.db.execute(
+        "INSERT INTO job (id, item_id, kind, state, lane, rank, attempt) "
+        "VALUES (1, ?, 'mirror', 'running', 'main', 0, 1)",
+        (ids["parent"],),
+    )
+    await q.db.commit()
+    (release_dir / "a.rar").write_bytes(b"a" * 300)
+
+    events_queue = q.events.subscribe()
+    await _tick_through_throttle(q)
+    messages = await _drain(q.events, events_queue)
+
+    types = {m["type"] for m in messages}
+    assert "progress" in types
+    assert "child_progress" in types, "job and child publishes must land on the same gated tick"
+
+
+async def test_job_speed_after_five_ticks_matches_delta_over_real_elapsed_time(
+    db, tmp_path, monkeypatch
+):
+    """The job-level speed math after the unification is exactly
+    `core/progress.py.ProgressSampler.sample`'s real-elapsed-time derivation over the *actual*
+    gap between two sampled ticks (here, `PROGRESS_SAMPLE_TICKS` calls apart) -- never
+    `tick_s * PROGRESS_SAMPLE_TICKS` assumed. A fake, controlled `time.monotonic()` proves it:
+    the two sampled ticks are set exactly 5.0s apart regardless of how many calls separate them.
+    """
+    q, release_dir, _queue_id, ids = await _setup(db, tmp_path)
+    await q.db.execute(
+        "INSERT INTO job (id, item_id, kind, state, lane, rank, attempt) "
+        "VALUES (1, ?, 'mirror', 'running', 'main', 0, 1)",
+        (ids["parent"],),
+    )
+    await q.db.commit()
+
+    clock = {"t": 0.0}
+
+    def fake_monotonic() -> float:
+        return clock["t"]
+
+    monkeypatch.setattr("lftpweb.core.progress.time.monotonic", fake_monotonic)
+    monkeypatch.setattr("lftpweb.core.queue.time.monotonic", fake_monotonic)
+
+    (release_dir / "a.rar").write_bytes(b"a" * 300)
+    (release_dir / "b.rar").write_bytes(b"b" * 200)
+
+    for i in range(PROGRESS_SAMPLE_TICKS):
+        clock["t"] = float(i + 1)  # a real 1.0s per underlying tick, gate opens at t=5.0
+        await q._sample_and_publish_progress()
+
+    job_row = await (await db.execute("SELECT bytes_done FROM job WHERE id = 1")).fetchone()
+    assert job_row["bytes_done"] == 500  # first sample: no prior history, speed 0
+
+    events_queue = q.events.subscribe()
+    (release_dir / "a.rar").write_bytes(b"a" * 800)  # +500 bytes total across both files
+    for _ in range(PROGRESS_SAMPLE_TICKS):
+        clock["t"] += 1.0  # 6.0 .. 10.0 -- another real 5.0s elapsed by the next gated tick
+        await q._sample_and_publish_progress()
+    messages = await _drain(q.events, events_queue)
+
+    progress_msgs = [m for m in messages if m["type"] == "progress"]
+    assert len(progress_msgs) == 1, "exactly one job-level publish per PROGRESS_SAMPLE_TICKS"
+    job = next(j for j in progress_msgs[0]["jobs"] if j["job_id"] == 1)
+    # instantaneous = 500 bytes / 5.0s real elapsed; ema_step seeds its base at the previous
+    # (real) speed, 0.0 after the first sample above -- not at `instantaneous` itself.
+    expected = DEFAULT_EMA_ALPHA * (500.0 / 5.0)
+    assert job["speed_bps"] == pytest.approx(expected)
+
+
+async def test_reap_is_not_gated_by_the_progress_sample_counter(db, tmp_path):
+    """Stop/reap latency must be unaffected by the progress-sampling gate (2026-08-16 unify):
+    `tick()` calls `_reap_finished()` before `_sample_and_publish_progress`, unconditionally,
+    every real `tick_s` -- a finished job must be reaped on the very next `tick()` regardless of
+    which of the `PROGRESS_SAMPLE_TICKS` phases the progress gate happens to be in.
+    """
+    q, _release_dir, _queue_id, ids = await _setup(db, tmp_path)
+    # Advance the shared counter to a non-gated phase (1, not a multiple of
+    # PROGRESS_SAMPLE_TICKS) so this reap happens on a tick that does *not* also sample
+    # progress -- proving the two are independent, not merely coincidentally both running.
+    q._progress_tick_count = 1
+    await q.db.execute(
+        "INSERT INTO job (id, item_id, kind, state, lane, rank, attempt) "
+        "VALUES (1, ?, 'mirror', 'running', 'main', 0, 1)",
+        (ids["parent"],),
+    )
+    await q.db.commit()
+
+    finished_proc = _RunningProcess(
+        job_id=1,
+        item_id=ids["parent"],
+        queue_id=_queue_id,
+        rel_path="Release",
+        is_dir=True,
+        kind="mirror",
+        lane="main",
+        rate_limit_bps=0,
+        forced_full_rate=False,
+        local_root=str(_release_dir),
+        bytes_total=1500,
+        remote_mtime=None,
+        spawned=_fake_spawned(tmp_path, 1),
+        wait_task=_resolved_wait_task(0, "ok"),
+    )
+    q._running[1] = finished_proc
+    # Let the already-resolved coroutine actually run to completion -- `asyncio.create_task`
+    # only schedules it, so `_reap_finished`'s `wait_task.done()` filter needs one real event
+    # loop turn before it can see it, same as any other freshly created task.
+    await asyncio.sleep(0)
+    assert finished_proc.wait_task.done()
+
+    await q.tick()
+
+    assert 1 not in q._running, "a finished job must reap on the very next tick, gate or not"
+    job_row = await (await db.execute("SELECT state FROM job WHERE id = 1")).fetchone()
+    assert job_row["state"] == "succeeded"
+
+
 # --- _flush_child_progress_final: the reap-time correction for a stale throttled reading -----
 #
 # 2026-08-13 (prompts/2026-08-13-delete-state-truthfulness.md, defect 3). The throttled sampler
-# above only persists a child on a tick that's a multiple of CHILD_PROGRESS_THROTTLE_TICKS, and
+# above only persists a child on a tick that's a multiple of PROGRESS_SAMPLE_TICKS, and
 # only for files whose size changed since the *previous* throttled tick -- so a job that
 # finishes between two throttled ticks can leave a child's row reading a stale PARTIAL forever
 # if nothing else ever revisits it (the exact shape a `move` queue produces: post-processing
@@ -393,8 +537,8 @@ async def test_child_progress_rate_is_not_derived_from_tick_count_but_a_real_tim
     db, tmp_path
 ):
     """The denominator is `now - prev_time` (both real `time.monotonic()`-shaped values), never
-    `tick_s * CHILD_PROGRESS_THROTTLE_TICKS` -- a slow pass between two throttled ticks must
-    still produce the correct rate, not one derived from an assumed cadence. Same delta as the
+    `tick_s * PROGRESS_SAMPLE_TICKS` -- a slow pass between two throttled ticks must still
+    produce the correct rate, not one derived from an assumed cadence. Same delta as the
     test above, but 5 real seconds apart instead of 1 -- a materially different rate proves the
     elapsed time, not a constant, drove the computation.
     """

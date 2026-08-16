@@ -11,7 +11,7 @@ truth and its sections are numbered for reference. The one decision everything h
 (local bytes vs. known remote size) and each transfer is its own short-lived lftp process. Do
 not reintroduce `jobs -v` parsing as a source of truth (§1.2 explains why).
 
-**Status:** beta `0.1.1`, all 9 build phases complete (`DESIGN.md` §13) plus three sessions of
+**Status:** beta `0.2.0`, all 9 build phases complete (`DESIGN.md` §13) plus three sessions of
 fixes driven by real use against a real seedbox — it connects, scans, reconciles, transfers,
 auto-queues, post-processes, and has auth, ops (logs/backups/health), and a Files page that has
 been used in anger. Real gaps remain, named in `README.md`'s "Known gaps."

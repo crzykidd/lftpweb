@@ -1,10 +1,11 @@
 # Open issues — 2026-08-12 / 2026-08-13 / 2026-08-14 sessions
 
 > **2026-08-14: `v0.1.0` shipped.** The first tagged release, a beta. Everything below that is
-> not struck through is post-release work. The three items most worth a fresh session's
-> attention are **issue #2** (`move` deletes the remote before extraction runs — now exercised
-> on every release, not just checksummed ones), **`AuthSettingsIn`'s silent-reset shape** (a
-> trusted-CIDR list that can quietly empty itself), and **row lifetime / issue #1**.
+> not struck through is post-release work. **Issue #2** (`move` deletes the remote before
+> extraction runs) was resolved by design on 2026-08-16 — see that entry below and
+> `docs/decisions.md`. The two items most worth a fresh session's attention now are
+> **`AuthSettingsIn`'s silent-reset shape** (a trusted-CIDR list that can quietly empty itself)
+> and **row lifetime / issue #1**.
 
 A living list, not a handoff prompt. It never moves to `done/`.
 
@@ -80,6 +81,87 @@ section before trusting any live-evidence conclusion in this file.
 
 ## Still open — read these first
 
+### Admission holds the 2nd job because a lone 1st job grabs the whole ceiling (allocation ≠ actual throughput)
+
+2026-08-15, user report against the real seedbox — the pattern that finds every real bug in this
+project. Config: **Max Bandwidth 50 MB/s, Max Concurrent Jobs 2**, files-in-parallel 2,
+connections-per-file 20. Two folders land a few seconds apart. The first starts; the second
+**queues and never auto-starts** until the first finishes, even though a slot is free.
+
+**Root cause — `core/scheduler.py.admit()`.** Admission gates on `if ready > 0 and headroom > 0`,
+where `headroom = ceiling − small_lane_reserve − Σ(running allocations)`. A job admitted *alone*
+gets `share = headroom / ready` with `ready == 1` — i.e. **essentially the entire ceiling**
+(~49 MB/s of 50). That allocation is written to lftp as `net:limit-total-rate`
+(`core/lftp.py`), a **ceiling, not a reservation**, and allocations are never re-shaped for a
+running job (the §4.5 invariant). So when the 2nd folder lands, `headroom = 50 − reserve − 49 ≈ 0`
+and it's parked — despite the free slot.
+
+**Why the user is right that there's real headroom.** A single transfer to their seedbox tops out
+at ~15 MB/s (per-transfer/SSH limit; 20 connections don't beat it), so the 49 MB/s ceiling on job
+A is **inert** — never reached. The link actually has ~35 MB/s idle, but the scheduler accounts
+for *allocated* bandwidth, not *measured* throughput (deliberately — §4.5's "no live control
+channel"), so it can't see it. **No setting fixes this**: raising or lowering Max Bandwidth doesn't
+help, because a lone first job always takes ~all of B whatever B is. The only current escape is
+**"Start now"** on the parked item (runs it, ignoring the cap).
+
+**The real fix (scheduler).** Allocate each job an equal **per-slot slice** —
+`(ceiling − reserve) ÷ max_concurrent_transfers` — instead of `headroom / ready`, so a lone job
+takes at most 1/N and leaves headroom for the other slots. For this user (~22 MB/s cap vs 15
+actual) the cap is inert and both folders simply run. **Tradeoff to decide, not assume:** a *solo*
+transfer that genuinely *can* saturate the link would be capped to 1/N when running alone — so this
+likely wants to be a **toggle** ("split bandwidth evenly across job slots" vs today's greedy first
+job), not a silent change for everyone. Small, well-contained change with a pure-function test
+(`admit()` is already table-tested against every §4.5 worked example — add the staggered-arrival
+case).
+
+**Cheaper interim mitigation (UX) — the user's own suggestion.** The header
+(`StatsHeader.tsx`) already shows **Allocated X / ceiling** and **Queued N**, and its docstring
+even calls allocated-vs-ceiling "the honest answer to why the next item hasn't started." But a user
+seeing **Speed 15 · Allocated 49/50 · Queued 1** doesn't connect the low speed to the full
+allocation. Add a plain-language hint (a `title=` tooltip, or an inline note shown only when
+`queued_count > 0` and `allocated_bps` is near `ceiling_bps` while `current_speed_bps` is well
+below it): "Transfers are admitted against *allocated* bandwidth, not current speed — a running job
+reserves up to the ceiling even if it isn't using it all, so the next item waits until bandwidth
+frees. Use *Start now* to override." Ship this first; its wording will depend on whether the
+scheduler toggle above lands, so do them together or the note before the fix.
+
+**The dynamic-bandwidth option — full fair-sharing via live lftp re-tuning (LOW PRIORITY).** The
+`(ceiling − reserve) ÷ N` static split above is the cheap fix. The *complete* solution to
+"allocation ≠ actual throughput" is to make allocations **dynamic**: re-tune each running job's
+`net:limit-total-rate` as jobs join and leave, so N jobs always fairly split B in real time.
+
+- **Model.** Job admitted alone → full pipe; a 2nd joins → both reshaped to ~B/2 **live**, no
+  restart; one finishes → the survivor reshaped back up. Reshape only at **admission/reap
+  boundaries** (when the running set changes), not continuously — that's the only time the split
+  actually changes, and it keeps stdin round-trips minimal.
+- **Feasibility is already proven.** Phase 3 confirmed that holding lftp's stdin open and sending
+  `set net:limit-total-rate X` mid-transfer works and takes effect; it was deliberately *not* wired
+  in because §4.5 wanted a stateless scheduler ("allocations never re-shaped"). The hard part is
+  de-risked; this reverses that one simplicity choice.
+- **The risks are operational, not correctness.** (a) Control channel: lftp must run *interactive*
+  (stdin held open, the transfer as a background job) instead of spawn-and-wait; a lost `set` write
+  just leaves a job at its old rate — a **soft** failure, never corruption. (b) The scheduler goes
+  **stateful**: per-job stdin handles, intended-vs-acked rate, partial-failure handling — new bug
+  surface beside the currently-pure `admit()`. (c) Oscillation under start/fail/stop churn (want
+  debounce/hysteresis); the `job.rate_limit_bps` column and the header "Allocated" readout must
+  update on every reshape or the UI lies; a missed down-shift is a **transient** overshoot of the
+  ceiling that self-heals next pass.
+- **Stop / requeue / resume / reboot: no correctness risk.** The rate is a pure speed knob
+  (`net:limit-total-rate`), fully decoupled from what makes a resume correct — the `.lftp` temp
+  file, pget's `.lftp-pget-status` sidecar, `-c`, and filesystem-derived progress. Every one of
+  these lifecycle events already **tears down and re-admits**, re-deriving the allocation from
+  scratch. Reboot specifically: `core/queue.py._reconcile_orphaned_jobs` fails the orphaned
+  `running` row, keeps the partial bytes, `-c` resumes, and auto-queue re-picks it — the pre-reboot
+  rate was never load-bearing. The reshape is **idempotent and derived** (allocation = f(current
+  running set)): never persisted, never restored, never migrated across a stop/resume/reboot, which
+  is exactly what makes it safe. Lowering a rate mid-transfer is flow control (throttles reads);
+  raising it lets it speed up — neither drops connections or touches bytes on disk.
+- **Priority: LOW — decide with production data.** Ship the static `(ceiling − reserve) ÷ N` split
+  first and run on it. If real workloads rarely leave a lone job hogging the pipe long enough to
+  matter, the static split is enough and this isn't worth the stateful complexity. Revisit only if
+  production shows sustained under-utilisation the static split doesn't fix (the user's own call,
+  2026-08-15: "more time running in production will help me determine if we need it").
+
 ### Post-`v0.1.0` audit — the deferred items (`docs/audit-v0.1.0.md`)
 
 A full audit landed 2026-08-14 (`docs/audit-v0.1.0.md`): findings **S1–S4** (security),
@@ -90,11 +172,9 @@ split, `90df1ea`), **P3** (`core/local_delete.py` split, `d480885`), and **P1 in
 → `lib/fileTree.ts`, `0cb294f`). The full audit doc has every finding's detail and the fix commit.
 **What's left, deliberately, for a session with the user in the loop:**
 
-- **G1 — `move`-mode delete runs before extraction.** This is the same thing as **issue #2**
-  below (a no-sidecar release verifies `SKIPPED`, its remote is deleted, then extraction may
-  fail — the only re-fetchable source already gone). It's a *design call*, not a mechanical fix:
-  either delete after a successful extract, or make the delete gate also require extraction not to
-  have failed (mirroring the download-prefix `release_ok` rule). Don't resolve it unilaterally.
+- ~~**G1 — `move`-mode delete runs before extraction.**~~ **Resolved by design, 2026-08-16** —
+  same item as **issue #2** below; see that entry and `docs/decisions.md` for the settled
+  four-rung ladder.
 - **G2 — `net:connection-limit` has no write path.** §4.5 calls it "first-class, host-level," but
   it lives only in the `host.connection_overrides` JSON blob with no UI/endpoint. Needs a
   migration (promote to a real column) + a Settings field. A scoped feature, not a one-liner.
@@ -301,18 +381,18 @@ consumer checked.
 - **`re_download_externally_removed` is site-level, not per-queue**, though
   `auto_queue_enabled` and `sync_mode` are both already per-queue columns and it only matters
   for `copy` queues. Needs a migration.
-- **`move` deletes the remote *before* extraction runs.**
+- ~~**`move` deletes the remote *before* extraction runs.**~~ **Resolved by design, 2026-08-16.**
   [Issue #2](https://github.com/crzykidd/lftpweb/issues/2) — filed 2026-08-15 with the full
-  reasoning, the proposed fix, and the tradeoff. A failed extraction happens after the remote
-  copy is gone; local archives survive, so it is recoverable. The user's call on 2026-08-13 was
-  "leave it, revisit if it bites." **It bit on 2026-08-14.** Deferred again on 2026-08-15 —
-  deliberately, to an issue rather than a prompt.
+  reasoning, the proposed fix, and the tradeoff; deferred twice (2026-08-13, 2026-08-15) before
+  being resolved. The fix: the delete is now the *last* gate on a four-rung ladder
+  (completeness, verify, extract, and — new — *arr import for a tracked item), not the second
+  step. See `docs/decisions.md` (2026-08-16) and
+  `prompts/done/2026-08-16-move-delete-gate-ladder.md` for the full settled design and the
+  rejected alternative (an early-delete toggle). Also closes `docs/audit-v0.1.0.md` G1.
 
   **`6883db3` widened its exposure**: a sidecar-less release used to be withheld at the delete
-  gate and never reached this window at all; now it deletes like any other, so the gap between
-  "remote gone" and "archives proven extractable" is exercised on every release. Not a
-  regression from that commit, but the reason this is worth more than it was when first
-  deferred. Do not reorder it as a side effect of unrelated work.
+  gate and never reached this window at all; the ladder is what re-narrowed it back down,
+  permanently, rather than reverting that commit.
 - **Encrypted-rar password retry is implemented but untestable** — no compressor exists
   anywhere to build an encrypted fixture. Real-archive rar coverage is old-style `.r00` only,
   not `.partNN`. **The user generated real `.partNN.rar` sets on 2026-08-14** (visible in that

@@ -6,6 +6,710 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-16 — Manual delete gains an independent Source scope: defaults, §7.1 interplay, and why partial failure doesn't 409
+
+`prompts/done/2026-08-16-manual-delete-local-and-remote.md`, the move-delete ladder's own
+follow-on task (see the entry immediately below) — resolving §7's forward note that `sync`
+mode's primary use case ("the importer took it, clean up the source") is now fully served
+without building `sync`. User-approved design, settled 2026-08-16.
+
+**The problem.** The ladder closes the *automatic* gap (source no longer deletes before
+extraction/`*arr` import can fail), but it deliberately has no timeout and no automatic
+fallback for a withheld or deferred item — by design, so a failure stays inspectable on both
+sides. That leaves no way to finish cleaning up a stuck item (a `CORRUPT` verify, a release the
+*arr never imported, a queue whose *arr integration isn't even configured) without SSHing into
+the seedbox by hand. `POST /api/items/{id}/delete` also could not touch the remote at all —
+it was local-only from the day it shipped.
+
+**The settled design.**
+
+- **Two independent, checkbox-driven scopes, not two buttons.** Local (the pre-existing
+  behavior, byte-for-byte unchanged when only it is requested) and Source (new). At least one
+  must be checked — enforced both in the dialog (`canConfirmDelete`) and the endpoint (400).
+  The Source checkbox itself only renders when a remote copy actually exists
+  (`shouldOfferSourceScope`) — nothing for a remote scope to act on otherwise.
+- **Defaults follow the queue's `sync_mode`, not a global default.** Both checked for `move`:
+  the queue is already configured to have lftpweb delete the source itself, so completing that
+  by hand for a stuck item is exactly the expected action, and defaulting it off would make the
+  common case two clicks instead of one. Source defaults *unchecked* for `copy` (and the unbuilt
+  `sync`) — §7.1's own warning is the reason: a `copy` queue's `remote_path` is never required
+  to be a hardlink pickup directory the way a `move` queue's is, so a `copy` queue may point
+  straight at live torrent data, and deleting "source" there can destroy a seed. The dialog
+  shows §7.1's warning text whenever Source is checked on a non-`move` queue, whether by the
+  user or (impossible by default, but checked anyway) some future default change.
+- **A source-only request refuses (409) rather than stopping a live transfer itself.** Local
+  already has its own stop-then-delete two-step (2026-08-13); a bare Source request has no
+  "delete" of its own that would justify silently killing a transfer, so it simply declines
+  when one is running and names the job. A combined request needs no separate check — local's
+  own stop-then-delete already satisfies the guard before source ever runs.
+- **Partial failure is a 200 with honest per-scope reporting, not a 409.** If local is
+  requested and fails, this raises 409 immediately (source is never attempted) — the
+  pre-existing single-scope behavior, unchanged. But if local *succeeds* (or wasn't requested)
+  and source then fails, raising 409 would misrepresent a request that already, irreversibly,
+  did something: the local bytes are already gone. `DeleteItemResponse` gained
+  `source_deleted`/`source_reason` (both `null` when source wasn't requested) precisely so the
+  two outcomes can be reported independently — 409 is reserved for a request that accomplished
+  *nothing at all*. The bulk delete flow (`FileTree.tsx.runAction`) reads these fields back out
+  of an otherwise-`fulfilled` promise so a partial failure can't quietly count as a success in
+  the "N of M succeeded" summary — the one place `Promise.allSettled`'s fulfilled/rejected
+  binary alone would have hidden it.
+- **Reuses `perform_remote_delete`, extended with a `caller` parameter, rather than a second
+  delete implementation.** `caller="pipeline"` (the default) keeps every existing message/level
+  byte-for-byte; `caller="manual"` gets a short, distinctly-tagged message ("deleted by user
+  request") on the *same* `remote_delete`/`remote_delete_failed` event kinds — History can tell
+  a ladder-authorized delete apart from a user-requested one without a new kind to filter on.
+  `PostprocessPipeline` gained a public `resolve_host()` wrapping its existing `_host_provider`
+  closure, so the manual endpoint reuses the identical host/`remote_pool` seam `main.py` already
+  wires for the automatic pipeline and `ArrSyncScheduler`, rather than a third
+  `load_host_config(db, config_dir)` call built fresh at the API layer.
+- **Idempotent, and clears a stale ladder handoff.** `item.remote_deleted_at` already set (the
+  ladder beat this request to it, or an earlier manual call already ran) short-circuits to a
+  no-op success without an SSH round trip — matches `delete_path`'s own idempotence, just
+  skipping the ask. A genuine manual delete also clears `item.remote_delete_pending`, so
+  "delete source for an item mid-ladder" really does complete the ladder early:
+  `core/arrsync.py._maybe_delete_remote_on_import`'s own `remote_deleted_at`/
+  `remote_delete_pending` guards were already correct for this (added by the ladder task,
+  written generally enough to cover any writer, not just itself) — no change needed there.
+- **Suppression: `deleted_source`, a new `suppressed_reason` (migration 020), written only on a
+  source-*only* success.** The dialog's own stated use case — a failed or never-imported item —
+  is exactly the shape most likely to still sit in an auto-queue-*eligible* state
+  (`REMOTE_ONLY`/`PARTIAL`); without marking it, a release that later reappeared under the same
+  `rel_path` would simply be auto-queued right back, undoing a deliberate cleanup action. A
+  *combined* request deliberately does **not** write this — `core/local_delete.py.delete_local`
+  already suppresses the row with `suppressed_reason = 'deleted_local'`, which is the more
+  complete fact about a row whose local copy is also gone, and the source step must not stomp
+  it back to a less-complete reason afterward. (The *automatic* ladder's own delete never needed
+  this: by the time it fires, `item.state` has already moved on past `REMOTE_ONLY`/`PARTIAL`, so
+  `core/autoqueue.py.ELIGIBLE_STATES` was never going to re-pick it up regardless.)
+- **Rejected: a `remote_size` existence check before attempting the SSH delete.** Considered and
+  rejected — every other delete in this codebase (`RemoteConnectionPool.delete_path` itself,
+  `perform_remote_delete`) is unconditional-and-idempotent rather than probe-first, and the
+  frontend already gates the checkbox's visibility on `hasRemoteCopy`. Adding a second way to
+  answer "does this have a remote copy" here would be exactly the kind of duplicate logic this
+  codebase tries to avoid, for a case the UI already prevents in the ordinary path.
+
+---
+
+## 2026-08-16 — The move-delete ladder: source deletes last, not second, and waits on *arr import
+
+`prompts/done/2026-08-16-move-delete-gate-ladder.md`, resolving open issue #2 /
+`docs/audit-v0.1.0.md` G1 (the "`move`-mode delete runs before extraction" design call flagged
+in the post-`v0.1.0` audit and deferred twice since). User-approved design, discussed and
+settled 2026-08-16.
+
+**The problem.** `core/postprocess.py._process_item` ran the `move`-mode remote delete
+*between* verify and extract. `SKIPPED` verification (no `.sfv`/`.md5` sidecar — the common
+case, and every case since the 2026-08-14 verification-gate revision that let `SKIPPED` proceed
+to delete) does not withhold, so a sidecar-less release's remote copy was gone before extraction
+— the step most likely to still fail — ever ran. A failed extraction then had no other copy to
+recover from. Separately, the newer Sonarr/Radarr integration (§16) can match, track, and later
+report an item `gone` from the *arr's own queue without ever importing it — a case the old gate
+had no way to account for at all, because it ran at `DOWNLOADED` time, long before the *arr
+poller could possibly know anything.
+
+**The settled design: a four-rung ladder, evaluated in order, delete only once every applicable
+rung passes.**
+
+1. **Completeness** (always) — unchanged, already true by the time the gate runs.
+2. **Verify** — `CORRUPT` is a hard veto at every rung, exactly as before; `SKIPPED` still
+   passes (2026-08-14's rule stands: "verification must not have failed," not "must have run").
+3. **Extract** — if archives were present and extraction is enabled, extraction must have
+   succeeded. `EXTRACT_FAILED` *defers* the delete (`remote_delete_deferred`) rather than the
+   delete having already happened, which is the whole point of this task.
+4. ***arr import*** — only if the item is *arr-tracked (`item.arr_status` non-null) by the time
+   the pipeline's delete gate runs. `core/postprocess.py` hands the decision to `core/arrsync.py`
+   instead of deleting (`item.remote_delete_pending` records the handoff, carrying the verify
+   evidence forward so the eventual delete event reads exactly as informative as an immediate
+   one); `core/arrsync.py` performs the delete the moment an association is confirmed `imported`
+   (the existing three-layer, two-pass-confirmed signal), never on `gone`. An item on a bound
+   queue that never matched (`arr_status` stays `NULL` forever) is *not* made to wait on an *arr
+   that has never heard of it — it deletes at rung 3 instead, same as any other queue.
+
+**Settled behaviors, stated explicitly because they were the actual points of disagreement to
+resolve, not implementation detail:**
+
+- **No timeout, no automatic fallback.** A withheld or deferred item keeps its source on both
+  sides until the user acts — fix the failing step and let the pipeline re-run (a fresh
+  `DOWNLOADED`, e.g. via re-queue), or the manual-delete dialog (`prompts/2026-08-16-manual-
+  delete-local-and-remote.md`, this ladder's own follow-on task). Deliberate: a failure state
+  must stay inspectable on both sides, not quietly resolve itself in either direction.
+- **Not a toggle.** This is simply how `move` works now, in the strictly later/safer direction
+  for every existing install. No new setting, no migration flag to opt out.
+- **Every deferral writes its own event** (`remote_delete_deferred`, naming the rung) distinct
+  from a permanent withhold (`remote_delete_withheld`, `CORRUPT` only) — History must be able to
+  answer "why is this still on the seedbox" without guessing which kind of "not yet" it is.
+
+**Rejected alternative: keep the early delete, add a toggle.** Discussed and rejected. A toggle
+would mean the *default* behavior for existing installs stays the one this task exists to fix,
+with the safer behavior opt-in — backwards from this project's own "a new capability defaults
+off, a safety fix defaults on" instinct. The redesign is strictly safer in every case (delete
+happens later, never earlier, than before), so there is no configuration for which the old
+behavior is actually wanted; a toggle would just be a way to keep shipping the bug.
+
+**Why the *arr-tracked check is `item.arr_status is not None`, not `queue.arr_instance_id is
+not None`.** The queue-bound check would wait on *every* item in a bound queue, including one
+the *arr will never hear about (a hand-dropped file, a replaced grab) — exactly the "wait
+forever" failure mode the settled rules explicitly rule out. Keying on the item's own match
+state means only an item the *arr actually knows about waits on it.
+
+**Why a durable `item.remote_delete_pending` column, not an inferred signal.** `core/arrsync.py`
+makes its delete decision at a completely different time than the postprocess run that
+determined verify/extract passed — often much later, on the *arr's own clock, not lftpweb's.
+`item.state` alone cannot stand in for "verify/extract passed": a later, unrelated step in the
+*same* pipeline run (e.g. a successful extraction) overwrites `item.state` to `EXTRACTED`, which
+would silently mask an earlier `CORRUPT` verify if anything downstream re-derived readiness from
+the state string instead of the fresh local variable each step actually produced. Migration
+`019_move_delete_ladder.sql` adds the column instead: `_maybe_delete_remote` writes it (as the
+verify evidence itself — `'VERIFIED'` or `'SKIPPED'` — doing double duty as both "ready" and
+"what to say when the delete finally fires") only on the one branch where rungs 1-3 are known,
+by fresh computation, to have passed, and explicitly clears it back to `NULL` on every
+withhold/defer branch — so a stale `'VERIFIED'` from an earlier successful pass can never
+authorize a delete for a release a later retry found `CORRUPT`.
+
+**Reuse, not a second delete implementation.** The actual asyncssh call plus its
+`remote_deleted_at`/event bookkeeping was factored out of `_maybe_delete_remote` into a
+module-level `perform_remote_delete` (`core/postprocess.py`), imported by `core/arrsync.py` for
+its rung-4 handoff. Per this project's own "one code path for an irreversible delete" rule
+(DESIGN.md §7.4) — `core/arrsync.py` gained the identical `remote_pool`/`host_provider`
+constructor seam `PostprocessPipeline` already has (both optional, `None`-safe, wired in
+`main.py` from the same `app.state.engine.pool`/`_host_provider`) rather than either module
+reaching into the other's internals.
+
+**`sync` mode's remaining rationale narrows further.** DESIGN.md §7 already argued `sync`'s own
+distinguishing feature (propagating a *local* delete performed by hand) is niche; this task
+closes the other half — `sync`'s most commonly imagined use, "the importer took it, clean up the
+source," is now `move`-with-the-ladder's job automatically, no `sync` required. Noted in DESIGN.md
+so a future session doesn't rebuild `sync` "for tidiness" without re-reading why it's still
+unscheduled.
+
+---
+
+## 2026-08-16 — `/api/health` carries `build_sha`/`build_channel`, beyond §12's shape again
+
+`prompts/done/2026-08-16-dev-build-version-badge.md`. User request: a `:dev` image should
+identify itself in the UI (`DEV: v0.1.1 · <short-sha>`) so a test instance is never mistaken
+for a release. Same shape question as `repo_url` (2026-08-11, below): the container has no git
+tree at runtime to ask what commit it was built from, and the SPA is built into static files
+long before the image's build args exist, so nothing but the backend can carry this to the UI.
+
+**Decision:** two more fields on `HealthResponse` — `build_sha` (short commit SHA) and
+`build_channel` (`"dev" | "release"`), both `None` unless baked. Same precedent as `repo_url`:
+smallest change that satisfies the requirement, flagged here rather than silently diverging
+from §12's literal shape a second time.
+
+**Baked, not read from the environment at request time the way `repo_url` is.** `repo_url` is a
+genuine runtime setting — an operator sets `LFTPWEB_REPO_URL` in their own compose file.
+`build_sha`/`build_channel` are facts about the *image*, not the deployment, so they're set via
+`ARG`/`ENV` in `docker/Dockerfile`'s `runtime` stage from `.github/workflows/publish.yml`'s
+`docker/build-push-action` `build-args:`, not documented as an operator-facing env var. They
+still flow through `config.Settings` (env-prefix `LFTPWEB_*`) like every other setting, because
+that's already the one mechanism this app has for getting a build-time value into a running
+process — introducing a second (e.g. a baked JSON file) for two strings wasn't worth it.
+
+**The empty-string-vs-`None` wrinkle.** Docker bakes an unset `ARG`'s declared default into
+`ENV` regardless of whether `--build-arg` was passed — so a `runtime` image built without the
+new build args (a manual `docker build docker/Dockerfile`, say) still gets
+`LFTPWEB_BUILD_SHA=""` as a real env var, not an absent one. Pydantic-settings would otherwise
+read that as the value `""`, distinct from the field's own `None` default — a
+`build_channel == ""` a frontend author could plausibly forget to guard against, on top of the
+`None` case. `config.Settings` gained a `field_validator` (`mode="before"`) on both fields that
+folds a blank string back to `None`, so there is exactly one "unbaked" value, not two.
+
+**Only the `runtime` stage declares the ARGs** — `dev`/`frontend-dev` don't, so
+`docker-compose.dev.yml`'s build never sets these env vars at all (not even blank), matching
+"local `uv run`" exactly rather than needing its own case in the frontend badge logic.
+
+---
+
+## 2026-08-16 — `cleaned` shares `imported`'s green-check icon instead of dimming to neutral
+
+`prompts/2026-08-16-cleaned-icon-keeps-green-check.md`. First live Radarr run with "Delete when
+imported" on: the original design (`docs/arr-integration-spec.md`'s icon-state table, user
+decision 2026-08-15) had `cleaned` render the plain neutral *arr mark, on the theory that its
+own distinguishing information belonged on the removal-grace countdown chip's re-worded text
+("Processed · Xm") rather than a second icon color. In practice, `imported` is a seconds-long
+transient when delete-on-import is on — cleanup runs on the very next poller beat — so the green
+✓ flashed and was immediately replaced by the dimmed `cleaned` mark. The success indicator
+effectively never got seen.
+
+**The fix:** `lib/fileTree.ts.ARR_ICON_VARIANTS['cleaned']` now maps to `'imported'` (the same
+green-check variant), not its own `'neutral'` entry. `LifecycleIcons.tsx.ArrIcon` and
+`TransfersPage.tsx`'s *arr expand-panel group both switch purely on the shared `arrIconVariant`/
+`arrHoverLabel` helpers, so both inherited the change with no per-consumer edit. The hover text
+(`ARR_STATUS_TEXT`) already read differently for the two statuses ("imported by the *arr" vs.
+"imported and cleaned up locally") and needed no change to keep the states tellable apart.
+
+**Rejected: keeping `cleaned` neutral and instead recoloring the countdown chip green.** Would
+have fixed the same visibility gap but diverges the chip from `gone`'s and every other
+removal-grace row's neutral countdown styling, and still leaves the *icon* itself lying about
+whether the *arr succeeded — the icon is the thing a user scans a row for first.
+
+---
+
+## 2026-08-16 — Progress cadence unified: job and per-file speed now sample on the same 5s tick
+
+`prompts/2026-08-16-unify-progress-cadence-5s.md`. The user, watching a live transfer, saw a
+one-file directory report two different speeds at once (46 vs. 40 MB/s) for the same download.
+Root cause: job-level speed (`core/progress.py.ProgressSampler.sample`, called from
+`core/queue.py._sample_and_publish_progress`) sampled on *every* tick of the 1s loop, while
+per-file (child) speed was throttled to every 3rd tick (`CHILD_PROGRESS_THROTTLE_TICKS = 3`,
+added 2026-08-14 for "per-file speed inside a mirror") purely to bound DB write pressure. Both
+used the exact same EMA formula (`α = 0.3`, `core/progress.py.ema_step`) and both derive their
+instantaneous rate from real elapsed time (`now - prev_time`, never `tick_s * N`) — but two
+independent sample instants, each smoothed on its own schedule, produce two different numbers
+for what is, for a one-file directory, the identical underlying transfer. Neither reading was
+wrong; they were just never going to agree, by construction.
+
+**The fix:** one constant, `core/queue.py.PROGRESS_SAMPLE_TICKS = 5` (replacing
+`CHILD_PROGRESS_THROTTLE_TICKS`), gates the *entire* body of `_sample_and_publish_progress` —
+job-level `ProgressSampler.sample`, the per-tick `item_delta` publish for the parent item, and
+`_publish_child_progress` alike. All three now run on the exact same tick, every 5th call
+(~5s at the default `tick_s`), instead of two of them running on independent schedules.
+
+**Why the tick loop itself stays at 1s, not 5s:** `TransferQueue.tick()` also drives admission,
+reaping, and stop handling (`_reap_finished`, `_admit`) — slowing the whole loop down would make
+a Stop click take up to 5s to act on a running process, not the ~1s it takes today. Only the
+*progress-sampling* work inside one tick's call to `_sample_and_publish_progress` moved; the
+gate is an early return at the top of that method, checked every tick, acted on every 5th.
+Verified this doesn't silently corrupt anything: `_sample_metrics` (throughput/dashboard feed)
+already tolerated a stale `self._last_progress` between ticks by design (falls back to
+`p.bytes_start` if a job has no entry yet) and just reuses the same cached bytes_done on the
+in-between ticks now, which `ThroughputSampler`'s own 30-tick averaging window already smooths
+over — no change needed there.
+
+**Why 5, not something else:** matches the prompt's explicit user decision, not derived from
+first principles — but it's not arbitrary either. Longer than 3 gives the underlying rate a
+wider delta window to average over (a real, if secondary, benefit); short enough that the Files/
+Transfers pages still read as "live" to a human watching. The one accepted cost: a freshly
+started job's speed now reads 0 until its *second* sample, ~5–10s in rather than ~1–2s (first
+sample has no history to derive a rate from — pre-existing behavior at a longer delay, not a new
+special case).
+
+**Rejected: giving child progress its own faster path back to 1 Hz instead of slowing job
+progress down.** Would have kept the write-pressure problem `CHILD_PROGRESS_THROTTLE_TICKS`
+existed to solve in the first place (§ the throttle's own original comment: a 50-file release
+recomputing every tick is up to 50 `UPDATE`s/s, the exact pattern that turned the `VACUUM INTO`
+backup race from rare to routine, `209928d`). Unifying downward (job onto child's cadence, not
+child onto job's) was the only option that didn't reopen that.
+
+**Deferred, not addressed here:** a dynamic/live-retune sampling cadence (faster while a
+transfer is young or bursty, slower once steady) — not proposed or logged anywhere yet, and
+out of scope for this task; the fixed 5s cadence is deliberately the simple first cut. (Not to
+be confused with `prompts/open-issues.md`'s separate, already-logged low-priority idea about
+*bandwidth* re-tuning a running job's `net:limit-total-rate` live — a different mechanism
+entirely, §4.5's admission-time allocation, untouched by this change.)
+
+## 2026-08-16 — History group summary: inlined onto `GET /api/history/jobs`, not a second endpoint
+
+`prompts/2026-08-16-history-jobs-group-collapse.md` left the endpoint-vs-inlined choice open,
+asking only that it fit `api/history.py`'s own conventions and that the choice be explained.
+Went with inlining a `queue_summaries` block onto the existing `HistoryJobsResponse`
+(`HistoryQueueSummaryOut`, `api/history.py._queue_summaries`) rather than a new `GET
+/api/history/jobs/summary` endpoint.
+
+**Why inlined:** `HistoryJobsSection.tsx` already refetches the jobs list on every filter change
+(queue/state/error class/date range, or the Refresh button) and on every "load more" — a separate
+summary endpoint would be a second round trip, computed from the *identical* filter, on every one
+of those triggers. Inlining costs one extra `GROUP BY` query per existing request instead, and
+keeps the two pieces of data — the page and its own totals — impossible to have drift apart from
+mismatched request timing (a summary fetched a beat after/before the page, mid-filter-change,
+could describe a different filter than what's on screen).
+
+**Why this couldn't just be a client-side sum, unlike Transfers' identical-looking queue-group
+header (`lib/transferPanel.ts.queueGroupSummary`):** Transfers' job list is unpaginated (`GET
+/api/jobs` returns the whole active+recently-terminal set by construction — `core/queue.py.
+list_jobs`'s own docstring), so summing the loaded rows *is* summing the true set. History's
+`jobs` list is `LIMIT`/`OFFSET` paginated (a busy install accumulates thousands of terminal jobs,
+well past `MAX_LIMIT`) — a client-side sum over `jobs` would be quietly wrong the instant a
+queue has more matching rows than are currently loaded, or before the first page has loaded at
+all. `_queue_summaries` runs one bounded `GROUP BY item.queue_id, path_queue.name, job.state`
+query against the exact same `_jobs_where_clause` output as the `jobs` list beside it — one row
+per `(queue, state)` combination (at most 3 per queue, since the WHERE clause's terminal-state
+base clause is never optional), so the query cost is bounded by queue count, not job count,
+regardless of how many rows match the filter.
+
+## 2026-08-16 — Transfers group header: added a `stopped` count beyond the prompt's literal four
+
+`prompts/2026-08-16-transfers-group-by-queue.md` named exactly four outcome buckets for a queue
+group's header line — "active / queued / succeeded / failed" — but `JobOut.state` has a fifth
+value, `cancelled`, that both `isDismissable` and `chipStateFor` (`TransfersPage.tsx`) already
+treat as first-class: a stopped job sits in the same group, visible, until dismissed, exactly
+like a failed one. Counting only the named four would have made a group header's counts not sum
+to its own row count whenever a stopped job was present — silently *hiding* it from the one
+summary line meant to replace the per-row detail, rather than naming it. `queueGroupSummary`
+(`lib/transferPanel.ts`) adds a fifth `stopped` bucket for `cancelled`, following `failed` in
+`formatQueueGroupCounts`'s enumeration order and omitted at zero exactly like every other
+bucket — same "zero counts omitted to keep it quiet" rule the prompt itself specified for the
+other four.
+
+## 2026-08-15 — Cleaned-item grace visibility: narrowing `_protected_rel_paths`, not
+`resolve_absence`
+
+`prompts/2026-08-15-cleaned-item-grace-visibility.md`, live defect: the first real run of the
+*arr delete-completed flow on a `move` queue (matched → notified → imported → cleanup deleted the
+local copy) dropped the row from the Files page *instantly* instead of riding the existing
+~10-minute removal grace as "Processed · Xm" (`docs/arr-integration-spec.md` "Cleanup" —
+`core/arrsync.py`'s cleanup step deliberately never writes `item.state`, leaving the row for the
+"existing scan + `core/mount_sentinel.py` absence-grace machinery" to carry to `REMOVED_LOCAL`,
+per the 2026-08-15 phase B entry above). `GET /api/files` kept showing the row
+(`state: LOCAL_ONLY`, `arr_status: "cleaned"`, `first_missing_at: null`) minutes and several scan
+passes later; the WS-driven Files page had already dropped it — REST and the published view
+disagreeing, the exact split the publish invariant (`core/itemview.py`) exists to prevent.
+
+**Two bugs stacked, both inside `core/engine.py._persist`, neither in `core/mount_sentinel.py`:**
+
+1. **`_protected_rel_paths` treated *any* `auto_queue_suppressed = 1` row as fully frozen.**
+   Cleanup sets that flag *first*, before touching disk (spec step 1 — belt-and-braces against a
+   copy-mode queue's re-download toggle re-grabbing the still-present remote copy while cleanup
+   runs). That flag's *other* meaning — "a scan pass must never touch this row's `state` again"
+   — is exactly right for `core/local_delete.py.delete_local()`'s own terminal write and for
+   STOPPED/FAILED (job-lifecycle holds with nowhere else to go), but wrong for an arr-cleaned
+   row, which still needs the ordinary per-node/vanished-sweep machinery to run so the grace
+   clock can start. Left unfixed, the row is simply excluded from `_persist`'s `vanished` set
+   forever — `first_missing_at` never gets touched, and the row silently drops out of `written`,
+   hence `_project`'s published set, on the very next scan.
+2. **Even once unprotected, a verify-skipped `move`-mode item rests at `state == "LOCAL_ONLY"`**
+   — `move` mode's own remote-delete step (`postprocess._maybe_delete_remote`) already removed
+   the remote copy at download time, well before cleanup, and with no `.sfv`/`.md5` sidecar
+   (the common case for TV/movie releases) `core/postprocess.py._do_verify`'s `SKIPPED` branch
+   leaves `state = "DOWNLOADED"`, which the very next scan overwrites to `LOCAL_ONLY` (an
+   intentional, correct reading — see `outcome_survives_rescan`'s own `remote_deleted_at`-gated
+   `LOCAL_ONLY` docstring). `LOCAL_ONLY` is not in `resolve_absence`'s `_STICKY_PREV_STATES`, so
+   once vanished from both trees it falls straight to `resolve_vanished`'s fallback and lands on
+   `REMOVED_BOTH` *instantly* — correct for a genuinely never-tracked local file's disappearance
+   (and it's exactly what produced the "earlier `REMOVED_BOTH` rows in the same queue" the live
+   evidence also showed), wrong for a row this codebase's own cleanup just marked.
+
+**The fix widens `_protected_rel_paths`'s SQL by one clause** (`auto_queue_suppressed = 1 AND
+arr_status IS NOT 'cleaned'`, `IS NOT` rather than `!=` so a NULL `arr_status` — every ordinary
+suppressed row — still reads protected) **and remaps one specific combination inside the vanished
+sweep**: `prev_state == "LOCAL_ONLY" and arr_status == "cleaned"` is fed to `resolve_absence` as
+`"DOWNLOADED"` instead of literally `"LOCAL_ONLY"`. Both changes live entirely in
+`core/engine.py._persist`; `core/mount_sentinel.py.resolve_absence`/`resolve_vanished` are
+untouched, and so is `postprocess.outcome_survives_rescan`.
+
+**Why `"DOWNLOADED"`, not a new sticky state or a `mount_sentinel.py` signature change:**
+`resolve_absence` already holds `prev_state` verbatim throughout the grace window and only
+resolves it at expiry — the frontend/`_local_facet` grace-eligibility check
+(`core/itemview.py._local_facet`, `frontend/src/lib/format.ts.REMOVAL_GRACE_ELIGIBLE_STATES`,
+kept in sync with `core/mount_sentinel.py.COMPLETE_STATES` and pinned equal by
+`tests/test_settings_api.py`) requires the *held* state to be one of `_COMPLETE_PREV_STATES` for
+the dim icon / "Processed · Xm" chip to render at all — literally holding `"LOCAL_ONLY"` would
+have rendered green/"present" throughout the entire grace window (`_local_facet`'s unconditional
+`LOCAL_ONLY → green` branch), the opposite of the intended effect. `"DOWNLOADED"` is exactly what
+that same state would have been had verify not been skipped and `outcome_survives_rescan`'s own
+`remote_deleted_at`-gated protection not intervened — it is the generic "content complete"
+reading `LOCAL_ONLY` is itself a refinement of, so the remap loses no information: by the time a
+row rests at bare `LOCAL_ONLY` rather than a postprocess outcome, verify/extract already left
+nothing more specific to preserve. The existing `REMOVED_LOCAL → REMOVED_BOTH` remap the vanished
+sweep already applies at grace expiry (2026-08-13, "vanished rows should leave the tree") fires
+unmodified on top of this, so the terminal state is still correctly `REMOVED_BOTH` (remote is
+genuinely gone too), never `REMOVED_LOCAL`.
+
+**Deliberately not generalized to every move-mode `LOCAL_ONLY` vanish.** The remap only fires
+when `arr_status == 'cleaned'` — a row this codebase's own cleanup marked. A move-mode item that
+vanishes from local for any *other* reason (an importer takes it via hardlink/copy outside
+lftpweb's own tracking, a user deletes it by hand outside the app) still resolves straight to
+`REMOVED_BOTH` with no grace, exactly as before this fix —
+`test_a_vanished_local_only_row_rests_at_removed_both_not_left_alone` (unmodified) pins this.
+Extending the grace period to *every* `LOCAL_ONLY` disappearance would be a real, if arguably
+reasonable, generalization of absence handling that this task's own scope explicitly excludes
+("do not redesign absence handling generally").
+
+**Not addressed, and not this bug's mechanism:** the `DOWNLOADED → LOCAL_ONLY` rewrite itself
+(a verify-skipped move-mode item's `state` changing from `"DOWNLOADED"` to `"LOCAL_ONLY"` the
+scan after its remote copy is deleted) is intentional, existing behavior — `outcome_survives_
+rescan` only protects the four `TERMINAL_STATES` outcomes, by design, and `"DOWNLOADED"` itself
+carries no information `"LOCAL_ONLY"` doesn't already convey more accurately (remote genuinely
+absent). It is the reason the live item was at `LOCAL_ONLY` rather than `DOWNLOADED` going into
+cleanup, but it is not a bug in its own right, and the fix above works correctly regardless of
+which of the two the row rests at when cleanup runs.
+
+---
+
+## 2026-08-15 — Transfers row collapse: what stays inline, what moves to the panel, and two
+kept judgment calls
+
+`prompts/2026-08-15-transfers-single-line-rows-with-detail.md`, driven by live-use feedback: the
+Transfers row had accreted queue position, file count, percent, live rate, ETA, allocated rate,
+elapsed, average speed, queued wait, and a post-processing note across three prior sessions
+(`6e6b217`, `25bc33c`, plus the original phase-3b/2026-08-13 row) — a wall of numbers rather than
+a scannable list. The fix: one line (name / queue / state word / one live number), a chevron
+expanding a three-group panel (Transfer / Processing / *arr).
+
+**Two deliberate departures from the prompt's most literal reading, both kept for parity with
+existing behaviour rather than escalated:**
+
+1. **Queue position and every action button (Move to top / Start now / Stop / Retry / Dismiss)
+   stay on the collapsed line**, not moved into the panel, even though the prompt's own line-up
+   names only "name, queue, state word, and the one most relevant live number." Reasoning: the
+   task's own "before you start" section frames the *crowding* as the 2026-08-14 timing/
+   post-processing additions specifically, not the pre-existing position badge or action row; and
+   "keep every existing action working" reads more naturally as "stays one click away," not
+   "now requires an expand first." Both a small badge (position) and small buttons (actions) fit
+   comfortably on one `flex-wrap` line alongside the trimmed metric, so nothing crowds the line
+   the way the removed figures did.
+2. **The Transfer group's "per-file mirror progress" is the existing file count** (`fileCountFor`,
+   unchanged), not a rebuild of `ItemDrawer.tsx`'s own virtualized per-file table. That table
+   already exists, already opens from the same row (clicking the item name, unchanged), and
+   duplicating a virtualized per-file breakdown inside a second, smaller surface would drift from
+   it eventually — the same "one place shows this, not two" reasoning `ItemDrawer.tsx`'s own
+   module comment gives for why it absorbed the Files-row info icon in the first place, applied
+   here to avoid re-forking it a second time.
+
+**Bulk "Dismiss all" reports failure honestly, but only at the request level.** The task's own
+phase-9 `Promise.allSettled` precedent is for a client-side loop over N independent calls that
+can each fail differently; `dismiss-all` is one server-side `UPDATE ... WHERE`, so there is no
+per-row result to report — only "the request succeeded with count N" or "the request itself
+failed" (network/HTTP), which is what `TransfersPage.tsx`'s `handleDismissAll` actually surfaces.
+This is not a gap relative to the instruction, since a single atomic `UPDATE` genuinely has no
+partial-row failure mode to hide — named here so a future reader doesn't go looking for one.
+
+**Item-events endpoint takes no `item_id` existence check.** `event.item_id` was already a real
+column (`ON DELETE SET NULL`, migration 001) rather than something inferred from message text, so
+the "check how events reference items" question the prompt raised was already answered by the
+schema — no migration needed, no message-text parsing. `GET /api/items/{id}/events` for an
+unknown or since-`reset_item`-forgotten item simply returns an empty list rather than 404ing: an
+empty "nothing happened here" and "this id never existed" are indistinguishable in a read-only,
+already-scoped endpoint, and treating them the same keeps the handler a single query.
+
+**No agent can see the rendered UI in this environment** — the row/panel layout, the ▼/▲
+chevron affordance (`HistoryJobsSection.tsx`'s own precedent, reused rather than forked), and the
+*arr group's `ArrIcon` reuse are all unviewed; a human should open Transfers and expand a few
+rows of different states (queued/running/failed/succeeded, with and without a bound *arr
+instance) before trusting the rendered result.
+
+## 2026-08-15 — verify: an upstream-extracted release reads `SKIPPED`, not `CORRUPT`
+
+Same live-test session, next item: `National.Lampoons.Animal.House.1978.iNTERNAL.1080p.BluRay
+.x264-EwDp` on the ar-movies queue. The seedbox's SABnzbd had already extracted the rar set
+upstream and deleted the volumes, keeping only the `.sfv`, so the release arrived locally as
+`movie.mkv` + a `.sfv` listing rar volumes that were never local to begin with.
+`core/verify.py` counted every sidecar-referenced name as "missing" → `CORRUPT`, and on this
+`move` queue that permanently withheld the remote delete — a false positive with the exact same
+shape as the two prior incidents already documented in that module's own docstring.
+
+**Why this is safe to relax, and why only this narrow shape.** Verification is the one gate
+ahead of an irreversible remote delete (`core/postprocess.py._maybe_delete_remote`, pipeline
+order verify → delete gate → extract → move). The user-approved rule: every sidecar-referenced
+file absent *and* other real content present → `SKIPPED` (zero files were verified, so
+`SKIPPED` — not `VERIFIED` — is the honest state; it's exactly the trust level a sidecar-less
+release already gets, and `SKIPPED` already permits the move-mode delete). Any referenced file
+present, including a half-deleted archive set, is unchanged and stays `CORRUPT` — by the time
+extraction would notice a missing volume the remote copy is already gone, and widening the
+relaxation to partial presence is a different, harder question tracked separately as
+`prompts/open-issues.md` #2 / **G1** (should the delete gate run after extraction instead).
+Sidecar-and-nothing-else also stays `CORRUPT` — there's no content the sidecar could have been
+vouching for.
+
+**Also relevant, worth stating plainly: "missing vs. the sidecar" at verify time can only mean
+an upstream anomaly, never a partial transfer.** `core/postprocess.py` only fires after
+`core/queue.py`'s local-vs-remote completeness gate has already passed (local bytes ≥ the
+item's known remote size, no leftover temp files) — so a file the sidecar names but this module
+can't find locally was *also* absent on the remote by the time completeness was measured.
+
+**Deviation from the literal prompt text, found during implementation, not pre-planned:** the
+rule as written ("at least one non-sidecar content file exists") turned out to also match an
+unrelated, already-fixed incident's regression test —
+`tests/test_postprocess.py::test_pipeline_withholds_archive_cleanup_when_verification_failed`
+(2026-08-14): a `.sfv` whose one entry names a *renamed* file (so that entry reads "absent")
+sitting beside the *real*, still-present, still-archived rar volumes under their actual names.
+By the literal rule, "other content exists" (the real archives) would flip this to `SKIPPED`,
+and since the archive_cleanup gate withholds only on `CORRUPT` (a deliberately lower bar than
+the remote-delete gate — see that gate's own comment), `SKIPPED` would let cleanup discard the
+very volumes verification never actually checked, reopening the exact incident the 2026-08-14 fix
+closed. Resolution: `_has_non_sidecar_content` (`core/verify.py`) excludes files that are
+themselves archive volumes, via a new `core/extract.py.is_archive_member()` (a plain per-file
+boolean classifier, factored alongside `find_archives` without changing that function's existing
+behavior). Rationale: a leftover archive volume is not evidence of an upstream extraction — it
+hasn't been extracted, it's still sitting there — so its presence must not be read as "nothing
+left to verify." This narrows the new rule's reach relative to a literal reading of the prompt
+text (deliberately, in the conservative direction — it makes `SKIPPED` fire in *fewer* cases, not
+more) and was applied rather than escalated because it fully resolves the conflict without
+touching rule 2's mixed-presence guarantee or rule 3's degenerate case, and is small enough to
+review inline; flagged here for visibility per the standing "name gaps, don't hide them" rule.
+
+## 2026-08-15 — auto-queue excludes `_UNPACK_`/`_FAILED_` remote staging: "show it, don't grab it"
+
+First real Sonarr live-testing run also surfaced this: the user's seedbox runs SABnzbd, which
+stages an in-progress unpack into a `_UNPACK_<name>` directory *on the remote* while unzipping,
+then renames it to the release's final name once done — coincidentally the identical
+`_UNPACK_`/`_FAILED_` prefix convention `core/extract.py` already uses for lftpweb's own *local*
+extraction staging, but this instance of it is SAB's, on the remote, and lftpweb has no control
+over it. The live instance showed 16 such remote directories (~34 GB) reconciling to ordinary
+`REMOTE_ONLY` items, real auto-queue candidates held back only by the settle gate (which will
+eventually let one through once SAB's rewriting looks quiescent for long enough — not a safe bet
+for a directory actively being unzipped).
+
+Two options considered: filter them out of the remote scan entirely (the same treatment
+`core/local_scan.py` already gives lftpweb's own local `_UNPACK_`/`_FAILED_` staging), or leave
+them visible and only block auto-queue. **User decision: leave them visible.** They exist on the
+remote and represent real, real-sized content someone might reasonably want to look at (or
+manually queue mid-unpack, if they know what they're doing) — hiding a 34 GB item from the tree
+entirely was judged worse than showing it in a state that just isn't auto-queued. This is a
+deliberate divergence from `local_scan.py`'s own filter, which hides lftpweb's *own* bookkeeping
+because it is never content the user asked for; a SAB unpack in progress, by contrast, unarguably
+is content, just not-yet-safe-to-grab content.
+
+Resolution: the exclusion lives in `core/autoqueue.py.AutoQueue.on_scan`, not `core/local_scan.py`
+or the reconciler — eligibility, not visibility. A top-level item whose name starts with
+`UNPACK_PREFIX`/`FAILED_PREFIX` (imported from `core/extract.py`, not duplicated) is skipped
+before pattern matching, unconditionally, regardless of `state`. Manual queueing
+(`core/queue.py.enqueue_item`) is untouched — consistent with every other auto-queue-only gate in
+this module (the settle gate, the mount gate): an explicit user action beats a heuristic.
+
+## 2026-08-15 — *arr `eventType` is a camelCase string in response bodies, not the numeric code
+
+The first real Sonarr live-testing run against the v0.1.1+arr build caught this directly: two
+releases (Gold Rush S16, NCIS New Orleans S07) were matched, transferred, notified, and genuinely
+imported by Sonarr — and both were classified `gone` by `core/arrsync.py`, the terminal-but-safe
+"queue record vanished with no import event" outcome, because `core/arrclient.py`'s
+`IMPORT_EVENT_TYPES = {3}` never matched a real history record. Root cause, confirmed against the
+live instance's actual response bodies: the *arr v3 API serializes `eventType` as a **camelCase
+string** (`"downloadFolderImported"`, `"grabbed"`, ...) in every response body; the numeric codes
+this codebase was built against exist only as *query-parameter* values on request-side filters,
+never as a response field's actual type. The fake-*arr test fixture's own test data encoded the
+same wrong assumption (`{"eventType": 3, ...}`), which is exactly why every test stayed green
+while the live run silently misclassified two real imports — the spec's own "Failure modes"
+section had flagged this vocabulary as unverified against a live instance for precisely this
+reason, and it turned out to be wrong in the one place (`eventType`) that mattered;
+`trackedDownloadState`'s strings (`"importing"`, `"imported"`) were already correct.
+
+Resolution: `IMPORT_EVENT_TYPES` is now string-keyed (`{"downloadFolderImported"}`), and the
+comparison is normalized in exactly one place — a new `HistoryEvent.is_import_event()` method,
+not at either call site — so a numeric `event_type` (never seen live, but cheap to tolerate for
+an *arr version or serializer setting this codebase hasn't encountered) still matches via a kept
+legacy-numeric fallback rather than being silently unsupported. Already-`gone` associations on
+the live instance are terminal by design and stay `gone`; this fix only changes classification
+for associations checked from now on.
+
+## 2026-08-15 — *arr integration phase C: instance name resolved client-side, never added to the item wire
+
+The spec's "UI" section says the icon's hover card "names the instance and the timestamp
+(`arr_status_at`)." But phase A's shipped projection (`core/itemview.py.ITEM_VIEW_COLUMNS`) only
+carries `arr_status`/`arr_status_at` on the item — the instance's own identity was deliberately
+left off (the spec's own note: `arr_download_id` "is never published in the item projection,"
+and the same reasoning extends to the instance id/name, which the item row doesn't even store —
+only the *queue* does, via `path_queue.arr_instance_id`). Adding a new wire field just for this
+hover card would be a real backend change mid-UI-only phase, which the phase split explicitly
+rules out.
+
+Resolution: `FilesPage.tsx` resolves the name itself, client-side, from data it already fetches
+for other reasons — `listQueues()` (already fetched for `QueueResetControls`) now carries
+`arr_instance_id` per queue (phase A shipped this on `PathQueueOut`, just unused by the frontend
+until now), and a new one-time `listArrInstances()` fetch supplies the id → name map. `FilesPage`
+computes each queue's own bound instance name once and threads it down as a plain string prop
+(`arrInstanceName`) through `FileTree` → `Row` → `ArrIcon`, exactly the same "fetched once at the
+page, passed down, never re-derived per row" shape `queueLocalPath` already established for the
+item drawer. `lib/fileTree.ts.arrHoverLabel` accepts the resolved name as a parameter rather than
+looking it up itself, so it stays a pure function testable without any fetch machinery. The
+degrade path (name not yet loaded, or genuinely unbound) reads "the bound *arr instance" rather
+than blocking the icon from rendering at all.
+
+## 2026-08-15 — *arr integration phase C: one Files-row icon slot, own resizable column, not folded into the R/L/V/E cluster
+
+The spec's icon-state table describes "one icon slot on the row." The lifecycle icons (R/L/V/E,
+`components/LifecycleIcons.tsx`) already occupy a tight fixed-width column (80px default, 68px
+minimum, sized for exactly four 14px glyphs) — folding a fifth icon into that cluster would mean
+either shrinking all five below a legible size or silently growing a column whose width was
+deliberately sized for four. Considered and rejected: the *arr icon is also **conceptually**
+different from the R/L/V/E set — those four are `core/itemview.py`-derived facets of the same
+underlying reconciliation the whole app already centers on, while the *arr icon reflects a
+separate, optional, per-queue integration that most installs will never turn on. Mixing them
+would make an already-dense row harder to parse for the common case (no integration configured)
+for no gain in the rare case (one configured).
+
+Resolution: a new `arr` entry in `lib/fileTree.ts.RESIZABLE_COLUMNS`, own resizable width (44px
+default, 36px minimum — small, since most rows render nothing there at all), positioned between
+the state chip and the R/L/V/E cluster in both the header and `Row`'s own cell order. Renders
+nothing (`ArrIcon` returns `null`) for `arr_status: null`, which is the common case, so an
+install with no *arr integration configured sees no visual difference at all from before this
+phase — the column exists but is reliably empty.
+
+## 2026-08-15 — *arr integration phase B: cleanup removes bytes but never writes `item.state`
+
+The spec's "Cleanup" section says "delete the local tree via the existing local-deletion
+machinery (`core/local_delete.py`, resolving through `_physical_local_root`)" — read as "call
+`delete_local()`," that would set `item.state` to `REMOVED_LOCAL`/`REMOVED_BOTH` *immediately*,
+the same instant cleanup runs, because that function's own docstring is explicit that its state
+write is unconditional and instant (correct for its own callers: a human clicking Delete, or
+scheduled retention, both of which already know for certain the removal is deliberate and
+final). But the same spec section also says, two sentences later: "The item then ages into
+`REMOVED_LOCAL` **through the normal grace machinery**" and describes the UX as "downloaded ->
+processed -> **(countdown)** -> gone," explicitly reusing the existing "Missing · Xm" chip
+(`frontend/src/lib/format.ts`'s `isRemovalGracePending`/`REMOVAL_GRACE_ELIGIBLE_STATES`) with
+only a presentational relabel. Traced that chip's actual trigger: it renders *only* while
+`item.state` is **not yet** `REMOVED_LOCAL` (`first_missing_at` set, state still one of the
+pre-removal terminal states) — `delete_local()`'s immediate write would skip past that window
+entirely and the chip could never appear, making the spec's own UX description physically
+impossible if cleanup called `delete_local()` unmodified.
+
+Resolution: `core/arrsync.py._maybe_cleanup` removes the bytes directly (reusing
+`core/local_delete.py._physical_local_root` for resolution — never a second resolver — plus the
+same containment/mount-sentinel guards, and `_do_remove_from_disk` for the actual removal) but
+**never touches `item.state`**, leaving the row exactly as it was. This is the identical pattern
+`core/postprocess.py._do_move` already established for a staging relocation: make the bytes
+disappear from `local_path`, and let the ordinary scan + `core/mount_sentinel.py.resolve_absence`
+grace machinery discover the absence and carry it to `REMOVED_LOCAL` on its own ~10-minute clock
+— "no new timer," and the countdown chip genuinely appears, exactly as the spec describes. Read
+"the existing local-deletion machinery" narrowly: its resolver and its safety guards, not its
+state-writing tail, which belongs to a different, more certain caller. Two other differences
+from `delete_local()` follow from the same reasoning: no `require_nlink_guard` (the *arr's own
+confirmed-import history event is the evidence substitute a hardlink proof would otherwise be
+needed for — cleanup does not call `delete_local()` at all, so this only matters as a note for
+why nlink is never even considered here), and a cleanup attempt against bytes already absent
+(neither `local_path` nor `staging_path` has anything on disk) is treated as success rather than
+withheld — the goal state already holds.
+
+## 2026-08-15 — *arr integration phase A: cleanup deferred to phase B despite the poller
+## section literally saying "run cleanup"
+
+`docs/arr-integration-spec.md`'s "The poller" section step 4 reads "For imported items on a
+`arr_delete_completed` queue: run cleanup (below)" — read in isolation, that sentence is in
+scope for `core/arrsync.py`. It isn't: the same spec's own "Build plan" section explicitly
+scopes phase 1 ("Backend foundation") to "poller with match + import detection" only, and
+names "Notify + cleanup" as a separate phase 2. The handoff prompt
+(`prompts/2026-08-15-arr-integration-backend.md`) says the same thing directly ("No notify
+push, no cleanup/deletion, no frontend in this phase"). Treated as the full-feature
+description (what the poller does once all three phases exist), not a phase-A requirement —
+`core/arrsync.py` transitions `(no status) -> detected` and `detected/notified -> imported |
+gone`, and stops there; nothing in phase A calls `core/local_delete.py` or sets
+`auto_queue_suppressed`. Recorded because a literal read of one section without the other
+would have over-built this phase.
+
+## 2026-08-15 — *arr integration phase A: two-pass quiescence guard is in-memory, not a new table
+
+The lifecycle's "confirmed on two consecutive poller passes" requirement (the guard against
+committing `imported`/`gone` on a single, possibly-racy observation) needed somewhere to keep
+"was this candidacy also true last pass." `core/settle.py`'s `item_settle` table does the
+analogous job for the remote-fingerprint settle gate, by persisting to survive a restart —
+but migration 018's own "Data model" section specifies *exactly* three new `item` columns and
+no new table for this feature, and the prompt says to build exactly that schema. Adding a
+persistence table here would be scope creep not asked for. The guard lives in
+`ArrSyncScheduler._pending`, an in-process dict keyed by item id, keyed further by the
+candidate `downloadId` so a restart or a regrab can't accidentally confirm the wrong
+association. A restart loses any pending candidacy and costs one extra poll interval before a
+transition can commit — the safe direction to err in for a feature that, in phase A, doesn't
+even reach the irreversible step (cleanup is phase B).
+
+## 2026-08-15 — *arr integration phase A: the fake-*arr test server runs on its own thread
+
+The first cut of `tests/fake_arr.py` scheduled the fake `uvicorn` server's `serve()` coroutine
+with `asyncio.create_task` on the *calling* test's own event loop — modeled on `pytest-
+asyncio`'s usual "just create a task" idiom. It hung every test that drove the app through
+`fastapi.testclient.TestClient`: `TestClient.post(...)` is a synchronous, blocking call from
+the calling coroutine's frame, and a coroutine mid-synchronous-call never yields control back
+to its own event loop, so the fake server's task — scheduled on that same loop — never got to
+read the incoming request or write a response. Every such request hung until
+`core/arrclient.py`'s own 10s timeout fired, and the test then failed on `ok is False` instead
+of erroring outright, which made the first diagnosis slower than it should have been. Fixed by
+running the fake server in a dedicated OS thread with `asyncio.run()`, decoupling its
+scheduling entirely from whatever the calling test happens to be blocked on — the same thing a
+real out-of-process fake seedbox container gets for free. `tests/fake_arr.py`'s
+`run_fake_arr_server` docstring carries the full reasoning; recorded here too since it's the
+kind of thing a future async-fixture-over-real-HTTP pattern in this repo will want to copy
+correctly the first time.
+
 ## 2026-08-14 — Audit P1 (partial): `FileTree.tsx`'s pure logic extracted to `lib/fileTree.ts`
 
 `FileTree.tsx` was the largest file in the repo (2267 lines). Extracted its pure,

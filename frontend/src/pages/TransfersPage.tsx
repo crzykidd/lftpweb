@@ -1,12 +1,39 @@
-import { useMemo, useState } from 'react'
-import { dismissJob, moveJobToTop, retryItem, startJobNow, stopJob } from '../api/client'
-import type { FileNode, JobOut } from '../api/types'
+import { Fragment, useEffect, useMemo, useState } from 'react'
+import {
+  dismissAllJobs,
+  dismissJob,
+  getItemEvents,
+  moveJobToTop,
+  retryItem,
+  startJobNow,
+  stopJob,
+} from '../api/client'
+import type { FileNode, ItemEventOut, JobOut } from '../api/types'
+import { ArrIcon, ArrRowChip } from '../components/LifecycleIcons'
 import { ItemDrawer } from '../components/ItemDrawer'
 import { StateChip } from '../components/StateChip'
 import { useJobs } from '../hooks/useJobs'
 import { useLiveModel } from '../hooks/useLiveModel'
-import { formatEta, formatPercent, formatRate } from '../lib/format'
-import { averageSpeedBps, elapsedSeconds, isNotableQueuedWait, postprocessNote, queuedWaitSeconds } from '../lib/transferTiming'
+import { arrHoverLabel } from '../lib/fileTree'
+import { formatBytes, formatRate, formatRelativeTimeIntl } from '../lib/format'
+import {
+  type LiveProgress,
+  type PanelField,
+  type QueueGroup,
+  completedTimeLabel,
+  formatQueueGroupCounts,
+  groupJobsByQueue,
+  hasArrGroup,
+  isQueueCollapsed,
+  processingGroupFields,
+  queueGroupSummary,
+  readCollapsedQueues,
+  sortTransferRows,
+  transferGroupFields,
+  transferLineValue,
+  withQueueCollapsed,
+  writeCollapsedQueues,
+} from '../lib/transferPanel'
 
 const START_NOW_EXPLAINED_KEY = 'lftpweb:startNowExplained'
 
@@ -81,7 +108,7 @@ interface DismissOutcome {
 interface RowProps {
   job: JobOut
   nodes: FileNode[]
-  live: { bytes_done: number; bytes_total: number | null; speed_bps: number; eta_s: number | null } | undefined
+  live: LiveProgress | undefined
   // Where this job sits in the actual run order (2026-08-13, prompts/2026-08-13-files-ux-pass.md
   // item 4) -- 1, 2, 3... counting only `state === 'queued'` rows, in the order `useJobs` already
   // returns them (`core/queue.py.list_jobs`'s own `ORDER BY job.rank DESC, job.queued_at ASC`,
@@ -110,34 +137,18 @@ function Row({
   onDismiss,
   busy,
 }: RowProps) {
-  const running = job.state === 'running'
-  const bytesDone = running ? (live?.bytes_done ?? job.bytes_done) : job.bytes_done
-  const bytesTotal = (running ? live?.bytes_total : job.bytes_total) ?? job.bytes_total
-  const speed = running ? (live?.speed_bps ?? job.speed_bps ?? 0) : 0
-  const eta = running ? (live?.eta_s ?? job.eta_s) : null
-
-  // Elapsed / average speed / queued wait (2026-08-14,
-  // prompts/2026-08-14-transfer-timing-and-throughput-display.md) -- "how long it took" and
-  // "what speed that works out to," derived from the job's own timestamps rather than left for
-  // a reader to reconstruct by hand from two ISO strings. For a running job, `elapsedSeconds`
-  // measures against `Date.now()` at render time -- no new timer: this row already re-renders
-  // roughly once a second while running, driven by the WS `progress` message that updates
-  // `live` (`useLiveModel.ts`).
-  const elapsed = elapsedSeconds(job.started_at, job.finished_at)
-  // `bytesDone` here (not `job.bytes_done`) so a running job's average uses the same freshest
-  // reading its percentage/ETA already do; `job.bytes_start` has no live counterpart -- it's
-  // fixed at spawn (`core/queue.py`'s admission), so the job's own value is always current.
-  const avgSpeed = averageSpeedBps(bytesDone, job.bytes_start, elapsed)
-  const queuedWait = queuedWaitSeconds(job.queued_at, job.started_at)
-  // The item's own state (`core/postprocess.py`'s VERIFYING/EXTRACTING, published via the same
-  // `item_delta`/`snapshot` WS messages this page already merges into `nodes` -- no new fetch,
-  // no new plumbing) is the honest source for "what is a finished-but-still-working row doing."
-  const itemNode = nodes.find((n) => n.id === job.item_id)
-  const postprocess = postprocessNote(job.state, itemNode?.state)
-  const showTimingRow = elapsed != null || avgSpeed != null || isNotableQueuedWait(queuedWait) || postprocess != null
+  // 2026-08-15 (prompts/2026-08-15-transfers-single-line-rows-with-detail.md): everything this
+  // row used to show inline -- file count, percent, rate, ETA, allocated, elapsed, average
+  // speed, queued wait, post-processing note -- moves into the expand panel below. The row
+  // itself keeps only what the task's own line-up names: queue position/tag (still needed for
+  // the Move-to-top action right there on the same line), name, state chip, and one live
+  // number (`transferLineValue`).
+  const [expanded, setExpanded] = useState(false)
+  const fileCount = fileCountFor(nodes, job)
+  const completed = completedTimeLabel(job)
 
   return (
-    <div className="flex flex-col gap-2 border-b border-zinc-200 px-3 py-2.5 text-sm last:border-b-0 dark:border-zinc-800">
+    <div className="flex flex-col gap-1.5 border-b border-zinc-200 px-3 py-2 text-sm last:border-b-0 dark:border-zinc-800">
       <div className="flex flex-wrap items-center gap-3">
         {/* Queue position (2026-08-13, item 4): "what is the proper way to see the priority of
          * the download queue" -- the capability (`rank DESC, queued_at ASC`, Move to top) already
@@ -152,15 +163,6 @@ function Row({
             #{queuePosition}
           </span>
         )}
-        {/* Which queue this row belongs to (DESIGN.md §9.2) -- deliberately a plain muted
-         * tag, not a StateChip, so it never competes with the state color for attention;
-         * with more than one active queue this is the only thing that tells rows apart. */}
-        <span
-          className="shrink-0 rounded bg-zinc-100 px-1.5 py-0.5 text-xs font-medium whitespace-nowrap text-zinc-500 dark:bg-zinc-800 dark:text-zinc-400"
-          title={`Queue: ${job.queue_name}`}
-        >
-          {job.queue_name}
-        </span>
         <button
           type="button"
           onClick={() => onOpenDrawer(job)}
@@ -170,134 +172,286 @@ function Row({
           {itemName(job.rel_path)}
         </button>
         <StateChip state={chipStateFor(job)} />
-        <span className="w-20 shrink-0 text-right text-zinc-500 dark:text-zinc-400">
-          {fileCountFor(nodes, job)} file{fileCountFor(nodes, job) === 1 ? '' : 's'}
+        {/* The *arr brand-logo chip (2026-08-16, prompts/2026-08-16-arr-chip-on-row-lines.md)
+         * -- sits right beside the state chip, in the same compact cluster; renders nothing
+         * when this item isn't *arr-tracked (`job.arr_status === null`). */}
+        <ArrRowChip
+          arrStatus={job.arr_status}
+          arrStatusAt={job.arr_status_at}
+          instanceName={job.arr_instance_name}
+          instanceKind={job.arr_instance_kind}
+        />
+        {/* Completed time (2026-08-16, user report from live use): "each terminal row should
+         * show when it completed" -- compact relative form, exact timestamp on hover, same
+         * value/title split every other timestamp on this page uses. `null` (nothing rendered)
+         * for an active row -- queued/running show what they show today, per the task's own
+         * instruction. */}
+        {completed && (
+          <span
+            className="w-20 shrink-0 text-right text-xs text-zinc-500 dark:text-zinc-400"
+            title={completed.title}
+          >
+            {completed.value}
+          </span>
+        )}
+        {/* The one live number this line keeps -- percent + current rate while downloading,
+         * final size otherwise. Everything else that used to sit here lives in the panel. */}
+        <span className="w-32 shrink-0 text-right text-zinc-500 dark:text-zinc-400">
+          {transferLineValue(job, live)}
         </span>
-        <span className="w-14 shrink-0 text-right text-zinc-500 dark:text-zinc-400">
-          {formatPercent(bytesDone, bytesTotal)}
-        </span>
-        <span className="w-24 shrink-0 text-right text-zinc-500 dark:text-zinc-400">{formatRate(speed)}</span>
-        <span className="w-20 shrink-0 text-right text-zinc-500 dark:text-zinc-400">
-          {running ? `ETA ${formatEta(eta)}` : '—'}
-        </span>
-        {/* Allocated vs. current (DESIGN.md §9.1): under admission control a job holds its
-         * allocation even while pulling less of it -- without this number the scheduler
-         * looks broken at exactly the moments it's working correctly. */}
-        <span
-          className="w-32 shrink-0 text-right text-zinc-500 dark:text-zinc-400"
-          title="Allocated at admission (DESIGN.md §4.5) -- held for this job's lifetime regardless of current speed"
-        >
-          {job.rate_limit_bps != null ? `${formatRate(job.rate_limit_bps)} alloc.` : '—'}
-        </span>
-      </div>
-
-      {/* Elapsed / average speed / queued wait / post-processing note (2026-08-14) -- see the
-       * derivations above for what each figure means and why it's guarded the way it is. Only
-       * rendered once there's at least one figure worth showing, e.g. a still-`queued` job with
-       * a trivial wait and no `started_at` yet shows nothing here. */}
-      {showTimingRow && (
-        <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-zinc-500 dark:text-zinc-400">
-          {postprocess && (
-            <span
-              className="font-medium text-amber-700 dark:text-amber-400"
-              title="This job finished transferring; verify/extract is still running against the same item -- not a stalled transfer"
-            >
-              {postprocess}
-            </span>
-          )}
-          {elapsed != null && (
-            <span title="Time this job spent running -- started_at to finished_at, or to now while still running">
-              Elapsed {formatEta(elapsed)}
-            </span>
-          )}
-          {avgSpeed != null && (
-            <span title="This attempt's bytes moved, averaged over its own elapsed time -- distinct from the live rate above, which is an EMA-smoothed instantaneous reading (core/progress.py)">
-              avg {formatRate(avgSpeed)}
-            </span>
-          )}
-          {isNotableQueuedWait(queuedWait) && queuedWait != null && (
-            <span title="Time this job waited in the queue before it started running -- queued_at to started_at, often a sign max_concurrent_transfers (DESIGN.md §4.5) was holding it back">
-              queued {formatEta(queuedWait)}
-            </span>
-          )}
-        </div>
-      )}
-
-      <div className="flex flex-wrap items-center gap-2">
-        {job.state === 'queued' && (
-          <>
-            <button
-              type="button"
-              disabled={busy}
-              onClick={() => onMoveToTop(job)}
-              className="rounded-md border border-zinc-300 px-2 py-1 text-xs font-medium text-zinc-700 hover:bg-zinc-50 disabled:opacity-50 dark:border-zinc-700 dark:text-zinc-200 dark:hover:bg-zinc-900"
-            >
-              Move to top
-            </button>
-            {!job.forced_full_rate && (
+        <div className="flex shrink-0 flex-wrap items-center gap-2">
+          {job.state === 'queued' && (
+            <>
               <button
                 type="button"
                 disabled={busy}
-                onClick={() => onStartNow(job)}
+                onClick={() => onMoveToTop(job)}
                 className="rounded-md border border-zinc-300 px-2 py-1 text-xs font-medium text-zinc-700 hover:bg-zinc-50 disabled:opacity-50 dark:border-zinc-700 dark:text-zinc-200 dark:hover:bg-zinc-900"
               >
-                Start now at max bandwidth
+                Move to top
               </button>
-            )}
-          </>
-        )}
-        {(job.state === 'queued' || job.state === 'running') && (
-          <button
-            type="button"
-            disabled={busy}
-            onClick={() => onStop(job)}
-            className="rounded-md border border-red-300 px-2 py-1 text-xs font-medium text-red-700 hover:bg-red-50 disabled:opacity-50 dark:border-red-900 dark:text-red-300 dark:hover:bg-red-950"
-          >
-            Stop
-          </button>
-        )}
+              {!job.forced_full_rate && (
+                <button
+                  type="button"
+                  disabled={busy}
+                  onClick={() => onStartNow(job)}
+                  className="rounded-md border border-zinc-300 px-2 py-1 text-xs font-medium text-zinc-700 hover:bg-zinc-50 disabled:opacity-50 dark:border-zinc-700 dark:text-zinc-200 dark:hover:bg-zinc-900"
+                >
+                  Start now at max bandwidth
+                </button>
+              )}
+            </>
+          )}
+          {(job.state === 'queued' || job.state === 'running') && (
+            <button
+              type="button"
+              disabled={busy}
+              onClick={() => onStop(job)}
+              className="rounded-md border border-red-300 px-2 py-1 text-xs font-medium text-red-700 hover:bg-red-50 disabled:opacity-50 dark:border-red-900 dark:text-red-300 dark:hover:bg-red-950"
+            >
+              Stop
+            </button>
+          )}
+          {job.state === 'failed' && (
+            <button
+              type="button"
+              disabled={busy}
+              onClick={() => onRetry(job)}
+              className="rounded-md border border-zinc-300 px-2 py-1 text-xs font-medium text-zinc-700 hover:bg-zinc-50 disabled:opacity-50 dark:border-zinc-700 dark:text-zinc-200 dark:hover:bg-zinc-900"
+            >
+              Retry
+            </button>
+          )}
+          {/* Dismiss (2026-08-13): terminal rows only -- a failed job whose remote is actually
+           * gone (REMOTE_GONE, permanently suppressed) had no action but Retry, which is
+           * precisely wrong for it. Purely a display action on this job row -- see
+           * `core/queue.py.dismiss_job`'s docstring for why it never touches the item's own
+           * state or suppression. No confirmation dialog: nothing is destroyed, the record
+           * stays on the History page. `succeeded` joined this set 2026-08-14
+           * (prompts/2026-08-14-exit-zero-is-not-completion.md) alongside `list_jobs()` starting
+           * to surface a recently-succeeded job at all -- see `isDismissable`. */}
+          {isDismissable(job.state) && (
+            <button
+              type="button"
+              disabled={busy}
+              onClick={() => onDismiss(job)}
+              className="rounded-md border border-zinc-300 px-2 py-1 text-xs font-medium text-zinc-500 hover:bg-zinc-50 disabled:opacity-50 dark:border-zinc-700 dark:text-zinc-400 dark:hover:bg-zinc-900"
+              title="Remove this row from Transfers -- it stays visible on the History page"
+            >
+              Dismiss
+            </button>
+          )}
+        </div>
+        {/* The expand control (2026-08-15) -- "chevron or ⓘ, matching existing idioms" per the
+         * task's own instruction; a plain chevron toggle is `HistoryJobsSection.tsx.JobRow`'s
+         * own precedent for an expandable row on this codebase. */}
+        <button
+          type="button"
+          onClick={() => setExpanded((v) => !v)}
+          aria-expanded={expanded}
+          title={expanded ? 'Hide details' : 'Show details -- transfer numbers, processing, and *arr status'}
+          className="shrink-0 rounded-md border border-zinc-300 px-2 py-1 text-xs font-medium text-zinc-500 hover:bg-zinc-50 dark:border-zinc-700 dark:text-zinc-400 dark:hover:bg-zinc-900"
+        >
+          {expanded ? '▲' : '▼'}
+        </button>
+      </div>
+
+      {expanded && <RowDetailPanel job={job} live={live} fileCount={fileCount} />}
+    </div>
+  )
+}
+
+/** A plain label/value block for one panel group (`PanelField[]`, `lib/transferPanel.ts`) --
+ * shared by all three groups so Transfer/Processing/*arr render identically, and `emptyText`
+ * says something honest rather than the group silently vanishing (a `queued` job's Processing
+ * group, say, genuinely has nothing yet).
+ */
+function PanelFieldList({ fields, emptyText }: { fields: PanelField[]; emptyText: string }) {
+  if (fields.length === 0) {
+    return <p className="text-zinc-400 dark:text-zinc-600">{emptyText}</p>
+  }
+  return (
+    <dl className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1">
+      {fields.map((f) => (
+        <Fragment key={f.label}>
+          <dt className="text-zinc-500 dark:text-zinc-400">{f.label}</dt>
+          <dd title={f.title} className="text-right text-zinc-800 dark:text-zinc-200">
+            {f.value}
+          </dd>
+        </Fragment>
+      ))}
+    </dl>
+  )
+}
+
+const ITEM_EVENTS_LIMIT = 20
+
+/** The Transfers row's expand panel (2026-08-15) -- three groups, per the task's own line-up:
+ * **Transfer** (bytes/elapsed/speed/queued-wait/file-count, plus a failed job's error class +
+ * output tail), **Processing** (the item's verify/extract/remote-delete milestones, enriched by
+ * the pipeline's own event messages -- fetched on demand, exactly once, when this panel first
+ * opens), and ***arr** (hidden entirely when the job's queue has no bound instance).
+ */
+function RowDetailPanel({ job, live, fileCount }: { job: JobOut; live: LiveProgress | undefined; fileCount: number }) {
+  const transferFields = useMemo(() => transferGroupFields(job, { live, fileCount }), [job, live, fileCount])
+  const processingFields = useMemo(() => processingGroupFields(job), [job])
+  const showArr = hasArrGroup(job)
+  const arrLabel = arrHoverLabel({ arr_status: job.arr_status, arr_status_at: job.arr_status_at }, job.arr_instance_name)
+
+  // The pipeline's own event messages (2026-08-15) -- "the carefully-worded event messages ARE
+  // the UI," the same History §7.3 philosophy this task's own instruction points at. Fetched
+  // once, when this panel mounts (which only happens while `expanded`, `TransfersPage.tsx`'s
+  // `Row` above) or if `job.item_id` itself changes -- the same on-open fetch shape
+  // `ItemDrawer.tsx`'s `HistoryPanel` already establishes.
+  const [events, setEvents] = useState<ItemEventOut[] | null>(null)
+  const [eventsLoading, setEventsLoading] = useState(false)
+  const [eventsError, setEventsError] = useState<string | null>(null)
+  useEffect(() => {
+    let cancelled = false
+    setEventsLoading(true)
+    setEventsError(null)
+    getItemEvents(job.item_id, ITEM_EVENTS_LIMIT)
+      .then((res) => {
+        if (!cancelled) setEvents(res.events)
+      })
+      .catch((err: unknown) => {
+        if (!cancelled) setEventsError(err instanceof Error ? err.message : String(err))
+      })
+      .finally(() => {
+        if (!cancelled) setEventsLoading(false)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [job.item_id])
+
+  return (
+    <div className="flex flex-col gap-3 rounded-md border border-zinc-200 bg-zinc-50 p-3 text-xs dark:border-zinc-800 dark:bg-zinc-900/40">
+      <div>
+        <h4 className="mb-1 text-[10px] font-medium tracking-wide text-zinc-500 uppercase dark:text-zinc-400">
+          Transfer
+        </h4>
+        <PanelFieldList fields={transferFields} emptyText="Nothing to show yet." />
         {job.state === 'failed' && (
-          <button
-            type="button"
-            disabled={busy}
-            onClick={() => onRetry(job)}
-            className="rounded-md border border-zinc-300 px-2 py-1 text-xs font-medium text-zinc-700 hover:bg-zinc-50 disabled:opacity-50 dark:border-zinc-700 dark:text-zinc-200 dark:hover:bg-zinc-900"
-          >
-            Retry
-          </button>
-        )}
-        {/* Dismiss (2026-08-13): terminal rows only -- a failed job whose remote is actually
-         * gone (REMOTE_GONE, permanently suppressed) had no action but Retry, which is
-         * precisely wrong for it. Purely a display action on this job row -- see
-         * `core/queue.py.dismiss_job`'s docstring for why it never touches the item's own
-         * state or suppression. No confirmation dialog: nothing is destroyed, the record
-         * stays on the History page. `succeeded` joined this set 2026-08-14
-         * (prompts/2026-08-14-exit-zero-is-not-completion.md) alongside `list_jobs()` starting
-         * to surface a recently-succeeded job at all -- see `isDismissable`. */}
-        {isDismissable(job.state) && (
-          <button
-            type="button"
-            disabled={busy}
-            onClick={() => onDismiss(job)}
-            className="rounded-md border border-zinc-300 px-2 py-1 text-xs font-medium text-zinc-500 hover:bg-zinc-50 disabled:opacity-50 dark:border-zinc-700 dark:text-zinc-400 dark:hover:bg-zinc-900"
-            title="Remove this row from Transfers -- it stays visible on the History page"
-          >
-            Dismiss
-          </button>
+          <div className="mt-2 rounded-md border border-red-200 bg-red-50 p-2 text-red-800 dark:border-red-900 dark:bg-red-950/40 dark:text-red-300">
+            <p className="font-medium">{job.error_class ?? 'UNKNOWN'}</p>
+            {job.output_tail && (
+              <pre className="mt-1 max-h-32 overflow-auto whitespace-pre-wrap break-words font-mono text-[11px] opacity-90">
+                {job.output_tail}
+              </pre>
+            )}
+          </div>
         )}
       </div>
 
-      {job.state === 'failed' && (
-        <div className="rounded-md border border-red-200 bg-red-50 p-2 text-xs text-red-800 dark:border-red-900 dark:bg-red-950/40 dark:text-red-300">
-          <p className="font-medium">{job.error_class ?? 'UNKNOWN'}</p>
-          {job.output_tail && (
-            <pre className="mt-1 max-h-32 overflow-auto whitespace-pre-wrap break-words font-mono text-[11px] opacity-90">
-              {job.output_tail}
-            </pre>
-          )}
+      <div>
+        <h4 className="mb-1 text-[10px] font-medium tracking-wide text-zinc-500 uppercase dark:text-zinc-400">
+          Processing
+        </h4>
+        <PanelFieldList fields={processingFields} emptyText="No verify/extract/delete milestones recorded yet." />
+        {eventsLoading && <p className="mt-1 text-zinc-400 dark:text-zinc-600">Loading processing events…</p>}
+        {eventsError && <p className="mt-1 text-red-600 dark:text-red-400">Couldn't load processing events: {eventsError}</p>}
+        {events != null && events.length > 0 && (
+          <ul className="mt-2 flex flex-col gap-1 border-t border-zinc-200 pt-2 dark:border-zinc-800">
+            {events.map((e) => (
+              <li key={e.id} className="flex flex-col gap-0.5">
+                <div className="flex items-baseline justify-between gap-3">
+                  <span
+                    className={
+                      e.level === 'error' || e.level === 'warning'
+                        ? 'font-medium text-amber-700 dark:text-amber-400'
+                        : 'font-medium text-zinc-700 dark:text-zinc-300'
+                    }
+                  >
+                    {e.kind}
+                  </span>
+                  <span className="text-zinc-500 dark:text-zinc-400" title={new Date(e.ts).toLocaleString()}>
+                    {formatRelativeTimeIntl(e.ts)}
+                  </span>
+                </div>
+                {/* The pipeline's own event message, verbatim -- "the carefully-worded event
+                 * messages ARE the UI" (History §7.3's own precedent, this task's instruction). */}
+                <p className="text-zinc-600 dark:text-zinc-400">{e.message}</p>
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
+
+      {showArr && (
+        <div>
+          <h4 className="mb-1 text-[10px] font-medium tracking-wide text-zinc-500 uppercase dark:text-zinc-400">
+            *arr
+          </h4>
+          <div className="flex items-center gap-2">
+            <ArrIcon arrStatus={job.arr_status} arrStatusAt={job.arr_status_at} instanceName={job.arr_instance_name} />
+            <span className="text-zinc-700 dark:text-zinc-300">
+              {arrLabel ?? `${job.arr_instance_name}: not yet matched`}
+            </span>
+          </div>
         </div>
       )}
     </div>
+  )
+}
+
+/** A queue group's header line (2026-08-16) -- queue name, outcome counts, and total/combined-
+ * rate, all in one clickable line that toggles the group's collapse state. The queue name used to
+ * repeat on every row (`Row` above, before this task); it lives here exactly once per group now.
+ */
+function GroupHeader({
+  group,
+  collapsed,
+  onToggle,
+  liveByJobId,
+}: {
+  group: QueueGroup
+  collapsed: boolean
+  onToggle: () => void
+  liveByJobId: Record<number, LiveProgress>
+}) {
+  const summary = useMemo(() => queueGroupSummary(group.jobs, liveByJobId), [group.jobs, liveByJobId])
+  const countsText = formatQueueGroupCounts(summary.counts)
+  return (
+    <button
+      type="button"
+      onClick={onToggle}
+      aria-expanded={!collapsed}
+      title={collapsed ? 'Expand this queue' : 'Collapse this queue'}
+      className="flex w-full flex-wrap items-center gap-3 border-b border-zinc-200 bg-zinc-50 px-3 py-2 text-left text-sm hover:bg-zinc-100 dark:border-zinc-800 dark:bg-zinc-900/60 dark:hover:bg-zinc-900"
+    >
+      <span className="shrink-0 text-zinc-400 dark:text-zinc-600" aria-hidden="true">
+        {collapsed ? '▸' : '▾'}
+      </span>
+      <span className="min-w-0 flex-1 truncate font-semibold text-zinc-900 dark:text-zinc-100">
+        {group.queueName}
+      </span>
+      {countsText && <span className="shrink-0 text-xs text-zinc-500 dark:text-zinc-400">{countsText}</span>}
+      <span className="shrink-0 text-right text-xs text-zinc-500 dark:text-zinc-400">
+        {formatBytes(summary.totalBytesDone)}
+        {summary.combinedRateBps != null && ` · ${formatRate(summary.combinedRateBps)}`}
+      </span>
+    </button>
   )
 }
 
@@ -313,12 +467,40 @@ export function TransfersPage() {
   const [startNowNotice, setStartNowNotice] = useState(false)
   const [clearingAll, setClearingAll] = useState(false)
   const [dismissOutcome, setDismissOutcome] = useState<DismissOutcome | null>(null)
+  const [dismissingAll, setDismissingAll] = useState(false)
+  const [dismissAllError, setDismissAllError] = useState<string | null>(null)
+  const [dismissAllCount, setDismissAllCount] = useState<number | null>(null)
 
   const nodesByQueue = useMemo(() => {
     const map = new Map<number, FileNode[]>()
     for (const q of queues) map.set(q.queue_id, q.nodes)
     return map
   }, [queues])
+
+  // Row order (2026-08-16, `lib/transferPanel.ts.sortTransferRows`'s own docstring): active rows
+  // keep `jobs`' own scheduler order untouched, terminal rows sort newest-completed-first --
+  // **replaces** the previous implicit order for terminal rows, which was the same `rank DESC,
+  // queued_at ASC` scheduler order active rows still use (meaningless for a row that's already
+  // finished). `queuePositions` below deliberately keeps reading `jobs` itself, not this sorted
+  // view -- a queue position is about the real future run order, unaffected by how terminal rows
+  // happen to be displayed.
+  const sortedJobs = useMemo(() => sortTransferRows(jobs), [jobs])
+
+  // Group by queue (2026-08-16, prompts/2026-08-16-transfers-group-by-queue.md): "per-row queue
+  // labels make the page busy" -- one collapsible group per queue, ordered by queue name, each
+  // row's within-group order untouched from `sortedJobs` above (`groupJobsByQueue`'s own
+  // docstring). Collapse state is per-queue, persisted, and read once on mount -- a queue that
+  // temporarily drops out of `jobs` (no visible rows right now) simply produces no group, but its
+  // stored preference is never pruned, so it's there again when the queue returns.
+  const groups = useMemo(() => groupJobsByQueue(sortedJobs), [sortedJobs])
+  const [collapsedQueues, setCollapsedQueues] = useState(readCollapsedQueues)
+  const toggleQueueCollapsed = (queueId: number) => {
+    setCollapsedQueues((prev) => {
+      const next = withQueueCollapsed(prev, queueId, !isQueueCollapsed(prev, queueId))
+      writeCollapsedQueues(next)
+      return next
+    })
+  }
 
   // Queue position (2026-08-13, item 4): `jobs` (`useJobs`/`GET /api/jobs`) already comes back
   // in the real run order (`core/queue.py.list_jobs`'s `ORDER BY job.rank DESC, job.queued_at
@@ -363,6 +545,32 @@ export function TransfersPage() {
   }
 
   const failedJobs = useMemo(() => jobs.filter((j) => j.state === 'failed'), [jobs])
+  const dismissableCount = useMemo(() => jobs.filter((j) => isDismissable(j.state)).length, [jobs])
+
+  /** "Dismiss all" at the top of the page (2026-08-15, user addition to
+   * prompts/2026-08-15-transfers-single-line-rows-with-detail.md) -- every currently-
+   * dismissable (terminal, not-yet-dismissed) job, not just `failed` (see `handleClearAllFailed`
+   * above for why that one stays scoped to `failed`). A single server-side bulk call
+   * (`core/queue.py.dismiss_all_terminal`), not a client-side `Promise.allSettled` fan-out --
+   * the task's own stated preference. Since it's one request, "partial failure" can only mean
+   * the request itself failed (network/HTTP) -- reported honestly via `dismissAllError`, same
+   * as any other failed mutation on this page, rather than a per-row breakdown there is no
+   * per-row result to report.
+   */
+  const handleDismissAll = async () => {
+    setDismissingAll(true)
+    setDismissAllError(null)
+    setDismissAllCount(null)
+    try {
+      const res = await dismissAllJobs()
+      setDismissAllCount(res.dismissed)
+      refresh()
+    } catch (err) {
+      setDismissAllError(errorMessage(err))
+    } finally {
+      setDismissingAll(false)
+    }
+  }
 
   /** "Clear all failed" (2026-08-13) -- the bulk counterpart to the per-row Dismiss button,
    * for the "I should have a clear or delete button" half of the user's report: one-at-a-time
@@ -413,6 +621,54 @@ export function TransfersPage() {
             className="shrink-0 rounded-md border border-amber-300 px-2 py-1 text-xs font-medium hover:bg-amber-100 dark:border-amber-800 dark:hover:bg-amber-900"
           >
             Got it
+          </button>
+        </div>
+      )}
+
+      {/* "Dismiss all" (2026-08-15, user addition) -- see `handleDismissAll`'s docstring.
+       * Hidden entirely once there is nothing dismissable, same "don't show a control with
+       * nothing to do" rule "Clear all failed" below already follows. */}
+      {dismissableCount > 0 && (
+        <div className="flex items-center justify-between gap-2">
+          <span className="text-xs text-zinc-500 dark:text-zinc-400">
+            {dismissableCount} dismissable job{dismissableCount === 1 ? '' : 's'}
+          </span>
+          <button
+            type="button"
+            disabled={dismissingAll}
+            onClick={handleDismissAll}
+            title="Dismiss every terminal (not active) job from this page -- records stay on the History page"
+            className="rounded-md border border-zinc-300 px-2.5 py-1.5 text-xs font-medium text-zinc-700 hover:bg-zinc-50 disabled:opacity-50 dark:border-zinc-700 dark:text-zinc-200 dark:hover:bg-zinc-900"
+          >
+            {dismissingAll ? 'Dismissing…' : 'Dismiss all'}
+          </button>
+        </div>
+      )}
+
+      {dismissAllCount != null && (
+        <div className="flex items-center justify-between gap-3 rounded-md border border-emerald-300 bg-emerald-50 px-3 py-2 text-sm text-emerald-900 dark:border-emerald-900 dark:bg-emerald-950/40 dark:text-emerald-200">
+          <span className="font-medium">
+            Dismissed {dismissAllCount} job{dismissAllCount === 1 ? '' : 's'}
+          </span>
+          <button
+            type="button"
+            onClick={() => setDismissAllCount(null)}
+            className="shrink-0 text-xs underline decoration-dotted"
+          >
+            Dismiss
+          </button>
+        </div>
+      )}
+
+      {dismissAllError && (
+        <div className="flex items-center justify-between gap-3 rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-900 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-200">
+          <span>Couldn't dismiss all: {dismissAllError}</span>
+          <button
+            type="button"
+            onClick={() => setDismissAllError(null)}
+            className="shrink-0 text-xs underline decoration-dotted"
+          >
+            Dismiss
           </button>
         </div>
       )}
@@ -488,23 +744,40 @@ export function TransfersPage() {
       )}
 
       {jobs.length > 0 && (
-        <div className="overflow-hidden rounded-md border border-zinc-200 dark:border-zinc-800">
-          {jobs.map((job) => (
-            <Row
-              key={job.id}
-              job={job}
-              nodes={nodesByQueue.get(job.queue_id) ?? []}
-              live={progressByJobId[job.id]}
-              queuePosition={queuePositions.get(job.id)}
-              onOpenDrawer={setDrawerJob}
-              onMoveToTop={handleMoveToTop}
-              onStartNow={handleStartNow}
-              onStop={handleStop}
-              onRetry={handleRetry}
-              onDismiss={handleDismiss}
-              busy={busyIds.has(job.id)}
-            />
-          ))}
+        <div className="flex flex-col gap-3">
+          {groups.map((group) => {
+            const collapsed = isQueueCollapsed(collapsedQueues, group.queueId)
+            return (
+              <div
+                key={group.queueId}
+                className="overflow-hidden rounded-md border border-zinc-200 dark:border-zinc-800"
+              >
+                <GroupHeader
+                  group={group}
+                  collapsed={collapsed}
+                  onToggle={() => toggleQueueCollapsed(group.queueId)}
+                  liveByJobId={progressByJobId}
+                />
+                {!collapsed &&
+                  group.jobs.map((job) => (
+                    <Row
+                      key={job.id}
+                      job={job}
+                      nodes={nodesByQueue.get(job.queue_id) ?? []}
+                      live={progressByJobId[job.id]}
+                      queuePosition={queuePositions.get(job.id)}
+                      onOpenDrawer={setDrawerJob}
+                      onMoveToTop={handleMoveToTop}
+                      onStartNow={handleStartNow}
+                      onStop={handleStop}
+                      onRetry={handleRetry}
+                      onDismiss={handleDismiss}
+                      busy={busyIds.has(job.id)}
+                    />
+                  ))}
+              </div>
+            )
+          })}
         </div>
       )}
 

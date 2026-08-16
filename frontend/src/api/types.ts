@@ -10,6 +10,11 @@ export interface HealthResponse {
   // host exists but the pooled connection last failed").
   host_reachable: boolean | null
   scheduler_alive: boolean
+  // 2026-08-16 (docs/decisions.md): baked at image build time, `null` for every build that
+  // never baked them (local dev, compose dev stack, a manual `docker build` with no
+  // `--build-arg`) -- see `lib/versionBadge.ts` for how the nav's version readout uses them.
+  build_sha: string | null
+  build_channel: 'dev' | 'release' | null
 }
 
 export interface StatsResponse {
@@ -127,11 +132,75 @@ export interface PathQueueIn {
   // items only; see Settings -> Transfer's own section for why.
   download_prefix_enabled: boolean | null
   download_prefix: string | null
+  // Sonarr/Radarr integration (migration 018, docs/arr-integration-spec.md "Data model" /
+  // "API surface"). Binding is per-queue, one instance at most -- `null` (the default, and
+  // every existing queue's value after the migration) means "no integration": no icons, no
+  // matching, no *arr behavior at all for this queue. Full-replace fields, like the rest of
+  // this interface (not the four post-processing toggles' merge-on-absence shape) -- Settings
+  // -> Queues' edit form always submits the complete queue state.
+  arr_instance_id: number | null
+  // Default off, per-queue, and only meaningful when `arr_instance_id` is set -- the backend
+  // rejects `true` with no bound instance (`api/settings_queues.py._validate_arr_binding`).
+  arr_delete_completed: boolean
+  // This queue's `local_path`, translated into the bound *arr's own namespace (spec "Path
+  // namespaces") -- `null` means "same namespace, no translation," never an empty-string
+  // sentinel.
+  arr_visible_path: string | null
 }
 
 export interface PathQueueOut extends PathQueueIn {
   id: number
   host_id: number
+}
+
+// --- Settings -> Integrations (migration 018, docs/arr-integration-spec.md) -------------
+//
+// Mirrors `backend/lftpweb/models.py`'s `ArrInstanceIn`/`ArrInstanceOut`/`ArrTestResponse`.
+// Sonarr and Radarr, v3 API, one client with a `kind` switch (spec "Scope"). Binding an
+// instance to a queue happens on `PathQueueIn.arr_instance_id` above, not here -- this is
+// only the instance CRUD + connectivity test.
+
+export type ArrKind = 'sonarr' | 'radarr'
+
+/** A create/update request body. `api_key` is plaintext here -- the only place it ever
+ * appears -- and is encrypted at rest server-side before touching the database, the same
+ * convention `HostIn.password` uses. Omitting it on an update keeps the stored key (the
+ * identical "unchanged must not mean cleared" rule `settings_host.py.put_host` follows) --
+ * `IntegrationsTab.tsx` never pre-fills this field with a real value, only a placeholder.
+ */
+export interface ArrInstanceIn {
+  name: string
+  kind: ArrKind
+  base_url: string
+  api_key?: string | null
+  enabled: boolean
+  notify_on_complete: boolean
+}
+
+export interface ArrInstanceOut {
+  id: number
+  name: string
+  kind: ArrKind
+  base_url: string
+  // Never the key itself (DESIGN.md §9.2's "must never round-trip the stored secret back to
+  // the browser") -- whether one is on file, mirroring `HostOut.has_password`.
+  has_api_key: boolean
+  enabled: boolean
+  notify_on_complete: boolean
+  created_at: string
+  updated_at: string
+}
+
+/** `POST /api/settings/arr/{id}/test` -- the `GET /api/v3/system/status` round trip, the
+ * Settings UI's Test button. Never a non-2xx for a reachable-but-erroring instance; the
+ * failure is reported in `message`/`error_class`, the same "test tells you what's wrong,
+ * doesn't throw" shape `TestConnectionResponse` already uses for the seedbox.
+ */
+export interface ArrTestResponse {
+  ok: boolean
+  error_class: string | null
+  message: string
+  version: string | null
 }
 
 // --- Settings -> Post-processing (phase 5, DESIGN.md §6) -------------------------------
@@ -358,16 +427,44 @@ export interface FileNode {
   // reason (never through the removal-grace clock). `lib/format.ts.isDeletedArchiveVolume` is
   // the one place that turns this into the chip substitution.
   deleted_archive_at: string | null
+  // Sonarr/Radarr integration (migration 018, docs/arr-integration-spec.md): the Files page's
+  // *arr icon reads `arr_status` directly. A facet, not a lifecycle state -- passed through
+  // verbatim from `item.arr_status`/`item.arr_status_at` (`core/itemview.py.item_view`), null
+  // for every item on a queue with no bound instance (or one the poller hasn't matched yet).
+  // `null | 'detected' | 'notified' | 'imported' | 'cleaned' | 'gone'`, kept as `string | null`
+  // here (not a literal union) since this type mirrors the wire shape and the backend's own
+  // `item.arr_status` column is a plain `TEXT`, not a `CHECK`-constrained enum -- see
+  // `lib/fileTree.ts.arrIconVariant` for the one place that switches on the known values and
+  // degrades an unrecognized one to the neutral icon rather than rendering nothing.
+  arr_status: string | null
+  arr_status_at: string | null
   facets: LifecycleFacets
 }
 
+// `POST /api/items/{item_id}/delete`'s optional body (2026-08-16, the delete dialog's
+// independent Local/Source scopes, prompts/2026-08-16-manual-delete-local-and-remote.md).
+// Omitted entirely means exactly the pre-existing behavior (`local=True, source=False`);
+// `client.ts.deleteItem` always sends both explicitly instead, so every call site says what it
+// means rather than relying on the backend's own default.
+export interface DeleteItemRequest {
+  local: boolean
+  source: boolean
+}
+
 // `POST /api/items/{item_id}/delete` (prompts/open-issues.md "7 + 8" -- the first delete
-// endpoint in this API). A withheld guard is a non-2xx response (client.ts's `sendJson`
-// throws), not `deleted: false` -- this shape only ever describes a successful delete.
+// endpoint in this API). A request that accomplishes *nothing at all* is a non-2xx response
+// (client.ts's `sendJson` throws) -- this shape describes every request that succeeded at
+// least partially. `deleted`/`reason`/`bytes_freed` describe the **local** scope, unchanged
+// from before the Source scope existed; `source_deleted`/`source_reason` are `null` when
+// `source` was not requested, and otherwise describe that independent outcome -- see
+// `api/jobs.py.DeleteItemResponse`'s own docstring for why a combined request can report
+// `deleted: true` alongside `source_deleted: false` rather than throwing.
 export interface DeleteItemResponse {
   deleted: boolean
   reason: string
   bytes_freed: number | null
+  source_deleted: boolean | null
+  source_reason: string | null
 }
 
 // --- Reset item tracking (2026-08-13, prompts/2026-08-13-reset-item-tracking.md) -----------
@@ -467,10 +564,55 @@ export interface JobOut {
   exit_code: number | null
   error_class: string | null
   output_tail: string | null
+  // 2026-08-15 (prompts/2026-08-15-transfers-single-line-rows-with-detail.md): the item-level
+  // facts the Transfers row's expand panel needs -- see `api/jobs.py._job_out`/`core/queue.py.
+  // list_jobs`'s own comments for the join these ride on. Mirrors `FileNode.verified_at`/
+  // `extracted_at`/`remote_deleted_at`/`arr_status`/`arr_status_at` (`lib/fileTree.ts`) exactly,
+  // plus `arr_instance_name` -- resolved server-side here (unlike the Files page, which resolves
+  // it client-side from `GET /api/settings/arr` -- see `lib/fileTree.ts`'s own comment on why
+  // that page does it differently) since `JobOut`'s row set is already bounded.
+  verified_at: string | null
+  extracted_at: string | null
+  remote_deleted_at: string | null
+  arr_status: string | null
+  arr_status_at: string | null
+  // `null` whenever this job's queue has no bound *arr instance -- the signal
+  // `lib/transferPanel.ts.hasArrGroup` gates the panel's *arr group on.
+  arr_instance_name: string | null
+  // The bound instance's `kind` ('sonarr' | 'radarr', migration 018's CHECK constraint) --
+  // added 2026-08-16 (prompts/2026-08-16-arr-chip-on-row-lines.md) for the row chip's
+  // brand-logo choice (`components/LifecycleIcons.tsx.ArrRowChip`). `arr_instance_name` is
+  // free text the user can rename to anything, so it can't drive which logo to draw; `kind` is
+  // the one field that reliably says which. `null` under the same condition
+  // `arr_instance_name` is null. Kept as `string | null` (not a literal union), same reasoning
+  // `FileNode.arr_status`'s own comment gives -- an unrecognized value degrades to a text chip
+  // rather than being rejected at the type level.
+  arr_instance_kind: string | null
 }
 
 export interface JobsResponse {
   jobs: JobOut[]
+}
+
+/** `POST /api/jobs/dismiss-all` (2026-08-15) -- the bulk counterpart to `dismissJob`. */
+export interface DismissAllResponse {
+  dismissed: number
+}
+
+/** `GET /api/items/{id}/events` (2026-08-15) -- the Transfers panel's on-demand "processing
+ * story" fetch, one `event` row per entry, newest first, server-capped.
+ */
+export interface ItemEventOut {
+  id: number
+  ts: string
+  level: string
+  kind: string
+  message: string
+  job_id: number | null
+}
+
+export interface ItemEventsResponse {
+  events: ItemEventOut[]
 }
 
 export interface QueueItemRequest {
@@ -548,6 +690,32 @@ export interface HistoryJobOut {
   // `null` if it never was. History shows every terminal job either way (dismissal only ever
   // hides a Transfers row); this just answers "did I dismiss this."
   dismissed_at: string | null
+  // The same *arr facts `JobOut` carries (2026-08-16, prompts/2026-08-16-arr-chip-on-row-lines.md)
+  // -- `item.arr_status`/`item.arr_status_at` plus the bound instance's `name`/`kind`, joined by
+  // `api/history.py.list_history_jobs` the identical way `core/queue.py.list_jobs()` does, so
+  // `HistoryJobsSection.tsx` can render the same `ArrRowChip`. `null` whenever this job's queue
+  // has no bound *arr instance.
+  arr_status: string | null
+  arr_status_at: string | null
+  arr_instance_name: string | null
+  arr_instance_kind: string | null
+}
+
+/** One queue's honest aggregate over the whole filtered set, not just the loaded page
+ * (2026-08-16, prompts/2026-08-16-history-jobs-group-collapse.md) -- `HistoryJobsResponse.jobs`
+ * is one `LIMIT`/`OFFSET` page, so a client-side sum over it would be wrong whenever more rows
+ * match the filter than are loaded. `backend/lftpweb/api/history.py._queue_summaries` computes
+ * this with a bounded `GROUP BY` against the exact same filter as the `jobs` list beside it.
+ * History's job domain is terminal-only, so unlike the Transfers page's `QueueGroupCounts`
+ * (`lib/transferPanel.ts`) there is no `active`/`queued` bucket here.
+ */
+export interface HistoryQueueSummaryOut {
+  queue_id: number
+  queue_name: string
+  succeeded: number
+  failed: number
+  cancelled: number
+  total_bytes_done: number
 }
 
 export interface HistoryJobsResponse {
@@ -555,6 +723,7 @@ export interface HistoryJobsResponse {
   total: number
   limit: number
   offset: number
+  queue_summaries: HistoryQueueSummaryOut[]
 }
 
 export interface HistoryJobOutputOut {

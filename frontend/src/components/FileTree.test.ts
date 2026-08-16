@@ -2,11 +2,16 @@ import { describe, expect, it } from 'vitest'
 import type { FileNode, LifecycleFacets } from '../api/types'
 import type { ChildSpeedSample } from '../hooks/useLiveModel'
 import {
+  arrChipOverlay,
+  arrHoverLabel,
+  arrIconVariant,
   buildTree,
+  canConfirmDelete,
   CHILD_SPEED_FRESHNESS_MS,
   clampColumnWidth,
   columnMinWidth,
   defaultColumnWidths,
+  defaultSourceChecked,
   effectiveEtaLabel,
   effectiveSpeedLabel,
   effectiveSpeedSortValue,
@@ -19,6 +24,8 @@ import {
   RESIZABLE_COLUMNS,
   resolveCollapsed,
   rowAction,
+  shouldOfferSourceScope,
+  showsCopyQueueSourceWarning,
   sortTree,
   type TreeEntry,
 } from '../lib/fileTree'
@@ -56,6 +63,8 @@ function node(rel_path: string, is_dir: boolean, overrides: Partial<FileNode> = 
     remote_deleted_at: null,
     pending_download_prefix: null,
     deleted_archive_at: null,
+    arr_status: null,
+    arr_status_at: null,
     facets: DIM,
     ...overrides,
   }
@@ -580,6 +589,113 @@ describe('matchesFacetFilter', () => {
     const stillPresent = entry({ local: { level: 'green', reason: 'present' } }, '2026-08-13T00:00:00Z')
     expect(matchesFacetFilter(stillPresent, 'missing_locally')).toBe(false)
   })
+
+  it('arr_tracked matches any non-null arr_status, and only that', () => {
+    expect(matchesFacetFilter({ ...entry({}), arr_status: null }, 'arr_tracked')).toBe(false)
+    for (const status of ['detected', 'notified', 'imported', 'cleaned', 'gone']) {
+      expect(matchesFacetFilter({ ...entry({}), arr_status: status }, 'arr_tracked')).toBe(true)
+    }
+  })
+
+  it('arr_gone matches only arr_status === "gone"', () => {
+    expect(matchesFacetFilter({ ...entry({}), arr_status: 'gone' }, 'arr_gone')).toBe(true)
+    for (const status of ['detected', 'notified', 'imported', 'cleaned', null]) {
+      expect(matchesFacetFilter({ ...entry({}), arr_status: status }, 'arr_gone')).toBe(false)
+    }
+  })
+})
+
+// --- Sonarr/Radarr integration icon (docs/arr-integration-spec.md "UI") -------------------
+
+describe('arrIconVariant', () => {
+  it('maps all five known arr_status values to the spec\'s icon-state table', () => {
+    expect(arrIconVariant('detected')).toBe('neutral')
+    expect(arrIconVariant('notified')).toBe('neutral')
+    expect(arrIconVariant('imported')).toBe('imported')
+    expect(arrIconVariant('gone')).toBe('gone')
+    expect(arrIconVariant('cleaned')).toBe('imported')
+  })
+
+  it('"cleaned" shares the green-check variant with "imported" (2026-08-16: with "Delete when '
+    + 'imported" on, "imported" is a seconds-long transient, so the success check must survive '
+    + 'into "cleaned" to ever be seen)', () => {
+    expect(arrIconVariant('cleaned')).toBe(arrIconVariant('imported'))
+  })
+
+  it('is "none" for a null arr_status -- no bound instance, or not yet matched', () => {
+    expect(arrIconVariant(null)).toBe('none')
+  })
+
+  it('degrades an unrecognized status string to the neutral mark rather than nothing', () => {
+    expect(arrIconVariant('some_future_status')).toBe('neutral')
+  })
+})
+
+describe('arrHoverLabel', () => {
+  it('is null when arr_status itself is null -- nothing to show', () => {
+    expect(arrHoverLabel({ arr_status: null, arr_status_at: null }, 'Sonarr')).toBeNull()
+  })
+
+  it('names the instance when one is known', () => {
+    const label = arrHoverLabel({ arr_status: 'imported', arr_status_at: null }, 'Sonarr')
+    expect(label).toContain('Sonarr')
+    expect(label).toContain('imported')
+  })
+
+  it('falls back to a generic name when the instance is not known', () => {
+    const label = arrHoverLabel({ arr_status: 'gone', arr_status_at: null }, null)
+    expect(label).toContain('the bound *arr instance')
+  })
+
+  it('includes a relative time when arr_status_at is set', () => {
+    const label = arrHoverLabel(
+      { arr_status: 'detected', arr_status_at: new Date(Date.now() - 60_000).toISOString() },
+      'Radarr',
+    )
+    expect(label).toMatch(/\(.*\)/)
+  })
+
+  it('"imported" and "cleaned" share an icon variant but keep distinct hover text', () => {
+    const imported = arrHoverLabel({ arr_status: 'imported', arr_status_at: null }, 'Sonarr')
+    const cleaned = arrHoverLabel({ arr_status: 'cleaned', arr_status_at: null }, 'Sonarr')
+    expect(imported).not.toBe(cleaned)
+    expect(cleaned).toContain('cleaned up')
+  })
+})
+
+// --- Sonarr/Radarr row chip (Files + Transfers + History, 2026-08-16,
+// prompts/2026-08-16-arr-chip-on-row-lines.md, prompts/2026-08-16-files-brand-logo-icons.md) --
+// `ArrRowChip` (`LifecycleIcons.tsx`) is the one component all three surfaces render on their
+// row line; `arrChipOverlay` is its status-to-overlay mapping, shared verbatim -- no per-surface
+// branch anywhere in this function, so a color asserted here is the color every surface shows.
+
+describe('arrChipOverlay', () => {
+  it('all five arr_status values (via arrIconVariant) map to the row chip\'s overlay per the spec', () => {
+    // detected/notified -- mid-flight, logo alone, no overlay
+    expect(arrChipOverlay(arrIconVariant('detected'))).toBeNull()
+    expect(arrChipOverlay(arrIconVariant('notified'))).toBeNull()
+    // imported/cleaned -- the *arr processed it: green check
+    expect(arrChipOverlay(arrIconVariant('imported'))).toBe('check')
+    expect(arrChipOverlay(arrIconVariant('cleaned'))).toBe('check')
+    // gone -- left the queue without importing: red warn
+    expect(arrChipOverlay(arrIconVariant('gone'))).toBe('warn')
+  })
+
+  it('a null arr_status resolves to the "none" variant, which the caller uses to render no chip at all', () => {
+    expect(arrIconVariant(null)).toBe('none')
+    expect(arrChipOverlay(arrIconVariant(null))).toBeNull()
+  })
+
+  it('an unrecognized future status degrades to the neutral variant -- logo alone, no overlay', () => {
+    expect(arrChipOverlay(arrIconVariant('some_future_status'))).toBeNull()
+  })
+
+  it('"gone" resolves to the red "warn" overlay, not the job-detail drawer icon\'s amber -- ' +
+    'the Files row chip (2026-08-16, prompts/2026-08-16-files-brand-logo-icons.md) reads this ' +
+    'exact value, same as Transfers/History, so "gone" is red on all three surfaces now', () => {
+    expect(arrChipOverlay(arrIconVariant('gone'))).toBe('warn')
+    expect(arrChipOverlay(arrIconVariant('gone'))).not.toBeNull()
+  })
 })
 
 // --- Column widths -----------------------------------------------------------------------
@@ -721,5 +837,87 @@ describe('rowAction', () => {
 
   it('offers nothing for a row with no id', () => {
     expect(rowAction(node('unpersisted.iso', false, { id: null, remote_size: 1000 }))).toBeNull()
+  })
+})
+
+// --- The delete dialog's Local/Source scopes ------------------------------------------------
+// 2026-08-16 (prompts/2026-08-16-manual-delete-local-and-remote.md, settled design): the
+// first manual remote-delete path in the app. Pure functions only -- the JSX/state wiring
+// (checkboxes, the §7.1 warning banner) lives in `FileTree.tsx` itself and isn't exercised
+// here, per this module's own "no React, no hooks, no DOM" scope.
+
+describe('defaultSourceChecked', () => {
+  it('checks Source by default for a move queue with a remote copy', () => {
+    expect(defaultSourceChecked('move', true)).toBe(true)
+  })
+
+  it('leaves Source unchecked for a move queue with no remote copy at all', () => {
+    expect(defaultSourceChecked('move', false)).toBe(false)
+  })
+
+  it('leaves Source unchecked by default for a copy queue, even with a remote copy (§7.1)', () => {
+    expect(defaultSourceChecked('copy', true)).toBe(false)
+  })
+
+  it('leaves Source unchecked by default for the unbuilt sync mode', () => {
+    expect(defaultSourceChecked('sync', true)).toBe(false)
+  })
+})
+
+describe('shouldOfferSourceScope', () => {
+  it('offers the Source checkbox when at least one pending entry has a remote copy', () => {
+    const entries = [
+      node('a', false, { remote_size: null }),
+      node('b', false, { remote_size: 1000 }),
+    ]
+    expect(shouldOfferSourceScope(entries)).toBe(true)
+  })
+
+  it('hides the Source checkbox when nothing pending has a remote copy', () => {
+    const entries = [
+      node('a', false, { remote_size: null }),
+      node('b', false, { remote_size: null }),
+    ]
+    expect(shouldOfferSourceScope(entries)).toBe(false)
+  })
+
+  it('hides the Source checkbox for an empty selection', () => {
+    expect(shouldOfferSourceScope([])).toBe(false)
+  })
+})
+
+describe('canConfirmDelete', () => {
+  it('allows local-only, the pre-existing behavior', () => {
+    expect(canConfirmDelete(true, false)).toBe(true)
+  })
+
+  it('allows source-only, the new behavior', () => {
+    expect(canConfirmDelete(false, true)).toBe(true)
+  })
+
+  it('allows both checked', () => {
+    expect(canConfirmDelete(true, true)).toBe(true)
+  })
+
+  it('refuses neither checked', () => {
+    expect(canConfirmDelete(false, false)).toBe(false)
+  })
+})
+
+describe('showsCopyQueueSourceWarning', () => {
+  it('warns on a copy queue when Source is checked', () => {
+    expect(showsCopyQueueSourceWarning('copy', true)).toBe(true)
+  })
+
+  it('does not warn on a copy queue when Source is unchecked', () => {
+    expect(showsCopyQueueSourceWarning('copy', false)).toBe(false)
+  })
+
+  it('does not warn on a move queue even when Source is checked', () => {
+    expect(showsCopyQueueSourceWarning('move', true)).toBe(false)
+  })
+
+  it('warns for the unbuilt sync mode too, same as copy', () => {
+    expect(showsCopyQueueSourceWarning('sync', true)).toBe(true)
   })
 })

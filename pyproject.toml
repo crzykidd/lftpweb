@@ -18,13 +18,16 @@ dependencies = [
     # Password hashing for AUTH_MODE=password (DESIGN.md §8, phase 8) -- argon2id via the
     # PasswordHasher default. Anticipated back in §11.1's musllinux-wheel list.
     "argon2-cffi>=25.1.0",
+    # Sonarr/Radarr integration (docs/arr-integration-spec.md, core/arrclient.py) -- promoted
+    # from the dev-only group below, same version floor, now that core/arrclient.py's async
+    # client is real runtime code, not just a test-time dependency of fastapi.testclient.
+    "httpx>=0.27",
 ]
 
 [dependency-groups]
 dev = [
     "pytest>=8.3",
     "pytest-asyncio>=0.24",
-    "httpx>=0.27",
 ]
 
 [build-system]

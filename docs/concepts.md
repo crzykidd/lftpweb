@@ -1,6 +1,6 @@
 # Concepts
 
-The seven things that actually trip people up, and what to do about each.
+The eight things that actually trip people up, and what to do about each.
 
 ```jump
 Nothing downloaded for a minute|#settle
@@ -10,6 +10,7 @@ Dismiss vs Clear vs Reset|#blast-radius
 The lifecycle icons|#icons
 copy vs move|#copy-move
 Inherit vs override|#inherit
+The Sonarr/Radarr icon|#arr-integration
 ```
 
 ## Why nothing downloaded for a minute — the settle gate {#settle}
@@ -107,7 +108,7 @@ that was fetched and unpacked before this codebase cleaned it up.
 
 ## Why an item will not re-download — auto-queue suppression {#suppression}
 
-Auto-queue deliberately refuses to pick an item up again once one of four things has happened to
+Auto-queue deliberately refuses to pick an item up again once one of five things has happened to
 it. This is the single most common "why is it ignoring this" and it is almost always working as
 intended.
 
@@ -116,7 +117,8 @@ intended.
 | `user_stopped` | You stopped the transfer — either before it started or while it was running. |
 | `retries_exhausted` | The transfer failed and will not be retried again on its own. Only three error classes are ever retried at all (host unreachable, TLS, and a transient local filesystem error), so this also covers a failure lftpweb could not classify. |
 | `permanent_error` | The failure was one that will recur identically: auth failed, permission denied, the remote path is gone, or the disk is full. |
-| `deleted_local` | lftpweb deleted the local copy itself — a manual delete from Files, or the retention sweep. |
+| `deleted_local` | lftpweb deleted the local copy itself — a manual delete from Files (Delete local copy), or the retention sweep. |
+| `deleted_source` | You manually deleted the seedbox copy from the Files page's delete dialog (Delete source), without also deleting the local copy — so a release that later reappears under the same path is not silently fetched right back. A combined delete (both boxes checked) is recorded as `deleted_local` instead, the more complete fact about a row whose local copy is also gone. |
 
 **Suppression only ever stops auto-queue.** A manual **Queue** click on the
 [Files](/files) page is never filtered by it, and using **Retry** on a failed job from
@@ -197,25 +199,37 @@ The worked example, because it looks alarming and is not:
 ## copy vs move {#copy-move}
 
 `copy` downloads and never touches the seedbox. `move` does one extra thing, once, at the very
-end of post-processing: it deletes the item's remote copy. Nothing else about a `move` queue
-behaves differently — not the transfer, not extraction, not relocation.
+end of post-processing — after verify *and* extract have both already run — it deletes the
+item's remote copy. Nothing else about a `move` queue behaves differently — not the transfer,
+not extraction, not relocation.
 
 **`move` forces verification on, regardless of the site-wide setting and regardless of any
-per-queue override.** Verification is the sole gate on that irreversible delete, so it is not
+per-queue override.** Verification is one of the gates on that irreversible delete, so it is not
 something a toggle elsewhere can switch off underneath you. In the queue form the Verify
 checkbox shows as ticked and locked, with the reason stated on it.
 
-If verification cannot produce evidence — no `.sfv`/`.md5` sidecar, and the whole-file-read
-fallback turned off — the remote delete is **withheld and audited**, not silently skipped. You
-will find it on the [History](/history) page as a warning event.
+The delete only fires once every applicable check has passed, in order — this is the "delete
+ladder":
+
+1. **Verify.** A checksum mismatch (`CORRUPT`) withholds the delete outright, always, and is
+   audited on [History](/history) as a warning event. If verification simply has no evidence to
+   go on — no `.sfv`/`.md5` sidecar, and the whole-file-read fallback turned off — the delete
+   **proceeds anyway** on the completeness checks the item already cleared; the History event
+   says so plainly rather than reading like a checksum-backed delete.
+2. **Extract.** If the release had archives and extraction is enabled, extraction must have
+   succeeded. A failed extraction *defers* the delete instead — you'll see a "source retained"
+   event, and the seedbox copy stays put until you fix the archive set and let the item's
+   pipeline re-run, or delete it by hand.
+3. ***arr import***, only if [Sonarr/Radarr integration](#arr-integration) has already matched
+   this item. The delete then waits for the *arr to confirm it actually imported the release —
+   never sooner, and never at all if the *arr's queue record disappears without an import
+   (`gone`). An item on a bound queue the *arr never matched isn't held up by this at all.
+
+There is no timeout on any of this: a withheld or deferred item keeps its seedbox copy until you
+act.
 
 > **Warning:** A `move` queue's remote path must be a hardlink pickup directory, never your
 > torrent client's live seeding data. The delete is real and there is no undo.
-
-> **Note:** One ordering quirk worth knowing: on a `move` queue the remote copy is deleted
-> before extraction runs. A failed extraction therefore happens after the remote copy is gone.
-> The downloaded archives are still on disk, so it is recoverable — but you recover it locally,
-> not by re-downloading.
 
 ## Inherit vs override on the post-processing toggles {#inherit}
 
@@ -242,3 +256,37 @@ Two toggles are conditional, and say so in place:
 > **Note:** Everything post-processing does defaults to off at both levels — a fresh install
 > runs none of it. The one exception in the other direction is `move` mode's forced
 > verification, above.
+
+## What the Sonarr/Radarr icon on a Files row means {#arr-integration}
+
+If a queue is bound to a Sonarr or Radarr instance (**Settings → Integrations**, then the *arr
+instance dropdown on that queue in **Settings → Queues**), a matching release gets a small mark
+on its Files row once lftpweb sees it in that instance's own download queue. It stays off, with
+no icon anywhere, until both an instance exists and enabled and a queue is bound to it —
+three separate, deliberate acts.
+
+The mark itself changes as the release moves through the *arr's own pipeline:
+
+- **Plain mark** — being watched. Detected in the *arr's queue, possibly already told to
+  import, but not confirmed finished yet.
+- **Mark with a green ✓** — the *arr has confirmed the release fully imported. If this queue's
+  "Delete when imported" is off, the files stay right where they are.
+- **Mark with an amber ⚠** — the release left the *arr's queue **without** ever importing.
+  Usually means the grab failed or was removed by hand on the *arr's side. Nothing was deleted
+  — this state is purely informational — but it is usually worth a look, and it has its own
+  entry in the Files page's filter dropdown for exactly that reason.
+- **The removal-grace countdown, reworded** — if "Delete when imported" is on for this queue,
+  lftpweb removes the local copy once import is fully confirmed (never before, and never on an
+  ambiguous signal). That row then runs through the exact same ~ten-minute [removal grace
+  period](#removal-grace) any other locally-deleted item does — except the countdown chip reads
+  **"Processed · Xm"** instead of "Missing · Xm", because this absence was deliberate and
+  audited, not an alarm.
+
+Hover the mark for which instance matched it and when.
+
+> **Note:** "Imported" is checked carefully on purpose. A large multi-file release imports one
+> file at a time on the *arr's side, so a single import event is not proof the whole release is
+> done — lftpweb waits for the *arr's own queue record for the release to disappear *and* for
+> history to confirm an import, and checks both are still true a minute later before treating
+> anything as finished. A release simply vanishing from the *arr's queue with no import evidence
+> is never treated as imported — that is exactly the amber-warning case above.

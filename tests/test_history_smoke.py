@@ -15,7 +15,7 @@ def test_history_jobs_empty_shape(isolated_config):
         resp = client.get("/api/history/jobs")
         assert resp.status_code == 200
         body = resp.json()
-        assert body == {"jobs": [], "total": 0, "limit": 200, "offset": 0}
+        assert body == {"jobs": [], "total": 0, "limit": 200, "offset": 0, "queue_summaries": []}
 
 
 def test_history_events_empty_shape(isolated_config):

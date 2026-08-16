@@ -22,6 +22,26 @@ def test_health_returns_200_with_version_and_db_status(isolated_config):
         # lifespan.
         assert body["host_reachable"] is None
         assert body["scheduler_alive"] is True
+        # 2026-08-16: unbaked (local uv run / TestClient) -> None, not "" or a missing key --
+        # the frontend's lib/versionBadge.ts degrades to today's plain rendering on exactly
+        # this value.
+        assert body["build_sha"] is None
+        assert body["build_channel"] is None
+
+
+def test_health_reports_build_sha_and_channel_when_baked(isolated_config, monkeypatch):
+    """2026-08-16, docs/decisions.md: docker/Dockerfile bakes these into env vars at image
+    build time; config.Settings reads them like any other LFTPWEB_* setting. Simulated here
+    via monkeypatch on the settings singleton, same pattern as test_spa_fallback.py.
+    """
+    from lftpweb.config import settings
+
+    monkeypatch.setattr(settings, "build_sha", "abc1234")
+    monkeypatch.setattr(settings, "build_channel", "dev")
+    with TestClient(app) as client:
+        body = client.get("/api/health").json()
+        assert body["build_sha"] == "abc1234"
+        assert body["build_channel"] == "dev"
 
 
 def test_health_reports_host_unreachable_once_a_host_exists_and_a_connection_failed(
@@ -53,6 +73,24 @@ def test_health_reports_host_unreachable_once_a_host_exists_and_a_connection_fai
         body = resp.json()
         assert body["host_reachable"] is False
         assert body["status"] == "degraded"
+
+
+def test_settings_build_fields_normalize_blank_env_to_none():
+    """2026-08-16: docker/Dockerfile's runtime stage always sets LFTPWEB_BUILD_SHA/_CHANNEL
+    as ENV, even when the corresponding ARG was never passed with --build-arg -- Docker bakes
+    an unset ARG's declared empty-string default in regardless. Settings must treat that blank
+    string identically to the var being absent entirely, not as a third, spurious value.
+    """
+    from lftpweb.config import Settings
+
+    assert Settings().build_sha is None
+    assert Settings().build_channel is None
+    blank = Settings(build_sha="", build_channel="")
+    assert blank.build_sha is None
+    assert blank.build_channel is None
+    baked = Settings(build_sha="abc1234", build_channel="dev")
+    assert baked.build_sha == "abc1234"
+    assert baked.build_channel == "dev"
 
 
 def test_stats_returns_documented_shape(isolated_config):

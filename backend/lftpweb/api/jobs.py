@@ -14,7 +14,9 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Request
 
 from lftpweb.core import audit, local_delete
+from lftpweb.core.itemview import item_view
 from lftpweb.core.lftp import build_transfer_command, effective_tuning_settings
+from lftpweb.core.postprocess import perform_remote_delete
 from lftpweb.core.queue import (
     JobNotDismissableError,
     TransferSettings,
@@ -23,10 +25,14 @@ from lftpweb.core.queue import (
 )
 from lftpweb.core.remote import parse_connection_limit
 from lftpweb.models import (
+    DeleteItemRequest,
     DeleteItemResponse,
+    DismissAllResponse,
     EffectiveLftpJobKind,
     EffectiveLftpSetting,
     EffectiveLftpSettingsOut,
+    ItemEventOut,
+    ItemEventsResponse,
     JobOut,
     JobsResponse,
     QueueItemRequest,
@@ -120,6 +126,20 @@ def _job_out(row: dict) -> JobOut:
         exit_code=row["exit_code"],
         error_class=row["error_class"],
         output_tail=row["output_tail"],
+        # 2026-08-15 (prompts/2026-08-15-transfers-single-line-rows-with-detail.md): the
+        # item-level facts the Transfers row's expand panel needs -- see `TransferQueue.
+        # list_jobs()`'s own docstring for the join these come from. `arr_instance_name`/
+        # `arr_instance_kind` (the latter added 2026-08-16 for the row chip's brand-logo choice,
+        # prompts/2026-08-16-arr-chip-on-row-lines.md) are always projected (`NULL` when the
+        # `LEFT JOIN arr_instance` finds no match), never absent from the row, so plain `row[...]`
+        # is safe here too.
+        verified_at=row["verified_at"],
+        extracted_at=row["extracted_at"],
+        remote_deleted_at=row["remote_deleted_at"],
+        arr_status=row["arr_status"],
+        arr_status_at=row["arr_status_at"],
+        arr_instance_name=row["arr_instance_name"],
+        arr_instance_kind=row["arr_instance_kind"],
     )
 
 
@@ -172,6 +192,71 @@ async def dismiss_job(job_id: int, request: Request) -> None:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
+@router.post("/api/jobs/dismiss-all", response_model=DismissAllResponse)
+async def dismiss_all_jobs(request: Request) -> DismissAllResponse:
+    """ "Dismiss all" at the top of the Transfers page (2026-08-15, user addition to
+    prompts/2026-08-15-transfers-single-line-rows-with-detail.md) -- the bulk counterpart to
+    `dismiss_job` above. A single server-side `UPDATE` (`TransferQueue.dismiss_all_terminal`'s
+    own docstring), not a client-side loop over every dismissable row's own `/dismiss` call --
+    the task's own stated preference, and it means there is no per-row network round trip to
+    partially fail the way `Promise.allSettled` bulk actions elsewhere in this app (Files page's
+    Queue/Stop, Transfers' own "Clear all failed") have to account for. Never touches a `queued`/
+    `running` job, by construction of the `UPDATE`'s own `WHERE` -- see that method's docstring.
+    """
+    dismissed = await request.app.state.queue.dismiss_all_terminal()
+    return DismissAllResponse(dismissed=dismissed)
+
+
+# --- Item events (2026-08-15, prompts/2026-08-15-transfers-single-line-rows-with-detail.md)
+# ---------------------------------------------------------------------------------------------
+#
+# The Transfers panel's "processing story" -- `core/postprocess.py`/`core/arrsync.py` already
+# write every branch's reasoning as `event` rows (`core/audit.py`), keyed directly by
+# `event.item_id` (an ON DELETE SET NULL column, migration 001). Bounded and on-demand, the same
+# shape `api/history.py`'s own endpoints already establish: never fetched inline on the jobs
+# list (which is bounded by row count, not by how much *history* each row could accumulate), and
+# capped regardless of what a caller asks for.
+
+ITEM_EVENTS_DEFAULT_LIMIT = 50
+ITEM_EVENTS_MAX_LIMIT = 200
+
+
+@router.get("/api/items/{item_id}/events", response_model=ItemEventsResponse)
+async def item_events(
+    item_id: int, request: Request, limit: int = ITEM_EVENTS_DEFAULT_LIMIT
+) -> ItemEventsResponse:
+    """The Transfers panel's Processing group, enriched (module comment above): every `event`
+    row for this one item, newest first, capped at `ITEM_EVENTS_MAX_LIMIT` regardless of what
+    `limit` asks for -- the same clamp shape `api/history.py._clamp_paging` uses, kept as a
+    simple `min()` here since this endpoint has no `offset` to clamp alongside it (the panel
+    wants "the recent story," not a paginated archive; `api/history.py` already is that for
+    anyone who wants the full trail). No existence check on `item_id` itself -- an unknown or
+    since-forgotten item (`api/jobs.py.reset_item`, "reset item tracking") simply yields an
+    empty list, which is indistinguishable from, and just as correct a response as, "this item
+    exists but nothing happened to it yet."
+    """
+    capped_limit = max(1, min(limit, ITEM_EVENTS_MAX_LIMIT))
+    cursor = await request.app.state.db.execute(
+        "SELECT id, ts, level, kind, message, job_id FROM event "
+        "WHERE item_id = ? ORDER BY ts DESC, id DESC LIMIT ?",
+        (item_id, capped_limit),
+    )
+    rows = await cursor.fetchall()
+    return ItemEventsResponse(
+        events=[
+            ItemEventOut(
+                id=row["id"],
+                ts=row["ts"],
+                level=row["level"],
+                kind=row["kind"],
+                message=row["message"],
+                job_id=row["job_id"],
+            )
+            for row in rows
+        ]
+    )
+
+
 @router.post("/api/jobs/{job_id}/move-to-top", status_code=204)
 async def move_to_top(job_id: int, request: Request) -> None:
     await request.app.state.queue.move_to_top(job_id)
@@ -189,37 +274,158 @@ async def stop_item(item_id: int, request: Request) -> dict:
     return {"applied": applied}
 
 
-@router.post("/api/items/{item_id}/delete", response_model=DeleteItemResponse)
-async def delete_item(item_id: int, request: Request) -> DeleteItemResponse:
-    """Manual "Delete local" (DESIGN.md §9.2's Files page; `prompts/open-issues.md` "7 + 8" --
-    the first delete endpoint in this API, and the only manual caller of
-    `core/local_delete.py.delete_local`). `require_nlink_guard=False`: a human clicking Delete
-    on `LOCAL_ONLY` junk with exactly one copy is precisely the case the guard exists to *not*
-    block (the module's own docstring). A withheld guard raises rather than returning
-    `deleted=False`, so `FileTree.tsx`'s existing `Promise.allSettled` bulk-action reporting
-    (Queue/Stop, phase 9) picks this up as a per-item failure with no new frontend plumbing.
-
-    **Stop first, then delete** (2026-08-13, `prompts/2026-08-13-delete-during-transfer.md`).
-    `delete_local`'s own "no active job" guard is unchanged and still correct -- see that
-    module's docstring -- so a Delete request for an item mid-transfer used to just bounce off
-    it with a 409. This endpoint now satisfies the guard itself first: `TransferQueue.
-    stop_item()` (the identical stop path the Stop button drives, §4.6 -- SIGTERM, a grace
-    period, SIGKILL, no second implementation) is always called before `delete_local`, whether
-    or not the item actually has an active job -- it's already a safe no-op when it doesn't
-    (`stop_item`'s own docstring). The call is run as a background task and awaited with a
-    bound (`STOP_BEFORE_DELETE_TIMEOUT_S`) **without cancelling it on timeout**: cancelling
-    mid-stop would abandon `core/queue.py`'s own bookkeeping (`self._running`, the job row)
-    half-updated, which is exactly the inconsistency this feature exists to avoid introducing.
-    A timeout instead just means this *request* stops waiting -- the stop attempt keeps running
-    in the background and will still finish reaping and persisting the job's terminal state on
-    its own -- and the delete is withheld with a 409 naming the reason, per the task's own
-    instruction: "if the stop cannot be confirmed within a bounded time, withhold the delete and
-    say why." By the time `stop_item()` *does* return, `_reap_one` has already persisted the
-    job as terminal (`cancelled`) and the item as `STOPPED`/`user_stopped` -- so `delete_local`'s
-    guard passes on this same call, and its own unconditional `suppressed_reason = 'deleted_local'`
-    write (`_mark_subtree_removed`) overwrites `user_stopped` a moment later: the row that comes
-    out the other end reads as a deliberate deletion, never a user stop.
+async def _publish_item_delta(request: Request, db: Any, item_id: int) -> None:
+    """The same "persist -> read back -> publish" idiom every writer in this codebase follows
+    (DESIGN.md §2.2) -- factored out here because the source scope below is the first thing in
+    `api/jobs.py` that mutates `item` outside of `local_delete`/`TransferQueue` (which already
+    publish their own deltas). A no-op if the events bus or the row itself is unavailable, the
+    same graceful-degradation shape `core/postprocess.py.PostprocessPipeline._publish` uses.
     """
+    events = getattr(request.app.state, "events", None)
+    if events is None:
+        return
+    cursor = await db.execute("SELECT * FROM item WHERE id = ?", (item_id,))
+    row = await cursor.fetchone()
+    if row is None:
+        return
+    events.publish({"type": "item_delta", "queue_id": row["queue_id"], "nodes": [item_view(row)]})
+
+
+async def _delete_source_manual(
+    request: Request, db: Any, item: Any, queue: Any
+) -> tuple[bool, str]:
+    """The manual delete dialog's **Source** scope (2026-08-16, the first manual remote-delete
+    path in the API, `prompts/2026-08-16-manual-delete-local-and-remote.md`). Reuses
+    `core/postprocess.py.perform_remote_delete` with `caller="manual"` -- itself built on
+    `RemoteConnectionPool.delete_path`, never a second SSH-delete implementation -- so the event
+    trail (`remote_delete`/`remote_delete_failed`) reads exactly like a ladder-authorized delete
+    except for the message, which says "deleted by user request" instead of citing a verify
+    rung. `remote_pool`/host resolution reuse `app.state.postprocess`'s own seam
+    (`PostprocessPipeline.resolve_host()`) -- the identical closure `main.py` hands
+    `TransferQueue`/`ArrSyncScheduler` too -- rather than a second `load_host_config` call built
+    fresh at this layer.
+
+    **Idempotent.** `item['remote_deleted_at']` already set -- the move-mode ladder beat this
+    request to it, or an earlier manual call already ran -- short-circuits to a no-op success
+    without an SSH round trip; `rm -rf` on an already-gone path is not an error either
+    (`RemoteConnectionPool.delete_path`'s own docstring), this just skips asking. On a genuine
+    success this also clears a stale `item.remote_delete_pending`, so "delete source for an item
+    mid-ladder" really does complete the ladder early: `core/arrsync.py.
+    _maybe_delete_remote_on_import`'s own guard already no-ops on `remote_deleted_at` being set,
+    but clearing the pending marker too means a later History read never shows a *arr-import
+    wait that no longer means anything.
+
+    No existence check against `item['remote_size']` -- the frontend only shows the Source
+    checkbox when `hasRemoteCopy(node)`, and every other delete in this codebase (`delete_path`
+    itself, `perform_remote_delete`) is unconditional-and-idempotent rather than probe-first;
+    adding a check here would be a second way to answer a question this codebase already
+    answers by just trying.
+    """
+    item_id = item["id"]
+    if item["remote_deleted_at"] is not None:
+        return True, "source already deleted -- idempotent no-op"
+
+    postprocess = getattr(request.app.state, "postprocess", None)
+    if postprocess is None or postprocess.remote_pool is None:
+        reason = "no remote connection available"
+        await audit.record_event(
+            db,
+            level="error",
+            item_id=item_id,
+            kind="remote_delete_withheld",
+            message=f"manual: source delete withheld -- {reason}",
+        )
+        return False, reason
+
+    host = await postprocess.resolve_host()
+    if host is None:
+        reason = "no host configured"
+        await audit.record_event(
+            db,
+            level="error",
+            item_id=item_id,
+            kind="remote_delete_withheld",
+            message=f"manual: source delete withheld -- {reason}",
+        )
+        return False, reason
+
+    remote_full = queue["remote_path"].rstrip("/") + "/" + item["rel_path"]
+    ok = await perform_remote_delete(
+        db,
+        postprocess.remote_pool,
+        host,
+        item_id=item_id,
+        queue_id=queue["id"],
+        queue_name=queue["name"],
+        remote_full=remote_full,
+        caller="manual",
+    )
+    if not ok:
+        return False, "remote delete failed -- see the event log for the exact error"
+
+    await db.execute("UPDATE item SET remote_delete_pending = NULL WHERE id = ?", (item_id,))
+    await db.commit()
+    return True, "deleted"
+
+
+@router.post("/api/items/{item_id}/delete", response_model=DeleteItemResponse)
+async def delete_item(
+    item_id: int, request: Request, body: DeleteItemRequest | None = None
+) -> DeleteItemResponse:
+    """Manual delete (DESIGN.md §9.2's Files page; `prompts/open-issues.md` "7 + 8" -- the
+    first delete endpoint in this API). Two independent scopes, `body.local`/`body.source`
+    (2026-08-16, the delete dialog's independent Local/Source checkboxes,
+    `prompts/2026-08-16-manual-delete-local-and-remote.md`) -- an omitted body means exactly the
+    pre-existing behavior, `local=True, source=False`, so every caller that predates this task
+    is unaffected.
+
+    **Local** (`require_nlink_guard=False`: a human clicking Delete on `LOCAL_ONLY` junk with
+    exactly one copy is precisely the case the guard exists to *not* block -- the module's own
+    docstring) is unchanged from before this task, including **stop first, then delete**
+    (2026-08-13, `prompts/2026-08-13-delete-during-transfer.md`): `TransferQueue.stop_item()`
+    (the identical stop path the Stop button drives, §4.6 -- SIGTERM, a grace period, SIGKILL,
+    no second implementation) is always called before `delete_local`, run as a background task
+    and awaited with a bound (`STOP_BEFORE_DELETE_TIMEOUT_S`) **without cancelling it on
+    timeout** -- cancelling mid-stop would abandon `core/queue.py`'s own bookkeeping half-
+    updated, which is exactly the inconsistency this exists to avoid. A timeout instead means
+    this *request* stops waiting -- the stop keeps running in the background -- and the delete
+    is withheld with a 409 naming the reason.
+
+    **Source** (new) is the first *manual* remote-delete path in the API -- see
+    `_delete_source_manual`'s own docstring for the mechanism. A **source-only** request
+    (`local=False`) refuses (409) rather than stopping an active transfer itself: unlike local,
+    which already has its own stop-then-delete two-step above, a bare source request has no
+    "delete" of its own that would justify silently killing a live transfer, so it simply
+    declines when one is running. A **combined** request (`local=True, source=True`, the delete
+    dialog's default for a `move` queue) needs no separate check here -- local's own
+    stop-then-delete already satisfies the guard, so by the time source runs any active job is
+    already gone.
+
+    **Ordering and partial failure.** Local runs first when requested: if it is withheld or
+    fails, this raises 409 immediately and source is never attempted -- byte-for-byte the
+    pre-existing single-scope behavior. If local succeeds (or was not requested) and source then
+    fails, this does **not** raise: the local side effect, if any, already happened and cannot
+    be undone, so a 409 here would misrepresent a request that partially succeeded. The response
+    instead carries `source_deleted=False`/`source_reason` alongside `deleted=True` (or the
+    source-only equivalent) -- 409 is reserved for a request that accomplished *nothing* at all.
+
+    **Suppression.** A source-only success (`local=False`) marks the item
+    `auto_queue_suppressed=1, suppressed_reason='deleted_source'` (migration 020) -- the same
+    mechanism `core/local_delete.py.delete_local` already uses for a local delete, applied here
+    because a source-only delete is most often reached exactly when an item still sits in an
+    auto-queue-*eligible* state (`REMOTE_ONLY`/`PARTIAL` -- a failed or never-imported item, the
+    dialog's own stated use case) and nothing else would stop a later reappearance under the same
+    `rel_path` from being auto-queued straight back, undoing a deliberate cleanup action. A
+    **combined** request deliberately skips this write -- `delete_local` already suppresses the
+    row with `suppressed_reason='deleted_local'`, the more complete fact about a row whose local
+    copy is also gone, and this must not stomp it back to a less-complete reason afterward.
+    """
+    scope = body if body is not None else DeleteItemRequest()
+    if not scope.local and not scope.source:
+        raise HTTPException(
+            status_code=400, detail="at least one of local/source must be requested"
+        )
+
     db = request.app.state.db
     cursor = await db.execute("SELECT * FROM item WHERE id = ?", (item_id,))
     item = await cursor.fetchone()
@@ -230,49 +436,97 @@ async def delete_item(item_id: int, request: Request) -> DeleteItemResponse:
     if queue is None:
         raise HTTPException(status_code=404, detail="item's queue no longer exists")
 
-    q = getattr(request.app.state, "queue", None)
-    if q is not None:
-        stop_task = _run_stop_in_background(q.stop_item(item_id))
-        done, _pending = await asyncio.wait({stop_task}, timeout=STOP_BEFORE_DELETE_TIMEOUT_S)
-        if stop_task not in done:
+    local_outcome: local_delete.DeleteOutcome | None = None
+    if scope.local:
+        q = getattr(request.app.state, "queue", None)
+        if q is not None:
+            stop_task = _run_stop_in_background(q.stop_item(item_id))
+            done, _pending = await asyncio.wait({stop_task}, timeout=STOP_BEFORE_DELETE_TIMEOUT_S)
+            if stop_task not in done:
+                reason = (
+                    f"an active transfer for {item['rel_path']!r} (queue {queue['id']} "
+                    f"'{queue['name']}') could not be confirmed stopped within "
+                    f"{STOP_BEFORE_DELETE_TIMEOUT_S:.0f}s -- refusing to delete out from under a "
+                    "transfer that may still be running; the stop is still being attempted in the "
+                    "background and this item can be deleted once it settles"
+                )
+                await audit.record_event(
+                    db,
+                    level="error",
+                    item_id=item_id,
+                    kind="local_delete_withheld",
+                    message=f"manual: delete withheld -- {reason}",
+                )
+                raise HTTPException(status_code=409, detail=reason)
+            # Propagate a genuine failure from stop_item itself (e.g. the job row vanished
+            # between the SELECT above and stop_item's own lookup -- ValueError, per stop_job's
+            # contract) rather than silently swallowing it and proceeding to delete anyway.
+            stop_task.result()
+
+        postprocess = getattr(request.app.state, "postprocess", None)
+        in_flight = postprocess.in_flight_item_ids() if postprocess is not None else frozenset()
+        delete_in_flight = getattr(request.app.state, "delete_in_flight", None)
+
+        local_outcome = await local_delete.delete_local(
+            db,
+            item=item,
+            queue=queue,
+            caller="manual",
+            require_nlink_guard=False,
+            in_flight_item_ids=in_flight,
+            events=request.app.state.events,
+            delete_in_flight=delete_in_flight,
+        )
+        if not local_outcome.deleted:
+            raise HTTPException(status_code=409, detail=local_outcome.reason)
+    else:
+        # Source-only: refuse rather than stopping an active transfer ourselves -- see the
+        # docstring's "Source" paragraph. Checked once, here, rather than inside
+        # `_delete_source_manual`, since a combined request must never reach this check at all
+        # (local's own stop-then-delete already satisfies it by the time source runs).
+        cursor = await db.execute(
+            "SELECT 1 FROM job WHERE item_id = ? AND state IN ('queued', 'running') LIMIT 1",
+            (item_id,),
+        )
+        if await cursor.fetchone() is not None:
             reason = (
-                f"an active transfer for {item['rel_path']!r} (queue {queue['id']} "
-                f"'{queue['name']}') could not be confirmed stopped within "
-                f"{STOP_BEFORE_DELETE_TIMEOUT_S:.0f}s -- refusing to delete out from under a "
-                "transfer that may still be running; the stop is still being attempted in the "
-                "background and this item can be deleted once it settles"
+                f"an active transfer exists for {item['rel_path']!r} (queue {queue['id']} "
+                f"'{queue['name']}') -- stop it first, or also delete the local copy (which "
+                "stops it for you)"
             )
             await audit.record_event(
                 db,
                 level="error",
                 item_id=item_id,
-                kind="local_delete_withheld",
-                message=f"manual: delete withheld -- {reason}",
+                kind="remote_delete_withheld",
+                message=f"manual: source delete withheld -- {reason}",
             )
             raise HTTPException(status_code=409, detail=reason)
-        # Propagate a genuine failure from stop_item itself (e.g. the job row vanished between
-        # the SELECT above and stop_item's own lookup -- ValueError, per stop_job's contract)
-        # rather than silently swallowing it and proceeding to delete anyway.
-        stop_task.result()
 
-    postprocess = getattr(request.app.state, "postprocess", None)
-    in_flight = postprocess.in_flight_item_ids() if postprocess is not None else frozenset()
-    delete_in_flight = getattr(request.app.state, "delete_in_flight", None)
+    source_deleted: bool | None = None
+    source_reason: str | None = None
+    if scope.source:
+        source_deleted, source_reason = await _delete_source_manual(request, db, item, queue)
+        if source_deleted and not scope.local:
+            # Suppression (docstring's "Suppression" paragraph) -- a combined request skips this
+            # deliberately, since `delete_local` above already suppressed the row with the more
+            # complete 'deleted_local' reason.
+            await db.execute(
+                "UPDATE item SET auto_queue_suppressed = 1, suppressed_reason = 'deleted_source' "
+                "WHERE id = ?",
+                (item_id,),
+            )
+            await db.commit()
+        if not source_deleted and not scope.local:
+            raise HTTPException(status_code=409, detail=source_reason)
+        await _publish_item_delta(request, db, item_id)
 
-    outcome = await local_delete.delete_local(
-        db,
-        item=item,
-        queue=queue,
-        caller="manual",
-        require_nlink_guard=False,
-        in_flight_item_ids=in_flight,
-        events=request.app.state.events,
-        delete_in_flight=delete_in_flight,
-    )
-    if not outcome.deleted:
-        raise HTTPException(status_code=409, detail=outcome.reason)
     return DeleteItemResponse(
-        deleted=outcome.deleted, reason=outcome.reason, bytes_freed=outcome.bytes_freed
+        deleted=local_outcome.deleted if local_outcome is not None else bool(source_deleted),
+        reason=local_outcome.reason if local_outcome is not None else (source_reason or ""),
+        bytes_freed=local_outcome.bytes_freed if local_outcome is not None else None,
+        source_deleted=source_deleted,
+        source_reason=source_reason,
     )
 
 

@@ -1,6 +1,10 @@
 """Progress without parsing (DESIGN.md §4.4). Samples **only the active set** — the files
-under currently-running jobs — at ~1 Hz, never a full tree walk of the queue. Computes
-transferred bytes, speed, and ETA itself, EMA-smoothed so the UI doesn't jitter.
+under currently-running jobs — never a full tree walk of the queue. Computes transferred bytes,
+speed, and ETA itself, EMA-smoothed so the UI doesn't jitter. The sampler itself is cadence-
+agnostic (its EMA math derives a real rate from whatever `now` it's given, §4.4); the caller,
+`core/queue.py`, is what fixes the cadence -- every `PROGRESS_SAMPLE_TICKS`-th tick (~5s as of
+2026-08-16, unified with per-child sampling; see that constant's comment), not the ~1 Hz the
+underlying `tick_s` loop still runs reap/admit at.
 
 This is the module the whole project's central thesis (§1.3) cashes out in: nothing here reads
 lftp's stdout. A job's progress is `local bytes on disk vs. its known remote size`, and "local
@@ -112,7 +116,7 @@ def child_speed_bps(
     no sleep between them actually exercises -- has no meaningful instantaneous rate to derive
     and returns `0.0` rather than dividing by zero or by a negative denominator into a
     nonsensical rate. This is deliberately a real elapsed-time measurement, not
-    `tick_s * CHILD_PROGRESS_THROTTLE_TICKS`: a slow pass (DB contention, a large tree walk)
+    `tick_s * core.queue.PROGRESS_SAMPLE_TICKS`: a slow pass (DB contention, a large tree walk)
     would make that assumption silently wrong, the same class of bug this project has already
     shipped once from a wrong denominator (`bytes_done` vs. `bytes_total`, `6e6b217`).
     """

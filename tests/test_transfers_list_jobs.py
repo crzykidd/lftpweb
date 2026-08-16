@@ -205,6 +205,18 @@ def _job_out_row(**overrides) -> dict:
         exit_code=0,
         error_class=None,
         output_tail=None,
+        # 2026-08-15: the panel fields `_job_out` also reads off the row -- see
+        # test_list_jobs_carries_item_processing_and_arr_facts above for the join that
+        # populates these on a real `list_jobs()` row.
+        verified_at=None,
+        extracted_at=None,
+        remote_deleted_at=None,
+        arr_status=None,
+        arr_status_at=None,
+        arr_instance_name=None,
+        # 2026-08-16 (prompts/2026-08-16-arr-chip-on-row-lines.md): the row chip's brand-logo
+        # choice -- see test_list_jobs_carries_item_processing_and_arr_facts below.
+        arr_instance_kind=None,
     )
     base.update(overrides)
     return base
@@ -382,6 +394,140 @@ async def test_dismiss_job_does_not_touch_item_state_or_suppression(db):
     assert row["auto_queue_suppressed"] == 1
     assert row["suppressed_reason"] == "permanent_error"
     assert row["error_class"] == "REMOTE_GONE"
+
+
+# --- dismiss_all_terminal: the bulk counterpart (2026-08-15,
+# prompts/2026-08-15-transfers-single-line-rows-with-detail.md) ----------------------------
+
+
+async def test_dismiss_all_terminal_dismisses_every_terminal_job(db):
+    queue_id = await _make_queue(db)
+    failed_item = await _make_item(db, queue_id, "failed.txt", state="FAILED")
+    failed_job = await _make_job(db, failed_item, state="failed")
+    cancelled_item = await _make_item(db, queue_id, "stopped.txt", state="STOPPED")
+    cancelled_job = await _make_job(db, cancelled_item, state="cancelled")
+    succeeded_item = await _make_item(db, queue_id, "done.txt", state="DOWNLOADED")
+    succeeded_job = await _make_job(db, succeeded_item, state="succeeded")
+
+    q = _queue(db)
+    assert len(await q.list_jobs()) == 3
+
+    dismissed = await q.dismiss_all_terminal()
+    assert dismissed == 3
+    assert await q.list_jobs() == []
+
+    for job_id in (failed_job, cancelled_job, succeeded_job):
+        row = await (
+            await db.execute("SELECT dismissed_at FROM job WHERE id = ?", (job_id,))
+        ).fetchone()
+        assert row["dismissed_at"] is not None
+
+
+async def test_dismiss_all_terminal_never_touches_an_active_job(db):
+    """The load-bearing guarantee: a lone `queued`/`running` job must survive a "Dismiss all"
+    click untouched -- this is the bulk endpoint's whole reason for a `WHERE` clause rather than
+    an unconditional `UPDATE job SET dismissed_at = ?`.
+    """
+    queue_id = await _make_queue(db)
+    queued_item = await _make_item(db, queue_id, "a.txt", state="QUEUED")
+    queued_job = await _make_job(db, queued_item, state="queued")
+    running_item = await _make_item(db, queue_id, "b.txt", state="DOWNLOADING")
+    running_job = await _make_job(db, running_item, state="running")
+    failed_item = await _make_item(db, queue_id, "failed.txt", state="FAILED")
+    await _make_job(db, failed_item, state="failed")
+
+    q = _queue(db)
+    dismissed = await q.dismiss_all_terminal()
+    assert dismissed == 1
+
+    jobs = await q.list_jobs()
+    assert {j["state"] for j in jobs} == {"queued", "running"}
+    for job_id in (queued_job, running_job):
+        row = await (
+            await db.execute("SELECT dismissed_at FROM job WHERE id = ?", (job_id,))
+        ).fetchone()
+        assert row["dismissed_at"] is None
+
+
+async def test_dismiss_all_terminal_is_a_no_op_when_nothing_is_dismissable(db):
+    queue_id = await _make_queue(db)
+    item = await _make_item(db, queue_id, "a.txt", state="QUEUED")
+    await _make_job(db, item, state="queued")
+
+    assert await _queue(db).dismiss_all_terminal() == 0
+
+
+# --- list_jobs()/_job_out: the 2026-08-15 panel fields (verified_at/extracted_at/
+# remote_deleted_at/arr_status/arr_status_at/arr_instance_name) --------------------------------
+
+
+async def _seed_arr_instance(db, *, name: str = "Sonarr") -> int:
+    now = "2026-08-15T00:00:00.000000Z"
+    cursor = await db.execute(
+        "INSERT INTO arr_instance (name, kind, base_url, api_key_enc, enabled, "
+        "notify_on_complete, created_at, updated_at) VALUES (?, 'sonarr', 'https://sonarr.test', "
+        "'enc', 1, 0, ?, ?)",
+        (name, now, now),
+    )
+    await db.commit()
+    return cursor.lastrowid
+
+
+async def test_list_jobs_carries_item_processing_and_arr_facts(db):
+    queue_id = await _make_queue(db)
+    instance_id = await _seed_arr_instance(db)
+    await db.execute(
+        "UPDATE path_queue SET arr_instance_id = ? WHERE id = ?", (instance_id, queue_id)
+    )
+    item = await _make_item(db, queue_id, "release", state="EXTRACTED")
+    await db.execute(
+        "UPDATE item SET verified_at = ?, extracted_at = ?, remote_deleted_at = ?, "
+        "arr_status = 'imported', arr_status_at = ? WHERE id = ?",
+        (
+            "2026-08-15T01:00:00.000000Z",
+            "2026-08-15T01:05:00.000000Z",
+            "2026-08-15T01:06:00.000000Z",
+            "2026-08-15T01:07:00.000000Z",
+            item,
+        ),
+    )
+    await db.commit()
+    await _make_job(db, item, state="succeeded")
+
+    jobs = await _queue(db).list_jobs()
+    assert len(jobs) == 1
+    row = jobs[0]
+    assert row["verified_at"] == "2026-08-15T01:00:00.000000Z"
+    assert row["extracted_at"] == "2026-08-15T01:05:00.000000Z"
+    assert row["remote_deleted_at"] == "2026-08-15T01:06:00.000000Z"
+    assert row["arr_status"] == "imported"
+    assert row["arr_status_at"] == "2026-08-15T01:07:00.000000Z"
+    assert row["arr_instance_name"] == "Sonarr"
+    # 2026-08-16 (prompts/2026-08-16-arr-chip-on-row-lines.md): `kind` drives the row chip's
+    # brand-logo choice -- `arr_instance_name` alone (free text) can't.
+    assert row["arr_instance_kind"] == "sonarr"
+
+    out = _job_out(row)
+    assert out.verified_at == "2026-08-15T01:00:00.000000Z"
+    assert out.arr_instance_name == "Sonarr"
+    assert out.arr_instance_kind == "sonarr"
+
+
+async def test_list_jobs_arr_instance_name_is_null_when_queue_has_no_bound_instance(db):
+    queue_id = await _make_queue(db)
+    item = await _make_item(db, queue_id, "release", state="DOWNLOADED")
+    await _make_job(db, item, state="succeeded")
+
+    jobs = await _queue(db).list_jobs()
+    assert len(jobs) == 1
+    assert jobs[0]["arr_instance_name"] is None
+    assert jobs[0]["arr_instance_kind"] is None
+    assert jobs[0]["arr_status"] is None
+
+    out = _job_out(jobs[0])
+    assert out.arr_instance_name is None
+    assert out.arr_instance_kind is None
+    assert out.arr_status is None
 
 
 async def test_retry_after_dismiss_produces_a_fresh_job_visible_again(db):

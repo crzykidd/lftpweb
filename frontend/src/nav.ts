@@ -19,6 +19,7 @@ export const SETTINGS_TABS: NavItem[] = [
   { path: '/settings/queues', label: 'Queues' },
   { path: '/settings/transfer', label: 'Transfer' },
   { path: '/settings/post-processing', label: 'Post-processing' },
+  { path: '/settings/integrations', label: 'Integrations' },
   { path: '/settings/logs', label: 'Logs' },
   { path: '/settings/backup', label: 'Backup' },
   { path: '/settings/auth', label: 'Auth' },

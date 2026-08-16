@@ -1,3 +1,3 @@
 """lftpweb — containerized web interface for syncing a local directory with a seedbox."""
 
-__version__ = "0.1.1"
+__version__ = "0.2.0"

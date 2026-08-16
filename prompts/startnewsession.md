@@ -77,6 +77,107 @@ than a first. Two things that bit the first time and will bit again:
 
 ## Where we are
 
+### *arr integration build run (2026-08-15, unattended) — LIVE PROGRESS LOG
+
+> `docs/arr-integration-spec.md` (approved 2026-08-15) specs a Sonarr/Radarr integration in
+> three handoff prompts: `prompts/2026-08-15-arr-integration-{backend,notify-cleanup,ui-and-docs}.md`.
+> The icon reads a bound instance's queue to prove a Files-page item is *arr-driven, watches it
+> through import, and optionally cleans up the local copy once the *arr is done with it. This
+> log tracks each phase as it lands, same convention as the 2026-08-14 overnight audit run below.
+
+| Phase | What | Status |
+|---|---|---|
+| A — backend foundation | Migration 018 (`arr_instance` + 3 `path_queue` cols + 3 `item` cols); `core/arrclient.py` (httpx, one class, `kind` switch); `core/arrsync.py` poller (matching + import/gone detection, two-pass quiescence guard, per-instance backoff); `ArrSettings`; `api/settings_arr.py` CRUD + Test; `api/settings_queues.py` extended; `arr_status`/`arr_status_at` joined into `core/itemview.py`'s one projection. No notify, no cleanup, no frontend — those are phases B/C. | ✅ done, this commit |
+| B — notify + cleanup | `core/arrnotify.py` (new, shared notify implementation); `PostprocessPipeline._maybe_notify_arr` (primary push, tail of a fully-successful pipeline run); `ArrSyncScheduler._maybe_retry_notify` (bounded retry) + `._maybe_cleanup` (withheld gates, suppression-first, bytes removed without touching `item.state`) | ✅ done, this commit |
+| C — UI | Integrations tab (instance CRUD + Test), Queues additions (*arr instance dropdown, delete-when-imported, visible-path), Files icon (own resizable column, multi-faceted) + "*arr-tracked"/"gone" filters, DESIGN.md §16 + README + CHANGELOG + Concepts doc section | ✅ done, this commit — **unviewed, no browser in this environment** |
+| D — live-testing fixes | First real Sonarr run (`v0.1.1`+arr build) against the user's seedbox: `eventType` fixed to match the *arr v3 wire format (string in response bodies, `core/arrclient.py`/`core/arrsync.py`, `docs/decisions.md` 2026-08-15); auto-queue now excludes remote `_UNPACK_`/`_FAILED_` SAB staging dirs by eligibility, not visibility ("show it, don't grab it," same date) | ✅ done, `prompts/done/2026-08-15-arr-eventtype-and-unpack-autoqueue.md` |
+| E — live-testing fix, verify | Same live-test session: an upstream-extracted release (rar'd at origin, unpacked+deleted by SABnzbd before reaching local disk) verified `CORRUPT` and wedged its `move` queue's remote delete forever. `core/verify.py` now reads "every sidecar-referenced file absent + other content present" as `SKIPPED`, narrowly — any referenced file present (including a half-deleted set) still stays `CORRUPT`; the broader pipeline-ordering question stays open (`prompts/open-issues.md` #2 / G1) | ✅ done, `prompts/done/2026-08-15-verify-skip-when-sidecar-targets-all-absent.md` |
+| F — live-testing fix, Transfers UX | Session follow-on: real-use feedback that a Transfers row had grown too many inline figures (queue position, file count, percent, rate, ETA, allocated, elapsed, average speed, queued wait, post-processing note). Rows now collapse to name/queue/state/one live number, with a chevron expanding a Transfer/Processing/*arr detail panel — the *arr group is the first place `arr_status`/`arr_instance_name` surface outside the Files page, reusing `lib/fileTree.ts`'s existing variant helpers. New bounded `GET /api/items/{id}/events` (item-scoped, capped, newest-first) feeds the Processing group with the pipeline's own recorded event messages on expand. New `POST /api/jobs/dismiss-all` + a "Dismiss all" control at the top of the page (user addition mid-task) | ✅ done, `prompts/done/2026-08-15-transfers-single-line-rows-with-detail.md` |
+| G — live-testing fix, cleaned-item grace visibility | First real *arr delete-completed run (`move` queue): a cleaned item vanished from the Files page instantly instead of riding the ~10-minute removal grace as "Processed · Xm". Two stacked bugs, both in `core/engine.py._persist`: `_protected_rel_paths` treated *any* `auto_queue_suppressed = 1` row (cleanup sets this first, before touching disk) as frozen, excluding it from the "vanished from both trees" sweep entirely — `first_missing_at` never started; and even once unprotected, a verify-skipped move-mode item rests at `state == "LOCAL_ONLY"`, which `resolve_absence` has no opinion about, so it fell straight to the instant-`REMOVED_BOTH` fallback with no grace at all. Fixed narrowly: `_protected_rel_paths` now exempts `arr_status = 'cleaned'` rows, and the vanished sweep remaps that one combination (`LOCAL_ONLY` + `arr_status == 'cleaned'`) to `"DOWNLOADED"` before consulting `resolve_absence`, reusing its existing grace machinery unmodified. `core/mount_sentinel.py` itself untouched. | ✅ done, `prompts/done/2026-08-15-cleaned-item-grace-visibility.md` |
+| H — live-testing fix, Transfers completed time + sort | Same live-use session, follow-on to phase F's single-line rows: user report that a terminal row didn't show when it finished, and the list didn't sort by it. `lib/transferPanel.ts` gained `completedTimeLabel` (relative value + exact-timestamp title, terminal-only, null for active rows — also threaded into the expand panel's Transfer group as a new "Completed" field) and `sortTransferRows` (active rows keep the scheduler's own order, terminal rows now sort newest-completed-first, replacing the previous implicit `rank`/`queued_at` order for terminal rows, which said nothing about actual completion time). Frontend-only — `JobOut.finished_at` was already on the wire. | ✅ done, `prompts/done/2026-08-15-transfers-completed-time-and-sort.md` |
+| I — live-use, Transfers grouped by queue | Same live-use thread, follow-on to phases F/H: per-row queue tags made the page busy with more than one active queue. `lib/transferPanel.ts` gained `groupJobsByQueue` (one collapsible group per queue present, ordered by queue name, within-group order untouched from `sortTransferRows`), `queueGroupSummary`/`formatQueueGroupCounts` (header line: outcome counts — active/queued/succeeded/failed, plus a `stopped` bucket for `cancelled` added beyond the prompt's literal four so counts don't silently undercount a group, `docs/decisions.md` — total `bytes_done`, combined current rate while anything's running), and a `transfers.collapsedQueues` `localStorage` map (`lib/storage.ts`'s existing wrapper, default-expanded exception set, never pruned so a queue that disappears keeps its preference). `TransfersPage.tsx`'s per-row queue tag is gone; a new `GroupHeader` component renders the collapsible line instead. Frontend-only. | ✅ done, `prompts/done/2026-08-16-transfers-group-by-queue.md` |
+| J — live-use, History jobs grouped by queue | Same live-use thread, same treatment on the History page's jobs section — but History's `jobs` list is `LIMIT`/`OFFSET` paginated (unlike Transfers' unbounded set), so a client-side sum over the loaded page would misreport a queue's true counts/size the instant more rows match the filter than are loaded. `GET /api/history/jobs` gained a `queue_summaries` block (`HistoryQueueSummaryOut`, `api/history.py._queue_summaries`) — one bounded `GROUP BY item.queue_id, job.state` query honoring the exact same `_jobs_where_clause` filter as the `jobs` list beside it, inlined onto the existing response rather than a second endpoint (`docs/decisions.md`). `lib/transferPanel.ts` gained History-specific variants alongside the Transfers ones: `readHistoryCollapsedQueues`/`writeHistoryCollapsedQueues` (own `history.collapsedQueues` storage key — a queue collapsed on one page never collapses on the other), `historyQueueGroupCounts` (reshapes the server summary onto `QueueGroupCounts` so the existing `formatQueueGroupCounts` renders it unmodified), `groupHistoryJobsByQueue` (flattens jobs into the header+job virtual-row array `HistoryJobsSection.tsx`'s virtualizer already walked, now filtering a collapsed queue's job rows out while keeping its header), and `decrementHistoryQueueSummary` (keeps a cleared row's queue summary in sync locally, mirroring the existing local `jobs`/`total` trim, without a full reload). `HistoryJobsSection.tsx`'s bare queue-name header row became a clickable `QueueGroupHeader` (name + counts + total size). Events section untouched, per the task's own scope. | ✅ done, `prompts/done/2026-08-16-history-jobs-group-collapse.md` |
+| K — live-use, unified progress cadence | Same live-use thread: watching a live transfer showed a one-file directory reporting two disagreeing speeds (46 vs. 40 MB/s) at once, because job-level speed sampled ~1 Hz while per-file (child) speed was throttled to every 3rd tick, each independently EMA-smoothed. `core/queue.py.PROGRESS_SAMPLE_TICKS = 5` (replacing `CHILD_PROGRESS_THROTTLE_TICKS = 3`) now gates job-level `ProgressSampler.sample`, the per-tick `item_delta` publish, and `_publish_child_progress` on one shared counter, so all three sample the same ~5s instant. The underlying 1s tick loop (`transfer_tick_s`) is untouched — admission, reaping, and Stop/Cancel still act within ~1s; only the progress-sampling work inside `_sample_and_publish_progress` moved to every 5th call. `DESIGN.md` §4.4 corrected (was ~1 Hz); `docs/decisions.md` has the full mechanism and rejected alternatives. | ✅ done, `prompts/done/2026-08-16-unify-progress-cadence-5s.md` |
+| L — live-use, cleaned icon keeps the green check | First live Radarr run with "Delete when imported" on: `imported` is a seconds-long transient (cleanup runs on the next poller beat), so the green ✓ flashed and was immediately replaced by the `cleaned` presentation (mark + "Processed · Xm" countdown, no check) — the success indicator effectively never got seen. `lib/fileTree.ts.arrIconVariant` now maps `cleaned` to the same `'imported'` (green-check) variant; `LifecycleIcons.tsx.ArrIcon` and `TransfersPage.tsx`'s *arr expand-panel group inherit it unmodified since both already switch on the shared helper. Hover text (`arrHoverLabel`) still distinguishes "imported" from "imported and cleaned up locally". | ✅ done, `prompts/done/2026-08-16-cleaned-icon-keeps-green-check.md` |
+| M — live-use, Transfers panel shows total transferred | Same live-use thread: the expand panel's Transfer group showed "Elapsed" and "Average speed" as two separate figures but never the reading the user actually wants — "14.8 GB in 6m 12s (40 MB/s avg)". `lib/transferPanel.ts` gained `transferredSummary` (composes `bytes_done` + `elapsedSeconds` + `averageSpeedBps` through the existing `formatBytes`/`formatEta`/`formatRate`, omitting the avg clause under `averageSpeedBps`'s own zero-elapsed guard rather than dividing by zero); `transferGroupFields` now collapses a terminal job's `Elapsed`/`Average speed` fields into one `Transferred` field, while a still-running job's fields are unchanged. Frontend-only. | ✅ done, `prompts/done/2026-08-16-transfer-panel-total-transferred.md` |
+| N — user request, dev-build version badge | User request: a `:dev` image should identify itself in the UI so it's never mistaken for a release. `docker/Dockerfile`'s `runtime` stage (only) now accepts `BUILD_SHA`/`BUILD_CHANNEL` build args, baked to `LFTPWEB_BUILD_SHA`/`LFTPWEB_BUILD_CHANNEL` env vars; `.github/workflows/publish.yml` computes a short SHA and `dev`/`release` channel per push and passes both via `build-args:`. `config.Settings` gained the two fields plus a validator folding a baked-but-blank env var back to `None` (Docker always sets the ENV, blank or not). `/api/health` carries them (beyond §12's shape, same precedent as `repo_url` — `docs/decisions.md`). Frontend: new pure `lib/versionBadge.ts` (unit-tested) computes the nav's bottom-left readout — `DEV: v0.1.1 · <sha>` in amber, linking to the commit, for a dev build; exactly today's plain `v0.1.1` (release link or plain text) for every other case, including health not yet loaded. `VersionLink.tsx` only renders what it returns. No CI job renamed; no new dependency. | ✅ done, `prompts/done/2026-08-16-dev-build-version-badge.md` |
+| O — user request, real brand-logo chip on Transfers/History row lines | User decision (refined same day): the collapsed Transfers row and each History job row show the **real** Sonarr/Radarr logo (not the Files page's generic *arr mark), in its own brand colour, with the outcome as a small status overlay — green check once processed (`imported`/`cleaned`), red dot once `gone`, logo alone while `detected`/`notified`, no chip at all when `arr_status` is null. `lib/fileTree.ts` gained `arrChipOverlay` (thin wrapper over the existing `arrIconVariant` — "one mapping, consumed everywhere"); `LifecycleIcons.tsx` gained `SonarrLogo`/`RadarrLogo` (real brand SVG path data, sourced from the simple-icons dataset — itself citing Sonarr's/Radarr's own repos — CC0, recorded in `NOTICE`) plus `ArrRowChip`, shared by both pages, with an `ArrTextChip` fallback for an unrecognized/future instance `kind`. Backend: `core/queue.py.list_jobs()` and `api/history.py.list_history_jobs()` both now also join `arr_instance.kind` (`JobOut`/`HistoryJobOut` gained `arr_instance_kind`; `HistoryJobOut` also gained `arr_status`/`arr_status_at`/`arr_instance_name`, which it lacked before this task) — two scalar columns on an already-paginated list, not the phase-6 blob trap. Deliberately red (not the Files icon's amber) for `gone` here — two different specs for two different affordances, noted in-code, not a drift. | ✅ done, `prompts/done/2026-08-16-arr-chip-on-row-lines.md` |
+| P — move-delete gate ladder (resolves open issue #2 / audit G1) | User-approved design: a `move` queue's remote delete is now the *last* gate on a four-rung ladder (completeness, verify, extract, and — new — *arr import for a tracked item), not the second step after verify. `core/postprocess.py._maybe_delete_remote` moved to the tail of `_process_item`, gained an `extract_state` parameter, and now defers rather than deletes when the item is already *arr-tracked (`item.arr_status` non-null), recording the handoff in a new `item.remote_delete_pending` column (migration 019 — carries the verify evidence forward). The actual asyncssh delete was factored out into a module-level `perform_remote_delete`, reused by a new `core/arrsync.py.ArrSyncScheduler._maybe_delete_remote_on_import`, which performs the deferred delete the moment `_commit_terminal` confirms `imported` — before that same pass's `arr_delete_completed` cleanup sweep, so "import green → delete source → delete local" holds within one poll. `ArrSyncScheduler` gained `remote_pool`/`host_provider` constructor seams, wired in `main.py` from the same `app.state.engine.pool`/`_host_provider` postprocess already uses. `CORRUPT` still vetoes at every rung, including this new one. DESIGN.md §7/§7.3 updated to describe the ladder and to note `sync` mode's primary use case is now served without building it; `docs/arr-integration-spec.md`'s Cleanup section updated for the new ordering. | ✅ done, `prompts/done/2026-08-16-move-delete-gate-ladder.md` |
+| Q — user feedback, Files unifies onto the brand-logo chip | User feedback: the real Sonarr/Radarr logos (phase O) show on Transfers/History rows, but the Files tree still rendered its own older generic *arr mark (`ArrIcon`) — one visual language everywhere was the point. `FileTree.tsx`'s *arr column now renders `ArrRowChip` (same component as Transfers/History); `FilesPage.tsx` resolves each row's bound instance `kind` the same way it already resolved the instance name (`listArrInstances()` keyed by `path_queue.arr_instance_id`), threaded down through `FileTree`/`Row` as a new `arrInstanceKind` prop. Status colors unify on the chip's own mapping — `gone` now reads **red** on Files too, replacing the old amber ⚠; the "Processed · Xm" countdown chip, filters, and removal-grace machinery are untouched. `ArrIcon`/`ArrMarkIcon` were *not* deleted — `TransfersPage.tsx`'s job-detail-drawer "*arr" section still consumes `ArrIcon` directly, the one place the generic mark and its amber `gone` reading remain. `docs/arr-integration-spec.md`'s "UI" section collapsed into one chip-based table covering all three surfaces. | ✅ done, `prompts/done/2026-08-16-files-brand-logo-icons.md` |
+| R — the move-delete ladder's follow-on, manual delete gains an independent Source scope | User-approved design, resolving §7's forward note that `sync` mode's primary use case is now fully served without building it. The Files-page delete dialog's confirmation gained a second, independent checkbox (Delete source, alongside the pre-existing Delete local copy) — the first manual remote-delete path in the API. Defaults follow `sync_mode`: both checked for `move`, source unchecked for `copy` (with §7.1's misconfiguration warning shown if checked anyway); the checkbox itself only renders when a remote copy exists. Backend: `POST /api/items/{id}/delete` takes an optional `{local, source}` body (`DeleteItemRequest`, omitted = today's local-only default); a source-only request refuses (409) rather than stopping an active transfer itself, while a combined request lets local's own stop-then-delete satisfy that guard first. `core/postprocess.py.perform_remote_delete` gained a `caller` parameter (`"pipeline"` unchanged, `"manual"` new) so the manual path reuses it rather than a second SSH-delete implementation, and `PostprocessPipeline` gained a public `resolve_host()` around its existing `_host_provider` closure. A source-only success is idempotent against an already-gone remote copy (clears a stale `remote_delete_pending` too — "mid-ladder" simply completes early) and marks the item `auto_queue_suppressed`/`suppressed_reason = 'deleted_source'` (migration 020) so a later reappearance under the same path isn't auto-queued right back; a combined request leaves `delete_local`'s own `'deleted_local'` reason alone. Partial failure (local succeeds, source then fails) is a 200 with `source_deleted: false`/`source_reason` set, not a 409 — the local side effect already happened and can't be undone — and `FileTree.tsx`'s bulk-delete reporting reads those fields back out so a partial failure can't hide inside an otherwise-`fulfilled` promise. DESIGN.md §9.2/§7 updated; `docs/concepts.md`'s suppression table gained the new reason. | ✅ done, `prompts/done/2026-08-16-manual-delete-local-and-remote.md` |
+
+**Phase A verification:** backend lint/format clean, full backend `pytest` green (new tests in
+`tests/test_arrclient.py`, `tests/test_arrsync.py`, `tests/test_settings_arr_api.py`,
+`tests/test_settings_queues_arr.py`, plus additions to `tests/test_itemview.py`), frontend
+untouched and re-verified anyway. The fake-*arr fixture (`tests/fake_arr.py`) runs a real
+`uvicorn` server on its own thread — see that file's docstring for why (a `TestClient`-driven
+test's synchronous call blocks the event loop a same-loop fake server would need to respond).
+Everything defaults off (`arr_instance.enabled = 0`, migration inserts no rows); the eventType/
+trackedDownloadState vocabulary in `core/arrclient.py` is flagged unverified against a live
+instance, per the spec's own warning.
+
+**Phase B verification:** backend lint/format clean, full backend `pytest` green (new
+`tests/test_arr_notify.py` for the primary push and `tests/test_arr_cleanup.py` for the poller's
+bounded retry + cleanup, both against the fake-*arr fixture; `tests/fake_arr.py` gained
+`FakeArrState.fail_command` so a test can fail only `POST /api/v3/command` without also failing
+`/queue` — `fail_all` fails everything, which never reaches a queue's own notify/cleanup pass).
+Frontend untouched, re-verified anyway. `core/arrnotify.py` is new: one `notify_arr()` shared by
+both callers (postprocess's primary attempt, arrsync's retry) so there is exactly one place that
+builds the *arr POST, translates the path, and writes the `arr_notified`/`arr_notify_failed`
+event. **Cleanup deliberately never writes `item.state`** — it removes the bytes and leaves the
+row exactly as it was, so the existing scan + `core/mount_sentinel.py` absence-grace machinery
+discovers the disappearance and carries it to `REMOVED_LOCAL` on its own ~10-minute clock, the
+same as `core/postprocess.py._do_move` already does for a staging relocation. This is a
+deliberate, spec-driven departure from "just call `core/local_delete.py.delete_local()`" — see
+`docs/decisions.md` (2026-08-15) for the full reasoning.
+
+**Phase C verification:** frontend lint/test/build all green (new `arrIconVariant`/`arrHoverLabel`
+tests in `components/FileTree.test.ts`, `removalGraceShortLabel`/`removalGraceLabel` "cleaned"
+tests in `lib/format.test.ts`, and a new `pages/settings/QueuesTab.test.ts` for the
+disabled-with-hint pure predicates `arrDeleteCompletedDisabled`/`nextArrDeleteCompleted`).
+Backend untouched, re-verified anyway (ruff check, ruff format --check, full `pytest`). **No
+browser exists in this environment** — every screen this phase shipped (Settings → Integrations,
+the three new Queues fields, the Files-row icon and its hover card, the two new filter options)
+is unviewed until a human opens the app; nothing here should be read as visually confirmed. The
+instance name resolution (`FilesPage.tsx` cross-referencing `listQueues()`'s `arr_instance_id`
+against a new `listArrInstances()` fetch, since the item wire itself only carries
+`arr_status`/`arr_status_at`, never the instance's identity) and the *arr icon's own resizable
+column (kept separate from the R/L/V/E cluster) are both recorded in `docs/decisions.md`
+(2026-08-15).
+
+**Run complete (2026-08-15, phases A-C).** All three phases landed on `dev`, nothing pushed,
+every gate green throughout: backend foundation (phase A), notify + cleanup (phase B), UI + docs
+(phase C, this entry). The feature is off at every level on every existing install (no instance
+rows, no queue bound, nothing polls) and entirely unviewed in a browser — a human should open
+Settings → Integrations, bind a queue, and watch a Files row before trusting the rendered result.
+
+**Phase D verification (live-testing fixes, 2026-08-15):** the two fixes above were diagnosed
+read-only against the user's live instance's audit trail (a real Sonarr run), then built and
+verified against the fake-*arr fixture and `core/autoqueue.py`'s own test suite —
+`tests/test_arrclient.py`/`tests/test_arrsync.py`/`tests/test_arr_cleanup.py` (eventType, string
++ legacy-numeric-tolerance coverage) and `tests/test_autoqueue.py` (`_UNPACK_`/`_FAILED_`
+exclusion, plus the renamed-item-becomes-eligible-again case). Backend lint/format clean, full
+backend `pytest` green, frontend untouched and re-verified anyway. Already-`gone` associations on
+the live instance are terminal by design and stay `gone` — this fix only changes classification
+for associations checked from now on; a human still needs to re-bind/re-watch anything that was
+misclassified before the fix landed if they want it corrected.
+
+**Phase G verification (live-testing fix, cleaned-item grace visibility, 2026-08-15):**
+diagnosed read-only against `GET /api/files`'s own disagreement with the live WS-driven Files
+page (REST kept showing the row, `state: LOCAL_ONLY`/`arr_status: "cleaned"`/`first_missing_at:
+null`, minutes and several scan passes after cleanup; the WS view had already dropped it) —
+exactly the split the publish invariant exists to prevent. Three new tests in
+`tests/test_state_persistence.py` pin the mechanism: a direct regression on the
+`_protected_rel_paths` SQL exemption, and a full engine-level reproduction (grace starts, ticks,
+survives a second pass, then expires into `REMOVED_BOTH` and leaves `engine.models`, mirroring
+the existing `test_move_mode_item_that_leaves_both_trees_reaches_removed_both`/`test_a_vanished_
+local_only_row_rests_at_removed_both_not_left_alone` tests this fix sits alongside — both still
+pass unmodified, proving a *generic* move-mode `LOCAL_ONLY` vanish (no arr cleanup) still lands
+on `REMOVED_BOTH` instantly, as designed). Backend lint/format clean, full backend `pytest`
+green, frontend untouched and re-verified anyway — the frontend's own `REMOVAL_GRACE_ELIGIBLE_
+STATES`/`removalGraceShortLabel` "Processed" wording already shipped in phase C and needed no
+change, since the backend now feeds it a state (`DOWNLOADED`) it was already built to expect.
+
 ### 🌙 Overnight audit run (started 2026-08-14, unattended) — LIVE PROGRESS LOG
 
 > A post-`v0.1.0` audit landed in `docs/audit-v0.1.0.md` (findings S1–S4, G1–G3, P1–P5). The user
@@ -927,8 +1028,40 @@ them and the ordering resolves itself.
 These are the places where the obvious implementation is wrong. Each is written up in
 `DESIGN.md`; this list exists so a fresh session knows to go read it.
 
-**Added 2026-08-12 (post-phase-9 session) — read these first, they are the newest and the
-most likely to be re-broken:**
+**Added 2026-08-15 (first real Sonarr live-testing run) — read this one first, it's the newest:**
+
+- ***arr enums are strings in bodies, ints in query params — the fixture must model the wire,
+  not the assumption.*** The Sonarr/Radarr v3 API serializes `eventType` as a camelCase
+  **string** (`"downloadFolderImported"`) in every response body; the numeric codes this
+  integration was originally built against exist only as query-parameter values. Two genuine
+  live imports were misclassified `gone` because `IMPORT_EVENT_TYPES = {3}` could never match a
+  real record — and every test stayed green because the fake-*arr test data encoded the same
+  wrong numeric assumption instead of the real wire shape. `docs/decisions.md` (2026-08-15) has
+  the full account; `core/arrclient.py.HistoryEvent.is_import_event()` is the one place the
+  comparison now happens, with a numeric fallback kept for tolerance only. **The general lesson:
+  when a spec flags a vocabulary "unverified against a live instance," the test fixture that
+  data drives must not itself be trusted as ground truth for that vocabulary — it can encode the
+  identical wrong guess the production code does, and then prove nothing.**
+- ***Missing-vs-the-sidecar at verify time always means the remote lacked it too, never "still
+  arriving."*** `core/verify.py` only runs from `core/postprocess.py`, which only fires after
+  `core/queue.py`'s local-vs-remote completeness gate has already passed — so a file a
+  `.sfv`/`.md5` references but can't find locally was *also* absent on the remote by the time
+  completeness was measured. That's what makes "every referenced file absent" a safe signal for
+  an upstream anomaly (a release rar'd at origin, extracted upstream, rars deleted before this
+  ever reached local disk) rather than a partial transfer — see the fix below and
+  `docs/decisions.md` (2026-08-15).
+- ***An upstream-extracted release verifies `SKIPPED`, not `CORRUPT` — but only when nothing
+  is provably missing.*** Live case: `National.Lampoons.Animal.House.1978.iNTERNAL.1080p.BluRay
+  .x264-EwDp` on the ar-movies queue arrived `movie.mkv` + `.sfv`, the `.sfv` still listing the
+  rar volumes SABnzbd had already extracted and deleted upstream. Treating every sidecar entry
+  as "missing" reported `CORRUPT` and permanently withheld the `move`-mode delete. The fix
+  (`core/verify.py`) narrows on purpose: every referenced entry absent **and** other content
+  present → `SKIPPED`; *any* referenced entry present (including a half-deleted archive set) →
+  unchanged, stays `CORRUPT`; sidecar and nothing else → stays `CORRUPT` (nothing to have been
+  vouching for). Don't widen the relaxation to mixed presence — that's the still-open pipeline-
+  ordering question, `prompts/open-issues.md` #2 / G1.
+
+**Added 2026-08-12 (post-phase-9 session):**
 
 - **`relevant == 0` on a directory means two different things**, and only one of them is
   `DOWNLOADED`. Every child excluded by a `file_exclude` pattern → vacuously `DOWNLOADED`, and

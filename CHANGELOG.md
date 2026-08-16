@@ -24,10 +24,204 @@ Skeleton for the next roll:
 ## [Unreleased]
 
 ### Added
+### Changed
+### Fixed
+### Security
+### Deprecated
+### Removed
+
+## [0.2.0] — 2026-08-16
+
+### Added
+
+- **Optional Sonarr/Radarr integration** (`docs/arr-integration-spec.md`), off at every level by
+  default. Bind a queue to a Sonarr or Radarr instance (new Settings → Integrations tab: instance
+  CRUD, write-only API key, a Test button) and lftpweb watches that instance's own download queue
+  for a matching release, marks the Files row with an *arr icon once found, and — only after the
+  *arr has *fully* confirmed import across two consecutive checks, never on an ambiguous signal —
+  can optionally clean up the local copy (a new per-queue "Delete when imported" toggle). The icon
+  is the real Sonarr/Radarr logo, multi-faceted: the bare logo while a release is being watched,
+  a green ✓ once imported, a red mark if a release left the *arr's queue without ever importing
+  (independently filterable, since that state usually needs a look), and the existing
+  removal-grace countdown chip reads
+  "Processed · Xm" instead of "Missing · Xm" for a row this feature cleaned up itself. A new
+  "*arr-tracked" filter facet covers every tracked row at once. Built across three phases
+  (backend foundation, notify + cleanup, this UI pass); see `DESIGN.md` §16 and
+  `docs/arr-integration-spec.md` for the full design.
+
+- **Transfers rows collapse to one line, with an expand panel for the rest of the story.**
+  Real-use feedback: the row had grown a queue position, file count, percent, live rate, ETA,
+  allocated rate, elapsed time, average speed, queued wait, and a post-processing note, all
+  inline — a wall of numbers rather than a scannable list. Each row now shows just name / queue /
+  state / one live number (progress + current speed while downloading, final size once
+  terminal); a chevron expands a detail panel with three groups: **Transfer** (every figure the
+  row used to show, plus the failed-job error/output block), **Processing** (verify/extract/
+  remote-delete timestamps, enriched on expand by the pipeline's own recorded event messages —
+  new bounded `GET /api/items/{id}/events`), and ***arr** (instance name, status, and timestamp,
+  reusing the Files page's own icon/vocabulary — hidden entirely on a queue with no bound
+  instance). A new "Dismiss all" control at the top of the page clears every dismissable
+  (terminal, not-yet-dismissed) row in one server-side call (`POST /api/jobs/dismiss-all`),
+  alongside the existing failed-only "Clear all failed".
+
+- **Transfers rows show when a terminal job completed, and the list sorts by it.** Real-use
+  follow-on to the single-line row pass above: a succeeded/failed/cancelled row now carries a
+  compact "3m ago"-style reading next to its state chip (exact timestamp on hover, and as a new
+  "Completed" field in the expand panel's Transfer group). Active rows (running, then queued)
+  still sort first in scheduler order exactly as before; terminal rows below them now sort
+  newest-completed-first, replacing the previous implicit order (the same `rank`/`queued_at`
+  scheduler order active rows use, which said nothing about when a finished job actually
+  finished).
+
+- **Transfers rows are now grouped by queue, each group collapsible and remembered.** Real-use
+  follow-on to the two passes above: with more than one active queue, a per-row queue tag on
+  every line made the page busy. Rows now sit under one collapsible header per queue (ordered by
+  queue name, click anywhere on the header to toggle), and the header carries what the row tag
+  used to: the queue name, job counts by outcome (active / queued / succeeded / failed / stopped
+  — zero counts omitted), the group's total size (summed `bytes_done`), and its combined current
+  rate while anything in it is downloading. Collapse state persists per queue in `localStorage`
+  (default expanded), including for a queue that temporarily has no visible jobs — its
+  preference is still there when it returns. "Dismiss all" is unchanged, still global at the top
+  of the page.
+
+- **History's jobs section now groups by queue the same way, collapsible and remembered
+  separately from Transfers.** Same single-click-anywhere header, same default-expanded
+  `localStorage` persistence, but under its own storage key — collapsing a queue on one page
+  never collapses it on the other. Because History's job list is paginated, the header's outcome
+  counts (succeeded / failed / cancelled) and total size are computed **server-side** over the
+  whole filtered set, not just the currently-loaded page, so they stay correct regardless of how
+  many rows are actually loaded — a new `queue_summaries` block riding alongside `GET
+  /api/history/jobs`'s existing response, honoring the same queue/state/error-class/date filters
+  as the list itself.
+
+- **A `:dev` image now identifies itself in the nav, so a test instance is never mistaken for a
+  release.** `docker/Dockerfile`'s `runtime` stage bakes the commit SHA and a build channel
+  (`dev` / `release`) at image-build time — the container has no git tree to ask at runtime —
+  and `/api/health` now carries them (`build_sha`, `build_channel`, both `null` when unbaked).
+  The bottom-left version readout renders `DEV: v0.1.1 · <short-sha>` in amber for a dev build,
+  linking to the commit on GitHub instead of the release tag; a release build (or anything run
+  without baked args — local `uv run`, the compose dev stack) renders exactly as before.
+
+- **Transfers and History job rows now carry a Sonarr/Radarr brand-logo chip with a status
+  overlay**, distinct from the Files page's own generic *arr mark. The collapsed Transfers row
+  and each History job row show the real Sonarr (blue) or Radarr (gold) logo — recognition at a
+  glance was the point, per the user's own decision — with a small green check once the *arr has
+  processed the item (`imported`/`cleaned`), a small red dot once a release left the *arr's queue
+  without importing (`gone`), the logo alone while still mid-flight (`detected`/`notified`), and
+  no chip at all for an item that isn't *arr-tracked. An unrecognized/future instance `kind`
+  falls back to a text chip of the instance name in the same status colors, so a tracked item
+  never renders nothing just because a logo is missing. `GET /api/history/jobs` rows gained
+  `arr_status`/`arr_status_at`/`arr_instance_name`/`arr_instance_kind` (the same
+  `path_queue.arr_instance_id -> arr_instance` join `core/queue.py.list_jobs()` already used for
+  the Transfers panel); `JobOut` gained `arr_instance_kind` alongside its existing
+  `arr_instance_name`. Logo path data copied from the simple-icons dataset (CC0), itself sourced
+  from Sonarr's/Radarr's own repositories — see `NOTICE`.
+
+- **The Files page delete dialog gained an independent Source (seedbox) scope — the first
+  manual remote-delete path in the app.** Two checkboxes, Delete local copy and Delete source,
+  can be ticked independently (at least one is required); the Source checkbox only appears when
+  a remote copy actually exists. Defaults follow the queue's sync mode: both checked for `move`
+  (the queue is already configured to have lftpweb delete the source itself, so finishing that
+  by hand for a stuck/deferred item is the expected action), source left unchecked for `copy`
+  with a warning if checked anyway — a `copy` queue's remote path isn't required to be a
+  hardlink pickup directory, so deleting the source there can destroy a seed (DESIGN.md §7.1).
+  A combined request runs local's existing stop-then-delete first; a source-only request
+  refuses (409) rather than stopping a live transfer itself. `POST /api/items/{id}/delete`
+  reuses `RemoteConnectionPool.delete_path` (never a second SSH-delete implementation) and
+  writes the same `remote_delete`/`remote_delete_failed` events the automatic `move`-mode ladder
+  writes, tagged "manual" so History can tell the two apart; it's idempotent against a remote
+  copy that's already gone (including one the ladder deleted itself, or a mid-ladder deferred
+  item — a source-only delete on one of those simply completes the ladder early) and marks a
+  source-only success `auto_queue_suppressed` (migration 020, `suppressed_reason =
+  'deleted_source'`) so a release that later reappears under the same path isn't silently
+  auto-queued right back. This closes the gap `sync` mode would otherwise have existed to cover
+  — see `DESIGN.md` §7's own note, added alongside the move-mode delete ladder.
 
 ### Changed
 
+- **`move`-mode remote delete is now the last gate on a ladder, not the second step.**
+  Previously a `move` queue deleted the seedbox copy right after verification, *before*
+  extraction ran — so an extraction failure (or an *arr that never actually imports) could
+  discover a problem after the only other copy was already gone. The source is now deleted
+  only once every applicable rung has passed, in order: completeness (unchanged), verification
+  (`CORRUPT` still vetoes at every rung; `SKIPPED` still passes, unchanged), extraction (an
+  archive release must have extracted successfully — a failure now *withholds* the delete
+  instead of it having already happened), and, only for an item the optional Sonarr/Radarr
+  integration is already tracking, confirmed *arr import. Every deferral writes a
+  `remote_delete_deferred` event naming the rung it's waiting on. There is no timeout and no
+  automatic fallback — a withheld or deferred item keeps its source on both sides until the
+  user acts (fix the failing step and let it re-run, or the manual-delete dialog — a follow-on
+  task), by design.
+  This is strictly in the later/safer direction for every existing install; not a new setting.
+  See `docs/decisions.md` and `prompts/done/2026-08-16-move-delete-gate-ladder.md`.
+- **Job speed and per-file speed now sample on one shared 5-second cadence, instead of two that
+  drifted apart.** Watching a live transfer showed a one-file directory reporting two different
+  speeds at once (46 vs. 40 MB/s) because job-level speed sampled roughly every second while
+  per-file speed sampled every third tick, each smoothed independently. Both now sample every 5th
+  tick of the underlying 1-second loop, which itself is unchanged — admission, reaping, and
+  Stop/Cancel still act within about a second. The one visible side effect: a freshly started
+  job's speed reads 0 for a little longer (up to ~10s, was ~2s) before its first real sample.
+
+- **The SPA fallback route's path guard was recast so CodeQL recognizes the containment barrier**
+  (post-v0.1.1 follow-up to audit item S1). No behavior change — the same requests are admitted
+  and refused as before; the guard is now expressed in the shape the analyzer models, so the
+  fixed alert stays fixed instead of reopening on every scan.
+
 ### Fixed
+
+- **Fixed *arr import detection against a real Sonarr run.** The Sonarr/Radarr v3 API returns
+  history `eventType` in response bodies as a camelCase **string** (`"downloadFolderImported"`),
+  not the numeric code the integration was built against — the numeric codes are only meaningful
+  as query-parameter values. Two releases that were genuinely matched, transferred, and imported
+  on the first live run were misclassified `gone` as a result. Import detection now matches the
+  string form, with the legacy numeric code tolerated as a fallback so no *arr version regresses.
+- **Auto-queue no longer grabs a SABnzbd `_UNPACK_`/`_FAILED_` staging directory on the remote.**
+  The user's seedbox stages an in-progress unpack under `_UNPACK_<name>` before renaming it to
+  the release's final name; these still show up as ordinary items in the Files tree (visible on
+  purpose — "show it, don't grab it"), but are now excluded from auto-queue eligibility
+  regardless of state or matching patterns. Manual queueing is unaffected.
+- **Verification no longer reports `CORRUPT` for a release extracted upstream.** A release rar'd
+  at origin but unpacked by the seedbox itself (rars deleted, `.sfv` kept) arrives locally as e.g.
+  `movie.mkv` + `movie.sfv`, with the sidecar listing rar volumes that were never local to begin
+  with. Every referenced entry read as "missing," and on a `move` queue this permanently withheld
+  the remote delete. Verification now reads "every sidecar-referenced file absent, with other
+  real content present" as `SKIPPED` — no evidence either way, the same trust level a
+  sidecar-less release already gets — while any referenced file actually present (including a
+  half-deleted archive set) still reports `CORRUPT` exactly as before, and a sidecar with no other
+  content at all still reports `CORRUPT` too.
+- **An *arr-cleaned item no longer vanishes from the Files page the instant cleanup runs.** It
+  now rides the existing ~10-minute removal grace as "Processed · Xm", exactly as the spec always
+  promised, before leaving through the normal `REMOVED_LOCAL`/`REMOVED_BOTH` transition. Two
+  stacked bugs, both in `core/engine.py._persist`: the row's own `auto_queue_suppressed = 1`
+  (set deliberately, to keep a copy-mode queue from re-grabbing the still-present remote copy)
+  was also excluding it from the scan machinery that starts the grace clock at all; and a
+  verify-skipped `move`-mode item's `LOCAL_ONLY` resting state fell straight to an instant,
+  grace-free removal once unprotected. Fixed narrowly — `core/mount_sentinel.py` itself is
+  untouched — so a genuinely externally-vanished item still behaves exactly as before.
+- **The *arr success check no longer disappears the moment cleanup runs.** With "Delete when
+  imported" on, `imported` is a seconds-long transient — cleanup runs on the very next poller
+  beat — so the green ✓ flashed and was immediately replaced by the `cleaned` presentation
+  (the *arr mark plus the "Processed · Xm" countdown, no check), which meant the success
+  indicator effectively never got seen on a real run. `cleaned` now renders the same green-✓
+  icon variant as `imported`, alongside the existing countdown chip; the hover text still
+  reads "imported" vs. "imported and cleaned up locally" so the two states stay tellable apart.
+- **The Transfers expand panel now shows total bytes transferred, not just elapsed time and
+  average speed.** Real-use feedback: a terminal job's Transfer group showed "Elapsed" and
+  "Average speed" as two separate figures, but never the reading a user actually wants — "14.8 GB
+  in 6m 12s (40 MB/s avg)." A terminal job's `Elapsed` and `Average speed` fields now collapse
+  into one `Transferred` field composing exactly that sentence; a still-running job's fields are
+  unchanged.
+- **The Files page's *arr indicator now renders the same real Sonarr/Radarr brand-logo chip as
+  Transfers and History, instead of its own generic mark.** User feedback: the real logos shipped
+  on Transfers/History rows the same day, but the Files tree still showed the older generic *arr
+  mark — one visual language everywhere was the point. The Files tree's *arr column now renders
+  `ArrRowChip` (`LifecycleIcons.tsx`), resolving each row's bound instance `kind` the same way it
+  already resolved the instance name (`FilesPage.tsx`, from `path_queue.arr_instance_id` against
+  `GET /api/settings/arr`), with the existing `ArrTextChip` fallback for an unrecognized/future
+  `kind`. Status colors now unify on the chip's own mapping too — `gone` reads a **red** dot on
+  Files, same as Transfers/History, replacing the old amber ⚠; the "Processed · Xm" countdown
+  chip, filters, and the removal-grace machinery are unchanged. The older generic mark (`ArrIcon`)
+  is unchanged and still renders in the Transfers/History job-detail drawer's own "*arr" section,
+  the one remaining place it's used.
 
 ### Security
 

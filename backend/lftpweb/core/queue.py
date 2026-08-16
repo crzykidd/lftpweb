@@ -1,10 +1,12 @@
 """Job lifecycle and process supervision (DESIGN.md §4.1–§4.6). `TransferQueue` owns
 spawning, watching, and reaping — `core/scheduler.py` owns only the admission *decision*
-(§4.5, §12). Every tick (`transfer_tick_s`, default ~1 Hz per §4.4):
+(§4.5, §12). Every tick (`transfer_tick_s`, default 1 s per §4.4):
 
 1. reap any process that exited since the last tick, persist the outcome, and either retry
    (transient class, attempts remaining) or terminate the item's lifecycle (§4.3/§4.6);
-2. sample progress for everything still running (`core/progress.py`) and publish it;
+2. sample progress for everything still running (`core/progress.py`) and publish it -- but only
+   every `PROGRESS_SAMPLE_TICKS`-th tick (~5s), not every tick; reap/admit/stop stay on the 1s
+   loop so a Stop click still takes effect in ~1s (§4.4);
 3. gather `(running, queue)` from the database, call `scheduler.admit()`, and spawn whatever
    it admits (`core/lftp.py`).
 
@@ -71,22 +73,31 @@ class JobNotDismissableError(Exception):
     """
 
 
-# Live per-file progress inside a mirroring directory (see `_publish_child_progress`), tuned
-# separately from the ~1 Hz `tick_s` cadence everything else in this module runs at:
+# Progress sampling cadence -- deliberately *not* the ~1 Hz `tick_s` everything else in this
+# module runs at (reap/admit/stop stay at `tick_s`, §4.4/DESIGN.md §4.4):
 #
-# - `CHILD_PROGRESS_THROTTLE_TICKS`: publish/persist per-child progress only every Nth tick,
-#   not every tick. Smooth feedback doesn't need 1 Hz precision on each `.rar`, and a 50-file
-#   release changing every tick at 1 Hz is up to 50 `UPDATE`s a second -- steady write pressure
-#   like that is exactly what turned the `VACUUM INTO` backup race from rare into routine (see
-#   `docs/decisions.md`, `209928d`). 3 ticks (~3s at the default `tick_s`) keeps the writes
-#   batched while still reading as "live" to someone watching the Files page.
+# - `PROGRESS_SAMPLE_TICKS`: `_sample_and_publish_progress` -- job-level `ProgressSampler.sample`,
+#   the per-tick `item_delta` publish for the parent item, *and* `_publish_child_progress` --
+#   all gate on this same counter, so job and child speeds are measured over the identical
+#   interval. Unified 2026-08-16 (user decision, watching a live transfer): job speed used to
+#   sample every tick (~1 Hz) while per-file speed sampled every 3rd tick, each with its own EMA
+#   lag, so a one-file directory showed two speeds that never agreed. One shared 5-tick (~5s)
+#   cadence fixes that (same instants, same smoothing) and gives the underlying rate a longer
+#   delta window to average over -- a side benefit, not the primary motivation. Was
+#   `CHILD_PROGRESS_THROTTLE_TICKS = 3`, child-progress-only; still keeps the write-pressure
+#   rationale that constant was for (`docs/decisions.md`, `209928d`): a 50-file release
+#   recomputing every tick at 1 Hz is up to 50 `UPDATE`s a second, exactly what turned the
+#   `VACUUM INTO` backup race from rare into routine. 5 ticks batches the writes further, not
+#   less, while still reading as "live" on the Files/Transfers pages. A fresh job's speed now
+#   reads 0 until its second sample, ~5-10s in -- longer than before, and accepted as-is (see
+#   `docs/decisions.md`).
 # - `MAX_CHILD_PROGRESS_UPDATES_PER_TICK`: a safety cap, not the normal case. In practice the
-#   changed set per throttled tick is bounded by lftp's own parallelism
+#   changed set per sampled tick is bounded by lftp's own parallelism
 #   (`mirror_parallel_transfer_count`, a handful of files at a time), never by how large the
 #   release is -- but nothing here enforces that bound structurally, so a cap plus a logged
 #   truncation (rather than a silent one) is cheap insurance against a future case where it
 #   doesn't hold.
-CHILD_PROGRESS_THROTTLE_TICKS = 3
+PROGRESS_SAMPLE_TICKS = 5
 MAX_CHILD_PROGRESS_UPDATES_PER_TICK = 100
 
 
@@ -251,20 +262,24 @@ class TransferQueue:
         self._last_speeds: dict[int, float] = {}  # job_id -> most recent EMA speed, for stats()
         # `list_jobs()` (an API read path, polled on whatever cadence the frontend chooses)
         # must never call `self.progress.sample()` itself — the sampler's EMA math assumes
-        # it's ticked once per `tick_s` by `_sample_and_publish_progress()` below, and a
-        # second, out-of-cadence call would corrupt that state (a shorter-than-expected `dt`
-        # skews the instantaneous rate it derives). This cache is what `list_jobs()` reads
-        # instead: whatever the last real tick computed.
+        # it's ticked once every `PROGRESS_SAMPLE_TICKS`-th `tick_s` by
+        # `_sample_and_publish_progress()` below, and a second, out-of-cadence call would
+        # corrupt that state (a shorter-than-expected `dt` skews the instantaneous rate it
+        # derives). This cache is what `list_jobs()` reads instead: whatever the last real
+        # sampled tick computed.
         self._last_progress: dict[int, Any] = {}  # job_id -> progress.JobProgress
 
         # Live per-file (child) progress inside a mirroring directory -- see
         # `_publish_child_progress`. `_progress_tick_count` counts calls to
-        # `_sample_and_publish_progress` so child publishing can be throttled to every
-        # `CHILD_PROGRESS_THROTTLE_TICKS`-th one. `_prev_child_sizes` is job_id -> {child
-        # rel_path (relative to the job's own `local_root`, i.e. the item's directory, not the
-        # queue root) -> the size last diffed for it} -- only the rel_paths this module has
-        # actually persisted/published, so a child skipped by the cap on one tick still reads
-        # as "changed" on the next rather than being silently marked seen. Reset per job_id in
+        # `_sample_and_publish_progress` (every `tick_s`, ~1s) and gates the *entire* body of
+        # that method -- job-level sampling, the parent's `item_delta`, and child publishing
+        # alike -- to run only every `PROGRESS_SAMPLE_TICKS`-th one (2026-08-16: unified onto
+        # one counter so job and child speeds are measured over the identical interval; see
+        # that constant's own comment). `_prev_child_sizes` is job_id -> {child rel_path
+        # (relative to the job's own `local_root`, i.e. the item's directory, not the queue
+        # root) -> the size last diffed for it} -- only the rel_paths this module has actually
+        # persisted/published, so a child skipped by the cap on one sampled tick still reads as
+        # "changed" on the next rather than being silently marked seen. Reset per job_id in
         # `_reap_one` below so a future job id never inherits stale history (same shape as
         # `self.progress.drop`).
         self._progress_tick_count = 0
@@ -272,9 +287,9 @@ class TransferQueue:
         # Per-child speed (this task, 2026-08-14, "per-file speed inside a mirror"): a real
         # timestamp per (job_id, rel_path) -- `_prev_child_sizes` above only ever recorded the
         # *value* last diffed, never *when*, so there was nothing to divide a byte delta by
-        # except the wrong assumption `tick_s * CHILD_PROGRESS_THROTTLE_TICKS`, which a slow
-        # pass makes silently wrong (this project has already shipped one bug from exactly that
-        # shape of wrong denominator, `6e6b217`). `_prev_child_times` is job_id -> {rel_path ->
+        # except the wrong assumption `tick_s * PROGRESS_SAMPLE_TICKS`, which a slow pass makes
+        # silently wrong (this project has already shipped one bug from exactly that shape of
+        # wrong denominator, `6e6b217`). `_prev_child_times` is job_id -> {rel_path ->
         # `time.monotonic()` at the last tick this method actually diffed that child};
         # `_child_speed` is job_id -> {rel_path -> its last EMA-smoothed rate}, the per-child
         # analogue of `ProgressSampler._speed` above, smoothed with the exact same
@@ -616,6 +631,31 @@ class TransferQueue:
         await self.db.execute("UPDATE job SET dismissed_at = ? WHERE id = ?", (_now_iso(), job_id))
         await self.db.commit()
 
+    async def dismiss_all_terminal(self) -> int:
+        """The bulk counterpart to `dismiss_job` above (2026-08-15, "Dismiss all" at the top of
+        the Transfers page) -- one `UPDATE`, not a per-job loop, per the task's own preference
+        for a bulk endpoint over a client-side `Promise.allSettled` fan-out.
+
+        Same guard as `dismiss_job`, just applied to every row at once: only `failed`/
+        `cancelled`/`succeeded` rows with `dismissed_at IS NULL` are touched -- a `queued`/
+        `running` job is never matched by this `WHERE`, so there is no active-job case to reject
+        the way `dismiss_job` raises `JobNotDismissableError` for one. Unlike that method, this
+        doesn't restrict itself to each item's *most recent* job (`list_jobs()`'s `MAX(id)`
+        superseding rule) -- an older, already-superseded terminal row is never shown on
+        Transfers regardless of its `dismissed_at`, so dismissing it too is harmless and keeps
+        this one plain `UPDATE ... WHERE` rather than a second copy of that subquery.
+
+        Returns the actual row count affected (`cursor.rowcount`), the same "report the real
+        number" convention `api/history.py`'s clear-history endpoints already use.
+        """
+        cursor = await self.db.execute(
+            "UPDATE job SET dismissed_at = ? "
+            "WHERE state IN ('failed','cancelled','succeeded') AND dismissed_at IS NULL",
+            (_now_iso(),),
+        )
+        await self.db.commit()
+        return cursor.rowcount
+
     async def _item_is_settled(self, queue_id: int, rel_path: str) -> bool:
         """The completion half of the settle gate (prompts/open-issues.md #2,
         `core/settle.py`), consulted from `_reap_one` on job success. Returns `True`
@@ -680,8 +720,9 @@ class TransferQueue:
             return
 
         if exit_code == 0:
-            # bytes_done otherwise retains whatever the ~1 Hz progress sampler last measured,
-            # which can trail the true final size by a fraction of a tick (found comparing
+            # bytes_done otherwise retains whatever the progress sampler last measured (as of
+            # 2026-08-16, up to `PROGRESS_SAMPLE_TICKS`-1 ticks stale, not "the last tick"),
+            # which can trail the true final size by up to a sample window (found comparing
             # /api/stats's 24h-transferred total against a real completed job's actual file
             # size). `cmd:fail-exit true` guarantees exit 0 only on a complete transfer
             # (§4.3), so the true byte count here is simply the job's own `bytes_total`
@@ -719,7 +760,7 @@ class TransferQueue:
 
             # 2026-08-13 (prompts/2026-08-13-delete-state-truthfulness.md, defect 3's "real
             # fix"): a final, accurate, un-throttled reading of every child row before anything
-            # downstream (post-processing's verify/delete/extract/move) can touch this job's
+            # downstream (post-processing's verify/extract/move/delete) can touch this job's
             # files -- see `_flush_child_progress_final`'s own docstring for the bug this
             # closes. A no-op for a `pget` job (single file, no children) and cheap for a
             # `mirror` job either way (bounded by the release's own file count, the same walk
@@ -1003,10 +1044,10 @@ class TransferQueue:
         forms anyway).
 
         **The bug.** `_publish_child_progress` persists a child's `local_size`/`state` only
-        every `CHILD_PROGRESS_THROTTLE_TICKS`-th tick, and only for files whose size changed
-        since the *previous* throttled tick -- deliberately, so a 50-file release doesn't mean
-        50 writes a second (that module's own docstring). But a job can finish *between* two
-        throttled ticks, and once it does, nothing ever samples that job's children again --
+        every `PROGRESS_SAMPLE_TICKS`-th tick, and only for files whose size changed since the
+        *previous* sampled tick -- deliberately, so a 50-file release doesn't mean 50 writes a
+        second (that module's own docstring). But a job can finish *between* two sampled
+        ticks, and once it does, nothing ever samples that job's children again --
         `_reap_one` only ever wrote the *parent* item's row. So the last thing a small file's
         row says can be a mid-transfer `PARTIAL`, true for a fraction of a second, frozen there
         indefinitely. On a `copy`-mode queue a later engine scan corrects it (the file is still
@@ -1065,26 +1106,35 @@ class TransferQueue:
             self.events.publish({"type": "item_delta", "queue_id": proc.queue_id, "nodes": nodes})
 
     async def _sample_and_publish_progress(self) -> None:
-        """The ~1 Hz tick the WS delta fix (DESIGN.md §2/§9) exists for. Two messages come
-        out of here, both bounded by `len(self._running)` — the *active* set — never by the
-        size of a queue's tree, however many thousand files it holds:
+        """Called every `tick_s` (~1s) from `tick()`, but the whole body below only actually
+        runs every `PROGRESS_SAMPLE_TICKS`-th call (~5s) -- 2026-08-16, unifying job- and
+        child-level progress onto one cadence (`PROGRESS_SAMPLE_TICKS`'s own comment has the
+        why: two independently-throttled EMAs never agreed on a one-file directory's speed).
+        Reap/admit/stop stay on the 1s `tick()` loop untouched -- a Stop click still takes
+        effect in ~1s regardless of where in this method's 5-tick window it lands, because
+        stopping signals the process directly (`stop_job`) rather than waiting for a sample.
 
-        - `progress` (job-centric, Transfers page): bytes/speed/ETA per running job.
-          Unchanged from phase 3a — it was already shaped this way.
-        - `item_delta` (item-centric, Files page): the same tick's local-size/state for the
-          items those jobs belong to, batched per queue, so a downloading item's row updates
-          live instead of waiting for the next full engine scan (up to `scan_interval_s`,
-          default 30s) — the gap that made "stop it and see it go STOPPED without a page
-          refresh" impossible before this phase.
-        - `child_progress` (this task, 2026-08-14, "per-file speed inside a mirror"): a third,
-          item-keyed message, `{item_id, speed_bps}` per changed child of a mirroring
-          directory — deliberately not folded into either message above. It does not belong in
-          `progress`: that message is job-centric and a child has no `job_id` of its own, so a
-          pseudo-entry there would collide in the frontend's `progressByJobId` map and put a
-          fictional row on the Transfers page. It does not belong in `item_delta` either: that
-          message carries `item_view()` projections of persisted `item` columns only
-          (DESIGN.md §2/§9's invariant), and a live rate is a sample, never a persisted one —
-          see `_publish_child_progress`.
+        On a sampled tick, three messages come out of here, all bounded by `len(self._running)`
+        — the *active* set — never by the size of a queue's tree, however many thousand files
+        it holds:
+
+        - `progress` (job-centric, Transfers page): bytes/speed/ETA per running job, from
+          `core/progress.py.ProgressSampler.sample`. Unchanged from phase 3a in shape; the
+          *cadence* it's called at is what moved.
+        - `item_delta` (item-centric, Files page): the same sampled tick's local-size/state for
+          the items those jobs belong to, batched per queue, so a downloading item's row
+          updates live instead of waiting for the next full engine scan (up to
+          `scan_interval_s`, default 30s) — the gap that made "stop it and see it go STOPPED
+          without a page refresh" impossible before this phase.
+        - `child_progress` (2026-08-14, "per-file speed inside a mirror"): a third, item-keyed
+          message, `{item_id, speed_bps}` per changed child of a mirroring directory —
+          deliberately not folded into either message above. It does not belong in `progress`:
+          that message is job-centric and a child has no `job_id` of its own, so a pseudo-entry
+          there would collide in the frontend's `progressByJobId` map and put a fictional row
+          on the Transfers page. It does not belong in `item_delta` either: that message
+          carries `item_view()` projections of persisted `item` columns only (DESIGN.md
+          §2/§9's invariant), and a live rate is a sample, never a persisted one — see
+          `_publish_child_progress`.
 
         The parent item's row is *persisted then read back* through `core/itemview.py` rather
         than hand-built, matching `core/engine.py.scan_queue`'s invariant (DESIGN.md §2/§9):
@@ -1097,10 +1147,18 @@ class TransferQueue:
         `SELECT` is one indexed lookup per running job -- bounded by `len(self._running)`, a
         handful of concurrent top-level transfers, never queue size.
 
-        Child (per-file) progress inside a mirroring directory is a separate, throttled pass
-        -- see `_publish_child_progress`.
+        Child (per-file) progress inside a mirroring directory is published unconditionally
+        whenever this method's body runs at all -- see `_publish_child_progress` -- since the
+        gate above already puts job and child sampling on the same tick.
         """
         if not self._running:
+            return
+        # The shared gate (see `PROGRESS_SAMPLE_TICKS`'s comment): only every Nth call to this
+        # method -- itself invoked every `tick_s` by `tick()` -- does any sampling, DB writes,
+        # or publishing at all. Only counts while something is running, matching the pre-2026-
+        # 08-16 child-only throttle's own behavior (a quiet queue never advances the counter).
+        self._progress_tick_count += 1
+        if self._progress_tick_count % PROGRESS_SAMPLE_TICKS != 0:
             return
         active = [
             ActiveJob(
@@ -1143,16 +1201,17 @@ class TransferQueue:
             if view is not None:
                 by_queue.setdefault(p.queue_id, []).append(view)
 
-        # Throttled, not every tick -- see CHILD_PROGRESS_THROTTLE_TICKS's comment. Appends
-        # into `by_queue` in place so a child rides the same `item_delta` message as its
-        # parent's row instead of a second WS round trip.
-        self._progress_tick_count += 1
-        if self._progress_tick_count % CHILD_PROGRESS_THROTTLE_TICKS == 0:
-            # One real timestamp for every child diffed this pass -- not `tick_s *
-            # CHILD_PROGRESS_THROTTLE_TICKS`, which a slow pass would make silently wrong (see
-            # `child_speed_bps`'s own docstring). `time.monotonic()` matches what
-            # `core/progress.py.ProgressSampler` already keys its own EMA history on.
-            await self._publish_child_progress(results, by_queue, now=time.monotonic())
+        # Unconditional now -- the gate at the top of this method already means we only get
+        # here on a `PROGRESS_SAMPLE_TICKS`-th tick, so job and child sampling share the exact
+        # same instant; there is no separate child-only throttle left to apply. Appends into
+        # `by_queue` in place so a child rides the same `item_delta` message as its parent's
+        # row instead of a second WS round trip.
+        #
+        # One real timestamp for every child diffed this pass -- not `tick_s *
+        # PROGRESS_SAMPLE_TICKS`, which a slow pass would make silently wrong (see
+        # `child_speed_bps`'s own docstring). `time.monotonic()` matches what
+        # `core/progress.py.ProgressSampler` already keys its own EMA history on.
+        await self._publish_child_progress(results, by_queue, now=time.monotonic())
 
         for queue_id, nodes in by_queue.items():
             self.events.publish({"type": "item_delta", "queue_id": queue_id, "nodes": nodes})
@@ -1216,7 +1275,7 @@ class TransferQueue:
         Persist -> read back -> publish, same invariant as the parent above and
         `core/engine.py.scan_queue`: a child's `UPDATE` is issued for every changed file (up
         to the cap), all committed together (batching the writes is the point -- see
-        `CHILD_PROGRESS_THROTTLE_TICKS`'s comment), then read back through `ITEM_VIEW_COLUMNS`/
+        `PROGRESS_SAMPLE_TICKS`'s comment), then read back through `ITEM_VIEW_COLUMNS`/
         `item_view` and only *that* goes on the wire. A child with no matching `item` row (not
         yet persisted by an engine scan) is silently skipped, not invented here -- `_persist`
         in `core/engine.py` is the only writer of new `item` rows.
@@ -1347,13 +1406,18 @@ class TransferQueue:
             self.events.publish({"type": "child_progress", "items": child_progress_items})
 
     async def _sample_metrics(self) -> None:
-        """Feeds `core/metrics.py`'s 30-tick throughput sampler from the exact same per-job
-        byte accounting `_sample_and_publish_progress` just wrote above (`self._last_progress`)
-        -- never a second measurement, and never lftp's own stdout (DESIGN.md §1.3). Called
-        every tick, including ticks where nothing is running (`self._running` empty) --
-        `ThroughputSampler.tick()` needs that to keep the heartbeat alive while lftpweb is
-        idle, which is what tells an idle instance apart from a stopped one (see that module's
-        docstring).
+        """Feeds `core/metrics.py`'s 30-tick throughput sampler from the same per-job byte
+        accounting `_sample_and_publish_progress` writes -- never a second measurement, and
+        never lftp's own stdout (DESIGN.md §1.3). Called every `tick_s` (~1s), including ticks
+        where nothing is running (`self._running` empty) -- `ThroughputSampler.tick()` needs
+        that to keep the heartbeat alive while lftpweb is idle, which is what tells an idle
+        instance apart from a stopped one (see that module's docstring).
+
+        `self._last_progress` is only refreshed every `PROGRESS_SAMPLE_TICKS`-th tick now
+        (2026-08-16) -- on the ticks between, this reuses the same cached bytes_done rather
+        than re-measuring, so a job's contribution here is a step function updated at the same
+        cadence as the progress sampler, not a fresh read every second. `ThroughputSampler`'s
+        own 30-tick averaging window already smooths over that.
         """
         running = [
             RunningJobBytes(
@@ -1846,13 +1910,30 @@ class TransferQueue:
         bounded by construction (the docstring above), unlike `api/history.py`'s unbounded,
         paginated endpoint — that's why this can inline the join instead of shipping
         `queue_id` alone and making the client resolve it.
+
+        **2026-08-15** (prompts/2026-08-15-transfers-single-line-rows-with-detail.md): also
+        joins `item.verified_at`/`item.extracted_at`/`item.remote_deleted_at`/`item.arr_status`/
+        `item.arr_status_at`, plus `arr_instance.name` via `path_queue.arr_instance_id` (`LEFT
+        JOIN` — most queues have no bound instance, migration 018's "everything OFF by
+        default"), for the Transfers row's new expand panel (`api/jobs.py._job_out`). Same
+        bounded-by-construction reasoning as `queue_name` above — this is not the phase-6
+        unbounded-list trap `api/history.py`'s own docstring warns against.
+
+        **2026-08-16** (prompts/2026-08-16-arr-chip-on-row-lines.md): also joins
+        `arr_instance.kind` (`'sonarr'`/`'radarr'`) — the collapsed row's new brand-logo chip
+        needs to know *which* logo to draw; `arr_instance_name` alone is free-text the user can
+        rename to anything, so it can't drive that choice on its own.
         """
         cursor = await self.db.execute(
             "SELECT job.*, item.rel_path, item.is_dir, item.queue_id, item.remote_size, "
-            "       path_queue.name AS queue_name "
+            "       item.verified_at, item.extracted_at, item.remote_deleted_at, "
+            "       item.arr_status, item.arr_status_at, "
+            "       path_queue.name AS queue_name, arr_instance.name AS arr_instance_name, "
+            "       arr_instance.kind AS arr_instance_kind "
             "FROM job "
             "JOIN item ON item.id = job.item_id "
             "JOIN path_queue ON path_queue.id = item.queue_id "
+            "LEFT JOIN arr_instance ON arr_instance.id = path_queue.arr_instance_id "
             "WHERE job.state IN ('queued','running') "
             "   OR (job.state IN ('failed','cancelled','succeeded') "
             "       AND job.dismissed_at IS NULL "

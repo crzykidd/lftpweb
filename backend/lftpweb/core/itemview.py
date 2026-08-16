@@ -60,11 +60,19 @@ from typing import Any
 # `LEFT JOIN item_settle ...` alongside `{ITEM_VIEW_COLUMNS}` in its own SELECT
 # (`core/engine.py._project`, `api/files.py.get_files`); `item_view` reads them via `_optional`
 # below rather than requiring them, so a query that doesn't join still works.
+# `arr_status`/`arr_status_at` (migration 018, docs/arr-integration-spec.md): the Sonarr/Radarr
+# integration's per-item facet -- deliberately **not** `arr_download_id`, which the spec's own
+# "Data model" section marks "not published in the item projection" (it exists only so
+# `core/arrsync.py`'s history lookup can be exact instead of name-based; it has no display use
+# and is never something a client needs). `arr_status` is a facet, not a lifecycle state
+# (spec: "it never touches `item.state` and the reconciler never writes it") -- it rides
+# alongside `state` on the wire exactly the way `substate`/`suppressed_reason` already do, not
+# folded into either.
 ITEM_VIEW_COLUMNS = (
     "id, rel_path, is_dir, remote_size, local_size, remote_mtime, local_mtime, state, substate, "
     "suppressed_reason, "
     "state_changed_at, first_seen_at, downloaded_at, verified_at, extracted_at, "
-    "first_missing_at, remote_deleted_at, pending_download_prefix"
+    "first_missing_at, remote_deleted_at, pending_download_prefix, arr_status, arr_status_at"
 )
 
 # The same column list, `item.`-qualified, for the two callers that `LEFT JOIN item_settle`
@@ -457,5 +465,12 @@ def item_view(row: Mapping[str, Any]) -> ItemView:
         # directory back to its real name).
         "pending_download_prefix": row["pending_download_prefix"],
         "deleted_archive_at": _optional(row, "deleted_archive_at"),
+        # `arr_status`/`arr_status_at` (migration 018) -- `_optional` because some pre-018-shape
+        # callers in this codebase's own test suite build a row dict by hand without these two
+        # keys (see `ITEM_VIEW_COLUMNS`'s own comment); any real `item` row has both columns
+        # once migration 018 has run, `NULL` until the poller (`core/arrsync.py`) first matches
+        # this item to a bound *arr instance's queue.
+        "arr_status": _optional(row, "arr_status"),
+        "arr_status_at": _optional(row, "arr_status_at"),
         "facets": _lifecycle_facets(row),
     }

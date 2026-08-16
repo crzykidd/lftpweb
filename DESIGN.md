@@ -112,7 +112,7 @@ SQLite for state, React SPA served as static files from the same origin.
      │
      ├── RemoteScanner   (core/remote.py)      asyncssh → remote tree; also remote deletes
      ├── LocalScanner    (core/local_scan.py)  os.scandir → local tree
-     ├── ProgressSampler (core/progress.py)    ~1 Hz stat of active files only
+     ├── ProgressSampler (core/progress.py)    sampled ~5s (§4.4), stat of active files only
      ├── Metrics         (core/metrics.py)     ~30 s throughput samples + liveness heartbeat
      ├── Scheduler       (core/scheduler.py)   admission control: who starts, at what rate
      ├── TransferQueue   (core/queue.py)       the job queue: one lftp process per job
@@ -129,7 +129,7 @@ SQLite for state, React SPA served as static files from the same origin.
 | Concern | SeedSync | lftpweb |
 |---|---|---|
 | lftp process model | 1 long-lived PTY per pair, shared `queue` | 1 short-lived process **per job**, plain pipes — no PTY, no readline, no ANSI, no wrapping |
-| Progress source | regex over `jobs -v` | local sizes vs remote sizes, sampled ~1 Hz |
+| Progress source | regex over `jobs -v` | local sizes vs remote sizes, sampled ~5s (§4.4) |
 | Job liveness | inferred from diffing the job list | process exit code |
 | Stopping a job | `kill <id>`, with an id race | SIGTERM to one PID |
 | Job queue & concurrency | delegated to lftp `cmd:queue-parallel` | owned in Python (asyncio semaphore) → reorder, priority, per-job settings |
@@ -679,9 +679,24 @@ the captured error text clean.
 
 ### 4.4 Progress without parsing
 
-`ProgressSampler` ticks at ~1 Hz and stats **only the active file set** — the files under
-currently-running jobs — never a full tree walk. From that it computes transferred bytes,
-instantaneous speed, and ETA, with EMA smoothing (α ≈ 0.3) so the UI doesn't jitter.
+`ProgressSampler` stats **only the active file set** — the files under currently-running jobs —
+never a full tree walk. From that it computes transferred bytes, instantaneous speed, and ETA,
+with EMA smoothing (α ≈ 0.3) so the UI doesn't jitter.
+
+**The tick loop and the progress-sampling cadence are two different things** (unified
+2026-08-16, user decision from watching a live transfer — this corrects an earlier ~1 Hz
+sampling claim in this section). `TransferQueue`'s tick loop (`transfer_tick_s`) still runs at
+~1 Hz — admission, reaping, and stop handling all stay on it, so a Stop click still takes
+effect in ~1 s. Progress sampling — job-level speed (`ProgressSampler.sample`), the per-tick
+`item_delta` publish for a downloading item's own row, and per-file (child) progress inside a
+mirroring directory — only actually runs every `PROGRESS_SAMPLE_TICKS`-th tick (5, ~5 s at the
+default), all three gated on the same counter so job and child speeds are measured over the
+identical interval. Before this, job speed sampled every tick while per-file speed sampled
+every 3rd tick, each with its own independent EMA lag — the two never agreed for a single-file
+directory (46 vs. 40 MB/s live, the case that prompted the fix). One shared, longer cadence
+fixes the disagreement and gives the underlying rate a longer delta window to average over. The
+cost: a freshly-started job's speed reads 0 until its second sample, ~5–10 s in, rather than
+~1–2 s — accepted as-is, not special-cased.
 
 Two on-disk conventions must be honored, because raw `st_size` lies. Both are **lftp's**, not
 SeedSync's — any program that lets lftp move the bytes inherits them, whatever inspired the
@@ -1067,8 +1082,9 @@ script; deleting the script deletes the machinery.
 script over SFTP and run it, emitting the same records. Kept small and only used on demand.
 
 **Cadence:** every 30 s by default, plus a forced rescan after any queue/stop/delete and on
-job completion. Local full walk every 10 s; the 1 Hz active-set poll (§4.4) covers the hot set
-in between. The scan interval is also the settle gate's unit of time (§3.3 counts *scans*, not
+job completion. Local full walk every 10 s; the active-set progress sampler (§4.4, ~5 s as of
+2026-08-16) covers the hot set in between. The scan interval is also the settle gate's unit of
+time (§3.3 counts *scans*, not
 seconds), so changing it changes how long an arriving item is held — which is why §3.3's gate
 also enforces its own wall-clock floor (`SETTLE_MIN_AGE_S`) independent of scan count, so a
 faster queue (below) is held to the same real-time guarantee rather than a weaker one.
@@ -1260,7 +1276,7 @@ lftpweb ever touches the remote side.
 | Mode | Behavior | Ships |
 |---|---|---|
 | `copy` | Download; **never** touch the remote. Local deletes do not propagate. **Default.** | v1 |
-| `move` | Download, verify, then delete the remote copy. | v1 |
+| `move` | Download, then delete the remote copy once every applicable rung of §7.3's ladder passes (verify, extract, *arr import if tracked). | v1 |
 | `sync` | Copy, plus propagate *local* deletes back to the remote. | **not scheduled** |
 
 `copy` is the default and is the only mode that is safe under every deployment shape. The other
@@ -1282,6 +1298,20 @@ mostly about why that is acceptable here and what keeps it acceptable.
 > mode, and the rate-based backstop (§7.3). **Not deferred:** `move` deletes remote data too, so
 > verification before deletion, deletes through our own asyncssh path (§7.4), and the full
 > `event` audit trail are all v1.
+>
+> **`sync`'s primary use case is now served without building it** (added 2026-08-16, alongside
+> §7.3's delete-ladder redesign, `prompts/done/2026-08-16-move-delete-gate-ladder.md`). The
+> workflow a reader would reach for `sync` to get — "the importer took it, now clean up the
+> source" — is exactly what `move`-with-the-ladder covers automatically, plus the Files page's
+> manual delete dialog for anything the ladder deliberately declines to resolve on its own (a
+> withheld or deferred item — no timeout, no automatic fallback, by design): the ladder's own
+> follow-on task, `prompts/done/2026-08-16-manual-delete-local-and-remote.md`, gave that dialog
+> an independent Source scope (§9.2, §7.4) so a stuck item can be cleaned up entirely from the
+> app, without SSHing into the seedbox by hand. `sync`'s own distinguishing feature would only
+> be propagating a *local* delete the user (or
+> something other than lftpweb) performed by hand — a narrower, still-unbuilt case. **A future
+> session should not build `sync` "for tidiness"**; the workflow gap it would close is already
+> closed.
 
 ### 7.1 Why remote deletion is safe here: the hardlink pickup directory
 
@@ -1325,10 +1355,12 @@ that disappearance is precisely the intended trigger for propagating a remote de
 mode. The pipeline is: lftpweb pulls it down → *arr moves it into the library → lftpweb notices
 it's gone → lftpweb removes the seedbox copy so the pickup dir doesn't grow forever.
 
-Worth stating because a reader will expect an integration here: **this serves the *arr workflow
-without talking to Sonarr or Radarr at all.** There is no *arr integration in v1 or on the near
-roadmap; the filesystem observation is the whole interface, and it works with any importer that
-moves files, or with a human doing it by hand.
+Worth stating because a reader will expect an integration here: **this flow serves the *arr
+workflow without talking to Sonarr or Radarr at all** — the filesystem observation is the whole
+interface, and it works with any importer that moves files, or with a human doing it by hand.
+(An *optional* API-level integration does now exist — §16, added post-v0.1.1 — but it layers on
+top of this flow rather than replacing it: everything in this section holds with the
+integration disabled, which is every instance's default.)
 
 This inverts the usual safety design, and the inversion has to be respected:
 
@@ -1441,6 +1473,33 @@ them distinguishable, because a bind mount that didn't come up has no sentinel i
   the rename gate stayed permissive for the irreversible one (moving files into a library) — the
   inconsistency ran in the more alarming direction. Restoring the old delete gate alone would not
   fix that; the rename gate would still publish the same item it withheld the delete for.
+- **The delete is the last gate on the ladder, not the second-to-last** (redesigned
+  2026-08-16, `prompts/done/2026-08-16-move-delete-gate-ladder.md`, resolving open issue #2 /
+  `docs/audit-v0.1.0.md` G1 — a sanctioned design change, not an extension of the verification
+  gate above). Before this task, `core/postprocess.py._process_item` ran the `move`-mode delete
+  *between* verify and extract, so a `SKIPPED`-verify release (the common, sidecar-less case,
+  widened to every release by the 2026-08-14 verification-gate revision above) had its only
+  other copy deleted before extraction — the step most likely to still fail — ever ran. The
+  fix moves the delete to the *end* of the pipeline and adds the two rungs extraction and *arr
+  import were missing:
+  - **Extract.** If archives were present and extraction is enabled, extraction must have
+    succeeded; `EXTRACT_FAILED` *defers* the delete (event `remote_delete_deferred`, naming the
+    rung) rather than never reaching a state where it could withhold it, as before.
+  - ***arr import**, only for an item that is *arr-tracked (`item.arr_status` non-null) by the
+    time its pipeline run reaches the delete gate. `core/postprocess.py` hands the decision to
+    `core/arrsync.py` at that point (`item.remote_delete_pending` records the handoff, carrying
+    the verify evidence forward) rather than deleting; `core/arrsync.py` performs the delete —
+    through the same `perform_remote_delete`, never a second implementation — the moment an
+    association is confirmed `imported` (the existing three-layer, two-pass-confirmed signal),
+    and never on `gone`. An item on a bound queue that never matched (`arr_status` stays `NULL`
+    forever — a hand-dropped file, a replaced grab) is not made to wait on an *arr that has
+    never heard of it; it deletes at the extraction rung instead.
+
+  `CORRUPT` remains a hard veto at every rung, unchanged. There is no timeout and no automatic
+  fallback for a withheld or deferred item — it keeps its source until the user acts (fix
+  verify/extract and let the pipeline re-run, or the manual-delete dialog); every deferral
+  writes its own `remote_delete_deferred` event naming the rung, so History can answer "why is
+  this still on the seedbox" in one call.
 - **Dry-run mode.** Per queue, logs exactly what *would* be deleted and why, and acts on
   nothing. This is the expected way to turn `sync` on for the first time on a real tree.
 - **Full audit trail.** Every delete — and every delete *withheld*, with the failing
@@ -1618,9 +1677,12 @@ Dashboard is the detail.
 
 **Files** — virtualized tree (must stay smooth at 10k+ rows), per row: state chip, progress
 bar, size, speed, ETA. Grouped by queue, collapsible per queue. Expand/collapse, multi-select
-with shift-range, bulk *Queue / Stop / Delete local / Delete remote*, text search, state
-filter, and a lifecycle facet filter (below) — composed together, never a second filtering
-path.
+with shift-range, bulk *Queue / Stop / Delete*, text search, state filter, and a lifecycle
+facet filter (below) — composed together, never a second filtering path. Delete's own dialog
+carries two independent scopes, Local and Source (2026-08-16,
+`prompts/2026-08-16-manual-delete-local-and-remote.md` — §7's own note and §7.4) — not two
+separate buttons as originally sketched here, since a combined delete (both scopes, one
+confirmation) is the common case for a `move` queue's stuck item.
 
 Four further row-level readings, all of them projections of the same persisted `item` row the
 state chip already reads (§2.2's one shared projection, never a second read of it):
@@ -2451,3 +2513,84 @@ superseded, and why.
 queues under a single host (§3.1, §9), `copy` and `move` shipping with backwards `sync`
 deferred entirely (§7), no `*arr` integration, and History as its own page grouped by queue
 (§9.2).
+
+---
+
+## 16. Sonarr/Radarr integration
+
+Built 2026-08-15 in three handoff prompts (backend foundation, notify + cleanup, UI + docs).
+Full detail — the data model, the association lifecycle, matching rules, the poller, and the
+resolved design decisions — lives in
+[`docs/arr-integration-spec.md`](docs/arr-integration-spec.md); this section is the
+architectural summary DESIGN.md's own rule requires, not a restatement.
+
+**The shape of it:** a queue's downloads are driven by Sonarr or Radarr sending grabs to a
+torrent client on the seedbox. lftpweb is the piece that lands those bytes locally. Binding a
+queue to a Sonarr/Radarr *instance* (migration `018_arr_integration.sql`, one instance per
+queue, one instance may serve many queues) lets lftpweb ask "is this release in your download
+queue?" — if yes, the Files-row gets an *arr icon, watches the release through import via a
+background poller (`core/arrsync.py`), and optionally cleans up the local copy once the *arr
+confirms it is fully done with it.
+
+**Three namespaces, one rule.** This feature spans the seedbox's own path, lftpweb's local
+path, and the *arr's own view of the synced directory (its Remote Path Mapping, which lftpweb
+never manages). Matching a queue record to an item therefore never compares paths across
+namespaces — it keys on the release **basename**, which is identical in all three — and the one
+path lftpweb ever *sends* to the *arr (the optional "notify on complete" push) is translated
+through a per-queue `arr_visible_path` override, describing the item's **post-move** location
+when a queue's Move step relocates it. Getting this wrong is the feature's most likely bug
+class, one level up from the logical-vs-physical lesson §1's own history already contains.
+
+**`arr_status` is a facet, not a lifecycle state.** It never touches `item.state`, the
+reconciler never writes it, and the delicate §3.2 state machine is untouched by this feature —
+the same "presence icons read the world; milestone icons read timestamps" split this project
+already made deliberately. It rides the one item projection (`core/itemview.py.
+ITEM_VIEW_COLUMNS`, §2.2's publish invariant) alongside every other field, so the WebSocket, the
+snapshot, and `GET /api/files` all agree on it by construction. `arr_download_id` (the *arr
+queue record's `downloadId`, recorded for exact history lookups) deliberately does **not** ride
+the wire — the frontend has no use for it and it is never something a client needs to see.
+
+**Three independent, escalating opt-ins, each defaulting off** — this project's standing rule
+for every new capability applies here as three separate switches, not one:
+
+1. Instance `enabled` — off means nothing polls, nothing matches, no icon ever appears.
+2. Instance `notify_on_complete` — off means lftpweb never pushes an import command; the *arr's
+   own Completed Download Handling may still import on its own schedule if it has a Remote Path
+   Mapping configured.
+3. Queue `arr_delete_completed` — off means lftpweb never deletes anything. The only
+   destructive switch this feature has, per-queue, and gated behind a confirmed import even
+   when on (below).
+
+**The fully-done gate.** "Imported" must mean the *arr is completely finished with a release,
+not merely that it has started — a multi-file release imports file by file, so a single history
+event is a trailing per-file signal, never a whole-release one. Three layered requirements gate
+the transition, all of them required: the *arr's own queue record for the release must be gone
+(a record still reporting `trackedDownloadState: importing` is never "imported," no matter what
+history says), at least one history import event must corroborate the disappearance was a real
+import rather than a removal, and both signals must hold across **two consecutive poller
+passes** roughly a minute apart — a settle-gate-style quiescence guard, the same "unchanged for
+two observations" philosophy §1.3's own settle gate already applies to a remote fingerprint.
+Cleanup (`core/arrsync.py`'s `_maybe_cleanup`) never runs on ambiguity: a queue record simply
+vanishing with no import event maps to `gone` — the icon dims to an amber warning, nothing is
+deleted, ever.
+
+**Cleanup reuses the removal-grace machinery, not a new timer.** When an item is cleaned up, the
+local bytes are removed but `item.state` is deliberately left untouched — the existing
+scan-driven absence-grace machinery (§7.3) discovers the disappearance and carries the row to
+`REMOVED_LOCAL` on its own ~10-minute clock, exactly as if a human had deleted it. The one
+presentational override: the removal-grace countdown chip, which normally reads "Missing · Xm"
+because an *unexplained* absence means a decision is pending, renders "Processed · Xm" for a
+`cleaned` row instead — same clock, different words, because this absence is deliberate and
+fully audited (`core/audit.py` event rows: `arr_matched`, `arr_notified`,
+`arr_notify_failed`, `arr_imported`, `arr_cleanup`, `arr_cleanup_withheld`).
+
+**UI:** a new Settings → Integrations tab (instance CRUD, write-only API key, a Test button
+against `GET /api/v3/system/status`); three additions to each queue's form in Settings → Queues
+(the *arr instance dropdown, the delete-when-imported checkbox — disabled with a hint unless an
+instance is bound — and the visible-path override); and, on the Files page, one icon slot per
+row driven purely by `arr_status`/`arr_status_at` off the wire. The icon is **multi-faceted**
+by deliberate decision (2026-08-15) — "the *arr processed it" (`imported`, green ✓) and "the
+*arr dropped it without importing" (`gone`, amber ⚠) are visually distinct states, not one
+dimmed glyph, and `gone` is independently filterable since it is the one state that usually
+needs a human. See `docs/arr-integration-spec.md`'s own "UI" section for the full icon-state
+table.

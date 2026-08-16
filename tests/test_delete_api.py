@@ -20,8 +20,9 @@ from lftpweb.api import settings_postprocess as settings_api
 from lftpweb.core import local_delete
 from lftpweb.core.events import EventBus
 from lftpweb.core.mount_sentinel import write_if_needed
+from lftpweb.core.remote import HostConfig
 from lftpweb.db import migrate
-from lftpweb.models import RetentionPreviewRequest, RetentionSettingsIn
+from lftpweb.models import DeleteItemRequest, RetentionPreviewRequest, RetentionSettingsIn
 
 
 @pytest.fixture
@@ -76,6 +77,50 @@ class _FakeStopQueue:
         if self.exc is not None:
             raise self.exc
         return self.result
+
+
+class _FakeRemotePool:
+    """Stands in for `core/remote.py.RemoteConnectionPool` -- the identical fake
+    `tests/test_postprocess.py` uses for the automatic ladder, reused here so the manual source
+    scope (`api/jobs.py._delete_source_manual`) is exercised the same way: no live SSH
+    connection, just a record of every delete attempt so "did this actually try to touch the
+    remote" is assertable.
+    """
+
+    def __init__(self, *, fail: bool = False):
+        self.calls: list[tuple[HostConfig, str]] = []
+        self.fail = fail
+
+    async def delete_path(self, host: HostConfig, remote_path: str) -> None:
+        self.calls.append((host, remote_path))
+        if self.fail:
+            raise RuntimeError("simulated remote delete failure")
+
+
+def _host_config() -> HostConfig:
+    return HostConfig(
+        id=1, address="seedbox.invalid", port=22, username="u", auth_method="key", key_path="/k"
+    )
+
+
+class _FakePostprocess:
+    """A minimal stand-in for `core/postprocess.py.PostprocessPipeline`, exposing only the
+    surface `delete_item`'s source scope reads: `remote_pool` (a plain attribute, same as the
+    real pipeline) and `resolve_host()` (the public wrapper this task added around
+    `_host_provider`). `in_flight_item_ids()` is included too since the local scope's own guard
+    reads it whenever a `postprocess` is supplied at all.
+    """
+
+    def __init__(self, *, remote_pool=None, host=None, in_flight=frozenset()):
+        self.remote_pool = remote_pool
+        self._host = host
+        self._in_flight = in_flight
+
+    def in_flight_item_ids(self):
+        return self._in_flight
+
+    async def resolve_host(self):
+        return self._host
 
 
 async def _make_queue(db, local_path) -> int:
@@ -275,6 +320,301 @@ async def test_delete_item_propagates_a_genuine_stop_failure(db, tmp_path):
 
     # Never reached delete_local -- the file must still be there.
     assert target.exists()
+
+
+# --- Manual source scope (2026-08-16, the delete dialog's independent Local/Source checkboxes,
+# prompts/2026-08-16-manual-delete-local-and-remote.md) -- the first manual remote-delete path in
+# the API. Real asyncssh-against-the-fake-seedbox coverage lives in
+# tests/test_manual_source_delete_e2e.py; these are the fast, no-process guard/wiring tests.
+# ------------------------------------------------------------------------------------------------
+
+
+async def test_delete_item_requires_at_least_one_scope(db, tmp_path):
+    queue_id = await _make_queue(db, tmp_path / "local")
+    item_id = await _make_item(db, queue_id, "junk.txt")
+
+    with pytest.raises(HTTPException) as excinfo:
+        await jobs.delete_item(
+            item_id, _FakeRequest(db), body=DeleteItemRequest(local=False, source=False)
+        )
+    assert excinfo.value.status_code == 400
+
+
+async def test_delete_item_source_only_deletes_remote_and_leaves_local_untouched(db, tmp_path):
+    local_root = tmp_path / "local"
+    local_root.mkdir()
+    target = local_root / "junk.txt"
+    target.write_bytes(b"still here")
+    write_if_needed(str(local_root))
+
+    queue_id = await _make_queue(db, local_root)
+    item_id = await _make_item(db, queue_id, "junk.txt")
+
+    pool = _FakeRemotePool()
+    postprocess = _FakePostprocess(remote_pool=pool, host=_host_config())
+
+    result = await jobs.delete_item(
+        item_id,
+        _FakeRequest(db, postprocess=postprocess),
+        body=DeleteItemRequest(local=False, source=True),
+    )
+
+    assert result.deleted is True
+    assert result.source_deleted is True
+    assert result.source_reason == "deleted"
+    # Local scope was never requested -- the file must still be there.
+    assert target.exists()
+    assert pool.calls == [(_host_config(), "/remote/junk.txt")]
+
+    cursor = await db.execute("SELECT * FROM item WHERE id = ?", (item_id,))
+    row = await cursor.fetchone()
+    assert row["remote_deleted_at"] is not None
+    assert row["auto_queue_suppressed"] == 1
+    assert row["suppressed_reason"] == "deleted_source"
+
+    cursor = await db.execute("SELECT kind, message FROM event WHERE item_id = ?", (item_id,))
+    events = await cursor.fetchall()
+    assert [e["kind"] for e in events] == ["remote_delete"]
+    assert "manual" in events[0]["message"]
+    assert "deleted by user request" in events[0]["message"]
+
+
+async def test_delete_item_source_only_refuses_409_when_job_active(db, tmp_path):
+    local_root = tmp_path / "local"
+    local_root.mkdir()
+    write_if_needed(str(local_root))
+
+    queue_id = await _make_queue(db, local_root)
+    item_id = await _make_item(db, queue_id, "junk.txt")
+    await db.execute(
+        "INSERT INTO job (item_id, kind, state, lane, rank) VALUES (?, 'pget', 'running', 'main', 0)",
+        (item_id,),
+    )
+    await db.commit()
+
+    pool = _FakeRemotePool()
+    postprocess = _FakePostprocess(remote_pool=pool, host=_host_config())
+
+    with pytest.raises(HTTPException) as excinfo:
+        await jobs.delete_item(
+            item_id,
+            _FakeRequest(db, postprocess=postprocess),
+            body=DeleteItemRequest(local=False, source=True),
+        )
+    assert excinfo.value.status_code == 409
+    assert "active transfer" in excinfo.value.detail
+    # Refused before ever touching the remote -- unlike local, a source-only request never
+    # stops the job itself.
+    assert pool.calls == []
+
+    cursor = await db.execute("SELECT kind FROM event WHERE item_id = ?", (item_id,))
+    events = await cursor.fetchall()
+    assert [e["kind"] for e in events] == ["remote_delete_withheld"]
+
+
+async def test_delete_item_source_only_idempotent_when_already_gone(db, tmp_path):
+    local_root = tmp_path / "local"
+    local_root.mkdir()
+    write_if_needed(str(local_root))
+
+    queue_id = await _make_queue(db, local_root)
+    item_id = await _make_item(db, queue_id, "junk.txt")
+    await db.execute(
+        "UPDATE item SET remote_deleted_at = '2026-08-16T00:00:00.000000Z' WHERE id = ?",
+        (item_id,),
+    )
+    await db.commit()
+
+    pool = _FakeRemotePool()
+    postprocess = _FakePostprocess(remote_pool=pool, host=_host_config())
+
+    result = await jobs.delete_item(
+        item_id,
+        _FakeRequest(db, postprocess=postprocess),
+        body=DeleteItemRequest(local=False, source=True),
+    )
+    assert result.source_deleted is True
+    assert "idempotent" in result.source_reason
+    # No SSH round trip for an already-gone remote copy.
+    assert pool.calls == []
+
+
+async def test_delete_item_source_only_clears_a_stale_remote_delete_pending(db, tmp_path):
+    """ "Deleting source for an item mid-ladder simply completes the ladder early" (the task's
+    own instruction) -- a manual source delete on an item the automatic pipeline had deferred
+    (`item.remote_delete_pending` set, awaiting *arr import) clears that marker too, so a later
+    History read never shows a wait that no longer means anything.
+    """
+    local_root = tmp_path / "local"
+    local_root.mkdir()
+    write_if_needed(str(local_root))
+
+    queue_id = await _make_queue(db, local_root)
+    item_id = await _make_item(db, queue_id, "junk.txt")
+    await db.execute("UPDATE item SET remote_delete_pending = 'VERIFIED' WHERE id = ?", (item_id,))
+    await db.commit()
+
+    pool = _FakeRemotePool()
+    postprocess = _FakePostprocess(remote_pool=pool, host=_host_config())
+
+    result = await jobs.delete_item(
+        item_id,
+        _FakeRequest(db, postprocess=postprocess),
+        body=DeleteItemRequest(local=False, source=True),
+    )
+    assert result.source_deleted is True
+
+    cursor = await db.execute("SELECT remote_delete_pending FROM item WHERE id = ?", (item_id,))
+    row = await cursor.fetchone()
+    assert row["remote_delete_pending"] is None
+
+
+async def test_delete_item_source_withholds_409_when_no_host_configured(db, tmp_path):
+    local_root = tmp_path / "local"
+    local_root.mkdir()
+    write_if_needed(str(local_root))
+
+    queue_id = await _make_queue(db, local_root)
+    item_id = await _make_item(db, queue_id, "junk.txt")
+
+    postprocess = _FakePostprocess(remote_pool=_FakeRemotePool(), host=None)
+
+    with pytest.raises(HTTPException) as excinfo:
+        await jobs.delete_item(
+            item_id,
+            _FakeRequest(db, postprocess=postprocess),
+            body=DeleteItemRequest(local=False, source=True),
+        )
+    assert excinfo.value.status_code == 409
+    assert "no host configured" in excinfo.value.detail
+
+
+async def test_delete_item_combined_deletes_both_and_keeps_deleted_local_suppression(db, tmp_path):
+    """A combined request (the delete dialog's `move`-queue default) must not have the source
+    step's own suppression write stomp `delete_local`'s `suppressed_reason = 'deleted_local'`
+    back to `'deleted_source'` -- 'deleted_local' is the more complete fact about a row whose
+    local copy is also gone.
+    """
+    local_root = tmp_path / "local"
+    local_root.mkdir()
+    target = local_root / "junk.txt"
+    target.write_bytes(b"only copy")
+    write_if_needed(str(local_root))
+
+    queue_id = await _make_queue(db, local_root)
+    item_id = await _make_item(db, queue_id, "junk.txt")
+
+    pool = _FakeRemotePool()
+    postprocess = _FakePostprocess(remote_pool=pool, host=_host_config())
+
+    result = await jobs.delete_item(
+        item_id,
+        _FakeRequest(db, postprocess=postprocess),
+        body=DeleteItemRequest(local=True, source=True),
+    )
+    assert result.deleted is True
+    assert result.source_deleted is True
+    assert not target.exists()
+    assert pool.calls == [(_host_config(), "/remote/junk.txt")]
+
+    cursor = await db.execute("SELECT * FROM item WHERE id = ?", (item_id,))
+    row = await cursor.fetchone()
+    assert row["remote_deleted_at"] is not None
+    assert row["auto_queue_suppressed"] == 1
+    assert row["suppressed_reason"] == "deleted_local"
+
+
+async def test_delete_item_combined_local_failure_never_attempts_source(db, tmp_path):
+    """Local runs first: if it is withheld, source must never be attempted at all -- the
+    pre-existing single-scope 409 behavior, unchanged, and the combined request's own "local
+    failure blocks the whole thing" rule from the endpoint's docstring.
+    """
+    local_root = tmp_path / "local"
+    local_root.mkdir()
+    (local_root / "junk.txt").write_bytes(b"x")
+    # No write_if_needed(): mount sentinel missing, so delete_local withholds.
+
+    queue_id = await _make_queue(db, local_root)
+    item_id = await _make_item(db, queue_id, "junk.txt")
+
+    pool = _FakeRemotePool()
+    postprocess = _FakePostprocess(remote_pool=pool, host=_host_config())
+
+    with pytest.raises(HTTPException) as excinfo:
+        await jobs.delete_item(
+            item_id,
+            _FakeRequest(db, postprocess=postprocess),
+            body=DeleteItemRequest(local=True, source=True),
+        )
+    assert excinfo.value.status_code == 409
+    assert pool.calls == []
+
+
+async def test_delete_item_combined_source_failure_after_local_success_is_200_not_409(db, tmp_path):
+    """A partial failure -- local already succeeded, source then fails -- must not raise: the
+    local side effect already happened and cannot be undone, so a 409 would misrepresent a
+    request that partially succeeded. The response instead reports the two scopes honestly.
+    """
+    local_root = tmp_path / "local"
+    local_root.mkdir()
+    target = local_root / "junk.txt"
+    target.write_bytes(b"only copy")
+    write_if_needed(str(local_root))
+
+    queue_id = await _make_queue(db, local_root)
+    item_id = await _make_item(db, queue_id, "junk.txt")
+
+    pool = _FakeRemotePool(fail=True)
+    postprocess = _FakePostprocess(remote_pool=pool, host=_host_config())
+
+    result = await jobs.delete_item(
+        item_id,
+        _FakeRequest(db, postprocess=postprocess),
+        body=DeleteItemRequest(local=True, source=True),
+    )
+    assert result.deleted is True
+    assert not target.exists()
+    assert result.source_deleted is False
+    assert result.source_reason is not None
+
+    cursor = await db.execute("SELECT kind FROM event WHERE item_id = ? ORDER BY id", (item_id,))
+    kinds = [e["kind"] for e in await cursor.fetchall()]
+    assert "remote_delete_failed" in kinds
+
+    # Combined-but-source-failed must not fall back to source-only suppression -- local's own
+    # 'deleted_local' write is what's there.
+    cursor = await db.execute("SELECT suppressed_reason FROM item WHERE id = ?", (item_id,))
+    row = await cursor.fetchone()
+    assert row["suppressed_reason"] == "deleted_local"
+
+
+async def test_delete_item_local_only_default_body_never_touches_remote(db, tmp_path):
+    """An omitted body means exactly the pre-existing behavior -- even with a `postprocess`
+    (and therefore a remote pool) available, a plain `delete_item(item_id, request)` call must
+    never make a remote delete attempt.
+    """
+    local_root = tmp_path / "local"
+    local_root.mkdir()
+    target = local_root / "junk.txt"
+    target.write_bytes(b"only copy")
+    write_if_needed(str(local_root))
+
+    queue_id = await _make_queue(db, local_root)
+    item_id = await _make_item(db, queue_id, "junk.txt")
+
+    pool = _FakeRemotePool()
+    postprocess = _FakePostprocess(remote_pool=pool, host=_host_config())
+
+    result = await jobs.delete_item(item_id, _FakeRequest(db, postprocess=postprocess))
+    assert result.deleted is True
+    assert result.source_deleted is None
+    assert result.source_reason is None
+    assert not target.exists()
+    assert pool.calls == []
+
+    cursor = await db.execute("SELECT remote_deleted_at FROM item WHERE id = ?", (item_id,))
+    row = await cursor.fetchone()
+    assert row["remote_deleted_at"] is None
 
 
 # --- Settings -> retention ---------------------------------------------------------------

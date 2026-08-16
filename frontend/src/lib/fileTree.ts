@@ -6,13 +6,14 @@
 // component keeps every JSX/stateful piece and imports these back by name.
 
 import type { CSSProperties } from 'react'
-import type { FileNode } from '../api/types'
+import type { FileNode, SyncMode } from '../api/types'
 import type { ChildSpeedSample } from '../hooks/useLiveModel'
 import {
   childEtaS,
   childSpeedLabel,
   childSpeedSortValue,
   formatEta,
+  formatRelativeTimeIntl,
   percentValue,
   transferEtaLabel,
   transferSpeedLabel,
@@ -22,14 +23,15 @@ import {
 /** How long a `child_progress` sample (2026-08-14, "per-file speed inside a mirror") is
  * trusted before `buildTree` treats it as stale and resolves `child_speed_bps` to `null` --
  * the frontend half of the freshness-gating decision (see `lib/format.ts`'s module comment
- * above `childSpeedLabel`, and docs/decisions.md). The backend throttles a live child's own
- * publish cadence to roughly `CHILD_PROGRESS_THROTTLE_TICKS * tick_s` while it keeps changing
- * (~3s at the default `tick_s`, `core/queue.py`) but that constant isn't on the wire and
- * `tick_s` is configurable, so this is a generous, independent multiple of the *default* rather
- * than a value derived from a setting the frontend can't see -- loose enough to absorb normal
- * jitter (a slow tick, WS latency) without a value flickering off between two genuinely live
- * samples, tight enough that a child that actually stopped changing reads as "not transferring"
- * again within a few seconds, not indefinitely.
+ * above `childSpeedLabel`, and docs/decisions.md). The backend samples a live child's own
+ * publish cadence at `PROGRESS_SAMPLE_TICKS * tick_s` (~5s at the default `tick_s`,
+ * `core/queue.py` -- unified with job-level sampling 2026-08-16, was `3 *
+ * CHILD_PROGRESS_THROTTLE_TICKS` ~3s) but that constant isn't on the wire and `tick_s` is
+ * configurable, so this is a generous, independent multiple of the *default* rather than a
+ * value derived from a setting the frontend can't see -- loose enough to absorb normal jitter
+ * (a slow tick, WS latency) without a value flickering off between two genuinely live samples,
+ * tight enough that a child that actually stopped changing reads as "not transferring" again
+ * within a few seconds, not indefinitely.
  */
 export const CHILD_SPEED_FRESHNESS_MS = 10_000
 
@@ -272,7 +274,64 @@ export function rowAction(node: FileNode): 'queue' | 'stop' | 'redownload' | nul
   return 'queue'
 }
 
-export type FacetFilter = '' | 'has_remote' | 'has_local' | 'extracted' | 'not_extracted' | 'missing_locally'
+// --- The delete dialog's Local/Source scopes (2026-08-16, the independent checkboxes,
+// prompts/2026-08-16-manual-delete-local-and-remote.md, settled design) -- pure functions so
+// the defaults/validation/visibility rules are testable without rendering `FileTree.tsx`'s own
+// dialog JSX, the same reasoning every other pure helper in this module already follows.
+
+/** The delete dialog's Source checkbox default: a `move` queue checks it -- the queue is
+ * already configured to have lftpweb delete the remote copy itself, so completing that by hand
+ * for a stuck/deferred item is the expected action. A `copy` (or the unbuilt `sync`) queue
+ * leaves it unchecked -- DESIGN.md §7.1's own warning is that a `copy` queue's remote path may
+ * point at live torrent data rather than a hardlink pickup directory, so deleting source there
+ * can destroy a seed, and nothing in this codebase assumes that's safe without the user opting
+ * in explicitly. `hasRemote` gates both ways -- moot when `false`, since
+ * `shouldOfferSourceScope` below means the checkbox never even renders in that case.
+ */
+export function defaultSourceChecked(syncMode: SyncMode, hasRemote: boolean): boolean {
+  return hasRemote && syncMode === 'move'
+}
+
+/** Whether the delete dialog's Source checkbox should render at all -- only when at least one
+ * pending entry actually has a remote copy (`hasRemoteCopy`) for a remote scope to act on;
+ * local-only junk has nothing there to delete.
+ */
+export function shouldOfferSourceScope(entries: FileNode[]): boolean {
+  return entries.some(hasRemoteCopy)
+}
+
+/** The delete dialog's own validation rule (settled design): at least one scope must be
+ * checked to proceed. Local-only keeps the pre-existing behavior; source-only is now possible;
+ * neither checked is never a valid delete request.
+ */
+export function canConfirmDelete(local: boolean, source: boolean): boolean {
+  return local || source
+}
+
+/** Whether the delete dialog shows DESIGN.md §7.1's misconfiguration warning -- a `copy`
+ * queue's remote path is not required to be a hardlink pickup directory the way a `move`
+ * queue's is, so checking Source there can destroy a live torrent's seeding data. Shown only
+ * when Source is actually checked; an unchecked, hidden, or not-applicable checkbox has
+ * nothing to warn about.
+ */
+export function showsCopyQueueSourceWarning(syncMode: SyncMode, sourceChecked: boolean): boolean {
+  return sourceChecked && syncMode !== 'move'
+}
+
+export type FacetFilter =
+  | ''
+  | 'has_remote'
+  | 'has_local'
+  | 'extracted'
+  | 'not_extracted'
+  | 'missing_locally'
+  // Sonarr/Radarr integration (migration 018, docs/arr-integration-spec.md "UI"): "*arr-tracked"
+  // is every row with a non-null `arr_status` (detected/notified/imported/cleaned/gone) --
+  // "being watched through the pipeline" in the spec's own words. `arr_gone` is called out on
+  // its own, per the spec's explicit instruction, because it's the one state that usually needs
+  // a human -- a release that left the *arr's queue without ever importing.
+  | 'arr_tracked'
+  | 'arr_gone'
 
 /** One predicate per facet-filter option, each keyed off `core/itemview.py`'s own `level`/`reason`
  * codes rather than re-deriving presence from raw bytes here. */
@@ -290,7 +349,108 @@ export function matchesFacetFilter(entry: TreeEntry, filter: FacetFilter): boole
       return entry.facets.extracted.reason !== 'extracted'
     case 'missing_locally':
       return entry.downloaded_at != null && entry.facets.local.reason === 'missing'
+    case 'arr_tracked':
+      return entry.arr_status != null
+    case 'arr_gone':
+      return entry.arr_status === 'gone'
   }
+}
+
+// --- Sonarr/Radarr integration icon (docs/arr-integration-spec.md "UI") -------------------
+//
+// `item.arr_status` (migration 018) rides the wire on `FileNode.arr_status`/`arr_status_at` --
+// a facet, never a lifecycle state (`core/itemview.py`'s own docstring). The instance's own
+// *name* deliberately does **not** ride the item projection (`core/itemview.py.ITEM_VIEW_COLUMNS`
+// carries only `arr_status`/`arr_status_at` -- see that module's comment on why
+// `arr_download_id` stops at the server); a caller that wants to name the instance in a hover
+// resolves it itself from the item's *queue* binding (`path_queue.arr_instance_id` ->
+// `GET /api/settings/arr`), which is exactly what `FilesPage.tsx` does before threading an
+// `arrInstanceName` prop down to `FileTree`/`Row`. Never invented as a new wire field here.
+
+export type ArrIconVariant = 'none' | 'neutral' | 'imported' | 'gone'
+
+const ARR_ICON_VARIANTS: Record<string, ArrIconVariant> = {
+  detected: 'neutral',
+  notified: 'neutral',
+  // `cleaned` renders the same green-check variant as `imported`. With "Delete when
+  // imported" on, `imported` is a seconds-long transient (cleanup runs on the very next
+  // poller beat), so the green check would flash and vanish before anyone saw it -- the
+  // success indicator never actually gets seen. `cleaned` keeps the same green ✓ alongside
+  // the removal-grace countdown chip ("Processed · Xm", see
+  // `lib/format.ts.removalGraceShortLabel`); the hover text (`ARR_STATUS_TEXT` below) still
+  // distinguishes "imported" from "imported and cleaned up" so the two states stay tellable
+  // apart.
+  cleaned: 'imported',
+  imported: 'imported',
+  gone: 'gone',
+}
+
+/** Maps `item.arr_status` to the *arr indicator's visual variant, per the spec's own
+ * icon-state table (docs/arr-integration-spec.md "UI"): `imported` (green ✓/check) and `gone`
+ * (amber ⚠ on `ArrIcon`, red dot on `ArrRowChip`) must read as distinct, colored states -- "the
+ * *arr processed it" and "the *arr merely dropped it" are not the same fact and must never
+ * collapse to one dimmed glyph (the spec's own "multi-faceted" requirement). `'none'` means
+ * render nothing at all -- an item on a queue with no bound *arr instance, or one the poller has
+ * never matched, carries `arr_status: null` and gets no icon/chip, per the "everything OFF by
+ * default" rule. One mapping, consumed by both `LifecycleIcons.tsx.ArrIcon` (the job-detail-
+ * drawer mark) and `.ArrRowChip` (the Files/Transfers/History row-line chip) -- see each
+ * component's own docstring for why they colour `gone` differently.
+ */
+export function arrIconVariant(arrStatus: string | null): ArrIconVariant {
+  if (arrStatus == null) return 'none'
+  return ARR_ICON_VARIANTS[arrStatus] ?? 'neutral'
+}
+
+// --- Sonarr/Radarr row chip (Files + Transfers + History, 2026-08-16,
+// prompts/2026-08-16-arr-chip-on-row-lines.md, prompts/2026-08-16-files-brand-logo-icons.md) --
+// the row line's brand-logo chip with a status overlay, distinct from the job-detail-drawer
+// `ArrIcon` above (generic mark, amber ⚠ for `gone`) -- introduced for Transfers/History first,
+// then adopted by the Files tree the same day ("one visual language everywhere"). This chip
+// renders the *real* Sonarr/Radarr logo in its own brand colour and overlays a small green check
+// or red dot -- "green when the *arr processed it, red when it failed out" (the task's own
+// wording), which is why `gone` reads red on every row line rather than `ArrIcon`'s amber. Both
+// consume the same `arrIconVariant` categorization above -- "one mapping, consumed everywhere"
+// -- rather than re-deriving it from `arrStatus` a second time.
+
+export type ArrChipOverlay = 'check' | 'warn' | null
+
+/** `imported`/`cleaned` (variant `'imported'`) -> green check ("processed"); `gone` -> red warn
+ * dot ("left the *arr's queue without importing"); `detected`/`notified` (variant `'neutral'`)
+ * -> the logo alone, no overlay -- the *arr is watching, mid-flight, no outcome yet to show.
+ * `variant === 'none'` (arr_status null) is the caller's own cue to render no chip at all; this
+ * function is never even called for that case by `ArrRowChip` below, but returns `null` for it
+ * too, defensively.
+ */
+export function arrChipOverlay(variant: ArrIconVariant): ArrChipOverlay {
+  if (variant === 'imported') return 'check'
+  if (variant === 'gone') return 'warn'
+  return null
+}
+
+const ARR_STATUS_TEXT: Record<string, string> = {
+  detected: 'detected in the *arr queue',
+  notified: 'import requested from the *arr',
+  imported: 'imported by the *arr',
+  gone: "left the *arr's queue without importing",
+  cleaned: 'imported and cleaned up locally',
+}
+
+/** The icon's hover text (spec: "Hover card names the instance and the timestamp
+ * (`arr_status_at`)"). `instanceName` is resolved by the caller (see the module comment above)
+ * -- `null` here means "resolve it anyway, just without a name" rather than showing nothing, so
+ * a queue config that hasn't loaded yet still explains itself. Returns `null` only when there is
+ * genuinely nothing to say (`arr_status` itself is `null`), so callers can skip rendering a
+ * title/tooltip entirely rather than showing an empty one.
+ */
+export function arrHoverLabel(
+  node: { arr_status: string | null; arr_status_at: string | null },
+  instanceName: string | null,
+): string | null {
+  if (node.arr_status == null) return null
+  const statusText = ARR_STATUS_TEXT[node.arr_status] ?? node.arr_status
+  const who = instanceName ?? 'the bound *arr instance'
+  const when = node.arr_status_at != null ? ` (${formatRelativeTimeIntl(node.arr_status_at)})` : ''
+  return `${who}: ${statusText}${when}`
 }
 
 // --- Column widths: one shared definition drives both the header row and `Row`. ----------------
@@ -319,6 +479,14 @@ export const RESIZABLE_COLUMNS: ColumnDef[] = [
     align: 'right',
     sortKey: 'percent',
     title: 'Sort by % complete',
+  },
+  {
+    id: 'arr',
+    label: '*arr',
+    defaultWidth: 44,
+    minWidth: 36,
+    align: 'right',
+    title: 'Sonarr/Radarr integration status, if this queue is bound to an instance',
   },
   { id: 'lifecycle', label: 'R L V E', defaultWidth: 80, minWidth: 68, align: 'right' },
   { id: 'changed', label: 'Changed', defaultWidth: 128, minWidth: 72, align: 'right', sortKey: 'state_changed_at' },

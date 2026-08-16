@@ -3,8 +3,9 @@ document on 2026-08-12; `docs/decisions.md` carries the reasoning and the reject
 alternatives). Feeds the Dashboard page's two charts (`api/metrics.py`) from the *same* byte
 accounting `core/progress.py`/`core/queue.py` already derive from the filesystem (§1.3/§4.4) --
 nothing here parses lftp's stdout, and nothing here re-measures anything; it only persists a
-delta of numbers `TransferQueue.tick()`'s existing ~1 Hz progress sample already computed for
-the live WebSocket feed.
+delta of numbers `TransferQueue.tick()`'s existing progress sample already computed for the
+live WebSocket feed (as of 2026-08-16, sampled every `PROGRESS_SAMPLE_TICKS`-th tick, ~5s, not
+every tick -- see that constant's comment in `core/queue.py`).
 
 **Two tables, one deliberately kept separate from the other** (docs/decisions.md has the full
 idle-vs-down reasoning; migrations/005_throughput_metrics.sql has the schema):

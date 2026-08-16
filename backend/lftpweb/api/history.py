@@ -19,6 +19,30 @@ already-filtered/paginated page -- see docs/decisions.md. Both endpoints return 
 `queue_name` (jobs always; events when the underlying item still exists) precisely so the
 frontend can group without a second request.
 
+**But per-queue *aggregates* are not a display concern** (2026-08-16,
+prompts/2026-08-16-history-jobs-group-collapse.md) -- the distinction the task itself draws.
+`list_history_jobs`'s `jobs` list is one `LIMIT`/`OFFSET` page; a queue's *true* counts/total
+size can span many pages. Summing only what happens to be loaded would show an honest-looking
+but wrong number the instant a queue has more matching jobs than are on the page (or the page
+hasn't loaded yet). `HistoryJobsResponse.queue_summaries` is a second, cheap `GROUP BY` query
+
+**`arr_status`/`arr_instance_name`/`arr_instance_kind` on every job row** (2026-08-16,
+prompts/2026-08-16-arr-chip-on-row-lines.md) -- the same `item.arr_status`/`item.arr_status_at`
+plus `path_queue.arr_instance_id -> arr_instance.name`/`arr_instance.kind` join `core/queue.py.
+list_jobs()` already carries for the Transfers row's *arr chip, added here so the History job
+row can draw the identical chip. **Not** the phase-6 unbounded-list trap this module's own
+docstring warns about above -- that trap is about shipping a *blob* (`output_tail`) on every row
+of an unbounded list; these are two short scalar strings plus a status code, no bigger than
+`queue_name` already sitting on every row.
+(`_queue_summaries` below) run against the exact same `_jobs_where_clause` output as the `jobs`
+list beside it -- same filter, so the two can never disagree -- one row per queue (bounded by
+queue count, not job count), never a per-row blob (the phase-6 trap this module's own history
+already names above). Inlined onto the existing response rather than a second `GET
+/api/history/jobs/summary` endpoint: the frontend's `HistoryJobsSection` already refetches this
+list on every filter change (queue/state/error class/date range, or Refresh), so a summary
+endpoint would just be a second round trip computed from the identical filter on every one of
+those triggers, for a payload that's a handful of rows regardless.
+
 **`DELETE /api/history/jobs[/{id}]`, `DELETE /api/history/events[/{id}]`** (2026-08-13,
 prompts/2026-08-13-clear-history.md) -- clearing History. This is a *different* action from
 `api/jobs.py`'s `dismiss_job` (2026-08-13, prompts/done/2026-08-13-dismiss-terminal-jobs.md):
@@ -64,6 +88,7 @@ from lftpweb.models import (
     HistoryJobOut,
     HistoryJobOutputOut,
     HistoryJobsResponse,
+    HistoryQueueSummaryOut,
 )
 
 router = APIRouter(prefix="/api/history")
@@ -175,7 +200,63 @@ def _job_out(row: Any) -> HistoryJobOut:
         error_class=row["error_class"],
         has_output_tail=row["output_tail"] is not None,
         dismissed_at=row["dismissed_at"],
+        arr_status=row["arr_status"],
+        arr_status_at=row["arr_status_at"],
+        arr_instance_name=row["arr_instance_name"],
+        arr_instance_kind=row["arr_instance_kind"],
     )
+
+
+async def _queue_summaries(
+    db: Any, where_sql: str, params: list[Any]
+) -> list[HistoryQueueSummaryOut]:
+    """The `queue_summaries` half of `list_history_jobs`'s response -- one `GROUP BY queue_id,
+    state` pass over the same filtered set the `jobs` page is drawn from (module docstring).
+    One row per `(queue, state)` combination -- at most 3 per queue, since `where_sql` always
+    carries the terminal-state base clause -- folded here into one row per queue with
+    `succeeded`/`failed`/`cancelled` counts and a summed `bytes_done`. Ordered by queue name to
+    match `groupJobsByQueue`'s own ordering on the frontend (`lib/transferPanel.ts`), though the
+    frontend does not depend on that order -- it groups by `queue_id` regardless.
+    """
+    cursor = await db.execute(
+        "SELECT item.queue_id AS queue_id, path_queue.name AS queue_name, job.state AS state, "
+        "COUNT(*) AS cnt, COALESCE(SUM(job.bytes_done), 0) AS bytes_done "
+        "FROM job "
+        "JOIN item ON item.id = job.item_id "
+        "JOIN path_queue ON path_queue.id = item.queue_id "
+        f"WHERE {where_sql} "
+        "GROUP BY item.queue_id, path_queue.name, job.state "
+        "ORDER BY path_queue.name",
+        params,
+    )
+    rows = await cursor.fetchall()
+
+    by_queue: dict[int, HistoryQueueSummaryOut] = {}
+    order: list[int] = []
+    for row in rows:
+        queue_id = row["queue_id"]
+        summary = by_queue.get(queue_id)
+        if summary is None:
+            summary = HistoryQueueSummaryOut(
+                queue_id=queue_id,
+                queue_name=row["queue_name"],
+                succeeded=0,
+                failed=0,
+                cancelled=0,
+                total_bytes_done=0,
+            )
+            by_queue[queue_id] = summary
+            order.append(queue_id)
+        state = row["state"]
+        if state == "succeeded":
+            summary.succeeded = row["cnt"]
+        elif state == "failed":
+            summary.failed = row["cnt"]
+        elif state == "cancelled":
+            summary.cancelled = row["cnt"]
+        summary.total_bytes_done += row["bytes_done"]
+
+    return [by_queue[qid] for qid in order]
 
 
 @router.get("/jobs", response_model=HistoryJobsResponse)
@@ -234,18 +315,26 @@ async def list_history_jobs(
         # reached `running` (so `job.bytes_total` is still NULL -- a spawn failure, or a row
         # from before this column was populated) falls back to the item's current value.
         "job.started_at, job.finished_at, COALESCE(job.bytes_total, item.remote_size) AS bytes_total, job.bytes_done, "
-        "job.exit_code, job.error_class, job.output_tail, job.dismissed_at "
+        "job.exit_code, job.error_class, job.output_tail, job.dismissed_at, "
+        "item.arr_status, item.arr_status_at, "
+        "arr_instance.name AS arr_instance_name, arr_instance.kind AS arr_instance_kind "
         "FROM job "
         "JOIN item ON item.id = job.item_id "
         "JOIN path_queue ON path_queue.id = item.queue_id "
+        "LEFT JOIN arr_instance ON arr_instance.id = path_queue.arr_instance_id "
         f"WHERE {where_sql} "
         "ORDER BY COALESCE(job.finished_at, job.queued_at) DESC, job.id DESC "
         "LIMIT ? OFFSET ?",
         [*params, limit, offset],
     )
     rows = await cursor.fetchall()
+    queue_summaries = await _queue_summaries(db, where_sql, params)
     return HistoryJobsResponse(
-        jobs=[_job_out(r) for r in rows], total=total, limit=limit, offset=offset
+        jobs=[_job_out(r) for r in rows],
+        total=total,
+        limit=limit,
+        offset=offset,
+        queue_summaries=queue_summaries,
     )
 
 

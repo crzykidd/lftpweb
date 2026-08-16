@@ -2,6 +2,9 @@ import type {
   ApiKeyCreatedOut,
   ApiKeyIn,
   ApiKeyOut,
+  ArrInstanceIn,
+  ArrInstanceOut,
+  ArrTestResponse,
   AuthSessionOut,
   AuthSettingsIn,
   AuthSettingsOut,
@@ -13,6 +16,7 @@ import type {
   BackupSettingsIn,
   BackupSettingsOut,
   DeleteItemResponse,
+  DismissAllResponse,
   DownloadPrefixSettingsIn,
   DownloadPrefixSettingsOut,
   EffectiveLftpSettingsOut,
@@ -27,6 +31,7 @@ import type {
   HostIn,
   HostOut,
   HostTestRequest,
+  ItemEventsResponse,
   JobOut,
   JobsResponse,
   LoginIn,
@@ -177,6 +182,35 @@ export function previewPatterns(
   )
 }
 
+// --- Settings -> Integrations (migration 018, docs/arr-integration-spec.md) -------------
+
+export function listArrInstances(): Promise<ArrInstanceOut[]> {
+  return getJson<ArrInstanceOut[]>('/api/settings/arr')
+}
+
+export function createArrInstance(body: ArrInstanceIn): Promise<ArrInstanceOut> {
+  return sendJson<ArrInstanceOut>('/api/settings/arr', 'POST', body)
+}
+
+/** `api_key` omitted (or `null`/`undefined`) keeps the previously stored key -- the browser
+ * never has the plaintext to send back. See `ArrInstanceIn`'s own docstring.
+ */
+export function updateArrInstance(id: number, body: ArrInstanceIn): Promise<ArrInstanceOut> {
+  return sendJson<ArrInstanceOut>(`/api/settings/arr/${id}`, 'PUT', body)
+}
+
+export function deleteArrInstance(id: number): Promise<void> {
+  return sendJson<void>(`/api/settings/arr/${id}`, 'DELETE')
+}
+
+/** The Settings UI's Test button -- `GET /api/v3/system/status` round trip. Never rejects for
+ * a reachable-but-erroring instance (see `ArrTestResponse`'s own docstring); only a genuine
+ * HTTP/network failure against lftpweb's own API throws here.
+ */
+export function testArrInstance(id: number): Promise<ArrTestResponse> {
+  return sendJson<ArrTestResponse>(`/api/settings/arr/${id}/test`, 'POST')
+}
+
 // --- Settings -> Post-processing (phase 5, DESIGN.md §6) --------------------------------
 
 export function getPostprocessSettings(): Promise<PostprocessSettingsOut> {
@@ -267,6 +301,23 @@ export function dismissJob(jobId: number): Promise<void> {
   return sendJson<void>(`/api/jobs/${jobId}/dismiss`, 'POST')
 }
 
+/** "Dismiss all" at the top of the Transfers page (2026-08-15, user addition to
+ * prompts/2026-08-15-transfers-single-line-rows-with-detail.md) -- one server-side bulk call
+ * (`core/queue.py.dismiss_all_terminal`), not a client-side loop over `dismissJob` for every
+ * dismissable row.
+ */
+export function dismissAllJobs(): Promise<DismissAllResponse> {
+  return sendJson<DismissAllResponse>('/api/jobs/dismiss-all', 'POST')
+}
+
+/** The Transfers panel's on-demand "processing story" (2026-08-15) -- one item's `event` rows,
+ * newest first, server-capped. Fetched only when a row's panel is expanded, never eagerly for
+ * the whole jobs list (`api/jobs.py.item_events`'s own docstring).
+ */
+export function getItemEvents(itemId: number, limit?: number): Promise<ItemEventsResponse> {
+  return getJson<ItemEventsResponse>(`/api/items/${itemId}/events${limit != null ? `?limit=${limit}` : ''}`)
+}
+
 export function startJobNow(jobId: number): Promise<{ applied: boolean }> {
   return sendJson<{ applied: boolean }>(`/api/jobs/${jobId}/start-now`, 'POST')
 }
@@ -282,13 +333,20 @@ export function stopItem(itemId: number): Promise<{ applied: boolean }> {
   return sendJson<{ applied: boolean }>(`/api/items/${itemId}/stop`, 'POST')
 }
 
-/** Delete-by-item (DESIGN.md §9.2's Files-page "Delete local"; prompts/open-issues.md
- * "7 + 8"). A withheld guard responds non-2xx, so `sendJson` throws -- this rejects exactly
- * the way `queueItem`/`stopItem` already do on failure, which is what lets `FileTree.tsx`'s
- * existing `Promise.allSettled` bulk-action reporting cover Delete with no new mechanism.
+/** Delete-by-item (DESIGN.md §9.2's Files-page delete dialog; prompts/open-issues.md "7 + 8").
+ * A request that accomplishes nothing at all responds non-2xx, so `sendJson` throws -- this
+ * rejects exactly the way `queueItem`/`stopItem` already do on failure, which is what lets
+ * `FileTree.tsx`'s existing `Promise.allSettled` bulk-action reporting cover Delete with no new
+ * mechanism (a combined request that partially succeeds resolves instead -- see
+ * `DeleteItemResponse`'s own comment).
+ *
+ * `local`/`source` are both explicit, required parameters (2026-08-16, the dialog's independent
+ * Local/Source checkboxes, prompts/2026-08-16-manual-delete-local-and-remote.md) -- every call
+ * site says what it means rather than relying on the backend's own local-only default for an
+ * omitted body.
  */
-export function deleteItem(itemId: number): Promise<DeleteItemResponse> {
-  return sendJson<DeleteItemResponse>(`/api/items/${itemId}/delete`, 'POST')
+export function deleteItem(itemId: number, local: boolean, source: boolean): Promise<DeleteItemResponse> {
+  return sendJson<DeleteItemResponse>(`/api/items/${itemId}/delete`, 'POST', { local, source })
 }
 
 // --- Reset item tracking (2026-08-13, prompts/2026-08-13-reset-item-tracking.md) -----------
