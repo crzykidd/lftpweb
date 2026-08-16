@@ -14,6 +14,7 @@ header) instead calls the route functions directly against an in-memory database
 from __future__ import annotations
 
 import asyncio
+import tempfile
 from datetime import UTC, datetime, timedelta
 
 import aiosqlite
@@ -39,9 +40,12 @@ def _make_queue(client: TestClient) -> int:
         },
     )
     assert resp.status_code == 200, resp.text
+    # `local_path` must be a real, readable directory (mid-run scope addition to
+    # `prompts/done/2026-08-16-path-browse-dialog.md`); `remote_path` stays a fake literal --
+    # that check is best-effort and this test's host is unreachable.
     resp = client.post(
         "/api/settings/queues",
-        json={"name": "TV", "remote_path": "/remote", "local_path": "/local"},
+        json={"name": "TV", "remote_path": "/remote", "local_path": tempfile.mkdtemp()},
     )
     assert resp.status_code == 201, resp.text
     return resp.json()["id"]

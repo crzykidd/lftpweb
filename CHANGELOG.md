@@ -24,8 +24,37 @@ Skeleton for the next roll:
 ## [Unreleased]
 
 ### Added
+
+- **Browse dialog for Settings → Queues' path fields** (GitHub issue #4). `Remote path`,
+  `Local path`, and `Final destination` each gain a `Browse…` button that opens a directory
+  picker over the relevant filesystem — the container's own local tree, or the seedbox over the
+  already-pooled SSH connection — rather than requiring the path to be typed blind. Two new
+  read-only endpoints, `GET /api/browse/local` and `GET /api/browse/remote`: a path that doesn't
+  exist, isn't a directory, or can't be read walks up to the nearest listable ancestor instead
+  of erroring, so a half-typed field still opens somewhere useful. Directories only; no create-
+  directory affordance. Not offered on `Path as seen by the *arr` (describes the *arr's own
+  host's view, which neither side here can list) or `Key path` (a file, not a directory).
+- **Settings → Queues now validates a queue's paths at save time.** `Local path` and (when set)
+  `Final destination` must be real, readable directories on the container's own filesystem, or
+  the save is rejected with a specific reason — catching a typo immediately instead of it
+  surfacing hours later as a WARNING log line the next time auto-queue's mount gate silently
+  refused to act. `Remote path` gets the same check, best-effort: only a reachable seedbox that
+  clearly reports the directory missing blocks the save — an unconfigured or unreachable host,
+  or one whose credentials need re-entry, never does.
+- **A gated or recovered auto-queue mount gate is now recorded in the audit trail**, not only
+  logged. Once per gating episode (not once per scan pass), and once when it recovers — visible
+  on the History page's Events section, the same place every other remote-delete gate/outcome
+  already shows up.
+
 ### Changed
 ### Fixed
+
+- **`gone`-commit `REMOVED_BOTH` resurrection fix (`4ecf5dc`, 2026-08-16) missed its changelog
+  entry at the time.** The *arr poller's `gone` commit no longer republishes a WebSocket delta
+  for a row that has already reached `REMOVED_BOTH` — it used to resurrect a dead, un-actionable
+  row on every connected client's Files page whenever a hand-deleted item's *arr queue record
+  was later removed. See `docs/decisions.md` (2026-08-16) for the full mechanism.
+
 ### Security
 ### Deprecated
 ### Removed

@@ -9,6 +9,7 @@ import {
   getAutoQueueSettings,
   getAutoQueueStatus,
   getDownloadPrefixSettings,
+  getHost,
   getPostprocessSettings,
   listArrInstances,
   listPatterns,
@@ -21,6 +22,7 @@ import type {
   ArrInstanceOut,
   AutoQueueSettingsOut,
   DownloadPrefixSettingsOut,
+  HostOut,
   PathQueueOut,
   PatternKind,
   PatternOut,
@@ -30,6 +32,8 @@ import type {
   SyncMode,
 } from '../../api/types'
 import { FieldHelp } from '../../components/FieldHelp'
+import { PathBrowseDialog } from '../../components/PathBrowseDialog'
+import { remoteBrowseDisabled } from '../../lib/pathBrowse'
 
 const inputClasses =
   'w-full rounded-md border border-zinc-300 bg-white px-2.5 py-1.5 text-sm text-zinc-900 outline-none focus:border-zinc-500 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100'
@@ -159,6 +163,57 @@ function useArrInstances(): ArrInstanceOut[] {
       .catch(() => setInstances([]))
   }, [])
   return instances
+}
+
+/** Settings -> Connection's own host status (GitHub issue #4, Browse dialog) -- reused here
+ * rather than a new poll, the same data source `CredentialsBanner.tsx`/`ConnectionTab.tsx`
+ * already read (`getHost()`), just fetched once for this page instead of polled: the remote
+ * Browse button's disabled-with-hint state doesn't need to track a mid-session host change any
+ * more precisely than any other field on this page already does. `null` on failure or while
+ * loading -- `lib/pathBrowse.ts.remoteBrowseDisabled` treats that the same as "no host."
+ */
+function useHostForBrowse(): HostOut | null {
+  const [host, setHost] = useState<HostOut | null>(null)
+  useEffect(() => {
+    getHost()
+      .then(setHost)
+      .catch(() => setHost(null))
+  }, [])
+  return host
+}
+
+/** One `Browse…` button beside a path field, opening `PathBrowseDialog` for it. Local-side is
+ * always enabled; remote-side is disabled-with-hint per `remoteBrowseDisabled` when no host is
+ * configured or its credentials need re-entry -- mirrors `arrDeleteCompletedDisabled`'s pure-
+ * predicate pattern above so the rule is unit-testable without a render harness.
+ */
+function BrowseButton({
+  side,
+  host,
+  onClick,
+}: {
+  side: 'local' | 'remote'
+  host: HostOut | null
+  onClick: () => void
+}) {
+  const disabled = side === 'remote' && remoteBrowseDisabled(host)
+  return (
+    <span className="flex flex-col gap-1">
+      <button
+        type="button"
+        disabled={disabled}
+        onClick={onClick}
+        className="w-fit rounded-md border border-zinc-300 px-2 py-1 text-xs font-medium text-zinc-700 hover:bg-zinc-50 disabled:cursor-not-allowed disabled:opacity-50 dark:border-zinc-700 dark:text-zinc-200 dark:hover:bg-zinc-900"
+      >
+        Browse…
+      </button>
+      {disabled && (
+        <span className="text-xs text-amber-600 dark:text-amber-400">
+          Configure a host in Settings → Connection first.
+        </span>
+      )}
+    </span>
+  )
 }
 
 /** One per-queue post-processing toggle, inherit-or-override (2026-08-13,
@@ -463,6 +518,17 @@ export function QueuesTab() {
   const postprocessSite = usePostprocessSiteSettings()
   const downloadPrefixSite = useDownloadPrefixSiteSettings()
   const arrInstances = useArrInstances()
+  const hostForBrowse = useHostForBrowse()
+  // Which field's Browse dialog is open, if any (GitHub issue #4,
+  // prompts/done/2026-08-16-path-browse-dialog.md) -- `remote_path`/`local_path` are always
+  // in scope; `staging_path` too, once it has a value to browse from ("Final destination" is
+  // optional -- see the field itself below). `arr_visible_path` and Settings -> Connection's
+  // `key_path` are deliberately never wired to this: `arr_visible_path` describes the path as
+  // the *arr's own host sees it, which neither this container nor the seedbox can list, and
+  // `key_path` is a file, not a directory.
+  const [browseField, setBrowseField] = useState<
+    'remote_path' | 'local_path' | 'staging_path' | null
+  >(null)
 
   const refresh = () => listQueues().then(setQueues)
 
@@ -659,19 +725,33 @@ export function QueuesTab() {
         </label>
         <label className="flex flex-col gap-1">
           <span className={labelClasses}>Remote path</span>
-          <input
-            className={inputClasses}
-            value={form.remote_path}
-            onChange={(e) => update('remote_path', e.target.value)}
-          />
+          <div className="flex items-start gap-2">
+            <input
+              className={inputClasses}
+              value={form.remote_path}
+              onChange={(e) => update('remote_path', e.target.value)}
+            />
+            <BrowseButton
+              side="remote"
+              host={hostForBrowse}
+              onClick={() => setBrowseField('remote_path')}
+            />
+          </div>
         </label>
         <label className="flex flex-col gap-1">
           <span className={labelClasses}>Local path</span>
-          <input
-            className={inputClasses}
-            value={form.local_path}
-            onChange={(e) => update('local_path', e.target.value)}
-          />
+          <div className="flex items-start gap-2">
+            <input
+              className={inputClasses}
+              value={form.local_path}
+              onChange={(e) => update('local_path', e.target.value)}
+            />
+            <BrowseButton
+              side="local"
+              host={hostForBrowse}
+              onClick={() => setBrowseField('local_path')}
+            />
+          </div>
         </label>
         <label className="flex flex-col gap-1">
           <span className={labelClasses}>
@@ -682,12 +762,30 @@ export function QueuesTab() {
               NVMe download cache onto the array. Leave blank to keep items in Local path.
             </span>
           </span>
-          <input
-            className={inputClasses}
-            value={form.staging_path}
-            onChange={(e) => update('staging_path', e.target.value)}
-          />
+          <div className="flex items-start gap-2">
+            <input
+              className={inputClasses}
+              value={form.staging_path}
+              onChange={(e) => update('staging_path', e.target.value)}
+            />
+            <BrowseButton
+              side="local"
+              host={hostForBrowse}
+              onClick={() => setBrowseField('staging_path')}
+            />
+          </div>
         </label>
+        {browseField && (
+          <PathBrowseDialog
+            side={browseField === 'remote_path' ? 'remote' : 'local'}
+            initialPath={form[browseField]}
+            onSelect={(path) => {
+              update(browseField, path)
+              setBrowseField(null)
+            }}
+            onClose={() => setBrowseField(null)}
+          />
+        )}
         <label className="flex flex-col gap-1">
           <span className={labelClasses}>
             Sync mode
@@ -1032,6 +1130,10 @@ export function QueuesTab() {
               Select an *arr instance above first.
             </p>
           )}
+          {/* No Browse button here (GitHub issue #4, prompts/done/2026-08-16-path-browse-dialog.md)
+           * -- deliberately: this describes the path as the *arr's own host sees it, which
+           * neither this container nor the seedbox can list, so a browser here would be
+           * actively misleading. */}
           <label className="flex flex-col gap-1">
             <span className={labelClasses}>Path as seen by the *arr (optional)</span>
             <input

@@ -10,6 +10,7 @@ import type {
   AuthSettingsOut,
   AutoQueueSettingsIn,
   AutoQueueSettingsOut,
+  BrowseResponse,
   ChangePasswordIn,
   BackupInfoOut,
   BackupListResponse,
@@ -147,6 +148,23 @@ export function deleteQueue(id: number): Promise<void> {
 
 export function getAutoQueueStatus(queueId: number): Promise<QueueAutoQueueStatus> {
   return getJson<QueueAutoQueueStatus>(`/api/settings/queues/${queueId}/autoqueue-status`)
+}
+
+// --- Settings -> Queues path-browse dialog (GitHub issue #4,
+// prompts/done/2026-08-16-path-browse-dialog.md) ------------------------------------------
+
+/** Omit `path` (or pass `''`) to open at the container filesystem root. */
+export function browseLocal(path?: string): Promise<BrowseResponse> {
+  return getJson<BrowseResponse>(`/api/browse/local${path ? `?path=${encodeURIComponent(path)}` : ''}`)
+}
+
+/** Omit `path` (or pass `''`) to open at the SSH user's home directory. Rejects (throws) with
+ * a 409 whose message names why -- no host configured, or credentials need re-entry -- shown
+ * verbatim by `PathBrowseDialog.tsx`, the same "err.message carries the server's own detail"
+ * convention every other settings error in this app already follows.
+ */
+export function browseRemote(path?: string): Promise<BrowseResponse> {
+  return getJson<BrowseResponse>(`/api/browse/remote${path ? `?path=${encodeURIComponent(path)}` : ''}`)
 }
 
 // --- Settings -> Queues -> Patterns (phase 4, DESIGN.md §3.1 `pattern`, §4.7) -----------

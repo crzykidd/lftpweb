@@ -66,7 +66,7 @@ from dataclasses import dataclass
 
 import aiosqlite
 
-from lftpweb.core import mount_sentinel, patterns, settle
+from lftpweb.core import audit, mount_sentinel, patterns, settle
 from lftpweb.core.extract import FAILED_PREFIX, UNPACK_PREFIX
 
 logger = logging.getLogger(__name__)
@@ -171,9 +171,17 @@ async def save_autoqueue_settings(db: aiosqlite.Connection, settings: AutoQueueS
 class QueueAutoConfig:
     """The subset of `core/engine.py.QueueConfig` this module needs, kept separate so it
     doesn't have to import the engine module (mirrors `core/lftp.py.HostCreds`' reasoning).
+
+    `name` (mid-run scope addition to `prompts/done/2026-08-16-path-browse-dialog.md`) exists
+    solely so `on_scan`'s new mount-gate audit events can name the queue in their message --
+    the `event` table has no `queue_id` column (only `item_id`/`job_id`, migration 001), and a
+    gating episode has neither: it's a whole-queue fact, not one item's. `perform_remote_delete`
+    already writes `f"queue {queue_id} ('{queue_name}')..."` into its own message for exactly
+    the same reason; this follows that precedent rather than inventing a second convention.
     """
 
     id: int
+    name: str
     local_path: str
     auto_queue_enabled: bool
     patterns_only: bool
@@ -197,6 +205,9 @@ class AutoQueue:
         queued, for logging/tests.
         """
         if not queue.auto_queue_enabled:
+            # Silent pop, deliberately (mid-run scope addition, docs/decisions.md): turning
+            # auto-queue *off* is not a gate recovery, it's the user choosing not to run it at
+            # all, so there is nothing an "ungated" event would be reporting.
             self.gated.pop(queue.id, None)
             return 0
 
@@ -206,10 +217,31 @@ class AutoQueue:
                 "completed a scan with the mount sentinel present"
             )
             if self.gated.get(queue.id) != reason:
+                # Once per *transition* into gating, not once per scan pass -- the `self.gated`
+                # dict entry is the existing debounce this log line already relied on; the new
+                # audit event reuses it rather than adding a second mechanism (mid-run scope
+                # addition to prompts/done/2026-08-16-path-browse-dialog.md: a mistyped
+                # `local_path` used to be visible only here, a log line nobody was watching).
                 logger.warning("auto-queue disabled for queue %d: %s", queue.id, reason)
+                await audit.record_event(
+                    self.db,
+                    level="warning",
+                    kind="autoqueue_gated",
+                    message=f"queue {queue.id} ('{queue.name}'): auto-queue disabled -- {reason}",
+                )
             self.gated[queue.id] = reason
             return 0
-        self.gated.pop(queue.id, None)
+        if self.gated.pop(queue.id, None) is not None:
+            # A real recovery -- the gate was actually blocking this queue a moment ago, not
+            # just "auto-queue happens to be checked every pass." Gives the gating episode a
+            # visible end in the audit trail, the same "record both the delete and the delete
+            # withheld" shape §7.3/§7.4's remote-delete audit events already follow.
+            await audit.record_event(
+                self.db,
+                level="info",
+                kind="autoqueue_ungated",
+                message=f"queue {queue.id} ('{queue.name}'): auto-queue resumed -- local root is present, readable, and holds the mount sentinel",
+            )
 
         compiled = await patterns.compiled_for_queue(
             self.db, queue.id, patterns_only=queue.patterns_only

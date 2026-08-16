@@ -326,6 +326,24 @@ export interface QueueAutoQueueStatus {
   gated_reason: string | null
 }
 
+// --- Settings -> Queues path-browse dialog (GitHub issue #4,
+// prompts/done/2026-08-16-path-browse-dialog.md) -- api/browse.py. One shared response shape
+// for both the local (container filesystem) and remote (seedbox over SFTP) endpoints.
+
+export interface BrowseEntry {
+  name: string
+}
+
+export interface BrowseResponse {
+  path: string
+  parent: string | null
+  entries: BrowseEntry[]
+  truncated: boolean
+  // Set only when the endpoint had to walk up from what was actually requested -- see
+  // core/browse.py's own docstring. `null` means `path` is exactly what was asked for.
+  fallback_from: string | null
+}
+
 // --- Files (phase 2, DESIGN.md §9.2) ----------------------------------------------------
 
 // Lifecycle facets (2026-08-13, prompts/2026-08-13-lifecycle-icons.md,

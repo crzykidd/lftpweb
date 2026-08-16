@@ -5,6 +5,8 @@ Same `TestClient` + `isolated_config` idiom as `tests/test_settings_api.py::test
 
 from __future__ import annotations
 
+import tempfile
+
 from fastapi.testclient import TestClient
 
 from lftpweb.main import app
@@ -40,7 +42,11 @@ def _create_instance(client: TestClient) -> int:
 
 
 def _queue_body(**overrides) -> dict:
-    body = {"name": "TV", "remote_path": "/data/tv", "local_path": "/downloads/tv"}
+    # A real, readable directory (mid-run scope addition to
+    # `prompts/done/2026-08-16-path-browse-dialog.md`) -- `local_path` is now hard-validated
+    # at save time; `remote_path` stays a fake literal since its own check is best-effort and
+    # this file's host ("example.invalid") is unreachable.
+    body = {"name": "TV", "remote_path": "/data/tv", "local_path": tempfile.mkdtemp()}
     body.update(overrides)
     return body
 

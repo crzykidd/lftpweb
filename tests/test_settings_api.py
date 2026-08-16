@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import tempfile
+
 import asyncssh
 from fastapi.testclient import TestClient
 
@@ -295,11 +297,16 @@ def test_test_connection_to_unreachable_host_reports_error_class(isolated_config
 
 
 def test_queue_crud(isolated_config):
+    # A real, readable directory (mid-run scope addition to
+    # `prompts/done/2026-08-16-path-browse-dialog.md`) -- this test is about queue CRUD, not
+    # path validation, so it uses one valid `local_path` throughout rather than the literal
+    # (nonexistent) "/downloads/tv" this test used before that addition.
+    local_path = tempfile.mkdtemp()
     with TestClient(app) as client:
         # Creating a queue before a host exists is rejected.
         resp = client.post(
             "/api/settings/queues",
-            json={"name": "TV", "remote_path": "/data/tv", "local_path": "/downloads/tv"},
+            json={"name": "TV", "remote_path": "/data/tv", "local_path": local_path},
         )
         assert resp.status_code == 409
 
@@ -316,9 +323,9 @@ def test_queue_crud(isolated_config):
 
         resp = client.post(
             "/api/settings/queues",
-            json={"name": "TV", "remote_path": "/data/tv", "local_path": "/downloads/tv"},
+            json={"name": "TV", "remote_path": "/data/tv", "local_path": local_path},
         )
-        assert resp.status_code == 201
+        assert resp.status_code == 201, resp.text
         queue = resp.json()
         assert queue["name"] == "TV"
         assert queue["sync_mode"] == "copy"
@@ -331,7 +338,7 @@ def test_queue_crud(isolated_config):
             json={
                 "name": "TV Shows",
                 "remote_path": "/data/tv",
-                "local_path": "/downloads/tv",
+                "local_path": local_path,
                 "enabled": False,
             },
         )
@@ -809,10 +816,16 @@ def _make_host_and_queue(client, **queue_overrides):
             "password": "hunter2",
         },
     )
-    body = {"name": "TV", "remote_path": "/data/tv", "local_path": "/downloads/tv"}
+    # `local_path` now has to be a real, readable directory (mid-run scope addition to
+    # `prompts/done/2026-08-16-path-browse-dialog.md`, `api/settings_queues.py._reject_invalid_
+    # local_paths`) -- `tempfile.mkdtemp()` rather than a `tmp_path`-fixture path, since this
+    # helper is called from tests that don't take `tmp_path` themselves. `remote_path` stays a
+    # fake literal: its own save-time check is best-effort and this test's fake host
+    # (`example.invalid`) is unreachable, which the check treats as "cannot verify -- allow."
+    body = {"name": "TV", "remote_path": "/data/tv", "local_path": tempfile.mkdtemp()}
     body.update(queue_overrides)
     resp = client.post("/api/settings/queues", json=body)
-    assert resp.status_code == 201
+    assert resp.status_code == 201, resp.text
     return resp.json()
 
 
@@ -953,8 +966,14 @@ def test_pattern_preview_unknown_queue_is_404(isolated_config):
 
 
 def test_autoqueue_status_reports_mount_not_ok_before_any_scan(isolated_config, tmp_path):
+    # The directory itself must exist for the save to be accepted at all (mid-run scope
+    # addition to `prompts/done/2026-08-16-path-browse-dialog.md`) -- what's still missing,
+    # and what this test is actually about, is the mount *sentinel* a scan would write, which
+    # `local_directory_error` deliberately never demands (its own docstring).
+    never_scanned = tmp_path / "never-scanned"
+    never_scanned.mkdir()
     with TestClient(app) as client:
-        queue = _make_host_and_queue(client, local_path=str(tmp_path / "never-scanned"))
+        queue = _make_host_and_queue(client, local_path=str(never_scanned))
         resp = client.get(f"/api/settings/queues/{queue['id']}/autoqueue-status")
         assert resp.status_code == 200
         assert resp.json()["mount_ok"] is False

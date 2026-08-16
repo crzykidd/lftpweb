@@ -184,7 +184,11 @@ async def test_file_exclude_pattern_drives_autoqueue_to_a_clean_downloaded_relea
         autoqueue = AutoQueue(db, enqueue_item=q.enqueue_item)
         queued = await autoqueue.on_scan(
             QueueAutoConfig(
-                id=queue_id, local_path=str(local_dir), auto_queue_enabled=True, patterns_only=False
+                id=queue_id,
+                name="e2e",
+                local_path=str(local_dir),
+                auto_queue_enabled=True,
+                patterns_only=False,
             )
         )
         assert queued == 1, "auto-queue should have picked up the release via its patterns"

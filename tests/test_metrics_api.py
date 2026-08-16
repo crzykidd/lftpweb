@@ -5,6 +5,7 @@ over the real HTTP app via TestClient -- mirrors tests/test_backup_api.py's shap
 from __future__ import annotations
 
 import asyncio
+import tempfile
 from datetime import UTC, datetime, timedelta
 
 from fastapi.testclient import TestClient
@@ -82,9 +83,12 @@ def test_throughput_reflects_seeded_heartbeat_and_samples(isolated_config, tmp_p
             },
         )
         assert resp.status_code == 200, resp.text
+        # `local_path` must be a real, readable directory (mid-run scope addition to
+        # `prompts/done/2026-08-16-path-browse-dialog.md`); `remote_path` stays a fake literal
+        # -- that check is best-effort and this test's host is unreachable.
         resp = client.post(
             "/api/settings/queues",
-            json={"name": "TV", "remote_path": "/remote", "local_path": "/local"},
+            json={"name": "TV", "remote_path": "/remote", "local_path": tempfile.mkdtemp()},
         )
         assert resp.status_code == 201, resp.text
         queue_id = resp.json()["id"]

@@ -210,6 +210,7 @@ async def _assert_never_requeued_by_autoqueue(db, queue_id: int, local_root) -> 
         queued = await aq.on_scan(
             QueueAutoConfig(
                 id=queue_id,
+                name="delete-during-transfer-e2e",
                 local_path=str(local_root),
                 auto_queue_enabled=True,
                 patterns_only=False,

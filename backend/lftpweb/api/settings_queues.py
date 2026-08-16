@@ -10,8 +10,10 @@ import logging
 from fastapi import APIRouter, HTTPException, Request
 
 from lftpweb.api.settings_host import _get_host_row  # the one shared read: "the" host row
+from lftpweb.core import browse as browse_core
 from lftpweb.core import patterns as patterns_core
 from lftpweb.core.download_prefix import validate_prefix
+from lftpweb.core.engine import load_host_config
 from lftpweb.core.mount_sentinel import check as mount_ok_check
 from lftpweb.models import (
     PathQueueIn,
@@ -154,6 +156,56 @@ def _reject_invalid_download_prefix(body: PathQueueIn) -> None:
         raise HTTPException(status_code=400, detail=error)
 
 
+def _reject_invalid_local_paths(body: PathQueueIn) -> None:
+    """Mid-run scope addition to `prompts/done/2026-08-16-path-browse-dialog.md` -- a mistyped
+    `local_path` used to save silently and surface only as a WARNING log line the next time
+    auto-queue's mount gate refused to act (`core/autoqueue.py.on_scan`), found hours later.
+    `local_path` is always checked; `staging_path` only when set (it's optional -- DESIGN.md
+    §9.2's "Final destination"). Hard, not best-effort: unlike `remote_path` below, the
+    container's own filesystem is always reachable from this process, so there is no
+    "unconfigured/unreachable" case that would justify silently allowing a bad value through
+    (docs/decisions.md).
+    """
+    error = browse_core.local_directory_error(body.local_path)
+    if error is not None:
+        raise HTTPException(status_code=400, detail=f"local_path: {error}")
+    if body.staging_path:
+        error = browse_core.local_directory_error(body.staging_path)
+        if error is not None:
+            raise HTTPException(status_code=400, detail=f"staging_path: {error}")
+
+
+async def _reject_invalid_remote_path(request: Request, remote_path: str) -> None:
+    """`remote_path`'s save-time check, deliberately **best-effort** -- the settled asymmetry
+    (docs/decisions.md, mid-run scope addition): an unconfigured, unreachable, or
+    `credentials_need_reentry` host must never block a Queues save, or a seedbox outage would
+    lock the user out of editing settings entirely. Only a clean "no such directory" answer
+    from the seedbox itself (`core/browse.py.RemotePathNotFoundError`) blocks the save; every
+    other failure (no engine wired, no host, can't decrypt, can't connect, a stat that fails
+    ambiguously) is swallowed and the save proceeds -- "cannot verify" is not "invalid."
+
+    Reuses the browse endpoint's own `core/browse.py.remote_directory_error` over the engine's
+    pooled SFTP connection (`app.state.engine.pool`, the same seam `api/browse.py`/
+    `PostprocessPipeline`/`ArrSyncScheduler` already share) rather than a second SFTP-stat path.
+    """
+    engine = getattr(request.app.state, "engine", None)
+    if engine is None:
+        return
+    host = await load_host_config(request.app.state.db, request.app.state.config_dir)
+    if host is None or host.credentials_need_reentry:
+        return
+    try:
+        conn = await engine.pool.get_connection(host)
+        async with conn.start_sftp_client() as sftp:
+            await browse_core.remote_directory_error(sftp, remote_path)
+    except browse_core.RemotePathNotFoundError as exc:
+        raise HTTPException(status_code=400, detail=f"remote_path: {exc}") from exc
+    except HTTPException:
+        raise
+    except Exception:  # noqa: BLE001 - best-effort: any other failure means "allow the save"
+        return
+
+
 async def _validate_arr_binding(
     db, arr_instance_id: int | None, arr_delete_completed: bool
 ) -> None:
@@ -191,11 +243,13 @@ async def create_queue(body: PathQueueIn, request: Request) -> PathQueueOut:
     _reject_unimplemented_sync_mode(body.sync_mode)
     _reject_invalid_scan_interval(body.scan_interval_s)
     _reject_invalid_download_prefix(body)
+    _reject_invalid_local_paths(body)
     db = request.app.state.db
     await _validate_arr_binding(db, body.arr_instance_id, body.arr_delete_completed)
     host_row = await _get_host_row(db)
     if host_row is None:
         raise HTTPException(status_code=409, detail="configure a host before creating a queue")
+    await _reject_invalid_remote_path(request, body.remote_path)
 
     cursor = await db.execute(
         "INSERT INTO path_queue (host_id, name, remote_path, local_path, staging_path, "
@@ -291,8 +345,10 @@ async def update_queue(queue_id: int, body: PathQueueIn, request: Request) -> Pa
     """
     _reject_unimplemented_sync_mode(body.sync_mode)
     _reject_invalid_scan_interval(body.scan_interval_s)
+    _reject_invalid_local_paths(body)
     db = request.app.state.db
     await _validate_arr_binding(db, body.arr_instance_id, body.arr_delete_completed)
+    await _reject_invalid_remote_path(request, body.remote_path)
 
     cursor = await db.execute(
         "SELECT auto_verify, auto_extract, auto_move, auto_delete_archives, "

@@ -1961,6 +1961,23 @@ or `sync` queue at a live torrent data directory rather than a hardlink pickup d
 destroys seeding torrents, and the warning belongs where the choice is made, not in a manual.
 Switching a queue to `move` or `sync` requires explicit confirmation, and offers dry-run.
 
+**Queues' path fields have a Browse dialog** (2026-08-16, GitHub issue #4,
+`prompts/done/2026-08-16-path-browse-dialog.md`) — `remote_path`, `local_path`, and the staging
+path each gain a `Browse…` button opening a directory picker over the relevant filesystem: the
+container's own local tree (`GET /api/browse/local`), or the seedbox over the already-pooled SSH
+connection (`GET /api/browse/remote`). A path that doesn't exist, isn't a directory, or can't be
+read walks up to the nearest listable ancestor rather than erroring, so a half-typed field still
+opens somewhere useful. Not offered on `arr_visible_path` (describes the path as the *arr's own
+host sees it, which neither side here can list) or Connection's `key_path` (a file, not a
+directory). **The same save now validates `local_path`/staging path as real, readable
+directories** (mid-run scope addition to the same prompt) — hard-blocking, since the container's
+own filesystem is always reachable from this process — and `remote_path` the same way,
+best-effort: an unconfigured, unreachable, or credentials-needing-re-entry host never blocks the
+save, only a live seedbox that clearly reports the directory missing does. A mistyped path used
+to surface only as a log line the next time auto-queue's mount gate silently refused to act; the
+same gating/recovery transition is now also an audit-trail event (`core/autoqueue.py.on_scan`,
+once per episode), visible on History → Events.
+
 ### 9.3 Advanced options exposed
 
 **Host-level** — describes the connection to the seedbox: `net:connection-limit` ·
