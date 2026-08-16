@@ -8,7 +8,7 @@ progress, auto-queue on patterns, and optionally verify, extract, and relocate f
 
 > ## Beta
 >
-> **Version `0.1.1`.** All 9 build phases are built, covered by backend unit and integration
+> **Version `0.2.0`.** All 9 build phases are built, covered by backend unit and integration
 > tests plus a frontend unit suite, and exercised manually through the UI against a real
 > seedbox. This is a **beta** — there is no upgrade path guaranteed between beta releases,
 > and the database schema may still change between them. See
@@ -85,18 +85,28 @@ Every verify outcome, every remote delete, and every delete withheld — with th
   partial window for that shape. See Settings → Transfer
 - Post-processing: verify (sidecar or hash-on-disk, which now also checks total bytes so it
   cannot bless a truncated file), extract (`7zz` for zip/7z/tar/gz/bz2/xz, `unrar` for rar/rar5
-  — see `NOTICE`), and `move` mode's verification-gated remote delete, all with an audited trail
+  — see `NOTICE`), and `move` mode's remote delete — fired only after the *last* enabled check
+  passes (completeness → verify → extract → *arr import when tracked), all with an audited trail
   on the History page. Extraction stages into `_UNPACK_` and merges into place only on full
   success, is gated on cheap filesystem preconditions first (zero-length head volume, a gap in a
   multi-volume rar set), and can optionally delete a release's spent archive volumes once they
   have extracted — off by default
 - **Optional Sonarr/Radarr integration** (`docs/arr-integration-spec.md`, off at every level by
   default): bind a queue to a Sonarr or Radarr instance from Settings → Integrations and lftpweb
-  watches that instance's download queue for a matching release, marks the Files row with an
-  *arr icon, and — only once the *arr has *fully* confirmed import, never on ambiguity —
-  optionally cleans up the local copy. The icon is multi-faceted: a plain mark while being
-  watched, a green check once imported, an amber warning if a release left the *arr's queue
-  without ever importing (filterable on its own, since that one usually needs a look)
+  closes the whole loop — it watches that instance's download queue for a matching release,
+  badges the row with the real Sonarr/Radarr logo while the release moves through download,
+  verify, and extract, tells the *arr "your files are here, import now" once post-processing
+  succeeds, and then waits for the *arr to *fully* confirm the import (its own queue record
+  finished plus import history, held for two consecutive checks — never on an ambiguous signal)
+  before doing any cleanup. On a `move` queue the **seedbox source is deleted only after that
+  confirmed import** — files exist on both sides until the *arr has the release, so any failure
+  is inspectable on both ends — and the optional per-queue "Delete when imported" toggle then
+  removes the local working copy too, leaving the row visible with a "Processed" countdown
+  before it ages out. The logo chip carries the outcome everywhere (Files, Transfers, History):
+  green check once imported, red mark if a release left the *arr's queue without ever importing
+  (filterable on its own, since that one usually needs a look). Stragglers are cleaned up from
+  the app: the delete dialog offers independent **Local** and **Source (seedbox)** scopes, so
+  failed or abandoned releases can be cleared from both sides without ever SSHing in
 - The History page: every completed/failed/cancelled transfer and every audit event
   (including remote deletes and deletes withheld), filterable and grouped by queue
 - Rotating log viewer, on-demand `VACUUM INTO` database backups (scheduled + manual), and a

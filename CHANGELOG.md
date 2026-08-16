@@ -24,6 +24,15 @@ Skeleton for the next roll:
 ## [Unreleased]
 
 ### Added
+### Changed
+### Fixed
+### Security
+### Deprecated
+### Removed
+
+## [0.2.0] — 2026-08-16
+
+### Added
 
 - **Optional Sonarr/Radarr integration** (`docs/arr-integration-spec.md`), off at every level by
   default. Bind a queue to a Sonarr or Radarr instance (new Settings → Integrations tab: instance
@@ -31,9 +40,10 @@ Skeleton for the next roll:
   for a matching release, marks the Files row with an *arr icon once found, and — only after the
   *arr has *fully* confirmed import across two consecutive checks, never on an ambiguous signal —
   can optionally clean up the local copy (a new per-queue "Delete when imported" toggle). The icon
-  is multi-faceted: a plain mark while a release is being watched, a green ✓ once imported, an
-  amber ⚠ if a release left the *arr's queue without ever importing (independently filterable,
-  since that state usually needs a look), and the existing removal-grace countdown chip reads
+  is the real Sonarr/Radarr logo, multi-faceted: the bare logo while a release is being watched,
+  a green ✓ once imported, a red mark if a release left the *arr's queue without ever importing
+  (independently filterable, since that state usually needs a look), and the existing
+  removal-grace countdown chip reads
   "Processed · Xm" instead of "Missing · Xm" for a row this feature cleaned up itself. A new
   "*arr-tracked" filter facet covers every tracked row at once. Built across three phases
   (backend foundation, notify + cleanup, this UI pass); see `DESIGN.md` §16 and
@@ -150,6 +160,11 @@ Skeleton for the next roll:
   tick of the underlying 1-second loop, which itself is unchanged — admission, reaping, and
   Stop/Cancel still act within about a second. The one visible side effect: a freshly started
   job's speed reads 0 for a little longer (up to ~10s, was ~2s) before its first real sample.
+
+- **The SPA fallback route's path guard was recast so CodeQL recognizes the containment barrier**
+  (post-v0.1.1 follow-up to audit item S1). No behavior change — the same requests are admitted
+  and refused as before; the guard is now expressed in the shape the analyzer models, so the
+  fixed alert stays fixed instead of reopening on every scan.
 
 ### Fixed
 
