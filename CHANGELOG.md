@@ -25,7 +25,16 @@ Skeleton for the next roll:
 
 ### Added
 ### Changed
+
 ### Fixed
+
+- **Bulk delete of a mixed Files-page selection no longer errors rows with no local copy.**
+  With both Local and Source checked, each selected row now gets only the scopes that actually
+  apply to it — a remote-only row gets a source-only delete instead of a doomed local delete
+  that used to fail the whole row before its source delete was ever attempted. A row where the
+  checked scopes leave nothing applicable (e.g. only Local checked on a remote-only row) is now
+  reported as skipped rather than as an error.
+
 ### Security
 ### Deprecated
 ### Removed

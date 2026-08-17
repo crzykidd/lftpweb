@@ -6,6 +6,43 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-17 — Bulk delete applies Local/Source per entry, not as blanket flags
+
+`prompts/done/2026-08-17-bulk-delete-per-entry-scopes.md`. Live-reported bug: a Files-page
+bulk delete with both Local and Source checked errored every selected row with no local
+content (`REMOTE_ONLY`, or a stranded `REMOVED_LOCAL` row — exactly what `canDeleteLocal`'s
+same-day widening, `prompts/done/2026-08-17-stranded-source-delete-retry.md`, made
+selectable). The Source scope was already computed per entry in `FileTree.tsx`'s `runAction`
+(`sourceRequestedFor(e)` only requested source when `hasRemoteCopy(e)`), but Local was a
+blanket flag — every row in the bulk call got `local: true` whenever the checkbox was checked.
+`api/jobs.py.delete_item` turns any local withhold into an immediate 409, so source was never
+even attempted for those rows.
+
+**Decision: make Local per-entry, symmetric to Source, entirely on the frontend.** New pure
+helper `effectiveDeleteScope(node, checked)` in `lib/fileTree.ts` reads the same two
+underlying facts every neighboring helper in that module reads (`hasLocalContent`,
+`hasRemoteCopy`) and returns `null` when neither checked scope applies to a given row —
+meaning "send no request for this row at all." `FileTree.tsx`'s `runAction` computes it once
+per entry and reuses it for the request body, the skip decision, and the
+`source_deleted`-false read-back, replacing the old `sourceRequestedFor` closure.
+
+**Skipped rows get their own bucket, not folded into success or failure.** `BulkOutcome` gained
+`skipped: { rel_path, name, reason }[]`, rendered as its own muted line in the outcome summary,
+distinct from the amber failure list. A skipped row stays selected (like a failure) so a retry
+with a different scope is one click away, and the summary never reports a fabricated 409 for a
+request that was never sent. If every row in a bulk selection ends up skipped, the same summary
+renders with `succeeded: 0` rather than suppressing it as a no-op success.
+
+**Rejected alternative: make the backend treat "nothing local to delete" as an idempotent
+success when source is also requested.** Considered and rejected — the 409-on-local-withhold
+contract in `api/jobs.py.delete_item`'s docstring is deliberate for single-row deletes (a
+withheld local delete should be loud, not silently downgraded), and the frontend already holds
+every fact needed to decide per-entry which scopes actually apply, so duplicating that logic
+into the backend's success/failure semantics would be solving a frontend bug in the wrong
+layer. No backend change was needed or made.
+
+---
+
 ## 2026-08-17 — Support bundle polish: per-instance byte budget, split failure markers, extract-password redaction
 
 `prompts/done/2026-08-17-support-bundle-polish.md`. The user generated the first real support

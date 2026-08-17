@@ -352,6 +352,35 @@ export function canConfirmDelete(local: boolean, source: boolean): boolean {
   return local || source
 }
 
+/** What a **single row's** delete request should actually ask for, given the dialog's
+ * checked scopes (2026-08-17, `prompts/2026-08-17-bulk-delete-per-entry-scopes.md`) --
+ * the fix for a live-reported bug: a mixed bulk selection with both Local and Source
+ * checked sent `local: true` to *every* row, including a `REMOTE_ONLY`/stranded
+ * `REMOVED_LOCAL` row with no local bytes at all (exactly what `canDeleteLocal`'s
+ * 2026-08-17 widening made selectable). The backend's `delete_local` withholds "nothing
+ * to delete" for that row, and `api/jobs.py.delete_item`'s own contract turns any local
+ * withhold into an immediate 409 -- source is never even attempted, so a perfectly
+ * deletable source copy fails alongside a request that never should have asked for
+ * local in the first place. `FileTree.tsx`'s `runAction` already got this right for
+ * Source (only requested when `hasRemoteCopy`, previously via a `sourceRequestedFor`
+ * closure this helper now replaces); this makes Local symmetric, reading the same two
+ * underlying facts every neighboring helper here reads (`hasLocalContent`,
+ * `hasRemoteCopy`) rather than a third predicate of its own.
+ *
+ * Returns `null` when neither scope ends up applicable for this row -- "send no request
+ * for this row at all," which `FileTree.tsx.runAction` reports as skipped rather than
+ * either a fake success or a fake failure.
+ */
+export function effectiveDeleteScope(
+  node: FileNode,
+  checked: { local: boolean; source: boolean },
+): { local: boolean; source: boolean } | null {
+  const local = checked.local && hasLocalContent(node)
+  const source = checked.source && hasRemoteCopy(node)
+  if (!local && !source) return null
+  return { local, source }
+}
+
 /** Whether the delete dialog shows DESIGN.md §7.1's misconfiguration warning -- a `copy`
  * queue's remote path is not required to be a hardlink pickup directory the way a `move`
  * queue's is, so checking Source there can destroy a live torrent's seeding data. Shown only
