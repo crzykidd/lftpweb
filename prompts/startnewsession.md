@@ -90,9 +90,11 @@ Four items from live use of the fresh v0.2.2 `:dev` build, each its own handoff 
 | **Dashboard bytes chart gains 24h/7d/30d ranges + a range total** — `_RANGES` gains `7d` (28×6h) and `30d` (30×1d); Chart 1 gets its own selector (`dashboard.bytesRange`, independent of the speed chart's untouched 1h/12h/24h), labels/title scale with bucket width, header shows the range total and the legend per-queue totals (client-side, pure `lib/bytesChart.ts`); a retention note (via the previously call-site-less `GET /api/settings/metrics`) explains empty older buckets when the range exceeds retention — **retention defaults to 7d, so 30d is only fully populated after raising it in Settings**. `BytesPerHourChart.tsx` renamed `BytesChart.tsx` | `4f1a912` |
 | **Chart height cap + single scroll context** — live follow-up from the user's first look at `4f1a912`: the SVG charts (viewBox + `w-full`, no height bound) grew taller as the window widened, and the shell's `min-h-screen` root let the window scrollbar engage alongside `main`'s `overflow-auto`, revealing unstyled white below the page in dark mode. Both charts now cap at `max-h-80` inside a centered `max-w-4xl` block (`charts/chartLayout.ts` — width cap chosen so `preserveAspectRatio="meet"` never actually pillarboxes); the shell root is `h-dvh overflow-hidden` (`dvh` over `h-screen` deliberately — mobile browser chrome; `docs/decisions.md`) making `main` the only scroller, and `index.css` themes `html, body` so overscroll can't flash white. All four react-virtual containers verified to scroll their own ref'd divs, never `window`, before the shell change. **Confirmed working by the user in a real browser (fresh `:dev` pull, 2026-08-17)** — the one item of this batch that's been human-viewed | `1416175` |
 
-Tests after the run: **1281 backend / 468 frontend, 0 skipped.** Every UI-facing piece
-(skipped-bucket banner, popout empty state, queue-list icons, chart ranges/totals) is
-**unviewed** — no browser here, as always. Operational note for the two spawned coding agents
+Tests after the run: **1281 backend / 468 frontend, 0 skipped.** Browser status
+(user-checked on a fresh `:dev` pull, 2026-08-17): **bulk-delete skipped reporting and the
+interrupted-popout empty state both confirmed working**, alongside the chart-cap fix in the
+row below; still unviewed: the Settings → Queues *arr icons and the bytes chart's 7d/30d
+ranges/totals. Operational note for the two spawned coding agents
 that stalled: both backgrounded the ~3-minute pytest run and waited on a notification that
 never reaches a subagent — a `SendMessage` nudge ("run it in the foreground, read the exit
 code, deliver the report") resumed each; tell future agents to run gates in the foreground
