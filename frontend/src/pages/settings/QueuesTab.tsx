@@ -753,6 +753,47 @@ export function QueuesTab() {
             />
           </div>
         </label>
+        {/* Moved here from the *arr section (user request, 2026-08-17) so the namespace pair
+         * reads as one thought: "this is where *we* see the files; this is where the *arr*
+         * sees the same files." The 2026-08-17 production incident is why this field earns
+         * front-row placement: it was unset, every notify pushed a path the *arr couldn't
+         * see, and imports silently fell back to the *arr's own scan schedule.
+         * No Browse button here (GitHub issue #4, prompts/done/2026-08-16-path-browse-dialog.md)
+         * -- deliberately: this describes the path as the *arr's own host sees it, which
+         * neither this container nor the seedbox can list, so a browser here would be
+         * actively misleading. */}
+        <label className="flex flex-col gap-1">
+          <span className={labelClasses}>
+            Path as seen by the *arr (optional)
+            <FieldHelp label="Path as seen by the *arr">
+              <p>
+                Only used when this queue is bound to a Sonarr/Radarr instance (below). lftpweb
+                and the *arr often mount the same storage at <em>different</em> paths — lftpweb
+                might see <code>/downloads/tv</code> where Sonarr sees{' '}
+                <code>/mnt/media/working/tv</code>. When lftpweb tells the *arr "your files are
+                here, import now", it must speak the <em>*arr&apos;s</em> path, not its own.
+              </p>
+              <p>
+                Set this to the directory the *arr would use for this queue&apos;s Local path —
+                the easiest way to find it is the download&apos;s own path shown in the
+                *arr&apos;s Queue/History. Leave blank only when both containers genuinely mount
+                the storage at the identical path.
+              </p>
+              <p>
+                If it&apos;s wrong or missing, the *arr accepts every scan request and silently
+                finds nothing — imports still happen, but only on the *arr&apos;s own schedule,
+                and lftpweb&apos;s source-delete/cleanup steps lag or strand. lftpweb flags the
+                mismatch as a warning in History → Events when it can detect it.
+              </p>
+            </FieldHelp>
+          </span>
+          <input
+            className={`${inputClasses} max-w-64`}
+            value={form.arr_visible_path}
+            onChange={(e) => update('arr_visible_path', e.target.value)}
+            placeholder="same as Local path above -- leave blank"
+          />
+        </label>
         <label className="flex flex-col gap-1">
           <span className={labelClasses}>
             Final destination (optional)
@@ -1130,19 +1171,6 @@ export function QueuesTab() {
               Select an *arr instance above first.
             </p>
           )}
-          {/* No Browse button here (GitHub issue #4, prompts/done/2026-08-16-path-browse-dialog.md)
-           * -- deliberately: this describes the path as the *arr's own host sees it, which
-           * neither this container nor the seedbox can list, so a browser here would be
-           * actively misleading. */}
-          <label className="flex flex-col gap-1">
-            <span className={labelClasses}>Path as seen by the *arr (optional)</span>
-            <input
-              className={`${inputClasses} max-w-64`}
-              value={form.arr_visible_path}
-              onChange={(e) => update('arr_visible_path', e.target.value)}
-              placeholder="same as Local path above -- leave blank"
-            />
-          </label>
         </div>
 
         {error && <p className="text-sm text-red-600 dark:text-red-400">{error}</p>}

@@ -44,6 +44,13 @@ Skeleton for the next roll:
   *accepted*. Both are advisory only — they change no behavior, only visibility, in History.
 
 ### Changed
+
+- **Settings → Queues' "Path as seen by the *arr" field moved to sit directly below Local
+  path** — the two paths describe the same files from two different containers' mount views,
+  and are meant to be read (and set) as a pair. It also gained a help tooltip explaining the
+  namespace split, how to find the right value from the *arr's own Queue/History path, and
+  what silently degrades when it's wrong.
+
 ### Fixed
 
 - **A fully cleaned-up release's spent archive volumes no longer orphan in the Files page
