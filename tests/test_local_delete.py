@@ -1340,6 +1340,7 @@ async def test_retention_deleted_item_is_not_requeued_by_autoqueue(tmp_path):
         queued = await aq.on_scan(
             QueueAutoConfig(
                 id=queue_id,
+                name="q",
                 local_path=str(local_root),
                 auto_queue_enabled=True,
                 patterns_only=False,
@@ -1396,6 +1397,7 @@ async def test_removed_local_after_delete_is_never_requeued_even_with_the_settin
         queued = await aq.on_scan(
             QueueAutoConfig(
                 id=queue_id,
+                name="q",
                 local_path=str(local_root),
                 auto_queue_enabled=True,
                 patterns_only=False,
@@ -2033,6 +2035,7 @@ async def test_remote_reappearing_after_a_self_delete_corrects_to_removed_local(
             queued = await aq.on_scan(
                 QueueAutoConfig(
                     id=queue_id,
+                    name="q",
                     local_path=str(local_root),
                     auto_queue_enabled=True,
                     patterns_only=False,

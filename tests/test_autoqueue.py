@@ -69,9 +69,12 @@ class _Recorder:
         return item_id
 
 
-def _mounted_config(queue_id, local_path, *, enabled=True, patterns_only=False):
+def _mounted_config(queue_id, local_path, *, enabled=True, patterns_only=False, name="q"):
+    # `name="q"` matches `_make_queue`'s own hardcoded queue name -- see `QueueAutoConfig`'s own
+    # docstring for why `on_scan`'s mount-gate audit events need it at all.
     return QueueAutoConfig(
         id=queue_id,
+        name=name,
         local_path=str(local_path),
         auto_queue_enabled=enabled,
         patterns_only=patterns_only,
@@ -115,6 +118,77 @@ async def test_sentinel_present_lets_auto_queue_proceed(db, tmp_path):
     assert queued == 1
     assert recorder.enqueued == [1]
     assert queue_id not in aq.gated
+
+
+# --- Mount-gate audit events (mid-run scope addition,
+# prompts/done/2026-08-16-path-browse-dialog.md) -- a mistyped `local_path` used to be visible
+# only as a WARNING log line; `on_scan` now also writes an `event` row so History shows it.
+
+
+async def _events(db, kind):
+    cursor = await db.execute("SELECT * FROM event WHERE kind = ? ORDER BY id", (kind,))
+    return await cursor.fetchall()
+
+
+async def test_gating_writes_exactly_one_warning_event_across_repeated_gated_passes(db, tmp_path):
+    queue_id = await _make_queue(db, tmp_path)
+    aq = AutoQueue(db, _Recorder())
+
+    for _ in range(3):
+        await aq.on_scan(_mounted_config(queue_id, tmp_path))
+
+    events = await _events(db, "autoqueue_gated")
+    assert len(events) == 1  # the existing `self.gated` dict is the debounce -- not one per pass
+    assert events[0]["level"] == "warning"
+    assert f"queue {queue_id}" in events[0]["message"]
+    assert "q" in events[0]["message"]  # the queue's own name, not just its id
+    assert str(tmp_path) in events[0]["message"]
+
+
+async def test_recovery_writes_an_info_event(db, tmp_path):
+    from lftpweb.core.mount_sentinel import write_if_needed
+
+    queue_id = await _make_queue(db, tmp_path)
+    aq = AutoQueue(db, _Recorder())
+
+    await aq.on_scan(_mounted_config(queue_id, tmp_path))  # gated
+    write_if_needed(str(tmp_path))
+    await aq.on_scan(_mounted_config(queue_id, tmp_path))  # recovers
+
+    gated_events = await _events(db, "autoqueue_gated")
+    ungated_events = await _events(db, "autoqueue_ungated")
+    assert len(gated_events) == 1
+    assert len(ungated_events) == 1
+    assert ungated_events[0]["level"] == "info"
+    assert f"queue {queue_id}" in ungated_events[0]["message"]
+
+
+async def test_disabled_queue_writes_no_gating_events_at_all(db, tmp_path):
+    # tmp_path has no sentinel -- would gate if auto-queue were even on.
+    queue_id = await _make_queue(db, tmp_path)
+    aq = AutoQueue(db, _Recorder())
+
+    await aq.on_scan(_mounted_config(queue_id, tmp_path, enabled=False))
+
+    assert await _events(db, "autoqueue_gated") == []
+    assert await _events(db, "autoqueue_ungated") == []
+
+
+async def test_a_fresh_gating_episode_after_recovery_writes_a_new_warning_event(db, tmp_path):
+    from lftpweb.core.mount_sentinel import SENTINEL_NAME
+
+    queue_id = await _make_queue(db, tmp_path)
+    aq = AutoQueue(db, _Recorder())
+
+    await aq.on_scan(_mounted_config(queue_id, tmp_path))  # gated (episode 1)
+    (tmp_path / SENTINEL_NAME).write_text("x")
+    await aq.on_scan(_mounted_config(queue_id, tmp_path))  # recovers
+    (tmp_path / SENTINEL_NAME).unlink()  # simulate the mount dropping again
+    await aq.on_scan(_mounted_config(queue_id, tmp_path))  # gated again (episode 2)
+    await aq.on_scan(_mounted_config(queue_id, tmp_path))  # still gated -- must not add a 3rd
+
+    events = await _events(db, "autoqueue_gated")
+    assert len(events) == 2  # one per episode, not one per pass within an episode
 
 
 async def test_stopped_item_is_never_resurrected_even_though_its_pattern_matches(db, tmp_path):

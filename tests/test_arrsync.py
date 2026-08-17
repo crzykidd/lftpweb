@@ -927,6 +927,48 @@ async def test_match_publishes_an_item_delta(db, fake_arr_server, tmp_path):
     assert "arr_download_id" not in nodes[item_id]
 
 
+async def test_gone_commit_on_a_removed_both_row_does_not_publish_an_item_delta(
+    db, fake_arr_server, tmp_path
+):
+    """Regression (2026-08-16, live): files deleted by hand carried the row to `REMOVED_BOTH`
+    -- out of the published projection (`core/engine.py._project`) and off the Files page --
+    then removing the *arr queue record made the `gone` commit publish an `item_delta` that
+    resurrected the dead node in every connected client: visible, un-actionable (nothing local
+    to delete, nothing remote to queue), and only cleared by the next connect-time snapshot.
+    The state write and the `arr_gone` audit event must still happen; only the WS publish is
+    skipped.
+    """
+    host_id = await _seed_host(db)
+    instance_id = await _seed_instance(
+        db,
+        str(tmp_path),
+        base_url=fake_arr_server.base_url,
+        api_key=fake_arr_server.state.api_key,
+    )
+    queue_id = await _seed_queue(db, host_id, arr_instance_id=instance_id)
+    item_id = await _seed_item(
+        db,
+        queue_id,
+        "Show.S01E05.1080p-GRP",
+        state="REMOVED_BOTH",
+        arr_status="detected",
+        arr_download_id="abc123",
+    )
+    fake_arr_server.state.queue_records = []
+    fake_arr_server.state.history_events = []  # removed from the *arr queue, never imported
+
+    events = EventBus()
+    subscriber = events.subscribe()
+    scheduler = ArrSyncScheduler(db=db, config_dir=str(tmp_path), events=events)
+    await scheduler.run_once()
+    await scheduler.run_once()  # two-pass quiescence guard
+
+    row = await _item_row(db, item_id)
+    assert row["arr_status"] == "gone"
+    assert await _event_kinds(db, item_id) == ["arr_gone"]
+    assert subscriber.empty()
+
+
 # --- Settings ------------------------------------------------------------------------------
 
 

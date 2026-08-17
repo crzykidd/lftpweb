@@ -19,7 +19,7 @@ from fastapi.staticfiles import StaticFiles
 from lftpweb import __version__
 from lftpweb.api import auth as auth_api
 from lftpweb.api import backup as backup_api
-from lftpweb.api import files, health, history, jobs, logs, stats, ws
+from lftpweb.api import browse, files, health, history, jobs, logs, stats, ws
 from lftpweb.api import metrics as metrics_api
 from lftpweb.api import settings_arr, settings_host, settings_postprocess, settings_queues
 from lftpweb.config import settings
@@ -198,6 +198,7 @@ def create_app() -> FastAPI:
     app.include_router(settings_queues.router)
     app.include_router(settings_postprocess.router)
     app.include_router(settings_arr.router)
+    app.include_router(browse.router)
     app.include_router(files.router)
     app.include_router(jobs.router)
     app.include_router(history.router)

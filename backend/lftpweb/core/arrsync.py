@@ -857,7 +857,17 @@ class ArrSyncScheduler:
             return
         cursor = await self.db.execute("SELECT * FROM item WHERE id = ?", (item_id,))
         row = await cursor.fetchone()
-        if row is not None:
-            self.events.publish(
-                {"type": "item_delta", "queue_id": queue_id, "nodes": [item_view(row)]}
-            )
+        if row is None:
+            return
+        if row["state"] == "REMOVED_BOTH":
+            # A row that has left both trees is out of the published projection
+            # (`core/engine.py._project`'s rel_paths filter) and off the Files page. An
+            # `item_delta` for it would resurrect a dead node in every connected client --
+            # visible, un-actionable (no local copy to delete, no remote copy to queue), and
+            # only cleared by the next connect-time snapshot. Seen live 2026-08-16: files
+            # deleted by hand, then the *arr queue record removed, and the `gone` commit's
+            # publish put both rows back on the page. The state write and audit event above
+            # still happen; only the WS publish is skipped. (`REMOVED_LOCAL` still publishes:
+            # its remote copy keeps it in the projection.)
+            return
+        self.events.publish({"type": "item_delta", "queue_id": queue_id, "nodes": [item_view(row)]})

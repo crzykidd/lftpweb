@@ -77,6 +77,20 @@ than a first. Two things that bit the first time and will bit again:
 
 ## Where we are
 
+### 🚀 v0.2.0 released 2026-08-16 — the Sonarr/Radarr release
+
+PR #6 (`dev` → `main`, merged `013bf7a`), tag `v0.2.0`, release notes = the `[0.2.0]`
+CHANGELOG section verbatim; `:latest`/`:0.2.0`/`:0` images published on the release event.
+The headline is the **optional *arr integration** plus the **move-delete gate ladder**
+(issue #2/G1 closed: source deletes only after the last enabled check — completeness →
+verify → extract → *arr import when tracked) and the **manual Local/Source delete dialog**
+(first manual remote-delete in the API). The whole pipeline was verified live before the
+cut — a 46-file Sonarr season pack and a single-file Radarr remux each ran
+match → notify → two-pass import confirm → source delete → cleanup → grace countdown, in
+order, on the first attempt. The build-run table below (rows A–R) is the full item log.
+Tests at release: **1186 backend / 378 frontend, 0 skipped.** The per-minor changelog
+archive was deliberately NOT performed (user call: leave 0.1.x in `CHANGELOG.md`).
+
 ### *arr integration build run (2026-08-15, unattended) — LIVE PROGRESS LOG
 
 > `docs/arr-integration-spec.md` (approved 2026-08-15) specs a Sonarr/Radarr integration in
@@ -105,6 +119,8 @@ than a first. Two things that bit the first time and will bit again:
 | P — move-delete gate ladder (resolves open issue #2 / audit G1) | User-approved design: a `move` queue's remote delete is now the *last* gate on a four-rung ladder (completeness, verify, extract, and — new — *arr import for a tracked item), not the second step after verify. `core/postprocess.py._maybe_delete_remote` moved to the tail of `_process_item`, gained an `extract_state` parameter, and now defers rather than deletes when the item is already *arr-tracked (`item.arr_status` non-null), recording the handoff in a new `item.remote_delete_pending` column (migration 019 — carries the verify evidence forward). The actual asyncssh delete was factored out into a module-level `perform_remote_delete`, reused by a new `core/arrsync.py.ArrSyncScheduler._maybe_delete_remote_on_import`, which performs the deferred delete the moment `_commit_terminal` confirms `imported` — before that same pass's `arr_delete_completed` cleanup sweep, so "import green → delete source → delete local" holds within one poll. `ArrSyncScheduler` gained `remote_pool`/`host_provider` constructor seams, wired in `main.py` from the same `app.state.engine.pool`/`_host_provider` postprocess already uses. `CORRUPT` still vetoes at every rung, including this new one. DESIGN.md §7/§7.3 updated to describe the ladder and to note `sync` mode's primary use case is now served without building it; `docs/arr-integration-spec.md`'s Cleanup section updated for the new ordering. | ✅ done, `prompts/done/2026-08-16-move-delete-gate-ladder.md` |
 | Q — user feedback, Files unifies onto the brand-logo chip | User feedback: the real Sonarr/Radarr logos (phase O) show on Transfers/History rows, but the Files tree still rendered its own older generic *arr mark (`ArrIcon`) — one visual language everywhere was the point. `FileTree.tsx`'s *arr column now renders `ArrRowChip` (same component as Transfers/History); `FilesPage.tsx` resolves each row's bound instance `kind` the same way it already resolved the instance name (`listArrInstances()` keyed by `path_queue.arr_instance_id`), threaded down through `FileTree`/`Row` as a new `arrInstanceKind` prop. Status colors unify on the chip's own mapping — `gone` now reads **red** on Files too, replacing the old amber ⚠; the "Processed · Xm" countdown chip, filters, and removal-grace machinery are untouched. `ArrIcon`/`ArrMarkIcon` were *not* deleted — `TransfersPage.tsx`'s job-detail-drawer "*arr" section still consumes `ArrIcon` directly, the one place the generic mark and its amber `gone` reading remain. `docs/arr-integration-spec.md`'s "UI" section collapsed into one chip-based table covering all three surfaces. | ✅ done, `prompts/done/2026-08-16-files-brand-logo-icons.md` |
 | R — the move-delete ladder's follow-on, manual delete gains an independent Source scope | User-approved design, resolving §7's forward note that `sync` mode's primary use case is now fully served without building it. The Files-page delete dialog's confirmation gained a second, independent checkbox (Delete source, alongside the pre-existing Delete local copy) — the first manual remote-delete path in the API. Defaults follow `sync_mode`: both checked for `move`, source unchecked for `copy` (with §7.1's misconfiguration warning shown if checked anyway); the checkbox itself only renders when a remote copy exists. Backend: `POST /api/items/{id}/delete` takes an optional `{local, source}` body (`DeleteItemRequest`, omitted = today's local-only default); a source-only request refuses (409) rather than stopping an active transfer itself, while a combined request lets local's own stop-then-delete satisfy that guard first. `core/postprocess.py.perform_remote_delete` gained a `caller` parameter (`"pipeline"` unchanged, `"manual"` new) so the manual path reuses it rather than a second SSH-delete implementation, and `PostprocessPipeline` gained a public `resolve_host()` around its existing `_host_provider` closure. A source-only success is idempotent against an already-gone remote copy (clears a stale `remote_delete_pending` too — "mid-ladder" simply completes early) and marks the item `auto_queue_suppressed`/`suppressed_reason = 'deleted_source'` (migration 020) so a later reappearance under the same path isn't auto-queued right back; a combined request leaves `delete_local`'s own `'deleted_local'` reason alone. Partial failure (local succeeds, source then fails) is a 200 with `source_deleted: false`/`source_reason` set, not a 409 — the local side effect already happened and can't be undone — and `FileTree.tsx`'s bulk-delete reporting reads those fields back out so a partial failure can't hide inside an otherwise-`fulfilled` promise. DESIGN.md §9.2/§7 updated; `docs/concepts.md`'s suppression table gained the new reason. | ✅ done, `prompts/done/2026-08-16-manual-delete-local-and-remote.md` |
+| S — live-use fix (post-v0.2.0), `gone` commit no longer resurrects a `REMOVED_BOTH` row | First post-release live find: the user hand-deleted two tracked items' files (rows reached `REMOVED_BOTH`, left the Files page), then removed them from Sonarr's queue — and the poller's `gone` commit published an `item_delta` that put both dead rows back on every connected client, visible but un-actionable, until a page-switch's fresh snapshot pruned them. `ArrSyncScheduler._publish_item` now skips the WS publish when the read-back row is `REMOVED_BOTH` (state write + `arr_gone` audit event unchanged; `REMOVED_LOCAL` still publishes — its remote copy keeps it in the projection). Deliberately *not* filtered out of the poller itself — the association still deserves its terminal verdict and audit row, and a row can reach `REMOVED_BOTH` mid-quiescence; `docs/decisions.md` (2026-08-16) has the rejected alternative. Regression test verified to fail on the unfixed code. | ✅ done, this commit |
+| T — path browse dialog (GitHub issue #4) plus two mid-run additions | Settings → Queues' `remote_path`/`local_path`/`Final destination` fields gain a `Browse…` button (`PathBrowseDialog.tsx`) opening a directory picker over the container's own filesystem (`GET /api/browse/local`) or the seedbox over the pooled SSH connection (`GET /api/browse/remote`), both backed by `core/browse.py`'s shared ancestor-walk-up resolver — a bad path opens at the nearest listable ancestor rather than erroring. Not offered on `arr_visible_path` or `key_path` (a file, not a directory). **Mid-run scope addition 1:** the same paths are now validated at save time — `local_path`/staging path hard (must be a real, readable directory; the container's own filesystem is always reachable), `remote_path` best-effort (only a live, reachable seedbox reporting "no such directory" blocks the save; unconfigured/unreachable/`credentials_need_reentry` all allow) — closing the real incident that prompted it: a mistyped `local_path` used to save silently. **Mid-run scope addition 2:** `core/autoqueue.py.on_scan`'s mount-gate gating/recovery transitions are now also `event` rows (`autoqueue_gated`/`autoqueue_ungated`, once per episode, reusing the existing `self.gated` debounce; silent when auto-queue itself is off), visible on History → Events — closing the other half of the same incident (the log line nobody was watching). `docs/decisions.md` (2026-08-16) has the full reasoning, including a pre-existing, unrelated test gap found and named (not fixed): the auth route-enumeration drift-guard test is currently vacuous against this FastAPI/Starlette version. **Browse dialogs confirmed working by the user in the dev deployment, 2026-08-16** — the save-time validation errors and the `autoqueue_gated` event rows remain unviewed. | ✅ done, `3dbe67f` |
 
 **Phase A verification:** backend lint/format clean, full backend `pytest` green (new tests in
 `tests/test_arrclient.py`, `tests/test_arrsync.py`, `tests/test_settings_arr_api.py`,
@@ -201,7 +217,9 @@ change, since the backend now feeds it a state (`DOWNLOADED`) it was already bui
 green throughout: `01efac4` (S1), `0a4593a` (S3+S4), `65b0618` (S2), `90df1ea` (P2), `d480885`
 (P3), `0cb294f` (P1 partial). Backend **1063 tests**, frontend **266 tests**, both lint gates,
 `vite build`, and the `/api/settings` route-parity check all pass. **Still open for the user:**
-**G1** (move-delete ordering = issue #2 — a design call), **G2** (connection-limit write path —
+~~**G1** (move-delete ordering = issue #2 — a design call)~~ **← closed in v0.2.0** (the
+move-delete gate ladder, row P in the build-run table above; GitHub issue #2 closed
+2026-08-16), **G2** (connection-limit write path —
 migration + UI feature), the **rest of P1** (Row/HoverCard component extraction — wants a browser),
 and **P4/P5** (`queue.py`/`engine.py` splits — deepest stateful code, wants review). See
 `docs/audit-v0.1.0.md` for all of them.
@@ -453,7 +471,10 @@ doesn't yet" and "Known gaps" sections for the consolidated, canonical list** (t
 doesn't duplicate it). Two headline items from phase 9 are now **closed** by the 2026-08-12
 post-phase-9 session below — Settings → Transfer has a UI, and the app has been run in a real
 browser — but Files still has no bulk "Delete local"/"Delete remote" (Queue/Stop only, per
-phase 9's own scope), and no manual delete endpoint exists anywhere in the API.
+phase 9's own scope), ~~and no manual delete endpoint exists anywhere in the API~~ — **no
+longer true as of v0.2.0**: per-item manual deletion exists with independent Local and
+Source (seedbox) scopes (`POST /api/items/{id}/delete`, the first manual remote-delete in
+the API). Bulk delete is still absent.
 
 ## 2026-08-12, post-phase-9 session — the dev environment became real, and the UI was opened
 
@@ -575,7 +596,12 @@ pull a fresh image to pick up the fix.
 They stay in this file until the user resolves them, not until the phase that raised them
 shipped. **Do not action any of them unilaterally.**
 
-1. **The user's live queue still has `sync_mode = 'move'` stored, and `move` works.** The row
+1. **The user's live queue still has `sync_mode = 'move'` stored, and `move` works.**
+   **RESOLVED by deliberate adoption** — as of 2026-08-15/16 the user runs `move` mode
+   knowingly on both test queues (`ar-tv`, `ar-movies`) against a genuine hardlink pickup
+   directory, exercised it live through the v0.2.0 delete-ladder testing, and designed the
+   ladder around it. No longer a pending decision. Original entry kept below for history:
+   The row
    has been in the database since before phase 4's guard existed, inert the whole time because
    nothing implemented `move` or read `sync_mode` to act on it. As of phase 5 it **deletes the
    verified remote copy after every download that queue completes.** Deliberately **not**
@@ -620,10 +646,11 @@ shipped. **Do not action any of them unilaterally.**
    the WebSocket published 6, the difference being paths that had left both trees during
    testing. Row *lifetime* is an unanswered design question distinct from state ownership —
    when, if ever, may a row be deleted, and what does History/audit need to keep?
-7. **Per-queue rescan interval** was requested and is not built. `scan_interval_s` is a single
-   global (30s, env-overridable); phase 2 collapsed §5's separate 30s remote / 10s local
-   cadences into it. Needs a migration, a per-queue next-due in the engine loop, and a field in
-   Settings → Queues.
+7. ~~**Per-queue rescan interval** was requested and is not built.~~ **Built 2026-08-13**
+   (`c8d3e8b`, migration 009 — per-queue 10/30/60/none dropdown in Settings → Queues, a
+   multi-cadence overrun-safe engine loop). This entry sat stale for three days after the
+   work shipped — the same trap as the drafted-wordings entry above: a tracker line is not
+   evidence of current state.
 
 Also open, but not a decision so much as a next step: **`dev` is ahead of `main` by every
 phase 4–9 commit plus the two 2026-08-12 commits, and no PR has been opened.** `main` is

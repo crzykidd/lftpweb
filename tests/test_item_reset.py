@@ -591,6 +591,7 @@ async def test_reset_item_then_a_real_scan_creates_a_fresh_unsuppressed_row(tmp_
         queued = await aq.on_scan(
             QueueAutoConfig(
                 id=queue_id,
+                name="q",
                 local_path=str(local_root),
                 auto_queue_enabled=True,
                 patterns_only=False,

@@ -187,6 +187,9 @@ export function ConnectionTab() {
             </span>
           </label>
 
+          {/* No Browse button here (GitHub issue #4, prompts/done/2026-08-16-path-browse-dialog.md)
+           * -- deliberately: this field names a *file*, not a directory, and the pasted-key
+           * alternative above is already the preferred path. */}
           <label className="flex flex-col gap-1">
             <span className={labelClasses}>Key path</span>
             <input className={inputClasses} value={form.key_path} onChange={(e) => update('key_path', e.target.value)} />

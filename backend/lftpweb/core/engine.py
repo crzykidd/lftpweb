@@ -856,6 +856,7 @@ class Engine:
                 await self.autoqueue.on_scan(
                     QueueAutoConfig(
                         id=q.id,
+                        name=q.name,
                         local_path=q.local_path,
                         auto_queue_enabled=q.auto_queue_enabled,
                         patterns_only=q.auto_queue_patterns_only,
@@ -958,6 +959,7 @@ class Engine:
                 await self.autoqueue.on_scan(
                     QueueAutoConfig(
                         id=q.id,
+                        name=q.name,
                         local_path=q.local_path,
                         auto_queue_enabled=q.auto_queue_enabled,
                         patterns_only=q.auto_queue_patterns_only,

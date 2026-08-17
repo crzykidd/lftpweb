@@ -42,6 +42,8 @@ PROTECTED_ROUTE_TEMPLATES: list[tuple[str, str]] = [
     ("PUT", "/api/settings/patterns/{pattern_id}"),
     ("DELETE", "/api/settings/patterns/{pattern_id}"),
     ("POST", "/api/settings/queues/{queue_id}/pattern-preview"),
+    ("GET", "/api/browse/local"),
+    ("GET", "/api/browse/remote"),
     ("GET", "/api/settings/postprocess"),
     ("PUT", "/api/settings/postprocess"),
     ("GET", "/api/settings/transfer"),

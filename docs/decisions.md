@@ -6,6 +6,183 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-16 — Three CodeQL `py/path-injection` alerts on `core/browse.py` dismissed as by-design (alerts #16–#18, PR #7)
+
+The v0.2.1 release PR's CodeQL gate flagged the browse feature's three filesystem touch
+points (`os.scandir` in `_try_list_local`, `os.stat`/`os.access` in `local_directory_error`)
+as user-controlled paths flowing into path expressions. Verified before dismissing, not
+assumed: all three are **metadata-only** operations — directory-name listing and existence/
+readability checks; no file contents are ever read, nothing is written or deleted — and the
+user-controlled path is the documented feature (the authenticated Settings directory browser
+deliberately lists any container directory; see the entry below and the changelog's own scope
+statement). Both routes are default-deny auth-gated and pinned by
+`tests/test_auth_api.py.test_protected_routes_return_401_unauthenticated_in_password_mode`.
+There is no confinement boundary a code change could enforce without deleting the feature.
+
+Dismissed `won't fix` (intended behavior — not `false positive`: the data flow CodeQL
+describes is real, it's the vulnerability framing that doesn't apply) with this justification
+on each alert, user-approved 2026-08-16. Same precedent as the five v0.1.0 dismissals
+(4 × path-injection on the anchored-regex log/backup download endpoints, 1 × weak-hash on
+token hashing).
+
+**Rejected alternative: a scanner-appeasing sanitizer** (`os.path.normpath` +
+`startswith("/")` guard) that CodeQL's taint model would likely accept as a barrier. A
+containment check against `/` is semantically empty — it would dress up by-design behavior
+as a fixed vulnerability and leave the next reader believing a real boundary exists where
+none does.
+
+**Standing consequence, same as v0.1.0's dismissals:** the 401 route-enumeration test is now
+a security control these dismissals rest on, not tidiness — the browse routes'
+`PROTECTED_ROUTE_TEMPLATES` entries must not be removed without re-opening the question.
+
+## 2026-08-16 — Path browse dialog (GitHub issue #4), plus two mid-run scope additions: save-time path validation and mount-gate audit events
+
+`prompts/done/2026-08-16-path-browse-dialog.md`, user-approved design settled the same day.
+Three pieces landed together because they share the same primitive
+(`core/browse.py`'s "can this path actually be listed/stat'd right now") and touch the same
+files (`api/settings_queues.py`, `core/autoqueue.py`) — see that prompt's own "Scope addition"
+section for the two additions verbatim, added mid-run.
+
+**Browse dialog scope exclusions.** `arr_visible_path` never gets a Browse button — it
+describes the path as the *arr's own host sees it, and neither this container nor the seedbox
+can list that host's filesystem, so a browser there would show something plausible-looking and
+wrong. `key_path` (Settings → Connection) never gets one either — it names a *file*, not a
+directory, and the pasted-key alternative (migration 014) is already the preferred path for
+that field. Both exclusions are recorded as short in-code comments at the fields themselves
+(`QueuesTab.tsx`, `ConnectionTab.tsx`), not just here.
+
+**Tilde/absolute-path policy is deliberately asymmetric between local and remote.** Local: `~`
+is meaningless in this container (DESIGN.md §11.2's numeric PUID/PGID identity — the app user
+has no real home), so any non-absolute input, `~` included, falls back straight to `/` with no
+apology (`fallback_from` stays unset — `/` is a sane starting point, not a failure). Remote: `~`
+and relative paths are meaningful (the SSH user has a real home on the seedbox) and resolve
+against it via SFTP `realpath`. Considered making local resolve `~` the same way against
+*something* (e.g. `$HOME` if set) for symmetry — rejected: the prompt's own framing is that the
+container's app user is intentionally homeless, and inventing a fallback home would silently
+paper over that rather than surfacing it.
+
+**Ancestor walk-up, one algorithm, two implementations.** A path that doesn't exist, isn't a
+directory, or can't be read walks up to the nearest listable ancestor instead of erroring —
+`core/browse.py.resolve_local_dir`/`resolve_remote_dir`, tested exhaustively in
+`tests/test_browse.py` (real trees under `tmp_path` for local; a hand-written fake SFTP client
+for remote, described below). `fallback_from` is set *only* when the walk-up loop actually had
+to move off the requested (and, for local, normalized) path — normalizing away a `..` or a
+trailing slash is canonicalization, not a fallback, and doesn't earn the note.
+
+**The local endpoint exposes the container's whole filesystem tree to any authenticated user —
+that is the feature, not an oversight.** `local_path`/`staging_path` can be mounted anywhere, so
+the browse dialog has to be able to reach anywhere. Auth-gating comes free from
+`middleware.py.AuthMiddleware`'s default-deny; neither `/api/browse/local` nor
+`/api/browse/remote` is in `PUBLIC_API_PATHS`.
+
+**Remote directory-type detection trusts `SFTPAttrs.type` on `scandir`/`stat` results without a
+second round trip per entry.** Verified directly against the installed asyncssh (2.24.0) before
+writing `core/browse.py`, not assumed: for an SFTPv3 server (the common case — OpenSSH's
+`sftp-server`), asyncssh's own attribute decoder derives `.type` from the wire `permissions`
+field (`sftp.py` line ~1923, `_stat_mode_to_filetype`), so it's populated on every `scandir`/
+`readdir`/`stat` result, not only on protocol v4+. A symlink entry still needs one extra `stat`
+call (which follows symlinks) to learn what it actually points at — `scandir` attrs describe the
+link itself. Confirmed live against the fake seedbox (`tests/test_browse.py`'s
+`test_live_resolve_remote_dir_against_the_real_seedbox`), not only asserted from source reading.
+
+**Remote listing failures return 502, not 500.** No strong precedent either way in this
+codebase (the few existing bare `500`s, `api/jobs.py`, are genuine "this should never happen"
+server bugs); 502 was chosen to read as "the seedbox, not lftpweb, is the problem" — matches the
+prompt's own "never a 500 traceback" instruction without conflating a network/protocol failure
+with an internal one.
+
+**Save-time path validation is hard for `local_path`/`staging_path`, best-effort for
+`remote_path` — deliberately asymmetric, not an oversight.** The container's own filesystem is
+always reachable from this process, so there's no "can't verify" case that would justify a
+silent allow; the seedbox is a network hop that can be down for reasons that have nothing to do
+with whether the typed path is actually right, and a save that refuses to persist *any* change
+to Queues just because the seedbox happens to be unreachable at that moment is a worse failure
+mode than occasionally accepting a genuinely-wrong `remote_path`. Concretely: no host, an
+unreachable host, and `credentials_need_reentry` all allow the save; only a live, reachable
+seedbox that cleanly reports "no such file" or "not a directory" blocks it
+(`core/browse.py.remote_directory_error`, `RemotePathNotFoundError` vs. every other exception
+left to propagate and be swallowed by the caller). Reuses the browse endpoint's own resolution
+code (`core/browse.py`) rather than a second SFTP-stat implementation, over the same pooled
+connection (`app.state.engine.pool`) `PostprocessPipeline`/`ArrSyncScheduler` already share.
+
+**Never auto-creates the directory.** The user's own instruction, and it matches this
+codebase's existing restraint (`mount_sentinel.write_if_needed`'s docstring gives the identical
+reasoning for the sentinel file): a not-yet-mounted root must never earn trust just because
+something tried to write into it.
+
+**Considered reusing `core/mount_sentinel.py.check()` for the hard local check — rejected.**
+That function also requires the mount *sentinel* file to already exist, which is written only
+after a successful scan. Demanding it at save time would refuse every legitimate first save of
+a brand-new queue, since nothing has scanned it yet. `core/browse.py.local_directory_error` is
+a separate, narrower check: exists, is a directory, is readable — nothing about *this codebase
+having scanned it before*.
+
+**Mount-gate transitions are now audit-trail events, not only a log line** — the concrete
+incident: a mistyped `local_path` saved silently (before the validation above existed) and the
+only symptom anywhere was a WARNING in the container log, found hours later. `core/autoqueue.py.
+on_scan` already had a debounce for the log line (`self.gated` — a dict entry persists for the
+whole gating episode); the new `autoqueue_gated`/`autoqueue_ungated` `core/audit.py.record_event`
+calls reuse that exact same debounce rather than adding a second mechanism, so a gated queue
+that's still gated on scan #50 doesn't produce 50 events. Recovery gets its own `info`-level
+event so the episode has a visible end in History → Events, the same "record both the action and
+its withholding/its end" shape `core/postprocess.py`'s `remote_delete`/`remote_delete_withheld`
+pair already established. **Deliberately silent when `auto_queue_enabled` is off** — the
+`self.gated.pop(queue.id, None)` in that branch stays a plain pop with no event: turning
+auto-queue off is a user choice, not a gate recovering, and an "ungated" event there would claim
+a recovery that didn't happen. `QueueAutoConfig` gained a `name` field solely so the event
+message can name the queue — the `event` table has no `queue_id` column (only `item_id`/
+`job_id`), so a whole-queue fact like this has to carry its own name, the identical reasoning
+`core/postprocess.py.perform_remote_delete`'s own message already follows.
+
+**A pre-existing, unrelated test gap was found and named, not fixed.**
+`tests/test_auth_api.py.test_protected_route_enumeration_has_no_drift` cross-references its
+hand-maintained `PROTECTED_ROUTE_TEMPLATES` list against `app.routes` to catch a router mounted
+and never added to the list. With the installed FastAPI/Starlette (0.141.1 / 1.6.0), `app.routes`
+no longer flattens an included router's routes into top-level `Route` objects with `.path`/
+`.methods` — each `include_router()` call now shows up as an opaque `_IncludedRouter` wrapper —
+so that test's own `app.routes` walk currently finds **zero** `/api/*` routes and the "no drift"
+assertion passes vacuously, regardless of what's actually registered. This is not something this
+task introduced and not something it fixed (a real fix means understanding the new FastAPI route
+model, a separate, non-trivial investigation). What this task *did* do: added `GET /api/browse/
+local` and `GET /api/browse/remote` to `PROTECTED_ROUTE_TEMPLATES`, which
+`test_protected_routes_return_401_unauthenticated_in_password_mode` — a *different* test in the
+same file, driven by real HTTP requests through `TestClient`, unaffected by the `app.routes`
+introspection bug — does verify for real. Confirmed both new routes 401 unauthenticated in
+password mode by actually running that test.
+
+---
+
+## 2026-08-16 — The *arr poller's `gone` commit no longer publishes a `REMOVED_BOTH` row (the resurrected-zombie fix)
+
+Found live, post-v0.2.0: the user deleted two Sonarr-tracked items' files by hand (rows rode
+the grace to `REMOVED_BOTH` and left the Files page), then removed them from Sonarr's queue.
+Two poller passes later `_commit_terminal` wrote `arr_status = 'gone'` and
+`ArrSyncScheduler._publish_item` pushed an `item_delta` for each — resurrecting dead nodes in
+every connected client. The rows were visible but un-actionable (`canDeleteLocal` correctly
+hides Delete for `REMOVED_BOTH`; `rowAction` correctly hides Queue with no remote copy) and
+only cleared when the user happened to navigate away and back, whose fresh connect-time
+snapshot re-read through `core/engine.py._project`'s rel_paths filter. The database was never
+wrong; the defect was purely a client-view resurrection — exactly the bug class the
+"`_project`'s rel_paths filter is load-bearing" warning describes, arriving through a publish
+path that didn't exist when the warning was written.
+
+**Fix: gate the publish, not the poller.** `_publish_item` now returns without publishing when
+the read-back row's `state == 'REMOVED_BOTH'`; the state write and the `arr_gone` audit event
+still happen unchanged. `REMOVED_LOCAL` still publishes — its remote copy keeps it in the
+projection, so its deltas are legitimate.
+
+**Rejected alternative: skip import-detection for `REMOVED_BOTH` rows entirely** (filter them
+out of `_process_queue`'s item query). Narrower-looking, but wrong twice over: the association
+still deserves its terminal `gone`/`imported` verdict and audit row even when the files are
+already gone (the audit trail is how "what did the *arr do?" gets answered later), and an item
+could reach `REMOVED_BOTH` *between* the two quiescence passes, which would freeze a
+half-confirmed candidacy in `_pending` forever instead of letting it commit. Gating only the
+WS publish keeps every state machine unchanged and touches the one thing that was actually
+wrong: the wire.
+
+Regression test: `tests/test_arrsync.py.test_gone_commit_on_a_removed_both_row_does_not_
+publish_an_item_delta` — verified to fail against the unfixed code.
+
 ## 2026-08-16 — Manual delete gains an independent Source scope: defaults, §7.1 interplay, and why partial failure doesn't 409
 
 `prompts/done/2026-08-16-manual-delete-local-and-remote.md`, the move-delete ladder's own

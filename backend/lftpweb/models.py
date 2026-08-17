@@ -561,6 +561,26 @@ class QueueAutoQueueStatus(BaseModel):
     gated_reason: str | None = None
 
 
+# --- Settings -> Queues path-browse dialog (GitHub issue #4,
+# prompts/done/2026-08-16-path-browse-dialog.md) -- `api/browse.py`. Directories only, one
+# shared shape for the local and remote endpoints alike.
+
+
+class BrowseEntryOut(BaseModel):
+    name: str
+
+
+class BrowseResponse(BaseModel):
+    path: str
+    parent: str | None
+    entries: list[BrowseEntryOut]
+    truncated: bool
+    # Set only when the endpoint had to walk up from what was actually requested (a nonexistent
+    # tail, a file instead of a directory, permission denied) -- `core/browse.py`'s own
+    # docstring has the full algorithm. `None` means `path` above is exactly what was asked for.
+    fallback_from: str | None = None
+
+
 # --- Files (DESIGN.md §9.2) --------------------------------------------------------------
 
 
