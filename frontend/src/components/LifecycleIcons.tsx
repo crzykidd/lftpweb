@@ -451,6 +451,40 @@ function ArrTextChip({
   )
 }
 
+/** A plain brand-logo mark, no status overlay -- introduced (2026-08-17,
+ * prompts/2026-08-17-queues-list-arr-brand-icon.md) for Settings → Queues' queue-list Name
+ * cell, which needs a *binding* indicator ("is this queue bound to an *arr instance"), never
+ * an *item-status* one -- `ArrRowChip` below is the wrong component there since it renders
+ * `null` without an `arr_status`, which a queue row never has. Same real Sonarr/Radarr logo,
+ * same `ArrTextChip`-style text fallback for an unrecognized/future `kind` (or `null`, the
+ * "bound instance not found" case), so there is still exactly one kind → logo mapping in this
+ * file -- `ArrRowChip` is rebuilt on top of this mark rather than duplicating the switch a
+ * second time. `muted` renders the mark at reduced opacity, this task's own rule for "the
+ * queue is bound, but the instance itself is currently disabled" -- the binding is real but
+ * inert.
+ */
+export function ArrBrandMark({
+  kind,
+  title,
+  muted = false,
+}: {
+  kind: string | null
+  title: string
+  muted?: boolean
+}) {
+  return (
+    <span className={`inline-flex shrink-0 items-center ${muted ? 'opacity-50' : ''}`}>
+      {kind === 'sonarr' ? (
+        <SonarrLogo title={title} />
+      ) : kind === 'radarr' ? (
+        <RadarrLogo title={title} />
+      ) : (
+        <ArrTextChip instanceName={kind} overlay={null} title={title} />
+      )}
+    </span>
+  )
+}
+
 /** The row chip's status-overlay badge -- green check ("processed") or red dot ("gone"),
  * absolutely positioned over the bottom-right corner of the logo/text-chip beside it. `null`
  * renders nothing, for the `detected`/`notified` mid-flight case (`arrChipOverlay`,
@@ -501,6 +535,15 @@ function ArrChipOverlayBadge({ overlay }: { overlay: ArrChipOverlay }) {
  * `arrIconVariant`/`arrChipOverlay` (`lib/fileTree.ts`) for the status categorization -- one
  * mapping, consumed by `ArrIcon` above and this component both -- and `arrHoverLabel` for the
  * hover text, unchanged from `ArrIcon`.
+ *
+ * The logo itself is `ArrBrandMark` above -- this component supplies the status-overlay badge
+ * layered on top, `ArrBrandMark` supplies the kind → logo mapping, and the two together are
+ * exactly this component's old, undivided behaviour (2026-08-17, this task: extracted so
+ * Settings → Queues can reuse the mapping without a bound `arr_status` to key off). The
+ * `sonarr`/`radarr` fallback stays `ArrTextChip` here, not `ArrBrandMark`'s own fallback --
+ * `ArrBrandMark` has no `instanceName` prop, so this call keeps the status-aware `overlay`
+ * colouring (green/red/neutral) on the pill, which `ArrBrandMark`'s plain neutral fallback
+ * doesn't carry.
  */
 export function ArrRowChip({
   arrStatus,
@@ -521,10 +564,8 @@ export function ArrRowChip({
 
   return (
     <span className="relative inline-flex shrink-0 items-center" title={hoverLabel ?? undefined}>
-      {instanceKind === 'sonarr' ? (
-        <SonarrLogo title={title} />
-      ) : instanceKind === 'radarr' ? (
-        <RadarrLogo title={title} />
+      {instanceKind === 'sonarr' || instanceKind === 'radarr' ? (
+        <ArrBrandMark kind={instanceKind} title={title} />
       ) : (
         <ArrTextChip instanceName={instanceName} overlay={overlay} title={title} />
       )}

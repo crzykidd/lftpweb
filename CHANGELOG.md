@@ -24,6 +24,14 @@ Skeleton for the next roll:
 ## [Unreleased]
 
 ### Added
+
+- **Settings → Queues' queue list now shows the Sonarr/Radarr brand logo beside the name of
+  any queue bound to an *arr instance** — previously the only way to tell was opening Edit and
+  checking the dropdown. Muted (reduced opacity) when the bound instance is currently disabled;
+  falls back to a small text chip naming the instance id if the binding points at an instance
+  that's since been deleted. Reuses the same real brand logos already shown on Files/Transfers/
+  History (`LifecycleIcons.tsx`'s new `ArrBrandMark`, factored out of `ArrRowChip`).
+
 ### Changed
 
 ### Fixed
