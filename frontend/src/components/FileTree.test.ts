@@ -7,6 +7,7 @@ import {
   arrIconVariant,
   buildTree,
   canConfirmDelete,
+  canDeleteLocal,
   CHILD_SPEED_FRESHNESS_MS,
   clampColumnWidth,
   columnMinWidth,
@@ -16,6 +17,7 @@ import {
   effectiveSpeedLabel,
   effectiveSpeedSortValue,
   flatten,
+  hasLocalContent,
   isCollapsePreference,
   isColumnWidths,
   isSortPreference,
@@ -24,6 +26,7 @@ import {
   RESIZABLE_COLUMNS,
   resolveCollapsed,
   rowAction,
+  shouldOfferLocalScope,
   shouldOfferSourceScope,
   showsCopyQueueSourceWarning,
   sortTree,
@@ -837,6 +840,65 @@ describe('rowAction', () => {
 
   it('offers nothing for a row with no id', () => {
     expect(rowAction(node('unpersisted.iso', false, { id: null, remote_size: 1000 }))).toBeNull()
+  })
+})
+
+// --- canDeleteLocal / hasLocalContent / shouldOfferLocalScope ------------------------------
+// 2026-08-17 (prompts/2026-08-17-stranded-source-delete-retry.md): a failed rung-4 deferred
+// source delete used to strand the remote copy with no Delete affordance at all -- a
+// `REMOVED_LOCAL` row (no local content) had its only escape hatch, the Source scope, hidden
+// because `canDeleteLocal` only ever asked about local content. Widened to "local content OR a
+// surviving remote copy," pinned here directly against the two shapes the incident produced.
+
+describe('canDeleteLocal', () => {
+  it('offers Delete for a REMOVED_LOCAL row with a surviving remote copy (the stranded rung-4 case)', () => {
+    const stranded = node('stranded-release', true, { state: 'REMOVED_LOCAL', remote_size: 5000 })
+    expect(canDeleteLocal(stranded)).toBe(true)
+  })
+
+  it('offers nothing for a REMOVED_BOTH row -- nothing anywhere to delete', () => {
+    const goneEverywhere = node('gone-everywhere', true, { state: 'REMOVED_BOTH', remote_size: null })
+    expect(canDeleteLocal(goneEverywhere)).toBe(false)
+  })
+
+  it('still offers Delete for the ordinary case: local content, no remote copy', () => {
+    expect(canDeleteLocal(node('local.iso', false, { state: 'DOWNLOADED', remote_size: null, local_size: 1000 }))).toBe(true)
+  })
+
+  it('offers nothing for a row with no id, even with a remote copy', () => {
+    expect(canDeleteLocal(node('unpersisted.iso', false, { id: null, remote_size: 1000 }))).toBe(false)
+  })
+})
+
+describe('hasLocalContent', () => {
+  it('is false for REMOVED_LOCAL regardless of remote presence', () => {
+    expect(hasLocalContent(node('x', true, { state: 'REMOVED_LOCAL', remote_size: 5000 }))).toBe(false)
+  })
+
+  it('is true for an ordinary downloaded state', () => {
+    expect(hasLocalContent(node('x', false, { state: 'DOWNLOADED' }))).toBe(true)
+  })
+})
+
+describe('shouldOfferLocalScope', () => {
+  it('offers the Local checkbox when at least one pending entry has local content', () => {
+    const entries = [
+      node('a', true, { state: 'REMOVED_LOCAL', remote_size: 5000 }),
+      node('b', false, { state: 'DOWNLOADED' }),
+    ]
+    expect(shouldOfferLocalScope(entries)).toBe(true)
+  })
+
+  it('hides the Local checkbox for a selection made entirely of stranded no-local-content rows', () => {
+    const entries = [
+      node('a', true, { state: 'REMOVED_LOCAL', remote_size: 5000 }),
+      node('b', true, { state: 'REMOVED_LOCAL', remote_size: 2000 }),
+    ]
+    expect(shouldOfferLocalScope(entries)).toBe(false)
+  })
+
+  it('hides the Local checkbox for an empty selection', () => {
+    expect(shouldOfferLocalScope([])).toBe(false)
   })
 })
 

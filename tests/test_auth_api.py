@@ -75,6 +75,7 @@ PROTECTED_ROUTE_TEMPLATES: list[tuple[str, str]] = [
     ("GET", "/api/logs/files"),
     ("GET", "/api/logs/tail"),
     ("GET", "/api/logs/{filename}/download"),
+    ("POST", "/api/support-bundle"),
     ("GET", "/api/metrics/throughput"),
     ("GET", "/api/settings/metrics"),
     ("PUT", "/api/settings/metrics"),

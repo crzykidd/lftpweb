@@ -709,6 +709,7 @@ from lftpweb.core.archive_cleanup import (  # noqa: E402,F401
     ArchiveCleanupResult,
     delete_extracted_archives,
     load_deleted_archive_paths,
+    purge_deleted_archive_paths,
     save_deleted_archive_paths,
 )
 from lftpweb.core.reset import (  # noqa: E402,F401

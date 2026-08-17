@@ -8,7 +8,7 @@ progress, auto-queue on patterns, and optionally verify, extract, and relocate f
 
 > ## Beta
 >
-> **Version `0.2.1`.** All 9 build phases are built, covered by backend unit and integration
+> **Version `0.2.2`.** All 9 build phases are built, covered by backend unit and integration
 > tests plus a frontend unit suite, and exercised manually through the UI against a real
 > seedbox. This is a **beta** — there is no upgrade path guaranteed between beta releases,
 > and the database schema may still change between them. See
@@ -123,6 +123,21 @@ Every verify outcome, every remote delete, and every delete withheld — with th
   links straight to the settings page it describes.
   Per-field help popups (`FieldHelp`) are being applied across the settings surface, starting
   with the fields whose wrong answer costs you data
+
+## Support bundle
+
+**Settings → Logs → "Support bundle…"** builds one downloadable zip to attach to an issue or
+send manually — generating one is recorded in the audit trail like every other diagnostic
+action here. It **captures**: lftpweb's own logs (already credential-redacted at write time,
+`logsetup.py`), a build/environment snapshot, a sanitized settings dump, recent audit events and
+job history, and — only for whichever Sonarr/Radarr instances you tick — each enabled instance's
+own log files, fetched newest-first up to a per-instance size cap. It **never captures**: the
+seedbox password, SSH keys, *arr API keys (a bundle carries only `has_*` booleans, the same as
+every Settings response), archive extract passwords (a count, not the passwords), the SQLite
+database itself, the install secret, or host-key pins. One caveat worth knowing before you
+attach one anywhere public: an included *arr instance's log files are carried **exactly as that
+*arr wrote them** — lftpweb doesn't rewrite another app's own logs — so give them a glance before
+sharing. Full contents, one part per checkbox: **[docs/concepts.md](docs/concepts.md#support-bundle)**.
 
 ## What doesn't yet
 

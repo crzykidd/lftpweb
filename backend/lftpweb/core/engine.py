@@ -1426,6 +1426,12 @@ class Engine:
         # suppressed row (`STOPPED`/`FAILED`/a self-delete's `REMOVED_BOTH`) never reaches this
         # loop either -- consistent with rule 6's "never rescanned".
         vanished = set(previous) - written - protected
+        # 2026-08-17 (prompts/2026-08-17-orphaned-spent-archive-rows.md): `rel_path`s the
+        # `deleted_archive_paths` branch below decides to lapse out of `EXCLUDED` this pass --
+        # collected here rather than purged one row at a time so the whole batch is one
+        # `DELETE ... IN (...)` inside this same transaction, mirroring `new_settle`/
+        # `save_settle_records` a few lines down.
+        archive_paths_to_purge: set[str] = set()
         for rel_path in sorted(vanished):
             (
                 prev_state,
@@ -1497,7 +1503,72 @@ class Engine:
                 # new one -- `core/itemview.py.item_view`'s `deleted_archive_at` field is what
                 # lets the frontend tell this `EXCLUDED` apart from an ordinary pattern-excluded
                 # file and render it as a greyed-out "Extracted" chip, never "Excluded".
-                vanished_state, vanished_first_missing_at = "EXCLUDED", None
+                #
+                # **The exemption above only holds while the item itself hasn't also left both
+                # trees (2026-08-17, prompts/2026-08-17-orphaned-spent-archive-rows.md).** Every
+                # comment above this one was written for a release still mid-pipeline -- extract
+                # succeeded, cleanup removed the spent volumes, but the release's own directory
+                # is still present (still importing, still being verified against `*arr`, or a
+                # `copy` queue that never removes it at all). Once the release finishes the
+                # *whole* pipeline and its own top-level row leaves both trees too (rides
+                # `resolve_absence`'s grace to `REMOVED_BOTH` a few lines below, same as any
+                # other vanished row), there is no longer a parent directory for these rows to
+                # be "part of a still-live release" under, and resting them at `EXCLUDED`
+                # forever is the orphaned-row bug this closes: a rel_path in `deleted_archive_
+                # paths` reaches this sweep at all specifically because it is *absent from both
+                # trees*, so this branch cannot tell "release still present, volume already
+                # gone" apart from "release itself also gone" without asking about the release
+                # separately -- there is no fresh structural reading for either case to read it
+                # off of.
+                #
+                # `ancestor` is the rel_path's first path segment (DESIGN.md §4.7's "item"
+                # notion -- the top-level directory or file `select`/`skip` match against, and
+                # the only thing archive cleanup ever operates inside). `ancestor in written`
+                # asks "is the item still present in either tree, as far as *this pass* is
+                # concerned" -- true the ordinary way (still in `nodes`, hence already in
+                # `written` before this sweep even starts) and true during the item's own grace
+                # window too (a non-terminal vanished resolution re-enters `written` a few lines
+                # below, *before* this loop reaches any of that item's nested archive children --
+                # `sorted(vanished)` guarantees it, since an ancestor's rel_path is always a
+                # strict string prefix of its descendants' and therefore always sorts first).
+                # So checking `written` mid-sweep, rather than a second query, is free and
+                # correct for exactly the "grace interplay" the task's own contract pins: a
+                # parent mid-grace still reads present here, and these rows keep resting
+                # `EXCLUDED` right alongside it; only once the parent's own row has resolved to
+                # a *terminal* state this pass (or an earlier one -- an unsuppressed
+                # `REMOVED_BOTH` row is never protected, so it keeps re-entering `vanished` and
+                # re-resolving to `REMOVED_BOTH` every subsequent pass too, which is what makes
+                # this self-heal for a row that was already orphaned before this fix shipped)
+                # does `ancestor in written` finally read false.
+                #
+                # Falls straight to `REMOVED_BOTH`, not through `resolve_absence`/
+                # `resolve_vanished`: this file's own `prev_state` is `EXCLUDED`, which neither
+                # function has an opinion about (`EXCLUDED` is in neither `_STICKY_PREV_STATES`
+                # nor `resolve_vanished`'s own fallback set, deliberately -- see that function's
+                # docstring), and there is no separate grace period to run here anyway -- the
+                # ancestor check above already *is* the grace gate, borrowed from the item's own
+                # clock rather than starting a second one. `REMOVED_BOTH` is the correct resting
+                # state on its own terms regardless: this codebase deleted the file on purpose
+                # and the release it belonged to is now gone from both trees too, which is
+                # exactly "both copies are gone" (DESIGN.md §3.2), the same reading an ordinary
+                # vanished row in this shape lands on a few lines below. Left unsuppressed, same
+                # as every other vanished-sweep `REMOVED_BOTH` -- nothing here asserts *who*
+                # removed anything beyond what `deleted_archive`'s own registry already recorded,
+                # and the registry purge below is what stops that record from outliving the row
+                # it describes.
+                #
+                # No `"/"` in `rel_path` means there is no separate ancestor to ask about at all
+                # -- `core/archive_cleanup.py.delete_extracted_archives` itself never produces
+                # this shape (its own docstring: "an item that is itself a loose top-level
+                # archive file... is withheld outright", precisely so a spent volume is never
+                # indistinguishable from the whole item), but `deleted_archive_paths` membership
+                # is a plain set lookup with no opinion on how a row got into it, and the old,
+                # unconditional behaviour for this degenerate case must not regress.
+                if "/" not in rel_path or rel_path.partition("/")[0] in written:
+                    vanished_state, vanished_first_missing_at = "EXCLUDED", None
+                else:
+                    archive_paths_to_purge.add(rel_path)
+                    vanished_state, vanished_first_missing_at = "REMOVED_BOTH", None
             elif (
                 override := mount_sentinel.resolve_absence(
                     prev_state=resolve_prev_state,
@@ -1557,6 +1628,16 @@ class Engine:
                 "UPDATE item SET remote_size = NULL, local_size = NULL, local_mtime = NULL, "
                 "state = ?, first_missing_at = ? WHERE queue_id = ? AND rel_path = ?",
                 (vanished_state, vanished_first_missing_at, queue_id, rel_path),
+            )
+
+        if archive_paths_to_purge:
+            # 2026-08-17 (prompts/2026-08-17-orphaned-spent-archive-rows.md): the registry
+            # half of the ancestor-gone branch above -- `local_delete.py` re-exports
+            # `core/archive_cleanup.py`'s own narrow delete rather than hand-rolling the SQL
+            # here, per that module's own docstring. Folded into this pass's transaction, not
+            # committed separately, same as every other write in this method.
+            await local_delete.purge_deleted_archive_paths(
+                self.db, queue_id, archive_paths_to_purge
             )
 
         if new_settle:

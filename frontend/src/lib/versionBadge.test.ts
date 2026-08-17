@@ -23,15 +23,15 @@ describe('versionBadge', () => {
   })
 
   describe('channel null (local uv run, compose dev stack -- no args baked)', () => {
-    it("renders exactly today's plain version, no link, when repo_url is empty", () => {
-      expect(versionBadge(health())).toEqual({ label: 'v0.1.1', dev: false, href: null })
+    it('links to the in-app Release notes route even when repo_url is empty (2026-08-17: no longer a dead link)', () => {
+      expect(versionBadge(health())).toEqual({ label: 'v0.1.1', dev: false, href: '/docs/release-notes' })
     })
 
-    it('links to the release tag when repo_url is present', () => {
+    it('still links to the in-app Release notes route, not GitHub, when repo_url is present', () => {
       expect(versionBadge(health({ repo_url: 'https://github.com/crzykidd/lftpweb' }))).toEqual({
         label: 'v0.1.1',
         dev: false,
-        href: 'https://github.com/crzykidd/lftpweb/releases/tag/v0.1.1',
+        href: '/docs/release-notes',
       })
     })
   })
@@ -49,7 +49,7 @@ describe('versionBadge', () => {
       ).toEqual({
         label: 'v0.1.1',
         dev: false,
-        href: 'https://github.com/crzykidd/lftpweb/releases/tag/v0.1.1',
+        href: '/docs/release-notes',
       })
     })
   })

@@ -1201,3 +1201,326 @@ async def test_a_child_is_recomputed_again_once_the_job_finishes(tmp_path, monke
         ] == "REMOTE_ONLY", "no active job -- the structural reading wins again"
     finally:
         await db.close()
+
+
+# --- 6. A spent-archive row leaves with its parent, never orphaned forever --------------------
+#
+# 2026-08-17 (prompts/2026-08-17-orphaned-spent-archive-rows.md), production live evidence: a
+# rar'd release ran the entire pipeline correctly -- verify, extract, `delete-archives-after-
+# extract` removed the 29 spent volumes (resting `EXCLUDED`, section 5 above), *arr import
+# confirmed, the `move`-mode remote copy was deleted, and *arr cleanup then removed the whole
+# local directory. The parent row rode the removal grace to `REMOVED_BOTH` and left the Files
+# page -- but the 29 archive-volume child rows stayed at `EXCLUDED` forever, because the
+# `deleted_archive_paths` branch (section 5) resolves unconditionally, with no notion that the
+# *parent* it was exempting them for had itself left both trees too.
+#
+# The fix: that branch now checks whether the row's own top-level ancestor (DESIGN.md §4.7's
+# "item") is still present in `written` -- the same set `_persist` uses to decide what gets
+# published this pass -- before resting at `EXCLUDED`. An ancestor still structurally present,
+# or still riding its own removal grace (a non-terminal vanished resolution, sorted and
+# resolved *before* any of its children in the same pass), reads present; only once the
+# ancestor's own row has landed on a terminal state does the exemption lapse, falling straight
+# to `REMOVED_BOTH` and purging the row's `deleted_archive` registry entry
+# (`core/archive_cleanup.py.purge_deleted_archive_paths`, re-exported from `core/local_delete.py`).
+
+PARENT_REL = "Release.Family"
+CHILD_RELS = (f"{PARENT_REL}/vol01.rar", f"{PARENT_REL}/vol02.rar")
+
+
+async def _new_archive_family_queue(tmp_path, sync_mode: str):
+    """Bare `host`/`path_queue` rows, no items yet -- callers seed `item`/`deleted_archive` rows
+    themselves so each test can control exactly what "already happened" before its first scan.
+    """
+    db = await aiosqlite.connect(":memory:")
+    db.row_factory = aiosqlite.Row
+    await db.execute("PRAGMA foreign_keys = ON")
+    await migrate(db)
+
+    cursor = await db.execute(
+        "INSERT INTO host (name, address, port, username, auth_method, known_hosts_policy) "
+        "VALUES ('h', '127.0.0.1', 22, 'u', 'key', 'strict')"
+    )
+    host_id = cursor.lastrowid
+    cursor = await db.execute(
+        "INSERT INTO path_queue (host_id, name, remote_path, local_path, enabled, sync_mode) "
+        "VALUES (?, 'q', '/remote', ?, 1, ?)",
+        (host_id, str(tmp_path), sync_mode),
+    )
+    queue_id = cursor.lastrowid
+    await db.commit()
+    await save_settle_settings(db, SettleSettings(enabled=False))
+    return db, host_id, queue_id
+
+
+async def _seed_archive_children(db, queue_id: int) -> list[int]:
+    """The two spent volumes, already resting `EXCLUDED` with a `deleted_archive` registry
+    entry each -- exactly what `delete_extracted_archives` leaves behind, before this task's
+    ancestor check ever gets a chance to run.
+    """
+    child_ids = []
+    for child_rel in CHILD_RELS:
+        cursor = await db.execute(
+            "INSERT INTO item (queue_id, rel_path, is_dir, remote_size, local_size, state) "
+            "VALUES (?, ?, 0, NULL, NULL, 'EXCLUDED')",
+            (queue_id, child_rel),
+        )
+        child_ids.append(cursor.lastrowid)
+        await db.execute(
+            "INSERT INTO deleted_archive (queue_id, rel_path, deleted_at) VALUES (?, ?, ?)",
+            (queue_id, child_rel, "2026-08-17T00:00:00.000000Z"),
+        )
+    await db.commit()
+    return child_ids
+
+
+def _archive_family_engine(
+    db, tmp_path, host_id, queue_id, sync_mode, *, remote_tree, local_tree, monkeypatch
+):
+    monkeypatch.setattr(
+        engine_module.local_scan,
+        "scan_local",
+        lambda root, **_kwargs: local_tree,  # noqa: ARG005
+    )
+    engine = Engine(db, str(tmp_path), EventBus())
+    engine.pool = _FakePool(remote_tree)
+    q = QueueConfig(
+        id=queue_id,
+        host_id=host_id,
+        name="q",
+        remote_path="/remote",
+        local_path=str(tmp_path),
+        staging_path=None,
+        enabled=True,
+        sync_mode=sync_mode,
+    )
+    host = HostConfig(
+        id=host_id,
+        address="127.0.0.1",
+        port=22,
+        username="u",
+        auth_method="key",
+        key_path="/k",
+        known_hosts_policy="strict",
+    )
+    return engine, q, host
+
+
+async def _deleted_archive_count(db, queue_id: int) -> int:
+    cursor = await db.execute(
+        "SELECT COUNT(*) AS n FROM deleted_archive WHERE queue_id = ?", (queue_id,)
+    )
+    return (await cursor.fetchone())["n"]
+
+
+async def test_archive_rows_rest_excluded_while_the_parent_directory_is_still_present(
+    tmp_path, monkeypatch
+):
+    """Pin the existing, unmodified behaviour with a genuine nested directory parent (not the
+    self-referential top-level-file shape section 5's own tests use): while the release
+    directory is still present in either tree -- mid-import, not yet delivered to *arr, or a
+    `copy` queue that never removes it -- the spent volumes rest `EXCLUDED`, no countdown, and
+    the registry entries survive, across repeated passes.
+    """
+    db, host_id, queue_id = await _new_archive_family_queue(tmp_path, "move")
+    cursor = await db.execute(
+        "INSERT INTO item (queue_id, rel_path, is_dir, remote_size, local_size, state, remote_deleted_at) "
+        "VALUES (?, ?, 1, NULL, 0, 'EXTRACTED', ?)",
+        (queue_id, PARENT_REL, "2026-08-17T00:00:00.000000Z"),
+    )
+    parent_id = cursor.lastrowid
+    child_ids = await _seed_archive_children(db, queue_id)
+
+    # Remote copy already gone (the `move` ladder's own delete, `remote_deleted_at` set exactly
+    # the way that delete leaves it -- `postprocess.outcome_survives_rescan`'s own precondition
+    # for keeping `EXTRACTED` rather than downgrading to a fresh `LOCAL_ONLY`), local directory
+    # still present -- exactly the window between the archive cleanup and *arr cleanup removing
+    # the rest.
+    local_tree = {PARENT_REL: LocalEntry(rel_path=PARENT_REL, is_dir=True, size=0)}
+    engine, q, host = _archive_family_engine(
+        db,
+        tmp_path,
+        host_id,
+        queue_id,
+        "move",
+        remote_tree={},
+        local_tree=local_tree,
+        monkeypatch=monkeypatch,
+    )
+    try:
+        for _ in range(3):
+            await engine.scan_queue(q, host)
+            assert (await _state_of(db, parent_id))[0] == "EXTRACTED"
+            for child_id in child_ids:
+                state, first_missing_at = await _state_of(db, child_id)
+                assert state == "EXCLUDED"
+                assert first_missing_at is None
+        assert await _deleted_archive_count(db, queue_id) == 2
+    finally:
+        await db.close()
+
+
+async def test_archive_rows_stay_excluded_through_the_parents_own_grace_then_follow_it_to_removed_both(
+    tmp_path, monkeypatch
+):
+    """The grace interplay the task pins: once the parent itself leaves both trees, its own row
+    rides §7.3's removal grace exactly like any other vanished row -- and while that grace is
+    running, the archive children keep resting `EXCLUDED` right alongside it, because the parent
+    is still "present" for this purpose (only a *terminal* resolution counts as gone). Once the
+    parent's grace expires and it lands on `REMOVED_BOTH`, the archive children follow in that
+    same scan pass, and their `deleted_archive` registry entries are purged.
+    """
+    db, host_id, queue_id = await _new_archive_family_queue(tmp_path, "move")
+    cursor = await db.execute(
+        "INSERT INTO item (queue_id, rel_path, is_dir, remote_size, local_size, state) "
+        "VALUES (?, ?, 1, NULL, 0, 'EXTRACTED')",
+        (queue_id, PARENT_REL),
+    )
+    parent_id = cursor.lastrowid
+    child_ids = await _seed_archive_children(db, queue_id)
+
+    # Both the parent and its archive children are now absent from both trees -- the *arr
+    # cleanup step removing the whole local directory, remote already long gone.
+    engine, q, host = _archive_family_engine(
+        db,
+        tmp_path,
+        host_id,
+        queue_id,
+        "move",
+        remote_tree={},
+        local_tree={},
+        monkeypatch=monkeypatch,
+    )
+    try:
+        # First pass: the parent's own grace clock starts. It is still "present" for the
+        # archive rows' purposes -- they must not flip yet.
+        await engine.scan_queue(q, host)
+        parent_state, parent_first_missing_at = await _state_of(db, parent_id)
+        assert parent_state == "EXTRACTED"
+        assert parent_first_missing_at is not None
+        for child_id in child_ids:
+            state, first_missing_at = await _state_of(db, child_id)
+            assert state == "EXCLUDED"
+            assert first_missing_at is None
+        assert await _deleted_archive_count(db, queue_id) == 2
+
+        # A second pass still inside the window changes nothing for either the parent or its
+        # archive children.
+        await engine.scan_queue(q, host)
+        assert (await _state_of(db, parent_id)) == (parent_state, parent_first_missing_at)
+        for child_id in child_ids:
+            assert (await _state_of(db, child_id)) == ("EXCLUDED", None)
+
+        # Backdate the parent's clock past the grace window, same technique as section 2 above.
+        await db.execute(
+            "UPDATE item SET first_missing_at = STRFTIME('%Y-%m-%dT%H:%M:%fZ', 'now', ?) "
+            "WHERE id = ?",
+            (f"-{int(DEFAULT_GRACE_S) + 60} seconds", parent_id),
+        )
+        await db.commit()
+
+        await engine.scan_queue(q, host)
+        assert (await _state_of(db, parent_id))[0] == "REMOVED_BOTH"
+        for child_id in child_ids:
+            state, first_missing_at = await _state_of(db, child_id)
+            assert state == "REMOVED_BOTH", "the archive row must follow its parent, not orphan"
+            assert first_missing_at is None
+        assert await _deleted_archive_count(db, queue_id) == 0, (
+            "the registry entries must be purged so a later release at the same paths never "
+            "inherits a stale exclusion"
+        )
+    finally:
+        await db.close()
+
+
+async def test_archive_rows_are_untouched_on_a_copy_queue_with_a_real_directory_parent(
+    tmp_path, monkeypatch
+):
+    """The other half of section 5's own coverage, repeated here with a genuine nested parent:
+    a `copy` queue's remote volumes survive cleanup, so the archive children never even reach
+    the vanished sweep this task's fix lives in -- `reconcile()`'s own predicate marks them
+    `EXCLUDED` directly, every pass, registry intact.
+    """
+    db, host_id, queue_id = await _new_archive_family_queue(tmp_path, "copy")
+    cursor = await db.execute(
+        "INSERT INTO item (queue_id, rel_path, is_dir, remote_size, local_size, state) "
+        "VALUES (?, ?, 1, 0, 0, 'DOWNLOADED')",
+        (queue_id, PARENT_REL),
+    )
+    parent_id = cursor.lastrowid
+    child_ids = await _seed_archive_children(db, queue_id)
+
+    # The remote archive volumes are still there (a `copy` queue never deletes remotely); only
+    # the local copies were removed by cleanup.
+    remote_tree = {
+        PARENT_REL: RemoteEntry(rel_path=PARENT_REL, is_dir=True, size=0, mtime=1.0),
+        CHILD_RELS[0]: RemoteEntry(rel_path=CHILD_RELS[0], is_dir=False, size=SIZE, mtime=1.0),
+        CHILD_RELS[1]: RemoteEntry(rel_path=CHILD_RELS[1], is_dir=False, size=SIZE, mtime=1.0),
+    }
+    local_tree = {PARENT_REL: LocalEntry(rel_path=PARENT_REL, is_dir=True, size=0)}
+    engine, q, host = _archive_family_engine(
+        db,
+        tmp_path,
+        host_id,
+        queue_id,
+        "copy",
+        remote_tree=remote_tree,
+        local_tree=local_tree,
+        monkeypatch=monkeypatch,
+    )
+    try:
+        for _ in range(2):
+            await engine.scan_queue(q, host)
+            assert (await _state_of(db, parent_id))[0] == "DOWNLOADED"
+            for child_id in child_ids:
+                state, first_missing_at = await _state_of(db, child_id)
+                assert state == "EXCLUDED"
+                assert first_missing_at is None
+        assert await _deleted_archive_count(db, queue_id) == 2
+    finally:
+        await db.close()
+
+
+async def test_a_preexisting_orphan_self_heals_within_a_scan_pass_or_two(tmp_path, monkeypatch):
+    """The retroactive self-heal the task requires: seed exactly the production shape an
+    upgrade would find already sitting in the database -- registry entries, `EXCLUDED` child
+    rows, and a parent that had *already* resolved to `REMOVED_BOTH` (unsuppressed, per
+    `core/mount_sentinel.py.resolve_vanished`'s own docstring -- the vanished sweep's own
+    `REMOVED_BOTH` reading is never suppressed, so this row keeps re-entering `vanished` every
+    pass) before this fix ever shipped. No migration, no manual reset -- the very next scan pass
+    must clean the orphans up on its own.
+    """
+    db, host_id, queue_id = await _new_archive_family_queue(tmp_path, "move")
+    cursor = await db.execute(
+        "INSERT INTO item (queue_id, rel_path, is_dir, remote_size, local_size, state) "
+        "VALUES (?, ?, 1, NULL, NULL, 'REMOVED_BOTH')",
+        (queue_id, PARENT_REL),
+    )
+    parent_id = cursor.lastrowid
+    child_ids = await _seed_archive_children(db, queue_id)
+
+    engine, q, host = _archive_family_engine(
+        db,
+        tmp_path,
+        host_id,
+        queue_id,
+        "move",
+        remote_tree={},
+        local_tree={},
+        monkeypatch=monkeypatch,
+    )
+    try:
+        await engine.scan_queue(q, host)
+        for child_id in child_ids:
+            state, first_missing_at = await _state_of(db, child_id)
+            assert state == "REMOVED_BOTH"
+            assert first_missing_at is None
+        assert (await _state_of(db, parent_id))[0] == "REMOVED_BOTH"
+        assert await _deleted_archive_count(db, queue_id) == 0
+
+        # A further pass changes nothing further -- both terminal, both already purged.
+        await engine.scan_queue(q, host)
+        for child_id in child_ids:
+            assert (await _state_of(db, child_id))[0] == "REMOVED_BOTH"
+        assert await _deleted_archive_count(db, queue_id) == 0
+    finally:
+        await db.close()

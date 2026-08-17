@@ -1500,6 +1500,16 @@ them distinguishable, because a bind mount that didn't come up has no sentinel i
   verify/extract and let the pipeline re-run, or the manual-delete dialog); every deferral
   writes its own `remote_delete_deferred` event naming the rung, so History can answer "why is
   this still on the seedbox" in one call.
+  **Rung 4's delete retries on failure rather than firing once** (2026-08-17,
+  `prompts/done/2026-08-17-stranded-source-delete-retry.md`, live incident: a transient SSH
+  failure on the deferred delete stranded the remote copy permanently, because the delete only
+  ever fired from the one-shot `imported` transition and cleanup removed the local copy anyway).
+  `core/arrsync.py` now sweeps every pass for an outstanding `item.remote_delete_pending` debt
+  and re-attempts it, with backoff and a bounded pause (one clear event, not a
+  `remote_delete_failed` every pass while a seedbox is down); cleanup itself now withholds while
+  that debt is owed, restoring "delete source → delete local" as an enforced order rather than a
+  hoped-for one; and the Files-page Delete action is reachable for a row with only a surviving
+  remote copy (no local content), the manual escape hatch this retry's own failure mode needs.
 - **Dry-run mode.** Per queue, logs exactly what *would* be deleted and why, and acts on
   nothing. This is the expected way to turn `sync` on for the first time on a real tree.
 - **Full audit trail.** Every delete — and every delete *withheld*, with the failing
@@ -1648,9 +1658,18 @@ reasserting itself, visible at all; both are changes no writer pushes, because n
   machinery of §9.2's Files-row hover card through the shared `lib/popoverPosition.ts`, rather
   than being a third popup mechanism alongside that card and the inline confirm panels. Click/tap
   toggles it and Enter/Space opens it, so it works without a pointer; hover only assists.
-- **Version in the bottom-left corner of the nav**, linking out to that release's notes on
-  GitHub. (Repo not created yet — the base URL is a config constant so it can be filled in
-  without touching the component.)
+- **Version in the bottom-left corner of the nav**, linking to that release's notes. Originally
+  sketched as a straight-out link to GitHub before the repo existed; since 2026-08-17
+  (`docs/decisions.md`) it links to the in-app Docs → Release notes page instead (a dev build's
+  `DEV: vX.Y.Z · <sha>` badge still links to the GitHub commit — the one case that genuinely
+  needs GitHub, not just the release notes) — the GitHub release itself is one click further,
+  from that page's own "View on GitHub" line.
+- **A what's-new popup on the first page load after an upgrade** (2026-08-17,
+  `docs/decisions.md`) shows the release notes for every version between what this browser last
+  saw (`localStorage`, per-browser) and the version now running — nothing on a fresh browser,
+  an unchanged version, or a downgrade. `lib/releaseNotes.ts` holds all of that logic, unit-
+  tested against the real `CHANGELOG.md`; the Docs → Release notes page above renders the same
+  file verbatim rather than through this popup's per-version splitting.
 - **Theme: dark / light / system**, with **system as the default** so it follows the OS until
   told otherwise. Persisted per browser.
 
@@ -2599,7 +2618,34 @@ presentational override: the removal-grace countdown chip, which normally reads 
 because an *unexplained* absence means a decision is pending, renders "Processed · Xm" for a
 `cleaned` row instead — same clock, different words, because this absence is deliberate and
 fully audited (`core/audit.py` event rows: `arr_matched`, `arr_notified`,
-`arr_notify_failed`, `arr_imported`, `arr_cleanup`, `arr_cleanup_withheld`).
+`arr_notify_failed`, `arr_imported`, `arr_cleanup`, `arr_cleanup_withheld`,
+`arr_path_mismatch`, `arr_scan_command_failed`).
+
+**The notify push is not actually fire-and-forget, as of 2026-08-17.** A `POST /api/v3/command`
+201 only ever meant "command queued" — it says nothing about whether the *arr could act on the
+pushed path at all. Production evidence
+(`private_data/debug_logs/productionlftpweb.log`): the user's *arr instances mount the synced
+storage at a different container path than lftpweb does, so every push before this landed on a
+path that doesn't exist inside the *arr's own container — accepted, then silently a no-op —
+and several associations drifted all the way to `gone` waiting on the *arr's own unrelated
+import schedule instead. lftpweb now closes this loop two ways, one predictive and one
+confirmed, both advisory-only (neither changes what the notify push itself does):
+
+- **Predictive — `arr_path_mismatch`.** The moment a queue record matches an item
+  (`core/arrsync.py._maybe_warn_path_mismatch`), the record's own `outputPath` — the *arr's own
+  view of this exact release — is compared against what a notify's `translate_to_arr_namespace`
+  translation would push. A disagreement fires one warning event, naming the *arr's reported
+  root and suggesting the queue's `arr_visible_path` value that would fix it, debounced once per
+  `(queue, derived root)` per process lifetime. Fires before the first notify for the item ever
+  goes out.
+- **Confirmed — `arr_scan_command_failed`.** `core/arrnotify.py.notify_arr` now records the
+  pushed command's own `id` (`item.arr_scan_command_id`, migration 021 — a persisted column, not
+  in-memory bookkeeping, because the two processes that can call `notify_arr` must not orphan a
+  restart mid-check). `core/arrsync.py._check_scan_commands` polls `GET /api/v3/command/{id}` on
+  later passes: `completed` clears the column silently, `failed` clears it and writes the one
+  warning event, and a command that never resolves within `MAX_SCAN_COMMAND_CHECK_ATTEMPTS`
+  passes (or that 404s — the *arr prunes finished commands, or lost its own history across a
+  restart) also clears silently, since absence of evidence is never treated as a failure.
 
 **UI:** a new Settings → Integrations tab (instance CRUD, write-only API key, a Test button
 against `GET /api/v3/system/status`); three additions to each queue's form in Settings → Queues

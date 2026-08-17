@@ -24,6 +24,9 @@ COPY frontend/ ./
 # Caught only by the CI image build — `npm run build` on a dev machine passes either way,
 # because the repo root is right there.
 COPY docs/ /app/docs/
+# Docs -> Release notes (2026-08-17) imports `../../../../CHANGELOG.md?raw` the same way -- one
+# more repo-root file this stage's build context has to carry in alongside docs/, above.
+COPY CHANGELOG.md /app/CHANGELOG.md
 RUN npm run build
 
 FROM node:22-alpine@sha256:c610fcdfb1d5b4740dd70c284ed3cb16bb857e0f7166196e36a5501df7a3aa32 AS frontend-dev

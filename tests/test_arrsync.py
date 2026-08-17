@@ -15,9 +15,16 @@ import aiosqlite
 import pytest
 from fake_arr import run_fake_arr_server
 
-from lftpweb.core.arrsync import ArrSyncScheduler
+from lftpweb.core.arrsync import (
+    INITIAL_BACKOFF_S,
+    MAX_BACKOFF_S,
+    MAX_SCAN_COMMAND_CHECK_ATTEMPTS,
+    MAX_SOURCE_DELETE_RETRY_ATTEMPTS,
+    ArrSyncScheduler,
+)
 from lftpweb.core.crypto import encrypt_secret
 from lftpweb.core.events import EventBus
+from lftpweb.core.mount_sentinel import write_if_needed
 from lftpweb.db import migrate
 
 # --- Fixtures / helpers ----------------------------------------------------------------------
@@ -47,11 +54,13 @@ async def _seed_queue(
     *,
     arr_instance_id: int | None = None,
     arr_delete_completed: bool = False,
+    local_path: str = "/l",
+    arr_visible_path: str | None = None,
 ) -> int:
     cursor = await db.execute(
         "INSERT INTO path_queue (host_id, name, remote_path, local_path, enabled, "
-        "arr_instance_id, arr_delete_completed) VALUES (?, 'q', '/r', '/l', 1, ?, ?)",
-        (host_id, arr_instance_id, 1 if arr_delete_completed else 0),
+        "arr_instance_id, arr_delete_completed, arr_visible_path) VALUES (?, 'q', '/r', ?, 1, ?, ?, ?)",
+        (host_id, local_path, arr_instance_id, 1 if arr_delete_completed else 0, arr_visible_path),
     )
     await db.commit()
     return cursor.lastrowid
@@ -65,17 +74,19 @@ async def _seed_instance(
     base_url: str,
     api_key: str,
     enabled: bool = True,
+    notify_on_complete: bool = False,
 ) -> int:
     now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
     cursor = await db.execute(
         "INSERT INTO arr_instance (name, kind, base_url, api_key_enc, enabled, "
-        "notify_on_complete, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 0, ?, ?)",
+        "notify_on_complete, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         (
             "Sonarr",
             kind,
             base_url,
             encrypt_secret(config_dir, api_key),
             1 if enabled else 0,
+            1 if notify_on_complete else 0,
             now,
             now,
         ),
@@ -589,13 +600,22 @@ class _FakeRemotePool:
     """Stands in for `core/remote.py`'s `RemoteConnectionPool` -- same shape as
     `tests/test_postprocess.py`'s own fake, kept local to this file rather than imported so
     this module's tests don't reach across test files for a fixture.
+
+    `fail_times` (2026-08-17, the retry-sweep task) makes the first N calls raise instead of
+    succeeding -- a transient SSH failure, the exact shape of the production incident
+    (`SSH connection closed`) this task's retry sweep exists to survive. `0` (the default)
+    preserves every existing rung-4 test's always-succeeds behavior unmodified.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, fail_times: int = 0) -> None:
         self.calls: list[tuple[object, str]] = []
+        self._fail_times = fail_times
 
     async def delete_path(self, host, remote_path: str) -> None:
         self.calls.append((host, remote_path))
+        if self._fail_times > 0:
+            self._fail_times -= 1
+            raise ConnectionError("SSH connection closed")
 
 
 async def _async_host():
@@ -719,6 +739,654 @@ async def test_move_mode_delete_never_fires_on_gone(db, fake_arr_server, tmp_pat
     assert row["remote_delete_pending"] == "VERIFIED", "left exactly as it was -- no fallback"
     kinds = await _event_kinds(db, item_id)
     assert "remote_delete" not in kinds
+
+
+async def test_gone_commit_on_pending_source_delete_names_it_in_the_event(
+    db, fake_arr_server, tmp_path
+):
+    """Purely audit-trail visibility (2026-08-17,
+    `prompts/done/2026-08-17-stranded-source-delete-retry.md`): rung 4 never fires on `gone` --
+    unchanged, see the test above -- so a source delete that was still pending when the *arr's
+    queue record vanished just sits stranded silently otherwise. Production evidence: 15 items
+    went `notified` -> `gone` with `remote_delete_pending` still set. `_commit_terminal`'s own
+    `arr_gone` event message now names the withheld delete so History can answer "why is this
+    still on the seedbox" without a second lookup.
+    """
+    host_id = await _seed_host(db)
+    instance_id = await _seed_instance(
+        db,
+        str(tmp_path),
+        base_url=fake_arr_server.base_url,
+        api_key=fake_arr_server.state.api_key,
+    )
+    queue_id = await _seed_queue(db, host_id, arr_instance_id=instance_id)
+    await db.execute("UPDATE path_queue SET sync_mode = 'move' WHERE id = ?", (queue_id,))
+    await db.commit()
+    item_id = await _seed_item(
+        db,
+        queue_id,
+        "Show.S01E05.1080p-GRP",
+        state="VERIFIED",
+        arr_status="notified",
+        arr_download_id="abc123",
+    )
+    await db.execute("UPDATE item SET remote_delete_pending = 'VERIFIED' WHERE id = ?", (item_id,))
+    await db.commit()
+
+    scheduler = ArrSyncScheduler(db=db, config_dir=str(tmp_path))
+    fake_arr_server.state.queue_records = []
+    fake_arr_server.state.history_events = []
+    await scheduler.run_once()
+    await scheduler.run_once()
+
+    row = await _item_row(db, item_id)
+    assert row["arr_status"] == "gone"
+    assert row["remote_delete_pending"] == "VERIFIED", "still withheld -- no behavior change"
+    cursor = await db.execute(
+        "SELECT message FROM event WHERE item_id = ? AND kind = 'arr_gone'", (item_id,)
+    )
+    message = (await cursor.fetchone())["message"]
+    assert "remote_delete_pending" in message or "deferred source delete" in message
+    assert "Files page" in message
+
+
+async def test_gone_commit_with_no_pending_source_delete_leaves_the_event_unchanged(
+    db, fake_arr_server, tmp_path
+):
+    """The common case -- nothing was ever deferred (`remote_delete_pending` NULL) -- must not
+    gain the new sentence; it would be misleading noise for an item that was never *arr-tracked
+    with a `move` delete deferred in the first place.
+    """
+    host_id = await _seed_host(db)
+    instance_id = await _seed_instance(
+        db,
+        str(tmp_path),
+        base_url=fake_arr_server.base_url,
+        api_key=fake_arr_server.state.api_key,
+    )
+    queue_id = await _seed_queue(db, host_id, arr_instance_id=instance_id)
+    item_id = await _seed_item(
+        db,
+        queue_id,
+        "Show.S01E05.1080p-GRP",
+        state="PARTIAL",
+        arr_status="detected",
+        arr_download_id="abc123",
+    )
+    fake_arr_server.state.queue_records = []
+    fake_arr_server.state.history_events = []
+
+    scheduler = ArrSyncScheduler(db=db, config_dir=str(tmp_path))
+    await scheduler.run_once()
+    await scheduler.run_once()
+
+    row = await _item_row(db, item_id)
+    assert row["arr_status"] == "gone"
+    cursor = await db.execute(
+        "SELECT message FROM event WHERE item_id = ? AND kind = 'arr_gone'", (item_id,)
+    )
+    message = (await cursor.fetchone())["message"]
+    assert "remote_delete_pending" not in message
+    assert "Files page" not in message
+
+
+# --- Rung-4 retry sweep: a failed deferred delete must not strand the source forever
+# (2026-08-17, prompts/done/2026-08-17-stranded-source-delete-retry.md, live on both the user's
+# test and production systems) -----------------------------------------------------------------
+
+
+async def test_stranded_source_delete_retries_and_succeeds_next_pass(
+    db, fake_arr_server, tmp_path, monkeypatch
+):
+    """The production incident this task fixes, reproduced end to end: rung 4's deferred delete
+    fails once (a transient SSH error, `_FakeRemotePool(fail_times=1)`), the debt survives, and
+    cleanup is withheld so the local copy is not removed out from under it (§7.3/§7.4's ladder
+    order, restored by `_maybe_cleanup`'s new gate) -- then the very next pass, with the seedbox
+    healthy again, the retry sweep clears the debt and cleanup proceeds. Full ladder order
+    preserved across the failure, matching the incident's own audit trail
+    (`arr_imported` -> failed `remote_delete` -> `arr_cleanup` anyway) except the local copy no
+    longer goes first.
+    """
+    clock = {"t": 0.0}
+    monkeypatch.setattr("lftpweb.core.arrsync.time.monotonic", lambda: clock["t"])
+
+    local_root = tmp_path / "local"
+    local_root.mkdir()
+    rel_path = "Show.S01E05.1080p-GRP"
+    (local_root / rel_path).write_bytes(b"the release")
+    write_if_needed(str(local_root))
+
+    host_id = await _seed_host(db)
+    instance_id = await _seed_instance(
+        db,
+        str(tmp_path),
+        base_url=fake_arr_server.base_url,
+        api_key=fake_arr_server.state.api_key,
+    )
+    queue_id = await _seed_queue(
+        db,
+        host_id,
+        arr_instance_id=instance_id,
+        arr_delete_completed=True,
+        local_path=str(local_root),
+    )
+    await db.execute("UPDATE path_queue SET sync_mode = 'move' WHERE id = ?", (queue_id,))
+    await db.commit()
+    item_id = await _seed_item(
+        db,
+        queue_id,
+        rel_path,
+        state="VERIFIED",
+        arr_status="imported",
+        arr_download_id="abc123",
+    )
+    await db.execute("UPDATE item SET remote_delete_pending = 'VERIFIED' WHERE id = ?", (item_id,))
+    await db.commit()
+
+    pool = _FakeRemotePool(fail_times=1)
+    scheduler = ArrSyncScheduler(
+        db=db, config_dir=str(tmp_path), remote_pool=pool, host_provider=_async_host
+    )
+
+    await scheduler.run_once()
+    row = await _item_row(db, item_id)
+    assert row["remote_delete_pending"] == "VERIFIED", "debt survives a failed attempt"
+    assert row["remote_deleted_at"] is None
+    assert (local_root / rel_path).exists(), "cleanup must withhold while source is still owed"
+    kinds = await _event_kinds(db, item_id)
+    assert "remote_delete_failed" in kinds
+    assert "arr_cleanup_withheld" in kinds
+    assert "remote_delete" not in kinds
+    assert "arr_cleanup" not in kinds
+
+    clock["t"] += INITIAL_BACKOFF_S + 1  # past the first attempt's backoff window
+    await scheduler.run_once()
+    row = await _item_row(db, item_id)
+    assert row["remote_delete_pending"] is None
+    assert row["remote_deleted_at"] is not None
+    assert row["arr_status"] == "cleaned"
+    assert not (local_root / rel_path).exists(), "local copy removed once source delete cleared"
+    kinds = await _event_kinds(db, item_id)
+    assert "remote_delete" in kinds
+    assert "arr_cleanup" in kinds
+    assert kinds.index("remote_delete") < kinds.index("arr_cleanup"), "ladder order preserved"
+
+
+async def test_stranded_source_delete_retries_back_off_and_eventually_pause(
+    db, fake_arr_server, tmp_path, monkeypatch
+):
+    """Repeated failures must not spam a `remote_delete_failed` event every ~60s pass for as
+    long as a seedbox stays down -- attempts space out (each `run_once` here is deliberately
+    made far enough apart, via the monkeypatched clock, that every one of them lands past the
+    current backoff window) and, once `MAX_SOURCE_DELETE_RETRY_ATTEMPTS` is exhausted, this
+    process pauses and writes exactly one `remote_delete_retries_paused` event.
+    `remote_delete_pending` stays set throughout -- never silently dropped -- and a later pass,
+    even with the pool healthy again, does not resume on its own (paused is sticky until a
+    restart's clean in-memory slate).
+    """
+    clock = {"t": 0.0}
+    monkeypatch.setattr("lftpweb.core.arrsync.time.monotonic", lambda: clock["t"])
+
+    host_id = await _seed_host(db)
+    instance_id = await _seed_instance(
+        db,
+        str(tmp_path),
+        base_url=fake_arr_server.base_url,
+        api_key=fake_arr_server.state.api_key,
+    )
+    queue_id = await _seed_queue(db, host_id, arr_instance_id=instance_id)
+    await db.execute("UPDATE path_queue SET sync_mode = 'move' WHERE id = ?", (queue_id,))
+    await db.commit()
+    item_id = await _seed_item(
+        db,
+        queue_id,
+        "Show.S01E05.1080p-GRP",
+        state="VERIFIED",
+        arr_status="imported",
+        arr_download_id="abc123",
+    )
+    await db.execute("UPDATE item SET remote_delete_pending = 'VERIFIED' WHERE id = ?", (item_id,))
+    await db.commit()
+
+    pool = _FakeRemotePool(fail_times=MAX_SOURCE_DELETE_RETRY_ATTEMPTS)
+    scheduler = ArrSyncScheduler(
+        db=db, config_dir=str(tmp_path), remote_pool=pool, host_provider=_async_host
+    )
+
+    for _attempt in range(MAX_SOURCE_DELETE_RETRY_ATTEMPTS):
+        await scheduler.run_once()
+        clock["t"] += MAX_BACKOFF_S + 1  # always past whatever the current backoff is
+
+    row = await _item_row(db, item_id)
+    assert row["remote_delete_pending"] == "VERIFIED", "debt survives -- never silently dropped"
+    assert len(pool.calls) == MAX_SOURCE_DELETE_RETRY_ATTEMPTS
+    kinds = await _event_kinds(db, item_id)
+    assert kinds.count("remote_delete_failed") == MAX_SOURCE_DELETE_RETRY_ATTEMPTS
+    assert kinds.count("remote_delete_retries_paused") == 1
+    assert kinds[-1] == "remote_delete_retries_paused"
+
+    # A later pass, even with the pool healthy again, must not resume on its own.
+    pool._fail_times = 0
+    clock["t"] += MAX_BACKOFF_S + 1
+    await scheduler.run_once()
+    assert len(pool.calls) == MAX_SOURCE_DELETE_RETRY_ATTEMPTS, "no further attempts once paused"
+
+
+async def test_stranded_source_delete_self_heals_a_row_stranded_before_this_shipped(
+    db, fake_arr_server, tmp_path
+):
+    """Retroactive self-heal, required by design: a row already stranded before this fix
+    shipped -- `cleaned`, remote copy still alive, `remote_delete_pending` still set from the
+    original one-shot attempt that failed -- matches the sweep's own query and gets its delete
+    attempted on the very first pass after upgrade. No migration, no state massaging: the query
+    alone is the self-heal.
+    """
+    host_id = await _seed_host(db)
+    instance_id = await _seed_instance(
+        db,
+        str(tmp_path),
+        base_url=fake_arr_server.base_url,
+        api_key=fake_arr_server.state.api_key,
+    )
+    queue_id = await _seed_queue(db, host_id, arr_instance_id=instance_id)
+    await db.execute("UPDATE path_queue SET sync_mode = 'move' WHERE id = ?", (queue_id,))
+    await db.commit()
+    item_id = await _seed_item(
+        db,
+        queue_id,
+        "Show.S01E05.1080p-GRP",
+        state="VERIFIED",
+        arr_status="cleaned",
+        arr_download_id="abc123",
+    )
+    await db.execute("UPDATE item SET remote_delete_pending = 'VERIFIED' WHERE id = ?", (item_id,))
+    await db.commit()
+
+    pool = _FakeRemotePool()
+    scheduler = ArrSyncScheduler(
+        db=db, config_dir=str(tmp_path), remote_pool=pool, host_provider=_async_host
+    )
+    await scheduler.run_once()
+
+    row = await _item_row(db, item_id)
+    assert row["arr_status"] == "cleaned", "arr_status untouched -- only the source debt clears"
+    assert row["remote_delete_pending"] is None
+    assert row["remote_deleted_at"] is not None
+    assert len(pool.calls) == 1
+    assert "remote_delete" in await _event_kinds(db, item_id)
+
+
+async def test_stranded_source_delete_sweep_is_a_no_op_when_the_feature_is_not_wired(
+    db, fake_arr_server, tmp_path
+):
+    """A process that never wired `remote_pool`/`host_provider` (most of this module's own
+    tests, and the identical rule the one-shot rung-4 call already follows) must leave a
+    stranded row exactly as it was -- no crash, no attempt, no bookkeeping accumulated for a
+    feature this process can't act on anyway.
+    """
+    host_id = await _seed_host(db)
+    instance_id = await _seed_instance(
+        db,
+        str(tmp_path),
+        base_url=fake_arr_server.base_url,
+        api_key=fake_arr_server.state.api_key,
+    )
+    queue_id = await _seed_queue(db, host_id, arr_instance_id=instance_id)
+    await db.execute("UPDATE path_queue SET sync_mode = 'move' WHERE id = ?", (queue_id,))
+    await db.commit()
+    item_id = await _seed_item(
+        db,
+        queue_id,
+        "Show.S01E05.1080p-GRP",
+        state="VERIFIED",
+        arr_status="cleaned",
+        arr_download_id="abc123",
+    )
+    await db.execute("UPDATE item SET remote_delete_pending = 'VERIFIED' WHERE id = ?", (item_id,))
+    await db.commit()
+
+    scheduler = ArrSyncScheduler(db=db, config_dir=str(tmp_path))  # no remote_pool/host_provider
+    await scheduler.run_once()
+
+    row = await _item_row(db, item_id)
+    assert row["remote_delete_pending"] == "VERIFIED"
+    assert row["remote_deleted_at"] is None
+
+
+# --- Namespace-mismatch detection (2026-08-17, production evidence:
+# private_data/debug_logs/productionlftpweb.log -- the user's *arr instances mount the same
+# storage at a different path than lftpweb does) ------------------------------------------------
+
+
+async def test_path_mismatch_warns_once_when_visible_path_is_unset(db, fake_arr_server, tmp_path):
+    """`arr_visible_path` unset means every notify would push lftpweb's own root -- detectable
+    the moment a match commits, from the matched record's own `outputPath` alone, well before
+    the first notify ever fires. Fires once per (queue, derived root) even across two items
+    matched in the same pass that share the same wrong root, and stays at exactly one across a
+    second pass that matches nothing new -- the debounce is per-root, not per-item or per-pass.
+    """
+    host_id = await _seed_host(db)
+    instance_id = await _seed_instance(
+        db,
+        str(tmp_path),
+        base_url=fake_arr_server.base_url,
+        api_key=fake_arr_server.state.api_key,
+        notify_on_complete=True,
+    )
+    queue_id = await _seed_queue(db, host_id, arr_instance_id=instance_id, local_path="/l")
+    item_a = await _seed_item(db, queue_id, "Show.S01E05.1080p-GRP")
+    item_b = await _seed_item(db, queue_id, "Show.S01E06.1080p-GRP")
+
+    fake_arr_server.state.queue_records = [
+        _queue_record(
+            download_id="a1",
+            title="Show S01E05 1080p GRP",
+            output_path="/arrside/box-dc-tv/Show.S01E05.1080p-GRP",
+        ),
+        _queue_record(
+            download_id="a2",
+            title="Show S01E06 1080p GRP",
+            output_path="/arrside/box-dc-tv/Show.S01E06.1080p-GRP",
+        ),
+    ]
+
+    scheduler = ArrSyncScheduler(db=db, config_dir=str(tmp_path))
+    await scheduler.run_once()
+
+    kinds_a = await _event_kinds(db, item_a)
+    kinds_b = await _event_kinds(db, item_b)
+    assert kinds_a.count("arr_path_mismatch") + kinds_b.count("arr_path_mismatch") == 1
+    cursor = await db.execute("SELECT message FROM event WHERE kind = 'arr_path_mismatch'")
+    message = (await cursor.fetchone())["message"]
+    assert "/arrside/box-dc-tv" in message
+    assert "Path as seen by the *arr" in message
+
+    # A second pass matches nothing new (both items already `detected`) -- still exactly one.
+    await scheduler.run_once()
+    cursor = await db.execute("SELECT COUNT(*) AS n FROM event WHERE kind = 'arr_path_mismatch'")
+    assert (await cursor.fetchone())["n"] == 1
+
+
+async def test_path_mismatch_fires_nothing_when_visible_path_is_correctly_set(
+    db, fake_arr_server, tmp_path
+):
+    host_id = await _seed_host(db)
+    instance_id = await _seed_instance(
+        db,
+        str(tmp_path),
+        base_url=fake_arr_server.base_url,
+        api_key=fake_arr_server.state.api_key,
+        notify_on_complete=True,
+    )
+    queue_id = await _seed_queue(
+        db,
+        host_id,
+        arr_instance_id=instance_id,
+        local_path="/l",
+        arr_visible_path="/arrside/box-dc-tv",
+    )
+    item_id = await _seed_item(db, queue_id, "Show.S01E05.1080p-GRP")
+    fake_arr_server.state.queue_records = [
+        _queue_record(
+            download_id="a1",
+            title="Show S01E05 1080p GRP",
+            output_path="/arrside/box-dc-tv/Show.S01E05.1080p-GRP",
+        )
+    ]
+
+    scheduler = ArrSyncScheduler(db=db, config_dir=str(tmp_path))
+    await scheduler.run_once()
+    assert "arr_path_mismatch" not in await _event_kinds(db, item_id)
+
+
+async def test_path_mismatch_fires_when_visible_path_is_set_but_wrong(
+    db, fake_arr_server, tmp_path
+):
+    host_id = await _seed_host(db)
+    instance_id = await _seed_instance(
+        db,
+        str(tmp_path),
+        base_url=fake_arr_server.base_url,
+        api_key=fake_arr_server.state.api_key,
+        notify_on_complete=True,
+    )
+    queue_id = await _seed_queue(
+        db, host_id, arr_instance_id=instance_id, local_path="/l", arr_visible_path="/wrong/path"
+    )
+    item_id = await _seed_item(db, queue_id, "Show.S01E05.1080p-GRP")
+    fake_arr_server.state.queue_records = [
+        _queue_record(
+            download_id="a1",
+            title="Show S01E05 1080p GRP",
+            output_path="/arrside/box-dc-tv/Show.S01E05.1080p-GRP",
+        )
+    ]
+
+    scheduler = ArrSyncScheduler(db=db, config_dir=str(tmp_path))
+    await scheduler.run_once()
+    kinds = await _event_kinds(db, item_id)
+    assert "arr_path_mismatch" in kinds
+    cursor = await db.execute(
+        "SELECT message FROM event WHERE item_id = ? AND kind = 'arr_path_mismatch'", (item_id,)
+    )
+    message = (await cursor.fetchone())["message"]
+    assert "/arrside/box-dc-tv" in message
+
+
+async def test_path_mismatch_fires_nothing_when_output_path_is_none(db, fake_arr_server, tmp_path):
+    """A title-fallback match has no *arr-side path to compare against at all."""
+    host_id = await _seed_host(db)
+    instance_id = await _seed_instance(
+        db,
+        str(tmp_path),
+        base_url=fake_arr_server.base_url,
+        api_key=fake_arr_server.state.api_key,
+        notify_on_complete=True,
+    )
+    queue_id = await _seed_queue(db, host_id, arr_instance_id=instance_id, local_path="/l")
+    item_id = await _seed_item(db, queue_id, "Show S01E05 1080p GRP")
+    fake_arr_server.state.queue_records = [
+        {
+            "downloadId": "a1",
+            "title": "Show S01E05 1080p GRP",
+            "outputPath": None,
+            "trackedDownloadState": "downloading",
+        }
+    ]
+
+    scheduler = ArrSyncScheduler(db=db, config_dir=str(tmp_path))
+    await scheduler.run_once()
+    assert "arr_path_mismatch" not in await _event_kinds(db, item_id)
+
+
+async def test_path_mismatch_fires_nothing_when_notify_on_complete_is_off(
+    db, fake_arr_server, tmp_path
+):
+    """Nothing will ever be pushed, so a namespace mismatch here is moot -- matches this
+    module's "everything defaults off produces zero events, not noise" convention.
+    """
+    host_id = await _seed_host(db)
+    instance_id = await _seed_instance(
+        db,
+        str(tmp_path),
+        base_url=fake_arr_server.base_url,
+        api_key=fake_arr_server.state.api_key,
+        notify_on_complete=False,
+    )
+    queue_id = await _seed_queue(db, host_id, arr_instance_id=instance_id, local_path="/l")
+    item_id = await _seed_item(db, queue_id, "Show.S01E05.1080p-GRP")
+    fake_arr_server.state.queue_records = [
+        _queue_record(
+            download_id="a1",
+            title="Show S01E05 1080p GRP",
+            output_path="/arrside/box-dc-tv/Show.S01E05.1080p-GRP",
+        )
+    ]
+
+    scheduler = ArrSyncScheduler(db=db, config_dir=str(tmp_path))
+    await scheduler.run_once()
+    assert "arr_path_mismatch" not in await _event_kinds(db, item_id)
+
+
+# --- Scan-command outcome verification (2026-08-17, production evidence:
+# private_data/debug_logs/productionlftpweb.log) -- `notify_arr`'s push was otherwise
+# fire-and-forget: a 201 only means "command queued," never "the *arr could act on this path."
+# Every test below pins a matching, still-`downloading` queue record for the item's own
+# `downloadId` so `_check_import` resets its pending-verdict guard every pass and never commits
+# `imported`/`gone` mid-test -- keeping these tests focused on the scan-command column alone. ---
+
+
+async def test_scan_command_completed_clears_the_column_with_no_event(
+    db, fake_arr_server, tmp_path
+):
+    host_id = await _seed_host(db)
+    instance_id = await _seed_instance(
+        db,
+        str(tmp_path),
+        base_url=fake_arr_server.base_url,
+        api_key=fake_arr_server.state.api_key,
+    )
+    queue_id = await _seed_queue(db, host_id, arr_instance_id=instance_id)
+    item_id = await _seed_item(
+        db, queue_id, "Show.S01E05.1080p-GRP", arr_status="notified", arr_download_id="abc123"
+    )
+    fake_arr_server.state.queue_records = [
+        _queue_record(
+            download_id="abc123",
+            title="Show S01E05 1080p GRP",
+            output_path="/data/torrents/complete/Show.S01E05.1080p-GRP",
+            tracked_download_state="downloading",
+        )
+    ]
+    fake_arr_server.state.command_statuses[7] = {"id": 7, "status": "completed"}
+    await db.execute("UPDATE item SET arr_scan_command_id = 7 WHERE id = ?", (item_id,))
+    await db.commit()
+
+    scheduler = ArrSyncScheduler(db=db, config_dir=str(tmp_path))
+    await scheduler.run_once()
+
+    row = await _item_row(db, item_id)
+    assert row["arr_scan_command_id"] is None
+    assert "arr_scan_command_failed" not in await _event_kinds(db, item_id)
+
+
+async def test_scan_command_failed_writes_one_warning_event_naming_the_path(
+    db, fake_arr_server, tmp_path
+):
+    host_id = await _seed_host(db)
+    instance_id = await _seed_instance(
+        db,
+        str(tmp_path),
+        base_url=fake_arr_server.base_url,
+        api_key=fake_arr_server.state.api_key,
+    )
+    queue_id = await _seed_queue(db, host_id, arr_instance_id=instance_id, local_path="/l")
+    item_id = await _seed_item(
+        db, queue_id, "Show.S01E05.1080p-GRP", arr_status="notified", arr_download_id="abc123"
+    )
+    fake_arr_server.state.queue_records = [
+        _queue_record(
+            download_id="abc123",
+            title="Show S01E05 1080p GRP",
+            output_path="/data/torrents/complete/Show.S01E05.1080p-GRP",
+            tracked_download_state="downloading",
+        )
+    ]
+    fake_arr_server.state.command_statuses[9] = {"id": 9, "status": "failed"}
+    await db.execute("UPDATE item SET arr_scan_command_id = 9 WHERE id = ?", (item_id,))
+    await db.commit()
+
+    scheduler = ArrSyncScheduler(db=db, config_dir=str(tmp_path))
+    await scheduler.run_once()
+
+    row = await _item_row(db, item_id)
+    assert row["arr_scan_command_id"] is None
+    kinds = await _event_kinds(db, item_id)
+    assert kinds.count("arr_scan_command_failed") == 1
+    cursor = await db.execute(
+        "SELECT message FROM event WHERE item_id = ? AND kind = 'arr_scan_command_failed'",
+        (item_id,),
+    )
+    message = (await cursor.fetchone())["message"]
+    assert "/l/Show.S01E05.1080p-GRP" in message
+    assert "Path as seen by the *arr" in message
+
+
+async def test_scan_command_404_clears_silently(db, fake_arr_server, tmp_path):
+    """An unknown command id -- pruned by the *arr, or lost across a restart -- is "no evidence
+    either way," not a failure: cleared with no event, same as a resolved `completed`.
+    """
+    host_id = await _seed_host(db)
+    instance_id = await _seed_instance(
+        db,
+        str(tmp_path),
+        base_url=fake_arr_server.base_url,
+        api_key=fake_arr_server.state.api_key,
+    )
+    queue_id = await _seed_queue(db, host_id, arr_instance_id=instance_id)
+    item_id = await _seed_item(
+        db, queue_id, "Show.S01E05.1080p-GRP", arr_status="notified", arr_download_id="abc123"
+    )
+    fake_arr_server.state.queue_records = [
+        _queue_record(
+            download_id="abc123",
+            title="Show S01E05 1080p GRP",
+            output_path="/data/torrents/complete/Show.S01E05.1080p-GRP",
+            tracked_download_state="downloading",
+        )
+    ]
+    # No entry seeded in `command_statuses` for id=42 -- simulates a pruned/unknown command.
+    await db.execute("UPDATE item SET arr_scan_command_id = 42 WHERE id = ?", (item_id,))
+    await db.commit()
+
+    scheduler = ArrSyncScheduler(db=db, config_dir=str(tmp_path))
+    await scheduler.run_once()
+
+    row = await _item_row(db, item_id)
+    assert row["arr_scan_command_id"] is None
+    assert "arr_scan_command_failed" not in await _event_kinds(db, item_id)
+
+
+async def test_scan_command_check_gives_up_silently_after_bounded_attempts(
+    db, fake_arr_server, tmp_path
+):
+    """A command that never resolves (still `queued` every pass) must not accumulate a
+    per-pass API call forever -- `MAX_SCAN_COMMAND_CHECK_ATTEMPTS` passes, then this process
+    gives up silently: the column clears, no event, same as a 404.
+    """
+    host_id = await _seed_host(db)
+    instance_id = await _seed_instance(
+        db,
+        str(tmp_path),
+        base_url=fake_arr_server.base_url,
+        api_key=fake_arr_server.state.api_key,
+    )
+    queue_id = await _seed_queue(db, host_id, arr_instance_id=instance_id)
+    item_id = await _seed_item(
+        db, queue_id, "Show.S01E05.1080p-GRP", arr_status="notified", arr_download_id="abc123"
+    )
+    fake_arr_server.state.queue_records = [
+        _queue_record(
+            download_id="abc123",
+            title="Show S01E05 1080p GRP",
+            output_path="/data/torrents/complete/Show.S01E05.1080p-GRP",
+            tracked_download_state="downloading",
+        )
+    ]
+    fake_arr_server.state.command_statuses[3] = {"id": 3, "status": "queued"}
+    await db.execute("UPDATE item SET arr_scan_command_id = 3 WHERE id = ?", (item_id,))
+    await db.commit()
+
+    scheduler = ArrSyncScheduler(db=db, config_dir=str(tmp_path))
+    for attempt in range(1, MAX_SCAN_COMMAND_CHECK_ATTEMPTS):
+        await scheduler.run_once()
+        row = await _item_row(db, item_id)
+        assert row["arr_scan_command_id"] == 3, f"cleared too early, after attempt {attempt}"
+
+    await scheduler.run_once()
+    row = await _item_row(db, item_id)
+    assert row["arr_scan_command_id"] is None
+    assert "arr_scan_command_failed" not in await _event_kinds(db, item_id)
 
 
 # --- Upgrade-regrab: a fresh association on a different downloadId ------------------------

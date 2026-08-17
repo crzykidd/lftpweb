@@ -74,6 +74,39 @@ async def save_deleted_archive_paths(
     await db.commit()
 
 
+async def purge_deleted_archive_paths(
+    db: aiosqlite.Connection, queue_id: int, rel_paths: Iterable[str]
+) -> None:
+    """Forget `rel_paths` from the `deleted_archive` registry -- the narrow delete this table
+    was missing (2026-08-17, `prompts/2026-08-17-orphaned-spent-archive-rows.md`).
+
+    `core/engine.py._persist`'s vanished-from-both-trees sweep resolves a spent archive
+    volume's `EXCLUDED` exemption to `REMOVED_BOTH` once the row's own top-level ancestor has
+    itself left both trees (the release finished its whole pipeline and departed) -- see that
+    sweep's own comment for the ancestor check. This call is the other half: without it, the
+    registry entry would survive forever, and a later release landing at the identical
+    `rel_path` would read `EXCLUDED` from its very first scan for a file it never touched --
+    the same stale-registry failure `core/reset.py`'s own module docstring names for
+    `reset_item`/`reset_scope`, reached here by an ordinary vanish rather than a deliberate
+    reset.
+
+    `rel_paths` is taken as already the safe-text form the `item`/`deleted_archive` rows are
+    both stored in -- `core/engine.py`'s `previous` dict keys are `item.rel_path` values, no
+    different an assumption from `core/reset.py._reset_rows`'s identical one for the same
+    table. No commit here, deliberately: the caller (`_persist`) folds this into the same
+    transaction as the rest of the pass's writes, exactly like the `UPDATE item` a few lines
+    away in that sweep.
+    """
+    rel_paths = list(rel_paths)
+    if not rel_paths:
+        return
+    placeholders = ",".join("?" for _ in rel_paths)
+    await db.execute(
+        f"DELETE FROM deleted_archive WHERE queue_id = ? AND rel_path IN ({placeholders})",  # noqa: S608 - placeholders only, no interpolated values
+        (queue_id, *rel_paths),
+    )
+
+
 async def delete_extracted_archives(
     db: aiosqlite.Connection,
     *,

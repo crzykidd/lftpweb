@@ -60,6 +60,7 @@ import type {
   SettleSettingsIn,
   SettleSettingsOut,
   StatsResponse,
+  SupportBundleRequest,
   TestConnectionResponse,
   TransferSettingsIn,
   TransferSettingsOut,
@@ -536,6 +537,46 @@ export function getLogTail(lines: number, level?: string): Promise<LogTailRespon
 
 export function logDownloadUrl(filename: string): string {
   return `/api/logs/${encodeURIComponent(filename)}/download`
+}
+
+// --- Support bundle (Settings -> Logs, 2026-08-17) ----------------------------------------
+
+/** `POST /api/support-bundle`, then trigger the browser's normal "Save As" for the returned
+ * zip. Unlike the log/backup GET downloads above (`logDownloadUrl`/`backupDownloadUrl`), a
+ * POST body has no plain `<a href download>` equivalent, so this fetches the blob directly and
+ * synthesizes the click a real download link would produce. The filename comes from the
+ * response's own `Content-Disposition` header (`core/supportbundle.py.bundle_filename`) --
+ * never guessed client-side, so the two can never drift.
+ */
+export async function downloadSupportBundle(body: SupportBundleRequest): Promise<void> {
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' }
+  if (csrfToken) headers['X-CSRF-Token'] = csrfToken
+  const res = await fetch('/api/support-bundle', {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(body),
+  })
+  if (!res.ok) {
+    const detail = await res.text().catch(() => '')
+    throw new Error(
+      `POST /api/support-bundle responded ${res.status}${detail ? `: ${detail}` : ''}`,
+    )
+  }
+  const disposition = res.headers.get('Content-Disposition') ?? ''
+  const match = /filename="([^"]+)"/.exec(disposition)
+  const filename = match ? match[1] : 'lftpweb-support.zip'
+  const blob = await res.blob()
+  const url = URL.createObjectURL(blob)
+  try {
+    const a = document.createElement('a')
+    a.href = url
+    a.download = filename
+    document.body.appendChild(a)
+    a.click()
+    a.remove()
+  } finally {
+    URL.revokeObjectURL(url)
+  }
 }
 
 // --- Settings -> Backup (phase 7, DESIGN.md §10.2) ---------------------------------------

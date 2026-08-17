@@ -6,6 +6,471 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-17 — Support bundle polish: per-instance byte budget, split failure markers, extract-password redaction
+
+`prompts/done/2026-08-17-support-bundle-polish.md`. The user generated the first real support
+bundle from the test system and it surfaced four real flaws the fake-*arr fixture couldn't have
+caught, all fixed the same session:
+
+**The `ARR_LOG_BYTE_BUDGET` (~20 MB) was written to read as "per instance" but was applied
+per file** — `fetch_arr_instance_logs` passed the constant as every single file's own
+`max_bytes`, with no running total across the instance's files at all. One real Sonarr instance
+with 53 debug files produced a 54 MB uncompressed folder. Fixed with a running total kept across
+the instance's whole file list, checked before each fetch; once it's exhausted, fetching stops
+and a `TRUNCATED.txt` marker names how many files didn't make it in. `ARR_LOG_PER_FILE_BYTE_CAP`
+was split out as its own name (same value) so a single pathological file still can't consume the
+budget in one download, but the instance-level running total is what actually binds.
+
+**Files are now fetched newest-first, not in whatever order the *arr's own listing returns.**
+`_log_file_sort_key` reads a rotated filename's own numeric suffix (`sonarr.1.txt` before
+`sonarr.2.txt` — ascending rotation numbers are progressively older on the *arr's own side) and
+sorts non-rotated names (`sonarr.txt`, `sonarr.debug.txt`) first. This is what makes the budget
+exhausting partway through mean something: what's already kept is the most recent material, not
+an arbitrary subset.
+
+**One file's fetch failing no longer escalates to the same marker an unreachable instance
+gets.** The first real bundle hit exactly this: a 404 on `delete-sonarr-source.log` (a
+custom-script log the *arr's listing names but serves from a different endpoint) produced a
+`FETCH-FAILED.txt` sitting beside 50+ log files that fetched fine — because the whole
+per-instance fetch (listing walk + every download) ran inside one `try`/`except ArrClientError`
+block, so a per-file `download_log_file` raising the same exception type as an unreachable
+instance was indistinguishable from one. Split into two markers by scope: `FETCH-FAILED.txt`
+stays instance-level (unreachable, a bad/undecryptable key, the listing request itself failing)
+and now lives outside the per-file loop entirely; a per-file failure writes
+`<filename>.FETCH-ERROR.txt` beside the files that did fetch and the loop continues to the next
+file rather than aborting. `tests/fake_arr.py` gained `FakeArrState.broken_log_files` — filenames
+the listing reports but whose own download always 404s — to model this shape without touching
+the existing `log_files`/`fail_all` fixtures.
+
+**`extract_passwords` doesn't belong in a diagnostic zip verbatim.** The three prior fixes were
+all found by the first real bundle; this one was caught reviewing it before it went anywhere —
+`bundle/settings.json` was exporting the user's own archive extract passwords as a plain list,
+the same way `_postprocess_out` correctly returns them to the authenticated Settings API. A
+support bundle is not that API. Fixed narrowly: `api/support_bundle.py._gather_settings` swaps
+the list for `extract_passwords_count` on the dict already built for the bundle *after* calling
+the shared `_postprocess_out` conversion — the real `/api/settings/postprocess` response, and
+the conversion function itself, are untouched. This is the one place in the bundle-building code
+that redacts a field the underlying response model doesn't already redact; every other field in
+the settings dump is safe by construction (module docstring, `api/support_bundle.py`) because it
+reuses a response model that already excludes secrets for the Settings API itself — extract
+passwords are the one field on `PostprocessSettingsOut` that's legitimately real for that API
+and needs a bundle-specific reduction on top.
+
+**`bundle/settings.json` was also missing the backup settings group** — the one `*Settings`
+group in this codebase the bundle hadn't picked up, simply never added when the feature first
+shipped. Added the same way every other group is: `load_backup_settings` +
+`BackupSettingsOut(interval_days, keep_count)`, `api/backup.py`'s own GET conversion, inlined
+since that module doesn't factor a `_backup_out` helper the way the other settings routers do.
+No secret lives in this group (interval/keep-count only).
+
+---
+
+## 2026-08-17 — Support bundle: zip not rar, DB excluded, settings dump built from response models, per-part failure isolation
+
+`prompts/done/2026-08-17-support-bundle.md`. User request: Settings → Logs gains a "Support
+bundle" button, a checkbox dialog producing one downloadable diagnostic archive.
+
+**The user said "rar"; this ships a zip.** RAR creation is proprietary (no open-source
+encoder), the image ships no `rar` binary (7-Zip handles extraction of archives the seedbox
+sends, not creation of new ones), and Python's stdlib `zipfile` needs no new dependency, no
+subprocess, and no license question. A zip is also what every issue tracker and support inbox
+already knows how to open without a plugin.
+
+**The SQLite database is deliberately never included**, even though it would be the single
+richest diagnostic artifact. It carries every encrypted secret this app stores (seedbox
+password/key, every *arr API key) plus the encryption landscape itself (`core/crypto.py`) —
+handing it out is handing out the keys, not just the lock's serial number. What support
+actually needs from it — schema/migration level, and the settings as they're currently
+configured — is covered by `bundle/environment.json`'s `migration_level` and
+`bundle/settings.json` instead, at a fraction of the risk.
+
+**`bundle/settings.json` is built by calling the same row→response-model conversion functions
+the settings endpoints already return** (`_host_out_from_row`, `_queue_out_from_row`,
+`_instance_out_from_row`, `_pattern_out_from_row`, `_postprocess_out`, plus
+`api/jobs.py`'s transfer-settings equivalent) — never a hand-picked `SELECT` of "the columns
+that look safe." Those functions are already the one place in the codebase a secret is kept off
+the wire (`HostOut.has_password` instead of the password, `ArrInstanceOut.has_api_key` instead
+of the key); reusing them means a bundle can only ever leak what the authenticated Settings API
+itself would already leak, and a future field added to `host`/`arr_instance` that needs
+redacting only has to be redacted once, at its response model, not twice. `tests/
+test_support_bundle_api.py::test_settings_dump_never_contains_secrets` seeds a real password and
+a real *arr API key and asserts both are absent from the settings dump specifically, and from
+every byte of the zip as a coarser check.
+
+**A per-instance *arr log fetch failure (unreachable, bad key, a 5xx) writes one
+`FETCH-FAILED.txt` marker in that instance's own `bundle/arr-<name>/` directory and does not
+fail the bundle.** The alternative — one instance's outage 500ing the whole request — would
+make the bundle least available exactly when a broken *arr integration is the thing being
+diagnosed. The same containment covers a stored API key that fails to decrypt.
+`core/supportbundle.py._safe_zip_component` also floors every *arr-supplied name (instance
+name, log filename) to a single path component before it becomes a zip entry path — `zipfile.
+ZipFile.writestr` does not sanitize its target path the way `extractall` sanitizes its own, so a
+misbehaving or compromised *arr instance must not be able to name a `../` segment and land a
+file outside its own directory in the bundle.
+
+**No redaction pass is attempted on fetched *arr log files.** They are the *arr's own logs, not
+lftpweb's — including one per instance is the user's own explicit, per-checkbox opt-in, the same
+trust boundary as pasting a log into a GitHub issue by hand.
+
+---
+
+## 2026-08-17 — Logs text filter stays client-side over the fetched window; byte ceiling mirrors `logsetup.MAX_BYTES`, not imported
+
+`prompts/done/2026-08-17-logs-search-and-lookback.md`. User request: Settings → Logs needed a
+text filter and a deeper lookback than the old 2,000-line cap — the *arr integration's
+per-minute poller HTTP lines now dominate a busy install's log, so 2,000 lines covered well
+under an hour.
+
+**The text filter searches the already-fetched window only, never a server-side grep across
+rotated files.** Considered and rejected: a `GET /api/logs/tail?q=...` server-side substring (or
+regex) search across the current file and its rotations, so a filter could reach further back
+than any one fetch's line count. Rejected because the two features (raise the lookback, add a
+filter) are meant to compound, not compete: `MAX_LINES_CAP` going to 10,000 means the fetched
+window can now span an entire live log file on its own — pairing that with a client-side filter
+gets "search the whole live file" for free, instantly, with no new endpoint, no new query
+grammar, and no risk of reintroducing an unbounded read on the one code path (`core/logtail.py`)
+that exists specifically to avoid that (see the 2026-08-11 "lftp is a transfer engine" entry
+below for the same shape of judgment: bound the read, don't special-case around the filter that
+would tempt you to lift the bound). A rotated-file search stays a real gap for anyone chasing an
+incident that predates the current file — named, not hidden — but is not being built now.
+
+**`DEFAULT_MAX_BYTES` (the per-tail byte ceiling) moved from a hardcoded 2 MB to 5 MB, mirrored
+from `logsetup.MAX_BYTES` rather than imported.** The two constants need to move together — the
+byte ceiling has to be able to cover one whole live log file for the line ceiling above it to be
+reachable at all — but `core/logtail.py` is `core/`, and `logsetup.py` is configured once,
+process-wide, before the app (and its `core/` package) is built at all; importing it down into
+`core/` for one integer would be a real layering violation, not a style nit. A code comment on
+each constant names the linkage explicitly instead, so a future change to one is visible from
+the other without a runtime dependency between them. No new byte-budget test was needed — the
+existing instrumented test (`tests/test_logtail.py::test_tail_lines_never_reads_more_than_the_byte_cap`)
+already passes its own `max_bytes` explicitly rather than relying on the default, so it wasn't
+pinned to the old 2 MB number and needed no change.
+
+**No match highlighting in v1.** The filter narrows which lines render; it does not mark up
+matched substrings inside them. Named as a scope line in the task brief, not discovered as a
+gap during the work — a plain, cheap first cut, with highlighting left for if it's actually
+wanted later.
+
+---
+
+## 2026-08-17 — Scan-command outcome verification: a persisted column, not memory; a 404 is silent; bounded checks
+
+`prompts/done/2026-08-17-stranded-source-delete-retry.md` (a same-day scope addition, folded
+into this task rather than a separate one — it completes the same "notify was too trusting"
+incident the namespace-mismatch entry below diagnoses). Production evidence
+(`private_data/debug_logs/productionlftpweb.log`): `notify_arr`'s `POST /api/v3/command` 201 was
+treated as success, when it only ever meant "command queued" — the *arr accepted pushes that
+then silently failed or no-op'd inside it, with zero visibility, because nothing ever asked what
+happened next.
+
+**A persisted column (`item.arr_scan_command_id`, migration 021), not an in-memory registry.**
+Every other bounded-retry counter in `core/arrsync.py` (`_notify_attempts`,
+`_source_delete_retries`, and this same task's `_scan_command_checks`) is deliberately in-memory,
+on the reasoning that losing it to a restart only costs a few extra attempts, never a missed one.
+That reasoning does not transfer here: `notify_arr` is called from two different processes'
+objects — `core/postprocess.py.PostprocessPipeline`'s primary push and `core/arrsync.py`'s own
+bounded notify-retry — so a registry owned by either one would never see a command the other
+pushed, and a restart between the push and the first check would orphan the command's id
+entirely, silently dropping the one mechanism built to catch a silently-broken push. Riding the
+database instead means the id survives exactly as long as the debt it represents does, the same
+principle `remote_delete_pending` (migration 019) already established for a different debt.
+
+**The *arr's own outcome vocabulary is inferred, not verified.** Unlike `eventType`/
+`trackedDownloadState` (`core/arrclient.py`'s own module docstring: confirmed against a live
+Sonarr v3 instance, 2026-08-15), `/api/v3/command/{id}`'s `status` field's exact shape has not
+been checked against a real instance for this task — `command_outcome` reads `"completed"` and
+`"failed"` off the *arr's public API documentation, treating anything else (`"queued"`,
+`"started"`, an unrecognized future value) as still pending. The safe direction is preserved
+either way: a misclassification can only ever delay a warning (reading a real failure as
+"pending" a while longer, until the bound below gives up on it silently), never fabricate one
+that didn't happen. If a live instance is ever found to report a different vocabulary, only
+`command_outcome` needs correcting — every caller already treats its three-way return as opaque.
+
+**A 404 clears the column silently, exactly like a resolved `completed`.** The *arr prunes
+finished commands from its own history after a while, and a restarted *arr instance loses its
+in-memory command list entirely — an unknown command id is the ordinary, expected shape of "this
+information no longer exists," not evidence the push failed. Treating it as a failure would
+produce a false warning on every *arr restart or command-history rotation, for a push that most
+likely succeeded and simply aged out of what the *arr remembers.
+
+**Bounded at `MAX_SCAN_COMMAND_CHECK_ATTEMPTS` (5) passes, in-memory.** Unlike the command id
+itself, the attempt counter is allowed to live in memory and reset on restart — the identical
+"restart loses it, and that's the safe direction" reasoning `_notify_attempts` already relies on:
+losing the counter only grants a stuck check a few more free attempts after a restart, never
+fewer than the bound promises. Exhausting the bound clears the column silently rather than
+writing a "gave up" event of its own — a command that never resolves is already indistinguishable
+from one that resolved and got pruned before this process got around to asking, so there is
+nothing more informative to say than the silent-404 case already says.
+
+**`arr_scan_command_failed` is the confirmed counterpart to `arr_path_mismatch` below, not a
+merge of the two.** The two events fire at different times off different evidence — a mismatch
+is detectable the moment a match commits, before any push has happened; a failed command is only
+knowable after the *arr has actually tried and given up — and a queue can be misconfigured in a
+way only one of the two would ever catch (a mismatch that happens to still resolve to *something*
+importable, or a push to a namespace this codebase's own comparison can't evaluate but the *arr
+itself rejects). Keeping them as two `kind`s, both advisory, lets History show whichever evidence
+actually fired without one masking the other.
+
+---
+
+## 2026-08-17 — Namespace-mismatch detection: derive the *arr-side root from `outputPath`, debounce per (queue, root), warn without gating
+
+`prompts/done/2026-08-17-stranded-source-delete-retry.md` (a same-day scope addition, folded
+into this task). Production evidence (`private_data/debug_logs/productionlftpweb.log`): the
+user's *arr instances mount the synced storage at a different container path than lftpweb does
+(`/mnt/seanas02_media/Working/box-dc-tv` vs. lftpweb's own
+`/mnt/seanas02-media-working/box-dc-tv`). With `arr_visible_path` unset, every notify pushed
+lftpweb's own path; the *arr accepted it (201) and scanned a directory that doesn't exist in its
+own container, so imports waited on the *arr's unrelated schedule instead, and several
+associations drifted all the way to `gone`. The fix (`_maybe_warn_path_mismatch`) is detection
+only, added the same day as the confirmed counterpart described above.
+
+**Detectable at match time, before the first notify ever fires.** A matched queue record's own
+`outputPath` is the *arr's view of this exact release — evidence that was already being fetched
+and thrown away every poll pass. Comparing it against what a notify *would* push
+(`core/arrnotify.py.translate_to_arr_namespace`, reused rather than reimplemented) catches a
+misconfiguration a full poll cycle or more before the first real push would have.
+
+**The *arr-side root is derived by stripping the item's own name off `outputPath`'s tail**
+(`_derive_arr_root`), tolerating a trailing filename that doesn't literally match (a
+title-fallback single-file match can report any filename) by falling back to a plain `dirname`.
+This mirrors exactly what the pushed path's own root would be (`local_path`/`staging_path`,
+translated) — comparing roots rather than full paths is what makes the check tolerant of the
+*arr reporting a release at a path one level deeper or shallower than expected without producing
+a false positive on the name segment itself, which the two sides were never going to agree on
+namespace-wise anyway.
+
+**Debounced per `(queue id, derived root)`, not per item, not per pass.** A misconfigured queue
+matches many releases before a human notices and fixes it — without this, every single match
+would repeat the identical advisory, one event per release, for as long as the setting stays
+wrong. Keying on the *derived root* rather than the item also means two different releases that
+happen to reveal the *same* wrong root only ever produce one event between them, which is the
+right granularity: there's exactly one setting to fix, regardless of how many releases have
+already revealed it's wrong.
+
+**Warning only, never a gate — and worded to allow for a deliberate mismatch.** The notify still
+fires exactly as before; an exotic remote-path-mapping setup where the two namespaces are
+supposed to differ from this comparison's assumption exists and costs nothing more than one
+advisory event, worded ("if this is intentional, ignore this") to say so rather than assert a
+mismatch is necessarily wrong.
+
+---
+
+## 2026-08-17 — Stranded source delete: a sweep keyed off the debt, not the transition; bounded backoff; cleanup gates on it; the manual delete widens
+
+`prompts/done/2026-08-17-stranded-source-delete-retry.md`, live on both the user's test and
+production systems, diagnosed from the test system's audit trail: `arr_imported` → a
+`remote_delete_failed` (`SSH connection closed`) on rung 4's deferred source delete → `arr_cleanup`
+ran anyway seconds later, removing the local copy. The resulting row (`REMOVED_LOCAL`, remote
+copy alive, `remote_delete_pending` still set) was stranded permanently: the delete only ever
+fired once, from `_commit_terminal`'s one-shot `imported` transition, so a transient failure was
+never retried; and `FileTree.tsx.canDeleteLocal` hid the Delete button for a no-local-content
+row, so the Source-scope manual escape hatch (2026-08-16) was unreachable exactly when it was
+needed.
+
+**A retry sweep keyed off `item.remote_delete_pending`, not the `imported` transition that first
+set it.** The alternative — re-firing the transition-triggered call more aggressively, or adding
+a dedicated "retry needed" flag — would still miss every row already stranded before the fix
+shipped. Querying the debt itself (`remote_delete_pending IS NOT NULL`, a terminal `arr_status`
+of `imported` **or** `cleaned`, `remote_deleted_at IS NULL`) sidesteps that entirely: a row
+already in this shape from before the fix matches the same query a freshly-stranded row does, so
+the self-heal is a consequence of the query, not a separate migration or one-time backfill.
+`cleaned` is named explicitly alongside `imported` for exactly this reason — `_maybe_cleanup`'s
+own new gate (below) means a *fresh* `cleaned` row can never carry a pending debt going forward,
+but a row that reached `cleaned` before this fix shipped already did.
+
+**Backoff is bounded, not indefinite, and reuses `_InstanceBackoff`'s own growing-delay shape
+rather than a second implementation.** A bare "retry every pass" would write a
+`remote_delete_failed` error event roughly every poll interval for as long as a seedbox stays
+down — real spam for a real outage. `MAX_SOURCE_DELETE_RETRY_ATTEMPTS` (5) bounds it: past that,
+one `remote_delete_retries_paused` event fires and this process stops trying, but
+`remote_delete_pending` is never cleared by giving up — the manual Files-page delete, or a
+restart's clean in-memory slate (the same "restart loses it, that's the safe direction"
+reasoning every other per-process dict in this module already relies on), can still act.
+Deliberately in-memory rather than persisted, unlike the debt column itself: losing the attempt
+count on restart only grants a few extra free attempts, never fewer than the bound promises.
+
+**Cleanup now withholds while a source delete is still owed** (`_maybe_cleanup`'s new first
+check, before even the `CORRUPT` check) — restoring "delete source → delete local" as an
+*enforced* ladder order rather than a hoped-for one. Before this, cleanup ran regardless of the
+debt, which is exactly how the local copy vanished while the remote copy was still stranded in
+the incident above. A `copy`-mode queue never sets `remote_delete_pending` in the first place, so
+this is a no-op there, matching the pre-existing behavior exactly.
+
+**`_commit_terminal`'s `gone` branch now names a still-pending source delete in its own event
+message** — purely audit-trail visibility, no behavior change; rung 4 still never fires on
+`gone`, by design (ambiguity must not trigger an irreversible delete). Production evidence: 15
+items went `notified` → `gone` with `remote_delete_pending` still set, each sitting stranded with
+nothing in History explaining why.
+
+**The manual-delete widening lives in `lib/fileTree.ts`, not `FileTree.tsx`, and widens
+`canDeleteLocal` itself rather than adding a second predicate.** The task's own instruction was
+explicit about this: a second "canDeleteRemoteOnly"-style predicate that nobody could reconcile
+against the first would be worse than updating the one function's reasoning. `canDeleteLocal`
+(moved from a private `FileTree.tsx` function to an exported pure helper, matching every other
+predicate this dialog already reads from that module) now offers Delete when a row has local
+content **or** `hasRemoteCopy` — not only local content — and the dialog's Local checkbox is
+symmetrically gated by a new `shouldOfferLocalScope` (mirroring the pre-existing
+`shouldOfferSourceScope`) so a stranded no-local-content row's dialog opens with Local absent
+and Source available, defaulted per the existing `defaultSourceChecked` rule.
+
+---
+
+## 2026-08-17 — A spent-archive volume's `EXCLUDED` exemption lapses once its parent leaves both trees too; the registry purge that goes with it
+
+`prompts/done/2026-08-17-orphaned-spent-archive-rows.md`, live production defect: a rar'd
+release ran the entire pipeline correctly — verify, extract, `delete-archives-after-extract`
+removed the 29 spent volumes, *arr import confirmed, remote copy deleted (`move` ladder), *arr
+cleanup removed the whole local directory. The parent row rode the removal grace to
+`REMOVED_BOTH` and left the Files page — but the 29 archive-volume child rows stayed behind
+forever: orphaned rows with no parent directory, a grey "Extracted" chip, and no delete
+affordance. The user cleared them by hand with Reset item tracking.
+
+**Root cause.** `core/engine.py._persist`'s vanished sweep resolves any `rel_path` in
+`deleted_archive_paths` to `("EXCLUDED", None)` *unconditionally, every pass* — the branch
+2026-08-14's "extracted archives rest as extracted" task added, correctly, for a spent volume
+*inside a still-present release*. It never accounted for the parent itself leaving both trees:
+once that happens there was no path out of `EXCLUDED` at all — `resolve_absence` has no opinion
+about an `EXCLUDED` `prev_state` (deliberately — see `mount_sentinel.py`'s own docstring), so the
+branch's `elif`/`else` arms were unreachable for these rows, and the `deleted_archive` registry
+entry never expired either.
+
+**The lapse rule, and why it's a `written`-membership check rather than a second query.** The
+branch now asks whether the row's own top-level ancestor (DESIGN.md §4.7's "item" — the first
+path segment; `delete_extracted_archives` never operates on a loose top-level file itself, so a
+genuine archive `rel_path` is always nested) is still in `written` at the point this row is
+processed. `written` is exactly `_persist`'s own "what does this pass consider present or still
+publishable" set, and checking it costs nothing extra: an ancestor still structurally present
+was already added to `written` by the ordinary per-node loop, which runs to completion before
+the vanished sweep even starts; an ancestor riding its own §7.3 removal grace re-enters
+`written` too (a non-terminal vanished resolution), and — the piece that makes this free rather
+than a second lookup — it does so *before* any of its archive children are visited in the same
+pass, because `sorted(vanished)` puts a rel_path ahead of every string it is a strict prefix of,
+and an ancestor's `rel_path` is always a strict prefix of its descendants'. So the grace
+interplay the task pinned ("a parent mid-grace is still present for this purpose") falls out of
+the existing sort order for free — no separate signal was threaded through for it.
+
+**Falls straight to `REMOVED_BOTH`, not through `resolve_absence`/`resolve_vanished`.** Once the
+ancestor is confirmed gone, there is no separate grace period to run for the archive row itself
+— the ancestor check above already *is* the grace gate, borrowed from the item's own clock. And
+neither existing arbitration function has an opinion about an `EXCLUDED` `prev_state` anyway
+(deliberately, per each one's own docstring), so calling them would just `continue` and leave the
+row frozen at `EXCLUDED` — the exact bug being fixed. `REMOVED_BOTH` is written directly instead,
+matching DESIGN.md §3.2's own definition ("both copies are gone") and the reading an ordinary
+vanished row in this shape already lands on a few lines below; left unsuppressed, same as every
+other vanished-sweep-produced `REMOVED_BOTH`.
+
+**The registry purge is a new function, not hand-rolled SQL in `engine.py`.**
+`core/archive_cleanup.py.purge_deleted_archive_paths` (re-exported from `core/local_delete.py`,
+same pattern as `load_/save_deleted_archive_paths`) does the `DELETE FROM deleted_archive`, no
+commit of its own — `_persist` batches every purge from one pass into its own single transaction,
+alongside the `UPDATE item` writes and `save_settle_records`. Without this, `deleted_archive`
+migration 010's own documented limitation ("a `rel_path` that later reappears... would still read
+`EXCLUDED` from a stale row here") would apply to the ordinary case of a whole release finishing
+and a later, differently-sourced release landing at the identical path — not just the edge case
+the migration's comment had in mind.
+
+**Retroactive self-heal is a consequence of the mechanism, not a separate code path.** A row
+already orphaned before this fix shipped (parent already resting `REMOVED_BOTH`, unsuppressed)
+simply re-enters `vanished` on the very next scan pass the same way it always has — `resolve_
+vanished` has no opinion about `REMOVED_BOTH` either, so the parent's own row keeps landing
+back in this sweep every pass without ever re-entering `written`. The ancestor check reads that
+correctly with no special-casing: an ancestor absent from `written` includes "never made it back
+into `written` because it's already terminal," identically to "just turned terminal this pass."
+No migration was needed.
+
+**One defensive carve-out, to protect existing coverage rather than because production can
+produce the shape.** `delete_extracted_archives` refuses to operate on an item that is itself a
+loose top-level archive file (its own docstring explains why — removing its only file would
+remove the whole item, `delete_local`'s job, not this one's), so a genuine `deleted_archive`
+entry always has a `"/"` in it. But `tests/test_state_persistence.py`'s existing (2026-08-14)
+tests exercise the branch with a self-referential top-level `rel_path` that has no separate
+parent to ask about — the ancestor would just be the row itself, mid-computation, always reading
+absent from `written` and wrongly flipping to `REMOVED_BOTH`. The branch special-cases `"/" not
+in rel_path` to keep resting such a row at `EXCLUDED` unconditionally, preserving the old
+behaviour for a shape the real pipeline cannot produce rather than let it regress the existing,
+still-valid tests.
+
+---
+
+## 2026-08-17 — What's-new popup, Docs → Release notes page, version link points in-app
+
+`prompts/done/2026-08-17-whats-new-popup-and-release-notes.md`, design settled the same day.
+Three pieces landed together (popup, new Docs page, `lib/versionBadge.ts`'s link target)
+because all three read the same source, `CHANGELOG.md`, and the third is what makes the second
+discoverable at all.
+
+**Docs → Release notes renders `CHANGELOG.md` verbatim, not through `MarkdownDoc`/
+`parseDocSource`.** That parser (`lib/docMarkdown.ts`) expects a strict shape — one `# Title`
+line, one lede paragraph, then *only* `## `-delimited section boundaries — and throws on
+anything else, by design (a malformed `docs/*.md` should fail loudly). `CHANGELOG.md` doesn't
+fit it: multiple intro paragraphs before the first real section, and a commented-out `<!-- ...
+-->` skeleton for the next roll that itself contains an example `## [Unreleased]` line, which a
+naive split would mistake for a real section boundary. Rather than reshaping the changelog to
+fit the parser (which would violate the whole reason for using it verbatim — GitHub and this
+app must show byte-identical prose, per `release-prep-and-cut`), `MarkdownDoc.tsx` now exports
+its inner `SectionBody` (the react-markdown + remark-gfm + `bodyComponents` pipeline, previously
+private) and `ReleaseNotesPage.tsx` feeds it the whole raw file as one opaque blob. `bodyComponents`
+gained `h1`/`h2`/`h3` mappings for this — no section body had ever contained a heading before,
+since a heading is exactly where `docMarkdown.ts` cuts a section.
+
+**`lib/releaseNotes.ts` is a separate, popup-only parser** (`parseChangelog`,
+`compareVersions`, `whatsNewSections`, `trimEmptySubsections`) that *does* split the file into
+per-version sections — needed to answer "what changed since version X," which the verbatim
+Docs page never has to ask. It strips `<!-- ... -->` blocks before splitting specifically to
+avoid the skeleton's own example heading being mistaken for a real one — a real incident hit
+while building this, not a defensive guess (a naive first pass produced a bogus `Unreleased`
+section before the real one). `trimEmptySubsections` (drops a `### Heading` with nothing under
+it before the next heading) is popup-only too, per the task's own instruction — the Docs page
+must never mutate what it shows.
+
+**First-visit-silent + multi-version accumulation.** `lastSeenVersion == null` (fresh browser)
+and `lastSeenVersion == currentVersion` both show nothing, storing the current version
+immediately — an install is not an "upgrade." An upgrade that skipped one or more releases (or
+a browser reopened after a while) shows every section with `lastSeen < version <= current`,
+newest first, not just the latest — the accumulated-since-last-visit list is the useful one. A
+downgrade, or a stored version whose matching releases have since been archived out of
+`CHANGELOG.md` entirely (`docs/CHANGELOG-0.x.md`-style archives, none exist yet), both fall out
+of the same range filter as an empty result with no separate branch — the caller always stores
+silently on an empty result either way, so `lastSeenVersion` never goes stale waiting for a
+"real" upgrade that will never come from a downgraded browser.
+
+**Per-browser only, no server-side seen-state** — `localStorage`, like every other per-browser
+preference in this app (`lib/storage.ts`). A second browser, or a private window, tracks "last
+seen" independently and will see the same what's-new popup again; this is named, not
+accidental — per-user seen-state would need a session concept the auth modes here don't
+uniformly have (`AUTH_MODE=none`/`proxy` have no per-user identity at all).
+
+**`lib/versionBadge.ts`'s non-dev branch (release build, or the no-channel fallback) now links
+to the in-app `/docs/release-notes` route instead of the GitHub release tag.** The GitHub URL
+isn't gone — it's the Release notes page's own "View on GitHub" link — but the nav's own link
+no longer needs `repo_url` to be non-null to have somewhere to go, which removes the one
+remaining "dead link, plain text" case that branch used to have. The dev-channel branch
+(commit link, `build_sha` + `repo_url`) is untouched: a dev build's whole reason for this badge
+is identifying *which commit*, which only GitHub can answer. `VersionLink.tsx` now branches on
+`lib/docLinks.ts`'s existing `classifyLink` (already the identical "route through the router or
+load a real page" decision the Docs Markdown renderer makes for a link) to render a router
+`Link` for the internal case and a plain `<a target="_blank">` otherwise, so the in-app route
+never triggers a full page reload.
+
+**Health source: a third independent one-shot `getHealth()` call**, not a shared context.
+`VersionLink.tsx` already does its own one-shot fetch on mount and `StatsHeader.tsx` polls
+separately every 5s; neither exposes its result to a sibling. `WhatsNewDialog.tsx` and
+`ReleaseNotesPage.tsx` each add their own one-shot fetch (mirroring `VersionLink`'s pattern, not
+`StatsHeader`'s poll) rather than lifting health into a shared context in `Layout.tsx` — that
+refactor would touch two already-working components for a task whose own brief was additive.
+Recorded as a real (small) inefficiency: three independent `GET /api/health` calls per page
+load instead of one shared read. `/api/health` is already on `logsetup.py`'s polled-path
+exemption list, so none of the three spam the access log.
+
+**Not in scope, named rather than built:** archived per-minor changelogs
+(`docs/CHANGELOG-0.x.md`) are not rendered in-app at all — a popup spanning an archive boundary
+shows only what `CHANGELOG.md` itself still carries, silently short of the full history. No
+server-side per-user seen-state (above). No vite.config.ts change was needed for the new
+repo-root `?raw` import — `fs.allow: ['..']` (added for `docs/*.md?raw`, 2026-08-14) already
+covers the whole repo root, `CHANGELOG.md` included; confirmed by `npm run build` and a real
+`docker build --target frontend-builder`, not just assumed from reading the config.
+
 ## 2026-08-16 — Three CodeQL `py/path-injection` alerts on `core/browse.py` dismissed as by-design (alerts #16–#18, PR #7)
 
 The v0.2.1 release PR's CodeQL gate flagged the browse feature's three filesystem touch

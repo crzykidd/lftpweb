@@ -33,6 +33,7 @@ import { StateChip } from './StateChip'
 import {
   buildTree,
   canConfirmDelete,
+  canDeleteLocal,
   clampColumnWidth,
   DEFAULT_COLLAPSE_PREFERENCE,
   DEFAULT_SORT_PREFERENCE,
@@ -41,6 +42,7 @@ import {
   effectiveSpeedLabel,
   fixedColumnStyle,
   flatten,
+  hasLocalContent,
   hasRemoteCopy,
   isCollapsePreference,
   isColumnWidths,
@@ -51,6 +53,7 @@ import {
   RESIZABLE_COLUMNS,
   resolveCollapsed,
   rowAction,
+  shouldOfferLocalScope,
   shouldOfferSourceScope,
   showsCopyQueueSourceWarning,
   sortTree,
@@ -136,21 +139,11 @@ function SortHeaderButton({
 
 
 
-/** Whether "Delete local" (DESIGN.md §9.2; prompts/open-issues.md "7 + 8") makes sense to
- * offer at all -- a node with no local content has nothing this action could do. `DOWNLOADING`/
- * `QUEUED` are deliberately *not* excluded: a node mid-transfer has real partial bytes on disk
- * (or is about to), and (2026-08-13, `prompts/2026-08-13-delete-during-transfer.md`)
- * `api/jobs.py.delete_item` now stops that transfer first rather than refusing outright, so
- * offering the button here is no longer a dead end -- `hasActiveJob` below is what the
- * confirmation panel uses to say so. The backend (`core/local_delete.py.delete_local`) still
- * runs its own guards regardless (mount sentinel, path containment, a delete already in
- * flight) and can withhold even when this returns true; this is only about not showing a
- * button that could never do anything, not a prediction of the guard outcome.
- */
-const NO_LOCAL_CONTENT_STATES = new Set(['REMOTE_ONLY', 'EXCLUDED', 'REMOVED_LOCAL', 'REMOVED_BOTH'])
-function canDeleteLocal(node: FileNode): boolean {
-  return node.id != null && !NO_LOCAL_CONTENT_STATES.has(node.state)
-}
+// `canDeleteLocal`/`hasLocalContent`/`shouldOfferLocalScope` moved to `lib/fileTree.ts`
+// (2026-08-17, prompts/2026-08-17-stranded-source-delete-retry.md) -- `canDeleteLocal` widened
+// there to offer Delete for a no-local-content row with a surviving remote copy too (a stranded
+// rung-4 source delete's escape hatch), and the pure-helper move keeps it testable without
+// rendering this component, the same reasoning every other predicate in that module follows.
 
 /** Bytes this node's delete would free -- the same "how much is there" reading the size
  * column already shows (`Row`'s own `size` computation), reused so the confirmation dialog's
@@ -968,7 +961,11 @@ function Row({
             type="button"
             disabled={actionBusy}
             onClick={() => onDeleteRequest(entry)}
-            title="Delete the local copy -- this cannot be undone"
+            title={
+              hasLocalContent(entry)
+                ? 'Delete the local copy -- this cannot be undone'
+                : 'Delete the remote copy on the seedbox -- this cannot be undone'
+            }
             className="rounded border border-red-300 px-1.5 py-0.5 text-xs font-medium text-red-700 hover:bg-red-50 disabled:opacity-50 dark:border-red-900 dark:text-red-300 dark:hover:bg-red-950"
           >
             Delete
@@ -1517,18 +1514,22 @@ export function FileTree({
 
   const deletableSelected = useMemo(() => selectedEntries.filter(canDeleteLocal), [selectedEntries])
   // Seeds the dialog's Local/Source checkboxes to their per-queue defaults every time a new
-  // delete is requested (2026-08-16, `defaultSourceChecked`'s own docstring) -- Local always
-  // starts checked (the pre-existing behavior), Source only when the queue is `move` *and* at
-  // least one target actually has a remote copy for it to act on.
+  // delete is requested (2026-08-16, `defaultSourceChecked`'s own docstring). Local starts
+  // checked only when at least one target actually has local content for that scope to act on
+  // (`shouldOfferLocalScope`, the pre-existing "always true" behavior for the common case where
+  // it does) -- 2026-08-17, `canDeleteLocal`'s widened rule now lets a delete be requested for a
+  // stranded no-local-content row too, and defaulting Local to checked there would offer a
+  // checkbox (or send a scope) with nothing under it. Source, symmetrically, only when the queue
+  // is `move` *and* at least one target actually has a remote copy for it to act on.
   const requestDeleteRow = (entry: TreeEntry) => {
     setPendingDelete([entry])
-    setDeleteLocalChecked(true)
+    setDeleteLocalChecked(shouldOfferLocalScope([entry]))
     setDeleteSourceChecked(defaultSourceChecked(queueSyncMode, hasRemoteCopy(entry)))
   }
   const requestDeleteSelected = () => {
     if (deletableSelected.length === 0) return
     setPendingDelete(deletableSelected)
-    setDeleteLocalChecked(true)
+    setDeleteLocalChecked(shouldOfferLocalScope(deletableSelected))
     setDeleteSourceChecked(defaultSourceChecked(queueSyncMode, deletableSelected.some(hasRemoteCopy)))
   }
   const confirmDelete = async () => {
@@ -1552,6 +1553,14 @@ export function FileTree({
   )
   const pendingDeleteOffersSource = useMemo(
     () => shouldOfferSourceScope(pendingDelete ?? []),
+    [pendingDelete],
+  )
+  // Symmetric to `pendingDeleteOffersSource` above (2026-08-17) -- `false` only for a selection
+  // made entirely of stranded no-local-content rows (`canDeleteLocal`'s widened rule is what
+  // let such a selection reach this dialog at all), so the Local checkbox itself goes unrendered
+  // rather than offered-then-refused.
+  const pendingDeleteOffersLocal = useMemo(
+    () => shouldOfferLocalScope(pendingDelete ?? []),
     [pendingDelete],
   )
   // How many of the pending selection are actively transferring right now (2026-08-13,
@@ -1721,14 +1730,16 @@ export function FileTree({
             {deleteLocalChecked && ` (${formatBytes(pendingDeleteBytes)} local)`}? This cannot be
             undone.
           </p>
-          <label className="flex items-center gap-2 text-red-900 dark:text-red-200">
-            <input
-              type="checkbox"
-              checked={deleteLocalChecked}
-              onChange={(e) => setDeleteLocalChecked(e.target.checked)}
-            />
-            Delete local copy
-          </label>
+          {pendingDeleteOffersLocal && (
+            <label className="flex items-center gap-2 text-red-900 dark:text-red-200">
+              <input
+                type="checkbox"
+                checked={deleteLocalChecked}
+                onChange={(e) => setDeleteLocalChecked(e.target.checked)}
+              />
+              Delete local copy
+            </label>
+          )}
           {pendingDeleteOffersSource && (
             <label className="flex items-center gap-2 text-red-900 dark:text-red-200">
               <input

@@ -30,6 +30,92 @@ Skeleton for the next roll:
 ### Deprecated
 ### Removed
 
+## [0.2.2] — 2026-08-17
+
+### Added
+
+- **A what's-new popup on the first page load after an upgrade**, plus a Docs → Release notes
+  page. The popup reads the release notes for every version between what this browser last saw
+  and the version now running (an upgrade that skips a release shows all of them, newest
+  first) and shows nothing on a fresh browser, an unchanged version, or a downgrade. Docs →
+  Release notes renders `CHANGELOG.md` itself, verbatim, with a "View on GitHub" link at the
+  top; the nav's bottom-left version readout now opens that page in-app instead of linking
+  straight out to GitHub (the GitHub link still exists, just one click further in). Per-browser
+  only (`localStorage`) — a second browser, or a private window, tracks its own "last seen"
+  independently.
+- **Two advisory warnings catch a misconfigured *arr "Path as seen by the *arr" setting**,
+  predictively and after the fact. If the *arr's own reported path for a matched release
+  doesn't agree with what a notify push would translate to, one warning event fires the moment
+  the match commits — before the first notify ever goes out — naming the *arr's own path and
+  suggesting the setting value that would fix it. Separately, the notify push itself is no
+  longer fire-and-forget: lftpweb now checks whether the *arr's scan command actually completed
+  and writes a warning if it didn't, rather than only ever knowing whether the push was
+  *accepted*. Both are advisory only — they change no behavior, only visibility, in History.
+- **Settings → Logs gains a text filter and a deeper lookback.** A new search box filters the
+  currently-shown lines by a case-insensitive substring, instantly, with no refetch, alongside
+  a "showing N of M lines" readout while it's active. The `Lines` option tops out at 10,000
+  (was 2,000) so the *arr integration's per-minute poller traffic no longer eats the whole
+  window in under an hour on a busy install.
+- **Settings → Logs gains a "Support bundle…" button** — a dialog of checkboxes (all default
+  ON) producing one downloadable zip to attach to an issue or send manually: lftpweb's own logs
+  (always included), a build/environment snapshot (version, migration level, health, `lftp`/
+  Python versions, per-queue disk usage), a sanitized settings dump — host/queue/pattern/
+  transfer/post-processing/backup settings, built from the same response models the Settings
+  pages already return, so a secret can never leak into it — the most recent 1,000 audit events,
+  the most recent 100 jobs with their error output, and — one checkbox per enabled Sonarr/Radarr
+  instance — that instance's own log files, fetched newest-first up to a per-instance size
+  budget. The database itself, the `known_hosts` pins, and the install secret are never
+  included.
+
+### Changed
+
+- **Settings → Queues' "Path as seen by the *arr" field moved to sit directly below Local
+  path** — the two paths describe the same files from two different containers' mount views,
+  and are meant to be read (and set) as a pair. It also gained a help tooltip explaining the
+  namespace split, how to find the right value from the *arr's own Queue/History path, and
+  what silently degrades when it's wrong.
+
+### Fixed
+
+- **A fully cleaned-up release's spent archive volumes no longer orphan in the Files page
+  forever.** A rar'd release that ran the whole pipeline — verified, extracted, had its spent
+  volumes removed, imported, and was cleaned up locally — used to leave its volumes behind as
+  permanent grey "Extracted" rows with no parent directory and no delete affordance, because the
+  exemption that keeps a spent volume from showing a false "Missing" countdown never expired
+  once the release itself was gone too. It now lapses the moment the release's own row leaves
+  both trees, the same way an ordinary vanished item does; existing orphans from before this fix
+  clean themselves up within a scan pass or two, with no manual reset needed.
+- **A transient seedbox failure during an *arr-tracked `move` queue's deferred source delete no
+  longer strands the remote copy permanently.** The delete used to fire exactly once, on the
+  confirmed *arr import; a failed attempt (an SSH hiccup, say) was never retried, and cleanup
+  removed the local copy anyway — leaving a row with only a remote copy and, until now, no
+  Delete affordance in the UI to fall back on. It now retries every pass (with backoff, and a
+  bounded pause rather than an error every ~60s while a seedbox stays down), cleanup withholds
+  until the source delete actually clears, a row already stranded before this fix self-heals on
+  the first pass after upgrade with no manual action, and the Files-page Delete action is now
+  offered for a row whose only remaining copy is remote.
+- **A support bundle's settings dump no longer carries archive extract passwords verbatim.**
+  Found reviewing the first real bundle: `postprocess.extract_passwords` was exported as-is —
+  they're user secrets like any other. The bundle's copy of that setting now carries only
+  `extract_passwords_count`; the real `/api/settings/postprocess` response is unaffected.
+- **A support bundle's per-*arr-instance log budget (~20 MB) is now enforced across the whole
+  instance, not reset for every file in it.** One Sonarr with 53 debug files produced a 54 MB
+  (uncompressed) folder in the first real bundle, because the budget was applied per file with
+  no running total. Files are now fetched newest-first (current file, then rotations oldest
+  last) against one running total per instance; once it's exhausted, fetching stops and a
+  `TRUNCATED.txt` names how many files were skipped.
+- **One *arr log file failing to fetch no longer reads as the whole instance failing.** The
+  first real bundle hit a 404 on a custom-script log the *arr lists but serves from a different
+  endpoint, and the resulting `FETCH-FAILED.txt` sat beside 50+ log files that fetched fine — an
+  instance-level marker for a single-file problem. An individual file's own fetch failure now
+  writes a narrower `<filename>.FETCH-ERROR.txt` beside the files that did fetch;
+  `FETCH-FAILED.txt` is reserved for the instance itself being unreachable, its key failing to
+  decrypt, or its listing request failing outright.
+
+### Security
+### Deprecated
+### Removed
+
 ## [0.2.1] — 2026-08-16
 
 ### Added

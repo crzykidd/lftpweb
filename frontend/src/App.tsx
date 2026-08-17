@@ -16,6 +16,7 @@ import { AuthTab } from './pages/settings/AuthTab'
 import { QuickStartPage } from './pages/docs/QuickStartPage'
 import { ConceptsPage } from './pages/docs/ConceptsPage'
 import { HowItWorksPage } from './pages/docs/HowItWorksPage'
+import { ReleaseNotesPage } from './pages/docs/ReleaseNotesPage'
 import { useAuth } from './hooks/authContext'
 
 function App() {
@@ -60,6 +61,7 @@ function App() {
           <Route path="quick-start" element={<QuickStartPage />} />
           <Route path="how-it-works" element={<HowItWorksPage />} />
           <Route path="concepts" element={<ConceptsPage />} />
+          <Route path="release-notes" element={<ReleaseNotesPage />} />
         </Route>
         <Route path="*" element={<Navigate to="/files" replace />} />
       </Route>

@@ -871,6 +871,20 @@ export interface LogTailResponse {
 
 export type LogLevel = 'DEBUG' | 'INFO' | 'WARNING' | 'ERROR' | 'CRITICAL'
 
+// --- Support bundle (Settings -> Logs, 2026-08-17) --------------------------------------
+//
+// `POST /api/support-bundle` -- mirrors `backend/lftpweb/models.py`'s `SupportBundleRequest`.
+// lftpweb's own logs are always included server-side regardless of what's sent here (the
+// dialog shows that checkbox checked and disabled), so there is no field for them.
+
+export interface SupportBundleRequest {
+  include_environment: boolean
+  include_settings: boolean
+  include_events: boolean
+  include_jobs: boolean
+  arr_instance_ids: number[]
+}
+
 // --- Auth (phase 8, DESIGN.md §8) -------------------------------------------------------
 
 export type AuthMode = 'none' | 'password' | 'proxy'

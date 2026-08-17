@@ -10,6 +10,15 @@
 // the point: `build_channel` is `null` (not `'release'`) on all of those paths, so `!== 'dev'`
 // is the one branch this function needs to fall back on, never a second "is this actually a
 // release" check.
+//
+// 2026-08-17 (prompts/2026-08-17-whats-new-popup-and-release-notes.md): that same `!== 'dev'`
+// branch's link target changed from the GitHub release tag to the in-app `/docs/release-notes`
+// route (`ReleaseNotesPage.tsx`), which renders `CHANGELOG.md` verbatim and carries its own
+// "View on GitHub" link -- the GitHub URL isn't lost, it just isn't this link's own target
+// anymore. Unlike the old `releaseHref`, the in-app route needs no `repo_url` to be non-null,
+// so this is now the one case in this function that can never render as a dead/missing link.
+// The dev-channel branch below is untouched -- it still wants the *commit* GitHub was built
+// from, which only GitHub can answer.
 
 import type { HealthResponse } from '../api/types'
 
@@ -19,9 +28,10 @@ export interface VersionBadge {
   label: string
   /** Drives the amber badge styling -- true only for a confirmed dev-channel build. */
   dev: boolean
-  /** Link target, or `null` to render plain text (no dead link). The commit on GitHub when
-   * both `build_sha` and `repo_url` are present on a dev build; the release tag otherwise,
-   * whenever `repo_url` is present; `null` when it isn't. */
+  /** Link target, or `null` to render plain text (no dead link). The in-app Release notes
+   * route (2026-08-17) for a release build or the no-channel fallback -- always present,
+   * `repo_url` or not. For a dev build: the commit on GitHub when both `build_sha` and
+   * `repo_url` are present; the release tag when only `repo_url` is; `null` when neither is. */
   href: string | null
 }
 
@@ -35,7 +45,7 @@ export function versionBadge(health: HealthResponse | null): VersionBadge | null
   const releaseHref = health.repo_url ? `${health.repo_url}/releases/tag/${label}` : null
 
   if (health.build_channel !== 'dev') {
-    return { label, dev: false, href: releaseHref }
+    return { label, dev: false, href: '/docs/release-notes' }
   }
 
   const sha = health.build_sha
