@@ -77,6 +77,45 @@ than a first. Two things that bit the first time and will bit again:
 
 ## Where we are
 
+### 🚀 v0.2.2 released 2026-08-17 (same day as v0.2.1) — self-healing *arr reliability, what's-new popup, support bundle
+
+PR #8 (`dev` → `main`, merged `ff73bcb`), tag `v0.2.2`, release notes = the `[0.2.2]`
+CHANGELOG section verbatim; `:latest`/`:0.2.2`/`:0` images published on the release event.
+**The merge bypassed branch-protection checks — deliberately, by the user, and the rationale
+matters:** GitHub had major service outages that day (503s on the API for hours); the CodeQL
+JS analysis failed to *upload* ("1 configuration not found" — an infra failure, not a
+finding), while **both real workflows (CI, image publish) were green** and the identical code
+had passed both CodeQL analyses clean on every earlier same-day push. No security signal was
+bypassed, only a check that couldn't run. The release-create itself took retry loops with an
+exists-check before each attempt (never re-tag) — that duplicate-safe retry shape is worth
+reusing next time GitHub wobbles. Tests at release: **1278 backend / 438 frontend, 0
+skipped.** Build-run rows U–Z + two unlettered commits are the item log; the headline
+content: the **what's-new upgrade popup + Docs → Release notes** (version link now routes
+in-app), the **orphaned spent-archive fix** (EXCLUDED exemption lapses with the parent,
+retroactively self-healing), the **stranded-source-delete retry sweep** + cleanup-ordering
+gate + Delete-reachable-for-remote-only-rows escape hatch, the **notify feedback loop**
+(`arr_path_mismatch` predictive + `arr_scan_command_failed` confirmed, migration **021**),
+the Queues **"Path as seen by the *arr" field moved under Local path** with a namespace
+tooltip, **Logs text filter + 10k lookback**, and the **support bundle** (zip, secrets
+verified absent from a real bundle, per-instance 20 MB *arr-log budget).
+
+**The day's production diagnosis, worth remembering:** the user's production *arrs mount
+storage at a different path than lftpweb (`/mnt/seanas02_media/Working/...` vs
+`/mnt/seanas02-media-working/...`). With `arr_visible_path` unset, every notify push was a
+silently-accepted no-op (201, then the *arr scanned a nonexistent path), imports fell back to
+the *arr's own schedule, and 15 associations drifted to `gone` with sources stranded on the
+seedbox. **The user has since set `arr_visible_path` on both production queues.** The two new
+warning events exist precisely so this class of failure can never be silent again — a clean
+run produces neither. Also verified live on the test system before release: the stranded
+Bull S06E22 source was deleted by the new retry sweep on its own (`events.ndjson` in the
+user's first real support bundle carries the proof).
+
+**Unviewed as of the cut:** the what's-new popup, Release notes page, support-bundle dialog,
+the moved Queues field/tooltip, the logs filter — all shipped browser-unverified per this
+environment's standing limitation; the user has exercised the browse dialogs and generated
+one real support bundle (reviewed clean by the session, four flaws found and fixed same day —
+rows Y/Z).
+
 ### 🚀 v0.2.1 released 2026-08-17 — path browsing, save-time validation, live-use fixes
 
 PR #7 (`dev` → `main`, merged `79ea0ea`, **auto-closed GitHub issue #4** via `Closes #4` in
