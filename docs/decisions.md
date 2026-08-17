@@ -6,6 +6,35 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-16 — Three CodeQL `py/path-injection` alerts on `core/browse.py` dismissed as by-design (alerts #16–#18, PR #7)
+
+The v0.2.1 release PR's CodeQL gate flagged the browse feature's three filesystem touch
+points (`os.scandir` in `_try_list_local`, `os.stat`/`os.access` in `local_directory_error`)
+as user-controlled paths flowing into path expressions. Verified before dismissing, not
+assumed: all three are **metadata-only** operations — directory-name listing and existence/
+readability checks; no file contents are ever read, nothing is written or deleted — and the
+user-controlled path is the documented feature (the authenticated Settings directory browser
+deliberately lists any container directory; see the entry below and the changelog's own scope
+statement). Both routes are default-deny auth-gated and pinned by
+`tests/test_auth_api.py.test_protected_routes_return_401_unauthenticated_in_password_mode`.
+There is no confinement boundary a code change could enforce without deleting the feature.
+
+Dismissed `won't fix` (intended behavior — not `false positive`: the data flow CodeQL
+describes is real, it's the vulnerability framing that doesn't apply) with this justification
+on each alert, user-approved 2026-08-16. Same precedent as the five v0.1.0 dismissals
+(4 × path-injection on the anchored-regex log/backup download endpoints, 1 × weak-hash on
+token hashing).
+
+**Rejected alternative: a scanner-appeasing sanitizer** (`os.path.normpath` +
+`startswith("/")` guard) that CodeQL's taint model would likely accept as a barrier. A
+containment check against `/` is semantically empty — it would dress up by-design behavior
+as a fixed vulnerability and leave the next reader believing a real boundary exists where
+none does.
+
+**Standing consequence, same as v0.1.0's dismissals:** the 401 route-enumeration test is now
+a security control these dismissals rest on, not tidiness — the browse routes'
+`PROTECTED_ROUTE_TEMPLATES` entries must not be removed without re-opening the question.
+
 ## 2026-08-16 — Path browse dialog (GitHub issue #4), plus two mid-run scope additions: save-time path validation and mount-gate audit events
 
 `prompts/done/2026-08-16-path-browse-dialog.md`, user-approved design settled the same day.
