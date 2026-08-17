@@ -1,16 +1,27 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import { getThroughput, listQueues } from '../api/client'
-import type { MetricsRange, MetricsThroughputResponse, PathQueueOut } from '../api/types'
-import { BytesPerHourChart } from '../components/charts/BytesPerHourChart'
+import { getMetricsSettings, getThroughput, listQueues } from '../api/client'
+import type { BytesRange, MetricsThroughputResponse, PathQueueOut, SpeedRange } from '../api/types'
+import { BytesChart } from '../components/charts/BytesChart'
 import { SpeedLineChart } from '../components/charts/SpeedLineChart'
 import { assignQueueColorSlots, colorVarForSlot } from '../components/charts/queueColors'
 import { usePoll } from '../hooks/usePoll'
+import { retentionNoteForRange } from '../lib/bytesChart'
 import { readLocalStorage, writeLocalStorage } from '../lib/storage'
 
-const RANGES: { value: MetricsRange; label: string }[] = [
+const SPEED_RANGES: { value: SpeedRange; label: string }[] = [
   { value: '1h', label: '1h' },
   { value: '12h', label: '12h' },
   { value: '24h', label: '24h' },
+]
+
+// Chart 1's own range selector (task prompt, 2026-08-17,
+// prompts/done/2026-08-17-bytes-chart-7d-30d-ranges-and-total.md) -- independent of Chart 2's
+// `SPEED_RANGES` above, both in storage key and in option list (`api/types.ts`'s
+// `BytesRange`/`SpeedRange` split).
+const BYTES_RANGES: { value: BytesRange; label: string }[] = [
+  { value: '24h', label: '24h' },
+  { value: '7d', label: '7d' },
+  { value: '30d', label: '30d' },
 ]
 
 // Refreshed on the same order of cadence as the rest of the app's polled pages (StatsHeader:
@@ -26,31 +37,64 @@ const selectClasses =
 // The remembered timeframe (2026-08-13, prompts/2026-08-13-files-ux-pass.md item 5) -- same
 // `lib/storage.ts` helper the Files page's sort/collapse preferences already use, not a second
 // one, with the same "a preference read/write failing must never break the page" guarantee.
-const RANGE_VALUES: MetricsRange[] = ['1h', '12h', '24h']
-function isMetricsRange(value: unknown): value is MetricsRange {
-  return typeof value === 'string' && (RANGE_VALUES as string[]).includes(value)
+const SPEED_RANGE_VALUES: SpeedRange[] = ['1h', '12h', '24h']
+function isSpeedRange(value: unknown): value is SpeedRange {
+  return typeof value === 'string' && (SPEED_RANGE_VALUES as string[]).includes(value)
+}
+
+// Chart 1's own remembered timeframe (`dashboard.bytesRange`, distinct key from Chart 2's
+// `dashboard.range` above) -- same synchronous-read-before-first-paint pattern, so this chart
+// never flashes 24h before jumping to a saved 7d/30d.
+const BYTES_RANGE_VALUES: BytesRange[] = ['24h', '7d', '30d']
+function isBytesRange(value: unknown): value is BytesRange {
+  return typeof value === 'string' && (BYTES_RANGE_VALUES as string[]).includes(value)
 }
 
 /** DESIGN.md — new "Dashboard" page proposed alongside this task (docs/decisions.md); not an
  * expansion of the header stats (decision 4) -- a new page, so the header doesn't try to
  * cram a chart into a single row of chrome. Two hand-rolled SVG charts, both fed by
- * `core/metrics.py`'s throughput sample store: bytes/hour for the last 24h, and speed over a
- * selectable window, per queue or site-wide.
+ * `core/metrics.py`'s throughput sample store, each with its own independent range selector
+ * (2026-08-17, prompts/done/2026-08-17-bytes-chart-7d-30d-ranges-and-total.md): bytes
+ * transferred (with a range total) over 24h/7d/30d, and speed over a selectable 1h/12h/24h
+ * window, per queue or site-wide.
  */
 export function DashboardPage() {
   const [queues, setQueues] = useState<PathQueueOut[]>([])
   // Read synchronously in the initial `useState`, not a `useEffect` (2026-08-13, item 5) -- a
   // `useEffect` would paint the default range first and then jump to the saved one once it
   // runs, which is exactly the flash the task's prompt calls out ("read it synchronously...
-  // or the chart renders one timeframe and then jumps").
-  const [range, setRangeState] = useState<MetricsRange>(
-    () => readLocalStorage('dashboard.range', isMetricsRange) ?? '24h',
+  // or the chart renders one timeframe and then jumps"). Chart 1's `bytesRange` follows the
+  // identical pattern (2026-08-17) with its own key -- the two charts' selectors are
+  // independent, so one never clobbers the other's saved preference.
+  const [bytesRange, setBytesRangeState] = useState<BytesRange>(
+    () => readLocalStorage('dashboard.bytesRange', isBytesRange) ?? '24h',
   )
-  const setRange = (next: MetricsRange) => {
-    setRangeState(next)
+  const setBytesRange = (next: BytesRange) => {
+    setBytesRangeState(next)
+    writeLocalStorage('dashboard.bytesRange', next)
+  }
+  const [speedRange, setSpeedRangeState] = useState<SpeedRange>(
+    () => readLocalStorage('dashboard.range', isSpeedRange) ?? '24h',
+  )
+  const setSpeedRange = (next: SpeedRange) => {
+    setSpeedRangeState(next)
     writeLocalStorage('dashboard.range', next)
   }
   const [queueId, setQueueId] = useState<number | undefined>(undefined)
+
+  // Retention (`core/metrics.py.MetricsSettings.retention_days`, read via the existing
+  // `GET /api/settings/metrics` the Settings page already round-trips -- no new endpoint,
+  // task prompt item 5) fetched once, not polled -- it changes only when a human edits it in
+  // Settings, so a stale read for the length of this page visit is harmless. `null` while
+  // unresolved or on a failed fetch means "say nothing," not "assume 7."
+  const [retentionDays, setRetentionDays] = useState<number | null>(null)
+  useEffect(() => {
+    getMetricsSettings()
+      .then((s) => setRetentionDays(s.retention_days))
+      .catch(() => {
+        // The retention note just doesn't render -- everything else on the page still works.
+      })
+  }, [])
 
   useEffect(() => {
     listQueues()
@@ -61,10 +105,10 @@ export function DashboardPage() {
       })
   }, [])
 
-  const dailyFetcher = useCallback(() => getThroughput('24h'), [])
+  const dailyFetcher = useCallback(() => getThroughput(bytesRange), [bytesRange])
   const daily = usePoll<MetricsThroughputResponse>(dailyFetcher, POLL_INTERVAL_MS)
 
-  const speedFetcher = useCallback(() => getThroughput(range, queueId), [range, queueId])
+  const speedFetcher = useCallback(() => getThroughput(speedRange, queueId), [speedRange, queueId])
   const speed = usePoll<MetricsThroughputResponse>(speedFetcher, POLL_INTERVAL_MS)
 
   const colorSlots = useMemo(() => assignQueueColorSlots(queues), [queues])
@@ -73,11 +117,38 @@ export function DashboardPage() {
   const seriesColor =
     queueId != null ? colorVarForSlot(colorSlots.get(queueId) ?? 0) : 'var(--series-1)'
 
+  const retentionNote = retentionNoteForRange(bytesRange, retentionDays)
+
   return (
     <div className="flex flex-col gap-6">
       <section className="flex flex-col gap-2 rounded-lg border border-zinc-200 p-4 dark:border-zinc-800">
+        <div className="flex justify-end">
+          <div className="flex overflow-hidden rounded-md border border-zinc-300 dark:border-zinc-700">
+            {BYTES_RANGES.map((r) => (
+              <button
+                key={r.value}
+                type="button"
+                onClick={() => setBytesRange(r.value)}
+                aria-pressed={bytesRange === r.value}
+                className={`px-2.5 py-1.5 text-sm font-medium ${
+                  bytesRange === r.value
+                    ? 'bg-zinc-900 text-white dark:bg-zinc-100 dark:text-zinc-900'
+                    : 'bg-white text-zinc-700 hover:bg-zinc-50 dark:bg-zinc-900 dark:text-zinc-200 dark:hover:bg-zinc-800'
+                }`}
+              >
+                {r.label}
+              </button>
+            ))}
+          </div>
+        </div>
+
         {daily ? (
-          <BytesPerHourChart buckets={daily.buckets} queues={queues} />
+          <BytesChart
+            buckets={daily.buckets}
+            bucketSeconds={daily.bucket_seconds}
+            queues={queues}
+            retentionNote={retentionNote}
+          />
         ) : (
           <div className="flex h-40 items-center justify-center text-sm text-zinc-400 dark:text-zinc-600">
             Loading…
@@ -105,14 +176,14 @@ export function DashboardPage() {
               ))}
             </select>
             <div className="flex overflow-hidden rounded-md border border-zinc-300 dark:border-zinc-700">
-              {RANGES.map((r) => (
+              {SPEED_RANGES.map((r) => (
                 <button
                   key={r.value}
                   type="button"
-                  onClick={() => setRange(r.value)}
-                  aria-pressed={range === r.value}
+                  onClick={() => setSpeedRange(r.value)}
+                  aria-pressed={speedRange === r.value}
                   className={`px-2.5 py-1.5 text-sm font-medium ${
-                    range === r.value
+                    speedRange === r.value
                       ? 'bg-zinc-900 text-white dark:bg-zinc-100 dark:text-zinc-900'
                       : 'bg-white text-zinc-700 hover:bg-zinc-50 dark:bg-zinc-900 dark:text-zinc-200 dark:hover:bg-zinc-800'
                   }`}

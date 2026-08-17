@@ -6,6 +6,52 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-17 — Dashboard bytes chart: 7d/30d ranges bucket at 6h/1d, and the retention note reuses the existing settings GET rather than a new endpoint
+
+`prompts/done/2026-08-17-bytes-chart-7d-30d-ranges-and-total.md`, executed end to end. The
+Dashboard's bytes-transferred chart only ever showed the last 24 hours; the user asked for a
+24h/7d/30d selector plus a total for the selected range.
+
+**Bucket-width choices: 21600s (6h) for 7d, 86400s (1d) for 30d.** Same reasoning
+`api/metrics.py`'s `_RANGES` comment already gave for the existing three ranges (finer buckets
+for a short window, coarser as it widens, so the chart stays a readable number of bars): 7d at
+hourly buckets would be 168 bars, unreadable on a 760px chart for no more information than 28
+six-hour bars gives; 30d at 6-hour buckets would be 120 bars, so it steps again to 30 one-day
+bars. Both stay consistent with the existing rule that a range's own bucket width is `hours *
+3600 / bucket_count`, chosen so the resulting bar count sits in the same "one glance" range the
+1h/12h/24h ranges already target (~24-60 bars). The endpoint's inclusive bucket-boundary walk
+(`get_throughput`'s `while epoch <= last_epoch`) means an N-bucket range always renders N+1
+points, not N -- true of every existing range too, just newly worth spelling out because the
+new tests pin the exact count (29 for 7d, 31 for 30d) rather than only asserting `>= 1` the way
+the pre-existing 1h test does.
+
+**The speed chart's own 1h/12h/24h selector is untouched, on purpose.** The task named this
+explicitly: speed over a week or month at 6h/1d buckets would average away exactly the spikes a
+speed chart exists to show, so Chart 2 keeps its original three ranges and its original
+`dashboard.range` localStorage key. Chart 1 gets an independent selector and its own key
+(`dashboard.bytesRange`) -- the two were never coupled in the API (`getThroughput(range,
+queueId?)` already took an arbitrary range string per call site), only in the frontend's shared
+`MetricsRange` type, which this task split into `SpeedRange`/`BytesRange` (still unioned into
+`MetricsRange` for the wire response shape, which doesn't care which selector a given request
+came from).
+
+**Retention note: read the existing `GET /api/settings/metrics`, once, no new endpoint.** The
+task's own contingency said to add a new endpoint only if no cheap read already existed --
+`getMetricsSettings()` was already defined in `client.ts` (added when the settings round-trip
+shipped) but had zero call sites anywhere in the frontend until this task. The Dashboard now
+calls it once on mount (not polled -- retention only changes when a human edits it in Settings,
+so a stale read for one page visit is harmless) and compares the selected range's day-span
+against it (`lib/bytesChart.ts.retentionNoteForRange`); a 30d selection on the default 7-day
+retention now says so in a muted one-line note instead of silently rendering 23 days of
+unexplained gaps that look like downtime rather than pruned history.
+
+**Renamed `BytesPerHourChart` → `BytesChart`.** Thin rename only (all three call sites/imports
+updated in the same commit) -- justified because the component stopped being per-hour-specific
+in behavior once `bucketSeconds` became a prop it labels against, and the task's own guidance
+was explicit that a parallel second chart component was not an acceptable alternative.
+
+---
+
 ## 2026-08-17 — An INTERRUPTED job's History popout explains itself, without attempt-grouping or reclassification
 
 `prompts/done/2026-08-17-interrupted-job-popout-explains-itself.md`. Live find on the test

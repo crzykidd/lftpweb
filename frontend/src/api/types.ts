@@ -830,7 +830,17 @@ export interface MetricsSettingsOut {
 
 export type MetricsSettingsIn = MetricsSettingsOut
 
-export type MetricsRange = '1h' | '12h' | '24h'
+// 2026-08-17 (prompts/done/2026-08-17-bytes-chart-7d-30d-ranges-and-total.md): the two Dashboard
+// charts' range selectors are independent and no longer offer the same option list -- the
+// speed chart (Chart 2) keeps its original 1h/12h/24h window (fine-grained speed over a month
+// would average away exactly the spikes it exists to show); the bytes chart (Chart 1, see
+// api/metrics.py's `_RANGES` comment) gained 7d/30d instead of 12h, since a speed-chart-style
+// short window says little about total bytes moved. `MetricsRange` stays the
+// union both narrower types feed into `MetricsThroughputResponse.range`/`getThroughput`, which
+// don't otherwise care which selector a given range came from.
+export type SpeedRange = '1h' | '12h' | '24h'
+export type BytesRange = '24h' | '7d' | '30d'
+export type MetricsRange = SpeedRange | BytesRange
 
 export interface MetricsBucketOut {
   ts: string

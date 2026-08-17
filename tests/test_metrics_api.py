@@ -62,6 +62,38 @@ def test_throughput_rejects_unknown_range(isolated_config):
         assert resp.status_code == 422
 
 
+def test_throughput_7d_range_uses_6_hour_buckets(isolated_config):
+    """2026-08-17: the bytes chart's new week view -- 21600s (6h) buckets covering the trailing
+    168 hours. The bucket-boundary walk (`get_throughput`) is inclusive of both ends, so a
+    range of N whole buckets always yields N+1 points (168h / 21600s = 28 buckets, 29 points,
+    exactly the same off-by-one the existing 24h/3600s case already has -- see 24h's own math:
+    24 buckets, 25 points); same empty-database all-down shape the 1h test above pins.
+    """
+    with TestClient(app) as client:
+        resp = client.get("/api/metrics/throughput", params={"range": "7d"})
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["range"] == "7d"
+        assert body["bucket_seconds"] == 21600
+        assert len(body["buckets"]) == 29
+        assert all(b["up"] is False for b in body["buckets"])
+
+
+def test_throughput_30d_range_uses_1_day_buckets(isolated_config):
+    """2026-08-17: the bytes chart's new month view -- 86400s (1d) buckets covering the
+    trailing 720 hours (30 buckets, 31 points -- see the 7d test above for the off-by-one
+    reasoning).
+    """
+    with TestClient(app) as client:
+        resp = client.get("/api/metrics/throughput", params={"range": "30d"})
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["range"] == "30d"
+        assert body["bucket_seconds"] == 86400
+        assert len(body["buckets"]) == 31
+        assert all(b["up"] is False for b in body["buckets"])
+
+
 def test_throughput_reflects_seeded_heartbeat_and_samples(isolated_config, tmp_path):
     """Drive the real endpoint against real rows, inserted directly (bypassing the sampler,
     which is exercised separately in tests/test_metrics.py) -- proves the endpoint's own SQL

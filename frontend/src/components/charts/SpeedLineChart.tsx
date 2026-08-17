@@ -39,7 +39,7 @@ interface SpeedLineChartProps {
  * line). Speed is derived at render time from the same bucketed byte deltas the bar chart
  * uses (`bytes / bucket_seconds`, decision 5: one table serves both charts by re-bucketing).
  * A `down` bucket breaks the line into a separate path segment rather than dropping to zero
- * -- the same idle-vs-down distinction as `BytesPerHourChart`.
+ * -- the same idle-vs-down distinction as `BytesChart`.
  */
 export function SpeedLineChart({ buckets, bucketSeconds, seriesLabel, colorVar }: SpeedLineChartProps) {
   const points: SpeedPoint[] = useMemo(

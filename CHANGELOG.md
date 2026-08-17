@@ -31,6 +31,16 @@ Skeleton for the next roll:
   falls back to a small text chip naming the instance id if the binding points at an instance
   that's since been deleted. Reuses the same real brand logos already shown on Files/Transfers/
   History (`LifecycleIcons.tsx`'s new `ArrBrandMark`, factored out of `ArrRowChip`).
+- **The Dashboard's bytes-transferred chart gains its own 24h / 7d / 30d range selector, plus
+  a total for the selected range.** Previously it only ever showed the last 24 hours; the new
+  7d range buckets at 6 hours and 30d at 1 day (same finer-when-short/coarser-when-long
+  reasoning as the existing ranges), and the chart's title, bar labels, and hover tooltips
+  scale with the bucket width. The header now reads "Total: 84.2 GB" for the whole selected
+  range, and each queue's legend entry gets its own range total alongside it. The speed chart's
+  1h/12h/24h selector is untouched and independent — the two charts remember their timeframes
+  separately. Sample retention still defaults to 7 days (30 max, Settings → configurable): a
+  7d or 30d selection past what's actually retained now says so in a one-line note instead of
+  silently rendering empty gaps with no explanation.
 
 ### Changed
 
