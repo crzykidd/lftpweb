@@ -5,6 +5,7 @@ import { CredentialsBanner } from './CredentialsBanner'
 import { StatsHeader } from './StatsHeader'
 import { ThemeToggle } from './ThemeToggle'
 import { VersionLink } from './VersionLink'
+import { WhatsNewDialog } from './WhatsNewDialog'
 
 const navLinkClasses = ({ isActive }: { isActive: boolean }) =>
   `block rounded-md px-3 py-2 text-sm font-medium transition-colors ${
@@ -31,6 +32,9 @@ export function Layout() {
 
   return (
     <div className="flex h-full min-h-screen bg-white text-zinc-900 dark:bg-zinc-950 dark:text-zinc-100">
+      {/* Mounted once for the whole shell (2026-08-17, DESIGN.md §9.1) -- it renders nothing
+       * until its own health fetch resolves to sections worth showing (lib/releaseNotes.ts). */}
+      <WhatsNewDialog />
       <aside className="flex w-48 shrink-0 flex-col justify-between border-r border-zinc-200 p-3 dark:border-zinc-800">
         <nav className="flex flex-col gap-1">
           {NAV_ITEMS.map((item) => (

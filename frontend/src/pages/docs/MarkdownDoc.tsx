@@ -23,6 +23,22 @@ import { Code, DocsPage, Jump, Note, P, Section, Step, UL, Warn, Where } from '.
 type DivProps = ComponentPropsWithoutRef<'div'> & { 'data-callout'?: string }
 
 const bodyComponents = {
+  // `h1`/`h2`/`h3` are only ever hit by `ReleaseNotesPage.tsx` (2026-08-17) -- a section's own
+  // `body` here never contains a heading (the `## ` that would start one is exactly where
+  // `docMarkdown.ts` cuts the section), but `CHANGELOG.md` is real Markdown with real headings
+  // at every level, rendered through this same `SectionBody` unstructured (see that file for
+  // why: the changelog must render verbatim, not be reshaped the way quick-start/concepts are).
+  h1: ({ children }: ComponentPropsWithoutRef<'h1'>) => (
+    <h1 className="text-xl font-semibold text-zinc-900 dark:text-zinc-100">{children}</h1>
+  ),
+  h2: ({ children }: ComponentPropsWithoutRef<'h2'>) => (
+    <h2 className="border-b border-zinc-200 pb-1 text-base font-semibold text-zinc-900 dark:border-zinc-800 dark:text-zinc-100">
+      {children}
+    </h2>
+  ),
+  h3: ({ children }: ComponentPropsWithoutRef<'h3'>) => (
+    <h3 className="text-sm font-semibold text-zinc-800 dark:text-zinc-200">{children}</h3>
+  ),
   p: ({ children }: ComponentPropsWithoutRef<'p'>) => <P>{children}</P>,
   ul: ({ children }: ComponentPropsWithoutRef<'ul'>) => <UL>{children}</UL>,
   code: ({ children }: ComponentPropsWithoutRef<'code'>) => <Code>{children}</Code>,
@@ -65,7 +81,16 @@ const bodyComponents = {
   ),
 }
 
-function SectionBody({ markdown }: { markdown: string }) {
+/** Exported for `ReleaseNotesPage.tsx` (2026-08-17), which feeds the *whole* raw
+ * `CHANGELOG.md?raw` string through this directly rather than through `MarkdownDoc` below --
+ * the changelog's own shape (a `# Changelog` title, an intro paragraph, an HTML-comment
+ * skeleton, then real `## `/`### ` headings) doesn't match what `parseDocSource` expects
+ * (a `# Title`, one lede paragraph, then *only* `## ` section boundaries) and would throw
+ * partway through the file's own commented-out skeleton example. Rendering it as one opaque
+ * Markdown blob through the same `bodyComponents` styling, with no structural parsing at all,
+ * is what "renders the file verbatim" (that page's own comment) means in practice.
+ */
+export function SectionBody({ markdown }: { markdown: string }) {
   return (
     <ReactMarkdown remarkPlugins={[remarkGfm, remarkCallouts]} components={bodyComponents}>
       {markdown}

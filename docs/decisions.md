@@ -6,6 +6,84 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-17 — What's-new popup, Docs → Release notes page, version link points in-app
+
+`prompts/done/2026-08-17-whats-new-popup-and-release-notes.md`, design settled the same day.
+Three pieces landed together (popup, new Docs page, `lib/versionBadge.ts`'s link target)
+because all three read the same source, `CHANGELOG.md`, and the third is what makes the second
+discoverable at all.
+
+**Docs → Release notes renders `CHANGELOG.md` verbatim, not through `MarkdownDoc`/
+`parseDocSource`.** That parser (`lib/docMarkdown.ts`) expects a strict shape — one `# Title`
+line, one lede paragraph, then *only* `## `-delimited section boundaries — and throws on
+anything else, by design (a malformed `docs/*.md` should fail loudly). `CHANGELOG.md` doesn't
+fit it: multiple intro paragraphs before the first real section, and a commented-out `<!-- ...
+-->` skeleton for the next roll that itself contains an example `## [Unreleased]` line, which a
+naive split would mistake for a real section boundary. Rather than reshaping the changelog to
+fit the parser (which would violate the whole reason for using it verbatim — GitHub and this
+app must show byte-identical prose, per `release-prep-and-cut`), `MarkdownDoc.tsx` now exports
+its inner `SectionBody` (the react-markdown + remark-gfm + `bodyComponents` pipeline, previously
+private) and `ReleaseNotesPage.tsx` feeds it the whole raw file as one opaque blob. `bodyComponents`
+gained `h1`/`h2`/`h3` mappings for this — no section body had ever contained a heading before,
+since a heading is exactly where `docMarkdown.ts` cuts a section.
+
+**`lib/releaseNotes.ts` is a separate, popup-only parser** (`parseChangelog`,
+`compareVersions`, `whatsNewSections`, `trimEmptySubsections`) that *does* split the file into
+per-version sections — needed to answer "what changed since version X," which the verbatim
+Docs page never has to ask. It strips `<!-- ... -->` blocks before splitting specifically to
+avoid the skeleton's own example heading being mistaken for a real one — a real incident hit
+while building this, not a defensive guess (a naive first pass produced a bogus `Unreleased`
+section before the real one). `trimEmptySubsections` (drops a `### Heading` with nothing under
+it before the next heading) is popup-only too, per the task's own instruction — the Docs page
+must never mutate what it shows.
+
+**First-visit-silent + multi-version accumulation.** `lastSeenVersion == null` (fresh browser)
+and `lastSeenVersion == currentVersion` both show nothing, storing the current version
+immediately — an install is not an "upgrade." An upgrade that skipped one or more releases (or
+a browser reopened after a while) shows every section with `lastSeen < version <= current`,
+newest first, not just the latest — the accumulated-since-last-visit list is the useful one. A
+downgrade, or a stored version whose matching releases have since been archived out of
+`CHANGELOG.md` entirely (`docs/CHANGELOG-0.x.md`-style archives, none exist yet), both fall out
+of the same range filter as an empty result with no separate branch — the caller always stores
+silently on an empty result either way, so `lastSeenVersion` never goes stale waiting for a
+"real" upgrade that will never come from a downgraded browser.
+
+**Per-browser only, no server-side seen-state** — `localStorage`, like every other per-browser
+preference in this app (`lib/storage.ts`). A second browser, or a private window, tracks "last
+seen" independently and will see the same what's-new popup again; this is named, not
+accidental — per-user seen-state would need a session concept the auth modes here don't
+uniformly have (`AUTH_MODE=none`/`proxy` have no per-user identity at all).
+
+**`lib/versionBadge.ts`'s non-dev branch (release build, or the no-channel fallback) now links
+to the in-app `/docs/release-notes` route instead of the GitHub release tag.** The GitHub URL
+isn't gone — it's the Release notes page's own "View on GitHub" link — but the nav's own link
+no longer needs `repo_url` to be non-null to have somewhere to go, which removes the one
+remaining "dead link, plain text" case that branch used to have. The dev-channel branch
+(commit link, `build_sha` + `repo_url`) is untouched: a dev build's whole reason for this badge
+is identifying *which commit*, which only GitHub can answer. `VersionLink.tsx` now branches on
+`lib/docLinks.ts`'s existing `classifyLink` (already the identical "route through the router or
+load a real page" decision the Docs Markdown renderer makes for a link) to render a router
+`Link` for the internal case and a plain `<a target="_blank">` otherwise, so the in-app route
+never triggers a full page reload.
+
+**Health source: a third independent one-shot `getHealth()` call**, not a shared context.
+`VersionLink.tsx` already does its own one-shot fetch on mount and `StatsHeader.tsx` polls
+separately every 5s; neither exposes its result to a sibling. `WhatsNewDialog.tsx` and
+`ReleaseNotesPage.tsx` each add their own one-shot fetch (mirroring `VersionLink`'s pattern, not
+`StatsHeader`'s poll) rather than lifting health into a shared context in `Layout.tsx` — that
+refactor would touch two already-working components for a task whose own brief was additive.
+Recorded as a real (small) inefficiency: three independent `GET /api/health` calls per page
+load instead of one shared read. `/api/health` is already on `logsetup.py`'s polled-path
+exemption list, so none of the three spam the access log.
+
+**Not in scope, named rather than built:** archived per-minor changelogs
+(`docs/CHANGELOG-0.x.md`) are not rendered in-app at all — a popup spanning an archive boundary
+shows only what `CHANGELOG.md` itself still carries, silently short of the full history. No
+server-side per-user seen-state (above). No vite.config.ts change was needed for the new
+repo-root `?raw` import — `fs.allow: ['..']` (added for `docs/*.md?raw`, 2026-08-14) already
+covers the whole repo root, `CHANGELOG.md` included; confirmed by `npm run build` and a real
+`docker build --target frontend-builder`, not just assumed from reading the config.
+
 ## 2026-08-16 — Three CodeQL `py/path-injection` alerts on `core/browse.py` dismissed as by-design (alerts #16–#18, PR #7)
 
 The v0.2.1 release PR's CodeQL gate flagged the browse feature's three filesystem touch

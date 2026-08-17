@@ -34,6 +34,9 @@ export const DOCS_TABS: NavItem[] = [
   { path: '/docs/quick-start', label: 'Quick start' },
   { path: '/docs/how-it-works', label: 'How it works' },
   { path: '/docs/concepts', label: 'Concepts' },
+  // 2026-08-17: renders CHANGELOG.md verbatim (ReleaseNotesPage.tsx); the nav's bottom-left
+  // version link now points here for a release build instead of straight to GitHub.
+  { path: '/docs/release-notes', label: 'Release notes' },
 ]
 
 /** Which top-tab strip (if any) belongs above a given route. `Layout.tsx` used to hardcode a

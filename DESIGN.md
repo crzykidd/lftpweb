@@ -1648,9 +1648,18 @@ reasserting itself, visible at all; both are changes no writer pushes, because n
   machinery of §9.2's Files-row hover card through the shared `lib/popoverPosition.ts`, rather
   than being a third popup mechanism alongside that card and the inline confirm panels. Click/tap
   toggles it and Enter/Space opens it, so it works without a pointer; hover only assists.
-- **Version in the bottom-left corner of the nav**, linking out to that release's notes on
-  GitHub. (Repo not created yet — the base URL is a config constant so it can be filled in
-  without touching the component.)
+- **Version in the bottom-left corner of the nav**, linking to that release's notes. Originally
+  sketched as a straight-out link to GitHub before the repo existed; since 2026-08-17
+  (`docs/decisions.md`) it links to the in-app Docs → Release notes page instead (a dev build's
+  `DEV: vX.Y.Z · <sha>` badge still links to the GitHub commit — the one case that genuinely
+  needs GitHub, not just the release notes) — the GitHub release itself is one click further,
+  from that page's own "View on GitHub" line.
+- **A what's-new popup on the first page load after an upgrade** (2026-08-17,
+  `docs/decisions.md`) shows the release notes for every version between what this browser last
+  saw (`localStorage`, per-browser) and the version now running — nothing on a fresh browser,
+  an unchanged version, or a downgrade. `lib/releaseNotes.ts` holds all of that logic, unit-
+  tested against the real `CHANGELOG.md`; the Docs → Release notes page above renders the same
+  file verbatim rather than through this popup's per-version splitting.
 - **Theme: dark / light / system**, with **system as the default** so it follows the OS until
   told otherwise. Persisted per browser.
 

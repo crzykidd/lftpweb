@@ -24,6 +24,17 @@ Skeleton for the next roll:
 ## [Unreleased]
 
 ### Added
+
+- **A what's-new popup on the first page load after an upgrade**, plus a Docs → Release notes
+  page. The popup reads the release notes for every version between what this browser last saw
+  and the version now running (an upgrade that skips a release shows all of them, newest
+  first) and shows nothing on a fresh browser, an unchanged version, or a downgrade. Docs →
+  Release notes renders `CHANGELOG.md` itself, verbatim, with a "View on GitHub" link at the
+  top; the nav's bottom-left version readout now opens that page in-app instead of linking
+  straight out to GitHub (the GitHub link still exists, just one click further in). Per-browser
+  only (`localStorage`) — a second browser, or a private window, tracks its own "last seen"
+  independently.
+
 ### Changed
 ### Fixed
 ### Security
