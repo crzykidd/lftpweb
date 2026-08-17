@@ -6,6 +6,50 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-17 — An INTERRUPTED job's History popout explains itself, without attempt-grouping or reclassification
+
+`prompts/done/2026-08-17-interrupted-job-popout-explains-itself.md`. Live find on the test
+instance: a container restart at 18:21:49Z cut a running 2.4 GB mirror; startup recovery marked
+the job `failed / INTERRUPTED`, a fresh job resumed two seconds later and completed, and the
+whole *arr ladder ran clean. History told that story badly in two independent ways — a failed
+job with no captured output expanded to a completely blank panel (`HistoryJobsSection.tsx`'s
+expand handler only fetched output when `has_output_tail` was true, and the panel's own
+"No output was captured" message only rendered once that fetch landed, so it was unreachable
+for exactly the failure class that needed it most), and the INTERRUPTED job itself recorded no
+reason at all — `core/queue.py`'s startup-recovery sweep set `error_class = 'INTERRUPTED'` and
+nothing else, so even a fixed panel would have had nothing to say.
+
+**Decision: fix both gaps narrowly — the row explains itself, the rows themselves don't
+change.** Backend: the same UPDATE that marks an orphaned `running` row `INTERRUPTED` now also
+writes a short human-facing explanation into `output_tail` (`INTERRUPTED_OUTPUT_TAIL`), guarded
+by `COALESCE(NULLIF(output_tail, ''), ?)` so it can never overwrite a genuinely captured tail.
+This is deliberately reused, unmodified, by the existing `has_output_tail`/`GET .../output`
+path — no API change. Frontend: `lib/transferPanel.ts` gained `failedJobPanelContent(job)`, a
+pure fetch-vs-static decision — `has_output_tail: false` now renders `job.error_class` plus the
+"No output was captured for this job." copy directly from the list row, no fetch attempted, so
+every pre-fix interrupted row already sitting in a user's database (and any other tail-less
+failure) gets the same explanation without a backfill migration.
+
+**Rejected: attempt-grouping the failed row under the job that resumed it.** Pairing an
+INTERRUPTED job with the fresh job that picked the item back up two seconds later would read
+naturally in the common case, but History is paginated and independently filterable by
+queue/state/error-class/date-range — a page boundary or an active filter can put the two jobs
+on different pages or hide one of them entirely, making the pairing unreliable exactly when a
+user is looking for it. Rejected as disproportionate for a cosmetic grouping.
+
+**Rejected: a server-side "resumed by job N" annotation.** Would need a stable link between an
+INTERRUPTED job and whatever later job (if any) actually resumed the same item — more schema
+and matching logic than a cosmetic annotation earns, especially since nothing about the item's
+correctness depends on that link being right.
+
+**Rejected: reclassifying or recounting anything.** The row stays `failed / INTERRUPTED`, the
+counts stay exactly as they are — both considered and rejected with the user as
+disproportionate machinery for what is, underneath, just an unreachable empty state and a
+missing sentence. No state-machine change, no new `error_class`, no new job or item field
+beyond the one `output_tail` write.
+
+---
+
 ## 2026-08-17 — Bulk delete applies Local/Source per entry, not as blanket flags
 
 `prompts/done/2026-08-17-bulk-delete-per-entry-scopes.md`. Live-reported bug: a Files-page

@@ -34,6 +34,11 @@ Skeleton for the next roll:
   that used to fail the whole row before its source delete was ever attempted. A row where the
   checked scopes leave nothing applicable (e.g. only Local checked on a remote-only row) is now
   reported as skipped rather than as an error.
+- **Expanding a failed transfer with no captured output on the History page now explains
+  itself instead of showing an empty panel.**
+- **A transfer interrupted by an application restart now records why it failed** — the History
+  popout says the transfer was interrupted and that the next attempt resumes from the partial
+  bytes already on disk, instead of leaving the job's captured output blank.
 
 ### Security
 ### Deprecated

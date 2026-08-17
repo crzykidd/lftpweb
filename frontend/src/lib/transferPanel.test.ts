@@ -4,6 +4,7 @@ import {
   type LiveProgress,
   completedTimeLabel,
   decrementHistoryQueueSummary,
+  failedJobPanelContent,
   formatQueueGroupCounts,
   groupHistoryJobsByQueue,
   groupJobsByQueue,
@@ -693,5 +694,30 @@ describe('decrementHistoryQueueSummary -- local update after a single-row clear'
     const result = decrementHistoryQueueSummary([summary({ failed: 0, total_bytes_done: 100 })], cleared)
     expect(result[0].failed).toBe(0)
     expect(result[0].total_bytes_done).toBe(0)
+  })
+})
+
+// 2026-08-17 (prompts/2026-08-17-interrupted-job-popout-explains-itself.md): the
+// fetch-vs-static-empty-state decision behind `HistoryJobsSection.tsx`'s failed-row expand
+// panel, pulled out as a pure function so it's reachable without mounting anything (the same
+// "no component rendering tested here" discipline every other describe block in this file
+// follows).
+describe('failedJobPanelContent -- fetch vs. static empty state for a failed row\'s panel', () => {
+  it('says "fetch" when the row has a captured output tail', () => {
+    const job = historyJob('failed', { error_class: 'AUTH_FAILED', has_output_tail: true })
+    expect(failedJobPanelContent(job)).toEqual({ kind: 'fetch' })
+  })
+
+  it('says "static" with the row\'s own error_class when there is no output tail to fetch', () => {
+    // The case a container-restart INTERRUPTED job hit before this task: `has_output_tail`
+    // false meant `handleToggle` never fetched, `output` stayed `null` forever, and the old
+    // render logic (gated on `output` being non-null) never showed anything at all.
+    const job = historyJob('failed', { error_class: 'INTERRUPTED', has_output_tail: false })
+    expect(failedJobPanelContent(job)).toEqual({ kind: 'static', errorClass: 'INTERRUPTED' })
+  })
+
+  it('carries a null error_class through to the static case rather than guessing', () => {
+    const job = historyJob('failed', { error_class: null, has_output_tail: false })
+    expect(failedJobPanelContent(job)).toEqual({ kind: 'static', errorClass: null })
   })
 })

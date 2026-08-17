@@ -64,6 +64,20 @@ PERMANENT_ERROR_CLASSES = frozenset(
 )
 
 
+# 2026-08-17 (prompts/2026-08-17-interrupted-job-popout-explains-itself.md): the explanation
+# `_reconcile_orphaned_jobs` below writes into `output_tail` for a job it marks INTERRUPTED. Real
+# lftp output has actual command transcripts in it; this is prose instead, but it lands in the
+# same column and flows through the same `has_output_tail`/`GET .../output` path the reap-path
+# writes already use (`api/history.py`), so the History popout has something to show instead of
+# the blank panel a NULL `output_tail` produced. Kept as a module constant, not inlined at the
+# call site, so the test asserting its exact wording and this comment's account of *why* it exists
+# stay next to each other only once.
+INTERRUPTED_OUTPUT_TAIL = (
+    "Transfer interrupted by an application restart or crash -- the process did not exit on its "
+    "own. Partial bytes on disk are retained; the next attempt for this item resumes from them."
+)
+
+
 class JobNotDismissableError(Exception):
     """Raised by `TransferQueue.dismiss_job` for a `queued`/`running` job (§4.6's active
     states) -- dismiss is a Transfers-page display action for a job that's already done,
@@ -330,6 +344,17 @@ class TransferQueue:
         decision (§4.6), so the item stays eligible to be picked up again. Partial bytes on
         disk are kept and `-c` resumes from them; the next scan recomputes the item's state
         from what is actually there.
+
+        **`output_tail` gets `INTERRUPTED_OUTPUT_TAIL`, not left NULL** (2026-08-17, a live find
+        on the test instance: a container restart mid-mirror produced exactly this row, and its
+        History popout rendered completely blank -- the frontend fix makes the panel reachable at
+        all, but a fixed panel with nothing to say is still an empty panel). `COALESCE(NULLIF(
+        output_tail, ''), ?)` only fills a NULL or empty-string column, never overwrites a
+        genuinely captured tail: a `running` row's `output_tail` is never written anywhere else in
+        this module (only reap/dismiss/auth-failure paths touch that column, and none of them can
+        run on a job this sweep is about to mark `failed` before the tick loop even starts), so the
+        guard is defensive, not load-bearing today -- but "never overwrite real captured lftp
+        output with prose" is cheap enough to state unconditionally rather than assume it forever.
         """
         cursor = await self.db.execute("SELECT id, item_id FROM job WHERE state = 'running'")
         rows = await cursor.fetchall()
@@ -343,8 +368,9 @@ class TransferQueue:
         )
         await self.db.execute(
             "UPDATE job SET state = 'failed', pid = NULL, error_class = 'INTERRUPTED', "
-            "finished_at = ? WHERE state = 'running'",
-            (_now_iso(),),
+            "finished_at = ?, output_tail = COALESCE(NULLIF(output_tail, ''), ?) "
+            "WHERE state = 'running'",
+            (_now_iso(), INTERRUPTED_OUTPUT_TAIL),
         )
         await self.db.execute(
             "UPDATE item SET state = 'PARTIAL' WHERE state = 'DOWNLOADING' AND id IN "

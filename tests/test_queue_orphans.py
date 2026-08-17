@@ -14,8 +14,10 @@ import asyncio
 
 import pytest
 
+from lftpweb.api import history
 from lftpweb.core import lftp as lftp_module
 from lftpweb.core import scheduler
+from lftpweb.core.queue import INTERRUPTED_OUTPUT_TAIL
 from test_queue import (
     _host_config,
     _make_db,
@@ -24,6 +26,25 @@ from test_queue import (
     _make_queue_row,
     _queue_for,
 )
+
+
+# Minimal `Request` stand-in for `history.list_history_jobs` -- same shape
+# `tests/test_history_api.py` defines, duplicated here rather than imported since that module's
+# own fixtures build a fresh `:memory:` db per test and this file's `db` fixture (from
+# `test_queue`) is a different one; the route functions only need `request.app.state.db`.
+class _FakeState:
+    def __init__(self, db):
+        self.db = db
+
+
+class _FakeApp:
+    def __init__(self, db):
+        self.state = _FakeState(db)
+
+
+class _FakeRequest:
+    def __init__(self, db):
+        self.app = _FakeApp(db)
 
 
 @pytest.fixture
@@ -58,15 +79,53 @@ async def test_running_jobs_left_by_a_restart_are_cleared_on_start(db, tmp_path)
     q = await _queue_for(db, tmp_path)
     await q._reconcile_orphaned_jobs()
 
-    job = await (await db.execute("SELECT state, error_class FROM job")).fetchone()
+    job = await (await db.execute("SELECT id, state, error_class, output_tail FROM job")).fetchone()
     assert job["state"] == "failed"
     assert job["error_class"] == "INTERRUPTED"
+    # 2026-08-17 (prompts/2026-08-17-interrupted-job-popout-explains-itself.md): before this,
+    # `output_tail` stayed NULL here, and the History popout for exactly this job class
+    # expanded to a blank panel -- the frontend fix makes the panel reachable, but only this
+    # backend write gives it something to say.
+    assert job["output_tail"] == INTERRUPTED_OUTPUT_TAIL
 
     item = await (
         await db.execute("SELECT state, auto_queue_suppressed FROM item WHERE id = ?", (item_id,))
     ).fetchone()
     assert item["state"] == "PARTIAL", "a stuck DOWNLOADING item must be freed for rescan"
     assert item["auto_queue_suppressed"] == 0, "an interrupted transfer is not a user stop"
+
+    # Flows through the existing `has_output_tail`/list endpoint untouched -- no API change
+    # needed, per the task's own "confirm the new backend-written tail flows through the
+    # existing endpoint with zero API changes" instruction.
+    resp = await history.list_history_jobs(_FakeRequest(db))
+    assert len(resp.jobs) == 1
+    assert resp.jobs[0].id == job["id"]
+    assert resp.jobs[0].has_output_tail is True
+
+
+async def test_a_job_that_somehow_already_has_an_output_tail_keeps_it(db, tmp_path):
+    """The reconcile UPDATE's `COALESCE(NULLIF(output_tail, ''), ?)` guard, exercised directly
+    -- in practice a `running` row's `output_tail` is never written by anything else in
+    `core/queue.py` (only reap/dismiss/auth-failure paths touch that column, and none of them
+    run on a job this sweep is about to mark `failed`), but the guard is stated unconditionally
+    in the docstring, so it earns its own test rather than relying on that invariant forever.
+    """
+    host_id = await _make_host_row(db)
+    queue_id = await _make_queue_row(db, host_id, tmp_path / "local")
+    item_id = await _make_item_row(db, queue_id, "Stale.Release.2", is_dir=True, remote_size=1000)
+    await db.execute("UPDATE item SET state = 'DOWNLOADING' WHERE id = ?", (item_id,))
+    await db.execute(
+        "INSERT INTO job (item_id, kind, state, lane, rank, attempt, forced_full_rate, "
+        "output_tail) VALUES (?, 'mirror', 'running', 'main', 0, 1, 0, ?)",
+        (item_id, "genuinely captured lftp output"),
+    )
+    await db.commit()
+
+    q = await _queue_for(db, tmp_path)
+    await q._reconcile_orphaned_jobs()
+
+    job = await (await db.execute("SELECT output_tail FROM job")).fetchone()
+    assert job["output_tail"] == "genuinely captured lftp output"
 
 
 # --- Duplicate jobs / duplicate processes (2026-08-13,

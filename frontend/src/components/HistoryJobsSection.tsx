@@ -5,6 +5,7 @@ import type { HistoryJobOut, HistoryJobsFilter, HistoryQueueSummaryOut, PathQueu
 import { formatBytes, formatPercent } from '../lib/format'
 import {
   decrementHistoryQueueSummary,
+  failedJobPanelContent,
   formatQueueGroupCounts,
   groupHistoryJobsByQueue,
   historyQueueGroupCounts,
@@ -116,6 +117,10 @@ function JobRow({ job, onClearRequest }: { job: HistoryJobOut; onClearRequest: (
     setExpanded((v) => !v)
   }
 
+  // The fetch-vs-static-empty-state decision for the panel below, computed once per render
+  // rather than at each of its two call sites -- see `failedJobPanelContent`'s own docstring.
+  const panelContent = job.state === 'failed' ? failedJobPanelContent(job) : null
+
   return (
     <div className="flex flex-col gap-1.5 border-b border-zinc-100 px-3 py-2 text-sm dark:border-zinc-900">
       <div className="flex flex-wrap items-center gap-3">
@@ -182,7 +187,21 @@ function JobRow({ job, onClearRequest }: { job: HistoryJobOut; onClearRequest: (
       {expanded && job.state === 'failed' && (
         <div className="rounded-md border border-red-200 bg-red-50 p-2 text-xs text-red-800 dark:border-red-900 dark:bg-red-950/40 dark:text-red-300">
           {loading && <p>Loading captured output…</p>}
-          {!loading && output && (
+          {/* 2026-08-17 (prompts/2026-08-17-interrupted-job-popout-explains-itself.md): a
+           * `has_output_tail: false` row (e.g. an INTERRUPTED job recovered before
+           * `core/queue.py` started writing a reason) never gets `output` fetched by
+           * `handleToggle` above -- `output` would stay `null` forever, and the fetch-path
+           * branch below would never render. This branch renders the same "no output" copy
+           * straight from `job.error_class`, which is already on the list row, no fetch
+           * needed. `failedJobPanelContent` is the single source of that fetch-vs-static
+           * decision, shared with `lib/transferPanel.test.ts`. */}
+          {!loading && panelContent?.kind === 'static' && (
+            <>
+              <p className="font-medium">{job.error_class ?? 'UNKNOWN'}</p>
+              <p className="mt-1 opacity-75">No output was captured for this job.</p>
+            </>
+          )}
+          {!loading && panelContent?.kind === 'fetch' && output && (
             <>
               <p className="font-medium">{output.error_class ?? 'UNKNOWN'}</p>
               {output.output_tail ? (

@@ -532,6 +532,23 @@ export function groupHistoryJobsByQueue(
   return rows
 }
 
+/** Whether a failed row's expand panel needs the on-demand `GET .../output` fetch, or can render
+ * a static empty state straight from the list row it already has (2026-08-17,
+ * prompts/2026-08-17-interrupted-job-popout-explains-itself.md). Before this,
+ * `HistoryJobsSection.tsx`'s `handleToggle` only fetched when `has_output_tail` was true, and the
+ * panel's "No output was captured for this job." message only rendered once a fetch actually
+ * landed -- so a failed job with no captured output (an INTERRUPTED job recovered before
+ * `core/queue.py`'s startup sweep started writing one, or any other tail-less failure already
+ * sitting in a user's database) expanded to a completely blank panel: the empty-state copy
+ * existed in the code but was unreachable for exactly the one failure class that most needed it.
+ * `job.error_class` is already on the list row, so the static case needs no fetch at all.
+ */
+export type FailedJobPanelContent = { kind: 'fetch' } | { kind: 'static'; errorClass: string | null }
+
+export function failedJobPanelContent(job: HistoryJobOut): FailedJobPanelContent {
+  return job.has_output_tail ? { kind: 'fetch' } : { kind: 'static', errorClass: job.error_class }
+}
+
 /** The local-update counterpart to the `jobs`/`total` state trimming `HistoryJobsSection.tsx`'s
  * `confirmClear` already does for a single-row clear -- keeps a just-cleared job's queue summary
  * in sync without a full reload, decrementing exactly the one outcome bucket that job belonged to
