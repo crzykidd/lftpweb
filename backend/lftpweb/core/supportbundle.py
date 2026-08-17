@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import re
 import shutil
 import sys
 import zipfile
@@ -37,10 +38,26 @@ EVENTS_LIMIT = 1000
 JOBS_LIMIT = 100
 
 # Per-*arr-instance log fetch budget -- the plan's own "cap per-instance fetch at a sane byte
-# budget (~20 MB)". A single instance's log directory is rotation-bounded on the *arr's own
-# side, so this is a safety cap against an unbounded or misbehaving response, not a number tuned
-# against a real observed log size.
+# budget (~20 MB)". **Binding across the whole instance** (2026-08-17 polish): a running total
+# is kept across every file fetched for one instance, not reset per file -- the bug this fixes
+# was a real one Sonarr with 53 debug files producing a 54 MB (uncompressed) folder, because the
+# original code applied this same number as each *individual* file's own cap with no running
+# total at all. A single instance's log directory is rotation-bounded on the *arr's own side, so
+# this is a safety cap against an unbounded or misbehaving response, not a number tuned against
+# one real observed log size.
 ARR_LOG_BYTE_BUDGET = 20 * 1024 * 1024
+
+# A single file's own download cap -- "a single file may not eat the whole budget" (2026-08-17
+# polish). Deliberately the *same* value as `ARR_LOG_BYTE_BUDGET`: the instance-level running
+# total above is the binding constraint (checked before every fetch), this is a secondary
+# ceiling against one pathological huge file consuming the whole budget in a single download,
+# and needs no separately-tuned number to do that job.
+ARR_LOG_PER_FILE_BYTE_CAP = ARR_LOG_BYTE_BUDGET
+
+# Rotated *arr log filename suffix -- `sonarr.1.txt`, `sonarr.debug.2.txt`, etc. Ascending
+# numbers are progressively older rotations on the *arr's own side; a filename with no such
+# suffix (`sonarr.txt`, `sonarr.debug.txt`) is the current, newest file.
+_ROTATION_SUFFIX_RE = re.compile(r"\.(\d+)\.[^.]+$")
 
 
 def bundle_filename(version: str, now: datetime) -> str:
@@ -150,6 +167,20 @@ async def queue_disk_usage(queues: Sequence[QueuePaths]) -> list[dict[str, Any]]
     return await asyncio.to_thread(_all)
 
 
+def _log_file_sort_key(filename: str) -> tuple[int, int, str]:
+    """Newest-first fetch order for one *arr instance's log-file listing (2026-08-17 polish):
+    non-rotated names first (`sonarr.txt`, `sonarr.debug.txt`), then rotations in ascending
+    numeric order (`sonarr.1.txt` before `sonarr.2.txt`) -- so when the instance-level budget
+    runs out partway through, what's already been kept is the most recent material, not
+    whatever order the *arr's own listing happened to return. Falls back to a plain alphabetic
+    sort within either group for a filename this pattern doesn't recognize.
+    """
+    match = _ROTATION_SUFFIX_RE.search(filename)
+    if match is None:
+        return (0, 0, filename)
+    return (1, int(match.group(1)), filename)
+
+
 def _safe_zip_component(name: str, *, fallback: str) -> str:
     """Reduce a name that ultimately came from a remote HTTP response (an *arr instance's own
     name, or a log filename it reports) to a single path component with no `/`, no `..`, and no
@@ -166,12 +197,25 @@ async def fetch_arr_instance_logs(
     *, kind: ArrKind, base_url: str, api_key: str, instance_name: str
 ) -> dict[str, bytes]:
     """One enabled *arr instance's own Sonarr/Radarr log files, keyed under
-    `bundle/arr-<name>/...`. Per-instance failure (unreachable, bad key, a 5xx) never raises --
-    the plan's own "must not fail the bundle" rule -- it writes a single `FETCH-FAILED.txt`
+    `bundle/arr-<name>/...`.
+
+    **Two failure markers, split by scope (2026-08-17 polish).** Instance-level failure --
+    unreachable, a bad/undecryptable key, or the listing request itself failing -- never raises
+    (the plan's own "must not fail the bundle" rule); it writes a single `FETCH-FAILED.txt`
     marker in that instance's own directory instead, so one broken instance can never take the
-    rest of the bundle down with it. Each file is capped at `ARR_LOG_BYTE_BUDGET`
-    (`ArrClient.download_log_file`); a truncated file gets a trailing marker appended, not a
-    silently cut-off file.
+    rest of the bundle down with it. An *individual file's* fetch failing (observed live: a
+    custom-script log the *arr lists but serves from a different, 404ing endpoint) no longer
+    escalates to that same instance-level marker sitting beside 50+ files that fetched fine --
+    it writes `<filename>.FETCH-ERROR.txt` next to the files that did succeed and the loop moves
+    on to the next file.
+
+    **The `ARR_LOG_BYTE_BUDGET` is a running total across every file in this instance, not a
+    per-file number** (the bug this fixes: one Sonarr with 53 debug files produced a 54 MB
+    uncompressed folder). Files are fetched newest-first (`_log_file_sort_key`) so once the
+    budget is exhausted, what's already kept is the most recent material; the remaining files
+    are named in a `TRUNCATED.txt` marker rather than silently dropped. Each individual
+    download is still capped at `ARR_LOG_PER_FILE_BYTE_CAP` -- the instance-level budget is the
+    binding constraint, this is just a floor against one huge file consuming it in one shot.
     """
     prefix = f"arr-{_safe_zip_component(instance_name, fallback='instance')}"
     parts: dict[str, bytes] = {}
@@ -180,19 +224,43 @@ async def fetch_arr_instance_logs(
             files = await client.log_files()
             if not files:
                 parts[f"{prefix}/NO-LOG-FILES.txt"] = b"the instance reported no log files\n"
-            for raw in files:
-                filename = raw.get("filename")
-                if not isinstance(filename, str) or not filename:
+                return parts
+
+            filenames = (
+                f["filename"] for f in files if isinstance(f.get("filename"), str) and f["filename"]
+            )
+            ordered = sorted(filenames, key=_log_file_sort_key)
+
+            instance_bytes = 0
+            attempted = 0
+            for filename in ordered:
+                if instance_bytes >= ARR_LOG_BYTE_BUDGET:
+                    break
+                attempted += 1
+                safe_name = _safe_zip_component(filename, fallback="log.txt")
+                try:
+                    content, truncated = await client.download_log_file(
+                        filename, max_bytes=ARR_LOG_PER_FILE_BYTE_CAP
+                    )
+                except ArrClientError as exc:
+                    parts[f"{prefix}/{safe_name}.FETCH-ERROR.txt"] = f"{exc}\n".encode()
                     continue
-                content, truncated = await client.download_log_file(
-                    filename, max_bytes=ARR_LOG_BYTE_BUDGET
-                )
                 if truncated:
                     content += (
-                        f"\n\n[lftpweb: truncated at {ARR_LOG_BYTE_BUDGET} bytes]\n"
+                        f"\n\n[lftpweb: truncated at {ARR_LOG_PER_FILE_BYTE_CAP} bytes]\n"
                     ).encode()
-                safe_name = _safe_zip_component(filename, fallback="log.txt")
                 parts[f"{prefix}/{safe_name}"] = content
+                instance_bytes += len(content)
+
+            skipped = len(ordered) - attempted
+            if skipped > 0:
+                budget_mb = ARR_LOG_BYTE_BUDGET // (1024 * 1024)
+                parts[f"{prefix}/TRUNCATED.txt"] = (
+                    f"{skipped} of {len(ordered)} log file(s) not fetched: the ~{budget_mb} MB "
+                    f"per-instance budget was exhausted after {attempted} file(s) were "
+                    "attempted (successes and per-file errors alike). Skipped, oldest first: "
+                    f"{', '.join(ordered[attempted:])}\n"
+                ).encode()
     except ArrClientError as exc:
         parts[f"{prefix}/FETCH-FAILED.txt"] = f"{exc}\n".encode()
     return parts

@@ -51,6 +51,12 @@ class FakeArrState:
     # populates this directly to model an instance's own log directory; empty (the default)
     # models an instance with no log files on disk yet.
     log_files: dict[str, bytes] = field(default_factory=dict)
+    # Support bundle polish (2026-08-17): filenames the listing reports (mixed in alongside
+    # `log_files`' keys) but whose own download 404s -- the real-world shape that broke a real
+    # bundle, a custom-script log the *arr lists but serves from a different endpoint. Kept
+    # separate from `log_files` rather than a sentinel value in it, since a real *arr log file's
+    # content is never `None`/absent.
+    broken_log_files: list[str] = field(default_factory=list)
     # Force a small effective page size regardless of what the client requests -- the one
     # knob the pagination test needs to make one small queue/history split across pages
     # without needing 250+ fixture records to do it honestly.
@@ -137,6 +143,7 @@ def create_fake_arr_app(state: FakeArrState) -> FastAPI:
 
     @app.get("/api/v3/log/file")
     async def log_file_list() -> Any:
+        names = [*state.log_files, *state.broken_log_files]
         return [
             {
                 "filename": name,
@@ -145,7 +152,7 @@ def create_fake_arr_app(state: FakeArrState) -> FastAPI:
                 "downloadUrl": f"/api/v3/log/file/{name}",
                 "id": i + 1,
             }
-            for i, name in enumerate(state.log_files)
+            for i, name in enumerate(names)
         ]
 
     @app.get("/api/v3/log/file/{filename}")

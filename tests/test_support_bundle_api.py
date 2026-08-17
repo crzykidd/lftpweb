@@ -15,10 +15,12 @@ import zipfile
 
 from fastapi.testclient import TestClient
 
+from lftpweb.core import supportbundle
 from lftpweb.main import app
 
 SEEDBOX_PASSWORD = "hunter2-seedbox-password-do-not-leak"  # noqa: S105 - test fixture secret
 ARR_API_KEY = "arr-api-key-do-not-leak-either"  # noqa: S105 - test fixture secret
+EXTRACT_PASSWORD = "hunter2-archive-extract-password"  # noqa: S105 - test fixture secret
 
 
 def _put_host(client: TestClient) -> None:
@@ -42,6 +44,22 @@ def _make_queue(client: TestClient, *, name: str = "TV") -> int:
     )
     assert resp.status_code == 201, resp.text
     return resp.json()["id"]
+
+
+def _set_extract_password(client: TestClient, *, password: str = EXTRACT_PASSWORD) -> None:
+    resp = client.put(
+        "/api/settings/postprocess",
+        json={
+            "verify_enabled": True,
+            "verify_hash_on_disk": False,
+            "extract_enabled": True,
+            "extract_target_dir": None,
+            "extract_passwords": [password],
+            "move_enabled": False,
+            "concurrency": 1,
+        },
+    )
+    assert resp.status_code == 200, resp.text
 
 
 def _create_arr_instance(client: TestClient, *, base_url: str, api_key: str = ARR_API_KEY) -> int:
@@ -160,6 +178,7 @@ def test_settings_dump_never_contains_secrets(isolated_config):
         _put_host(client)
         _make_queue(client)
         _create_arr_instance(client, base_url="http://sonarr.example.invalid")
+        _set_extract_password(client)
 
         resp = client.post(
             "/api/support-bundle",
@@ -168,6 +187,7 @@ def test_settings_dump_never_contains_secrets(isolated_config):
         # Coarse, defense-in-depth check over every byte of the zip response...
         assert SEEDBOX_PASSWORD.encode() not in resp.content
         assert ARR_API_KEY.encode() not in resp.content
+        assert EXTRACT_PASSWORD.encode() not in resp.content
 
         # ...and a precise one over the decompressed settings dump specifically, the part the
         # plan calls out by name.
@@ -175,6 +195,7 @@ def test_settings_dump_never_contains_secrets(isolated_config):
         settings_text = zf.read("bundle/settings.json").decode()
         assert SEEDBOX_PASSWORD not in settings_text
         assert ARR_API_KEY not in settings_text
+        assert EXTRACT_PASSWORD not in settings_text
 
         settings_json = json.loads(settings_text)
         assert settings_json["host"]["has_password"] is True
@@ -182,6 +203,13 @@ def test_settings_dump_never_contains_secrets(isolated_config):
         assert settings_json["arr_instances"][0]["has_api_key"] is True
         assert "api_key" not in settings_json["arr_instances"][0]
         assert settings_json["auth_mode"] == "none"
+
+        # extract_passwords is a count, not the passwords themselves (support-bundle polish).
+        assert settings_json["postprocess"]["extract_passwords_count"] == 1
+        assert "extract_passwords" not in settings_json["postprocess"]
+
+        # The backup settings group, previously the one `*Settings` group missing entirely.
+        assert settings_json["backup"] == {"interval_days": 1.0, "keep_count": 7}
 
 
 # --- *arr log fetch: success and per-instance failure isolation ----------------------------
@@ -228,6 +256,80 @@ async def test_arr_instance_fetch_failure_is_a_marker_not_a_500(isolated_config,
         assert resp.status_code == 200
         zf = _zip_from(resp)
         assert "arr-Sonarr/FETCH-FAILED.txt" in zf.namelist()
+
+
+async def test_one_broken_arr_log_file_gets_its_own_marker_not_an_instance_failure(
+    isolated_config, fake_arr_server
+):
+    """The real observed defect: one 404 (a custom-script log the *arr lists but serves from a
+    different endpoint) must not read as instance-level failure sitting beside 50+ files that
+    fetched fine.
+    """
+    fake_arr_server.state.api_key = ARR_API_KEY
+    fake_arr_server.state.log_files = {
+        "sonarr.txt": b"current log\n",
+        "sonarr.debug.txt": b"current debug log\n",
+    }
+    fake_arr_server.state.broken_log_files = ["delete-sonarr-source.log"]
+    with TestClient(app) as client:
+        instance_id = _create_arr_instance(client, base_url=fake_arr_server.base_url)
+
+        resp = client.post(
+            "/api/support-bundle",
+            json={
+                "include_environment": False,
+                "include_settings": False,
+                "include_events": False,
+                "include_jobs": False,
+                "arr_instance_ids": [instance_id],
+            },
+        )
+        zf = _zip_from(resp)
+        names = zf.namelist()
+        assert "arr-Sonarr/sonarr.txt" in names
+        assert "arr-Sonarr/sonarr.debug.txt" in names
+        assert "arr-Sonarr/delete-sonarr-source.log.FETCH-ERROR.txt" in names
+        assert "arr-Sonarr/FETCH-FAILED.txt" not in names
+
+
+async def test_arr_log_budget_is_per_instance_and_fetches_newest_first(
+    isolated_config, fake_arr_server, monkeypatch
+):
+    """One Sonarr with more log content than the budget allows: the running total is tracked
+    across every file (not reset per file), the newest files (non-rotated, then ascending
+    rotation numbers) are kept, and a `TRUNCATED.txt` names what didn't fit.
+    """
+    monkeypatch.setattr(supportbundle, "ARR_LOG_BYTE_BUDGET", 25)
+    monkeypatch.setattr(supportbundle, "ARR_LOG_PER_FILE_BYTE_CAP", 25)
+    fake_arr_server.state.api_key = ARR_API_KEY
+    fake_arr_server.state.log_files = {
+        "sonarr.2.txt": b"oldest rotation..........",
+        "sonarr.1.txt": b"newer rotation...........",
+        "sonarr.txt": b"current, newest file.....",
+    }
+    with TestClient(app) as client:
+        instance_id = _create_arr_instance(client, base_url=fake_arr_server.base_url)
+
+        resp = client.post(
+            "/api/support-bundle",
+            json={
+                "include_environment": False,
+                "include_settings": False,
+                "include_events": False,
+                "include_jobs": False,
+                "arr_instance_ids": [instance_id],
+            },
+        )
+        zf = _zip_from(resp)
+        names = zf.namelist()
+        assert "arr-Sonarr/sonarr.txt" in names
+        assert "arr-Sonarr/sonarr.1.txt" not in names
+        assert "arr-Sonarr/sonarr.2.txt" not in names
+        assert "arr-Sonarr/TRUNCATED.txt" in names
+        truncated_text = zf.read("arr-Sonarr/TRUNCATED.txt").decode()
+        assert "2 of 3" in truncated_text
+        assert "sonarr.1.txt" in truncated_text
+        assert "sonarr.2.txt" in truncated_text
 
 
 # --- The audit trail (the plan's own "when was this bundle made and what's in it") ---------

@@ -6,6 +6,65 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-17 — Support bundle polish: per-instance byte budget, split failure markers, extract-password redaction
+
+`prompts/done/2026-08-17-support-bundle-polish.md`. The user generated the first real support
+bundle from the test system and it surfaced four real flaws the fake-*arr fixture couldn't have
+caught, all fixed the same session:
+
+**The `ARR_LOG_BYTE_BUDGET` (~20 MB) was written to read as "per instance" but was applied
+per file** — `fetch_arr_instance_logs` passed the constant as every single file's own
+`max_bytes`, with no running total across the instance's files at all. One real Sonarr instance
+with 53 debug files produced a 54 MB uncompressed folder. Fixed with a running total kept across
+the instance's whole file list, checked before each fetch; once it's exhausted, fetching stops
+and a `TRUNCATED.txt` marker names how many files didn't make it in. `ARR_LOG_PER_FILE_BYTE_CAP`
+was split out as its own name (same value) so a single pathological file still can't consume the
+budget in one download, but the instance-level running total is what actually binds.
+
+**Files are now fetched newest-first, not in whatever order the *arr's own listing returns.**
+`_log_file_sort_key` reads a rotated filename's own numeric suffix (`sonarr.1.txt` before
+`sonarr.2.txt` — ascending rotation numbers are progressively older on the *arr's own side) and
+sorts non-rotated names (`sonarr.txt`, `sonarr.debug.txt`) first. This is what makes the budget
+exhausting partway through mean something: what's already kept is the most recent material, not
+an arbitrary subset.
+
+**One file's fetch failing no longer escalates to the same marker an unreachable instance
+gets.** The first real bundle hit exactly this: a 404 on `delete-sonarr-source.log` (a
+custom-script log the *arr's listing names but serves from a different endpoint) produced a
+`FETCH-FAILED.txt` sitting beside 50+ log files that fetched fine — because the whole
+per-instance fetch (listing walk + every download) ran inside one `try`/`except ArrClientError`
+block, so a per-file `download_log_file` raising the same exception type as an unreachable
+instance was indistinguishable from one. Split into two markers by scope: `FETCH-FAILED.txt`
+stays instance-level (unreachable, a bad/undecryptable key, the listing request itself failing)
+and now lives outside the per-file loop entirely; a per-file failure writes
+`<filename>.FETCH-ERROR.txt` beside the files that did fetch and the loop continues to the next
+file rather than aborting. `tests/fake_arr.py` gained `FakeArrState.broken_log_files` — filenames
+the listing reports but whose own download always 404s — to model this shape without touching
+the existing `log_files`/`fail_all` fixtures.
+
+**`extract_passwords` doesn't belong in a diagnostic zip verbatim.** The three prior fixes were
+all found by the first real bundle; this one was caught reviewing it before it went anywhere —
+`bundle/settings.json` was exporting the user's own archive extract passwords as a plain list,
+the same way `_postprocess_out` correctly returns them to the authenticated Settings API. A
+support bundle is not that API. Fixed narrowly: `api/support_bundle.py._gather_settings` swaps
+the list for `extract_passwords_count` on the dict already built for the bundle *after* calling
+the shared `_postprocess_out` conversion — the real `/api/settings/postprocess` response, and
+the conversion function itself, are untouched. This is the one place in the bundle-building code
+that redacts a field the underlying response model doesn't already redact; every other field in
+the settings dump is safe by construction (module docstring, `api/support_bundle.py`) because it
+reuses a response model that already excludes secrets for the Settings API itself — extract
+passwords are the one field on `PostprocessSettingsOut` that's legitimately real for that API
+and needs a bundle-specific reduction on top.
+
+**`bundle/settings.json` was also missing the backup settings group** — the one `*Settings`
+group in this codebase the bundle hadn't picked up, simply never added when the feature first
+shipped. Added the same way every other group is: `load_backup_settings` +
+`BackupSettingsOut(interval_days, keep_count)`, `api/backup.py`'s own GET conversion, inlined
+since that module doesn't factor a `_backup_out` helper the way the other settings routers do.
+No secret lives in this group (interval/keep-count only).
+
+---
+
 ## 2026-08-17 — Support bundle: zip not rar, DB excluded, settings dump built from response models, per-part failure isolation
 
 `prompts/done/2026-08-17-support-bundle.md`. User request: Settings → Logs gains a "Support

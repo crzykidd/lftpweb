@@ -301,13 +301,21 @@ send manually. Each part is its own checkbox, all default on:
 |---|---|
 | lftpweb logs | The live log file plus every rotated file, exactly what Settings → Logs already lists. Always included — this checkbox is checked and disabled. |
 | Environment snapshot | Version, build, migration level, the health readout, `lftp`/Python versions, and per-queue disk usage. |
-| Settings dump | Host config, queues, patterns, transfer/post-processing settings, auth mode, and *arr instances — built from the same responses the Settings pages already return, so it can never carry a password, API key, or key material. |
+| Settings dump | Host config, queues, patterns, transfer/post-processing/backup settings, auth mode, and *arr instances — built from the same responses the Settings pages already return, so it can never carry a password, API key, or key material. An archive extract password is a secret too, so this dump carries only how many are configured (`extract_passwords_count`), never the passwords themselves. |
 | Recent audit trail | The most recent 1,000 History events. |
 | Recent job history | The most recent 100 jobs, including their error output. |
-| A Sonarr/Radarr instance's logs | One checkbox per *enabled* instance — its own log files, fetched live from that *arr. Hidden entirely when no instance is enabled. |
+| A Sonarr/Radarr instance's logs | One checkbox per *enabled* instance — its own log files, fetched live from that *arr, newest-first, up to a per-instance size budget (~20 MB). Hidden entirely when no instance is enabled. |
 
 The SQLite database itself is never included — it carries every encrypted secret this app
 stores, and the settings dump above covers what support actually needs. If one Sonarr/Radarr
-instance can't be reached while building the bundle, that instance's directory gets a
-`FETCH-FAILED.txt` note instead of failing the whole download. Building a bundle writes one
-audit event so there is always a record of when one was made and what it contained.
+instance can't be reached while building the bundle (unreachable, a bad key, or its listing
+request itself failing), that instance's directory gets a `FETCH-FAILED.txt` note instead of
+failing the whole download; one *file* within an otherwise-healthy instance failing to fetch
+(seen live: a custom-script log the *arr lists but serves from a different, 404ing endpoint)
+gets its own narrower `<filename>.FETCH-ERROR.txt` beside the files that did fetch, rather than
+marking the whole instance failed. If an instance has more log content than the per-instance
+budget allows, the newest files are kept (current file, then rotations oldest-last) and a
+`TRUNCATED.txt` names what didn't fit. *arr log files are carried exactly as that *arr wrote
+them — unredacted, since lftpweb doesn't rewrite another app's own logs — so give one a glance
+before sharing it publicly. Building a bundle writes one audit event so there is always a record
+of when one was made and what it contained.

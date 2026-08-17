@@ -17,9 +17,11 @@ hand-picked columns instead is exactly how a future field would leak into it
   frontend shows this checkbox checked and disabled.
 - `bundle/environment.json` -- version, build SHA/channel, migration level, the `/api/health`
   payload, `lftp`/Python versions, per-queue disk usage.
-- `bundle/settings.json` -- host config, queues, patterns, transfer/postprocess settings, auth
-  *mode only*, *arr instances -- every secret excluded by construction (module docstring
-  above).
+- `bundle/settings.json` -- host config, queues, patterns, transfer/postprocess/backup settings,
+  auth *mode only*, *arr instances -- every secret excluded by construction (module docstring
+  above), including postprocess's `extract_passwords` -- an archive extract password is a user
+  secret too, so the bundle's own copy of that dict carries `extract_passwords_count` instead
+  (2026-08-17 polish; the real `/api/settings/postprocess` response is untouched).
 - `bundle/events.ndjson` -- the most recent `core.supportbundle.EVENTS_LIMIT` audit rows,
   newest first.
 - `bundle/jobs.ndjson` -- the most recent `core.supportbundle.JOBS_LIMIT` jobs, including
@@ -27,8 +29,11 @@ hand-picked columns instead is exactly how a future field would leak into it
   `output_tail` from every row by design (`api/history.py`'s module docstring), a bundle *is*
   the on-demand case that endpoint's docstring carves out.
 - `bundle/arr-<name>/` -- one directory per selected, still-*enabled* *arr instance, its own
-  Sonarr/Radarr log files. A per-instance fetch failure never fails the whole bundle (module
-  docstring above).
+  Sonarr/Radarr log files, fetched newest-first up to a per-instance byte budget (a `TRUNCATED
+  .txt` marker names what didn't fit). An instance-level fetch failure never fails the whole
+  bundle -- `FETCH-FAILED.txt` in that instance's own directory; one file's own fetch failing is
+  a narrower `<filename>.FETCH-ERROR.txt` beside the files that did fetch (`core/supportbundle.
+  py.fetch_arr_instance_logs`).
 
 One `support_bundle_created` info event is written on success, naming the selected parts --
 "when was this bundle made and what's in it" is the exact question the audit trail exists to
@@ -60,9 +65,10 @@ from lftpweb.api.history import _event_out, _events_where_clause, _jobs_where_cl
 from lftpweb.config import settings as app_settings
 from lftpweb.core import audit, supportbundle
 from lftpweb.core.auth import load_auth_settings
+from lftpweb.core.backup import load_backup_settings
 from lftpweb.core.postprocess import load_postprocess_settings
 from lftpweb.core.queue import load_transfer_settings
-from lftpweb.models import SupportBundleRequest
+from lftpweb.models import BackupSettingsOut, SupportBundleRequest
 
 router = APIRouter()
 
@@ -123,11 +129,29 @@ async def _gather_settings(db: Any) -> dict[str, Any]:
     patterns = [_pattern_out_from_row(r).model_dump() for r in await cursor.fetchall()]
 
     transfer = _transfer_settings_out(await load_transfer_settings(db)).model_dump()
+
+    # Bundle-only redaction (2026-08-17 polish): `_postprocess_out` -- correctly -- returns
+    # `extract_passwords` verbatim to the authenticated Settings API, the same way `password`
+    # would if `PostprocessSettingsOut` carried one. A support bundle is not that API: these are
+    # the user's own archive passwords, secrets in their own right, so the bundle's own copy of
+    # this dict swaps the list for a count and drops the key. The real `/api/settings/postprocess`
+    # response is untouched -- this mutation happens only on the dict already `model_dump()`ed
+    # for this bundle, never on the shared conversion function itself.
     postprocess = _postprocess_out(await load_postprocess_settings(db)).model_dump()
+    postprocess["extract_passwords_count"] = len(postprocess.pop("extract_passwords"))
+
     auth_mode = (await load_auth_settings(db)).mode
 
     cursor = await db.execute(f"SELECT {_INSTANCE_COLUMNS} FROM arr_instance ORDER BY id")
     arr_instances = [_instance_out_from_row(r).model_dump() for r in await cursor.fetchall()]
+
+    # The one `*Settings` group support-bundle-polish (2026-08-17) found missing from the dump
+    # -- same api-module conversion (`BackupSettingsOut`) `api/backup.py`'s own GET uses; no
+    # secret lives in this group (interval/keep-count only), so nothing to redact here.
+    backup_settings = await load_backup_settings(db)
+    backup = BackupSettingsOut(
+        interval_days=backup_settings.interval_days, keep_count=backup_settings.keep_count
+    ).model_dump()
 
     return {
         "host": host,
@@ -137,6 +161,7 @@ async def _gather_settings(db: Any) -> dict[str, Any]:
         "postprocess": postprocess,
         "auth_mode": auth_mode,
         "arr_instances": arr_instances,
+        "backup": backup,
     }
 
 

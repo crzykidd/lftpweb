@@ -50,12 +50,13 @@ Skeleton for the next roll:
 - **Settings → Logs gains a "Support bundle…" button** — a dialog of checkboxes (all default
   ON) producing one downloadable zip to attach to an issue or send manually: lftpweb's own logs
   (always included), a build/environment snapshot (version, migration level, health, `lftp`/
-  Python versions, per-queue disk usage), a sanitized settings dump (built from the same
-  response models the Settings pages already return, so a secret can never leak into it), the
-  most recent 1,000 audit events, the most recent 100 jobs with their error output, and — one
-  checkbox per enabled Sonarr/Radarr instance — that instance's own log files. A single *arr
-  instance's log fetch failing never fails the rest of the bundle. The database itself, the
-  `known_hosts` pins, and the install secret are never included.
+  Python versions, per-queue disk usage), a sanitized settings dump — host/queue/pattern/
+  transfer/post-processing/backup settings, built from the same response models the Settings
+  pages already return, so a secret can never leak into it — the most recent 1,000 audit events,
+  the most recent 100 jobs with their error output, and — one checkbox per enabled Sonarr/Radarr
+  instance — that instance's own log files, fetched newest-first up to a per-instance size
+  budget. The database itself, the `known_hosts` pins, and the install secret are never
+  included.
 
 ### Changed
 
@@ -84,6 +85,23 @@ Skeleton for the next roll:
   until the source delete actually clears, a row already stranded before this fix self-heals on
   the first pass after upgrade with no manual action, and the Files-page Delete action is now
   offered for a row whose only remaining copy is remote.
+- **A support bundle's settings dump no longer carries archive extract passwords verbatim.**
+  Found reviewing the first real bundle: `postprocess.extract_passwords` was exported as-is —
+  they're user secrets like any other. The bundle's copy of that setting now carries only
+  `extract_passwords_count`; the real `/api/settings/postprocess` response is unaffected.
+- **A support bundle's per-*arr-instance log budget (~20 MB) is now enforced across the whole
+  instance, not reset for every file in it.** One Sonarr with 53 debug files produced a 54 MB
+  (uncompressed) folder in the first real bundle, because the budget was applied per file with
+  no running total. Files are now fetched newest-first (current file, then rotations oldest
+  last) against one running total per instance; once it's exhausted, fetching stops and a
+  `TRUNCATED.txt` names how many files were skipped.
+- **One *arr log file failing to fetch no longer reads as the whole instance failing.** The
+  first real bundle hit a 404 on a custom-script log the *arr lists but serves from a different
+  endpoint, and the resulting `FETCH-FAILED.txt` sat beside 50+ log files that fetched fine — an
+  instance-level marker for a single-file problem. An individual file's own fetch failure now
+  writes a narrower `<filename>.FETCH-ERROR.txt` beside the files that did fetch;
+  `FETCH-FAILED.txt` is reserved for the instance itself being unreachable, its key failing to
+  decrypt, or its listing request failing outright.
 
 ### Security
 ### Deprecated

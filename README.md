@@ -124,6 +124,21 @@ Every verify outcome, every remote delete, and every delete withheld — with th
   Per-field help popups (`FieldHelp`) are being applied across the settings surface, starting
   with the fields whose wrong answer costs you data
 
+## Support bundle
+
+**Settings → Logs → "Support bundle…"** builds one downloadable zip to attach to an issue or
+send manually — generating one is recorded in the audit trail like every other diagnostic
+action here. It **captures**: lftpweb's own logs (already credential-redacted at write time,
+`logsetup.py`), a build/environment snapshot, a sanitized settings dump, recent audit events and
+job history, and — only for whichever Sonarr/Radarr instances you tick — each enabled instance's
+own log files, fetched newest-first up to a per-instance size cap. It **never captures**: the
+seedbox password, SSH keys, *arr API keys (a bundle carries only `has_*` booleans, the same as
+every Settings response), archive extract passwords (a count, not the passwords), the SQLite
+database itself, the install secret, or host-key pins. One caveat worth knowing before you
+attach one anywhere public: an included *arr instance's log files are carried **exactly as that
+*arr wrote them** — lftpweb doesn't rewrite another app's own logs — so give them a glance before
+sharing. Full contents, one part per checkbox: **[docs/concepts.md](docs/concepts.md#support-bundle)**.
+
 ## What doesn't yet
 
 All 9 build phases shipped (see `prompts/startnewsession.md` for exactly what each one built
