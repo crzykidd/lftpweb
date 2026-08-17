@@ -787,6 +787,19 @@ class JobsResponse(BaseModel):
     jobs: list[JobOut]
 
 
+class DismissAllRequest(BaseModel):
+    """`POST /api/jobs/dismiss-all`'s optional JSON body (2026-08-17, the Transfers page's
+    per-queue-group "Dismiss Queue" control, `prompts/2026-08-17-transfers-dismiss-per-queue.md`)
+    -- scopes the bulk dismiss to one queue's own terminal jobs instead of every queue. Omitted
+    entirely (no body at all), or `queue_id: null`, means exactly today's pre-existing behavior
+    -- every queue -- so every caller that predates this task (including every existing test
+    that calls `dismiss_all_jobs` with no body) is unaffected. The same "optional body, omitted
+    means unchanged" shape `DeleteItemRequest` above already set (2026-08-16).
+    """
+
+    queue_id: int | None = None
+
+
 class DismissAllResponse(BaseModel):
     """`POST /api/jobs/dismiss-all` (2026-08-15) -- the bulk counterpart to `POST
     /api/jobs/{id}/dismiss`. `dismissed` is the actual row count the bulk `UPDATE` affected

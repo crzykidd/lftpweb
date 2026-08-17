@@ -657,7 +657,7 @@ class TransferQueue:
         await self.db.execute("UPDATE job SET dismissed_at = ? WHERE id = ?", (_now_iso(), job_id))
         await self.db.commit()
 
-    async def dismiss_all_terminal(self) -> int:
+    async def dismiss_all_terminal(self, queue_id: int | None = None) -> int:
         """The bulk counterpart to `dismiss_job` above (2026-08-15, "Dismiss all" at the top of
         the Transfers page) -- one `UPDATE`, not a per-job loop, per the task's own preference
         for a bulk endpoint over a client-side `Promise.allSettled` fan-out.
@@ -671,14 +671,31 @@ class TransferQueue:
         Transfers regardless of its `dismissed_at`, so dismissing it too is harmless and keeps
         this one plain `UPDATE ... WHERE` rather than a second copy of that subquery.
 
+        `queue_id` (2026-08-17, the group-header "Dismiss Queue" control,
+        `prompts/2026-08-17-transfers-dismiss-per-queue.md`) restricts the same `UPDATE` to one
+        queue's own terminal jobs, `None` (the default, and every call before this task) meaning
+        every queue -- byte-for-byte the original behavior. `job` has no `queue_id` column of its
+        own (only `item_id`, migration 001), so the restriction is a subquery over `item`, the
+        same join `list_jobs()` already does via SQL rather than a second Python-side filter. A
+        `queue_id` naming no queue that exists simply matches zero rows -- the same "nothing to
+        do, not an error" answer an empty/all-dismissed queue already gives; this never 404s.
+
         Returns the actual row count affected (`cursor.rowcount`), the same "report the real
         number" convention `api/history.py`'s clear-history endpoints already use.
         """
-        cursor = await self.db.execute(
-            "UPDATE job SET dismissed_at = ? "
-            "WHERE state IN ('failed','cancelled','succeeded') AND dismissed_at IS NULL",
-            (_now_iso(),),
-        )
+        if queue_id is None:
+            cursor = await self.db.execute(
+                "UPDATE job SET dismissed_at = ? "
+                "WHERE state IN ('failed','cancelled','succeeded') AND dismissed_at IS NULL",
+                (_now_iso(),),
+            )
+        else:
+            cursor = await self.db.execute(
+                "UPDATE job SET dismissed_at = ? "
+                "WHERE state IN ('failed','cancelled','succeeded') AND dismissed_at IS NULL "
+                "AND item_id IN (SELECT id FROM item WHERE queue_id = ?)",
+                (_now_iso(), queue_id),
+            )
         await self.db.commit()
         return cursor.rowcount
 

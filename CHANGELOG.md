@@ -41,6 +41,13 @@ Skeleton for the next roll:
   separately. Sample retention still defaults to 7 days (30 max, Settings → configurable): a
   7d or 30d selection past what's actually retained now says so in a one-line note instead of
   silently rendering empty gaps with no explanation.
+- **The Transfers page's per-queue group header gains its own "Dismiss Queue" control**,
+  scoped to just that queue's finished rows — previously the only bulk option was the
+  page-wide "Dismiss all," with no way to clear one queue's terminal jobs without touching
+  every other queue's. `POST /api/jobs/dismiss-all` gains an optional `queue_id` body field
+  (omitted means the original every-queue behavior, unchanged); the control itself only shows
+  once its queue actually has something dismissable, and clicking it never toggles the group's
+  own collapse state.
 
 ### Changed
 

@@ -6,10 +6,12 @@ import {
   decrementHistoryQueueSummary,
   failedJobPanelContent,
   formatQueueGroupCounts,
+  groupHasDismissable,
   groupHistoryJobsByQueue,
   groupJobsByQueue,
   hasArrGroup,
   historyQueueGroupCounts,
+  isDismissable,
   isQueueCollapsed,
   processingGroupFields,
   queueGroupSummary,
@@ -394,6 +396,40 @@ describe('groupJobsByQueue', () => {
 
   it('returns no groups for an empty job list', () => {
     expect(groupJobsByQueue([])).toEqual([])
+  })
+})
+
+// 2026-08-17 (prompts/2026-08-17-transfers-dismiss-per-queue.md): `isDismissable` moved here
+// from `TransfersPage.tsx` so `groupHasDismissable` below can reuse it without `lib/` importing
+// from `pages/` -- see that function's own docstring. `TransfersPage.test.ts`'s pre-existing
+// `isDismissable` coverage keeps passing unchanged (the page re-exports the same function), so
+// this only adds the states this task's move didn't already have direct coverage for.
+describe('isDismissable', () => {
+  it('is true for a terminal state -- failed, cancelled, succeeded', () => {
+    expect(isDismissable('failed')).toBe(true)
+    expect(isDismissable('cancelled')).toBe(true)
+    expect(isDismissable('succeeded')).toBe(true)
+  })
+
+  it('is false for an active state -- queued, running', () => {
+    expect(isDismissable('queued')).toBe(false)
+    expect(isDismissable('running')).toBe(false)
+  })
+})
+
+describe('groupHasDismissable -- the group header\'s "Dismiss Queue" visibility', () => {
+  it('is true once at least one job in the group is dismissable', () => {
+    const jobs = [job('running', { id: 1 }), job('failed', { id: 2 })]
+    expect(groupHasDismissable(jobs)).toBe(true)
+  })
+
+  it('is false when every job in the group is still active', () => {
+    const jobs = [job('running', { id: 1 }), job('queued', { id: 2 })]
+    expect(groupHasDismissable(jobs)).toBe(false)
+  })
+
+  it('is false for an empty group', () => {
+    expect(groupHasDismissable([])).toBe(false)
   })
 })
 

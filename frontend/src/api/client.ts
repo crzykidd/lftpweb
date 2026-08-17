@@ -324,9 +324,19 @@ export function dismissJob(jobId: number): Promise<void> {
  * prompts/2026-08-15-transfers-single-line-rows-with-detail.md) -- one server-side bulk call
  * (`core/queue.py.dismiss_all_terminal`), not a client-side loop over `dismissJob` for every
  * dismissable row.
+ *
+ * `queueId` (2026-08-17, the Transfers group header's own "Dismiss Queue" control,
+ * prompts/2026-08-17-transfers-dismiss-per-queue.md) scopes the same bulk call to one queue's
+ * own terminal jobs. Omitted (the pre-existing call every caller before this task still makes)
+ * sends no body at all -- byte-for-byte the original request -- matching
+ * `api/jobs.py.dismiss_all_jobs`'s own "omitted body means every queue" contract.
  */
-export function dismissAllJobs(): Promise<DismissAllResponse> {
-  return sendJson<DismissAllResponse>('/api/jobs/dismiss-all', 'POST')
+export function dismissAllJobs(queueId?: number): Promise<DismissAllResponse> {
+  return sendJson<DismissAllResponse>(
+    '/api/jobs/dismiss-all',
+    'POST',
+    queueId != null ? { queue_id: queueId } : undefined,
+  )
 }
 
 /** The Transfers panel's on-demand "processing story" (2026-08-15) -- one item's `event` rows,

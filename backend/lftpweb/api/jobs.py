@@ -27,6 +27,7 @@ from lftpweb.core.remote import parse_connection_limit
 from lftpweb.models import (
     DeleteItemRequest,
     DeleteItemResponse,
+    DismissAllRequest,
     DismissAllResponse,
     EffectiveLftpJobKind,
     EffectiveLftpSetting,
@@ -193,7 +194,9 @@ async def dismiss_job(job_id: int, request: Request) -> None:
 
 
 @router.post("/api/jobs/dismiss-all", response_model=DismissAllResponse)
-async def dismiss_all_jobs(request: Request) -> DismissAllResponse:
+async def dismiss_all_jobs(
+    request: Request, body: DismissAllRequest | None = None
+) -> DismissAllResponse:
     """ "Dismiss all" at the top of the Transfers page (2026-08-15, user addition to
     prompts/2026-08-15-transfers-single-line-rows-with-detail.md) -- the bulk counterpart to
     `dismiss_job` above. A single server-side `UPDATE` (`TransferQueue.dismiss_all_terminal`'s
@@ -202,8 +205,16 @@ async def dismiss_all_jobs(request: Request) -> DismissAllResponse:
     partially fail the way `Promise.allSettled` bulk actions elsewhere in this app (Files page's
     Queue/Stop, Transfers' own "Clear all failed") have to account for. Never touches a `queued`/
     `running` job, by construction of the `UPDATE`'s own `WHERE` -- see that method's docstring.
+
+    2026-08-17 (`prompts/2026-08-17-transfers-dismiss-per-queue.md`): `body.queue_id`, when
+    given, scopes the bulk dismiss to that one queue's own terminal jobs -- the group-header
+    "Dismiss Queue" control's own endpoint, reusing this one rather than adding a second. An
+    omitted body (`body is None`, the pre-existing no-body call every caller before this task
+    still makes) or an explicit `queue_id: null` both mean the original every-queue behavior,
+    byte-for-byte -- see `DismissAllRequest`'s own docstring.
     """
-    dismissed = await request.app.state.queue.dismiss_all_terminal()
+    queue_id = body.queue_id if body is not None else None
+    dismissed = await request.app.state.queue.dismiss_all_terminal(queue_id=queue_id)
     return DismissAllResponse(dismissed=dismissed)
 
 
