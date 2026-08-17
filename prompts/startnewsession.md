@@ -77,10 +77,16 @@ than a first. Two things that bit the first time and will bit again:
 
 ## Where we are
 
-### Post-v0.2.2 work on `dev` (2026-08-17, same day as the release) — four user-driven items, all pushed
+### 🚀 v0.2.3 released 2026-08-17 (the third same-day release) — six live-use items, every one browser-confirmed before the cut
 
-Four items from live use of the fresh v0.2.2 `:dev` build, each its own handoff prompt in
-`prompts/done/2026-08-17-*`, each verified green (every gate run separately) and pushed:
+PR #9 (`dev` → `main`, merged `28b98af`), tag `v0.2.3`, release notes = the `[0.2.3]`
+CHANGELOG section verbatim; `:latest`/`:0.2.3`/`:0` published on the release event. **A clean
+cut, unlike v0.2.2's** — every check green including both CodeQL analyses, no bypasses.
+Tests at release: **1284 backend / 473 frontend, 0 skipped**, integration tests confirmed
+actually run (fake seedboxes up during `/release-prep`'s local gate). Uniquely for this
+project so far, **all six functional changes were confirmed in a real browser by the user
+before the release was cut** — the user pulled `:dev` and click-tested each as it landed.
+The six items, each its own handoff prompt in `prompts/done/2026-08-17-*`:
 
 | What | Commit |
 |---|---|
