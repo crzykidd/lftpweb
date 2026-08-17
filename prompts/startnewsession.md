@@ -77,6 +77,26 @@ than a first. Two things that bit the first time and will bit again:
 
 ## Where we are
 
+### Post-v0.2.2 work on `dev` (2026-08-17, same day as the release) — four user-driven items, all pushed
+
+Four items from live use of the fresh v0.2.2 `:dev` build, each its own handoff prompt in
+`prompts/done/2026-08-17-*`, each verified green (every gate run separately) and pushed:
+
+| What | Commit |
+|---|---|
+| **Bulk delete applies Local/Source per entry, not as blanket flags** — a mixed multi-select (some rows with no local content, e.g. `REMOTE_ONLY` or stranded `REMOVED_LOCAL`) errored 409 per no-local row and never attempted its source delete. New pure `lib/fileTree.ts.effectiveDeleteScope` (Local only where `hasLocalContent`, Source only where `hasRemoteCopy`, `null` = no request); rows with nothing applicable land in a new **skipped** bucket in the bulk outcome (distinct from failures, stay selected). Frontend-only; the backend's 409-on-local-withhold contract deliberately unchanged (rejected alternative in `docs/decisions.md`) | `c786d02` |
+| **Interrupted-job History popout explains itself** — live find (Fresh.Off.the.Boat S04E16, jobs 265/266 on the test system): a container restart at 18:21:49Z cut a running mirror; the failed/`INTERRUPTED` row expanded to a *blank* panel (the fetch guard skipped `has_output_tail: false` rows and the empty-state message was unreachable), and recovery recorded no reason. Startup recovery now writes an explanatory `output_tail` (guarded, never clobbers a real tail); the failed-row panel renders a static error-class + "No output was captured" state without fetching. **Attempt-grouping and a "resumed by job N" annotation were considered with the user and rejected** (pagination/filtering make the pairing unreliable; disproportionate) — the rows stay as they are, they just explain themselves | `b63529e` |
+| **Settings → Queues list shows the Sonarr/Radarr brand icon on bound queues** — new exported `ArrBrandMark` (plain brand logo, no status overlay — the *binding* fact, not item status), `ArrRowChip` rebuilt on it so the kind→logo mapping stays single; rendered in the Name cell via pure `queueArrBindingMark` (muted + "(instance disabled)" tooltip when the instance is disabled, text-chip fallback for a deleted instance) | `109ac96` |
+| **Dashboard bytes chart gains 24h/7d/30d ranges + a range total** — `_RANGES` gains `7d` (28×6h) and `30d` (30×1d); Chart 1 gets its own selector (`dashboard.bytesRange`, independent of the speed chart's untouched 1h/12h/24h), labels/title scale with bucket width, header shows the range total and the legend per-queue totals (client-side, pure `lib/bytesChart.ts`); a retention note (via the previously call-site-less `GET /api/settings/metrics`) explains empty older buckets when the range exceeds retention — **retention defaults to 7d, so 30d is only fully populated after raising it in Settings**. `BytesPerHourChart.tsx` renamed `BytesChart.tsx` | `4f1a912` |
+
+Tests after the run: **1281 backend / 468 frontend, 0 skipped.** Every UI-facing piece
+(skipped-bucket banner, popout empty state, queue-list icons, chart ranges/totals) is
+**unviewed** — no browser here, as always. Operational note for the two spawned coding agents
+that stalled: both backgrounded the ~3-minute pytest run and waited on a notification that
+never reaches a subagent — a `SendMessage` nudge ("run it in the foreground, read the exit
+code, deliver the report") resumed each; tell future agents to run gates in the foreground
+with an adequate timeout up front.
+
 ### 🚀 v0.2.2 released 2026-08-17 (same day as v0.2.1) — self-healing *arr reliability, what's-new popup, support bundle
 
 PR #8 (`dev` → `main`, merged `ff73bcb`), tag `v0.2.2`, release notes = the `[0.2.2]`
