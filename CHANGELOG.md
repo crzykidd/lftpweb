@@ -24,6 +24,15 @@ Skeleton for the next roll:
 ## [Unreleased]
 
 ### Added
+### Changed
+### Fixed
+### Security
+### Deprecated
+### Removed
+
+## [0.2.2] — 2026-08-17
+
+### Added
 
 - **A what's-new popup on the first page load after an upgrade**, plus a Docs → Release notes
   page. The popup reads the release notes for every version between what this browser last saw
