@@ -6,6 +6,83 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-17 — A spent-archive volume's `EXCLUDED` exemption lapses once its parent leaves both trees too; the registry purge that goes with it
+
+`prompts/done/2026-08-17-orphaned-spent-archive-rows.md`, live production defect: a rar'd
+release ran the entire pipeline correctly — verify, extract, `delete-archives-after-extract`
+removed the 29 spent volumes, *arr import confirmed, remote copy deleted (`move` ladder), *arr
+cleanup removed the whole local directory. The parent row rode the removal grace to
+`REMOVED_BOTH` and left the Files page — but the 29 archive-volume child rows stayed behind
+forever: orphaned rows with no parent directory, a grey "Extracted" chip, and no delete
+affordance. The user cleared them by hand with Reset item tracking.
+
+**Root cause.** `core/engine.py._persist`'s vanished sweep resolves any `rel_path` in
+`deleted_archive_paths` to `("EXCLUDED", None)` *unconditionally, every pass* — the branch
+2026-08-14's "extracted archives rest as extracted" task added, correctly, for a spent volume
+*inside a still-present release*. It never accounted for the parent itself leaving both trees:
+once that happens there was no path out of `EXCLUDED` at all — `resolve_absence` has no opinion
+about an `EXCLUDED` `prev_state` (deliberately — see `mount_sentinel.py`'s own docstring), so the
+branch's `elif`/`else` arms were unreachable for these rows, and the `deleted_archive` registry
+entry never expired either.
+
+**The lapse rule, and why it's a `written`-membership check rather than a second query.** The
+branch now asks whether the row's own top-level ancestor (DESIGN.md §4.7's "item" — the first
+path segment; `delete_extracted_archives` never operates on a loose top-level file itself, so a
+genuine archive `rel_path` is always nested) is still in `written` at the point this row is
+processed. `written` is exactly `_persist`'s own "what does this pass consider present or still
+publishable" set, and checking it costs nothing extra: an ancestor still structurally present
+was already added to `written` by the ordinary per-node loop, which runs to completion before
+the vanished sweep even starts; an ancestor riding its own §7.3 removal grace re-enters
+`written` too (a non-terminal vanished resolution), and — the piece that makes this free rather
+than a second lookup — it does so *before* any of its archive children are visited in the same
+pass, because `sorted(vanished)` puts a rel_path ahead of every string it is a strict prefix of,
+and an ancestor's `rel_path` is always a strict prefix of its descendants'. So the grace
+interplay the task pinned ("a parent mid-grace is still present for this purpose") falls out of
+the existing sort order for free — no separate signal was threaded through for it.
+
+**Falls straight to `REMOVED_BOTH`, not through `resolve_absence`/`resolve_vanished`.** Once the
+ancestor is confirmed gone, there is no separate grace period to run for the archive row itself
+— the ancestor check above already *is* the grace gate, borrowed from the item's own clock. And
+neither existing arbitration function has an opinion about an `EXCLUDED` `prev_state` anyway
+(deliberately, per each one's own docstring), so calling them would just `continue` and leave the
+row frozen at `EXCLUDED` — the exact bug being fixed. `REMOVED_BOTH` is written directly instead,
+matching DESIGN.md §3.2's own definition ("both copies are gone") and the reading an ordinary
+vanished row in this shape already lands on a few lines below; left unsuppressed, same as every
+other vanished-sweep-produced `REMOVED_BOTH`.
+
+**The registry purge is a new function, not hand-rolled SQL in `engine.py`.**
+`core/archive_cleanup.py.purge_deleted_archive_paths` (re-exported from `core/local_delete.py`,
+same pattern as `load_/save_deleted_archive_paths`) does the `DELETE FROM deleted_archive`, no
+commit of its own — `_persist` batches every purge from one pass into its own single transaction,
+alongside the `UPDATE item` writes and `save_settle_records`. Without this, `deleted_archive`
+migration 010's own documented limitation ("a `rel_path` that later reappears... would still read
+`EXCLUDED` from a stale row here") would apply to the ordinary case of a whole release finishing
+and a later, differently-sourced release landing at the identical path — not just the edge case
+the migration's comment had in mind.
+
+**Retroactive self-heal is a consequence of the mechanism, not a separate code path.** A row
+already orphaned before this fix shipped (parent already resting `REMOVED_BOTH`, unsuppressed)
+simply re-enters `vanished` on the very next scan pass the same way it always has — `resolve_
+vanished` has no opinion about `REMOVED_BOTH` either, so the parent's own row keeps landing
+back in this sweep every pass without ever re-entering `written`. The ancestor check reads that
+correctly with no special-casing: an ancestor absent from `written` includes "never made it back
+into `written` because it's already terminal," identically to "just turned terminal this pass."
+No migration was needed.
+
+**One defensive carve-out, to protect existing coverage rather than because production can
+produce the shape.** `delete_extracted_archives` refuses to operate on an item that is itself a
+loose top-level archive file (its own docstring explains why — removing its only file would
+remove the whole item, `delete_local`'s job, not this one's), so a genuine `deleted_archive`
+entry always has a `"/"` in it. But `tests/test_state_persistence.py`'s existing (2026-08-14)
+tests exercise the branch with a self-referential top-level `rel_path` that has no separate
+parent to ask about — the ancestor would just be the row itself, mid-computation, always reading
+absent from `written` and wrongly flipping to `REMOVED_BOTH`. The branch special-cases `"/" not
+in rel_path` to keep resting such a row at `EXCLUDED` unconditionally, preserving the old
+behaviour for a shape the real pipeline cannot produce rather than let it regress the existing,
+still-valid tests.
+
+---
+
 ## 2026-08-17 — What's-new popup, Docs → Release notes page, version link points in-app
 
 `prompts/done/2026-08-17-whats-new-popup-and-release-notes.md`, design settled the same day.

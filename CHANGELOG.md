@@ -37,6 +37,16 @@ Skeleton for the next roll:
 
 ### Changed
 ### Fixed
+
+- **A fully cleaned-up release's spent archive volumes no longer orphan in the Files page
+  forever.** A rar'd release that ran the whole pipeline — verified, extracted, had its spent
+  volumes removed, imported, and was cleaned up locally — used to leave its volumes behind as
+  permanent grey "Extracted" rows with no parent directory and no delete affordance, because the
+  exemption that keeps a spent volume from showing a false "Missing" countdown never expired
+  once the release itself was gone too. It now lapses the moment the release's own row leaves
+  both trees, the same way an ordinary vanished item does; existing orphans from before this fix
+  clean themselves up within a scan pass or two, with no manual reset needed.
+
 ### Security
 ### Deprecated
 ### Removed
