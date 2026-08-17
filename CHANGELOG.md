@@ -34,6 +34,14 @@ Skeleton for the next roll:
   straight out to GitHub (the GitHub link still exists, just one click further in). Per-browser
   only (`localStorage`) — a second browser, or a private window, tracks its own "last seen"
   independently.
+- **Two advisory warnings catch a misconfigured *arr "Path as seen by the *arr" setting**,
+  predictively and after the fact. If the *arr's own reported path for a matched release
+  doesn't agree with what a notify push would translate to, one warning event fires the moment
+  the match commits — before the first notify ever goes out — naming the *arr's own path and
+  suggesting the setting value that would fix it. Separately, the notify push itself is no
+  longer fire-and-forget: lftpweb now checks whether the *arr's scan command actually completed
+  and writes a warning if it didn't, rather than only ever knowing whether the push was
+  *accepted*. Both are advisory only — they change no behavior, only visibility, in History.
 
 ### Changed
 ### Fixed
@@ -46,6 +54,15 @@ Skeleton for the next roll:
   once the release itself was gone too. It now lapses the moment the release's own row leaves
   both trees, the same way an ordinary vanished item does; existing orphans from before this fix
   clean themselves up within a scan pass or two, with no manual reset needed.
+- **A transient seedbox failure during an *arr-tracked `move` queue's deferred source delete no
+  longer strands the remote copy permanently.** The delete used to fire exactly once, on the
+  confirmed *arr import; a failed attempt (an SSH hiccup, say) was never retried, and cleanup
+  removed the local copy anyway — leaving a row with only a remote copy and, until now, no
+  Delete affordance in the UI to fall back on. It now retries every pass (with backoff, and a
+  bounded pause rather than an error every ~60s while a seedbox stays down), cleanup withholds
+  until the source delete actually clears, a row already stranded before this fix self-heals on
+  the first pass after upgrade with no manual action, and the Files-page Delete action is now
+  offered for a row whose only remaining copy is remote.
 
 ### Security
 ### Deprecated

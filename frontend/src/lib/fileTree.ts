@@ -261,6 +261,38 @@ export function hasRemoteCopy(node: FileNode): boolean {
   return node.remote_size != null
 }
 
+/** Whether this node has local bytes a "Delete local copy" scope could actually act on
+ * (DESIGN.md §9.2; prompts/open-issues.md "7 + 8"). `DOWNLOADING`/`QUEUED` are deliberately
+ * *not* excluded: a node mid-transfer has real partial bytes on disk (or is about to), and
+ * (2026-08-13, `prompts/2026-08-13-delete-during-transfer.md`) `api/jobs.py.delete_item` now
+ * stops that transfer first rather than refusing outright, so offering the button here is no
+ * longer a dead end -- `hasActiveJob` in `FileTree.tsx` is what the confirmation panel uses to
+ * say so. The backend (`core/local_delete.py.delete_local`) still runs its own guards
+ * regardless (mount sentinel, path containment, a delete already in flight) and can withhold
+ * even when this returns true; this is only about not showing a button/checkbox that could
+ * never do anything, not a prediction of the guard outcome.
+ */
+const NO_LOCAL_CONTENT_STATES = new Set(['REMOTE_ONLY', 'EXCLUDED', 'REMOVED_LOCAL', 'REMOVED_BOTH'])
+export function hasLocalContent(node: FileNode): boolean {
+  return !NO_LOCAL_CONTENT_STATES.has(node.state)
+}
+
+/** Whether the Files-page Delete action should be offered for this row at all (2026-08-17,
+ * `prompts/2026-08-17-stranded-source-delete-retry.md`) -- widened from "has local content"
+ * alone to "has local content **or** a surviving remote copy" (`hasRemoteCopy`). A row whose
+ * local copy is already gone but whose source delete failed and got stranded
+ * (`REMOVED_LOCAL`, remote alive, DESIGN.md §7.3/§7.4's rung-4 handoff) used to have no delete
+ * affordance at all -- exactly the shape where the Source scope (2026-08-16,
+ * `defaultSourceChecked`'s own docstring) is the escape hatch, and it was unreachable. This is
+ * the *offering* gate only (row button, bulk-selection filter); which scopes the dialog then
+ * shows/defaults to is `shouldOfferLocalScope`/`shouldOfferSourceScope`/`defaultSourceChecked`
+ * below, all reading the same two underlying facts (`hasLocalContent`, `hasRemoteCopy`) rather
+ * than a third predicate of their own.
+ */
+export function canDeleteLocal(node: FileNode): boolean {
+  return node.id != null && (hasLocalContent(node) || hasRemoteCopy(node))
+}
+
 /** What this row's own action button offers, if anything (DESIGN.md §9.2, §4.7). Manual queueing
  * always wins over suppression and is never filtered by state -- except a node with nothing remote
  * to fetch (`!hasRemoteCopy`), where "Queue" would mean nothing. `'redownload'` is the same click
@@ -298,6 +330,18 @@ export function defaultSourceChecked(syncMode: SyncMode, hasRemote: boolean): bo
  */
 export function shouldOfferSourceScope(entries: FileNode[]): boolean {
   return entries.some(hasRemoteCopy)
+}
+
+/** Whether the delete dialog's Local checkbox should render at all (2026-08-17, the counterpart
+ * `shouldOfferSourceScope` above never had to earn until a no-local-content row became
+ * deletable via `canDeleteLocal`'s widened rule) -- only when at least one pending entry
+ * actually has local bytes for that scope to act on. A stranded `REMOVED_LOCAL` row (or a
+ * bulk selection entirely made of such rows) has nothing local left to check, so the checkbox
+ * is absent rather than offered-then-refused; Source is the only scope such a selection can
+ * confirm with (`canConfirmDelete`).
+ */
+export function shouldOfferLocalScope(entries: FileNode[]): boolean {
+  return entries.some(hasLocalContent)
 }
 
 /** The delete dialog's own validation rule (settled design): at least one scope must be

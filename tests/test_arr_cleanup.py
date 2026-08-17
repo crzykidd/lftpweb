@@ -368,6 +368,60 @@ async def test_cleanup_withheld_when_a_job_is_active(db, fake_arr_server, tmp_pa
     assert "active job" in message
 
 
+# --- Withheld: a deferred source delete is still owed (2026-08-17,
+# prompts/done/2026-08-17-stranded-source-delete-retry.md) -- restores "delete source -> delete
+# local" as an *enforced* ladder order, closing the production incident where cleanup ran
+# regardless and removed the local copy while a failed rung-4 delete had stranded the remote
+# copy permanently. ------------------------------------------------------------------------
+
+
+async def test_cleanup_withheld_when_source_delete_still_pending(db, fake_arr_server, tmp_path):
+    """An `imported` item whose rung-4 source delete hasn't cleared yet
+    (`item.remote_delete_pending` still set) must not have its local copy removed underneath
+    it -- the exact ordering violation the production incident showed (`arr_cleanup` ran right
+    after a failed `remote_delete_failed`). `remote_pool`/`host_provider` are deliberately left
+    unwired here so the withhold is proven to come from `_maybe_cleanup`'s own new gate, not as
+    a side effect of the retry sweep (`_sweep_stranded_source_deletes`) failing to clear it.
+    """
+    local_root = tmp_path / "local"
+    local_root.mkdir()
+    rel_path = "Release.File.mkv"
+    (local_root / rel_path).write_bytes(b"the release")
+
+    host_id = await _seed_host(db)
+    instance_id = await _seed_instance(
+        db, str(tmp_path), base_url=fake_arr_server.base_url, api_key=fake_arr_server.state.api_key
+    )
+    queue_id = await _seed_queue(
+        db,
+        host_id,
+        local_path=str(local_root),
+        arr_instance_id=instance_id,
+        arr_delete_completed=True,
+    )
+    item_id = await _seed_item(
+        db, queue_id, rel_path, state="VERIFIED", arr_status="imported", arr_download_id="abc123"
+    )
+    await db.execute("UPDATE item SET remote_delete_pending = 'VERIFIED' WHERE id = ?", (item_id,))
+    await db.commit()
+
+    scheduler = ArrSyncScheduler(db=db, config_dir=str(tmp_path))
+    await scheduler.run_once()
+
+    row = await _item_row(db, item_id)
+    assert row["arr_status"] == "imported", "withheld, not terminal"
+    assert row["auto_queue_suppressed"] == 0, "never suppressed on a withheld cleanup"
+    assert (local_root / rel_path).exists(), "local copy must survive while source is still owed"
+    kinds = await _event_kinds(db, item_id)
+    assert kinds == ["arr_cleanup_withheld"]
+    cursor = await db.execute(
+        "SELECT message FROM event WHERE item_id = ? AND kind = 'arr_cleanup_withheld'",
+        (item_id,),
+    )
+    message = (await cursor.fetchone())["message"]
+    assert "remote_delete_pending" in message
+
+
 # --- `gone` items are never cleaned, ever -----------------------------------------------------
 
 

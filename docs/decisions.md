@@ -6,6 +6,169 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-17 — Scan-command outcome verification: a persisted column, not memory; a 404 is silent; bounded checks
+
+`prompts/done/2026-08-17-stranded-source-delete-retry.md` (a same-day scope addition, folded
+into this task rather than a separate one — it completes the same "notify was too trusting"
+incident the namespace-mismatch entry below diagnoses). Production evidence
+(`private_data/debug_logs/productionlftpweb.log`): `notify_arr`'s `POST /api/v3/command` 201 was
+treated as success, when it only ever meant "command queued" — the *arr accepted pushes that
+then silently failed or no-op'd inside it, with zero visibility, because nothing ever asked what
+happened next.
+
+**A persisted column (`item.arr_scan_command_id`, migration 021), not an in-memory registry.**
+Every other bounded-retry counter in `core/arrsync.py` (`_notify_attempts`,
+`_source_delete_retries`, and this same task's `_scan_command_checks`) is deliberately in-memory,
+on the reasoning that losing it to a restart only costs a few extra attempts, never a missed one.
+That reasoning does not transfer here: `notify_arr` is called from two different processes'
+objects — `core/postprocess.py.PostprocessPipeline`'s primary push and `core/arrsync.py`'s own
+bounded notify-retry — so a registry owned by either one would never see a command the other
+pushed, and a restart between the push and the first check would orphan the command's id
+entirely, silently dropping the one mechanism built to catch a silently-broken push. Riding the
+database instead means the id survives exactly as long as the debt it represents does, the same
+principle `remote_delete_pending` (migration 019) already established for a different debt.
+
+**The *arr's own outcome vocabulary is inferred, not verified.** Unlike `eventType`/
+`trackedDownloadState` (`core/arrclient.py`'s own module docstring: confirmed against a live
+Sonarr v3 instance, 2026-08-15), `/api/v3/command/{id}`'s `status` field's exact shape has not
+been checked against a real instance for this task — `command_outcome` reads `"completed"` and
+`"failed"` off the *arr's public API documentation, treating anything else (`"queued"`,
+`"started"`, an unrecognized future value) as still pending. The safe direction is preserved
+either way: a misclassification can only ever delay a warning (reading a real failure as
+"pending" a while longer, until the bound below gives up on it silently), never fabricate one
+that didn't happen. If a live instance is ever found to report a different vocabulary, only
+`command_outcome` needs correcting — every caller already treats its three-way return as opaque.
+
+**A 404 clears the column silently, exactly like a resolved `completed`.** The *arr prunes
+finished commands from its own history after a while, and a restarted *arr instance loses its
+in-memory command list entirely — an unknown command id is the ordinary, expected shape of "this
+information no longer exists," not evidence the push failed. Treating it as a failure would
+produce a false warning on every *arr restart or command-history rotation, for a push that most
+likely succeeded and simply aged out of what the *arr remembers.
+
+**Bounded at `MAX_SCAN_COMMAND_CHECK_ATTEMPTS` (5) passes, in-memory.** Unlike the command id
+itself, the attempt counter is allowed to live in memory and reset on restart — the identical
+"restart loses it, and that's the safe direction" reasoning `_notify_attempts` already relies on:
+losing the counter only grants a stuck check a few more free attempts after a restart, never
+fewer than the bound promises. Exhausting the bound clears the column silently rather than
+writing a "gave up" event of its own — a command that never resolves is already indistinguishable
+from one that resolved and got pruned before this process got around to asking, so there is
+nothing more informative to say than the silent-404 case already says.
+
+**`arr_scan_command_failed` is the confirmed counterpart to `arr_path_mismatch` below, not a
+merge of the two.** The two events fire at different times off different evidence — a mismatch
+is detectable the moment a match commits, before any push has happened; a failed command is only
+knowable after the *arr has actually tried and given up — and a queue can be misconfigured in a
+way only one of the two would ever catch (a mismatch that happens to still resolve to *something*
+importable, or a push to a namespace this codebase's own comparison can't evaluate but the *arr
+itself rejects). Keeping them as two `kind`s, both advisory, lets History show whichever evidence
+actually fired without one masking the other.
+
+---
+
+## 2026-08-17 — Namespace-mismatch detection: derive the *arr-side root from `outputPath`, debounce per (queue, root), warn without gating
+
+`prompts/done/2026-08-17-stranded-source-delete-retry.md` (a same-day scope addition, folded
+into this task). Production evidence (`private_data/debug_logs/productionlftpweb.log`): the
+user's *arr instances mount the synced storage at a different container path than lftpweb does
+(`/mnt/seanas02_media/Working/box-dc-tv` vs. lftpweb's own
+`/mnt/seanas02-media-working/box-dc-tv`). With `arr_visible_path` unset, every notify pushed
+lftpweb's own path; the *arr accepted it (201) and scanned a directory that doesn't exist in its
+own container, so imports waited on the *arr's unrelated schedule instead, and several
+associations drifted all the way to `gone`. The fix (`_maybe_warn_path_mismatch`) is detection
+only, added the same day as the confirmed counterpart described above.
+
+**Detectable at match time, before the first notify ever fires.** A matched queue record's own
+`outputPath` is the *arr's view of this exact release — evidence that was already being fetched
+and thrown away every poll pass. Comparing it against what a notify *would* push
+(`core/arrnotify.py.translate_to_arr_namespace`, reused rather than reimplemented) catches a
+misconfiguration a full poll cycle or more before the first real push would have.
+
+**The *arr-side root is derived by stripping the item's own name off `outputPath`'s tail**
+(`_derive_arr_root`), tolerating a trailing filename that doesn't literally match (a
+title-fallback single-file match can report any filename) by falling back to a plain `dirname`.
+This mirrors exactly what the pushed path's own root would be (`local_path`/`staging_path`,
+translated) — comparing roots rather than full paths is what makes the check tolerant of the
+*arr reporting a release at a path one level deeper or shallower than expected without producing
+a false positive on the name segment itself, which the two sides were never going to agree on
+namespace-wise anyway.
+
+**Debounced per `(queue id, derived root)`, not per item, not per pass.** A misconfigured queue
+matches many releases before a human notices and fixes it — without this, every single match
+would repeat the identical advisory, one event per release, for as long as the setting stays
+wrong. Keying on the *derived root* rather than the item also means two different releases that
+happen to reveal the *same* wrong root only ever produce one event between them, which is the
+right granularity: there's exactly one setting to fix, regardless of how many releases have
+already revealed it's wrong.
+
+**Warning only, never a gate — and worded to allow for a deliberate mismatch.** The notify still
+fires exactly as before; an exotic remote-path-mapping setup where the two namespaces are
+supposed to differ from this comparison's assumption exists and costs nothing more than one
+advisory event, worded ("if this is intentional, ignore this") to say so rather than assert a
+mismatch is necessarily wrong.
+
+---
+
+## 2026-08-17 — Stranded source delete: a sweep keyed off the debt, not the transition; bounded backoff; cleanup gates on it; the manual delete widens
+
+`prompts/done/2026-08-17-stranded-source-delete-retry.md`, live on both the user's test and
+production systems, diagnosed from the test system's audit trail: `arr_imported` → a
+`remote_delete_failed` (`SSH connection closed`) on rung 4's deferred source delete → `arr_cleanup`
+ran anyway seconds later, removing the local copy. The resulting row (`REMOVED_LOCAL`, remote
+copy alive, `remote_delete_pending` still set) was stranded permanently: the delete only ever
+fired once, from `_commit_terminal`'s one-shot `imported` transition, so a transient failure was
+never retried; and `FileTree.tsx.canDeleteLocal` hid the Delete button for a no-local-content
+row, so the Source-scope manual escape hatch (2026-08-16) was unreachable exactly when it was
+needed.
+
+**A retry sweep keyed off `item.remote_delete_pending`, not the `imported` transition that first
+set it.** The alternative — re-firing the transition-triggered call more aggressively, or adding
+a dedicated "retry needed" flag — would still miss every row already stranded before the fix
+shipped. Querying the debt itself (`remote_delete_pending IS NOT NULL`, a terminal `arr_status`
+of `imported` **or** `cleaned`, `remote_deleted_at IS NULL`) sidesteps that entirely: a row
+already in this shape from before the fix matches the same query a freshly-stranded row does, so
+the self-heal is a consequence of the query, not a separate migration or one-time backfill.
+`cleaned` is named explicitly alongside `imported` for exactly this reason — `_maybe_cleanup`'s
+own new gate (below) means a *fresh* `cleaned` row can never carry a pending debt going forward,
+but a row that reached `cleaned` before this fix shipped already did.
+
+**Backoff is bounded, not indefinite, and reuses `_InstanceBackoff`'s own growing-delay shape
+rather than a second implementation.** A bare "retry every pass" would write a
+`remote_delete_failed` error event roughly every poll interval for as long as a seedbox stays
+down — real spam for a real outage. `MAX_SOURCE_DELETE_RETRY_ATTEMPTS` (5) bounds it: past that,
+one `remote_delete_retries_paused` event fires and this process stops trying, but
+`remote_delete_pending` is never cleared by giving up — the manual Files-page delete, or a
+restart's clean in-memory slate (the same "restart loses it, that's the safe direction"
+reasoning every other per-process dict in this module already relies on), can still act.
+Deliberately in-memory rather than persisted, unlike the debt column itself: losing the attempt
+count on restart only grants a few extra free attempts, never fewer than the bound promises.
+
+**Cleanup now withholds while a source delete is still owed** (`_maybe_cleanup`'s new first
+check, before even the `CORRUPT` check) — restoring "delete source → delete local" as an
+*enforced* ladder order rather than a hoped-for one. Before this, cleanup ran regardless of the
+debt, which is exactly how the local copy vanished while the remote copy was still stranded in
+the incident above. A `copy`-mode queue never sets `remote_delete_pending` in the first place, so
+this is a no-op there, matching the pre-existing behavior exactly.
+
+**`_commit_terminal`'s `gone` branch now names a still-pending source delete in its own event
+message** — purely audit-trail visibility, no behavior change; rung 4 still never fires on
+`gone`, by design (ambiguity must not trigger an irreversible delete). Production evidence: 15
+items went `notified` → `gone` with `remote_delete_pending` still set, each sitting stranded with
+nothing in History explaining why.
+
+**The manual-delete widening lives in `lib/fileTree.ts`, not `FileTree.tsx`, and widens
+`canDeleteLocal` itself rather than adding a second predicate.** The task's own instruction was
+explicit about this: a second "canDeleteRemoteOnly"-style predicate that nobody could reconcile
+against the first would be worse than updating the one function's reasoning. `canDeleteLocal`
+(moved from a private `FileTree.tsx` function to an exported pure helper, matching every other
+predicate this dialog already reads from that module) now offers Delete when a row has local
+content **or** `hasRemoteCopy` — not only local content — and the dialog's Local checkbox is
+symmetrically gated by a new `shouldOfferLocalScope` (mirroring the pre-existing
+`shouldOfferSourceScope`) so a stranded no-local-content row's dialog opens with Local absent
+and Source available, defaulted per the existing `defaultSourceChecked` rule.
+
+---
+
 ## 2026-08-17 — A spent-archive volume's `EXCLUDED` exemption lapses once its parent leaves both trees too; the registry purge that goes with it
 
 `prompts/done/2026-08-17-orphaned-spent-archive-rows.md`, live production defect: a rar'd

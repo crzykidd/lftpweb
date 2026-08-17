@@ -1,9 +1,10 @@
-"""A fake Sonarr/Radarr instance -- small FastAPI app speaking the four v3 endpoints this
+"""A fake Sonarr/Radarr instance -- small FastAPI app speaking the five v3 endpoints this
 codebase touches (`/api/v3/system/status`, `/api/v3/queue`, `/api/v3/history`,
-`/api/v3/command`), served over a real, listening `uvicorn` socket -- same philosophy as the
-fake seedbox (`docker-compose.test.yml`'s sshd containers): exercise `core/arrclient.py`'s real
-HTTP request/response cycle (headers, query-string encoding, JSON parsing, pagination), not a
-mocked transport.
+`/api/v3/command` (POST), `/api/v3/command/{id}` (GET, 2026-08-17, scan-command outcome
+verification)), served over a real, listening `uvicorn` socket -- same philosophy as the fake
+seedbox (`docker-compose.test.yml`'s sshd containers): exercise `core/arrclient.py`'s real HTTP
+request/response cycle (headers, query-string encoding, JSON parsing, pagination), not a mocked
+transport.
 
 `FakeArrState` is the shared, mutable store a test manipulates directly (in-process, no HTTP)
 between poller passes -- this is what lets `test_arrsync.py` model a slow multi-file import: a
@@ -37,6 +38,14 @@ class FakeArrState:
     queue_records: list[dict[str, Any]] = field(default_factory=list)
     history_events: list[dict[str, Any]] = field(default_factory=list)
     command_calls: list[dict[str, Any]] = field(default_factory=list)
+    # `GET /api/v3/command/{id}` outcome per command id (2026-08-17, scan-command outcome
+    # verification) -- populated automatically by the `POST /api/v3/command` handler below at
+    # `"queued"`; a test mutates the entry directly (`command_statuses[id]["status"] =
+    # "completed"|"failed"`) to model the *arr's own eventual verdict on a later poll, or `del`s
+    # the key to model the *arr pruning a finished command (or losing it across a restart) --
+    # both read as 404 to `core/arrclient.py.ArrClient.get_command` and `core/arrsync.py`'s
+    # check, the same "no evidence either way" outcome either way.
+    command_statuses: dict[int, dict[str, Any]] = field(default_factory=dict)
     # Force a small effective page size regardless of what the client requests -- the one
     # knob the pagination test needs to make one small queue/history split across pages
     # without needing 250+ fixture records to do it honestly.
@@ -109,7 +118,17 @@ def create_fake_arr_app(state: FakeArrState) -> FastAPI:
         if state.fail_command:
             return JSONResponse(status_code=503, content={"message": "simulated command outage"})
         state.command_calls.append(body)
-        return {"id": len(state.command_calls), "name": body.get("name"), "status": "queued"}
+        command_id = len(state.command_calls)
+        status_body = {"id": command_id, "name": body.get("name"), "status": "queued"}
+        state.command_statuses[command_id] = status_body
+        return status_body
+
+    @app.get("/api/v3/command/{command_id}")
+    async def get_command(command_id: int) -> Any:
+        status_body = state.command_statuses.get(command_id)
+        if status_body is None:
+            return JSONResponse(status_code=404, content={"message": "command not found"})
+        return status_body
 
     return app
 

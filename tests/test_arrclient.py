@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from fake_arr import run_fake_arr_server
 
-from lftpweb.core.arrclient import ArrClient, ArrClientError, HistoryEvent
+from lftpweb.core.arrclient import ArrClient, ArrClientError, HistoryEvent, command_outcome
 
 
 async def test_system_status_round_trip(fake_arr_server):
@@ -133,6 +133,48 @@ async def test_post_scan_command_uses_kind_specific_name(fake_arr_server):
     assert calls[0]["path"] == "/data/torrents/complete/Show.S01E05"
     assert calls[0]["importMode"] == "Copy"
     assert calls[1]["name"] == "DownloadedMoviesScan"
+
+
+# --- get_command / command_outcome (2026-08-17, scan-command outcome verification) ----------
+
+
+async def test_get_command_round_trips_the_pushed_command_id(fake_arr_server):
+    async with ArrClient(
+        kind="sonarr", base_url=fake_arr_server.base_url, api_key=fake_arr_server.state.api_key
+    ) as client:
+        pushed = await client.post_scan_command("/data/torrents/complete/Show.S01E05")
+        fetched = await client.get_command(pushed["id"])
+    assert fetched is not None
+    assert fetched["id"] == pushed["id"]
+    assert fetched["status"] == "queued"
+
+
+async def test_get_command_returns_none_on_404(fake_arr_server):
+    async with ArrClient(
+        kind="sonarr", base_url=fake_arr_server.base_url, api_key=fake_arr_server.state.api_key
+    ) as client:
+        assert await client.get_command(999) is None
+
+
+def test_command_outcome_reads_completed():
+    assert command_outcome({"id": 1, "status": "completed"}) == "completed"
+
+
+def test_command_outcome_reads_failed():
+    assert command_outcome({"id": 1, "status": "failed"}) == "failed"
+
+
+def test_command_outcome_reads_queued_and_started_as_pending():
+    assert command_outcome({"id": 1, "status": "queued"}) == "pending"
+    assert command_outcome({"id": 1, "status": "started"}) == "pending"
+
+
+def test_command_outcome_treats_an_unrecognized_status_as_pending():
+    """An *arr version or response shape this codebase hasn't seen must never be misread as a
+    terminal outcome -- "keep checking next pass" is always the safe default here.
+    """
+    assert command_outcome({"id": 1, "status": "some-future-status"}) == "pending"
+    assert command_outcome({"id": 1}) == "pending"
 
 
 async def test_two_independent_fake_instances_do_not_share_state():

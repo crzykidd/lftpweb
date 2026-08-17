@@ -264,11 +264,13 @@ class ArrClient:
         mid-flight, and Copy keeps "who deletes what" in exactly one place (our own cleanup
         step, phase B).
 
-        Not called by anything yet in this phase -- built now, per the handoff prompt, so the
-        client is complete before phase B wires it into `PostprocessPipeline.process_item`'s
-        tail. `path` must already be in the *arr's own namespace
-        (`path_queue.arr_visible_path`'s translation, spec "Path namespaces") -- this client
-        does no path translation of its own.
+        `path` must already be in the *arr's own namespace (`path_queue.arr_visible_path`'s
+        translation, spec "Path namespaces") -- this client does no path translation of its own.
+
+        **The response body's own `id` is not decoration** (2026-08-17, scan-command outcome
+        verification): a 201 here only means "command queued", not "the *arr could act on this
+        path" -- `core/arrnotify.py.notify_arr` persists this `id` (`item.arr_scan_command_id`,
+        migration 021) so `get_command` below can poll for the outcome on a later pass.
         """
         name = _SCAN_COMMAND_NAME[self.kind]
         try:
@@ -280,3 +282,53 @@ class ArrClient:
         except httpx.HTTPError as exc:
             raise ArrClientError(f"{self.kind} command {name} failed: {exc}") from exc
         return response.json()
+
+    async def get_command(self, command_id: int) -> dict[str, Any] | None:
+        """`GET /api/v3/command/{id}` -- the eventual outcome of a previously-pushed command
+        (2026-08-17, scan-command outcome verification: `post_scan_command`'s 201 is otherwise
+        fire-and-forget). `core/arrsync.py`'s poller calls this on later passes for every item
+        still carrying a `item.arr_scan_command_id`.
+
+        `None` on a 404 -- the *arr prunes finished commands after a while, and a restarted
+        instance loses its in-memory command history entirely, so an unknown id is a routine,
+        expected outcome, not a failure. Every caller treats it as "no evidence either way,"
+        the same reading `import_events`'s empty-list case gets when there's nothing to say.
+        Any other non-2xx still raises `ArrClientError`, same as every other method here.
+        """
+        try:
+            response = await self._client.get(f"/api/v3/command/{command_id}")
+        except httpx.HTTPError as exc:
+            raise ArrClientError(
+                f"{self.kind} GET /api/v3/command/{command_id} failed: {exc}"
+            ) from exc
+        if response.status_code == 404:
+            return None
+        try:
+            response.raise_for_status()
+        except httpx.HTTPError as exc:
+            raise ArrClientError(
+                f"{self.kind} GET /api/v3/command/{command_id} failed: {exc}"
+            ) from exc
+        return response.json()
+
+
+CommandOutcome = Literal["completed", "failed", "pending"]
+
+
+def command_outcome(raw: dict[str, Any]) -> CommandOutcome:
+    """Classify a `/api/v3/command/{id}` response body's `status`
+    (docs/arr-integration-spec.md doesn't cover this endpoint, and -- unlike `eventType`/
+    `trackedDownloadState` above -- this vocabulary is **not** yet verified against a live
+    instance; it follows the *arr v3 API's own public documentation instead. See
+    docs/decisions.md 2026-08-17 for the full reasoning if a live instance is ever found to
+    disagree). `"completed"` and `"failed"` are the only statuses the *arr is documented to
+    ever settle on; anything else (`"queued"`, `"started"`, a value this codebase hasn't seen)
+    reads as still in flight -- the safe default, since the poller simply checks again next
+    pass rather than guessing at a terminal outcome.
+    """
+    status = str(raw.get("status") or "").lower()
+    if status == "failed":
+        return "failed"
+    if status == "completed":
+        return "completed"
+    return "pending"

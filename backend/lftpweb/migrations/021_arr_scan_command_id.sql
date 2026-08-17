@@ -1,0 +1,30 @@
+-- Scan-command outcome verification (2026-08-17, prompts/done/2026-08-17-stranded-source-
+-- delete-retry.md's scope addition, production evidence:
+-- private_data/debug_logs/productionlftpweb.log) -- the notify push (`core/arrnotify.py.
+-- notify_arr`) was fire-and-forget: `POST /api/v3/command`'s 201 only means "command queued",
+-- not "the *arr could actually act on this path". On the user's production system, pushes
+-- were accepted and then failed/no-op'd inside the *arr (a mismatched `arr_visible_path`) with
+-- zero visibility -- the evidence to detect it (the command's own eventual outcome) was
+-- sitting in the *arr the whole time, just never asked for.
+--
+-- `core/arrnotify.py.notify_arr` stores the pushed command's own `id` here, in the same UPDATE
+-- that sets `arr_status = 'notified'`. `core/arrsync.py`'s poller (`_check_scan_command`)
+-- polls `GET /api/v3/command/{id}` on later passes and clears this column once the outcome
+-- resolves one way or the other, or once a bounded number of checks has passed with no
+-- resolution -- see that module's own docstring for the full state machine.
+--
+-- A column, not an in-memory registry, deliberately -- unlike the in-memory dicts this module
+-- already uses for other bounded-retry bookkeeping (`_notify_attempts`, `_source_delete_
+-- retries`), where "a restart loses it, and that's the safe direction" is the reasoning:
+-- `notify_arr` is called from two different processes' objects (`core/postprocess.py`'s
+-- primary push, `core/arrsync.py`'s own bounded notify-retry), so an in-memory registry keyed
+-- in one of them would never see a command pushed by the other. Losing track of a pushed
+-- command on restart would also silently drop the one check meant to catch a silently-broken
+-- push -- the opposite of the safe direction here -- so this rides the database instead.
+--
+-- NULL means "no scan command outcome currently being tracked for this item" -- the ordinary
+-- case for every item that hasn't been notified yet, one whose outcome already resolved, or
+-- one bound to an instance where `notify_on_complete` is off. Same plain `ALTER TABLE ... ADD
+-- COLUMN` shape migration 019 used for `remote_delete_pending` -- no CHECK constraint needed,
+-- since an *arr command id is an opaque identifier, not a closed vocabulary.
+ALTER TABLE item ADD COLUMN arr_scan_command_id INTEGER;

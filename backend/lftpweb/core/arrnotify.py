@@ -121,7 +121,10 @@ async def notify_arr(
     writes an event: this project's "everything defaults off" rule means a queue that never
     opted in produces zero events, not a stream of "nothing to do" noise.
 
-    `"notified"` -- the push succeeded: `arr_status = 'notified'` + `arr_notified` event.
+    `"notified"` -- the push succeeded: `arr_status = 'notified'` + `arr_notified` event, and
+    (2026-08-17) the pushed command's own id recorded in `item.arr_scan_command_id` so
+    `core/arrsync.py`'s poller can later confirm the *arr actually finished it, not just
+    accepted it.
     `"failed"` -- the instance could not be reached, returned a non-2xx, or its stored API key
     could no longer be decrypted: `arr_notify_failed` event, `arr_status` left at `'detected'`
     so `core/arrsync.py`'s bounded retry can try again on a later pass. Never raises -- every
@@ -171,13 +174,20 @@ async def notify_arr(
         async with ArrClient(
             kind=instance["kind"], base_url=instance["base_url"], api_key=api_key
         ) as client:
-            await client.post_scan_command(arr_path)
+            command = await client.post_scan_command(arr_path)
     except ArrClientError as exc:
         return await _fail(str(exc))
 
+    # `id` (2026-08-17, scan-command outcome verification) -- the 201 above only means "command
+    # queued", not "the *arr could act on this path"; `core/arrsync.py`'s poller polls this id
+    # (`get_command`) on later passes to close that gap. `None` if the response body is missing
+    # or unexpectedly shaped -- degrades to "no outcome check happens for this item," never a
+    # notify failure of its own (the push itself still succeeded).
+    command_id = command.get("id") if isinstance(command, dict) else None
     await db.execute(
-        "UPDATE item SET arr_status = 'notified', arr_status_at = ? WHERE id = ?",
-        (_now_iso(), item["id"]),
+        "UPDATE item SET arr_status = 'notified', arr_status_at = ?, arr_scan_command_id = ? "
+        "WHERE id = ?",
+        (_now_iso(), command_id, item["id"]),
     )
     await db.commit()
     await audit.record_event(
