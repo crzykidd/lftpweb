@@ -24,6 +24,15 @@ Skeleton for the next roll:
 ## [Unreleased]
 
 ### Added
+### Changed
+### Fixed
+### Security
+### Deprecated
+### Removed
+
+## [0.2.3] — 2026-08-17
+
+### Added
 
 - **Settings → Queues' queue list now shows the Sonarr/Radarr brand logo beside the name of
   any queue bound to an *arr instance** — previously the only way to tell was opening Edit and
