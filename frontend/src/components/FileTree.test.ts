@@ -13,6 +13,7 @@ import {
   columnMinWidth,
   defaultColumnWidths,
   defaultSourceChecked,
+  effectiveDeleteScope,
   effectiveEtaLabel,
   effectiveSpeedLabel,
   effectiveSpeedSortValue,
@@ -981,5 +982,60 @@ describe('showsCopyQueueSourceWarning', () => {
 
   it('warns for the unbuilt sync mode too, same as copy', () => {
     expect(showsCopyQueueSourceWarning('sync', true)).toBe(true)
+  })
+})
+
+// --- effectiveDeleteScope ------------------------------------------------------------------
+// 2026-08-17 (prompts/2026-08-17-bulk-delete-per-entry-scopes.md): the live-reported bug -- a
+// bulk delete sent a blanket `local: true` to every selected row, so any row with no local
+// content (a `REMOTE_ONLY` row, or a stranded `REMOVED_LOCAL` row made selectable by
+// `canDeleteLocal`'s own 2026-08-17 widening) 409'd on the local withhold before its source
+// delete was ever attempted. `effectiveDeleteScope` is the per-entry fix -- pinned here against
+// the truth table plus the exact mixed-selection shape the report described.
+
+describe('effectiveDeleteScope', () => {
+  const both = node('both.iso', false, { state: 'DOWNLOADING', remote_size: 1000, local_size: 500 })
+  const remoteOnly = node('remote-only', true, { state: 'REMOTE_ONLY', remote_size: 5000, local_size: null })
+  const localOnly = node('local-only.iso', false, { state: 'DOWNLOADED', remote_size: null, local_size: 1000 })
+
+  it('local-content+remote row: neither checked -> null (no request at all)', () => {
+    expect(effectiveDeleteScope(both, { local: false, source: false })).toBeNull()
+  })
+
+  it('local-content+remote row: Local only checked -> local only requested', () => {
+    expect(effectiveDeleteScope(both, { local: true, source: false })).toEqual({ local: true, source: false })
+  })
+
+  it('local-content+remote row: Source only checked -> source only requested', () => {
+    expect(effectiveDeleteScope(both, { local: false, source: true })).toEqual({ local: false, source: true })
+  })
+
+  it('local-content+remote row: both checked -> both requested', () => {
+    expect(effectiveDeleteScope(both, { local: true, source: true })).toEqual({ local: true, source: true })
+  })
+
+  it('REMOTE_ONLY row with both checked -> source only, never local (the bug this fixes)', () => {
+    expect(effectiveDeleteScope(remoteOnly, { local: true, source: true })).toEqual({ local: false, source: true })
+  })
+
+  it('REMOTE_ONLY row with Local only checked -> null, no request at all', () => {
+    expect(effectiveDeleteScope(remoteOnly, { local: true, source: false })).toBeNull()
+  })
+
+  it('local-only row with Source only checked -> null, no request at all', () => {
+    expect(effectiveDeleteScope(localOnly, { local: false, source: true })).toBeNull()
+  })
+
+  it('local-only row with both checked -> local only requested', () => {
+    expect(effectiveDeleteScope(localOnly, { local: true, source: true })).toEqual({ local: true, source: false })
+  })
+
+  it('regression: mixed selection (a local-content row plus a REMOTE_ONLY row), both boxes ' +
+    'checked -- the remote-only row is never sent local: true', () => {
+    const checked = { local: true, source: true }
+    const localRow = node('local-content-row', false, { state: 'DOWNLOADED', remote_size: 2000, local_size: 2000 })
+    const remoteOnlyRow = node('remote-only-row', true, { state: 'REMOTE_ONLY', remote_size: 3000, local_size: null })
+    expect(effectiveDeleteScope(localRow, checked)).toEqual({ local: true, source: true })
+    expect(effectiveDeleteScope(remoteOnlyRow, checked)).toEqual({ local: false, source: true })
   })
 })

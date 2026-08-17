@@ -31,7 +31,16 @@ export function Layout() {
   const { session, logout } = useAuth()
 
   return (
-    <div className="flex h-full min-h-screen bg-white text-zinc-900 dark:bg-zinc-950 dark:text-zinc-100">
+    // `h-dvh` + `overflow-hidden` (2026-08-17, prompts/done/2026-08-17-chart-height-cap-and-
+    // single-scroll.md; see docs/decisions.md for `h-dvh` vs `h-screen`) -- previously
+    // `min-h-screen` let this root *grow* past the viewport when content was tall, so the
+    // window scrollbar engaged alongside `<main>`'s own `overflow-auto` below: two scroll
+    // contexts, and scrolling the window past this root's painted background revealed the
+    // unstyled document background (white, worst in dark mode -- see index.css for the
+    // matching fix on `html`/`body`). Pinning the root to exactly one viewport height and
+    // clipping overflow here makes `<main>` the *only* scroll context; the sidebar stays put
+    // while content scrolls, which was already the markup's intent.
+    <div className="flex h-dvh overflow-hidden bg-white text-zinc-900 dark:bg-zinc-950 dark:text-zinc-100">
       {/* Mounted once for the whole shell (2026-08-17, DESIGN.md §9.1) -- it renders nothing
        * until its own health fetch resolves to sections worth showing (lib/releaseNotes.ts). */}
       <WhatsNewDialog />

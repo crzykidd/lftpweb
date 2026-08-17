@@ -30,6 +30,63 @@ Skeleton for the next roll:
 ### Deprecated
 ### Removed
 
+## [0.2.3] — 2026-08-17
+
+### Added
+
+- **Settings → Queues' queue list now shows the Sonarr/Radarr brand logo beside the name of
+  any queue bound to an *arr instance** — previously the only way to tell was opening Edit and
+  checking the dropdown. Muted (reduced opacity) when the bound instance is currently disabled;
+  falls back to a small text chip naming the instance id if the binding points at an instance
+  that's since been deleted. Reuses the same real brand logos already shown on Files/Transfers/
+  History (`LifecycleIcons.tsx`'s new `ArrBrandMark`, factored out of `ArrRowChip`).
+- **The Dashboard's bytes-transferred chart gains its own 24h / 7d / 30d range selector, plus
+  a total for the selected range.** Previously it only ever showed the last 24 hours; the new
+  7d range buckets at 6 hours and 30d at 1 day (same finer-when-short/coarser-when-long
+  reasoning as the existing ranges), and the chart's title, bar labels, and hover tooltips
+  scale with the bucket width. The header now reads "Total: 84.2 GB" for the whole selected
+  range, and each queue's legend entry gets its own range total alongside it. The speed chart's
+  1h/12h/24h selector is untouched and independent — the two charts remember their timeframes
+  separately. Sample retention still defaults to 7 days (30 max, Settings → configurable): a
+  7d or 30d selection past what's actually retained now says so in a one-line note instead of
+  silently rendering empty gaps with no explanation.
+- **The Transfers page's per-queue group header gains its own "Dismiss Queue" control**,
+  scoped to just that queue's finished rows — previously the only bulk option was the
+  page-wide "Dismiss all," with no way to clear one queue's terminal jobs without touching
+  every other queue's. `POST /api/jobs/dismiss-all` gains an optional `queue_id` body field
+  (omitted means the original every-queue behavior, unchanged); the control itself only shows
+  once its queue actually has something dismissable, and clicking it never toggles the group's
+  own collapse state.
+
+### Changed
+
+### Fixed
+
+- **Bulk delete of a mixed Files-page selection no longer errors rows with no local copy.**
+  With both Local and Source checked, each selected row now gets only the scopes that actually
+  apply to it — a remote-only row gets a source-only delete instead of a doomed local delete
+  that used to fail the whole row before its source delete was ever attempted. A row where the
+  checked scopes leave nothing applicable (e.g. only Local checked on a remote-only row) is now
+  reported as skipped rather than as an error.
+- **Expanding a failed transfer with no captured output on the History page now explains
+  itself instead of showing an empty panel.**
+- **A transfer interrupted by an application restart now records why it failed** — the History
+  popout says the transfer was interrupted and that the next attempt resumes from the partial
+  bytes already on disk, instead of leaving the job's captured output blank.
+- **Dashboard charts no longer grow unbounded with window width**, and the app now has a
+  single scroll context with no white flash below the page. The bytes and speed charts'
+  `<svg>` had no height ceiling — the browser derived height from width via the viewBox's
+  aspect ratio, so a wider window made them arbitrarily taller; both now cap at 320px, paired
+  with a max-width on the chart block so the cap doesn't pillarbox on very wide windows. The
+  app shell root was `min-h-screen`, which let it grow past the viewport and engage the window
+  scrollbar alongside `<main>`'s own inner scroll; it's now pinned to `h-dvh` with
+  `overflow-hidden` so `<main>` is the only scroll context, and the document background is now
+  themed so overscroll/rubber-band can no longer flash white in dark mode.
+
+### Security
+### Deprecated
+### Removed
+
 ## [0.2.2] — 2026-08-17
 
 ### Added

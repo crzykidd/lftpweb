@@ -1,6 +1,8 @@
 import { useMemo } from 'react'
 import type { MetricsBucketOut, PathQueueOut } from '../../api/types'
+import { bucketLabel, bytesChartTitle, sumBytesByQueue, sumTotalBytes } from '../../lib/bytesChart'
 import { formatBytes } from '../../lib/format'
+import { CHART_BLOCK_CLASSES, CHART_SVG_MAX_HEIGHT_CLASS } from './chartLayout'
 import { assignQueueColorSlots, colorVarForSlot } from './queueColors'
 import './chartTheme.css'
 
@@ -14,25 +16,27 @@ const PLOT_W = WIDTH - PAD_LEFT - PAD_RIGHT
 const PLOT_H = HEIGHT - PAD_TOP - PAD_BOTTOM
 const Y_GRIDLINES = 4
 
-function formatHour(ts: string): string {
-  const d = new Date(ts)
-  return Number.isNaN(d.getTime())
-    ? ts
-    : d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-}
-
-interface BytesPerHourChartProps {
+interface BytesChartProps {
   buckets: MetricsBucketOut[]
+  // Drives labeling/title (`lib/bytesChart.ts`) -- 3600s (24h range), 21600s (7d), or 86400s
+  // (30d), per `api/metrics.py`'s `_RANGES`. Passed rather than re-derived from `buckets` so an
+  // empty response (no buckets at all) still knows what it would have shown.
+  bucketSeconds: number
   queues: PathQueueOut[]
+  // Task prompt item 5 -- a one-line muted note when the selected range outruns configured
+  // retention, or `null` to show nothing (`lib/bytesChart.ts.retentionNoteForRange`).
+  retentionNote: string | null
 }
 
-/** Chart 1 (DESIGN.md new section proposed): bytes transferred per hour, last 24h, stacked
- * per queue with a site total. Hand-rolled inline SVG, no charting dependency
- * (docs/decisions.md) -- a `down` bucket (no heartbeat at all, `up: false`) renders as a
- * short muted dash at the baseline, never a zero-height bar, so "nothing was transferring"
- * and "lftpweb wasn't running" are never visually the same thing.
+/** Chart 1 (DESIGN.md new section proposed; renamed from `BytesPerHourChart` 2026-08-17,
+ * prompts/done/2026-08-17-bytes-chart-7d-30d-ranges-and-total.md, once it stopped being
+ * per-hour-specific -- the 7d/30d ranges that task added bucket at 6h/1d instead) -- bytes
+ * transferred over the selected range, stacked per queue with a range total. Hand-rolled
+ * inline SVG, no charting dependency (docs/decisions.md) -- a `down` bucket (no heartbeat at
+ * all, `up: false`) renders as a short muted dash at the baseline, never a zero-height bar, so
+ * "nothing was transferring" and "lftpweb wasn't running" are never visually the same thing.
  */
-export function BytesPerHourChart({ buckets, queues }: BytesPerHourChartProps) {
+export function BytesChart({ buckets, bucketSeconds, queues, retentionNote }: BytesChartProps) {
   const colorSlots = useMemo(() => assignQueueColorSlots(queues), [queues])
   const queuesById = useMemo(() => new Map(queues.map((q) => [q.id, q])), [queues])
 
@@ -63,22 +67,32 @@ export function BytesPerHourChart({ buckets, queues }: BytesPerHourChartProps) {
     return [...ids].sort((a, b) => (colorSlots.get(a) ?? 0) - (colorSlots.get(b) ?? 0))
   }, [buckets, colorSlots])
 
-  const totalWindowBytes = upBuckets.reduce((sum, b) => sum + (b.total_bytes ?? 0), 0)
+  const totalWindowBytes = sumTotalBytes(buckets)
+  // Same numbers as the header total, split by queue -- appended to each legend entry (task
+  // prompt item 4: "same numbers, one place") rather than computed a second way.
+  const totalsByQueue = useMemo(() => sumBytesByQueue(buckets), [buckets])
 
-  // Thin the x-axis labels -- 24 labels on a 760px-wide chart is unreadable clutter
-  // (dataviz skill: "recessive grid/axes"). Show roughly every 4th bucket, plus the last.
+  const title = bytesChartTitle(bucketSeconds)
+
+  // Thin the x-axis labels -- as many labels as buckets on a 760px-wide chart is unreadable
+  // clutter (dataviz skill: "recessive grid/axes"). Show roughly every 4th bucket, plus the
+  // last, regardless of how many buckets the selected range produced.
   const labelEvery = Math.max(1, Math.ceil(buckets.length / 6))
 
   return (
-    <div className="viz-root flex flex-col gap-2">
+    <div className={`viz-root flex flex-col gap-2 ${CHART_BLOCK_CLASSES}`}>
       <div className="flex items-baseline justify-between">
-        <h3 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">
-          Bytes transferred per hour — last 24h
-        </h3>
+        <h3 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">{title}</h3>
         <span className="text-xs" style={{ color: 'var(--chart-ink)' }}>
-          total {formatBytes(totalWindowBytes)}
+          Total: {formatBytes(totalWindowBytes)}
         </span>
       </div>
+
+      {retentionNote && (
+        <p className="text-xs" style={{ color: 'var(--chart-muted)' }}>
+          {retentionNote}
+        </p>
+      )}
 
       {buckets.length === 0 ? (
         <div className="flex h-40 items-center justify-center rounded-lg border border-dashed border-zinc-300 text-sm text-zinc-400 dark:border-zinc-700 dark:text-zinc-600">
@@ -88,8 +102,8 @@ export function BytesPerHourChart({ buckets, queues }: BytesPerHourChartProps) {
         <svg
           viewBox={`0 0 ${WIDTH} ${HEIGHT}`}
           role="img"
-          aria-label={`Bar chart of bytes transferred per hour over the last 24 hours, total ${formatBytes(totalWindowBytes)}`}
-          className="w-full"
+          aria-label={`${title}, total ${formatBytes(totalWindowBytes)}`}
+          className={`w-full ${CHART_SVG_MAX_HEIGHT_CLASS}`}
         >
           {gridlines.map(({ value, y }) => (
             <g key={value}>
@@ -125,6 +139,7 @@ export function BytesPerHourChart({ buckets, queues }: BytesPerHourChartProps) {
           {buckets.map((bucket, i) => {
             const x = PAD_LEFT + i * barSlot + (barSlot - barWidth) / 2
             const showLabel = i % labelEvery === 0 || i === buckets.length - 1
+            const label = bucketLabel(bucket.ts, bucketSeconds)
 
             if (!bucket.up) {
               return (
@@ -137,7 +152,7 @@ export function BytesPerHourChart({ buckets, queues }: BytesPerHourChartProps) {
                     rx={1}
                     fill="var(--chart-gap-fill)"
                   >
-                    <title>{`${formatHour(bucket.ts)} — no data (lftpweb was not running)`}</title>
+                    <title>{`${label} — no data (lftpweb was not running)`}</title>
                   </rect>
                   {showLabel && (
                     <text
@@ -147,7 +162,7 @@ export function BytesPerHourChart({ buckets, queues }: BytesPerHourChartProps) {
                       fontSize={9}
                       fill="var(--chart-muted)"
                     >
-                      {formatHour(bucket.ts)}
+                      {label}
                     </text>
                   )}
                 </g>
@@ -174,7 +189,7 @@ export function BytesPerHourChart({ buckets, queues }: BytesPerHourChartProps) {
                       height={h}
                       fill={colorVarForSlot(slot)}
                     >
-                      <title>{`${formatHour(bucket.ts)} — ${queueName}: ${formatBytes(value)}`}</title>
+                      <title>{`${label} — ${queueName}: ${formatBytes(value)}`}</title>
                     </rect>
                   )
                 })}
@@ -186,7 +201,7 @@ export function BytesPerHourChart({ buckets, queues }: BytesPerHourChartProps) {
                     fontSize={9}
                     fill="var(--chart-muted)"
                   >
-                    {formatHour(bucket.ts)}
+                    {label}
                   </text>
                 )}
               </g>
@@ -203,7 +218,7 @@ export function BytesPerHourChart({ buckets, queues }: BytesPerHourChartProps) {
                 className="inline-block h-2.5 w-2.5 rounded-full"
                 style={{ backgroundColor: colorVarForSlot(colorSlots.get(qid) ?? 0) }}
               />
-              {queuesById.get(qid)?.name ?? `queue ${qid}`}
+              {queuesById.get(qid)?.name ?? `queue ${qid}`}: {formatBytes(totalsByQueue[qid] ?? 0)}
             </span>
           ))}
         </div>
@@ -213,10 +228,10 @@ export function BytesPerHourChart({ buckets, queues }: BytesPerHourChartProps) {
        * (aria-label on interactive controls) doesn't cover a chart's data directly, so this
        * mirrors the same intent as a plain table a screen reader can read row by row. */}
       <table className="sr-only">
-        <caption>Bytes transferred per hour, last 24 hours, by queue</caption>
+        <caption>{title}, by queue</caption>
         <thead>
           <tr>
-            <th>Hour</th>
+            <th>Bucket</th>
             <th>Status</th>
             {activeQueueIds.map((qid) => (
               <th key={qid}>{queuesById.get(qid)?.name ?? `queue ${qid}`}</th>
@@ -227,7 +242,7 @@ export function BytesPerHourChart({ buckets, queues }: BytesPerHourChartProps) {
         <tbody>
           {buckets.map((bucket) => (
             <tr key={bucket.ts}>
-              <td>{formatHour(bucket.ts)}</td>
+              <td>{bucketLabel(bucket.ts, bucketSeconds)}</td>
               <td>{bucket.up ? 'up' : 'lftpweb offline'}</td>
               {activeQueueIds.map((qid) => (
                 <td key={qid}>{formatBytes(bucket.by_queue[String(qid)] ?? 0)}</td>

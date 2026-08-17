@@ -31,6 +31,7 @@ import type {
   QueueAutoQueueStatus,
   SyncMode,
 } from '../../api/types'
+import { ArrBrandMark } from '../../components/LifecycleIcons'
 import { FieldHelp } from '../../components/FieldHelp'
 import { PathBrowseDialog } from '../../components/PathBrowseDialog'
 import { remoteBrowseDisabled } from '../../lib/pathBrowse'
@@ -154,15 +155,55 @@ function usePostprocessSiteSettings(): PostprocessSettingsOut | null {
  * except this one's an array (there can be many instances) rather than a single settings
  * object. Empty array on failure, not `null` -- the dropdown degrades to "None" only, which is
  * always a safe, honest option regardless of why the fetch failed.
+ *
+ * `loaded` (2026-08-17, prompts/2026-08-17-queues-list-arr-brand-icon.md) distinguishes "the
+ * fetch simply hasn't resolved yet" from "it resolved (successfully or not) to a list that
+ * doesn't contain this queue's bound instance" -- the queue list's brand-icon binding indicator
+ * (`queueArrBindingMark` below) renders nothing for the former (still-in-flight is a fine,
+ * ordinary transient) but must fall back to a named-id text chip for the latter, never silent
+ * nothing for a bound queue once the fetch has actually settled either way.
  */
-function useArrInstances(): ArrInstanceOut[] {
+function useArrInstances(): { instances: ArrInstanceOut[]; loaded: boolean } {
   const [instances, setInstances] = useState<ArrInstanceOut[]>([])
+  const [loaded, setLoaded] = useState(false)
   useEffect(() => {
     listArrInstances()
       .then(setInstances)
       .catch(() => setInstances([]))
+      .finally(() => setLoaded(true))
   }, [])
-  return instances
+  return { instances, loaded }
+}
+
+/** What the queue list's Name cell should render beside a bound queue's name -- pure so it's
+ * unit-testable without a render harness, the same shape `arrDeleteCompletedDisabled`/
+ * `nextArrDeleteCompleted` above already use. `null` covers two genuinely different "render
+ * nothing" cases: no `arr_instance_id` bound at all (never had one), and the instances fetch
+ * still in flight (`instancesLoaded` false) -- but *not* a bound id the loaded list doesn't
+ * contain (a deleted instance, or a fetch that failed and settled to `[]`), which returns the
+ * `kind: null` branch below instead so `ArrBrandMark`'s own text-chip fallback names the id
+ * rather than a bound queue silently showing nothing forever, per this task's own rule.
+ */
+export function queueArrBindingMark(
+  arrInstanceId: number | null,
+  instances: ArrInstanceOut[],
+  instancesLoaded: boolean,
+): { kind: string | null; title: string; muted: boolean } | null {
+  if (arrInstanceId == null) return null
+  if (!instancesLoaded) return null
+  const instance = instances.find((i) => i.id === arrInstanceId) ?? null
+  if (instance == null) {
+    return {
+      kind: null,
+      title: `Bound to *arr instance #${arrInstanceId} (not found in Settings → Integrations)`,
+      muted: false,
+    }
+  }
+  const kindLabel = instance.kind === 'sonarr' ? 'Sonarr' : 'Radarr'
+  const title = instance.enabled
+    ? `Bound to ${kindLabel} instance '${instance.name}'`
+    : `Bound to ${kindLabel} instance '${instance.name}' (instance disabled)`
+  return { kind: instance.kind, title, muted: !instance.enabled }
 }
 
 /** Settings -> Connection's own host status (GitHub issue #4, Browse dialog) -- reused here
@@ -517,7 +558,7 @@ export function QueuesTab() {
   const [moveConfirmed, setMoveConfirmed] = useState(false)
   const postprocessSite = usePostprocessSiteSettings()
   const downloadPrefixSite = useDownloadPrefixSiteSettings()
-  const arrInstances = useArrInstances()
+  const { instances: arrInstances, loaded: arrInstancesLoaded } = useArrInstances()
   const hostForBrowse = useHostForBrowse()
   // Which field's Browse dialog is open, if any (GitHub issue #4,
   // prompts/done/2026-08-16-path-browse-dialog.md) -- `remote_path`/`local_path` are always
@@ -670,46 +711,54 @@ export function QueuesTab() {
                 </td>
               </tr>
             )}
-            {queues.map((q) => (
-              <tr key={q.id} className="border-t border-zinc-100 dark:border-zinc-900">
-                <td className="px-3 py-2">{q.name}</td>
-                <td className="px-3 py-2 font-mono text-xs">{q.remote_path}</td>
-                <td className="px-3 py-2 font-mono text-xs">{q.local_path}</td>
-                <td className="px-3 py-2">{q.sync_mode}</td>
-                <td className="px-3 py-2">{q.enabled ? 'yes' : 'no'}</td>
-                <td className="px-3 py-2">{formatScanInterval(q.scan_interval_s)}</td>
-                <td className="px-3 py-2">
-                  {q.auto_queue_enabled
-                    ? q.auto_queue_patterns_only
-                      ? 'on (patterns-only)'
-                      : 'on'
-                    : 'off'}
-                </td>
-                <td className="px-3 py-2 text-right whitespace-nowrap">
-                  <button
-                    type="button"
-                    onClick={() => setPatternsQueueId(q.id)}
-                    className="mr-2 text-zinc-600 hover:underline dark:text-zinc-300"
-                  >
-                    Patterns
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => startEdit(q)}
-                    className="mr-2 text-zinc-600 hover:underline dark:text-zinc-300"
-                  >
-                    Edit
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => handleDelete(q.id)}
-                    className="text-red-600 hover:underline dark:text-red-400"
-                  >
-                    Delete
-                  </button>
-                </td>
-              </tr>
-            ))}
+            {queues.map((q) => {
+              const arrMark = queueArrBindingMark(q.arr_instance_id, arrInstances, arrInstancesLoaded)
+              return (
+                <tr key={q.id} className="border-t border-zinc-100 dark:border-zinc-900">
+                  <td className="px-3 py-2">
+                    <span className="flex items-center gap-1.5">
+                      {q.name}
+                      {arrMark && <ArrBrandMark kind={arrMark.kind} title={arrMark.title} muted={arrMark.muted} />}
+                    </span>
+                  </td>
+                  <td className="px-3 py-2 font-mono text-xs">{q.remote_path}</td>
+                  <td className="px-3 py-2 font-mono text-xs">{q.local_path}</td>
+                  <td className="px-3 py-2">{q.sync_mode}</td>
+                  <td className="px-3 py-2">{q.enabled ? 'yes' : 'no'}</td>
+                  <td className="px-3 py-2">{formatScanInterval(q.scan_interval_s)}</td>
+                  <td className="px-3 py-2">
+                    {q.auto_queue_enabled
+                      ? q.auto_queue_patterns_only
+                        ? 'on (patterns-only)'
+                        : 'on'
+                      : 'off'}
+                  </td>
+                  <td className="px-3 py-2 text-right whitespace-nowrap">
+                    <button
+                      type="button"
+                      onClick={() => setPatternsQueueId(q.id)}
+                      className="mr-2 text-zinc-600 hover:underline dark:text-zinc-300"
+                    >
+                      Patterns
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => startEdit(q)}
+                      className="mr-2 text-zinc-600 hover:underline dark:text-zinc-300"
+                    >
+                      Edit
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => handleDelete(q.id)}
+                      className="text-red-600 hover:underline dark:text-red-400"
+                    >
+                      Delete
+                    </button>
+                  </td>
+                </tr>
+              )
+            })}
           </tbody>
         </table>
       </div>

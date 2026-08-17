@@ -22,8 +22,10 @@ import {
   type QueueGroup,
   completedTimeLabel,
   formatQueueGroupCounts,
+  groupHasDismissable,
   groupJobsByQueue,
   hasArrGroup,
+  isDismissable,
   isQueueCollapsed,
   processingGroupFields,
   queueGroupSummary,
@@ -34,6 +36,11 @@ import {
   withQueueCollapsed,
   writeCollapsedQueues,
 } from '../lib/transferPanel'
+
+// Re-exported so `TransfersPage.test.ts`'s pre-existing `import { isDismissable } from
+// './TransfersPage'` keeps working unchanged -- the definition itself moved to
+// `lib/transferPanel.ts` on 2026-08-17 (see that function's own docstring for why).
+export { isDismissable }
 
 const START_NOW_EXPLAINED_KEY = 'lftpweb:startNowExplained'
 
@@ -58,19 +65,6 @@ export function chipStateFor(job: JobOut): string {
     default:
       return job.state
   }
-}
-
-/** Whether a job's Dismiss button (2026-08-13, `core/queue.py.dismiss_job`) should show for a
- * row in this state -- must match that endpoint's own guard (`JobNotDismissableError`) exactly,
- * or a click here would just surface a 409. `succeeded` joined 2026-08-14
- * (prompts/2026-08-14-exit-zero-is-not-completion.md) alongside `list_jobs()` starting to
- * surface a recently-succeeded job on this page at all -- a completed transfer needs the same
- * "stop showing this row" action a failed or stopped one already had. Exported as its own pure
- * function (rather than inlined in `Row`) so it can be unit-tested without mounting the
- * component -- this project doesn't test component rendering (README.md's Known gaps).
- */
-export function isDismissable(state: JobOut['state']): boolean {
-  return state === 'failed' || state === 'cancelled' || state === 'succeeded'
 }
 
 function fileCountFor(nodes: FileNode[], job: JobOut): number {
@@ -418,24 +412,45 @@ function RowDetailPanel({ job, live, fileCount }: { job: JobOut; live: LiveProgr
 /** A queue group's header line (2026-08-16) -- queue name, outcome counts, and total/combined-
  * rate, all in one clickable line that toggles the group's collapse state. The queue name used to
  * repeat on every row (`Row` above, before this task); it lives here exactly once per group now.
+ *
+ * 2026-08-17 (prompts/2026-08-17-transfers-dismiss-per-queue.md): the header line used to be a
+ * single full-width `<button>` -- adding a second, independently-clickable "Dismiss Queue"
+ * control inside it means that can no longer be a real `<button>` (a `<button>` nested inside a
+ * `<button>` is invalid HTML and makes click handling ambiguous). It's a `<div role="button">`
+ * instead, carrying the same `onClick`/keyboard toggle behavior by hand (`onKeyDown` below), so
+ * the whole row is still one big click target for collapse/expand -- only the inner Dismiss
+ * Queue button, an actual sibling `<button>`, stops that click from also propagating up to the
+ * row's own toggle.
  */
 function GroupHeader({
   group,
   collapsed,
   onToggle,
   liveByJobId,
+  dismissing,
+  onDismissQueue,
 }: {
   group: QueueGroup
   collapsed: boolean
   onToggle: () => void
   liveByJobId: Record<number, LiveProgress>
+  dismissing: boolean
+  onDismissQueue: () => void
 }) {
   const summary = useMemo(() => queueGroupSummary(group.jobs, liveByJobId), [group.jobs, liveByJobId])
   const countsText = formatQueueGroupCounts(summary.counts)
+  const showDismiss = groupHasDismissable(group.jobs)
   return (
-    <button
-      type="button"
+    <div
+      role="button"
+      tabIndex={0}
       onClick={onToggle}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault()
+          onToggle()
+        }
+      }}
       aria-expanded={!collapsed}
       title={collapsed ? 'Expand this queue' : 'Collapse this queue'}
       className="flex w-full flex-wrap items-center gap-3 border-b border-zinc-200 bg-zinc-50 px-3 py-2 text-left text-sm hover:bg-zinc-100 dark:border-zinc-800 dark:bg-zinc-900/60 dark:hover:bg-zinc-900"
@@ -451,7 +466,23 @@ function GroupHeader({
         {formatBytes(summary.totalBytesDone)}
         {summary.combinedRateBps != null && ` · ${formatRate(summary.combinedRateBps)}`}
       </span>
-    </button>
+      {showDismiss && (
+        <button
+          type="button"
+          disabled={dismissing}
+          onClick={(e) => {
+            // Doesn't toggle the group's own collapse -- the header line above is a collapse
+            // toggle (this task's own instruction).
+            e.stopPropagation()
+            onDismissQueue()
+          }}
+          title="Dismiss this queue's finished rows"
+          className="shrink-0 rounded-md border border-zinc-300 px-2 py-1 text-xs font-medium text-zinc-700 hover:bg-zinc-100 disabled:opacity-50 dark:border-zinc-700 dark:text-zinc-200 dark:hover:bg-zinc-800"
+        >
+          {dismissing ? 'Dismissing…' : 'Dismiss Queue'}
+        </button>
+      )}
+    </div>
   )
 }
 
@@ -470,6 +501,12 @@ export function TransfersPage() {
   const [dismissingAll, setDismissingAll] = useState(false)
   const [dismissAllError, setDismissAllError] = useState<string | null>(null)
   const [dismissAllCount, setDismissAllCount] = useState<number | null>(null)
+  // Per-queue "Dismiss Queue" (2026-08-17, prompts/2026-08-17-transfers-dismiss-per-queue.md) --
+  // keyed by `queueId`, not a single flag/string/number the way the page-wide Dismiss-all state
+  // above is, so two different groups' controls never lock or clobber each other.
+  const [dismissingQueueIds, setDismissingQueueIds] = useState<Set<number>>(new Set())
+  const [dismissQueueError, setDismissQueueError] = useState<Record<number, string>>({})
+  const [dismissQueueCount, setDismissQueueCount] = useState<Record<number, number>>({})
 
   const nodesByQueue = useMemo(() => {
     const map = new Map<number, FileNode[]>()
@@ -569,6 +606,41 @@ export function TransfersPage() {
       setDismissAllError(errorMessage(err))
     } finally {
       setDismissingAll(false)
+    }
+  }
+
+  /** A `GroupHeader`'s own "Dismiss Queue" control (2026-08-17,
+   * prompts/2026-08-17-transfers-dismiss-per-queue.md) -- the per-queue-scoped counterpart to
+   * `handleDismissAll` above, same shape: one bulk request (`dismissAllJobs(queueId)` ->
+   * `core/queue.py.dismiss_all_terminal(queue_id=...)`), and the same honest "the request itself
+   * either worked or it didn't" error reporting, just keyed by `queueId` throughout so a second
+   * group's button stays live (and its own outcome/error stay separate) while this one is still
+   * in flight.
+   */
+  const handleDismissQueue = async (queueId: number) => {
+    setDismissingQueueIds((prev) => new Set(prev).add(queueId))
+    setDismissQueueError((prev) => {
+      const next = { ...prev }
+      delete next[queueId]
+      return next
+    })
+    setDismissQueueCount((prev) => {
+      const next = { ...prev }
+      delete next[queueId]
+      return next
+    })
+    try {
+      const res = await dismissAllJobs(queueId)
+      setDismissQueueCount((prev) => ({ ...prev, [queueId]: res.dismissed }))
+      refresh()
+    } catch (err) {
+      setDismissQueueError((prev) => ({ ...prev, [queueId]: errorMessage(err) }))
+    } finally {
+      setDismissingQueueIds((prev) => {
+        const next = new Set(prev)
+        next.delete(queueId)
+        return next
+      })
     }
   }
 
@@ -757,7 +829,48 @@ export function TransfersPage() {
                   collapsed={collapsed}
                   onToggle={() => toggleQueueCollapsed(group.queueId)}
                   liveByJobId={progressByJobId}
+                  dismissing={dismissingQueueIds.has(group.queueId)}
+                  onDismissQueue={() => handleDismissQueue(group.queueId)}
                 />
+                {dismissQueueCount[group.queueId] != null && (
+                  <div className="flex items-center justify-between gap-3 border-b border-zinc-200 bg-emerald-50 px-3 py-1.5 text-xs text-emerald-900 dark:border-zinc-800 dark:bg-emerald-950/40 dark:text-emerald-200">
+                    <span className="font-medium">
+                      Dismissed {dismissQueueCount[group.queueId]} job
+                      {dismissQueueCount[group.queueId] === 1 ? '' : 's'}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setDismissQueueCount((prev) => {
+                          const next = { ...prev }
+                          delete next[group.queueId]
+                          return next
+                        })
+                      }
+                      className="shrink-0 underline decoration-dotted"
+                    >
+                      Dismiss
+                    </button>
+                  </div>
+                )}
+                {dismissQueueError[group.queueId] && (
+                  <div className="flex items-center justify-between gap-3 border-b border-zinc-200 bg-amber-50 px-3 py-1.5 text-xs text-amber-900 dark:border-zinc-800 dark:bg-amber-950/40 dark:text-amber-200">
+                    <span>Couldn't dismiss this queue: {dismissQueueError[group.queueId]}</span>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setDismissQueueError((prev) => {
+                          const next = { ...prev }
+                          delete next[group.queueId]
+                          return next
+                        })
+                      }
+                      className="shrink-0 underline decoration-dotted"
+                    >
+                      Dismiss
+                    </button>
+                  </div>
+                )}
                 {!collapsed &&
                   group.jobs.map((job) => (
                     <Row

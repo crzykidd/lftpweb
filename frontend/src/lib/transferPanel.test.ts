@@ -4,11 +4,14 @@ import {
   type LiveProgress,
   completedTimeLabel,
   decrementHistoryQueueSummary,
+  failedJobPanelContent,
   formatQueueGroupCounts,
+  groupHasDismissable,
   groupHistoryJobsByQueue,
   groupJobsByQueue,
   hasArrGroup,
   historyQueueGroupCounts,
+  isDismissable,
   isQueueCollapsed,
   processingGroupFields,
   queueGroupSummary,
@@ -396,6 +399,40 @@ describe('groupJobsByQueue', () => {
   })
 })
 
+// 2026-08-17 (prompts/2026-08-17-transfers-dismiss-per-queue.md): `isDismissable` moved here
+// from `TransfersPage.tsx` so `groupHasDismissable` below can reuse it without `lib/` importing
+// from `pages/` -- see that function's own docstring. `TransfersPage.test.ts`'s pre-existing
+// `isDismissable` coverage keeps passing unchanged (the page re-exports the same function), so
+// this only adds the states this task's move didn't already have direct coverage for.
+describe('isDismissable', () => {
+  it('is true for a terminal state -- failed, cancelled, succeeded', () => {
+    expect(isDismissable('failed')).toBe(true)
+    expect(isDismissable('cancelled')).toBe(true)
+    expect(isDismissable('succeeded')).toBe(true)
+  })
+
+  it('is false for an active state -- queued, running', () => {
+    expect(isDismissable('queued')).toBe(false)
+    expect(isDismissable('running')).toBe(false)
+  })
+})
+
+describe('groupHasDismissable -- the group header\'s "Dismiss Queue" visibility', () => {
+  it('is true once at least one job in the group is dismissable', () => {
+    const jobs = [job('running', { id: 1 }), job('failed', { id: 2 })]
+    expect(groupHasDismissable(jobs)).toBe(true)
+  })
+
+  it('is false when every job in the group is still active', () => {
+    const jobs = [job('running', { id: 1 }), job('queued', { id: 2 })]
+    expect(groupHasDismissable(jobs)).toBe(false)
+  })
+
+  it('is false for an empty group', () => {
+    expect(groupHasDismissable([])).toBe(false)
+  })
+})
+
 describe('queueGroupSummary', () => {
   it('counts each state into its outcome bucket, including cancelled as stopped', () => {
     const jobs = [
@@ -693,5 +730,30 @@ describe('decrementHistoryQueueSummary -- local update after a single-row clear'
     const result = decrementHistoryQueueSummary([summary({ failed: 0, total_bytes_done: 100 })], cleared)
     expect(result[0].failed).toBe(0)
     expect(result[0].total_bytes_done).toBe(0)
+  })
+})
+
+// 2026-08-17 (prompts/2026-08-17-interrupted-job-popout-explains-itself.md): the
+// fetch-vs-static-empty-state decision behind `HistoryJobsSection.tsx`'s failed-row expand
+// panel, pulled out as a pure function so it's reachable without mounting anything (the same
+// "no component rendering tested here" discipline every other describe block in this file
+// follows).
+describe('failedJobPanelContent -- fetch vs. static empty state for a failed row\'s panel', () => {
+  it('says "fetch" when the row has a captured output tail', () => {
+    const job = historyJob('failed', { error_class: 'AUTH_FAILED', has_output_tail: true })
+    expect(failedJobPanelContent(job)).toEqual({ kind: 'fetch' })
+  })
+
+  it('says "static" with the row\'s own error_class when there is no output tail to fetch', () => {
+    // The case a container-restart INTERRUPTED job hit before this task: `has_output_tail`
+    // false meant `handleToggle` never fetched, `output` stayed `null` forever, and the old
+    // render logic (gated on `output` being non-null) never showed anything at all.
+    const job = historyJob('failed', { error_class: 'INTERRUPTED', has_output_tail: false })
+    expect(failedJobPanelContent(job)).toEqual({ kind: 'static', errorClass: 'INTERRUPTED' })
+  })
+
+  it('carries a null error_class through to the static case rather than guessing', () => {
+    const job = historyJob('failed', { error_class: null, has_output_tail: false })
+    expect(failedJobPanelContent(job)).toEqual({ kind: 'static', errorClass: null })
   })
 })

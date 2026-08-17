@@ -6,6 +6,173 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-17 — Shell root uses `h-dvh` over `h-screen`; chart width cap chosen so the height cap never actually engages
+
+`prompts/done/2026-08-17-chart-height-cap-and-single-scroll.md`, executed end to end. Two
+confirmed-in-code bugs from live use: the Dashboard charts grew taller with no ceiling as the
+window widened, and the page had two scroll contexts (the window and `<main>`'s own
+`overflow-auto`) with an unstyled white flash below the shell on overscroll, worst in dark mode.
+
+**`h-dvh`, not `h-screen`, on `Layout`'s shell root.** The prompt named this as a call worth
+checking rather than assuming. `h-screen` is `100vh`, which on mobile Safari/Chrome includes
+the area the browser's own address-bar chrome can cover, so the page can be taller than the
+actually-visible viewport and reintroduce exactly the "content taller than what's visible"
+condition this task is fixing. `h-dvh` (`100dvh`, the *dynamic* viewport height) tracks the
+real visible area as browser chrome shows/hides. Confirmed available: Tailwind 4.3.3
+(`node_modules/tailwindcss/dist/default-theme.js`) ships `dvh` height utilities.
+
+**Verified all four `@tanstack/react-virtual` scroll containers before touching the shell.**
+`FileTree.tsx`, `HistoryJobsSection.tsx`, `HistoryEventsSection.tsx`, `ItemDrawer.tsx` all pass
+`getScrollElement: () => scrollRef.current` — their own ref'd `<div>`, never `window` — and
+each of those divs already carries its own explicit height/overflow independent of the shell
+(`max-h-[70vh] overflow-auto`, `max-h-[28rem] overflow-auto` ×2, and `ItemDrawer`'s drawer is
+`fixed inset-0` with `h-full` on its own panel, entirely outside document flow). None of them
+depend on `<main>`'s scroll or on the shell root's height, so pinning the root to `h-dvh` +
+`overflow-hidden` doesn't touch their wiring — confirmed by reading each, not assumed from the
+shared library.
+
+**Chart width cap picked so it makes the height cap redundant in practice, on purpose.** Both
+chart `<svg>`s get `max-h-80` (320px) as a hard ceiling, but the accompanying chart-block cap
+(`max-w-4xl`, 896px, `frontend/src/components/charts/chartLayout.ts`) was chosen so that at
+896px wide, both charts' *natural* height from their own viewBox aspect ratio (760×260 and
+760×220) already sits under 320px — 306px and 259px respectively. That means the default
+`preserveAspectRatio="meet"` letterboxing the task flagged as a risk (a height-capped, still-
+full-width SVG pillarboxes) never actually triggers for these two charts at any width up to the
+cap; the max-height stays in the code as a real ceiling (e.g. for a future chart with a taller
+viewBox) rather than load-bearing for these two.
+
+**No new tests.** `chartLayout.ts` is two string constants, not logic — nothing there is worth
+a unit test beyond what `npm run build`/`npm test` already exercise by rendering the charts.
+
+---
+
+## 2026-08-17 — Dashboard bytes chart: 7d/30d ranges bucket at 6h/1d, and the retention note reuses the existing settings GET rather than a new endpoint
+
+`prompts/done/2026-08-17-bytes-chart-7d-30d-ranges-and-total.md`, executed end to end. The
+Dashboard's bytes-transferred chart only ever showed the last 24 hours; the user asked for a
+24h/7d/30d selector plus a total for the selected range.
+
+**Bucket-width choices: 21600s (6h) for 7d, 86400s (1d) for 30d.** Same reasoning
+`api/metrics.py`'s `_RANGES` comment already gave for the existing three ranges (finer buckets
+for a short window, coarser as it widens, so the chart stays a readable number of bars): 7d at
+hourly buckets would be 168 bars, unreadable on a 760px chart for no more information than 28
+six-hour bars gives; 30d at 6-hour buckets would be 120 bars, so it steps again to 30 one-day
+bars. Both stay consistent with the existing rule that a range's own bucket width is `hours *
+3600 / bucket_count`, chosen so the resulting bar count sits in the same "one glance" range the
+1h/12h/24h ranges already target (~24-60 bars). The endpoint's inclusive bucket-boundary walk
+(`get_throughput`'s `while epoch <= last_epoch`) means an N-bucket range always renders N+1
+points, not N -- true of every existing range too, just newly worth spelling out because the
+new tests pin the exact count (29 for 7d, 31 for 30d) rather than only asserting `>= 1` the way
+the pre-existing 1h test does.
+
+**The speed chart's own 1h/12h/24h selector is untouched, on purpose.** The task named this
+explicitly: speed over a week or month at 6h/1d buckets would average away exactly the spikes a
+speed chart exists to show, so Chart 2 keeps its original three ranges and its original
+`dashboard.range` localStorage key. Chart 1 gets an independent selector and its own key
+(`dashboard.bytesRange`) -- the two were never coupled in the API (`getThroughput(range,
+queueId?)` already took an arbitrary range string per call site), only in the frontend's shared
+`MetricsRange` type, which this task split into `SpeedRange`/`BytesRange` (still unioned into
+`MetricsRange` for the wire response shape, which doesn't care which selector a given request
+came from).
+
+**Retention note: read the existing `GET /api/settings/metrics`, once, no new endpoint.** The
+task's own contingency said to add a new endpoint only if no cheap read already existed --
+`getMetricsSettings()` was already defined in `client.ts` (added when the settings round-trip
+shipped) but had zero call sites anywhere in the frontend until this task. The Dashboard now
+calls it once on mount (not polled -- retention only changes when a human edits it in Settings,
+so a stale read for one page visit is harmless) and compares the selected range's day-span
+against it (`lib/bytesChart.ts.retentionNoteForRange`); a 30d selection on the default 7-day
+retention now says so in a muted one-line note instead of silently rendering 23 days of
+unexplained gaps that look like downtime rather than pruned history.
+
+**Renamed `BytesPerHourChart` → `BytesChart`.** Thin rename only (all three call sites/imports
+updated in the same commit) -- justified because the component stopped being per-hour-specific
+in behavior once `bucketSeconds` became a prop it labels against, and the task's own guidance
+was explicit that a parallel second chart component was not an acceptable alternative.
+
+---
+
+## 2026-08-17 — An INTERRUPTED job's History popout explains itself, without attempt-grouping or reclassification
+
+`prompts/done/2026-08-17-interrupted-job-popout-explains-itself.md`. Live find on the test
+instance: a container restart at 18:21:49Z cut a running 2.4 GB mirror; startup recovery marked
+the job `failed / INTERRUPTED`, a fresh job resumed two seconds later and completed, and the
+whole *arr ladder ran clean. History told that story badly in two independent ways — a failed
+job with no captured output expanded to a completely blank panel (`HistoryJobsSection.tsx`'s
+expand handler only fetched output when `has_output_tail` was true, and the panel's own
+"No output was captured" message only rendered once that fetch landed, so it was unreachable
+for exactly the failure class that needed it most), and the INTERRUPTED job itself recorded no
+reason at all — `core/queue.py`'s startup-recovery sweep set `error_class = 'INTERRUPTED'` and
+nothing else, so even a fixed panel would have had nothing to say.
+
+**Decision: fix both gaps narrowly — the row explains itself, the rows themselves don't
+change.** Backend: the same UPDATE that marks an orphaned `running` row `INTERRUPTED` now also
+writes a short human-facing explanation into `output_tail` (`INTERRUPTED_OUTPUT_TAIL`), guarded
+by `COALESCE(NULLIF(output_tail, ''), ?)` so it can never overwrite a genuinely captured tail.
+This is deliberately reused, unmodified, by the existing `has_output_tail`/`GET .../output`
+path — no API change. Frontend: `lib/transferPanel.ts` gained `failedJobPanelContent(job)`, a
+pure fetch-vs-static decision — `has_output_tail: false` now renders `job.error_class` plus the
+"No output was captured for this job." copy directly from the list row, no fetch attempted, so
+every pre-fix interrupted row already sitting in a user's database (and any other tail-less
+failure) gets the same explanation without a backfill migration.
+
+**Rejected: attempt-grouping the failed row under the job that resumed it.** Pairing an
+INTERRUPTED job with the fresh job that picked the item back up two seconds later would read
+naturally in the common case, but History is paginated and independently filterable by
+queue/state/error-class/date-range — a page boundary or an active filter can put the two jobs
+on different pages or hide one of them entirely, making the pairing unreliable exactly when a
+user is looking for it. Rejected as disproportionate for a cosmetic grouping.
+
+**Rejected: a server-side "resumed by job N" annotation.** Would need a stable link between an
+INTERRUPTED job and whatever later job (if any) actually resumed the same item — more schema
+and matching logic than a cosmetic annotation earns, especially since nothing about the item's
+correctness depends on that link being right.
+
+**Rejected: reclassifying or recounting anything.** The row stays `failed / INTERRUPTED`, the
+counts stay exactly as they are — both considered and rejected with the user as
+disproportionate machinery for what is, underneath, just an unreachable empty state and a
+missing sentence. No state-machine change, no new `error_class`, no new job or item field
+beyond the one `output_tail` write.
+
+---
+
+## 2026-08-17 — Bulk delete applies Local/Source per entry, not as blanket flags
+
+`prompts/done/2026-08-17-bulk-delete-per-entry-scopes.md`. Live-reported bug: a Files-page
+bulk delete with both Local and Source checked errored every selected row with no local
+content (`REMOTE_ONLY`, or a stranded `REMOVED_LOCAL` row — exactly what `canDeleteLocal`'s
+same-day widening, `prompts/done/2026-08-17-stranded-source-delete-retry.md`, made
+selectable). The Source scope was already computed per entry in `FileTree.tsx`'s `runAction`
+(`sourceRequestedFor(e)` only requested source when `hasRemoteCopy(e)`), but Local was a
+blanket flag — every row in the bulk call got `local: true` whenever the checkbox was checked.
+`api/jobs.py.delete_item` turns any local withhold into an immediate 409, so source was never
+even attempted for those rows.
+
+**Decision: make Local per-entry, symmetric to Source, entirely on the frontend.** New pure
+helper `effectiveDeleteScope(node, checked)` in `lib/fileTree.ts` reads the same two
+underlying facts every neighboring helper in that module reads (`hasLocalContent`,
+`hasRemoteCopy`) and returns `null` when neither checked scope applies to a given row —
+meaning "send no request for this row at all." `FileTree.tsx`'s `runAction` computes it once
+per entry and reuses it for the request body, the skip decision, and the
+`source_deleted`-false read-back, replacing the old `sourceRequestedFor` closure.
+
+**Skipped rows get their own bucket, not folded into success or failure.** `BulkOutcome` gained
+`skipped: { rel_path, name, reason }[]`, rendered as its own muted line in the outcome summary,
+distinct from the amber failure list. A skipped row stays selected (like a failure) so a retry
+with a different scope is one click away, and the summary never reports a fabricated 409 for a
+request that was never sent. If every row in a bulk selection ends up skipped, the same summary
+renders with `succeeded: 0` rather than suppressing it as a no-op success.
+
+**Rejected alternative: make the backend treat "nothing local to delete" as an idempotent
+success when source is also requested.** Considered and rejected — the 409-on-local-withhold
+contract in `api/jobs.py.delete_item`'s docstring is deliberate for single-row deletes (a
+withheld local delete should be loud, not silently downgraded), and the frontend already holds
+every fact needed to decide per-entry which scopes actually apply, so duplicating that logic
+into the backend's success/failure semantics would be solving a frontend bug in the wrong
+layer. No backend change was needed or made.
+
+---
+
 ## 2026-08-17 — Support bundle polish: per-instance byte budget, split failure markers, extract-password redaction
 
 `prompts/done/2026-08-17-support-bundle-polish.md`. The user generated the first real support

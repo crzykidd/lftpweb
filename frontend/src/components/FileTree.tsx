@@ -38,6 +38,7 @@ import {
   DEFAULT_COLLAPSE_PREFERENCE,
   DEFAULT_SORT_PREFERENCE,
   defaultSourceChecked,
+  effectiveDeleteScope,
   effectiveEtaLabel,
   effectiveSpeedLabel,
   fixedColumnStyle,
@@ -986,11 +987,25 @@ interface BulkFailure {
   error: string
 }
 
+/** A row `runAction` sent no request for at all -- distinct from both success and failure
+ * (2026-08-17, `prompts/2026-08-17-bulk-delete-per-entry-scopes.md`). Only produced for
+ * `action === 'delete'`, when `effectiveDeleteScope` finds nothing applicable for this row
+ * given the checked scopes (e.g. only Local checked, but this row has no local content).
+ * Counted separately so the summary's arithmetic (`succeeded + failures.length +
+ * skipped.length === total`) stays honest rather than folding a no-op into either bucket.
+ */
+interface BulkSkip {
+  rel_path: string
+  name: string
+  reason: string
+}
+
 interface BulkOutcome {
   action: 'queue' | 'stop' | 'delete'
   total: number
   succeeded: number
   failures: BulkFailure[]
+  skipped: BulkSkip[]
 }
 
 const BULK_OUTCOME_LABEL: Record<BulkOutcome['action'], string> = {
@@ -1431,13 +1446,18 @@ export function FileTree({
    * both, per the task's own instruction not to build a parallel one.
    *
    * `deleteScope` (2026-08-16, the dialog's independent Local/Source checkboxes) is only read
-   * for `action === 'delete'`. Per-entry, not a blanket flag across the whole bulk call: Source
-   * is only ever actually requested for an entry that `hasRemoteCopy` (an entry with none has
-   * nothing there to delete, matching the dialog's own "the Source checkbox only renders when
-   * a remote copy exists" rule at the bulk level too), so `deleteScope.source` alone can't tell
-   * "was source requested for *this* entry" apart from "the checkbox happened to be checked" --
-   * `sourceRequestedFor` below is that per-entry answer, computed once and reused for both the
-   * request itself and reading its response honestly afterward.
+   * for `action === 'delete'`. Per-entry, not a blanket flag across the whole bulk call
+   * (2026-08-17, `prompts/2026-08-17-bulk-delete-per-entry-scopes.md` -- the live-reported bug:
+   * a blanket `local: true` sent to every row 409'd any row with no local content before its
+   * perfectly deletable source copy was ever attempted): `effectiveDeleteScope` (`lib/fileTree.ts`)
+   * is the per-entry answer for *both* scopes, computed once per entry (`entryScopes` below) and
+   * reused for the request body, the skip decision, and reading the response honestly afterward.
+   *
+   * A row whose effective scope comes back `null` (neither checked scope applies to it -- e.g.
+   * only Local was checked but this row is `REMOTE_ONLY`) gets no HTTP request at all and lands
+   * in `skipped`, not `failures` or `succeededPaths` -- it stays selected, like a failure does,
+   * so a retry with a different scope is one click away, but it never shows a fabricated error
+   * for a request that was never sent.
    *
    * **Honest partial-failure reporting** (the task's own instruction for a bulk delete): a
    * combined request that deletes the local copy but fails to delete the source resolves
@@ -1456,23 +1476,51 @@ export function FileTree({
     setBulkBusy(true)
     setBulkOutcome(null)
     try {
-      const sourceRequestedFor = (e: TreeEntry) => (deleteScope?.source ?? false) && hasRemoteCopy(e)
+      const failures: BulkFailure[] = []
+      const skipped: BulkSkip[] = []
+      const succeededPaths = new Set<string>()
+
+      // Per-entry effective scope -- `undefined` (not in the map) for queue/stop, where no
+      // scope question ever applies.
+      const entryScopes = new Map<TreeEntry, { local: boolean; source: boolean } | null>()
+      if (action === 'delete' && deleteScope) {
+        for (const e of targets) entryScopes.set(e, effectiveDeleteScope(e, deleteScope))
+      }
+
+      // Rows with nothing applicable are filtered out before the request goes out at all --
+      // never sent as a doomed request, never counted as a request that "succeeded".
+      const sendable = targets.filter((e) => {
+        if (action !== 'delete') return true
+        if (entryScopes.get(e) !== null) return true
+        const localOnly = (deleteScope?.local ?? false) && !(deleteScope?.source ?? false)
+        const sourceOnly = !(deleteScope?.local ?? false) && (deleteScope?.source ?? false)
+        skipped.push({
+          rel_path: e.rel_path,
+          name: e.name,
+          reason: localOnly
+            ? 'no local copy — only Local was selected'
+            : sourceOnly
+              ? 'no remote copy — only Source was selected'
+              : 'nothing applicable to this row',
+        })
+        return false
+      })
+
       const results = await Promise.allSettled(
-        targets.map((e) => {
+        sendable.map((e) => {
           if (action === 'queue') return queueItem(e.id as number)
           if (action === 'stop') return stopItem(e.id as number)
-          return deleteItem(e.id as number, deleteScope?.local ?? true, sourceRequestedFor(e))
+          const scope = entryScopes.get(e) as { local: boolean; source: boolean }
+          return deleteItem(e.id as number, scope.local, scope.source)
         }),
       )
-      const failures: BulkFailure[] = []
-      const succeededPaths = new Set<string>()
       results.forEach((result, i) => {
-        const entry = targets[i]
+        const entry = sendable[i]
         if (result.status !== 'fulfilled') {
           failures.push({ rel_path: entry.rel_path, name: entry.name, error: errorMessage(result.reason) })
           return
         }
-        if (action === 'delete' && sourceRequestedFor(entry)) {
+        if (action === 'delete' && entryScopes.get(entry)?.source) {
           const response = result.value as DeleteItemResponse
           if (response.source_deleted === false) {
             failures.push({
@@ -1488,7 +1536,13 @@ export function FileTree({
       const nextSelection = new Set(selected)
       for (const path of succeededPaths) nextSelection.delete(path)
       onSelectionChange(nextSelection)
-      setBulkOutcome({ action, total: targets.length, succeeded: succeededPaths.size, failures })
+      setBulkOutcome({
+        action,
+        total: targets.length,
+        succeeded: succeededPaths.size,
+        failures,
+        skipped,
+      })
     } finally {
       setBulkBusy(false)
     }
@@ -1812,7 +1866,7 @@ export function FileTree({
       {bulkOutcome && (
         <div
           className={`rounded-md border px-3 py-2 text-sm ${
-            bulkOutcome.failures.length === 0
+            bulkOutcome.failures.length === 0 && bulkOutcome.skipped.length === 0
               ? 'border-emerald-300 bg-emerald-50 text-emerald-900 dark:border-emerald-900 dark:bg-emerald-950/40 dark:text-emerald-200'
               : 'border-amber-300 bg-amber-50 text-amber-900 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-200'
           }`}
@@ -1822,6 +1876,7 @@ export function FileTree({
               {BULK_OUTCOME_LABEL[bulkOutcome.action]}: {bulkOutcome.succeeded} of {bulkOutcome.total}{' '}
               succeeded
               {bulkOutcome.failures.length > 0 && `, ${bulkOutcome.failures.length} failed`}
+              {bulkOutcome.skipped.length > 0 && `, ${bulkOutcome.skipped.length} skipped`}
             </span>
             <button
               type="button"
@@ -1836,6 +1891,17 @@ export function FileTree({
               {bulkOutcome.failures.map((f) => (
                 <li key={f.rel_path}>
                   <span className="font-mono">{f.name}</span> — {f.error}
+                </li>
+              ))}
+            </ul>
+          )}
+          {/* Skipped rows (2026-08-17): a distinct bucket from failures -- no request was ever
+              sent for these, so they get their own muted line rather than reading as an error. */}
+          {bulkOutcome.skipped.length > 0 && (
+            <ul className="mt-1.5 list-disc space-y-0.5 pl-5 text-xs text-zinc-600 dark:text-zinc-400">
+              {bulkOutcome.skipped.map((s) => (
+                <li key={s.rel_path}>
+                  <span className="font-mono">{s.name}</span> — skipped: {s.reason}
                 </li>
               ))}
             </ul>

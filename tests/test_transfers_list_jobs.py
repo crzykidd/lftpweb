@@ -457,6 +457,66 @@ async def test_dismiss_all_terminal_is_a_no_op_when_nothing_is_dismissable(db):
     assert await _queue(db).dismiss_all_terminal() == 0
 
 
+# --- dismiss_all_terminal(queue_id=...): the group-header "Dismiss Queue" scope (2026-08-17,
+# prompts/2026-08-17-transfers-dismiss-per-queue.md) ---------------------------------------
+
+
+async def test_dismiss_all_terminal_scoped_to_one_queue_leaves_other_queue_untouched(db):
+    queue_a = await _make_queue(db)
+    queue_b = await _make_queue(db)
+    item_a = await _make_item(db, queue_a, "a.txt", state="FAILED")
+    job_a = await _make_job(db, item_a, state="failed")
+    item_b = await _make_item(db, queue_b, "b.txt", state="FAILED")
+    job_b = await _make_job(db, item_b, state="failed")
+
+    q = _queue(db)
+    dismissed = await q.dismiss_all_terminal(queue_id=queue_a)
+    assert dismissed == 1
+
+    row_a = await (
+        await db.execute("SELECT dismissed_at FROM job WHERE id = ?", (job_a,))
+    ).fetchone()
+    row_b = await (
+        await db.execute("SELECT dismissed_at FROM job WHERE id = ?", (job_b,))
+    ).fetchone()
+    assert row_a["dismissed_at"] is not None
+    assert row_b["dismissed_at"] is None
+
+
+async def test_dismiss_all_terminal_omitted_queue_id_still_dismisses_across_queues(db):
+    queue_a = await _make_queue(db)
+    queue_b = await _make_queue(db)
+    item_a = await _make_item(db, queue_a, "a.txt", state="FAILED")
+    job_a = await _make_job(db, item_a, state="failed")
+    item_b = await _make_item(db, queue_b, "b.txt", state="FAILED")
+    job_b = await _make_job(db, item_b, state="failed")
+
+    q = _queue(db)
+    dismissed = await q.dismiss_all_terminal()
+    assert dismissed == 2
+
+    for job_id in (job_a, job_b):
+        row = await (
+            await db.execute("SELECT dismissed_at FROM job WHERE id = ?", (job_id,))
+        ).fetchone()
+        assert row["dismissed_at"] is not None
+
+
+async def test_dismiss_all_terminal_unknown_queue_id_dismisses_nothing(db):
+    queue_id = await _make_queue(db)
+    item = await _make_item(db, queue_id, "a.txt", state="FAILED")
+    job_id = await _make_job(db, item, state="failed")
+
+    q = _queue(db)
+    dismissed = await q.dismiss_all_terminal(queue_id=999999)
+    assert dismissed == 0
+
+    row = await (
+        await db.execute("SELECT dismissed_at FROM job WHERE id = ?", (job_id,))
+    ).fetchone()
+    assert row["dismissed_at"] is None
+
+
 # --- list_jobs()/_job_out: the 2026-08-15 panel fields (verified_at/extracted_at/
 # remote_deleted_at/arr_status/arr_status_at/arr_instance_name) --------------------------------
 

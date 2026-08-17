@@ -278,6 +278,25 @@ export function hasArrGroup(job: JobOut): boolean {
   return job.arr_instance_name != null
 }
 
+/** Whether a job's Dismiss button (2026-08-13, `core/queue.py.dismiss_job`) should show for a
+ * row in this state -- must match that endpoint's own guard (`JobNotDismissableError`) exactly,
+ * or a click here would just surface a 409. `succeeded` joined 2026-08-14
+ * (prompts/2026-08-14-exit-zero-is-not-completion.md) alongside `list_jobs()` starting to
+ * surface a recently-succeeded job on the Transfers page at all -- a completed transfer needs
+ * the same "stop showing this row" action a failed or stopped one already had.
+ *
+ * Lives here, not in `TransfersPage.tsx` (where it shipped 2026-08-13), as of 2026-08-17
+ * (prompts/2026-08-17-transfers-dismiss-per-queue.md): the group header's own "Dismiss Queue"
+ * control needs the exact same predicate to decide whether it has anything to do
+ * (`groupHasDismissable` below), and `lib/` can't import from `pages/` -- this is the one
+ * definition both sides now share, rather than a second copy of the state list drifting out of
+ * sync with `dismiss_job`'s guard. `TransfersPage.tsx` re-exports this name so its own existing
+ * import (and `TransfersPage.test.ts`'s) keeps working unchanged.
+ */
+export function isDismissable(state: JobOut['state']): boolean {
+  return state === 'failed' || state === 'cancelled' || state === 'succeeded'
+}
+
 // --- Group by queue (2026-08-16, prompts/2026-08-16-transfers-group-by-queue.md): "per-row
 // queue labels make the page busy" -- the queue name/summary moves to a collapsible group
 // header, one per queue, so individual rows can stop repeating it. ------------------------
@@ -305,6 +324,19 @@ export function groupJobsByQueue(jobs: JobOut[]): QueueGroup[] {
     group.jobs.push(job)
   }
   return [...groups.values()].sort((a, b) => a.queueName.localeCompare(b.queueName))
+}
+
+/** Whether a `GroupHeader`'s own "Dismiss Queue" control (2026-08-17,
+ * prompts/2026-08-17-transfers-dismiss-per-queue.md) has anything to do -- true once at least
+ * one job in this group is `isDismissable` (terminal, and therefore still shown at all: a
+ * dismissed job never appears in `jobs` in the first place, per `core/queue.py.list_jobs`).
+ * Reuses `isDismissable` rather than re-listing its three states here -- the same predicate a
+ * single row's own Dismiss button already uses, applied to the whole group. Hidden entirely at
+ * `false`, matching "Dismiss all"'s own "don't show a control with nothing to do" rule
+ * (`TransfersPage.tsx`'s `dismissableCount > 0` gate).
+ */
+export function groupHasDismissable(jobs: JobOut[]): boolean {
+  return jobs.some((job) => isDismissable(job.state))
 }
 
 /** A group header's job counts by outcome. The task's own instruction names four buckets --
@@ -530,6 +562,23 @@ export function groupHistoryJobsByQueue(
     if (!currentCollapsed) rows.push({ kind: 'job', job })
   }
   return rows
+}
+
+/** Whether a failed row's expand panel needs the on-demand `GET .../output` fetch, or can render
+ * a static empty state straight from the list row it already has (2026-08-17,
+ * prompts/2026-08-17-interrupted-job-popout-explains-itself.md). Before this,
+ * `HistoryJobsSection.tsx`'s `handleToggle` only fetched when `has_output_tail` was true, and the
+ * panel's "No output was captured for this job." message only rendered once a fetch actually
+ * landed -- so a failed job with no captured output (an INTERRUPTED job recovered before
+ * `core/queue.py`'s startup sweep started writing one, or any other tail-less failure already
+ * sitting in a user's database) expanded to a completely blank panel: the empty-state copy
+ * existed in the code but was unreachable for exactly the one failure class that most needed it.
+ * `job.error_class` is already on the list row, so the static case needs no fetch at all.
+ */
+export type FailedJobPanelContent = { kind: 'fetch' } | { kind: 'static'; errorClass: string | null }
+
+export function failedJobPanelContent(job: HistoryJobOut): FailedJobPanelContent {
+  return job.has_output_tail ? { kind: 'fetch' } : { kind: 'static', errorClass: job.error_class }
 }
 
 /** The local-update counterpart to the `jobs`/`total` state trimming `HistoryJobsSection.tsx`'s

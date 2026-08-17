@@ -77,6 +77,69 @@ than a first. Two things that bit the first time and will bit again:
 
 ## Where we are
 
+### Post-v0.2.2 work on `dev` (2026-08-17, same day as the release) — four user-driven items, all pushed
+
+Four items from live use of the fresh v0.2.2 `:dev` build, each its own handoff prompt in
+`prompts/done/2026-08-17-*`, each verified green (every gate run separately) and pushed:
+
+| What | Commit |
+|---|---|
+| **Bulk delete applies Local/Source per entry, not as blanket flags** — a mixed multi-select (some rows with no local content, e.g. `REMOTE_ONLY` or stranded `REMOVED_LOCAL`) errored 409 per no-local row and never attempted its source delete. New pure `lib/fileTree.ts.effectiveDeleteScope` (Local only where `hasLocalContent`, Source only where `hasRemoteCopy`, `null` = no request); rows with nothing applicable land in a new **skipped** bucket in the bulk outcome (distinct from failures, stay selected). Frontend-only; the backend's 409-on-local-withhold contract deliberately unchanged (rejected alternative in `docs/decisions.md`) | `c786d02` |
+| **Interrupted-job History popout explains itself** — live find (Fresh.Off.the.Boat S04E16, jobs 265/266 on the test system): a container restart at 18:21:49Z cut a running mirror; the failed/`INTERRUPTED` row expanded to a *blank* panel (the fetch guard skipped `has_output_tail: false` rows and the empty-state message was unreachable), and recovery recorded no reason. Startup recovery now writes an explanatory `output_tail` (guarded, never clobbers a real tail); the failed-row panel renders a static error-class + "No output was captured" state without fetching. **Attempt-grouping and a "resumed by job N" annotation were considered with the user and rejected** (pagination/filtering make the pairing unreliable; disproportionate) — the rows stay as they are, they just explain themselves | `b63529e` |
+| **Settings → Queues list shows the Sonarr/Radarr brand icon on bound queues** — new exported `ArrBrandMark` (plain brand logo, no status overlay — the *binding* fact, not item status), `ArrRowChip` rebuilt on it so the kind→logo mapping stays single; rendered in the Name cell via pure `queueArrBindingMark` (muted + "(instance disabled)" tooltip when the instance is disabled, text-chip fallback for a deleted instance) | `109ac96` |
+| **Dashboard bytes chart gains 24h/7d/30d ranges + a range total** — `_RANGES` gains `7d` (28×6h) and `30d` (30×1d); Chart 1 gets its own selector (`dashboard.bytesRange`, independent of the speed chart's untouched 1h/12h/24h), labels/title scale with bucket width, header shows the range total and the legend per-queue totals (client-side, pure `lib/bytesChart.ts`); a retention note (via the previously call-site-less `GET /api/settings/metrics`) explains empty older buckets when the range exceeds retention — **retention defaults to 7d, so 30d is only fully populated after raising it in Settings**. `BytesPerHourChart.tsx` renamed `BytesChart.tsx` | `4f1a912` |
+| **Transfers group headers gain a per-queue "Dismiss Queue" control** (label the user's own) — `POST /api/jobs/dismiss-all` takes an optional `{queue_id}` body (`DismissAllRequest`; omitted = the old every-queue behavior, scoping is a subquery over `item` since `job` carries no `queue_id`), `GroupHeader` shows the button only when its group has dismissable rows (`lib/transferPanel.ts.groupHasDismissable`, `isDismissable` moved into `lib/` and re-exported), per-queue busy/error state so groups don't lock each other. The header itself became a keyboard-accessible `div role="button"` — HTML forbids a button inside a `<button>`. **Confirmed working by the user in-browser (fresh `:dev` pull, 2026-08-17)** | `278e10f` |
+| **Chart height cap + single scroll context** — live follow-up from the user's first look at `4f1a912`: the SVG charts (viewBox + `w-full`, no height bound) grew taller as the window widened, and the shell's `min-h-screen` root let the window scrollbar engage alongside `main`'s `overflow-auto`, revealing unstyled white below the page in dark mode. Both charts now cap at `max-h-80` inside a centered `max-w-4xl` block (`charts/chartLayout.ts` — width cap chosen so `preserveAspectRatio="meet"` never actually pillarboxes); the shell root is `h-dvh overflow-hidden` (`dvh` over `h-screen` deliberately — mobile browser chrome; `docs/decisions.md`) making `main` the only scroller, and `index.css` themes `html, body` so overscroll can't flash white. All four react-virtual containers verified to scroll their own ref'd divs, never `window`, before the shell change. **Confirmed working by the user in a real browser (fresh `:dev` pull, 2026-08-17)** — the one item of this batch that's been human-viewed | `1416175` |
+
+Tests after the run: **1281 backend / 468 frontend, 0 skipped.** Browser status
+(user-checked on a fresh `:dev` pull, 2026-08-17): **bulk-delete skipped reporting and the
+interrupted-popout empty state both confirmed working**, alongside the chart-cap fix in the
+row below; still unviewed: the Settings → Queues *arr icons and the bytes chart's 7d/30d
+ranges/totals. Operational note for the two spawned coding agents
+that stalled: both backgrounded the ~3-minute pytest run and waited on a notification that
+never reaches a subagent — a `SendMessage` nudge ("run it in the foreground, read the exit
+code, deliver the report") resumed each; tell future agents to run gates in the foreground
+with an adequate timeout up front.
+
+### 🚀 v0.2.2 released 2026-08-17 (same day as v0.2.1) — self-healing *arr reliability, what's-new popup, support bundle
+
+PR #8 (`dev` → `main`, merged `ff73bcb`), tag `v0.2.2`, release notes = the `[0.2.2]`
+CHANGELOG section verbatim; `:latest`/`:0.2.2`/`:0` images published on the release event.
+**The merge bypassed branch-protection checks — deliberately, by the user, and the rationale
+matters:** GitHub had major service outages that day (503s on the API for hours); the CodeQL
+JS analysis failed to *upload* ("1 configuration not found" — an infra failure, not a
+finding), while **both real workflows (CI, image publish) were green** and the identical code
+had passed both CodeQL analyses clean on every earlier same-day push. No security signal was
+bypassed, only a check that couldn't run. The release-create itself took retry loops with an
+exists-check before each attempt (never re-tag) — that duplicate-safe retry shape is worth
+reusing next time GitHub wobbles. Tests at release: **1278 backend / 438 frontend, 0
+skipped.** Build-run rows U–Z + two unlettered commits are the item log; the headline
+content: the **what's-new upgrade popup + Docs → Release notes** (version link now routes
+in-app), the **orphaned spent-archive fix** (EXCLUDED exemption lapses with the parent,
+retroactively self-healing), the **stranded-source-delete retry sweep** + cleanup-ordering
+gate + Delete-reachable-for-remote-only-rows escape hatch, the **notify feedback loop**
+(`arr_path_mismatch` predictive + `arr_scan_command_failed` confirmed, migration **021**),
+the Queues **"Path as seen by the *arr" field moved under Local path** with a namespace
+tooltip, **Logs text filter + 10k lookback**, and the **support bundle** (zip, secrets
+verified absent from a real bundle, per-instance 20 MB *arr-log budget).
+
+**The day's production diagnosis, worth remembering:** the user's production *arrs mount
+storage at a different path than lftpweb (`/mnt/seanas02_media/Working/...` vs
+`/mnt/seanas02-media-working/...`). With `arr_visible_path` unset, every notify push was a
+silently-accepted no-op (201, then the *arr scanned a nonexistent path), imports fell back to
+the *arr's own schedule, and 15 associations drifted to `gone` with sources stranded on the
+seedbox. **The user has since set `arr_visible_path` on both production queues.** The two new
+warning events exist precisely so this class of failure can never be silent again — a clean
+run produces neither. Also verified live on the test system before release: the stranded
+Bull S06E22 source was deleted by the new retry sweep on its own (`events.ndjson` in the
+user's first real support bundle carries the proof).
+
+**Unviewed as of the cut:** the what's-new popup, Release notes page, support-bundle dialog,
+the moved Queues field/tooltip, the logs filter — all shipped browser-unverified per this
+environment's standing limitation; the user has exercised the browse dialogs and generated
+one real support bundle (reviewed clean by the session, four flaws found and fixed same day —
+rows Y/Z).
+
 ### 🚀 v0.2.1 released 2026-08-17 — path browsing, save-time validation, live-use fixes
 
 PR #7 (`dev` → `main`, merged `79ea0ea`, **auto-closed GitHub issue #4** via `Closes #4` in

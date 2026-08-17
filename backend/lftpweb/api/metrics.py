@@ -36,11 +36,21 @@ settings_router = APIRouter(prefix="/api/settings/metrics")
 # same 1-minute resolution would be 1,440 points on a chart nobody can read, for no more
 # information than the hourly resolution the bytes-per-hour bar chart already uses. 24h's own
 # bucket width (3600s) is deliberately the same as that bar chart's, so the two charts agree
-# on what "one bar/point" means when both are looking at the same day.
+# on what "one bar/point" means when both are looking at the same day. 2026-08-17
+# (prompts/done/2026-08-17-bytes-chart-7d-30d-ranges-and-total.md) extends this same reasoning
+# further out: 7d at 24 hourly bars would be a 168-bar chart nobody can read either, so it
+# steps to 6-hour buckets (28 bars/week, still fine enough to see a day's shape); 30d steps
+# again to 1-day buckets (30 bars/month, one bar per day -- any finer and the chart is wider
+# than it is informative). Both new ranges feed the bytes chart only (Chart 1's own range
+# selector, `dashboard.bytesRange`) -- the speed chart's 1h/12h/24h selector is untouched, on
+# purpose: speed over a week/month at these bucket widths would average away exactly the
+# spikes a speed chart exists to show.
 _RANGES: dict[str, tuple[int, int]] = {
     "1h": (1, 60),  # 60 x 1-minute buckets
     "12h": (12, 900),  # 48 x 15-minute buckets
     "24h": (24, 3600),  # 24 x 1-hour buckets
+    "7d": (168, 21600),  # 28 x 6-hour buckets
+    "30d": (720, 86400),  # 30 x 1-day buckets
 }
 
 
