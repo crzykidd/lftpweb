@@ -77,6 +77,28 @@ than a first. Two things that bit the first time and will bit again:
 
 ## Where we are
 
+### 🚀 v0.2.1 released 2026-08-17 — path browsing, save-time validation, live-use fixes
+
+PR #7 (`dev` → `main`, merged `79ea0ea`, **auto-closed GitHub issue #4** via `Closes #4` in
+the PR body — the `(#4)` reference in the feature commit alone would not have), tag `v0.2.1`,
+release notes = the `[0.2.1]` CHANGELOG section verbatim; `:latest`/`:0.2.1`/`:0` images
+published on the release event. The headline is the **path browse dialog** on Settings →
+Queues' three path fields (rows S–T in the build-run table below), **save-time path
+validation** (a mistyped `local_path` now blocks the save with an inline reason instead of
+surfacing hours later as a log line), **mount-gate audit events** (`autoqueue_gated`/
+`autoqueue_ungated`, visible on History → Events), and the `gone`-commit `REMOVED_BOTH`
+resurrection fix. Tests at release: **1242 backend / 389 frontend, 0 skipped.** The release
+PR's CodeQL gate raised 3 `py/path-injection` alerts on `core/browse.py` (#16–#18) —
+**verified by-design (metadata-only ops, auth-gated, browsing is the feature) and dismissed
+`won't fix` with the user's approval**; `docs/decisions.md` (2026-08-16) has the full
+reasoning, including why a scanner-appeasing `normpath`+`startswith("/")` guard was rejected.
+Also this session but pre-release: a deep-dive into "does the *arr push actually trigger
+import?" concluded from the test system's audit trail that it does (push fires <500 ms after
+job completion; ~2–3 min of perceived lag is lftpweb's own two-pass confirmation cadence) —
+**the user's production system remains unverified**; see the memory note on the two
+deployments and the production checklist (notify_on_complete, `arr_visible_path` namespace,
+Radarr History timestamps).
+
 ### 🚀 v0.2.0 released 2026-08-16 — the Sonarr/Radarr release
 
 PR #6 (`dev` → `main`, merged `013bf7a`), tag `v0.2.0`, release notes = the `[0.2.0]`
