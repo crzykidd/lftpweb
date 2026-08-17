@@ -29,8 +29,17 @@ from pathlib import Path
 from typing import BinaryIO
 
 DEFAULT_MAX_LINES = 200
-MAX_LINES_CAP = 2000
-DEFAULT_MAX_BYTES = 2 * 1024 * 1024  # 2 MB -- the hard ceiling on what any one tail reads
+MAX_LINES_CAP = 10000
+
+# Mirrors `logsetup.MAX_BYTES` (5 MB) rather than importing it: `logtail.py` is `core/`,
+# `logsetup.py` sits a layer up (process-wide logging config, imported by `main.py` before the
+# app itself is built) -- pulling it down into `core/` would be a layering violation for one
+# constant. The linkage is deliberate, not coincidental: this is the per-tail byte ceiling, and
+# it needs to be able to cover one *whole* live log file (2026-08-17,
+# prompts/2026-08-17-logs-search-and-lookback.md) -- a rotated file is at most `MAX_BYTES`, so
+# anything smaller would make `MAX_LINES_CAP` (10000 lines) unreachable on a busy install well
+# before the file itself runs out. 10k lines at a typical ~150-200 B/line comfortably fits.
+DEFAULT_MAX_BYTES = 5 * 1024 * 1024  # 5 MB -- keep in lockstep with logsetup.MAX_BYTES
 _CHUNK_SIZE = 65536
 
 _LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")

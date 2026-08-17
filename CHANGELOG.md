@@ -42,6 +42,11 @@ Skeleton for the next roll:
   longer fire-and-forget: lftpweb now checks whether the *arr's scan command actually completed
   and writes a warning if it didn't, rather than only ever knowing whether the push was
   *accepted*. Both are advisory only — they change no behavior, only visibility, in History.
+- **Settings → Logs gains a text filter and a deeper lookback.** A new search box filters the
+  currently-shown lines by a case-insensitive substring, instantly, with no refetch, alongside
+  a "showing N of M lines" readout while it's active. The `Lines` option tops out at 10,000
+  (was 2,000) so the *arr integration's per-minute poller traffic no longer eats the whole
+  window in under an hour on a busy install.
 
 ### Changed
 

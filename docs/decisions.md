@@ -6,6 +6,45 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-17 — Logs text filter stays client-side over the fetched window; byte ceiling mirrors `logsetup.MAX_BYTES`, not imported
+
+`prompts/done/2026-08-17-logs-search-and-lookback.md`. User request: Settings → Logs needed a
+text filter and a deeper lookback than the old 2,000-line cap — the *arr integration's
+per-minute poller HTTP lines now dominate a busy install's log, so 2,000 lines covered well
+under an hour.
+
+**The text filter searches the already-fetched window only, never a server-side grep across
+rotated files.** Considered and rejected: a `GET /api/logs/tail?q=...` server-side substring (or
+regex) search across the current file and its rotations, so a filter could reach further back
+than any one fetch's line count. Rejected because the two features (raise the lookback, add a
+filter) are meant to compound, not compete: `MAX_LINES_CAP` going to 10,000 means the fetched
+window can now span an entire live log file on its own — pairing that with a client-side filter
+gets "search the whole live file" for free, instantly, with no new endpoint, no new query
+grammar, and no risk of reintroducing an unbounded read on the one code path (`core/logtail.py`)
+that exists specifically to avoid that (see the 2026-08-11 "lftp is a transfer engine" entry
+below for the same shape of judgment: bound the read, don't special-case around the filter that
+would tempt you to lift the bound). A rotated-file search stays a real gap for anyone chasing an
+incident that predates the current file — named, not hidden — but is not being built now.
+
+**`DEFAULT_MAX_BYTES` (the per-tail byte ceiling) moved from a hardcoded 2 MB to 5 MB, mirrored
+from `logsetup.MAX_BYTES` rather than imported.** The two constants need to move together — the
+byte ceiling has to be able to cover one whole live log file for the line ceiling above it to be
+reachable at all — but `core/logtail.py` is `core/`, and `logsetup.py` is configured once,
+process-wide, before the app (and its `core/` package) is built at all; importing it down into
+`core/` for one integer would be a real layering violation, not a style nit. A code comment on
+each constant names the linkage explicitly instead, so a future change to one is visible from
+the other without a runtime dependency between them. No new byte-budget test was needed — the
+existing instrumented test (`tests/test_logtail.py::test_tail_lines_never_reads_more_than_the_byte_cap`)
+already passes its own `max_bytes` explicitly rather than relying on the default, so it wasn't
+pinned to the old 2 MB number and needed no change.
+
+**No match highlighting in v1.** The filter narrows which lines render; it does not mark up
+matched substrings inside them. Named as a scope line in the task brief, not discovered as a
+gap during the work — a plain, cheap first cut, with highlighting left for if it's actually
+wanted later.
+
+---
+
 ## 2026-08-17 — Scan-command outcome verification: a persisted column, not memory; a 404 is silent; bounded checks
 
 `prompts/done/2026-08-17-stranded-source-delete-retry.md` (a same-day scope addition, folded

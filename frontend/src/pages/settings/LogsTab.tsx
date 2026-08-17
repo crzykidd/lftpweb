@@ -1,12 +1,16 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { getLogFiles, getLogTail, logDownloadUrl } from '../../api/client'
 import type { LogFileOut, LogLevel } from '../../api/types'
 import { FieldHelp } from '../../components/FieldHelp'
 import { formatBytes } from '../../lib/format'
+import { filterLogLines, logFilterSummary } from '../../lib/logFilter'
 
 const LEVELS: LogLevel[] = ['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL']
+const LINE_COUNT_OPTIONS = [100, 200, 500, 1000, 2000, 5000, 10000]
 
 const selectClasses =
+  'rounded-md border border-zinc-300 bg-white px-2.5 py-1.5 text-sm text-zinc-900 outline-none focus:border-zinc-500 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100'
+const inputClasses =
   'rounded-md border border-zinc-300 bg-white px-2.5 py-1.5 text-sm text-zinc-900 outline-none focus:border-zinc-500 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100'
 const buttonClasses =
   'rounded-md bg-zinc-900 px-3 py-1.5 text-sm font-medium text-white hover:bg-zinc-700 disabled:opacity-50 dark:bg-zinc-100 dark:text-zinc-900 dark:hover:bg-zinc-300'
@@ -24,6 +28,7 @@ export function LogsTab() {
   const [truncated, setTruncated] = useState(false)
   const [level, setLevel] = useState<LogLevel | ''>('')
   const [maxLines, setMaxLines] = useState(200)
+  const [textFilter, setTextFilter] = useState('')
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
 
@@ -48,6 +53,13 @@ export function LogsTab() {
     load()
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
+
+  // Client-side only, over the fetched window (`lines`) -- no refetch. `lib/logFilter.ts` has
+  // the settled scope: at the 10k-line ceiling this window can span an entire live file, which
+  // is the point of pairing the deeper lookback with this filter rather than a server-side grep
+  // across rotated files (docs/decisions.md).
+  const filteredLines = useMemo(() => filterLogLines(lines, textFilter), [lines, textFilter])
+  const filterSummary = logFilterSummary(filteredLines.length, lines.length, textFilter)
 
   if (loading) return <p className="text-sm text-zinc-500 dark:text-zinc-400">Loading…</p>
 
@@ -98,12 +110,45 @@ export function LogsTab() {
             value={maxLines}
             onChange={(e) => setMaxLines(Number(e.target.value))}
           >
-            {[100, 200, 500, 1000, 2000].map((n) => (
+            {LINE_COUNT_OPTIONS.map((n) => (
               <option key={n} value={n}>
                 {n}
               </option>
             ))}
           </select>
+        </label>
+
+        <label className="flex flex-col gap-1">
+          <span className="text-sm font-medium text-zinc-700 dark:text-zinc-300">
+            Filter
+            <FieldHelp label="Filter">
+              <p>
+                Case-insensitive substring search over the lines already shown above -- instant,
+                no refetch. It only searches the fetched window (the Lines setting): it does not
+                reach further back into the file, or into rotated files, than that window already
+                covers.
+              </p>
+            </FieldHelp>
+          </span>
+          <div className="flex items-center gap-1">
+            <input
+              type="text"
+              className={`${inputClasses} w-56`}
+              placeholder="Search shown lines…"
+              value={textFilter}
+              onChange={(e) => setTextFilter(e.target.value)}
+            />
+            {textFilter && (
+              <button
+                type="button"
+                onClick={() => setTextFilter('')}
+                title="Clear filter"
+                className="rounded-md px-2 py-1.5 text-sm text-zinc-500 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800"
+              >
+                ×
+              </button>
+            )}
+          </div>
         </label>
 
         <button type="button" className={buttonClasses} onClick={load}>
@@ -120,8 +165,12 @@ export function LogsTab() {
         </p>
       )}
 
+      {filterSummary && (
+        <p className="text-xs text-zinc-500 dark:text-zinc-400">{filterSummary}</p>
+      )}
+
       <pre className="max-h-[32rem] overflow-auto rounded-md border border-zinc-200 bg-zinc-50 p-3 text-xs text-zinc-800 dark:border-zinc-800 dark:bg-zinc-950 dark:text-zinc-200">
-        {lines.length > 0 ? lines.join('\n') : '(no matching lines)'}
+        {filteredLines.length > 0 ? filteredLines.join('\n') : '(no matching lines)'}
       </pre>
 
       <div className="flex flex-col gap-2">
