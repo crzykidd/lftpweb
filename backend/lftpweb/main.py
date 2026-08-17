@@ -22,6 +22,7 @@ from lftpweb.api import backup as backup_api
 from lftpweb.api import browse, files, health, history, jobs, logs, stats, ws
 from lftpweb.api import metrics as metrics_api
 from lftpweb.api import settings_arr, settings_host, settings_postprocess, settings_queues
+from lftpweb.api import support_bundle
 from lftpweb.config import settings
 from lftpweb.core import auth
 from lftpweb.core.arrsync import ArrSyncScheduler
@@ -203,6 +204,7 @@ def create_app() -> FastAPI:
     app.include_router(jobs.router)
     app.include_router(history.router)
     app.include_router(logs.router)
+    app.include_router(support_bundle.router)
     app.include_router(backup_api.router)
     app.include_router(auth_api.router)
     app.include_router(auth_api.settings_router)

@@ -6,6 +6,55 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-17 — Support bundle: zip not rar, DB excluded, settings dump built from response models, per-part failure isolation
+
+`prompts/done/2026-08-17-support-bundle.md`. User request: Settings → Logs gains a "Support
+bundle" button, a checkbox dialog producing one downloadable diagnostic archive.
+
+**The user said "rar"; this ships a zip.** RAR creation is proprietary (no open-source
+encoder), the image ships no `rar` binary (7-Zip handles extraction of archives the seedbox
+sends, not creation of new ones), and Python's stdlib `zipfile` needs no new dependency, no
+subprocess, and no license question. A zip is also what every issue tracker and support inbox
+already knows how to open without a plugin.
+
+**The SQLite database is deliberately never included**, even though it would be the single
+richest diagnostic artifact. It carries every encrypted secret this app stores (seedbox
+password/key, every *arr API key) plus the encryption landscape itself (`core/crypto.py`) —
+handing it out is handing out the keys, not just the lock's serial number. What support
+actually needs from it — schema/migration level, and the settings as they're currently
+configured — is covered by `bundle/environment.json`'s `migration_level` and
+`bundle/settings.json` instead, at a fraction of the risk.
+
+**`bundle/settings.json` is built by calling the same row→response-model conversion functions
+the settings endpoints already return** (`_host_out_from_row`, `_queue_out_from_row`,
+`_instance_out_from_row`, `_pattern_out_from_row`, `_postprocess_out`, plus
+`api/jobs.py`'s transfer-settings equivalent) — never a hand-picked `SELECT` of "the columns
+that look safe." Those functions are already the one place in the codebase a secret is kept off
+the wire (`HostOut.has_password` instead of the password, `ArrInstanceOut.has_api_key` instead
+of the key); reusing them means a bundle can only ever leak what the authenticated Settings API
+itself would already leak, and a future field added to `host`/`arr_instance` that needs
+redacting only has to be redacted once, at its response model, not twice. `tests/
+test_support_bundle_api.py::test_settings_dump_never_contains_secrets` seeds a real password and
+a real *arr API key and asserts both are absent from the settings dump specifically, and from
+every byte of the zip as a coarser check.
+
+**A per-instance *arr log fetch failure (unreachable, bad key, a 5xx) writes one
+`FETCH-FAILED.txt` marker in that instance's own `bundle/arr-<name>/` directory and does not
+fail the bundle.** The alternative — one instance's outage 500ing the whole request — would
+make the bundle least available exactly when a broken *arr integration is the thing being
+diagnosed. The same containment covers a stored API key that fails to decrypt.
+`core/supportbundle.py._safe_zip_component` also floors every *arr-supplied name (instance
+name, log filename) to a single path component before it becomes a zip entry path — `zipfile.
+ZipFile.writestr` does not sanitize its target path the way `extractall` sanitizes its own, so a
+misbehaving or compromised *arr instance must not be able to name a `../` segment and land a
+file outside its own directory in the bundle.
+
+**No redaction pass is attempted on fetched *arr log files.** They are the *arr's own logs, not
+lftpweb's — including one per instance is the user's own explicit, per-checkbox opt-in, the same
+trust boundary as pasting a log into a GitHub issue by hand.
+
+---
+
 ## 2026-08-17 — Logs text filter stays client-side over the fetched window; byte ceiling mirrors `logsetup.MAX_BYTES`, not imported
 
 `prompts/done/2026-08-17-logs-search-and-lookback.md`. User request: Settings → Logs needed a

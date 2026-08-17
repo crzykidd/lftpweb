@@ -24,6 +24,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 from typing import Any, Literal
+from urllib.parse import quote
 
 import httpx
 
@@ -282,6 +283,47 @@ class ArrClient:
         except httpx.HTTPError as exc:
             raise ArrClientError(f"{self.kind} command {name} failed: {exc}") from exc
         return response.json()
+
+    async def log_files(self) -> list[dict[str, Any]]:
+        """`GET /api/v3/log/file` -- the instance's own list of log files (support bundle,
+        2026-08-17, `core/supportbundle.py`). Not paginated on the real API (an *arr's log
+        directory is small, rotation-bounded, unlike `/queue`/`/history`), so this is a single
+        request returning the raw record list -- each record's own `filename` is what
+        `download_log_file` below takes.
+        """
+        data = await self._get("/api/v3/log/file")
+        return data if isinstance(data, list) else []
+
+    async def download_log_file(self, filename: str, *, max_bytes: int) -> tuple[bytes, bool]:
+        """`GET /api/v3/log/file/{filename}` -- one log file's content, streamed and capped at
+        `max_bytes` (support bundle, 2026-08-17: the plan's own "cap per-instance fetch at a
+        sane byte budget"). Returns `(content, truncated)` -- `truncated` is True the moment
+        the cap is hit, so the caller can note it in the bundle rather than silently shipping a
+        cut-off file. Streamed rather than a plain `client.get(...).content` precisely so a log
+        file far larger than the cap is never pulled fully into memory first.
+        """
+        try:
+            async with self._client.stream(
+                "GET", f"/api/v3/log/file/{quote(filename, safe='')}"
+            ) as response:
+                response.raise_for_status()
+                chunks = bytearray()
+                truncated = False
+                async for chunk in response.aiter_bytes():
+                    remaining = max_bytes - len(chunks)
+                    if remaining <= 0:
+                        truncated = True
+                        break
+                    if len(chunk) > remaining:
+                        chunks.extend(chunk[:remaining])
+                        truncated = True
+                        break
+                    chunks.extend(chunk)
+                return bytes(chunks), truncated
+        except httpx.HTTPError as exc:
+            raise ArrClientError(
+                f"{self.kind} GET /api/v3/log/file/{filename} failed: {exc}"
+            ) from exc
 
     async def get_command(self, command_id: int) -> dict[str, Any] | None:
         """`GET /api/v3/command/{id}` -- the eventual outcome of a previously-pushed command

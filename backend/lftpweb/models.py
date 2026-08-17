@@ -1185,3 +1185,27 @@ class ArrTestResponse(BaseModel):
     error_class: str | None
     message: str
     version: str | None = None
+
+
+# --- Support bundle (Settings -> Logs, 2026-08-17) ---------------------------------------
+#
+# `POST /api/support-bundle` (`api/support_bundle.py`, `core/supportbundle.py`): a downloadable
+# diagnostic zip -- see that module's docstring for the full bundle shape. lftpweb's own logs
+# are always included (the dialog shows that checkbox checked and disabled), so there is no
+# field here to turn them off; every other part defaults on, matching the dialog's own
+# default-all-checked state -- a client that sends `{}` gets everything except *arr logs (which
+# need an instance id to name, so there is no "all" default for those).
+
+MAX_ARR_INSTANCE_IDS = 64  # generous: no real install binds anywhere near this many instances
+
+
+class SupportBundleRequest(BaseModel):
+    include_environment: bool = True
+    include_settings: bool = True
+    include_events: bool = True
+    include_jobs: bool = True
+    # Enabled *arr instance ids whose own Sonarr/Radarr log files should be fetched and
+    # bundled -- empty (the default) fetches none. One checkbox per enabled instance on the
+    # frontend, all pre-checked; unlike the fixed boolean parts above this list is inherently
+    # variable-length, so "select everything" is expressed as "name every id", not a bool.
+    arr_instance_ids: list[int] = Field(default_factory=list, max_length=MAX_ARR_INSTANCE_IDS)

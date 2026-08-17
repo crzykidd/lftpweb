@@ -47,6 +47,15 @@ Skeleton for the next roll:
   a "showing N of M lines" readout while it's active. The `Lines` option tops out at 10,000
   (was 2,000) so the *arr integration's per-minute poller traffic no longer eats the whole
   window in under an hour on a busy install.
+- **Settings → Logs gains a "Support bundle…" button** — a dialog of checkboxes (all default
+  ON) producing one downloadable zip to attach to an issue or send manually: lftpweb's own logs
+  (always included), a build/environment snapshot (version, migration level, health, `lftp`/
+  Python versions, per-queue disk usage), a sanitized settings dump (built from the same
+  response models the Settings pages already return, so a secret can never leak into it), the
+  most recent 1,000 audit events, the most recent 100 jobs with their error output, and — one
+  checkbox per enabled Sonarr/Radarr instance — that instance's own log files. A single *arr
+  instance's log fetch failing never fails the rest of the bundle. The database itself, the
+  `known_hosts` pins, and the install secret are never included.
 
 ### Changed
 

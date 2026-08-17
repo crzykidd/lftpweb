@@ -1,6 +1,6 @@
 # Concepts
 
-The eight things that actually trip people up, and what to do about each.
+The nine things that actually trip people up, and what to do about each.
 
 ```jump
 Nothing downloaded for a minute|#settle
@@ -11,6 +11,7 @@ The lifecycle icons|#icons
 copy vs move|#copy-move
 Inherit vs override|#inherit
 The Sonarr/Radarr icon|#arr-integration
+What's in a support bundle|#support-bundle
 ```
 
 ## Why nothing downloaded for a minute — the settle gate {#settle}
@@ -290,3 +291,23 @@ Hover the mark for which instance matched it and when.
 > history to confirm an import, and checks both are still true a minute later before treating
 > anything as finished. A release simply vanishing from the *arr's queue with no import evidence
 > is never treated as imported — that is exactly the amber-warning case above.
+
+## What's in a support bundle {#support-bundle}
+
+**Settings → Logs → "Support bundle…"** builds one downloadable zip to attach to an issue or
+send manually. Each part is its own checkbox, all default on:
+
+| Part | Contents |
+|---|---|
+| lftpweb logs | The live log file plus every rotated file, exactly what Settings → Logs already lists. Always included — this checkbox is checked and disabled. |
+| Environment snapshot | Version, build, migration level, the health readout, `lftp`/Python versions, and per-queue disk usage. |
+| Settings dump | Host config, queues, patterns, transfer/post-processing settings, auth mode, and *arr instances — built from the same responses the Settings pages already return, so it can never carry a password, API key, or key material. |
+| Recent audit trail | The most recent 1,000 History events. |
+| Recent job history | The most recent 100 jobs, including their error output. |
+| A Sonarr/Radarr instance's logs | One checkbox per *enabled* instance — its own log files, fetched live from that *arr. Hidden entirely when no instance is enabled. |
+
+The SQLite database itself is never included — it carries every encrypted secret this app
+stores, and the settings dump above covers what support actually needs. If one Sonarr/Radarr
+instance can't be reached while building the bundle, that instance's directory gets a
+`FETCH-FAILED.txt` note instead of failing the whole download. Building a bundle writes one
+audit event so there is always a record of when one was made and what it contained.

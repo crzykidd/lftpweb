@@ -25,7 +25,7 @@ from typing import Any
 
 import pytest
 import uvicorn
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
 
 DEFAULT_API_KEY = "test-arr-key"  # noqa: S105 - test-only fixture credential, never real
@@ -46,6 +46,11 @@ class FakeArrState:
     # both read as 404 to `core/arrclient.py.ArrClient.get_command` and `core/arrsync.py`'s
     # check, the same "no evidence either way" outcome either way.
     command_statuses: dict[int, dict[str, Any]] = field(default_factory=dict)
+    # Support bundle (2026-08-17, `core/supportbundle.py`): `filename -> content` for
+    # `GET /api/v3/log/file` (list) / `GET /api/v3/log/file/{filename}` (download). A test
+    # populates this directly to model an instance's own log directory; empty (the default)
+    # models an instance with no log files on disk yet.
+    log_files: dict[str, bytes] = field(default_factory=dict)
     # Force a small effective page size regardless of what the client requests -- the one
     # knob the pagination test needs to make one small queue/history split across pages
     # without needing 250+ fixture records to do it honestly.
@@ -129,6 +134,26 @@ def create_fake_arr_app(state: FakeArrState) -> FastAPI:
         if status_body is None:
             return JSONResponse(status_code=404, content={"message": "command not found"})
         return status_body
+
+    @app.get("/api/v3/log/file")
+    async def log_file_list() -> Any:
+        return [
+            {
+                "filename": name,
+                "lastWriteTime": "2026-08-17T00:00:00Z",
+                "contentsUrl": f"/api/v3/log/file/{name}",
+                "downloadUrl": f"/api/v3/log/file/{name}",
+                "id": i + 1,
+            }
+            for i, name in enumerate(state.log_files)
+        ]
+
+    @app.get("/api/v3/log/file/{filename}")
+    async def log_file_download(filename: str) -> Any:
+        content = state.log_files.get(filename)
+        if content is None:
+            return JSONResponse(status_code=404, content={"message": "log file not found"})
+        return Response(content=content, media_type="text/plain")
 
     return app
 

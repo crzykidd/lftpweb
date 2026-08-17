@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from 'react'
 import { getLogFiles, getLogTail, logDownloadUrl } from '../../api/client'
 import type { LogFileOut, LogLevel } from '../../api/types'
 import { FieldHelp } from '../../components/FieldHelp'
+import { SupportBundleDialog } from '../../components/SupportBundleDialog'
 import { formatBytes } from '../../lib/format'
 import { filterLogLines, logFilterSummary } from '../../lib/logFilter'
 
@@ -31,6 +32,7 @@ export function LogsTab() {
   const [textFilter, setTextFilter] = useState('')
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
+  const [bundleOpen, setBundleOpen] = useState(false)
 
   const load = async () => {
     setError(null)
@@ -154,7 +156,17 @@ export function LogsTab() {
         <button type="button" className={buttonClasses} onClick={load}>
           Refresh
         </button>
+
+        <button
+          type="button"
+          className="rounded-md border border-zinc-300 px-3 py-1.5 text-sm font-medium text-zinc-700 hover:bg-zinc-50 dark:border-zinc-700 dark:text-zinc-200 dark:hover:bg-zinc-900"
+          onClick={() => setBundleOpen(true)}
+        >
+          Support bundle…
+        </button>
       </div>
+
+      {bundleOpen && <SupportBundleDialog onClose={() => setBundleOpen(false)} />}
 
       {error && <p className="text-sm text-red-600 dark:text-red-400">{error}</p>}
 
