@@ -13,6 +13,19 @@ body,
   height: 100%;
 }
 
+/* 2026-08-17 (prompts/done/2026-08-17-chart-height-cap-and-single-scroll.md): themed document
+ * background, independent of `Layout`'s shell root. `Layout` now pins itself to `h-dvh` with
+ * `overflow-hidden` so the window scrollbar should never engage at all, but rubber-band/
+ * overscroll on some browsers can still momentarily reveal whatever is painted behind the
+ * shell -- previously the default white `<body>|<html>` background, which flashed jarringly
+ * in dark mode. `@apply` here (not a hand-written hex value) keeps this in lockstep with the
+ * `.dark` class strategy above and with `Layout`'s own `bg-white dark:bg-zinc-950`.
+ */
+html,
+body {
+  @apply bg-white dark:bg-zinc-950;
+}
+
 body {
   margin: 0;
 }

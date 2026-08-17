@@ -2,6 +2,7 @@ import { useMemo } from 'react'
 import type { MetricsBucketOut, PathQueueOut } from '../../api/types'
 import { bucketLabel, bytesChartTitle, sumBytesByQueue, sumTotalBytes } from '../../lib/bytesChart'
 import { formatBytes } from '../../lib/format'
+import { CHART_BLOCK_CLASSES, CHART_SVG_MAX_HEIGHT_CLASS } from './chartLayout'
 import { assignQueueColorSlots, colorVarForSlot } from './queueColors'
 import './chartTheme.css'
 
@@ -79,7 +80,7 @@ export function BytesChart({ buckets, bucketSeconds, queues, retentionNote }: By
   const labelEvery = Math.max(1, Math.ceil(buckets.length / 6))
 
   return (
-    <div className="viz-root flex flex-col gap-2">
+    <div className={`viz-root flex flex-col gap-2 ${CHART_BLOCK_CLASSES}`}>
       <div className="flex items-baseline justify-between">
         <h3 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">{title}</h3>
         <span className="text-xs" style={{ color: 'var(--chart-ink)' }}>
@@ -102,7 +103,7 @@ export function BytesChart({ buckets, bucketSeconds, queues, retentionNote }: By
           viewBox={`0 0 ${WIDTH} ${HEIGHT}`}
           role="img"
           aria-label={`${title}, total ${formatBytes(totalWindowBytes)}`}
-          className="w-full"
+          className={`w-full ${CHART_SVG_MAX_HEIGHT_CLASS}`}
         >
           {gridlines.map(({ value, y }) => (
             <g key={value}>

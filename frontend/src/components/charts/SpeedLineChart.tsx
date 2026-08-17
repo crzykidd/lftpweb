@@ -1,6 +1,7 @@
 import { useMemo } from 'react'
 import type { MetricsBucketOut } from '../../api/types'
 import { formatRate } from '../../lib/format'
+import { CHART_BLOCK_CLASSES, CHART_SVG_MAX_HEIGHT_CLASS } from './chartLayout'
 import './chartTheme.css'
 
 const WIDTH = 760
@@ -83,7 +84,7 @@ export function SpeedLineChart({ buckets, bucketSeconds, seriesLabel, colorVar }
   const labelEvery = Math.max(1, Math.ceil(points.length / 6))
 
   return (
-    <div className="viz-root flex flex-col gap-2">
+    <div className={`viz-root flex flex-col gap-2 ${CHART_BLOCK_CLASSES}`}>
       {buckets.length === 0 || downRuns ? (
         <div className="flex h-32 items-center justify-center rounded-lg border border-dashed border-zinc-300 text-sm text-zinc-400 dark:border-zinc-700 dark:text-zinc-600">
           {buckets.length === 0
@@ -95,7 +96,7 @@ export function SpeedLineChart({ buckets, bucketSeconds, seriesLabel, colorVar }
           viewBox={`0 0 ${WIDTH} ${HEIGHT}`}
           role="img"
           aria-label={`Line chart of ${seriesLabel} transfer speed over time`}
-          className="w-full"
+          className={`w-full ${CHART_SVG_MAX_HEIGHT_CLASS}`}
         >
           {gridlines.map(({ value, y }) => (
             <g key={value}>

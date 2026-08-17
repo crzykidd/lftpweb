@@ -6,6 +6,46 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-17 — Shell root uses `h-dvh` over `h-screen`; chart width cap chosen so the height cap never actually engages
+
+`prompts/done/2026-08-17-chart-height-cap-and-single-scroll.md`, executed end to end. Two
+confirmed-in-code bugs from live use: the Dashboard charts grew taller with no ceiling as the
+window widened, and the page had two scroll contexts (the window and `<main>`'s own
+`overflow-auto`) with an unstyled white flash below the shell on overscroll, worst in dark mode.
+
+**`h-dvh`, not `h-screen`, on `Layout`'s shell root.** The prompt named this as a call worth
+checking rather than assuming. `h-screen` is `100vh`, which on mobile Safari/Chrome includes
+the area the browser's own address-bar chrome can cover, so the page can be taller than the
+actually-visible viewport and reintroduce exactly the "content taller than what's visible"
+condition this task is fixing. `h-dvh` (`100dvh`, the *dynamic* viewport height) tracks the
+real visible area as browser chrome shows/hides. Confirmed available: Tailwind 4.3.3
+(`node_modules/tailwindcss/dist/default-theme.js`) ships `dvh` height utilities.
+
+**Verified all four `@tanstack/react-virtual` scroll containers before touching the shell.**
+`FileTree.tsx`, `HistoryJobsSection.tsx`, `HistoryEventsSection.tsx`, `ItemDrawer.tsx` all pass
+`getScrollElement: () => scrollRef.current` — their own ref'd `<div>`, never `window` — and
+each of those divs already carries its own explicit height/overflow independent of the shell
+(`max-h-[70vh] overflow-auto`, `max-h-[28rem] overflow-auto` ×2, and `ItemDrawer`'s drawer is
+`fixed inset-0` with `h-full` on its own panel, entirely outside document flow). None of them
+depend on `<main>`'s scroll or on the shell root's height, so pinning the root to `h-dvh` +
+`overflow-hidden` doesn't touch their wiring — confirmed by reading each, not assumed from the
+shared library.
+
+**Chart width cap picked so it makes the height cap redundant in practice, on purpose.** Both
+chart `<svg>`s get `max-h-80` (320px) as a hard ceiling, but the accompanying chart-block cap
+(`max-w-4xl`, 896px, `frontend/src/components/charts/chartLayout.ts`) was chosen so that at
+896px wide, both charts' *natural* height from their own viewBox aspect ratio (760×260 and
+760×220) already sits under 320px — 306px and 259px respectively. That means the default
+`preserveAspectRatio="meet"` letterboxing the task flagged as a risk (a height-capped, still-
+full-width SVG pillarboxes) never actually triggers for these two charts at any width up to the
+cap; the max-height stays in the code as a real ceiling (e.g. for a future chart with a taller
+viewBox) rather than load-bearing for these two.
+
+**No new tests.** `chartLayout.ts` is two string constants, not logic — nothing there is worth
+a unit test beyond what `npm run build`/`npm test` already exercise by rendering the charts.
+
+---
+
 ## 2026-08-17 — Dashboard bytes chart: 7d/30d ranges bucket at 6h/1d, and the retention note reuses the existing settings GET rather than a new endpoint
 
 `prompts/done/2026-08-17-bytes-chart-7d-30d-ranges-and-total.md`, executed end to end. The

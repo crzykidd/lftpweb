@@ -57,6 +57,15 @@ Skeleton for the next roll:
 - **A transfer interrupted by an application restart now records why it failed** — the History
   popout says the transfer was interrupted and that the next attempt resumes from the partial
   bytes already on disk, instead of leaving the job's captured output blank.
+- **Dashboard charts no longer grow unbounded with window width**, and the app now has a
+  single scroll context with no white flash below the page. The bytes and speed charts'
+  `<svg>` had no height ceiling — the browser derived height from width via the viewBox's
+  aspect ratio, so a wider window made them arbitrarily taller; both now cap at 320px, paired
+  with a max-width on the chart block so the cap doesn't pillarbox on very wide windows. The
+  app shell root was `min-h-screen`, which let it grow past the viewport and engage the window
+  scrollbar alongside `<main>`'s own inner scroll; it's now pinned to `h-dvh` with
+  `overflow-hidden` so `<main>` is the only scroll context, and the document background is now
+  themed so overscroll/rubber-band can no longer flash white in dark mode.
 
 ### Security
 ### Deprecated
