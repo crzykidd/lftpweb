@@ -102,18 +102,25 @@ async def _seed_item(
     is_dir: bool = False,
     state: str = "DOWNLOADED",
     arr_status: str | None = None,
+    arr_status_at: str | None = None,
     arr_download_id: str | None = None,
     pending_download_prefix: str | None = None,
 ) -> int:
+    # 2026-08-18: a `dropped` row's grace check reads `arr_status_at` off the DB directly (see
+    # `tests/test_arrsync.py`'s own `_seed_item` for the full reasoning) -- defaults to "now"
+    # whenever `arr_status` is set but the caller didn't pass one explicitly.
+    if arr_status is not None and arr_status_at is None:
+        arr_status_at = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
     cursor = await db.execute(
-        "INSERT INTO item (queue_id, rel_path, is_dir, state, arr_status, arr_download_id, "
-        "pending_download_prefix) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO item (queue_id, rel_path, is_dir, state, arr_status, arr_status_at, "
+        "arr_download_id, pending_download_prefix) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         (
             queue_id,
             rel_path,
             1 if is_dir else 0,
             state,
             arr_status,
+            arr_status_at,
             arr_download_id,
             pending_download_prefix,
         ),
@@ -452,6 +459,43 @@ async def test_gone_items_are_never_cleaned(db, fake_arr_server, tmp_path):
 
     row = await _item_row(db, item_id)
     assert row["arr_status"] == "gone"
+    assert (local_root / rel_path).exists()
+    assert "arr_cleanup" not in await _event_kinds(db, item_id)
+    assert "arr_cleanup_withheld" not in await _event_kinds(db, item_id)
+
+
+async def test_dropped_items_are_never_cleaned(db, fake_arr_server, tmp_path):
+    """`dropped` (2026-08-18, prompts/2026-08-18-arr-gone-grace-and-recheck.md) must behave
+    exactly like `gone` here -- the `arr_delete_completed` cleanup sweep only ever queries
+    `arr_status = 'imported'`, so an amber, still-being-rechecked row is never a candidate,
+    pinned rather than assumed.
+    """
+    local_root = tmp_path / "local"
+    local_root.mkdir()
+    rel_path = "Release.File.mkv"
+    (local_root / rel_path).write_bytes(b"the release")
+
+    host_id = await _seed_host(db)
+    instance_id = await _seed_instance(
+        db, str(tmp_path), base_url=fake_arr_server.base_url, api_key=fake_arr_server.state.api_key
+    )
+    queue_id = await _seed_queue(
+        db,
+        host_id,
+        local_path=str(local_root),
+        arr_instance_id=instance_id,
+        arr_delete_completed=True,
+    )
+    item_id = await _seed_item(
+        db, queue_id, rel_path, state="DOWNLOADED", arr_status="dropped", arr_download_id="abc123"
+    )
+
+    scheduler = ArrSyncScheduler(db=db, config_dir=str(tmp_path))
+    await scheduler.run_once()
+    await scheduler.run_once()
+
+    row = await _item_row(db, item_id)
+    assert row["arr_status"] == "dropped"
     assert (local_root / rel_path).exists()
     assert "arr_cleanup" not in await _event_kinds(db, item_id)
     assert "arr_cleanup_withheld" not in await _event_kinds(db, item_id)

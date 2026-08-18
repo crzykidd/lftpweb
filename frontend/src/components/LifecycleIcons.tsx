@@ -326,10 +326,15 @@ export function ArrIcon({
   const variant = arrIconVariant(arrStatus)
   if (variant === 'none') return null
   const hoverLabel = arrHoverLabel({ arr_status: arrStatus, arr_status_at: arrStatusAt }, instanceName)
+  // `dropped` (2026-08-18) shares `gone`'s amber treatment here -- this drawer already reads
+  // `gone` as amber rather than the row chip's red (the one place the two specs differ, per
+  // this component's own docstring), so `dropped`'s "held for confirmation, not yet actionable"
+  // amber lands in the same visual slot; the full-sentence hover text (`arrHoverLabel`) is what
+  // keeps the two tellable apart here, same as `imported`/`cleaned` already share a slot.
   const markClass =
     variant === 'imported'
       ? 'text-emerald-600 dark:text-emerald-400'
-      : variant === 'gone'
+      : variant === 'gone' || variant === 'dropped'
         ? 'text-amber-500 dark:text-amber-400'
         : 'text-zinc-400 dark:text-zinc-500'
   return (
@@ -340,7 +345,7 @@ export function ArrIcon({
           ✓
         </span>
       )}
-      {variant === 'gone' && (
+      {(variant === 'gone' || variant === 'dropped') && (
         <span className="text-[10px] leading-none text-amber-500 dark:text-amber-400" aria-hidden="true">
           ⚠
         </span>
@@ -485,10 +490,10 @@ export function ArrBrandMark({
   )
 }
 
-/** The row chip's status-overlay badge -- green check ("processed") or red dot ("gone"),
- * absolutely positioned over the bottom-right corner of the logo/text-chip beside it. `null`
- * renders nothing, for the `detected`/`notified` mid-flight case (`arrChipOverlay`,
- * `lib/fileTree.ts`).
+/** The row chip's status-overlay badge -- green check ("processed"), amber dot ("dropped --
+ * rechecking", 2026-08-18), or red dot ("gone"), absolutely positioned over the bottom-right
+ * corner of the logo/text-chip beside it. `null` renders nothing, for the `detected`/`notified`
+ * mid-flight case (`arrChipOverlay`, `lib/fileTree.ts`).
  */
 function ArrChipOverlayBadge({ overlay }: { overlay: ArrChipOverlay }) {
   if (overlay === 'check') {
@@ -499,6 +504,17 @@ function ArrChipOverlayBadge({ overlay }: { overlay: ArrChipOverlay }) {
       >
         ✓
       </span>
+    )
+  }
+  if (overlay === 'pending') {
+    // Same size/positioning as the red `warn` dot below, per this task's own instruction --
+    // only the color differs, so the two read as siblings on the same scale (amber = "still
+    // being decided," red = "decided, and it needs you") rather than unrelated shapes.
+    return (
+      <span
+        className="absolute -right-1 -bottom-1 h-2 w-2 rounded-full bg-amber-500 ring-1 ring-white dark:bg-amber-400 dark:ring-zinc-900"
+        aria-hidden="true"
+      />
     )
   }
   if (overlay === 'warn') {
@@ -515,11 +531,13 @@ function ArrChipOverlayBadge({ overlay }: { overlay: ArrChipOverlay }) {
 /** The Files/Transfers/History row-line *arr chip (2026-08-16, prompts/2026-08-16-arr-chip-on-
  * row-lines.md, prompts/2026-08-16-files-brand-logo-icons.md) -- the real Sonarr/Radarr brand
  * logo, in its own brand colour, with the outcome as a small status overlay: green check once
- * the *arr processed it (`imported`/`cleaned`), red dot once a release left the *arr's queue
- * without importing (`gone`), the logo alone while still mid-flight (`detected`/`notified`), and
- * **nothing at all** when `arrStatus` is null -- the item isn't *arr-tracked, per this
- * integration's "everything off by default" rule. One component, one visual language, across
- * all three surfaces.
+ * the *arr processed it (`imported`/`cleaned`), amber pending dot once a release drops out of
+ * the *arr's queue and lftpweb is rechecking every pass (`dropped`, 2026-08-18 -- see
+ * `lib/fileTree.ts.arrChipOverlay`'s own docstring), red dot once that grace window expires with
+ * neither a reappearance nor an import confirmed (`gone`), the logo alone while still mid-flight
+ * (`detected`/`notified`), and **nothing at all** when `arrStatus` is null -- the item isn't
+ * *arr-tracked, per this integration's "everything off by default" rule. One component, one
+ * visual language, across all three surfaces.
  *
  * `instanceKind` selects the logo (`'sonarr'` | `'radarr'`). Transfers/History read it straight
  * off the wire (`JobOut.arr_instance_kind`/`HistoryJobOut.arr_instance_kind`, joined server-side

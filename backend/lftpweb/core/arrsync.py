@@ -75,6 +75,38 @@ other externally-caused move"). This is what makes the spec's own UX description
 never appear. See `docs/decisions.md` (2026-08-15) for the full reasoning and why this reads
 "the existing local-deletion machinery" narrowly (its resolvers and guards, not its
 state-writing tail).
+
+**`dropped` -- an amber grace state between the two-pass quiescence guard and `gone`**
+(2026-08-18, production incident, support bundle `lftpweb-support-0.2.3-20260818T013532Z`).
+SABnzbd sometimes returns a blank/empty queue to Sonarr's own poll, so Sonarr's queue view
+empties for a beat and the records return on the next refresh -- but this codebase's own poller
+runs once a minute, slower than SABnzbd's blip, so *both* of the two-pass guard's observations
+landed inside the same blank window: 8 items committed straight to `gone` in a single pass while
+lftpweb was still actively downloading them (proof it was a blip, not a real removal -- their
+verify/rename events ran minutes later). `gone` is deliberately terminal (`_REMATCHABLE_STATES`
+below refuses to re-match a `gone`/`cleaned` row against the *identical* `downloadId` -- see that
+set's own docstring and `docs/decisions.md`), and the stranded-source-delete sweep only ever
+retries `imported`/`cleaned` rows, so all 8 rows sat with a permanent red dot, a parked rung-4
+source delete, and no cleanup, even though the *arr imported every one of them normally an hour
+later. `_check_import` below now commits `dropped` instead of `gone` at the point the two-pass
+guard would have confirmed "no import evidence" -- everything from there is re-checked *every
+subsequent pass* (`_check_dropped_items`), not gated behind another two-pass observation, since
+`dropped` itself is already the "held for confirmation" state: the *same* `downloadId`
+reappearing in the queue is direct evidence the disappearance was transient and sends the row
+straight back to `detected` (`_match_items` widens its rematch candidates for `dropped` alone,
+without `gone`/`cleaned`'s different-`downloadId` restriction -- see `docs/decisions.md`,
+2026-08-18, for why the two states diverge here); an import history event promotes it to
+`imported` through the normal `_commit_terminal` path (rung-4 delete + cleanup then proceed
+exactly as any other import); and only once `arr_status_at` is older than `DROPPED_GONE_GRACE_S`
+(6h, a deliberate constant -- see `docs/concepts.md`) with neither signal does it finally commit
+`gone`. `_heal_stranded_gone_rows` is the retroactive, bounded counterpart for a row that already
+committed `gone` before this shipped (the production 8, and any like them): keyed off
+`arr_status='gone' AND remote_delete_pending IS NOT NULL AND remote_deleted_at IS NULL` -- the
+debt itself, the same "query alone is the self-heal, no migration" shape
+`_sweep_stranded_source_deletes` already established -- it re-asks `import_events` by the item's
+own stored `arr_download_id` and promotes to `imported` the moment one shows up, bounded by
+`MAX_GONE_HEAL_ATTEMPTS` (reusing `_InstanceBackoff`'s growing-delay shape, `_GoneHealRetryState`
+below) so a genuinely-gone row doesn't get queried forever.
 """
 
 from __future__ import annotations
@@ -200,8 +232,24 @@ def _derive_arr_root(output_path: str, item_name: str) -> str:
 # terminal one a regrab can restart (spec "Failure modes": "a second record matching an
 # already-`cleaned` item name must start a *fresh* association, not resurrect the old one").
 # `imported`/`detected`/`notified` are deliberately excluded -- an actively-tracked association
-# is never re-matched out from under itself.
+# is never re-matched out from under itself. A match against one of these states is refused when
+# the record's own `downloadId` is *identical* to the one already recorded (`_match_items` below)
+# -- the same release still sitting in the queue's listing is not a regrab. This refusal is
+# deliberately narrower than it looks: it is what keeps a settled `gone`/`cleaned` row from
+# spuriously flipping back just because the *arr's queue happens to still (or again) list the
+# same download -- see `_REAPPEARANCE_REMATCHABLE_STATES` below for the state that inverts this
+# rule on purpose (2026-08-18, `docs/decisions.md`).
 _REMATCHABLE_STATES = frozenset({"gone", "cleaned"})
+
+# `dropped` (2026-08-18, this module's own docstring -- the amber grace state, production
+# incident) joins the rematch candidates too, but *without* `_REMATCHABLE_STATES`'s
+# different-`downloadId` restriction: the identical `downloadId` reappearing in the *arr's queue
+# is exactly the direct evidence that the disappearance was a transient blip, not a real removal
+# -- the whole point of holding `dropped` rather than committing `gone` outright. `gone`/`cleaned`
+# keep the old, stricter rule (a settled row is settled); `dropped` is deliberately not settled
+# yet, so it gets the opposite treatment. See `docs/decisions.md`, 2026-08-18, for the full
+# reasoning on why these two now diverge.
+_REAPPEARANCE_REMATCHABLE_STATES = frozenset({"dropped"})
 
 # States considered "still being watched for import" (spec "The poller" step 3).
 _TRACKED_STATES = frozenset({"detected", "notified"})
@@ -233,6 +281,35 @@ def _now_iso() -> str:
     convention for "a Python-side UTC timestamp," not a second one invented here.
     """
     return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
+def _parse_iso(ts: str) -> datetime:
+    """The inverse of `_now_iso` -- every `arr_status_at` value this module ever writes was
+    produced by that function, so this is the one place that format is parsed back, rather than
+    every caller re-deriving it.
+    """
+    return datetime.strptime(ts, "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=UTC)
+
+
+# How long a `dropped` row (this module's own docstring, 2026-08-18) is held in the amber
+# "rechecking" state before `_check_dropped_items` gives up and commits `gone` -- a deliberate,
+# named constant (`docs/concepts.md`), not a settings knob: the production blip that motivated
+# this was minutes long, so 6h is generous headroom against a much longer download-client outage
+# without holding a genuinely-removed release in limbo for a user-uncomfortable length of time. A
+# per-instance/per-queue override is a named future option, not built now.
+DROPPED_GONE_GRACE_S = 6 * 3600.0
+
+
+def _dropped_grace_expired(arr_status_at: str, *, now: datetime | None = None) -> bool:
+    """Whether a `dropped` row's grace window (`DROPPED_GONE_GRACE_S`) has elapsed since
+    `arr_status_at` (the moment `_commit_dropped` below set it). Wall-clock, not
+    `time.monotonic()` -- unlike this module's other bounded-retry bookkeeping (`_InstanceBackoff`
+    and friends, all in-memory and restart-loses-it by design), `arr_status_at` is a persisted
+    column and must be compared against a persisted, restart-surviving clock; `now` is only ever
+    overridden by a test.
+    """
+    now = now or datetime.now(UTC)
+    return (now - _parse_iso(arr_status_at)).total_seconds() >= DROPPED_GONE_GRACE_S
 
 
 # --- Two-pass quiescence guard (spec "The association lifecycle": "Both signals must hold on
@@ -277,6 +354,30 @@ class _InstanceBackoff:
 # `remote_delete_pending` is never cleared by pausing -- the manual Files-page delete or a
 # restart's clean in-memory slate (`_SourceDeleteRetryState`'s own docstring) can still act.
 MAX_SOURCE_DELETE_RETRY_ATTEMPTS = 5
+
+
+# --- Retroactive self-heal for a row already stranded `gone` before `dropped` existed
+# (2026-08-18, this module's own docstring) -------------------------------------------------
+
+# Bounded, same reasoning as `MAX_SOURCE_DELETE_RETRY_ATTEMPTS` above: a genuinely-gone row must
+# not accumulate a per-pass `import_events` call forever just because it still owes a source
+# delete. Growing-delay backoff (`_GoneHealRetryState` below) spreads the attempts out further
+# apart each time, same shape as `_SourceDeleteRetryState`.
+MAX_GONE_HEAL_ATTEMPTS = 10
+
+
+@dataclass
+class _GoneHealRetryState:
+    """One stranded `gone` row's retroactive-heal bookkeeping -- in-memory, same "restart loses
+    it, and that's the safe direction" reasoning as `_SourceDeleteRetryState` above: a restart
+    just gets a clean slate and starts counting from attempt 1 again, which the sweep's own query
+    (`arr_status='gone' AND remote_delete_pending IS NOT NULL AND remote_deleted_at IS NULL`)
+    already guarantees finds the row again regardless.
+    """
+
+    attempts: int
+    next_attempt_at: float  # time.monotonic()
+    paused: bool = False
 
 
 @dataclass
@@ -354,6 +455,9 @@ class ArrSyncScheduler:
         # Rung-4 stranded-source-delete retry backoff, keyed by item id -- see
         # `_SourceDeleteRetryState`'s own docstring for why in-memory is the right call here too.
         self._source_delete_retries: dict[int, _SourceDeleteRetryState] = {}
+        # Retroactive `gone`-row heal backoff (2026-08-18, `_GoneHealRetryState`'s own docstring),
+        # keyed by item id -- same in-memory reasoning as every other bounded-retry dict above.
+        self._gone_heal_retries: dict[int, _GoneHealRetryState] = {}
         # Namespace-mismatch warning debounce (2026-08-17, `_maybe_warn_path_mismatch`'s own
         # docstring) -- once per (queue id, derived *arr-side root) per process lifetime, the
         # same in-memory "restart loses it, and that's the safe direction" reasoning as every
@@ -525,6 +629,21 @@ class ArrSyncScheduler:
                 # never re-enters this branch, not this `if`).
                 await self._maybe_retry_notify(queue, item)
             await self._check_import(client, queue, item, records)
+
+        # `dropped` rows (2026-08-18, this module's own docstring) -- rechecked every pass, not
+        # gated behind another two-pass observation, since `dropped` itself already *is* the
+        # "held for confirmation" state. A fresh query, not the stale `items` snapshot above:
+        # `_match_items` may have just rematched some of these rows back to `detected` this very
+        # pass (the same-`downloadId`-reappeared case), and those must not also be evaluated here
+        # against pre-match data.
+        await self._check_dropped_items(client, queue)
+
+        # Retroactive heal for a row that already committed `gone` before `dropped` existed
+        # (2026-08-18) -- ahead of the rung-4 sweep below, same "resolve the *arr status first,
+        # then chase the delete debt" ordering `_check_import`/`_check_dropped_items` already
+        # follow, so a row this promotes to `imported` this very pass has its rung-4 delete
+        # already attempted (inside `_commit_terminal`) before the sweep below even queries.
+        await self._heal_stranded_gone_rows(client, queue)
 
         # Rung-4 retry sweep (this module's own docstring, 2026-08-17) -- after the
         # import-check loop above (so a delete that finally clears this very pass is already
@@ -784,7 +903,11 @@ class ArrSyncScheduler:
         notify_on_complete: bool,
     ) -> None:
         candidates = [
-            i for i in items if i["arr_status"] is None or i["arr_status"] in _REMATCHABLE_STATES
+            i
+            for i in items
+            if i["arr_status"] is None
+            or i["arr_status"] in _REMATCHABLE_STATES
+            or i["arr_status"] in _REAPPEARANCE_REMATCHABLE_STATES
         ]
         if not candidates:
             return
@@ -802,7 +925,10 @@ class ArrSyncScheduler:
                 # fresh association, not resurrect the old one" -- the identical downloadId
                 # reappearing is not a regrab, it's the same release still sitting in the
                 # queue's listing, and must not spuriously flip a settled `gone`/`cleaned` row
-                # back to `detected`).
+                # back to `detected`). Deliberately does NOT apply to `_REAPPEARANCE_REMATCHABLE_
+                # STATES` (`dropped`, 2026-08-18) -- there, the identical downloadId reappearing
+                # is exactly the evidence that confirms the disappearance was a blip; see
+                # `_REAPPEARANCE_REMATCHABLE_STATES`'s own docstring.
                 if (
                     item["arr_status"] in _REMATCHABLE_STATES
                     and record.download_id is not None
@@ -827,6 +953,7 @@ class ArrSyncScheduler:
     ) -> None:
         queue_id = queue["id"]
         is_regrab = item["arr_status"] in _REMATCHABLE_STATES
+        is_reappearance = item["arr_status"] in _REAPPEARANCE_REMATCHABLE_STATES
         await self.db.execute(
             "UPDATE item SET arr_status = 'detected', arr_status_at = ?, arr_download_id = ? "
             "WHERE id = ?",
@@ -839,6 +966,11 @@ class ArrSyncScheduler:
         )
         if is_regrab:
             message += f" -- fresh association, prior state was {item['arr_status']!r} (regrab)"
+        elif is_reappearance:
+            message += (
+                " -- reappeared with the same downloadId after briefly dropping out of the "
+                "*arr's queue; confirms the disappearance was a transient blip, not a removal"
+            )
         await audit.record_event(
             self.db, level="info", kind="arr_matched", item_id=item["id"], message=message
         )
@@ -1053,12 +1185,49 @@ class ArrSyncScheduler:
             and prior.verdict == candidate_verdict
             and prior.download_id == download_id
         ):
-            await self._commit_terminal(queue, item, candidate_verdict, len(history))
             self._pending.pop(item_id, None)
+            if candidate_verdict == "imported":
+                await self._commit_terminal(queue, item, "imported", len(history))
+            else:
+                # 2026-08-18 (this module's own docstring, production incident): the two-pass
+                # guard confirming "no import evidence" no longer commits terminal `gone`
+                # directly -- it commits the amber `dropped` grace state instead.
+                # `_check_dropped_items` takes it from there on every subsequent pass.
+                await self._commit_dropped(queue, item)
         else:
             self._pending[item_id] = _PendingVerdict(
                 verdict=candidate_verdict, download_id=download_id
             )
+
+    async def _commit_dropped(self, queue: aiosqlite.Row, item: aiosqlite.Row) -> None:
+        """`detected`/`notified` -> `dropped` (2026-08-18, this module's own docstring): the
+        two-pass quiescence guard confirmed the *arr's queue record is gone with no import
+        history event, but rather than treating that as settled (the old, direct-to-`gone`
+        behavior), this holds the row in an amber "rechecking" state for `DROPPED_GONE_GRACE_S`
+        -- `_check_dropped_items` re-evaluates it every subsequent pass rather than gating behind
+        another two-pass observation, since `dropped` itself already *is* the held-for-
+        confirmation state.
+        """
+        await self.db.execute(
+            "UPDATE item SET arr_status = 'dropped', arr_status_at = ? WHERE id = ?",
+            (_now_iso(), item["id"]),
+        )
+        await self.db.commit()
+        await audit.record_event(
+            self.db,
+            level="info",
+            kind="arr_queue_dropped",
+            item_id=item["id"],
+            message=(
+                "*arr queue record disappeared with no import history event -- holding amber "
+                f"for {DROPPED_GONE_GRACE_S / 3600:.0f}h before calling it gone; rechecking "
+                "every pass (2026-08-17/18 production incident: a download-client blank-queue "
+                "blip flipped 8 items straight to gone in a single pass while lftpweb was still "
+                "downloading them -- support bundle "
+                "lftpweb-support-0.2.3-20260818T013532Z, docs/decisions.md)"
+            ),
+        )
+        await self._publish_item(queue["id"], item["id"])
 
     async def _commit_terminal(
         self,
@@ -1066,7 +1235,17 @@ class ArrSyncScheduler:
         item: aiosqlite.Row,
         verdict: Literal["imported", "gone"],
         import_event_count: int,
+        *,
+        source: Literal["quiescence", "dropped", "gone_heal"] = "quiescence",
     ) -> None:
+        """`source` only changes the audit-event wording, never the transition itself --
+        `"quiescence"` is the original two-pass-guard confirmation (`_check_import`, `verdict`
+        always `"imported"` since 2026-08-18: the `"gone"` candidate now routes through
+        `_commit_dropped` instead, see that method's own docstring); `"dropped"` is
+        `_check_dropped_items` (either an import surfaced during the grace window, or the window
+        itself expired with neither signal); `"gone_heal"` is `_heal_stranded_gone_rows`
+        promoting a row that had already committed terminal `gone` before this shipped.
+        """
         queue_id = queue["id"]
         await self.db.execute(
             "UPDATE item SET arr_status = ?, arr_status_at = ? WHERE id = ?",
@@ -1074,17 +1253,44 @@ class ArrSyncScheduler:
         )
         await self.db.commit()
         if verdict == "imported":
-            kind, message = (
-                "arr_imported",
-                f"*arr queue record gone/imported with {import_event_count} import history "
-                "event(s), confirmed on two consecutive poller passes",
-            )
+            if source == "dropped":
+                kind, message = (
+                    "arr_imported",
+                    f"*arr history shows {import_event_count} import event(s) for this release, "
+                    "confirmed after the queue record had earlier dropped out of the *arr's "
+                    "queue with no import evidence (arr_status was 'dropped') -- the "
+                    "disappearance resolved within the grace window",
+                )
+            elif source == "gone_heal":
+                kind, message = (
+                    "arr_imported",
+                    f"*arr history now shows {import_event_count} import event(s) for this "
+                    "release -- promoted from a stranded 'gone' verdict by the retroactive heal "
+                    "sweep (2026-08-18); a deferred source delete/cleanup, if still owed, "
+                    "proceeds normally from here",
+                )
+            else:
+                kind, message = (
+                    "arr_imported",
+                    f"*arr queue record gone/imported with {import_event_count} import history "
+                    "event(s), confirmed on two consecutive poller passes",
+                )
         else:
-            kind, message = (
-                "arr_gone",
-                "*arr queue record disappeared with no import history event, confirmed on two "
-                "consecutive poller passes -- local files untouched, no cleanup performed",
-            )
+            if source == "dropped":
+                kind, message = (
+                    "arr_gone",
+                    f"unconfirmed for {DROPPED_GONE_GRACE_S / 3600:.0f}h after leaving the "
+                    "*arr's queue (arr_status was 'dropped') -- no import history event "
+                    "appeared within the grace window; local files untouched, no cleanup "
+                    "performed",
+                )
+            else:
+                kind, message = (
+                    "arr_gone",
+                    "*arr queue record disappeared with no import history event, confirmed on "
+                    "two consecutive poller passes -- local files untouched, no cleanup "
+                    "performed",
+                )
             if item["remote_delete_pending"] is not None:
                 # Visibility only, no behavior change (2026-08-17, this module's own docstring)
                 # -- rung 4 never fires on `gone` (by design: ambiguity must not trigger an
@@ -1110,6 +1316,48 @@ class ArrSyncScheduler:
             # source -> (optionally) delete local" holds even within a single poller pass.
             # Never called on `gone`.
             await self._maybe_delete_remote_on_import(queue, item["id"])
+
+    # --- `dropped`: rechecked every pass (this module's own docstring, 2026-08-18) -----------
+
+    async def _check_dropped_items(self, client: ArrClient, queue: aiosqlite.Row) -> None:
+        """Every row this queue is currently holding at `arr_status = 'dropped'`, re-evaluated
+        this pass. A fresh query, not a stale snapshot -- a row `_match_items` (run earlier this
+        same pass, in `_process_queue`) just rematched back to `detected` (the same-`downloadId`-
+        reappeared case) is already gone from this query's own result, so it is not
+        double-processed against pre-match data.
+
+        Deliberately not gated by another two-pass observation the way `_check_import`'s
+        `detected`/`notified` -> `dropped` transition is -- `dropped` itself already *is* the
+        held-for-confirmation state; gating it again would just double the grace window for no
+        added safety.
+        """
+        cursor = await self.db.execute(
+            "SELECT id, rel_path, arr_download_id, arr_status_at, remote_delete_pending "
+            "FROM item WHERE queue_id = ? AND arr_status = 'dropped'",
+            (queue["id"],),
+        )
+        for row in await cursor.fetchall():
+            await self._check_one_dropped_item(client, queue, row)
+
+    async def _check_one_dropped_item(
+        self, client: ArrClient, queue: aiosqlite.Row, row: aiosqlite.Row
+    ) -> None:
+        """One `dropped` row's turn: an import history event promotes it straight to `imported`
+        (no further quiescence wait -- the row already spent a pass or more absent from the
+        queue, and an import event is strong, not ambiguous, evidence); otherwise, once
+        `arr_status_at` is older than `DROPPED_GONE_GRACE_S`, it finally commits `gone`. Neither
+        condition holding yet is a silent no-op -- the row just stays `dropped` for another pass.
+        """
+        download_id = row["arr_download_id"]
+        history: list[HistoryEvent] = await client.import_events(
+            download_id=download_id,
+            source_title=None if download_id else row["rel_path"],
+        )
+        if any(e.is_import_event() for e in history):
+            await self._commit_terminal(queue, row, "imported", len(history), source="dropped")
+            return
+        if _dropped_grace_expired(row["arr_status_at"]):
+            await self._commit_terminal(queue, row, "gone", len(history), source="dropped")
 
     # --- Rung 4 of the move-mode delete ladder (this module's own docstring, 2026-08-16) -----
 
@@ -1270,6 +1518,88 @@ class ArrSyncScheduler:
 
         delay = min(INITIAL_BACKOFF_S * (BACKOFF_FACTOR ** (attempts - 1)), MAX_BACKOFF_S)
         self._source_delete_retries[item_id] = _SourceDeleteRetryState(
+            attempts=attempts, next_attempt_at=time.monotonic() + delay
+        )
+
+    # --- Retroactive heal for a row already stranded `gone` before `dropped` existed
+    # (2026-08-18, this module's own docstring) -------------------------------------------------
+
+    async def _heal_stranded_gone_rows(self, client: ArrClient, queue: aiosqlite.Row) -> None:
+        """A row that already committed terminal `gone` before this fix shipped (the production
+        8, and any like them) can still be carrying a stranded rung-4 delete debt --
+        `core/postprocess.py._maybe_delete_remote` defers on *any* non-null `arr_status`,
+        `gone` included, so a `move`-mode item whose pipeline run only finished *after* the
+        `gone` verdict committed still got `remote_delete_pending` set. Keyed off the debt
+        itself, the same "the query alone is the self-heal, no migration" shape
+        `_sweep_stranded_source_deletes` already established for the analogous
+        transient-SSH-failure case: `arr_status = 'gone' AND remote_delete_pending IS NOT NULL
+        AND remote_deleted_at IS NULL`. Runs unconditionally (not gated on `remote_pool`/
+        `host_provider` being wired) -- promoting a wrongly-stuck `gone` row to `imported` is
+        worth doing for the *arr-status/icon alone, independent of whether this process can also
+        act on the delete debt; `_commit_terminal`'s own `imported` branch already no-ops safely
+        when the delete plumbing isn't wired, the same as every other caller of it.
+        """
+        cursor = await self.db.execute(
+            "SELECT id, rel_path, arr_download_id, remote_delete_pending FROM item "
+            "WHERE queue_id = ? AND arr_status = 'gone' AND remote_delete_pending IS NOT NULL "
+            "AND remote_deleted_at IS NULL",
+            (queue["id"],),
+        )
+        for row in await cursor.fetchall():
+            await self._heal_one_gone_row(client, queue, row)
+
+    async def _heal_one_gone_row(
+        self, client: ArrClient, queue: aiosqlite.Row, row: aiosqlite.Row
+    ) -> None:
+        """One stranded `gone` row's turn -- backoff bookkeeping around the shared
+        `import_events` lookup, same growing-delay shape as `_retry_stranded_source_delete`
+        above but bounded at `MAX_GONE_HEAL_ATTEMPTS`: past that, one `arr_gone_heal_giving_up`
+        event fires and this process stops asking. `remote_delete_pending` (and `arr_status`)
+        stay exactly as they were either way -- a restart's clean in-memory slate, or the query
+        itself on the very next pass after a restart, picks the row back up regardless.
+        """
+        item_id = row["id"]
+        state = self._gone_heal_retries.get(item_id)
+        if state is not None and (state.paused or time.monotonic() < state.next_attempt_at):
+            return
+
+        download_id = row["arr_download_id"]
+        if download_id is None:
+            # No downloadId ever recorded for this association (a title-fallback match, or a row
+            # that predates matching recording one at all) -- there is no exact history lookup
+            # possible. Counts as an attempt anyway, per this sweep's own hard cap, so a row like
+            # this doesn't sit exempt from ever giving up either.
+            history: list[HistoryEvent] = []
+        else:
+            history = await client.import_events(download_id=download_id)
+
+        if any(e.is_import_event() for e in history):
+            self._gone_heal_retries.pop(item_id, None)
+            await self._commit_terminal(queue, row, "imported", len(history), source="gone_heal")
+            return
+
+        attempts = (state.attempts if state is not None else 0) + 1
+        if attempts >= MAX_GONE_HEAL_ATTEMPTS:
+            self._gone_heal_retries[item_id] = _GoneHealRetryState(
+                attempts=attempts, next_attempt_at=time.monotonic(), paused=True
+            )
+            await audit.record_event(
+                self.db,
+                level="warning",
+                item_id=item_id,
+                kind="arr_gone_heal_giving_up",
+                message=(
+                    f"queue {queue['id']} ({queue['name']!r}): checked *arr history "
+                    f"{attempts} times for an import that would promote this stranded 'gone' "
+                    "row -- none found; giving up automatic rechecks. A deferred source delete "
+                    "(remote_delete_pending) is still parked -- manual deletion from the Files "
+                    "page is the intended path"
+                ),
+            )
+            return
+
+        delay = min(INITIAL_BACKOFF_S * (BACKOFF_FACTOR ** (attempts - 1)), MAX_BACKOFF_S)
+        self._gone_heal_retries[item_id] = _GoneHealRetryState(
             attempts=attempts, next_attempt_at=time.monotonic() + delay
         )
 

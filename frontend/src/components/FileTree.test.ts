@@ -596,14 +596,15 @@ describe('matchesFacetFilter', () => {
 
   it('arr_tracked matches any non-null arr_status, and only that', () => {
     expect(matchesFacetFilter({ ...entry({}), arr_status: null }, 'arr_tracked')).toBe(false)
-    for (const status of ['detected', 'notified', 'imported', 'cleaned', 'gone']) {
+    for (const status of ['detected', 'notified', 'imported', 'cleaned', 'dropped', 'gone']) {
       expect(matchesFacetFilter({ ...entry({}), arr_status: status }, 'arr_tracked')).toBe(true)
     }
   })
 
-  it('arr_gone matches only arr_status === "gone"', () => {
+  it('arr_gone matches only arr_status === "gone" -- "dropped" (2026-08-18) does NOT count, '
+    + 'by design: it is a transient amber state, not the actionable one this filter targets', () => {
     expect(matchesFacetFilter({ ...entry({}), arr_status: 'gone' }, 'arr_gone')).toBe(true)
-    for (const status of ['detected', 'notified', 'imported', 'cleaned', null]) {
+    for (const status of ['detected', 'notified', 'imported', 'cleaned', 'dropped', null]) {
       expect(matchesFacetFilter({ ...entry({}), arr_status: status }, 'arr_gone')).toBe(false)
     }
   })
@@ -612,12 +613,19 @@ describe('matchesFacetFilter', () => {
 // --- Sonarr/Radarr integration icon (docs/arr-integration-spec.md "UI") -------------------
 
 describe('arrIconVariant', () => {
-  it('maps all five known arr_status values to the spec\'s icon-state table', () => {
+  it('maps all six known arr_status values to the spec\'s icon-state table', () => {
     expect(arrIconVariant('detected')).toBe('neutral')
     expect(arrIconVariant('notified')).toBe('neutral')
     expect(arrIconVariant('imported')).toBe('imported')
     expect(arrIconVariant('gone')).toBe('gone')
     expect(arrIconVariant('cleaned')).toBe('imported')
+    expect(arrIconVariant('dropped')).toBe('dropped')
+  })
+
+  it('"dropped" (2026-08-18) gets its own variant, not folded into "gone" -- it is the amber '
+    + '"rechecking" grace state, not yet the actionable red one', () => {
+    expect(arrIconVariant('dropped')).not.toBe(arrIconVariant('gone'))
+    expect(arrIconVariant('dropped')).not.toBe(arrIconVariant('imported'))
   })
 
   it('"cleaned" shares the green-check variant with "imported" (2026-08-16: with "Delete when '
@@ -665,6 +673,24 @@ describe('arrHoverLabel', () => {
     expect(imported).not.toBe(cleaned)
     expect(cleaned).toContain('cleaned up')
   })
+
+  it('"dropped" (2026-08-18) embeds the relative time inline -- "removed ... <time> ago -- '
+    + 'rechecking" -- rather than the generic "statusText (when)" shape every other status uses', () => {
+    const label = arrHoverLabel(
+      { arr_status: 'dropped', arr_status_at: new Date(Date.now() - 5 * 60_000).toISOString() },
+      'Sonarr',
+    )
+    expect(label).toContain('Sonarr')
+    expect(label).toContain("removed from the *arr's queue")
+    expect(label).toContain('rechecking')
+    expect(label).not.toMatch(/\(.*ago.*\)/) // not the generic "(Xm ago)" parenthetical shape
+  })
+
+  it('"dropped" still reads sensibly with no arr_status_at yet', () => {
+    const label = arrHoverLabel({ arr_status: 'dropped', arr_status_at: null }, null)
+    expect(label).toContain('the bound *arr instance')
+    expect(label).toContain('rechecking')
+  })
 })
 
 // --- Sonarr/Radarr row chip (Files + Transfers + History, 2026-08-16,
@@ -674,15 +700,26 @@ describe('arrHoverLabel', () => {
 // branch anywhere in this function, so a color asserted here is the color every surface shows.
 
 describe('arrChipOverlay', () => {
-  it('all five arr_status values (via arrIconVariant) map to the row chip\'s overlay per the spec', () => {
+  it('all six arr_status values (via arrIconVariant) map to the row chip\'s overlay per the spec', () => {
     // detected/notified -- mid-flight, logo alone, no overlay
     expect(arrChipOverlay(arrIconVariant('detected'))).toBeNull()
     expect(arrChipOverlay(arrIconVariant('notified'))).toBeNull()
     // imported/cleaned -- the *arr processed it: green check
     expect(arrChipOverlay(arrIconVariant('imported'))).toBe('check')
     expect(arrChipOverlay(arrIconVariant('cleaned'))).toBe('check')
-    // gone -- left the queue without importing: red warn
+    // dropped (2026-08-18) -- left the queue moments ago, rechecking: amber pending
+    expect(arrChipOverlay(arrIconVariant('dropped'))).toBe('pending')
+    // gone -- unconfirmed past the grace window: red warn
     expect(arrChipOverlay(arrIconVariant('gone'))).toBe('warn')
+  })
+
+  it('"dropped" is amber "pending", distinct from both "gone"\'s red warn and "imported"\'s '
+    + 'green check', () => {
+    const pending = arrChipOverlay(arrIconVariant('dropped'))
+    expect(pending).toBe('pending')
+    expect(pending).not.toBe(arrChipOverlay(arrIconVariant('gone')))
+    expect(pending).not.toBe(arrChipOverlay(arrIconVariant('imported')))
+    expect(pending).not.toBeNull()
   })
 
   it('a null arr_status resolves to the "none" variant, which the caller uses to render no chip at all', () => {

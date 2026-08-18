@@ -6,6 +6,62 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-18 — `dropped` gets `gone`/`cleaned`'s same-downloadId rematch rule *inverted*, not removed
+
+`prompts/done/2026-08-18-arr-gone-grace-and-recheck.md`, production incident (support bundle
+`lftpweb-support-0.2.3-20260818T013532Z`): a download client (SABnzbd) occasionally returns a
+blank/empty queue to Sonarr's own poll, and this codebase's *arr poller runs on its own, slower
+(default 60s) clock than that blip — both of the two-pass quiescence guard's observations landed
+inside the same blank window, and 8 real items committed straight to the old, terminal `gone` in
+a single pass while lftpweb was still actively downloading them (their verify/rename events ran
+minutes later — proof it was a blip, not a real removal). `gone` is deliberately terminal
+(`docs/arr-integration-spec.md`'s "Failure modes" section, approved 2026-08-15, and
+`core/arrsync.py._REMATCHABLE_STATES`'s own docstring — this exact refusal has no dedicated
+decisions.md entry of its own prior to this one; it shipped straight from the spec): a fresh
+queue record matching a `gone`/`cleaned` row is refused when its `downloadId` is *identical* to
+the one already recorded, precisely so the same release still sitting in the
+*arr's own queue listing can't spuriously resurrect a settled row. That rule is exactly what
+turned the blip into a permanent, unrecoverable red dot here: Sonarr re-listed the same
+`downloadId` an hour later (its own poll recovering), but the matcher refused it as "not a
+regrab," so the row could never climb back out on its own, and the stranded-source-delete sweep
+(gated on a terminal-*import* status) never even looked at it.
+
+**The fix is a new intermediate status, `dropped`, that inverts the refusal rule rather than
+loosening it for everyone.** `gone`/`cleaned` keep the *exact* same same-downloadId refusal,
+completely unchanged — that rule is still correct for a row this codebase has genuinely finished
+with. `dropped` is a new, separate rematch class
+(`_REAPPEARANCE_REMATCHABLE_STATES`) that gets the *opposite* treatment: an identical
+`downloadId` reappearing is not refused, it's exactly the evidence a `dropped` row is waiting
+for — direct proof the disappearance was transient, sending the row straight back to `detected`.
+The two rules coexist deliberately, on purpose, for different reasons: `gone`/`cleaned` are
+*settled* facts (a row this codebase already made a final call about, where a same-id reappearance
+is far more likely a queue-listing quirk than genuine new information); `dropped` is explicitly
+*not yet settled* — it exists only because the previous pass couldn't tell blip from removal, so
+the strongest possible signal (the identical release, still there) is treated as conclusive.
+
+**Why hold `dropped` for hours rather than just running the two-pass guard twice (four
+observations)?** The production blip was minutes long and covered two ~60s-apart passes
+end-to-end — any fixed multiple of the poll interval that's safely larger than that blip is still
+tiny compared to how long a genuinely-failed grab realistically sits unconfirmed. A named,
+generous constant (`DROPPED_GONE_GRACE_S`, 6h) that's rechecked *continuously* (every pass, not
+gated behind another N-observation count) is simpler to reason about and to explain in the UI
+("rechecking, will call it gone after 6h with nothing") than "N consecutive passes must now
+each independently reconfirm absence," and costs nothing extra per pass (one `import_events` call
+either way).
+
+**The retroactive heal for already-`gone` rows deliberately doesn't touch `arr_status` for a
+`cleaned` row with a stranded debt** (the pre-existing `_sweep_stranded_source_deletes` already
+covers `arr_status IN ('imported', 'cleaned')` for that) — `_heal_stranded_gone_rows` is scoped
+to `arr_status = 'gone'` only, since that's the one terminal state this task's own bug produced
+that the pre-existing sweep couldn't reach (it never touched `gone` at all, by design — rung 4
+never fires on `gone`). The two sweeps are deliberately separate queries rather than one merged
+one: `_sweep_stranded_source_deletes` retries a *known-owed* delete for a row already `imported`/
+`cleaned`; `_heal_stranded_gone_rows` first has to *discover* that the row should never have
+stayed `gone` at all, a materially different question (an `import_events` lookup, not a delete
+retry) that happens to feed into the same downstream machinery once it succeeds.
+
+---
+
 ## 2026-08-17 — Shell root uses `h-dvh` over `h-screen`; chart width cap chosen so the height cap never actually engages
 
 `prompts/done/2026-08-17-chart-height-cap-and-single-scroll.md`, executed end to end. Two

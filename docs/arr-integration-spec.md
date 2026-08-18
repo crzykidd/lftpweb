@@ -69,13 +69,17 @@ ALTER TABLE path_queue ADD COLUMN arr_visible_path TEXT;
     -- NULL = same namespace, no translation. See "Path namespaces" below.
 
 ALTER TABLE item ADD COLUMN arr_status TEXT;           -- NULL | detected | notified
-                                                       -- | imported | cleaned | gone
+                                                       -- | imported | cleaned | dropped | gone
 ALTER TABLE item ADD COLUMN arr_status_at TEXT;        -- when arr_status last changed
 ALTER TABLE item ADD COLUMN arr_download_id TEXT;      -- the *arr queue record's downloadId
                                                        -- (infohash), recorded at match time;
                                                        -- makes history lookup exact. Not
                                                        -- published in the item projection.
 ```
+
+`dropped` (2026-08-18, `prompts/2026-08-18-arr-gone-grace-and-recheck.md`) is a value, not a
+migration -- `arr_status` is plain `TEXT` with no `CHECK` constraint (unlike `arr_instance.kind`
+above), so a new value needs no schema change at all.
 
 No new rows inserted; every existing install behaves identically after migration (icons need
 an instance created + enabled + bound, three explicit acts).
@@ -96,8 +100,52 @@ It joins `ITEM_VIEW_COLUMNS` in `core/itemview.py` so the WebSocket, the snapsho
                                             delete_completed?  imported
                                               ON → cleanup → cleaned
                                               OFF → stays imported (green icon)
-   queue record vanished with NO import event ──▶ gone (icon dims; nothing deleted)
+
+   queue record vanished, no import event, confirmed over 2 passes ──▶ dropped (amber, rechecking)
+     dropped ──same downloadId reappears──▶ detected
+     dropped ──import event surfaces──▶ imported (rung 4 + cleanup proceed normally)
+     dropped ──neither, for DROPPED_GONE_GRACE_S (6h)──▶ gone (red; nothing deleted, ever)
 ```
+
+**`dropped` (2026-08-18, production incident, support bundle
+`lftpweb-support-0.2.3-20260818T013532Z`)** sits between the two-pass quiescence guard and the
+old, terminal `gone`. SABnzbd sometimes returns a blank/empty queue to Sonarr's own poll; this
+codebase's poller runs slower than that blip (once a minute), so both of the guard's observation
+passes can land inside the same blank window -- 8 real items committed straight to `gone` in a
+single pass while lftpweb was still actively downloading them (their verify/rename events ran
+minutes later, proving no import could have existed yet). `gone` is deliberately terminal (a
+settled row refuses to re-match on an identical `downloadId`, below) and the stranded-source-
+delete sweep only retries `imported`/`cleaned` rows, so all 8 rows sat with a permanent red dot,
+a parked rung-4 source delete, and no cleanup -- even though the *arr imported every one of them
+normally an hour later.
+
+The two-pass guard confirming "record gone, no import evidence" now commits `dropped` instead of
+`gone`, and the row is re-checked **every subsequent poller pass** -- not gated behind another
+two-pass observation, since `dropped` itself already *is* the held-for-confirmation state:
+
+- The identical `downloadId` reappearing in the queue is direct evidence the disappearance was a
+  blip, not a removal, and sends the row straight back to `detected`. This is the deliberate
+  *opposite* of the `gone`/`cleaned` matching rule below (a settled row refuses to re-match on
+  that same identical `downloadId`) -- `dropped` is not settled yet, so it gets the opposite
+  treatment. See `docs/decisions.md`, 2026-08-18.
+- A history import event surfacing while `dropped` promotes straight to `imported` through the
+  normal two-pass-guard's own commit path -- rung 4's deferred source delete and cleanup then
+  proceed exactly as they would for any other import.
+- Only once `arr_status_at` is older than `DROPPED_GONE_GRACE_S` (a deliberate, named module
+  constant defaulting to **6 hours** -- `core/arrsync.py`, `docs/concepts.md`; a settings knob is
+  a named future option, not built now) with neither signal does the row finally commit `gone`.
+
+**Retroactive self-heal.** A row that already committed the old, direct `gone` before this
+shipped -- the production 8, and any like them -- is healed automatically:
+`core/arrsync.py._heal_stranded_gone_rows` re-queries `import_events` by the item's own stored
+`arr_download_id` for every `gone` row still carrying a stranded rung-4 delete debt
+(`remote_delete_pending IS NOT NULL AND remote_deleted_at IS NULL`) -- the query alone is the
+self-heal, no migration or state massaging needed. An import event found promotes the row to
+`imported` through the normal path (rung-4 delete + cleanup then proceed normally); bounded by
+`MAX_GONE_HEAL_ATTEMPTS`, growing-delay backoff (same shape as the rung-4 retry sweep), so a
+genuinely-gone row is not queried forever -- one `arr_gone_heal_giving_up` event on giving up. A
+row with no recorded `arr_download_id` (an old title-fallback match) still counts each check as
+an attempt, since no exact lookup is possible for it.
 
 - **detected** — a record in the bound instance's `/api/v3/queue` matched this item.
 - **notified** — the scan command was POSTed (only if `notify_on_complete`; skipped state
@@ -302,7 +350,8 @@ gone once the *arr has it, which is the point.
   | `null` | *(no chip at all)* | not *arr-tracked |
   | `detected` / `notified` | none | Sonarr/Radarr queued this; it's being watched through the pipeline |
   | `imported` | green ✓ badge | the *arr confirmed import; files kept (delete-completed off) |
-  | `gone` | red dot badge | left the *arr's queue **without** importing — likely a failed/removed grab, may need attention |
+  | `dropped` | amber pending dot | left the *arr's queue moments ago with no import evidence yet — rechecked every pass; not yet actionable (2026-08-18) |
+  | `gone` | red dot badge | stayed unconfirmed past the `dropped` grace window — likely a failed/removed grab, may need attention |
   | `cleaned` | green ✓ badge + (Files only) "Processed · Xm" countdown | imported and locally cleaned up; visible through the ~10m removal grace, then leaves via the normal `REMOVED_LOCAL` flow |
 
   `cleaned` shares the `imported` row's green ✓ (decision, 2026-08-16, first live Radarr

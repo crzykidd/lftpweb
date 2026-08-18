@@ -8,7 +8,7 @@ progress, auto-queue on patterns, and optionally verify, extract, and relocate f
 
 > ## Beta
 >
-> **Version `0.2.3`.** All 9 build phases are built, covered by backend unit and integration
+> **Version `0.2.4`.** All 9 build phases are built, covered by backend unit and integration
 > tests plus a frontend unit suite, and exercised manually through the UI against a real
 > seedbox. This is a **beta** — there is no upgrade path guaranteed between beta releases,
 > and the database schema may still change between them. See
