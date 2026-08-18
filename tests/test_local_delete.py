@@ -17,7 +17,7 @@ import aiosqlite
 import pytest
 
 import lftpweb.core.engine as engine_module
-from lftpweb.core import local_delete, local_scan
+from lftpweb.core import extract, local_delete, local_scan, retention
 from lftpweb.core.autoqueue import (
     AutoQueue,
     AutoQueueSettings,
@@ -1568,6 +1568,249 @@ async def test_retention_scheduler_leaves_orphans_alone_while_disabled(tmp_path)
         await scheduler.run_once()
 
         assert stale.exists()
+    finally:
+        await db.close()
+
+
+# --- Orphaned extract-debris sweep (2026-08-18, prompts/done/2026-08-18-sweep-orphaned-extract-
+# debris.md) -- widens the existing `_FAILED_` bounded-lifetime mechanism
+# (`extract.sweep_failed_dirs`, gated by `PostprocessSettings.failed_retention_enabled`) to the
+# case it structurally cannot reach: the owning item has left tracking (or both trees) entirely,
+# not merely "gotten old." No settings toggle -- see `docs/decisions.md` and
+# `RetentionScheduler._sweep_orphan_extract_debris`'s own docstring for why. -------------------
+
+
+def test_derive_debris_owner_candidates_strips_prefix_and_download_prefix():
+    """The production incident's exact shape: `_FAILED_.downloading-<name>` resolves to item
+    name `<name>`, with the un-stripped `.downloading-<name>` kept as a second candidate.
+    """
+    assert retention._derive_debris_owner_candidates(
+        f"{extract.FAILED_PREFIX}.downloading-Hard.Knocks.S02E09"
+    ) == ("Hard.Knocks.S02E09", ".downloading-Hard.Knocks.S02E09")
+
+
+def test_derive_debris_owner_candidates_without_download_prefix():
+    assert retention._derive_debris_owner_candidates(f"{extract.UNPACK_PREFIX}Some.Release") == (
+        "Some.Release",
+    )
+
+
+def test_derive_debris_owner_candidates_empty_after_strip():
+    assert retention._derive_debris_owner_candidates(extract.FAILED_PREFIX) == ()
+
+
+def test_derive_debris_owner_candidates_not_a_staging_prefix_at_all():
+    assert retention._derive_debris_owner_candidates("OrdinaryRelease") == ()
+
+
+async def test_orphan_extract_debris_sweep_removes_a_failed_dir_with_no_item_row(tmp_path):
+    """The manual-delete case: the item was removed via `Reset item tracking` (or simply never
+    tracked at all), so no `item` row of any kind matches the derived name.
+    """
+    local_root = tmp_path / "local"
+    local_root.mkdir()
+    debris = local_root / f"{extract.FAILED_PREFIX}Hard.Knocks.S02E09"
+    debris.mkdir()
+    (debris / "evidence.txt").write_text("stale")
+    write_if_needed(str(local_root))
+
+    db = await _make_db()
+    try:
+        await _make_queue(db, local_root)
+
+        scheduler = local_delete.RetentionScheduler(db, EventBus())
+        await scheduler.run_once()
+
+        assert not debris.exists()
+        events = await (
+            await db.execute(
+                "SELECT item_id, message FROM event WHERE kind = 'extract_debris_removed'"
+            )
+        ).fetchall()
+        assert len(events) == 1
+        assert events[0]["item_id"] is None
+        assert "Hard.Knocks.S02E09" in events[0]["message"]
+    finally:
+        await db.close()
+
+
+async def test_orphan_extract_debris_sweep_removes_a_dir_whose_item_reads_removed_both(tmp_path):
+    local_root = tmp_path / "local"
+    local_root.mkdir()
+    debris = local_root / f"{extract.FAILED_PREFIX}Some.Release"
+    debris.mkdir()
+    write_if_needed(str(local_root))
+
+    db = await _make_db()
+    try:
+        queue_id = await _make_queue(db, local_root)
+        item_id = await _make_item(
+            db,
+            queue_id,
+            "Some.Release",
+            is_dir=True,
+            state="REMOVED_BOTH",
+            remote_size=None,
+        )
+
+        scheduler = local_delete.RetentionScheduler(db, EventBus())
+        await scheduler.run_once()
+
+        assert not debris.exists()
+        events = await (
+            await db.execute("SELECT item_id FROM event WHERE kind = 'extract_debris_removed'")
+        ).fetchall()
+        assert len(events) == 1
+        assert events[0]["item_id"] == item_id
+    finally:
+        await db.close()
+
+
+async def test_orphan_extract_debris_sweep_leaves_a_dir_whose_item_is_still_live(tmp_path):
+    """A `_FAILED_` whose item still exists in a non-terminal (not `REMOVED_BOTH`) state must
+    be left alone -- today's bounded-lifetime behavior (age-based, off by default) still governs
+    it; this sweep only widens coverage to the provably-orphaned case.
+    """
+    local_root = tmp_path / "local"
+    local_root.mkdir()
+    debris = local_root / f"{extract.FAILED_PREFIX}Still.Downloading"
+    debris.mkdir()
+    write_if_needed(str(local_root))
+
+    db = await _make_db()
+    try:
+        queue_id = await _make_queue(db, local_root)
+        await _make_item(db, queue_id, "Still.Downloading", is_dir=True, state="PARTIAL")
+
+        scheduler = local_delete.RetentionScheduler(db, EventBus())
+        await scheduler.run_once()
+
+        assert debris.exists()
+        events = await (
+            await db.execute("SELECT 1 FROM event WHERE kind = 'extract_debris_removed'")
+        ).fetchall()
+        assert events == []
+    finally:
+        await db.close()
+
+
+async def test_orphan_extract_debris_sweep_leaves_an_in_flight_owners_dir_untouched(tmp_path):
+    """The owning item's row already reads `REMOVED_BOTH` -- which alone would make the
+    directory eligible for the sweep -- but a worker is (per `in_flight_provider`) still
+    actually inside `PostprocessPipeline.process_item` for it. The in-flight guard must win over
+    the state check, never sweeping out from under a running extract/delete worker.
+    """
+    local_root = tmp_path / "local"
+    local_root.mkdir()
+    debris = local_root / f"{extract.UNPACK_PREFIX}Mid.Extract"
+    debris.mkdir()
+    write_if_needed(str(local_root))
+
+    db = await _make_db()
+    try:
+        queue_id = await _make_queue(db, local_root)
+        item_id = await _make_item(
+            db,
+            queue_id,
+            "Mid.Extract",
+            is_dir=True,
+            state="REMOVED_BOTH",
+            remote_size=None,
+        )
+
+        scheduler = local_delete.RetentionScheduler(
+            db, EventBus(), in_flight_provider=lambda: frozenset({item_id})
+        )
+        await scheduler.run_once()
+
+        assert debris.exists()
+    finally:
+        await db.close()
+
+
+async def test_orphan_extract_debris_sweep_resolves_the_incidents_exact_name_shape(tmp_path):
+    """Production shape: `_FAILED_.downloading-<name>` -- the folder-prefix-during-transfer
+    layer must be stripped along with the staging prefix, resolving to item name `<name>`, not
+    `.downloading-<name>`.
+    """
+    local_root = tmp_path / "local"
+    local_root.mkdir()
+    debris = local_root / f"{extract.FAILED_PREFIX}.downloading-Hard.Knocks.S02E09"
+    debris.mkdir()
+    write_if_needed(str(local_root))
+
+    db = await _make_db()
+    try:
+        queue_id = await _make_queue(db, local_root)
+        item_id = await _make_item(
+            db,
+            queue_id,
+            "Hard.Knocks.S02E09",
+            is_dir=True,
+            state="REMOVED_BOTH",
+            remote_size=None,
+        )
+
+        scheduler = local_delete.RetentionScheduler(db, EventBus())
+        await scheduler.run_once()
+
+        assert not debris.exists()
+        events = await (
+            await db.execute(
+                "SELECT item_id, message FROM event WHERE kind = 'extract_debris_removed'"
+            )
+        ).fetchall()
+        assert len(events) == 1
+        assert events[0]["item_id"] == item_id
+        assert "'Hard.Knocks.S02E09'" in events[0]["message"]
+    finally:
+        await db.close()
+
+
+async def test_orphan_extract_debris_sweep_skips_a_queue_that_fails_the_mount_sentinel(tmp_path):
+    """A vanished mount must not read as 'everything is orphaned' -- the load-bearing rail. No
+    `write_if_needed()` call here, so `mount_sentinel.check` reads `False` for this queue and
+    the whole sweep is skipped for it, even though the directory would otherwise be an
+    unambiguous no-item-row orphan.
+    """
+    local_root = tmp_path / "local"
+    local_root.mkdir()
+    debris = local_root / f"{extract.FAILED_PREFIX}Orphaned.Release"
+    debris.mkdir()
+
+    db = await _make_db()
+    try:
+        await _make_queue(db, local_root)
+
+        scheduler = local_delete.RetentionScheduler(db, EventBus())
+        await scheduler.run_once()
+
+        assert debris.exists()
+    finally:
+        await db.close()
+
+
+async def test_orphan_extract_debris_sweep_runs_with_no_settings_toggle(tmp_path):
+    """Unlike `OrphanTempCleanupSettings`/`RetentionSettings`, this sweep has no settings gate
+    at all (docs/decisions.md) -- it fires on the scheduler's normal pass with nothing to opt
+    into, since it only ever acts once an owning item is provably gone.
+    """
+    local_root = tmp_path / "local"
+    local_root.mkdir()
+    debris = local_root / f"{extract.FAILED_PREFIX}No.Toggle.Needed"
+    debris.mkdir()
+    write_if_needed(str(local_root))
+
+    db = await _make_db()
+    try:
+        await _make_queue(db, local_root)
+        # No settings of any kind saved -- retention_settings, orphan_temp_cleanup_settings,
+        # nothing.
+
+        scheduler = local_delete.RetentionScheduler(db, EventBus())
+        await scheduler.run_once()
+
+        assert not debris.exists()
     finally:
         await db.close()
 

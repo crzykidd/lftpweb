@@ -638,3 +638,39 @@ def sweep_failed_dirs(
         removed.append((resolved_child, age_days))
         shutil.rmtree(resolved_child)
     return removed
+
+
+def list_top_level_debris_dirs(queue_root: Path) -> list[Path]:
+    """Every direct child of `queue_root` (a path queue's `local_path`) whose name starts with
+    `UNPACK_PREFIX` or `FAILED_PREFIX` -- the enumeration half of the orphan-debris sweep
+    (2026-08-18, `prompts/done/2026-08-18-sweep-orphaned-extract-debris.md`; production find:
+    `_FAILED_.downloading-Hard.Knocks...` survived its item's manual delete forever, because
+    both prefixes are filtered out of `core/local_scan.py`'s walk by design -- nothing else in
+    this codebase will ever notice one is there once its item row is gone too).
+
+    This widens `sweep_failed_dirs`'s reach rather than duplicating it: same direct-child-only,
+    containment-reverified shape (`resolve_within_root` re-checked here, not trusted from the
+    caller -- this module's own rule, see that function's docstring: there is exactly one
+    containment check disk content is ever deleted through), but neither age-gated nor
+    `_FAILED_`-only -- an in-progress `_UNPACK_` staging directory can be listed here too; it is
+    the caller's job to decide it's actually orphaned before removing anything.
+
+    Pure / no DB access, matching every other function in this module. Whether a listed
+    directory is actually *orphaned* -- its owning item row is gone, or has itself left both
+    trees -- needs the `item` table, which lives in `core/retention.py.RetentionScheduler.
+    _sweep_orphan_extract_debris`, the only caller.
+    """
+    resolved_root = queue_root.resolve()
+    if not resolved_root.is_dir():
+        return []
+    out: list[Path] = []
+    for child in sorted(resolved_root.iterdir()):
+        if not child.is_dir():
+            continue
+        if not (child.name.startswith(UNPACK_PREFIX) or child.name.startswith(FAILED_PREFIX)):
+            continue
+        resolved_child = resolve_within_root(child, resolved_root)
+        if resolved_child is None or resolved_child.parent != resolved_root:
+            continue  # symlink (or similar) escaping the queue root -- refuse
+        out.append(resolved_child)
+    return out

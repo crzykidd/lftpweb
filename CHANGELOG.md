@@ -33,6 +33,11 @@ Skeleton for the next roll:
   a completed transfer's re-queued `mirror -c` no-ops straight into post-processing, a partial
   one resumes from its bytes. Interrupted items re-queue themselves on restart instead of
   requiring a manual Queue click.
+- Leftover `_FAILED_`/`_UNPACK_` extraction folders whose release is long gone are now cleaned
+  up automatically instead of sitting invisible on disk forever. Previously, once an item's own
+  row left tracking (a manual delete, or the item leaving both trees entirely), its extraction
+  staging/evidence directory had no item row, no Files-page presence, and no delete affordance
+  — nothing would ever clean it up.
 
 ### Security
 ### Deprecated
