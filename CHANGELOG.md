@@ -24,6 +24,15 @@ Skeleton for the next roll:
 ## [Unreleased]
 
 ### Added
+### Changed
+### Fixed
+### Security
+### Deprecated
+### Removed
+
+## [0.2.4] — 2026-08-17
+
+### Added
 
 - **An amber "rechecking" state for the Sonarr/Radarr icon** — a release that drops out of the
   bound *arr instance's queue with no import evidence yet no longer jumps straight to the red
