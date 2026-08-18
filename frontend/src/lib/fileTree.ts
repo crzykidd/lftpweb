@@ -399,10 +399,13 @@ export type FacetFilter =
   | 'not_extracted'
   | 'missing_locally'
   // Sonarr/Radarr integration (migration 018, docs/arr-integration-spec.md "UI"): "*arr-tracked"
-  // is every row with a non-null `arr_status` (detected/notified/imported/cleaned/gone) --
-  // "being watched through the pipeline" in the spec's own words. `arr_gone` is called out on
-  // its own, per the spec's explicit instruction, because it's the one state that usually needs
-  // a human -- a release that left the *arr's queue without ever importing.
+  // is every row with a non-null `arr_status` (detected/notified/imported/cleaned/dropped/gone)
+  // -- "being watched through the pipeline" in the spec's own words; `dropped` (2026-08-18)
+  // counts here without a filter of its own. `arr_gone` is called out on its own, per the spec's
+  // explicit instruction, because it's the one state that usually needs a human -- a release
+  // that left the *arr's queue and stayed unconfirmed past the `dropped` grace window. No
+  // separate `arr_dropped` filter (deliberate, this task's own scope: `dropped` is a transient
+  // amber "rechecking" state, not an actionable one the way `gone` is).
   | 'arr_tracked'
   | 'arr_gone'
 
@@ -440,7 +443,7 @@ export function matchesFacetFilter(entry: TreeEntry, filter: FacetFilter): boole
 // `GET /api/settings/arr`), which is exactly what `FilesPage.tsx` does before threading an
 // `arrInstanceName` prop down to `FileTree`/`Row`. Never invented as a new wire field here.
 
-export type ArrIconVariant = 'none' | 'neutral' | 'imported' | 'gone'
+export type ArrIconVariant = 'none' | 'neutral' | 'imported' | 'gone' | 'dropped'
 
 const ARR_ICON_VARIANTS: Record<string, ArrIconVariant> = {
   detected: 'neutral',
@@ -456,6 +459,14 @@ const ARR_ICON_VARIANTS: Record<string, ArrIconVariant> = {
   cleaned: 'imported',
   imported: 'imported',
   gone: 'gone',
+  // `dropped` (2026-08-18, `prompts/2026-08-18-arr-gone-grace-and-recheck.md`, production
+  // incident: a download-client blank-queue blip flipped 8 items straight to `gone` in a
+  // single poller pass) -- the amber "removed from the *arr's queue, rechecking" grace state
+  // between the two-pass quiescence guard and `gone` itself. Its own variant, not folded into
+  // `gone`'s: the whole point is that this is *not yet* the actionable red state -- it may
+  // still resolve back to `detected` (the same downloadId reappears) or `imported` (a history
+  // event surfaces) before the grace window (backend `DROPPED_GONE_GRACE_S`, 6h) expires.
+  dropped: 'dropped',
 }
 
 /** Maps `item.arr_status` to the *arr indicator's visual variant, per the spec's own
@@ -485,18 +496,20 @@ export function arrIconVariant(arrStatus: string | null): ArrIconVariant {
 // consume the same `arrIconVariant` categorization above -- "one mapping, consumed everywhere"
 // -- rather than re-deriving it from `arrStatus` a second time.
 
-export type ArrChipOverlay = 'check' | 'warn' | null
+export type ArrChipOverlay = 'check' | 'warn' | 'pending' | null
 
 /** `imported`/`cleaned` (variant `'imported'`) -> green check ("processed"); `gone` -> red warn
- * dot ("left the *arr's queue without importing"); `detected`/`notified` (variant `'neutral'`)
- * -> the logo alone, no overlay -- the *arr is watching, mid-flight, no outcome yet to show.
- * `variant === 'none'` (arr_status null) is the caller's own cue to render no chip at all; this
- * function is never even called for that case by `ArrRowChip` below, but returns `null` for it
- * too, defensively.
+ * dot ("left the *arr's queue without importing"); `dropped` (2026-08-18) -> amber pending dot
+ * ("left the *arr's queue moments ago -- rechecking," not yet the actionable red state);
+ * `detected`/`notified` (variant `'neutral'`) -> the logo alone, no overlay -- the *arr is
+ * watching, mid-flight, no outcome yet to show. `variant === 'none'` (arr_status null) is the
+ * caller's own cue to render no chip at all; this function is never even called for that case by
+ * `ArrRowChip` below, but returns `null` for it too, defensively.
  */
 export function arrChipOverlay(variant: ArrIconVariant): ArrChipOverlay {
   if (variant === 'imported') return 'check'
   if (variant === 'gone') return 'warn'
+  if (variant === 'dropped') return 'pending'
   return null
 }
 
@@ -506,6 +519,10 @@ const ARR_STATUS_TEXT: Record<string, string> = {
   imported: 'imported by the *arr',
   gone: "left the *arr's queue without importing",
   cleaned: 'imported and cleaned up locally',
+  // `dropped`'s own sentence is built specially, below (it embeds the relative time inline
+  // rather than appending it in parens) -- this entry is a defensive fallback only, never
+  // actually read on the normal path.
+  dropped: "removed from the *arr's queue -- rechecking",
 }
 
 /** The icon's hover text (spec: "Hover card names the instance and the timestamp
@@ -514,14 +531,24 @@ const ARR_STATUS_TEXT: Record<string, string> = {
  * a queue config that hasn't loaded yet still explains itself. Returns `null` only when there is
  * genuinely nothing to say (`arr_status` itself is `null`), so callers can skip rendering a
  * title/tooltip entirely rather than showing an empty one.
+ *
+ * **`dropped` (2026-08-18) gets its own sentence shape** -- "removed from the *arr's queue
+ * <relative time> ago -- rechecking" -- rather than the generic "who: statusText (when)" every
+ * other status uses, because the relative time itself *is* the point of this hover (how much of
+ * the grace window has elapsed), not an incidental timestamp appended after the fact.
+ * `formatRelativeTimeIntl` already renders the trailing "ago" itself, so it is not repeated here.
  */
 export function arrHoverLabel(
   node: { arr_status: string | null; arr_status_at: string | null },
   instanceName: string | null,
 ): string | null {
   if (node.arr_status == null) return null
-  const statusText = ARR_STATUS_TEXT[node.arr_status] ?? node.arr_status
   const who = instanceName ?? 'the bound *arr instance'
+  if (node.arr_status === 'dropped') {
+    const when = node.arr_status_at != null ? ` ${formatRelativeTimeIntl(node.arr_status_at)}` : ''
+    return `${who}: removed from the *arr's queue${when} -- rechecking`
+  }
+  const statusText = ARR_STATUS_TEXT[node.arr_status] ?? node.arr_status
   const when = node.arr_status_at != null ? ` (${formatRelativeTimeIntl(node.arr_status_at)})` : ''
   return `${who}: ${statusText}${when}`
 }

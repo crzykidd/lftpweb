@@ -272,10 +272,20 @@ The mark itself changes as the release moves through the *arr's own pipeline:
   import, but not confirmed finished yet.
 - **Mark with a green ✓** — the *arr has confirmed the release fully imported. If this queue's
   "Delete when imported" is off, the files stay right where they are.
-- **Mark with an amber ⚠** — the release left the *arr's queue **without** ever importing.
-  Usually means the grab failed or was removed by hand on the *arr's side. Nothing was deleted
-  — this state is purely informational — but it is usually worth a look, and it has its own
-  entry in the Files page's filter dropdown for exactly that reason.
+- **Mark with an amber pending dot** — the release just dropped out of the *arr's queue with no
+  import evidence yet. Not necessarily a problem: download clients occasionally return a blank
+  queue for a poll or two, so lftpweb rechecks every pass rather than giving up right away — if
+  the release reappears in the *arr's queue it goes straight back to "being watched," and if an
+  import shows up in the *arr's history it goes green. Only if **neither** happens within a
+  fixed **6-hour** grace window does it escalate to the red state below. (This 6-hour window is
+  a deliberate, fixed constant today, not a setting.)
+- **Mark with a red ⚠** — the release left the *arr's queue and stayed unconfirmed for the full
+  grace window above. Usually means the grab failed or was removed by hand on the *arr's side.
+  Nothing was deleted — this state is purely informational — but it is usually worth a look, and
+  it has its own entry in the Files page's filter dropdown for exactly that reason. (A release
+  that reaches this red state and is *later* imported anyway — the *arr got to it eventually —
+  self-heals automatically: lftpweb keeps rechecking a bounded number of times in the
+  background and promotes it to green the moment an import shows up.)
 - **The removal-grace countdown, reworded** — if "Delete when imported" is on for this queue,
   lftpweb removes the local copy once import is fully confirmed (never before, and never on an
   ambiguous signal). That row then runs through the exact same ~ten-minute [removal grace
@@ -290,7 +300,8 @@ Hover the mark for which instance matched it and when.
 > done — lftpweb waits for the *arr's own queue record for the release to disappear *and* for
 > history to confirm an import, and checks both are still true a minute later before treating
 > anything as finished. A release simply vanishing from the *arr's queue with no import evidence
-> is never treated as imported — that is exactly the amber-warning case above.
+> is never treated as imported — that is exactly the amber-pending case above, and only turns red
+> once it has genuinely sat unconfirmed for the full 6-hour window.
 
 ## What's in a support bundle {#support-bundle}
 

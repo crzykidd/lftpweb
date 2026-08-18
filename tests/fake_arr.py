@@ -10,7 +10,10 @@ transport.
 between poller passes -- this is what lets `test_arrsync.py` model a slow multi-file import: a
 queue record stays present with `trackedDownloadState: importing` while `history_events`
 accretes one entry per file, exactly the shape docs/arr-integration-spec.md's "Failure modes"
-section asks the test fixture to model.
+section asks the test fixture to model. `queue_empty_for_requests` (2026-08-18,
+prompts/2026-08-18-arr-gone-grace-and-recheck.md) models the other production shape this fixture
+needs: a download client (SABnzbd) returning a transient blank queue response, independent of
+mutating `queue_records` itself.
 """
 
 from __future__ import annotations
@@ -61,6 +64,14 @@ class FakeArrState:
     # knob the pagination test needs to make one small queue/history split across pages
     # without needing 250+ fixture records to do it honestly.
     page_size_override: int | None = None
+    # The SAB-blank-queue-blip fixture (2026-08-18,
+    # prompts/2026-08-18-arr-gone-grace-and-recheck.md, production incident: SABnzbd sometimes
+    # returns a blank/empty response to Sonarr's own queue poll) -- when > 0, `GET /api/v3/queue`
+    # ignores `queue_records` entirely and returns an empty page, decrementing this counter by
+    # one per request; once it reaches zero, `queue_records` serves normally again. A test seeds
+    # `queue_records` once with the real records and just sets this counter to the number of
+    # poller passes the blip should span -- no need to juggle the underlying list itself.
+    queue_empty_for_requests: int = 0
     # When True, every request 500s -- the "unreachable instance" scenario
     # (`core/arrsync.py._handle_failure`) without actually tearing the server down.
     fail_all: bool = False
@@ -96,6 +107,9 @@ def create_fake_arr_app(state: FakeArrState) -> FastAPI:
 
     @app.get("/api/v3/queue")
     async def queue(page: int = 1, pageSize: int = 20) -> dict[str, Any]:
+        if state.queue_empty_for_requests > 0:
+            state.queue_empty_for_requests -= 1
+            return {"page": page, "pageSize": pageSize, "totalRecords": 0, "records": []}
         sliced, effective_size = _paginate(state.queue_records, page, pageSize)
         return {
             "page": page,

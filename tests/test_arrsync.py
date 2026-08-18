@@ -5,6 +5,10 @@ lifecycle" sections plus the handoff prompt's "at minimum" list.
 Phase A scope reminder (see core/arrsync.py's own module docstring): only `(no status) ->
 detected` and `detected/notified -> imported|gone` are reachable. Notify (`-> notified`) and
 cleanup are phase B and are not exercised here.
+
+2026-08-18 (`prompts/2026-08-18-arr-gone-grace-and-recheck.md`, production incident) adds the
+amber `dropped` grace state between the two-pass guard and terminal `gone`, plus the retroactive
+`gone`-row heal sweep -- see the "dropped" and "Retroactive heal" sections below.
 """
 
 from __future__ import annotations
@@ -18,6 +22,7 @@ from fake_arr import run_fake_arr_server
 from lftpweb.core.arrsync import (
     INITIAL_BACKOFF_S,
     MAX_BACKOFF_S,
+    MAX_GONE_HEAL_ATTEMPTS,
     MAX_SCAN_COMMAND_CHECK_ATTEMPTS,
     MAX_SOURCE_DELETE_RETRY_ATTEMPTS,
     ArrSyncScheduler,
@@ -103,12 +108,28 @@ async def _seed_item(
     is_dir: bool = True,
     state: str = "REMOTE_ONLY",
     arr_status: str | None = None,
+    arr_status_at: str | None = None,
     arr_download_id: str | None = None,
 ) -> int:
+    # 2026-08-18 (`_dropped_grace_expired`'s own docstring): a `dropped` row's grace check reads
+    # `arr_status_at` off the DB directly, so a test that seeds `arr_status='dropped'` straight
+    # into the table (bypassing `_commit_dropped`, which always stamps it) must not leave it
+    # NULL -- defaults to "now" whenever `arr_status` is set but the caller didn't pass one
+    # explicitly, matching what any real row in that state actually looks like.
+    if arr_status is not None and arr_status_at is None:
+        arr_status_at = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
     cursor = await db.execute(
-        "INSERT INTO item (queue_id, rel_path, is_dir, state, arr_status, arr_download_id) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
-        (queue_id, rel_path, 1 if is_dir else 0, state, arr_status, arr_download_id),
+        "INSERT INTO item (queue_id, rel_path, is_dir, state, arr_status, arr_status_at, "
+        "arr_download_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (
+            queue_id,
+            rel_path,
+            1 if is_dir else 0,
+            state,
+            arr_status,
+            arr_status_at,
+            arr_download_id,
+        ),
     )
     await db.commit()
     return cursor.lastrowid
@@ -558,10 +579,21 @@ async def test_pending_candidacy_resets_if_signals_stop_holding(db, fake_arr_ser
     assert (await _item_row(db, item_id))["arr_status"] == "imported"
 
 
-# --- gone: two-pass confirmation, no history ----------------------------------------------
+# --- dropped: the amber grace state (2026-08-18, production incident, support bundle
+# lftpweb-support-0.2.3-20260818T013532Z) -- a queue record vanishing with no import evidence
+# no longer commits terminal `gone` directly; it commits the amber `dropped` state, which is
+# then re-checked every subsequent pass (not gated behind another two-pass observation) until it
+# either reappears (-> detected), gets confirmed imported (-> imported), or its grace window
+# expires (-> gone). -------------------------------------------------------------------------
 
 
-async def test_gone_when_record_vanishes_with_no_import_event(db, fake_arr_server, tmp_path):
+async def test_dropped_when_record_vanishes_with_no_import_event_confirmed_over_two_passes(
+    db, fake_arr_server, tmp_path
+):
+    """The old `gone`-after-two-passes test, updated for the new terminal semantics: the
+    two-pass quiescence guard confirming "record gone, no import" now lands on `dropped`, not
+    `gone`.
+    """
     host_id = await _seed_host(db)
     instance_id = await _seed_instance(
         db,
@@ -587,8 +619,270 @@ async def test_gone_when_record_vanishes_with_no_import_event(db, fake_arr_serve
 
     await scheduler.run_once()
     row = await _item_row(db, item_id)
+    assert row["arr_status"] == "dropped"
+    assert await _event_kinds(db, item_id) == ["arr_queue_dropped"]
+
+
+async def test_dropped_blip_spanning_both_quiescence_passes_never_reaches_gone(
+    db, fake_arr_server, tmp_path
+):
+    """The production incident itself, reproduced via `fake_arr.py`'s own blip fixture: a
+    download client (SABnzbd) returns a blank queue for both of the quiescence guard's
+    observation passes, exactly the shape that used to flip 8 real items straight to `gone` in a
+    single pass. The row must land on `dropped`, never `gone` -- and once the blip clears, the
+    identical `downloadId` reappearing sends it straight back to `detected`.
+    """
+    host_id = await _seed_host(db)
+    instance_id = await _seed_instance(
+        db,
+        str(tmp_path),
+        base_url=fake_arr_server.base_url,
+        api_key=fake_arr_server.state.api_key,
+    )
+    queue_id = await _seed_queue(db, host_id, arr_instance_id=instance_id)
+    item_id = await _seed_item(
+        db,
+        queue_id,
+        "Show.S01E05.1080p-GRP",
+        state="DOWNLOADING",  # still actively downloading -- the incident's own evidence
+        arr_status="detected",
+        arr_download_id="abc123",
+    )
+    fake_arr_server.state.queue_records = [
+        _queue_record(
+            download_id="abc123",
+            title="Show S01E05 1080p GRP",
+            output_path="/data/torrents/complete/Show.S01E05.1080p-GRP",
+        )
+    ]
+    fake_arr_server.state.queue_empty_for_requests = 2  # the blip spans both observation passes
+
+    scheduler = ArrSyncScheduler(db=db, config_dir=str(tmp_path))
+    await scheduler.run_once()
+    assert (await _item_row(db, item_id))["arr_status"] == "detected", "pass 1 -- pending only"
+
+    await scheduler.run_once()
+    row = await _item_row(db, item_id)
+    assert row["arr_status"] == "dropped", "confirmed after two blank passes -- never gone"
+
+    # The blip has now cleared (`queue_empty_for_requests` exhausted) -- the *same* downloadId
+    # reappearing is direct evidence this was transient, so it goes straight back to `detected`.
+    await scheduler.run_once()
+    row = await _item_row(db, item_id)
+    assert row["arr_status"] == "detected"
+    kinds = await _event_kinds(db, item_id)
+    assert kinds == ["arr_queue_dropped", "arr_matched"]
+    cursor = await db.execute(
+        "SELECT message FROM event WHERE item_id = ? AND kind = 'arr_matched'", (item_id,)
+    )
+    message = (await cursor.fetchone())["message"]
+    assert "dropping out" in message or "dropped" in message
+
+
+async def test_dropped_reappearance_with_same_download_id_returns_to_detected(
+    db, fake_arr_server, tmp_path
+):
+    """The narrower, direct-DB-seeded version of the scenario above: a row seeded straight at
+    `dropped` (bypassing the two-pass mechanism) rematches on the identical `downloadId` alone,
+    unlike `gone`/`cleaned` which refuse exactly that match.
+    """
+    host_id = await _seed_host(db)
+    instance_id = await _seed_instance(
+        db,
+        str(tmp_path),
+        base_url=fake_arr_server.base_url,
+        api_key=fake_arr_server.state.api_key,
+    )
+    queue_id = await _seed_queue(db, host_id, arr_instance_id=instance_id)
+    item_id = await _seed_item(
+        db,
+        queue_id,
+        "Show.S01E05.1080p-GRP",
+        state="DOWNLOADED",
+        arr_status="dropped",
+        arr_download_id="abc123",
+    )
+    fake_arr_server.state.queue_records = [
+        _queue_record(
+            download_id="abc123",
+            title="Show S01E05 1080p GRP",
+            output_path="/data/torrents/complete/Show.S01E05.1080p-GRP",
+        )
+    ]
+
+    scheduler = ArrSyncScheduler(db=db, config_dir=str(tmp_path))
+    await scheduler.run_once()
+
+    row = await _item_row(db, item_id)
+    assert row["arr_status"] == "detected"
+    assert row["arr_download_id"] == "abc123"
+
+
+async def test_dropped_promotes_to_imported_when_history_shows_an_import(
+    db, fake_arr_server, tmp_path
+):
+    """While `dropped`, an import history event promotes straight to `imported` -- rechecked
+    every pass, no further two-pass wait (the row already spent a pass or more absent).
+    """
+    host_id = await _seed_host(db)
+    instance_id = await _seed_instance(
+        db,
+        str(tmp_path),
+        base_url=fake_arr_server.base_url,
+        api_key=fake_arr_server.state.api_key,
+    )
+    queue_id = await _seed_queue(db, host_id, arr_instance_id=instance_id)
+    item_id = await _seed_item(
+        db,
+        queue_id,
+        "Show.S01E05.1080p-GRP",
+        state="DOWNLOADED",
+        arr_status="dropped",
+        arr_download_id="abc123",
+    )
+    fake_arr_server.state.queue_records = []  # still absent from the queue
+    fake_arr_server.state.history_events = [_import_event(download_id="abc123")]
+
+    scheduler = ArrSyncScheduler(db=db, config_dir=str(tmp_path))
+    await scheduler.run_once()
+
+    row = await _item_row(db, item_id)
+    assert row["arr_status"] == "imported"
+    kinds = await _event_kinds(db, item_id)
+    assert kinds == ["arr_imported"]
+
+
+async def test_dropped_promotion_to_imported_fires_rung_4_delete(db, fake_arr_server, tmp_path):
+    """The `dropped` -> `imported` promotion runs through the exact same `_commit_terminal`
+    path as any other import -- a move-mode item's deferred rung-4 source delete fires from it,
+    not just the plain `arr_status` flip.
+    """
+    host_id = await _seed_host(db)
+    instance_id = await _seed_instance(
+        db,
+        str(tmp_path),
+        base_url=fake_arr_server.base_url,
+        api_key=fake_arr_server.state.api_key,
+    )
+    queue_id = await _seed_queue(db, host_id, arr_instance_id=instance_id)
+    await db.execute("UPDATE path_queue SET sync_mode = 'move' WHERE id = ?", (queue_id,))
+    await db.commit()
+    item_id = await _seed_item(
+        db,
+        queue_id,
+        "Show.S01E05.1080p-GRP",
+        state="VERIFIED",
+        arr_status="dropped",
+        arr_download_id="abc123",
+    )
+    await db.execute("UPDATE item SET remote_delete_pending = 'VERIFIED' WHERE id = ?", (item_id,))
+    await db.commit()
+    fake_arr_server.state.queue_records = []
+    fake_arr_server.state.history_events = [_import_event(download_id="abc123")]
+
+    pool = _FakeRemotePool()
+    scheduler = ArrSyncScheduler(
+        db=db, config_dir=str(tmp_path), remote_pool=pool, host_provider=_async_host
+    )
+    await scheduler.run_once()
+
+    row = await _item_row(db, item_id)
+    assert row["arr_status"] == "imported"
+    assert len(pool.calls) == 1
+    assert row["remote_deleted_at"] is not None
+    assert row["remote_delete_pending"] is None
+
+
+async def test_dropped_grace_window_expiry_commits_gone(db, fake_arr_server, tmp_path, monkeypatch):
+    """Neither reappearance nor import within `DROPPED_GONE_GRACE_S` -- the row finally commits
+    `gone`, today's terminal semantics unchanged (icon dims, nothing deleted). The grace constant
+    is monkeypatched down to 0 so the very next check pass reads as expired -- this module's own
+    `_dropped_grace_expired` compares against the real wall clock (a persisted `arr_status_at`),
+    not `time.monotonic()`, so there's no clock to fake here, only the threshold.
+    """
+    host_id = await _seed_host(db)
+    instance_id = await _seed_instance(
+        db,
+        str(tmp_path),
+        base_url=fake_arr_server.base_url,
+        api_key=fake_arr_server.state.api_key,
+    )
+    queue_id = await _seed_queue(db, host_id, arr_instance_id=instance_id)
+    item_id = await _seed_item(
+        db,
+        queue_id,
+        "Show.S01E05.1080p-GRP",
+        state="PARTIAL",
+        arr_status="dropped",
+        arr_download_id="abc123",
+    )
+    fake_arr_server.state.queue_records = []
+    fake_arr_server.state.history_events = []
+
+    scheduler = ArrSyncScheduler(db=db, config_dir=str(tmp_path))
+    # Not yet expired at the real 6h default -- stays dropped.
+    await scheduler.run_once()
+    assert (await _item_row(db, item_id))["arr_status"] == "dropped"
+
+    monkeypatch.setattr("lftpweb.core.arrsync.DROPPED_GONE_GRACE_S", 0.0)
+    await scheduler.run_once()
+    row = await _item_row(db, item_id)
     assert row["arr_status"] == "gone"
-    assert await _event_kinds(db, item_id) == ["arr_gone"]
+    kinds = await _event_kinds(db, item_id)
+    assert kinds == ["arr_gone"]
+    cursor = await db.execute(
+        "SELECT message FROM event WHERE item_id = ? AND kind = 'arr_gone'", (item_id,)
+    )
+    message = (await cursor.fetchone())["message"]
+    assert "unconfirmed" in message
+    assert "grace window" in message
+
+
+# --- Ladder/cleanup gates: `dropped` behaves exactly like any other non-imported tracked status
+# (2026-08-18) -------------------------------------------------------------------------------
+
+
+async def test_dropped_never_fires_rung_4_delete_while_still_dropped(db, fake_arr_server, tmp_path):
+    """A `dropped` row must not trigger the rung-4 deferred delete on its own -- only an actual
+    promotion to `imported` (reappearance -> detected -> ... -> imported, or a history event
+    found while dropped) may do that. Several passes of "still absent, no import" must leave the
+    deferred delete exactly as it was.
+    """
+    host_id = await _seed_host(db)
+    instance_id = await _seed_instance(
+        db,
+        str(tmp_path),
+        base_url=fake_arr_server.base_url,
+        api_key=fake_arr_server.state.api_key,
+    )
+    queue_id = await _seed_queue(db, host_id, arr_instance_id=instance_id)
+    await db.execute("UPDATE path_queue SET sync_mode = 'move' WHERE id = ?", (queue_id,))
+    await db.commit()
+    item_id = await _seed_item(
+        db,
+        queue_id,
+        "Show.S01E05.1080p-GRP",
+        state="VERIFIED",
+        arr_status="dropped",
+        arr_download_id="abc123",
+    )
+    await db.execute("UPDATE item SET remote_delete_pending = 'VERIFIED' WHERE id = ?", (item_id,))
+    await db.commit()
+    fake_arr_server.state.queue_records = []
+    fake_arr_server.state.history_events = []
+
+    pool = _FakeRemotePool()
+    scheduler = ArrSyncScheduler(
+        db=db, config_dir=str(tmp_path), remote_pool=pool, host_provider=_async_host
+    )
+    await scheduler.run_once()
+    await scheduler.run_once()
+
+    row = await _item_row(db, item_id)
+    assert row["arr_status"] == "dropped"
+    assert pool.calls == []
+    assert row["remote_deleted_at"] is None
+    assert row["remote_delete_pending"] == "VERIFIED"
 
 
 # --- Rung 4 of the move-mode delete ladder (2026-08-16,
@@ -696,10 +990,14 @@ async def test_move_mode_delete_survives_detected_and_notified_fires_only_on_imp
     assert kinds.index("arr_imported") < kinds.index("remote_delete")
 
 
-async def test_move_mode_delete_never_fires_on_gone(db, fake_arr_server, tmp_path):
-    """`gone` -- the *arr's queue record disappeared with no import history event -- must never
-    delete the source. A deferred item stays deferred exactly as the ladder promises: no
-    timeout, no automatic fallback.
+async def test_move_mode_delete_never_fires_while_dropped_or_after_gone(
+    db, fake_arr_server, tmp_path, monkeypatch
+):
+    """The *arr's queue record disappearing with no import history event -- through both the
+    amber `dropped` grace state and the eventual terminal `gone` once the window expires -- must
+    never delete the source. A deferred item stays deferred exactly as the ladder promises: no
+    timeout, no automatic fallback (2026-08-18: this used to reach `gone` directly after the
+    two-pass guard; it now passes through `dropped` first -- see `docs/decisions.md`).
     """
     host_id = await _seed_host(db)
     instance_id = await _seed_instance(
@@ -733,16 +1031,26 @@ async def test_move_mode_delete_never_fires_on_gone(db, fake_arr_server, tmp_pat
     await scheduler.run_once()
 
     row = await _item_row(db, item_id)
-    assert row["arr_status"] == "gone"
+    assert row["arr_status"] == "dropped"
     assert pool.calls == []
     assert row["remote_deleted_at"] is None
     assert row["remote_delete_pending"] == "VERIFIED", "left exactly as it was -- no fallback"
     kinds = await _event_kinds(db, item_id)
     assert "remote_delete" not in kinds
 
+    # Grace window expires -- still no fallback delete, even once terminal `gone` commits.
+    monkeypatch.setattr("lftpweb.core.arrsync.DROPPED_GONE_GRACE_S", 0.0)
+    await scheduler.run_once()
+    row = await _item_row(db, item_id)
+    assert row["arr_status"] == "gone"
+    assert pool.calls == []
+    assert row["remote_deleted_at"] is None
+    assert row["remote_delete_pending"] == "VERIFIED"
+    assert "remote_delete" not in await _event_kinds(db, item_id)
+
 
 async def test_gone_commit_on_pending_source_delete_names_it_in_the_event(
-    db, fake_arr_server, tmp_path
+    db, fake_arr_server, tmp_path, monkeypatch
 ):
     """Purely audit-trail visibility (2026-08-17,
     `prompts/done/2026-08-17-stranded-source-delete-retry.md`): rung 4 never fires on `gone` --
@@ -750,7 +1058,9 @@ async def test_gone_commit_on_pending_source_delete_names_it_in_the_event(
     queue record vanished just sits stranded silently otherwise. Production evidence: 15 items
     went `notified` -> `gone` with `remote_delete_pending` still set. `_commit_terminal`'s own
     `arr_gone` event message now names the withheld delete so History can answer "why is this
-    still on the seedbox" without a second lookup.
+    still on the seedbox" without a second lookup. 2026-08-18: the terminal `gone` commit this
+    now names is the grace-window-expiry one (`dropped` -> `gone`), not the two-pass guard's own
+    commit -- that one lands on `dropped`, not `gone`, per this same task.
     """
     host_id = await _seed_host(db)
     instance_id = await _seed_instance(
@@ -778,6 +1088,10 @@ async def test_gone_commit_on_pending_source_delete_names_it_in_the_event(
     fake_arr_server.state.history_events = []
     await scheduler.run_once()
     await scheduler.run_once()
+    assert (await _item_row(db, item_id))["arr_status"] == "dropped"
+
+    monkeypatch.setattr("lftpweb.core.arrsync.DROPPED_GONE_GRACE_S", 0.0)
+    await scheduler.run_once()
 
     row = await _item_row(db, item_id)
     assert row["arr_status"] == "gone"
@@ -791,7 +1105,7 @@ async def test_gone_commit_on_pending_source_delete_names_it_in_the_event(
 
 
 async def test_gone_commit_with_no_pending_source_delete_leaves_the_event_unchanged(
-    db, fake_arr_server, tmp_path
+    db, fake_arr_server, tmp_path, monkeypatch
 ):
     """The common case -- nothing was ever deferred (`remote_delete_pending` NULL) -- must not
     gain the new sentence; it would be misleading noise for an item that was never *arr-tracked
@@ -818,6 +1132,10 @@ async def test_gone_commit_with_no_pending_source_delete_leaves_the_event_unchan
 
     scheduler = ArrSyncScheduler(db=db, config_dir=str(tmp_path))
     await scheduler.run_once()
+    await scheduler.run_once()
+    assert (await _item_row(db, item_id))["arr_status"] == "dropped"
+
+    monkeypatch.setattr("lftpweb.core.arrsync.DROPPED_GONE_GRACE_S", 0.0)
     await scheduler.run_once()
 
     row = await _item_row(db, item_id)
@@ -1051,6 +1369,184 @@ async def test_stranded_source_delete_sweep_is_a_no_op_when_the_feature_is_not_w
     row = await _item_row(db, item_id)
     assert row["remote_delete_pending"] == "VERIFIED"
     assert row["remote_deleted_at"] is None
+
+
+# --- Retroactive heal for a row already stranded `gone` before `dropped` existed (2026-08-18,
+# production incident: the 8 items whose pipeline run finished -- and so set
+# `remote_delete_pending` -- only *after* their `gone` verdict already committed) -----------
+
+
+async def test_gone_heal_promotes_a_stranded_row_when_history_shows_an_import(
+    db, fake_arr_server, tmp_path
+):
+    """A row already sitting at `arr_status='gone'` with a stranded rung-4 debt, exactly the
+    production shape -- promoted to `imported` the moment `import_events` turns up a matching
+    event, with the deferred source delete firing from the very same pass (through the normal
+    `_commit_terminal` path, "proceed normally from here").
+    """
+    host_id = await _seed_host(db)
+    instance_id = await _seed_instance(
+        db,
+        str(tmp_path),
+        base_url=fake_arr_server.base_url,
+        api_key=fake_arr_server.state.api_key,
+    )
+    queue_id = await _seed_queue(db, host_id, arr_instance_id=instance_id)
+    await db.execute("UPDATE path_queue SET sync_mode = 'move' WHERE id = ?", (queue_id,))
+    await db.commit()
+    item_id = await _seed_item(
+        db,
+        queue_id,
+        "Show.S01E05.1080p-GRP",
+        state="VERIFIED",
+        arr_status="gone",
+        arr_download_id="abc123",
+    )
+    await db.execute("UPDATE item SET remote_delete_pending = 'VERIFIED' WHERE id = ?", (item_id,))
+    await db.commit()
+    fake_arr_server.state.queue_records = []
+    fake_arr_server.state.history_events = [_import_event(download_id="abc123")]
+
+    pool = _FakeRemotePool()
+    scheduler = ArrSyncScheduler(
+        db=db, config_dir=str(tmp_path), remote_pool=pool, host_provider=_async_host
+    )
+    await scheduler.run_once()
+
+    row = await _item_row(db, item_id)
+    assert row["arr_status"] == "imported"
+    assert len(pool.calls) == 1
+    assert row["remote_deleted_at"] is not None
+    assert row["remote_delete_pending"] is None
+    kinds = await _event_kinds(db, item_id)
+    assert "arr_imported" in kinds
+    assert "remote_delete" in kinds
+
+
+async def test_gone_heal_ignored_when_remote_delete_pending_is_not_set(
+    db, fake_arr_server, tmp_path
+):
+    """The sweep's own query is gated on `remote_delete_pending IS NOT NULL` -- a `gone` row
+    with nothing owed is not this sweep's business at all (and must not spuriously promote to
+    `imported` just because history happens to show something for its downloadId).
+    """
+    host_id = await _seed_host(db)
+    instance_id = await _seed_instance(
+        db,
+        str(tmp_path),
+        base_url=fake_arr_server.base_url,
+        api_key=fake_arr_server.state.api_key,
+    )
+    queue_id = await _seed_queue(db, host_id, arr_instance_id=instance_id)
+    item_id = await _seed_item(
+        db,
+        queue_id,
+        "Show.S01E05.1080p-GRP",
+        state="PARTIAL",
+        arr_status="gone",
+        arr_download_id="abc123",
+    )
+    fake_arr_server.state.history_events = [_import_event(download_id="abc123")]
+
+    scheduler = ArrSyncScheduler(db=db, config_dir=str(tmp_path))
+    await scheduler.run_once()
+
+    row = await _item_row(db, item_id)
+    assert row["arr_status"] == "gone"
+    assert "arr_imported" not in await _event_kinds(db, item_id)
+
+
+async def test_gone_heal_gives_up_after_bounded_attempts_with_no_import_ever_found(
+    db, fake_arr_server, tmp_path, monkeypatch
+):
+    """A genuinely-gone row -- no import ever shows up in history -- must not be queried
+    forever. `MAX_GONE_HEAL_ATTEMPTS` attempts, spaced apart by the same growing-delay backoff
+    the rung-4 retry sweep uses, then one `arr_gone_heal_giving_up` event and no more.
+    `remote_delete_pending` stays set throughout -- never silently dropped, same discipline as
+    the rung-4 sweep's own pause.
+    """
+    clock = {"t": 0.0}
+    monkeypatch.setattr("lftpweb.core.arrsync.time.monotonic", lambda: clock["t"])
+
+    host_id = await _seed_host(db)
+    instance_id = await _seed_instance(
+        db,
+        str(tmp_path),
+        base_url=fake_arr_server.base_url,
+        api_key=fake_arr_server.state.api_key,
+    )
+    queue_id = await _seed_queue(db, host_id, arr_instance_id=instance_id)
+    await db.execute("UPDATE path_queue SET sync_mode = 'move' WHERE id = ?", (queue_id,))
+    await db.commit()
+    item_id = await _seed_item(
+        db,
+        queue_id,
+        "Show.S01E05.1080p-GRP",
+        state="VERIFIED",
+        arr_status="gone",
+        arr_download_id="abc123",
+    )
+    await db.execute("UPDATE item SET remote_delete_pending = 'VERIFIED' WHERE id = ?", (item_id,))
+    await db.commit()
+    fake_arr_server.state.queue_records = []
+    fake_arr_server.state.history_events = []  # never an import, ever
+
+    scheduler = ArrSyncScheduler(db=db, config_dir=str(tmp_path))
+
+    for _attempt in range(MAX_GONE_HEAL_ATTEMPTS):
+        await scheduler.run_once()
+        clock["t"] += MAX_BACKOFF_S + 1  # always past whatever the current backoff is
+
+    row = await _item_row(db, item_id)
+    assert row["arr_status"] == "gone"
+    assert row["remote_delete_pending"] == "VERIFIED", "debt survives -- never silently dropped"
+    kinds = await _event_kinds(db, item_id)
+    assert kinds.count("arr_gone_heal_giving_up") == 1
+    assert kinds[-1] == "arr_gone_heal_giving_up"
+
+    # A later pass must not resume on its own, even once history would satisfy it.
+    fake_arr_server.state.history_events = [_import_event(download_id="abc123")]
+    clock["t"] += MAX_BACKOFF_S + 1
+    await scheduler.run_once()
+    row = await _item_row(db, item_id)
+    assert row["arr_status"] == "gone", "paused -- no further automatic attempts"
+
+
+async def test_gone_heal_skips_and_counts_an_attempt_when_download_id_is_absent(
+    db, fake_arr_server, tmp_path, monkeypatch
+):
+    """No `arr_download_id` recorded means no exact history lookup is possible -- this counts as
+    an attempt (per this sweep's own hard cap) rather than exempting the row from ever giving up.
+    """
+    clock = {"t": 0.0}
+    monkeypatch.setattr("lftpweb.core.arrsync.time.monotonic", lambda: clock["t"])
+
+    host_id = await _seed_host(db)
+    instance_id = await _seed_instance(
+        db,
+        str(tmp_path),
+        base_url=fake_arr_server.base_url,
+        api_key=fake_arr_server.state.api_key,
+    )
+    queue_id = await _seed_queue(db, host_id, arr_instance_id=instance_id)
+    await db.execute("UPDATE path_queue SET sync_mode = 'move' WHERE id = ?", (queue_id,))
+    await db.commit()
+    item_id = await _seed_item(
+        db, queue_id, "Show.S01E05.1080p-GRP", state="VERIFIED", arr_status="gone"
+    )
+    await db.execute("UPDATE item SET remote_delete_pending = 'VERIFIED' WHERE id = ?", (item_id,))
+    await db.commit()
+
+    scheduler = ArrSyncScheduler(db=db, config_dir=str(tmp_path))
+
+    for _attempt in range(MAX_GONE_HEAL_ATTEMPTS):
+        await scheduler.run_once()
+        clock["t"] += MAX_BACKOFF_S + 1
+
+    row = await _item_row(db, item_id)
+    assert row["arr_status"] == "gone"
+    assert row["remote_delete_pending"] == "VERIFIED"
+    assert (await _event_kinds(db, item_id)).count("arr_gone_heal_giving_up") == 1
 
 
 # --- Namespace-mismatch detection (2026-08-17, production evidence:
@@ -1596,15 +2092,18 @@ async def test_match_publishes_an_item_delta(db, fake_arr_server, tmp_path):
 
 
 async def test_gone_commit_on_a_removed_both_row_does_not_publish_an_item_delta(
-    db, fake_arr_server, tmp_path
+    db, fake_arr_server, tmp_path, monkeypatch
 ):
     """Regression (2026-08-16, live): files deleted by hand carried the row to `REMOVED_BOTH`
     -- out of the published projection (`core/engine.py._project`) and off the Files page --
     then removing the *arr queue record made the `gone` commit publish an `item_delta` that
     resurrected the dead node in every connected client: visible, un-actionable (nothing local
     to delete, nothing remote to queue), and only cleared by the next connect-time snapshot.
-    The state write and the `arr_gone` audit event must still happen; only the WS publish is
-    skipped.
+    The state write and the audit event must still happen; only the WS publish is skipped.
+    2026-08-18: the two-pass guard's own commit now lands on `dropped`, not `gone` -- both it and
+    the eventual grace-window-expiry `gone` commit must skip the publish, since `_publish_item`'s
+    `REMOVED_BOTH` guard is generic (keyed off the row's own `state`, unaffected by which
+    `arr_status` transition triggered the call).
     """
     host_id = await _seed_host(db)
     instance_id = await _seed_instance(
@@ -1632,8 +2131,15 @@ async def test_gone_commit_on_a_removed_both_row_does_not_publish_an_item_delta(
     await scheduler.run_once()  # two-pass quiescence guard
 
     row = await _item_row(db, item_id)
+    assert row["arr_status"] == "dropped"
+    assert await _event_kinds(db, item_id) == ["arr_queue_dropped"]
+    assert subscriber.empty()
+
+    monkeypatch.setattr("lftpweb.core.arrsync.DROPPED_GONE_GRACE_S", 0.0)
+    await scheduler.run_once()
+    row = await _item_row(db, item_id)
     assert row["arr_status"] == "gone"
-    assert await _event_kinds(db, item_id) == ["arr_gone"]
+    assert await _event_kinds(db, item_id) == ["arr_queue_dropped", "arr_gone"]
     assert subscriber.empty()
 
 

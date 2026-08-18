@@ -2607,8 +2607,37 @@ import rather than a removal, and both signals must hold across **two consecutiv
 passes** roughly a minute apart — a settle-gate-style quiescence guard, the same "unchanged for
 two observations" philosophy §1.3's own settle gate already applies to a remote fingerprint.
 Cleanup (`core/arrsync.py`'s `_maybe_cleanup`) never runs on ambiguity: a queue record simply
-vanishing with no import event maps to `gone` — the icon dims to an amber warning, nothing is
-deleted, ever.
+vanishing with no import event maps to `dropped`, not directly to `gone` (below) — the icon
+dims to an amber "rechecking" warning, nothing is deleted, ever.
+
+**`dropped` — an amber grace state, not an immediate verdict** (2026-08-18, production
+incident, support bundle `lftpweb-support-0.2.3-20260818T013532Z`: a download client
+occasionally returns a blank/empty queue to Sonarr's own poll, and this codebase's poller runs
+slower than that blip, so both of the two-pass guard's observations can land inside the same
+blank window — 8 real items committed straight to the old, terminal `gone` in a single pass
+while lftpweb was still actively downloading them). The two-pass quiescence guard confirming "no
+import evidence" now commits `dropped` instead of `gone`, and the row is re-checked **every
+subsequent poller pass** — not gated behind another two-pass observation, since `dropped` itself
+already *is* the held-for-confirmation state:
+
+- The *same* `downloadId` reappearing in the queue is direct evidence the disappearance was a
+  blip, not a removal — the row goes straight back to `detected`. This is deliberately the
+  *opposite* of `gone`/`cleaned`'s own matching rule (a settled row refuses to re-match on an
+  identical `downloadId` — see the "Failure modes" section above and `docs/decisions.md`,
+  2026-08-18, for why the two rules diverge).
+- A history import event surfacing while `dropped` promotes the row straight to `imported`
+  through the normal `_commit_terminal` path — rung 4's deferred source delete and cleanup then
+  proceed exactly as they would for any other import.
+- Only once `arr_status_at` is older than a deliberate, named constant
+  (`core/arrsync.py.DROPPED_GONE_GRACE_S`, 6 hours — see `docs/concepts.md`) with neither signal
+  does the row finally commit terminal `gone`, today's semantics unchanged: icon reads red,
+  nothing deleted, ever.
+
+A row that already committed the old, direct `gone` before this shipped — the production 8, and
+any like them — self-heals retroactively: `core/arrsync.py._heal_stranded_gone_rows` re-queries
+`import_events` by the item's own stored `arr_download_id` for any `gone` row still carrying a
+stranded rung-4 delete debt (`remote_delete_pending` non-null, `remote_deleted_at` null), bounded
+by attempts so a genuinely-gone row is not queried forever.
 
 **Cleanup reuses the removal-grace machinery, not a new timer.** When an item is cleaned up, the
 local bytes are removed but `item.state` is deliberately left untouched — the existing
@@ -2619,7 +2648,7 @@ because an *unexplained* absence means a decision is pending, renders "Processed
 `cleaned` row instead — same clock, different words, because this absence is deliberate and
 fully audited (`core/audit.py` event rows: `arr_matched`, `arr_notified`,
 `arr_notify_failed`, `arr_imported`, `arr_cleanup`, `arr_cleanup_withheld`,
-`arr_path_mismatch`, `arr_scan_command_failed`).
+`arr_path_mismatch`, `arr_scan_command_failed`, `arr_queue_dropped`, `arr_gone_heal_giving_up`).
 
 **The notify push is not actually fire-and-forget, as of 2026-08-17.** A `POST /api/v3/command`
 201 only ever meant "command queued" — it says nothing about whether the *arr could act on the
@@ -2652,8 +2681,10 @@ against `GET /api/v3/system/status`); three additions to each queue's form in Se
 (the *arr instance dropdown, the delete-when-imported checkbox — disabled with a hint unless an
 instance is bound — and the visible-path override); and, on the Files page, one icon slot per
 row driven purely by `arr_status`/`arr_status_at` off the wire. The icon is **multi-faceted**
-by deliberate decision (2026-08-15) — "the *arr processed it" (`imported`, green ✓) and "the
-*arr dropped it without importing" (`gone`, amber ⚠) are visually distinct states, not one
-dimmed glyph, and `gone` is independently filterable since it is the one state that usually
-needs a human. See `docs/arr-integration-spec.md`'s own "UI" section for the full icon-state
+by deliberate decision (2026-08-15) — "the *arr processed it" (`imported`, green ✓), "the *arr's
+queue record just disappeared, rechecking" (`dropped`, amber pending — 2026-08-18, above), and
+"the release stayed unconfirmed past the grace window" (`gone`, red) are visually distinct
+states, not one dimmed glyph, and `gone` is independently filterable since it is the one state
+that usually needs a human (`dropped` deliberately is not — it's a transient state, not yet
+actionable). See `docs/arr-integration-spec.md`'s own "UI" section for the full icon-state
 table.

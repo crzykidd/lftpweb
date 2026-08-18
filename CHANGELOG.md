@@ -24,8 +24,23 @@ Skeleton for the next roll:
 ## [Unreleased]
 
 ### Added
+
+- **An amber "rechecking" state for the Sonarr/Radarr icon** — a release that drops out of the
+  bound *arr instance's queue with no import evidence yet no longer jumps straight to the red
+  "gone" warning. It now holds amber and is rechecked on every poll: if the same release
+  reappears in the queue it goes back to "being watched," if the *arr's history shows an import
+  it goes green, and only if neither happens within 6 hours does it turn red. Fixes a
+  download-client blip (a blank/empty queue response) permanently mislabeling an item that the
+  *arr actually imported normally minutes later.
+
 ### Changed
 ### Fixed
+
+- **Already-"gone" items with a stranded delete now self-heal.** A release that hit the old,
+  immediate "gone" verdict before this fix — and was later imported by the *arr anyway — used to
+  sit stuck forever with a parked seedbox-side delete and no cleanup. lftpweb now rechecks a
+  bounded number of times in the background and promotes it once an import shows up.
+
 ### Security
 ### Deprecated
 ### Removed
