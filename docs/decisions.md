@@ -6,6 +6,62 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-18 — Startup re-queue of interrupted items reuses `enqueue_item`, never a second
+pipeline trigger; mount-gated; rule-4 remote-vanished gap accepted
+
+`prompts/done/2026-08-18-startup-rescue-complete-unwitnessed-items.md`, production incident
+diagnosed live + support bundle `lftpweb-support-0.2.4-20260818T192004Z`: job 195 (a 74 GB
+season pack) actually finished during an NFS half-outage, but the supervisor froze in D-state
+disk-wait and never reaped its exit. The restart sweep marked it `failed`/`INTERRUPTED`; the
+item correctly re-derived `DOWNLOADED` from the filesystem (§1.3), but `DOWNLOADED` isn't an
+auto-queue-eligible state, so nothing ever re-queued it, no post-processing ran, and the
+`.downloading-` prefix stayed on forever. Its `PARTIAL` sibling (job 193) self-healed within
+seconds because `PARTIAL` *is* auto-queue eligible — the asymmetry was the bug.
+
+**Re-queue through `enqueue_item`, not a hand-rolled pipeline kickoff.** The alternative
+considered was to have the startup sweep call `postprocess.trigger()` directly for an item it
+suspects is already complete-on-disk. Rejected: that would be a second entry point into the
+post-processing pipeline, parallel to (and inevitably drifting from) `_reap_one`'s existing
+"observed job success triggers post-processing" path — every future change to *when* it's safe
+to trigger (settle gate, completeness check, top-level-only) would need to be kept in sync by
+hand across two call sites. Re-queuing via `enqueue_item` instead means a re-queued complete
+item's `mirror -c` finds nothing to transfer, exits 0 almost immediately, and that *observed*
+success is what triggers the pipeline through the one path that already exists — exactly the
+recovery the user performed by hand (one Queue click) for the live incident item. The sweep
+never asserts "this item is definitely done"; it just asks lftp again and trusts the answer,
+matching §1.3's own principle.
+
+**Mount-gated, per queue, same as `core/autoqueue.py.on_scan`.** A restart with a broken mount
+is precisely this incident's own shape, so the sweep must not spawn lftp processes into an
+unmounted directory. Checked once per affected queue (not per item) via
+`core/mount_sentinel.py.check`, with a single warning event per gated queue for the whole
+startup pass — matching auto-queue's own once-per-transition debounce rather than one event per
+stranded item, which could otherwise spam the audit log for a queue holding several affected
+releases at once. A gated item is left exactly as before this fix: marked INTERRUPTED, not
+re-queued; a `PARTIAL` one is still picked up by the next healthy scan's auto-queue on its own,
+and a `DOWNLOADED` one is covered by the rule-2 rescue below on the *next* startup.
+
+**Rule 2 (rescuing rows stranded by an *earlier* restart) is keyed on:** `item.state =
+'DOWNLOADED'`, top-level (`instr(rel_path, '/') = 0`), its **most recent** job already
+`failed`/`INTERRUPTED`, no active (`queued`/`running`) job remaining, and its physical directory
+— resolved via `core/local_delete.py._physical_local_root`, never a second resolver — still
+carrying the download-prefix name. This exists because the live incident item was already in
+this wedged state *before* this fix shipped: rule 1 alone only re-queues jobs the current
+startup just interrupted, so without rule 2 the production item would have stayed stranded
+forever even after upgrading. Deliberately narrow: a stranded `PARTIAL` row is already
+auto-queue's job on the next healthy scan, so rule 2 only covers the one shape auto-queue
+structurally cannot see (`DOWNLOADED` is not in `ELIGIBLE_STATES`).
+
+**Rule 4 accepted, not solved: a complete-local item whose remote has since vanished.** If a
+crash happens *and* something external deletes the remote copy before the next restart, the
+re-queued no-op `mirror -c` fails `REMOTE_GONE` (a permanent error class) and the item is
+suppressed rather than reaching the pipeline — the same outcome a manual Queue click would hit
+today. Rare enough (needs both a crash after completion and an external remote delete in the
+same window) that it isn't worth a special-cased "verify local completeness without asking the
+remote" path; recorded here rather than silently left unhandled.
+
+---
+
 ## 2026-08-18 — `dropped` gets `gone`/`cleaned`'s same-downloadId rematch rule *inverted*, not removed
 
 `prompts/done/2026-08-18-arr-gone-grace-and-recheck.md`, production incident (support bundle

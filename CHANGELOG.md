@@ -26,6 +26,14 @@ Skeleton for the next roll:
 ### Added
 ### Changed
 ### Fixed
+
+- **A transfer that finished during a crash/hang no longer strands as
+  downloaded-but-never-processed.** A restart's startup sweep now re-queues every item it just
+  marked interrupted, and separately rescues rows an earlier restart already left in that state:
+  a completed transfer's re-queued `mirror -c` no-ops straight into post-processing, a partial
+  one resumes from its bytes. Interrupted items re-queue themselves on restart instead of
+  requiring a manual Queue click.
+
 ### Security
 ### Deprecated
 ### Removed
