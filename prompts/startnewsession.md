@@ -77,6 +77,33 @@ than a first. Two things that bit the first time and will bit again:
 
 ## Where we are
 
+### 🚀 v0.2.4 released 2026-08-17 (fourth same-day release) — the *arr "dropped" grace state, from a production diagnosis
+
+PR #10 (`dev` → `main`, merged `481e725`), tag `v0.2.4`, release notes = the `[0.2.4]`
+CHANGELOG section verbatim; `:latest`/`:0.2.4`/`:0` published on the release event. One item,
+but a substantial one (`prompts/done/2026-08-18-arr-gone-grace-and-recheck.md`, commit
+`7bf6941`), diagnosed from the user's production support bundle
+(`private_data/debug_logs/lftpweb-support-0.2.3-20260818T013532Z.zip`): **SABnzbd sometimes
+answers Sonarr's queue poll with a blank response**, Sonarr's queue view empties for a
+refresh, and 8 mid-download items flipped terminal `gone` (red dot) in a single lftpweb pass —
+provably premature, since lftpweb was still transferring them when the verdict landed. Worse
+than cosmetic: a `gone` row's rung-4 deferred source delete is parked forever (the stranded
+sweep gates on terminal-*import*), and cleanup never runs. The fix (design settled with the
+user, their own proposal): a queue-record disappearance now commits an intermediate
+**`dropped`** status — amber dot, "removed from the *arr's queue Xm ago — rechecking" —
+revisited every pass: same-downloadId reappearance → back to `detected` (the one state where
+the 2026-08-16 identical-downloadId re-match refusal deliberately does NOT apply; `gone`/
+`cleaned` keep it), an import in history → `imported` (rung 4 + cleanup fire normally), 6h
+(`DROPPED_GONE_GRACE_S`, module constant) with neither → `gone`, today's terminal semantics.
+Plus a **bounded retroactive heal**: `gone` rows still owing a deferred source delete get
+history rechecks (10 attempts, backoff, one giving-up event) and promote to `imported` when
+the import is found. **Verified on production before the cut** — the user ran `:dev` there and
+watched the stranded rows clean themselves up. No migration (arr_status is unconstrained
+TEXT). Tests at release: **1295 backend / 477 frontend, 0 skipped.** Also this release: the
+PR's push-event CI run had its Test suite job wedge in `pending` for 15+ minutes (GitHub
+status page claimed all-operational) — **cancel + `gh run rerun` was the fix, no check
+bypassed**, rerun green in 4m20s; the right playbook when the runner, not the code, is stuck.
+
 ### 🚀 v0.2.3 released 2026-08-17 (the third same-day release) — six live-use items, every one browser-confirmed before the cut
 
 PR #9 (`dev` → `main`, merged `28b98af`), tag `v0.2.3`, release notes = the `[0.2.3]`
