@@ -4,7 +4,9 @@ import {
   type LiveProgress,
   completedTimeLabel,
   decrementHistoryQueueSummary,
+  dismissableJobIds,
   failedJobPanelContent,
+  filterTransferJobs,
   formatQueueGroupCounts,
   groupHasDismissable,
   groupHistoryJobsByQueue,
@@ -18,6 +20,7 @@ import {
   readCollapsedQueues,
   readHistoryCollapsedQueues,
   sortTransferRows,
+  transferFilterSummary,
   transferGroupFields,
   transferLineValue,
   transferredSummary,
@@ -445,6 +448,96 @@ describe('groupHasDismissable -- the group header\'s "Dismiss Queue" visibility'
 
   it('is false for an empty group', () => {
     expect(groupHasDismissable([])).toBe(false)
+  })
+})
+
+// 2026-08-19 (prompts/2026-08-19-transfers-name-filter.md): the Transfers page's name filter --
+// `rel_path`-only substring match, empty-search identity passthrough, and the "Dismiss list"
+// button's own id list.
+describe('filterTransferJobs -- the name filter', () => {
+  it('matches case-insensitively', () => {
+    const jobs = [job('queued', { id: 1, rel_path: 'Married.At.First.Sight.S01' })]
+    expect(filterTransferJobs(jobs, 'married')).toEqual(jobs)
+    expect(filterTransferJobs(jobs, 'MARRIED')).toEqual(jobs)
+  })
+
+  it('matches a dotted literal like a plain substring -- no glob/regex parsing', () => {
+    const jobs = [
+      job('queued', { id: 1, rel_path: 'Married.At.First.Sight.S01E02' }),
+      job('queued', { id: 2, rel_path: 'Some.Other.Release' }),
+    ]
+    expect(filterTransferJobs(jobs, 'at.first.sight')).toEqual([jobs[0]])
+  })
+
+  it('returns the exact same array by identity for an empty search', () => {
+    const jobs = [job('queued', { id: 1 })]
+    expect(filterTransferJobs(jobs, '')).toBe(jobs)
+  })
+
+  it('returns the exact same array by identity for a whitespace-only search', () => {
+    const jobs = [job('queued', { id: 1 })]
+    expect(filterTransferJobs(jobs, '   ')).toBe(jobs)
+  })
+
+  it('returns an empty array when nothing matches', () => {
+    const jobs = [job('queued', { id: 1, rel_path: 'Some.Release' })]
+    expect(filterTransferJobs(jobs, 'nope')).toEqual([])
+  })
+
+  it('matches only rel_path, never queue_name -- a "movies" queue must not make every row in it match "movies"', () => {
+    const jobs = [job('queued', { id: 1, rel_path: 'Some.Release', queue_name: 'movies' })]
+    expect(filterTransferJobs(jobs, 'movies')).toEqual([])
+  })
+
+  it('matches a nested path, not just the trailing name', () => {
+    const jobs = [job('queued', { id: 1, rel_path: 'Show.S01/Show.S01E01.mkv' })]
+    expect(filterTransferJobs(jobs, 'show.s01e01')).toEqual(jobs)
+  })
+
+  it('preserves input order', () => {
+    const jobs = [
+      job('queued', { id: 1, rel_path: 'Zebra.Release' }),
+      job('queued', { id: 2, rel_path: 'Apple.Release' }),
+    ]
+    expect(filterTransferJobs(jobs, 'release')).toEqual(jobs)
+  })
+})
+
+describe('dismissableJobIds -- the "Dismiss list" button\'s own id list', () => {
+  it('returns the ids of every dismissable (terminal) job', () => {
+    const jobs = [job('failed', { id: 1 }), job('cancelled', { id: 2 }), job('succeeded', { id: 3 })]
+    expect(dismissableJobIds(jobs)).toEqual([1, 2, 3])
+  })
+
+  it('skips active (queued/running) rows', () => {
+    const jobs = [job('queued', { id: 1 }), job('running', { id: 2 }), job('failed', { id: 3 })]
+    expect(dismissableJobIds(jobs)).toEqual([3])
+  })
+
+  it('is empty for an empty input', () => {
+    expect(dismissableJobIds([])).toEqual([])
+  })
+
+  it('is empty when every job is still active', () => {
+    expect(dismissableJobIds([job('queued', { id: 1 }), job('running', { id: 2 })])).toEqual([])
+  })
+})
+
+describe('transferFilterSummary', () => {
+  it('is null while the search is empty', () => {
+    expect(transferFilterSummary(3, 12, '')).toBeNull()
+  })
+
+  it('is null for a whitespace-only search', () => {
+    expect(transferFilterSummary(3, 12, '   ')).toBeNull()
+  })
+
+  it('reports shown of total once the search is non-empty', () => {
+    expect(transferFilterSummary(3, 12, 'married')).toBe('Showing 3 of 12 transfers')
+  })
+
+  it('uses the singular "transfer" for a total of exactly one', () => {
+    expect(transferFilterSummary(1, 1, 'x')).toBe('Showing 1 of 1 transfer')
   })
 })
 

@@ -24,6 +24,8 @@ import {
   type PanelField,
   type QueueGroup,
   completedTimeLabel,
+  dismissableJobIds,
+  filterTransferJobs,
   formatQueueGroupCounts,
   groupHasDismissable,
   groupJobsByQueue,
@@ -34,6 +36,7 @@ import {
   queueGroupSummary,
   readCollapsedQueues,
   sortTransferRows,
+  transferFilterSummary,
   transferGroupFields,
   transferLineValue,
   withQueueCollapsed,
@@ -523,6 +526,19 @@ export function TransfersPage() {
   const [dismissingQueueIds, setDismissingQueueIds] = useState<Set<number>>(new Set())
   const [dismissQueueError, setDismissQueueError] = useState<Record<number, string>>({})
   const [dismissQueueCount, setDismissQueueCount] = useState<Record<number, number>>({})
+  // The name filter (2026-08-19, prompts/2026-08-19-transfers-name-filter.md) -- plain
+  // `useState`, deliberately not persisted (no localStorage, no URL param): it clears on reload
+  // and on navigating away, matching the Files page's own text filter and the Logs filter. A
+  // stale filter hiding active transfers after a reload would be its own confusion.
+  const [search, setSearch] = useState('')
+  // "Dismiss list" -- its own busy/error/outcome trio, same shape "Dismiss all"'s
+  // dismissingAll/dismissAllError/dismissAllCount above already use (the page's existing
+  // notification convention), kept separate rather than reusing those three: "Dismiss list" is
+  // a distinct control the user can click independently of (and possibly around the same time
+  // as) "Dismiss all"/"Dismiss Queue", and those two stay completely unchanged by this task.
+  const [dismissingList, setDismissingList] = useState(false)
+  const [dismissListError, setDismissListError] = useState<string | null>(null)
+  const [dismissListCount, setDismissListCount] = useState<number | null>(null)
 
   const nodesByQueue = useMemo(() => {
     const map = new Map<number, FileNode[]>()
@@ -559,15 +575,39 @@ export function TransfersPage() {
   // happen to be displayed.
   const sortedJobs = useMemo(() => sortTransferRows(jobs), [jobs])
 
+  // The name filter (2026-08-19) -- applied *before* `groupJobsByQueue` below, so a queue with
+  // no matching rows produces no group at all rather than an empty one. `filterTransferJobs`
+  // returns `sortedJobs` itself, by identity, whenever `search` is empty/whitespace-only, so
+  // this is a no-op `useMemo` recompute rather than a fresh array on every render while the
+  // filter isn't in use.
+  const filteredJobs = useMemo(() => filterTransferJobs(sortedJobs, search), [sortedJobs, search])
+  const filterActive = search.trim() !== ''
+  const filterSummary = transferFilterSummary(filteredJobs.length, sortedJobs.length, search)
+  // The ids "Dismiss list" would act on -- every currently-filtered row that's actually
+  // dismissable (terminal). Also drives the button's own disabled/enabled + count reading below.
+  const filteredDismissableIds = useMemo(() => dismissableJobIds(filteredJobs), [filteredJobs])
+
   // Group by queue (2026-08-16, prompts/2026-08-16-transfers-group-by-queue.md): "per-row queue
   // labels make the page busy" -- one collapsible group per queue, ordered by queue name, each
   // row's within-group order untouched from `sortedJobs` above (`groupJobsByQueue`'s own
   // docstring). Collapse state is per-queue, persisted, and read once on mount -- a queue that
   // temporarily drops out of `jobs` (no visible rows right now) simply produces no group, but its
   // stored preference is never pruned, so it's there again when the queue returns.
-  const groups = useMemo(() => groupJobsByQueue(sortedJobs), [sortedJobs])
+  //
+  // 2026-08-19: grouped off `filteredJobs`, not `sortedJobs`, so a queue with no matching rows
+  // while the filter is active drops out of `groups` entirely -- same reasoning as
+  // `FileTree.tsx`'s own text filter. Byte-for-byte `groupJobsByQueue(sortedJobs)` while the
+  // filter is empty, since `filteredJobs === sortedJobs` by identity in that case.
+  const groups = useMemo(() => groupJobsByQueue(filteredJobs), [filteredJobs])
   const [collapsedQueues, setCollapsedQueues] = useState(readCollapsedQueues)
   const toggleQueueCollapsed = (queueId: number) => {
+    // Ignored while the filter is active (2026-08-19): every group renders forced-expanded
+    // during a filter (below, the `groups.map` render's own `collapsed` computation) so a match
+    // inside a collapsed queue still surfaces -- writing to the stored preference here would
+    // silently change what "expanded" means once the filter clears, which is exactly the
+    // confusion `FileTree.tsx`'s identical rule exists to avoid. The preference is left
+    // untouched and applies again unchanged the moment `search` clears.
+    if (filterActive) return
     setCollapsedQueues((prev) => {
       const next = withQueueCollapsed(prev, queueId, !isQueueCollapsed(prev, queueId))
       writeCollapsedQueues(next)
@@ -680,6 +720,32 @@ export function TransfersPage() {
     }
   }
 
+  /** "Dismiss list" (2026-08-19, prompts/2026-08-19-transfers-name-filter.md) -- the name
+   * filter's own dedicated control, dismissing exactly the terminal rows the filter currently
+   * matches (`filteredDismissableIds`, `lib/transferPanel.ts.dismissableJobIds`) in **one**
+   * request (`dismissAllJobs(undefined, jobIds)` -> `core/queue.py.dismiss_all_terminal
+   * (job_ids=...)`), never a client-side loop over each row's own `/dismiss` call. A new,
+   * separate control -- not a re-scoping of "Clear all failed"/"Dismiss all"/"Dismiss Queue"
+   * above, which keep their existing whole-queue meaning untouched by this task. No confirmation
+   * dialog: dismiss only ever sets `dismissed_at` on an already-terminal job row, never touches
+   * `item.state`, never deletes bytes, and never touches the remote.
+   */
+  const handleDismissList = async () => {
+    if (filteredDismissableIds.length === 0) return
+    setDismissingList(true)
+    setDismissListError(null)
+    setDismissListCount(null)
+    try {
+      const res = await dismissAllJobs(undefined, filteredDismissableIds)
+      setDismissListCount(res.dismissed)
+      refresh()
+    } catch (err) {
+      setDismissListError(errorMessage(err))
+    } finally {
+      setDismissingList(false)
+    }
+  }
+
   /** "Clear all failed" (2026-08-13) -- the bulk counterpart to the per-row Dismiss button,
    * for the "I should have a clear or delete button" half of the user's report: one-at-a-time
    * dismissal of a stack of dead rows is its own annoyance. Scoped to `failed` only, not
@@ -710,6 +776,17 @@ export function TransfersPage() {
     }
   }
 
+  // "Dismiss list"'s disabled/tooltip logic (2026-08-19) -- disabled while the filter is empty
+  // (nothing to scope it to), and disabled again once it's non-empty but matches no dismissable
+  // rows (every match is still running/queued) -- a live tooltip says which of the two it is, so
+  // a greyed-out button never reads as simply broken.
+  const dismissListDisabled = !filterActive || filteredDismissableIds.length === 0 || dismissingList
+  const dismissListTitle = !filterActive
+    ? 'Type in the filter above to enable -- dismisses only the terminal rows it matches'
+    : filteredDismissableIds.length === 0
+      ? "No dismissable rows match this filter -- everything matching is still queued or downloading"
+      : `Dismiss the ${filteredDismissableIds.length} matching row${filteredDismissableIds.length === 1 ? '' : 's'} that ${filteredDismissableIds.length === 1 ? 'is' : 'are'} finished -- records stay on the History page`
+
   const drawerNodes = drawerJob ? (nodesByQueue.get(drawerJob.queue_id) ?? []) : []
 
   return (
@@ -731,6 +808,64 @@ export function TransfersPage() {
             className="shrink-0 rounded-md border border-amber-300 px-2 py-1 text-xs font-medium hover:bg-amber-100 dark:border-amber-800 dark:hover:bg-amber-900"
           >
             Got it
+          </button>
+        </div>
+      )}
+
+      {/* Name filter + "Dismiss list" (2026-08-19, prompts/2026-08-19-transfers-name-filter.md)
+       * -- start typing and only rows whose `rel_path` contains the text stay visible, across
+       * every group. "Dismiss list" is a new, separate control scoped to exactly what the
+       * filter currently matches -- "Clear all failed"/"Dismiss all"/"Dismiss Queue" below keep
+       * their existing whole-queue meaning, untouched by this task, including while a filter is
+       * active. */}
+      <div className="flex flex-wrap items-center gap-2">
+        <input
+          type="text"
+          value={search}
+          onChange={(e) => setSearch(e.target.value)}
+          placeholder="Filter by name…"
+          className="min-w-0 flex-1 rounded-md border border-zinc-300 px-2.5 py-1.5 text-sm text-zinc-900 placeholder:text-zinc-400 focus:border-indigo-400 focus:ring-1 focus:ring-indigo-400 focus:outline-none dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100 dark:placeholder:text-zinc-600"
+        />
+        {filterSummary && (
+          <span className="shrink-0 text-xs text-zinc-500 dark:text-zinc-400">{filterSummary}</span>
+        )}
+        <button
+          type="button"
+          disabled={dismissListDisabled}
+          onClick={handleDismissList}
+          title={dismissListTitle}
+          className="shrink-0 rounded-md border border-zinc-300 px-2.5 py-1.5 text-xs font-medium text-zinc-700 hover:bg-zinc-50 disabled:opacity-50 dark:border-zinc-700 dark:text-zinc-200 dark:hover:bg-zinc-900"
+        >
+          {dismissingList
+            ? 'Dismissing…'
+            : `Dismiss list${filteredDismissableIds.length > 0 ? ` (${filteredDismissableIds.length})` : ''}`}
+        </button>
+      </div>
+
+      {dismissListCount != null && (
+        <div className="flex items-center justify-between gap-3 rounded-md border border-emerald-300 bg-emerald-50 px-3 py-2 text-sm text-emerald-900 dark:border-emerald-900 dark:bg-emerald-950/40 dark:text-emerald-200">
+          <span className="font-medium">
+            Dismissed {dismissListCount} job{dismissListCount === 1 ? '' : 's'}
+          </span>
+          <button
+            type="button"
+            onClick={() => setDismissListCount(null)}
+            className="shrink-0 text-xs underline decoration-dotted"
+          >
+            Dismiss
+          </button>
+        </div>
+      )}
+
+      {dismissListError && (
+        <div className="flex items-center justify-between gap-3 rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-900 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-200">
+          <span>Couldn't dismiss list: {dismissListError}</span>
+          <button
+            type="button"
+            onClick={() => setDismissListError(null)}
+            className="shrink-0 text-xs underline decoration-dotted"
+          >
+            Dismiss
           </button>
         </div>
       )}
@@ -786,6 +921,22 @@ export function TransfersPage() {
       {jobs.length === 0 && (
         <div className="flex h-40 items-center justify-center rounded-lg border border-dashed border-zinc-300 text-zinc-400 dark:border-zinc-700 dark:text-zinc-600">
           Nothing queued or downloading — queue an item from Files.
+        </div>
+      )}
+
+      {/* The filter's own empty state (2026-08-19) -- distinct from the "nothing queued or
+       * downloading" state above: there *are* transfers, none of them just happen to match the
+       * filter text. */}
+      {jobs.length > 0 && filterActive && filteredJobs.length === 0 && (
+        <div className="flex h-40 flex-col items-center justify-center gap-2 rounded-lg border border-dashed border-zinc-300 text-zinc-400 dark:border-zinc-700 dark:text-zinc-600">
+          <span>No transfers match "{search.trim()}".</span>
+          <button
+            type="button"
+            onClick={() => setSearch('')}
+            className="text-xs text-zinc-500 underline decoration-dotted hover:text-zinc-700 dark:text-zinc-400 dark:hover:text-zinc-200"
+          >
+            Clear filter
+          </button>
         </div>
       )}
 
@@ -853,10 +1004,14 @@ export function TransfersPage() {
         </div>
       )}
 
-      {jobs.length > 0 && (
+      {jobs.length > 0 && filteredJobs.length > 0 && (
         <div className="flex flex-col gap-3">
           {groups.map((group) => {
-            const collapsed = isQueueCollapsed(collapsedQueues, group.queueId)
+            // 2026-08-19: forced expanded while the filter is active, ignoring the stored
+            // preference entirely -- a match inside a collapsed queue must still surface. See
+            // `toggleQueueCollapsed`'s own comment for why the preference itself is never
+            // written to while this is happening.
+            const collapsed = filterActive ? false : isQueueCollapsed(collapsedQueues, group.queueId)
             return (
               <div
                 key={group.queueId}

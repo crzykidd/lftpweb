@@ -1920,6 +1920,21 @@ Some.Release.S03E04.2160p    [downloading]   18 files   62%   4.1 MB/s   ETA 12m
   actions already are) — scoped to `failed` only, not `cancelled`, since a stopped job is a
   deliberate Stop click, not the kind of unattended pile-up a permanent-error class like
   `REMOTE_GONE` can become. No confirmation dialog on either: nothing is destroyed.
+- **A name filter**, in the page toolbar above the row groups (2026-08-19) — start typing and
+  only rows whose `rel_path` contains that text (case-insensitive substring, no glob/regex)
+  stay visible, across every queue group; a "showing N of M" readout appears alongside it once
+  it's non-empty. Not persisted — no `localStorage`, no URL param — matching the Files page's
+  own text filter and the Logs filter, since a stale filter hiding active transfers after a
+  reload would be its own confusion. While active, every group renders expanded regardless of
+  its own collapse preference (a match inside a collapsed queue must still surface) — the
+  preference itself is left untouched and applies again unchanged the moment the filter clears,
+  the identical rule the Files page's own text filter already established. Alongside the input,
+  **Dismiss list** dismisses exactly the terminal rows the filter currently matches, in one bulk
+  request (`core/queue.py.dismiss_all_terminal`'s `job_ids` scope, never a client-side loop over
+  each row's own dismiss) — greyed out while the filter is empty, and again if it matches no
+  dismissable rows, with a tooltip naming which. It is a new, separate control: any other bulk
+  dismiss action on this page keeps its own existing whole-queue meaning, unaffected by whether
+  a filter happens to be active.
 
 **Item drawer.** A **side drawer** — not a modal, because file lists get long and the queue
 should stay visible — listing the files inside that item: name, size, transferred, per-file

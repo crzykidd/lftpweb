@@ -108,7 +108,9 @@ Every verify outcome, every remote delete, and every delete withheld — with th
   the app: the delete dialog offers independent **Local** and **Source (seedbox)** scopes, so
   failed or abandoned releases can be cleared from both sides without ever SSHing in
 - The History page: every completed/failed/cancelled transfer and every audit event
-  (including remote deletes and deletes withheld), filterable and grouped by queue
+  (including remote deletes and deletes withheld), filterable and grouped by queue. The
+  Transfers page has its own name filter (2026-08-19) with a scoped "Dismiss list" button that
+  bulk-dismisses only the matching finished rows
 - Rotating log viewer, on-demand `VACUUM INTO` database backups (scheduled + manual), and a
   header readout for seedbox reachability and scheduler liveness (`/api/health`)
 - Credentials encrypted at rest

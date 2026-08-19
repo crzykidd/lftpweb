@@ -20,6 +20,7 @@ import asyncio
 import json
 import logging
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -962,7 +963,9 @@ class TransferQueue:
         await self.db.execute("UPDATE job SET dismissed_at = ? WHERE id = ?", (_now_iso(), job_id))
         await self.db.commit()
 
-    async def dismiss_all_terminal(self, queue_id: int | None = None) -> int:
+    async def dismiss_all_terminal(
+        self, queue_id: int | None = None, job_ids: Sequence[int] | None = None
+    ) -> int:
         """The bulk counterpart to `dismiss_job` above (2026-08-15, "Dismiss all" at the top of
         the Transfers page) -- one `UPDATE`, not a per-job loop, per the task's own preference
         for a bulk endpoint over a client-side `Promise.allSettled` fan-out.
@@ -985,22 +988,40 @@ class TransferQueue:
         `queue_id` naming no queue that exists simply matches zero rows -- the same "nothing to
         do, not an error" answer an empty/all-dismissed queue already gives; this never 404s.
 
+        `job_ids` (2026-08-19, the Transfers page's name filter and its own "Dismiss list"
+        button, `prompts/2026-08-19-transfers-name-filter.md`) restricts the same `UPDATE` to an
+        explicit set of job ids -- `None` (the default) means no id restriction at all, exactly
+        today's pre-existing behavior. `job_ids` is a *narrowing* of the same terminal-state
+        `WHERE`, never an override of it: an id naming a `queued`/`running` job simply matches
+        zero rows for that id, the identical "the client's list can only ask for a subset of
+        what the guard already allows" contract `DismissAllRequest`'s own docstring states.
+
+        **An empty `job_ids` list (`[]`, as opposed to `None`) must dismiss nothing and return
+        `0` -- it must never degrade into "no filter, so dismiss everything."** This is the
+        dangerous edge of this whole change: `[]` is a real, deliberate "the current filter
+        matches zero dismissable rows" input, not "no restriction was given." Handled with an
+        early return before the `UPDATE` is even built, both because it is the correct answer
+        and because `... AND id IN ()` is not valid SQL to begin with.
+
         Returns the actual row count affected (`cursor.rowcount`), the same "report the real
         number" convention `api/history.py`'s clear-history endpoints already use.
         """
-        if queue_id is None:
-            cursor = await self.db.execute(
-                "UPDATE job SET dismissed_at = ? "
-                "WHERE state IN ('failed','cancelled','succeeded') AND dismissed_at IS NULL",
-                (_now_iso(),),
-            )
-        else:
-            cursor = await self.db.execute(
-                "UPDATE job SET dismissed_at = ? "
-                "WHERE state IN ('failed','cancelled','succeeded') AND dismissed_at IS NULL "
-                "AND item_id IN (SELECT id FROM item WHERE queue_id = ?)",
-                (_now_iso(), queue_id),
-            )
+        if job_ids is not None and len(job_ids) == 0:
+            return 0
+
+        where = ["state IN ('failed','cancelled','succeeded')", "dismissed_at IS NULL"]
+        params: list[Any] = [_now_iso()]
+        if queue_id is not None:
+            where.append("item_id IN (SELECT id FROM item WHERE queue_id = ?)")
+            params.append(queue_id)
+        if job_ids is not None:
+            placeholders = ",".join("?" for _ in job_ids)
+            where.append(f"id IN ({placeholders})")
+            params.extend(job_ids)
+
+        cursor = await self.db.execute(
+            f"UPDATE job SET dismissed_at = ? WHERE {' AND '.join(where)}", params
+        )
         await self.db.commit()
         return cursor.rowcount
 

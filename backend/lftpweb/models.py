@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 # Input length caps (audit S3, docs/audit-v0.1.0.md). Chosen deliberately *generous* -- large
 # enough that no legitimate value is ever rejected, small enough that an attacker can't hand the
@@ -809,9 +809,33 @@ class DismissAllRequest(BaseModel):
     -- every queue -- so every caller that predates this task (including every existing test
     that calls `dismiss_all_jobs` with no body) is unaffected. The same "optional body, omitted
     means unchanged" shape `DeleteItemRequest` above already set (2026-08-16).
+
+    `job_ids` (2026-08-19, the Transfers page's name filter and its own "Dismiss list" button,
+    `prompts/2026-08-19-transfers-name-filter.md`) scopes the same bulk dismiss to an explicit
+    set of job ids instead of a whole queue -- "Dismiss list" sends the ids of exactly the
+    terminal rows the filter currently matches (`lib/transferPanel.ts.dismissableJobIds`) as
+    **one** request, never a client-side loop over each row's own `/dismiss` call (see
+    `TransferQueue.dismiss_all_terminal`'s own docstring). Omitted entirely, or `job_ids: null`,
+    means exactly today's pre-existing behavior -- the same "optional field, omitted means
+    unchanged" shape `queue_id` above already set, so every caller that predates this task is
+    unaffected. `job_ids: []` is a real, deliberate "match nothing" input (an empty filter
+    result), not "no filter" -- it dismisses zero rows, never every row; see
+    `TransferQueue.dismiss_all_terminal`'s own comment for why that distinction has to be made
+    explicitly rather than falling out of an `if job_ids:` truthiness check.
+
+    `job_ids` and `queue_id` are mutually exclusive -- a request naming both is rejected with a
+    422 (`_job_ids_and_queue_id_are_mutually_exclusive` below) rather than guessing an
+    intersection of the two scopes.
     """
 
     queue_id: int | None = None
+    job_ids: list[int] | None = None
+
+    @model_validator(mode="after")
+    def _job_ids_and_queue_id_are_mutually_exclusive(self) -> "DismissAllRequest":
+        if self.queue_id is not None and self.job_ids is not None:
+            raise ValueError("queue_id and job_ids are mutually exclusive -- pass at most one")
+        return self
 
 
 class DismissAllResponse(BaseModel):

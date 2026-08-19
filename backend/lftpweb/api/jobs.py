@@ -215,9 +215,19 @@ async def dismiss_all_jobs(
     omitted body (`body is None`, the pre-existing no-body call every caller before this task
     still makes) or an explicit `queue_id: null` both mean the original every-queue behavior,
     byte-for-byte -- see `DismissAllRequest`'s own docstring.
+
+    2026-08-19 (`prompts/2026-08-19-transfers-name-filter.md`): `body.job_ids`, when given,
+    scopes the bulk dismiss to that explicit set of job ids instead -- the name filter's own
+    "Dismiss list" button, again reusing this one endpoint rather than adding a second. Mutually
+    exclusive with `queue_id` at the request-model level (`DismissAllRequest`'s own validator,
+    a 422 if a caller sends both); this handler just threads whichever one was given straight
+    through to `dismiss_all_terminal`.
     """
     queue_id = body.queue_id if body is not None else None
-    dismissed = await request.app.state.queue.dismiss_all_terminal(queue_id=queue_id)
+    job_ids = body.job_ids if body is not None else None
+    dismissed = await request.app.state.queue.dismiss_all_terminal(
+        queue_id=queue_id, job_ids=job_ids
+    )
     return DismissAllResponse(dismissed=dismissed)
 
 

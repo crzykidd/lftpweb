@@ -16,12 +16,15 @@ Covers two phase 3b changes:
 from __future__ import annotations
 
 import aiosqlite
+import pydantic
 import pytest
 
+from lftpweb.api import jobs
 from lftpweb.api.jobs import _job_out
 from lftpweb.core.events import EventBus
 from lftpweb.core.queue import JobNotDismissableError, TransferQueue
 from lftpweb.db import migrate
+from lftpweb.models import DismissAllRequest
 
 
 @pytest.fixture
@@ -515,6 +518,150 @@ async def test_dismiss_all_terminal_unknown_queue_id_dismisses_nothing(db):
         await db.execute("SELECT dismissed_at FROM job WHERE id = ?", (job_id,))
     ).fetchone()
     assert row["dismissed_at"] is None
+
+
+# --- dismiss_all_terminal(job_ids=...): the Transfers page's name filter + "Dismiss list"
+# button (2026-08-19, prompts/2026-08-19-transfers-name-filter.md) -------------------------
+
+
+async def test_dismiss_all_terminal_job_ids_dismisses_only_those_rows(db):
+    queue_id = await _make_queue(db)
+    item_a = await _make_item(db, queue_id, "a.txt", state="FAILED")
+    job_a = await _make_job(db, item_a, state="failed")
+    item_b = await _make_item(db, queue_id, "b.txt", state="STOPPED")
+    job_b = await _make_job(db, item_b, state="cancelled")
+    item_c = await _make_item(db, queue_id, "c.txt", state="DOWNLOADED")
+    job_c = await _make_job(db, item_c, state="succeeded")
+
+    q = _queue(db)
+    dismissed = await q.dismiss_all_terminal(job_ids=[job_a, job_b])
+    assert dismissed == 2
+
+    row_a = await (
+        await db.execute("SELECT dismissed_at FROM job WHERE id = ?", (job_a,))
+    ).fetchone()
+    row_b = await (
+        await db.execute("SELECT dismissed_at FROM job WHERE id = ?", (job_b,))
+    ).fetchone()
+    row_c = await (
+        await db.execute("SELECT dismissed_at FROM job WHERE id = ?", (job_c,))
+    ).fetchone()
+    assert row_a["dismissed_at"] is not None
+    assert row_b["dismissed_at"] is not None
+    assert row_c["dismissed_at"] is None
+
+
+async def test_dismiss_all_terminal_empty_job_ids_dismisses_nothing(db):
+    """The dangerous edge this task's own instruction names explicitly: `[]` must never degrade
+    into "no filter, so dismiss everything" -- it means the filter matched zero dismissable
+    rows, and the correct answer to that is zero dismissed, not every terminal row in the db.
+    """
+    queue_id = await _make_queue(db)
+    item = await _make_item(db, queue_id, "a.txt", state="FAILED")
+    job_id = await _make_job(db, item, state="failed")
+
+    q = _queue(db)
+    dismissed = await q.dismiss_all_terminal(job_ids=[])
+    assert dismissed == 0
+
+    row = await (
+        await db.execute("SELECT dismissed_at FROM job WHERE id = ?", (job_id,))
+    ).fetchone()
+    assert row["dismissed_at"] is None
+
+
+async def test_dismiss_all_terminal_job_ids_never_overrides_the_terminal_state_guard(db):
+    """`job_ids` is a *narrowing* of the existing terminal-state `WHERE`, never an override of
+    it -- an id naming a still-active job must not be dismissed just because the client asked
+    for it by id.
+    """
+    queue_id = await _make_queue(db)
+    queued_item = await _make_item(db, queue_id, "a.txt", state="QUEUED")
+    queued_job = await _make_job(db, queued_item, state="queued")
+    failed_item = await _make_item(db, queue_id, "b.txt", state="FAILED")
+    failed_job = await _make_job(db, failed_item, state="failed")
+
+    q = _queue(db)
+    dismissed = await q.dismiss_all_terminal(job_ids=[queued_job, failed_job])
+    assert dismissed == 1
+
+    queued_row = await (
+        await db.execute("SELECT dismissed_at FROM job WHERE id = ?", (queued_job,))
+    ).fetchone()
+    failed_row = await (
+        await db.execute("SELECT dismissed_at FROM job WHERE id = ?", (failed_job,))
+    ).fetchone()
+    assert queued_row["dismissed_at"] is None
+    assert failed_row["dismissed_at"] is not None
+
+
+async def test_dismiss_all_terminal_job_ids_none_still_behaves_like_every_existing_call(db):
+    """Every existing no-body call (`job_ids` never passed, defaulting to `None`) must keep
+    behaving identically -- the same coverage `test_dismiss_all_terminal_dismisses_every_
+    terminal_job` above already gives the `queue_id`-only path, repeated here for the
+    `job_ids` default specifically.
+    """
+    queue_id = await _make_queue(db)
+    item = await _make_item(db, queue_id, "a.txt", state="FAILED")
+    job_id = await _make_job(db, item, state="failed")
+
+    dismissed = await _queue(db).dismiss_all_terminal(job_ids=None)
+    assert dismissed == 1
+
+    row = await (
+        await db.execute("SELECT dismissed_at FROM job WHERE id = ?", (job_id,))
+    ).fetchone()
+    assert row["dismissed_at"] is not None
+
+
+async def test_dismiss_all_request_rejects_job_ids_and_queue_id_together(db):
+    """The mutual-exclusivity rule is enforced by `DismissAllRequest`'s own Pydantic validator
+    (`models.py`), not in the endpoint body -- constructing the model with both set raises
+    `ValidationError`, which FastAPI turns into a 422 for any real HTTP caller.
+    """
+    with pytest.raises(pydantic.ValidationError, match="mutually exclusive"):
+        DismissAllRequest(queue_id=1, job_ids=[1, 2])
+
+
+class _FakeQueueApp:
+    def __init__(self, queue):
+        self.state = _FakeQueueState(queue)
+
+
+class _FakeQueueState:
+    def __init__(self, queue):
+        self.queue = queue
+
+
+class _FakeQueueRequest:
+    def __init__(self, queue):
+        self.app = _FakeQueueApp(queue)
+
+
+async def test_dismiss_all_jobs_endpoint_threads_job_ids_through_to_the_queue(db):
+    """The route-level wiring (`api/jobs.py.dismiss_all_jobs`) -- `body.job_ids` must reach
+    `TransferQueue.dismiss_all_terminal` unchanged, exercised end to end against a real
+    `TransferQueue` rather than a mock, the same "the thing under test is the route's own
+    wiring" shape `tests/test_delete_api.py` already establishes for this router.
+    """
+    queue_id = await _make_queue(db)
+    item_a = await _make_item(db, queue_id, "a.txt", state="FAILED")
+    job_a = await _make_job(db, item_a, state="failed")
+    item_b = await _make_item(db, queue_id, "b.txt", state="FAILED")
+    job_b = await _make_job(db, item_b, state="failed")
+
+    q = _queue(db)
+    result = await jobs.dismiss_all_jobs(_FakeQueueRequest(q), DismissAllRequest(job_ids=[job_a]))
+    assert result.dismissed == 1
+
+    row_a = await (
+        await db.execute("SELECT dismissed_at FROM job WHERE id = ?", (job_a,))
+    ).fetchone()
+    row_b = await (
+        await db.execute("SELECT dismissed_at FROM job WHERE id = ?", (job_b,))
+    ).fetchone()
+    assert row_a["dismissed_at"] is not None
+    assert row_b["dismissed_at"] is None
 
 
 # --- list_jobs()/_job_out: the 2026-08-15 panel fields (verified_at/extracted_at/

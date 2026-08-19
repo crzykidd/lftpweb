@@ -311,6 +311,53 @@ export function isDismissable(state: JobOut['state']): boolean {
   return state === 'failed' || state === 'cancelled' || state === 'succeeded'
 }
 
+// --- Name filter + "Dismiss list" (2026-08-19, prompts/2026-08-19-transfers-name-filter.md):
+// a busy install's Transfers page has no way to narrow a long list. Pure logic only, same
+// discipline this whole file already follows -- `TransfersPage.tsx` applies these before
+// `groupJobsByQueue` below, so a queue with no matching rows produces no group at all rather
+// than an empty one. -----------------------------------------------------------------------
+
+/** Case-insensitive substring filter over `rel_path` only -- **not** `queue_name` too, since a
+ * queue named e.g. "movies" would otherwise make every row in it match the word "movies", which
+ * is not what a name filter means. `JobOut` has no separate `name` field; `rel_path` is the
+ * item's path within the queue and already contains the name, so a substring match over it
+ * covers both a bare name and a nested one (`at.first.sight` matches literally, same as any
+ * other substring -- no glob/regex parsing).
+ *
+ * An empty/whitespace-only `search` returns `jobs` **unchanged and by identity**, not a copy --
+ * same "don't churn a downstream `useMemo` for a no-op filter" reasoning `FileTree.tsx`'s own
+ * `visiblePaths` follows for its filtered flat list. Preserves input order; the caller
+ * (`TransfersPage.tsx`) has already sorted via `sortTransferRows` above.
+ */
+export function filterTransferJobs(jobs: JobOut[], search: string): JobOut[] {
+  const needle = search.trim().toLowerCase()
+  if (!needle) return jobs
+  return jobs.filter((job) => job.rel_path.toLowerCase().includes(needle))
+}
+
+/** The "Dismiss list" button's own id list (2026-08-19) -- every id in `jobs` that
+ * `isDismissable` allows, reusing that exact predicate rather than re-deriving the terminal-
+ * state set a third time. Callers pass this straight to `dismissAllJobs`'s `job_ids` param
+ * (`api/client.ts`) as **one** request -- `core/queue.py.dismiss_all_terminal`'s own docstring
+ * is explicit that this is a single server-side `UPDATE`, never a client-side loop over every
+ * dismissable row's own `/dismiss` call.
+ */
+export function dismissableJobIds(jobs: JobOut[]): number[] {
+  return jobs.filter((job) => isDismissable(job.state)).map((job) => job.id)
+}
+
+/** The name filter's own "showing N of M" readout, alongside the input. Same shape as the Logs
+ * filter's `lib/logFilter.ts.logFilterSummary` (`null` while the filter is empty, so the caller
+ * renders nothing rather than a no-op "showing 12 of 12" on every load) -- but not that function
+ * itself: its string is hardcoded to say "lines", which would misdescribe a page whose rows are
+ * transfers, not log lines. A small sibling here instead of parameterizing that one for a word
+ * neither of its two other current wordings needs.
+ */
+export function transferFilterSummary(shown: number, total: number, search: string): string | null {
+  if (!search.trim()) return null
+  return `Showing ${shown} of ${total} transfer${total === 1 ? '' : 's'}`
+}
+
 // --- Group by queue (2026-08-16, prompts/2026-08-16-transfers-group-by-queue.md): "per-row
 // queue labels make the page busy" -- the queue name/summary moves to a collapsible group
 // header, one per queue, so individual rows can stop repeating it. ------------------------

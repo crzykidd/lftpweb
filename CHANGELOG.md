@@ -24,6 +24,14 @@ Skeleton for the next roll:
 ## [Unreleased]
 
 ### Added
+
+- **A name filter on the Transfers page**: start typing and only rows whose name contains that
+  text stay visible, across every queue group (case-insensitive, matches a dotted release name
+  literally). A **"Dismiss list"** button beside it bulk-dismisses exactly the finished rows the
+  filter currently matches, in one request — greyed out until the filter matches at least one
+  dismissable row. The filter itself doesn't persist across a reload, matching the Files page's
+  own text filter and the Logs filter.
+
 ### Changed
 ### Fixed
 ### Security

@@ -6,6 +6,24 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-19 — Transfers name filter: "Dismiss list" gets its own state trio, not a share of
+"Dismiss all"'s
+
+`prompts/done/2026-08-19-transfers-name-filter.md`. The task said to "reuse the page's existing
+busy/error/outcome state conventions for the other dismiss controls" without saying which of
+two readings that means: literally share `dismissingAll`/`dismissAllError`/`dismissAllCount`
+between "Dismiss all" and the new "Dismiss list", or give "Dismiss list" its own three state
+variables that follow the identical *shape* (a busy flag, an error string, a dismissed-count
+banner, the same inline emerald/amber notification markup).
+
+**Went with the second reading** — `dismissingList`/`dismissListError`/`dismissListCount`,
+separate from `dismissAllCount` et al. The two controls sit in different parts of the toolbar
+and can be clicked independently (a filtered dismiss, then a moment later an unrelated "Dismiss
+all" click, or vice versa); sharing one flag would make one control's busy/error/outcome state
+silently clobber the other's mid-flight, and — since "Dismiss all"/"Dismiss Queue" are the task's
+own explicit "leave completely unchanged" controls — reusing their state variables risked
+coupling a new control's behavior to code this task was told not to touch.
+
 ## 2026-08-19 — "Start now" becomes a menu: fraction-of-site-limit, 409-not-silent-Max,
 widened field + a parallel DB column, no migration for "no site limit configured"
 

@@ -330,12 +330,23 @@ export function dismissJob(jobId: number): Promise<void> {
  * own terminal jobs. Omitted (the pre-existing call every caller before this task still makes)
  * sends no body at all -- byte-for-byte the original request -- matching
  * `api/jobs.py.dismiss_all_jobs`'s own "omitted body means every queue" contract.
+ *
+ * `jobIds` (2026-08-19, the name filter's own "Dismiss list" button,
+ * prompts/2026-08-19-transfers-name-filter.md) scopes the same bulk call to an explicit set of
+ * job ids instead -- one request carrying `lib/transferPanel.ts.dismissableJobIds`'s own output,
+ * never a client-side loop over `dismissJob`. Mutually exclusive with `queueId` (`models.py.
+ * DismissAllRequest`'s own validator rejects a request naming both); no caller in this app
+ * passes both. Threaded the same "omitted means not sent" way `queueId` already is, not a
+ * second function -- both scopes are optional narrowings of the same one bulk call.
  */
-export function dismissAllJobs(queueId?: number): Promise<DismissAllResponse> {
+export function dismissAllJobs(queueId?: number, jobIds?: number[]): Promise<DismissAllResponse> {
+  const body: { queue_id?: number; job_ids?: number[] } = {}
+  if (queueId != null) body.queue_id = queueId
+  if (jobIds != null) body.job_ids = jobIds
   return sendJson<DismissAllResponse>(
     '/api/jobs/dismiss-all',
     'POST',
-    queueId != null ? { queue_id: queueId } : undefined,
+    Object.keys(body).length > 0 ? body : undefined,
   )
 }
 
