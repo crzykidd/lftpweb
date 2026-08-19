@@ -255,7 +255,8 @@ job(
   pid NULL, argv JSON, lftp_settings JSON,
   bytes_start, bytes_done, bytes_total,
   rate_limit_bps NULL,               -- the allocation this process was spawned with (§4.5)
-  forced_full_rate BOOL,             -- admitted via "start now at max bandwidth"
+  forced_full_rate BOOL,             -- admitted via "Start now" (§4.5); forced_rate_fraction
+                                      -- (migration 022) carries which menu option was picked
   started_at, finished_at, exit_code NULL,
   error_class NULL, output_tail TEXT NULL)
 
@@ -855,13 +856,24 @@ unmetered was considered and rejected: queue 300 small files and it saturates th
 concurrency cap, starving the rate-limited main lane and blowing past the ceiling exactly when
 the ceiling matters.
 
-#### Start now at max bandwidth
+#### Start now
 
-A per-item action that admits immediately with allocation = the full B, **deliberately
-oversubscribing** past the ceiling. While `Σ allocations > B − small_lane_reserve` the scheduler
-admits nothing new; normal admission resumes once enough jobs finish to bring the total back
-under. This is intentional, not a leak in the model: it is the "I want this one now" escape
-hatch, and it pays for itself by freezing new work rather than by throttling what is running.
+A per-item action that admits immediately, **deliberately oversubscribing** past the ceiling.
+While `Σ allocations > B − small_lane_reserve` the scheduler admits nothing new; normal admission
+resumes once enough jobs finish to bring the total back under. This is intentional, not a leak in
+the model: it is the "I want this one now" escape hatch, and it pays for itself by freezing new
+work rather than by throttling what is running.
+
+**A menu, not a single button** (2026-08-19, deliberate design extension,
+prompts/done/2026-08-19-start-now-bandwidth-fractions.md): **10% / 25% / 50% / 75% / Max** of the
+site's `max_bandwidth` (this section's own table, above). The chosen fraction is computed once,
+at admission — `fraction × B`, rounded to the nearest whole byte/sec — and held for the job's
+lifetime exactly like any other allocation; the invariant above is untouched. Max
+(`fraction = 1.0`) is byte-for-byte the original "Start now at max bandwidth" behavior this menu
+replaces: same value, same code path. **No site limit configured (`max_bandwidth <= 0`) makes a
+percentage meaningless** — the four fraction options are disabled in the UI with a hint, and the
+API refuses a fraction request outright (409) rather than silently substituting Max; Max itself
+is exempt from this check and always works, reusing whatever `max_bandwidth` already is.
 
 #### Residual inefficiency, stated plainly
 
@@ -1892,8 +1904,10 @@ Some.Release.S03E04.2160p    [downloading]   18 files   62%   4.1 MB/s   ETA 12m
   capability (ordering, Move to top, Start now) existed before this and was invisible; nothing
   new was added server-side, the list was already sorted. `rank` grows monotonically on every
   "Move to top" with no compaction — not a practical problem at 64-bit `INTEGER` width.
-- **Start now at max bandwidth** as a per-row action, with its oversubscription behavior
-  explained inline the first time it's used.
+- **Start now**, a per-row menu (10% / 25% / 50% / 75% / Max of the site total limit,
+  2026-08-19 — §4.5's "Start now" section has the fraction math), with its oversubscription
+  behavior explained inline the first time it's used. The percent options are disabled with a
+  hint when no site bandwidth limit is configured; Max always works.
 - Failures show the error class plus the captured lftp output tail.
 - **Dismiss**, on a `failed`/`cancelled` row (2026-08-13) — a display-only action that stops
   the row showing on this page (`job.dismissed_at`) without deleting the `job` row or touching

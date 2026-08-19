@@ -35,13 +35,27 @@ export interface LiveProgress {
  * size" half of the task's "final size + outcome" instruction -- the *outcome* half is already
  * the state chip sitting right next to this text, so it is not repeated here. `'—'` only when
  * even the size isn't known yet (a `queued`/`failed` job whose remote size was never scanned).
+ *
+ * 2026-08-19 (prompts/2026-08-19-transfers-row-shows-eta.md): a third, running-only figure --
+ * "<duration> left" -- answers "how long until this finishes" without expanding. Same live/job
+ * fallback discipline the expand panel's own `eta` already uses (`opts.live?.eta_s ?? job.eta_s`
+ * in `transferGroupFields` below), through the same `formatEta` its "(ETA <eta>)" reading already
+ * goes through. Omitted entirely (not "—", not "0s") when that comes back `null` -- a transfer
+ * that only just started has no ETA yet, and a blank figure says that more honestly than a
+ * placeholder would. Worded as a "left" suffix rather than an "ETA " prefix (the panel's own
+ * wording): this line already reads left-to-right as percent, then rate, then a third bare
+ * duration -- an "ETA " prefix would separate that duration from the two figures beside it more
+ * than the row's own "·" idiom does, where a one-word suffix keeps the same rhythm while still
+ * resolving on sight that it's remaining time, not elapsed.
  */
 export function transferLineValue(job: JobOut, live?: LiveProgress): string {
   if (job.state === 'running') {
     const bytesDone = live?.bytes_done ?? job.bytes_done
     const bytesTotal = (live?.bytes_total ?? job.bytes_total) ?? job.bytes_total
     const speed = live?.speed_bps ?? job.speed_bps ?? 0
-    return `${formatPercent(bytesDone, bytesTotal)} · ${formatRate(speed)}`
+    const eta = live?.eta_s ?? job.eta_s
+    const base = `${formatPercent(bytesDone, bytesTotal)} · ${formatRate(speed)}`
+    return eta != null ? `${base} · ${formatEta(eta)} left` : base
   }
   return job.bytes_total != null ? formatBytes(job.bytes_total) : '—'
 }

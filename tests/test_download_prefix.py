@@ -358,7 +358,7 @@ def _mirror_proc_with_prefix(
         kind="mirror",
         lane="main",
         rate_limit_bps=0,
-        forced_full_rate=False,
+        forced_rate_fraction=None,
         local_root=str(local_root),
         bytes_total=bytes_total,
         remote_mtime=None,

@@ -6,6 +6,88 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-19 — "Start now" becomes a menu: fraction-of-site-limit, 409-not-silent-Max,
+widened field + a parallel DB column, no migration for "no site limit configured"
+
+`prompts/done/2026-08-19-start-now-bandwidth-fractions.md`, user request: DESIGN.md §4.5's
+"Start now at max bandwidth" escape hatch becomes a dropdown — 10% / 25% / 50% / 75% / Max —
+rather than a single always-Max button.
+
+**Fraction is of the site total limit (`max_bandwidth_bps`), computed once at admission.** Not
+of "whatever headroom happens to exist right now," and not re-derived later — same "fixed at
+spawn, never re-shaped" invariant every other allocation in §4.5 already follows. `fraction=1.0`
+had to produce the byte-identical value (and take the identical code path) the pre-existing
+`forced_full_rate=True` design always did; `round(1.0 * B) == B` for any integer `B`, so this
+fell out for free rather than needing a special case.
+
+**A fraction request with no site limit configured is a 409, never a silent Max.** Considered
+letting the backend just clamp/substitute Max when a percentage would be meaningless — rejected
+because it means a user who thinks they picked 25% is actually getting oversubscribed at 100%
+with no error, exactly the "confidently wrong" failure mode this codebase's own memory (Check
+for a second writer before blaming code) keeps finding elsewhere. Max itself is exempt from the
+check: it reuses whatever `max_bandwidth_bps` already is, unconditionally, matching its
+pre-fraction behavior exactly.
+
+**"No site limit configured" reads as `max_bandwidth_bps <= 0`, deliberately not a new
+sentinel/nullable settings field.** This repo has no existing concept of "unlimited bandwidth" —
+`TransferSettings.max_bandwidth_bps` is a required, always-populated `int`, defaulting to
+10 MB/s. `Settings -> Transfer` already lets the field go to `0`, and the UI already treats that
+as a real, named degenerate case ("ceiling — the main lane will admit nothing, ever, with no
+error and no log line," `TransferTab.tsx`'s own reserve-clamp warning). Reusing that exact
+reading for "not configured" needed no schema change to the `setting` row and no new UI concept
+— a genuinely different design (a separate `bandwidth_limit_enabled` flag, say) would have been
+more explicit but added a field this task's own settled decisions never asked for.
+
+**Widened the field at the application layer; kept a parallel column at the schema layer.**
+`core/scheduler.py`'s `QueuedJob`/`AdmitDecision` and `core/queue.py`'s `_RunningProcess` all
+replace `forced_full_rate: bool` outright with `forced_rate_fraction: float | None` — one field,
+one meaning, throughout the Python side. The database is different: every migration in this repo
+so far is a plain `ALTER TABLE ... ADD COLUMN` (migration 016's own comment: "no prior migration
+drops or renames a column"), and SQLite has no in-place way to widen a column's type without a
+full table rebuild this codebase has never done. Migration 022 adds `job.forced_rate_fraction
+REAL` alongside the existing `job.forced_full_rate INTEGER`, backfills every historical forced
+row to `1.0` (they all predate fractions, so they were always Max), and every writer from this
+task forward keeps the two in lockstep (`forced_full_rate = 1` iff `forced_rate_fraction is not
+NULL`) — `core/queue.py.resolve_forced_rate_fraction` is the one place that reads both and
+resolves what a row actually means, so every reader (`_admit`, `api/jobs.py._job_out`) agrees.
+The alternative — an actual table rebuild to drop `forced_full_rate` and rename the new column
+into its place — was rejected as disproportionate to what this task needed: the old column costs
+nothing to keep, every raw-SQL test insert that already sets it explicitly keeps working
+unchanged, and "additive-only migrations" is a real property of this codebase worth not breaking
+for one field's naming purity.
+
+---
+
+## 2026-08-19 — Startup rescue re-queue: preserve `queued_at`, never boost `rank`
+
+`prompts/done/2026-08-19-rescue-requeue-keeps-queue-position.md`, production find, support
+bundle `lftpweb-support-0.2.5-*`: S10 (job 203) was mid-download at 39.7 of 66.6 GB when the
+container restarted for the v0.2.5 upgrade. The 2026-08-18 startup rescue correctly re-queued
+it (`interrupted_requeued`) — but `enqueue_item` stamped a fresh `queued_at`, while jobs that
+were merely *queued* (never started) at restart kept their own older timestamps. Scheduler order
+is `rank DESC, queued_at ASC` (DESIGN.md §4.5), so the item that had 40 GB of partial bytes
+already down went to the back of a long line, behind everything that hadn't even started.
+
+**Chose:** carry the *interrupted* job's original `queued_at` forward onto the fresh re-queued
+row (`enqueue_item` gained an opt-in `queued_at` override, same pattern as
+`core/postprocess.py.perform_remote_delete`'s `caller`). A running item was, by definition,
+already among the oldest jobs in line, so backdating naturally resumes it at (or near) the
+front. `rank` is left alone throughout.
+
+**Rejected: bump `rank` instead (or in addition).** Rank is the *explicit* "Move to top"
+signal (§4.5) — a user-visible override an operator reaches for on purpose. Having the rescue
+also touch it would mean a restart-recovered item could silently outrank something a human
+had deliberately promoted, for a reason the rescue has no way to know about. Preserving
+`queued_at` restores natural queue order without ever contending with that signal.
+
+**Backdating is honest, not just a scheduling trick.** The item genuinely has been waiting
+since its original `queued_at` — the restart didn't reset that clock, it just interrupted the
+process supervising it. So the Transfers page's queued-wait readout continues to tell the
+truth after a rescue-requeue, rather than reporting a wait that restarts at the moment of the
+crash.
+
+---
+
 ## 2026-08-18 — Orphaned `_FAILED_`/`_UNPACK_` extraction debris: widen the existing
 bounded-lifetime mechanism, don't build a second one; unconditional, not settings-gated
 

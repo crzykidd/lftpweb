@@ -19,8 +19,10 @@ from lftpweb.core.lftp import build_transfer_command, effective_tuning_settings
 from lftpweb.core.postprocess import perform_remote_delete
 from lftpweb.core.queue import (
     JobNotDismissableError,
+    NoSiteLimitConfiguredError,
     TransferSettings,
     load_transfer_settings,
+    resolve_forced_rate_fraction,
     save_transfer_settings,
 )
 from lftpweb.core.remote import parse_connection_limit
@@ -43,6 +45,7 @@ from lftpweb.models import (
     ResetPatternPreviewRequest,
     ResetPatternPreviewResponse,
     ResetSummaryResponse,
+    StartNowRequest,
     TransferSettingsIn,
     TransferSettingsOut,
 )
@@ -109,7 +112,7 @@ def _job_out(row: dict) -> JobOut:
         finished_at=row["finished_at"],
         pid=row["pid"],
         rate_limit_bps=row["rate_limit_bps"],
-        forced_full_rate=bool(row["forced_full_rate"]),
+        forced_rate_fraction=resolve_forced_rate_fraction(row),
         bytes_start=row["bytes_start"],
         bytes_done=row["bytes_done"],
         # 2026-08-14 (prompts/2026-08-14-exit-zero-is-not-completion.md, defect 4): prefer the
@@ -274,8 +277,20 @@ async def move_to_top(job_id: int, request: Request) -> None:
 
 
 @router.post("/api/jobs/{job_id}/start-now", response_model=dict)
-async def start_now(job_id: int, request: Request) -> dict:
-    applied = await request.app.state.queue.start_now(job_id)
+async def start_now(job_id: int, request: Request, body: StartNowRequest | None = None) -> dict:
+    """ "Start now" (DESIGN.md §4.5), now a menu -- 10%/25%/50%/75%/Max of the site total limit
+    (2026-08-19, prompts/done/2026-08-19-start-now-bandwidth-fractions.md). `body` omitted (no
+    request payload at all -- every caller before this task) means Max, exactly as before;
+    `rate_percent` outside `{10, 25, 50, 75, 100}` is a 422 for free via `StartNowRequest`'s own
+    `Literal` field, never reaching this handler. A fraction with no site bandwidth limit
+    configured is a 409 (`core/queue.py.NoSiteLimitConfiguredError`) -- see that class's own
+    docstring for why this never silently substitutes Max instead.
+    """
+    rate_percent = body.rate_percent if body is not None else None
+    try:
+        applied = await request.app.state.queue.start_now(job_id, rate_percent=rate_percent)
+    except NoSiteLimitConfiguredError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     return {"applied": applied}
 
 

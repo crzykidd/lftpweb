@@ -573,7 +573,11 @@ export interface JobOut {
   // lifetime, distinct from `speed_bps` (what it's *actually* pulling right now). Under
   // admission control a job can hold its full allocation while pulling far less of it.
   rate_limit_bps: number | null
-  forced_full_rate: boolean
+  // "Start now" as a menu, not a single button (2026-08-19,
+  // prompts/done/2026-08-19-start-now-bandwidth-fractions.md) -- widened from a plain
+  // `forced_full_rate: boolean`. `null` means never force-started; `1.0` means Max
+  // (byte-identical to the old `true`); `0.1`/`0.25`/`0.5`/`0.75` are the new menu options.
+  forced_rate_fraction: number | null
   bytes_start: number
   bytes_done: number
   bytes_total: number | null

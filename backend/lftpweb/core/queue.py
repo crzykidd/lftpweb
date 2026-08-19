@@ -97,6 +97,18 @@ class JobNotDismissableError(Exception):
     """
 
 
+class NoSiteLimitConfiguredError(Exception):
+    """Raised by `TransferQueue.start_now` for a *fractional* request (`rate_percent < 100`)
+    when no site bandwidth limit is configured (2026-08-19,
+    prompts/done/2026-08-19-start-now-bandwidth-fractions.md). A percentage of nothing is
+    meaningless -- `api/jobs.py.start_now` turns this into a 409 naming the reason, rather than
+    silently substituting Max, which is the one outcome the task's own settled decisions rule
+    out explicitly. Max itself (`rate_percent` omitted or `100`) never raises this: it reuses
+    whatever `max_bandwidth_bps` already is, unconditionally, exactly as the pre-fraction
+    "Start now at max bandwidth" path always did.
+    """
+
+
 # Progress sampling cadence -- deliberately *not* the ~1 Hz `tick_s` everything else in this
 # module runs at (reap/admit/stop stay at `tick_s`, §4.4/DESIGN.md §4.4):
 #
@@ -133,6 +145,27 @@ def _parent_rel(rel_path: str) -> str | None:
     if "/" not in rel_path:
         return None
     return rel_path.rsplit("/", 1)[0]
+
+
+def resolve_forced_rate_fraction(row: Any) -> float | None:
+    """The one place that reads both `job.forced_rate_fraction` (migration 022) and
+    `job.forced_full_rate` (migration 001) off a `job` row, so every reader -- `_admit` below,
+    `api/jobs.py._job_out` -- agrees on what a row means (2026-08-19,
+    prompts/done/2026-08-19-start-now-bandwidth-fractions.md). Prefers the fraction column;
+    falls back to `1.0` for a legacy row that predates it (`forced_full_rate=1`,
+    `forced_rate_fraction` NULL) -- migration 022 backfills every such row at upgrade time, so
+    this fallback is a belt-and-suspenders read, not the normal path. `row` is a plain `dict`
+    (every caller passes one -- `list_jobs()`'s own `dict(row)`, or a test fixture built the
+    same shape) or a `sqlite3.Row`-like mapping; `.get` covers a dict missing the key entirely
+    (an older test fixture, say) the same way it already covers `speed_bps`/`eta_s` elsewhere in
+    this module's own row shaping.
+    """
+    fraction = (
+        row.get("forced_rate_fraction") if hasattr(row, "get") else row["forced_rate_fraction"]
+    )
+    if fraction is not None:
+        return float(fraction)
+    return 1.0 if row["forced_full_rate"] else None
 
 
 def _parent_rel_path(full_path: str) -> str:
@@ -227,7 +260,10 @@ class _RunningProcess:
     kind: str
     lane: str
     rate_limit_bps: int
-    forced_full_rate: bool
+    # 2026-08-19 (prompts/done/2026-08-19-start-now-bandwidth-fractions.md): the fraction of the
+    # site limit this job was force-started at (`None` for a normal admission, `1.0` for Max) --
+    # mirrors `scheduler.AdmitDecision.forced_rate_fraction`, the field this replaces.
+    forced_rate_fraction: float | None
     local_root: str  # what progress.py should sample (file path for pget, item dir for mirror)
     bytes_total: int | None
     remote_mtime: float | None
@@ -388,7 +424,9 @@ class TransferQueue:
         the deliberate choice recorded in `docs/decisions.md` — this sweep only ever calls the
         same `enqueue_item` every other caller uses, never a hand-rolled pipeline kickoff.
         """
-        cursor = await self.db.execute("SELECT id, item_id FROM job WHERE state = 'running'")
+        cursor = await self.db.execute(
+            "SELECT id, item_id, queued_at FROM job WHERE state = 'running'"
+        )
         rows = await cursor.fetchall()
         if rows:
             logger.warning(
@@ -426,6 +464,7 @@ class TransferQueue:
                 mount_cache=mount_cache,
                 gated_logged=gated_logged,
                 freshly_interrupted=True,
+                queued_at=row["queued_at"],
             )
 
         # Rule 2: rescue rows stranded by *earlier* restarts (before this fix shipped, or from
@@ -441,6 +480,7 @@ class TransferQueue:
         mount_cache: dict[int, tuple[bool, str]],
         gated_logged: set[int],
         freshly_interrupted: bool,
+        queued_at: str,
     ) -> None:
         """Re-queue one item whose most recent job is `failed`/`INTERRUPTED` -- `enqueue_item`
         is idempotent (never a hand-rolled INSERT: the duplicate-process guards it carries exist
@@ -458,6 +498,17 @@ class TransferQueue:
         next healthy scan's auto-queue still picks up a `PARTIAL` one on its own; a `DOWNLOADED`
         one is covered by `_requeue_stranded_downloaded` on the *next* startup (auto-queue itself
         structurally cannot see a `DOWNLOADED` item -- it isn't in `ELIGIBLE_STATES`).
+
+        **`queued_at` preserves queue position** (2026-08-19,
+        prompts/2026-08-19-rescue-requeue-keeps-queue-position.md): the caller passes the
+        interrupted job's own original `queued_at` -- for rule 1 that's the row this sweep just
+        marked INTERRUPTED, for rule 2 (`_requeue_stranded_downloaded`) it's the most recent
+        interrupted job it already keyed off. A running item was, by definition, already among
+        the oldest jobs in line (`rank DESC, queued_at ASC`, `core/scheduler.py`); backdating the
+        fresh row to that same timestamp puts it back at (or near) the front instead of behind
+        every job that hadn't even started, and is honest besides -- the item genuinely has been
+        waiting since then, so the Transfers page's queued-wait readout tells the truth. `rank`
+        is never touched here, so this still can't outrank an explicit "Move to top".
         """
         item = await self._fetch_item(item_id)
         if item is None:
@@ -479,7 +530,7 @@ class TransferQueue:
                 )
             return
         try:
-            job_id = await self.enqueue_item(item_id)
+            job_id = await self.enqueue_item(item_id, queued_at=queued_at)
         except Exception:
             logger.exception("startup re-queue of item %d after an interrupted job failed", item_id)
             return
@@ -492,7 +543,8 @@ class TransferQueue:
             message=(
                 f"item {item_id} ({item['rel_path']!r}): job interrupted by a restart/crash -- "
                 "re-queued; a completed transfer no-ops straight into post-processing, a "
-                "partial one resumes from its bytes"
+                "partial one resumes from its bytes -- re-queued at its original position, not "
+                "the back of the line"
                 + ("" if freshly_interrupted else " (stranded by an earlier restart)")
             ),
         )
@@ -522,7 +574,9 @@ class TransferQueue:
         `EXTRACTED`/`EXTRACT_FAILED`), so there is nothing further to check there.
         """
         cursor = await self.db.execute(
-            "SELECT i.id AS item_id, i.rel_path, i.queue_id, i.pending_download_prefix "
+            "SELECT i.id AS item_id, i.rel_path, i.queue_id, i.pending_download_prefix, "
+            "(SELECT j.queued_at FROM job j WHERE j.item_id = i.id ORDER BY j.id DESC LIMIT 1) "
+            "AS interrupted_queued_at "
             "FROM item i WHERE i.state = 'DOWNLOADED' AND i.pending_download_prefix IS NOT NULL "
             "AND instr(i.rel_path, '/') = 0 "
             "AND NOT EXISTS ("
@@ -552,6 +606,7 @@ class TransferQueue:
                 mount_cache=mount_cache,
                 gated_logged=gated_logged,
                 freshly_interrupted=False,
+                queued_at=row["interrupted_queued_at"],
             )
 
     async def _mount_ok(
@@ -656,9 +711,28 @@ class TransferQueue:
 
     # --- public actions (called by api/jobs.py) -----------------------------------------
 
-    async def enqueue_item(self, item_id: int, *, forced_full_rate: bool = False) -> int:
+    async def enqueue_item(
+        self, item_id: int, *, forced_full_rate: bool = False, queued_at: str | None = None
+    ) -> int:
         """Manual queue (DESIGN.md §4.7): always wins, clears suppression, resets `attempt`.
         Returns the `job.id` -- a fresh one, or (see below) an existing active one.
+
+        `forced_full_rate` stays a plain boolean here -- the `POST /api/jobs` request body's
+        own `start_now` field (`QueueItemRequest`), unrelated to and unextended by the "Start
+        now" *menu* (2026-08-19, prompts/done/2026-08-19-start-now-bandwidth-fractions.md),
+        which only widened the already-queued job's own `POST /api/jobs/{id}/start-now` action.
+        `True` here maps onto `forced_rate_fraction=1.0` (Max) below -- byte-identical to what
+        this boolean already did before that task.
+
+        **`queued_at` override** (2026-08-19,
+        prompts/2026-08-19-rescue-requeue-keeps-queue-position.md): `None` (every caller before
+        this task, and every caller today except the startup rescue below) stamps today's
+        now, byte-for-byte the pre-existing behavior -- same opt-in-parameter pattern as
+        `core/postprocess.py.perform_remote_delete`'s `caller`. The startup rescue passes the
+        *interrupted* job's own original `queued_at` so a transfer that was mid-download at
+        restart re-enters the queue at (or near) the front rather than the back -- see
+        `_requeue_interrupted_item` for why. `rank` is untouched either way (still defaults to
+        0 via `_insert_job`), so this never outranks an explicit "Move to top".
 
         **Idempotent, not rejecting** (2026-08-13,
         prompts/2026-08-13-lftp-timestamped-temp-files.md's root cause). This used to insert a
@@ -702,7 +776,12 @@ class TransferQueue:
         kind = "mirror" if item["is_dir"] else "pget"
         lane = await self._lane_for(item)
         job_id = await self._insert_job(
-            item_id, kind=kind, lane=lane, attempt=1, forced_full_rate=forced_full_rate
+            item_id,
+            kind=kind,
+            lane=lane,
+            attempt=1,
+            forced_rate_fraction=1.0 if forced_full_rate else None,
+            queued_at=queued_at,
         )
         await self.db.execute(
             "UPDATE item SET state = 'QUEUED', auto_queue_suppressed = 0, suppressed_reason = NULL, "
@@ -777,16 +856,43 @@ class TransferQueue:
         await self.db.commit()
         self.request_tick()
 
-    async def start_now(self, job_id: int) -> bool:
-        """The "Start now at max bandwidth" action (DESIGN.md §4.5) — only meaningful for a
-        still-queued job; a running job's allocation is fixed at spawn and never re-shaped
-        (the invariant this whole scheduler exists to protect), so this is a no-op (returns
-        `False`) once a job is already running rather than silently pretending to retune it.
+    async def start_now(self, job_id: int, *, rate_percent: int | None = None) -> bool:
+        """The "Start now" action (DESIGN.md §4.5), now a menu (2026-08-19,
+        prompts/done/2026-08-19-start-now-bandwidth-fractions.md): `rate_percent` is one of
+        `10`/`25`/`50`/`75`/`100` (validated by `api/jobs.py.StartNowRequest`'s `Literal` before
+        this is ever called), or `None` -- both `None` and `100` mean Max, byte-for-byte the
+        only behavior this action had before this task.
+
+        Only meaningful for a still-queued job; a running job's allocation is fixed at spawn
+        and never re-shaped (the invariant this whole scheduler exists to protect), so this is
+        a no-op (returns `False`) once a job is already running rather than silently pretending
+        to retune it.
+
+        **A fraction requires a configured site bandwidth limit.** `10 MB/s at 25%` is a real
+        number; `25% of nothing` is not -- raises `NoSiteLimitConfiguredError` rather than
+        silently admitting at Max instead, which the task's settled decisions rule out by name.
+        "No site limit configured" reads as `max_bandwidth_bps <= 0` (docs/decisions.md has the
+        call): the Settings -> Transfer field already treats 0 as the degenerate "admits
+        nothing, ever" ceiling (`TransferTab.tsx`'s own reserve-clamp warning), so 0 doubling as
+        "not really configured" needs no new sentinel or migration to the settings row itself.
+        Max (`fraction == 1.0`) is exempt from this check -- it reuses whatever
+        `max_bandwidth_bps` already is, unconditionally, exactly as the pre-fraction path did.
         """
         row = await self._fetch_job(job_id)
         if row is None or row["state"] != "queued":
             return False
-        await self.db.execute("UPDATE job SET forced_full_rate = 1 WHERE id = ?", (job_id,))
+        fraction = (rate_percent or 100) / 100.0
+        if fraction != 1.0:
+            settings = await load_transfer_settings(self.db)
+            if settings.max_bandwidth_bps <= 0:
+                raise NoSiteLimitConfiguredError(
+                    "start-now at a fraction requires a configured site bandwidth limit "
+                    "(Settings -> Transfer -> Max bandwidth) -- none is set"
+                )
+        await self.db.execute(
+            "UPDATE job SET forced_full_rate = 1, forced_rate_fraction = ? WHERE id = ?",
+            (fraction, job_id),
+        )
         await self.db.commit()
         self.request_tick()
         return True
@@ -1689,7 +1795,8 @@ class TransferQueue:
         ]
         now = time.monotonic()
         cursor = await self.db.execute(
-            "SELECT job.id, job.item_id, job.lane, job.rank, job.queued_at, job.forced_full_rate "
+            "SELECT job.id, job.item_id, job.lane, job.rank, job.queued_at, "
+            "       job.forced_full_rate, job.forced_rate_fraction "
             "FROM job WHERE job.state = 'queued' ORDER BY job.rank DESC, job.queued_at ASC"
         )
         rows = await cursor.fetchall()
@@ -1721,7 +1828,7 @@ class TransferQueue:
                     lane=row["lane"],
                     rank=row["rank"],
                     queued_at=row["queued_at"],
-                    forced_full_rate=bool(row["forced_full_rate"]),
+                    forced_rate_fraction=resolve_forced_rate_fraction(row),
                 )
             )
 
@@ -1928,7 +2035,7 @@ class TransferQueue:
             kind=job_row["kind"],
             lane=decision.lane,
             rate_limit_bps=decision.rate_limit_bps,
-            forced_full_rate=decision.forced_full_rate,
+            forced_rate_fraction=decision.forced_rate_fraction,
             local_root=local_root_for_progress,
             bytes_total=item["remote_size"],
             remote_mtime=float(item["remote_mtime"]) if item["remote_mtime"] is not None else None,
@@ -1949,18 +2056,22 @@ class TransferQueue:
             local_full,
             spawned.pid,
             decision.rate_limit_bps,
-            ", start-now" if decision.forced_full_rate else "",
+            f", start-now @ {round(decision.forced_rate_fraction * 100)}%"
+            if decision.forced_rate_fraction is not None
+            else "",
         )
 
         started_at = _now_iso()
         await self.db.execute(
             "UPDATE job SET state = 'running', pid = ?, started_at = ?, rate_limit_bps = ?, "
-            "forced_full_rate = ?, bytes_start = ?, bytes_total = ? WHERE id = ?",
+            "forced_full_rate = ?, forced_rate_fraction = ?, bytes_start = ?, bytes_total = ? "
+            "WHERE id = ?",
             (
                 spawned.pid,
                 started_at,
                 decision.rate_limit_bps,
-                1 if decision.forced_full_rate else 0,
+                1 if decision.forced_rate_fraction is not None else 0,
+                decision.forced_rate_fraction,
                 item["local_size"] or 0,
                 # 2026-08-14 (prompts/2026-08-14-exit-zero-is-not-completion.md, defect 4):
                 # `job.bytes_total` was never written here, so it stayed NULL forever and
@@ -2043,13 +2154,37 @@ class TransferQueue:
         return prefix if enabled else None
 
     async def _insert_job(
-        self, item_id: int, *, kind: str, lane: str, attempt: int, forced_full_rate: bool = False
+        self,
+        item_id: int,
+        *,
+        kind: str,
+        lane: str,
+        attempt: int,
+        forced_rate_fraction: float | None = None,
+        queued_at: str | None = None,
     ) -> int:
-        cursor = await self.db.execute(
-            "INSERT INTO job (item_id, kind, state, lane, rank, attempt, forced_full_rate) "
-            "VALUES (?, ?, 'queued', ?, 0, ?, ?)",
-            (item_id, kind, lane, attempt, 1 if forced_full_rate else 0),
-        )
+        """`queued_at=None` (every caller before 2026-08-19) lets the column's own
+        `DEFAULT (STRFTIME(...))` stamp now, unchanged. A caller may pass an explicit value to
+        backdate the row instead -- see `enqueue_item`'s own docstring for why.
+
+        `forced_rate_fraction` (2026-08-19,
+        prompts/done/2026-08-19-start-now-bandwidth-fractions.md) writes both columns in
+        lockstep -- `forced_full_rate = 1` iff `forced_rate_fraction is not None` -- migration
+        022's own contract for keeping the two in agreement.
+        """
+        forced_full_rate = 1 if forced_rate_fraction is not None else 0
+        if queued_at is None:
+            cursor = await self.db.execute(
+                "INSERT INTO job (item_id, kind, state, lane, rank, attempt, forced_full_rate, "
+                "forced_rate_fraction) VALUES (?, ?, 'queued', ?, 0, ?, ?, ?)",
+                (item_id, kind, lane, attempt, forced_full_rate, forced_rate_fraction),
+            )
+        else:
+            cursor = await self.db.execute(
+                "INSERT INTO job (item_id, kind, state, lane, rank, attempt, forced_full_rate, "
+                "forced_rate_fraction, queued_at) VALUES (?, ?, 'queued', ?, 0, ?, ?, ?, ?)",
+                (item_id, kind, lane, attempt, forced_full_rate, forced_rate_fraction, queued_at),
+            )
         await self.db.commit()
         return cursor.lastrowid
 

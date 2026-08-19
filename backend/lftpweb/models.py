@@ -726,6 +726,15 @@ class QueueItemRequest(BaseModel):
     start_now: bool = False  # "Start now at max bandwidth" (§4.5), applied at admission
 
 
+# "Start now" (§4.5) as a menu, not a single button (2026-08-19,
+# prompts/done/2026-08-19-start-now-bandwidth-fractions.md): `POST /api/jobs/{id}/start-now`'s
+# optional body. `rate_percent` omitted (no body at all -- every caller before this task) or
+# `100` both mean Max, byte-for-byte the only behavior this action had before. Anything outside
+# the five menu options is a 422 for free, via `Literal` -- no hand-written validation needed.
+class StartNowRequest(BaseModel):
+    rate_percent: Literal[10, 25, 50, 75, 100] | None = None
+
+
 class JobOut(BaseModel):
     id: int
     item_id: int
@@ -743,7 +752,12 @@ class JobOut(BaseModel):
     finished_at: str | None
     pid: int | None
     rate_limit_bps: int | None
-    forced_full_rate: bool
+    # 2026-08-19 (prompts/done/2026-08-19-start-now-bandwidth-fractions.md): widened from a
+    # plain `forced_full_rate: bool` -- `None` means never force-started, `1.0` means Max
+    # (byte-identical to the old `True`), and the new menu's `0.1`/`0.25`/`0.5`/`0.75` fill the
+    # gap between. See `core/queue.py.resolve_forced_rate_fraction` for how a row resolves to
+    # this.
+    forced_rate_fraction: float | None
     bytes_start: int
     bytes_done: int
     bytes_total: int | None
