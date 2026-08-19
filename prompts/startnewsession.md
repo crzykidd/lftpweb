@@ -77,7 +77,24 @@ than a first. Two things that bit the first time and will bit again:
 
 ## Where we are
 
-### Post-v0.2.5 work on `dev` (2026-08-19) — first-restart feedback + two queue-view features, pushed, unreleased
+### 🚀 v0.2.6 released 2026-08-18 (local; third same-day release) — the queue-view batch ships
+
+PR #12 (`dev` → `main`, merged `f90ed70`), tag `v0.2.6`, release notes = the `[0.2.6]`
+CHANGELOG section verbatim; `:latest`/`:0.2.6`/`:0` published on the release event. Contents:
+exactly the three items in the section below (`62dbb46`/`31216a8`/`2d9c620`), **released
+browser-unverified** (flagged to the user pre-merge; the ETA figure, Start-now menu, and a
+real fraction transfer's throughput still await human eyes) — migration **022** runs on first
+start. Tests at release: **1339 backend / 488 frontend, 0 skipped.** GitHub Actions fought
+back twice more this cut: the PR push's duplicate Test-suite job wedged `pending` ~15 min
+(cancel + rerun, green in 4m13s — third dispatch wedge this week), then the post-merge main
+CI's Test suite hung ~18 min inside `apt-get update` (dead runner mirror; job has no
+`timeout-minutes`, GitHub's default is 6h — cancel + rerun, green in 4m). **CI diagnosis
+recorded:** every push with an open PR runs CI twice (`push: [dev]` + `pull_request: [main]`,
+no `concurrency` group), doubling the stall lottery; hardening options named but deliberately
+deferred (concurrency group per-commit; `timeout-minutes` + apt retries on the lftp install
+step) — queue them if the stalls outlive GitHub's bad week.
+
+### Post-v0.2.5 work on `dev` (2026-08-19 UTC) — first-restart feedback + two queue-view features (released as v0.2.6 above)
 
 The first production restart onto v0.2.5 (heavy queue) surfaced a positioning flaw in the
 day-old startup rescue, and live queue-watching prompted two features. Each its own prompt in
