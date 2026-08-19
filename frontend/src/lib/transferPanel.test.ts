@@ -71,18 +71,33 @@ function job(state: JobState, overrides: Partial<JobOut> = {}): JobOut {
 }
 
 describe('transferLineValue -- the row-collapse decision', () => {
-  it('shows percent + live rate while running, from the live progress reading', () => {
+  it('shows percent + live rate + ETA while running, from the live progress reading', () => {
     const live: LiveProgress = { bytes_done: 500, bytes_total: 1000, speed_bps: 1024 * 1024, eta_s: 30 }
     const value = transferLineValue(job('running', { bytes_done: 100, bytes_total: 1000 }), live)
-    expect(value).toBe('50% · 1.0 MB/s')
+    expect(value).toBe('50% · 1.0 MB/s · 30s left')
   })
 
-  it('falls back to the job\'s own bytes_done/speed_bps while running if no live reading has arrived yet', () => {
-    const value = transferLineValue(job('running', { bytes_done: 250, bytes_total: 1000, speed_bps: 512 * 1024 }))
-    expect(value).toBe('25% · 512.0 KB/s')
+  it('falls back to the job\'s own bytes_done/speed_bps/eta_s while running if no live reading has arrived yet', () => {
+    const value = transferLineValue(
+      job('running', { bytes_done: 250, bytes_total: 1000, speed_bps: 512 * 1024, eta_s: 90 }),
+    )
+    expect(value).toBe('25% · 512.0 KB/s · 1m left')
   })
 
-  it('shows the final size, not percent/rate, once a job is terminal', () => {
+  // 2026-08-19 (prompts/2026-08-19-transfers-row-shows-eta.md): "how long until this finishes"
+  // surfaced on the collapsed line, one level up from the expand panel's existing ETA.
+  it('omits the ETA figure entirely (no placeholder) while running with no ETA known yet', () => {
+    const value = transferLineValue(job('running', { bytes_done: 100, bytes_total: 1000, eta_s: null }))
+    expect(value).toBe('10% · 0 B/s')
+  })
+
+  it("prefers the live sample's eta_s over the job's own while running, same as bytes_done/speed_bps", () => {
+    const live: LiveProgress = { bytes_done: 500, bytes_total: 1000, speed_bps: 1024 * 1024, eta_s: 45 }
+    const value = transferLineValue(job('running', { bytes_done: 500, bytes_total: 1000, eta_s: 999 }), live)
+    expect(value).toBe('50% · 1.0 MB/s · 45s left')
+  })
+
+  it('shows the final size, not percent/rate/ETA, once a job is terminal', () => {
     expect(transferLineValue(job('succeeded', { bytes_total: 1_500_000_000 }))).toBe('1.4 GB')
     expect(transferLineValue(job('failed', { bytes_total: 2000 }))).toBe('2.0 KB')
     expect(transferLineValue(job('cancelled', { bytes_total: 1000 }))).toBe('1000 B')

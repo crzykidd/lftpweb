@@ -188,9 +188,12 @@ function Row({
             {completed.value}
           </span>
         )}
-        {/* The one live number this line keeps -- percent + current rate while downloading,
-         * final size otherwise. Everything else that used to sit here lives in the panel. */}
-        <span className="w-32 shrink-0 text-right text-zinc-500 dark:text-zinc-400">
+        {/* The one live figure this line keeps -- percent + current rate while downloading (plus
+         * a "<duration> left" ETA once one is known, 2026-08-19,
+         * prompts/2026-08-19-transfers-row-shows-eta.md), final size otherwise. Everything else
+         * that used to sit here lives in the panel. `w-44` (not the original `w-32`): the ETA
+         * addition can make this the longest of the three figures ever shown here. */}
+        <span className="w-44 shrink-0 whitespace-nowrap text-right text-zinc-500 dark:text-zinc-400">
           {transferLineValue(job, live)}
         </span>
         <div className="flex shrink-0 flex-wrap items-center gap-2">

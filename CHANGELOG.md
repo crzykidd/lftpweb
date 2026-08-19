@@ -24,6 +24,10 @@ Skeleton for the next roll:
 ## [Unreleased]
 
 ### Added
+
+- **A downloading transfer's row now shows how long until it completes**, next to its percent
+  and speed on the same collapsed line.
+
 ### Changed
 ### Fixed
 
