@@ -347,8 +347,23 @@ export function getItemEvents(itemId: number, limit?: number): Promise<ItemEvent
   return getJson<ItemEventsResponse>(`/api/items/${itemId}/events${limit != null ? `?limit=${limit}` : ''}`)
 }
 
-export function startJobNow(jobId: number): Promise<{ applied: boolean }> {
-  return sendJson<{ applied: boolean }>(`/api/jobs/${jobId}/start-now`, 'POST')
+/** "Start now" (DESIGN.md §4.5), now a menu -- 10%/25%/50%/75%/Max of the site total limit
+ * (2026-08-19, prompts/done/2026-08-19-start-now-bandwidth-fractions.md). `ratePercent`
+ * omitted sends no body at all -- byte-for-byte the pre-fraction request every caller before
+ * this task made -- matching `api/jobs.py.start_now`'s own "omitted body means Max" contract
+ * (the same `undefined`-omits-the-body idiom `dismissAllJobs` above already uses). A 409
+ * (`core/queue.py.NoSiteLimitConfiguredError`) means a fraction was requested with no site
+ * bandwidth limit configured -- `sendJson` throws, same as any other non-2xx.
+ */
+export function startJobNow(
+  jobId: number,
+  ratePercent?: 10 | 25 | 50 | 75 | 100,
+): Promise<{ applied: boolean }> {
+  return sendJson<{ applied: boolean }>(
+    `/api/jobs/${jobId}/start-now`,
+    'POST',
+    ratePercent != null ? { rate_percent: ratePercent } : undefined,
+  )
 }
 
 export function retryItem(itemId: number): Promise<JobOut> {

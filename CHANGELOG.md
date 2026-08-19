@@ -27,6 +27,9 @@ Skeleton for the next roll:
 
 - **A downloading transfer's row now shows how long until it completes**, next to its percent
   and speed on the same collapsed line.
+- **"Start now" is a menu, not a single button**: 10% / 25% / 50% / 75% / Max of your configured
+  site bandwidth limit, instead of always jumping straight to the full ceiling. The percent
+  options are disabled with a hint if no site bandwidth limit is set — Max always works.
 
 ### Changed
 ### Fixed

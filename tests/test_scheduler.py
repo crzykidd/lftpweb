@@ -34,9 +34,15 @@ def _settings(**overrides) -> SchedulerSettings:
 
 
 def _q(
-    id_: int, queued_at: str, rank: float = 0.0, lane: str = LANE_MAIN, forced: bool = False
+    id_: int,
+    queued_at: str,
+    rank: float = 0.0,
+    lane: str = LANE_MAIN,
+    forced_fraction: float | None = None,
 ) -> QueuedJob:
-    return QueuedJob(id=id_, lane=lane, rank=rank, queued_at=queued_at, forced_full_rate=forced)
+    return QueuedJob(
+        id=id_, lane=lane, rank=rank, queued_at=queued_at, forced_rate_fraction=forced_fraction
+    )
 
 
 # --- §4.5's worked table, N=2 B=10MB/s, reserve=0 ------------------------------------------
@@ -174,27 +180,31 @@ def test_fast_lane_never_consumes_a_main_lane_slot():
     assert ids == {1, 2}  # both admitted despite N=1 -- the small item didn't compete for it
 
 
-# --- Start now at max bandwidth: oversubscribes, then freezes normal admission --------------
+# --- Start now (10%/25%/50%/75%/Max of the site total limit): oversubscribes, then freezes
+# normal admission (2026-08-19, prompts/done/2026-08-19-start-now-bandwidth-fractions.md widened
+# the old "Start now at max bandwidth" single button into this menu; `forced_fraction=1.0` below
+# is Max, and is asserted byte-identical to the pre-widening `forced=True` behavior it replaces)
+# ------------------------------------------------------------------------------------------
 
 
 def test_start_now_admits_unconditionally_at_full_bandwidth():
     settings = _settings(max_concurrent_transfers=1)
     running = [RunningJob(id=1, lane=LANE_MAIN, rate_limit_bps=10_000_000)]  # N already full
-    queue = [_q(2, "t2", forced=True)]
+    queue = [_q(2, "t2", forced_fraction=1.0)]
     decisions = admit(settings, running=running, queue=queue)
     assert decisions == [
-        AdmitDecision(job_id=2, lane=LANE_MAIN, rate_limit_bps=10_000_000, forced_full_rate=True)
+        AdmitDecision(job_id=2, lane=LANE_MAIN, rate_limit_bps=10_000_000, forced_rate_fraction=1.0)
     ]
 
 
 def test_start_now_oversubscription_freezes_further_normal_admission():
     settings = _settings(max_concurrent_transfers=5)
-    queue = [_q(1, "t1", forced=True), _q(2, "t2")]
+    queue = [_q(1, "t1", forced_fraction=1.0), _q(2, "t2")]
     decisions = admit(settings, running=[], queue=queue)
     # Item 1 is force-admitted at the full 10,000,000; that alone drives headroom negative
     # (10,000,000 - 0 - 10,000,000 = 0), so item 2 gets nothing this pass.
     assert decisions == [
-        AdmitDecision(job_id=1, lane=LANE_MAIN, rate_limit_bps=10_000_000, forced_full_rate=True)
+        AdmitDecision(job_id=1, lane=LANE_MAIN, rate_limit_bps=10_000_000, forced_rate_fraction=1.0)
     ]
 
 
@@ -204,6 +214,75 @@ def test_start_now_admission_resumes_once_the_forced_job_finishes():
     # `running` either -> headroom is back to normal.
     decisions = admit(settings, running=[], queue=[_q(2, "t2")])
     assert decisions == [AdmitDecision(job_id=2, lane=LANE_MAIN, rate_limit_bps=10_000_000)]
+
+
+# --- Start now at a fraction (the menu's own addition, not just Max) -----------------------
+
+
+def test_start_now_fraction_admits_unconditionally_at_a_fraction_of_the_site_limit():
+    # 25% of B=10,000,000 -> 2,500,000 -- admits despite N already full, exactly like Max does,
+    # just at a smaller cap.
+    settings = _settings(max_concurrent_transfers=1)
+    running = [RunningJob(id=1, lane=LANE_MAIN, rate_limit_bps=10_000_000)]
+    queue = [_q(2, "t2", forced_fraction=0.25)]
+    decisions = admit(settings, running=running, queue=queue)
+    assert decisions == [
+        AdmitDecision(job_id=2, lane=LANE_MAIN, rate_limit_bps=2_500_000, forced_rate_fraction=0.25)
+    ]
+
+
+@pytest.mark.parametrize(
+    "fraction, expected_bps",
+    [(0.10, 1_000_000), (0.25, 2_500_000), (0.5, 5_000_000), (0.75, 7_500_000)],
+)
+def test_start_now_fraction_every_menu_option_computes_fraction_of_site_limit(
+    fraction, expected_bps
+):
+    settings = _settings(max_concurrent_transfers=5)
+    decisions = admit(settings, running=[], queue=[_q(1, "t1", forced_fraction=fraction)])
+    assert decisions == [
+        AdmitDecision(
+            job_id=1, lane=LANE_MAIN, rate_limit_bps=expected_bps, forced_rate_fraction=fraction
+        )
+    ]
+
+
+def test_start_now_fraction_rounds_to_the_nearest_whole_byte_per_second():
+    # B=10,000,001 at 10% -> 1,000,000.1, rounds to 1,000,000 -- never a fractional byte rate.
+    settings = _settings(max_bandwidth_bps=10_000_001, max_concurrent_transfers=5)
+    decisions = admit(settings, running=[], queue=[_q(1, "t1", forced_fraction=0.10)])
+    assert decisions == [
+        AdmitDecision(job_id=1, lane=LANE_MAIN, rate_limit_bps=1_000_000, forced_rate_fraction=0.10)
+    ]
+
+
+def test_start_now_fraction_one_is_byte_identical_to_the_old_forced_full_rate_path():
+    # fraction=1.0 must take the identical code path (and produce the identical value) the
+    # pre-widening `forced_full_rate=True` design always did -- DESIGN.md §4.5's own requirement
+    # for this task.
+    settings = _settings(max_concurrent_transfers=1)
+    running = [RunningJob(id=1, lane=LANE_MAIN, rate_limit_bps=10_000_000)]
+    max_decision = admit(settings, running=running, queue=[_q(2, "t2", forced_fraction=1.0)])[0]
+    assert max_decision.rate_limit_bps == settings.max_bandwidth_bps
+
+
+def test_start_now_fraction_other_running_jobs_keep_their_existing_allocations():
+    # A forced-fraction admission must not re-shape anything already running -- the same
+    # invariant Max's own oversubscription already respects (§4.5: "allocations are never
+    # re-shaped"). Two jobs already running at 5,000,000 each; a forced-25% job arrives.
+    settings = _settings(max_concurrent_transfers=2)
+    running = [
+        RunningJob(id=1, lane=LANE_MAIN, rate_limit_bps=5_000_000),
+        RunningJob(id=2, lane=LANE_MAIN, rate_limit_bps=5_000_000),
+    ]
+    decisions = admit(settings, running=running, queue=[_q(3, "t3", forced_fraction=0.25)])
+    assert decisions == [
+        AdmitDecision(job_id=3, lane=LANE_MAIN, rate_limit_bps=2_500_000, forced_rate_fraction=0.25)
+    ]
+    # Nothing here re-issues a decision for jobs 1/2 -- they simply aren't in `decisions`, which
+    # is what "never re-shaped" means for a pure function that only ever emits decisions for
+    # newly-admitted jobs.
+    assert {d.job_id for d in decisions} == {3}
 
 
 # --- regression: the fast-lane reserve must never exceed the ceiling -----------------------
@@ -233,7 +312,7 @@ def test_low_ceiling_still_admits_work(ceiling):
             lane="main",
             rank=0.0,
             queued_at=datetime(2026, 8, 11, tzinfo=UTC),
-            forced_full_rate=False,
+            forced_rate_fraction=None,
         )
     ]
     decisions = admit(settings, [], queued)

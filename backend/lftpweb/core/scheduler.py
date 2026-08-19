@@ -53,15 +53,19 @@ class RunningJob:
 class QueuedJob:
     """A job waiting for admission. `rank`/`queued_at` implement DESIGN.md §4.5's ordering
     (`rank DESC, queued_at ASC` — default oldest-first, `queued_at` as the tiebreak, "Move to
-    top" as a higher `rank`). `forced_full_rate` is the "Start now at max bandwidth" escape
-    hatch (§4.5) — set per-item by a dedicated action, not by raising rank.
+    top" as a higher `rank`). `forced_rate_fraction` is the "Start now" escape hatch (§4.5) —
+    set per-item by a dedicated action, not by raising rank. `None` means not forced; otherwise
+    it's the fraction of the site's `max_bandwidth_bps` this job admits at (2026-08-19,
+    prompts/done/2026-08-19-start-now-bandwidth-fractions.md: the menu's 10%/25%/50%/75%
+    options), with `1.0` reading as "Max" — byte-identical to the pre-fraction
+    `forced_full_rate=True` this field replaces.
     """
 
     id: int
     lane: Lane
     rank: float
     queued_at: str  # sortable (ISO-8601), ties broken oldest-first
-    forced_full_rate: bool = False
+    forced_rate_fraction: float | None = None
 
 
 @dataclass(frozen=True)
@@ -69,7 +73,9 @@ class AdmitDecision:
     job_id: int
     lane: Lane
     rate_limit_bps: int
-    forced_full_rate: bool = False
+    # Mirrors the admitted `QueuedJob.forced_rate_fraction`, if this decision came from step 1
+    # below — `None` for every ordinary main-lane/fast-lane admission.
+    forced_rate_fraction: float | None = None
 
 
 def _priority_key(q: QueuedJob) -> tuple[float, str]:
@@ -86,12 +92,18 @@ def admit(
 
     Three independent decisions, in this order, each below its own heading in DESIGN.md §4.5:
 
-    1. **Start now at max bandwidth** — any queued main-lane item flagged
-       `forced_full_rate` admits unconditionally, at the full ceiling `B`, regardless of slots
-       or headroom. This is the deliberate-oversubscription escape hatch; it is *not* gated by
+    1. **Start now** — any queued main-lane item with a `forced_rate_fraction` set admits
+       unconditionally, at `fraction × B` (rounded to the nearest whole byte/sec), regardless of
+       slots or headroom (2026-08-19,
+       prompts/done/2026-08-19-start-now-bandwidth-fractions.md — the "Start now at max
+       bandwidth" escape hatch widened into a menu: 10%/25%/50%/75%/Max of the site total limit,
+       computed once here, at admission, never re-shaped afterward like any other job's
+       allocation). `fraction=1.0` (Max) computes `round(1.0 × B) == B` — the identical value,
+       and the identical code path, the pre-fraction design always took. This is *not* gated by
        anything below. Its allocation folds into `headroom` for step 2 exactly like any other
        running job would, which is what "freezes new [normal] admissions" without any special
-       casing — headroom simply goes negative.
+       casing — headroom simply goes negative (more so at Max than at a smaller fraction, but
+       the mechanism is the same either way).
     2. **Main-lane admission** — the `slots`/`headroom`/floor-loop algorithm, over whatever
        main-lane queue entries step 1 didn't already take.
     3. **Fast lane** — a separate concurrency cap and its own reserve slice of `B`, entered by
@@ -101,18 +113,19 @@ def admit(
     """
     decisions: list[AdmitDecision] = []
 
-    # --- 1. Start now at max bandwidth ------------------------------------------------
+    # --- 1. Start now (10%/25%/50%/75%/Max of the site total limit) -------------------
     forced = sorted(
-        (q for q in queue if q.lane == LANE_MAIN and q.forced_full_rate),
+        (q for q in queue if q.lane == LANE_MAIN and q.forced_rate_fraction is not None),
         key=_priority_key,
     )
     for q in forced:
+        assert q.forced_rate_fraction is not None  # narrows for the type checker; filtered above
         decisions.append(
             AdmitDecision(
                 job_id=q.id,
                 lane=LANE_MAIN,
-                rate_limit_bps=settings.max_bandwidth_bps,
-                forced_full_rate=True,
+                rate_limit_bps=round(q.forced_rate_fraction * settings.max_bandwidth_bps),
+                forced_rate_fraction=q.forced_rate_fraction,
             )
         )
     forced_ids = {d.job_id for d in decisions}

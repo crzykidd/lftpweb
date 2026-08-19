@@ -50,7 +50,7 @@ function job(state: JobState, overrides: Partial<JobOut> = {}): JobOut {
     finished_at: null,
     pid: null,
     rate_limit_bps: null,
-    forced_full_rate: false,
+    forced_rate_fraction: null,
     bytes_start: 0,
     bytes_done: 0,
     bytes_total: null,

@@ -659,8 +659,9 @@ export function TransferTab() {
                 </p>
                 <p>
                   <strong>Start now</strong> (Transfers page) bypasses this cap entirely — a
-                  forced item always admits immediately, at full bandwidth, regardless of how
-                  many slots are already in use.
+                  forced item always admits immediately, at your chosen share of the bandwidth
+                  above (10%/25%/50%/75%, or Max for the full ceiling), regardless of how many
+                  slots are already in use.
                 </p>
               </FieldHelp>
             }

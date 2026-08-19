@@ -3,6 +3,7 @@ import {
   dismissAllJobs,
   dismissJob,
   getItemEvents,
+  getTransferSettings,
   moveJobToTop,
   retryItem,
   startJobNow,
@@ -11,11 +12,13 @@ import {
 import type { FileNode, ItemEventOut, JobOut } from '../api/types'
 import { ArrIcon, ArrRowChip } from '../components/LifecycleIcons'
 import { ItemDrawer } from '../components/ItemDrawer'
+import { StartNowMenu } from '../components/StartNowMenu'
 import { StateChip } from '../components/StateChip'
 import { useJobs } from '../hooks/useJobs'
 import { useLiveModel } from '../hooks/useLiveModel'
 import { arrHoverLabel } from '../lib/fileTree'
 import { formatBytes, formatRate, formatRelativeTimeIntl } from '../lib/format'
+import type { StartNowRatePercent } from '../lib/startNow'
 import {
   type LiveProgress,
   type PanelField,
@@ -109,9 +112,14 @@ interface RowProps {
   // the real future run order). `undefined` for a running/failed/cancelled row -- those aren't
   // "queued" in the sense a position means anything for.
   queuePosition: number | undefined
+  // Settings -> Transfer's site total limit (2026-08-19,
+  // prompts/done/2026-08-19-start-now-bandwidth-fractions.md) -- fed straight into
+  // `StartNowMenu`, which decides (via `lib/startNow.ts`) whether the fraction options are
+  // enabled. `undefined` while `GET /api/settings/transfer` is still in flight.
+  maxBandwidthBps: number | undefined
   onOpenDrawer: (job: JobOut) => void
   onMoveToTop: (job: JobOut) => void
-  onStartNow: (job: JobOut) => void
+  onStartNow: (job: JobOut, ratePercent: StartNowRatePercent | undefined) => void
   onStop: (job: JobOut) => void
   onRetry: (job: JobOut) => void
   onDismiss: (job: JobOut) => void
@@ -123,6 +131,7 @@ function Row({
   nodes,
   live,
   queuePosition,
+  maxBandwidthBps,
   onOpenDrawer,
   onMoveToTop,
   onStartNow,
@@ -207,15 +216,12 @@ function Row({
               >
                 Move to top
               </button>
-              {!job.forced_full_rate && (
-                <button
-                  type="button"
+              {job.forced_rate_fraction == null && (
+                <StartNowMenu
                   disabled={busy}
-                  onClick={() => onStartNow(job)}
-                  className="rounded-md border border-zinc-300 px-2 py-1 text-xs font-medium text-zinc-700 hover:bg-zinc-50 disabled:opacity-50 dark:border-zinc-700 dark:text-zinc-200 dark:hover:bg-zinc-900"
-                >
-                  Start now at max bandwidth
-                </button>
+                  maxBandwidthBps={maxBandwidthBps}
+                  onSelect={(ratePercent) => onStartNow(job, ratePercent)}
+                />
               )}
             </>
           )}
@@ -499,6 +505,13 @@ export function TransfersPage() {
   const [busyIds, setBusyIds] = useState<Set<number>>(new Set())
   const [drawerJob, setDrawerJob] = useState<JobOut | null>(null)
   const [startNowNotice, setStartNowNotice] = useState(false)
+  // Settings -> Transfer's site total limit (2026-08-19,
+  // prompts/done/2026-08-19-start-now-bandwidth-fractions.md) -- fetched once on mount, purely
+  // to decide whether the "Start now" menu's fraction options are enabled
+  // (`lib/startNow.ts.isSiteLimitConfigured`). `undefined` until the request resolves; every
+  // row's menu reads disabled in the meantime, same as "not configured" (`StartNowMenu`'s own
+  // fallback).
+  const [maxBandwidthBps, setMaxBandwidthBps] = useState<number | undefined>(undefined)
   const [clearingAll, setClearingAll] = useState(false)
   const [dismissOutcome, setDismissOutcome] = useState<DismissOutcome | null>(null)
   const [dismissingAll, setDismissingAll] = useState(false)
@@ -516,6 +529,26 @@ export function TransfersPage() {
     for (const q of queues) map.set(q.queue_id, q.nodes)
     return map
   }, [queues])
+
+  // Fetched once, not polled -- the "Start now" menu only needs to know whether a site limit is
+  // configured at all, not track it live; a page reload after a Settings -> Transfer change
+  // picks up the new value, the same freshness every other one-shot settings read on this page
+  // already has. A failed fetch leaves `maxBandwidthBps` `undefined`, which every fraction
+  // option already treats as "not configured" (`lib/startNow.ts.isSiteLimitConfigured`) --
+  // Max stays available regardless, so there is nothing to show the user beyond that.
+  useEffect(() => {
+    let cancelled = false
+    getTransferSettings()
+      .then((settings) => {
+        if (!cancelled) setMaxBandwidthBps(settings.max_bandwidth_bps)
+      })
+      .catch(() => {
+        // Deliberately silent -- see the comment above.
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [])
 
   // Row order (2026-08-16, `lib/transferPanel.ts.sortTransferRows`'s own docstring): active rows
   // keep `jobs`' own scheduler order untouched, terminal rows sort newest-completed-first --
@@ -576,12 +609,12 @@ export function TransfersPage() {
   const handleStop = (job: JobOut) => withBusy(job.id, () => stopJob(job.id))
   const handleRetry = (job: JobOut) => withBusy(job.id, () => retryItem(job.item_id))
   const handleDismiss = (job: JobOut) => withBusy(job.id, () => dismissJob(job.id))
-  const handleStartNow = (job: JobOut) => {
+  const handleStartNow = (job: JobOut, ratePercent: StartNowRatePercent | undefined) => {
     if (localStorage.getItem(START_NOW_EXPLAINED_KEY) !== '1') {
       setStartNowNotice(true)
       localStorage.setItem(START_NOW_EXPLAINED_KEY, '1')
     }
-    return withBusy(job.id, () => startJobNow(job.id))
+    return withBusy(job.id, () => startJobNow(job.id, ratePercent))
   }
 
   const failedJobs = useMemo(() => jobs.filter((j) => j.state === 'failed'), [jobs])
@@ -684,11 +717,13 @@ export function TransfersPage() {
       {startNowNotice && (
         <div className="flex items-start justify-between gap-3 rounded-md border border-amber-300 bg-amber-50 p-3 text-sm text-amber-900 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-200">
           <p>
-            <strong>Start now</strong> admits this job immediately at the full bandwidth ceiling —
-            deliberately <em>oversubscribing</em> past what other running jobs are allocated
-            (DESIGN.md §4.5). It's the "I want this one now" escape hatch: new admissions pause
-            until enough jobs finish to bring the total back under the ceiling, rather than
-            throttling what's already running.
+            <strong>Start now</strong> admits this job immediately at your chosen share of the
+            site bandwidth limit — 10%/25%/50%/75%, or Max for the full ceiling — deliberately
+            <em> oversubscribing</em> past what other running jobs are allocated (DESIGN.md
+            §4.5). It's the "I want this one now" escape hatch: new admissions pause until enough
+            jobs finish to bring the total back under the ceiling, rather than throttling what's
+            already running. The percent options need a site bandwidth limit configured
+            (Settings → Transfer) — Max always works.
           </p>
           <button
             type="button"
@@ -882,6 +917,7 @@ export function TransfersPage() {
                       nodes={nodesByQueue.get(job.queue_id) ?? []}
                       live={progressByJobId[job.id]}
                       queuePosition={queuePositions.get(job.id)}
+                      maxBandwidthBps={maxBandwidthBps}
                       onOpenDrawer={setDrawerJob}
                       onMoveToTop={handleMoveToTop}
                       onStartNow={handleStartNow}
