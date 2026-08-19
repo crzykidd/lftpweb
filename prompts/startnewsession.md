@@ -77,14 +77,28 @@ than a first. Two things that bit the first time and will bit again:
 
 ## Where we are
 
+### Post-v0.2.6 work on `dev` (2026-08-19) — the README's safety-rails section, and two v0.2.6 items confirmed in a browser
+
+| What | Commit |
+|---|---|
+| **README gains "Safety rails: when a volume drops or a remote stops answering"** — a user-facing write-up of the two failure families that were only documented in code and `docs/decisions.md` before: the mount sentinel (what `.lftpweb-mount-ok` is, why an empty dir and an unmounted share are indistinguishable without it, and the six things a failed check blocks blanket-per-queue) plus the removal grace period; then the remote side — a failed remote scan persisting nothing and keeping its cached tree, partial-`find` success, per-instance *arr backoff (60 s → 30 min, 10 s call timeout), the amber `dropped` 6 h grace state, confirmed-import-only source deletes, and the bounded delete-retry/self-heal sweeps. Written from the code, not the brief. Scope calls the user made during review: **no table** (prose only), **no production-incident anecdotes** (the mechanisms stand on their own), **no NFS mount-option guidance**, and **no "hung vs. dropped mount" caveat** — the sentinel catching a dropped mount but blocking on a half-alive NFS server is real and deliberately left unsaid. Two bolded lead-ins say "Sonarr/Radarr" rather than `*arr` purely because an unmatched `*` inside `**…**` mis-renders | `c7e2d6e` |
+
+**Browser verification landed the same day** (see the v0.2.6 blocks below for the detail): the
+user pulled `:dev`, exercised the **Start-now fraction menu** and the **Transfers-row ETA**, and
+reported both working. The **rescue re-queue ordering** is the one item of that batch still
+unwitnessed — it only manifests on a real mid-download restart, so it is being watched for
+opportunistically rather than staged.
+
 ### 🚀 v0.2.6 released 2026-08-18 (local; third same-day release) — the queue-view batch ships
 
 PR #12 (`dev` → `main`, merged `f90ed70`), tag `v0.2.6`, release notes = the `[0.2.6]`
 CHANGELOG section verbatim; `:latest`/`:0.2.6`/`:0` published on the release event. Contents:
 exactly the three items in the section below (`62dbb46`/`31216a8`/`2d9c620`), **released
-browser-unverified** (flagged to the user pre-merge; the ETA figure, Start-now menu, and a
-real fraction transfer's throughput still await human eyes) — migration **022** runs on first
-start. Tests at release: **1339 backend / 488 frontend, 0 skipped.** GitHub Actions fought
+browser-unverified** (flagged to the user pre-merge) — migration **022** runs on first start.
+**Since confirmed by the user in a real browser on 2026-08-19: the Start-now fraction menu and
+the Transfers-row ETA both work.** Only the rescue re-queue ordering is still unwitnessed —
+it needs a real mid-download restart to hit, and the user will watch for it next time one
+happens. Tests at release: **1339 backend / 488 frontend, 0 skipped.** GitHub Actions fought
 back twice more this cut: the PR push's duplicate Test-suite job wedged `pending` ~15 min
 (cancel + rerun, green in 4m13s — third dispatch wedge this week), then the post-merge main
 CI's Test suite hung ~18 min inside `apt-get update` (dead runner mirror; job has no
@@ -106,9 +120,11 @@ day-old startup rescue, and live queue-watching prompted two features. Each its 
 | **Transfers row shows time-to-completion** — a `running` row's collapsed line now reads "45% · 40 MB/s · 25m left" (live WS `eta_s` with job-row fallback, omitted while null; figure container widened `w-32→w-44`). One figure added, row economy otherwise untouched | `31216a8` |
 | **"Start now" is a 10%/25%/50%/75%/Max menu** of the site bandwidth limit — §4.5 extension (DESIGN.md updated as such): fraction × site limit computed once at admission, other allocations never reshaped; `fraction=1.0` is byte-identical to the old Max path. **Migration 022** (`job.forced_rate_fraction REAL`, old `forced_full_rate` kept + written in lockstep — SQLite can't retype a column; parallel column, single Python-layer field). Fractions with no site limit: options disabled with a hint AND server-side 409 (never a silent Max). New `StartNowMenu.tsx` (keyboard-navigable, built on the existing popover mechanics — no new dependency), pure `lib/startNow.ts` | `2d9c620` |
 
-Tests after the batch: **1339 backend / 488 frontend, 0 skipped.** Unviewed: the ETA figure,
-the Start-now menu (keyboard nav + disabled hint), and a real fraction transfer's actual
-throughput — all await the user's next `:dev` pull. Also answered from code this session
+Tests after the batch: **1339 backend / 488 frontend, 0 skipped.** **Browser status
+(user-checked 2026-08-19): the Start-now fraction menu and the Transfers-row ETA are both
+confirmed working.** Still unwitnessed: the rescue re-queue ordering, which only shows itself
+on a real mid-download restart — the user is watching for the next one rather than staging it.
+Also answered from code this session
 (no change needed): Move-to-top and Start-now are ordering/allocation-only — both spawn the
 same `mirror -c` at the same `.downloading-` physical dir, so an existing partial resumes,
 never restarts.
