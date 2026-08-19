@@ -26,6 +26,15 @@ Skeleton for the next roll:
 ### Added
 ### Changed
 ### Fixed
+### Security
+### Deprecated
+### Removed
+
+## [0.2.5] — 2026-08-18
+
+### Added
+### Changed
+### Fixed
 
 - **A transfer that finished during a crash/hang no longer strands as
   downloaded-but-never-processed.** A restart's startup sweep now re-queues every item it just
