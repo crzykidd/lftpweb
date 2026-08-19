@@ -60,6 +60,15 @@ class FakeArrState:
     # separate from `log_files` rather than a sentinel value in it, since a real *arr log file's
     # content is never `None`/absent.
     broken_log_files: list[str] = field(default_factory=list)
+    # Support bundle log-recency fix (2026-08-19, docs/decisions.md): per-file `lastWriteTime`
+    # the listing reports, keyed by filename, overriding the default constant below. A test sets
+    # this to model several independent rotation series with controllable ages -- including the
+    # exact production shape this fix exists for, a large stale `trace` series alongside a
+    # small current main series -- or the missing-timestamp case: mapping a filename to `None`
+    # here omits `lastWriteTime` from that file's record entirely, rather than reporting `null`,
+    # matching "the *arr didn't report a usable timestamp" being the thing under test, not "the
+    # *arr reported an explicit null."
+    log_file_last_write_times: dict[str, str | None] = field(default_factory=dict)
     # Force a small effective page size regardless of what the client requests -- the one
     # knob the pagination test needs to make one small queue/history split across pages
     # without needing 250+ fixture records to do it honestly.
@@ -158,16 +167,23 @@ def create_fake_arr_app(state: FakeArrState) -> FastAPI:
     @app.get("/api/v3/log/file")
     async def log_file_list() -> Any:
         names = [*state.log_files, *state.broken_log_files]
-        return [
-            {
+        out: list[dict[str, Any]] = []
+        for i, name in enumerate(names):
+            record: dict[str, Any] = {
                 "filename": name,
-                "lastWriteTime": "2026-08-17T00:00:00Z",
                 "contentsUrl": f"/api/v3/log/file/{name}",
                 "downloadUrl": f"/api/v3/log/file/{name}",
                 "id": i + 1,
             }
-            for i, name in enumerate(names)
-        ]
+            if name in state.log_file_last_write_times:
+                last_write = state.log_file_last_write_times[name]
+                if last_write is not None:
+                    record["lastWriteTime"] = last_write
+                # else: `None` means omit the field entirely -- the missing-timestamp case.
+            else:
+                record["lastWriteTime"] = "2026-08-17T00:00:00Z"
+            out.append(record)
+        return out
 
     @app.get("/api/v3/log/file/{filename}")
     async def log_file_download(filename: str) -> Any:

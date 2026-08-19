@@ -307,6 +307,13 @@ async def test_arr_log_budget_is_per_instance_and_fetches_newest_first(
         "sonarr.1.txt": b"newer rotation...........",
         "sonarr.txt": b"current, newest file.....",
     }
+    # Explicit `lastWriteTime`s matching the content above -- the fetch order is decided by
+    # these, not by the rotation-suffix naming convention (2026-08-19 fix).
+    fake_arr_server.state.log_file_last_write_times = {
+        "sonarr.2.txt": "2026-08-01T00:00:00Z",
+        "sonarr.1.txt": "2026-08-10T00:00:00Z",
+        "sonarr.txt": "2026-08-19T00:00:00Z",
+    }
     with TestClient(app) as client:
         instance_id = _create_arr_instance(client, base_url=fake_arr_server.base_url)
 
@@ -330,6 +337,104 @@ async def test_arr_log_budget_is_per_instance_and_fetches_newest_first(
         assert "2 of 3" in truncated_text
         assert "sonarr.1.txt" in truncated_text
         assert "sonarr.2.txt" in truncated_text
+
+
+async def test_arr_log_budget_orders_by_recency_across_series_not_by_filename(
+    isolated_config, fake_arr_server, monkeypatch
+):
+    """The real production shape (2026-08-19, docs/decisions.md): a dormant `debug`/`trace`
+    series' own newest file can still be nine days stale while the live main series has a
+    current file -- and a filename-based sort ("non-rotated names first") treats every bare
+    filename as equally recent, so the stale series wins the budget purely by sorting
+    alphabetically ahead of the live one. This must not happen: the current file must be kept
+    and the stale ones dropped, decided by `lastWriteTime`, not by name.
+
+    Fails against the pre-fix code: `sonarr.debug.txt` sorts before `sonarr.txt` alphabetically
+    (both "non-rotated"), so the old filename-only sort fetches the stale debug file and drops
+    the current one -- the exact inversion the production bundle hit.
+    """
+    monkeypatch.setattr(supportbundle, "ARR_LOG_BYTE_BUDGET", 20)
+    monkeypatch.setattr(supportbundle, "ARR_LOG_PER_FILE_BYTE_CAP", 20)
+    fake_arr_server.state.api_key = ARR_API_KEY
+    fake_arr_server.state.log_files = {
+        "sonarr.debug.txt": b"stale debug series, dormant for days" * 5,
+        "sonarr.trace.txt": b"stale trace series, dormant for days" * 5,
+        "sonarr.txt": b"current-log-content!",  # exactly 20 bytes -- fills the budget alone
+    }
+    fake_arr_server.state.log_file_last_write_times = {
+        "sonarr.debug.txt": "2026-08-10T00:00:00Z",
+        "sonarr.trace.txt": "2026-08-10T00:00:00Z",
+        "sonarr.txt": "2026-08-19T18:15:00Z",
+    }
+    with TestClient(app) as client:
+        instance_id = _create_arr_instance(client, base_url=fake_arr_server.base_url)
+
+        resp = client.post(
+            "/api/support-bundle",
+            json={
+                "include_environment": False,
+                "include_settings": False,
+                "include_events": False,
+                "include_jobs": False,
+                "arr_instance_ids": [instance_id],
+            },
+        )
+        zf = _zip_from(resp)
+        names = zf.namelist()
+        assert "arr-Sonarr/sonarr.txt" in names
+        assert "arr-Sonarr/sonarr.debug.txt" not in names
+        assert "arr-Sonarr/sonarr.trace.txt" not in names
+        assert "arr-Sonarr/TRUNCATED.txt" in names
+        truncated_text = zf.read("arr-Sonarr/TRUNCATED.txt").decode()
+        assert "2 of 3" in truncated_text
+        # Both the fetched (current) and skipped (stale) entries carry their own timestamp.
+        assert "sonarr.txt" in truncated_text
+        assert "2026-08-19" in truncated_text
+        assert "sonarr.debug.txt" in truncated_text
+        assert "sonarr.trace.txt" in truncated_text
+        assert "2026-08-10" in truncated_text
+
+
+async def test_arr_log_missing_timestamp_sorts_last_not_first(
+    isolated_config, fake_arr_server, monkeypatch
+):
+    """A file the *arr reports with no usable `lastWriteTime` must never outrank a file the
+    *arr positively reports as recent -- "unknown age" is not "newest." Fails against the
+    pre-fix code: `sonarr.a-unknown-age.txt` sorts alphabetically ahead of `sonarr.txt` (both
+    "non-rotated"), so the old filename-only sort fetches the unknown-age file first regardless
+    of the known-recent file's actual timestamp.
+    """
+    monkeypatch.setattr(supportbundle, "ARR_LOG_BYTE_BUDGET", 20)
+    monkeypatch.setattr(supportbundle, "ARR_LOG_PER_FILE_BYTE_CAP", 20)
+    fake_arr_server.state.api_key = ARR_API_KEY
+    fake_arr_server.state.log_files = {
+        "sonarr.a-unknown-age.txt": b"no timestamp reported for this one",
+        "sonarr.txt": b"current-log-content!",  # exactly 20 bytes -- fills the budget alone
+    }
+    fake_arr_server.state.log_file_last_write_times = {
+        "sonarr.a-unknown-age.txt": None,  # omitted from the listing entirely
+        "sonarr.txt": "2026-08-19T18:15:00Z",
+    }
+    with TestClient(app) as client:
+        instance_id = _create_arr_instance(client, base_url=fake_arr_server.base_url)
+
+        resp = client.post(
+            "/api/support-bundle",
+            json={
+                "include_environment": False,
+                "include_settings": False,
+                "include_events": False,
+                "include_jobs": False,
+                "arr_instance_ids": [instance_id],
+            },
+        )
+        zf = _zip_from(resp)
+        names = zf.namelist()
+        assert "arr-Sonarr/sonarr.txt" in names
+        assert "arr-Sonarr/sonarr.a-unknown-age.txt" not in names
+        truncated_text = zf.read("arr-Sonarr/TRUNCATED.txt").decode()
+        assert "sonarr.a-unknown-age.txt" in truncated_text
+        assert "no timestamp reported" in truncated_text
 
 
 # --- The audit trail (the plan's own "when was this bundle made and what's in it") ---------

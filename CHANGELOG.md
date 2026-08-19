@@ -34,6 +34,18 @@ Skeleton for the next roll:
 
 ### Changed
 ### Fixed
+
+- **Support bundle *arr log fetch now spends its per-instance budget on the newest files, not
+  the biggest stale ones.** The fetch order was a filename/rotation-suffix sort, which orders
+  correctly *within* one log series (`sonarr.*`, `sonarr.debug.*`, `sonarr.trace.*`) but
+  interleaves *across* series purely by name — a dormant debug/trace series' own stale files
+  could sort ahead of a live series' current file. Seen in production: a ~20 MB budget was
+  spent entirely on three files from a switched-off debug/trace session, all nine days stale,
+  while the files covering the actual incident window were dropped. Now sorted by the *arr's
+  own reported `lastWriteTime`, newest first, across every series at once; a file with no
+  usable timestamp sorts last, never first. `TRUNCATED.txt` now lists a last-modified timestamp
+  for both the fetched and the skipped files.
+
 ### Security
 ### Deprecated
 ### Removed

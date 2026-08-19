@@ -6,6 +6,46 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-19 — Support bundle *arr log fetch: order by `lastWriteTime` across every series,
+not by filename within one
+
+`prompts/done/2026-08-19-support-bundle-log-recency.md`, production evidence: bundle
+`lftpweb-support-0.2.6-20260819T205145Z.zip`, taken to diagnose two `REMOTE_GONE` jobs. Its
+`arr-Sonarr/TRUNCATED.txt` reported 6 of 12 log files not fetched, skipped "oldest first" —
+except three of the six *skipped* files were current and three of the *fetched* files were nine
+days stale, from a debug/trace session that had since been switched off. The files that would
+have shown what Sonarr did during the incident window were among the six dropped.
+
+**Root cause, confirmed before fixing (not assumed):** `arrclient.log_files()` already returns
+`lastWriteTime` unmodified — the *arr wire format was never the problem. The bug was entirely
+in `supportbundle.py`'s `_log_file_sort_key`, which ordered by filename: non-rotated names
+first (`sonarr.txt`, `sonarr.debug.txt`, `sonarr.trace.txt`), then rotations by ascending
+numeric suffix. That's correct *within* one series (`sonarr.1.txt` is indeed older than
+`sonarr.txt`) but has no way to compare *across* series — `sonarr.debug.txt` and
+`sonarr.trace.txt` both read as "non-rotated" and sort purely alphabetically ahead of the live
+`sonarr.*` series' own rotated files, regardless of which series is actually dormant. Verified
+against the evidence table: alphabetically, `debug` < `trace` < `txt`, so the old sort fetches
+`sonarr.debug.txt` first even when it's stale and `sonarr.txt` is current — exactly the
+inversion production hit.
+
+**Fix: sort every candidate file by the *arr's own `lastWriteTime`, descending, across the
+whole listing at once** — never by filename or rotation-suffix pattern, and never per-series.
+A file with no usable timestamp (missing field, unparseable) sorts **last**, never first —
+"unknown age" must never outrank a file the *arr positively reports as recent. Two regression
+tests (`tests/test_support_bundle_api.py`) assert this against `tests/fake_arr.py`'s new
+per-file `lastWriteTime` control (`log_file_last_write_times`), and both were checked to
+actually fail against the pre-fix code before the fix landed, not just pass after it.
+
+**Left the ~20 MB budget itself alone** — this incident was entirely about what the budget
+buys, not how big it is; the prompt was explicit that raising the cap was out of scope for this
+task. **`TRUNCATED.txt` now carries a timestamp for every file it names, fetched and skipped
+alike** — the pre-fix "skipped, oldest first" listed only filenames, which was actively
+misleading here (skipped files were newer than fetched ones); a reader now sees the actual
+recency at a glance instead of having to cross-reference file contents to find out it was
+wrong.
+
+---
+
 ## 2026-08-19 — Transfers name filter: "Dismiss list" gets its own state trio, not a share of
 "Dismiss all"'s
 
