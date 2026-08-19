@@ -139,6 +139,79 @@ attach one anywhere public: an included *arr instance's log files are carried **
 *arr wrote them** — lftpweb doesn't rewrite another app's own logs — so give them a glance before
 sharing. Full contents, one part per checkbox: **[docs/concepts.md](docs/concepts.md#support-bundle)**.
 
+## Safety rails: when a volume drops or a remote stops answering
+
+> Both failure modes have the same shape — *something that is still there stops being visible* —
+> and in both, the naive reading is destructive. A dropped NFS mount makes every downloaded item
+> look locally absent, which reads as "re-download the whole library." An *arr that answers a
+> queue poll with nothing makes every tracked release look abandoned, which reads as "give up and
+> strand the source on the seedbox." Neither is allowed to follow from a single bad reading.
+
+### A local volume that drops out
+
+**The mount sentinel.** After every scan that finds a queue's local root present, readable and
+writable, lftpweb writes a marker file (`.lftpweb-mount-ok`) at that root. The marker lives on the
+*share*, so it vanishes with the share. An empty directory and an unmounted share are
+indistinguishable by content alone — that is the whole reason the file exists. lftpweb also never
+creates the root itself, because `mkdir` on a mount point succeeds happily against whatever
+filesystem is underneath it.
+
+A queue whose root fails that check is blocked from acting at all — for the entire queue, not item
+by item. That covers auto-queue (the whole pass, not just the transitions that look risky), manual
+and scheduled local deletes, retention's expiry sweep and its orphaned-extraction-debris sweep,
+spent-archive cleanup after extraction, the *arr "delete when imported" cleanup, and re-queueing
+items a restart marked interrupted. Blanket-per-queue on purpose: a brand-new queue whose root
+never mounted has no history to compare against — every item reads "remote only" on the very first
+scan — so only a blanket gate stops auto-queue transferring an entire remote tree into a directory
+that isn't really there.
+
+**The removal grace period.** An item that had a complete local copy and is now locally absent does
+not become "never downloaded." It keeps showing its last known state — including a failure state
+like `CORRUPT`, so you don't lose the thing you need to see — and only transitions to
+`REMOVED_LOCAL` once absence has persisted for about ten minutes across consecutive scans. While
+the mount gate is failing, that clock never even starts. A transition made while the mount was
+healthy is sticky: the gate exists to stop a bad transition beginning, not to undo a correct one.
+
+### A seedbox or Sonarr/Radarr that stops answering
+
+**A failed remote scan persists nothing.** The pass aborts before any write, the last-known-good
+remote tree is kept in cache rather than discarded, every item keeps its state, and the failure
+surfaces as a scan error in the header readout and the UI. Don't invent data, don't throw away good
+data either.
+
+**A partial remote scan is partial success, not failure.** GNU `find` exits nonzero the moment it
+can't read one subdirectory, but still prints everything else — so any nonzero exit *with usable
+output* is treated as a partial scan, and only an exit with no output at all is a real failure. The
+settle gate holds rather than resets on a partial scan, so a transient unreadable subtree can't
+restart a release's settle clock.
+
+**An unreachable Sonarr/Radarr backs off, per instance.** One warning and one audit event, then
+capped exponential backoff from 60 seconds up to 30 minutes. Nothing is committed on a failed poll,
+and one dead instance never slows the others. Every *arr HTTP call carries a 10-second timeout.
+
+**A release vanishing from the Sonarr/Radarr queue doesn't go straight to terminal.** It commits an
+amber `dropped` state — "removed from the *arr's queue Xm ago — rechecking" — re-examined every pass
+for six hours. The same download reappearing sends it back to `detected`; an import turning up in
+history promotes it to `imported`, with the source delete and cleanup then proceeding normally; only
+six hours with neither signal commits `gone`. A poller runs on its own clock, slower than an
+upstream client's momentary blip, so both halves of a two-pass confirmation can land inside the same
+bad window — the grace state is what makes that survivable.
+
+**The source delete waits for a confirmed import, never an ambiguous one** — the *arr's own queue
+record finished and import history, held across two consecutive checks. Files exist on both sides
+until then, so any failure is inspectable from both ends.
+
+**A deferred source delete retries rather than firing once** (five attempts, growing backoff), so a
+transient SSH failure can't strand a remote copy permanently; it pauses with one clear event rather
+than logging a failure every minute for as long as a seedbox stays down. Local cleanup is withheld
+while a source delete is still owed, making "delete source → delete local" an enforced order rather
+than a hoped-for one. Rows that were stranded before these rails existed heal themselves — a `gone`
+row still owing a source delete is re-checked against import history, bounded to ten attempts with
+backoff, and promoted to `imported` if the import turns up.
+
+Every withheld action writes an audit event, so the History page can always tell you *why* something
+didn't happen.
+
 ## What doesn't yet
 
 All 9 build phases shipped (see `prompts/startnewsession.md` for exactly what each one built
