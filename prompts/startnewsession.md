@@ -77,6 +77,25 @@ than a first. Two things that bit the first time and will bit again:
 
 ## Where we are
 
+### Post-v0.2.5 work on `dev` (2026-08-19) — first-restart feedback + two queue-view features, pushed, unreleased
+
+The first production restart onto v0.2.5 (heavy queue) surfaced a positioning flaw in the
+day-old startup rescue, and live queue-watching prompted two features. Each its own prompt in
+`prompts/done/2026-08-19-*`:
+
+| What | Commit |
+|---|---|
+| **Rescue re-queue keeps the item's original queue position** — the rescue re-queued mid-download S10 (39.7/66.6 GB) with a fresh `queued_at`, dropping it behind the whole surviving pre-restart backlog (`rank DESC, queued_at ASC`). `enqueue_item` gained an opt-in `queued_at` override (omitted = SQL default now-stamp, all existing callers unchanged); both rescue paths carry the interrupted job's original timestamp forward. Deliberately the timestamp, not a rank boost — never outranks an explicit Move-to-top, and the queued-wait readout stays honest. Ordering pinned via the admission path's own SQL in tests | `62dbb46` |
+| **Transfers row shows time-to-completion** — a `running` row's collapsed line now reads "45% · 40 MB/s · 25m left" (live WS `eta_s` with job-row fallback, omitted while null; figure container widened `w-32→w-44`). One figure added, row economy otherwise untouched | `31216a8` |
+| **"Start now" is a 10%/25%/50%/75%/Max menu** of the site bandwidth limit — §4.5 extension (DESIGN.md updated as such): fraction × site limit computed once at admission, other allocations never reshaped; `fraction=1.0` is byte-identical to the old Max path. **Migration 022** (`job.forced_rate_fraction REAL`, old `forced_full_rate` kept + written in lockstep — SQLite can't retype a column; parallel column, single Python-layer field). Fractions with no site limit: options disabled with a hint AND server-side 409 (never a silent Max). New `StartNowMenu.tsx` (keyboard-navigable, built on the existing popover mechanics — no new dependency), pure `lib/startNow.ts` | `2d9c620` |
+
+Tests after the batch: **1339 backend / 488 frontend, 0 skipped.** Unviewed: the ETA figure,
+the Start-now menu (keyboard nav + disabled hint), and a real fraction transfer's actual
+throughput — all await the user's next `:dev` pull. Also answered from code this session
+(no change needed): Move-to-top and Start-now are ordering/allocation-only — both spawn the
+same `mirror -c` at the same `.downloading-` physical dir, so an existing partial resumes,
+never restarts.
+
 ### 🚀 v0.2.5 released 2026-08-18 — the NFS-incident fixes ship
 
 PR #11 (`dev` → `main`, merged `75f812e`), tag `v0.2.5`, release notes = the `[0.2.5]`
