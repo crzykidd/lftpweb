@@ -77,6 +77,63 @@ than a first. Two things that bit the first time and will bit again:
 
 ## Where we are
 
+### 2026-08-18 — the production NFS hang, its diagnosis, and two fixes on `dev` (post-v0.2.4, pushed, unreleased)
+
+Production froze overnight: the app stopped responding at 00:01 local and the container was
+unkillable. Diagnosis (from the container log + `ps`): **processes in uninterruptible D-state
+(`folio_wait_bit_common`) on the NAS mount** — the NFS share backing the download target went
+half-alive (server answering just slowly enough that `soft`'s RPC timeout never fired; mount
+was genuinely `soft,timeo=600` per `nfsstat -m`, so this was the half-alive case, possibly a
+v4.0 state wrinkle — NAS is an RS2414+ capped at NFSv4). Recovery: `umount -f -l` to EIO the
+stuck I/O (the only "kill" that works on D-state), stop container, remount, restart every
+container binding the share (lazy unmount leaves stale mounts in running namespaces). **Mount
+guidance settled with the user: NFSv3 + `soft,timeo=150,retrans=2,nolock,nofail,_netdev`, no
+`intr` (no-op since 2008), no 8k rsize/wsize** (v3 because it's stateless — v4.0's state
+machinery retries forever regardless of `soft`; the NAS can't do 4.1). A docker named volume
+to the same NAS was found mounted `hard` (jellystat) — flagged to the user as the next hang
+waiting to happen. Root cause on the NAS side unidentified (check midnight scheduled tasks).
+
+The post-mortem support bundle (`lftpweb-support-0.2.4-20260818T192004Z`) yielded two defects,
+both fixed same day, each its own prompt in `prompts/done/2026-08-18-*`:
+
+| What | Commit |
+|---|---|
+| **Startup sweep re-queues interrupted items instead of stranding complete ones** — job 195's lftp *finished* its 74 GB season pack during the half-alive window (byte-parity verified against the seedbox) but the frozen supervisor never reaped the exit; restart marked it `INTERRUPTED` and the item wedged at `DOWNLOADED`-with-prefix forever (auto-queue ignores `DOWNLOADED`; the pipeline only fires on *observed* success — its genuinely-partial sibling self-healed precisely because `PARTIAL` is eligible). The sweep now re-queues every item it marks `INTERRUPTED` (complete → `mirror -c` no-op → observed success → pipeline; partial → resume, auto-queue no longer required), **mount-gated** per queue (a restart with a dead mount must not spawn lftp into the void — one `interrupted_requeue_gated` warning per queue) plus a one-shot startup rescue for rows stranded by *earlier* restarts (latest job `INTERRUPTED` + `DOWNLOADED` + still-prefixed dir). Accepted limitation (decisions.md): complete-local + remote-vanished re-queue fails `REMOTE_GONE` and still misses the pipeline. The live production row was un-stuck manually (Queue click) before the fix shipped | `5b28a32` |
+| **Orphaned `_FAILED_`/`_UNPACK_` extraction debris swept once its item is gone** — a `_FAILED_.downloading-<name>` failed-extraction evidence dir (the wrapped download prefix proves local origin; no job ever transferred a remote `_FAILED_`, the auto-queue exclusion held) outlived its item's manual delete invisibly forever (both prefixes hidden from `scan_local` by design). New hourly `RetentionScheduler._sweep_orphan_extract_debris()`: removes a debris dir only when **no** derived owner candidate (prefix-stripped, then `.downloading-`-stripped) resolves to a live or in-flight row; skips the queue entirely on mount-sentinel failure (a vanished mount must not read as "everything orphaned"); one `extract_debris_removed` event per removal. **Deliberately not settings-gated** — unlike every other deletion feature — because it only fires when the owner is provably gone (reasoned in decisions.md, same logic as the v0.2.2 spent-archive self-heal); flag to the user if this default ever feels wrong. `extract.sweep_failed_dirs` (age-gated, tracked-items) untouched | `b783c05` |
+
+Tests after the pair: **1317 backend / 477 frontend, 0 skipped.** Also learned this session,
+smaller but real: `.downloading-*` dirs are invisible to plain `ls` (dot-prefix) — a user
+report of "the partial vanished" was solved by `ls -la`; and the amber `dropped` system
+(v0.2.4) rode out a full evening of recurring SAB blank-queue blips in production with zero
+false `gone` verdicts — flap-heavy but correct, exactly as designed.
+
+### 🚀 v0.2.4 released 2026-08-17 (fourth same-day release) — the *arr "dropped" grace state, from a production diagnosis
+
+PR #10 (`dev` → `main`, merged `481e725`), tag `v0.2.4`, release notes = the `[0.2.4]`
+CHANGELOG section verbatim; `:latest`/`:0.2.4`/`:0` published on the release event. One item,
+but a substantial one (`prompts/done/2026-08-18-arr-gone-grace-and-recheck.md`, commit
+`7bf6941`), diagnosed from the user's production support bundle
+(`private_data/debug_logs/lftpweb-support-0.2.3-20260818T013532Z.zip`): **SABnzbd sometimes
+answers Sonarr's queue poll with a blank response**, Sonarr's queue view empties for a
+refresh, and 8 mid-download items flipped terminal `gone` (red dot) in a single lftpweb pass —
+provably premature, since lftpweb was still transferring them when the verdict landed. Worse
+than cosmetic: a `gone` row's rung-4 deferred source delete is parked forever (the stranded
+sweep gates on terminal-*import*), and cleanup never runs. The fix (design settled with the
+user, their own proposal): a queue-record disappearance now commits an intermediate
+**`dropped`** status — amber dot, "removed from the *arr's queue Xm ago — rechecking" —
+revisited every pass: same-downloadId reappearance → back to `detected` (the one state where
+the 2026-08-16 identical-downloadId re-match refusal deliberately does NOT apply; `gone`/
+`cleaned` keep it), an import in history → `imported` (rung 4 + cleanup fire normally), 6h
+(`DROPPED_GONE_GRACE_S`, module constant) with neither → `gone`, today's terminal semantics.
+Plus a **bounded retroactive heal**: `gone` rows still owing a deferred source delete get
+history rechecks (10 attempts, backoff, one giving-up event) and promote to `imported` when
+the import is found. **Verified on production before the cut** — the user ran `:dev` there and
+watched the stranded rows clean themselves up. No migration (arr_status is unconstrained
+TEXT). Tests at release: **1295 backend / 477 frontend, 0 skipped.** Also this release: the
+PR's push-event CI run had its Test suite job wedge in `pending` for 15+ minutes (GitHub
+status page claimed all-operational) — **cancel + `gh run rerun` was the fix, no check
+bypassed**, rerun green in 4m20s; the right playbook when the runner, not the code, is stuck.
+
 ### 🚀 v0.2.3 released 2026-08-17 (the third same-day release) — six live-use items, every one browser-confirmed before the cut
 
 PR #9 (`dev` → `main`, merged `28b98af`), tag `v0.2.3`, release notes = the `[0.2.3]`

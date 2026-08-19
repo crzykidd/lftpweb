@@ -6,6 +6,147 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-18 — Orphaned `_FAILED_`/`_UNPACK_` extraction debris: widen the existing
+bounded-lifetime mechanism, don't build a second one; unconditional, not settings-gated
+
+`prompts/done/2026-08-18-sweep-orphaned-extract-debris.md`, production find, same day as the
+startup-rescue entry above: the user's queue root held
+`_FAILED_.downloading-Hard.Knocks.in.Season.S02E09.1080p.WEB.h264-KOGi` — lftpweb's own
+failed-extraction evidence directory. The item it belonged to had been manually deleted (both
+scopes), but the evidence dir is a *sibling* with its own top-level name, hidden from
+`scan_local` by design (DESIGN.md §6) — no item row, no UI presence, no delete affordance, and
+nothing that would ever clean it up. Same defect shape as the v0.2.2 orphaned spent-archive-row
+fix (2026-08-17 entry, further below): a bookkeeping artifact whose parent left both trees,
+resting invisible forever.
+
+**Widens `extract.sweep_failed_dirs` (2026-08-12) rather than building a second mechanism.**
+That sweep is real and still does exactly what it always did — age-gated, `_FAILED_`-only, and
+triggered only from inside `PostprocessPipeline._do_extract`, i.e. only when *another*
+extraction attempt happens to touch the same queue. It structurally cannot reach the incident's
+shape: once the owning item leaves tracking (a manual delete, or `Reset item tracking`), no
+future extraction at that name will ever fire again, so that sweep's own trigger never comes
+back around — however long `failed_retention_days` is set to, and it never covered `_UNPACK_`
+at all. The new pass (`core/retention.py.RetentionScheduler._sweep_orphan_extract_debris`)
+covers exactly that gap — "the owning item is gone from tracking altogether" — a condition age
+can't express and the existing sweep never checks. The enumeration primitive
+(`extract.list_top_level_debris_dirs`) is deliberately a thin sibling of `sweep_failed_dirs`,
+same containment shape, reused rather than duplicated logic for "what counts as a candidate
+directory."
+
+**Lives on `RetentionScheduler`, not the 30s scan pass or the post-processing pipeline.**
+Three layers could plausibly own this; `RetentionScheduler` already owns the closest sibling
+task, `_sweep_orphan_temp_files` (2026-08-13) — walk every enabled queue's root for filesystem
+debris the reconciler deliberately hides from `scan_local`, remove what qualifies, write one
+`event` per removal — and it already has both `self.db` (for the `item` lookups this task needs
+that `core/extract.py`'s pure functions deliberately don't do) and `in_flight_provider`/
+`delete_in_flight` wired from `main.py` for exactly this class of guard. `core/engine.py`'s scan
+pass owns reconciliation, not deletion; `PostprocessPipeline` only ever acts on an item it has
+an id for, which an orphan by definition does not have.
+
+**Deliberately *not* gated by a new settings toggle**, unlike every other deletion feature in
+this codebase (`RetentionSettings`, `OrphanTempCleanupSettings`, `PostprocessSettings.
+failed_retention_enabled` — all default off, "unattended deletion is the last place to grant an
+exception," DESIGN.md §6). Considered and rejected: those toggles gate a *policy* choice — how
+long to keep diagnostic evidence around, how aggressively to reap accidental byte waste — where
+reasonable operators disagree and the safe default is "off until asked." This sweep never faces
+that choice: it only ever acts once the owning item is *provably* gone from the `item` table too
+(no row at all, or the row itself already reads `REMOVED_BOTH`) — at that point the directory has
+no Files-page row, no delete affordance, and no legitimate future use to anyone. Gating it behind
+an off-by-default toggle would just mean a default install keeps leaking exactly the disk the
+production incident found, the same reasoning the 2026-08-17 orphaned-spent-archive-row fix
+applied to a DB row instead of bytes on disk. It earns the exception by staying narrow: any
+owning-item state short of `REMOVED_BOTH` (including `REMOVED_LOCAL`, where a remote copy could
+still come back) leaves the directory untouched, and the in-flight guard below still applies
+regardless.
+
+**Liveness rule, exactly:** derive the owning item's logical name(s) from the directory's own
+name (strip `_FAILED_`/`_UNPACK_`, then strip a leading `.downloading-` — `core/download_prefix.
+py.DEFAULT_PREFIX` — if present, keeping *both* the stripped and un-stripped form as candidates).
+Check every candidate against `item` for this queue. If **any** candidate resolves to a row whose
+id is in `in_flight_item_ids()`/`DeleteInFlight`, or whose `state` is anything other than
+`REMOVED_BOTH`, the directory is left alone. Only when *no* candidate matches at all, or every
+match reads `REMOVED_BOTH` and none is in flight, is the directory removed. Ambiguous is "leave
+it alone," never "guess and delete" — matching this codebase's existing rule for exactly this
+class of decision (`core/local_delete.py._physical_local_root`'s "trust what's recorded, fall
+back to what's provably true" shape).
+
+**Named limitation, not a silent one: only the *default* `.downloading-` prefix is recognised.**
+A queue running a custom `download_prefix` value does not get a second candidate for that custom
+prefix — `core/postprocess.py._find_item_id_for_failed_dir` can recover a *live* item's actual
+physical prefix from its own persisted `pending_download_prefix` column, but there is by
+construction no row left to read that column off in the primary case this sweep exists for (no
+item row at all). A directory produced under a custom prefix, once its owning item is fully
+gone, is left as an orphan this sweep cannot yet resolve — accepted rather than hidden, matching
+this project's own rule for scope reductions.
+
+**Mount-sentinel gated, per queue, load-bearing** (stated in-code as well as here). `core/
+mount_sentinel.py.check`'s own docstring: an empty directory and an unmounted share are
+indistinguishable by content alone. If a queue's `local_path` is a dropped mount exposing some
+*other*, bare filesystem underneath, every item this scheduler actually knows about would
+correctly read "no matching row" against whatever unrelated content happens to sit there — which
+would misread as "everything is orphaned" and sweep debris that has nothing to do with this
+queue. A queue that fails `mount_sentinel.check` is skipped **entirely** for this pass, the same
+rail `core/autoqueue.py.on_scan` and `local_delete.delete_local` already apply before acting on
+anything.
+
+---
+
+## 2026-08-18 — Startup re-queue of interrupted items reuses `enqueue_item`, never a second
+pipeline trigger; mount-gated; rule-4 remote-vanished gap accepted
+
+`prompts/done/2026-08-18-startup-rescue-complete-unwitnessed-items.md`, production incident
+diagnosed live + support bundle `lftpweb-support-0.2.4-20260818T192004Z`: job 195 (a 74 GB
+season pack) actually finished during an NFS half-outage, but the supervisor froze in D-state
+disk-wait and never reaped its exit. The restart sweep marked it `failed`/`INTERRUPTED`; the
+item correctly re-derived `DOWNLOADED` from the filesystem (§1.3), but `DOWNLOADED` isn't an
+auto-queue-eligible state, so nothing ever re-queued it, no post-processing ran, and the
+`.downloading-` prefix stayed on forever. Its `PARTIAL` sibling (job 193) self-healed within
+seconds because `PARTIAL` *is* auto-queue eligible — the asymmetry was the bug.
+
+**Re-queue through `enqueue_item`, not a hand-rolled pipeline kickoff.** The alternative
+considered was to have the startup sweep call `postprocess.trigger()` directly for an item it
+suspects is already complete-on-disk. Rejected: that would be a second entry point into the
+post-processing pipeline, parallel to (and inevitably drifting from) `_reap_one`'s existing
+"observed job success triggers post-processing" path — every future change to *when* it's safe
+to trigger (settle gate, completeness check, top-level-only) would need to be kept in sync by
+hand across two call sites. Re-queuing via `enqueue_item` instead means a re-queued complete
+item's `mirror -c` finds nothing to transfer, exits 0 almost immediately, and that *observed*
+success is what triggers the pipeline through the one path that already exists — exactly the
+recovery the user performed by hand (one Queue click) for the live incident item. The sweep
+never asserts "this item is definitely done"; it just asks lftp again and trusts the answer,
+matching §1.3's own principle.
+
+**Mount-gated, per queue, same as `core/autoqueue.py.on_scan`.** A restart with a broken mount
+is precisely this incident's own shape, so the sweep must not spawn lftp processes into an
+unmounted directory. Checked once per affected queue (not per item) via
+`core/mount_sentinel.py.check`, with a single warning event per gated queue for the whole
+startup pass — matching auto-queue's own once-per-transition debounce rather than one event per
+stranded item, which could otherwise spam the audit log for a queue holding several affected
+releases at once. A gated item is left exactly as before this fix: marked INTERRUPTED, not
+re-queued; a `PARTIAL` one is still picked up by the next healthy scan's auto-queue on its own,
+and a `DOWNLOADED` one is covered by the rule-2 rescue below on the *next* startup.
+
+**Rule 2 (rescuing rows stranded by an *earlier* restart) is keyed on:** `item.state =
+'DOWNLOADED'`, top-level (`instr(rel_path, '/') = 0`), its **most recent** job already
+`failed`/`INTERRUPTED`, no active (`queued`/`running`) job remaining, and its physical directory
+— resolved via `core/local_delete.py._physical_local_root`, never a second resolver — still
+carrying the download-prefix name. This exists because the live incident item was already in
+this wedged state *before* this fix shipped: rule 1 alone only re-queues jobs the current
+startup just interrupted, so without rule 2 the production item would have stayed stranded
+forever even after upgrading. Deliberately narrow: a stranded `PARTIAL` row is already
+auto-queue's job on the next healthy scan, so rule 2 only covers the one shape auto-queue
+structurally cannot see (`DOWNLOADED` is not in `ELIGIBLE_STATES`).
+
+**Rule 4 accepted, not solved: a complete-local item whose remote has since vanished.** If a
+crash happens *and* something external deletes the remote copy before the next restart, the
+re-queued no-op `mirror -c` fails `REMOTE_GONE` (a permanent error class) and the item is
+suppressed rather than reaching the pipeline — the same outcome a manual Queue click would hit
+today. Rare enough (needs both a crash after completion and an external remote delete in the
+same window) that it isn't worth a special-cased "verify local completeness without asking the
+remote" path; recorded here rather than silently left unhandled.
+
+---
+
 ## 2026-08-18 — `dropped` gets `gone`/`cleaned`'s same-downloadId rematch rule *inverted*, not removed
 
 `prompts/done/2026-08-18-arr-gone-grace-and-recheck.md`, production incident (support bundle

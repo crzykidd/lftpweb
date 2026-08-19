@@ -748,6 +748,73 @@ def test_sweep_failed_dirs_is_a_no_op_on_a_root_that_does_not_exist(tmp_path):
     assert extract.sweep_failed_dirs(tmp_path / "gone", max_age_days=14.0) == []
 
 
+# --- core/extract.py.list_top_level_debris_dirs (orphan-debris sweep, 2026-08-18,
+# prompts/done/2026-08-18-sweep-orphaned-extract-debris.md) -----------------------------------
+
+
+def test_list_top_level_debris_dirs_finds_both_prefixes(tmp_path):
+    failed = tmp_path / f"{extract.FAILED_PREFIX}Release.One"
+    unpack = tmp_path / f"{extract.UNPACK_PREFIX}Release.Two"
+    failed.mkdir()
+    unpack.mkdir()
+
+    found = extract.list_top_level_debris_dirs(tmp_path)
+
+    assert set(found) == {failed.resolve(), unpack.resolve()}
+
+
+def test_list_top_level_debris_dirs_ignores_age_unlike_sweep_failed_dirs(tmp_path):
+    """Unlike `sweep_failed_dirs`, this is a pure enumeration with no age filter at all --
+    the orphan sweep built on top of it decides "sweep or not" from the `item` table, never
+    from mtime.
+    """
+    failed = tmp_path / f"{extract.FAILED_PREFIX}FreshRelease"
+    failed.mkdir()  # mtime is "now"
+
+    found = extract.list_top_level_debris_dirs(tmp_path)
+
+    assert found == [failed.resolve()]
+
+
+def test_list_top_level_debris_dirs_ignores_ordinary_directories_and_files(tmp_path):
+    (tmp_path / "OrdinaryRelease").mkdir()
+    (tmp_path / "some.mkv").write_bytes(b"x")
+
+    assert extract.list_top_level_debris_dirs(tmp_path) == []
+
+
+def test_list_top_level_debris_dirs_only_direct_children(tmp_path):
+    """A `_FAILED_`/`_UNPACK_`-prefixed directory nested *inside* an ordinary release must
+    never be a candidate -- only a direct child of `queue_root` is, matching
+    `sweep_failed_dirs`'s own containment shape.
+    """
+    nested = tmp_path / "Release" / f"{extract.FAILED_PREFIX}Nested"
+    nested.mkdir(parents=True)
+
+    assert extract.list_top_level_debris_dirs(tmp_path) == []
+
+
+def test_list_top_level_debris_dirs_refuses_a_symlink_escaping_the_queue_root(tmp_path):
+    outside = tmp_path.parent / f"outside-{tmp_path.name}"
+    outside.mkdir()
+    (outside / "do-not-delete.txt").write_text("must survive")
+
+    queue_root = tmp_path / "queue"
+    queue_root.mkdir()
+    escape = queue_root / f"{extract.FAILED_PREFIX}Escape"
+    escape.symlink_to(outside, target_is_directory=True)
+
+    try:
+        assert extract.list_top_level_debris_dirs(queue_root) == []
+        assert (outside / "do-not-delete.txt").exists()
+    finally:
+        shutil.rmtree(outside, ignore_errors=True)
+
+
+def test_list_top_level_debris_dirs_is_a_no_op_on_a_root_that_does_not_exist(tmp_path):
+    assert extract.list_top_level_debris_dirs(tmp_path / "gone") == []
+
+
 def test_first_rar_volume_detection_is_name_based_only():
     """Pure name matching, no filesystem access needed: DESIGN.md §6's "extract from the
     first volume only" -- `unrar` is only ever handed `.part1.rar` (or a bare `.rar`), never

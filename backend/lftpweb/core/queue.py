@@ -27,9 +27,19 @@ from typing import Any
 
 import aiosqlite
 
-from lftpweb.core import audit, download_prefix, lftp, local_scan, patterns, scheduler, settle
+from lftpweb.core import (
+    audit,
+    download_prefix,
+    lftp,
+    local_scan,
+    mount_sentinel,
+    patterns,
+    scheduler,
+    settle,
+)
 from lftpweb.core.events import EventBus
 from lftpweb.core.itemview import ITEM_VIEW_COLUMNS, ItemView, item_view
+from lftpweb.core.local_delete import _physical_local_root
 from lftpweb.core.metrics import RunningJobBytes, ThroughputSampler
 from lftpweb.core.progress import ActiveJob, JobProgress, ProgressSampler, child_speed_bps
 from lftpweb.core.remote import HostConfig, parse_connection_limit
@@ -331,7 +341,9 @@ class TransferQueue:
             self._task = asyncio.create_task(self._loop(), name="lftpweb-transfer-queue-loop")
 
     async def _reconcile_orphaned_jobs(self) -> None:
-        """Clear `running` rows left behind by a restart.
+        """Clear `running` rows left behind by a restart, then re-queue everything this sweep
+        (or an earlier one) left interrupted (2026-08-18, production incident diagnosed live +
+        support bundle `lftpweb-support-0.2.4-20260818T192004Z`).
 
         A job is only `running` while this process supervises its lftp child, so any such row
         found at startup is orphaned by definition — the container went away and took the
@@ -355,30 +367,217 @@ class TransferQueue:
         run on a job this sweep is about to mark `failed` before the tick loop even starts), so the
         guard is defensive, not load-bearing today -- but "never overwrite real captured lftp
         output with prose" is cheap enough to state unconditionally rather than assume it forever.
+
+        **The 2026-08-18 incident, and why "stays eligible" wasn't actually true.** The docstring
+        above has always claimed an interrupted item "stays eligible to be picked up again" — but
+        that only ever held for `PARTIAL`. A job that had *actually finished* (every byte on disk,
+        lftp already exited 0) when the supervisor itself froze in D-state disk-wait during an NFS
+        half-outage got the exact same `failed`/`INTERRUPTED` marking as a genuinely-partial one,
+        and the item correctly re-derives `DOWNLOADED` from the filesystem (§1.3) on the next scan
+        — but `DOWNLOADED` is not an auto-queue-eligible state, so nothing ever re-queues it, no
+        post-processing runs, and the `.downloading-` prefix stays on forever. Its `PARTIAL`
+        sibling self-healed within seconds because `PARTIAL` *is* auto-queue eligible; the
+        asymmetry was the bug. The fix below re-queues what this sweep just interrupted (rule 1)
+        and, since production already had a row stranded by an *earlier* restart before this fix
+        shipped, also rescues that shape directly (rule 2) — see `_requeue_stranded_downloaded`.
+        A re-queued complete item's `mirror -c` finds nothing to transfer, exits 0 almost
+        immediately, and that *observed* job success is what triggers the post-processing
+        pipeline (`_reap_one` below) — the exact recovery the user performed by hand (one Queue
+        click) for the live incident item. Reusing observed-job-success as the single pipeline
+        trigger, rather than adding a second entry point that fires straight from this sweep, is
+        the deliberate choice recorded in `docs/decisions.md` — this sweep only ever calls the
+        same `enqueue_item` every other caller uses, never a hand-rolled pipeline kickoff.
         """
         cursor = await self.db.execute("SELECT id, item_id FROM job WHERE state = 'running'")
         rows = await cursor.fetchall()
-        if not rows:
-            return
+        if rows:
+            logger.warning(
+                "clearing %d job(s) left 'running' by a previous run: %s",
+                len(rows),
+                ", ".join(str(r["id"]) for r in rows),
+            )
+            await self.db.execute(
+                "UPDATE job SET state = 'failed', pid = NULL, error_class = 'INTERRUPTED', "
+                "finished_at = ?, output_tail = COALESCE(NULLIF(output_tail, ''), ?) "
+                "WHERE state = 'running'",
+                (_now_iso(), INTERRUPTED_OUTPUT_TAIL),
+            )
+            await self.db.execute(
+                "UPDATE item SET state = 'PARTIAL' WHERE state = 'DOWNLOADING' AND id IN "
+                "(SELECT item_id FROM job WHERE error_class = 'INTERRUPTED')"
+            )
+            await self.db.commit()
+            for row in rows:
+                await self._publish_item_state(row["item_id"])
 
-        logger.warning(
-            "clearing %d job(s) left 'running' by a previous run: %s",
-            len(rows),
-            ", ".join(str(r["id"]) for r in rows),
-        )
-        await self.db.execute(
-            "UPDATE job SET state = 'failed', pid = NULL, error_class = 'INTERRUPTED', "
-            "finished_at = ?, output_tail = COALESCE(NULLIF(output_tail, ''), ?) "
-            "WHERE state = 'running'",
-            (_now_iso(), INTERRUPTED_OUTPUT_TAIL),
-        )
-        await self.db.execute(
-            "UPDATE item SET state = 'PARTIAL' WHERE state = 'DOWNLOADING' AND id IN "
-            "(SELECT item_id FROM job WHERE error_class = 'INTERRUPTED')"
-        )
-        await self.db.commit()
+        # Rule 1: re-queue every item this pass just marked INTERRUPTED -- mount-gated per
+        # queue below. `handled_item_ids` is threaded into rule 2 so an item this pass already
+        # handled (queued or gated) is never double-processed by the stranded-row query.
+        # `mount_cache`/`gated_logged` are shared across both rules so a queue holding several
+        # affected items is only stat'd once and only ever earns one gate event for this whole
+        # pass, not one per item (matching `core/autoqueue.py.on_scan`'s own per-queue debounce).
+        mount_cache: dict[int, tuple[bool, str]] = {}
+        gated_logged: set[int] = set()
+        handled_item_ids: set[int] = set()
         for row in rows:
-            await self._publish_item_state(row["item_id"])
+            handled_item_ids.add(row["item_id"])
+            await self._requeue_interrupted_item(
+                row["item_id"],
+                mount_cache=mount_cache,
+                gated_logged=gated_logged,
+                freshly_interrupted=True,
+            )
+
+        # Rule 2: rescue rows stranded by *earlier* restarts (before this fix shipped, or from
+        # a previous pass that found its queue mount-gated). See `_requeue_stranded_downloaded`.
+        await self._requeue_stranded_downloaded(
+            mount_cache=mount_cache, gated_logged=gated_logged, exclude_item_ids=handled_item_ids
+        )
+
+    async def _requeue_interrupted_item(
+        self,
+        item_id: int,
+        *,
+        mount_cache: dict[int, tuple[bool, str]],
+        gated_logged: set[int],
+        freshly_interrupted: bool,
+    ) -> None:
+        """Re-queue one item whose most recent job is `failed`/`INTERRUPTED` -- `enqueue_item`
+        is idempotent (never a hand-rolled INSERT: the duplicate-process guards it carries exist
+        for exactly this kind of caller, prompts/2026-08-13-lftp-timestamped-temp-files.md), so
+        this is safe to call even if auto-queue or a human races it. A re-queued `DOWNLOADED`
+        item's `mirror -c` no-ops straight into the post-processing pipeline on its observed
+        success; a re-queued `PARTIAL` one resumes from its bytes, same as auto-queue would have
+        done, but without depending on auto-queue being enabled for this queue.
+
+        **Mount-gated** (2026-08-18): auto-queue refuses to act for a queue whose mount sentinel
+        fails, precisely so nothing writes into an unmounted directory
+        (`core/mount_sentinel.py`, `core/autoqueue.py.on_scan`) -- a restart with a broken mount
+        (the exact incident this exists for) must not have this sweep spawn lftp processes into
+        the void. A gated item is left exactly as today: marked INTERRUPTED, not re-queued. The
+        next healthy scan's auto-queue still picks up a `PARTIAL` one on its own; a `DOWNLOADED`
+        one is covered by `_requeue_stranded_downloaded` on the *next* startup (auto-queue itself
+        structurally cannot see a `DOWNLOADED` item -- it isn't in `ELIGIBLE_STATES`).
+        """
+        item = await self._fetch_item(item_id)
+        if item is None:
+            return
+        ok, reason = await self._mount_ok(item["queue_id"], mount_cache)
+        if not ok:
+            if item["queue_id"] not in gated_logged:
+                gated_logged.add(item["queue_id"])
+                await audit.record_event(
+                    self.db,
+                    level="warning",
+                    kind="interrupted_requeue_gated",
+                    message=(
+                        f"queue {item['queue_id']}: startup re-queue of interrupted items "
+                        f"skipped -- {reason}. Marking left as INTERRUPTED; a PARTIAL item will "
+                        "still be picked up by the next healthy scan's auto-queue, a DOWNLOADED "
+                        "one on the next startup once the mount is healthy."
+                    ),
+                )
+            return
+        try:
+            job_id = await self.enqueue_item(item_id)
+        except Exception:
+            logger.exception("startup re-queue of item %d after an interrupted job failed", item_id)
+            return
+        await audit.record_event(
+            self.db,
+            level="info",
+            item_id=item_id,
+            job_id=job_id,
+            kind="interrupted_requeued",
+            message=(
+                f"item {item_id} ({item['rel_path']!r}): job interrupted by a restart/crash -- "
+                "re-queued; a completed transfer no-ops straight into post-processing, a "
+                "partial one resumes from its bytes"
+                + ("" if freshly_interrupted else " (stranded by an earlier restart)")
+            ),
+        )
+
+    async def _requeue_stranded_downloaded(
+        self,
+        *,
+        mount_cache: dict[int, tuple[bool, str]],
+        gated_logged: set[int],
+        exclude_item_ids: set[int],
+    ) -> None:
+        """Rescue rows stranded by an *earlier* restart -- the shape this fix's own production
+        incident item was already in before this code shipped: rule 1 above only re-queues jobs
+        *this* startup just marked INTERRUPTED, so a row an earlier, unfixed restart already
+        wedged would otherwise sit stranded forever, exactly as it did in production.
+
+        Deliberately narrow -- only the complete-but-unwitnessed shape auto-queue structurally
+        cannot see (`DOWNLOADED` is not in its `ELIGIBLE_STATES`). A stranded `PARTIAL` row is
+        already auto-queue's job on the next healthy scan; this clause does not touch it.
+
+        The shape: item `state = 'DOWNLOADED'`, its **most recent** job is `failed`/
+        `INTERRUPTED`, no active job remains for it, and its physical directory (the one true
+        resolver, `core/local_delete.py._physical_local_root` -- never a second one) still
+        carries the download prefix, i.e. the *arr-visible name never got restored. `state =
+        'DOWNLOADED'` alone already rules out every postprocess outcome state
+        (`core/postprocess.py.OWNED_STATES` -- `VERIFYING`/`VERIFIED`/`CORRUPT`/`EXTRACTING`/
+        `EXTRACTED`/`EXTRACT_FAILED`), so there is nothing further to check there.
+        """
+        cursor = await self.db.execute(
+            "SELECT i.id AS item_id, i.rel_path, i.queue_id, i.pending_download_prefix "
+            "FROM item i WHERE i.state = 'DOWNLOADED' AND i.pending_download_prefix IS NOT NULL "
+            "AND instr(i.rel_path, '/') = 0 "
+            "AND NOT EXISTS ("
+            "  SELECT 1 FROM job j WHERE j.item_id = i.id AND j.state IN ('queued', 'running')"
+            ") "
+            "AND (SELECT j.error_class FROM job j WHERE j.item_id = i.id ORDER BY j.id DESC "
+            "     LIMIT 1) = 'INTERRUPTED'"
+        )
+        candidates = await cursor.fetchall()
+        for row in candidates:
+            if row["item_id"] in exclude_item_ids:
+                continue
+            queue = await self._fetch_queue(row["queue_id"])
+            if queue is None:
+                continue
+            root = Path(queue["local_path"].rstrip("/"))
+            physical = await _physical_local_root(
+                self.db, queue_id=row["queue_id"], root=root, rel_path=row["rel_path"]
+            )
+            if physical.name != f"{row['pending_download_prefix']}{row['rel_path']}":
+                # The prefixed directory is no longer on disk (an earlier pass already renamed
+                # it, or something else changed it out from under this column) -- nothing
+                # stranded here after all.
+                continue
+            await self._requeue_interrupted_item(
+                row["item_id"],
+                mount_cache=mount_cache,
+                gated_logged=gated_logged,
+                freshly_interrupted=False,
+            )
+
+    async def _mount_ok(
+        self, queue_id: int, mount_cache: dict[int, tuple[bool, str]]
+    ) -> tuple[bool, str]:
+        """`(is_ok, reason)` for `queue_id`'s mount sentinel, cached per call to
+        `_reconcile_orphaned_jobs` so a queue with several affected items is only stat'd once
+        (`core/mount_sentinel.py.check`). The caller pairs this with `gated_logged` to also emit
+        only a single gate event per queue for the whole pass, matching
+        `core/autoqueue.py.on_scan`'s own once-per-queue debounce rather than one event per item.
+        """
+        if queue_id in mount_cache:
+            return mount_cache[queue_id]
+        queue = await self._fetch_queue(queue_id)
+        if queue is None:
+            result = (False, f"queue {queue_id} no longer exists")
+        elif not mount_sentinel.check(queue["local_path"]):
+            result = (
+                False,
+                f"local root {queue['local_path']!r} is missing, unreadable, or has not yet "
+                "completed a scan with the mount sentinel present",
+            )
+        else:
+            result = (True, "")
+        mount_cache[queue_id] = result
+        return result
 
     async def stop(self) -> None:
         """Graceful shutdown (DESIGN.md §10.3): SIGTERM every in-flight lftp child so its
