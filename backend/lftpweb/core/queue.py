@@ -388,7 +388,9 @@ class TransferQueue:
         the deliberate choice recorded in `docs/decisions.md` — this sweep only ever calls the
         same `enqueue_item` every other caller uses, never a hand-rolled pipeline kickoff.
         """
-        cursor = await self.db.execute("SELECT id, item_id FROM job WHERE state = 'running'")
+        cursor = await self.db.execute(
+            "SELECT id, item_id, queued_at FROM job WHERE state = 'running'"
+        )
         rows = await cursor.fetchall()
         if rows:
             logger.warning(
@@ -426,6 +428,7 @@ class TransferQueue:
                 mount_cache=mount_cache,
                 gated_logged=gated_logged,
                 freshly_interrupted=True,
+                queued_at=row["queued_at"],
             )
 
         # Rule 2: rescue rows stranded by *earlier* restarts (before this fix shipped, or from
@@ -441,6 +444,7 @@ class TransferQueue:
         mount_cache: dict[int, tuple[bool, str]],
         gated_logged: set[int],
         freshly_interrupted: bool,
+        queued_at: str,
     ) -> None:
         """Re-queue one item whose most recent job is `failed`/`INTERRUPTED` -- `enqueue_item`
         is idempotent (never a hand-rolled INSERT: the duplicate-process guards it carries exist
@@ -458,6 +462,17 @@ class TransferQueue:
         next healthy scan's auto-queue still picks up a `PARTIAL` one on its own; a `DOWNLOADED`
         one is covered by `_requeue_stranded_downloaded` on the *next* startup (auto-queue itself
         structurally cannot see a `DOWNLOADED` item -- it isn't in `ELIGIBLE_STATES`).
+
+        **`queued_at` preserves queue position** (2026-08-19,
+        prompts/2026-08-19-rescue-requeue-keeps-queue-position.md): the caller passes the
+        interrupted job's own original `queued_at` -- for rule 1 that's the row this sweep just
+        marked INTERRUPTED, for rule 2 (`_requeue_stranded_downloaded`) it's the most recent
+        interrupted job it already keyed off. A running item was, by definition, already among
+        the oldest jobs in line (`rank DESC, queued_at ASC`, `core/scheduler.py`); backdating the
+        fresh row to that same timestamp puts it back at (or near) the front instead of behind
+        every job that hadn't even started, and is honest besides -- the item genuinely has been
+        waiting since then, so the Transfers page's queued-wait readout tells the truth. `rank`
+        is never touched here, so this still can't outrank an explicit "Move to top".
         """
         item = await self._fetch_item(item_id)
         if item is None:
@@ -479,7 +494,7 @@ class TransferQueue:
                 )
             return
         try:
-            job_id = await self.enqueue_item(item_id)
+            job_id = await self.enqueue_item(item_id, queued_at=queued_at)
         except Exception:
             logger.exception("startup re-queue of item %d after an interrupted job failed", item_id)
             return
@@ -492,7 +507,8 @@ class TransferQueue:
             message=(
                 f"item {item_id} ({item['rel_path']!r}): job interrupted by a restart/crash -- "
                 "re-queued; a completed transfer no-ops straight into post-processing, a "
-                "partial one resumes from its bytes"
+                "partial one resumes from its bytes -- re-queued at its original position, not "
+                "the back of the line"
                 + ("" if freshly_interrupted else " (stranded by an earlier restart)")
             ),
         )
@@ -522,7 +538,9 @@ class TransferQueue:
         `EXTRACTED`/`EXTRACT_FAILED`), so there is nothing further to check there.
         """
         cursor = await self.db.execute(
-            "SELECT i.id AS item_id, i.rel_path, i.queue_id, i.pending_download_prefix "
+            "SELECT i.id AS item_id, i.rel_path, i.queue_id, i.pending_download_prefix, "
+            "(SELECT j.queued_at FROM job j WHERE j.item_id = i.id ORDER BY j.id DESC LIMIT 1) "
+            "AS interrupted_queued_at "
             "FROM item i WHERE i.state = 'DOWNLOADED' AND i.pending_download_prefix IS NOT NULL "
             "AND instr(i.rel_path, '/') = 0 "
             "AND NOT EXISTS ("
@@ -552,6 +570,7 @@ class TransferQueue:
                 mount_cache=mount_cache,
                 gated_logged=gated_logged,
                 freshly_interrupted=False,
+                queued_at=row["interrupted_queued_at"],
             )
 
     async def _mount_ok(
@@ -656,9 +675,21 @@ class TransferQueue:
 
     # --- public actions (called by api/jobs.py) -----------------------------------------
 
-    async def enqueue_item(self, item_id: int, *, forced_full_rate: bool = False) -> int:
+    async def enqueue_item(
+        self, item_id: int, *, forced_full_rate: bool = False, queued_at: str | None = None
+    ) -> int:
         """Manual queue (DESIGN.md §4.7): always wins, clears suppression, resets `attempt`.
         Returns the `job.id` -- a fresh one, or (see below) an existing active one.
+
+        **`queued_at` override** (2026-08-19,
+        prompts/2026-08-19-rescue-requeue-keeps-queue-position.md): `None` (every caller before
+        this task, and every caller today except the startup rescue below) stamps today's
+        now, byte-for-byte the pre-existing behavior -- same opt-in-parameter pattern as
+        `core/postprocess.py.perform_remote_delete`'s `caller`. The startup rescue passes the
+        *interrupted* job's own original `queued_at` so a transfer that was mid-download at
+        restart re-enters the queue at (or near) the front rather than the back -- see
+        `_requeue_interrupted_item` for why. `rank` is untouched either way (still defaults to
+        0 via `_insert_job`), so this never outranks an explicit "Move to top".
 
         **Idempotent, not rejecting** (2026-08-13,
         prompts/2026-08-13-lftp-timestamped-temp-files.md's root cause). This used to insert a
@@ -702,7 +733,12 @@ class TransferQueue:
         kind = "mirror" if item["is_dir"] else "pget"
         lane = await self._lane_for(item)
         job_id = await self._insert_job(
-            item_id, kind=kind, lane=lane, attempt=1, forced_full_rate=forced_full_rate
+            item_id,
+            kind=kind,
+            lane=lane,
+            attempt=1,
+            forced_full_rate=forced_full_rate,
+            queued_at=queued_at,
         )
         await self.db.execute(
             "UPDATE item SET state = 'QUEUED', auto_queue_suppressed = 0, suppressed_reason = NULL, "
@@ -2043,13 +2079,31 @@ class TransferQueue:
         return prefix if enabled else None
 
     async def _insert_job(
-        self, item_id: int, *, kind: str, lane: str, attempt: int, forced_full_rate: bool = False
+        self,
+        item_id: int,
+        *,
+        kind: str,
+        lane: str,
+        attempt: int,
+        forced_full_rate: bool = False,
+        queued_at: str | None = None,
     ) -> int:
-        cursor = await self.db.execute(
-            "INSERT INTO job (item_id, kind, state, lane, rank, attempt, forced_full_rate) "
-            "VALUES (?, ?, 'queued', ?, 0, ?, ?)",
-            (item_id, kind, lane, attempt, 1 if forced_full_rate else 0),
-        )
+        """`queued_at=None` (every caller before 2026-08-19) lets the column's own
+        `DEFAULT (STRFTIME(...))` stamp now, unchanged. A caller may pass an explicit value to
+        backdate the row instead -- see `enqueue_item`'s own docstring for why.
+        """
+        if queued_at is None:
+            cursor = await self.db.execute(
+                "INSERT INTO job (item_id, kind, state, lane, rank, attempt, forced_full_rate) "
+                "VALUES (?, ?, 'queued', ?, 0, ?, ?)",
+                (item_id, kind, lane, attempt, 1 if forced_full_rate else 0),
+            )
+        else:
+            cursor = await self.db.execute(
+                "INSERT INTO job (item_id, kind, state, lane, rank, attempt, forced_full_rate, queued_at) "
+                "VALUES (?, ?, 'queued', ?, 0, ?, ?, ?)",
+                (item_id, kind, lane, attempt, 1 if forced_full_rate else 0, queued_at),
+            )
         await self.db.commit()
         return cursor.lastrowid
 

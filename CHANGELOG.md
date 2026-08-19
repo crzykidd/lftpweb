@@ -26,6 +26,12 @@ Skeleton for the next roll:
 ### Added
 ### Changed
 ### Fixed
+
+- **A transfer interrupted by a restart now resumes at its original place in the queue**,
+  instead of dropping to the back behind everything that hadn't started. The startup rescue
+  used to re-queue an interrupted item with a fresh timestamp, which could put an item that was
+  40 GB into a 66 GB download behind a long line of items that had never even started.
+
 ### Security
 ### Deprecated
 ### Removed

@@ -11,6 +11,7 @@ real process, so they belong here rather than in the seedbox-gated `test_queue.p
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -582,6 +583,158 @@ async def test_stranded_downloaded_item_from_an_earlier_restart_is_requeued(db, 
     assert len(requeued_events) == 1
     assert requeued_events[0]["item_id"] == item_id
     assert "stranded by an earlier restart" in requeued_events[0]["message"]
+
+
+# --- `queued_at` carries forward, not just now() (2026-08-19,
+# prompts/2026-08-19-rescue-requeue-keeps-queue-position.md) -- production find: S10 (job 203)
+# was mid-download at restart, but the rescue's `enqueue_item` call stamped a fresh `queued_at`
+# while jobs that were merely *queued* (never started) at restart kept their own older
+# timestamps, so the actively-downloading item went to the back of the line behind everything
+# that hadn't started. Fix: both rescue paths pass the interrupted job's own original
+# `queued_at` through to the fresh row. -------------------------------------------------------
+
+
+async def _admission_order_item_ids(db) -> list[int]:
+    """The exact ordering query `_admit` uses (`core/queue.py`) -- deliberately not a
+    re-implementation of `rank DESC, queued_at ASC`, so this test fails if that query itself
+    ever changes rather than only if a second, independent copy of the sort does.
+    """
+    cursor = await db.execute(
+        "SELECT job.item_id FROM job WHERE job.state = 'queued' "
+        "ORDER BY job.rank DESC, job.queued_at ASC"
+    )
+    rows = await cursor.fetchall()
+    return [r["item_id"] for r in rows]
+
+
+async def test_requeued_interrupted_item_keeps_its_original_queue_position(db, tmp_path):
+    """The production scenario itself: an item that was actively downloading (hence `running`,
+    hence among the *oldest* jobs by definition) must resume ahead of items that were merely
+    `queued` (never started) with newer -- but still older-than-now -- timestamps, once the
+    interrupted job's original `queued_at` is preserved rather than replaced with a fresh now().
+    """
+    local_dir = tmp_path / "local"
+    local_dir.mkdir()
+    write_if_needed(str(local_dir))
+    host_id = await _make_host_row(db)
+    queue_id = await _make_queue_row(db, host_id, local_dir)
+
+    # The interrupted item: was `running` since the oldest timestamp of the three.
+    old_item_id = await _make_item_row(
+        db, queue_id, "Was.Downloading", is_dir=True, remote_size=1000
+    )
+    await db.execute("UPDATE item SET state = 'DOWNLOADING' WHERE id = ?", (old_item_id,))
+    await db.execute(
+        "INSERT INTO job (item_id, kind, state, lane, rank, attempt, forced_full_rate, queued_at) "
+        "VALUES (?, 'mirror', 'running', 'main', 0, 1, 0, '2020-01-01T00:00:00.000000Z')",
+        (old_item_id,),
+    )
+
+    # Two items that were merely queued (never started) at restart, with their own older-than-
+    # now but newer-than-the-interrupted-job timestamps -- exactly the "everything that hadn't
+    # even started" the incident describes.
+    mid_item_id = await _make_item_row(
+        db, queue_id, "Was.Queued.Mid", is_dir=True, remote_size=1000
+    )
+    await db.execute(
+        "INSERT INTO job (item_id, kind, state, lane, rank, attempt, forced_full_rate, queued_at) "
+        "VALUES (?, 'mirror', 'queued', 'main', 0, 1, 0, '2020-06-01T00:00:00.000000Z')",
+        (mid_item_id,),
+    )
+    new_item_id = await _make_item_row(
+        db, queue_id, "Was.Queued.New", is_dir=True, remote_size=1000
+    )
+    await db.execute(
+        "INSERT INTO job (item_id, kind, state, lane, rank, attempt, forced_full_rate, queued_at) "
+        "VALUES (?, 'mirror', 'queued', 'main', 0, 1, 0, '2020-07-01T00:00:00.000000Z')",
+        (new_item_id,),
+    )
+    await db.commit()
+
+    q = await _queue_for(db, tmp_path)
+    await q._reconcile_orphaned_jobs()
+
+    order = await _admission_order_item_ids(db)
+    assert order == [old_item_id, mid_item_id, new_item_id], (
+        "the re-queued interrupted item must be admitted first, backdated to its original "
+        "queued_at -- not last, behind items that had merely been queued"
+    )
+
+    # The re-queued row's own `queued_at` must equal the interrupted job's, not today's now().
+    requeued = await (
+        await db.execute(
+            "SELECT queued_at FROM job WHERE item_id = ? AND state = 'queued'", (old_item_id,)
+        )
+    ).fetchone()
+    assert requeued["queued_at"] == "2020-01-01T00:00:00.000000Z"
+
+
+async def test_enqueue_item_without_override_still_stamps_now(db, tmp_path):
+    """Regression on the default: every caller before this task (and every caller today except
+    the startup rescue) must still get today's now() -- the `queued_at` param is opt-in, not a
+    behavior change for the common case.
+    """
+    host_id = await _make_host_row(db)
+    queue_id = await _make_queue_row(db, host_id, tmp_path / "local")
+    item_id = await _make_item_row(db, queue_id, "Some.Release", is_dir=True, remote_size=1000)
+
+    q = await _queue_for(db, tmp_path)
+    before = datetime.now(UTC)
+    await q.enqueue_item(item_id)
+    after = datetime.now(UTC)
+
+    row = await (
+        await db.execute("SELECT queued_at FROM job WHERE item_id = ?", (item_id,))
+    ).fetchone()
+    stamped = datetime.strptime(row["queued_at"], "%Y-%m-%dT%H:%M:%S.%f%z")
+    # SQLite's `STRFTIME('%f', ...)` truncates to millisecond resolution (vs. Python's
+    # microsecond `datetime.now()`), so `stamped` can legitimately read a hair below `before`
+    # -- a 1s tolerance absorbs that truncation without loosening what this test actually
+    # checks: the row got today's now(), not some arbitrary override.
+    tolerance = timedelta(seconds=1)
+    assert (
+        before - tolerance <= stamped <= after + tolerance
+    ), "no override must still stamp a fresh now(), unchanged"
+
+
+async def test_stranded_downloaded_requeue_carries_the_original_queued_at(db, tmp_path):
+    """Rule 2 (`_requeue_stranded_downloaded`) must carry the *most recent* interrupted job's
+    own `queued_at` forward too, not just rule 1's freshly-interrupted path -- the row it already
+    keys off (`ORDER BY j.id DESC LIMIT 1`) is the one whose timestamp must survive.
+    """
+    local_dir = tmp_path / "local"
+    local_dir.mkdir()
+    write_if_needed(str(local_dir))
+
+    prefixed = local_dir / ".downloading-Stranded.Timestamp"
+    prefixed.mkdir()
+    (prefixed / "a.mkv").write_bytes(b"y" * 512)
+
+    host_id = await _make_host_row(db)
+    queue_id = await _make_queue_row(db, host_id, local_dir)
+    item_id = await _make_item_row(db, queue_id, "Stranded.Timestamp", is_dir=True, remote_size=512)
+    await db.execute(
+        "UPDATE item SET state = 'DOWNLOADED', pending_download_prefix = '.downloading-' "
+        "WHERE id = ?",
+        (item_id,),
+    )
+    await db.execute(
+        "INSERT INTO job (item_id, kind, state, lane, rank, attempt, forced_full_rate, "
+        "error_class, finished_at, queued_at) VALUES (?, 'mirror', 'failed', 'main', 0, 1, 0, "
+        "'INTERRUPTED', ?, '2020-03-01T00:00:00.000000Z')",
+        (item_id, "2026-08-18T01:00:00.000000Z"),
+    )
+    await db.commit()
+
+    q = await _queue_for(db, tmp_path)
+    await q._reconcile_orphaned_jobs()
+
+    requeued = await (
+        await db.execute(
+            "SELECT queued_at FROM job WHERE item_id = ? AND state = 'queued'", (item_id,)
+        )
+    ).fetchone()
+    assert requeued["queued_at"] == "2020-03-01T00:00:00.000000Z"
 
 
 async def test_stopped_job_item_is_not_requeued(db, tmp_path):

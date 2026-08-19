@@ -6,6 +6,36 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-19 — Startup rescue re-queue: preserve `queued_at`, never boost `rank`
+
+`prompts/done/2026-08-19-rescue-requeue-keeps-queue-position.md`, production find, support
+bundle `lftpweb-support-0.2.5-*`: S10 (job 203) was mid-download at 39.7 of 66.6 GB when the
+container restarted for the v0.2.5 upgrade. The 2026-08-18 startup rescue correctly re-queued
+it (`interrupted_requeued`) — but `enqueue_item` stamped a fresh `queued_at`, while jobs that
+were merely *queued* (never started) at restart kept their own older timestamps. Scheduler order
+is `rank DESC, queued_at ASC` (DESIGN.md §4.5), so the item that had 40 GB of partial bytes
+already down went to the back of a long line, behind everything that hadn't even started.
+
+**Chose:** carry the *interrupted* job's original `queued_at` forward onto the fresh re-queued
+row (`enqueue_item` gained an opt-in `queued_at` override, same pattern as
+`core/postprocess.py.perform_remote_delete`'s `caller`). A running item was, by definition,
+already among the oldest jobs in line, so backdating naturally resumes it at (or near) the
+front. `rank` is left alone throughout.
+
+**Rejected: bump `rank` instead (or in addition).** Rank is the *explicit* "Move to top"
+signal (§4.5) — a user-visible override an operator reaches for on purpose. Having the rescue
+also touch it would mean a restart-recovered item could silently outrank something a human
+had deliberately promoted, for a reason the rescue has no way to know about. Preserving
+`queued_at` restores natural queue order without ever contending with that signal.
+
+**Backdating is honest, not just a scheduling trick.** The item genuinely has been waiting
+since its original `queued_at` — the restart didn't reset that clock, it just interrupted the
+process supervising it. So the Transfers page's queued-wait readout continues to tell the
+truth after a rescue-requeue, rather than reporting a wait that restarts at the moment of the
+crash.
+
+---
+
 ## 2026-08-18 — Orphaned `_FAILED_`/`_UNPACK_` extraction debris: widen the existing
 bounded-lifetime mechanism, don't build a second one; unconditional, not settings-gated
 
