@@ -77,7 +77,17 @@ than a first. Two things that bit the first time and will bit again:
 
 ## Where we are
 
-### 2026-08-18 — the production NFS hang, its diagnosis, and two fixes on `dev` (post-v0.2.4, pushed, unreleased)
+### 🚀 v0.2.5 released 2026-08-18 — the NFS-incident fixes ship
+
+PR #11 (`dev` → `main`, merged `75f812e`), tag `v0.2.5`, release notes = the `[0.2.5]`
+CHANGELOG section verbatim; `:latest`/`:0.2.5`/`:0` published on the release event. A clean
+cut — every check green, no bypasses, no stalls. Contents: exactly the two incident fixes in
+the section below (`5b28a32` startup rescue, `b783c05` debris sweep). Tests at release:
+**1317 backend / 477 frontend, 0 skipped**, integration suite genuinely exercised (fake
+seedboxes up during the local prep gate). Both fixes were running on the user's test system
+via `:dev` before the cut.
+
+### 2026-08-18 — the production NFS hang, its diagnosis, and two fixes (released as v0.2.5 above)
 
 Production froze overnight: the app stopped responding at 00:01 local and the container was
 unkillable. Diagnosis (from the container log + `ps`): **processes in uninterruptible D-state
