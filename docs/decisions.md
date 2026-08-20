@@ -6,8 +6,50 @@ leaving the reasoning only in a commit message.
 
 ---
 
-## 2026-08-20 — Transfers row file-list expansion: bound, live-update mechanism, and coexistence
-with the failed-output panel
+## 2026-08-20 — History → Events: keep the `job` endpoints, don't gut the drawer, deep link lives
+in the drawer header
+
+`prompts/done/2026-08-20-history-becomes-events.md`, phase 1 stage 7 (the last) of
+`docs/transfers-redesign-spec.md` §2, browser-unverified.
+
+**Keep `GET`/`DELETE /api/history/jobs*` — the prompt's own premise that `GET` "loses its only
+frontend consumer" was checked and found wrong.** `HistoryJobsSection.tsx` (deleted this task)
+was not the only caller: `ItemDrawer.tsx`'s `HistoryPanel` also calls `getHistoryJobs({item_id,
+limit: 10})` for its own bounded per-item attempt-history list, unrelated to the page being
+renamed. Removing the `GET` endpoint would have broken the drawer. Once that correction stood,
+the honest scope of "now-unused" shrank to just the `DELETE` (clear) siblings, which really did
+lose their only caller (`HistoryJobsSection`'s own "Clear" button). Decided to leave those too,
+for three reasons: (1) stage 7 is explicitly scoped **"frontend only"** in the build-order table
+(`docs/transfers-redesign-spec.md` §7) — no backend change was asked for; (2) they're harmless
+and already tested; (3) cutting only the jobs-clear surface while leaving the still-live
+events-clear surface (`DELETE /api/history/events*`, still called by the new `EventsSection.tsx`)
+would be an asymmetry with no functional gain, indistinguishable from an oversight to a later
+reader. The frontend-only `clearHistoryJob`/`clearHistoryJobs` wrapper functions in
+`api/client.ts` *were* removed — unlike a backend endpoint, a dead TS export has no
+"someone might curl it" argument in its favor, and it had zero remaining callers anywhere,
+including tests.
+
+**The per-item Events deep link lives in `ItemDrawer.tsx`'s header, not directly on a Files or
+Transfers row**, despite the spec's own wording ("a row... gets an affordance"). Both rows'
+layouts are already tight and explicitly browser-unverified: `FileTree.tsx`'s row comments call
+its columns "already tight" (one prior task trimmed labels specifically because they were
+clipping), and `TransfersPage.tsx`'s row went through a dedicated "crowding" fix (2026-08-15)
+to get down to one line plus an expand panel. Adding a new element to either, with no browser in
+this environment to check the result against, is exactly the risk both of those precedents exist
+to avoid. `ItemDrawer.tsx` is already the one shared surface both rows open on a single click
+(its own module comment: "one drawer, keyed on an item, opened from two places... rather than two
+overlapping detail surfaces") — putting the link there costs one extra click from a row (open the
+drawer, then click Events) in exchange for zero layout risk on either row. If a human confirms
+the collapsed-row placement is wanted after looking at this in a browser, that's a small, isolated
+follow-up (new `EventsLinkButton.tsx` already exists and is reusable as-is).
+
+**The drawer's own events panel is not gutted, but is now a documented duplicate.**
+`ItemDrawer.tsx`'s `HistoryPanel` shows the last 10 events for an item; the new deep link opens
+the unbounded, filterable, superset view of the exact same data. The task's own instruction was
+"do not gut the drawer in this task" — so `HistoryPanel` is unchanged, and the redundancy is
+recorded here and in the handoff prompt's own report rather than acted on. The panel's *jobs*
+half (attempt history) is not redundant with anything — no other page lists one item's own
+transfer attempts — so even a future trim should only ever touch the events half.
 
 `prompts/done/2026-08-20-transfers-row-file-progress.md`, phase 1 stage 5 of
 `docs/transfers-redesign-spec.md` §3.3, browser-unverified.

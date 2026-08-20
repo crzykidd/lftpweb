@@ -85,6 +85,17 @@ Skeleton for the next roll:
   `/files` route now redirects there rather than 404ing. Each tab has its own URL, so it's
   linkable and survives a reload, the same pattern Settings' and Docs' tabs already use
   (`nav.ts.tabsForPath`).
+- **History becomes Events** (`docs/transfers-redesign-spec.md` §2, phase 1 stage 7, the last
+  stage of phase 1) — now the audit-event log only: every verify/extract/move outcome, every
+  remote delete, and every delete withheld, with the reason. Its own `job` list is gone; the
+  Queue tab's Complete box already covers "what finished, in what order" (stage 4b), so the two
+  were answering the same question. `/history` still resolves to this page (a redirect,
+  `App.tsx`) so nothing that links or bookmarks the old path breaks — the same pattern stage 6
+  set for `/files` → `/transfers/files`.
+- **A per-item Events deep link, in the item drawer's own header** — one click to the full,
+  unbounded, filterable event log for exactly this item, pre-filtered via the URL (`?item_id=`)
+  so the resulting view is linkable, reloadable, and back-button friendly. The Events page shows
+  plainly when it's filtered this way, with one click back to the unfiltered log.
 
 ### Changed
 
@@ -128,7 +139,16 @@ Skeleton for the next roll:
 
 ### Security
 ### Deprecated
+
 ### Removed
+
+- **The old History page's job list** (`docs/transfers-redesign-spec.md` §2, phase 1 stage 7) —
+  superseded by the Queue tab's Complete box (stage 4b). One consequence named rather than
+  hidden (README's Known gaps): a dismissed job no longer appears on any list page. Its `job`
+  row is untouched — dismissal was always display-only — and stays reachable one item at a time
+  from that item's own drawer, but nothing lists every dismissed job across the whole install
+  any longer. The underlying `GET`/`DELETE /api/history/jobs*` endpoints are unaffected —
+  `docs/decisions.md` records why they're staying.
 
 ## [0.2.6] — 2026-08-18
 

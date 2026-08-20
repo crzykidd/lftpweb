@@ -1727,7 +1727,7 @@ reasserting itself, visible at all; both are changes no writer pushes, because n
 │  ▲ 8.2 MB/s    ⣿ 9.0 / 10 allocated    ⏳ 12 queued (48 GB)    24h: 310 GB │
 ├──────────┬─────────────────────────────────────────────────────────────┤
 │ Transfers│  [ Queue · Files ]              ← Transfers has tabs too     │
-│  History │                                                              │
+│  Events  │                                                              │
 │ Dashboard│                                                              │
 │  Settings│  [ Connection · Queues · Transfer · Post-processing ·        │
 │  Docs    │    Logs · Backup · Auth ]        ← tabs, only where a        │
@@ -2034,9 +2034,14 @@ Some.Release.S03E04.2160p    [downloading]   18 files   62%   4.1 MB/s   ETA 12m
   the row showing on this page (`job.dismissed_at`) without deleting the `job` row or touching
   the item's own state/suppression. Added after a user hit a `REMOTE_GONE` failure — the
   remote files were genuinely gone, and Retry was the only action this page offered, which is
-  exactly wrong for that case. History (below) keeps showing a dismissed job regardless — it
-  reads the same table and dismissal was never meant to erase what happened, only to declutter
-  this page. **Clear all failed** dismisses every currently-`failed` row in one action
+  exactly wrong for that case. Dismissal was never meant to erase what happened, only to
+  declutter this page -- the `job` row itself is untouched and stays reachable one item at a
+  time from that item's own drawer (§9.2, above). **As of 2026-08-20 (`docs/transfers-redesign-
+  spec.md` §2, phase 1 stage 7) no page lists every dismissed job across the whole install any
+  longer** -- the old History page's job list, which used to be that page, was dropped when
+  History became Events; the Complete box below already excluded dismissed rows before and after
+  (README's Known gaps names this). **Clear all failed** dismisses every currently-`failed` row
+  in one action
   (`Promise.allSettled`, honest about partial failure the same way the Files page's bulk
   actions already are) — scoped to `failed` only, not `cancelled`, since a stopped job is a
   deliberate Stop click, not the kind of unattended pile-up a permanent-error class like
@@ -2096,34 +2101,51 @@ both sides where each exists (`local_mtime` is the local counterpart to `remote_
 newest-child rollup answers a question the byte-comparison model asks), the lifecycle chronology
 from `first_seen_at` through `state_changed_at` rendered in the order it actually happened, and a
 bounded recent-history panel — the last handful of transfer attempts and audit events, including
-the delete trail. History is fetched **once, when the drawer opens**, never per row and never
-eagerly for a tree.
+the delete trail. That panel is fetched **once, when the drawer opens**, never per row and never
+eagerly for a tree. **A per-item Events deep link** sits in the drawer's own header (2026-08-20,
+`docs/transfers-redesign-spec.md` §2, phase 1 stage 7) — one click further to the full,
+unbounded, filterable log for this item, which is what lets the bounded panel here stay bounded
+without being the only way to see everything that happened to one item. The panel's own *events*
+half is now a strict subset of what that link opens; its *jobs* (attempt-history) half is not --
+no other page lists one item's own transfer attempts, so it stays.
 
-**History** — **its own page**, not a panel: the `job` and `event` tables, **grouped by queue**,
-filterable by state, error class, date range, and event kind. This is where remote deletes are
-reviewed, so it must render the delete audit trail (§7.3) legibly — what was deleted, from
-which queue, under which mode, and what gated it. The only view that answers "what did it
-remove last night". A row a Transfers-page Dismiss removed from that page still shows here
-(same table, dismissal is display-only) with a quiet **dismissed** marker — worth surfacing,
-since it's the only page that can answer "why is this no longer on Transfers."
+**Events** — **its own page**, not a panel: the `event` table (audit log only, DESIGN.md §7.3/
+§7.4), filterable by queue, kind, level, and date range, plus a per-item filter carried in the
+URL (the deep link above) rather than component state, so the filtered view is linkable,
+reloadable, and back-button friendly. Formerly **History**, a two-section page pairing this
+event log with its own `job` list; the `job` list was dropped 2026-08-20
+(`docs/transfers-redesign-spec.md` §2, phase 1 stage 7) once the Queue tab's Complete box (stage
+4b) already covered "what finished, in what order" -- keeping both was the exact overlapping-
+answer duplication the redesign exists to remove. `/history` still resolves to this page (a
+redirect, `App.tsx`), and the underlying `job` table and its `GET /api/history/jobs*` endpoints
+are untouched -- only the page that listed them is gone (docs/decisions.md). One consequence: a
+row a Transfers-page Dismiss hid isn't listed anywhere anymore -- its `job` row is untouched
+(dismissal was always display-only), reachable one item at a time from that item's own drawer,
+but no page lists every dismissed job across the whole install any longer (README's Known gaps).
+This page is where remote deletes are reviewed, so it must render the delete audit trail (§7.3)
+legibly — what was deleted, from which queue, under which mode, and what gated it. The only view
+that answers "what did it remove last night".
 
 **Clear** (2026-08-13) — the different, irreversible sibling of Dismiss: one row, everything
-matching the current filter ("by outcome" falls out of that for free — filter by `state` or
-`kind`/`level`, then clear), or everything, deleting the `job`/`event` rows outright rather than
-just hiding them. Confirmed before running (unlike Dismiss, which destroys nothing). No category
-is protected — the delete-audit events clear the same as anything else; see docs/decisions.md
-for why the obvious "protect the audit trail" alternative was considered and rejected. **Not to
-be confused with the Files page's "Reset item tracking"** (2026-08-13, above) — that forgets an
-`item` row so a path can be re-fetched; this page's Clear only ever touches `job`/`event` rows
-and is explicitly barred from touching `item` (next sentence) — clearing here must never change
-what the next scan does. Bulk
-clears run as one server-side `DELETE ... WHERE`, built from the same filter the matching `GET`
-uses, rather than a client-side loop over ids. **Never touches `item`**, `auto_queue_suppressed`,
-or `suppressed_reason` — clearing is bookkeeping, not behavior, and cannot change what the next
-scan does — and has no effect on the Dashboard (§10.4's `metric_sample`/`metric_heartbeat` carry
-no `job`/`event` reference and are never touched). Logs and backups are separate and out of
-scope. An active (`queued`/`running`) job is not history and is rejected server-side, not just
-hidden from the button.
+matching the current filter ("by outcome" falls out of that for free — filter by `kind`/`level`,
+then clear), or everything, deleting `event` rows outright rather than just hiding them.
+Confirmed before running (unlike Dismiss, which destroys nothing). No category is protected —
+the delete-audit events clear the same as anything else; see docs/decisions.md for why the
+obvious "protect the audit trail" alternative was considered and rejected. **Not to be confused
+with the Files page's "Reset item tracking"** (2026-08-13, above) — that forgets an `item` row
+so a path can be re-fetched; this page's Clear only ever touches `event` rows and is explicitly
+barred from touching `item` (next sentence) — clearing here must never change what the next scan
+does. Bulk clears run as one server-side `DELETE ... WHERE`, built from the same filter the
+matching `GET` uses, rather than a client-side loop over ids. **Never touches `item`**,
+`auto_queue_suppressed`, or `suppressed_reason` — clearing is bookkeeping, not behavior, and
+cannot change what the next scan does — and has no effect on the Dashboard (§10.4's
+`metric_sample`/`metric_heartbeat` carry no `job`/`event` reference and are never touched). Logs
+and backups are separate and out of scope. `GET`/`DELETE /api/history/jobs*` (job clearing
+included) are unaffected by this page's redesign and still exist server-side — `docs/decisions.
+md` records the decision to leave them, since `GET` still has a live frontend caller (the item
+drawer's own attempt-history panel, above) and an active (`queued`/`running`) job was already
+rejected server-side there, not just hidden from a button — but this page (and its own Clear
+button) no longer surfaces or calls any of them.
 
 **Dashboard** — throughput over time, from the sample store in §10.4: bytes moved per hour over
 the last 24 h, broken down by queue with a site total, and speed over a selectable 1 h / 12 h /
@@ -2166,7 +2188,7 @@ best-effort: an unconfigured, unreachable, or credentials-needing-re-entry host 
 save, only a live seedbox that clearly reports the directory missing does. A mistyped path used
 to surface only as a log line the next time auto-queue's mount gate silently refused to act; the
 same gating/recovery transition is now also an audit-trail event (`core/autoqueue.py.on_scan`,
-once per episode), visible on History → Events.
+once per episode), visible on the Events page.
 
 ### 9.3 Advanced options exposed
 
@@ -2419,7 +2441,7 @@ backend/lftpweb/
   core/itemview.py    core/settle.py     core/mount_sentinel.py
   core/audit.py       core/metrics.py    core/logtail.py
   remote_agent/scan_fs.py          # stdlib-only fallback scanner
-frontend/   Vite app — routes Files / Transfers / History / Dashboard / Settings / Docs
+frontend/   Vite app — routes Transfers (Queue/Files tabs) / Events / Dashboard / Settings / Docs
 tests/      unit + integration
 private_data/   gitignored — local scratch, test fixtures, sample trees, scratch compose (§12.1)
 ```

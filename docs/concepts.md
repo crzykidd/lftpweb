@@ -136,24 +136,24 @@ automatically.
 > only the case where _something else_ — an `*arr` importer, a script, a human — took the local
 > copy away. It never applies to a copy lftpweb deleted itself.
 
-**To make a path genuinely reusable, use Reset item tracking.** Clearing History will not do
+**To make a path genuinely reusable, use Reset item tracking.** Clearing events will not do
 it — see below.
 
-## Dismiss vs Clear history vs Reset item tracking {#blast-radius}
+## Dismiss vs Clear events vs Reset item tracking {#blast-radius}
 
 Three actions with similar names, sitting a few pixels apart, with completely different blast
 radii. This is the table to check before clicking one.
 
 | Action | Where | What it removes | What survives |
 |---|---|---|---|
-| **Dismiss** | [Transfers](/transfers/queue) | Nothing. It flags one failed or cancelled job as dismissed so it stops cluttering the Transfers list. | Everything — the job is still in History, marked dismissed. Reversible in the sense that nothing was lost. |
-| **Clear history** | [History](/history) | Transfer records and audit events — one row, everything matching your current filter, or everything. No category is protected, including remote-delete audit entries. | Every item, every suppression flag, every local file. Clearing History changes nothing about what will or will not download next. |
-| **Reset item tracking** | [Files](/transfers/files) | The item record itself and its whole subtree — plus its settle bookkeeping and archive-cleanup bookkeeping. Its transfer records go too, as an unavoidable consequence of the item row going. | Your local files, untouched. Audit events stay in History but lose their link back to the item. |
+| **Dismiss** | [Transfers](/transfers/queue) | Nothing. It flags one failed or cancelled job as dismissed so it stops cluttering the Transfers list. | Everything — the job row itself is untouched, just marked dismissed. It no longer appears on any list page, but it's still reachable from the item drawer's own recent-history panel (open the item and look). Reversible in the sense that nothing was lost. |
+| **Clear events** | [Events](/events) | Audit-event records — one row, everything matching your current filter, or everything. No category is protected, including remote-delete audit entries. | Every item, every suppression flag, every local file, and every transfer's own job record (unaffected — Events only ever holds the `event` table). Clearing events changes nothing about what will or will not download next. |
+| **Reset item tracking** | [Files](/transfers/files) | The item record itself and its whole subtree — plus its settle bookkeeping and archive-cleanup bookkeeping. Its transfer records go too, as an unavoidable consequence of the item row going. | Your local files, untouched. Audit events stay in Events but lose their link back to the item. |
 
-Put plainly: **Dismiss tidies a list. Clear history deletes records. Reset item tracking forgets
-a path** — it makes lftpweb treat that path as brand new on the next scan, which is the only one
-of the three that changes future behaviour. That is exactly what you want after a suppressed,
-stopped, or permanently-failed item, and exactly what you do not want by accident.
+Put plainly: **Dismiss tidies a list. Clear events deletes audit records. Reset item tracking
+forgets a path** — it makes lftpweb treat that path as brand new on the next scan, which is the
+only one of the three that changes future behaviour. That is exactly what you want after a
+suppressed, stopped, or permanently-failed item, and exactly what you do not want by accident.
 
 > **Warning:** Resetting a path whose remote copy still exists, on a queue with auto-queue on,
 > will start it downloading again on the next scan. Every reset panel computes and states the
@@ -213,9 +213,9 @@ The delete only fires once every applicable check has passed, in order — this 
 ladder":
 
 1. **Verify.** A checksum mismatch (`CORRUPT`) withholds the delete outright, always, and is
-   audited on [History](/history) as a warning event. If verification simply has no evidence to
+   audited on [Events](/events) as a warning event. If verification simply has no evidence to
    go on — no `.sfv`/`.md5` sidecar, and the whole-file-read fallback turned off — the delete
-   **proceeds anyway** on the completeness checks the item already cleared; the History event
+   **proceeds anyway** on the completeness checks the item already cleared; the Events entry
    says so plainly rather than reading like a checksum-backed delete.
 2. **Extract.** If the release had archives and extraction is enabled, extraction must have
    succeeded. A failed extraction *defers* the delete instead — you'll see a "source retained"
@@ -313,7 +313,7 @@ send manually. Each part is its own checkbox, all default on:
 | lftpweb logs | The live log file plus every rotated file, exactly what Settings → Logs already lists. Always included — this checkbox is checked and disabled. |
 | Environment snapshot | Version, build, migration level, the health readout, `lftp`/Python versions, and per-queue disk usage. |
 | Settings dump | Host config, queues, patterns, transfer/post-processing/backup settings, auth mode, and *arr instances — built from the same responses the Settings pages already return, so it can never carry a password, API key, or key material. An archive extract password is a secret too, so this dump carries only how many are configured (`extract_passwords_count`), never the passwords themselves. |
-| Recent audit trail | The most recent 1,000 History events. |
+| Recent audit trail | The most recent 1,000 events (the Events page's own data). |
 | Recent job history | The most recent 100 jobs, including their error output. |
 | A Sonarr/Radarr instance's logs | One checkbox per *enabled* instance — its own log files, fetched live from that *arr, newest-last-modified-first across every rotation series, up to a per-instance size budget (~20 MB). Hidden entirely when no instance is enabled. |
 

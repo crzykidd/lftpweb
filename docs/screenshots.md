@@ -29,7 +29,7 @@ and ETA, because progress is sampled per file rather than for the job as a whole
 
 Bytes transferred per hour over 24 hours, split by queue, and a live transfer-speed chart with
 1h / 12h / 24h ranges. Both are drawn from lftpweb's own sampling table, independent of the
-History page — clearing history does not touch them.
+Events page — clearing events does not touch them.
 
 ## Transfer tuning, and what it actually means
 

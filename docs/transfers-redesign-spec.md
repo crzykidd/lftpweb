@@ -349,10 +349,15 @@ stages are split small.
 | 4b | — two paginated boxes (20 active/pending client-side, 50 complete server-side, reusing `api/history.py`'s paginator) — **done 2026-08-19** (`prompts/done/2026-08-19-transfers-paginated-boxes.md`) | 4a |
 | 5 | **Row expansion to per-file progress**, children fetched lazily on expand — **done 2026-08-20, browser-unverified** (`GET /api/items/{id}/children`, `prompts/done/2026-08-20-transfers-row-file-progress.md`) | 4a |
 | 6 | **Tabs** — Transfers as main section with Queue + Files tabs — **done 2026-08-20, browser-unverified** (`prompts/done/2026-08-20-transfers-queue-files-tabs.md`) | 4a |
-| 7 | **History → Events** — drop the jobs list, add the per-item deep link (frontend only) | 4a, 6 |
+| 7 | **History → Events** — drop the jobs list, add the per-item deep link (frontend only) — **done 2026-08-20, browser-unverified** (`prompts/done/2026-08-20-history-becomes-events.md`) | 4a, 6 |
 
 Stage 1 carries the real architectural risk; 3 and 4 are low-risk and independently useful.
 Stages 3 and 1 have no dependency on each other and can go in either order.
+
+**Phase 1 is complete as of stage 7 (2026-08-20).** Every stage above shipped; the whole phase
+is still browser-unverified end to end — no agent in this project can render a page — so a human
+walkthrough of the redesigned Transfers section and the new Events page is the next real gate
+before phase 2 (download clients) is picked up.
 
 ### Phase 2 — download clients (not started; revisit after phase 1 is in use)
 

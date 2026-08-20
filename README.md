@@ -38,7 +38,7 @@ Remote and local as one tree, with live per-file progress, speed, and ETA:
 
 Every verify outcome, every remote delete, and every delete withheld — with the reason:
 
-![The History page showing the audit trail](docs/images/history-audit-trail.png)
+![The Events page showing the audit trail](docs/images/history-audit-trail.png)
 
 **[More screenshots →](docs/screenshots.md)**
 
@@ -87,7 +87,7 @@ Every verify outcome, every remote delete, and every delete withheld — with th
   cannot bless a truncated file), extract (`7zz` for zip/7z/tar/gz/bz2/xz, `unrar` for rar/rar5
   — see `NOTICE`), and `move` mode's remote delete — fired only after the *last* enabled check
   passes (completeness → verify → extract → *arr import when tracked), all with an audited trail
-  on the History page. Extraction stages into `_UNPACK_` and merges into place only on full
+  on the Events page. Extraction stages into `_UNPACK_` and merges into place only on full
   success, is gated on cheap filesystem preconditions first (zero-length head volume, a gap in a
   multi-volume rar set), and can optionally delete a release's spent archive volumes once they
   have extracted — off by default
@@ -102,15 +102,17 @@ Every verify outcome, every remote delete, and every delete withheld — with th
   confirmed import** — files exist on both sides until the *arr has the release, so any failure
   is inspectable on both ends — and the optional per-queue "Delete when imported" toggle then
   removes the local working copy too, leaving the row visible with a "Processed" countdown
-  before it ages out. The logo chip carries the outcome everywhere (Files, Transfers, History):
+  before it ages out. The logo chip carries the outcome everywhere (Files, Queue, Events):
   green check once imported, red mark if a release left the *arr's queue without ever importing
   (filterable on its own, since that one usually needs a look). Stragglers are cleaned up from
   the app: the delete dialog offers independent **Local** and **Source (seedbox)** scopes, so
   failed or abandoned releases can be cleared from both sides without ever SSHing in
-- The History page: every completed/failed/cancelled transfer and every audit event
-  (including remote deletes and deletes withheld), filterable and grouped by queue. The
-  Transfers page has its own name filter (2026-08-19) with a scoped "Dismiss list" button that
-  bulk-dismisses only the matching finished rows
+- The Queue tab's Complete box: every completed/failed/cancelled transfer, paginated and
+  filterable, with a scoped name filter (2026-08-19) and a "Dismiss list" button that
+  bulk-dismisses only the matching finished rows. The Events page is the separate audit-event
+  log — every verify/extract/move outcome and every remote delete or delete withheld, filterable
+  and grouped by queue, plus a per-item deep link from a Queue or Files row's item drawer
+  (2026-08-20)
 - Rotating log viewer, on-demand `VACUUM INTO` database backups (scheduled + manual), and a
   header readout for seedbox reachability and scheduler liveness (`/api/health`)
 - Credentials encrypted at rest
@@ -211,7 +213,7 @@ than a hoped-for one. Rows that were stranded before these rails existed heal th
 row still owing a source delete is re-checked against import history, bounded to ten attempts with
 backoff, and promoted to `imported` if the import turns up.
 
-Every withheld action writes an audit event, so the History page can always tell you *why* something
+Every withheld action writes an audit event, so the Events page can always tell you *why* something
 didn't happen.
 
 ## What doesn't yet
@@ -240,9 +242,15 @@ and known limitations, recorded in full in `docs/decisions.md` and `prompts/open
   RAR compressor exists in this project's toolchain, so the fixture can't be built. The
   equivalent 7zz path *is* tested against a real encrypted zip; the rar path is assumed correct
   by analogy, which is weaker than every other claim here.
-- **History date filters are UTC calendar days.** No timezone handling exists anywhere —
+- **Events date filters are UTC calendar days.** No timezone handling exists anywhere —
   timestamps are stored UTC and rendered with `toLocaleString()`. Away from UTC, "yesterday" can
   include a few hours of today.
+- **A dismissed job has no list page that shows it anymore.** Before the Events rename
+  (2026-08-20), the old History page's job list showed every terminal job including dismissed
+  ones; that list is gone (the Queue tab's Complete box, its replacement, filters dismissed jobs
+  out, same as it always has). The job row itself is untouched — dismissal was never deletion —
+  and is still reachable one item at a time, from that item's drawer, but nothing lists every
+  dismissed job across the whole install anymore.
 - **API keys and session tokens are hashed with SHA-256, not argon2id.** Deliberate: a key is
   256 bits of `secrets.token_urlsafe`, not a guessable secret, so argon2's slowness would add
   latency and buy nothing.
