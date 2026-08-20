@@ -114,13 +114,25 @@ read as a confirmed *arr import, or trigger notify/cleanup/post-processing. Neit
 is the signal something has gone wrong. A real terminal outcome later does **not** supersede it
 (`docs/decisions.md` has the reasoning); Undo is the way back.
 
-**What a human should check first:** an *arr-bound queue with something mid-import — that the row
-stays under Active with an "Awaiting import" chip and does not also appear under Complete, and
-that "Page X of Y (Z total)" agrees with the rows on screen in both boxes.
+**✅ Verified by the user on a real `:dev` pull, 2026-08-20** — the headline claim of this task,
+end to end: a downloaded item shows **"Awaiting import"** under Active/pending and then **moves to
+Complete once the *arr finishes processing it**. The transition, not just the label. Also
+confirmed the same day: the **multi-page Complete section**.
 
 Tests after this task: **1510 backend / 566 frontend, 0 skipped.**
 
-### 🚧 Transfers redesign — phase 1 in progress on `dev` (2026-08-19/20), 5 of 7 stages landed
+### 2026-08-20 — the browser-review batch (all three from the user's first real look at phase 1)
+
+Three follow-ups from the user reviewing the finished redesign, each its own prompt in
+`prompts/done/2026-08-20-*`:
+
+| What | Commit |
+|---|---|
+| **Page-size selector (10/20/50) per box**, remembered per browser (`transfers.activePageSize`/`transfers.completePageSize`), **both defaulting to 20** — the Complete box drops from its old fixed 50, the user's call after seeing it on screen. Stored values are validated on read (`isPageSize`), so a stale or hand-edited entry falls back to 20 rather than being trusted. Size change resets to page 1 deliberately — no scroll preservation, no equivalent-page arithmetic. `useCompleteJobs`'s existing `requestIdRef` race guard was **confirmed** to cover a size change, not assumed | `444e252` |
+| **Dismiss becomes an outcome menu in the Complete box header** (All / Downloaded / Failed / Stopped), moved down from the page top to sit with the rows it acts on. **Outcome and `name_filter` compose** (AND-ed — the user's explicit call), `job_ids` stays exclusive with both; `queue_id` deliberately not widened since it has had no caller since grouping was dropped. **"Clear all failed" was folded in**, not merely deleted — its old scope is exactly the menu's "Failed", now one server-side `UPDATE` instead of a client-side fan-out. Both boxes share one `pageReadout()` so the wording can't drift, and the Active box now always renders its shell with an honest empty state instead of vanishing | `35ce8ec` |
+| **Active/pending holds a row until its whole pipeline finishes** — see the section above | `bd614c0` |
+
+### ✅ Transfers redesign — phase 1 COMPLETE on `dev` (2026-08-19/20), all 7 stages landed
 
 **`docs/transfers-redesign-spec.md` is the plan and the reasoning — read it before touching the
 Transfers page, `core/scheduler.py`, or the queue ordering.** It is a *proposal document*, not a
