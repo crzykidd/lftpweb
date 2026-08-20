@@ -91,7 +91,7 @@ function EventRow({
         <button
           type="button"
           onClick={() => onClearRequest(event)}
-          title="Clear this record from History -- cannot be undone"
+          title="Clear this record -- cannot be undone"
           className="shrink-0 rounded-md px-1.5 py-0.5 text-xs font-medium text-zinc-400 hover:bg-red-50 hover:text-red-700 dark:text-zinc-600 dark:hover:bg-red-950 dark:hover:text-red-300"
         >
           Clear
@@ -106,20 +106,35 @@ function EventRow({
   )
 }
 
-interface HistoryEventsSectionProps {
+export interface EventsItemFilter {
+  itemId: number
+  itemLabel: string | null
+}
+
+interface EventsSectionProps {
   queues: PathQueueOut[]
+  // The per-item deep link (2026-08-20, docs/transfers-redesign-spec.md §2, phase 1 stage 7) --
+  // `null` is the normal, unfiltered log; a non-null value came from the URL (`EventsPage.tsx`'s
+  // own `parseItemEventsFilter`), not component state, so a reload or a bookmark reproduces the
+  // exact same filtered view. `onClearItemFilter` is how the banner below gets back to the
+  // unfiltered log without losing any of the *other* filters the user may have also set.
+  itemFilter: EventsItemFilter | null
+  onClearItemFilter: () => void
 }
 
 const ROW_ESTIMATE_PX = 56
 const HEADER_ESTIMATE_PX = 32
 
-/** The `event` table half of the History page (DESIGN.md §3.1/§7.3/§7.4/§9.2) -- every
- * verify/extract/move outcome and, critically, every remote delete and every delete
- * *withheld*, with the failing precondition. A remote delete is irreversible; this is the
- * reconstruction trail. Grouped by queue, filterable by kind/level/date range; virtualized
- * and server-capped like the jobs section above it.
+/** Events -- the audit-event log (2026-08-20, docs/transfers-redesign-spec.md §2, phase 1 stage
+ * 7). Formerly one half of the History page (alongside a `job` list, `HistoryJobsSection.tsx`,
+ * now removed -- the Queue tab's Complete box, stage 4b, covers "what finished, in what order,"
+ * which made the jobs half a second, overlapping answer to the same question). This is what
+ * nothing else has: every verify/extract/move outcome and, critically, every remote delete and
+ * every delete *withheld*, with the failing precondition. A remote delete is irreversible; this
+ * is the reconstruction trail. Grouped by queue, filterable by kind/level/date range, and now
+ * also by a single item via the URL (`itemFilter` above); virtualized and server-capped.
  */
-export function HistoryEventsSection({ queues }: HistoryEventsSectionProps) {
+export function EventsSection({ queues, itemFilter, onClearItemFilter }: EventsSectionProps) {
   const [queueId, setQueueId] = useState<string>('')
   const [kind, setKind] = useState<string>('')
   const [level, setLevel] = useState<string>('')
@@ -133,13 +148,14 @@ export function HistoryEventsSection({ queues }: HistoryEventsSectionProps) {
 
   const filter: HistoryEventsFilter = useMemo(
     () => ({
+      item_id: itemFilter?.itemId,
       queue_id: queueId ? Number(queueId) : undefined,
       kind: kind || undefined,
       level: (level || undefined) as HistoryEventsFilter['level'],
       since: since ? `${since}T00:00:00.000000Z` : undefined,
       until: until ? `${until}T23:59:59.999999Z` : undefined,
     }),
-    [queueId, kind, level, since, until],
+    [itemFilter, queueId, kind, level, since, until],
   )
 
   const load = async (offset: number, replace: boolean) => {
@@ -158,10 +174,10 @@ export function HistoryEventsSection({ queues }: HistoryEventsSectionProps) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [filter])
 
-  // --- Clearing (2026-08-13, prompts/2026-08-13-clear-history.md) -- same shape as
-  // HistoryJobsSection's clearing block; see that file's comment for the reasoning
-  // (server-side bulk delete against the filter, local removal for a single row).
-  const hasActiveFilter = Boolean(queueId || kind || level || since || until)
+  // --- Clearing (2026-08-13, prompts/2026-08-13-clear-history.md) -- server-side bulk delete
+  // against the filter (including a URL-driven item filter, if one is set), local removal for a
+  // single row.
+  const hasActiveFilter = Boolean(itemFilter || queueId || kind || level || since || until)
   const [pendingClear, setPendingClear] = useState<
     { kind: 'row'; event: HistoryEventOut } | { kind: 'bulk' } | null
   >(null)
@@ -202,13 +218,31 @@ export function HistoryEventsSection({ queues }: HistoryEventsSectionProps) {
   return (
     <section className="flex flex-col gap-2">
       <div className="flex items-center justify-between gap-2">
-        <h2 className="text-base font-semibold text-zinc-900 dark:text-zinc-100">
-          Events &amp; delete audit
-        </h2>
+        <h2 className="text-base font-semibold text-zinc-900 dark:text-zinc-100">Events</h2>
         <span className="text-xs text-zinc-500 dark:text-zinc-400">
           {events.length} of {total} shown
         </span>
       </div>
+
+      {/* The per-item deep link's own "you are not looking at everything" banner (2026-08-20,
+       * docs/transfers-redesign-spec.md §2) -- a filtered view that looks like the whole log is
+       * the same class of mistake the Queue tab's Complete box already had to avoid (stage 4b's
+       * page-scoped filter, docs/decisions.md). Placed above every other control so it can never
+       * be scrolled past unnoticed. */}
+      {itemFilter && (
+        <div className="flex flex-wrap items-center gap-2 rounded-md border border-sky-300 bg-sky-50 px-3 py-2 text-sm text-sky-900 dark:border-sky-800 dark:bg-sky-950/40 dark:text-sky-200">
+          <span>
+            Showing events for <strong>{itemFilter.itemLabel ?? `item ${itemFilter.itemId}`}</strong> only.
+          </span>
+          <button
+            type="button"
+            onClick={onClearItemFilter}
+            className="ml-auto shrink-0 rounded-md border border-sky-400 px-2 py-1 text-xs font-medium text-sky-800 hover:bg-sky-100 dark:border-sky-700 dark:text-sky-200 dark:hover:bg-sky-900"
+          >
+            Show full log
+          </button>
+        </div>
+      )}
 
       <div className="flex flex-wrap items-center gap-2">
         <select className={inputClasses} value={queueId} onChange={(e) => setQueueId(e.target.value)}>
@@ -272,9 +306,8 @@ export function HistoryEventsSection({ queues }: HistoryEventsSectionProps) {
         </button>
       </div>
 
-      {/* Same shared-confirm-panel shape as HistoryJobsSection -- no category (including the
-       * delete-audit kinds highlighted above) is exempt from either the row or bulk path;
-       * see docs/decisions.md for why. */}
+      {/* Clearing is irreversible -- one confirm panel shared by the per-row "Clear" button and
+       * the toolbar's bulk clear above, distinguished only by its message and count. */}
       {pendingClear && (
         <div className="flex flex-col gap-2 rounded-md border border-red-300 bg-red-50 px-3 py-2 text-sm dark:border-red-900 dark:bg-red-950/40">
           <p className="text-red-900 dark:text-red-200">

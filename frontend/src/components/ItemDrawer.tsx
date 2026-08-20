@@ -13,6 +13,7 @@ import {
   removalGraceLabel,
 } from '../lib/format'
 import { averageSpeedBps, elapsedSeconds } from '../lib/transferTiming'
+import { EventsLinkButton } from './EventsLinkButton'
 import { StateChip } from './StateChip'
 
 const ROW_HEIGHT_PX = 40
@@ -483,13 +484,24 @@ export function ItemDrawer({
               {files.length} file{files.length === 1 ? '' : 's'}
             </p>
           </div>
-          <button
-            type="button"
-            onClick={onClose}
-            className="rounded-md border border-zinc-300 px-2.5 py-1 text-sm text-zinc-700 hover:bg-zinc-50 dark:border-zinc-700 dark:text-zinc-200 dark:hover:bg-zinc-900"
-          >
-            Close
-          </button>
+          <div className="flex shrink-0 items-center gap-3">
+            {/* The per-item Events deep link (2026-08-20, docs/transfers-redesign-spec.md §2,
+             * phase 1 stage 7) -- lives here, in the drawer's own header, rather than on the
+             * Files/Transfers row that opened it: both of those rows' layouts are already tight
+             * and browser-unverified (`FileTree.tsx`'s own "already tight... clipping" note;
+             * `TransfersPage.tsx`'s row-crowding fix), so adding a new element to either without
+             * a way to check the result is exactly the risk this avoids. The drawer is already
+             * the one shared surface both rows open on a single click (its own module comment,
+             * below), so this is always one click further from wherever this drawer was opened. */}
+            {itemId != null && <EventsLinkButton itemId={itemId} label={title} />}
+            <button
+              type="button"
+              onClick={onClose}
+              className="rounded-md border border-zinc-300 px-2.5 py-1 text-sm text-zinc-700 hover:bg-zinc-50 dark:border-zinc-700 dark:text-zinc-200 dark:hover:bg-zinc-900"
+            >
+              Close
+            </button>
+          </div>
         </div>
 
         {/* Both sides, the lifecycle chronology, and a little history -- all item-level

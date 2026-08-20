@@ -7,7 +7,11 @@ export interface NavItem {
 
 export const NAV_ITEMS: NavItem[] = [
   { path: '/transfers', label: 'Transfers' },
-  { path: '/history', label: 'History' },
+  // 2026-08-20 (docs/transfers-redesign-spec.md §2, phase 1 stage 7): History becomes Events --
+  // the audit-event log only, its `job` list dropped since the Queue tab's Complete box (stage
+  // 4b) already covers "what finished, in what order." `/history` still redirects here
+  // (`App.tsx`) so nothing that links or bookmarks the old path breaks.
+  { path: '/events', label: 'Events' },
   { path: '/dashboard', label: 'Dashboard' },
   { path: '/settings', label: 'Settings' },
   { path: '/docs', label: 'Docs' },

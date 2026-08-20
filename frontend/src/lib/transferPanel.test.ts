@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import type { FileNode, HistoryJobOut, HistoryQueueSummaryOut, JobOut, JobState } from '../api/types'
+import type { FileNode, JobOut, JobState } from '../api/types'
 import type { ChildSpeedSample } from '../hooks/useLiveModel'
 import {
   type LiveProgress,
@@ -8,28 +8,19 @@ import {
   canMoveUp,
   childDisplayName,
   completedTimeLabel,
-  decrementHistoryQueueSummary,
-  failedJobPanelContent,
   fileListCapNote,
   filterTransferJobs,
-  formatQueueGroupCounts,
-  groupHistoryJobsByQueue,
   hasArrGroup,
-  historyQueueGroupCounts,
   isDismissable,
   isFastLane,
-  isQueueCollapsed,
   mergeFileListChildren,
   processingGroupFields,
-  readHistoryCollapsedQueues,
   showsFileList,
   sortTransferRows,
   transferFilterSummary,
   transferGroupFields,
   transferLineValue,
   transferredSummary,
-  withQueueCollapsed,
-  writeHistoryCollapsedQueues,
 } from './transferPanel'
 
 // 2026-08-15 (prompts/2026-08-15-transfers-single-line-rows-with-detail.md): "one line per
@@ -529,267 +520,6 @@ describe('transferFilterSummary', () => {
 
   it('uses the singular "transfer" for a total of exactly one', () => {
     expect(transferFilterSummary(1, 1, 'x')).toBe('Showing 1 of 1 transfer')
-  })
-})
-
-describe('formatQueueGroupCounts', () => {
-  it('lists every non-zero bucket in a fixed order', () => {
-    const text = formatQueueGroupCounts({ active: 1, queued: 2, succeeded: 3, failed: 0, stopped: 1 })
-    expect(text).toBe('1 active, 2 queued, 3 succeeded, 1 stopped')
-  })
-
-  it('omits every zero-count bucket -- "to keep it quiet"', () => {
-    const text = formatQueueGroupCounts({ active: 0, queued: 0, succeeded: 5, failed: 0, stopped: 0 })
-    expect(text).toBe('5 succeeded')
-  })
-
-  it('renders an empty string when every bucket is zero', () => {
-    expect(formatQueueGroupCounts({ active: 0, queued: 0, succeeded: 0, failed: 0, stopped: 0 })).toBe('')
-  })
-})
-
-// `isQueueCollapsed`/`withQueueCollapsed` are shape-agnostic pure map logic -- the only caller
-// left after 2026-08-19 (docs/transfers-redesign-spec.md §3.1, phase 1 stage 4a, Transfers'
-// own per-queue collapse removed) is the History jobs section, but these two functions don't
-// know that; covered generically here, then the History-specific storage-key round-trip below.
-describe('isQueueCollapsed / withQueueCollapsed', () => {
-  afterEach(() => {
-    localStorage.clear()
-  })
-
-  it('reads a queue with no stored preference as expanded (not collapsed) by default', () => {
-    expect(isQueueCollapsed({}, 42)).toBe(false)
-  })
-
-  it('withQueueCollapsed(..., true) marks a queue collapsed; (..., false) clears it back out', () => {
-    const collapsed = withQueueCollapsed({}, 1, true)
-    expect(isQueueCollapsed(collapsed, 1)).toBe(true)
-
-    const expanded = withQueueCollapsed(collapsed, 1, false)
-    expect(isQueueCollapsed(expanded, 1)).toBe(false)
-    // Expanded is the default -- clearing back to it drops the entry rather than storing `false`.
-    expect(expanded).toEqual({})
-  })
-})
-
-// 2026-08-16 (prompts/2026-08-16-history-jobs-group-collapse.md): the History jobs section's own
-// per-queue collapse, under its own storage key -- the read/write round-trip through the
-// History-specific helpers themselves.
-describe('History jobs section: per-queue collapse persistence', () => {
-  afterEach(() => {
-    localStorage.clear()
-  })
-
-  it('round-trips through the History-specific localStorage helpers', () => {
-    expect(readHistoryCollapsedQueues()).toEqual({})
-    const map = withQueueCollapsed({}, 9, true)
-    writeHistoryCollapsedQueues(map)
-    expect(readHistoryCollapsedQueues()).toEqual({ '9': true })
-    expect(isQueueCollapsed(readHistoryCollapsedQueues(), 9)).toBe(true)
-  })
-
-  it('a queue that disappears from the payload keeps its stored preference for when it returns', () => {
-    // Nothing about `withQueueCollapsed`/`isQueueCollapsed` reads the current job list -- the
-    // map is only ever consulted by queue id, so a queue with zero visible jobs right now still
-    // reads its previously-stored preference exactly like one that's still present.
-    writeHistoryCollapsedQueues(withQueueCollapsed({}, 3, true))
-    const storedLater = readHistoryCollapsedQueues()
-    expect(isQueueCollapsed(storedLater, 3)).toBe(true)
-  })
-})
-
-// 2026-08-16: `historyQueueGroupCounts` reshapes the server's `HistoryQueueSummaryOut` onto
-// `QueueGroupCounts` so `formatQueueGroupCounts` (already tested above) can render it -- History
-// reuses that exact formatter rather than a parallel one.
-describe('historyQueueGroupCounts -- reshaping the server summary for formatQueueGroupCounts', () => {
-  function summary(overrides: Partial<HistoryQueueSummaryOut> = {}): HistoryQueueSummaryOut {
-    return {
-      queue_id: 1,
-      queue_name: 'tv',
-      succeeded: 0,
-      failed: 0,
-      cancelled: 0,
-      total_bytes_done: 0,
-      ...overrides,
-    }
-  }
-
-  it('maps succeeded/failed straight across and cancelled onto the stopped bucket', () => {
-    const counts = historyQueueGroupCounts(summary({ succeeded: 3, failed: 1, cancelled: 2 }))
-    expect(counts).toEqual({ active: 0, queued: 0, succeeded: 3, failed: 1, stopped: 2 })
-  })
-
-  it('always reports zero active/queued -- History has no such bucket', () => {
-    const counts = historyQueueGroupCounts(summary({ succeeded: 10 }))
-    expect(counts.active).toBe(0)
-    expect(counts.queued).toBe(0)
-  })
-
-  it('composes with formatQueueGroupCounts to omit zero buckets', () => {
-    const text = formatQueueGroupCounts(historyQueueGroupCounts(summary({ succeeded: 5 })))
-    expect(text).toBe('5 succeeded')
-  })
-})
-
-// 2026-08-16: `groupHistoryJobsByQueue`/`decrementHistoryQueueSummary` -- the pure logic behind
-// `HistoryJobsSection.tsx`'s flattened, virtualized, collapsible queue groups. Pulled out of the
-// component into this module specifically so it's reachable without mounting anything (the
-// project's whole component-testing story, README.md's Known gaps).
-
-function historyJob(state: HistoryJobOut['state'], overrides: Partial<HistoryJobOut> = {}): HistoryJobOut {
-  return {
-    id: 1,
-    item_id: 1,
-    queue_id: 1,
-    queue_name: 'tv',
-    rel_path: 'Show/episode.mkv',
-    is_dir: false,
-    kind: 'pget',
-    state,
-    attempt: 1,
-    queued_at: '2026-08-16T00:00:00.000000Z',
-    started_at: '2026-08-16T00:00:01.000000Z',
-    finished_at: '2026-08-16T00:01:00.000000Z',
-    bytes_total: 1000,
-    bytes_done: 1000,
-    exit_code: 0,
-    error_class: null,
-    has_output_tail: false,
-    dismissed_at: null,
-    arr_status: null,
-    arr_status_at: null,
-    arr_instance_name: null,
-    arr_instance_kind: null,
-    ...overrides,
-  }
-}
-
-describe('groupHistoryJobsByQueue -- flattening + collapse filtering for the virtualizer', () => {
-  it('inserts one header row per queue, preserving input order within each queue', () => {
-    const jobs = [
-      historyJob('succeeded', { id: 1, queue_id: 1, queue_name: 'tv' }),
-      historyJob('failed', { id: 2, queue_id: 1, queue_name: 'tv' }),
-      historyJob('succeeded', { id: 3, queue_id: 2, queue_name: 'movies' }),
-    ]
-    const rows = groupHistoryJobsByQueue(jobs, {})
-    expect(rows).toEqual([
-      { kind: 'header', queueId: 1, queueName: 'tv' },
-      { kind: 'job', job: jobs[0] },
-      { kind: 'job', job: jobs[1] },
-      { kind: 'header', queueId: 2, queueName: 'movies' },
-      { kind: 'job', job: jobs[2] },
-    ])
-  })
-
-  it('emits a new header whenever the queue changes, even if the same queue reappears later', () => {
-    // `jobs` is assumed pre-sorted by the caller (the server's own newest-first order) -- this
-    // function only groups *consecutive* runs, it never re-sorts, so a queue that appears twice
-    // non-consecutively gets a second, separate header row rather than being merged with its
-    // earlier appearance. Documents the actual (simple, linear-scan) behaviour rather than a
-    // stronger "true grouping" guarantee this function doesn't provide.
-    const jobs = [
-      historyJob('succeeded', { id: 1, queue_id: 1, queue_name: 'tv' }),
-      historyJob('succeeded', { id: 2, queue_id: 2, queue_name: 'movies' }),
-      historyJob('succeeded', { id: 3, queue_id: 1, queue_name: 'tv' }),
-    ]
-    const rows = groupHistoryJobsByQueue(jobs, {})
-    expect(rows.filter((r) => r.kind === 'header')).toHaveLength(3)
-  })
-
-  it('a collapsed queue keeps its header row but drops every job row', () => {
-    const jobs = [
-      historyJob('succeeded', { id: 1, queue_id: 1, queue_name: 'tv' }),
-      historyJob('failed', { id: 2, queue_id: 1, queue_name: 'tv' }),
-      historyJob('succeeded', { id: 3, queue_id: 2, queue_name: 'movies' }),
-    ]
-    const collapsed = withQueueCollapsed({}, 1, true)
-    const rows = groupHistoryJobsByQueue(jobs, collapsed)
-    expect(rows).toEqual([
-      { kind: 'header', queueId: 1, queueName: 'tv' },
-      { kind: 'header', queueId: 2, queueName: 'movies' },
-      { kind: 'job', job: jobs[2] },
-    ])
-  })
-
-  it('defaults every queue to expanded -- an empty collapse map drops nothing', () => {
-    const jobs = [historyJob('succeeded', { id: 1 })]
-    const rows = groupHistoryJobsByQueue(jobs, {})
-    expect(rows.filter((r) => r.kind === 'job')).toHaveLength(1)
-  })
-
-  it('an empty job list produces an empty row array', () => {
-    expect(groupHistoryJobsByQueue([], {})).toEqual([])
-  })
-})
-
-describe('decrementHistoryQueueSummary -- local update after a single-row clear', () => {
-  function summary(overrides: Partial<HistoryQueueSummaryOut> = {}): HistoryQueueSummaryOut {
-    return {
-      queue_id: 1,
-      queue_name: 'tv',
-      succeeded: 2,
-      failed: 1,
-      cancelled: 1,
-      total_bytes_done: 4000,
-      ...overrides,
-    }
-  }
-
-  it('decrements the bucket matching the cleared job\'s state and its total_bytes_done', () => {
-    const cleared = historyJob('failed', { queue_id: 1, bytes_done: 1000 })
-    const result = decrementHistoryQueueSummary([summary()], cleared)
-    expect(result).toEqual([summary({ failed: 0, total_bytes_done: 3000 })])
-  })
-
-  it('decrements cancelled and succeeded buckets the same way', () => {
-    const clearedCancelled = historyJob('cancelled', { queue_id: 1, bytes_done: 500 })
-    expect(decrementHistoryQueueSummary([summary()], clearedCancelled)).toEqual([
-      summary({ cancelled: 0, total_bytes_done: 3500 }),
-    ])
-
-    const clearedSucceeded = historyJob('succeeded', { queue_id: 1, bytes_done: 500 })
-    expect(decrementHistoryQueueSummary([summary()], clearedSucceeded)).toEqual([
-      summary({ succeeded: 1, total_bytes_done: 3500 }),
-    ])
-  })
-
-  it('leaves every other queue\'s summary untouched', () => {
-    const other = summary({ queue_id: 2, queue_name: 'movies' })
-    const cleared = historyJob('failed', { queue_id: 1, bytes_done: 1000 })
-    const result = decrementHistoryQueueSummary([summary(), other], cleared)
-    expect(result[1]).toEqual(other)
-  })
-
-  it('clamps at zero rather than going negative when the summary is already stale', () => {
-    const cleared = historyJob('failed', { queue_id: 1, bytes_done: 999999 })
-    const result = decrementHistoryQueueSummary([summary({ failed: 0, total_bytes_done: 100 })], cleared)
-    expect(result[0].failed).toBe(0)
-    expect(result[0].total_bytes_done).toBe(0)
-  })
-})
-
-// 2026-08-17 (prompts/2026-08-17-interrupted-job-popout-explains-itself.md): the
-// fetch-vs-static-empty-state decision behind `HistoryJobsSection.tsx`'s failed-row expand
-// panel, pulled out as a pure function so it's reachable without mounting anything (the same
-// "no component rendering tested here" discipline every other describe block in this file
-// follows).
-describe('failedJobPanelContent -- fetch vs. static empty state for a failed row\'s panel', () => {
-  it('says "fetch" when the row has a captured output tail', () => {
-    const job = historyJob('failed', { error_class: 'AUTH_FAILED', has_output_tail: true })
-    expect(failedJobPanelContent(job)).toEqual({ kind: 'fetch' })
-  })
-
-  it('says "static" with the row\'s own error_class when there is no output tail to fetch', () => {
-    // The case a container-restart INTERRUPTED job hit before this task: `has_output_tail`
-    // false meant `handleToggle` never fetched, `output` stayed `null` forever, and the old
-    // render logic (gated on `output` being non-null) never showed anything at all.
-    const job = historyJob('failed', { error_class: 'INTERRUPTED', has_output_tail: false })
-    expect(failedJobPanelContent(job)).toEqual({ kind: 'static', errorClass: 'INTERRUPTED' })
-  })
-
-  it('carries a null error_class through to the static case rather than guessing', () => {
-    const job = historyJob('failed', { error_class: null, has_output_tail: false })
-    expect(failedJobPanelContent(job)).toEqual({ kind: 'static', errorClass: null })
   })
 })
 

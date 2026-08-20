@@ -21,8 +21,11 @@ describe('tabsForPath', () => {
   it('returns null for a section with no tabs', () => {
     // `/files` is the old standalone route -- App.tsx now redirects it to `/transfers/files`
     // rather than rendering anything at it directly, so it never gets a tab strip of its own.
+    // `/history` is the same shape, redirecting to `/events` (2026-08-20, phase 1 stage 7); like
+    // `/events` itself, it has never had a tab strip.
     expect(tabsForPath('/files')).toBeNull()
     expect(tabsForPath('/history')).toBeNull()
+    expect(tabsForPath('/events')).toBeNull()
     expect(tabsForPath('/')).toBeNull()
   })
 
@@ -44,6 +47,11 @@ describe('nav items', () => {
   it('has one Transfers entry, not a separate Files entry -- Files is a tab now', () => {
     expect(NAV_ITEMS.map((i) => i.path)).toContain('/transfers')
     expect(NAV_ITEMS.map((i) => i.path)).not.toContain('/files')
+  })
+
+  it('has an Events entry, not a History entry -- History became Events (phase 1 stage 7)', () => {
+    expect(NAV_ITEMS.map((i) => i.path)).toContain('/events')
+    expect(NAV_ITEMS.map((i) => i.path)).not.toContain('/history')
   })
 
   it('gives every tab a path inside its own section', () => {

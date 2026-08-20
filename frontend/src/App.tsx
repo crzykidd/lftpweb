@@ -2,7 +2,7 @@ import { Navigate, Route, Routes } from 'react-router-dom'
 import { Layout } from './components/Layout'
 import { FilesPage } from './pages/FilesPage'
 import { TransfersPage } from './pages/TransfersPage'
-import { HistoryPage } from './pages/HistoryPage'
+import { EventsPage } from './pages/EventsPage'
 import { DashboardPage } from './pages/DashboardPage'
 import { LoginPage } from './pages/LoginPage'
 import { ConnectionTab } from './pages/settings/ConnectionTab'
@@ -54,7 +54,14 @@ function App() {
           <Route path="queue" element={<TransfersPage />} />
           <Route path="files" element={<FilesPage />} />
         </Route>
-        <Route path="history" element={<HistoryPage />} />
+        <Route path="events" element={<EventsPage />} />
+        {/* `/history` was the standalone History route before this task (2026-08-20,
+         * docs/transfers-redesign-spec.md §2, phase 1 stage 7): the page it named is now
+         * Events, its jobs list dropped since the Queue tab's Complete box already covers
+         * "what finished, in what order" (stage 4b). Kept as a redirect, not removed, so nothing
+         * that already links or bookmarks it 404s -- the exact `/files` -> `/transfers/files`
+         * pattern stage 6 established (see the comment above `Route path="files"` above). */}
+        <Route path="history" element={<Navigate to="/events" replace />} />
         <Route path="dashboard" element={<DashboardPage />} />
         <Route path="settings">
           <Route index element={<Navigate to="/settings/connection" replace />} />
