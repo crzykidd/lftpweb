@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { clampPage, isPageSize, pageCount, pageWindow, paginateClientSide } from './pagination'
+import { clampPage, isPageSize, pageCount, pageReadout, pageWindow, paginateClientSide } from './pagination'
 
 describe('pageCount', () => {
   it('is 1 for an empty result set -- "page 1 of 1", never "page 1 of 0"', () => {
@@ -147,5 +147,24 @@ describe('isPageSize', () => {
     expect(isPageSize(undefined)).toBe(false)
     expect(isPageSize({})).toBe(false)
     expect(isPageSize([20])).toBe(false)
+  })
+})
+
+describe('pageReadout -- the "Page X of Y (Z total)" readout shared by both Queue-tab boxes', () => {
+  it('renders the page/count/total for a real total', () => {
+    expect(pageReadout(1, 1, 30)).toBe('Page 1 of 1 (30 total)')
+    expect(pageReadout(2, 4, 61)).toBe('Page 2 of 4 (61 total)')
+  })
+
+  it('is null for a zero total -- an empty box has nothing to page through', () => {
+    expect(pageReadout(1, 1, 0)).toBeNull()
+  })
+
+  it('is null for a negative total -- defensive, same floor every other total here uses', () => {
+    expect(pageReadout(1, 1, -3)).toBeNull()
+  })
+
+  it('renders even when count is 1 -- independent of `Pager`\'s own count<=1 guard, which lives in TransfersPage.tsx, not here', () => {
+    expect(pageReadout(1, 1, 3)).toBe('Page 1 of 1 (3 total)')
   })
 })

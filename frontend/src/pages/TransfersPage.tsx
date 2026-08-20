@@ -14,6 +14,7 @@ import {
 import type { MoveDirection } from '../api/client'
 import type { FileNode, ItemEventOut, JobOut } from '../api/types'
 import { ArrIcon, ArrRowChip } from '../components/LifecycleIcons'
+import { DismissMenu } from '../components/DismissMenu'
 import { ItemDrawer } from '../components/ItemDrawer'
 import { StartNowMenu } from '../components/StartNowMenu'
 import { StateChip } from '../components/StateChip'
@@ -29,6 +30,7 @@ import {
   PAGE_SIZE_OPTIONS,
   isPageSize,
   pageCount,
+  pageReadout,
   pageWindow,
   paginateClientSide,
 } from '../lib/pagination'
@@ -44,6 +46,7 @@ import {
   canMoveUp,
   childDisplayName,
   completedTimeLabel,
+  dismissMenuOptions,
   fileListCapNote,
   filterTransferJobs,
   hasArrGroup,
@@ -101,23 +104,6 @@ function itemName(relPath: string): string {
 
 function errorMessage(reason: unknown): string {
   return reason instanceof Error ? reason.message : String(reason)
-}
-
-/** "Clear all failed" (2026-08-13, prompts/done/2026-08-13-dismiss-terminal-jobs.md) --
- * `Promise.allSettled`, not `Promise.all`, same reasoning `FileTree.tsx`'s bulk actions
- * already use: one job's dismiss failing (e.g. it started running between page load and the
- * click) must not hide whether the other N-1 succeeded.
- */
-interface DismissFailure {
-  rel_path: string
-  name: string
-  error: string
-}
-
-interface DismissOutcome {
-  total: number
-  succeeded: number
-  failures: DismissFailure[]
 }
 
 interface RowProps {
@@ -791,11 +777,15 @@ export function TransfersPage() {
   // row's menu reads disabled in the meantime, same as "not configured" (`StartNowMenu`'s own
   // fallback).
   const [maxBandwidthBps, setMaxBandwidthBps] = useState<number | undefined>(undefined)
-  const [clearingAll, setClearingAll] = useState(false)
-  const [dismissOutcome, setDismissOutcome] = useState<DismissOutcome | null>(null)
-  const [dismissingAll, setDismissingAll] = useState(false)
-  const [dismissAllError, setDismissAllError] = useState<string | null>(null)
-  const [dismissAllCount, setDismissAllCount] = useState<number | null>(null)
+  // The Complete box's "Dismiss" menu (2026-08-20, follow-up to phase 1 stage 4b -- see
+  // `handleDismissOutcome`'s own docstring below) -- replaces both the old page-top "Dismiss
+  // all" button (`dismissingAll`/`dismissAllError`/`dismissAllCount`, same three-state shape
+  // reused here under new names) and "Clear all failed" (folded in: its job is now exactly
+  // "Dismiss > Failed", server-side and atomic rather than a client-side `Promise.allSettled`
+  // fan-out over each row's own `/dismiss` call -- see that handler's own removal note).
+  const [dismissingOutcome, setDismissingOutcome] = useState(false)
+  const [dismissOutcomeError, setDismissOutcomeError] = useState<string | null>(null)
+  const [dismissOutcomeCount, setDismissOutcomeCount] = useState<number | null>(null)
   // The name filter (2026-08-19, prompts/2026-08-19-transfers-name-filter.md) -- plain
   // `useState`, deliberately not persisted (no localStorage, no URL param): it clears on reload
   // and on navigating away, matching the Files page's own text filter and the Logs filter. A
@@ -813,12 +803,12 @@ export function TransfersPage() {
     const id = setTimeout(() => setDebouncedSearch(search), 250)
     return () => clearTimeout(id)
   }, [search])
-  // "Dismiss list" -- its own busy/error/outcome trio, same shape "Dismiss all"'s
-  // dismissingAll/dismissAllError/dismissAllCount above already use (the page's existing
-  // notification convention), kept separate rather than reusing those three: "Dismiss list" is
-  // a distinct control the user can click independently of (and possibly around the same time
-  // as) "Dismiss all", which stays completely unchanged by this task. It also supersedes the
-  // per-queue "Dismiss Queue" control this task removes (2026-08-19, docs/transfers-redesign-
+  // "Dismiss list" -- its own busy/error/outcome trio, same shape the Dismiss menu's own
+  // `dismissingOutcome`/`dismissOutcomeError`/`dismissOutcomeCount` above use (the page's
+  // existing notification convention), kept separate rather than reusing those three: "Dismiss
+  // list" is a distinct control the user can click independently of (and possibly around the
+  // same time as) the Dismiss menu, which this task's own instruction keeps unchanged. It also
+  // supersedes the per-queue "Dismiss Queue" control removed 2026-08-19 (docs/transfers-redesign-
   // spec.md §3.1, phase 1 stage 4a) -- filter to a queue, then "Dismiss list" does the same job.
   const [dismissingList, setDismissingList] = useState(false)
   const [dismissListError, setDismissListError] = useState<string | null>(null)
@@ -1002,38 +992,58 @@ export function TransfersPage() {
     return withBusy(job.id, () => startJobNow(job.id, ratePercent))
   }
 
-  const failedJobs = useMemo(() => jobs.filter((j) => j.state === 'failed'), [jobs])
-  const dismissableCount = useMemo(() => jobs.filter((j) => isDismissable(j.state)).length, [jobs])
-
-  /** "Dismiss all" at the top of the page (2026-08-15, user addition to
-   * prompts/2026-08-15-transfers-single-line-rows-with-detail.md) -- every currently-
-   * dismissable (terminal, not-yet-dismissed) job, not just `failed` (see `handleClearAllFailed`
-   * above for why that one stays scoped to `failed`). A single server-side bulk call
-   * (`core/queue.py.dismiss_all_terminal`), not a client-side `Promise.allSettled` fan-out --
-   * the task's own stated preference. Since it's one request, "partial failure" can only mean
-   * the request itself failed (network/HTTP) -- reported honestly via `dismissAllError`, same
-   * as any other failed mutation on this page, rather than a per-row breakdown there is no
-   * per-row result to report.
+  /** The Complete box's "Dismiss" menu (2026-08-20, follow-up to phase 1 stage 4b from the
+   * user's browser review, `prompts/2026-08-20-transfers-dismiss-menu-and-counts.md`) --
+   * replaces the old page-top "Dismiss all" button (which only ever offered every dismissable
+   * job, unfiltered) with an outcome picker (`lib/transferPanel.ts.dismissMenuOptions`: All,
+   * Downloaded, Failed, Stopped) that lives where the rows it acts on do. Still one server-side
+   * bulk call (`core/queue.py.dismiss_all_terminal`), not a client-side `Promise.allSettled`
+   * fan-out -- the same preference "Dismiss all" was already built on, now also true of the
+   * control this replaces below.
+   *
+   * **Folds in "Clear all failed"** -- that control's whole job ("dismiss every currently-failed
+   * job", `Promise.allSettled` over each row's own `/dismiss` call) is now exactly what choosing
+   * "Failed" here does, server-side and atomic in one request instead of N. `outcome="failed"`
+   * plus whatever `debouncedSearch` currently is reproduces its old scope (and, once a filter is
+   * active, narrows it further -- the decided composition, see `docs/decisions.md`) with no
+   * loss of correctness: a single bulk `UPDATE` can only fail as a whole (network/HTTP), so
+   * there is no per-row partial-failure case left to report the way `Promise.allSettled` had to
+   * account for.
+   *
+   * **Composes with the current name filter, decided 2026-08-20** (`docs/decisions.md`): sends
+   * `debouncedSearch.trim()` alongside whichever `outcome` was chosen (`undefined` for "All"),
+   * so this control always acts on exactly the terminal rows the Complete box is currently
+   * showing, narrowed further by outcome if one was picked -- never a separate "ignore whatever
+   * filter is active" scope. This is *not* a re-scoping of "Dismiss list" below, which keeps its
+   * own independent, unchanged meaning (name-filter-only, no outcome) per this task's own
+   * instruction.
    */
-  const handleDismissAll = async () => {
-    setDismissingAll(true)
-    setDismissAllError(null)
-    setDismissAllCount(null)
+  const handleDismissOutcome = async (outcome: JobOut['state'] | null) => {
+    setDismissingOutcome(true)
+    setDismissOutcomeError(null)
+    setDismissOutcomeCount(null)
     try {
-      const res = await dismissAllJobs()
-      setDismissAllCount(res.dismissed)
+      const trimmedFilter = debouncedSearch.trim()
+      const res = await dismissAllJobs(
+        undefined,
+        undefined,
+        trimmedFilter !== '' ? trimmedFilter : undefined,
+        outcome ?? undefined,
+      )
+      setDismissOutcomeCount(res.dismissed)
       refreshAll()
     } catch (err) {
-      setDismissAllError(errorMessage(err))
+      setDismissOutcomeError(errorMessage(err))
     } finally {
-      setDismissingAll(false)
+      setDismissingOutcome(false)
     }
   }
 
   /** "Dismiss list" (2026-08-19, prompts/2026-08-19-transfers-name-filter.md) -- the name
-   * filter's own dedicated control. A new, separate control -- not a re-scoping of "Clear all
-   * failed"/"Dismiss all" above, which keep their existing whole-list meaning untouched by this
-   * task. Supersedes the per-queue "Dismiss Queue" control (v0.2.3, `278e10f`), removed
+   * filter's own dedicated control, unchanged by the 2026-08-20 Dismiss-menu follow-up above per
+   * that task's own explicit instruction ("'Dismiss list' keeps its current meaning"): name
+   * filter only, no outcome, independent of whatever outcome the Dismiss menu was last used
+   * with. Supersedes the per-queue "Dismiss Queue" control (v0.2.3, `278e10f`), removed
    * 2026-08-19 alongside grouping (docs/transfers-redesign-spec.md §3.1) -- filter to a queue,
    * then this does the same job. No confirmation dialog: dismiss only ever sets `dismissed_at`
    * on an already-terminal job row, never touches `item.state`, never deletes bytes, and never
@@ -1069,36 +1079,6 @@ export function TransfersPage() {
     }
   }
 
-  /** "Clear all failed" (2026-08-13) -- the bulk counterpart to the per-row Dismiss button,
-   * for the "I should have a clear or delete button" half of the user's report: one-at-a-time
-   * dismissal of a stack of dead rows is its own annoyance. Scoped to `failed` only, not
-   * `cancelled` too -- a stopped job is the result of a deliberate Stop click, not the kind of
-   * unattended pile-up `failed` rows (auto-retries exhausted, or a permanent class like
-   * REMOTE_GONE) can become; a cancelled row is still one Dismiss click away individually.
-   * `Promise.allSettled` (not `Promise.all`) so one job racing to `running` between page load
-   * and the click doesn't hide whether the rest actually cleared.
-   */
-  const handleClearAllFailed = async () => {
-    const targets = failedJobs
-    if (targets.length === 0) return
-    setClearingAll(true)
-    setDismissOutcome(null)
-    try {
-      const results = await Promise.allSettled(targets.map((job) => dismissJob(job.id)))
-      const failures: DismissFailure[] = []
-      let succeeded = 0
-      results.forEach((result, i) => {
-        const job = targets[i]
-        if (result.status === 'fulfilled') succeeded += 1
-        else failures.push({ rel_path: job.rel_path, name: itemName(job.rel_path), error: errorMessage(result.reason) })
-      })
-      setDismissOutcome({ total: targets.length, succeeded, failures })
-      refreshAll()
-    } finally {
-      setClearingAll(false)
-    }
-  }
-
   // "Dismiss list"'s disabled/tooltip logic (2026-08-19) -- disabled while the (debounced)
   // filter is empty (nothing to scope it to), and disabled again once it's non-empty but the
   // Complete box's own query matched zero rows -- a live tooltip says which of the two it is, so
@@ -1111,6 +1091,19 @@ export function TransfersPage() {
     : completeTotal === 0
       ? "No dismissable rows match this filter -- everything matching is still queued or downloading"
       : `Dismiss the ${completeTotal} matching row${completeTotal === 1 ? '' : 's'} that ${completeTotal === 1 ? 'is' : 'are'} finished -- records stay on the History page`
+
+  // The Complete box's own "Dismiss" menu, disabled/labelled off `completeTotal` -- the same
+  // count "All" would act on (it already reflects whatever name filter is active, composing the
+  // same way `handleDismissOutcome` composes its own request). Titled only while disabled, same
+  // "explain why, not just that" convention `dismissListTitle` above already follows.
+  const dismissMenuDisabled = completeTotal === 0
+  const dismissMenuTitle =
+    completeTotal === 0
+      ? completeFilterActive
+        ? 'No dismissable rows match this filter'
+        : 'Nothing dismissable yet'
+      : 'Dismiss by outcome -- All, or narrow to one'
+  const dismissMenuLabel = completeTotal > 0 ? `Dismiss (${completeTotal})` : 'Dismiss'
 
   const drawerNodes = drawerJob ? (nodesByQueue.get(drawerJob.queue_id) ?? []) : []
 
@@ -1142,9 +1135,10 @@ export function TransfersPage() {
        * in the Active/pending box below (client-side, bounded), after a short debounce in the
        * Complete box (server-side, paginated -- `useCompleteJobs`). "Dismiss list" is a separate
        * control scoped to exactly what the filter currently matches, server-side, across every
-       * page (2026-08-19, phase 1 stage 4b -- `handleDismissList`'s own docstring) -- "Clear all
-       * failed"/"Dismiss all" below keep their existing whole-list meaning, untouched by this
-       * task, including while a filter is active. */}
+       * page (2026-08-19, phase 1 stage 4b -- `handleDismissList`'s own docstring) -- unchanged
+       * by the 2026-08-20 Dismiss-menu follow-up (that control moved into the Complete box's own
+       * header below, and folded "Clear all failed" into itself; see `handleDismissOutcome`'s
+       * docstring). */}
       <div className="flex flex-wrap items-center gap-2">
         <input
           type="text"
@@ -1195,81 +1189,6 @@ export function TransfersPage() {
         </div>
       )}
 
-      {/* "Dismiss all" (2026-08-15, user addition) -- see `handleDismissAll`'s docstring.
-       * Hidden entirely once there is nothing dismissable, same "don't show a control with
-       * nothing to do" rule "Clear all failed" below already follows. */}
-      {dismissableCount > 0 && (
-        <div className="flex items-center justify-between gap-2">
-          <span className="text-xs text-zinc-500 dark:text-zinc-400">
-            {dismissableCount} dismissable job{dismissableCount === 1 ? '' : 's'}
-          </span>
-          <button
-            type="button"
-            disabled={dismissingAll}
-            onClick={handleDismissAll}
-            title="Dismiss every terminal (not active) job from this page -- records stay on the History page"
-            className="rounded-md border border-zinc-300 px-2.5 py-1.5 text-xs font-medium text-zinc-700 hover:bg-zinc-50 disabled:opacity-50 dark:border-zinc-700 dark:text-zinc-200 dark:hover:bg-zinc-900"
-          >
-            {dismissingAll ? 'Dismissing…' : 'Dismiss all'}
-          </button>
-        </div>
-      )}
-
-      {dismissAllCount != null && (
-        <div className="flex items-center justify-between gap-3 rounded-md border border-emerald-300 bg-emerald-50 px-3 py-2 text-sm text-emerald-900 dark:border-emerald-900 dark:bg-emerald-950/40 dark:text-emerald-200">
-          <span className="font-medium">
-            Dismissed {dismissAllCount} job{dismissAllCount === 1 ? '' : 's'}
-          </span>
-          <button
-            type="button"
-            onClick={() => setDismissAllCount(null)}
-            className="shrink-0 text-xs underline decoration-dotted"
-          >
-            Dismiss
-          </button>
-        </div>
-      )}
-
-      {dismissAllError && (
-        <div className="flex items-center justify-between gap-3 rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-900 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-200">
-          <span>Couldn't dismiss all: {dismissAllError}</span>
-          <button
-            type="button"
-            onClick={() => setDismissAllError(null)}
-            className="shrink-0 text-xs underline decoration-dotted"
-          >
-            Dismiss
-          </button>
-        </div>
-      )}
-
-      {/* "Nothing queued or downloading" now reads off `activeJobs` (2026-08-19, phase 1 stage
-       * 4b), not `jobs` -- `jobs` still carries each item's most recent terminal job too
-       * (unchanged, docs/decisions.md), which would otherwise suppress this message the moment
-       * anything had ever finished, even with nothing currently active. */}
-      {activeJobs.length === 0 && (
-        <div className="flex h-40 items-center justify-center rounded-lg border border-dashed border-zinc-300 text-zinc-400 dark:border-zinc-700 dark:text-zinc-600">
-          Nothing queued or downloading — queue an item from Files.
-        </div>
-      )}
-
-      {/* The filter's own empty state for the Active/pending box (2026-08-19) -- distinct from
-       * the "nothing queued or downloading" state above: there *are* active transfers, none of
-       * them just happen to match the filter text. The Complete box's own empty/no-match states
-       * render separately, inside that box below. */}
-      {activeJobs.length > 0 && filterActive && filteredActiveJobs.length === 0 && (
-        <div className="flex h-40 flex-col items-center justify-center gap-2 rounded-lg border border-dashed border-zinc-300 text-zinc-400 dark:border-zinc-700 dark:text-zinc-600">
-          <span>No active transfers match "{search.trim()}".</span>
-          <button
-            type="button"
-            onClick={() => setSearch('')}
-            className="text-xs text-zinc-500 underline decoration-dotted hover:text-zinc-700 dark:text-zinc-400 dark:hover:text-zinc-200"
-          >
-            Clear filter
-          </button>
-        </div>
-      )}
-
       {/* Makes the row order legible as an order (2026-08-13, item 4) -- "what is the proper
        * way to see the priority of the download queue" was the ask; the ordering already
        * existed (`rank DESC, queued_at ASC`) but nothing said so. Only shown once there's an
@@ -1283,58 +1202,6 @@ export function TransfersPage() {
           Queued jobs run in the order shown, top to bottom — use each row's{' '}
           <strong>▲ / ▼ / ▲▲</strong> controls to reorder.
         </p>
-      )}
-
-      {/* "Clear all failed" (2026-08-13) -- the bulk counterpart to each row's own Dismiss
-       * button; see `handleClearAllFailed`'s docstring for why this is scoped to `failed`
-       * only. Only shown once there's something to clear. */}
-      {failedJobs.length > 0 && (
-        <div className="flex items-center justify-between gap-2">
-          <span className="text-xs text-zinc-500 dark:text-zinc-400">
-            {failedJobs.length} failed job{failedJobs.length === 1 ? '' : 's'}
-          </span>
-          <button
-            type="button"
-            disabled={clearingAll}
-            onClick={handleClearAllFailed}
-            className="rounded-md border border-zinc-300 px-2.5 py-1.5 text-xs font-medium text-zinc-700 hover:bg-zinc-50 disabled:opacity-50 dark:border-zinc-700 dark:text-zinc-200 dark:hover:bg-zinc-900"
-          >
-            {clearingAll ? 'Clearing…' : 'Clear all failed'}
-          </button>
-        </div>
-      )}
-
-      {dismissOutcome && (
-        <div
-          className={`rounded-md border px-3 py-2 text-sm ${
-            dismissOutcome.failures.length === 0
-              ? 'border-emerald-300 bg-emerald-50 text-emerald-900 dark:border-emerald-900 dark:bg-emerald-950/40 dark:text-emerald-200'
-              : 'border-amber-300 bg-amber-50 text-amber-900 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-200'
-          }`}
-        >
-          <div className="flex items-center justify-between gap-3">
-            <span className="font-medium">
-              Cleared {dismissOutcome.succeeded} of {dismissOutcome.total}
-              {dismissOutcome.failures.length > 0 && `, ${dismissOutcome.failures.length} failed`}
-            </span>
-            <button
-              type="button"
-              onClick={() => setDismissOutcome(null)}
-              className="shrink-0 text-xs underline decoration-dotted"
-            >
-              Dismiss
-            </button>
-          </div>
-          {dismissOutcome.failures.length > 0 && (
-            <ul className="mt-1.5 list-disc space-y-0.5 pl-5 text-xs">
-              {dismissOutcome.failures.map((f) => (
-                <li key={f.rel_path}>
-                  <span className="font-mono">{f.name}</span> — {f.error}
-                </li>
-              ))}
-            </ul>
-          )}
-        </div>
       )}
 
       {/* Two paginated boxes, no per-queue grouping (2026-08-19, docs/transfers-redesign-
@@ -1355,12 +1222,48 @@ export function TransfersPage() {
        * finishes is accepted and explicitly not a problem to solve (the spec's own words, same
        * as SAB). `Row` itself needed no changes for this box: a terminal job's id is never a key
        * in `queuePositions`, so its chevrons/Start-now/Stop simply don't render, the same
-       * `job.state === 'queued'`/`'running'` guards `Row` already had. */}
-      {activePageJobs.length > 0 && (
-        <div className="flex flex-col gap-2">
-          <h2 className="text-xs font-semibold tracking-wide text-zinc-500 uppercase dark:text-zinc-400">
-            Active / pending
-          </h2>
+       * `job.state === 'queued'`/`'running'` guards `Row` already had.
+       *
+       * **Both boxes now always render their own header/rows-or-empty-state/footer shell**
+       * (2026-08-20, follow-up to phase 1 stage 4b from the user's browser review) -- a
+       * pre-existing inconsistency the Complete box never had and the Active box always did:
+       * the Active box used to render nothing at all -- no header, no page-size selector, no
+       * "Page X of Y" readout -- whenever it had zero rows to show (empty queue, or a filter
+       * matching nothing), while the Complete box's shell was already unconditional. Both boxes'
+       * own empty states now live *inside* their shell rather than as separate top-level blocks
+       * above it, the same place the Complete box's already lived. */}
+      <div className="flex flex-col gap-2">
+        <h2 className="text-xs font-semibold tracking-wide text-zinc-500 uppercase dark:text-zinc-400">
+          Active / pending
+        </h2>
+
+        {/* "Nothing queued or downloading" reads off `activeJobs` (2026-08-19, phase 1 stage
+         * 4b), not `jobs` -- `jobs` still carries each item's most recent terminal job too
+         * (unchanged, docs/decisions.md), which would otherwise suppress this message the moment
+         * anything had ever finished, even with nothing currently active. */}
+        {activeJobs.length === 0 && (
+          <div className="flex h-40 items-center justify-center rounded-lg border border-dashed border-zinc-300 text-zinc-400 dark:border-zinc-700 dark:text-zinc-600">
+            Nothing queued or downloading — queue an item from Files.
+          </div>
+        )}
+
+        {/* The filter's own empty state for this box (2026-08-19) -- distinct from "nothing
+         * queued or downloading" above: there *are* active transfers, none of them just happen
+         * to match the filter text. */}
+        {activeJobs.length > 0 && filterActive && filteredActiveJobs.length === 0 && (
+          <div className="flex h-40 flex-col items-center justify-center gap-2 rounded-lg border border-dashed border-zinc-300 text-zinc-400 dark:border-zinc-700 dark:text-zinc-600">
+            <span>No active transfers match "{search.trim()}".</span>
+            <button
+              type="button"
+              onClick={() => setSearch('')}
+              className="text-xs text-zinc-500 underline decoration-dotted hover:text-zinc-700 dark:text-zinc-400 dark:hover:text-zinc-200"
+            >
+              Clear filter
+            </button>
+          </div>
+        )}
+
+        {activePageJobs.length > 0 && (
           <div className="overflow-hidden rounded-md border border-zinc-200 dark:border-zinc-800">
             {activePageJobs.map((job) => (
               <Row
@@ -1382,17 +1285,66 @@ export function TransfersPage() {
               />
             ))}
           </div>
-          <div className="flex items-center justify-between gap-2">
+        )}
+
+        <div className="flex items-center justify-between gap-2">
+          <span className="text-xs text-zinc-500 dark:text-zinc-400">
+            {pageReadout(activePage, activePageCount, filteredActiveJobs.length)}
+          </span>
+          <div className="flex items-center gap-2">
             <PageSizeSelect id="active" value={activePageSize} onChange={setActivePageSize} />
             <Pager current={activePage} count={activePageCount} onChange={setActivePage} />
           </div>
         </div>
-      )}
+      </div>
 
       <div className="flex flex-col gap-2">
-        <h2 className="text-xs font-semibold tracking-wide text-zinc-500 uppercase dark:text-zinc-400">
-          Complete
-        </h2>
+        <div className="flex items-center justify-between gap-2">
+          <h2 className="text-xs font-semibold tracking-wide text-zinc-500 uppercase dark:text-zinc-400">
+            Complete
+          </h2>
+          {/* The Dismiss menu (2026-08-20, follow-up to phase 1 stage 4b) -- moved here from the
+           * page top ("the dismissall button should move down the top of the completed
+           * section", the user's own report) and widened from a single "Dismiss all" button into
+           * an outcome picker (`handleDismissOutcome`'s own docstring has the full reasoning,
+           * including what happened to "Clear all failed"). */}
+          <DismissMenu
+            disabled={dismissMenuDisabled}
+            busy={dismissingOutcome}
+            label={dismissMenuLabel}
+            title={dismissMenuTitle}
+            options={dismissMenuOptions()}
+            onSelect={handleDismissOutcome}
+          />
+        </div>
+
+        {dismissOutcomeCount != null && (
+          <div className="flex items-center justify-between gap-3 rounded-md border border-emerald-300 bg-emerald-50 px-3 py-2 text-sm text-emerald-900 dark:border-emerald-900 dark:bg-emerald-950/40 dark:text-emerald-200">
+            <span className="font-medium">
+              Dismissed {dismissOutcomeCount} job{dismissOutcomeCount === 1 ? '' : 's'}
+            </span>
+            <button
+              type="button"
+              onClick={() => setDismissOutcomeCount(null)}
+              className="shrink-0 text-xs underline decoration-dotted"
+            >
+              Dismiss
+            </button>
+          </div>
+        )}
+
+        {dismissOutcomeError && (
+          <div className="flex items-center justify-between gap-3 rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-900 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-200">
+            <span>Couldn't dismiss: {dismissOutcomeError}</span>
+            <button
+              type="button"
+              onClick={() => setDismissOutcomeError(null)}
+              className="shrink-0 text-xs underline decoration-dotted"
+            >
+              Dismiss
+            </button>
+          </div>
+        )}
 
         {completeError && (
           <div className="flex items-center justify-between gap-3 rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-900 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-200">
@@ -1445,8 +1397,7 @@ export function TransfersPage() {
 
         <div className="flex items-center justify-between gap-2">
           <span className="text-xs text-zinc-500 dark:text-zinc-400">
-            {completeTotal > 0 &&
-              `Page ${completePage} of ${completePageCount} (${completeTotal} total)`}
+            {pageReadout(completePage, completePageCount, completeTotal)}
           </span>
           <div className="flex items-center gap-2">
             <PageSizeSelect id="complete" value={completePageSize} onChange={setCompletePageSize} />

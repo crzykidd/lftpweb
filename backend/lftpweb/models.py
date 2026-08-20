@@ -906,21 +906,53 @@ class DismissAllRequest(BaseModel):
     every row) -- it is `None`, not `""`, that means "no filter given", the same "unset means
     unchanged" convention every other optional field on this model already uses.
 
-    `job_ids`, `queue_id`, and `name_filter` are mutually exclusive -- a request naming more than
-    one is rejected with a 422 (`_scopes_are_mutually_exclusive` below) rather than guessing an
-    intersection of the scopes.
+    `outcome` (2026-08-20, follow-up to phase 1 stage 4b from the user's browser review,
+    `prompts/2026-08-20-transfers-dismiss-menu-and-counts.md`) narrows the same bulk dismiss to
+    one terminal outcome -- the Complete box's own "Dismiss" menu, "all, downloaded, failed (or
+    whatever the completed status are)" in the user's own words. One of the three states
+    `TransferQueue.dismiss_job`'s own guard (and `lib/transferPanel.ts.isDismissable` on the
+    frontend) already allows: `succeeded`/`failed`/`cancelled`. `None` (the default, and every
+    call before this task) means no outcome restriction -- unchanged behavior for every existing
+    caller.
+
+    **Decided by the user (2026-08-20): `outcome` and `name_filter` COMPOSE rather than being
+    mutually exclusive.** Both are *narrowings* of the same dismissable set, not alternative
+    scopes -- "dismiss the failed ones matching `Married`" is a coherent request the Complete
+    box's own header now has to express (the outcome menu lives inside the same box the name
+    filter already narrows), so a request naming both is valid and dismisses their intersection.
+    See `TransferQueue.dismiss_all_terminal`'s own docstring for the SQL and
+    `docs/decisions.md` for the fuller reasoning, including why `queue_id` was *not* given the
+    same treatment.
+
+    **`job_ids` and `queue_id` stay mutually exclusive with everything, including each other.**
+    `job_ids` already names exactly which rows to dismiss -- composing a narrowing alongside an
+    explicit id list is meaningless (and `outcome`/`name_filter` are exactly that: narrowings of
+    an implicit set, not restrictions on an explicit one). `queue_id` is arguably also a
+    narrowing (dropping it into the composing group would be consistent), but it has had no
+    caller since per-queue grouping was dropped in phase 1 stage 4a -- kept mutually exclusive
+    the way it always was, since widening it costs real validator complexity for a scope nothing
+    sends. The restructured validator (`_scopes_are_coherent` below) checks this in two tiers
+    -- `job_ids`/`queue_id` against each other, then `job_ids`/`queue_id` against
+    `outcome`/`name_filter` -- rather than one flat "name more than one of four" rule, which
+    would have wrongly rejected `outcome` + `name_filter` together.
     """
 
     queue_id: int | None = None
     job_ids: list[int] | None = None
     name_filter: str | None = None
+    outcome: Literal["succeeded", "failed", "cancelled"] | None = None
 
     @model_validator(mode="after")
-    def _scopes_are_mutually_exclusive(self) -> "DismissAllRequest":
-        given = sum(scope is not None for scope in (self.queue_id, self.job_ids, self.name_filter))
-        if given > 1:
+    def _scopes_are_coherent(self) -> "DismissAllRequest":
+        exclusive_scopes = sum(scope is not None for scope in (self.queue_id, self.job_ids))
+        if exclusive_scopes > 1:
+            raise ValueError("queue_id and job_ids are mutually exclusive -- pass at most one")
+        narrowings_given = sum(scope is not None for scope in (self.outcome, self.name_filter))
+        if exclusive_scopes > 0 and narrowings_given > 0:
             raise ValueError(
-                "queue_id, job_ids, and name_filter are mutually exclusive -- pass at most one"
+                "queue_id/job_ids are mutually exclusive with outcome/name_filter -- job_ids "
+                "already names exactly which rows to dismiss, and queue_id has no caller that "
+                "composes with a narrowing"
             )
         return self
 

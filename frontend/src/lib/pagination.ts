@@ -102,3 +102,21 @@ export function paginateClientSide<T>(items: readonly T[], page: number, pageSiz
   const start = (clamped - 1) * pageSize
   return items.slice(start, start + pageSize)
 }
+
+/** The "Page X of Y (Z total)" readout shared by both of the Queue tab's boxes' footers
+ * (2026-08-20, follow-up to phase 1 stage 4b from the user's browser review: "I have Page 1 of
+ * 1 (30 total) at the bottom of the completed section. I don't see that at the active/pending
+ * section" -- a real bug, not a design choice. The Complete box already had this wording inline;
+ * the Active box had nothing at all. One shared function, not two copies of the same template
+ * literal, so the wording can never drift between the two boxes again.
+ *
+ * `null` while `total <= 0` -- an empty box has nothing to page through, reproducing the
+ * Complete box's own pre-existing `completeTotal > 0` guard exactly. Deliberately independent
+ * of `Pager`'s own `count <= 1` guard (`TransfersPage.tsx`) -- a single-page box still has a
+ * real total worth reading ("Page 1 of 1 (3 total)"), even though `Pager` itself renders
+ * nothing for it; the two guards protect different things and must stay separate.
+ */
+export function pageReadout(page: number, count: number, total: number): string | null {
+  if (total <= 0) return null
+  return `Page ${page} of ${count} (${total} total)`
+}

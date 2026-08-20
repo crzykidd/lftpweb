@@ -75,6 +75,30 @@ Skeleton for the next roll:
   saw it on screen ("50 is too many rows at once in practice"). Changing a box's size always
   resets it to page 1 rather than trying to preserve scroll position or compute an equivalent
   page.
+- **"Dismiss" moves into the Complete box header and becomes an outcome menu**
+  (2026-08-20, a follow-up to phase 1 stage 4b from the user's browser review,
+  `prompts/done/2026-08-20-transfers-dismiss-menu-and-counts.md`): the old page-top "Dismiss
+  all" button sat far from the rows it acted on ("the dismissall button should move down the
+  top of the completed section"); it's now a keyboard-navigable dropdown right there — **All**,
+  **Downloaded**, **Failed**, **Stopped** — reusing the site bandwidth "Start now" menu's own
+  popover pattern rather than a new one. **Folds in "Clear all failed"**, whose whole job is now
+  exactly "Dismiss → Failed" done server-side and atomically instead of a client-side
+  `Promise.allSettled` loop over each row. **The outcome filter composes with the name filter**
+  (both narrow the same set; `job_ids`/`queue_id` stay mutually exclusive with everything, as
+  before) — `DismissAllRequest` gains an `outcome` field and its mutual-exclusion validator is
+  restructured to allow that composition (see `docs/decisions.md`). An outcome matching zero
+  rows still dismisses nothing, never everything — the same guarantee `name_filter`'s own empty
+  match already gave, now extended to the composed case. Per-outcome counts aren't fetched (the
+  Complete box's total is server-paginated and doesn't have them cheaply available) — only
+  "All" shows a count, reusing the box's own already-known total.
+- **The Active/pending box gets the same "Page X of Y (Z total)" readout the Complete box
+  already had** (2026-08-20, same follow-up) — a real inconsistency the user's browser review
+  caught, not a design choice: the Complete box showed it unconditionally, the Active box showed
+  nothing. Both boxes now read it from one shared `lib/pagination.ts.pageReadout` so the wording
+  can't drift between them again. **The Active box's entire shell (header, empty state,
+  page-size selector, pager) now always renders**, matching the Complete box's own always-on
+  shell — previously an empty or fully-filtered Active box vanished outright, taking its
+  page-size selector with it.
 - **A directory row's expand panel on the Transfers page now shows per-file progress**
   (`docs/transfers-redesign-spec.md` §3.3, phase 1 stage 5) — the thing the Files page was
   previously the only way to see, moved to where the ordering lives. Expanding a row fetches its

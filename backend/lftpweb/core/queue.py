@@ -1265,6 +1265,7 @@ class TransferQueue:
         queue_id: int | None = None,
         job_ids: Sequence[int] | None = None,
         name_filter: str | None = None,
+        outcome: str | None = None,
     ) -> int:
         """The bulk counterpart to `dismiss_job` above (2026-08-15, "Dismiss all" at the top of
         the Transfers page) -- one `UPDATE`, not a per-job loop, per the task's own preference
@@ -1325,6 +1326,34 @@ class TransferQueue:
         never a candidate to begin with), but a real drift here since `name_filter` is
         recomputed server-side against the *whole* table, not a client-supplied id list.
 
+        `outcome` (2026-08-20, follow-up to phase 1 stage 4b,
+        `prompts/2026-08-20-transfers-dismiss-menu-and-counts.md`) restricts the same `UPDATE`
+        to one terminal state -- the Complete box's own "Dismiss" menu ("all, downloaded, failed
+        (or whatever the completed status are)", the user's own words). `None` (the default)
+        means no state restriction beyond the base `state IN (...)` guard already applies --
+        unchanged behavior for every caller that predates this task.
+
+        **`outcome` composes with `name_filter` -- decided by the user, 2026-08-20** (recorded
+        in `docs/decisions.md`): both narrow the same set, so a request naming both dismisses
+        their intersection (`AND`ed into the same `WHERE`, not two separate queries reconciled
+        after the fact). `DismissAllRequest`'s own validator is what keeps `job_ids`/`queue_id`
+        out of this composition -- this method trusts its caller to have already enforced that,
+        the same way it trusts the `job_ids == []` guard above to have already been checked by
+        the time any of these branches run.
+
+        `outcome` deliberately does **not** add the `name_filter` branch's `MAX(id)`-per-item
+        restriction on its own (only `name_filter` does, whether or not `outcome` is also given)
+        -- an `outcome`-only dismiss is a narrowing of this method's own pre-existing "dismiss
+        every terminal row, superseded or not" behavior (see the module docstring above for why
+        that's harmless with no filter at all), not a promise to match `list_complete_jobs`'s
+        listing predicate the way `name_filter` alone is. Once `name_filter` is also given, the
+        combined `WHERE` picks up the restriction the normal way, which is what keeps
+        `list_complete_jobs(name_filter=..., outcome=...)`'s `total` and this method's
+        `(name_filter=..., outcome=...)` dismissed count in agreement -- the same property
+        `name_filter` alone already guarantees, now extended to the composed case (see
+        `docs/decisions.md` and the paired test,
+        `test_dismiss_all_terminal_name_filter_count_matches_list_complete_jobs_total`).
+
         Returns the actual row count affected (`cursor.rowcount`), the same "report the real
         number" convention `api/history.py`'s clear-history endpoints already use.
         """
@@ -1340,6 +1369,9 @@ class TransferQueue:
             placeholders = ",".join("?" for _ in job_ids)
             where.append(f"id IN ({placeholders})")
             params.extend(job_ids)
+        if outcome is not None:
+            where.append("state = ?")
+            params.append(outcome)
         if name_filter is not None:
             where.append("id = (SELECT MAX(j2.id) FROM job j2 WHERE j2.item_id = job.item_id)")
             where.append(
@@ -2723,7 +2755,12 @@ class TransferQueue:
         return out
 
     async def list_complete_jobs(
-        self, *, limit: int, offset: int, name_filter: str | None = None
+        self,
+        *,
+        limit: int,
+        offset: int,
+        name_filter: str | None = None,
+        outcome: str | None = None,
     ) -> tuple[list[dict], int]:
         """The Queue tab's **Complete** box (2026-08-19, docs/transfers-redesign-spec.md §3.2,
         phase 1 stage 4b) -- `list_jobs()`'s terminal half, split out, server-side paginated,
@@ -2751,6 +2788,19 @@ class TransferQueue:
         same predicate `dismiss_all_terminal`'s own `name_filter` branch uses, so "Dismiss
         list"'s dismissed count always matches what this method reports as `total` for the same
         filter text -- see that method's own docstring for why that agreement matters.
+
+        `outcome` (2026-08-20, follow-up to phase 1 stage 4b,
+        `prompts/2026-08-20-transfers-dismiss-menu-and-counts.md`) restricts the listing to one
+        terminal state, the same vocabulary `dismiss_all_terminal`'s own `outcome` narrows to.
+        **Not currently reachable from `GET /api/jobs/complete`** -- the Complete box's "Dismiss"
+        menu deliberately does not fetch a live per-outcome count (the task's own instruction:
+        "if per-outcome counts are not already available, do not add a query to get them"), so
+        no frontend caller passes this. It exists here purely so `dismiss_all_terminal`'s
+        `(name_filter=..., outcome=...)` composed case can be tested against the identical
+        predicate this method would use, the same "count and dismissed set built from one
+        predicate" property `name_filter` alone already has a test for
+        (`test_dismiss_all_terminal_name_filter_count_matches_list_complete_jobs_total`,
+        extended rather than duplicated for this case).
         """
         where = [
             "job.state IN ('failed','cancelled','succeeded')",
@@ -2761,6 +2811,9 @@ class TransferQueue:
         if name_filter is not None:
             where.append("LOWER(item.rel_path) LIKE ? ESCAPE '\\'")
             params.append(f"%{_like_escape(name_filter.lower())}%")
+        if outcome is not None:
+            where.append("job.state = ?")
+            params.append(outcome)
         where_sql = " AND ".join(where)
 
         count_cursor = await self.db.execute(

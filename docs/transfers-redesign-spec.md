@@ -97,6 +97,28 @@ defaulting to 50 (phase 1 stage 4b); the user's own call once they'd seen it on 
 always resets it to page 1 — no attempt to preserve scroll position or compute an equivalent
 page.
 
+**Both boxes now share the exact same footer shape** (2026-08-20, another follow-up from the
+same browser review, `prompts/done/2026-08-20-transfers-dismiss-menu-and-counts.md`) — the
+Complete box always rendered a "Page X of Y (Z total)" readout; the Active box originally had
+no readout at all, and in fact rendered nothing whatsoever (no header, no readout, no page-size
+selector) once it had zero rows to show. Both boxes now read the readout from one shared
+`lib/pagination.ts.pageReadout` (so the wording can never drift between them) and always render
+their own header/rows-or-empty-state/footer shell, the empty state living inside the shell.
+
+**"Dismiss" moved into the Complete box's own header, as an outcome menu**, in the same
+browser-review follow-up: "the dismissall button should move down the top of the completed
+section," and "maybe it is dismiss with a drop down list all, downloaded, failed (or whatever
+the completed status are)" — the user's own words, both taken literally. The dropdown (**All /
+Downloaded / Failed / Stopped**) reuses the "Start now" menu's own keyboard-navigable popover
+pattern rather than inventing a second one. It folds in the old "Clear all failed" control
+(v0.2.4) — "Dismiss → Failed" is now that control's exact job, done as one atomic server-side
+`UPDATE` instead of a client-side `Promise.allSettled` fan-out. The chosen outcome **composes**
+with the page's name filter (both narrow the same dismissable set; `job_ids`/`queue_id` stay
+mutually exclusive with everything, since each already names an explicit or whole-queue scope
+rather than a narrowing) — see `docs/decisions.md` for the decided reasoning and what stayed
+exclusive. "Dismiss list" (§3.2, above) is unaffected: it keeps its own independent,
+name-filter-only meaning.
+
 ### 3.3 Rows expand to per-file progress
 
 This is the thing Files is currently used for, moved to where the ordering lives.

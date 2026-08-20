@@ -629,6 +629,47 @@ async def test_dismiss_all_request_rejects_job_ids_and_queue_id_together(db):
         DismissAllRequest(queue_id=1, job_ids=[1, 2])
 
 
+# --- outcome: the Complete box's "Dismiss" menu (2026-08-20, follow-up to phase 1 stage 4b,
+# prompts/2026-08-20-transfers-dismiss-menu-and-counts.md) -- decided: `outcome` composes with
+# `name_filter` (both are narrowings of the same set), but stays mutually exclusive with
+# `job_ids`/`queue_id` (each of those already names an explicit/whole-queue scope). ------------
+
+
+async def test_dismiss_all_request_rejects_outcome_with_job_ids():
+    with pytest.raises(pydantic.ValidationError, match="mutually exclusive"):
+        DismissAllRequest(outcome="failed", job_ids=[1])
+
+
+async def test_dismiss_all_request_rejects_outcome_with_queue_id():
+    with pytest.raises(pydantic.ValidationError, match="mutually exclusive"):
+        DismissAllRequest(outcome="failed", queue_id=1)
+
+
+async def test_dismiss_all_request_allows_outcome_with_name_filter():
+    """The decided composition: unlike `job_ids`/`queue_id`, `outcome` and `name_filter` may be
+    given together without raising -- "dismiss the failed ones matching `Married`" is a coherent
+    request, not a scope conflict.
+    """
+    req = DismissAllRequest(outcome="failed", name_filter="married")
+    assert req.outcome == "failed"
+    assert req.name_filter == "married"
+    assert req.job_ids is None
+    assert req.queue_id is None
+
+
+async def test_dismiss_all_request_outcome_alone_is_valid():
+    req = DismissAllRequest(outcome="succeeded")
+    assert req.outcome == "succeeded"
+
+
+async def test_dismiss_all_request_rejects_unknown_outcome_value():
+    """`outcome` is a closed `Literal` -- the same three states `isDismissable`/`dismiss_job`
+    already allow, not an arbitrary string that could silently match zero rows forever.
+    """
+    with pytest.raises(pydantic.ValidationError):
+        DismissAllRequest(outcome="queued")
+
+
 class _FakeQueueApp:
     def __init__(self, queue):
         self.state = _FakeQueueState(queue)
@@ -1053,10 +1094,112 @@ async def test_dismiss_all_terminal_name_filter_matches_the_same_predicate_as_th
     assert row["dismissed_at"] is None
 
 
+# --- dismiss_all_terminal(outcome=...): the Complete box's "Dismiss" menu (2026-08-20,
+# follow-up to phase 1 stage 4b, prompts/2026-08-20-transfers-dismiss-menu-and-counts.md) -------
+
+
+async def test_dismiss_all_terminal_outcome_dismisses_only_matching_state(db):
+    queue_id = await _make_queue(db)
+    failed_item = await _make_item(db, queue_id, "failed.txt", state="FAILED")
+    failed_job = await _make_job(db, failed_item, state="failed")
+    succeeded_item = await _make_item(db, queue_id, "done.txt", state="DOWNLOADED")
+    succeeded_job = await _make_job(db, succeeded_item, state="succeeded")
+    cancelled_item = await _make_item(db, queue_id, "stopped.txt", state="STOPPED")
+    cancelled_job = await _make_job(db, cancelled_item, state="cancelled")
+
+    q = _queue(db)
+    dismissed = await q.dismiss_all_terminal(outcome="failed")
+    assert dismissed == 1
+
+    failed_row = await (
+        await db.execute("SELECT dismissed_at FROM job WHERE id = ?", (failed_job,))
+    ).fetchone()
+    succeeded_row = await (
+        await db.execute("SELECT dismissed_at FROM job WHERE id = ?", (succeeded_job,))
+    ).fetchone()
+    cancelled_row = await (
+        await db.execute("SELECT dismissed_at FROM job WHERE id = ?", (cancelled_job,))
+    ).fetchone()
+    assert failed_row["dismissed_at"] is not None
+    assert succeeded_row["dismissed_at"] is None
+    assert cancelled_row["dismissed_at"] is None
+
+
+async def test_dismiss_all_terminal_outcome_never_touches_an_active_job(db):
+    queue_id = await _make_queue(db)
+    queued_item = await _make_item(db, queue_id, "queued-release", state="QUEUED")
+    queued_job = await _make_job(db, queued_item, state="queued")
+
+    q = _queue(db)
+    dismissed = await q.dismiss_all_terminal(outcome="failed")
+    assert dismissed == 0
+
+    row = await (
+        await db.execute("SELECT dismissed_at FROM job WHERE id = ?", (queued_job,))
+    ).fetchone()
+    assert row["dismissed_at"] is None
+
+
+async def test_dismiss_all_terminal_outcome_no_match_dismisses_nothing_not_everything(db):
+    """The same load-bearing guarantee `name_filter`'s own no-match test states, for `outcome`:
+    a state that matches none of the dismissable rows present must dismiss nothing -- never
+    degrade into "no restriction was effectively applied, so dismiss everything." Seeds real
+    dismissable rows of *other* outcomes so a bug that silently dropped the `state = ?` clause
+    would be caught dismissing them.
+    """
+    queue_id = await _make_queue(db)
+    for i in range(3):
+        item = await _make_item(db, queue_id, f"real-failure-{i}", state="FAILED")
+        await _make_job(db, item, state="failed")
+
+    q = _queue(db)
+    dismissed = await q.dismiss_all_terminal(outcome="succeeded")
+    assert dismissed == 0
+
+    rows = await (await db.execute("SELECT dismissed_at FROM job")).fetchall()
+    assert all(r["dismissed_at"] is None for r in rows)
+
+
+async def test_dismiss_all_terminal_outcome_composes_with_name_filter(db):
+    """The decided composition (`DismissAllRequest`'s own docstring, `docs/decisions.md`):
+    `outcome` and `name_filter` narrow the same set together, `AND`ed -- only a row matching
+    *both* is dismissed, not the union of either alone.
+    """
+    queue_id = await _make_queue(db)
+    both = await _make_item(db, queue_id, "Married.At.First.Sight", state="FAILED")
+    both_job = await _make_job(db, both, state="failed")
+    # Matches the name filter, wrong outcome.
+    name_only = await _make_item(db, queue_id, "Married.Again", state="DOWNLOADED")
+    name_only_job = await _make_job(db, name_only, state="succeeded")
+    # Matches the outcome, wrong name.
+    outcome_only = await _make_item(db, queue_id, "Unrelated.Release", state="FAILED")
+    outcome_only_job = await _make_job(db, outcome_only, state="failed")
+
+    q = _queue(db)
+    dismissed = await q.dismiss_all_terminal(name_filter="married", outcome="failed")
+    assert dismissed == 1
+
+    both_row = await (
+        await db.execute("SELECT dismissed_at FROM job WHERE id = ?", (both_job,))
+    ).fetchone()
+    name_only_row = await (
+        await db.execute("SELECT dismissed_at FROM job WHERE id = ?", (name_only_job,))
+    ).fetchone()
+    outcome_only_row = await (
+        await db.execute("SELECT dismissed_at FROM job WHERE id = ?", (outcome_only_job,))
+    ).fetchone()
+    assert both_row["dismissed_at"] is not None
+    assert name_only_row["dismissed_at"] is None
+    assert outcome_only_row["dismissed_at"] is None
+
+
 async def test_dismiss_all_terminal_name_filter_count_matches_list_complete_jobs_total(db):
     """The property `DismissAllRequest.name_filter`'s own docstring promises: for the same
     filter text, `dismiss_all_terminal`'s dismissed count and `list_complete_jobs`'s `total`
-    always agree, since both are built from the identical predicate.
+    always agree, since both are built from the identical predicate. **Extended 2026-08-20**
+    (rather than duplicated -- the task's own instruction) to the composed `outcome` +
+    `name_filter` case: the same agreement must hold once `outcome` also narrows the set, so a
+    future change to either method's `WHERE` in isolation can't quietly break the pairing.
     """
     queue_id = await _make_queue(db)
     for i in range(4):
@@ -1071,6 +1214,24 @@ async def test_dismiss_all_terminal_name_filter_count_matches_list_complete_jobs
     _, total = await q.list_complete_jobs(limit=50, offset=0, name_filter="agreement-release")
     dismissed = await q.dismiss_all_terminal(name_filter="agreement-release")
     assert dismissed == total == 4
+
+    # The composed case: re-seed a fresh set (the plain-name-filter dismiss above already
+    # consumed the rows above) and check the same agreement holds with `outcome` added.
+    for i in range(3):
+        item = await _make_item(db, queue_id, f"agreement-composed-{i}", state="FAILED")
+        await _make_job(db, item, state="failed")
+    also_matches_name_wrong_outcome = await _make_item(
+        db, queue_id, "agreement-composed-succeeded", state="DOWNLOADED"
+    )
+    await _make_job(db, also_matches_name_wrong_outcome, state="succeeded")
+
+    _, composed_total = await q.list_complete_jobs(
+        limit=50, offset=0, name_filter="agreement-composed", outcome="failed"
+    )
+    composed_dismissed = await q.dismiss_all_terminal(
+        name_filter="agreement-composed", outcome="failed"
+    )
+    assert composed_dismissed == composed_total == 3
 
 
 async def test_dismiss_all_request_rejects_name_filter_with_job_ids():
@@ -1111,3 +1272,51 @@ async def test_dismiss_all_jobs_endpoint_threads_name_filter_through_to_the_queu
     ).fetchone()
     assert matching_row["dismissed_at"] is not None
     assert other_row["dismissed_at"] is None
+
+
+async def test_dismiss_all_jobs_endpoint_threads_outcome_through_to_the_queue(db):
+    """`body.outcome`'s own route-level wiring test -- same shape as `name_filter`'s above."""
+    queue_id = await _make_queue(db)
+    failed_item = await _make_item(db, queue_id, "a.txt", state="FAILED")
+    failed_job = await _make_job(db, failed_item, state="failed")
+    succeeded_item = await _make_item(db, queue_id, "b.txt", state="DOWNLOADED")
+    succeeded_job = await _make_job(db, succeeded_item, state="succeeded")
+
+    q = _queue(db)
+    result = await jobs.dismiss_all_jobs(_FakeQueueRequest(q), DismissAllRequest(outcome="failed"))
+    assert result.dismissed == 1
+
+    failed_row = await (
+        await db.execute("SELECT dismissed_at FROM job WHERE id = ?", (failed_job,))
+    ).fetchone()
+    succeeded_row = await (
+        await db.execute("SELECT dismissed_at FROM job WHERE id = ?", (succeeded_job,))
+    ).fetchone()
+    assert failed_row["dismissed_at"] is not None
+    assert succeeded_row["dismissed_at"] is None
+
+
+async def test_dismiss_all_jobs_endpoint_threads_composed_outcome_and_name_filter(db):
+    """The composed case threaded end to end through the route -- both scopes reach
+    `dismiss_all_terminal` together, not silently dropped to just one of them.
+    """
+    queue_id = await _make_queue(db)
+    both = await _make_item(db, queue_id, "married-failure", state="FAILED")
+    both_job = await _make_job(db, both, state="failed")
+    wrong_outcome = await _make_item(db, queue_id, "married-success", state="DOWNLOADED")
+    wrong_outcome_job = await _make_job(db, wrong_outcome, state="succeeded")
+
+    q = _queue(db)
+    result = await jobs.dismiss_all_jobs(
+        _FakeQueueRequest(q), DismissAllRequest(name_filter="married", outcome="failed")
+    )
+    assert result.dismissed == 1
+
+    both_row = await (
+        await db.execute("SELECT dismissed_at FROM job WHERE id = ?", (both_job,))
+    ).fetchone()
+    wrong_outcome_row = await (
+        await db.execute("SELECT dismissed_at FROM job WHERE id = ?", (wrong_outcome_job,))
+    ).fetchone()
+    assert both_row["dismissed_at"] is not None
+    assert wrong_outcome_row["dismissed_at"] is None

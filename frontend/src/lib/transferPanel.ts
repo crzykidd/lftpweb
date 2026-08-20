@@ -313,6 +313,58 @@ export function isDismissable(state: JobOut['state']): boolean {
   return state === 'failed' || state === 'cancelled' || state === 'succeeded'
 }
 
+// --- Dismiss outcome menu (2026-08-20, follow-up to phase 1 stage 4b from the user's browser
+// review, prompts/2026-08-20-transfers-dismiss-menu-and-counts.md): "maybe it is dismiss with a
+// drop down list all, downloaded, failed (or whatever the completed status are)" -- the user's
+// own words. `isDismissable`'s own three states above are exactly "whatever the completed
+// states are"; this turns that vocabulary into the menu's own option list, rather than the
+// Complete box's header re-deriving it (or worse, a hand-typed list that could drift from
+// `isDismissable`). ------------------------------------------------------------------------
+
+/** The three states `isDismissable` allows, in the order the Dismiss menu lists them -- the
+ * user's own naming order ("downloaded, failed"), Stopped (`cancelled`) last since it's the
+ * least common of the three in practice (a deliberate Stop click, not an unattended outcome).
+ */
+export const DISMISS_OUTCOMES: readonly JobOut['state'][] = ['succeeded', 'failed', 'cancelled']
+
+/** Human labels for the Dismiss menu -- the same words `TransfersPage.tsx.chipStateFor` renders
+ * on each row's own state chip for these three states, duplicated here rather than imported:
+ * `lib/` must never import from `pages/` (`isDismissable`'s own docstring above has the history
+ * of that rule, 2026-08-17). Keep in sync with `chipStateFor` by hand if either one changes.
+ */
+export const DISMISS_OUTCOME_LABELS: Record<JobOut['state'], string> = {
+  queued: 'Queued',
+  running: 'Downloading',
+  succeeded: 'Downloaded',
+  failed: 'Failed',
+  cancelled: 'Stopped',
+}
+
+export interface DismissMenuOption {
+  /** `null` = every dismissable outcome ("All"); a specific state narrows the bulk dismiss to
+   * it (`models.py.DismissAllRequest.outcome`, composed server-side with whatever name filter
+   * is currently active -- `TransfersPage.tsx.handleDismissOutcome`).
+   */
+  outcome: JobOut['state'] | null
+  label: string
+}
+
+/** The Dismiss menu's own option list, "All" first. Pure and unit-tested (this codebase's whole
+ * component-testing story is `lib/*.test.ts`, README.md's Known gaps: no component rendering is
+ * tested) -- `components/DismissMenu.tsx` renders exactly what this returns and nothing more,
+ * the same split `lib/startNow.ts`/`components/StartNowMenu.tsx` already establish. No counts
+ * baked in here -- per-outcome counts would need a query the Complete box's server-side
+ * pagination doesn't already have cheaply available (the task's own instruction: don't add one
+ * just for this), so `TransfersPage.tsx` labels only "All" with a count of its own (`
+ * completeTotal`, which it already has from the box's own fetch) and leaves these three plain.
+ */
+export function dismissMenuOptions(): DismissMenuOption[] {
+  return [
+    { outcome: null, label: 'All' },
+    ...DISMISS_OUTCOMES.map((outcome) => ({ outcome, label: DISMISS_OUTCOME_LABELS[outcome] })),
+  ]
+}
+
 // --- Chevron reordering (2026-08-19, docs/transfers-redesign-spec.md §3.4 stage 2,
 // prompts/2026-08-19-queue-reorder-chevrons.md): "can this row move" is pure enough to live
 // here and be unit-tested directly, rather than inlined in `Row`'s own JSX. -------------------

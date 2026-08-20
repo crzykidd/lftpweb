@@ -3,11 +3,14 @@ import type { FileNode, JobOut, JobState } from '../api/types'
 import type { ChildSpeedSample } from '../hooks/useLiveModel'
 import {
   type LiveProgress,
+  DISMISS_OUTCOMES,
+  DISMISS_OUTCOME_LABELS,
   FAST_LANE_HINT,
   canMoveDown,
   canMoveUp,
   childDisplayName,
   completedTimeLabel,
+  dismissMenuOptions,
   fileListCapNote,
   filterTransferJobs,
   hasArrGroup,
@@ -388,6 +391,43 @@ describe('isDismissable', () => {
   it('is false for an active state -- queued, running', () => {
     expect(isDismissable('queued')).toBe(false)
     expect(isDismissable('running')).toBe(false)
+  })
+})
+
+// 2026-08-20 (follow-up to phase 1 stage 4b from the user's browser review,
+// prompts/2026-08-20-transfers-dismiss-menu-and-counts.md): the Complete box's "Dismiss" menu --
+// "all, downloaded, failed (or whatever the completed status are)", the user's own words.
+describe('DISMISS_OUTCOMES -- the menu\'s own state vocabulary', () => {
+  it('is exactly the three states isDismissable allows, nothing more and nothing less', () => {
+    for (const state of DISMISS_OUTCOMES) {
+      expect(isDismissable(state)).toBe(true)
+    }
+    for (const state of ['queued', 'running'] as const) {
+      expect(DISMISS_OUTCOMES).not.toContain(state)
+    }
+  })
+})
+
+describe('dismissMenuOptions -- the Dismiss menu\'s option list', () => {
+  it('lists "All" first, then one option per dismissable outcome', () => {
+    const options = dismissMenuOptions()
+    expect(options[0]).toEqual({ outcome: null, label: 'All' })
+    expect(options.slice(1).map((o) => o.outcome)).toEqual([...DISMISS_OUTCOMES])
+  })
+
+  it('labels each outcome the same way the row\'s own state chip does', () => {
+    const options = dismissMenuOptions()
+    expect(options.find((o) => o.outcome === 'succeeded')?.label).toBe('Downloaded')
+    expect(options.find((o) => o.outcome === 'failed')?.label).toBe('Failed')
+    expect(options.find((o) => o.outcome === 'cancelled')?.label).toBe('Stopped')
+  })
+
+  it('has a label for every outcome it lists, drawn from DISMISS_OUTCOME_LABELS', () => {
+    for (const option of dismissMenuOptions()) {
+      if (option.outcome != null) {
+        expect(option.label).toBe(DISMISS_OUTCOME_LABELS[option.outcome])
+      }
+    }
   })
 })
 

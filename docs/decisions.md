@@ -6,6 +6,71 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-20 — Dismiss menu: `outcome` composes with `name_filter`, stays exclusive with
+`job_ids`/`queue_id`; "Clear all failed" folded into "Dismiss → Failed"
+
+`prompts/done/2026-08-20-transfers-dismiss-menu-and-counts.md`, a follow-up to phase 1 stage 4b
+of `docs/transfers-redesign-spec.md` §3.2 from the user's browser review, browser-unverified.
+
+**`DismissAllRequest.outcome` composes with `name_filter` — decided by the user, explicitly,
+not inferred.** Both are *narrowings* of the same dismissable set ("dismiss the failed ones
+matching `Married`" is one coherent request), not alternative scopes. The previous validator
+(`_scopes_are_mutually_exclusive`) rejected any request naming more than one of `queue_id`/
+`job_ids`/`name_filter`; a fourth field could not simply extend that same flat rule without
+also, wrongly, rejecting `outcome` + `name_filter` together. Restructured into two tiers instead
+(`_scopes_are_coherent`, `models.py`): `queue_id`/`job_ids` are checked against each other first
+(still mutually exclusive), then checked as a pair against `outcome`/`name_filter` together
+(still mutually exclusive with *both* of those, but not with each other). `outcome` and
+`name_filter` themselves are never checked against each other at all — composing is simply
+"pass the validator with nothing to reject."
+
+**`queue_id` was *not* given the same composing treatment**, even though it's arguably also a
+narrowing (dropping it into the composing group would have been internally consistent). It has
+had zero callers since per-queue grouping was dropped in phase 1 stage 4a — nothing on the
+frontend has sent it in months — so widening its validator relationship purely for symmetry
+would add real complexity (a third participant in the composing tier, more branches to test) for
+a scope nothing exercises. Kept mutually exclusive with everything, exactly as it always was.
+If a caller for `queue_id` ever returns, this is the first thing to revisit.
+
+**`job_ids` stays mutually exclusive with everything, including the new field** — it already
+names the exact rows to dismiss; a narrowing alongside an explicit id list is a contradiction in
+terms, not a composable input the way `outcome`/`name_filter` are narrowings of an *implicit*
+set.
+
+**`outcome` does not add `name_filter`'s `MAX(id)`-per-item restriction on its own.** An
+`outcome`-only dismiss is a narrowing of `dismiss_all_terminal`'s own pre-existing "dismiss every
+terminal row, superseded or not" behavior with no filter at all (harmless: a superseded row is
+never shown regardless of whether it also gets dismissed) — not a promise to match
+`list_complete_jobs`'s listing predicate the way `name_filter` alone already is. Once
+`name_filter` is also given, the restriction applies the normal way and the composed case gets
+the same total/dismissed-count agreement `name_filter` alone already guaranteed
+(`test_dismiss_all_terminal_name_filter_count_matches_list_complete_jobs_total`, extended rather
+than duplicated to cover the composed case, per the task's own instruction not to write a
+parallel test that could drift).
+
+**`list_complete_jobs` gained an `outcome` parameter with no frontend caller.** The Complete
+box's "Dismiss" menu deliberately does not fetch a live per-outcome count — the task's own
+instruction was "if per-outcome counts are not already available, do not add a query to get
+them, leave the labels plain," so only "All" shows a count (reusing `completeTotal`, already on
+hand). `list_complete_jobs(outcome=...)` exists purely so the count/dismissed-set identity test
+above can exercise the composed case against the real listing predicate, not a hand-rolled SQL
+count in the test that could itself drift from the real query. `GET /api/jobs/complete` was
+*not* widened to accept `outcome` as a query param — there is no caller for it, and adding
+unused public API surface for a test's convenience isn't worth it.
+
+**"Clear all failed" is folded into the Dismiss menu's "Failed" option, not kept alongside it.**
+The task invited a decision here rather than dictating one. Its old scope (`failed` only, not
+`cancelled` — a stopped job is a deliberate Stop click, not the kind of unattended pile-up a
+permanent-error class can become) is now exactly `outcome="failed"`, and the new path is a
+strict improvement: one atomic server-side `UPDATE` instead of a client-side
+`Promise.allSettled` fan-out over each row's own `/dismiss` call, with the same load-bearing
+zero-match guard the rest of `dismiss_all_terminal` already has. The only thing lost is
+per-row partial-failure reporting ("cleared 4 of 5, 1 failed: <reason>") — accepted as
+reasonable, since a single bulk `UPDATE` genuinely can't partially fail per row (it either runs
+or it doesn't), the same reasoning the original "Dismiss all" control was already built on.
+
+---
+
 ## 2026-08-20 — History → Events: keep the `job` endpoints, don't gut the drawer, deep link lives
 in the drawer header
 

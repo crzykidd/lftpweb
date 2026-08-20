@@ -2020,7 +2020,14 @@ Some.Release.S03E04.2160p    [downloading]   18 files   62%   4.1 MB/s   ETA 12m
   dismisses nothing, never everything, the same guarantee the id-list scope gave before this
   change. `GET /api/jobs`/`list_jobs()` itself is unchanged by this split (see docs/decisions.md
   for why keeping it, rather than narrowing it to active-only, was chosen) — the Active box just
-  no longer renders the terminal rows it still returns.
+  no longer renders the terminal rows it still returns. **Both boxes render the identical
+  "Page X of Y (Z total)" readout and always render their own shell** (2026-08-20, a follow-up
+  from the user's browser review) — the Complete box had the readout unconditionally from the
+  start, but the Active box originally had neither the readout nor a shell at all once it had
+  zero rows to show (empty queue, or a filter matching nothing); one shared
+  `lib/pagination.ts.pageReadout` now backs both, and both boxes' header/empty-state/page-size-
+  selector/pager render unconditionally, the empty state living inside the shell rather than as
+  a separate top-level block above it.
 - **▲ up one / ▼ down one / ▲▲ to top** on each queued row (§4.5's "Queue order and priority" —
   stage 2, 2026-08-19, `prompts/2026-08-19-queue-reorder-chevrons.md`; replaced a single "Move to
   top" button); default order is oldest-first. **Each still-queued row shows its actual run
@@ -2034,9 +2041,9 @@ Some.Release.S03E04.2160p    [downloading]   18 files   62%   4.1 MB/s   ETA 12m
   behavior explained inline the first time it's used. The percent options are disabled with a
   hint when no site bandwidth limit is configured; Max always works.
 - Failures show the error class plus the captured lftp output tail.
-- **Dismiss**, on a `failed`/`cancelled` row (2026-08-13) — a display-only action that stops
-  the row showing on this page (`job.dismissed_at`) without deleting the `job` row or touching
-  the item's own state/suppression. Added after a user hit a `REMOTE_GONE` failure — the
+- **Dismiss**, on a `failed`/`cancelled`/`succeeded` row (2026-08-13) — a display-only action
+  that stops the row showing on this page (`job.dismissed_at`) without deleting the `job` row or
+  touching the item's own state/suppression. Added after a user hit a `REMOTE_GONE` failure — the
   remote files were genuinely gone, and Retry was the only action this page offered, which is
   exactly wrong for that case. Dismissal was never meant to erase what happened, only to
   declutter this page -- the `job` row itself is untouched and stays reachable one item at a
@@ -2044,12 +2051,23 @@ Some.Release.S03E04.2160p    [downloading]   18 files   62%   4.1 MB/s   ETA 12m
   spec.md` §2, phase 1 stage 7) no page lists every dismissed job across the whole install any
   longer** -- the old History page's job list, which used to be that page, was dropped when
   History became Events; the Complete box below already excluded dismissed rows before and after
-  (README's Known gaps names this). **Clear all failed** dismisses every currently-`failed` row
-  in one action
-  (`Promise.allSettled`, honest about partial failure the same way the Files page's bulk
-  actions already are) — scoped to `failed` only, not `cancelled`, since a stopped job is a
-  deliberate Stop click, not the kind of unattended pile-up a permanent-error class like
-  `REMOTE_GONE` can become. No confirmation dialog on either: nothing is destroyed.
+  (README's Known gaps names this). **The bulk "Dismiss" control lives in the Complete box's own
+  header** (2026-08-20, a follow-up to phase 1 stage 4b from the user's browser review,
+  `prompts/done/2026-08-20-transfers-dismiss-menu-and-counts.md`) — moved down from the page top,
+  where it originally sat, to sit beside the rows it acts on. It's a keyboard-navigable dropdown
+  (the same popover pattern the "Start now" menu already established, not a second one): **All**,
+  **Downloaded**, **Failed**, **Stopped** — one bulk `UPDATE` per choice
+  (`core/queue.py.dismiss_all_terminal`), never a client-side loop over each row's own dismiss.
+  This **folds in the old "Clear all failed"** control (v0.2.4): its whole job — dismiss every
+  currently-`failed` row — is now exactly "Dismiss → Failed", done atomically server-side
+  instead of a `Promise.allSettled` fan-out that could partially fail per row. **The chosen
+  outcome composes with the page's name filter** (decided 2026-08-20, `docs/decisions.md`): both
+  narrow the same dismissable set, so "the failed ones matching `Married`" is one request, not
+  two exclusive scopes — `job_ids`/`queue_id` (see below) stay mutually exclusive with
+  everything, since each already names an explicit or whole-queue scope rather than a narrowing.
+  An outcome matching zero rows still dismisses nothing, never everything — the same guarantee
+  the name filter's own empty match already gives, now proven for the composed case too. No
+  confirmation dialog: nothing is destroyed.
 - **A name filter**, in the page toolbar above the two boxes (2026-08-19) — start typing and
   only rows whose `rel_path` contains that text (case-insensitive substring, no glob/regex)
   stay visible; a "showing N of M" readout appears alongside it once it's non-empty for the
@@ -2063,11 +2081,13 @@ Some.Release.S03E04.2160p    [downloading]   18 files   62%   4.1 MB/s   ETA 12m
   `name_filter` scope, sent as the same filter text the Complete box's own query is using — not
   an id list, which could only ever name one page's worth once that box was paginated; never a
   client-side loop over each row's own dismiss either way) — greyed out while the filter is
-  empty, and again if it matches no dismissable rows, with a tooltip naming which. It is a new,
-  separate control: any other bulk dismiss action on this page keeps its own existing whole-list
-  meaning, unaffected by whether a filter happens to be active. It also supersedes the per-queue
-  **Dismiss Queue** control (v0.2.3, `278e10f`), removed 2026-08-19 alongside grouping — filter
-  to a queue, then Dismiss list does the same job.
+  empty, and again if it matches no dismissable rows, with a tooltip naming which. It is a
+  separate control from the Complete box's own "Dismiss" menu (above) and keeps its own
+  unchanged, name-filter-only meaning regardless of that menu's last-chosen outcome — the menu
+  itself, unlike this control, *does* pick up whatever filter text is currently active (the
+  decided composition, above). It also supersedes the per-queue **Dismiss Queue** control
+  (v0.2.3, `278e10f`), removed 2026-08-19 alongside grouping — filter to a queue, then Dismiss
+  list does the same job.
 - **A directory row's expand panel gains a Files group, showing per-file progress** (2026-08-20,
   `docs/transfers-redesign-spec.md` §3.3, phase 1 stage 5) — "the thing Files is currently used
   for, moved to where the ordering lives." Not a second data source: `core/queue.py.

@@ -281,15 +281,24 @@ async def dismiss_all_jobs(
     See `DismissAllRequest.name_filter`'s own docstring for the full reasoning and
     `TransferQueue.dismiss_all_terminal`'s for the SQL.
 
-    All three scopes are mutually exclusive at the request-model level (`DismissAllRequest`'s
-    own validator, a 422 if a caller names more than one); this handler just threads whichever
-    one was given straight through to `dismiss_all_terminal`.
+    2026-08-20 (follow-up to phase 1 stage 4b, `prompts/2026-08-20-transfers-dismiss-menu-and-
+    counts.md`): `body.outcome` narrows the same bulk dismiss to one terminal state -- the
+    Complete box's own "Dismiss" menu, now moved into that box's header. Unlike `job_ids`/
+    `queue_id`, `outcome` **composes** with `name_filter` (both can be given together) -- see
+    `DismissAllRequest`'s own docstring for the decided reasoning and its restructured validator
+    for what's still rejected.
+
+    `job_ids` and `queue_id` stay mutually exclusive with every other scope, including each
+    other, at the request-model level (`DismissAllRequest`'s own validator, a 422 for anything
+    incoherent); this handler just threads whichever ones were given straight through to
+    `dismiss_all_terminal`.
     """
     queue_id = body.queue_id if body is not None else None
     job_ids = body.job_ids if body is not None else None
     name_filter = body.name_filter if body is not None else None
+    outcome = body.outcome if body is not None else None
     dismissed = await request.app.state.queue.dismiss_all_terminal(
-        queue_id=queue_id, job_ids=job_ids, name_filter=name_filter
+        queue_id=queue_id, job_ids=job_ids, name_filter=name_filter, outcome=outcome
     )
     return DismissAllResponse(dismissed=dismissed)
 

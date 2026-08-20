@@ -389,20 +389,31 @@ export function dismissJob(jobId: number): Promise<void> {
  * mean "matches every row"), so this only omits the field when `nameFilter` is `undefined` --
  * `!= null`, not truthiness.
  *
- * All three scopes are mutually exclusive (`DismissAllRequest`'s own validator rejects a
- * request naming more than one); no caller in this app passes more than one. Threaded the same
- * "omitted means not sent" way every scope on this call already is, not three functions --
- * they're all optional narrowings of the same one bulk call.
+ * `outcome` (2026-08-20, follow-up to phase 1 stage 4b, the Complete box's own "Dismiss" menu,
+ * `lib/transferPanel.ts.dismissMenuOptions`) narrows the same bulk call to one terminal state.
+ * **Composes with `nameFilter`** -- unlike `queueId`/`jobIds`, both may be sent together
+ * (`models.py.DismissAllRequest`'s own restructured validator allows it; see that model's
+ * docstring and `docs/decisions.md` for the decided reasoning). `TransfersPage.tsx.
+ * handleDismissOutcome` sends the box's own current (debounced) name filter alongside whichever
+ * outcome the user picked, so the dismiss always matches what the box is currently showing.
+ *
+ * `queueId` and `jobIds` stay mutually exclusive with every other scope, including each other
+ * (`DismissAllRequest`'s own validator rejects an incoherent combination); no caller in this app
+ * sends either alongside `outcome`/`nameFilter`. Threaded the same "omitted means not sent" way
+ * every scope on this call already is, not five functions -- they're all optional narrowings
+ * (or, for `queueId`/`jobIds`, exclusive scopes) of the same one bulk call.
  */
 export function dismissAllJobs(
   queueId?: number,
   jobIds?: number[],
   nameFilter?: string,
+  outcome?: JobOut['state'],
 ): Promise<DismissAllResponse> {
-  const body: { queue_id?: number; job_ids?: number[]; name_filter?: string } = {}
+  const body: { queue_id?: number; job_ids?: number[]; name_filter?: string; outcome?: string } = {}
   if (queueId != null) body.queue_id = queueId
   if (jobIds != null) body.job_ids = jobIds
   if (nameFilter != null) body.name_filter = nameFilter
+  if (outcome != null) body.outcome = outcome
   return sendJson<DismissAllResponse>(
     '/api/jobs/dismiss-all',
     'POST',
