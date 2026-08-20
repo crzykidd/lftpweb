@@ -311,6 +311,22 @@ export function moveJobToTop(jobId: number): Promise<void> {
   return sendJson<void>(`/api/jobs/${jobId}/move-to-top`, 'POST')
 }
 
+/** The chevron reorder controls (2026-08-19, docs/transfers-redesign-spec.md §3.4 stage 2,
+ * prompts/2026-08-19-queue-reorder-chevrons.md) -- ▲ up one / ▼ down one / ▲▲ to top, one
+ * endpoint for all three (`api/jobs.py.move_job`) rather than three near-identical calls.
+ * `sendJson` throws on a non-2xx response -- a 404 (unknown job) or 409 (the job is no longer
+ * `queued`, e.g. it started running between the page render and the click) both surface as a
+ * thrown `Error`, the same shape every other job action on this page already reports through
+ * `withBusy`. Already-at-the-edge and a single-job queue are silent 204 no-ops server-side, not
+ * errors -- the frontend's own `canMoveUp`/`canMoveDown` (`lib/transferPanel.ts`) additionally
+ * disable the buttons for those cases so the request is rarely even sent.
+ */
+export type MoveDirection = 'up' | 'down' | 'top'
+
+export function moveJob(jobId: number, direction: MoveDirection): Promise<void> {
+  return sendJson<void>(`/api/jobs/${jobId}/move`, 'POST', { direction })
+}
+
 /** Dismiss a terminal (`failed`/`cancelled`) job from the Transfers page (2026-08-13,
  * prompts/done/2026-08-13-dismiss-terminal-jobs.md) -- the row's own record stays in History;
  * this only stops it showing here. Rejects (non-2xx, `sendJson` throws) for a `queued`/

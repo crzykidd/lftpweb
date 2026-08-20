@@ -735,6 +735,18 @@ class StartNowRequest(BaseModel):
     rate_percent: Literal[10, 25, 50, 75, 100] | None = None
 
 
+# The chevron reorder actions (2026-08-19, docs/transfers-redesign-spec.md §3.4 stage 2,
+# `prompts/2026-08-19-queue-reorder-chevrons.md`) -- `POST /api/jobs/{id}/move`'s required body.
+# One endpoint, one request shape, rather than three near-identical routes; anything outside the
+# three directions is a 422 for free via `Literal`, the same pattern `StartNowRequest` above uses
+# for its own five-option menu.
+MoveDirection = Literal["up", "down", "top"]
+
+
+class MoveJobRequest(BaseModel):
+    direction: MoveDirection
+
+
 class JobOut(BaseModel):
     id: int
     item_id: int

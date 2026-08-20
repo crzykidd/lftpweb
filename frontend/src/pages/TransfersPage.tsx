@@ -4,11 +4,12 @@ import {
   dismissJob,
   getItemEvents,
   getTransferSettings,
-  moveJobToTop,
+  moveJob,
   retryItem,
   startJobNow,
   stopJob,
 } from '../api/client'
+import type { MoveDirection } from '../api/client'
 import type { FileNode, ItemEventOut, JobOut } from '../api/types'
 import { ArrIcon, ArrRowChip } from '../components/LifecycleIcons'
 import { ItemDrawer } from '../components/ItemDrawer'
@@ -23,6 +24,8 @@ import {
   type LiveProgress,
   type PanelField,
   type QueueGroup,
+  canMoveDown,
+  canMoveUp,
   completedTimeLabel,
   dismissableJobIds,
   filterTransferJobs,
@@ -116,13 +119,19 @@ interface RowProps {
   // for a running/failed/cancelled row -- those aren't
   // "queued" in the sense a position means anything for.
   queuePosition: number | undefined
+  // How many rows are currently `queued` (2026-08-19, `TransfersPage.tsx`'s own
+  // `queuePositions.size`) -- `canMoveDown` (`lib/transferPanel.ts`) needs this alongside
+  // `queuePosition` to know whether this row is already last in the global order.
+  queuedCount: number
   // Settings -> Transfer's site total limit (2026-08-19,
   // prompts/done/2026-08-19-start-now-bandwidth-fractions.md) -- fed straight into
   // `StartNowMenu`, which decides (via `lib/startNow.ts`) whether the fraction options are
   // enabled. `undefined` while `GET /api/settings/transfer` is still in flight.
   maxBandwidthBps: number | undefined
   onOpenDrawer: (job: JobOut) => void
-  onMoveToTop: (job: JobOut) => void
+  // The chevron reorder controls (2026-08-19, docs/transfers-redesign-spec.md §3.4 stage 2) --
+  // one handler for ▲/▼/▲▲, replacing the previous single-purpose `onMoveToTop`.
+  onMove: (job: JobOut, direction: MoveDirection) => void
   onStartNow: (job: JobOut, ratePercent: StartNowRatePercent | undefined) => void
   onStop: (job: JobOut) => void
   onRetry: (job: JobOut) => void
@@ -135,9 +144,10 @@ function Row({
   nodes,
   live,
   queuePosition,
+  queuedCount,
   maxBandwidthBps,
   onOpenDrawer,
-  onMoveToTop,
+  onMove,
   onStartNow,
   onStop,
   onRetry,
@@ -165,7 +175,7 @@ function Row({
         {queuePosition != null && (
           <span
             className="shrink-0 rounded-full bg-indigo-100 px-1.5 py-0.5 text-xs font-semibold tabular-nums text-indigo-800 dark:bg-indigo-900/40 dark:text-indigo-300"
-            title={`Queue position ${queuePosition} -- runs in this order (Move to top to reorder)`}
+            title={`Queue position ${queuePosition} -- runs in this order (use the row's move controls to reorder)`}
           >
             #{queuePosition}
           </span>
@@ -212,13 +222,44 @@ function Row({
         <div className="flex shrink-0 flex-wrap items-center gap-2">
           {job.state === 'queued' && (
             <>
+              {/* Chevron reorder controls (2026-08-19, docs/transfers-redesign-spec.md §3.4
+               * stage 2) -- ▲▲ to top, ▲ up one, ▼ down one, replacing the previous single
+               * "Move to top" button. Global scope, not within-group (spec §3.4): the page
+               * still groups by queue at this stage (grouping doesn't drop until stage 4), so
+               * a move may not swap with the row visually above/below it -- a known
+               * intermediate state, not a bug. Disabled at the edges of the *global* queued
+               * order (`canMoveUp`/`canMoveDown`, `lib/transferPanel.ts`) -- the backend's own
+               * `move_job` treats an out-of-turn request as a silent no-op regardless, so this
+               * is the UI affordance on top of that guard, not the only one. */}
               <button
                 type="button"
-                disabled={busy}
-                onClick={() => onMoveToTop(job)}
+                disabled={busy || !canMoveUp(queuePosition)}
+                onClick={() => onMove(job, 'top')}
+                aria-label="Move to top of queue"
+                title="Move to top of queue"
                 className="rounded-md border border-zinc-300 px-2 py-1 text-xs font-medium text-zinc-700 hover:bg-zinc-50 disabled:opacity-50 dark:border-zinc-700 dark:text-zinc-200 dark:hover:bg-zinc-900"
               >
-                Move to top
+                ▲▲
+              </button>
+              <button
+                type="button"
+                disabled={busy || !canMoveUp(queuePosition)}
+                onClick={() => onMove(job, 'up')}
+                aria-label="Move up one"
+                title="Move up one"
+                className="rounded-md border border-zinc-300 px-2 py-1 text-xs font-medium text-zinc-700 hover:bg-zinc-50 disabled:opacity-50 dark:border-zinc-700 dark:text-zinc-200 dark:hover:bg-zinc-900"
+              >
+                ▲
+              </button>
+              <button
+                type="button"
+                disabled={busy || !canMoveDown(queuePosition, queuedCount)}
+                onClick={() => onMove(job, 'down')}
+                aria-label="Move down one"
+                title="Move down one"
+                className="rounded-md border border-zinc-300 px-2 py-1 text-xs font-medium text-zinc-700 hover:bg-zinc-50 disabled:opacity-50 dark:border-zinc-700 dark:text-zinc-200 dark:hover:bg-zinc-900"
+              >
+                ▼
               </button>
               {job.forced_rate_fraction == null && (
                 <StartNowMenu
@@ -647,7 +688,8 @@ export function TransfersPage() {
     }
   }
 
-  const handleMoveToTop = (job: JobOut) => withBusy(job.id, () => moveJobToTop(job.id))
+  const handleMove = (job: JobOut, direction: MoveDirection) =>
+    withBusy(job.id, () => moveJob(job.id, direction))
   const handleStop = (job: JobOut) => withBusy(job.id, () => stopJob(job.id))
   const handleRetry = (job: JobOut) => withBusy(job.id, () => retryItem(job.item_id))
   const handleDismiss = (job: JobOut) => withBusy(job.id, () => dismissJob(job.id))
@@ -949,8 +991,8 @@ export function TransfersPage() {
        * interesting on its own. */}
       {queuedCount > 1 && (
         <p className="text-xs text-zinc-500 dark:text-zinc-400">
-          Queued jobs run in the order shown, top to bottom — use <strong>Move to top</strong> to
-          reorder.
+          Queued jobs run in the order shown, top to bottom — use each row's{' '}
+          <strong>▲ / ▼ / ▲▲</strong> controls to reorder.
         </p>
       )}
 
@@ -1074,9 +1116,10 @@ export function TransfersPage() {
                       nodes={nodesByQueue.get(job.queue_id) ?? []}
                       live={progressByJobId[job.id]}
                       queuePosition={queuePositions.get(job.id)}
+                      queuedCount={queuedCount}
                       maxBandwidthBps={maxBandwidthBps}
                       onOpenDrawer={setDrawerJob}
-                      onMoveToTop={handleMoveToTop}
+                      onMove={handleMove}
                       onStartNow={handleStartNow}
                       onStop={handleStop}
                       onRetry={handleRetry}

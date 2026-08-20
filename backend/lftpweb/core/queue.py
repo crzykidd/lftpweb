@@ -110,6 +110,18 @@ class NoSiteLimitConfiguredError(Exception):
     """
 
 
+class JobNotQueuedError(Exception):
+    """Raised by `TransferQueue.move_job` when `job_id` is no longer `queued` -- it started
+    running, or reached a terminal state, sometime between the Transfers page rendering its
+    chevrons and the click landing (2026-08-19, docs/transfers-redesign-spec.md §3.4 stage 2,
+    `prompts/2026-08-19-queue-reorder-chevrons.md`). Reordering a running job is meaningless:
+    its allocation is fixed at spawn and never re-shaped (DESIGN.md §4.5's invariant), and a
+    terminal job isn't in line at all. `api/jobs.py.move_job` turns this into a 409, matching
+    `JobNotDismissableError`'s own "the job exists, the request just isn't valid for its current
+    state" convention above -- never a 404, which would wrongly suggest the job itself is gone.
+    """
+
+
 # Progress sampling cadence -- deliberately *not* the ~1 Hz `tick_s` everything else in this
 # module runs at (reap/admit/stop stay at `tick_s`, §4.4/DESIGN.md §4.4):
 #
@@ -984,6 +996,152 @@ class TransferQueue:
         )
         await self.db.commit()
         self.request_tick()
+
+    async def move_job(self, job_id: int, direction: str) -> None:
+        """The chevron reorder actions (2026-08-19, docs/transfers-redesign-spec.md §3.4 stage
+        2, `prompts/2026-08-19-queue-reorder-chevrons.md`): `direction` is `'up'`, `'down'`, or
+        `'top'`. One method, not three near-identical ones -- `api/jobs.py` exposes it behind a
+        single `POST /api/jobs/{id}/move` endpoint.
+
+        **`'top'` reuses `move_to_top` verbatim** -- no second implementation of "front of the
+        line" exists. It only adds the same not-queued guard `'up'`/`'down'` need below (
+        `move_to_top` itself has no such guard -- its own `UPDATE ... WHERE id = ? AND state =
+        'queued'` just silently no-ops on a non-queued row, which was fine when its only caller
+        was a UI button that already hid itself for a non-queued row; this method's callers need
+        an explicit signal instead, per the task's own "reject cleanly" instruction).
+
+        **`'up'`/`'down'` resolve the target's adjacent neighbour in the same lane-agnostic
+        global position order the scheduler uses** (`queue_position ASC, id ASC` over `state =
+        'queued'`, identical to `_admit`'s own ordering query), then set the moved job's position
+        to the midpoint (`position_between`) between that neighbour and the neighbour's own
+        next-outward neighbour -- a standard swap-by-midpoint reorder. Concretely, for `'up'`
+        moving a job from index `i` to `i-1`: the new position lands between index `i-2`'s
+        position (or unbounded, if `i-1` is already the front) and index `i-1`'s own position,
+        which is exactly what makes the two rows trade places without touching either neighbour's
+        stored value.
+
+        **Edge cases, each covered by its own test in `tests/test_queue_position.py`:**
+
+        - Already at the front (`'up'`) or back (`'down'`) of the *global* queued order: a no-op
+          that returns normally, not an error. The UI disables the control here, but this method
+          cannot rely on that -- a second tab, or a stale render, can still send the request.
+        - Only one job queued: both directions are trivially the "already at the edge" case
+          above.
+        - `job_id` not found at all: `ValueError` (matches every other not-found guard in this
+          class -- `api/jobs.py` maps it to 404).
+        - `job_id` exists but is not `queued` (running, or already terminal -- started or
+          finished between the page rendering its position and the click landing):
+          `JobNotQueuedError` (`api/jobs.py` maps it to 409). Reordering a running job is
+          meaningless: DESIGN.md §4.5's invariant is that its allocation is fixed at spawn and
+          never re-shaped, so there is nothing here for a position change to affect.
+        - **Concurrent moves.** Two `move_job` calls racing each other can each read the same
+          neighbour positions before either commits, in principle landing two jobs on the exact
+          same `queue_position`. This is survivable, not corrupting: every reader of
+          `queue_position` (`_admit`, `list_jobs`, this method's own neighbour query) orders
+          `queue_position ASC, id ASC`, so `id` is the deterministic final tiebreak regardless of
+          how many rows share a position -- see `tests/test_queue_position.py`'s duplicate-
+          position test. No lock is taken here for the same reason `_insert_job`/`move_to_top`
+          never have: SQLite's own single-writer serialization already makes each individual
+          `UPDATE` atomic, and a stale-neighbour race merely produces "close enough" ordering for
+          one tick, never two rows silently colliding into an unreadable state.
+
+        **Position exhaustion.** Repeated midpoint bisection between the same two neighbours
+        halves the gap between them every time, and eventually produces a value float precision
+        cannot distinguish from one of its own bounds (`position_between`'s own docstring calls
+        this out as an accepted property of the fractional-key design, "occasional rebalance").
+        Detected here by comparing the computed midpoint back against the two bounds that
+        produced it -- if it lands on either one, the *entire* queued set is renormalized to
+        1.0, 2.0, 3.0... in current order (`_renormalize_queue_positions`, below) and this method
+        retries once against the now evenly-spaced positions, which cannot exhaust on the very
+        next bisection.
+        """
+        if direction == "top":
+            row = await self._fetch_job(job_id)
+            if row is None:
+                raise ValueError(f"job {job_id} not found")
+            if row["state"] != "queued":
+                raise JobNotQueuedError(f"job {job_id} is not queued (state={row['state']!r})")
+            await self.move_to_top(job_id)
+            return
+
+        if direction not in ("up", "down"):
+            raise ValueError(f"unknown move direction {direction!r}")
+
+        cursor = await self.db.execute(
+            "SELECT id, queue_position FROM job WHERE state = 'queued' "
+            "ORDER BY queue_position ASC, id ASC"
+        )
+        rows = await cursor.fetchall()
+        ids = [r["id"] for r in rows]
+        positions = [r["queue_position"] for r in rows]
+
+        try:
+            index = ids.index(job_id)
+        except ValueError:
+            row = await self._fetch_job(job_id)
+            if row is None:
+                raise ValueError(f"job {job_id} not found") from None
+            raise JobNotQueuedError(
+                f"job {job_id} is not queued (state={row['state']!r})"
+            ) from None
+
+        if direction == "up":
+            if index == 0:
+                return  # already at the front of the global order -- no-op
+            neighbour_idx, outward_idx = index - 1, index - 2
+        else:
+            if index == len(ids) - 1:
+                return  # already at the back of the global order -- no-op
+            neighbour_idx, outward_idx = index + 1, index + 2
+
+        neighbour_pos = positions[neighbour_idx]
+        outward_pos = positions[outward_idx] if 0 <= outward_idx < len(positions) else None
+
+        if direction == "up":
+            lower, upper = outward_pos, neighbour_pos
+        else:
+            lower, upper = neighbour_pos, outward_pos
+        new_position = position_between(lower, upper)
+
+        # Exhaustion only ever arises from a genuine two-bound midpoint -- an unbounded insert
+        # (`lower`/`upper` None) always lands 1.0 away from its one real bound, never adjacent to
+        # it in float terms.
+        exhausted = (
+            lower is not None
+            and upper is not None
+            and (new_position <= lower or new_position >= upper)
+        )
+        if exhausted:
+            await self._renormalize_queue_positions()
+            await self.move_job(job_id, direction)
+            return
+
+        await self.db.execute(
+            "UPDATE job SET queue_position = ? WHERE id = ? AND state = 'queued'",
+            (new_position, job_id),
+        )
+        await self.db.commit()
+        self.request_tick()
+
+    async def _renormalize_queue_positions(self) -> None:
+        """Collapse whatever float precision `move_job`'s repeated midpoint bisection has
+        exhausted: rewrite every `queued` job's `queue_position` as 1.0, 2.0, 3.0... in its
+        current `queue_position ASC, id ASC` order. Purely a precision reset, not a reordering --
+        every row keeps its relative place, so a caller that re-derives its own neighbours
+        immediately afterward (`move_job`'s own retry) computes the identical move it was already
+        trying to make, just against evenly-spaced inputs that cannot be adjacent in float terms.
+        `rank`/`queued_at` are untouched; this only ever rewrites `queue_position`, the one column
+        bisection can exhaust.
+        """
+        cursor = await self.db.execute(
+            "SELECT id FROM job WHERE state = 'queued' ORDER BY queue_position ASC, id ASC"
+        )
+        rows = await cursor.fetchall()
+        for i, row in enumerate(rows, start=1):
+            await self.db.execute(
+                "UPDATE job SET queue_position = ? WHERE id = ?", (float(i), row["id"])
+            )
+        await self.db.commit()
 
     async def start_now(self, job_id: int, *, rate_percent: int | None = None) -> bool:
         """The "Start now" action (DESIGN.md §4.5), now a menu (2026-08-19,

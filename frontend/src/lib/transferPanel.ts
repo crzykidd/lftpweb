@@ -312,6 +312,31 @@ export function isDismissable(state: JobOut['state']): boolean {
   return state === 'failed' || state === 'cancelled' || state === 'succeeded'
 }
 
+// --- Chevron reordering (2026-08-19, docs/transfers-redesign-spec.md §3.4 stage 2,
+// prompts/2026-08-19-queue-reorder-chevrons.md): "can this row move" is pure enough to live
+// here and be unit-tested directly, rather than inlined in `Row`'s own JSX. -------------------
+
+/** Whether a queued row's ▲ (up one) / ▲▲ (to top) chevrons should be enabled -- disabled on
+ * the very first queued row in the global order, since there's nothing above it to trade places
+ * with; the position number beside it already says so. `queuePosition` is `TransfersPage.tsx`'s
+ * own 1-based `queuePositions` reading for this job (`undefined` for a non-queued row, which
+ * never renders chevrons at all -- `Row`'s own `job.state === 'queued'` guard covers that
+ * case before this function is ever called). The backend's own edge-case handling
+ * (`core/queue.py.TransferQueue.move_job`) makes an out-of-turn request a silent no-op rather
+ * than an error regardless -- this is the UI affordance on top of that, not the only guard.
+ */
+export function canMoveUp(queuePosition: number | undefined): boolean {
+  return queuePosition != null && queuePosition > 1
+}
+
+/** The ▼ (down one) chevron's counterpart -- disabled on the last queued row in the global
+ * order. `queuedCount` is `TransfersPage.tsx`'s own `queuePositions.size` (how many rows are
+ * currently `queued`, the same count the page already derives for nothing else today).
+ */
+export function canMoveDown(queuePosition: number | undefined, queuedCount: number): boolean {
+  return queuePosition != null && queuePosition < queuedCount
+}
+
 // --- Name filter + "Dismiss list" (2026-08-19, prompts/2026-08-19-transfers-name-filter.md):
 // a busy install's Transfers page has no way to narrow a long list. Pure logic only, same
 // discipline this whole file already follows -- `TransfersPage.tsx` applies these before

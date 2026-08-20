@@ -31,6 +31,17 @@ Skeleton for the next roll:
   filter currently matches, in one request — greyed out until the filter matches at least one
   dismissable row. The filter itself doesn't persist across a reload, matching the Files page's
   own text filter and the Logs filter.
+- **Per-row queue reordering on the Transfers page**: **▲ up one**, **▼ down one**, and **▲▲ to
+  top** on each queued row, replacing the previous single "Move to top" button
+  (`docs/transfers-redesign-spec.md` §3.4, phase 1 stage 2). One endpoint,
+  `POST /api/jobs/{id}/move`, backs all three. Disabled at the front/back of the global queue
+  order (the position number already says so); an out-of-turn request against the backend itself
+  (a second tab, a stale render) is a silent no-op rather than an error, and a job that started
+  running or finished between the page render and the click is rejected instead of silently
+  reordering a job whose bandwidth allocation is already fixed. The move's scope is global, not
+  within a visible queue group — since the Transfers page still groups rows by queue at this
+  stage (grouping doesn't drop until a later stage of the same redesign), a move doesn't always
+  swap a row with the one shown directly above/below it on screen.
 
 ### Changed
 

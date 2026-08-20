@@ -2,6 +2,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { HistoryJobOut, HistoryQueueSummaryOut, JobOut, JobState } from '../api/types'
 import {
   type LiveProgress,
+  canMoveDown,
+  canMoveUp,
   completedTimeLabel,
   decrementHistoryQueueSummary,
   dismissableJobIds,
@@ -448,6 +450,43 @@ describe('groupHasDismissable -- the group header\'s "Dismiss Queue" visibility'
 
   it('is false for an empty group', () => {
     expect(groupHasDismissable([])).toBe(false)
+  })
+})
+
+// 2026-08-19 (prompts/2026-08-19-queue-reorder-chevrons.md): the chevron reorder controls' own
+// enabled/disabled logic -- "can this row move" pulled out of `TransfersPage.tsx`'s `Row` so it's
+// unit-testable without mounting anything (README.md's Known gaps: no component rendering).
+describe('canMoveUp -- the ▲/▲▲ chevrons\' enabled state', () => {
+  it('is false for the first queued row -- nothing above it to trade places with', () => {
+    expect(canMoveUp(1)).toBe(false)
+  })
+
+  it('is true for any row past the first', () => {
+    expect(canMoveUp(2)).toBe(true)
+    expect(canMoveUp(9)).toBe(true)
+  })
+
+  it('is false for a non-queued row (no position at all)', () => {
+    expect(canMoveUp(undefined)).toBe(false)
+  })
+})
+
+describe('canMoveDown -- the ▼ chevron\'s enabled state', () => {
+  it('is false for the last queued row -- nothing below it to trade places with', () => {
+    expect(canMoveDown(3, 3)).toBe(false)
+  })
+
+  it('is true for any row before the last', () => {
+    expect(canMoveDown(1, 3)).toBe(true)
+    expect(canMoveDown(2, 3)).toBe(true)
+  })
+
+  it('is false for a non-queued row (no position at all)', () => {
+    expect(canMoveDown(undefined, 3)).toBe(false)
+  })
+
+  it('is false when it is the only queued row', () => {
+    expect(canMoveDown(1, 1)).toBe(false)
   })
 })
 

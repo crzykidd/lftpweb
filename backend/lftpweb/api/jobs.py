@@ -1,4 +1,4 @@
-"""Queue/stop/retry/move-to-top/start-now, the active+pending job list, and the site-level
+"""Queue/stop/retry/move-to-top/move/start-now, the active+pending job list, and the site-level
 transfer settings (DESIGN.md §4.5, §9.2 Transfers, §9.3). Backend only this phase — the
 Transfers page and item drawer are phase 3b; this is the API they'll consume, verified here
 through the API itself and the fake seedbox rather than through a UI that doesn't exist yet.
@@ -19,6 +19,7 @@ from lftpweb.core.lftp import build_transfer_command, effective_tuning_settings
 from lftpweb.core.postprocess import perform_remote_delete
 from lftpweb.core.queue import (
     JobNotDismissableError,
+    JobNotQueuedError,
     NoSiteLimitConfiguredError,
     TransferSettings,
     load_transfer_settings,
@@ -38,6 +39,7 @@ from lftpweb.models import (
     ItemEventsResponse,
     JobOut,
     JobsResponse,
+    MoveJobRequest,
     QueueItemRequest,
     QueueResetRequest,
     ResetItemResponse,
@@ -284,6 +286,30 @@ async def item_events(
 @router.post("/api/jobs/{job_id}/move-to-top", status_code=204)
 async def move_to_top(job_id: int, request: Request) -> None:
     await request.app.state.queue.move_to_top(job_id)
+
+
+@router.post("/api/jobs/{job_id}/move", status_code=204)
+async def move_job(job_id: int, body: MoveJobRequest, request: Request) -> None:
+    """The chevron reorder controls (2026-08-19, docs/transfers-redesign-spec.md §3.4 stage 2,
+    `prompts/2026-08-19-queue-reorder-chevrons.md`) -- one endpoint for **▲ up one**, **▼ down
+    one**, and **▲▲ to top**, rather than three near-identical routes. `body.direction` outside
+    `{'up', 'down', 'top'}` is a 422 for free via `MoveJobRequest`'s own `Literal`, never reaching
+    this handler.
+
+    An unknown `job_id` is a 404 (`ValueError`, matching every other not-found guard in this
+    file); a `job_id` that exists but is no longer `queued` -- it started running, or reached a
+    terminal state, between the page rendering its chevrons and the click landing -- is a 409
+    (`core/queue.py.JobNotQueuedError`), the same "the job exists, the request just isn't valid
+    for its current state" distinction `dismiss_job` above already draws. Already-at-the-edge
+    (top row + `'up'`/`'top'`, bottom row + `'down'`) and a queue with only one job are silent
+    no-ops, not errors -- `TransferQueue.move_job`'s own docstring.
+    """
+    try:
+        await request.app.state.queue.move_job(job_id, body.direction)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except JobNotQueuedError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @router.post("/api/jobs/{job_id}/start-now", response_model=dict)

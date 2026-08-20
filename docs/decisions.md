@@ -6,6 +6,31 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-19 — Chevron reordering: kept `POST /api/jobs/{id}/move-to-top` alongside the new
+`POST /api/jobs/{id}/move`
+
+`prompts/done/2026-08-19-queue-reorder-chevrons.md`, phase 1 stage 2 of
+`docs/transfers-redesign-spec.md` §3.4. The task's own instruction was "reuse the existing
+move-to-top implementation for `top` — do not write a second one," which the new endpoint honors
+at the *core* layer: `TransferQueue.move_job(..., "top")` calls `move_to_top` directly rather than
+duplicating its `position_between(None, MIN(...))` logic. It says nothing about the pre-existing
+HTTP route, though, and the two are now genuinely redundant from the frontend's point of view —
+`TransfersPage.tsx`'s chevrons call the new `/move` endpoint exclusively (including for "to top"),
+so `/move-to-top` is reachable only by a caller outside this codebase.
+
+**Decided: leave `/move-to-top` in place, unused by the frontend, rather than remove it.**
+Removing a live API route is a separate, bigger decision than "add chevrons" — it risks breaking
+some future or external caller for no gain this task needs, and the route costs nothing to keep
+(it's a thin wrapper already fully covered by `tests/test_queue_position.py`'s `move_to_top`
+tests). If a future session confirms nothing depends on it, removing it then is a clean, separate
+change.
+
+**Also decided: `move_job`'s error mapping is 404 for an unknown job, 409 for a known job that's
+no longer `queued`.** Matches `dismiss_job`'s existing "the job exists, the request just isn't
+valid for its current state" distinction (`api/jobs.py`) rather than inventing a new convention.
+
+---
+
 ## 2026-08-19 — Queue ordering moved from `rank`/boost to a dense `queue_position` model
 
 `prompts/done/2026-08-19-queue-position-order-model.md`, phase 1 stage 1 of

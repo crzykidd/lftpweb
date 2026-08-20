@@ -853,24 +853,39 @@ Ordering is `queue_position ASC, id ASC` (migration 023, 2026-08-19,
 docs/transfers-redesign-spec.md §3.4/§3.5) — a dense fractional total order, one value per
 queued job, assigned on insert (`MAX(queue_position) + 1` — **the default is oldest-first**,
 since that's the same order `queued_at` would have given) and rewritten on reorder. **Move to
-top** takes `MIN(queue_position) - 1`; a future per-row "move up one / down one" (not yet built)
-takes the midpoint between two neighbours — one `UPDATE`, no renumbering of anything else. This
-replaced an earlier `rank DESC, queued_at ASC` boost scheme (`rank` defaulting to 0, "Move to
-top" setting `rank = MAX(rank) + 1`) that fit "Move to top" but could not support "move up one":
-two adjacent rank-0 jobs could only be swapped by swapping `queued_at` (which corrupts the
-queued-wait readout the column is also used for), the zone boundary made "up one" actually mean
-"vault above the entire backlog," and rank inside the boosted zone encoded recency-of-boost, not
-position. `rank` stays in the schema (unread for ordering) and `queued_at` keeps its original
-meaning as the queued-wait readout's source — see migration 023's own comment for why neither
-column was dropped.
+top** takes `MIN(queue_position) - 1`; **"move up one" / "move down one"** (stage 2, 2026-08-19,
+`prompts/2026-08-19-queue-reorder-chevrons.md`) take the midpoint (`position_between`) between the
+job's two adjacent neighbours in that same global order — one `UPDATE`, no renumbering of
+anything else. All three actions sit behind one endpoint, `POST /api/jobs/{id}/move` (body
+`{"direction": "up" | "down" | "top"}`, `core/queue.py.TransferQueue.move_job`), which reuses
+`move_to_top` verbatim for `"top"` rather than a second implementation. Already-at-an-edge and a
+single-job queue are silent no-ops; a job that stopped being `queued` between the page rendering
+its chevrons and the click (started running, or reached a terminal state) is rejected (409) —
+reordering a running job is meaningless, since its allocation is fixed at spawn and never
+re-shaped (this section's own invariant, above). Repeated midpoint bisection between the same two
+neighbours eventually produces a value float precision can't distinguish from one of its bounds;
+`move_job` detects that and renormalizes the whole queued set (rewritten 1.0, 2.0, 3.0… in current
+order) before retrying, rather than silently degrading or corrupting the order. This replaced an
+earlier `rank DESC, queued_at ASC` boost scheme (`rank` defaulting to 0, "Move to top" setting
+`rank = MAX(rank) + 1`) that fit "Move to top" but could not support "move up one": two adjacent
+rank-0 jobs could only be swapped by swapping `queued_at` (which corrupts the queued-wait readout
+the column is also used for), the zone boundary made "up one" actually mean "vault above the
+entire backlog," and rank inside the boosted zone encoded recency-of-boost, not position. `rank`
+stays in the schema (unread for ordering, but still written by `move_to_top` — the one durable
+"was this job ever explicitly boosted" marker `_rescue_position` reads) and `queued_at` keeps its
+original meaning as the queued-wait readout's source — see migration 023's own comment for why
+neither column was dropped.
 
 **Positions are global across both lanes** — the main and fast lanes admit from independent
-pools (below), but the ordering key is one shared sequence, so the chevron a stage-2 UI will
-expose and the displayed queue number always agree. One consequence to accept: a fast-lane item
-can display a higher position number than a main-lane item it's about to start ahead of, since
-the numbering doesn't split by lane (§3.5's "fast lane makes today's numbering slightly
-dishonest" — decided to keep one `1..N` numbering with a fast-lane badge, not two numbering
-schemes).
+pools (below), but the ordering key is one shared sequence, so the chevron UI (stage 2) and the
+displayed queue number always agree. One consequence to accept: a fast-lane item can display a
+higher position number than a main-lane item it's about to start ahead of, since the numbering
+doesn't split by lane (§3.5's "fast lane makes today's numbering slightly dishonest" — decided to
+keep one `1..N` numbering with a fast-lane badge, not two numbering schemes). A second, related
+consequence (stage-2-specific, resolves itself at stage 4): the Transfers page still groups rows
+by queue at this stage, so a chevron move's *global* scope doesn't always swap a row with the one
+immediately above/below it *on screen* — only with its actual neighbour in the shared position
+order, which may sit in a different queue's group.
 
 **The v0.2.6 startup rescue re-derives its position, not just its `queued_at`.** An interrupted
 item is re-queued carrying its original `queued_at` forward (unchanged — still what keeps the
@@ -1963,13 +1978,14 @@ Some.Release.S03E04.2160p    [downloading]   18 files   62%   4.1 MB/s   ETA 12m
 - Visible status vocabulary is **queued / downloading / downloaded**. The other internal states
   (§3.2) surface only on rows where they actually apply, rather than expanding everyone's
   mental model to twelve chips.
-- **Move to top** on each row (§4.5); default order is oldest-first. **Each still-queued row
-  shows its actual run position** (2026-08-13) — a small `#N` ordinal, 1/2/3… in the order
-  `GET /api/jobs` already returns them (`rank DESC, queued_at ASC`), plus a one-line caption
-  once there is more than one queued job that the list order *is* the queue order. The
-  capability (ordering, Move to top, Start now) existed before this and was invisible; nothing
-  new was added server-side, the list was already sorted. `rank` grows monotonically on every
-  "Move to top" with no compaction — not a practical problem at 64-bit `INTEGER` width.
+- **▲ up one / ▼ down one / ▲▲ to top** on each queued row (§4.5's "Queue order and priority" —
+  stage 2, 2026-08-19, `prompts/2026-08-19-queue-reorder-chevrons.md`; replaced a single "Move to
+  top" button); default order is oldest-first. **Each still-queued row shows its actual run
+  position** (2026-08-13) — a small `#N` ordinal, 1/2/3… in the order `GET /api/jobs` already
+  returns them (`queue_position ASC, id ASC`), plus a one-line caption once there is more than one
+  queued job that the list order *is* the queue order. `▲`/`▲▲` are disabled on the first queued
+  row and `▼` on the last — the position number already tells the user where they are, and the
+  backend's own edge-case handling makes an out-of-turn request a no-op regardless.
 - **Start now**, a per-row menu (10% / 25% / 50% / 75% / Max of the site total limit,
   2026-08-19 — §4.5's "Start now" section has the fraction math), with its oversubscription
   behavior explained inline the first time it's used. The percent options are disabled with a
