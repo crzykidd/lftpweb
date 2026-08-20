@@ -1,22 +1,26 @@
-import { Fragment, useEffect, useMemo, useState } from 'react'
+import { Fragment, useCallback, useEffect, useMemo, useState } from 'react'
 import {
   dismissAllJobs,
   dismissJob,
+  getHealth,
   getHistoryJobOutput,
   getItemChildren,
   getItemEvents,
   getTransferSettings,
   moveJob,
+  pauseQueue,
   resolveItem,
   retryItem,
   startJobNow,
   stopJob,
+  unpauseQueue,
 } from '../api/client'
 import type { MoveDirection } from '../api/client'
 import type { FileNode, ItemEventOut, JobOut } from '../api/types'
 import { ArrIcon, ArrRowChip } from '../components/LifecycleIcons'
 import { DismissMenu } from '../components/DismissMenu'
 import { ItemDrawer } from '../components/ItemDrawer'
+import { PauseMenu } from '../components/PauseMenu'
 import { ResolveMenu } from '../components/ResolveMenu'
 import { StartNowMenu } from '../components/StartNowMenu'
 import { StateChip } from '../components/StateChip'
@@ -24,6 +28,7 @@ import { useCompleteJobs } from '../hooks/useCompleteJobs'
 import { useJobs } from '../hooks/useJobs'
 import type { ChildSpeedSample } from '../hooks/useLiveModel'
 import { useLiveModel } from '../hooks/useLiveModel'
+import { usePoll } from '../hooks/usePoll'
 import { arrHoverLabel, nodeDisplaySize, stateProgressPercent } from '../lib/fileTree'
 import { childSpeedLabel, formatBytes, formatRelativeTimeIntl } from '../lib/format'
 import {
@@ -139,6 +144,11 @@ interface RowProps {
   // `StartNowMenu`, which decides (via `lib/startNow.ts`) whether the fraction options are
   // enabled. `undefined` while `GET /api/settings/transfer` is still in flight.
   maxBandwidthBps: number | undefined
+  // 2026-08-20 (prompts/2026-08-20-queue-pause.md): "Start now" doesn't work while the transfer
+  // queue is paused -- disabled here (with a reason in the tooltip) *and* rejected server-side
+  // with a 409 (`core/queue.py.QueuePausedError`); reordering (the chevrons above) is
+  // deliberately unaffected -- see this task's own settled decisions for why.
+  queuePaused: boolean
   onOpenDrawer: (job: JobOut) => void
   // The chevron reorder controls (2026-08-19, docs/transfers-redesign-spec.md §3.4 stage 2) --
   // one handler for ▲/▼/▲▲, replacing the previous single-purpose `onMoveToTop`.
@@ -163,6 +173,7 @@ function Row({
   queuePosition,
   queuedCount,
   maxBandwidthBps,
+  queuePaused,
   onOpenDrawer,
   onMove,
   onStartNow,
@@ -345,7 +356,8 @@ function Row({
               </button>
               {job.forced_rate_fraction == null && (
                 <StartNowMenu
-                  disabled={busy}
+                  disabled={busy || queuePaused}
+                  title={queuePaused ? 'Unavailable while the transfer queue is paused' : undefined}
                   maxBandwidthBps={maxBandwidthBps}
                   onSelect={(ratePercent) => onStartNow(job, ratePercent)}
                 />
@@ -865,6 +877,17 @@ export function TransfersPage() {
   // row's menu reads disabled in the meantime, same as "not configured" (`StartNowMenu`'s own
   // fallback).
   const [maxBandwidthBps, setMaxBandwidthBps] = useState<number | undefined>(undefined)
+  // Pause (2026-08-20, prompts/2026-08-20-queue-pause.md): `/api/health`'s `queue_paused` is
+  // the one source of truth for whether the queue is currently paused -- polled independently
+  // here, same "a second, independent one-shot/polled `getHealth()` call" pattern
+  // `StatsHeader.tsx`/`WhatsNewDialog.tsx` already use (health is on the access-log polling
+  // exemption list specifically for this). `undefined` until the first response lands, read as
+  // "not paused" everywhere below -- a briefly-missing paused banner on first paint is a far
+  // smaller problem than the Pause button flashing "Unpause" for a moment.
+  const healthFetcher = useCallback(getHealth, [])
+  const health = usePoll(healthFetcher, 5000)
+  const [pauseBusy, setPauseBusy] = useState(false)
+  const [pauseError, setPauseError] = useState<string | null>(null)
   // The Complete box's "Dismiss" menu (2026-08-20, follow-up to phase 1 stage 4b -- see
   // `handleDismissOutcome`'s own docstring below) -- replaces both the old page-top "Dismiss
   // all" button (`dismissingAll`/`dismissAllError`/`dismissAllCount`, same three-state shape
@@ -1097,6 +1120,38 @@ export function TransfersPage() {
     return withBusy(job.id, () => startJobNow(job.id, ratePercent))
   }
 
+  /** The Pause control (2026-08-20, prompts/2026-08-20-queue-pause.md) -- not per-row, so it
+   * doesn't go through `withBusy`/`busyIds` (those are keyed by job id); a page-level busy flag
+   * disables the control itself for the duration of the request instead. `refreshAll()` on
+   * success so a "pause now" is reflected immediately (jobs that were `running` a moment ago now
+   * read `queued`) rather than waiting for the next poll tick.
+   */
+  const handlePause = async (mode: 'after_current' | 'now') => {
+    setPauseBusy(true)
+    setPauseError(null)
+    try {
+      await pauseQueue(mode === 'now')
+      refreshAll()
+    } catch (err) {
+      setPauseError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setPauseBusy(false)
+    }
+  }
+
+  const handleUnpause = async () => {
+    setPauseBusy(true)
+    setPauseError(null)
+    try {
+      await unpauseQueue()
+      refreshAll()
+    } catch (err) {
+      setPauseError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setPauseBusy(false)
+    }
+  }
+
   /** The Complete box's "Dismiss" menu (2026-08-20, follow-up to phase 1 stage 4b from the
    * user's browser review, `prompts/2026-08-20-transfers-dismiss-menu-and-counts.md`) --
    * replaces the old page-top "Dismiss all" button (which only ever offered every dismissable
@@ -1214,6 +1269,38 @@ export function TransfersPage() {
 
   return (
     <div className="flex flex-col gap-3">
+      {/* Pause (2026-08-20, prompts/2026-08-20-queue-pause.md): the control lives at the very
+       * top of the Queue tab, above every other control on this page -- pausing is a page-level
+       * action, not a per-row one, and "a queue that silently does nothing is a support question
+       * waiting to happen" is the task's own reasoning for making the paused state unmistakable
+       * rather than a quiet badge. Reordering (the chevrons below) and auto-queue/manual Queue
+       * clicks keep working while paused -- only admission itself stops -- so this banner reads
+       * as "nothing new is starting," not "nothing is happening." */}
+      <div className="flex flex-wrap items-center gap-3">
+        {health?.queue_paused ? (
+          <>
+            <span className="flex items-center gap-1.5 rounded-md border border-amber-300 bg-amber-50 px-2.5 py-1 text-xs font-medium text-amber-900 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-200">
+              ● Queue paused — nothing new is being admitted
+            </span>
+            <button
+              type="button"
+              disabled={pauseBusy}
+              onClick={handleUnpause}
+              className="rounded-md border border-zinc-300 px-2 py-1 text-xs font-medium text-zinc-700 hover:bg-zinc-50 disabled:opacity-50 dark:border-zinc-700 dark:text-zinc-200 dark:hover:bg-zinc-900"
+            >
+              {pauseBusy ? 'Resuming…' : 'Unpause'}
+            </button>
+          </>
+        ) : (
+          <PauseMenu disabled={pauseBusy} onSelect={handlePause} />
+        )}
+        {pauseError && (
+          <span className="text-xs text-red-600 dark:text-red-400">
+            Couldn't update the pause state: {pauseError}
+          </span>
+        )}
+      </div>
+
       {startNowNotice && (
         <div className="flex items-start justify-between gap-3 rounded-md border border-amber-300 bg-amber-50 p-3 text-sm text-amber-900 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-200">
           <p>
@@ -1383,6 +1470,7 @@ export function TransfersPage() {
                 queuePosition={queuePositions.get(job.id)}
                 queuedCount={queuedCount}
                 maxBandwidthBps={maxBandwidthBps}
+                queuePaused={health?.queue_paused ?? false}
                 onOpenDrawer={setDrawerJob}
                 onMove={handleMove}
                 onStartNow={handleStartNow}
@@ -1492,6 +1580,7 @@ export function TransfersPage() {
                 queuePosition={queuePositions.get(job.id)}
                 queuedCount={queuedCount}
                 maxBandwidthBps={maxBandwidthBps}
+                queuePaused={health?.queue_paused ?? false}
                 onOpenDrawer={setDrawerJob}
                 onMove={handleMove}
                 onStartNow={handleStartNow}

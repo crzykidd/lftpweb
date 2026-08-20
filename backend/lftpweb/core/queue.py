@@ -115,6 +115,19 @@ class NoSiteLimitConfiguredError(Exception):
     """
 
 
+class QueuePausedError(Exception):
+    """Raised by `TransferQueue.start_now` while the queue is paused (this task, 2026-08-20,
+    `prompts/2026-08-20-queue-pause.md`). "Start now" is the oversubscription escape hatch
+    (DESIGN.md §4.5) -- letting it through while paused would silently defeat the pause the
+    user just asked for, the same "an explicit user action beats a heuristic" question §4.7
+    already answers the other way for manual Queue clicks (those still enqueue while paused;
+    only *admission* is gated). `api/jobs.py.start_now` turns this into a 409, disjoint from
+    `JobNotQueuedError`'s 409 below and from `move_job`'s own guard -- reordering a queued job
+    stays fully functional while paused (this task's own settled decision: pause is the moment
+    you curate the order), so this check lives only in `start_now`, never in `move_job`.
+    """
+
+
 class JobNotQueuedError(Exception):
     """Raised by `TransferQueue.move_job` when `job_id` is no longer `queued` -- it started
     running, or reached a terminal state, sometime between the Transfers page rendering its
@@ -310,6 +323,50 @@ async def save_transfer_settings(db: aiosqlite.Connection, settings: TransferSet
     await db.commit()
 
 
+@dataclass(frozen=True)
+class QueuePauseState:
+    """Whether admission is paused (this task, 2026-08-20,
+    `prompts/2026-08-20-queue-pause.md`) -- persisted the same way as every other site-level
+    setting in this module (`TransferSettings` above): a small dataclass, JSON in `setting`,
+    under its own key. A dedicated `setting` row rather than a migration -- a single bool needs
+    no schema of its own, and this codebase already has a generic key/value store built for
+    exactly this shape (every other `core/*.py` module's own `SETTING_KEY` constant).
+
+    **Which entry mode ("pause after current" vs "pause now") was used is deliberately not
+    part of this state.** Once paused, the two modes are indistinguishable from here on:
+    nothing new is admitted either way, and "pause now" already finished doing its one-time
+    extra work (returning running jobs to `queued`, see `TransferQueue._pause_running_jobs`)
+    by the time this is read again. There is nothing left for the entry mode to mean.
+    """
+
+    paused: bool = False
+
+
+PAUSE_SETTING_KEY = "queue_pause_state"
+
+
+async def load_queue_pause_state(db: aiosqlite.Connection) -> QueuePauseState:
+    cursor = await db.execute("SELECT value FROM setting WHERE key = ?", (PAUSE_SETTING_KEY,))
+    row = await cursor.fetchone()
+    if row is None:
+        return QueuePauseState()
+    try:
+        data = json.loads(row["value"])
+    except (ValueError, TypeError):
+        return QueuePauseState()
+    return QueuePauseState(paused=bool(data.get("paused", False)))
+
+
+async def save_queue_pause_state(db: aiosqlite.Connection, state: QueuePauseState) -> None:
+    payload = json.dumps({"paused": state.paused})
+    await db.execute(
+        "INSERT INTO setting (key, value, updated_at) VALUES (?, ?, STRFTIME('%Y-%m-%dT%H:%M:%fZ','now')) "
+        "ON CONFLICT (key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+        (PAUSE_SETTING_KEY, payload),
+    )
+    await db.commit()
+
+
 @dataclass
 class _RunningProcess:
     job_id: int
@@ -335,6 +392,10 @@ class _RunningProcess:
     # module's docstring for why `bytes_done` alone can't be differenced by job id.
     bytes_start: int = 0
     stop_requested: bool = False
+    # "Pause now" (this task, 2026-08-20) -- mirrors `stop_requested` above, but `_reap_one`
+    # routes it to a different outcome: back to `queued` in place, not `STOPPED`/suppressed.
+    # See `TransferQueue._pause_running_jobs` and `_reap_one`'s own `paused` branch.
+    pause_requested: bool = False
 
 
 class TransferQueue:
@@ -429,9 +490,17 @@ class TransferQueue:
         # state instead of once per second for as long as it lasts (see `_admit` below).
         self.credentials_need_reentry = False
 
+        # Pause (this task, 2026-08-20, `prompts/2026-08-20-queue-pause.md`) -- cached
+        # in-memory, same shape as `credentials_need_reentry` above, so `_admit`'s gate and
+        # `/api/health` never pay a DB read on the hot path. Loaded from its persisted setting
+        # row in `start()` below (so a restart doesn't quietly resume everything); every write
+        # goes through `pause()`/`unpause()`, which update both the row and this cache together.
+        self._paused = False
+
     # --- lifecycle ---------------------------------------------------------------------
 
     async def start(self) -> None:
+        self._paused = (await load_queue_pause_state(self.db)).paused
         await self._reconcile_orphaned_jobs()
         if self._task is None:
             self._task = asyncio.create_task(self._loop(), name="lftpweb-transfer-queue-loop")
@@ -813,6 +882,110 @@ class TransferQueue:
                     result,
                 )
 
+    @property
+    def paused(self) -> bool:
+        """Whether admission is currently paused (this task, 2026-08-20,
+        `prompts/2026-08-20-queue-pause.md`) -- `/api/health`'s `queue_paused` and
+        `start_now`'s 409 guard both read this. Backed by `self._paused`, kept in memory and
+        loaded from its persisted `setting` row at `start()`; every write goes through
+        `pause()`/`unpause()` below, which update the row and this cache together.
+        """
+        return self._paused
+
+    async def pause(self, *, stop_running: bool) -> None:
+        """Pause admission (this task -- the two "Pause after current" / "Pause now" entry
+        modes from the Transfers -> Queue tab control).
+
+        **The admission gate lives in `_admit()`, not in `core/scheduler.py.admit()`.** The
+        caller (this module) simply skips calling the scheduler at all while paused, rather
+        than threading a new flag through `SchedulerSettings`/`admit()`. `admit()` is a
+        deliberately pure function with worked examples in DESIGN.md §4.5 that mention nothing
+        about pause; a caller-side skip leaves that function, and every one of those examples,
+        completely untouched. Reaping, progress publishing, scanning, and auto-queue are
+        unaffected either way -- only `_admit()`'s own body is short-circuited (see its own
+        gate, right at the top).
+
+        `stop_running=False` ("pause after current"): running jobs are left alone and finish
+        naturally; nothing new is admitted from here on.
+
+        `stop_running=True` ("pause now"): additionally, every in-flight lftp child is
+        SIGTERM'd and its job returned straight to `queued`, in place -- see
+        `_pause_running_jobs` for why this is the graceful-shutdown model (§10.3) plus the
+        v0.2.6 startup rescue's re-queue, and explicitly **not** `stop_job`'s §4.6 stop
+        semantics (auto_queue_suppressed, `STOPPED`) -- reusing stop would suppress every
+        paused-now item and it would never come back on unpause, the opposite of what pausing
+        means.
+
+        Auto-queue and manual Queue clicks keep enqueueing while paused (DESIGN.md §4.7:
+        "always wins," untouched by this task) -- the queue simply builds up and is worked
+        through once admission resumes.
+        """
+        await save_queue_pause_state(self.db, QueuePauseState(paused=True))
+        self._paused = True
+        await audit.record_event(
+            self.db,
+            level="info",
+            kind="queue_paused",
+            message=(
+                "transfer queue paused ('pause now' -- running transfers were stopped and "
+                "requeued)"
+                if stop_running
+                else "transfer queue paused after current (nothing new admitted; running "
+                "transfers finish normally)"
+            ),
+        )
+        if stop_running:
+            await self._pause_running_jobs()
+
+    async def unpause(self) -> None:
+        """Resume admission immediately, in `queue_position` order -- `request_tick()` wakes
+        the loop rather than waiting up to `tick_s` for the next scheduled pass.
+        """
+        await save_queue_pause_state(self.db, QueuePauseState(paused=False))
+        self._paused = False
+        await audit.record_event(
+            self.db, level="info", kind="queue_unpaused", message="transfer queue unpaused"
+        )
+        self.request_tick()
+
+    async def _pause_running_jobs(self) -> None:
+        """ "Pause now"'s per-job half: SIGTERM every in-flight lftp child, concurrently -- the
+        exact same reasoning as `stop()`'s graceful shutdown above (independent processes,
+        nothing to serialize, and a queue full of running jobs must not take `N * grace_s` to
+        pause). The difference from `stop()` is what happens after each child exits:
+        `_reap_one` sees `pause_requested` and returns the job straight to `queued` **in
+        place** rather than tearing this process down.
+
+        Never re-derives `queue_position` (unlike the startup rescue's own `_rescue_position`
+        --- that one exists because a restart already destroyed the interrupted job's row,
+        forcing a *fresh* row to be inserted and re-placed). Here the job row survives
+        untouched throughout; only `job.state` ever changes at admission
+        (`_spawn_decision`'s `UPDATE job SET state = 'running', ...` never touches
+        `queue_position`), so simply flipping the state back to `queued` finds the row exactly
+        where it already was -- no neighbour search needed.
+        """
+        running = list(self._running.values())
+        if not running:
+            return
+
+        async def _pause_one(proc: _RunningProcess) -> None:
+            proc.pause_requested = True
+            try:
+                await lftp.terminate(proc.spawned, grace_s=10.0)
+            finally:
+                await self._reap_one(proc)
+
+        results = await asyncio.gather(
+            *(_pause_one(proc) for proc in running), return_exceptions=True
+        )
+        for proc, result in zip(running, results, strict=True):
+            if isinstance(result, Exception):
+                logger.warning(
+                    "job %s: error pausing lftp child (SIGTERM/requeue): %r",
+                    proc.job_id,
+                    result,
+                )
+
     def request_tick(self) -> None:
         self._wake.set()
 
@@ -1180,7 +1353,19 @@ class TransferQueue:
         "not really configured" needs no new sentinel or migration to the settings row itself.
         Max (`fraction == 1.0`) is exempt from this check -- it reuses whatever
         `max_bandwidth_bps` already is, unconditionally, exactly as the pre-fraction path did.
+
+        **Refused (409, `QueuePausedError`) while the queue is paused** (this task, 2026-08-20):
+        paused means paused -- oversubscribing past the ceiling to force one item through would
+        silently defeat the pause the user just asked for. Checked before anything else below,
+        so it applies unconditionally, the same "belt-and-braces" shape (disabled client-side
+        *and* rejected server-side) `NoSiteLimitConfiguredError` already uses for its own case.
+        Reordering (`move_job`) is a separate method entirely and is untouched by this check --
+        it stays fully usable while paused (this task's own settled decision).
         """
+        if self._paused:
+            raise QueuePausedError(
+                "start-now is unavailable while the transfer queue is paused -- unpause first"
+            )
         row = await self._fetch_job(job_id)
         if row is None or row["state"] != "queued":
             return False
@@ -1496,6 +1681,48 @@ class TransferQueue:
                 (exit_code, tail[-lftp.OUTPUT_TAIL_BYTES :], finished_at, proc.job_id),
             )
             await self._suppress_item(proc.item_id, reason="user_stopped", state="STOPPED")
+            await self.db.commit()
+            await self._publish_item_state(proc.item_id)
+            proc.spawned.cleanup()
+            return
+
+        if proc.pause_requested:
+            # "Pause now" (this task, 2026-08-20, `prompts/2026-08-20-queue-pause.md`) -- the
+            # job returns straight to `queued`, **in place**: `queue_position` is never touched
+            # here (`_pause_running_jobs`'s own docstring has why no neighbour search is
+            # needed), `attempt` is unchanged (this is a resume, not a retry), and neither
+            # `auto_queue_suppressed` nor `STOPPED` is ever set -- the one thing this whole task
+            # exists to get right. Reusing `stop_job`'s §4.6 semantics (the branch just above)
+            # would suppress the item and it would never come back on unpause -- the exact
+            # opposite of what "pause" means.
+            #
+            # **A SIGTERM'd lftp exits non-zero, but `exit_code`/`error_class` are deliberately
+            # never written here.** This branch returns before the exit-code classification
+            # below and the retry/failure bookkeeping it drives, exactly like the `stopped`
+            # branch above -- a pause must never produce a `FAILED` row or an `error_class`.
+            #
+            # `forced_full_rate`/`forced_rate_fraction` are cleared: a job admitted via "Start
+            # now" goes back through ordinary admission on unpause, rather than silently
+            # re-oversubscribing the instant it resumes.
+            await self.db.execute(
+                "UPDATE job SET state = 'queued', pid = NULL, started_at = NULL, "
+                "rate_limit_bps = NULL, forced_full_rate = 0, forced_rate_fraction = NULL, "
+                "output_tail = ? WHERE id = ?",
+                (tail[-lftp.OUTPUT_TAIL_BYTES :], proc.job_id),
+            )
+            await self.db.execute("UPDATE item SET state = 'QUEUED' WHERE id = ?", (proc.item_id,))
+            await audit.record_event(
+                self.db,
+                level="info",
+                item_id=proc.item_id,
+                job_id=proc.job_id,
+                kind="paused_now_requeued",
+                message=(
+                    f"job {proc.job_id} for {proc.rel_path!r}: stopped by 'pause now' -- "
+                    "returned to queued at its same position; partial bytes on disk are kept "
+                    "and the next attempt resumes from them"
+                ),
+            )
             await self.db.commit()
             await self._publish_item_state(proc.item_id)
             proc.spawned.cleanup()
@@ -2220,6 +2447,15 @@ class TransferQueue:
         await self.metrics.tick(running)
 
     async def _admit(self) -> None:
+        # The pause gate (this task, 2026-08-20) -- a caller-side skip, not a flag threaded
+        # into `scheduler.admit()` (see `pause()`'s own docstring for why). Deliberately no log
+        # line here: unlike "admitted none" below (a *surprising* zero that needs explaining),
+        # a paused queue admitting nothing is exactly what was asked for, and the paused banner
+        # / health readout already say so continuously -- logging it every tick would just be
+        # per-second noise for as long as the pause lasts.
+        if self._paused:
+            return
+
         settings = await load_transfer_settings(self.db)
         sched_settings = settings.scheduler_settings()
 

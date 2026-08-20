@@ -942,6 +942,49 @@ percentage meaningless** — the four fraction options are disabled in the UI wi
 API refuses a fraction request outright (409) rather than silently substituting Max; Max itself
 is exempt from this check and always works, reusing whatever `max_bandwidth` already is.
 
+#### Pausing admission
+
+A site-wide **Pause** (2026-08-20, `prompts/2026-08-20-queue-pause.md`), independent of any
+single job's Start now/Stop: while paused, `_admit()` (`core/queue.py`) refuses to run at all —
+a caller-side early return, before it ever gathers `(running, queue)` or calls `admit()` above.
+**`admit()` itself carries no pause concept** and is never called while paused; every worked
+example in this section holds exactly as written, both while paused (they simply never run) and
+once resumed. The alternative — a `paused` flag threaded through `SchedulerSettings` — was
+rejected for exactly that reason: it would touch the one function this whole design keeps
+deliberately pure and mentioning `queue_id` zero times, for a decision that only the caller needs
+to make.
+
+Persisted (a `setting` row, not a migration — the same key/value store every other site-level
+setting in `core/queue.py`/`core/autoqueue.py`/etc. already uses) so a container restart does not
+quietly resume a queue someone paused on purpose.
+
+Two entry modes, one paused state:
+
+- **Pause after current** — running jobs are left alone and finish normally; nothing new is
+  admitted from here on.
+- **Pause now** — additionally SIGTERMs every in-flight lftp child (concurrently, the same
+  reasoning as graceful shutdown, §10.3) and returns each one to `queued`, **in place**: same
+  `queue_position`, same `attempt`, same row. This is deliberately the graceful-shutdown model
+  plus the v0.2.6 startup rescue's re-queue — **not** §4.6's stop semantics. Stop sets
+  `auto_queue_suppressed` on purpose (§4.6); reusing it here would suppress every paused-now item
+  and it would never come back on unpause, the opposite of what pausing means. A SIGTERM'd lftp
+  exits non-zero, but that exit is never run through the failure-classification path
+  (`lftp.classify_output`) at all — the same short-circuit `stop_job`'s own `stop_requested`
+  branch already uses — so a pause never produces a `FAILED` row or an `error_class`.
+
+**Auto-queue, manual Queue clicks, reaping, progress publishing, scanning, and post-processing
+all keep running while paused** — only admission stops. Pause means "stop moving bytes," not
+"stop noticing things": a release that ages off the seedbox during a pause would otherwise be
+missed, and an already-downloaded item's verify/extract/import must not stall just because the
+transfer engine is paused.
+
+**Reordering (this section's own "Queue order and priority," above) stays fully live while
+paused — this is the point of pausing, not an oversight.** Pause is the moment to curate the
+order: stop everything, rearrange the queue so the right item is next, then unpause. The chevrons
+and `POST /api/jobs/{id}/move` carry no pause check at all, and "Start now"'s own 409 guard
+(`core/queue.py.QueuePausedError`, disabled client-side with a reason in the tooltip too) is
+scoped to `start_now` alone, so it cannot accidentally catch the reorder endpoint.
+
 #### Residual inefficiency, stated plainly
 
 Because allocations are never re-shaped, a job admitted at B/2 keeps B/2 after its partner
@@ -975,6 +1018,15 @@ for too much". Therefore:
 
 **Stopping is a user action, and it is terminal.** It is never a pause, and it never leads to
 an automatic retry.
+
+**This is a genuinely different action from the site-wide Pause (§4.5's "Pausing admission"),
+despite both sending the same SIGTERM.** Stop is per-job and permanent — the rule right below is
+what makes it mean anything — while "pause now" is site-wide and always reversible: it returns
+every affected job straight to `queued`, never sets `auto_queue_suppressed`, and never touches
+`STOPPED`/`FAILED`. Conflating the two was the single easiest way to get pause wrong (found while
+scoping `prompts/2026-08-20-queue-pause.md`): reusing this section's stop semantics for "pause
+now" would suppress every item that happened to be running at the moment of pausing, and none of
+them would come back on unpause.
 
 - **Running job:** SIGTERM to that one PID (§4.1). Not SIGKILL — SIGTERM lets lftp flush its
   `.lftp-pget-status` sidecar so the partial is resumable (§4.4). SIGKILL only after a grace
@@ -2334,8 +2386,9 @@ That is worth a backup.
 
 ### 10.3 Health and shutdown
 
-- **`HEALTHCHECK`** on `/api/health` — reports DB reachability, host reachability, and whether
-  the scheduler loop is live.
+- **`HEALTHCHECK`** on `/api/health` — reports DB reachability, host reachability, whether
+  the scheduler loop is live, and whether admission is paused (`queue_paused`, §4.5's "Pausing
+  admission" — a deliberate, healthy state, folded into neither `status` nor `scheduler_alive`).
 - **Graceful shutdown:** SIGTERM propagates to in-flight lftp children so their `-c` resume
   state is clean and the next start resumes rather than restarts.
 

@@ -11,6 +11,7 @@ function health(overrides: Partial<HealthResponse> = {}): HealthResponse {
     repo_url: '',
     host_reachable: null,
     scheduler_alive: true,
+    queue_paused: false,
     build_sha: null,
     build_channel: null,
     ...overrides,

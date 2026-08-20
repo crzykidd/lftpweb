@@ -6,6 +6,52 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-20 — Pausing: a caller-side gate in `_admit()`, "pause now" reuses the shutdown/
+rescue model rather than stop, a `setting` row rather than a migration
+
+`prompts/2026-08-20-queue-pause.md`, a user request for a site-wide Pause control on the
+Transfers → Queue tab. Browser-unverified (no page render).
+
+**The admission gate lives in `core/queue.py._admit()`, not in `core/scheduler.py.admit()`.**
+The prompt asked which to pick; the caller-side skip won because `admit()` is deliberately pure,
+has worked examples in DESIGN.md §4.5 that a pause flag would need to either extend or leave
+silently untested, and mentions `queue_id` zero times by design (§12's scheduler/queue split).
+`_admit()` simply returns before gathering `(running, queue)` at all when paused — no log line
+either (an "admitted none" log fires only for a *surprising* zero; a paused queue admitting
+nothing is exactly what was asked for, and the banner/health readout already say so
+continuously).
+
+**"Pause now" reuses the graceful-shutdown model (§10.3) plus the v0.2.6 startup rescue's
+re-queue, explicitly not `stop_job`'s §4.6 semantics.** This was the prompt's own named trap:
+stop sets `auto_queue_suppressed` on purpose, so reusing it would suppress every item that
+happened to be running at the moment of pausing and none of them would come back on unpause.
+The mechanism: a new `pause_requested` flag on `_RunningProcess` (mirroring `stop_requested`),
+SIGTERM'd concurrently (same reasoning as `stop()`'s own fan-out), and a new branch in
+`_reap_one` that short-circuits *before* the exit-code classification path — a SIGTERM'd lftp
+exits non-zero, and running that exit through `lftp.classify_output` would produce a `FAILED`
+row and an `error_class` for a pause, exactly the failure mode the prompt called out as "the
+most likely way to get this wrong." Unlike the startup rescue, this never re-derives
+`queue_position` via `_rescue_position` — that method exists because a restart destroys the
+interrupted job's row, forcing a fresh insert; here the row survives untouched throughout (only
+`job.state` ever changes at admission), so flipping `state` back to `queued` finds it exactly
+where it already was.
+
+**Persistence: a new `setting` row (`queue_pause_state`), not a migration.** Same key/value
+pattern every other site-level setting in this codebase already uses (`TransferSettings`,
+`AutoQueueSettings`, etc., each its own small dataclass + `SETTING_KEY` constant) — a single
+bool needs no schema of its own. Which entry mode was used to pause is deliberately **not**
+persisted: once paused, "after current" and "now" are indistinguishable from that point on (the
+one-time extra work "now" does is already finished by the time the state is read again), so
+there is nothing left for the mode to mean.
+
+**Start now's 409 guard lives only in `start_now()`, not in a shared pre-check**, so it cannot
+accidentally catch `move_job` — reordering was the user's own explicit reasoning for why Start
+now doesn't need to work while paused ("you should be able to move things up in the queue while
+paused... rearrange before unpausing"), and the prompt named the risk of a shared guard
+by name.
+
+---
+
 ## 2026-08-20 — The Active/Complete split predicate lives server-side as SQL text; the paused
 source delete is bounded by age, not by its event; a manual resolution is never superseded
 

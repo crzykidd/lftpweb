@@ -39,6 +39,11 @@ class HealthResponse(BaseModel):
     # yet (a fresh install), distinct from `False` (a host is configured but unreachable).
     host_reachable: bool | None = None
     scheduler_alive: bool = True
+    # 2026-08-20 (`prompts/2026-08-20-queue-pause.md`): whether admission is paused
+    # (`core/queue.py.TransferQueue.paused`). The header bar and the Queue tab's own banner both
+    # read this -- "a queue that silently does nothing is a support question waiting to happen"
+    # is the task's own reasoning for surfacing it here alongside `scheduler_alive`.
+    queue_paused: bool = False
     # 2026-08-16 (docs/decisions.md): also not in §12's literal shape, same reasoning as
     # `repo_url` above -- `config.Settings.build_sha`/`.build_channel` are baked at image
     # *build* time (docker/Dockerfile's `runtime` stage, .github/workflows/publish.yml), and
@@ -795,6 +800,14 @@ MoveDirection = Literal["up", "down", "top"]
 
 class MoveJobRequest(BaseModel):
     direction: MoveDirection
+
+
+# The Transfers -> Queue tab's Pause control (2026-08-20, `prompts/2026-08-20-queue-pause.md`):
+# `POST /api/queue/pause`'s body -- "pause after current" (`stop_running=False`, the default)
+# leaves running jobs alone; "pause now" (`stop_running=True`) also SIGTERMs and requeues them
+# (`core/queue.py.TransferQueue.pause`). `POST /api/queue/unpause` takes no body.
+class QueuePauseRequest(BaseModel):
+    stop_running: bool = False
 
 
 class JobOut(BaseModel):

@@ -34,6 +34,10 @@ async def health(request: Request) -> HealthResponse:
     # admission-control loop (§4.5).
     queue = getattr(request.app.state, "queue", None)
     scheduler_alive = bool(queue is not None and queue.is_alive)
+    # 2026-08-20 (`prompts/2026-08-20-queue-pause.md`): paused is a deliberate, healthy state
+    # (the scheduler loop is still alive, admission is just refused) -- it is not folded into
+    # `status`/`scheduler_alive` below, only reported as its own field.
+    queue_paused = bool(queue is not None and queue.paused)
 
     status = "ok" if db_ok and scheduler_alive and host_reachable is not False else "degraded"
 
@@ -45,6 +49,7 @@ async def health(request: Request) -> HealthResponse:
         repo_url=settings.repo_url,
         host_reachable=host_reachable,
         scheduler_alive=scheduler_alive,
+        queue_paused=queue_paused,
         build_sha=settings.build_sha,
         build_channel=settings.build_channel,
     )

@@ -461,6 +461,20 @@ export function startJobNow(
   )
 }
 
+/** The Transfers -> Queue tab's Pause control (2026-08-20, `prompts/2026-08-20-queue-pause.md`).
+ * `stopRunning` omitted/`false` is "pause after current" -- running jobs finish normally, nothing
+ * new is admitted. `true` is "pause now" -- additionally stops every in-flight transfer and
+ * returns it to `queued` at its same position (`core/queue.py.TransferQueue.pause`).
+ */
+export function pauseQueue(stopRunning = false): Promise<void> {
+  return sendJson<void>('/api/queue/pause', 'POST', { stop_running: stopRunning })
+}
+
+/** Resume admission immediately, in queue-position order. */
+export function unpauseQueue(): Promise<void> {
+  return sendJson<void>('/api/queue/unpause', 'POST')
+}
+
 export function retryItem(itemId: number): Promise<JobOut> {
   return sendJson<JobOut>(`/api/items/${itemId}/retry`, 'POST')
 }

@@ -135,6 +135,18 @@ Skeleton for the next roll:
   twice-confirmed evidence, never on a button click. Every resolution is written to the Events
   log, and the row carries a **Marked complete**/**Marked failed** chip so it never quietly
   reads as a normal completion.
+- **A site-wide Pause control at the top of the Transfers → Queue tab** (`prompts/2026-08-20-
+  queue-pause.md`): **Pause after current** leaves running transfers alone and admits nothing
+  new; **Pause now** additionally stops every in-flight transfer and returns each one to
+  `queued` at its same position, ready to resume — not restart — from the same bytes once
+  unpaused. Deliberately **not** the same thing as Stop: a paused-now item never carries
+  `auto_queue_suppressed` and never reads `STOPPED`/`FAILED`, so nothing needs a manual re-queue
+  to come back. Auto-queue, manual Queue clicks, reaping, post-processing, and scanning all keep
+  running while paused — only admission itself stops — and reordering (the ▲/▼/▲▲ chevrons)
+  stays fully live, which is the point: pause, rearrange the queue, then unpause. Persisted
+  across a restart. An unmistakable amber banner marks the paused state on the Queue tab, and
+  the header bar's health readout gets a matching **● queue paused** badge. "Start now" is
+  disabled (with a reason in the tooltip) and rejected server-side (409) while paused.
 
 ### Changed
 

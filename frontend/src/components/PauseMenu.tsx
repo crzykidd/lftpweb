@@ -2,29 +2,47 @@ import type { CSSProperties, KeyboardEvent as ReactKeyboardEvent } from 'react'
 import { useEffect, useId, useLayoutEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { placePopover, POPOVER_EDGE_MARGIN_PX } from '../lib/popoverPosition'
-import { type StartNowOption, type StartNowRatePercent, startNowOptions, startNowRequestArg } from '../lib/startNow'
 
-// The Transfers row's "Start now" control (2026-08-19,
-// prompts/done/2026-08-19-start-now-bandwidth-fractions.md): DESIGN.md §4.5's single "Start now
-// at max bandwidth" button widened into a 10%/25%/50%/75%/Max menu. `lib/startNow.ts` owns every
-// decision (labels, which options are disabled, the request payload); this component only
-// renders what that pure module returns and wires up the interaction.
+// The Transfers -> Queue tab's Pause control (2026-08-20, `prompts/2026-08-20-queue-pause.md`)
+// -- two entry modes into one paused state:
 //
-// **No existing menu idiom to reuse.** `FieldHelp.tsx`/`FileTree.tsx`'s hover card are
-// passive tooltips (`role="tooltip"`, no keyboard navigation between items) -- this is a real
-// action menu, so it borrows their portal/positioning mechanics (`lib/popoverPosition.ts`,
-// `createPortal` into `document.body` so no ancestor's `overflow` can clip it, painted at
-// `opacity: 0` for one frame to measure real size before placing) but is otherwise a plain,
-// native, keyboard-accessible `role="menu"` -- no new dependency, per the task's own fallback
-// instruction.
+// - **Pause after current**: running transfers finish; nothing new is admitted.
+// - **Pause now**: also stops what's running, returning each job to `queued` at its same
+//   position so it resumes (not restarts) once unpaused.
+//
+// Reuses `StartNowMenu.tsx`'s own menu mechanics verbatim (portal into `document.body` so no
+// ancestor's `overflow` can clip it, `lib/popoverPosition.ts` for placement, plain keyboard-
+// accessible `role="menu"`) rather than a new dependency or a hand-rolled variant -- the task's
+// own instruction. Unlike that menu, both options here are always enabled: there is no
+// per-option "disabled" state to compute (that menu's whole `lib/startNow.ts` doesn't have an
+// analogue here), so this component owns its two options directly rather than reading them from
+// a pure module.
 
 const buttonClasses =
   'rounded-md border border-zinc-300 px-2 py-1 text-xs font-medium text-zinc-700 hover:bg-zinc-50 disabled:opacity-50 dark:border-zinc-700 dark:text-zinc-200 dark:hover:bg-zinc-900'
 
-function StartNowMenuList({
+interface PauseOption {
+  key: 'after_current' | 'now'
+  label: string
+  hint: string
+}
+
+const PAUSE_OPTIONS: PauseOption[] = [
+  {
+    key: 'after_current',
+    label: 'Pause after current',
+    hint: 'Nothing new starts; running transfers finish normally.',
+  },
+  {
+    key: 'now',
+    label: 'Pause now',
+    hint: 'Also stops what is running -- resumes from the same bytes once unpaused.',
+  },
+]
+
+function PauseMenuList({
   id,
   anchorEl,
-  options,
   activeIndex,
   itemRefs,
   onSelect,
@@ -32,10 +50,9 @@ function StartNowMenuList({
 }: {
   id: string
   anchorEl: HTMLElement
-  options: StartNowOption[]
   activeIndex: number
   itemRefs: React.MutableRefObject<Array<HTMLButtonElement | null>>
-  onSelect: (option: StartNowOption) => void
+  onSelect: (option: PauseOption) => void
   onItemKeyDown: (e: ReactKeyboardEvent<HTMLButtonElement>, index: number) => void
 }) {
   const listRef = useRef<HTMLDivElement>(null)
@@ -58,62 +75,44 @@ function StartNowMenuList({
       ref={listRef}
       id={id}
       role="menu"
-      aria-label="Start now at"
-      className="fixed z-50 flex min-w-[8rem] flex-col gap-0.5 rounded-md border border-zinc-200 bg-white p-1 text-sm shadow-lg dark:border-zinc-700 dark:bg-zinc-900"
+      aria-label="Pause the transfer queue"
+      className="fixed z-50 flex min-w-[16rem] flex-col gap-0.5 rounded-md border border-zinc-200 bg-white p-1 text-sm shadow-lg dark:border-zinc-700 dark:bg-zinc-900"
       style={style}
     >
-      {options.map((option, index) => (
+      {PAUSE_OPTIONS.map((option, index) => (
         <button
-          key={option.ratePercent}
+          key={option.key}
           ref={(el) => {
             itemRefs.current[index] = el
           }}
           type="button"
           role="menuitem"
-          disabled={option.disabled}
-          title={option.disabledHint ?? undefined}
           tabIndex={index === activeIndex ? 0 : -1}
           onClick={() => onSelect(option)}
           onKeyDown={(e) => onItemKeyDown(e, index)}
-          className="rounded px-2 py-1 text-left text-zinc-700 hover:bg-zinc-100 focus:bg-zinc-100 focus:outline-none disabled:cursor-not-allowed disabled:text-zinc-400 disabled:hover:bg-transparent dark:text-zinc-200 dark:hover:bg-zinc-800 dark:focus:bg-zinc-800 dark:disabled:text-zinc-600"
+          className="flex flex-col items-start gap-0.5 rounded px-2 py-1.5 text-left text-zinc-700 hover:bg-zinc-100 focus:bg-zinc-100 focus:outline-none dark:text-zinc-200 dark:hover:bg-zinc-800 dark:focus:bg-zinc-800"
         >
-          {option.label}
+          <span className="font-medium">{option.label}</span>
+          <span className="text-xs text-zinc-500 dark:text-zinc-400">{option.hint}</span>
         </button>
       ))}
     </div>
   )
 }
 
-export function StartNowMenu({
+export function PauseMenu({
   disabled,
-  title,
-  maxBandwidthBps,
   onSelect,
 }: {
-  /** The row's own busy state (a request already in flight) or the queue being paused --
-   * distinct from an *option's* own `disabled` (no site limit for a fraction), which
-   * `lib/startNow.ts` decides per-option.
-   */
+  /** A pause/unpause request already in flight. */
   disabled: boolean
-  /** Shown as a hover tooltip on the (disabled) button itself -- e.g. "unavailable while the
-   * transfer queue is paused" (2026-08-20, prompts/2026-08-20-queue-pause.md). A disabled menu
-   * with no reason attached is the "disabled button alone is not the guard" trap in reverse: the
-   * server-side 409 is the real guard, but a disabled control with nothing explaining why reads
-   * as broken, not as "this is deliberate."
-   */
-  title?: string
-  maxBandwidthBps: number | null | undefined
-  onSelect: (ratePercent: StartNowRatePercent | undefined) => void
+  onSelect: (mode: 'after_current' | 'now') => void
 }) {
   const id = useId()
   const buttonRef = useRef<HTMLButtonElement>(null)
   const itemRefs = useRef<Array<HTMLButtonElement | null>>([])
   const [open, setOpen] = useState(false)
   const [activeIndex, setActiveIndex] = useState(0)
-
-  const options = startNowOptions(maxBandwidthBps)
-  const firstEnabledIndex = options.findIndex((o) => !o.disabled)
-  const lastEnabledIndex = options.length - 1 - [...options].reverse().findIndex((o) => !o.disabled)
 
   const close = (focusButton: boolean) => {
     setOpen(false)
@@ -125,8 +124,8 @@ export function StartNowMenu({
     setOpen(true)
   }
 
-  // Escape closes from anywhere in the menu, a click/tap outside closes it without moving
-  // focus -- the same two dismissal paths `FieldHelp.tsx`'s own portal-rendered card uses.
+  // Same two dismissal paths StartNowMenu.tsx uses: Escape from anywhere in the menu, a
+  // click/tap outside closes it without moving focus.
   useEffect(() => {
     if (!open) return
     const onKeyDown = (e: KeyboardEvent) => {
@@ -144,40 +143,29 @@ export function StartNowMenu({
       document.removeEventListener('keydown', onKeyDown)
       document.removeEventListener('pointerdown', onPointerDown)
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- `close` is stable enough here (no
-    // deps of its own beyond refs/setState); re-subscribing every render would be needless churn.
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- `close` is stable enough here.
   }, [open, id])
 
-  // Move focus onto the active item once the menu is open, and whenever the active item changes
-  // via arrow-key navigation.
   useEffect(() => {
     if (open) itemRefs.current[activeIndex]?.focus()
   }, [open, activeIndex])
 
   const moveActive = (delta: number) => {
-    setActiveIndex((prev) => {
-      let next = prev
-      for (let i = 0; i < options.length; i++) {
-        next = (next + delta + options.length) % options.length
-        if (!options[next].disabled) return next
-      }
-      return prev
-    })
+    setActiveIndex((prev) => (prev + delta + PAUSE_OPTIONS.length) % PAUSE_OPTIONS.length)
   }
 
-  const select = (option: StartNowOption) => {
-    if (option.disabled) return
+  const select = (option: PauseOption) => {
     close(true)
-    onSelect(startNowRequestArg(option))
+    onSelect(option.key)
   }
 
   const handleButtonKeyDown = (e: ReactKeyboardEvent<HTMLButtonElement>) => {
     if (e.key === 'ArrowDown' || e.key === 'Enter' || e.key === ' ') {
       e.preventDefault()
-      openAt(firstEnabledIndex)
+      openAt(0)
     } else if (e.key === 'ArrowUp') {
       e.preventDefault()
-      openAt(lastEnabledIndex)
+      openAt(PAUSE_OPTIONS.length - 1)
     }
   }
 
@@ -193,24 +181,23 @@ export function StartNowMenu({
         break
       case 'Home':
         e.preventDefault()
-        setActiveIndex(firstEnabledIndex)
+        setActiveIndex(0)
         break
       case 'End':
         e.preventDefault()
-        setActiveIndex(lastEnabledIndex)
+        setActiveIndex(PAUSE_OPTIONS.length - 1)
         break
       case 'Escape':
         e.preventDefault()
         close(true)
         break
       case 'Tab':
-        // Let focus leave the menu normally rather than trapping it -- just close first.
         close(false)
         break
       case 'Enter':
       case ' ':
         e.preventDefault()
-        select(options[index])
+        select(PAUSE_OPTIONS[index])
         break
       default:
         break
@@ -223,23 +210,21 @@ export function StartNowMenu({
         ref={buttonRef}
         type="button"
         disabled={disabled}
-        title={title}
         aria-haspopup="menu"
         aria-expanded={open}
         aria-controls={open ? id : undefined}
-        onClick={() => (open ? close(true) : openAt(firstEnabledIndex))}
+        onClick={() => (open ? close(true) : openAt(0))}
         onKeyDown={handleButtonKeyDown}
         className={buttonClasses}
       >
-        Start now ▾
+        Pause ▾
       </button>
       {open &&
         buttonRef.current &&
         createPortal(
-          <StartNowMenuList
+          <PauseMenuList
             id={id}
             anchorEl={buttonRef.current}
-            options={options}
             activeIndex={activeIndex}
             itemRefs={itemRefs}
             onSelect={select}

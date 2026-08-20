@@ -1,8 +1,9 @@
 # Concepts
 
-The nine things that actually trip people up, and what to do about each.
+The ten things that actually trip people up, and what to do about each.
 
 ```jump
+Nothing is downloading at all — the queue is paused|#pause
 Nothing downloaded for a minute|#settle
 A finished item looks broken for ten minutes|#removal-grace
 An item won't re-download|#suppression
@@ -13,6 +14,40 @@ Inherit vs override|#inherit
 The Sonarr/Radarr icon|#arr-integration
 What's in a support bundle|#support-bundle
 ```
+
+## Nothing is downloading at all — the queue is paused {#pause}
+
+Before chasing the settle gate or a suppression flag below, check the top of
+[Transfers → Queue](/transfers/queue) for an amber **Queue paused** banner, or the header bar's
+**● queue paused** badge. If it's there, that's the whole explanation: someone (possibly you,
+possibly a while ago) paused the transfer queue, and it survives a container restart on purpose —
+so "I don't remember pausing it" doesn't rule it out.
+
+Pausing has two flavors, both reached from the same **Pause** control:
+
+| Mode | What it does |
+|---|---|
+| **Pause after current** | Nothing new starts. Whatever is already running keeps going to completion. |
+| **Pause now** | Also stops whatever is running, immediately — but leaves it **ready to resume**, not restarted. The partial bytes on disk are untouched, and unpausing picks it back up from exactly where it left off, at the front of the queue it was already holding a place in. |
+
+**This is deliberately not the same thing as Stop.** A paused-now item never carries the
+`user_stopped` suppression flag (see [auto-queue suppression](#suppression) below) and never
+reads `STOPPED`. It doesn't need a Retry click to come back — unpausing alone is enough, because
+pausing was never a decision about *that item*, only about *right now*.
+
+**What keeps running anyway.** Pausing only ever stops new transfers from starting. It does not
+stop:
+
+- Auto-queue, or a manual **Queue** click — the queue you see keeps building while paused, so
+  nothing that appears on the seedbox during a pause is missed; it's simply waiting.
+- Verify, extract, notify, import, and cleanup for anything already downloaded.
+- Scanning, so the Files page keeps reflecting reality.
+
+**Reordering works while paused — this is the point, not a gap.** Use the pause to rearrange the
+queue (the ▲/▼/▲▲ controls on each row) so the item you actually want next is at the top, then
+unpause. **Start now** is the one control that's turned off while paused (with the reason in its
+tooltip) — oversubscribing past the ceiling to force one item through would defeat the pause you
+just asked for.
 
 ## Why nothing downloaded for a minute — the settle gate {#settle}
 

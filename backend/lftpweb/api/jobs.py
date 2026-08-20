@@ -1,6 +1,6 @@
-"""Queue/stop/retry/move-to-top/move/start-now, the active+pending job list, and the site-level
-transfer settings (DESIGN.md §4.5, §9.2 Transfers, §9.3). Backend only this phase — the
-Transfers page and item drawer are phase 3b; this is the API they'll consume, verified here
+"""Queue/stop/retry/move-to-top/move/start-now/pause, the active+pending job list, and the
+site-level transfer settings (DESIGN.md §4.5, §9.2 Transfers, §9.3). Backend only this phase —
+the Transfers page and item drawer are phase 3b; this is the API they'll consume, verified here
 through the API itself and the fake seedbox rather than through a UI that doesn't exist yet.
 """
 
@@ -22,6 +22,7 @@ from lftpweb.core.queue import (
     JobNotDismissableError,
     JobNotQueuedError,
     NoSiteLimitConfiguredError,
+    QueuePausedError,
     TransferSettings,
     load_transfer_settings,
     resolve_forced_rate_fraction,
@@ -45,6 +46,7 @@ from lftpweb.models import (
     JobsResponse,
     MoveJobRequest,
     QueueItemRequest,
+    QueuePauseRequest,
     QueueResetRequest,
     ResetItemResponse,
     ResetPatternPreviewItem,
@@ -535,7 +537,32 @@ async def start_now(job_id: int, request: Request, body: StartNowRequest | None 
         applied = await request.app.state.queue.start_now(job_id, rate_percent=rate_percent)
     except NoSiteLimitConfiguredError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except QueuePausedError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     return {"applied": applied}
+
+
+@router.post("/api/queue/pause", status_code=204)
+async def pause_queue(request: Request, body: QueuePauseRequest | None = None) -> None:
+    """Transfers -> Queue tab's Pause control (this task, 2026-08-20,
+    `prompts/2026-08-20-queue-pause.md`). `body` omitted (or `stop_running` omitted/`false`)
+    is "pause after current" -- running jobs finish normally, nothing new is admitted. `{
+    "stop_running": true }` is "pause now" -- additionally SIGTERMs every in-flight lftp child
+    and returns it to `queued` at its same position, never `STOPPED`/suppressed (see
+    `core/queue.py.TransferQueue.pause`'s own docstring for why `stop_job`'s §4.6 semantics
+    would be wrong here). Idempotent: pausing an already-paused queue with `stop_running=true`
+    still stops whatever is running at the moment of the call.
+    """
+    stop_running = body.stop_running if body is not None else False
+    await request.app.state.queue.pause(stop_running=stop_running)
+
+
+@router.post("/api/queue/unpause", status_code=204)
+async def unpause_queue(request: Request) -> None:
+    """Resume admission immediately, in `queue_position` order -- see
+    `core/queue.py.TransferQueue.unpause`.
+    """
+    await request.app.state.queue.unpause()
 
 
 @router.post("/api/items/{item_id}/stop", response_model=dict)

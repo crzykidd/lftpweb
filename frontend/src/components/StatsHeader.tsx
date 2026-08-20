@@ -78,6 +78,14 @@ export function StatsHeader() {
           >
             ● scheduler {health.scheduler_alive ? 'alive' : 'dead'}
           </span>
+          {health.queue_paused && (
+            <span
+              className="text-amber-600 dark:text-amber-400"
+              title="Nothing new is being admitted -- unpause from the Queue tab. Reaping, post-processing, scanning, and auto-queue all keep running."
+            >
+              ● queue paused
+            </span>
+          )}
         </div>
       )}
     </div>
