@@ -55,6 +55,11 @@ honor by default:
 - **Do not add `Co-authored-by:` trailers** unless the user explicitly asks.
 - **Doc updates ship in the same commit as the code they describe** — never as a
   follow-up commit.
+- **Run `uv run pytest` from the REPO ROOT, never from `backend/`.** `testpaths` is defined in
+  the root `pyproject.toml` and `tests/` is a sibling of `backend/`, not inside it — so running
+  from `backend/` collects **zero** tests and exits 0, which is indistinguishable from a pass at
+  a glance. Same for `ruff`. And `ruff check` passing is **not** `ruff format --check` passing:
+  they are separate gates, run both and read each exit code.
 - **Never bypass hooks** (no `--no-verify`, `--no-gpg-sign`, etc.) unless the user
   explicitly asks. If a hook fails, fix the underlying issue.
 - **Stable releases are tagged from `main` only.** Don't tag from `dev`.
