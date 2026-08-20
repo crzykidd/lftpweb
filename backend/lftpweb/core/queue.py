@@ -2645,12 +2645,18 @@ class TransferQueue:
         `arr_instance.kind` (`'sonarr'`/`'radarr'`) — the collapsed row's new brand-logo chip
         needs to know *which* logo to draw; `arr_instance_name` alone is free-text the user can
         rename to anything, so it can't drive that choice on its own.
+
+        **2026-08-19** (docs/transfers-redesign-spec.md §3.6, phase 1 stage 4a): also joins
+        `path_queue.short_name AS queue_short_name` — the ungrouped Transfers row's queue badge
+        (`api/jobs.py._job_out`, `lib/queueDisplayName.ts`) needs a queue's short name per row
+        now that grouping (and its once-per-queue header) is gone.
         """
         cursor = await self.db.execute(
             "SELECT job.*, item.rel_path, item.is_dir, item.queue_id, item.remote_size, "
             "       item.verified_at, item.extracted_at, item.remote_deleted_at, "
             "       item.arr_status, item.arr_status_at, "
-            "       path_queue.name AS queue_name, arr_instance.name AS arr_instance_name, "
+            "       path_queue.name AS queue_name, path_queue.short_name AS queue_short_name, "
+            "       arr_instance.name AS arr_instance_name, "
             "       arr_instance.kind AS arr_instance_kind "
             "FROM job "
             "JOIN item ON item.id = job.item_id "

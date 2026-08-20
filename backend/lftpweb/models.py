@@ -766,6 +766,12 @@ class JobOut(BaseModel):
     item_id: int
     queue_id: int
     queue_name: str
+    # The queue's short display name (migration 024, `path_queue.short_name`) -- `null` when
+    # unset, same fallback-to-`queue_name` convention `api/settings_queues.py.
+    # resolve_queue_display_name` / `lib/queueDisplayName.ts` already both define. Added
+    # 2026-08-19 (docs/transfers-redesign-spec.md §3.6, phase 1 stage 4a) so a Transfers row can
+    # show a queue badge without grouping rows by queue.
+    queue_short_name: str | None
     rel_path: str
     is_dir: bool
     kind: str

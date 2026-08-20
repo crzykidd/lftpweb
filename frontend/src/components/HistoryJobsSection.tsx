@@ -51,14 +51,16 @@ function formatTs(ts: string | null): string {
 }
 
 /** A queue group's header line (2026-08-16) -- queue name, outcome counts, and total size, all
- * in one clickable line that toggles the group's collapse state. Mirrors
- * `TransfersPage.tsx.GroupHeader`'s own idiom (single-click-anywhere toggle, chevron + name +
- * counts + size), but reads the server-computed `HistoryQueueSummaryOut` instead of computing an
- * aggregate client-side over the loaded page -- see `groupHistoryJobsByQueue`'s and the `queueSummaries`
- * state's own comments for why. `summary` is only `undefined` for a queue whose rows just loaded
- * but whose summary response hasn't landed yet (the two arrive on the exact same response, so in
- * practice this is only a one-render gap) -- the header still renders, just without the counts/
- * size text until it does.
+ * in one clickable line that toggles the group's collapse state. Originally mirrored
+ * `TransfersPage.tsx`'s own now-removed `GroupHeader` idiom (single-click-anywhere toggle,
+ * chevron + name + counts + size, dropped from Transfers 2026-08-19 when the Queue tab moved to
+ * one globally-ordered list -- docs/transfers-redesign-spec.md §3.1); History keeps its own
+ * grouping, unaffected by that change. Reads the server-computed `HistoryQueueSummaryOut` instead
+ * of computing an aggregate client-side over the loaded page -- see `groupHistoryJobsByQueue`'s
+ * and the `queueSummaries` state's own comments for why. `summary` is only `undefined` for a
+ * queue whose rows just loaded but whose summary response hasn't landed yet (the two arrive on
+ * the exact same response, so in practice this is only a one-render gap) -- the header still
+ * renders, just without the counts/size text until it does.
  */
 function QueueGroupHeader({
   queueId,

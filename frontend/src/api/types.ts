@@ -566,6 +566,10 @@ export interface JobOut {
   item_id: number
   queue_id: number
   queue_name: string
+  // The queue's short display name (migration 024, `path_queue.short_name`) -- `null` when
+  // unset. Added 2026-08-19 (docs/transfers-redesign-spec.md §3.6, phase 1 stage 4a) for the
+  // ungrouped Transfers row's queue badge (`lib/queueDisplayName.ts`).
+  queue_short_name: string | null
   rel_path: string
   is_dir: boolean
   kind: JobKind

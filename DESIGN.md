@@ -882,10 +882,13 @@ displayed queue number always agree. One consequence to accept: a fast-lane item
 higher position number than a main-lane item it's about to start ahead of, since the numbering
 doesn't split by lane (§3.5's "fast lane makes today's numbering slightly dishonest" — decided to
 keep one `1..N` numbering with a fast-lane badge, not two numbering schemes). A second, related
-consequence (stage-2-specific, resolves itself at stage 4): the Transfers page still groups rows
-by queue at this stage, so a chevron move's *global* scope doesn't always swap a row with the one
-immediately above/below it *on screen* — only with its actual neighbour in the shared position
-order, which may sit in a different queue's group.
+consequence held only through stage 2 and 3: the Transfers page still grouped rows by queue at
+that point, so a chevron move's *global* scope did not always swap a row with the one immediately
+above/below it *on screen* — only with its actual neighbour in the shared position order, which
+could sit in a different queue's group. **Resolved at stage 4a** (2026-08-19,
+`docs/transfers-redesign-spec.md` §3.1) — grouping is gone, the page renders one flat,
+globally-ordered list, and a chevron move now always swaps with the row directly above/below it
+on screen, matching its actual neighbour in the shared position order.
 
 **The v0.2.6 startup rescue re-derives its position, not just its `queued_at`.** An interrupted
 item is re-queued carrying its original `queued_at` forward (unchanged — still what keeps the
@@ -1978,6 +1981,19 @@ Some.Release.S03E04.2160p    [downloading]   18 files   62%   4.1 MB/s   ETA 12m
 - Visible status vocabulary is **queued / downloading / downloaded**. The other internal states
   (§3.2) surface only on rows where they actually apply, rather than expanding everyone's
   mental model to twelve chips.
+- **One globally-ordered list, no per-queue grouping** (2026-08-19,
+  `docs/transfers-redesign-spec.md` §3.1, phase 1 stage 4a — reverses the 2026-08-16 per-queue
+  grouping, `docs/decisions.md`). `core/scheduler.py` has zero references to `queue_id`; there is
+  exactly one global admission line, so grouping by queue visually implied each queue had its own
+  ordering, which was false. Each row instead carries a compact, muted **queue badge**
+  (`short_name` if the queue has one, Settings → Queues, else its full name — the row's `title`
+  always carries the full name) and, for a job admitted from the small-item fast lane (§4.5,
+  under `small_item_threshold_bytes`, 10 MB default), a **fast lane** marker whose tooltip
+  explains that it may start before a lower-numbered main-lane job — one `1..N` numbering
+  throughout, not a second numbering scheme. Dropping grouping also resolves a stage-2 oddity:
+  the ▲/▼ chevrons below always moved a job in this same global order, so a grouped view could
+  make a move appear to swap a job with something in a different group; in the flat list the row
+  directly above is always the one being traded with.
 - **▲ up one / ▼ down one / ▲▲ to top** on each queued row (§4.5's "Queue order and priority" —
   stage 2, 2026-08-19, `prompts/2026-08-19-queue-reorder-chevrons.md`; replaced a single "Move to
   top" button); default order is oldest-first. **Each still-queued row shows its actual run
@@ -2002,21 +2018,19 @@ Some.Release.S03E04.2160p    [downloading]   18 files   62%   4.1 MB/s   ETA 12m
   actions already are) — scoped to `failed` only, not `cancelled`, since a stopped job is a
   deliberate Stop click, not the kind of unattended pile-up a permanent-error class like
   `REMOTE_GONE` can become. No confirmation dialog on either: nothing is destroyed.
-- **A name filter**, in the page toolbar above the row groups (2026-08-19) — start typing and
+- **A name filter**, in the page toolbar above the row list (2026-08-19) — start typing and
   only rows whose `rel_path` contains that text (case-insensitive substring, no glob/regex)
-  stay visible, across every queue group; a "showing N of M" readout appears alongside it once
-  it's non-empty. Not persisted — no `localStorage`, no URL param — matching the Files page's
-  own text filter and the Logs filter, since a stale filter hiding active transfers after a
-  reload would be its own confusion. While active, every group renders expanded regardless of
-  its own collapse preference (a match inside a collapsed queue must still surface) — the
-  preference itself is left untouched and applies again unchanged the moment the filter clears,
-  the identical rule the Files page's own text filter already established. Alongside the input,
-  **Dismiss list** dismisses exactly the terminal rows the filter currently matches, in one bulk
-  request (`core/queue.py.dismiss_all_terminal`'s `job_ids` scope, never a client-side loop over
-  each row's own dismiss) — greyed out while the filter is empty, and again if it matches no
-  dismissable rows, with a tooltip naming which. It is a new, separate control: any other bulk
-  dismiss action on this page keeps its own existing whole-queue meaning, unaffected by whether
-  a filter happens to be active.
+  stay visible; a "showing N of M" readout appears alongside it once it's non-empty. Not
+  persisted — no `localStorage`, no URL param — matching the Files page's own text filter and
+  the Logs filter, since a stale filter hiding active transfers after a reload would be its own
+  confusion. Alongside the input, **Dismiss list** dismisses exactly the terminal rows the
+  filter currently matches, in one bulk request (`core/queue.py.dismiss_all_terminal`'s
+  `job_ids` scope, never a client-side loop over each row's own dismiss) — greyed out while the
+  filter is empty, and again if it matches no dismissable rows, with a tooltip naming which. It
+  is a new, separate control: any other bulk dismiss action on this page keeps its own existing
+  whole-list meaning, unaffected by whether a filter happens to be active. It also supersedes
+  the per-queue **Dismiss Queue** control (v0.2.3, `278e10f`), removed 2026-08-19 alongside
+  grouping — filter to a queue, then Dismiss list does the same job.
 
 **Item drawer.** A **side drawer** — not a modal, because file lists get long and the queue
 should stay visible — listing the files inside that item: name, size, transferred, per-file

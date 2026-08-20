@@ -26,11 +26,11 @@ Skeleton for the next roll:
 ### Added
 
 - **A name filter on the Transfers page**: start typing and only rows whose name contains that
-  text stay visible, across every queue group (case-insensitive, matches a dotted release name
-  literally). A **"Dismiss list"** button beside it bulk-dismisses exactly the finished rows the
-  filter currently matches, in one request — greyed out until the filter matches at least one
-  dismissable row. The filter itself doesn't persist across a reload, matching the Files page's
-  own text filter and the Logs filter.
+  text stay visible (case-insensitive, matches a dotted release name literally). A **"Dismiss
+  list"** button beside it bulk-dismisses exactly the finished rows the filter currently matches,
+  in one request — greyed out until the filter matches at least one dismissable row. The filter
+  itself doesn't persist across a reload, matching the Files page's own text filter and the Logs
+  filter.
 - **Per-row queue reordering on the Transfers page**: **▲ up one**, **▼ down one**, and **▲▲ to
   top** on each queued row, replacing the previous single "Move to top" button
   (`docs/transfers-redesign-spec.md` §3.4, phase 1 stage 2). One endpoint,
@@ -38,16 +38,25 @@ Skeleton for the next roll:
   order (the position number already says so); an out-of-turn request against the backend itself
   (a second tab, a stale render) is a silent no-op rather than an error, and a job that started
   running or finished between the page render and the click is rejected instead of silently
-  reordering a job whose bandwidth allocation is already fixed. The move's scope is global, not
-  within a visible queue group — since the Transfers page still groups rows by queue at this
-  stage (grouping doesn't drop until a later stage of the same redesign), a move doesn't always
-  swap a row with the one shown directly above/below it on screen.
+  reordering a job whose bandwidth allocation is already fixed. The move's scope is global — now
+  that the Transfers page renders one flat, globally-ordered list (below), a move always swaps a
+  row with the one shown directly above/below it on screen.
 - **A short display name per queue** (Settings → Queues, `docs/transfers-redesign-spec.md` §3.6,
   phase 1 stage 3): an optional, per-queue label (e.g. "DC-Movies" → "MOV") for the compact
-  per-row queue tag a later stage renders on the Transfers page once it drops its per-queue
-  grouping. Not rendered anywhere yet — this stage only adds the field and its Settings form
-  input. Trimmed at save time, capped at 10 characters, and not required to be unique — it's a
-  display hint, not an identifier. Leaving it blank falls back to the queue's full name.
+  per-row queue badge the Transfers page now renders (below). Trimmed at save time, capped at 10
+  characters, and not required to be unique — it's a display hint, not an identifier. Leaving it
+  blank falls back to the queue's full name.
+- **The Transfers page drops per-queue grouping for one globally-ordered list**
+  (`docs/transfers-redesign-spec.md` §3.1, phase 1 stage 4a) — `core/scheduler.py` has zero
+  references to `queue_id`; admission is one global line, and grouping visually implied each
+  queue had its own ordering, which was false. Each row now carries a compact queue badge (its
+  short name if set, else its full name, always in the row's `title`) and, for a job admitted
+  from the small-item fast lane, a **fast lane** marker explaining that it may start before a
+  lower-numbered main-lane job. This also resolves the stage-2 chevron oddity above: with
+  grouping gone, ▲/▼ always trade with the row directly on screen. The per-queue **Dismiss
+  Queue** button (v0.2.3) is **superseded, not merely deleted** — the name filter plus
+  **Dismiss list** does the same job: filter to a queue, dismiss the list. This reverses the
+  2026-08-16 "group rows by queue" decision; see `docs/decisions.md` for why.
 
 ### Changed
 

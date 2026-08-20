@@ -14,6 +14,7 @@ function job(state: JobState, overrides: Partial<JobOut> = {}): JobOut {
     item_id: 1,
     queue_id: 1,
     queue_name: 'test',
+    queue_short_name: null,
     rel_path: 'Release',
     is_dir: true,
     kind: 'mirror',

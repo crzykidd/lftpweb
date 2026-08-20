@@ -188,6 +188,7 @@ def _job_out_row(**overrides) -> dict:
         item_id=1,
         queue_id=1,
         queue_name="q",
+        queue_short_name=None,
         rel_path="a.txt",
         is_dir=False,
         kind="pget",

@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { HistoryJobOut, HistoryQueueSummaryOut, JobOut, JobState } from '../api/types'
 import {
   type LiveProgress,
+  FAST_LANE_HINT,
   canMoveDown,
   canMoveUp,
   completedTimeLabel,
@@ -10,16 +11,13 @@ import {
   failedJobPanelContent,
   filterTransferJobs,
   formatQueueGroupCounts,
-  groupHasDismissable,
   groupHistoryJobsByQueue,
-  groupJobsByQueue,
   hasArrGroup,
   historyQueueGroupCounts,
   isDismissable,
+  isFastLane,
   isQueueCollapsed,
   processingGroupFields,
-  queueGroupSummary,
-  readCollapsedQueues,
   readHistoryCollapsedQueues,
   sortTransferRows,
   transferFilterSummary,
@@ -27,7 +25,6 @@ import {
   transferLineValue,
   transferredSummary,
   withQueueCollapsed,
-  writeCollapsedQueues,
   writeHistoryCollapsedQueues,
 } from './transferPanel'
 
@@ -43,6 +40,7 @@ function job(state: JobState, overrides: Partial<JobOut> = {}): JobOut {
     item_id: 1,
     queue_id: 1,
     queue_name: 'test',
+    queue_short_name: null,
     rel_path: 'Release',
     is_dir: true,
     kind: 'mirror',
@@ -379,51 +377,11 @@ describe('sortTransferRows -- the Transfers page\'s row order', () => {
   })
 })
 
-// 2026-08-16 (prompts/2026-08-16-transfers-group-by-queue.md): "group rows by queue,
-// collapsible with remembered state" -- grouping, header aggregates, and collapse persistence,
-// all as pure functions per the task's own instruction.
-
-describe('groupJobsByQueue', () => {
-  it('groups jobs by queue id, one group per queue with at least one visible job', () => {
-    const a1 = job('running', { id: 1, queue_id: 1, queue_name: 'Alpha' })
-    const b1 = job('queued', { id: 2, queue_id: 2, queue_name: 'Bravo' })
-    const a2 = job('failed', { id: 3, queue_id: 1, queue_name: 'Alpha' })
-
-    const groups = groupJobsByQueue([a1, b1, a2])
-    expect(groups).toHaveLength(2)
-    expect(groups.find((g) => g.queueId === 1)?.jobs.map((j) => j.id)).toEqual([1, 3])
-    expect(groups.find((g) => g.queueId === 2)?.jobs.map((j) => j.id)).toEqual([2])
-  })
-
-  it('orders groups by queue name, not by first-seen order', () => {
-    const zulu = job('running', { id: 1, queue_id: 9, queue_name: 'Zulu' })
-    const alpha = job('running', { id: 2, queue_id: 1, queue_name: 'Alpha' })
-
-    const groups = groupJobsByQueue([zulu, alpha])
-    expect(groups.map((g) => g.queueName)).toEqual(['Alpha', 'Zulu'])
-  })
-
-  it('keeps each group\'s within-group order exactly as passed in', () => {
-    const running = job('running', { id: 1, queue_id: 1, queue_name: 'Alpha' })
-    const queued = job('queued', { id: 2, queue_id: 1, queue_name: 'Alpha' })
-    const terminal = job('succeeded', { id: 3, queue_id: 1, queue_name: 'Alpha' })
-
-    // Callers always pass `sortTransferRows`'s own output -- passing an already-decided order
-    // here and asserting it survives untouched is the contract this function must not break.
-    const groups = groupJobsByQueue([running, queued, terminal])
-    expect(groups[0].jobs.map((j) => j.id)).toEqual([1, 2, 3])
-  })
-
-  it('returns no groups for an empty job list', () => {
-    expect(groupJobsByQueue([])).toEqual([])
-  })
-})
-
 // 2026-08-17 (prompts/2026-08-17-transfers-dismiss-per-queue.md): `isDismissable` moved here
-// from `TransfersPage.tsx` so `groupHasDismissable` below can reuse it without `lib/` importing
-// from `pages/` -- see that function's own docstring. `TransfersPage.test.ts`'s pre-existing
-// `isDismissable` coverage keeps passing unchanged (the page re-exports the same function), so
-// this only adds the states this task's move didn't already have direct coverage for.
+// from `TransfersPage.tsx` -- see that function's own docstring. `TransfersPage.test.ts`'s
+// pre-existing `isDismissable` coverage keeps passing unchanged (the page re-exports the same
+// function), so this only adds the states this task's move didn't already have direct coverage
+// for.
 describe('isDismissable', () => {
   it('is true for a terminal state -- failed, cancelled, succeeded', () => {
     expect(isDismissable('failed')).toBe(true)
@@ -437,19 +395,28 @@ describe('isDismissable', () => {
   })
 })
 
-describe('groupHasDismissable -- the group header\'s "Dismiss Queue" visibility', () => {
-  it('is true once at least one job in the group is dismissable', () => {
-    const jobs = [job('running', { id: 1 }), job('failed', { id: 2 })]
-    expect(groupHasDismissable(jobs)).toBe(true)
+// 2026-08-19 (docs/transfers-redesign-spec.md §3.5, phase 1 stage 4a): the fast-lane marker's
+// own predicate -- a single ordered list intermixes lanes, so a row needs to say why it can start
+// before a lower-numbered one.
+describe('isFastLane', () => {
+  it('is true for a job admitted from the small lane', () => {
+    expect(isFastLane(job('queued', { lane: 'small' }))).toBe(true)
   })
 
-  it('is false when every job in the group is still active', () => {
-    const jobs = [job('running', { id: 1 }), job('queued', { id: 2 })]
-    expect(groupHasDismissable(jobs)).toBe(false)
+  it('is false for a main-lane job', () => {
+    expect(isFastLane(job('queued', { lane: 'main' }))).toBe(false)
   })
 
-  it('is false for an empty group', () => {
-    expect(groupHasDismissable([])).toBe(false)
+  it('does not depend on job state -- a running or terminal fast-lane job is still fast-lane', () => {
+    expect(isFastLane(job('running', { lane: 'small' }))).toBe(true)
+    expect(isFastLane(job('succeeded', { lane: 'small' }))).toBe(true)
+  })
+})
+
+describe('FAST_LANE_HINT', () => {
+  it('explains why, not just that -- names both the size threshold and the ordering consequence', () => {
+    expect(FAST_LANE_HINT).toMatch(/small/i)
+    expect(FAST_LANE_HINT).toMatch(/start before/i)
   })
 })
 
@@ -580,55 +547,6 @@ describe('transferFilterSummary', () => {
   })
 })
 
-describe('queueGroupSummary', () => {
-  it('counts each state into its outcome bucket, including cancelled as stopped', () => {
-    const jobs = [
-      job('running', { id: 1 }),
-      job('queued', { id: 2 }),
-      job('queued', { id: 3 }),
-      job('succeeded', { id: 4 }),
-      job('failed', { id: 5 }),
-      job('cancelled', { id: 6 }),
-    ]
-    const summary = queueGroupSummary(jobs, {})
-    expect(summary.counts).toEqual({ active: 1, queued: 2, succeeded: 1, failed: 1, stopped: 1 })
-  })
-
-  it('sums bytes_done across the group, preferring the live reading for a running job', () => {
-    const running = job('running', { id: 1, bytes_done: 100 })
-    const queued = job('queued', { id: 2, bytes_done: 50 })
-    const live: Record<number, LiveProgress> = {
-      1: { bytes_done: 400, bytes_total: 1000, speed_bps: 0, eta_s: null },
-    }
-    const summary = queueGroupSummary([running, queued], live)
-    expect(summary.totalBytesDone).toBe(450) // 400 (live) + 50 (queued's own bytes_done)
-  })
-
-  it('falls back to the job\'s own bytes_done when no live sample has arrived for it yet', () => {
-    const running = job('running', { id: 1, bytes_done: 100 })
-    const summary = queueGroupSummary([running], {})
-    expect(summary.totalBytesDone).toBe(100)
-  })
-
-  it('combines the current rate only across running jobs, summing live over polled speed_bps', () => {
-    const runningWithLive = job('running', { id: 1, speed_bps: 999 })
-    const runningNoLive = job('running', { id: 2, speed_bps: 2048 })
-    const queued = job('queued', { id: 3, speed_bps: null })
-    const live: Record<number, LiveProgress> = {
-      1: { bytes_done: 0, bytes_total: null, speed_bps: 1024, eta_s: null },
-    }
-    const summary = queueGroupSummary([runningWithLive, runningNoLive, queued], live)
-    expect(summary.combinedRateBps).toBe(1024 + 2048)
-  })
-
-  it('reports no combined rate when nothing in the group is running', () => {
-    const queued = job('queued', { id: 1 })
-    const succeeded = job('succeeded', { id: 2 })
-    const summary = queueGroupSummary([queued, succeeded], {})
-    expect(summary.combinedRateBps).toBeNull()
-  })
-})
-
 describe('formatQueueGroupCounts', () => {
   it('lists every non-zero bucket in a fixed order', () => {
     const text = formatQueueGroupCounts({ active: 1, queued: 2, succeeded: 3, failed: 0, stopped: 1 })
@@ -645,7 +563,11 @@ describe('formatQueueGroupCounts', () => {
   })
 })
 
-describe('per-queue collapse persistence', () => {
+// `isQueueCollapsed`/`withQueueCollapsed` are shape-agnostic pure map logic -- the only caller
+// left after 2026-08-19 (docs/transfers-redesign-spec.md §3.1, phase 1 stage 4a, Transfers'
+// own per-queue collapse removed) is the History jobs section, but these two functions don't
+// know that; covered generically here, then the History-specific storage-key round-trip below.
+describe('isQueueCollapsed / withQueueCollapsed', () => {
   afterEach(() => {
     localStorage.clear()
   })
@@ -663,32 +585,12 @@ describe('per-queue collapse persistence', () => {
     // Expanded is the default -- clearing back to it drops the entry rather than storing `false`.
     expect(expanded).toEqual({})
   })
-
-  it('round-trips a collapse map through the actual localStorage read/write helpers', () => {
-    expect(readCollapsedQueues()).toEqual({})
-    const map = withQueueCollapsed({}, 7, true)
-    writeCollapsedQueues(map)
-    expect(readCollapsedQueues()).toEqual({ '7': true })
-    expect(isQueueCollapsed(readCollapsedQueues(), 7)).toBe(true)
-  })
-
-  it('a queue that disappears from the payload keeps its stored preference for when it returns', () => {
-    // Nothing about `withQueueCollapsed`/`isQueueCollapsed` reads the current job list -- the
-    // map is only ever consulted by queue id, so a queue with zero visible jobs right now still
-    // reads its previously-stored preference exactly like one that's still present.
-    writeCollapsedQueues(withQueueCollapsed({}, 3, true))
-    const storedLater = readCollapsedQueues()
-    expect(isQueueCollapsed(storedLater, 3)).toBe(true)
-  })
 })
 
 // 2026-08-16 (prompts/2026-08-16-history-jobs-group-collapse.md): the History jobs section's own
-// per-queue collapse reuses `isQueueCollapsed`/`withQueueCollapsed` (covered above -- shape-
-// agnostic, no reason to retest) but writes to a *different* storage key than Transfers' --
-// "a queue collapsed on Transfers is not implicitly collapsed on History" (the task's own
-// instruction). These tests cover exactly that separation, plus the read/write round-trip
-// through the History-specific helpers themselves.
-describe('History jobs section: per-queue collapse persistence, separate namespace from Transfers', () => {
+// per-queue collapse, under its own storage key -- the read/write round-trip through the
+// History-specific helpers themselves.
+describe('History jobs section: per-queue collapse persistence', () => {
   afterEach(() => {
     localStorage.clear()
   })
@@ -701,12 +603,13 @@ describe('History jobs section: per-queue collapse persistence, separate namespa
     expect(isQueueCollapsed(readHistoryCollapsedQueues(), 9)).toBe(true)
   })
 
-  it('collapsing a queue on Transfers does not collapse it on History, and vice versa', () => {
-    writeCollapsedQueues(withQueueCollapsed({}, 5, true))
-    expect(isQueueCollapsed(readHistoryCollapsedQueues(), 5)).toBe(false)
-
-    writeHistoryCollapsedQueues(withQueueCollapsed({}, 6, true))
-    expect(isQueueCollapsed(readCollapsedQueues(), 6)).toBe(false)
+  it('a queue that disappears from the payload keeps its stored preference for when it returns', () => {
+    // Nothing about `withQueueCollapsed`/`isQueueCollapsed` reads the current job list -- the
+    // map is only ever consulted by queue id, so a queue with zero visible jobs right now still
+    // reads its previously-stored preference exactly like one that's still present.
+    writeHistoryCollapsedQueues(withQueueCollapsed({}, 3, true))
+    const storedLater = readHistoryCollapsedQueues()
+    expect(isQueueCollapsed(storedLater, 3)).toBe(true)
   })
 })
 

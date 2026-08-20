@@ -6,6 +6,50 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-19 — Transfers page: dropped per-queue grouping for one globally-ordered list
+(reverses the 2026-08-16 grouping decision)
+
+`prompts/done/2026-08-19-transfers-single-ordered-list.md`, phase 1 stage 4a of
+`docs/transfers-redesign-spec.md` §3.1/§3.5/§3.6.
+
+**This reverses `prompts/done/2026-08-16-transfers-group-by-queue.md`**, which grouped Transfers
+rows by queue because "per-row queue labels make the page busy." That reasoning was sound in a
+world with no filter. The name filter (`e0befc5`, 2026-08-19) changes it: a row needs far less
+queue signal once a queue can be isolated on demand, and a compact per-row queue badge costs less
+than the header/collapse machinery grouping needed. **The deeper reason grouping goes: it was
+never just a display preference — `core/scheduler.py` has zero references to `queue_id`, so
+there is exactly one global admission line. Grouping by queue visually implied each queue had its
+own line and its own ordering, which was false**, and it is why positions inside one group read
+`#3`, `#7`, `#11` — the numbering was always honest; the grouping was the lie.
+
+**Also reverses the per-queue "Dismiss Queue" control** (v0.2.3, `278e10f`) — superseded, not
+merely deleted, by the name filter's own **Dismiss list** (`e0befc5`): filter to a queue, dismiss
+the list does the identical job without a group header to hang the button on.
+
+**Confirmed, not assumed: this also fixes the stage-2 chevron oddity.** Stage 2
+(`prompts/done/2026-08-19-queue-reorder-chevrons.md`) moved a job in the *global* queue order
+while the page still grouped rows by queue, so ▲/▼ could appear to swap a job with something in a
+*different* group. `sortTransferRows` places all `queued` rows contiguously (running first,
+then queued in the exact order `queuePositions` numbers them, then terminal), so once grouping
+is gone the row immediately above position N in the DOM is always position N-1 — verified by
+inspection of `TransfersPage.tsx`'s render order, not just asserted.
+
+**Deletion, not deprecation, for the client-side grouping helpers.** `groupJobsByQueue`,
+`GroupHeader`, `groupHasDismissable`, `queueGroupSummary` (and its private `outcomeCounts`), and
+the Transfers-specific collapse storage (`readCollapsedQueues`/`writeCollapsedQueues`,
+`transfers.collapsedQueues`) are removed outright along with their tests, rather than left
+unused — `lib/transferPanel.ts` is shared with the History page, which still groups by queue and
+still needs `isQueueCollapsed`/`withQueueCollapsed`/`QueueCollapseMap`/`formatQueueGroupCounts`/
+`QueueGroupCounts`; those stayed, confirmed live by grep before removal.
+
+**Backend: `JobOut` gained `queue_short_name`, no new endpoint.** The queue badge needs
+`path_queue.short_name` per row; `lane` was already on `JobOut` (added earlier for the fast-lane
+badge's use here). Both are simple field additions onto the existing, already-joined
+`list_jobs()` query — within the task's explicit scope guard (field additions permitted, a new
+endpoint or response-shape change was not).
+
+---
+
 ## 2026-08-19 — Chevron reordering: kept `POST /api/jobs/{id}/move-to-top` alongside the new
 `POST /api/jobs/{id}/move`
 

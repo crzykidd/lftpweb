@@ -18,32 +18,26 @@ import { StateChip } from '../components/StateChip'
 import { useJobs } from '../hooks/useJobs'
 import { useLiveModel } from '../hooks/useLiveModel'
 import { arrHoverLabel } from '../lib/fileTree'
-import { formatBytes, formatRate, formatRelativeTimeIntl } from '../lib/format'
+import { formatRelativeTimeIntl } from '../lib/format'
+import { queueDisplayName } from '../lib/queueDisplayName'
 import type { StartNowRatePercent } from '../lib/startNow'
 import {
+  FAST_LANE_HINT,
   type LiveProgress,
   type PanelField,
-  type QueueGroup,
   canMoveDown,
   canMoveUp,
   completedTimeLabel,
   dismissableJobIds,
   filterTransferJobs,
-  formatQueueGroupCounts,
-  groupHasDismissable,
-  groupJobsByQueue,
   hasArrGroup,
   isDismissable,
-  isQueueCollapsed,
+  isFastLane,
   processingGroupFields,
-  queueGroupSummary,
-  readCollapsedQueues,
   sortTransferRows,
   transferFilterSummary,
   transferGroupFields,
   transferLineValue,
-  withQueueCollapsed,
-  writeCollapsedQueues,
 } from '../lib/transferPanel'
 
 // Re-exported so `TransfersPage.test.ts`'s pre-existing `import { isDismissable } from
@@ -180,6 +174,33 @@ function Row({
             #{queuePosition}
           </span>
         )}
+        {/* Queue badge (2026-08-19, docs/transfers-redesign-spec.md §3.6, phase 1 stage 4a) --
+         * a compact, muted locator, not a headline: dropping per-queue grouping (this task)
+         * means each row now needs to say which queue it's from on its own. `queueDisplayName`
+         * is the same `short_name || name` fallback `api/settings_queues.py.
+         * resolve_queue_display_name` uses server-side, so this always agrees with Settings ->
+         * Queues. The full name sits in the `title` for hover -- the same "chip short, hover
+         * long" split the name button beside it already uses for `rel_path`. */}
+        <span
+          className="max-w-[8rem] shrink-0 truncate rounded bg-zinc-100 px-1.5 py-0.5 text-[10px] font-medium text-zinc-500 dark:bg-zinc-800 dark:text-zinc-400"
+          title={job.queue_name}
+        >
+          {queueDisplayName(job.queue_short_name, job.queue_name)}
+        </span>
+        {/* Fast-lane marker (2026-08-19, spec §3.5) -- small items (under
+         * `small_item_threshold_bytes`, 10 MB default, DESIGN.md §4.5) admit from a separate
+         * lane with its own concurrency cap and reserved bandwidth, so a job at #9 can genuinely
+         * start before the main-lane job at #2. Decided: keep one `1..N` numbering and mark the
+         * row rather than give the fast lane its own numbering or its own box -- the tooltip
+         * (`FAST_LANE_HINT`) says why, not just that. */}
+        {isFastLane(job) && (
+          <span
+            className="shrink-0 rounded-full bg-sky-100 px-1.5 py-0.5 text-[10px] font-semibold text-sky-700 dark:bg-sky-900/40 dark:text-sky-300"
+            title={FAST_LANE_HINT}
+          >
+            fast lane
+          </span>
+        )}
         <button
           type="button"
           onClick={() => onOpenDrawer(job)}
@@ -224,13 +245,17 @@ function Row({
             <>
               {/* Chevron reorder controls (2026-08-19, docs/transfers-redesign-spec.md §3.4
                * stage 2) -- ▲▲ to top, ▲ up one, ▼ down one, replacing the previous single
-               * "Move to top" button. Global scope, not within-group (spec §3.4): the page
-               * still groups by queue at this stage (grouping doesn't drop until stage 4), so
-               * a move may not swap with the row visually above/below it -- a known
-               * intermediate state, not a bug. Disabled at the edges of the *global* queued
-               * order (`canMoveUp`/`canMoveDown`, `lib/transferPanel.ts`) -- the backend's own
-               * `move_job` treats an out-of-turn request as a silent no-op regardless, so this
-               * is the UI affordance on top of that guard, not the only one. */}
+               * "Move to top" button. Global scope, matching the global scheduler and the
+               * global numbering (`queuePositions` below). Stage 2 shipped this while the page
+               * still grouped rows by queue, so a move could appear to swap a job with something
+               * in a *different* group -- a known intermediate state at the time, not a bug.
+               * Stage 4a (phase 1, this task) drops grouping for one flat, globally-ordered
+               * list, which resolves it: the row directly above in the global order is now also
+               * the row directly above on screen, so ▲ always trades with what's visually right
+               * there. Disabled at the edges of the *global* queued order (`canMoveUp`/
+               * `canMoveDown`, `lib/transferPanel.ts`) -- the backend's own `move_job` treats an
+               * out-of-turn request as a silent no-op regardless, so this is the UI affordance on
+               * top of that guard, not the only one. */}
               <button
                 type="button"
                 disabled={busy || !canMoveUp(queuePosition)}
@@ -463,83 +488,6 @@ function RowDetailPanel({ job, live, fileCount }: { job: JobOut; live: LiveProgr
   )
 }
 
-/** A queue group's header line (2026-08-16) -- queue name, outcome counts, and total/combined-
- * rate, all in one clickable line that toggles the group's collapse state. The queue name used to
- * repeat on every row (`Row` above, before this task); it lives here exactly once per group now.
- *
- * 2026-08-17 (prompts/2026-08-17-transfers-dismiss-per-queue.md): the header line used to be a
- * single full-width `<button>` -- adding a second, independently-clickable "Dismiss Queue"
- * control inside it means that can no longer be a real `<button>` (a `<button>` nested inside a
- * `<button>` is invalid HTML and makes click handling ambiguous). It's a `<div role="button">`
- * instead, carrying the same `onClick`/keyboard toggle behavior by hand (`onKeyDown` below), so
- * the whole row is still one big click target for collapse/expand -- only the inner Dismiss
- * Queue button, an actual sibling `<button>`, stops that click from also propagating up to the
- * row's own toggle.
- */
-function GroupHeader({
-  group,
-  collapsed,
-  onToggle,
-  liveByJobId,
-  dismissing,
-  onDismissQueue,
-}: {
-  group: QueueGroup
-  collapsed: boolean
-  onToggle: () => void
-  liveByJobId: Record<number, LiveProgress>
-  dismissing: boolean
-  onDismissQueue: () => void
-}) {
-  const summary = useMemo(() => queueGroupSummary(group.jobs, liveByJobId), [group.jobs, liveByJobId])
-  const countsText = formatQueueGroupCounts(summary.counts)
-  const showDismiss = groupHasDismissable(group.jobs)
-  return (
-    <div
-      role="button"
-      tabIndex={0}
-      onClick={onToggle}
-      onKeyDown={(e) => {
-        if (e.key === 'Enter' || e.key === ' ') {
-          e.preventDefault()
-          onToggle()
-        }
-      }}
-      aria-expanded={!collapsed}
-      title={collapsed ? 'Expand this queue' : 'Collapse this queue'}
-      className="flex w-full flex-wrap items-center gap-3 border-b border-zinc-200 bg-zinc-50 px-3 py-2 text-left text-sm hover:bg-zinc-100 dark:border-zinc-800 dark:bg-zinc-900/60 dark:hover:bg-zinc-900"
-    >
-      <span className="shrink-0 text-zinc-400 dark:text-zinc-600" aria-hidden="true">
-        {collapsed ? '▸' : '▾'}
-      </span>
-      <span className="min-w-0 flex-1 truncate font-semibold text-zinc-900 dark:text-zinc-100">
-        {group.queueName}
-      </span>
-      {countsText && <span className="shrink-0 text-xs text-zinc-500 dark:text-zinc-400">{countsText}</span>}
-      <span className="shrink-0 text-right text-xs text-zinc-500 dark:text-zinc-400">
-        {formatBytes(summary.totalBytesDone)}
-        {summary.combinedRateBps != null && ` · ${formatRate(summary.combinedRateBps)}`}
-      </span>
-      {showDismiss && (
-        <button
-          type="button"
-          disabled={dismissing}
-          onClick={(e) => {
-            // Doesn't toggle the group's own collapse -- the header line above is a collapse
-            // toggle (this task's own instruction).
-            e.stopPropagation()
-            onDismissQueue()
-          }}
-          title="Dismiss this queue's finished rows"
-          className="shrink-0 rounded-md border border-zinc-300 px-2 py-1 text-xs font-medium text-zinc-700 hover:bg-zinc-100 disabled:opacity-50 dark:border-zinc-700 dark:text-zinc-200 dark:hover:bg-zinc-800"
-        >
-          {dismissing ? 'Dismissing…' : 'Dismiss Queue'}
-        </button>
-      )}
-    </div>
-  )
-}
-
 /** DESIGN.md §9.2 Transfers page -- the job queue. Rows stay deliberately plain (queued /
  * downloading / downloaded, with STOPPED/FAILED surfacing only where they apply); the item
  * drawer opens per row for the full per-file breakdown.
@@ -562,12 +510,6 @@ export function TransfersPage() {
   const [dismissingAll, setDismissingAll] = useState(false)
   const [dismissAllError, setDismissAllError] = useState<string | null>(null)
   const [dismissAllCount, setDismissAllCount] = useState<number | null>(null)
-  // Per-queue "Dismiss Queue" (2026-08-17, prompts/2026-08-17-transfers-dismiss-per-queue.md) --
-  // keyed by `queueId`, not a single flag/string/number the way the page-wide Dismiss-all state
-  // above is, so two different groups' controls never lock or clobber each other.
-  const [dismissingQueueIds, setDismissingQueueIds] = useState<Set<number>>(new Set())
-  const [dismissQueueError, setDismissQueueError] = useState<Record<number, string>>({})
-  const [dismissQueueCount, setDismissQueueCount] = useState<Record<number, number>>({})
   // The name filter (2026-08-19, prompts/2026-08-19-transfers-name-filter.md) -- plain
   // `useState`, deliberately not persisted (no localStorage, no URL param): it clears on reload
   // and on navigating away, matching the Files page's own text filter and the Logs filter. A
@@ -577,7 +519,9 @@ export function TransfersPage() {
   // dismissingAll/dismissAllError/dismissAllCount above already use (the page's existing
   // notification convention), kept separate rather than reusing those three: "Dismiss list" is
   // a distinct control the user can click independently of (and possibly around the same time
-  // as) "Dismiss all"/"Dismiss Queue", and those two stay completely unchanged by this task.
+  // as) "Dismiss all", which stays completely unchanged by this task. It also supersedes the
+  // per-queue "Dismiss Queue" control this task removes (2026-08-19, docs/transfers-redesign-
+  // spec.md §3.1, phase 1 stage 4a) -- filter to a queue, then "Dismiss list" does the same job.
   const [dismissingList, setDismissingList] = useState(false)
   const [dismissListError, setDismissListError] = useState<string | null>(null)
   const [dismissListCount, setDismissListCount] = useState<number | null>(null)
@@ -617,45 +561,18 @@ export function TransfersPage() {
   // happen to be displayed.
   const sortedJobs = useMemo(() => sortTransferRows(jobs), [jobs])
 
-  // The name filter (2026-08-19) -- applied *before* `groupJobsByQueue` below, so a queue with
-  // no matching rows produces no group at all rather than an empty one. `filterTransferJobs`
-  // returns `sortedJobs` itself, by identity, whenever `search` is empty/whitespace-only, so
-  // this is a no-op `useMemo` recompute rather than a fresh array on every render while the
-  // filter isn't in use.
+  // The name filter (2026-08-19) -- applied to `sortedJobs`, producing the flat, globally-
+  // ordered row set the page renders directly (grouping by queue was dropped 2026-08-19,
+  // docs/transfers-redesign-spec.md §3.1, phase 1 stage 4a -- see docs/decisions.md for the
+  // reversal and its cause). `filterTransferJobs` returns `sortedJobs` itself, by identity,
+  // whenever `search` is empty/whitespace-only, so this is a no-op `useMemo` recompute rather
+  // than a fresh array on every render while the filter isn't in use.
   const filteredJobs = useMemo(() => filterTransferJobs(sortedJobs, search), [sortedJobs, search])
   const filterActive = search.trim() !== ''
   const filterSummary = transferFilterSummary(filteredJobs.length, sortedJobs.length, search)
   // The ids "Dismiss list" would act on -- every currently-filtered row that's actually
   // dismissable (terminal). Also drives the button's own disabled/enabled + count reading below.
   const filteredDismissableIds = useMemo(() => dismissableJobIds(filteredJobs), [filteredJobs])
-
-  // Group by queue (2026-08-16, prompts/2026-08-16-transfers-group-by-queue.md): "per-row queue
-  // labels make the page busy" -- one collapsible group per queue, ordered by queue name, each
-  // row's within-group order untouched from `sortedJobs` above (`groupJobsByQueue`'s own
-  // docstring). Collapse state is per-queue, persisted, and read once on mount -- a queue that
-  // temporarily drops out of `jobs` (no visible rows right now) simply produces no group, but its
-  // stored preference is never pruned, so it's there again when the queue returns.
-  //
-  // 2026-08-19: grouped off `filteredJobs`, not `sortedJobs`, so a queue with no matching rows
-  // while the filter is active drops out of `groups` entirely -- same reasoning as
-  // `FileTree.tsx`'s own text filter. Byte-for-byte `groupJobsByQueue(sortedJobs)` while the
-  // filter is empty, since `filteredJobs === sortedJobs` by identity in that case.
-  const groups = useMemo(() => groupJobsByQueue(filteredJobs), [filteredJobs])
-  const [collapsedQueues, setCollapsedQueues] = useState(readCollapsedQueues)
-  const toggleQueueCollapsed = (queueId: number) => {
-    // Ignored while the filter is active (2026-08-19): every group renders forced-expanded
-    // during a filter (below, the `groups.map` render's own `collapsed` computation) so a match
-    // inside a collapsed queue still surfaces -- writing to the stored preference here would
-    // silently change what "expanded" means once the filter clears, which is exactly the
-    // confusion `FileTree.tsx`'s identical rule exists to avoid. The preference is left
-    // untouched and applies again unchanged the moment `search` clears.
-    if (filterActive) return
-    setCollapsedQueues((prev) => {
-      const next = withQueueCollapsed(prev, queueId, !isQueueCollapsed(prev, queueId))
-      writeCollapsedQueues(next)
-      return next
-    })
-  }
 
   // Queue position (2026-08-13, item 4): `jobs` (`useJobs`/`GET /api/jobs`) already comes back
   // in the real run order (`core/queue.py.list_jobs`'s `ORDER BY queue_position ASC, id ASC`,
@@ -729,48 +646,15 @@ export function TransfersPage() {
     }
   }
 
-  /** A `GroupHeader`'s own "Dismiss Queue" control (2026-08-17,
-   * prompts/2026-08-17-transfers-dismiss-per-queue.md) -- the per-queue-scoped counterpart to
-   * `handleDismissAll` above, same shape: one bulk request (`dismissAllJobs(queueId)` ->
-   * `core/queue.py.dismiss_all_terminal(queue_id=...)`), and the same honest "the request itself
-   * either worked or it didn't" error reporting, just keyed by `queueId` throughout so a second
-   * group's button stays live (and its own outcome/error stay separate) while this one is still
-   * in flight.
-   */
-  const handleDismissQueue = async (queueId: number) => {
-    setDismissingQueueIds((prev) => new Set(prev).add(queueId))
-    setDismissQueueError((prev) => {
-      const next = { ...prev }
-      delete next[queueId]
-      return next
-    })
-    setDismissQueueCount((prev) => {
-      const next = { ...prev }
-      delete next[queueId]
-      return next
-    })
-    try {
-      const res = await dismissAllJobs(queueId)
-      setDismissQueueCount((prev) => ({ ...prev, [queueId]: res.dismissed }))
-      refresh()
-    } catch (err) {
-      setDismissQueueError((prev) => ({ ...prev, [queueId]: errorMessage(err) }))
-    } finally {
-      setDismissingQueueIds((prev) => {
-        const next = new Set(prev)
-        next.delete(queueId)
-        return next
-      })
-    }
-  }
-
   /** "Dismiss list" (2026-08-19, prompts/2026-08-19-transfers-name-filter.md) -- the name
    * filter's own dedicated control, dismissing exactly the terminal rows the filter currently
    * matches (`filteredDismissableIds`, `lib/transferPanel.ts.dismissableJobIds`) in **one**
    * request (`dismissAllJobs(undefined, jobIds)` -> `core/queue.py.dismiss_all_terminal
    * (job_ids=...)`), never a client-side loop over each row's own `/dismiss` call. A new,
-   * separate control -- not a re-scoping of "Clear all failed"/"Dismiss all"/"Dismiss Queue"
-   * above, which keep their existing whole-queue meaning untouched by this task. No confirmation
+   * separate control -- not a re-scoping of "Clear all failed"/"Dismiss all" above, which keep
+   * their existing whole-list meaning untouched by this task. Supersedes the per-queue "Dismiss
+   * Queue" control (v0.2.3, `278e10f`), removed 2026-08-19 alongside grouping (docs/transfers-
+   * redesign-spec.md §3.1) -- filter to a queue, then this does the same job. No confirmation
    * dialog: dismiss only ever sets `dismissed_at` on an already-terminal job row, never touches
    * `item.state`, never deletes bytes, and never touches the remote.
    */
@@ -857,11 +741,10 @@ export function TransfersPage() {
       )}
 
       {/* Name filter + "Dismiss list" (2026-08-19, prompts/2026-08-19-transfers-name-filter.md)
-       * -- start typing and only rows whose `rel_path` contains the text stay visible, across
-       * every group. "Dismiss list" is a new, separate control scoped to exactly what the
-       * filter currently matches -- "Clear all failed"/"Dismiss all"/"Dismiss Queue" below keep
-       * their existing whole-queue meaning, untouched by this task, including while a filter is
-       * active. */}
+       * -- start typing and only rows whose `rel_path` contains the text stay visible. "Dismiss
+       * list" is a separate control scoped to exactly what the filter currently matches --
+       * "Clear all failed"/"Dismiss all" below keep their existing whole-list meaning, untouched
+       * by this task, including while a filter is active. */}
       <div className="flex flex-wrap items-center gap-2">
         <input
           type="text"
@@ -1048,88 +931,36 @@ export function TransfersPage() {
         </div>
       )}
 
+      {/* One globally-ordered list, no per-queue grouping (2026-08-19, docs/transfers-redesign-
+       * spec.md §3.1, phase 1 stage 4a). `core/scheduler.py` has zero references to `queue_id` --
+       * admission is one global line -- so grouping by queue visually implied each queue had its
+       * own line and its own ordering, which was false. It also fixes a stage-2 oddity: the ▲/▼
+       * chevrons already moved a job in the *global* order, so with grouping still in place they
+       * could appear to swap a job with something in a different group; now the row directly
+       * above is always the one being traded with. `Row`'s own queue badge (`queueDisplayName`)
+       * and fast-lane marker (`isFastLane`) replace the group header's queue name -- the name
+       * filter (2026-08-19, `e0befc5`) is what makes that safe to drop (see docs/decisions.md
+       * for the reversal). */}
       {jobs.length > 0 && filteredJobs.length > 0 && (
-        <div className="flex flex-col gap-3">
-          {groups.map((group) => {
-            // 2026-08-19: forced expanded while the filter is active, ignoring the stored
-            // preference entirely -- a match inside a collapsed queue must still surface. See
-            // `toggleQueueCollapsed`'s own comment for why the preference itself is never
-            // written to while this is happening.
-            const collapsed = filterActive ? false : isQueueCollapsed(collapsedQueues, group.queueId)
-            return (
-              <div
-                key={group.queueId}
-                className="overflow-hidden rounded-md border border-zinc-200 dark:border-zinc-800"
-              >
-                <GroupHeader
-                  group={group}
-                  collapsed={collapsed}
-                  onToggle={() => toggleQueueCollapsed(group.queueId)}
-                  liveByJobId={progressByJobId}
-                  dismissing={dismissingQueueIds.has(group.queueId)}
-                  onDismissQueue={() => handleDismissQueue(group.queueId)}
-                />
-                {dismissQueueCount[group.queueId] != null && (
-                  <div className="flex items-center justify-between gap-3 border-b border-zinc-200 bg-emerald-50 px-3 py-1.5 text-xs text-emerald-900 dark:border-zinc-800 dark:bg-emerald-950/40 dark:text-emerald-200">
-                    <span className="font-medium">
-                      Dismissed {dismissQueueCount[group.queueId]} job
-                      {dismissQueueCount[group.queueId] === 1 ? '' : 's'}
-                    </span>
-                    <button
-                      type="button"
-                      onClick={() =>
-                        setDismissQueueCount((prev) => {
-                          const next = { ...prev }
-                          delete next[group.queueId]
-                          return next
-                        })
-                      }
-                      className="shrink-0 underline decoration-dotted"
-                    >
-                      Dismiss
-                    </button>
-                  </div>
-                )}
-                {dismissQueueError[group.queueId] && (
-                  <div className="flex items-center justify-between gap-3 border-b border-zinc-200 bg-amber-50 px-3 py-1.5 text-xs text-amber-900 dark:border-zinc-800 dark:bg-amber-950/40 dark:text-amber-200">
-                    <span>Couldn't dismiss this queue: {dismissQueueError[group.queueId]}</span>
-                    <button
-                      type="button"
-                      onClick={() =>
-                        setDismissQueueError((prev) => {
-                          const next = { ...prev }
-                          delete next[group.queueId]
-                          return next
-                        })
-                      }
-                      className="shrink-0 underline decoration-dotted"
-                    >
-                      Dismiss
-                    </button>
-                  </div>
-                )}
-                {!collapsed &&
-                  group.jobs.map((job) => (
-                    <Row
-                      key={job.id}
-                      job={job}
-                      nodes={nodesByQueue.get(job.queue_id) ?? []}
-                      live={progressByJobId[job.id]}
-                      queuePosition={queuePositions.get(job.id)}
-                      queuedCount={queuedCount}
-                      maxBandwidthBps={maxBandwidthBps}
-                      onOpenDrawer={setDrawerJob}
-                      onMove={handleMove}
-                      onStartNow={handleStartNow}
-                      onStop={handleStop}
-                      onRetry={handleRetry}
-                      onDismiss={handleDismiss}
-                      busy={busyIds.has(job.id)}
-                    />
-                  ))}
-              </div>
-            )
-          })}
+        <div className="overflow-hidden rounded-md border border-zinc-200 dark:border-zinc-800">
+          {filteredJobs.map((job) => (
+            <Row
+              key={job.id}
+              job={job}
+              nodes={nodesByQueue.get(job.queue_id) ?? []}
+              live={progressByJobId[job.id]}
+              queuePosition={queuePositions.get(job.id)}
+              queuedCount={queuedCount}
+              maxBandwidthBps={maxBandwidthBps}
+              onOpenDrawer={setDrawerJob}
+              onMove={handleMove}
+              onStartNow={handleStartNow}
+              onStop={handleStop}
+              onRetry={handleRetry}
+              onDismiss={handleDismiss}
+              busy={busyIds.has(job.id)}
+            />
+          ))}
         </div>
       )}
 

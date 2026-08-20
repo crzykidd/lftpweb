@@ -300,13 +300,12 @@ export function hasArrGroup(job: JobOut): boolean {
  * surface a recently-succeeded job on the Transfers page at all -- a completed transfer needs
  * the same "stop showing this row" action a failed or stopped one already had.
  *
- * Lives here, not in `TransfersPage.tsx` (where it shipped 2026-08-13), as of 2026-08-17
- * (prompts/2026-08-17-transfers-dismiss-per-queue.md): the group header's own "Dismiss Queue"
- * control needs the exact same predicate to decide whether it has anything to do
- * (`groupHasDismissable` below), and `lib/` can't import from `pages/` -- this is the one
- * definition both sides now share, rather than a second copy of the state list drifting out of
- * sync with `dismiss_job`'s guard. `TransfersPage.tsx` re-exports this name so its own existing
- * import (and `TransfersPage.test.ts`'s) keeps working unchanged.
+ * Lives here, not in `TransfersPage.tsx` (where it shipped 2026-08-13), since 2026-08-17
+ * (prompts/2026-08-17-transfers-dismiss-per-queue.md) -- originally so the (now-removed,
+ * 2026-08-19) group header's own "Dismiss Queue" control could reuse it without `lib/` importing
+ * from `pages/`; `dismissableJobIds` below is the same reasoning applied to "Dismiss list."
+ * `TransfersPage.tsx` re-exports this name so its own existing import (and
+ * `TransfersPage.test.ts`'s) keeps working unchanged.
  */
 export function isDismissable(state: JobOut['state']): boolean {
   return state === 'failed' || state === 'cancelled' || state === 'succeeded'
@@ -337,11 +336,30 @@ export function canMoveDown(queuePosition: number | undefined, queuedCount: numb
   return queuePosition != null && queuePosition < queuedCount
 }
 
+// --- Fast-lane marker (2026-08-19, docs/transfers-redesign-spec.md §3.5, phase 1 stage 4a):
+// small items (under `small_item_threshold_bytes`, 10 MB default, DESIGN.md §4.5) admit from a
+// separate lane with its own concurrency cap and reserved bandwidth, so a job at #9 can
+// genuinely start before the main-lane job at #2. Grouped-by-queue rows made that easy to miss;
+// one intermixed ordered list reads it as a bug unless the row explains itself. Decided: keep
+// one `1..N` numbering (not per-lane numbering, not a third box) and mark fast-lane rows --
+// `isFastLane` is the predicate, `FAST_LANE_HINT` the tooltip copy the row renders alongside it.
+// -----------------------------------------------------------------------------------------
+
+export function isFastLane(job: JobOut): boolean {
+  return job.lane === 'small'
+}
+
+/** The fast-lane badge's tooltip -- explains *why* a marked row can start before a lower-numbered
+ * one, rather than just flagging that it can. Its own constant (not inlined at the one call site)
+ * so the wording is unit-testable without mounting `Row`.
+ */
+export const FAST_LANE_HINT =
+  'Small file -- transfers on its own lane and may start before higher-numbered items'
+
 // --- Name filter + "Dismiss list" (2026-08-19, prompts/2026-08-19-transfers-name-filter.md):
 // a busy install's Transfers page has no way to narrow a long list. Pure logic only, same
-// discipline this whole file already follows -- `TransfersPage.tsx` applies these before
-// `groupJobsByQueue` below, so a queue with no matching rows produces no group at all rather
-// than an empty one. -----------------------------------------------------------------------
+// discipline this whole file already follows -- `TransfersPage.tsx` applies this before
+// rendering the flat, globally-ordered list. -----------------------------------------------
 
 /** Case-insensitive substring filter over `rel_path` only -- **not** `queue_name` too, since a
  * queue named e.g. "movies" would otherwise make every row in it match the word "movies", which
@@ -384,55 +402,19 @@ export function transferFilterSummary(shown: number, total: number, search: stri
   return `Showing ${shown} of ${total} transfer${total === 1 ? '' : 's'}`
 }
 
-// --- Group by queue (2026-08-16, prompts/2026-08-16-transfers-group-by-queue.md): "per-row
-// queue labels make the page busy" -- the queue name/summary moves to a collapsible group
-// header, one per queue, so individual rows can stop repeating it. ------------------------
+// --- Group counts -- History's own group header still needs these (`formatQueueGroupCounts`,
+// `historyQueueGroupCounts` below). Transfers' own grouping (and the client-computed
+// `queueGroupSummary`/`groupJobsByQueue`/`groupHasDismissable` it needed) was removed 2026-08-19
+// (docs/transfers-redesign-spec.md §3.1, phase 1 stage 4a) when the Queue tab dropped per-queue
+// grouping for one globally-ordered list -- see docs/decisions.md for the reversal and its
+// cause. --------------------------------------------------------------------------------------
 
-/** One queue's rows, in the order the caller passed them in -- always call this on
- * `sortTransferRows`'s own output, so a group's `jobs` keep that exact within-group order
- * (active rows in scheduler order, terminal rows newest-completed-first) without this function
- * re-deriving or disturbing it. Only queues with at least one visible job produce a group, and
- * groups themselves are ordered by queue name -- both per the task's own instruction.
- */
-export interface QueueGroup {
-  queueId: number
-  queueName: string
-  jobs: JobOut[]
-}
-
-export function groupJobsByQueue(jobs: JobOut[]): QueueGroup[] {
-  const groups = new Map<number, QueueGroup>()
-  for (const job of jobs) {
-    let group = groups.get(job.queue_id)
-    if (!group) {
-      group = { queueId: job.queue_id, queueName: job.queue_name, jobs: [] }
-      groups.set(job.queue_id, group)
-    }
-    group.jobs.push(job)
-  }
-  return [...groups.values()].sort((a, b) => a.queueName.localeCompare(b.queueName))
-}
-
-/** Whether a `GroupHeader`'s own "Dismiss Queue" control (2026-08-17,
- * prompts/2026-08-17-transfers-dismiss-per-queue.md) has anything to do -- true once at least
- * one job in this group is `isDismissable` (terminal, and therefore still shown at all: a
- * dismissed job never appears in `jobs` in the first place, per `core/queue.py.list_jobs`).
- * Reuses `isDismissable` rather than re-listing its three states here -- the same predicate a
- * single row's own Dismiss button already uses, applied to the whole group. Hidden entirely at
- * `false`, matching "Dismiss all"'s own "don't show a control with nothing to do" rule
- * (`TransfersPage.tsx`'s `dismissableCount > 0` gate).
- */
-export function groupHasDismissable(jobs: JobOut[]): boolean {
-  return jobs.some((job) => isDismissable(job.state))
-}
-
-/** A group header's job counts by outcome. The task's own instruction names four buckets --
- * active (running), queued, succeeded, failed -- but a `cancelled` (Stopped) row is a real fifth
- * outcome `isDismissable`/`chipStateFor` already both treat as first-class (a stopped job sits in
- * this same group until dismissed); dropping it from the header's counts would make them not sum
- * to the group's own row count, silently hiding rather than naming it (docs/decisions.md). It
- * follows `failed` in `formatQueueGroupCounts`'s enumeration order below and is omitted at zero
- * exactly like every other bucket.
+/** A group header's job counts by outcome. Four buckets came from the original task -- active
+ * (running), queued, succeeded, failed -- plus a `cancelled` (Stopped) row, a real fifth outcome
+ * `isDismissable`/`chipStateFor` already both treat as first-class; dropping it from the header's
+ * counts would make them not sum to the group's own row count, silently hiding rather than naming
+ * it (docs/decisions.md). It follows `failed` in `formatQueueGroupCounts`'s enumeration order
+ * below and is omitted at zero exactly like every other bucket.
  */
 export interface QueueGroupCounts {
   active: number
@@ -440,63 +422,6 @@ export interface QueueGroupCounts {
   succeeded: number
   failed: number
   stopped: number
-}
-
-function outcomeCounts(jobs: JobOut[]): QueueGroupCounts {
-  const counts: QueueGroupCounts = { active: 0, queued: 0, succeeded: 0, failed: 0, stopped: 0 }
-  for (const job of jobs) {
-    switch (job.state) {
-      case 'running':
-        counts.active += 1
-        break
-      case 'queued':
-        counts.queued += 1
-        break
-      case 'succeeded':
-        counts.succeeded += 1
-        break
-      case 'failed':
-        counts.failed += 1
-        break
-      case 'cancelled':
-        counts.stopped += 1
-        break
-    }
-  }
-  return counts
-}
-
-/** A group header's aggregate figures -- counts by outcome, the group's total size (sum of
- * `bytes_done`, per the task's own instruction), and its combined current rate while anything in
- * the group is downloading (`null` otherwise, so the header can omit the rate entirely rather
- * than show a stale/zero one). Reads live progress the same way `transferLineValue`/
- * `transferGroupFields` already do for a single row -- `liveByJobId[job.id]`'s reading takes
- * priority over the job's own last-polled figures while `running`, falling back to the job's own
- * figures for every other state (or if no live sample has arrived yet).
- */
-export interface QueueGroupSummary {
-  counts: QueueGroupCounts
-  totalBytesDone: number
-  combinedRateBps: number | null
-}
-
-export function queueGroupSummary(
-  jobs: JobOut[],
-  liveByJobId: Record<number, LiveProgress | undefined>,
-): QueueGroupSummary {
-  let totalBytesDone = 0
-  let combinedRateBps = 0
-  let anyRunning = false
-  for (const job of jobs) {
-    const live = liveByJobId[job.id]
-    const running = job.state === 'running'
-    totalBytesDone += running ? (live?.bytes_done ?? job.bytes_done) : job.bytes_done
-    if (running) {
-      anyRunning = true
-      combinedRateBps += live?.speed_bps ?? job.speed_bps ?? 0
-    }
-  }
-  return { counts: outcomeCounts(jobs), totalBytesDone, combinedRateBps: anyRunning ? combinedRateBps : null }
 }
 
 const COUNT_LABELS: ReadonlyArray<[keyof QueueGroupCounts, string]> = [
@@ -509,9 +434,8 @@ const COUNT_LABELS: ReadonlyArray<[keyof QueueGroupCounts, string]> = [
 
 /** The counts half of a group header's one line -- e.g. `"2 active, 3 queued"` -- omitting any
  * bucket that's zero (the task's own instruction, "to keep it quiet"). `''` when every bucket is
- * zero (a queue with no visible jobs never produces a group in the first place, per
- * `groupJobsByQueue`, so this is mostly a defensive empty string rather than a case that occurs
- * in practice).
+ * zero, a mostly-defensive empty string rather than a case History's own caller
+ * (`historyQueueGroupCounts`) produces in practice.
  */
 export function formatQueueGroupCounts(counts: QueueGroupCounts): string {
   return COUNT_LABELS.filter(([key]) => counts[key] > 0)
@@ -525,15 +449,14 @@ export function formatQueueGroupCounts(counts: QueueGroupCounts): string {
 // when it returns, since this map is never pruned against the currently-live queue list). ---
 //
 // 2026-08-16 (prompts/2026-08-16-history-jobs-group-collapse.md): the History page's jobs
-// section reuses this exact map shape and read/write logic for its own per-queue collapse, but
-// under a *different* storage key -- "a queue collapsed on Transfers is not implicitly collapsed
-// on History" (the task's own instruction; the two pages' groups aren't even the same rows --
-// Transfers is active+queued, History is terminal-only). `readCollapsedQueues`/
-// `writeCollapsedQueues` below stay as the Transfers-specific names already wired into
-// `TransfersPage.tsx`; `readCollapsedQueuesFor`/`writeCollapsedQueuesFor` below take the storage
-// key explicitly so both pages share one implementation rather than two copies.
+// section owns per-queue collapse under its own storage key. This map shape/read-write logic
+// used to be shared with Transfers' own per-queue collapse (`readCollapsedQueues`/
+// `writeCollapsedQueues`, its own storage key) -- that side was removed 2026-08-19
+// (docs/transfers-redesign-spec.md §3.1, phase 1 stage 4a) when the Queue tab dropped grouping
+// entirely, so History is the sole caller now. `readCollapsedQueuesFor`/`writeCollapsedQueuesFor`
+// below still take the storage key explicitly rather than being inlined into the History-named
+// functions -- the cheapest shape if a second collapsible grouped view ever needs this again.
 
-const TRANSFERS_COLLAPSED_QUEUES_KEY = 'transfers.collapsedQueues'
 export const HISTORY_COLLAPSED_QUEUES_KEY = 'history.collapsedQueues'
 
 /** JSON object keys are always strings on the wire/in storage (same fact `useLiveModel.ts`'s own
@@ -572,14 +495,6 @@ function writeCollapsedQueuesFor(key: string, map: QueueCollapseMap): void {
   writeLocalStorage(key, map)
 }
 
-export function readCollapsedQueues(): QueueCollapseMap {
-  return readCollapsedQueuesFor(TRANSFERS_COLLAPSED_QUEUES_KEY)
-}
-
-export function writeCollapsedQueues(map: QueueCollapseMap): void {
-  writeCollapsedQueuesFor(TRANSFERS_COLLAPSED_QUEUES_KEY, map)
-}
-
 export function readHistoryCollapsedQueues(): QueueCollapseMap {
   return readCollapsedQueuesFor(HISTORY_COLLAPSED_QUEUES_KEY)
 }
@@ -590,12 +505,12 @@ export function writeHistoryCollapsedQueues(map: QueueCollapseMap): void {
 
 // --- History jobs section's own group header aggregate (2026-08-16) -- the server-computed,
 // filter-honest `HistoryQueueSummaryOut` (api/history.py._queue_summaries), formatted for the
-// group header the same way `formatQueueGroupCounts` already formats Transfers' client-computed
-// `QueueGroupCounts`. Reuses that exact function rather than a parallel formatter -- History's
-// three outcome buckets (succeeded/failed/cancelled) are a subset of Transfers' five, so mapping
-// onto `QueueGroupCounts` with `active`/`queued` pinned at 0 (never rendered, since
-// `formatQueueGroupCounts` omits zero counts) gets identical output for identical meaning with no
-// new formatting logic to maintain in parallel. -----------------------------------------------
+// group header via `formatQueueGroupCounts`/`QueueGroupCounts` above (originally shared with
+// Transfers' own now-removed client-computed group summary -- see that section's own comment).
+// History's three outcome buckets (succeeded/failed/cancelled) are a subset of the five
+// `QueueGroupCounts` names, so mapping onto it with `active`/`queued` pinned at 0 (never
+// rendered, since `formatQueueGroupCounts` omits zero counts) gets identical output for identical
+// meaning with no new formatting logic to maintain. ---------------------------------------------
 
 /** `HistoryQueueSummaryOut`'s counts, reshaped onto `QueueGroupCounts` so
  * `formatQueueGroupCounts` can render them -- `cancelled` maps to the `stopped` bucket, matching

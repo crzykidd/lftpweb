@@ -102,6 +102,7 @@ def _job_out(row: dict) -> JobOut:
         item_id=row["item_id"],
         queue_id=row["queue_id"],
         queue_name=row["queue_name"],
+        queue_short_name=row["queue_short_name"],
         rel_path=row["rel_path"],
         is_dir=bool(row["is_dir"]),
         kind=row["kind"],
