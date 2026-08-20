@@ -42,6 +42,12 @@ Skeleton for the next roll:
   within a visible queue group — since the Transfers page still groups rows by queue at this
   stage (grouping doesn't drop until a later stage of the same redesign), a move doesn't always
   swap a row with the one shown directly above/below it on screen.
+- **A short display name per queue** (Settings → Queues, `docs/transfers-redesign-spec.md` §3.6,
+  phase 1 stage 3): an optional, per-queue label (e.g. "DC-Movies" → "MOV") for the compact
+  per-row queue tag a later stage renders on the Transfers page once it drops its per-queue
+  grouping. Not rendered anywhere yet — this stage only adds the field and its Settings form
+  input. Trimmed at save time, capped at 10 characters, and not required to be unique — it's a
+  display hint, not an identifier. Leaving it blank falls back to the queue's full name.
 
 ### Changed
 

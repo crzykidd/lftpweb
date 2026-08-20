@@ -343,7 +343,7 @@ stages are split small.
 |---|---|---|
 | 1 | **Queue order model** — dense position key, migration, admission query, auto-queue insert; re-prove the v0.2.6 rescue ordering by test — **done 2026-08-19** (migration 023, `prompts/done/2026-08-19-queue-position-order-model.md`) | — |
 | 2 | **Chevron reordering UI** (▲ ▼ ▲▲) — **done 2026-08-19** (`POST /api/jobs/{id}/move`, `prompts/done/2026-08-19-queue-reorder-chevrons.md`) | 1 |
-| 3 | **Queue short display name** on `path_queue` + Settings → Queues field | — |
+| 3 | **Queue short display name** on `path_queue` + Settings → Queues field — **done 2026-08-19** (migration 024, `prompts/done/2026-08-19-queue-short-display-name.md`) | — |
 | 4 | **Single ungrouped Queue list** — drop grouping, two paginated boxes (20 / 50), short name on rows, fast-lane badge | 3 |
 | 5 | **Row expansion to per-file progress**, children fetched lazily on expand | 4 |
 | 6 | **Tabs** — Transfers as main section with Queue + Files tabs | 4 |

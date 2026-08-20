@@ -216,6 +216,20 @@ class PathQueueIn(BaseModel):
     # sentinel. Optional even when an instance is bound: it is only read by phase B's notify
     # push, not by matching.
     arr_visible_path: str | None = Field(default=None, max_length=MAX_PATH_LEN)
+    # Migration 024 (docs/transfers-redesign-spec.md §3.6, phase 1 stage 3,
+    # prompts/done/2026-08-19-queue-short-display-name.md). `None` (the default, and every
+    # existing queue's value after the migration -- nullable with **no backfill**) means "no
+    # short name set": every read falls back to the full `name` via
+    # `api/settings_queues.py.resolve_queue_display_name`, the one place that fallback is
+    # computed. An explicit value is a per-queue display hint for the compact per-row label
+    # stage 4 renders once Transfers drops its per-queue grouping (`DC-Movies` -> `MOV`) --
+    # deliberately **not** an identifier: no uniqueness constraint, two queues may share one.
+    # Trimmed and empty-after-trim-normalized-to-`None` at save time
+    # (`api/settings_queues.py._normalized_short_name`), and length-capped there too
+    # (`MAX_SHORT_NAME_LEN`) rather than via this field's own `Field(max_length=...)` -- unlike
+    # every other capped field on this model, the cap here must apply to the *trimmed* value,
+    # and an over-length value must not be rejected before trimming has a chance to fix it.
+    short_name: str | None = None
 
 
 class PathQueueOut(PathQueueIn):

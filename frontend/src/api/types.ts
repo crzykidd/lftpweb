@@ -146,6 +146,14 @@ export interface PathQueueIn {
   // namespaces") -- `null` means "same namespace, no translation," never an empty-string
   // sentinel.
   arr_visible_path: string | null
+  // Migration 024 (docs/transfers-redesign-spec.md §3.6, phase 1 stage 3). `null` (the
+  // default, and every existing queue's value) means "no short name set" -- every display
+  // falls back to the full `name` (`lib/queueDisplayName.ts.queueDisplayName`). A per-queue
+  // display hint for the compact per-row label stage 4 renders once Transfers drops its
+  // per-queue grouping (`DC-Movies` -> `MOV`) -- not an identifier, so two queues may share
+  // one. The backend trims and normalizes empty-after-trim to `null`, and rejects anything
+  // over its own length cap.
+  short_name: string | null
 }
 
 export interface PathQueueOut extends PathQueueIn {
