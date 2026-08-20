@@ -672,6 +672,21 @@ export interface ItemEventsResponse {
   events: ItemEventOut[]
 }
 
+/** `GET /api/items/{id}/children` (2026-08-20, docs/transfers-redesign-spec.md §3.3, phase 1
+ * stage 5) -- the Transfers row's on-demand per-file expansion. `children` is `FileNode`, the
+ * same `core/itemview.py.item_view` projection every other consumer of the `item` table reads
+ * through -- never a second shape invented for this one panel. `total`/`limit`/`offset` are the
+ * same paging trio `HistoryJobsResponse`/`CompleteJobsResponse` already use: `total` is the true
+ * descendant-file count regardless of the server-side cap (`api/jobs.py.
+ * ITEM_CHILDREN_MAX_LIMIT`), so a capped response can still say "showing N of total" honestly.
+ */
+export interface ItemChildrenResponse {
+  children: FileNode[]
+  total: number
+  limit: number
+  offset: number
+}
+
 export interface QueueItemRequest {
   item_id: number
   start_now: boolean

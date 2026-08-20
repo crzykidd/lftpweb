@@ -2052,6 +2052,24 @@ Some.Release.S03E04.2160p    [downloading]   18 files   62%   4.1 MB/s   ETA 12m
   meaning, unaffected by whether a filter happens to be active. It also supersedes the per-queue
   **Dismiss Queue** control (v0.2.3, `278e10f`), removed 2026-08-19 alongside grouping — filter
   to a queue, then Dismiss list does the same job.
+- **A directory row's expand panel gains a Files group, showing per-file progress** (2026-08-20,
+  `docs/transfers-redesign-spec.md` §3.3, phase 1 stage 5) — "the thing Files is currently used
+  for, moved to where the ordering lives." Not a second data source: `core/queue.py.
+  _publish_child_progress` already computes/persists/publishes each child file's size, state,
+  and rate from the same walk the running job performs; `GET /api/items/{id}/children`
+  (`core/itemview.py.item_view`, capped at 500, generous default 200) is a second on-demand
+  renderer of it, following the same "fetch once, on expand, never inline on the jobs list"
+  pattern `GET /api/history/jobs/{id}/output` already established — a season pack has dozens of
+  children, and the two boxes' row caps only bound the *jobs* list, not what any one row's own
+  subtree could inline onto it. Once expanded, a row does **not** re-poll this endpoint for live
+  updates — it overlays the same `item_delta`/`child_progress` WebSocket messages the Files page
+  already receives (the page's single `useLiveModel()` call, already open), so N expanded rows
+  never mean N independent polls. **One expand affordance, one panel, multiple sections** — Files
+  joins Transfer/Processing/*arr inside the existing chevron-toggled panel rather than getting a
+  second toggle, so a failed *and* directory row can show captured output and its per-file
+  breakdown from the one click that already opens everything else. A `pget` (single-file) job has
+  no children by construction (`is_dir = false` at the top level) and does not offer this group at
+  all — its own progress is already the row's one collapsed-line figure.
 
 **Item drawer.** A **side drawer** — not a modal, because file lists get long and the queue
 should stay visible — listing the files inside that item: name, size, transferred, per-file

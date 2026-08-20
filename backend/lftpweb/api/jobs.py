@@ -14,7 +14,7 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Request
 
 from lftpweb.core import audit, local_delete
-from lftpweb.core.itemview import item_view
+from lftpweb.core.itemview import ITEM_VIEW_COLUMNS_QUALIFIED, item_view
 from lftpweb.core.lftp import build_transfer_command, effective_tuning_settings
 from lftpweb.core.postprocess import perform_remote_delete
 from lftpweb.core.queue import (
@@ -36,6 +36,8 @@ from lftpweb.models import (
     EffectiveLftpJobKind,
     EffectiveLftpSetting,
     EffectiveLftpSettingsOut,
+    FileNode,
+    ItemChildrenResponse,
     ItemEventOut,
     ItemEventsResponse,
     JobOut,
@@ -339,6 +341,122 @@ async def item_events(
             )
             for row in rows
         ]
+    )
+
+
+# --- Per-file children (2026-08-20, docs/transfers-redesign-spec.md §3.3, phase 1 stage 5) -----
+#
+# The Transfers row's per-file expansion -- "the thing Files is currently used for, moved to
+# where the ordering lives" (the spec's own words). **Not a second data source**:
+# `core/queue.py._publish_child_progress` already computes, persists, and publishes each child
+# file's size/state/rate from the same filesystem walk the running job performs; the Files tree
+# is one renderer of that data, and this is a second one, both reading the `item` table back
+# through `core/itemview.py.item_view` -- "nothing may publish a state it did not read back from
+# the `item` table" holds here exactly as it does for `GET /api/files`.
+#
+# **Bounded, on-demand, same shape as `item_events` immediately above**: fetched once, when a
+# row's panel expands, never inlined into `GET /api/jobs`/`GET /api/jobs/complete` -- a season
+# pack has dozens of children; inlining even that modest a payload onto a list endpoint the
+# frontend polls is exactly the trap `api/history.py`'s own module docstring names for
+# `output_tail`, just for a different field. `ITEM_CHILDREN_MAX_LIMIT` is the backstop against a
+# genuinely pathological release (thousands of files) rather than the expected case -- chosen to
+# match `api/history.py.MAX_LIMIT` (500), the closest existing precedent for "how big a capped
+# list on this app gets," rather than inventing a new number with no anchor. Once expanded, the
+# row does **not** re-poll this endpoint for live updates -- see `TransfersPage.tsx`'s own
+# comment on why the existing `item_delta`/`child_progress` WebSocket stream (already open,
+# already subscribed) is what keeps an expanded row current, so N expanded rows never mean N
+# independent polls.
+
+ITEM_CHILDREN_DEFAULT_LIMIT = 200
+ITEM_CHILDREN_MAX_LIMIT = 500
+
+
+def _clamp_children_paging(limit: int, offset: int) -> tuple[int, int]:
+    return max(1, min(limit, ITEM_CHILDREN_MAX_LIMIT)), max(0, offset)
+
+
+@router.get("/api/items/{item_id}/children", response_model=ItemChildrenResponse)
+async def item_children(
+    item_id: int,
+    request: Request,
+    limit: int = ITEM_CHILDREN_DEFAULT_LIMIT,
+    offset: int = 0,
+) -> ItemChildrenResponse:
+    """Every leaf file nested under `item_id`'s own `rel_path`, ordered by `rel_path` -- capped
+    at `ITEM_CHILDREN_MAX_LIMIT` regardless of what `limit` asks for, same clamp shape
+    `api/history.py._clamp_paging`/`item_events` already use. 404 for an unknown `item_id` --
+    unlike `item_events`, which treats an unknown id as "no history yet" (an event row outlives
+    the item it described), a children fetch is meaningless without a real parent row to resolve
+    `rel_path`/`queue_id` from.
+
+    **A non-directory item (a `pget` job's own single-file row) has no children by
+    construction** -- `is_dir = 0` at the top level is exactly the condition
+    `core/queue.py._publish_child_progress`'s own "pget job: no children" branch keys off
+    (`JobProgress.children is None`), so this returns an empty list rather than querying for
+    descendants that structurally cannot exist. Not a 404 or an error: an empty subtree is a
+    valid, expected answer for a real item, not a fault.
+
+    **Descendants, not just direct children** -- `instr(item.rel_path, ?) = 1` (the same
+    substring-prefix technique `core/engine.py`'s in-flight-descendant clause and
+    `core/queue.py._relevant_remote_total` already use, chosen over `LIKE` specifically because a
+    literal `%`/`_` in a real release name needs no escaping against it) matches every row whose
+    `rel_path` starts with `"{parent.rel_path}/"`, at any depth -- a season pack with a `Season
+    01/`/`Season 02/` split still shows every episode, not just the top level. `AND is_dir = 0`
+    scopes this to leaf files only, the same scope `_publish_child_progress` itself has ("only
+    leaf files nested under a currently downloading mirror item") -- an intermediate directory
+    row carries no progress of its own worth showing here.
+
+    **`LEFT JOIN item_settle`/`deleted_archive`**, identical to `api/files.py.get_files`'s own
+    join -- so a child that happens to be a spent, on-purpose-deleted archive volume renders the
+    same grey "Extracted" reading here that it would on the Files page, rather than a plainer
+    `EXCLUDED` this endpoint would otherwise show for want of the join.
+    """
+    limit, offset = _clamp_children_paging(limit, offset)
+    db = request.app.state.db
+
+    cursor = await db.execute(
+        "SELECT queue_id, rel_path, is_dir FROM item WHERE id = ?", (item_id,)
+    )
+    parent = await cursor.fetchone()
+    if parent is None:
+        raise HTTPException(status_code=404, detail="item not found")
+    if not parent["is_dir"]:
+        return ItemChildrenResponse(children=[], total=0, limit=limit, offset=offset)
+
+    queue_id = parent["queue_id"]
+    prefix = f"{parent['rel_path']}/"
+
+    count_cursor = await db.execute(
+        "SELECT COUNT(*) AS c FROM item WHERE queue_id = ? AND is_dir = 0 AND instr(rel_path, ?) = 1",
+        (queue_id, prefix),
+    )
+    total_row = await count_cursor.fetchone()
+    total = total_row["c"] if total_row is not None else 0
+
+    cursor = await db.execute(
+        f"SELECT {ITEM_VIEW_COLUMNS_QUALIFIED}, "  # noqa: S608 - module constants, not user input
+        "settle.matched_scans AS settle_matched_scans, "
+        "settle.updated_at AS settle_first_matched_at, "
+        "settle.total_bytes AS settle_total_bytes, "
+        "settle.first_observed_at AS settle_first_observed_at, "
+        "settle.last_changed_at AS settle_last_changed_at, "
+        "deleted_archive.deleted_at AS deleted_archive_at "
+        "FROM item "
+        "LEFT JOIN item_settle AS settle "
+        "ON settle.queue_id = item.queue_id AND settle.rel_path = item.rel_path "
+        "LEFT JOIN deleted_archive "
+        "ON deleted_archive.queue_id = item.queue_id AND deleted_archive.rel_path = item.rel_path "
+        "WHERE item.queue_id = ? AND item.is_dir = 0 AND instr(item.rel_path, ?) = 1 "
+        "ORDER BY item.rel_path "
+        "LIMIT ? OFFSET ?",
+        (queue_id, prefix, limit, offset),
+    )
+    rows = await cursor.fetchall()
+    return ItemChildrenResponse(
+        children=[FileNode(**item_view(row)) for row in rows],
+        total=total,
+        limit=limit,
+        offset=offset,
     )
 
 

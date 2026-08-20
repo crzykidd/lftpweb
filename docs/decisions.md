@@ -6,6 +6,63 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-20 — Transfers row file-list expansion: bound, live-update mechanism, and coexistence
+with the failed-output panel
+
+`prompts/done/2026-08-20-transfers-row-file-progress.md`, phase 1 stage 5 of
+`docs/transfers-redesign-spec.md` §3.3, browser-unverified.
+
+**The bound: `GET /api/items/{id}/children` caps at 500, defaults to 200.** The task explicitly
+asked for a decision rather than a silent unbounded list. `500` was chosen to match
+`api/history.py.MAX_LIMIT` — the closest existing precedent in this codebase for "how big a
+capped list gets before an explicit backstop kicks in" — rather than inventing a new number with
+no anchor. `200` as the default is generous over the realistic case the spec itself names ("a
+season pack has dozens of children") without inheriting the pathological-release cap by default.
+Unlike `api/history.py`, there is no "load more" affordance in the UI for this endpoint's own
+`limit`/`offset` — out of scope for this stage; a capped release shows a plain "Showing N of
+total files" note (`lib/transferPanel.ts.fileListCapNote`) rather than a paging control.
+
+**Live updates while expanded: overlay the already-open WebSocket, never re-poll the new
+endpoint.** `TransfersPage.tsx` already makes exactly one `useLiveModel()` call (checked before
+assuming, per the task's own instruction) and already threads its `queues`-derived
+`nodesByQueue` down to `Row` for `fileCountFor`. `child_progress`/`item_delta` messages already
+carry every child file's live state (`core/queue.py._publish_child_progress` publishes children
+through `item_delta`, not a separate message) — confirmed by reading `core/engine.py.snapshot()`/
+`_project`, which send *every* item row per queue, not just top-level ones. So the fix was to
+widen what the page's one existing hook call reads (`childSpeedByItemId`, previously
+unused on this page) rather than add a second subscription or a per-row poller. The REST
+endpoint supplies the initial, *bounded* row set on expand (matching the History-output
+precedent, and giving a definitive read even before the WS has synced a queue); `lib/
+transferPanel.ts.mergeFileListChildren` then looks up each of those exact rel_paths in the live
+`nodes` array on every render, overlaying fresher `state`/`local_size`, never re-deriving the
+*set* of rows shown from the live (unbounded) tree — that would silently drop the cap the moment
+`nodes` had more entries than the fetch capped at. Consequence: N expanded rows read the one
+already-open socket; none of them are a second request, ever.
+
+**Coexistence with the Complete box's existing failed-output expansion: one panel, one chevron,
+a new section, not a second toggle.** `RowDetailPanel` already had three groups (Transfer/
+Processing/*arr) behind the one chevron `Row` already renders, with the failed-job output panel
+nested *inside* the Transfer group. Files joins as a fourth group, gated on `job.is_dir`
+(`lib/transferPanel.ts.showsFileList`) — so a failed *and* directory row shows its captured
+output and its per-file breakdown from the same click, and nothing on this page grew a second
+expand affordance.
+
+**A `pget` (single-file) job: the affordance is omitted entirely, not rendered empty.** Its own
+progress is already the row's one collapsed-line figure and its own state chip; a one-row
+"expansion" repeating those two facts would be a second place to look for information already
+stated, not new information. `showsFileList` gates on `job.is_dir`, which is already on the wire
+and matches the backend's own gate (`item.is_dir` decides whether `GET /api/items/{id}/children`
+even queries for descendants).
+
+**Reuse, not a second copy**: `nodeDisplaySize`/`stateProgressPercent` moved from `FileTree.tsx`
+into `lib/fileTree.ts` (widened to take the three plain fields they read rather than a full
+`TreeEntry`), and the `child_progress` freshness gate (`now - receivedAt <= 
+CHILD_SPEED_FRESHNESS_MS`) was factored out of `buildTree` into `freshChildSpeedBps` — both used
+by the Files page's own rows and this new panel, so the two surfaces cannot drift on when a
+percent or a rate is honest to show.
+
+---
+
 ## 2026-08-19 — Transfers page: two paginated boxes, `list_jobs()` kept unchanged, "Dismiss list"
 re-scoped to a server-side filter
 

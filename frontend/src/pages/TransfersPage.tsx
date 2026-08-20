@@ -3,6 +3,7 @@ import {
   dismissAllJobs,
   dismissJob,
   getHistoryJobOutput,
+  getItemChildren,
   getItemEvents,
   getTransferSettings,
   moveJob,
@@ -18,9 +19,10 @@ import { StartNowMenu } from '../components/StartNowMenu'
 import { StateChip } from '../components/StateChip'
 import { useCompleteJobs } from '../hooks/useCompleteJobs'
 import { useJobs } from '../hooks/useJobs'
+import type { ChildSpeedSample } from '../hooks/useLiveModel'
 import { useLiveModel } from '../hooks/useLiveModel'
-import { arrHoverLabel } from '../lib/fileTree'
-import { formatRelativeTimeIntl } from '../lib/format'
+import { arrHoverLabel, nodeDisplaySize, stateProgressPercent } from '../lib/fileTree'
+import { childSpeedLabel, formatBytes, formatRelativeTimeIntl } from '../lib/format'
 import { ACTIVE_PAGE_SIZE, COMPLETE_PAGE_SIZE, pageCount, pageWindow, paginateClientSide } from '../lib/pagination'
 import { queueDisplayName } from '../lib/queueDisplayName'
 import type { StartNowRatePercent } from '../lib/startNow'
@@ -30,12 +32,16 @@ import {
   type PanelField,
   canMoveDown,
   canMoveUp,
+  childDisplayName,
   completedTimeLabel,
+  fileListCapNote,
   filterTransferJobs,
   hasArrGroup,
   isDismissable,
   isFastLane,
+  mergeFileListChildren,
   processingGroupFields,
+  showsFileList,
   sortTransferRows,
   transferFilterSummary,
   transferGroupFields,
@@ -107,6 +113,11 @@ interface DismissOutcome {
 interface RowProps {
   job: JobOut
   nodes: FileNode[]
+  // `child_progress` WS samples for this job's own queue, keyed by item id (2026-08-20,
+  // docs/transfers-redesign-spec.md §3.3 stage 5) -- threaded down to the file-list expansion
+  // the same way `nodes` already is, so N expanded rows read the one already-open socket
+  // instead of polling. See `TransfersPage.tsx`'s own `useLiveModel()` call.
+  childSpeedByItemId: Record<number, ChildSpeedSample>
   live: LiveProgress | undefined
   // Where this job sits in the actual run order (2026-08-13, prompts/2026-08-13-files-ux-pass.md
   // item 4) -- 1, 2, 3... counting only `state === 'queued'` rows, in the order `useJobs` already
@@ -138,6 +149,7 @@ interface RowProps {
 function Row({
   job,
   nodes,
+  childSpeedByItemId,
   live,
   queuePosition,
   queuedCount,
@@ -351,7 +363,9 @@ function Row({
         </button>
       </div>
 
-      {expanded && <RowDetailPanel job={job} live={live} fileCount={fileCount} />}
+      {expanded && (
+        <RowDetailPanel job={job} live={live} fileCount={fileCount} nodes={nodes} childSpeedByItemId={childSpeedByItemId} />
+      )}
     </div>
   )
 }
@@ -434,13 +448,136 @@ function FailedOutputPanel({ job }: { job: JobOut }) {
 
 const ITEM_EVENTS_LIMIT = 20
 
-/** The Transfers row's expand panel (2026-08-15) -- three groups, per the task's own line-up:
- * **Transfer** (bytes/elapsed/speed/queued-wait/file-count, plus a failed job's error class +
- * output tail), **Processing** (the item's verify/extract/remote-delete milestones, enriched by
- * the pipeline's own event messages -- fetched on demand, exactly once, when this panel first
- * opens), and ***arr** (hidden entirely when the job's queue has no bound instance).
+/** One row of the file-list group below -- a leaner sibling of `FileTree.tsx`'s own `Row`, not
+ * that component reused: this list is a handful of label/value cells inside an expand panel, not
+ * a virtualized tree with its own selection/hover-card/column-resize machinery, so reusing `Row`
+ * wholesale would drag all of that in for no benefit. What *is* shared is the actual
+ * presentation logic (`stateProgressPercent`/`nodeDisplaySize`/`childSpeedLabel`/`formatBytes`,
+ * all from `lib/fileTree.ts`/`lib/format.ts`) -- see this file's own module comment.
  */
-function RowDetailPanel({ job, live, fileCount }: { job: JobOut; live: LiveProgress | undefined; fileCount: number }) {
+function FileListRow({ row, jobRelPath }: { row: ReturnType<typeof mergeFileListChildren>[number]; jobRelPath: string }) {
+  const percent = stateProgressPercent(row.state, row.local_size, row.remote_size)
+  const size = nodeDisplaySize({ is_dir: false, local_size: row.local_size, remote_size: row.remote_size })
+  const speedLabel = childSpeedLabel(row.speed_bps)
+  return (
+    <li className="flex items-center gap-2 py-0.5">
+      <span className="min-w-0 flex-1 truncate text-zinc-700 dark:text-zinc-300" title={row.rel_path}>
+        {childDisplayName(row.rel_path, jobRelPath)}
+      </span>
+      <StateChip state={row.state} percent={percent} />
+      <span className="w-16 shrink-0 text-right text-zinc-500 dark:text-zinc-400">
+        {size != null ? formatBytes(size) : '—'}
+      </span>
+      <span className="w-20 shrink-0 text-right text-zinc-500 dark:text-zinc-400">{speedLabel}</span>
+    </li>
+  )
+}
+
+/** The Transfers row's **Files** group (2026-08-20, docs/transfers-redesign-spec.md §3.3, phase
+ * 1 stage 5) -- "the thing Files is currently used for, moved to where the ordering lives."
+ * Only rendered for a directory (`mirror`) job (`showsFileList`, `RowDetailPanel` below); a
+ * `pget` job's single file already has its own progress on the collapsed line, so there is
+ * nothing for this group to add for it.
+ *
+ * **Fetched once, on mount** (`GET /api/items/{id}/children`, capped server-side) -- the same
+ * "fetch once, on expand" shape `FailedOutputPanel`/this panel's own Processing group already
+ * establish. **Never re-fetched for live updates**: once the initial, bounded row set has
+ * landed, `mergeFileListChildren` overlays the freshest `state`/`local_size`/`speed_bps` from
+ * `nodes`/`childSpeedByItemId` -- the same `item_delta`/`child_progress` WebSocket messages
+ * `TransfersPage.tsx`'s single `useLiveModel()` call already receives for the Files page. That is
+ * the whole point of threading `nodes`/`childSpeedByItemId` down from there rather than polling
+ * this endpoint: ten expanded rows read the one already-open socket, not ten independent pollers.
+ */
+function FileListGroup({
+  job,
+  nodes,
+  childSpeedByItemId,
+}: {
+  job: JobOut
+  nodes: FileNode[]
+  childSpeedByItemId: Record<number, ChildSpeedSample>
+}) {
+  const [fetched, setFetched] = useState<FileNode[] | null>(null)
+  const [total, setTotal] = useState(0)
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+
+  useEffect(() => {
+    let cancelled = false
+    setLoading(true)
+    setError(null)
+    getItemChildren(job.item_id)
+      .then((res) => {
+        if (cancelled) return
+        setFetched(res.children)
+        setTotal(res.total)
+      })
+      .catch((err: unknown) => {
+        if (!cancelled) setError(err instanceof Error ? err.message : String(err))
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [job.item_id])
+
+  const rows = useMemo(
+    () => (fetched != null ? mergeFileListChildren(fetched, nodes, childSpeedByItemId) : []),
+    [fetched, nodes, childSpeedByItemId],
+  )
+  const capNote = fetched != null ? fileListCapNote(fetched.length, total) : null
+
+  return (
+    <div>
+      <h4 className="mb-1 text-[10px] font-medium tracking-wide text-zinc-500 uppercase dark:text-zinc-400">
+        Files
+      </h4>
+      {loading && fetched == null && <p className="text-zinc-400 dark:text-zinc-600">Loading files…</p>}
+      {error && <p className="text-red-600 dark:text-red-400">Couldn't load files: {error}</p>}
+      {fetched != null && fetched.length === 0 && !loading && (
+        <p className="text-zinc-400 dark:text-zinc-600">No files tracked yet.</p>
+      )}
+      {rows.length > 0 && (
+        <ul className="flex flex-col divide-y divide-zinc-100 dark:divide-zinc-800">
+          {rows.map((row) => (
+            <FileListRow key={row.rel_path} row={row} jobRelPath={job.rel_path} />
+          ))}
+        </ul>
+      )}
+      {capNote && <p className="mt-1 text-zinc-400 dark:text-zinc-600">{capNote}</p>}
+    </div>
+  )
+}
+
+/** The Transfers row's expand panel (2026-08-15) -- four groups now (2026-08-20, stage 5 added
+ * **Files**): **Transfer** (bytes/elapsed/speed/queued-wait/file-count, plus a failed job's
+ * error class + output tail), **Files** (per-file progress, directory jobs only --
+ * `showsFileList`), **Processing** (the item's verify/extract/remote-delete milestones, enriched
+ * by the pipeline's own event messages -- fetched on demand, exactly once, when this panel first
+ * opens), and ***arr** (hidden entirely when the job's queue has no bound instance).
+ *
+ * **One expand affordance, one panel, multiple sections** -- not a second chevron. The Complete
+ * box's failed-row output (`FailedOutputPanel`, unchanged, still nested inside the Transfer
+ * group below) already established that this panel is where every "more detail on this same
+ * row" surface lives; Files joins that list rather than getting its own toggle, so a
+ * failed-and-directory row can show its captured output *and* its per-file breakdown from the
+ * one click that already opens everything else.
+ */
+function RowDetailPanel({
+  job,
+  live,
+  fileCount,
+  nodes,
+  childSpeedByItemId,
+}: {
+  job: JobOut
+  live: LiveProgress | undefined
+  fileCount: number
+  nodes: FileNode[]
+  childSpeedByItemId: Record<number, ChildSpeedSample>
+}) {
   const transferFields = useMemo(() => transferGroupFields(job, { live, fileCount }), [job, live, fileCount])
   const processingFields = useMemo(() => processingGroupFields(job), [job])
   const showArr = hasArrGroup(job)
@@ -482,6 +619,8 @@ function RowDetailPanel({ job, live, fileCount }: { job: JobOut; live: LiveProgr
         <PanelFieldList fields={transferFields} emptyText="Nothing to show yet." />
         {job.state === 'failed' && <FailedOutputPanel job={job} />}
       </div>
+
+      {showsFileList(job) && <FileListGroup job={job} nodes={nodes} childSpeedByItemId={childSpeedByItemId} />}
 
       <div>
         <h4 className="mb-1 text-[10px] font-medium tracking-wide text-zinc-500 uppercase dark:text-zinc-400">
@@ -588,7 +727,12 @@ function Pager({ current, count, onChange }: { current: number; count: number; o
  */
 export function TransfersPage() {
   const { jobs, refresh } = useJobs()
-  const { queues, progressByJobId } = useLiveModel()
+  // `childSpeedByItemId` (2026-08-20, docs/transfers-redesign-spec.md §3.3 stage 5) -- the same
+  // `useLiveModel()` call this page already made for `queues`/`progressByJobId`, just reading one
+  // more field off its return value. Not a second WebSocket: `useLiveModel` opens one connection
+  // per call, and this page already has exactly one call, so widening what it reads costs nothing
+  // in request volume no matter how many rows a user expands.
+  const { queues, progressByJobId, childSpeedByItemId } = useLiveModel()
   const [busyIds, setBusyIds] = useState<Set<number>>(new Set())
   const [drawerJob, setDrawerJob] = useState<JobOut | null>(null)
   const [startNowNotice, setStartNowNotice] = useState(false)
@@ -1148,6 +1292,7 @@ export function TransfersPage() {
                 key={job.id}
                 job={job}
                 nodes={nodesByQueue.get(job.queue_id) ?? []}
+                childSpeedByItemId={childSpeedByItemId}
                 live={progressByJobId[job.id]}
                 queuePosition={queuePositions.get(job.id)}
                 queuedCount={queuedCount}
@@ -1205,6 +1350,7 @@ export function TransfersPage() {
                 key={job.id}
                 job={job}
                 nodes={nodesByQueue.get(job.queue_id) ?? []}
+                childSpeedByItemId={childSpeedByItemId}
                 live={progressByJobId[job.id]}
                 queuePosition={queuePositions.get(job.id)}
                 queuedCount={queuedCount}

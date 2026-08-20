@@ -11,7 +11,11 @@
 // ("crowding the row") is about. None of that information is dropped: it moves into the expand
 // panel's three groups (Transfer / Processing / *arr), assembled here.
 
-import type { HistoryJobOut, HistoryQueueSummaryOut, JobOut } from '../api/types'
+import type { FileNode, HistoryJobOut, HistoryQueueSummaryOut, JobOut } from '../api/types'
+// `ChildSpeedSample` is `useLiveModel.ts`'s own shape, imported for its type only -- the same
+// "pull the field types out, not the whole hook" split `LiveProgress` above already establishes.
+import type { ChildSpeedSample } from '../hooks/useLiveModel'
+import { freshChildSpeedBps } from './fileTree'
 import { formatBytes, formatEta, formatPercent, formatRate, formatRelativeTimeIntl } from './format'
 import { readLocalStorage, writeLocalStorage } from './storage'
 import { averageSpeedBps, elapsedSeconds, isNotableQueuedWait, queuedWaitSeconds } from './transferTiming'
@@ -600,4 +604,98 @@ export function decrementHistoryQueueSummary(
     else if (job.state === 'cancelled') next.cancelled = Math.max(0, next.cancelled - 1)
     return next
   })
+}
+
+// --- Row expansion: per-file progress (2026-08-20, docs/transfers-redesign-spec.md §3.3, phase
+// 1 stage 5) -- "the thing Files is currently used for, moved to where the ordering lives." ------
+
+/** Whether a Transfers row should offer the per-file expansion at all. A `pget` (single-file)
+ * job's own item row is never a directory (`job.is_dir`, already on the wire) -- structurally,
+ * it has no children (`core/queue.py._publish_child_progress`'s own "pget job: no children"
+ * branch; `GET /api/items/{id}/children` mirrors this server-side, returning an empty list for
+ * a non-directory item rather than erroring). **Decided: omit the affordance entirely for such
+ * a row, rather than show it and render an empty panel.** The single file's own progress is
+ * already this row's one collapsed-line figure (`transferLineValue`) and its own state chip --
+ * a one-row "expansion" repeating the same two facts would be a second place to look for
+ * information the row already states, not new information.
+ */
+export function showsFileList(job: JobOut): boolean {
+  return job.is_dir
+}
+
+/** One row of the file-list panel -- deliberately narrower than `FileNode`: only the fields the
+ * panel actually renders (name is derived by the caller via `childDisplayName` below, not
+ * carried here as a separate field, so there is exactly one place that decides how a full
+ * `rel_path` becomes a short display name).
+ */
+export interface FileListChildRow {
+  id: number | null
+  rel_path: string
+  state: string
+  remote_size: number | null
+  local_size: number | null
+  /** This child's live, freshness-gated rate (`freshChildSpeedBps`) -- `null` whenever there is
+   * no recent `child_progress` sample for it (not currently changing, or the id has none yet).
+   */
+  speed_bps: number | null
+}
+
+/** The file-list panel's own per-row merge. `fetched` is the bounded initial read from `GET
+ * /api/items/{id}/children` -- **the set of rel_paths displayed is fixed to this list** for the
+ * life of one expansion; the server-side cap (`api/jobs.py.ITEM_CHILDREN_MAX_LIMIT`) is what
+ * keeps a pathological release's DOM bounded, and re-deriving the row set from the live tree on
+ * every render would silently drop that guarantee the instant `liveNodes` grew past it.
+ *
+ * `liveNodes` is the same queue's full node list the page already holds in memory
+ * (`TransfersPage.tsx`'s `nodesByQueue`, itself `useLiveModel`'s `item_delta`-merged state, kept
+ * live over the WebSocket connection the page already opens) -- looked up by `rel_path` so each
+ * displayed row's `state`/`local_size` reflects the latest tick **without a second poll**, which
+ * is the whole point: N expanded rows read from the one already-open socket, never N independent
+ * requests. A `rel_path` with no live entry yet (the WS still reconnecting, say, or this queue
+ * hasn't snapshotted) simply keeps its initially-fetched value -- degrade to "last known," never
+ * to nothing.
+ *
+ * `childSpeedByItemId`/`now` feed `freshChildSpeedBps` (`lib/fileTree.ts`) for the live rate --
+ * the identical freshness gate the Files page's own per-child speed already uses, not a second
+ * one with its own window.
+ */
+export function mergeFileListChildren(
+  fetched: FileNode[],
+  liveNodes: FileNode[],
+  childSpeedByItemId: Record<number, ChildSpeedSample>,
+  now: number = Date.now(),
+): FileListChildRow[] {
+  const liveByPath = new Map(liveNodes.map((n) => [n.rel_path, n]))
+  return fetched.map((child) => {
+    const live = liveByPath.get(child.rel_path) ?? child
+    return {
+      id: live.id,
+      rel_path: live.rel_path,
+      state: live.state,
+      remote_size: live.remote_size,
+      local_size: live.local_size,
+      speed_bps: live.id != null ? freshChildSpeedBps(childSpeedByItemId[live.id], now) : null,
+    }
+  })
+}
+
+/** A child row's display name -- its own `rel_path` with the parent job's `rel_path` prefix
+ * stripped, so a nested file reads as `Season 01/episode.mkv` rather than repeating the job's
+ * own name in full (`Release Name/Season 01/episode.mkv`) on every one of its own rows. Falls
+ * back to the untouched `rel_path` if it somehow doesn't carry the expected prefix (defensive,
+ * not an expected case: every row this panel renders came from `GET /api/items/{id}/children`,
+ * which only ever returns descendants of the parent it was asked about).
+ */
+export function childDisplayName(childRelPath: string, jobRelPath: string): string {
+  const prefix = `${jobRelPath}/`
+  return childRelPath.startsWith(prefix) ? childRelPath.slice(prefix.length) : childRelPath
+}
+
+/** The file-list panel's own "showing N of total" note -- `null` whenever nothing was capped
+ * (the common case, a season pack's "dozens of children" comfortably under
+ * `ITEM_CHILDREN_DEFAULT_LIMIT`), so the panel only shows this line when it's telling the user
+ * something true and useful about their own release.
+ */
+export function fileListCapNote(shown: number, total: number): string | null {
+  return shown < total ? `Showing ${shown} of ${total} files.` : null
 }

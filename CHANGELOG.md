@@ -68,6 +68,13 @@ Skeleton for the next roll:
   currently on screen — the id-list scope it used before this change could only ever name a
   single page's worth. An empty filter result still dismisses nothing, never everything, the
   same guarantee the id-list scope already gave.
+- **A directory row's expand panel on the Transfers page now shows per-file progress**
+  (`docs/transfers-redesign-spec.md` §3.3, phase 1 stage 5) — the thing the Files page was
+  previously the only way to see, moved to where the ordering lives. Expanding a row fetches its
+  files once (`GET /api/items/{id}/children`, capped at 500) and keeps them live from the same
+  WebSocket connection the page already has open, so expanding several rows at once never means
+  several independent polls. A `pget` (single-file) job has no children and doesn't offer this
+  group — its own progress is already the row's collapsed-line figure.
 
 ### Changed
 

@@ -14,7 +14,6 @@ import {
   isDeletedArchiveVolume,
   isRemovalGracePending,
   isStillArriving,
-  percentValue,
   removalGraceLabel,
   removalGraceShortLabel,
   settleArrivingLabel,
@@ -58,6 +57,7 @@ import {
   shouldOfferSourceScope,
   showsCopyQueueSourceWarning,
   sortTree,
+  stateProgressPercent,
   type CollapsePreference,
   type ColumnDef,
   type ColumnWidths,
@@ -213,17 +213,9 @@ function remoteCopyNote(total: number, remoteCount: number): string {
   )
 }
 
-/** The state chip's inline fill (2026-08-13): only where a percentage means something.
- * `DOWNLOADING`/`PARTIAL` are the two states an in-progress read is actually informative for --
- * a complete item doesn't need a 100% bar, and `REMOTE_ONLY`/`EXCLUDED` have no denominator
- * that means anything yet. `percentValue` already guards the `NaN`/divide-by-zero cases (no or
- * non-positive `remote_size`), so a queue whose `remote_size` hasn't arrived yet just shows no
- * bar rather than a broken one.
- */
-function stateProgressPercent(node: FileNode): number | null {
-  if (node.state !== 'DOWNLOADING' && node.state !== 'PARTIAL') return null
-  return percentValue(node.local_size, node.remote_size)
-}
+// `stateProgressPercent` moved to `lib/fileTree.ts` (2026-08-20, docs/transfers-redesign-spec.md
+// §3.3 stage 5) -- the Transfers row's own file-list expansion shares it now; see that module's
+// own docstring for the full reasoning, unchanged from this file's original comment.
 
 // --- Row hover card (2026-08-13, prompts/2026-08-13-both-sides-hover-card.md) -----------------
 // Replaces the previous native `title` tooltip (a plain `\n`-joined string -- no columns, no
@@ -881,7 +873,11 @@ function Row({
                     ? 'ARCHIVE_EXTRACTED'
                     : entry.state
           }
-          percent={isRemoving || isSettling || isMissing || isDeletedArchive ? null : stateProgressPercent(entry)}
+          percent={
+            isRemoving || isSettling || isMissing || isDeletedArchive
+              ? null
+              : stateProgressPercent(entry.state, entry.local_size, entry.remote_size)
+          }
           label={
             isStillArrivingRow
               ? settleArrivingShortLabel(entry)

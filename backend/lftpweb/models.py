@@ -954,6 +954,31 @@ class ItemEventsResponse(BaseModel):
     events: list[ItemEventOut]
 
 
+class ItemChildrenResponse(BaseModel):
+    """`GET /api/items/{id}/children` (2026-08-20, docs/transfers-redesign-spec.md §3.3, phase 1
+    stage 5) -- the Transfers row's on-demand per-file expansion, "the thing Files is currently
+    used for, moved to where the ordering lives" (the spec's own words).
+
+    **Fetched only when a row expands, never inlined into the jobs list** -- the exact trap
+    `api/history.py`'s own module docstring names for `output_tail`: a season pack has dozens of
+    children, and the Active/Complete boxes are bounded by row count, not by how large any one
+    row's own subtree is. `api/jobs.py.item_children` is the fetch this response belongs to; see
+    its docstring for the query and the cap.
+
+    `children` is `FileNode` -- the exact same `core/itemview.py.item_view` projection every
+    other consumer of the `item` table reads through (`GET /api/files`, the WebSocket, this
+    endpoint), never a second shape invented for this one panel. `total` is the true descendant
+    file count regardless of the cap, so a capped response can still say "showing N of total"
+    honestly -- the same `total`/`limit`/`offset` shape `HistoryJobsResponse`/
+    `CompleteJobsResponse` already use, reused rather than a fourth paging idiom.
+    """
+
+    children: list[FileNode] = Field(default_factory=list)
+    total: int
+    limit: int
+    offset: int
+
+
 class TransferSettingsOut(BaseModel):
     max_bandwidth_bps: int
     max_concurrent_transfers: int

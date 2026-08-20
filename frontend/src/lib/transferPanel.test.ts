@@ -1,13 +1,16 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import type { HistoryJobOut, HistoryQueueSummaryOut, JobOut, JobState } from '../api/types'
+import type { FileNode, HistoryJobOut, HistoryQueueSummaryOut, JobOut, JobState } from '../api/types'
+import type { ChildSpeedSample } from '../hooks/useLiveModel'
 import {
   type LiveProgress,
   FAST_LANE_HINT,
   canMoveDown,
   canMoveUp,
+  childDisplayName,
   completedTimeLabel,
   decrementHistoryQueueSummary,
   failedJobPanelContent,
+  fileListCapNote,
   filterTransferJobs,
   formatQueueGroupCounts,
   groupHistoryJobsByQueue,
@@ -16,8 +19,10 @@ import {
   isDismissable,
   isFastLane,
   isQueueCollapsed,
+  mergeFileListChildren,
   processingGroupFields,
   readHistoryCollapsedQueues,
+  showsFileList,
   sortTransferRows,
   transferFilterSummary,
   transferGroupFields,
@@ -785,5 +790,129 @@ describe('failedJobPanelContent -- fetch vs. static empty state for a failed row
   it('carries a null error_class through to the static case rather than guessing', () => {
     const job = historyJob('failed', { error_class: null, has_output_tail: false })
     expect(failedJobPanelContent(job)).toEqual({ kind: 'static', errorClass: null })
+  })
+})
+
+// 2026-08-20 (docs/transfers-redesign-spec.md §3.3, phase 1 stage 5): the Transfers row's
+// per-file expansion -- "the thing Files is currently used for, moved to where the ordering
+// lives." Pure functions only, same discipline as every other describe block in this file.
+
+const DIM_FACETS = {
+  remote: { level: 'dim' as const, reason: 'absent' },
+  local: { level: 'dim' as const, reason: 'missing' },
+  verified: { level: 'dim' as const, reason: 'unverified' },
+  extracted: { level: 'dim' as const, reason: 'not_extracted' },
+}
+
+function fileNode(rel_path: string, overrides: Partial<FileNode> = {}): FileNode {
+  return {
+    id: 1,
+    rel_path,
+    is_dir: false,
+    state: 'PARTIAL',
+    substate: null,
+    suppressed_reason: null,
+    remote_size: 1000,
+    local_size: 500,
+    remote_mtime: null,
+    local_mtime: null,
+    state_changed_at: null,
+    first_seen_at: null,
+    settle_matched_scans: null,
+    settle_first_matched_at: null,
+    settle_total_bytes: null,
+    settle_first_observed_at: null,
+    settle_last_changed_at: null,
+    downloaded_at: null,
+    verified_at: null,
+    extracted_at: null,
+    first_missing_at: null,
+    remote_deleted_at: null,
+    pending_download_prefix: null,
+    deleted_archive_at: null,
+    arr_status: null,
+    arr_status_at: null,
+    facets: DIM_FACETS,
+    ...overrides,
+  }
+}
+
+describe('showsFileList -- whether a row offers the per-file expansion', () => {
+  it('a directory (mirror) job offers it', () => {
+    expect(showsFileList(job('running', { is_dir: true }))).toBe(true)
+  })
+
+  it('a single-file (pget) job does not -- it has no children by construction', () => {
+    expect(showsFileList(job('running', { is_dir: false }))).toBe(false)
+  })
+})
+
+describe('childDisplayName -- a child row\'s name relative to its job', () => {
+  it('strips the job\'s own rel_path prefix', () => {
+    expect(childDisplayName('Release/Season 01/e01.mkv', 'Release')).toBe('Season 01/e01.mkv')
+  })
+
+  it('strips a single-level prefix down to the bare filename', () => {
+    expect(childDisplayName('Release/e01.mkv', 'Release')).toBe('e01.mkv')
+  })
+
+  it('falls back to the untouched rel_path if the expected prefix is absent (defensive)', () => {
+    expect(childDisplayName('Other/e01.mkv', 'Release')).toBe('Other/e01.mkv')
+  })
+})
+
+describe('fileListCapNote -- the "showing N of total" line', () => {
+  it('is null when nothing was capped', () => {
+    expect(fileListCapNote(30, 30)).toBeNull()
+  })
+
+  it('names both numbers when the server-side cap trimmed the list', () => {
+    expect(fileListCapNote(500, 812)).toBe('Showing 500 of 812 files.')
+  })
+})
+
+describe('mergeFileListChildren -- overlaying live WS state onto the fetched, capped row set', () => {
+  it('prefers the live node\'s state/sizes over the initially-fetched ones, by rel_path', () => {
+    const fetched = [fileNode('Release/a.mkv', { state: 'PARTIAL', local_size: 100, remote_size: 1000 })]
+    const live = [fileNode('Release/a.mkv', { state: 'DOWNLOADED', local_size: 1000, remote_size: 1000 })]
+    const rows = mergeFileListChildren(fetched, live, {})
+    expect(rows).toEqual([
+      { id: 1, rel_path: 'Release/a.mkv', state: 'DOWNLOADED', remote_size: 1000, local_size: 1000, speed_bps: null },
+    ])
+  })
+
+  it('keeps the fetched row as-is when the live tree has nothing for that rel_path yet', () => {
+    const fetched = [fileNode('Release/a.mkv', { state: 'PARTIAL', local_size: 100, remote_size: 1000 })]
+    const rows = mergeFileListChildren(fetched, [], {})
+    expect(rows[0]).toMatchObject({ state: 'PARTIAL', local_size: 100 })
+  })
+
+  it('never grows or shrinks the row set -- the fetched, capped list is the fixed set', () => {
+    const fetched = [fileNode('Release/a.mkv'), fileNode('Release/b.mkv', { id: 2 })]
+    // A live tree with an extra file (`c.mkv`) that was never part of the fetched/capped set --
+    // it must not appear, since the cap's whole point is a bounded row count.
+    const live = [...fetched, fileNode('Release/c.mkv', { id: 3 })]
+    const rows = mergeFileListChildren(fetched, live, {})
+    expect(rows.map((r) => r.rel_path)).toEqual(['Release/a.mkv', 'Release/b.mkv'])
+  })
+
+  it('attaches a fresh child_progress sample as this row\'s speed_bps, by item id', () => {
+    const fetched = [fileNode('Release/a.mkv', { id: 7 })]
+    const samples: Record<number, ChildSpeedSample> = { 7: { speedBps: 4096, receivedAt: 1000 } }
+    const rows = mergeFileListChildren(fetched, fetched, samples, 1000)
+    expect(rows[0].speed_bps).toBe(4096)
+  })
+
+  it('reads null for a stale child_progress sample rather than a phantom rate', () => {
+    const fetched = [fileNode('Release/a.mkv', { id: 7 })]
+    const samples: Record<number, ChildSpeedSample> = { 7: { speedBps: 4096, receivedAt: 1000 } }
+    const rows = mergeFileListChildren(fetched, fetched, samples, 1000 + 60_000)
+    expect(rows[0].speed_bps).toBeNull()
+  })
+
+  it('reads null for a row with no id at all, rather than throwing', () => {
+    const fetched = [fileNode('Release/a.mkv', { id: null })]
+    const rows = mergeFileListChildren(fetched, fetched, {}, 1000)
+    expect(rows[0].speed_bps).toBeNull()
   })
 })

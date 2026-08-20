@@ -33,6 +33,7 @@ import type {
   HostIn,
   HostOut,
   HostTestRequest,
+  ItemChildrenResponse,
   ItemEventsResponse,
   JobOut,
   JobsResponse,
@@ -415,6 +416,19 @@ export function dismissAllJobs(
  */
 export function getItemEvents(itemId: number, limit?: number): Promise<ItemEventsResponse> {
   return getJson<ItemEventsResponse>(`/api/items/${itemId}/events${limit != null ? `?limit=${limit}` : ''}`)
+}
+
+/** The Transfers row's per-file expansion (2026-08-20, docs/transfers-redesign-spec.md §3.3,
+ * phase 1 stage 5) -- fetched once, when a directory row's panel is expanded, never eagerly for
+ * the whole jobs list (`api/jobs.py.item_children`'s own docstring; the same "on demand" shape
+ * `getItemEvents` above already establishes for this page). The response is already capped
+ * server-side (`ItemChildrenResponse.total` says the true count); once expanded, live updates
+ * come from the WebSocket this page already has open (`useLiveModel`'s `item_delta`/
+ * `child_progress` messages, merged client-side by `lib/transferPanel.ts.mergeFileListChildren`)
+ * rather than a second call here -- see `TransfersPage.tsx`'s own comment on why.
+ */
+export function getItemChildren(itemId: number): Promise<ItemChildrenResponse> {
+  return getJson<ItemChildrenResponse>(`/api/items/${itemId}/children`)
 }
 
 /** "Start now" (DESIGN.md §4.5), now a menu -- 10%/25%/50%/75%/Max of the site total limit
