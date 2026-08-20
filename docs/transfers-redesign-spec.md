@@ -81,11 +81,21 @@ supersedes it — filter to a queue, dismiss the list.
 
 | Box | Page size | Ordering | Pagination |
 |---|---|---|---|
-| **Active / pending** | 20 | true admission order | client-side — the set is bounded and already fully loaded |
-| **Complete** | 50 | most recently finished first | **server-side — reuse `api/history.py`'s existing paginator**, do not build a second one |
+| **Active / pending** | selectable 10/20/50, default 20 | true admission order | client-side — the set is bounded and already fully loaded |
+| **Complete** | selectable 10/20/50, default 20 | most recently finished first | **server-side — reuse `api/history.py`'s existing paginator**, do not build a second one |
 
 Numbered pages (`1 2 3 4 >`), SAB-style. Rows shifting between pages as work completes is
 **accepted and explicitly not a problem to solve** — the user's call, and it is how SAB behaves.
+
+**Page size is a per-box, per-browser preference, not a fixed constant** (2026-08-20, a
+follow-up from the user's first real look at the finished page,
+`prompts/done/2026-08-20-transfers-page-size-selector.md`): each box carries its own "Show
+10/20/50" selector, persisted independently in `localStorage` (a stale or invalid stored value
+falls back to the default rather than being trusted). The Complete box originally shipped
+defaulting to 50 (phase 1 stage 4b); the user's own call once they'd seen it on screen was that
+50 is too many rows at once in practice, so both boxes now default to 20. Changing a box's size
+always resets it to page 1 — no attempt to preserve scroll position or compute an equivalent
+page.
 
 ### 3.3 Rows expand to per-file progress
 

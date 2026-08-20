@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { getCompleteJobs } from '../api/client'
 import type { JobOut } from '../api/types'
-import { COMPLETE_PAGE_SIZE } from '../lib/pagination'
+import { COMPLETE_PAGE_SIZE, type PageSize } from '../lib/pagination'
 
 const POLL_INTERVAL_MS = 2000
 
@@ -17,14 +17,26 @@ const POLL_INTERVAL_MS = 2000
  * responsible for debouncing `nameFilter` before it reaches here (typing shouldn't fire a
  * request per keystroke) and for resetting `page` to `1` when the filter text changes.
  *
+ * `pageSize` (2026-08-20, prompts/2026-08-20-transfers-page-size-selector.md) is likewise owned
+ * by the caller -- it's a per-browser persisted preference, not a constant, now that the
+ * Complete box carries its own "Show 10/20/50" selector. Defaults to `COMPLETE_PAGE_SIZE` so
+ * every existing call site (and every existing test) keeps working unchanged. Same as `page`
+ * changing, changing `pageSize` is just a different request: a new `limit`/`offset` pair, caught
+ * by the same request-id guard below -- there is nothing size-specific to add.
+ *
  * A request-id guard (`requestIdRef`), not `useJobs.ts`'s simpler `cancelledRef`, because two
- * requests can genuinely race here (a poll tick landing while `page`/`nameFilter` just changed
- * and fired a new request) -- only the response to the *latest* request is ever applied, so a
- * slow response to a since-superseded page/filter can't clobber newer state.
+ * requests can genuinely race here (a poll tick landing while `page`/`nameFilter`/`pageSize` just
+ * changed and fired a new request) -- only the response to the *latest* request is ever applied,
+ * so a slow response to a since-superseded page/filter/size can't clobber newer state. This is
+ * exactly what covers "the user switches Complete's page size while a fetch for the old size is
+ * still in flight": the in-flight request's `requestId` no longer matches `requestIdRef.current`
+ * (the size change bumped it via a fresh `refresh()` call, same as a page/filter change already
+ * did) by the time it resolves, so its `.then`/`.catch` both bail out before touching state.
  */
 export function useCompleteJobs(
   page: number,
   nameFilter: string,
+  pageSize: PageSize = COMPLETE_PAGE_SIZE,
 ): { jobs: JobOut[]; total: number; loading: boolean; error: string | null; refresh: () => void } {
   const [jobs, setJobs] = useState<JobOut[]>([])
   const [total, setTotal] = useState(0)
@@ -43,8 +55,8 @@ export function useCompleteJobs(
     const trimmedFilter = nameFilter.trim()
     getCompleteJobs({
       nameFilter: trimmedFilter !== '' ? trimmedFilter : undefined,
-      limit: COMPLETE_PAGE_SIZE,
-      offset: (page - 1) * COMPLETE_PAGE_SIZE,
+      limit: pageSize,
+      offset: (page - 1) * pageSize,
     })
       .then((res) => {
         if (requestIdRef.current !== requestId) return // superseded by a newer request
@@ -59,7 +71,7 @@ export function useCompleteJobs(
       .finally(() => {
         if (requestIdRef.current === requestId) setLoading(false)
       })
-  }, [page, nameFilter])
+  }, [page, nameFilter, pageSize])
 
   useEffect(() => {
     refresh()

@@ -23,9 +23,19 @@ import type { ChildSpeedSample } from '../hooks/useLiveModel'
 import { useLiveModel } from '../hooks/useLiveModel'
 import { arrHoverLabel, nodeDisplaySize, stateProgressPercent } from '../lib/fileTree'
 import { childSpeedLabel, formatBytes, formatRelativeTimeIntl } from '../lib/format'
-import { ACTIVE_PAGE_SIZE, COMPLETE_PAGE_SIZE, pageCount, pageWindow, paginateClientSide } from '../lib/pagination'
+import {
+  ACTIVE_PAGE_SIZE,
+  COMPLETE_PAGE_SIZE,
+  PAGE_SIZE_OPTIONS,
+  isPageSize,
+  pageCount,
+  pageWindow,
+  paginateClientSide,
+} from '../lib/pagination'
+import type { PageSize } from '../lib/pagination'
 import { queueDisplayName } from '../lib/queueDisplayName'
 import type { StartNowRatePercent } from '../lib/startNow'
+import { readLocalStorage, writeLocalStorage } from '../lib/storage'
 import {
   FAST_LANE_HINT,
   type LiveProgress,
@@ -721,6 +731,44 @@ function Pager({ current, count, onChange }: { current: number; count: number; o
   )
 }
 
+/** "Show 10/20/50" rows-per-page selector (2026-08-20, prompts/2026-08-20-transfers-page-size-
+ * selector.md), one independent instance per box. Unlike `Pager` above, this is **always
+ * rendered** whenever its box is -- a control that vanishes once the row count drops is hard to
+ * find again, and there's no crowding argument here to outweigh that (it sits in the same footer
+ * row as the pager/page-count text, which already tolerates a variable-width neighbour). `id` is
+ * per-box (`"active"`/`"complete"`) so the two `<label>`s' `htmlFor` never collide.
+ */
+function PageSizeSelect({
+  id,
+  value,
+  onChange,
+}: {
+  id: string
+  value: PageSize
+  onChange: (size: PageSize) => void
+}) {
+  const selectId = `transfers-page-size-${id}`
+  return (
+    <div className="flex items-center gap-1.5">
+      <label htmlFor={selectId} className="text-xs text-zinc-500 dark:text-zinc-400">
+        Show
+      </label>
+      <select
+        id={selectId}
+        value={value}
+        onChange={(e) => onChange(Number(e.target.value) as PageSize)}
+        className="rounded-md border border-zinc-300 bg-white px-1.5 py-1 text-xs font-medium text-zinc-700 hover:bg-zinc-50 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-200 dark:hover:bg-zinc-800"
+      >
+        {PAGE_SIZE_OPTIONS.map((size) => (
+          <option key={size} value={size}>
+            {size}
+          </option>
+        ))}
+      </select>
+    </div>
+  )
+}
+
 /** DESIGN.md §9.2 Transfers page -- the job queue. Rows stay deliberately plain (queued /
  * downloading / downloaded, with STOPPED/FAILED surfacing only where they apply); the item
  * drawer opens per row for the full per-file breakdown.
@@ -780,6 +828,33 @@ export function TransfersPage() {
   // boundary/window arithmetic; this page only ever stores "which page" and hands it there.
   const [activePage, setActivePage] = useState(1)
   const [completePage, setCompletePage] = useState(1)
+  // Each box's own "Show 10/20/50" rows-per-page choice (2026-08-20, prompts/2026-08-20-
+  // transfers-page-size-selector.md), independent per box and remembered per browser --
+  // `dashboard.bytesRange`'s own pattern (`DashboardPage.tsx`): read synchronously in the
+  // initial `useState` (not a `useEffect`) so the box never paints at the default size and then
+  // jumps to the saved one, and `isPageSize` (`lib/pagination.ts`) rejects anything stored that
+  // isn't one of `PAGE_SIZE_OPTIONS` -- a hand-edited or stale value falls back to the box's
+  // default (`ACTIVE_PAGE_SIZE`/`COMPLETE_PAGE_SIZE`, both 20) exactly like "never saved".
+  const [activePageSize, setActivePageSizeState] = useState<PageSize>(
+    () => readLocalStorage('transfers.activePageSize', isPageSize) ?? ACTIVE_PAGE_SIZE,
+  )
+  const setActivePageSize = (next: PageSize) => {
+    setActivePageSizeState(next)
+    writeLocalStorage('transfers.activePageSize', next)
+    // A size change can strand the user on a page that no longer exists (the task's own example:
+    // page 4 of 10 at size 10, switch to 50, page 4 is gone) -- reset to page 1 rather than try
+    // to preserve scroll position or compute an equivalent page. The clamp effect below is a
+    // second, independent safety net for anything this misses, not a substitute for it.
+    setActivePage(1)
+  }
+  const [completePageSize, setCompletePageSizeState] = useState<PageSize>(
+    () => readLocalStorage('transfers.completePageSize', isPageSize) ?? COMPLETE_PAGE_SIZE,
+  )
+  const setCompletePageSize = (next: PageSize) => {
+    setCompletePageSizeState(next)
+    writeLocalStorage('transfers.completePageSize', next)
+    setCompletePage(1) // same reset-to-page-1 reasoning as the Active box above
+  }
 
   const nodesByQueue = useMemo(() => {
     const map = new Map<number, FileNode[]>()
@@ -829,10 +904,10 @@ export function TransfersPage() {
   const filteredActiveJobs = useMemo(() => filterTransferJobs(sortedActiveJobs, search), [sortedActiveJobs, search])
   const filterActive = search.trim() !== ''
   const activeFilterSummary = transferFilterSummary(filteredActiveJobs.length, sortedActiveJobs.length, search)
-  const activePageCount = pageCount(filteredActiveJobs.length, ACTIVE_PAGE_SIZE)
+  const activePageCount = pageCount(filteredActiveJobs.length, activePageSize)
   const activePageJobs = useMemo(
-    () => paginateClientSide(filteredActiveJobs, activePage, ACTIVE_PAGE_SIZE),
-    [filteredActiveJobs, activePage],
+    () => paginateClientSide(filteredActiveJobs, activePage, activePageSize),
+    [filteredActiveJobs, activePage, activePageSize],
   )
   // Reset to page 1 when the filter text changes (task's own instruction) -- keyed on `search`
   // alone, never on `jobs` (which changes every ~2s poll tick regardless of the filter), so
@@ -848,8 +923,8 @@ export function TransfersPage() {
   }, [activePage, activePageCount])
 
   // --- Complete box (2026-08-19, docs/transfers-redesign-spec.md §3.2, phase 1 stage 4b) --
-  // server-side paginated and filtered, 50/page, newest-finished first
-  // (`useCompleteJobs`/`GET /api/jobs/complete`). ------------------------------------------
+  // server-side paginated and filtered, page size selectable (`completePageSize` above, default
+  // 20), newest-finished first (`useCompleteJobs`/`GET /api/jobs/complete`). -------------------
 
   const {
     jobs: completeJobs,
@@ -857,9 +932,9 @@ export function TransfersPage() {
     loading: completeLoading,
     error: completeError,
     refresh: refreshComplete,
-  } = useCompleteJobs(completePage, debouncedSearch)
+  } = useCompleteJobs(completePage, debouncedSearch, completePageSize)
   const completeFilterActive = debouncedSearch.trim() !== ''
-  const completePageCount = pageCount(completeTotal, COMPLETE_PAGE_SIZE)
+  const completePageCount = pageCount(completeTotal, completePageSize)
   // Same reset-on-filter-change/clamp-on-narrow pair as the Active box above, keyed on the
   // debounced filter text and the server-reported total respectively.
   useEffect(() => {
@@ -1307,7 +1382,8 @@ export function TransfersPage() {
               />
             ))}
           </div>
-          <div className="flex items-center justify-end">
+          <div className="flex items-center justify-between gap-2">
+            <PageSizeSelect id="active" value={activePageSize} onChange={setActivePageSize} />
             <Pager current={activePage} count={activePageCount} onChange={setActivePage} />
           </div>
         </div>
@@ -1372,7 +1448,10 @@ export function TransfersPage() {
             {completeTotal > 0 &&
               `Page ${completePage} of ${completePageCount} (${completeTotal} total)`}
           </span>
-          <Pager current={completePage} count={completePageCount} onChange={setCompletePage} />
+          <div className="flex items-center gap-2">
+            <PageSizeSelect id="complete" value={completePageSize} onChange={setCompletePageSize} />
+            <Pager current={completePage} count={completePageCount} onChange={setCompletePage} />
+          </div>
         </div>
       </div>
 

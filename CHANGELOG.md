@@ -58,16 +58,23 @@ Skeleton for the next roll:
   **Dismiss list** does the same job: filter to a queue, dismiss the list. This reverses the
   2026-08-16 "group rows by queue" decision; see `docs/decisions.md` for why.
 - **The Transfers page splits into two paginated boxes** (`docs/transfers-redesign-spec.md`
-  §3.2, phase 1 stage 4b): **Active / pending** (queued/running, 20/page, client-side — the set
-  is bounded and already loaded) and **Complete** (finished, 50/page, newest-finished first,
-  **server-side** via the new `GET /api/jobs/complete`), numbered pages, SAB-style. Rows shifting
-  between pages as work completes is expected, not a bug. The name filter now runs server-side
-  for the Complete box (it can no longer see everything client-side once it's paginated), and
-  **Dismiss list** carries that same filter text to the server (`dismiss_all_terminal`'s new
-  `name_filter` scope) so it dismisses every matching row across every page, not just the one
-  currently on screen — the id-list scope it used before this change could only ever name a
-  single page's worth. An empty filter result still dismisses nothing, never everything, the
-  same guarantee the id-list scope already gave.
+  §3.2, phase 1 stage 4b): **Active / pending** (queued/running, client-side — the set is bounded
+  and already loaded) and **Complete** (finished, newest-finished first, **server-side** via the
+  new `GET /api/jobs/complete`), numbered pages, SAB-style. Rows shifting between pages as work
+  completes is expected, not a bug. The name filter now runs server-side for the Complete box (it
+  can no longer see everything client-side once it's paginated), and **Dismiss list** carries
+  that same filter text to the server (`dismiss_all_terminal`'s new `name_filter` scope) so it
+  dismisses every matching row across every page, not just the one currently on screen — the
+  id-list scope it used before this change could only ever name a single page's worth. An empty
+  filter result still dismisses nothing, never everything, the same guarantee the id-list scope
+  already gave. **Each box now also carries its own "Show 10/20/50" rows-per-page selector**
+  (2026-08-20, a follow-up from the user's first real look at the finished page,
+  `prompts/done/2026-08-20-transfers-page-size-selector.md`), independently remembered per
+  browser (`localStorage`, invalid/stale stored values fall back to the default). Both boxes now
+  default to **20** — the Complete box changes from a fixed 50, per the user's own call once they
+  saw it on screen ("50 is too many rows at once in practice"). Changing a box's size always
+  resets it to page 1 rather than trying to preserve scroll position or compute an equivalent
+  page.
 - **A directory row's expand panel on the Transfers page now shows per-file progress**
   (`docs/transfers-redesign-spec.md` §3.3, phase 1 stage 5) — the thing the Files page was
   previously the only way to see, moved to where the ordering lives. Expanding a row fetches its

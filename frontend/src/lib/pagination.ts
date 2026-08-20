@@ -7,8 +7,36 @@
 // whole component-testing story is `lib/*.test.ts` (README.md's Known gaps: no component
 // rendering is tested).
 
+// Both are now *defaults*, not fixed sizes (2026-08-20, prompts/2026-08-20-transfers-page-size-
+// selector.md, a follow-up to phase 1 stage 4b from the user's first real look at the finished
+// page) -- each box now carries its own "Show 10/20/50" selector, persisted per browser
+// (`TransfersPage.tsx`'s `activePageSize`/`completePageSize` state, `lib/storage.ts`). These
+// constants are what a box falls back to when nothing is stored yet (or what's stored is
+// invalid -- `isPageSize` below). `COMPLETE_PAGE_SIZE` changes from 50 to 20 here -- the user's
+// own words, "probably default to 20 now that I have seen it on screen": 50 was too many rows at
+// once in practice, and there is no reason for the two boxes to default differently.
 export const ACTIVE_PAGE_SIZE = 20
-export const COMPLETE_PAGE_SIZE = 50
+export const COMPLETE_PAGE_SIZE = 20
+
+/** The only sizes either box's selector offers. A single shared list -- both boxes' dropdowns
+ * read from it, and `isPageSize` validates against it, so adding/removing an option can never
+ * leave the selector and the validator disagreeing with each other.
+ */
+export const PAGE_SIZE_OPTIONS = [10, 20, 50] as const
+
+export type PageSize = (typeof PAGE_SIZE_OPTIONS)[number]
+
+/** Validates a page size read back out of `localStorage` -- a hand-edited value (`"999"`), a
+ * foreign/corrupt one, or a size this version no longer offers, must fall back to the box's
+ * default rather than being trusted (this codebase's existing defensive shape for every other
+ * persisted preference, `lib/storage.ts`'s own docstring). `readLocalStorage` already rejects
+ * anything that fails `JSON.parse` (a bare `abc`) or throws; this only has to handle a value
+ * that *did* parse but isn't one of the offered sizes -- a non-number, or a number not in
+ * `PAGE_SIZE_OPTIONS` (`999`, `0`, a stale size an earlier version offered and this one dropped).
+ */
+export function isPageSize(value: unknown): value is PageSize {
+  return typeof value === 'number' && (PAGE_SIZE_OPTIONS as readonly number[]).includes(value)
+}
 
 /** How many page-number buttons show at once -- the task's own SAB-style example, `1 2 3 4 >`. */
 export const PAGE_WINDOW_SIZE = 5

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { clampPage, pageCount, pageWindow, paginateClientSide } from './pagination'
+import { clampPage, isPageSize, pageCount, pageWindow, paginateClientSide } from './pagination'
 
 describe('pageCount', () => {
   it('is 1 for an empty result set -- "page 1 of 1", never "page 1 of 0"', () => {
@@ -120,5 +120,32 @@ describe('paginateClientSide', () => {
     const copy = [...items]
     paginateClientSide(items, 2, 20)
     expect(items).toEqual(copy)
+  })
+})
+
+describe('isPageSize', () => {
+  it('accepts every offered size', () => {
+    expect(isPageSize(10)).toBe(true)
+    expect(isPageSize(20)).toBe(true)
+    expect(isPageSize(50)).toBe(true)
+  })
+
+  it('rejects a number that is not one of the offered sizes -- a hand-edited "999"', () => {
+    expect(isPageSize(999)).toBe(false)
+    expect(isPageSize(0)).toBe(false)
+    expect(isPageSize(-20)).toBe(false)
+  })
+
+  it('rejects a stale size an earlier version offered and this one no longer does', () => {
+    expect(isPageSize(100)).toBe(false)
+  })
+
+  it('rejects a non-number -- a foreign/corrupt stored value that still parsed as JSON', () => {
+    expect(isPageSize('20')).toBe(false)
+    expect(isPageSize('abc')).toBe(false)
+    expect(isPageSize(null)).toBe(false)
+    expect(isPageSize(undefined)).toBe(false)
+    expect(isPageSize({})).toBe(false)
+    expect(isPageSize([20])).toBe(false)
   })
 })

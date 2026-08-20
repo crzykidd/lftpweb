@@ -2002,11 +2002,15 @@ Some.Release.S03E04.2160p    [downloading]   18 files   62%   4.1 MB/s   ETA 12m
   make a move appear to swap a job with something in a different group; in the flat list the row
   directly above is always the one being traded with.
 - **Two paginated boxes, not one flat list** (2026-08-19, `docs/transfers-redesign-spec.md` §3.2,
-  phase 1 stage 4b): **Active / pending** (queued/running, 20/page, client-side — the set is
-  bounded and already loaded) and **Complete** (terminal, one row per item — the same
-  most-recent-job-wins rule as before — 50/page, newest-finished first, **server-side** via
-  `GET /api/jobs/complete`). Numbered pages, SAB-style. Rows shifting between pages as work
-  completes is accepted, not a bug — the same behavior SAB itself has. The name filter now has
+  phase 1 stage 4b): **Active / pending** (queued/running, client-side — the set is bounded and
+  already loaded) and **Complete** (terminal, one row per item — the same most-recent-job-wins
+  rule as before — newest-finished first, **server-side** via `GET /api/jobs/complete`). Numbered
+  pages, SAB-style. Each box carries its own "Show 10/20/50" page-size selector, both defaulting
+  to **20** and independently remembered per browser (2026-08-20, a follow-up from the user's
+  first real look at the finished page — the Complete box originally defaulted to 50, but 50
+  proved too many rows at once in practice once seen on screen; a stale/invalid stored size falls
+  back to the default). Changing either box's size resets it to page 1. Rows shifting between
+  pages as work completes is accepted, not a bug — the same behavior SAB itself has. The name filter now has
   two halves: unchanged (client-side, instant) for the Active box, but server-side (debounced) for
   the Complete box, since a client-side filter over only the loaded page would silently stop
   seeing most of the matches the moment that box became paginated. **Dismiss list** follows the
