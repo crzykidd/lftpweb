@@ -55,6 +55,12 @@ honor by default:
 - **Do not add `Co-authored-by:` trailers** unless the user explicitly asks.
 - **Doc updates ship in the same commit as the code they describe** — never as a
   follow-up commit.
+- **Never run a verification gate in the background — always foreground, with a generous
+  explicit timeout.** The full `pytest` run takes ~3.5 minutes. A **spawned subagent never
+  receives a background-task completion notification**, so an agent that backgrounds a gate
+  waits on a signal that cannot arrive and stalls indefinitely. This has now happened to
+  several agents in this repo. Run each gate as its own foreground command and read its exit
+  code directly.
 - **Run `uv run pytest` from the REPO ROOT, never from `backend/`.** `testpaths` is defined in
   the root `pyproject.toml` and `tests/` is a sibling of `backend/`, not inside it — so running
   from `backend/` collects **zero** tests and exits 0, which is indistinguishable from a pass at
