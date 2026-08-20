@@ -33,6 +33,15 @@ Skeleton for the next roll:
   own text filter and the Logs filter.
 
 ### Changed
+
+- **The transfer queue's ordering internals moved from a `rank`/boost scheme to a dense
+  `queue_position` model** (migration 023, `docs/transfers-redesign-spec.md` §3.4/§3.5,
+  phase 1 stage 1) — the prerequisite for the upcoming per-row "move up one / down one"
+  reordering. No user-visible change on its own: existing queues are backfilled in the same
+  order they'd have run in before, "Move to top" behaves identically, and the v0.2.6
+  startup-rescue ordering (re-queuing an interrupted item back to its original place in line)
+  was re-derived and re-proven by test rather than merely ported.
+
 ### Fixed
 
 - **Auto-queue no longer re-downloads a release the *arr has just imported.** Found in

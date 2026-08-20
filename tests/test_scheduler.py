@@ -5,8 +5,6 @@ I/O: `(N, B, running, queue, settings)` in, an admit list out.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
-
 import pytest
 
 from lftpweb.core.scheduler import (
@@ -35,13 +33,22 @@ def _settings(**overrides) -> SchedulerSettings:
 
 def _q(
     id_: int,
-    queued_at: str,
-    rank: float = 0.0,
+    position: float | None = None,
     lane: str = LANE_MAIN,
     forced_fraction: float | None = None,
 ) -> QueuedJob:
+    """`position=None` defaults to the job's own id -- every existing call site built its
+    ordering out of ids/labels that were already ascending together (`_q(i, f"t{i}")`), so this
+    keeps every one of those call sites' intended order unchanged after dropping the string
+    `queued_at` label the position model retired (2026-08-19,
+    docs/transfers-redesign-spec.md §3.4). Pass `position=` explicitly for a test that needs a
+    specific (e.g. non-id-ordered, or "moved to top") position instead.
+    """
     return QueuedJob(
-        id=id_, lane=lane, rank=rank, queued_at=queued_at, forced_rate_fraction=forced_fraction
+        id=id_,
+        lane=lane,
+        queue_position=float(id_) if position is None else position,
+        forced_rate_fraction=forced_fraction,
     )
 
 
@@ -50,7 +57,7 @@ def _q(
 
 def test_five_queued_nothing_running_admits_two_at_half():
     settings = _settings()
-    queue = [_q(i, f"t{i}") for i in range(1, 6)]
+    queue = [_q(i) for i in range(1, 6)]
     decisions = admit(settings, running=[], queue=queue)
     assert decisions == [
         AdmitDecision(job_id=1, lane=LANE_MAIN, rate_limit_bps=5_000_000),
@@ -60,14 +67,14 @@ def test_five_queued_nothing_running_admits_two_at_half():
 
 def test_one_item_alone_admits_at_full_bandwidth():
     settings = _settings()
-    decisions = admit(settings, running=[], queue=[_q(1, "t1")])
+    decisions = admit(settings, running=[], queue=[_q(1)])
     assert decisions == [AdmitDecision(job_id=1, lane=LANE_MAIN, rate_limit_bps=10_000_000)]
 
 
 def test_second_item_blocked_while_first_holds_full_bandwidth():
     settings = _settings()
     running = [RunningJob(id=1, lane=LANE_MAIN, rate_limit_bps=10_000_000)]
-    decisions = admit(settings, running=running, queue=[_q(2, "t2")])
+    decisions = admit(settings, running=running, queue=[_q(2)])
     assert decisions == []  # headroom is 0 -> the third/blocked item waits
 
 
@@ -76,7 +83,7 @@ def test_refill_at_half_share_when_partner_already_finished():
     # running job is untouched (still 5, never re-shaped).
     settings = _settings()
     running = [RunningJob(id=1, lane=LANE_MAIN, rate_limit_bps=5_000_000)]
-    decisions = admit(settings, running=running, queue=[_q(2, "t2")])
+    decisions = admit(settings, running=running, queue=[_q(2)])
     assert decisions == [AdmitDecision(job_id=2, lane=LANE_MAIN, rate_limit_bps=5_000_000)]
 
 
@@ -85,21 +92,24 @@ def test_job_finishes_three_still_queued_refills_at_headroom_over_one():
     # running at 5) -> headroom 5, ready 1 -> next by priority starts at 5.
     settings = _settings()
     running = [RunningJob(id=1, lane=LANE_MAIN, rate_limit_bps=5_000_000)]
-    queue = [_q(2, "t2"), _q(3, "t3"), _q(4, "t4")]
+    queue = [_q(2), _q(3), _q(4)]
     decisions = admit(settings, running=running, queue=queue)
     assert decisions == [AdmitDecision(job_id=2, lane=LANE_MAIN, rate_limit_bps=5_000_000)]
 
 
 def test_default_order_is_oldest_first():
     settings = _settings(max_concurrent_transfers=1)
-    queue = [_q(3, "t3"), _q(1, "t1"), _q(2, "t2")]  # inserted out of order
+    queue = [_q(3), _q(1), _q(2)]  # inserted out of order
     decisions = admit(settings, running=[], queue=queue)
     assert [d.job_id for d in decisions] == [1]
 
 
-def test_move_to_top_uses_higher_rank_over_queued_at():
+def test_moved_to_top_job_has_a_lower_position_and_admits_first():
+    # 2026-08-19: replaces the old rank-based version of this test -- "moved to top" is now a
+    # *lower* `queue_position` (job 2's 1.0 is lower than job 1's default-by-id 5.0), not a
+    # higher `rank` (docs/transfers-redesign-spec.md §3.4).
     settings = _settings(max_concurrent_transfers=1)
-    queue = [_q(1, "t1", rank=0.0), _q(2, "t2", rank=100.0)]  # 2 was "moved to top"
+    queue = [_q(1, position=5.0), _q(2, position=1.0)]  # 2 was "moved to top"
     decisions = admit(settings, running=[], queue=queue)
     assert [d.job_id for d in decisions] == [2]
 
@@ -115,7 +125,7 @@ def test_floor_loop_reduces_ready_until_share_clears_the_floor():
         max_concurrent_transfers=5,
         min_share_floor_bps=300_000,
     )
-    queue = [_q(i, f"t{i}") for i in range(1, 6)]
+    queue = [_q(i) for i in range(1, 6)]
     decisions = admit(settings, running=[], queue=queue)
     assert [d.job_id for d in decisions] == [1, 2, 3]
     assert all(d.rate_limit_bps == 333_333 for d in decisions)
@@ -127,14 +137,14 @@ def test_floor_loop_stops_at_ready_one_even_below_the_floor():
     settings = _settings(
         max_bandwidth_bps=100_000, max_concurrent_transfers=5, min_share_floor_bps=300_000
     )
-    decisions = admit(settings, running=[], queue=[_q(1, "t1")])
+    decisions = admit(settings, running=[], queue=[_q(1)])
     assert decisions == [AdmitDecision(job_id=1, lane=LANE_MAIN, rate_limit_bps=100_000)]
 
 
 def test_zero_or_negative_headroom_admits_nothing_on_the_main_lane():
     settings = _settings(max_bandwidth_bps=10_000_000, max_concurrent_transfers=5)
     running = [RunningJob(id=1, lane=LANE_MAIN, rate_limit_bps=10_000_000)]
-    decisions = admit(settings, running=running, queue=[_q(2, "t2")])
+    decisions = admit(settings, running=running, queue=[_q(2)])
     assert decisions == []
 
 
@@ -145,7 +155,7 @@ def test_fast_lane_item_admits_even_when_main_lane_headroom_is_negative():
     settings = _settings(small_lane_reserve_bps=1_000_000, small_lane_concurrency=2)
     # Main lane fully saturated: headroom deeply negative.
     running = [RunningJob(id=1, lane=LANE_MAIN, rate_limit_bps=10_000_000)]
-    queue = [_q(2, "small-1", lane=LANE_SMALL)]
+    queue = [_q(2, lane=LANE_SMALL)]
     decisions = admit(settings, running=running, queue=queue)
     assert decisions == [AdmitDecision(job_id=2, lane=LANE_SMALL, rate_limit_bps=1_000_000)]
 
@@ -153,9 +163,9 @@ def test_fast_lane_item_admits_even_when_main_lane_headroom_is_negative():
 def test_fast_lane_shares_its_reserve_across_concurrent_small_jobs():
     settings = _settings(small_lane_reserve_bps=1_000_000, small_lane_concurrency=2)
     queue = [
-        _q(1, "small-1", lane=LANE_SMALL),
-        _q(2, "small-2", lane=LANE_SMALL),
-        _q(3, "small-3", lane=LANE_SMALL),
+        _q(1, lane=LANE_SMALL),
+        _q(2, lane=LANE_SMALL),
+        _q(3, lane=LANE_SMALL),
     ]
     decisions = admit(settings, running=[], queue=queue)
     # Concurrency cap is 2 -> only two admitted, third waits; the reserve splits evenly.
@@ -166,7 +176,7 @@ def test_fast_lane_shares_its_reserve_across_concurrent_small_jobs():
 def test_fast_lane_running_jobs_are_never_re_shaped_by_a_new_arrival():
     settings = _settings(small_lane_reserve_bps=1_000_000, small_lane_concurrency=2)
     running = [RunningJob(id=1, lane=LANE_SMALL, rate_limit_bps=1_000_000)]
-    decisions = admit(settings, running=running, queue=[_q(2, "small-2", lane=LANE_SMALL)])
+    decisions = admit(settings, running=running, queue=[_q(2, lane=LANE_SMALL)])
     # Job 1 keeps its 1,000,000 (not present in `decisions` — it's not re-admitted); job 2
     # gets a share computed over both active small jobs, not the full reserve to itself.
     assert decisions == [AdmitDecision(job_id=2, lane=LANE_SMALL, rate_limit_bps=500_000)]
@@ -174,7 +184,7 @@ def test_fast_lane_running_jobs_are_never_re_shaped_by_a_new_arrival():
 
 def test_fast_lane_never_consumes_a_main_lane_slot():
     settings = _settings(max_concurrent_transfers=1, small_lane_reserve_bps=1_000_000)
-    queue = [_q(1, "main-1", lane=LANE_MAIN), _q(2, "small-1", lane=LANE_SMALL)]
+    queue = [_q(1, lane=LANE_MAIN), _q(2, lane=LANE_SMALL)]
     decisions = admit(settings, running=[], queue=queue)
     ids = {d.job_id for d in decisions}
     assert ids == {1, 2}  # both admitted despite N=1 -- the small item didn't compete for it
@@ -190,7 +200,7 @@ def test_fast_lane_never_consumes_a_main_lane_slot():
 def test_start_now_admits_unconditionally_at_full_bandwidth():
     settings = _settings(max_concurrent_transfers=1)
     running = [RunningJob(id=1, lane=LANE_MAIN, rate_limit_bps=10_000_000)]  # N already full
-    queue = [_q(2, "t2", forced_fraction=1.0)]
+    queue = [_q(2, forced_fraction=1.0)]
     decisions = admit(settings, running=running, queue=queue)
     assert decisions == [
         AdmitDecision(job_id=2, lane=LANE_MAIN, rate_limit_bps=10_000_000, forced_rate_fraction=1.0)
@@ -199,7 +209,7 @@ def test_start_now_admits_unconditionally_at_full_bandwidth():
 
 def test_start_now_oversubscription_freezes_further_normal_admission():
     settings = _settings(max_concurrent_transfers=5)
-    queue = [_q(1, "t1", forced_fraction=1.0), _q(2, "t2")]
+    queue = [_q(1, forced_fraction=1.0), _q(2)]
     decisions = admit(settings, running=[], queue=queue)
     # Item 1 is force-admitted at the full 10,000,000; that alone drives headroom negative
     # (10,000,000 - 0 - 10,000,000 = 0), so item 2 gets nothing this pass.
@@ -212,7 +222,7 @@ def test_start_now_admission_resumes_once_the_forced_job_finishes():
     settings = _settings(max_concurrent_transfers=5)
     # The forced job has already left `queue` (it's running now) and finished, so it's not in
     # `running` either -> headroom is back to normal.
-    decisions = admit(settings, running=[], queue=[_q(2, "t2")])
+    decisions = admit(settings, running=[], queue=[_q(2)])
     assert decisions == [AdmitDecision(job_id=2, lane=LANE_MAIN, rate_limit_bps=10_000_000)]
 
 
@@ -224,7 +234,7 @@ def test_start_now_fraction_admits_unconditionally_at_a_fraction_of_the_site_lim
     # just at a smaller cap.
     settings = _settings(max_concurrent_transfers=1)
     running = [RunningJob(id=1, lane=LANE_MAIN, rate_limit_bps=10_000_000)]
-    queue = [_q(2, "t2", forced_fraction=0.25)]
+    queue = [_q(2, forced_fraction=0.25)]
     decisions = admit(settings, running=running, queue=queue)
     assert decisions == [
         AdmitDecision(job_id=2, lane=LANE_MAIN, rate_limit_bps=2_500_000, forced_rate_fraction=0.25)
@@ -239,7 +249,7 @@ def test_start_now_fraction_every_menu_option_computes_fraction_of_site_limit(
     fraction, expected_bps
 ):
     settings = _settings(max_concurrent_transfers=5)
-    decisions = admit(settings, running=[], queue=[_q(1, "t1", forced_fraction=fraction)])
+    decisions = admit(settings, running=[], queue=[_q(1, forced_fraction=fraction)])
     assert decisions == [
         AdmitDecision(
             job_id=1, lane=LANE_MAIN, rate_limit_bps=expected_bps, forced_rate_fraction=fraction
@@ -250,7 +260,7 @@ def test_start_now_fraction_every_menu_option_computes_fraction_of_site_limit(
 def test_start_now_fraction_rounds_to_the_nearest_whole_byte_per_second():
     # B=10,000,001 at 10% -> 1,000,000.1, rounds to 1,000,000 -- never a fractional byte rate.
     settings = _settings(max_bandwidth_bps=10_000_001, max_concurrent_transfers=5)
-    decisions = admit(settings, running=[], queue=[_q(1, "t1", forced_fraction=0.10)])
+    decisions = admit(settings, running=[], queue=[_q(1, forced_fraction=0.10)])
     assert decisions == [
         AdmitDecision(job_id=1, lane=LANE_MAIN, rate_limit_bps=1_000_000, forced_rate_fraction=0.10)
     ]
@@ -262,7 +272,7 @@ def test_start_now_fraction_one_is_byte_identical_to_the_old_forced_full_rate_pa
     # for this task.
     settings = _settings(max_concurrent_transfers=1)
     running = [RunningJob(id=1, lane=LANE_MAIN, rate_limit_bps=10_000_000)]
-    max_decision = admit(settings, running=running, queue=[_q(2, "t2", forced_fraction=1.0)])[0]
+    max_decision = admit(settings, running=running, queue=[_q(2, forced_fraction=1.0)])[0]
     assert max_decision.rate_limit_bps == settings.max_bandwidth_bps
 
 
@@ -275,7 +285,7 @@ def test_start_now_fraction_other_running_jobs_keep_their_existing_allocations()
         RunningJob(id=1, lane=LANE_MAIN, rate_limit_bps=5_000_000),
         RunningJob(id=2, lane=LANE_MAIN, rate_limit_bps=5_000_000),
     ]
-    decisions = admit(settings, running=running, queue=[_q(3, "t3", forced_fraction=0.25)])
+    decisions = admit(settings, running=running, queue=[_q(3, forced_fraction=0.25)])
     assert decisions == [
         AdmitDecision(job_id=3, lane=LANE_MAIN, rate_limit_bps=2_500_000, forced_rate_fraction=0.25)
     ]
@@ -310,8 +320,7 @@ def test_low_ceiling_still_admits_work(ceiling):
         QueuedJob(
             id=1,
             lane="main",
-            rank=0.0,
-            queued_at=datetime(2026, 8, 11, tzinfo=UTC),
+            queue_position=1.0,
             forced_rate_fraction=None,
         )
     ]

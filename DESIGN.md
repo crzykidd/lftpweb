@@ -250,8 +250,11 @@ job(
   id, item_id, kind TEXT,           -- 'mirror' | 'pget'
   state TEXT,                        -- queued|running|succeeded|failed|cancelled
   lane TEXT,                         -- 'main' | 'small'   (§4.5 fast lane)
-  rank REAL, attempt INT,            -- sortable rank; order is rank DESC, queued_at ASC
-  queued_at,
+  rank REAL,                         -- vestigial as of migration 023 -- see queue_position below
+  attempt INT,
+  queued_at,                         -- no longer an ordering input; still the queued-wait readout
+  queue_position REAL,               -- migration 023: dense fractional order; order is
+                                      -- queue_position ASC, id ASC (§4.5 "Queue order and priority")
   pid NULL, argv JSON, lftp_settings JSON,
   bytes_start, bytes_done, bytes_total,
   rate_limit_bps NULL,               -- the allocation this process was spawned with (§4.5)
@@ -274,10 +277,15 @@ Three notes on the shape:
   credentials, and connection tuning are set once. Speed and concurrency are site-level too
   (§4.5). Only what legitimately varies per path is per-queue: `sync_mode`, auto-queue,
   patterns, post-processing toggles, and staging path. §9.3 lists which knob sits where.
-- **`rank` is a sortable real, not an integer priority level.** Default ordering is
-  oldest-first (`rank DESC, queued_at ASC` with equal ranks); **Move to top** assigns a rank
-  above every queued row. Storing a sortable value means arbitrary drag-reorder is a later UI
-  change rather than a schema migration.
+- **`queue_position` is a dense fractional order (migration 023, 2026-08-19,
+  docs/transfers-redesign-spec.md §3.4), not an integer priority level.** Ordering is
+  `queue_position ASC, id ASC`; a move between two neighbours takes their midpoint (one
+  `UPDATE`, no renumbering of any other row), so per-row "move up one / down one" is a later UI
+  change rather than a schema migration. Replaces the older `rank DESC, queued_at ASC` boost
+  scheme, which could support "Move to top" but not "move up one" (§4.5's "Queue order and
+  priority" has the three concrete reasons why). `rank` is left in the schema, unread for
+  ordering, and `queued_at` keeps its original meaning as the queued-wait readout's source —
+  neither column was dropped; see migration 023's own comment.
 - **`sync_mode` subsumes the old `auto_delete_remote` boolean.** There is exactly one switch
   governing whether we touch the remote, with three values, not a mode plus an overlapping
   flag. `copy` is the default and never deletes anything remote.
@@ -841,12 +849,37 @@ drains. You do not drift back to one-at-full while work is waiting.
 
 #### Queue order and priority
 
-Ordering is `priority DESC, queued_at ASC` — so the **default is oldest-first**, and priority is
-invisible until someone uses it. The one action exposed is **Move to top**, which sets that
-item's rank above everything currently queued.
+Ordering is `queue_position ASC, id ASC` (migration 023, 2026-08-19,
+docs/transfers-redesign-spec.md §3.4/§3.5) — a dense fractional total order, one value per
+queued job, assigned on insert (`MAX(queue_position) + 1` — **the default is oldest-first**,
+since that's the same order `queued_at` would have given) and rewritten on reorder. **Move to
+top** takes `MIN(queue_position) - 1`; a future per-row "move up one / down one" (not yet built)
+takes the midpoint between two neighbours — one `UPDATE`, no renumbering of anything else. This
+replaced an earlier `rank DESC, queued_at ASC` boost scheme (`rank` defaulting to 0, "Move to
+top" setting `rank = MAX(rank) + 1`) that fit "Move to top" but could not support "move up one":
+two adjacent rank-0 jobs could only be swapped by swapping `queued_at` (which corrupts the
+queued-wait readout the column is also used for), the zone boundary made "up one" actually mean
+"vault above the entire backlog," and rank inside the boosted zone encoded recency-of-boost, not
+position. `rank` stays in the schema (unread for ordering) and `queued_at` keeps its original
+meaning as the queued-wait readout's source — see migration 023's own comment for why neither
+column was dropped.
 
-Store the rank as a sortable value rather than an integer level, so full drag-reorder becomes a
-UI addition later instead of a schema migration.
+**Positions are global across both lanes** — the main and fast lanes admit from independent
+pools (below), but the ordering key is one shared sequence, so the chevron a stage-2 UI will
+expose and the displayed queue number always agree. One consequence to accept: a fast-lane item
+can display a higher position number than a main-lane item it's about to start ahead of, since
+the numbering doesn't split by lane (§3.5's "fast lane makes today's numbering slightly
+dishonest" — decided to keep one `1..N` numbering with a fast-lane badge, not two numbering
+schemes).
+
+**The v0.2.6 startup rescue re-derives its position, not just its `queued_at`.** An interrupted
+item is re-queued carrying its original `queued_at` forward (unchanged — still what keeps the
+Transfers page's queued-wait readout honest), but under the position model that alone no longer
+places anything; `TransferQueue._rescue_position` (`core/queue.py`) finds the two natural-zone
+(`rank = 0`) neighbours that `queued_at` would have fallen between and takes their midpoint,
+deliberately excluding boosted (`rank != 0`) jobs from that search so a rescued job can never
+land ahead of an explicit Move to top (see that method's own docstring for the counterexample
+this rules out).
 
 #### The fast lane
 

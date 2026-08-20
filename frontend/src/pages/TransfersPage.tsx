@@ -111,8 +111,9 @@ interface RowProps {
   live: LiveProgress | undefined
   // Where this job sits in the actual run order (2026-08-13, prompts/2026-08-13-files-ux-pass.md
   // item 4) -- 1, 2, 3... counting only `state === 'queued'` rows, in the order `useJobs` already
-  // returns them (`core/queue.py.list_jobs`'s own `ORDER BY job.rank DESC, job.queued_at ASC`,
-  // the real future run order). `undefined` for a running/failed/cancelled row -- those aren't
+  // returns them (`core/queue.py.list_jobs`'s own `ORDER BY queue_position ASC, id ASC`,
+  // 2026-08-19 -- was `rank DESC, queued_at ASC` -- the real future run order). `undefined`
+  // for a running/failed/cancelled row -- those aren't
   // "queued" in the sense a position means anything for.
   queuePosition: number | undefined
   // Settings -> Transfer's site total limit (2026-08-19,
@@ -616,8 +617,9 @@ export function TransfersPage() {
   }
 
   // Queue position (2026-08-13, item 4): `jobs` (`useJobs`/`GET /api/jobs`) already comes back
-  // in the real run order (`core/queue.py.list_jobs`'s `ORDER BY job.rank DESC, job.queued_at
-  // ASC`) -- no new endpoint, just counting the `queued` rows in the order already returned.
+  // in the real run order (`core/queue.py.list_jobs`'s `ORDER BY queue_position ASC, id ASC`,
+  // 2026-08-19 -- was `rank DESC, queued_at ASC`) -- no new endpoint, just counting the
+  // `queued` rows in the order already returned.
   // Running/failed/cancelled rows are in the same list (`list_jobs`'s own docstring) but never
   // get a position: a running job isn't waiting, and a failed/cancelled one isn't in line at
   // all.

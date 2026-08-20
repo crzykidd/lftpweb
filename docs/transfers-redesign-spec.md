@@ -341,7 +341,7 @@ stages are split small.
 
 | # | Stage | Depends on |
 |---|---|---|
-| 1 | **Queue order model** — dense position key, migration, admission query, auto-queue insert; re-prove the v0.2.6 rescue ordering by test | — |
+| 1 | **Queue order model** — dense position key, migration, admission query, auto-queue insert; re-prove the v0.2.6 rescue ordering by test — **done 2026-08-19** (migration 023, `prompts/done/2026-08-19-queue-position-order-model.md`) | — |
 | 2 | **Chevron reordering UI** (▲ ▼ ▲▲) | 1 |
 | 3 | **Queue short display name** on `path_queue` + Settings → Queues field | — |
 | 4 | **Single ungrouped Queue list** — drop grouping, two paginated boxes (20 / 50), short name on rows, fast-lane badge | 3 |

@@ -169,6 +169,37 @@ def resolve_forced_rate_fraction(row: Any) -> float | None:
     return 1.0 if row["forced_full_rate"] else None
 
 
+def position_between(lower: float | None, upper: float | None) -> float:
+    """A fresh `job.queue_position` for a spot in the queue's dense ordering
+    (`queue_position ASC`, `migrations/023_queue_position.sql`) -- the one primitive every
+    writer of the column uses, so the arithmetic exists in exactly one place. `lower` is the
+    position of the row immediately before the new one belongs (`None` = insert before
+    everything); `upper` is the row immediately after (`None` = insert after everything). Both
+    `None` means an empty ordering.
+
+    - `_insert_job`'s default (append at the back): `position_between(MAX(queue_position), None)`.
+    - `move_to_top`: `position_between(None, MIN(queue_position))`.
+    - `_rescue_position` (the v0.2.6 startup-rescue re-derivation, below): the midpoint between
+      the natural-zone neighbours the rescued job's original `queued_at` falls between.
+    - **Not yet called by any chevron** -- this is stage 1 of
+      docs/transfers-redesign-spec.md §3.4; stage 2's "move up one / down one" will call this
+      directly with the row's immediate neighbours. Exercised today only via the three callers
+      above and this module's own tests, per the spec's "prove the primitive now" instruction.
+
+    No rebalancing: repeated midpoint bisection between the same two neighbours converges on
+    float precision after ~50 successive inserts at the same spot, which is an existing,
+    accepted property of the fractional-key design (DESIGN.md §4.5's "occasional rebalance"),
+    not a new limitation this function introduces.
+    """
+    if lower is None and upper is None:
+        return 1.0
+    if lower is None:
+        return upper - 1.0
+    if upper is None:
+        return lower + 1.0
+    return (lower + upper) / 2.0
+
+
 def _parent_rel_path(full_path: str) -> str:
     """The directory portion of a full filesystem path, POSIX-style — used only to compute
     the directory a `pget` target file must already live in (see `_spawn_decision`), not for
@@ -500,16 +531,18 @@ class TransferQueue:
         one is covered by `_requeue_stranded_downloaded` on the *next* startup (auto-queue itself
         structurally cannot see a `DOWNLOADED` item -- it isn't in `ELIGIBLE_STATES`).
 
-        **`queued_at` preserves queue position** (2026-08-19,
+        **`queued_at` preserves the queued-wait readout** (2026-08-19,
         prompts/2026-08-19-rescue-requeue-keeps-queue-position.md): the caller passes the
         interrupted job's own original `queued_at` -- for rule 1 that's the row this sweep just
         marked INTERRUPTED, for rule 2 (`_requeue_stranded_downloaded`) it's the most recent
-        interrupted job it already keyed off. A running item was, by definition, already among
-        the oldest jobs in line (`rank DESC, queued_at ASC`, `core/scheduler.py`); backdating the
-        fresh row to that same timestamp puts it back at (or near) the front instead of behind
-        every job that hadn't even started, and is honest besides -- the item genuinely has been
-        waiting since then, so the Transfers page's queued-wait readout tells the truth. `rank`
-        is never touched here, so this still can't outrank an explicit "Move to top".
+        interrupted job it already keyed off. It is honest besides -- the item genuinely has been
+        waiting since then, so the Transfers page's queued-wait readout tells the truth.
+
+        **`_rescue_position` re-derives the actual queue *place*** (2026-08-19, this task --
+        under the position model, `queued_at` alone no longer places anything; see that method's
+        own docstring for how the neighbours are found and why boosted jobs are excluded from the
+        search). `rank` is never touched here, so this still can't outrank an explicit
+        "Move to top".
         """
         item = await self._fetch_item(item_id)
         if item is None:
@@ -531,7 +564,8 @@ class TransferQueue:
                 )
             return
         try:
-            job_id = await self.enqueue_item(item_id, queued_at=queued_at)
+            position = await self._rescue_position(queued_at)
+            job_id = await self.enqueue_item(item_id, queued_at=queued_at, queue_position=position)
         except Exception:
             logger.exception("startup re-queue of item %d after an interrupted job failed", item_id)
             return
@@ -549,6 +583,72 @@ class TransferQueue:
                 + ("" if freshly_interrupted else " (stranded by an earlier restart)")
             ),
         )
+
+    async def _rescue_position(self, original_queued_at: str) -> float:
+        """Re-derive the `queue_position` the v0.2.6 startup rescue needs, now that
+        `queued_at` is no longer an ordering input (2026-08-19, this task -- the acceptance
+        criterion for `docs/transfers-redesign-spec.md`'s stage 1, and the one thing in this
+        task that already shipped to production and must not regress).
+
+        **The old fix, and why it stopped placing anything.** Before this task, the rescue
+        carried the interrupted job's own `queued_at` forward and left `rank` at its default
+        (0) -- under `rank DESC, queued_at ASC` that was enough: rank-0 rows sort purely by
+        `queued_at`, so backdating it put the row back among the natural-zone jobs exactly
+        where it belonged, and rank 0 could never outrank a `rank > 0` "Move to top". Under
+        `queue_position ASC`, `queued_at` carries no positional weight at all -- this method is
+        what replaces it: find the two *natural-zone* jobs the original `queued_at` falls
+        between, and take their `queue_position` midpoint (`position_between`, above).
+
+        **Restricted to `rank = 0` jobs -- this is load-bearing, not incidental.** `rank`
+        is otherwise dead for ordering as of this task (migration 023's own comment), but it is
+        still written by `move_to_top` and stays the one reliable "was this job ever explicitly
+        boosted" marker. Natural-zone (`rank = 0`) jobs are the only ones whose `queue_position`
+        is guaranteed ordered the same as their `queued_at` -- they only ever get a position by
+        appending at the back (`_insert_job`'s default) or by this very method's own midpoint
+        insert, both of which preserve that correlation by construction. A boosted job's
+        position carries no such relationship to its `queued_at` -- it could have been queued
+        long ago and boosted just now, or boosted long ago and left with an old timestamp -- so
+        comparing the rescued job's `queued_at` against a boosted job's can pick the wrong
+        neighbour and land the rescued job ahead of an explicit "Move to top". Concretely: a job
+        boosted to `queue_position = -3` with `queued_at` *after* the rescued job's original
+        timestamp would, under a naive comparison across all queued jobs, look like a valid
+        "right neighbour" -- and the midpoint would land the rescued job in front of it. Excluding
+        boosted jobs from the search entirely is what rules that out; see
+        tests/test_queue_orphans.py's rescue-position tests for the worked counterexample.
+
+        The natural-zone neighbours bracket the position; `MAX(queue_position)` over boosted
+        (`rank != 0`) jobs is the floor a rescued job must never cross, folded in via
+        `position_between` exactly like every other caller of that primitive.
+        """
+        cursor = await self.db.execute(
+            "SELECT queue_position FROM job WHERE state = 'queued' AND rank = 0 "
+            "AND queued_at <= ? ORDER BY queue_position DESC LIMIT 1",
+            (original_queued_at,),
+        )
+        left = await cursor.fetchone()
+        cursor = await self.db.execute(
+            "SELECT queue_position FROM job WHERE state = 'queued' AND rank = 0 "
+            "AND queued_at > ? ORDER BY queue_position ASC LIMIT 1",
+            (original_queued_at,),
+        )
+        right = await cursor.fetchone()
+        cursor = await self.db.execute(
+            "SELECT MAX(queue_position) AS m FROM job WHERE state = 'queued' AND rank != 0"
+        )
+        boosted_max = (await cursor.fetchone())["m"]
+
+        if left is not None and right is not None:
+            return position_between(left["queue_position"], right["queue_position"])
+        if right is not None:
+            # No natural-zone job has an older `queued_at` -- the rescued job belongs at the
+            # very front of the natural zone, immediately after the last boosted job (if any).
+            return position_between(boosted_max, right["queue_position"])
+        if left is not None:
+            # No natural-zone job has a newer `queued_at` -- the rescued job belongs at the
+            # back of the natural zone.
+            return position_between(left["queue_position"], None)
+        # No natural-zone jobs currently queued at all -- park it right after any boosted ones.
+        return position_between(boosted_max, None)
 
     async def _requeue_stranded_downloaded(
         self,
@@ -713,7 +813,12 @@ class TransferQueue:
     # --- public actions (called by api/jobs.py) -----------------------------------------
 
     async def enqueue_item(
-        self, item_id: int, *, forced_full_rate: bool = False, queued_at: str | None = None
+        self,
+        item_id: int,
+        *,
+        forced_full_rate: bool = False,
+        queued_at: str | None = None,
+        queue_position: float | None = None,
     ) -> int:
         """Manual queue (DESIGN.md §4.7): always wins, clears suppression, resets `attempt`.
         Returns the `job.id` -- a fresh one, or (see below) an existing active one.
@@ -730,10 +835,17 @@ class TransferQueue:
         this task, and every caller today except the startup rescue below) stamps today's
         now, byte-for-byte the pre-existing behavior -- same opt-in-parameter pattern as
         `core/postprocess.py.perform_remote_delete`'s `caller`. The startup rescue passes the
-        *interrupted* job's own original `queued_at` so a transfer that was mid-download at
-        restart re-enters the queue at (or near) the front rather than the back -- see
-        `_requeue_interrupted_item` for why. `rank` is untouched either way (still defaults to
-        0 via `_insert_job`), so this never outranks an explicit "Move to top".
+        *interrupted* job's own original `queued_at` so the Transfers page's queued-wait
+        readout stays honest -- see `_requeue_interrupted_item` for why.
+
+        **`queue_position` override** (2026-08-19, this task -- replaces "carrying `queued_at`
+        forward" as what actually places a rescued job in line, now that position rather than
+        `queued_at` is the ordering key): `None` (every caller except the startup rescue) appends
+        at the back via `_insert_job`'s own default. The rescue passes `_rescue_position`'s
+        result instead, so the re-queued row lands where its original `queued_at` would have put
+        it -- between the same neighbours -- while never landing ahead of an explicit "Move to
+        top". `rank` is untouched either way (still defaults to 0 via `_insert_job`), which is
+        what makes that guarantee hold -- see `_rescue_position`'s own docstring.
 
         **Idempotent, not rejecting** (2026-08-13,
         prompts/2026-08-13-lftp-timestamped-temp-files.md's root cause). This used to insert a
@@ -783,6 +895,7 @@ class TransferQueue:
             attempt=1,
             forced_rate_fraction=1.0 if forced_full_rate else None,
             queued_at=queued_at,
+            queue_position=queue_position,
         )
         await self.db.execute(
             "UPDATE item SET state = 'QUEUED', auto_queue_suppressed = 0, suppressed_reason = NULL, "
@@ -846,13 +959,28 @@ class TransferQueue:
             self.request_tick()
 
     async def move_to_top(self, job_id: int) -> None:
+        """`position_between(None, MIN(queue_position))` -- one `UPDATE`, no renumbering of any
+        other row (2026-08-19, docs/transfers-redesign-spec.md §3.4). Behaviorally identical to
+        the pre-position-model implementation from the user's point of view: this job now sorts
+        before every other queued job.
+
+        **`rank` is still bumped too**, even though it is otherwise dead for ordering as of this
+        task (migration 023's own comment) -- it is the one durable "was this job ever explicitly
+        boosted" marker, and `TransferQueue._rescue_position` reads it (only it, nothing else
+        does) to keep the startup rescue from ever landing a re-queued job ahead of a job moved
+        to top here. Not read back by this method itself; kept in lockstep purely for that
+        reader.
+        """
         cursor = await self.db.execute(
-            "SELECT COALESCE(MAX(rank), 0) AS max_rank FROM job WHERE state = 'queued'"
+            "SELECT MIN(queue_position) AS min_pos, COALESCE(MAX(rank), 0) AS max_rank "
+            "FROM job WHERE state = 'queued'"
         )
         row = await cursor.fetchone()
+        new_position = position_between(None, row["min_pos"])
         new_rank = (row["max_rank"] or 0) + 1
         await self.db.execute(
-            "UPDATE job SET rank = ? WHERE id = ? AND state = 'queued'", (new_rank, job_id)
+            "UPDATE job SET queue_position = ?, rank = ? WHERE id = ? AND state = 'queued'",
+            (new_position, new_rank, job_id),
         )
         await self.db.commit()
         self.request_tick()
@@ -1816,9 +1944,11 @@ class TransferQueue:
         ]
         now = time.monotonic()
         cursor = await self.db.execute(
-            "SELECT job.id, job.item_id, job.lane, job.rank, job.queued_at, "
+            "SELECT job.id, job.item_id, job.lane, "
+            "       COALESCE(job.queue_position, 1e18) AS queue_position, "
             "       job.forced_full_rate, job.forced_rate_fraction "
-            "FROM job WHERE job.state = 'queued' ORDER BY job.rank DESC, job.queued_at ASC"
+            "FROM job WHERE job.state = 'queued' "
+            "ORDER BY COALESCE(job.queue_position, 1e18) ASC, job.id ASC"
         )
         rows = await cursor.fetchall()
         queue: list[scheduler.QueuedJob] = []
@@ -1831,9 +1961,14 @@ class TransferQueue:
         # `enqueue_item` calls, or a row inserted directly (as a test does, or as some future
         # caller might), still lands here as two `queued` rows for one `item_id`, and this is
         # the layer that refuses to let both become processes regardless of how they got there.
-        # `rows` is already ordered `rank DESC, queued_at ASC`, so the row kept for admission is
-        # the one that would have been served first anyway; the other stays `queued` and is
-        # picked up on a later tick, once the running one is no longer active.
+        # `rows` is already ordered `queue_position ASC, id ASC`
+        # (2026-08-19, docs/transfers-redesign-spec.md §3.4 -- replaces `rank DESC, queued_at
+        # ASC`), so the row kept for admission is the one that would have been served first
+        # anyway; the other stays `queued` and is picked up on a later tick, once the running
+        # one is no longer active. `COALESCE(..., 1e18)` is defensive, not load-bearing in
+        # production -- `_insert_job` never leaves the column NULL -- but it keeps a
+        # hand-crafted row (a test building one directly) sorting *last* rather than first,
+        # which is what SQLite's own NULL-sorts-first default would otherwise do.
         active_item_ids = {p.item_id for p in self._running.values()}
         for row in rows:
             if row["id"] in self._running:
@@ -1847,8 +1982,7 @@ class TransferQueue:
                 scheduler.QueuedJob(
                     id=row["id"],
                     lane=row["lane"],
-                    rank=row["rank"],
-                    queued_at=row["queued_at"],
+                    queue_position=row["queue_position"],
                     forced_rate_fraction=resolve_forced_rate_fraction(row),
                 )
             )
@@ -2183,6 +2317,7 @@ class TransferQueue:
         attempt: int,
         forced_rate_fraction: float | None = None,
         queued_at: str | None = None,
+        queue_position: float | None = None,
     ) -> int:
         """`queued_at=None` (every caller before 2026-08-19) lets the column's own
         `DEFAULT (STRFTIME(...))` stamp now, unchanged. A caller may pass an explicit value to
@@ -2192,19 +2327,50 @@ class TransferQueue:
         prompts/done/2026-08-19-start-now-bandwidth-fractions.md) writes both columns in
         lockstep -- `forced_full_rate = 1` iff `forced_rate_fraction is not None` -- migration
         022's own contract for keeping the two in agreement.
+
+        `queue_position=None` (every caller except the startup rescue, this task) appends at the
+        back -- `position_between(MAX(queue_position over queued jobs), None)`, the position
+        model's replacement for "new jobs sort last under `queued_at ASC`"
+        (`migrations/023_queue_position.sql`). The rescue passes an explicit, pre-computed
+        position instead (`_rescue_position`) so the re-queued row lands where its original
+        `queued_at` would have placed it, not at the back.
         """
         forced_full_rate = 1 if forced_rate_fraction is not None else 0
+        if queue_position is None:
+            cursor = await self.db.execute(
+                "SELECT MAX(queue_position) AS m FROM job WHERE state = 'queued'"
+            )
+            row = await cursor.fetchone()
+            queue_position = position_between(row["m"], None)
         if queued_at is None:
             cursor = await self.db.execute(
                 "INSERT INTO job (item_id, kind, state, lane, rank, attempt, forced_full_rate, "
-                "forced_rate_fraction) VALUES (?, ?, 'queued', ?, 0, ?, ?, ?)",
-                (item_id, kind, lane, attempt, forced_full_rate, forced_rate_fraction),
+                "forced_rate_fraction, queue_position) VALUES (?, ?, 'queued', ?, 0, ?, ?, ?, ?)",
+                (
+                    item_id,
+                    kind,
+                    lane,
+                    attempt,
+                    forced_full_rate,
+                    forced_rate_fraction,
+                    queue_position,
+                ),
             )
         else:
             cursor = await self.db.execute(
                 "INSERT INTO job (item_id, kind, state, lane, rank, attempt, forced_full_rate, "
-                "forced_rate_fraction, queued_at) VALUES (?, ?, 'queued', ?, 0, ?, ?, ?, ?)",
-                (item_id, kind, lane, attempt, forced_full_rate, forced_rate_fraction, queued_at),
+                "forced_rate_fraction, queued_at, queue_position) VALUES (?, ?, 'queued', ?, 0, ?, "
+                "?, ?, ?, ?)",
+                (
+                    item_id,
+                    kind,
+                    lane,
+                    attempt,
+                    forced_full_rate,
+                    forced_rate_fraction,
+                    queued_at,
+                    queue_position,
+                ),
             )
         await self.db.commit()
         return cursor.lastrowid
@@ -2336,7 +2502,7 @@ class TransferQueue:
             "   OR (job.state IN ('failed','cancelled','succeeded') "
             "       AND job.dismissed_at IS NULL "
             "       AND job.id = (SELECT MAX(j2.id) FROM job j2 WHERE j2.item_id = job.item_id)) "
-            "ORDER BY job.rank DESC, job.queued_at ASC"
+            "ORDER BY COALESCE(job.queue_position, 1e18) ASC, job.id ASC"
         )
         rows = await cursor.fetchall()
         out = []

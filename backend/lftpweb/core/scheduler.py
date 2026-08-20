@@ -51,11 +51,17 @@ class RunningJob:
 
 @dataclass(frozen=True)
 class QueuedJob:
-    """A job waiting for admission. `rank`/`queued_at` implement DESIGN.md §4.5's ordering
-    (`rank DESC, queued_at ASC` — default oldest-first, `queued_at` as the tiebreak, "Move to
-    top" as a higher `rank`). `forced_rate_fraction` is the "Start now" escape hatch (§4.5) —
-    set per-item by a dedicated action, not by raising rank. `None` means not forced; otherwise
-    it's the fraction of the site's `max_bandwidth_bps` this job admits at (2026-08-19,
+    """A job waiting for admission. `queue_position` implements DESIGN.md §4.5's ordering —
+    `queue_position ASC` (with `id` below as the final tiebreak) — a dense fractional total
+    order that replaced `rank DESC, queued_at ASC` (2026-08-19,
+    docs/transfers-redesign-spec.md §3.4, prompts/done/2026-08-19-queue-position-order-model.md).
+    The old scheme was a two-zone boost (boosted zone by most-recently-boosted `rank`, natural
+    zone by oldest `queued_at`) that could not support "move up one" — see the migration
+    (`migrations/023_queue_position.sql`) and that prompt for why. `queued_at` still exists on
+    `job` and still drives the Transfers page's queued-wait readout; it is simply no longer an
+    ordering input to this module. `forced_rate_fraction` is the "Start now" escape hatch
+    (§4.5) — set per-item by a dedicated action, not by position — `None` means not forced;
+    otherwise it's the fraction of the site's `max_bandwidth_bps` this job admits at (2026-08-19,
     prompts/done/2026-08-19-start-now-bandwidth-fractions.md: the menu's 10%/25%/50%/75%
     options), with `1.0` reading as "Max" — byte-identical to the pre-fraction
     `forced_full_rate=True` this field replaces.
@@ -63,8 +69,7 @@ class QueuedJob:
 
     id: int
     lane: Lane
-    rank: float
-    queued_at: str  # sortable (ISO-8601), ties broken oldest-first
+    queue_position: float
     forced_rate_fraction: float | None = None
 
 
@@ -78,9 +83,10 @@ class AdmitDecision:
     forced_rate_fraction: float | None = None
 
 
-def _priority_key(q: QueuedJob) -> tuple[float, str]:
-    # rank DESC, queued_at ASC — negate rank so a plain ascending sort gives rank-descending.
-    return (-q.rank, q.queued_at)
+def _priority_key(q: QueuedJob) -> tuple[float, int]:
+    # queue_position ASC, id ASC — `id` is a stable final tiebreak for the (rare, but not
+    # impossible) case of two rows sharing a position, e.g. an admission race.
+    return (q.queue_position, q.id)
 
 
 def admit(

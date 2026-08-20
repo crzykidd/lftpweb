@@ -246,10 +246,11 @@ export function completedTimeLabel(job: JobOut): { value: string; title: string 
 /** The Transfers page's row order (2026-08-16, same user report as `completedTimeLabel` above:
  * "the list should sort by that"). **Replaces the previous implicit order for terminal rows**:
  * before this, the whole list -- active and terminal alike -- came straight off `GET /api/jobs`
- * in `core/queue.py.list_jobs`'s own `ORDER BY job.rank DESC, job.queued_at ASC`, which is the
+ * in `core/queue.py.list_jobs`'s own `ORDER BY queue_position ASC, id ASC` (2026-08-19,
+ * docs/transfers-redesign-spec.md §3.4 -- was `rank DESC, queued_at ASC`), which is the
  * *scheduler's* run order and says nothing about when a terminal job actually finished; a job
  * that failed hours ago could sit above one that just succeeded, if the failed one happened to
- * have a higher `rank` or an earlier `queued_at`. This still trusts that same input order for
+ * have a lower `queue_position`. This still trusts that same input order for
  * *active* rows (running, then queued in scheduler order) -- untouched, since that ordering is
  * exactly the run order the page's "Queued jobs run in the order shown" copy and Move-to-top
  * button promise -- but terminal rows now sort newest-completed-first instead.

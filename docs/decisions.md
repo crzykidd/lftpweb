@@ -6,6 +6,63 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-19 — Queue ordering moved from `rank`/boost to a dense `queue_position` model
+
+`prompts/done/2026-08-19-queue-position-order-model.md`, phase 1 stage 1 of
+`docs/transfers-redesign-spec.md` §3.4/§3.5. Refactor, not a behavior change: the queue's run
+order must come out identical to today for every existing scenario.
+
+**The model.** `job.queue_position REAL` (migration 023), ordering `queue_position ASC, id ASC`.
+New jobs take `MAX(queue_position) + 1`; Move to top takes `MIN(queue_position) - 1`; a future
+move-between-neighbours takes their midpoint. One primitive, `position_between(lower, upper)`
+(`core/queue.py`), backs all three plus the rescue re-derivation below — the "prove the midpoint
+primitive now, even with no chevron caller yet" instruction from the prompt is satisfied by that
+function's own direct unit tests (`tests/test_queue_position.py`) rather than by inventing a
+fake caller.
+
+**`rank` was kept, not dropped — and kept *meaningful*, not just present.** SQLite can't drop a
+column without a full table rebuild this codebase has never done for `job`, so the column stays
+either way. The live decision was whether to also keep *writing* it. Reading `rank` for ordering
+had to stop (that's the whole point of the task), but `move_to_top` still writes it, because
+`TransferQueue._rescue_position` needs a way to tell "was this job ever explicitly boosted"
+apart from "this is a natural-zone job whose `queue_position` happens to be small" — and
+`queue_position` alone can't answer that (a boosted job's position is deliberately decoupled
+from any FIFO meaning). `rank = 0` is the cheapest possible answer that already existed. This is
+a narrow, deliberate exception to "rank is vestigial for ordering," not an oversight — recorded
+here because the prompt's own "surface, don't silently resolve" instruction flagged it as worth
+calling out explicitly rather than leaving implicit in a docstring.
+
+**Why the rescue needed re-deriving, not just re-plumbing.** The v0.2.6 fix
+(`prompts/done/2026-08-19-rescue-requeue-keeps-queue-position.md`) carried a re-queued job's
+original `queued_at` forward so `rank DESC, queued_at ASC` put it back in its old place, and
+never touched `rank` so it could never outrank an explicit Move to top. Under a position model
+`queued_at` carries no positional weight at all, so "carry it forward" does nothing on its own.
+The replacement, `_rescue_position`, finds the two *natural-zone* (`rank = 0`) neighbours the
+original `queued_at` falls between and takes their `position_between` midpoint —
+**deliberately excluding boosted jobs from that search.** A first draft that compared the
+rescued job's `queued_at` against *every* queued job (boosted included) breaks: a job boosted to
+the very front can have any `queued_at` at all, including one *later* than the rescued job's —
+which a naive comparison would treat as a valid "right neighbour," landing the rescued job
+*ahead* of an explicit Move to top. `tests/test_queue_orphans.py`'s
+`test_requeued_interrupted_item_never_lands_ahead_of_a_boosted_job_with_a_later_queued_at` is
+the regression test for exactly this, written before the fallback logic was finalized (per the
+prompt's "write the §5 test first" instruction) — it caught the naive version failing before the
+excluded-boosted-zone version replaced it.
+
+**Backfill exactness: downgraded mid-task from a hard requirement to a nice-to-have, kept
+anyway because it was cheap.** The original acceptance criterion was that migration 023 must
+reproduce the *exact* pre-migration order (`rank DESC, queued_at ASC, id ASC`) for every
+existing row, so an upgrade never reshuffles a real backlog. Partway through, the user relaxed
+this explicitly: a fresh install has no backlog to reshuffle, and exact-order preservation was
+told to be a "nice-to-have, not an acceptance criterion" — take the simple path (e.g. order by
+id) if exactness fights the SQL. It didn't: `ROW_NUMBER() OVER (ORDER BY rank DESC, queued_at
+ASC, id ASC)` in a single correlated `UPDATE` is not awkward SQL, so the exact-order backfill
+shipped as originally designed (migration 023's own comment records this history). What did
+**not** relax, and is enforced by `COALESCE(job.queue_position, 1e18)` everywhere the column is
+read for ordering: every row ends up with a real, usable position, and a legacy/test row that
+somehow ends up NULL sorts *last*, never jumps the queue via SQLite's default NULL-sorts-first
+behavior.
+
 ## 2026-08-19 — Auto-queue re-queued a release the *arr had just imported: the grace period
 now covers *partial* local absence, and an *arr-handed item is never picked up again
 

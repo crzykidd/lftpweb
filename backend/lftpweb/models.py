@@ -745,6 +745,10 @@ class JobOut(BaseModel):
     kind: str
     state: str
     lane: str
+    # Vestigial for ordering as of migration 023 (`queue_position`, below, is the ordering key
+    # now) -- kept in the API response unchanged since it's still a real, still-written column
+    # (docs/transfers-redesign-spec.md §3.4, migration 023's own comment on why `rank` wasn't
+    # dropped). Not read by the frontend for sorting.
     rank: float
     attempt: int
     queued_at: str
