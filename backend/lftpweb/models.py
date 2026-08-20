@@ -454,6 +454,42 @@ class DeleteItemResponse(BaseModel):
     source_reason: str | None = None
 
 
+# --- Manual pipeline resolution (2026-08-20, docs/transfers-redesign-spec.md §3.2's
+# pipeline-completion rule, migration 025) ------------------------------------------------------
+#
+# The escape hatch for a genuinely wedged row in the Queue tab's Active/pending box. Every
+# blocking condition has a bounded automatic exit (`core/pipeline_flight.py`), but automatic exits
+# are necessary rather than sufficient, and a box that can silently accumulate rows nothing is
+# working on stops being trustworthy.
+
+
+class ResolveItemRequest(BaseModel):
+    """`POST /api/items/{item_id}/resolve`'s body. `outcome` is `'complete'`/`'failed'` to file
+    the row out of Active with that outcome, or **`null` to undo** a resolution set by mistake --
+    the row then goes straight back through the normal predicate as if it had never been touched.
+
+    **This is a CLASSIFICATION ONLY and that is not negotiable.** It moves a row between two
+    boxes on a page; it is evidence of nothing. See migration 025's own comment for the explicit
+    list (it must never advance the `move`-mode delete ladder, never be read as a confirmed *arr
+    import, never trigger notify/cleanup/retention/post-processing, never alter auto-queue's
+    eligibility). DESIGN.md §7.3 makes a source delete wait for a *confirmed* import held across
+    two consecutive poller passes precisely because that delete is irreversible; a user clicking a
+    button on a hunch is not that evidence.
+    """
+
+    outcome: Literal["complete", "failed"] | None = None
+
+
+class ResolveItemResponse(BaseModel):
+    """Echoes what is now stored on the item, so the caller never has to guess whether an undo
+    landed. `manual_outcome` is `null` after an undo.
+    """
+
+    item_id: int
+    manual_outcome: str | None
+    manual_outcome_at: str | None
+
+
 # --- Reset item tracking (2026-08-13, prompts/2026-08-13-reset-item-tracking.md) -----------
 #
 # Distinct from Delete (above, removes bytes) and from Clear History (`api/history.py`, removes
@@ -846,6 +882,33 @@ class JobOut(BaseModel):
     # the one field that reliably says "this is a Sonarr instance" vs. "this is a Radarr
     # instance". `null` under the same condition `arr_instance_name` is null.
     arr_instance_kind: str | None = None
+    # **Which box this row belongs in** (2026-08-20, docs/transfers-redesign-spec.md §3.2's
+    # pipeline-completion rule) -- `true` = Active/pending, `false` = Complete. Computed
+    # server-side by `core/pipeline_flight.py`, the *same* expression `GET /api/jobs/complete`
+    # filters its listing and its `total` on, and shipped as a field rather than re-derived on
+    # the client on purpose: the Active box is client-side over `GET /api/jobs` and the Complete
+    # box is a server-side paginated query, so a second encoding of this rule would drift and put
+    # a row in both boxes or neither. The frontend's own rule is exactly
+    # `job.state === 'queued' || job.state === 'running' || job.pipeline_in_flight`, and the first
+    # two disjuncts are already inside this flag -- they're kept client-side only so the box still
+    # renders sensibly against a response from an older server.
+    pipeline_in_flight: bool = False
+    # What the row is waiting on, when it is in flight and its own state chip doesn't already say
+    # ('verifying' | 'extracting' | 'processing' | 'awaiting_import' | 'deleting_source', or
+    # `null`). Derived from the same clauses as `pipeline_in_flight` in one `CASE`
+    # (`core/pipeline_flight.waiting_reason_expr`), so the label and the box can never disagree.
+    # `null` for a `queued`/`running` row -- the state chip already says "QUEUED"/"DOWNLOADING".
+    # An unrecognized value degrades to the raw string on the row, the same tolerance
+    # `arr_instance_kind` above documents.
+    pipeline_waiting_reason: str | None = None
+    # The manual escape hatch (migration 025) -- `'complete'`/`'failed'` once a human has resolved
+    # this item out of the Active box, `null` otherwise. **A classification only**: nothing but
+    # `core/pipeline_flight.py` reads it, and migration 025's own comment lists what it must never
+    # be mistaken for. Surfaced here so the row can *show* it was manually resolved rather than
+    # looking like a normal completion -- otherwise the audit trail says one thing and the UI
+    # another.
+    manual_outcome: str | None = None
+    manual_outcome_at: str | None = None
 
 
 class JobsResponse(BaseModel):

@@ -263,25 +263,37 @@ export function completedTimeLabel(job: JobOut): { value: string; title: string 
  * two terminal jobs with the same `finished_at` (or both missing one) keep their relative
  * position from the input array, i.e. `list_jobs`'s own `rank`/`queued_at` order -- a reasonable
  * fallback, and never a re-shuffle on every poll for jobs that didn't actually move.
+ *
+ * **2026-08-20: a fourth partition, between running and queued** (docs/transfers-redesign-spec.md
+ * §3.2's pipeline-completion rule) -- a row whose lftp job has finished but whose *pipeline* has
+ * not (`pipeline_in_flight`: verifying, extracting, awaiting import, deleting source) now stays
+ * in the Active box, and it is a terminal-state job, so it would otherwise sort into the
+ * newest-finished-first tail *below the entire queued backlog* -- page 11 of a busy queue, where
+ * the user would never see the thing they are being told is still moving. It belongs with
+ * `running`: both are work actively happening right now, and neither has a queue position. Same
+ * newest-first ordering within the partition as the terminal tail, for the same reason.
  */
 export function sortTransferRows(jobs: JobOut[]): JobOut[] {
   const running: JobOut[] = []
+  const processing: JobOut[] = []
   const queued: JobOut[] = []
   const terminal: JobOut[] = []
   for (const job of jobs) {
     if (job.state === 'running') running.push(job)
     else if (job.state === 'queued') queued.push(job)
+    else if (job.pipeline_in_flight === true) processing.push(job)
     else terminal.push(job)
   }
-  const newestFirst = [...terminal].sort((a, b) => {
-    const aTime = a.finished_at != null ? new Date(a.finished_at).getTime() : null
-    const bTime = b.finished_at != null ? new Date(b.finished_at).getTime() : null
-    if (aTime == null && bTime == null) return 0
-    if (aTime == null) return 1 // missing sorts last
-    if (bTime == null) return -1
-    return bTime - aTime // newest first
-  })
-  return [...running, ...queued, ...newestFirst]
+  const newestFirst = (rows: JobOut[]) =>
+    [...rows].sort((a, b) => {
+      const aTime = a.finished_at != null ? new Date(a.finished_at).getTime() : null
+      const bTime = b.finished_at != null ? new Date(b.finished_at).getTime() : null
+      if (aTime == null && bTime == null) return 0
+      if (aTime == null) return 1 // missing sorts last
+      if (bTime == null) return -1
+      return bTime - aTime // newest first
+    })
+  return [...running, ...newestFirst(processing), ...queued, ...newestFirst(terminal)]
 }
 
 /** Whether the panel's ***arr** group should render at all -- "hidden entirely when the queue
@@ -311,6 +323,106 @@ export function hasArrGroup(job: JobOut): boolean {
  */
 export function isDismissable(state: JobOut['state']): boolean {
   return state === 'failed' || state === 'cancelled' || state === 'succeeded'
+}
+
+// --- The pipeline-completion split (2026-08-20, docs/transfers-redesign-spec.md §3.2,
+// prompts/done/2026-08-20-active-box-holds-inflight-pipeline.md) -----------------------------
+//
+// The two boxes used to split on *job termination* -- lftp exits 0, the row moves to Complete --
+// but the item's pipeline continues well past that (verify, extract, move, notify the *arr, wait
+// for a confirmed import, delete the seedbox source). The user's own browser review: "Shouldn't a
+// job live in that state until the sonarr/radarr hook lands if they are enabled? Currently they
+// move to complete but they technically aren't."
+//
+// **The rule itself lives server-side, in `core/pipeline_flight.py`, and is not reimplemented
+// here.** That is the whole point: the Active box is client-side over `GET /api/jobs` while the
+// Complete box is a *server-side paginated* query with its own `total`, so two independently
+// written tests would drift and put a row in both boxes or neither. Everything below reads
+// `job.pipeline_in_flight`/`job.pipeline_waiting_reason` as given.
+
+/** Whether this row belongs in the Active/pending box. The two job-state disjuncts are kept
+ * client-side (they are already inside the server's own flag) purely so the page still splits
+ * sensibly against a response from an older server that doesn't send the flag at all -- the same
+ * "unknown degrades to complete" direction the server-side predicate takes.
+ */
+export function isPipelineInFlight(job: JobOut): boolean {
+  return job.state === 'queued' || job.state === 'running' || job.pipeline_in_flight === true
+}
+
+/** Human wording for `JobOut.pipeline_waiting_reason` -- "rather than one vague label, the row
+ * says what it is waiting on." `null` in, `null` out (a queued/running row's state chip already
+ * says what it is doing); an unrecognized reason falls back to the raw string rather than
+ * vanishing, so a server that grows a new one degrades to something readable instead of silently
+ * showing nothing.
+ */
+export function waitingReasonLabel(reason: string | null | undefined): string | null {
+  if (reason == null || reason === '') return null
+  switch (reason) {
+    case 'verifying':
+      return 'Verifying'
+    case 'extracting':
+      return 'Extracting'
+    case 'processing':
+      return 'Processing'
+    case 'awaiting_import':
+      return 'Awaiting import'
+    case 'deleting_source':
+      return 'Deleting source'
+    default:
+      return reason
+  }
+}
+
+/** Whether this row's Dismiss button should render. `isDismissable` (the state vocabulary) is
+ * necessary but no longer sufficient: an in-flight row is not dismissable, because dismissing
+ * something still being worked on makes no sense -- and because `core/queue.py.list_jobs` drops
+ * a dismissed job unconditionally, so dismissing an in-flight row is exactly how one would
+ * vanish from *both* boxes. `core/queue.py.dismiss_job` rejects it with a 409 regardless; this
+ * keeps the button from offering a click that can only fail.
+ */
+export function canDismiss(job: JobOut): boolean {
+  return isDismissable(job.state) && !isPipelineInFlight(job)
+}
+
+/** Whether this row should offer the manual "Mark complete / Mark failed" menu -- an in-flight
+ * row whose own transfer is no longer running. A `queued`/`running` job is deliberately excluded:
+ * a transfer that is genuinely running is not something a classification button gets to hide, Stop
+ * is the control for that, and `api/jobs.py.resolve_item` refuses the write besides.
+ */
+export function canResolveManually(job: JobOut): boolean {
+  return isPipelineInFlight(job) && job.state !== 'queued' && job.state !== 'running'
+}
+
+/** The chip text for a row that was resolved by hand, or `null`. The row must *show* this rather
+ * than looking like a normal completion -- otherwise the audit trail says one thing and the UI
+ * another.
+ */
+export function manualOutcomeLabel(job: JobOut): string | null {
+  if (job.manual_outcome === 'complete') return 'Marked complete'
+  if (job.manual_outcome === 'failed') return 'Marked failed'
+  return null
+}
+
+export interface ResolveOption {
+  /** `null` = undo an existing manual resolution (`api/client.ts.resolveItem(id, null)`). */
+  outcome: 'complete' | 'failed' | null
+  label: string
+}
+
+/** The per-row Resolve menu's options, in the order it lists them -- the same pure-function /
+ * dumb-component split `dismissMenuOptions`/`DismissMenu.tsx` already established, so the
+ * vocabulary stays unit-testable without mounting anything.
+ *
+ * "Mark complete" first, matching the task's own wording. The undo option is only offered on a
+ * row that actually carries a manual outcome -- offering "Clear" on a row that was never
+ * resolved would be a no-op control.
+ */
+export function resolveMenuOptions(resolved = false): ResolveOption[] {
+  const base: ResolveOption[] = [
+    { outcome: 'complete', label: 'Mark complete' },
+    { outcome: 'failed', label: 'Mark failed' },
+  ]
+  return resolved ? [...base, { outcome: null, label: 'Clear manual outcome' }] : base
 }
 
 // --- Dismiss outcome menu (2026-08-20, follow-up to phase 1 stage 4b from the user's browser

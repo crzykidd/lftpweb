@@ -40,6 +40,11 @@ from lftpweb.core import (
 )
 from lftpweb.core.events import EventBus
 from lftpweb.core.itemview import ITEM_VIEW_COLUMNS, ItemView, item_view
+from lftpweb.core.pipeline_flight import (
+    in_flight_expr,
+    item_pipeline_busy_subquery,
+    waiting_reason_expr,
+)
 from lftpweb.core.local_delete import _physical_local_root
 from lftpweb.core.metrics import RunningJobBytes, ThroughputSampler
 from lftpweb.core.progress import ActiveJob, JobProgress, ProgressSampler, child_speed_bps
@@ -1248,6 +1253,15 @@ class TransferQueue:
         have dismiss also clear suppression — don't; that path already exists and is called
         Retry (`retry_item` above, "always wins, clears suppression, resets `attempt`"), which
         is the deliberate, visible way to say "actually, try again."
+
+        **Nor an item whose pipeline is still in flight** (2026-08-20, docs/transfers-redesign-
+        spec.md §3.2's pipeline-completion rule) — a job can exit 0 while verify/extract, the
+        *arr's confirmed import, or the deferred source delete are all still outstanding, and that
+        row now lives in the Active/pending box. Dismissing something still being worked on makes
+        no sense, and it is also how a row would vanish from *both* boxes (`list_jobs()` excludes
+        a dismissed job unconditionally). Same `JobNotDismissableError` → 409 shape as the active
+        states above, and the same "the UI not offering the button is a courtesy, this is the
+        guard" reasoning. `core/pipeline_flight.py` owns the test itself.
         """
         row = await self._fetch_job(job_id)
         if row is None:
@@ -1257,8 +1271,32 @@ class TransferQueue:
                 f"job {job_id} is {row['state']!r}; only a failed, cancelled, or succeeded "
                 "job can be dismissed"
             )
+        if await self.item_pipeline_busy(row["item_id"]):
+            raise JobNotDismissableError(
+                f"job {job_id} has finished but its item's pipeline is still in flight "
+                "(post-processing, an *arr import, or a deferred source delete) — it is still "
+                "shown under Active/pending and can be dismissed once that finishes, or "
+                "resolved manually"
+            )
         await self.db.execute("UPDATE job SET dismissed_at = ? WHERE id = ?", (_now_iso(), job_id))
         await self.db.commit()
+
+    async def item_pipeline_busy(self, item_id: int) -> bool:
+        """Whether one item is still in flight by the shared predicate
+        (`core/pipeline_flight.item_pipeline_busy_subquery`) — the single-item read `dismiss_job`
+        above and `api/jobs.py.resolve_item` both need, expressed against the same SQL the two
+        listing queries use rather than as a fourth hand-written version of the rule.
+
+        The *item* half only: neither caller has a job row in scope, and both already know
+        whatever they need about job state separately.
+        """
+        cursor = await self.db.execute(
+            "SELECT 1 FROM ("
+            f"{item_pipeline_busy_subquery(self._postprocess_in_flight_ids())}"
+            ") AS busy WHERE busy.id = ?",
+            (item_id,),
+        )
+        return await cursor.fetchone() is not None
 
     async def dismiss_all_terminal(
         self,
@@ -1354,13 +1392,28 @@ class TransferQueue:
         `docs/decisions.md` and the paired test,
         `test_dismiss_all_terminal_name_filter_count_matches_list_complete_jobs_total`).
 
+        **An item whose pipeline is still in flight is never dismissed** (2026-08-20,
+        docs/transfers-redesign-spec.md §3.2's pipeline-completion rule) -- dismissing something
+        still being worked on makes no sense, and this `UPDATE`'s count has to keep matching
+        `list_complete_jobs`'s `total`, which now excludes those rows too. Same one expression
+        (`core/pipeline_flight.item_pipeline_busy_subquery`), reached through a subquery because
+        an `UPDATE job` has no `item`/`arr_instance` join of its own. Only the *item* half is
+        needed here: this `WHERE` already restricts to terminal jobs, for which the job half is
+        false by construction. This applies to **every** scope, `job_ids` included -- an explicit
+        id naming an in-flight row simply matches nothing, the same "a narrowing can only ask for
+        a subset of what the guard already allows" contract every other scope has.
+
         Returns the actual row count affected (`cursor.rowcount`), the same "report the real
         number" convention `api/history.py`'s clear-history endpoints already use.
         """
         if job_ids is not None and len(job_ids) == 0:
             return 0
 
-        where = ["state IN ('failed','cancelled','succeeded')", "dismissed_at IS NULL"]
+        where = [
+            "state IN ('failed','cancelled','succeeded')",
+            "dismissed_at IS NULL",
+            f"item_id NOT IN ({item_pipeline_busy_subquery(self._postprocess_in_flight_ids())})",
+        ]
         params: list[Any] = [_now_iso()]
         if queue_id is not None:
             where.append("item_id IN (SELECT id FROM item WHERE queue_id = ?)")
@@ -2674,6 +2727,32 @@ class TransferQueue:
 
     # --- read models for api/jobs.py --------------------------------------------------------
 
+    def _postprocess_in_flight_ids(self) -> frozenset[int]:
+        """`PostprocessPipeline.in_flight_item_ids()`, read straight off the pipeline this queue
+        already holds a reference to (`self.postprocess`, set after construction by `app.py`;
+        `None` in most tests and in a process where post-processing was never wired).
+
+        Read *here*, in the read models themselves, rather than plumbed in from `api/jobs.py` --
+        `dismiss_all_terminal` needs the same set and has no request context to take it from, and
+        one lookup site is one fewer place for the three callers to disagree. `api/jobs.py`'s own
+        `_busy_context` stays as it is: that one feeds `core/local_delete.py`'s guards, an
+        unrelated consumer of the same set.
+        """
+        if self.postprocess is None:
+            return frozenset()
+        ids = self.postprocess.in_flight_item_ids()
+        return frozenset(ids) if ids else frozenset()
+
+    def _in_flight_select(self) -> str:
+        """The two computed columns both listing queries project, built once so their aliases
+        (and the expressions behind them) can't drift apart -- `core/pipeline_flight.py`.
+        """
+        ids = self._postprocess_in_flight_ids()
+        return (
+            f"{in_flight_expr(ids)} AS pipeline_in_flight, "
+            f"{waiting_reason_expr(ids)} AS pipeline_waiting_reason"
+        )
+
     async def list_jobs(self) -> list[dict]:
         """The Transfers page's row set (DESIGN.md §9.2). Not just `queued`/`running`:
         §9.2 explicitly requires "failed rows show the error class and the captured lftp
@@ -2724,11 +2803,24 @@ class TransferQueue:
         `path_queue.short_name AS queue_short_name` — the ungrouped Transfers row's queue badge
         (`api/jobs.py._job_out`, `lib/queueDisplayName.ts`) needs a queue's short name per row
         now that grouping (and its once-per-queue header) is gone.
+
+        **2026-08-20** (docs/transfers-redesign-spec.md §3.2's pipeline-completion rule): also
+        projects `pipeline_in_flight`/`pipeline_waiting_reason` from
+        `core/pipeline_flight.py` — the *one* definition of "still moving," shared verbatim with
+        `list_complete_jobs`'s own `NOT (...)` and `dismiss_all_terminal`'s exclusion, so the two
+        boxes can never disagree about which one a row belongs in. Deliberately computed here and
+        shipped as a field rather than re-derived on the client: a second encoding of this rule is
+        exactly the drift the split cannot survive. `item.manual_outcome`/`manual_outcome_at`
+        (migration 025) ride along so the row can *show* it was manually resolved rather than
+        looking like a normal completion, and `item.state` is joined only because the reason
+        expression reads it (never projected — see `models.py.JobOut`).
         """
         cursor = await self.db.execute(
             "SELECT job.*, item.rel_path, item.is_dir, item.queue_id, item.remote_size, "
             "       item.verified_at, item.extracted_at, item.remote_deleted_at, "
             "       item.arr_status, item.arr_status_at, "
+            "       item.manual_outcome, item.manual_outcome_at, "
+            f"       {self._in_flight_select()}, "
             "       path_queue.name AS queue_name, path_queue.short_name AS queue_short_name, "
             "       arr_instance.name AS arr_instance_name, "
             "       arr_instance.kind AS arr_instance_kind "
@@ -2801,11 +2893,23 @@ class TransferQueue:
         predicate" property `name_filter` alone already has a test for
         (`test_dismiss_all_terminal_name_filter_count_matches_list_complete_jobs_total`,
         extended rather than duplicated for this case).
+
+        **2026-08-20: terminal is no longer the same thing as complete** (docs/transfers-redesign-
+        spec.md §3.2's pipeline-completion rule). An item whose lftp job exited 0 but whose
+        verify/extract, *arr import, or deferred source delete is still outstanding belongs in the
+        *Active* box, so it is excluded from both this listing **and its `total`** by
+        `NOT (core/pipeline_flight.in_flight_expr(...))` -- the identical expression `list_jobs`
+        projects as `pipeline_in_flight`, so a row is in exactly one box by construction rather
+        than by two rules that happen to agree today. The count query grew the same
+        `path_queue`/`arr_instance` joins the page query already had, purely so that one
+        expression can be evaluated identically in both.
         """
+        in_flight = self._postprocess_in_flight_ids()
         where = [
             "job.state IN ('failed','cancelled','succeeded')",
             "job.dismissed_at IS NULL",
             "job.id = (SELECT MAX(j2.id) FROM job j2 WHERE j2.item_id = job.item_id)",
+            f"NOT {in_flight_expr(in_flight)}",
         ]
         params: list[Any] = []
         if name_filter is not None:
@@ -2817,7 +2921,11 @@ class TransferQueue:
         where_sql = " AND ".join(where)
 
         count_cursor = await self.db.execute(
-            f"SELECT COUNT(*) AS c FROM job JOIN item ON item.id = job.item_id WHERE {where_sql}",
+            "SELECT COUNT(*) AS c FROM job "
+            "JOIN item ON item.id = job.item_id "
+            "JOIN path_queue ON path_queue.id = item.queue_id "
+            "LEFT JOIN arr_instance ON arr_instance.id = path_queue.arr_instance_id "
+            f"WHERE {where_sql}",
             params,
         )
         count_row = await count_cursor.fetchone()
@@ -2827,6 +2935,8 @@ class TransferQueue:
             "SELECT job.*, item.rel_path, item.is_dir, item.queue_id, item.remote_size, "
             "       item.verified_at, item.extracted_at, item.remote_deleted_at, "
             "       item.arr_status, item.arr_status_at, "
+            "       item.manual_outcome, item.manual_outcome_at, "
+            f"       {self._in_flight_select()}, "
             "       path_queue.name AS queue_name, path_queue.short_name AS queue_short_name, "
             "       arr_instance.name AS arr_instance_name, "
             "       arr_instance.kind AS arr_instance_kind "

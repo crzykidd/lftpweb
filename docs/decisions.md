@@ -6,6 +6,75 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-20 — The Active/Complete split predicate lives server-side as SQL text; the paused
+source delete is bounded by age, not by its event; a manual resolution is never superseded
+
+`prompts/done/2026-08-20-active-box-holds-inflight-pipeline.md`, a follow-up to phase 1 stage 4b
+of `docs/transfers-redesign-spec.md` §3.2 from the user's browser review, browser-unverified.
+
+**The predicate is one SQL string in `core/pipeline_flight.py`, not a Python function and not a
+client-side rule.** Three callers have to agree on it: `list_jobs()` (which the client-side
+Active box reads), `list_complete_jobs()` (a *server-side paginated* query with its own `total`),
+and `dismiss_all_terminal()` (whose dismissed count already has a test asserting it matches that
+`total`). Two of those are `WHERE` clauses that must be evaluated in SQL — `list_complete_jobs`
+cannot filter in Python without breaking its own `total` — so a Python predicate would have
+needed a SQL twin, which is precisely the drift the task warns about (a row in both boxes or
+neither). Making it SQL text pasted into all three, and *exposing the classification as a field*
+rather than letting the client re-derive it, means there is exactly one encoding. **Literals, not
+bound parameters**: one of the three callers is an `UPDATE ... WHERE item_id NOT IN (subquery)`
+and the same clause appears more than once inside the reason `CASE`, so threading a
+positionally-correct parameter list through all of it is bookkeeping that fails silently.
+Everything interpolated is a module constant or an `int()` of an in-process id.
+
+**Rejected: a Python mirror for testability.** The tests go through the real queries instead,
+which is what actually proves the property that matters (a row is in exactly one box).
+
+**The `JobOut.item_state` field the task suggested was not added.** The classification *and* its
+label are computed server-side from the item's state; shipping the raw state as well would create
+a second place the client could derive a label from, which is the same drift in miniature.
+
+**The paused source delete is bounded by age, not by reading its own event.**
+`_sweep_stranded_source_deletes` pauses after `MAX_SOURCE_DELETE_RETRY_ATTEMPTS` and deliberately
+leaves `remote_delete_pending` set (so a manual Files-page delete or a restart's clean in-memory
+slate can still act), so the pause is **not** readable from the item row — a naive
+"`remote_delete_pending` non-null ⇒ still in flight" test blocks forever. It *is* technically
+distinguishable: one `remote_delete_retries_paused` event row is persisted. That was rejected as
+the signal for two reasons. `event` has no index on `item_id` (migration 001 indexes `ts` only),
+so an `EXISTS` subquery would table-scan the audit log on an endpoint the browser polls every
+~2s. And the event is not authoritative anyway: the retry state is in-memory, so a restart
+resumes sweeping with no event to say the pause ended. Chosen instead: block only while
+`arr_status_at` is younger than `SOURCE_DELETE_WAIT_MAX_S` (1h), comfortably past the ~20-minute
+retry ladder. The same reasoning produced `ARR_WAIT_MAX_S` (24h, deliberately longer than
+`DROPPED_GONE_GRACE_S` so it never pre-empts the `dropped → gone` ladder) for the genuinely
+reachable case of an *enabled* instance whose *arr is permanently unreachable — the poller
+retries forever by design, so nothing ever moves the item off `notified`.
+
+**Unknown reads as "not blocking", everywhere.** A NULL or unparseable `arr_status_at`, or no
+bound instance, files the row as Complete. Failing that direction leaves a visible, dismissable
+row with honest chips; failing the other way wedges it where nothing can clear it.
+
+**A real terminal outcome does NOT supersede a manual one.** The two honest options were "the
+manual outcome stands" and "a real outcome supersedes the guess"; the first was chosen. Superseding
+can only ever move a row *back into Active* after the user deliberately filed it, which is exactly
+the "this box can't be trusted" failure the whole change exists to fix, and it would make the
+predicate non-monotone under a 2s poll. Nothing is lost by standing pat: the real outcome is still
+written to the item's own columns, still drawn on the row's *arr chip, and still in the Events
+trail. Reversibility comes from an explicit **Undo** (`resolve_item` with `outcome: null`)
+instead — the user un-resolves a row they resolved by mistake, rather than the system silently
+deciding it knew better.
+
+**A manual outcome deliberately does not override an active job.** The predicate is
+`job.state IN ('queued','running') OR (manual_outcome IS NULL AND <item busy>)`, so a genuinely
+running transfer can never be hidden by a classification button; `resolve_item` refuses the write
+with a 409 besides. Stop is the control for that.
+
+**In-flight rows sort between `running` and `queued`.** They are terminal-state jobs, so
+`sortTransferRows`' existing partition would have put them in the newest-finished-first tail
+*below the entire queued backlog* — page 11 of a busy queue, where the user would never see the
+thing they are being told is still moving.
+
+---
+
 ## 2026-08-20 — Dismiss menu: `outcome` composes with `name_filter`, stays exclusive with
 `job_ids`/`queue_id`; "Clear all failed" folded into "Dismiss → Failed"
 

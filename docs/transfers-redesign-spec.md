@@ -84,6 +84,60 @@ supersedes it — filter to a queue, dismiss the list.
 | **Active / pending** | selectable 10/20/50, default 20 | true admission order | client-side — the set is bounded and already fully loaded |
 | **Complete** | selectable 10/20/50, default 20 | most recently finished first | **server-side — reuse `api/history.py`'s existing paginator**, do not build a second one |
 
+#### The split is on pipeline completion, not job termination
+
+**A genuine extension of this section that the original spec did not anticipate** (2026-08-20,
+from the user's browser review of the finished phase 1;
+`prompts/done/2026-08-20-active-box-holds-inflight-pipeline.md`). As first built, the two boxes
+split on **job termination** — lftp exits 0 and the row moves to Complete. The user's observation,
+and it is correct:
+
+> *"Shouldn't a job live in that state until the sonarr/radarr hook lands if they are enabled?
+> Currently they move to complete but they technically aren't."*
+
+The item's pipeline continues well past the job: verify → extract → move → notify the *arr → wait
+for a confirmed import → delete the seedbox source → local cleanup. A row sat under "Complete"
+while the release was demonstrably not, which contradicts what §2 says this tab is *for* ("what
+is moving, and in what order?") — an item awaiting import is still moving.
+
+**The rule, decided with the user 2026-08-20: split on pipeline completion, and apply it
+consistently whether or not a queue is *arr-bound.** The consistent rule was chosen explicitly
+over a narrower *arr-only one — one definition of "done", because post-processing a large release
+is not instant either. A row belongs in **Active / pending** while its job is `queued`/`running`,
+**or** post-processing is in flight, **or** the queue is bound to a *currently enabled* *arr
+instance with a non-terminal `arr_status`, **or** a deferred source delete is still owed.
+Otherwise it is Complete. **The row says what it is waiting on** — *Verifying*, *Extracting*,
+*Processing*, *Awaiting import*, *Deleting source* — derived from the same predicate that does
+the splitting.
+
+**One predicate, server-side, or the two boxes drift.** The Active box is client-side over
+`list_jobs()`; the Complete box is a server-side paginated query with its own `total`; "Dismiss"
+is a third `WHERE` that must agree with that total. Written separately they would diverge and a
+row would appear in *both boxes or neither*. So the predicate is SQL text defined once
+(`core/pipeline_flight.py`), pasted verbatim into all three, and the classification is **exposed
+to the client as a field** (`JobOut.pipeline_in_flight`) rather than re-derived there.
+
+**Every blocking condition needs a guaranteed terminal exit**, or rows accumulate in Active
+forever and the box silently stops being trustworthy — which is worse than the bug this fixes.
+Post-processing keys off the live worker's existence (`in_flight_item_ids()`), never the
+transient state string, so a crashed worker cannot wedge a row. The *arr condition requires a
+*currently enabled* instance, so disabling Sonarr releases everything sitting at `notified`.
+`dropped` is bounded by its own `DROPPED_GONE_GRACE_S` ladder to terminal `gone`. And two age
+backstops cover the cases the pipeline's own ladders cannot reach at all: an enabled instance
+whose *arr is permanently unreachable, and a source-delete retry sweep that **paused without
+clearing `remote_delete_pending`** — deliberately, so a manual delete or a restart can still act,
+which is exactly why "pending non-null ⇒ still in flight" would block forever.
+
+**A manual escape hatch, and it is a classification only.** In-flight rows carry a *Mark
+complete* / *Mark failed* menu (with *Undo*), recorded in `item.manual_outcome` (migration 025)
+and read by the split predicate and nothing else. It must never advance the `move`-mode delete
+ladder, never be read as a confirmed *arr import, never trigger notify/cleanup/post-processing,
+and never alter auto-queue's eligibility — DESIGN.md §7.3 makes the irreversible source delete
+wait on a *confirmed* import held across two consecutive checks precisely because a hunch is not
+evidence. Every resolution writes an audit event and the row shows a chip, so a manual resolution
+never silently reads as a normal completion. A real terminal outcome arriving later does not
+supersede it (`docs/decisions.md`).
+
 Numbered pages (`1 2 3 4 >`), SAB-style. Rows shifting between pages as work completes is
 **accepted and explicitly not a problem to solve** — the user's call, and it is how SAB behaves.
 

@@ -127,8 +127,33 @@ Skeleton for the next roll:
   unbounded, filterable event log for exactly this item, pre-filtered via the URL (`?item_id=`)
   so the resulting view is linkable, reloadable, and back-button friendly. The Events page shows
   plainly when it's filtered this way, with one click back to the unfiltered log.
+- **"Mark complete" / "Mark failed" on an in-flight Transfers row**, with **Undo** — the manual
+  escape hatch for a release that has genuinely wedged somewhere in its pipeline. **It is a
+  classification only**: it files the row under Complete and does nothing else. It never deletes
+  the seedbox source, is never read as a confirmed Sonarr/Radarr import, and never triggers
+  post-processing, notify, or cleanup — a source delete is irreversible and still waits on real,
+  twice-confirmed evidence, never on a button click. Every resolution is written to the Events
+  log, and the row carries a **Marked complete**/**Marked failed** chip so it never quietly
+  reads as a normal completion.
 
 ### Changed
+
+- **The Transfers page's two boxes now split on *pipeline* completion, not on the transfer
+  exiting** (`docs/transfers-redesign-spec.md` §3.2) — the user's own report: *"Shouldn't a job
+  live in that state until the sonarr/radarr hook lands if they are enabled? Currently they move
+  to complete but they technically aren't."* A release's work continues well past lftp:
+  verifying, extracting, the move out of staging, waiting for the *arr to actually import it, and
+  deleting the seedbox source. Those rows now stay under **Active / pending** and **say what
+  they're waiting on** — *Verifying*, *Extracting*, *Processing*, *Awaiting import*, *Deleting
+  source* — instead of sitting under Complete while the release plainly wasn't. Applied to every
+  queue, whether or not it's bound to a Sonarr/Radarr instance: one definition of "done".
+  Nothing can get stuck there — disabling an *arr instance immediately releases everything
+  waiting on it, a post-processing step that died with the app doesn't hold a row, and every
+  remaining wait is time-bounded. A row that's still in flight can no longer be dismissed
+  (including by the bulk Dismiss menu), since dismissing something still being worked on would
+  make it vanish from both boxes at once; use "Mark complete"/"Mark failed" if it really is
+  stuck. In-flight rows sort next to the running ones rather than beneath the whole queued
+  backlog.
 
 - **The transfer queue's ordering internals moved from a `rank`/boost scheme to a dense
   `queue_position` model** (migration 023, `docs/transfers-redesign-spec.md` §3.4/§3.5,

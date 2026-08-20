@@ -633,6 +633,26 @@ export interface JobOut {
   // `FileNode.arr_status`'s own comment gives -- an unrecognized value degrades to a text chip
   // rather than being rejected at the type level.
   arr_instance_kind: string | null
+  // **Which box this row belongs in** (2026-08-20, docs/transfers-redesign-spec.md §3.2's
+  // pipeline-completion rule) -- `true` = Active/pending, `false` = Complete. Computed
+  // server-side by `core/pipeline_flight.py`, the same expression `GET /api/jobs/complete`
+  // filters its listing *and its `total`* on. Never re-derived here: the Active box is
+  // client-side and the Complete box is server-paginated, so a second encoding of the rule would
+  // drift and put a row in both boxes or neither. Optional so a response from an older server
+  // still type-checks and degrades to "complete" -- the same fail-safe direction the predicate
+  // itself takes for anything unknown.
+  pipeline_in_flight?: boolean
+  // What the row is waiting on ('verifying' | 'extracting' | 'processing' | 'awaiting_import' |
+  // 'deleting_source'), or `null`. From the *same* `CASE` as `pipeline_in_flight`, so the label
+  // and the box can never disagree. `null` for a queued/running row -- the state chip already
+  // says DOWNLOADING/QUEUED. `string | null`, not a literal union, for the same
+  // unrecognized-value-degrades-gracefully reason `arr_instance_kind` above documents.
+  pipeline_waiting_reason?: string | null
+  // The manual escape hatch (migration 025) -- 'complete' | 'failed' once a human resolved this
+  // item out of the Active box. **A classification only**; the row shows it so a manual
+  // resolution never silently reads as a normal completion.
+  manual_outcome?: string | null
+  manual_outcome_at?: string | null
 }
 
 export interface JobsResponse {

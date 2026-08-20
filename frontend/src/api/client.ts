@@ -465,6 +465,23 @@ export function retryItem(itemId: number): Promise<JobOut> {
   return sendJson<JobOut>(`/api/items/${itemId}/retry`, 'POST')
 }
 
+/** Manually resolve a wedged row out of the Queue tab's Active/pending box (2026-08-20,
+ * docs/transfers-redesign-spec.md §3.2's pipeline-completion rule) -- `'complete'`/`'failed'` to
+ * file it with that outcome, `null` to undo a resolution set by mistake.
+ *
+ * **A classification only.** It moves a row between two boxes on a page and is evidence of
+ * nothing: it never advances the `move`-mode delete ladder, is never read as a confirmed *arr
+ * import, and never triggers notify/cleanup/post-processing. See `api/jobs.py.resolve_item` and
+ * migration 025 for the full constraint. Rejects (409) while the item's own transfer is still
+ * queued or running -- Stop is the control for that.
+ */
+export function resolveItem(
+  itemId: number,
+  outcome: 'complete' | 'failed' | null,
+): Promise<{ item_id: number; manual_outcome: string | null; manual_outcome_at: string | null }> {
+  return sendJson(`/api/items/${itemId}/resolve`, 'POST', { outcome })
+}
+
 /** Stop-by-item (DESIGN.md §9.2's Files-page Stop action) -- the Files page only knows the
  * item, never the job id an item may currently be running under.
  */

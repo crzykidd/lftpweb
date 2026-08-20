@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Coroutine
+from datetime import UTC, datetime
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
@@ -50,6 +51,8 @@ from lftpweb.models import (
     ResetPatternPreviewRequest,
     ResetPatternPreviewResponse,
     ResetSummaryResponse,
+    ResolveItemRequest,
+    ResolveItemResponse,
     StartNowRequest,
     TransferSettingsIn,
     TransferSettingsOut,
@@ -77,6 +80,15 @@ STOP_BEFORE_DELETE_TIMEOUT_S = 25.0
 # the request that spawned them; `_forget_background_stop` (its own `add_done_callback`) is what
 # keeps it from growing forever.
 _background_stop_tasks: set[asyncio.Task] = set()
+
+
+def _now_iso() -> str:
+    """The one wall-clock format this codebase writes (`core/audit.py.record_event`,
+    `core/queue.py._now_iso`, `core/arrsync.py._now_iso`) -- `item.manual_outcome_at` must be
+    comparable with every other persisted timestamp, so it uses the same one rather than a second
+    convention invented here.
+    """
+    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
 def _forget_background_stop(task: asyncio.Task) -> None:
@@ -159,6 +171,16 @@ def _job_out(row: dict, *, include_output_tail: bool = True) -> JobOut:
         arr_status_at=row["arr_status_at"],
         arr_instance_name=row["arr_instance_name"],
         arr_instance_kind=row["arr_instance_kind"],
+        # 2026-08-20 (docs/transfers-redesign-spec.md §3.2's pipeline-completion rule): the
+        # server-computed box assignment and its reason (`core/pipeline_flight.py`), projected by
+        # both listing queries under these exact aliases. `.get`, not `row[...]`: `_job_out` is
+        # also called on rows that never went through those queries in a handful of tests, and a
+        # missing classification degrading to "complete" matches this predicate's own documented
+        # fail-safe direction (unknown is never blocking).
+        pipeline_in_flight=bool(row.get("pipeline_in_flight") or 0),
+        pipeline_waiting_reason=row.get("pipeline_waiting_reason"),
+        manual_outcome=row.get("manual_outcome"),
+        manual_outcome_at=row.get("manual_outcome_at"),
     )
 
 
@@ -806,6 +828,99 @@ def _forget_and_rescan(
         return
     engine.forget_rel_paths(queue_id, affected_rel_paths)
     engine.request_rescan()
+
+
+@router.post("/api/items/{item_id}/resolve", response_model=ResolveItemResponse)
+async def resolve_item(
+    item_id: int, request: Request, body: ResolveItemRequest | None = None
+) -> ResolveItemResponse:
+    """**Manually resolve a wedged row out of the Queue tab's Active/pending box** (2026-08-20,
+    docs/transfers-redesign-spec.md §3.2's pipeline-completion rule, migration 025). The Active
+    box now holds a row until its *whole* pipeline finishes; every blocking condition has a
+    bounded automatic exit (`core/pipeline_flight.py`), but automatic exits are necessary rather
+    than sufficient, and a box that can accumulate rows nothing is working on stops being
+    trustworthy. This is the human override of last resort.
+
+    **It is a CLASSIFICATION ONLY.** It writes exactly two columns, `item.manual_outcome` and
+    `item.manual_outcome_at`, which are read by exactly one thing: the split predicate. It must
+    never be read as evidence by any other subsystem -- not as a confirmed *arr import, not as a
+    rung on the `move`-mode delete ladder, not as a trigger for notify/cleanup/retention/post-
+    processing, not as an input to auto-queue's eligibility. Neither `core/postprocess.py` nor
+    `core/arrsync.py` reads either column, deliberately; migration 025's own comment says so at
+    length, and DESIGN.md §7.3 explains why the bar for the irreversible step is a *confirmed*
+    import held across two consecutive poller passes rather than a button click.
+
+    **Refused (409) while the item's lftp job is still `queued`/`running`.** A transfer that is
+    genuinely running is not something a classification button gets to hide -- Stop is the control
+    for that -- and the predicate itself refuses to let a manual outcome override an active job,
+    so allowing the write here would just produce a resolution that appeared to do nothing.
+
+    **Undo.** `outcome: null` clears both columns and puts the row straight back through the
+    normal predicate. That is the answer to "resolved by mistake."
+
+    **A real terminal outcome does not supersede a manual one** (decided 2026-08-20,
+    `docs/decisions.md`). If the *arr does import the release an hour later, the manual outcome
+    stands and the row stays filed. The alternative -- a real outcome clearing the manual flag --
+    can only ever move a row *back into Active* after the user deliberately filed it, which is
+    exactly the "this box can't be trusted" failure this whole change exists to fix; and nothing
+    is lost by standing pat, because the real outcome is still written to the item's own columns,
+    still drawn on the row's *arr chip, and still in the Events page's forensic trail.
+
+    Every call writes an audit event (`core/audit.py`) -- a human overriding the system's own
+    judgement belongs in the same forensic trail as a remote delete or a withheld delete.
+    """
+    scope = body if body is not None else ResolveItemRequest()
+    db = request.app.state.db
+    cursor = await db.execute(
+        "SELECT id, rel_path, queue_id, manual_outcome FROM item WHERE id = ?", (item_id,)
+    )
+    item = await cursor.fetchone()
+    if item is None:
+        raise HTTPException(status_code=404, detail="item not found")
+
+    cursor = await db.execute(
+        "SELECT 1 FROM job WHERE item_id = ? AND state IN ('queued', 'running') LIMIT 1",
+        (item_id,),
+    )
+    if await cursor.fetchone() is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"{item['rel_path']!r} still has a queued or running transfer -- stop it first "
+                "if you want it out of Active/pending; marking it resolved would not hide a job "
+                "that is genuinely running"
+            ),
+        )
+
+    now = _now_iso()
+    await db.execute(
+        "UPDATE item SET manual_outcome = ?, manual_outcome_at = ? WHERE id = ?",
+        (scope.outcome, now if scope.outcome is not None else None, item_id),
+    )
+    await db.commit()
+
+    previous = item["manual_outcome"]
+    if scope.outcome is None:
+        message = (
+            f"manual: cleared the manual resolution ({previous!r}) on {item['rel_path']!r} -- "
+            "the row is classified by the pipeline again"
+        )
+        kind = "manual_resolution_cleared"
+    else:
+        message = (
+            f"manual: marked {item['rel_path']!r} {scope.outcome!r} -- a classification only, "
+            "filing the row under Complete; no source delete, no *arr import, no post-processing "
+            "and no cleanup is implied or performed by this"
+        )
+        kind = "manual_resolution_set"
+    await audit.record_event(db, level="info", item_id=item_id, kind=kind, message=message)
+
+    await _publish_item_delta(request, db, item_id)
+    return ResolveItemResponse(
+        item_id=item_id,
+        manual_outcome=scope.outcome,
+        manual_outcome_at=now if scope.outcome is not None else None,
+    )
 
 
 @router.post("/api/items/{item_id}/reset", response_model=ResetItemResponse)

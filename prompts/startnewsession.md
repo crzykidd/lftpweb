@@ -77,6 +77,49 @@ than a first. Two things that bit the first time and will bit again:
 
 ## Where we are
 
+### 2026-08-20 — Active/pending now holds a row until its whole *pipeline* finishes (browser-unverified)
+
+A follow-up to phase 1 stage 4b from the user's browser review, and the biggest behavioural change
+in the redesign so far. The two boxes used to split on **job termination** — lftp exits 0, the row
+moves to Complete — but verify/extract, the *arr's confirmed import, and the deferred source delete
+all continue past that, so a row sat under "Complete" while the release plainly was not. The user's
+own words: *"Shouldn't a job live in that state until the sonarr/radarr hook lands if they are
+enabled?"* Applied **consistently whether or not a queue is *arr-bound** — one definition of done,
+chosen explicitly over a narrower *arr-only rule. `prompts/done/2026-08-20-active-box-holds-
+inflight-pipeline.md`; **migration 025**.
+
+**The one thing to know before touching this: the predicate is ONE SQL string in
+`core/pipeline_flight.py`.** Three callers paste it verbatim — `list_jobs()` projects it as
+`pipeline_in_flight`, `list_complete_jobs()` puts `NOT (...)` in *both* its page query and its
+`COUNT(*)`, and `dismiss_all_terminal()` excludes the same item ids. The client never re-derives
+it. That is not stylistic: the Active box is client-side and the Complete box is server-paginated
+with its own `total`, so a second encoding drifts a row into **both boxes or neither**. The
+waiting-reason label (*Verifying / Extracting / Processing / Awaiting import / Deleting source*)
+comes out of the same `CASE`, so the label and the box cannot disagree.
+
+**Every blocking condition has a bounded exit, and that is the design constraint, not a nicety** —
+a box that can accumulate rows nothing is working on is worse than the bug this fixed. Post-
+processing keys off `in_flight_item_ids()` (the live worker), never the transient state string, so
+a crashed worker can't wedge a row. The *arr condition requires a **currently enabled** instance.
+Two age backstops (`ARR_WAIT_MAX_S` 24h, deliberately > `DROPPED_GONE_GRACE_S`;
+`SOURCE_DELETE_WAIT_MAX_S` 1h) cover what the pipeline's own ladders can't reach — notably the
+**paused source-delete retry**, which leaves `remote_delete_pending` set on purpose and is
+therefore invisible in item state. `tests/test_pipeline_flight.py` asserts both properties (exactly
+one box; nothing blocks forever) over a state matrix, not case by case.
+
+**"Mark complete" / "Mark failed" (+ Undo) is a CLASSIFICATION ONLY** — `item.manual_outcome`,
+read by the predicate and nothing else. It must never advance the `move`-mode delete ladder, be
+read as a confirmed *arr import, or trigger notify/cleanup/post-processing. Neither
+`core/postprocess.py` nor `core/arrsync.py` reads it; if a change makes one of them want to, that
+is the signal something has gone wrong. A real terminal outcome later does **not** supersede it
+(`docs/decisions.md` has the reasoning); Undo is the way back.
+
+**What a human should check first:** an *arr-bound queue with something mid-import — that the row
+stays under Active with an "Awaiting import" chip and does not also appear under Complete, and
+that "Page X of Y (Z total)" agrees with the rows on screen in both boxes.
+
+Tests after this task: **1510 backend / 566 frontend, 0 skipped.**
+
 ### 🚧 Transfers redesign — phase 1 in progress on `dev` (2026-08-19/20), 5 of 7 stages landed
 
 **`docs/transfers-redesign-spec.md` is the plan and the reasoning — read it before touching the

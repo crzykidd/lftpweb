@@ -7,6 +7,7 @@ import {
   getItemEvents,
   getTransferSettings,
   moveJob,
+  resolveItem,
   retryItem,
   startJobNow,
   stopJob,
@@ -16,6 +17,7 @@ import type { FileNode, ItemEventOut, JobOut } from '../api/types'
 import { ArrIcon, ArrRowChip } from '../components/LifecycleIcons'
 import { DismissMenu } from '../components/DismissMenu'
 import { ItemDrawer } from '../components/ItemDrawer'
+import { ResolveMenu } from '../components/ResolveMenu'
 import { StartNowMenu } from '../components/StartNowMenu'
 import { StateChip } from '../components/StateChip'
 import { useCompleteJobs } from '../hooks/useCompleteJobs'
@@ -42,8 +44,10 @@ import {
   FAST_LANE_HINT,
   type LiveProgress,
   type PanelField,
+  canDismiss,
   canMoveDown,
   canMoveUp,
+  canResolveManually,
   childDisplayName,
   completedTimeLabel,
   dismissMenuOptions,
@@ -52,13 +56,17 @@ import {
   hasArrGroup,
   isDismissable,
   isFastLane,
+  isPipelineInFlight,
+  manualOutcomeLabel,
   mergeFileListChildren,
   processingGroupFields,
+  resolveMenuOptions,
   showsFileList,
   sortTransferRows,
   transferFilterSummary,
   transferGroupFields,
   transferLineValue,
+  waitingReasonLabel,
 } from '../lib/transferPanel'
 
 // Re-exported so `TransfersPage.test.ts`'s pre-existing `import { isDismissable } from
@@ -139,6 +147,11 @@ interface RowProps {
   onStop: (job: JobOut) => void
   onRetry: (job: JobOut) => void
   onDismiss: (job: JobOut) => void
+  // The manual escape hatch (2026-08-20, docs/transfers-redesign-spec.md §3.2's
+  // pipeline-completion rule) -- `'complete'`/`'failed'` files a wedged in-flight row out of the
+  // Active box, `null` undoes a resolution set by mistake. A classification only; see
+  // `api/client.ts.resolveItem`.
+  onResolve: (job: JobOut, outcome: 'complete' | 'failed' | null) => void
   busy: boolean
 }
 
@@ -156,6 +169,7 @@ function Row({
   onStop,
   onRetry,
   onDismiss,
+  onResolve,
   busy,
 }: RowProps) {
   // 2026-08-15 (prompts/2026-08-15-transfers-single-line-rows-with-detail.md): everything this
@@ -167,6 +181,11 @@ function Row({
   const [expanded, setExpanded] = useState(false)
   const fileCount = fileCountFor(nodes, job)
   const completed = completedTimeLabel(job)
+  // 2026-08-20 (docs/transfers-redesign-spec.md §3.2's pipeline-completion rule): what this row
+  // is still waiting on, and whether a human already resolved it by hand. Both come straight off
+  // the server's own classification (`core/pipeline_flight.py`) -- nothing here re-derives either.
+  const waiting = waitingReasonLabel(job.pipeline_waiting_reason)
+  const manual = manualOutcomeLabel(job)
 
   return (
     <div className="flex flex-col gap-1.5 border-b border-zinc-200 px-3 py-2 text-sm last:border-b-0 dark:border-zinc-800">
@@ -220,6 +239,34 @@ function Row({
           {itemName(job.rel_path)}
         </button>
         <StateChip state={chipStateFor(job)} />
+        {/* What this row is still waiting on (2026-08-20, docs/transfers-redesign-spec.md §3.2's
+         * pipeline-completion rule) -- Verifying / Extracting / Processing / Awaiting import /
+         * Deleting source. The point of the Queue tab is to say what is moving *and why*, so a
+         * row that stays under Active/pending after its transfer finished has to explain itself
+         * rather than looking stuck. Derived from the same server-side `CASE` that decides which
+         * box the row is in (`JobOut.pipeline_waiting_reason`), so the label and the box can
+         * never disagree; `null` (nothing rendered) for queued/running, whose own state chip
+         * immediately to the left already says what they're doing. */}
+        {waiting && (
+          <span
+            className="shrink-0 rounded-full bg-amber-100 px-1.5 py-0.5 text-[10px] font-semibold text-amber-800 dark:bg-amber-900/40 dark:text-amber-300"
+            title="This release's transfer has finished but its pipeline hasn't — it stays under Active/pending until every step is done"
+          >
+            {waiting}
+          </span>
+        )}
+        {/* A row a human resolved by hand (2026-08-20) must *show* that rather than looking like
+         * a normal completion -- otherwise the Events page's audit trail says one thing and this
+         * row says another. It is a classification only: nothing was verified, imported,
+         * deleted, or cleaned up on the strength of this. */}
+        {manual && (
+          <span
+            className="shrink-0 rounded-full bg-violet-100 px-1.5 py-0.5 text-[10px] font-semibold text-violet-800 dark:bg-violet-900/40 dark:text-violet-300"
+            title="Resolved by hand — a classification only. Nothing was imported, deleted, or cleaned up because of it; the pipeline's own record is on the Events page."
+          >
+            {manual}
+          </span>
+        )}
         {/* The *arr brand-logo chip (2026-08-16, prompts/2026-08-16-arr-chip-on-row-lines.md)
          * -- sits right beside the state chip, in the same compact cluster; renders nothing
          * when this item isn't *arr-tracked (`job.arr_status === null`). */}
@@ -325,6 +372,41 @@ function Row({
               Retry
             </button>
           )}
+          {/* The manual escape hatch (2026-08-20, docs/transfers-redesign-spec.md §3.2's
+           * pipeline-completion rule) -- offered only on a row that is *in flight but no longer
+           * transferring* (`canResolveManually`), i.e. exactly the rows that can get wedged.
+           * Every blocking condition has a bounded automatic exit, but automatic exits are
+           * necessary rather than sufficient, and a box that can accumulate rows nothing is
+           * working on stops being trustworthy.
+           *
+           * **A classification only, and this is not negotiable.** It writes one item column and
+           * moves the row between two boxes on this page. It never advances the `move`-mode
+           * delete ladder, is never read as a confirmed *arr import, and never triggers
+           * notify/cleanup/post-processing -- DESIGN.md §7.3 makes a source delete wait on a
+           * *confirmed* import held across two consecutive poller passes precisely because that
+           * delete is irreversible, and a button click is not that evidence. See migration 025
+           * and `api/jobs.py.resolve_item`. */}
+          {canResolveManually(job) && (
+            <ResolveMenu
+              disabled={busy}
+              options={resolveMenuOptions(job.manual_outcome != null)}
+              title="Mark this row resolved — a classification only. Nothing is imported, deleted, or cleaned up because of it."
+              onSelect={(outcome) => onResolve(job, outcome)}
+            />
+          )}
+          {/* Undo, for a row already filed by hand -- it is no longer in flight, so the menu
+           * above isn't offered on it any more, and "resolved by mistake" needs a way back. */}
+          {!canResolveManually(job) && job.manual_outcome != null && (
+            <button
+              type="button"
+              disabled={busy}
+              onClick={() => onResolve(job, null)}
+              title="Undo this manual resolution — the row goes back to being classified by the pipeline"
+              className="rounded-md border border-zinc-300 px-2 py-1 text-xs font-medium text-zinc-500 hover:bg-zinc-50 disabled:opacity-50 dark:border-zinc-700 dark:text-zinc-400 dark:hover:bg-zinc-900"
+            >
+              Undo
+            </button>
+          )}
           {/* Dismiss (2026-08-13): terminal rows only -- a failed job whose remote is actually
            * gone (REMOTE_GONE, permanently suppressed) had no action but Retry, which is
            * precisely wrong for it. Purely a display action on this job row -- see
@@ -332,8 +414,14 @@ function Row({
            * state or suppression. No confirmation dialog: nothing is destroyed, the record
            * stays on the History page. `succeeded` joined this set 2026-08-14
            * (prompts/2026-08-14-exit-zero-is-not-completion.md) alongside `list_jobs()` starting
-           * to surface a recently-succeeded job at all -- see `isDismissable`. */}
-          {isDismissable(job.state) && (
+           * to surface a recently-succeeded job at all -- see `isDismissable`.
+           *
+           * 2026-08-20: `canDismiss`, not `isDismissable`, so an **in-flight** terminal row
+           * doesn't offer a button `core/queue.py.dismiss_job` now rejects with a 409 --
+           * dismissing something still being worked on makes no sense, and `list_jobs()` drops a
+           * dismissed job unconditionally, so it is also how a row would vanish from both boxes
+           * at once. */}
+          {canDismiss(job) && (
             <button
               type="button"
               disabled={busy}
@@ -873,16 +961,20 @@ export function TransfersPage() {
   }, [])
 
   // --- Active / pending box (2026-08-19, docs/transfers-redesign-spec.md §3.2, phase 1 stage
-  // 4b) -- client-side paginated, 20/page, over `jobs` narrowed to `queued`/`running` only.
-  // `jobs` itself (`useJobs`/`GET /api/jobs`, `core/queue.py.list_jobs`) is deliberately
-  // unchanged by this task (see docs/decisions.md for why keeping it was chosen over narrowing
-  // it) -- it still carries each item's most recent terminal job too; this box simply doesn't
-  // render those any more, since the Complete box below owns them now. -------------------------
+  // 4b) -- client-side paginated, 20/page, over `jobs`. `jobs` itself (`useJobs`/`GET
+  // /api/jobs`, `core/queue.py.list_jobs`) is deliberately unchanged in shape (see
+  // docs/decisions.md for why keeping it was chosen over narrowing it) -- it still carries each
+  // item's most recent terminal job too.
+  //
+  // **2026-08-20: the split is on pipeline completion, not job termination.** This box used to
+  // narrow to `queued`/`running`, which meant a row moved to Complete the instant lftp exited --
+  // while verify/extract, the *arr's confirmed import, and the deferred source delete were all
+  // still outstanding. `isPipelineInFlight` reads the server's own classification
+  // (`JobOut.pipeline_in_flight`, `core/pipeline_flight.py`), the *same* expression `GET
+  // /api/jobs/complete` excludes from its listing and its `total`, so a row is in exactly one box
+  // by construction rather than by two client/server rules that happen to agree today. ---------
 
-  const activeJobs = useMemo(
-    () => jobs.filter((j) => j.state === 'queued' || j.state === 'running'),
-    [jobs],
-  )
+  const activeJobs = useMemo(() => jobs.filter(isPipelineInFlight), [jobs])
   // Row order (2026-08-16, `lib/transferPanel.ts.sortTransferRows`'s own docstring): running
   // before queued, in `jobs`' own scheduler order -- unaffected by this task, since `activeJobs`
   // never contains a terminal row for `sortTransferRows`'s own newest-first branch to act on.
@@ -984,6 +1076,19 @@ export function TransfersPage() {
   const handleStop = (job: JobOut) => withBusy(job.id, () => stopJob(job.id))
   const handleRetry = (job: JobOut) => withBusy(job.id, () => retryItem(job.item_id))
   const handleDismiss = (job: JobOut) => withBusy(job.id, () => dismissJob(job.id))
+  /** The manual escape hatch (2026-08-20, docs/transfers-redesign-spec.md §3.2's
+   * pipeline-completion rule) -- files a wedged in-flight row out of Active/pending with the
+   * chosen outcome, or (`null`) undoes a resolution set by mistake. Refreshes both boxes, the
+   * same `refreshAll` every other row action uses: this is precisely an action that moves a row
+   * from one box to the other, so refreshing only one would leave the page showing it twice
+   * until the next poll tick.
+   *
+   * **A classification only** -- `api/client.ts.resolveItem`'s own docstring and migration 025
+   * have the constraint in full. Nothing here (or on the server) reads it as evidence of an
+   * import, a completed post-process, or permission to delete anything.
+   */
+  const handleResolve = (job: JobOut, outcome: 'complete' | 'failed' | null) =>
+    withBusy(job.id, () => resolveItem(job.item_id, outcome))
   const handleStartNow = (job: JobOut, ratePercent: StartNowRatePercent | undefined) => {
     if (localStorage.getItem(START_NOW_EXPLAINED_KEY) !== '1') {
       setStartNowNotice(true)
@@ -1237,19 +1342,22 @@ export function TransfersPage() {
           Active / pending
         </h2>
 
-        {/* "Nothing queued or downloading" reads off `activeJobs` (2026-08-19, phase 1 stage
-         * 4b), not `jobs` -- `jobs` still carries each item's most recent terminal job too
-         * (unchanged, docs/decisions.md), which would otherwise suppress this message the moment
-         * anything had ever finished, even with nothing currently active. */}
+        {/* The box's empty state reads off `activeJobs` (2026-08-19, phase 1 stage 4b), not
+         * `jobs` -- `jobs` still carries each item's most recent terminal job too (unchanged,
+         * docs/decisions.md), which would otherwise suppress this message the moment anything
+         * had ever finished, even with nothing currently active. Wording widened 2026-08-20:
+         * this box now also holds rows whose transfer is done but whose pipeline isn't
+         * (verifying, extracting, awaiting import, deleting source), so "nothing queued or
+         * downloading" no longer described everything its absence rules out. */}
         {activeJobs.length === 0 && (
           <div className="flex h-40 items-center justify-center rounded-lg border border-dashed border-zinc-300 text-zinc-400 dark:border-zinc-700 dark:text-zinc-600">
-            Nothing queued or downloading — queue an item from Files.
+            Nothing in flight — queue an item from Files.
           </div>
         )}
 
-        {/* The filter's own empty state for this box (2026-08-19) -- distinct from "nothing
-         * queued or downloading" above: there *are* active transfers, none of them just happen
-         * to match the filter text. */}
+        {/* The filter's own empty state for this box (2026-08-19) -- distinct from the "nothing
+         * in flight" one above: there *are* active transfers, none of them just happen to match
+         * the filter text. */}
         {activeJobs.length > 0 && filterActive && filteredActiveJobs.length === 0 && (
           <div className="flex h-40 flex-col items-center justify-center gap-2 rounded-lg border border-dashed border-zinc-300 text-zinc-400 dark:border-zinc-700 dark:text-zinc-600">
             <span>No active transfers match "{search.trim()}".</span>
@@ -1281,6 +1389,7 @@ export function TransfersPage() {
                 onStop={handleStop}
                 onRetry={handleRetry}
                 onDismiss={handleDismiss}
+                onResolve={handleResolve}
                 busy={busyIds.has(job.id)}
               />
             ))}
@@ -1389,6 +1498,7 @@ export function TransfersPage() {
                 onStop={handleStop}
                 onRetry={handleRetry}
                 onDismiss={handleDismiss}
+                onResolve={handleResolve}
                 busy={busyIds.has(job.id)}
               />
             ))}

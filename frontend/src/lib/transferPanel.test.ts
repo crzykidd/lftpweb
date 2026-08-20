@@ -6,8 +6,10 @@ import {
   DISMISS_OUTCOMES,
   DISMISS_OUTCOME_LABELS,
   FAST_LANE_HINT,
+  canDismiss,
   canMoveDown,
   canMoveUp,
+  canResolveManually,
   childDisplayName,
   completedTimeLabel,
   dismissMenuOptions,
@@ -16,14 +18,18 @@ import {
   hasArrGroup,
   isDismissable,
   isFastLane,
+  isPipelineInFlight,
+  manualOutcomeLabel,
   mergeFileListChildren,
   processingGroupFields,
+  resolveMenuOptions,
   showsFileList,
   sortTransferRows,
   transferFilterSummary,
   transferGroupFields,
   transferLineValue,
   transferredSummary,
+  waitingReasonLabel,
 } from './transferPanel'
 
 // 2026-08-15 (prompts/2026-08-15-transfers-single-line-rows-with-detail.md): "one line per
@@ -684,5 +690,151 @@ describe('mergeFileListChildren -- overlaying live WS state onto the fetched, ca
     const fetched = [fileNode('Release/a.mkv', { id: null })]
     const rows = mergeFileListChildren(fetched, fetched, {}, 1000)
     expect(rows[0].speed_bps).toBeNull()
+  })
+})
+
+// --- The pipeline-completion split (2026-08-20, docs/transfers-redesign-spec.md §3.2,
+// prompts/done/2026-08-20-active-box-holds-inflight-pipeline.md) ------------------------------
+//
+// The rule itself is server-side (`core/pipeline_flight.py`) and deliberately not reimplemented
+// here -- the Active box is client-side while the Complete box is a server-paginated query with
+// its own `total`, so two independently written tests would drift. What *is* tested here is the
+// page's own use of the server's answer: which box a row lands in, what the row says it is
+// waiting on, and which controls it offers.
+
+describe('isPipelineInFlight -- which box a row belongs in', () => {
+  it('holds a succeeded job whose pipeline is still running in the Active box', () => {
+    expect(isPipelineInFlight(job('succeeded', { pipeline_in_flight: true }))).toBe(true)
+  })
+
+  it('files a succeeded job whose pipeline is finished under Complete', () => {
+    expect(isPipelineInFlight(job('succeeded', { pipeline_in_flight: false }))).toBe(false)
+  })
+
+  it('never moves a queued or running job out of Active, whatever the flag says', () => {
+    expect(isPipelineInFlight(job('queued', { pipeline_in_flight: false }))).toBe(true)
+    expect(isPipelineInFlight(job('running', { pipeline_in_flight: false }))).toBe(true)
+  })
+
+  it('degrades a missing flag to "complete" rather than wedging the row in Active', () => {
+    // An older server that doesn't send the field at all -- the same fail-safe direction the
+    // server-side predicate takes for anything it can't bound.
+    expect(isPipelineInFlight(job('failed'))).toBe(false)
+  })
+})
+
+describe('waitingReasonLabel -- the row says what it is waiting on', () => {
+  it('maps each reason the server can send to its own wording', () => {
+    expect(waitingReasonLabel('verifying')).toBe('Verifying')
+    expect(waitingReasonLabel('extracting')).toBe('Extracting')
+    expect(waitingReasonLabel('processing')).toBe('Processing')
+    expect(waitingReasonLabel('awaiting_import')).toBe('Awaiting import')
+    expect(waitingReasonLabel('deleting_source')).toBe('Deleting source')
+  })
+
+  it('renders nothing when there is no reason (a queued/running row says it on its state chip)', () => {
+    expect(waitingReasonLabel(null)).toBeNull()
+    expect(waitingReasonLabel(undefined)).toBeNull()
+    expect(waitingReasonLabel('')).toBeNull()
+  })
+
+  it('falls back to the raw value for a reason this build does not know yet', () => {
+    expect(waitingReasonLabel('awaiting_something_new')).toBe('awaiting_something_new')
+  })
+})
+
+describe('canDismiss -- an in-flight row is not dismissable', () => {
+  it('offers Dismiss on a terminal row whose pipeline is done', () => {
+    expect(canDismiss(job('succeeded', { pipeline_in_flight: false }))).toBe(true)
+    expect(canDismiss(job('failed'))).toBe(true)
+  })
+
+  it('withholds it while the pipeline is still in flight', () => {
+    // `core/queue.py.dismiss_job` rejects this with a 409 now, and `list_jobs()` drops a
+    // dismissed job unconditionally -- so allowing the click is how a row vanishes from *both*
+    // boxes at once.
+    expect(canDismiss(job('succeeded', { pipeline_in_flight: true }))).toBe(false)
+  })
+
+  it('still withholds it from an active job, exactly as isDismissable always did', () => {
+    expect(canDismiss(job('queued'))).toBe(false)
+    expect(canDismiss(job('running'))).toBe(false)
+  })
+})
+
+describe('canResolveManually -- where the escape hatch is offered', () => {
+  it('offers it on an in-flight row that is no longer transferring', () => {
+    expect(canResolveManually(job('succeeded', { pipeline_in_flight: true }))).toBe(true)
+  })
+
+  it('never offers it on a genuinely queued or running job', () => {
+    // A transfer that is actually running is not something a classification button gets to hide
+    // -- Stop is the control for that, and `api/jobs.py.resolve_item` refuses the write besides.
+    expect(canResolveManually(job('queued'))).toBe(false)
+    expect(canResolveManually(job('running'))).toBe(false)
+  })
+
+  it('never offers it on a row that has already reached Complete', () => {
+    expect(canResolveManually(job('succeeded', { pipeline_in_flight: false }))).toBe(false)
+  })
+})
+
+describe('manualOutcomeLabel -- a hand-resolved row must not look like a normal completion', () => {
+  it('names the outcome that was chosen', () => {
+    expect(manualOutcomeLabel(job('succeeded', { manual_outcome: 'complete' }))).toBe('Marked complete')
+    expect(manualOutcomeLabel(job('failed', { manual_outcome: 'failed' }))).toBe('Marked failed')
+  })
+
+  it('renders nothing for a row nobody touched', () => {
+    expect(manualOutcomeLabel(job('succeeded'))).toBeNull()
+  })
+})
+
+describe('resolveMenuOptions', () => {
+  it('offers the two outcomes, complete first', () => {
+    expect(resolveMenuOptions()).toEqual([
+      { outcome: 'complete', label: 'Mark complete' },
+      { outcome: 'failed', label: 'Mark failed' },
+    ])
+  })
+
+  it('adds the undo option only once a row actually carries a manual outcome', () => {
+    expect(resolveMenuOptions(true).map((o) => o.outcome)).toEqual(['complete', 'failed', null])
+  })
+})
+
+describe('sortTransferRows -- in-flight post-transfer rows sit with the running ones', () => {
+  it('places a still-processing row above the queued backlog, not below it', () => {
+    // Otherwise it sorts into the newest-finished-first tail beneath the whole backlog -- page 11
+    // of a busy queue, where the user never sees the thing they're being told is still moving.
+    const running = job('running', { id: 1 })
+    const processing = job('succeeded', {
+      id: 2,
+      pipeline_in_flight: true,
+      finished_at: '2026-08-20T10:00:00.000000Z',
+    })
+    const queued = job('queued', { id: 3 })
+    const done = job('succeeded', {
+      id: 4,
+      pipeline_in_flight: false,
+      finished_at: '2026-08-20T11:00:00.000000Z',
+    })
+    expect(sortTransferRows([done, queued, processing, running]).map((j) => j.id)).toEqual([
+      1, 2, 3, 4,
+    ])
+  })
+
+  it('orders several in-flight rows newest-finished first, same as the terminal tail', () => {
+    const older = job('succeeded', {
+      id: 1,
+      pipeline_in_flight: true,
+      finished_at: '2026-08-20T09:00:00.000000Z',
+    })
+    const newer = job('succeeded', {
+      id: 2,
+      pipeline_in_flight: true,
+      finished_at: '2026-08-20T10:00:00.000000Z',
+    })
+    expect(sortTransferRows([older, newer]).map((j) => j.id)).toEqual([2, 1])
   })
 })

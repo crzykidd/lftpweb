@@ -2002,8 +2002,8 @@ Some.Release.S03E04.2160p    [downloading]   18 files   62%   4.1 MB/s   ETA 12m
   make a move appear to swap a job with something in a different group; in the flat list the row
   directly above is always the one being traded with.
 - **Two paginated boxes, not one flat list** (2026-08-19, `docs/transfers-redesign-spec.md` §3.2,
-  phase 1 stage 4b): **Active / pending** (queued/running, client-side — the set is bounded and
-  already loaded) and **Complete** (terminal, one row per item — the same most-recent-job-wins
+  phase 1 stage 4b): **Active / pending** (client-side — the set is bounded and
+  already loaded) and **Complete** (one row per item — the same most-recent-job-wins
   rule as before — newest-finished first, **server-side** via `GET /api/jobs/complete`). Numbered
   pages, SAB-style. Each box carries its own "Show 10/20/50" page-size selector, both defaulting
   to **20** and independently remembered per browser (2026-08-20, a follow-up from the user's
@@ -2028,6 +2028,44 @@ Some.Release.S03E04.2160p    [downloading]   18 files   62%   4.1 MB/s   ETA 12m
   `lib/pagination.ts.pageReadout` now backs both, and both boxes' header/empty-state/page-size-
   selector/pager render unconditionally, the empty state living inside the shell rather than as
   a separate top-level block above it.
+- **The two boxes split on pipeline completion, not job termination** (2026-08-20, a follow-up to
+  phase 1 stage 4b from the user's browser review — `docs/transfers-redesign-spec.md` §3.2,
+  `prompts/done/2026-08-20-active-box-holds-inflight-pipeline.md`). Stage 4b split them the
+  moment lftp exited, so a row sat under "Complete" while its release demonstrably was not:
+  verify, extract, the staging move, the *arr's confirmed import and the deferred source delete
+  all continue past the job. The user's own words: *"Shouldn't a job live in that state until the
+  sonarr/radarr hook lands if they are enabled? Currently they move to complete but they
+  technically aren't."* Applied **consistently whether or not a queue is *arr-bound** — one
+  definition of done, chosen explicitly over a narrower *arr-only rule, since post-processing a
+  large release is not instant either. **The predicate is server-side and defined exactly once**
+  (`core/pipeline_flight.py`): `list_jobs()` projects it as `pipeline_in_flight`,
+  `GET /api/jobs/complete` excludes it from both its listing and its `total`, and
+  `dismiss_all_terminal` excludes the same items — the client never re-derives it, because the
+  Active box is client-side while the Complete box is server-paginated and two encodings of one
+  rule would drift a row into both boxes or neither. **Rather than one vague label, the row says
+  what it is waiting on** — *Verifying / Extracting / Processing / Awaiting import / Deleting
+  source*, from the same `CASE` that does the splitting. **Every blocking condition has a bounded
+  exit**: post-processing keys off the live worker's existence (`in_flight_item_ids()`), never a
+  transient state string, so a crashed worker can't wedge a row; the *arr condition requires a
+  *currently enabled* instance, so disabling Sonarr releases everything waiting on it; and both
+  the *arr wait and the deferred-source-delete wait carry age backstops for the cases the
+  pipeline's own ladders can't reach (a permanently unreachable *arr; a source-delete retry that
+  paused without clearing `remote_delete_pending` — see that module's own docstring). An
+  in-flight row is **not dismissable**, at the API as well as in the UI.
+- **"Mark complete" / "Mark failed" — the manual escape hatch** (2026-08-20, same task,
+  migration 025) on an in-flight row whose own transfer has finished, plus an **Undo** on a row
+  already resolved. Automatic exits are necessary but not sufficient: a genuinely wedged item
+  needs a human override, or the Active box slowly fills with rows nothing is working on and
+  stops being trustworthy. **It is a classification only, and that constraint is not
+  negotiable** — it writes `item.manual_outcome`, read by the split predicate and by nothing
+  else. It must never advance the `move`-mode delete ladder or cause a source delete, never be
+  read as a confirmed *arr import or write `arr_status`, never trigger notify/cleanup/retention/
+  post-processing, and never alter auto-queue's eligibility (§7.3 makes the irreversible delete
+  wait on a *confirmed* import held across two consecutive poller passes precisely because a
+  hunch is not evidence). Every resolution writes an audit `event`, and the row carries a
+  **Marked complete / Marked failed** chip so it never silently reads as a normal completion. A
+  real terminal outcome arriving later does **not** supersede it (`docs/decisions.md`,
+  2026-08-20).
 - **▲ up one / ▼ down one / ▲▲ to top** on each queued row (§4.5's "Queue order and priority" —
   stage 2, 2026-08-19, `prompts/2026-08-19-queue-reorder-chevrons.md`; replaced a single "Move to
   top" button); default order is oldest-first. **Each still-queued row shows its actual run
