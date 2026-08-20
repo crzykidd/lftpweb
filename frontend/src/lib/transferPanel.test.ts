@@ -7,7 +7,6 @@ import {
   canMoveUp,
   completedTimeLabel,
   decrementHistoryQueueSummary,
-  dismissableJobIds,
   failedJobPanelContent,
   filterTransferJobs,
   formatQueueGroupCounts,
@@ -62,6 +61,7 @@ function job(state: JobState, overrides: Partial<JobOut> = {}): JobOut {
     exit_code: null,
     error_class: null,
     output_tail: null,
+    has_output_tail: false,
     verified_at: null,
     extracted_at: null,
     remote_deleted_at: null,
@@ -506,26 +506,6 @@ describe('filterTransferJobs -- the name filter', () => {
       job('queued', { id: 2, rel_path: 'Apple.Release' }),
     ]
     expect(filterTransferJobs(jobs, 'release')).toEqual(jobs)
-  })
-})
-
-describe('dismissableJobIds -- the "Dismiss list" button\'s own id list', () => {
-  it('returns the ids of every dismissable (terminal) job', () => {
-    const jobs = [job('failed', { id: 1 }), job('cancelled', { id: 2 }), job('succeeded', { id: 3 })]
-    expect(dismissableJobIds(jobs)).toEqual([1, 2, 3])
-  })
-
-  it('skips active (queued/running) rows', () => {
-    const jobs = [job('queued', { id: 1 }), job('running', { id: 2 }), job('failed', { id: 3 })]
-    expect(dismissableJobIds(jobs)).toEqual([3])
-  })
-
-  it('is empty for an empty input', () => {
-    expect(dismissableJobIds([])).toEqual([])
-  })
-
-  it('is empty when every job is still active', () => {
-    expect(dismissableJobIds([job('queued', { id: 1 }), job('running', { id: 2 })])).toEqual([])
   })
 })
 

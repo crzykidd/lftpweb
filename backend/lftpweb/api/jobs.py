@@ -28,6 +28,7 @@ from lftpweb.core.queue import (
 )
 from lftpweb.core.remote import parse_connection_limit
 from lftpweb.models import (
+    CompleteJobsResponse,
     DeleteItemRequest,
     DeleteItemResponse,
     DismissAllRequest,
@@ -96,7 +97,15 @@ def _run_stop_in_background(coro: Coroutine[Any, Any, bool]) -> asyncio.Task:
     return task
 
 
-def _job_out(row: dict) -> JobOut:
+def _job_out(row: dict, *, include_output_tail: bool = True) -> JobOut:
+    """`include_output_tail=False` (2026-08-19, docs/transfers-redesign-spec.md §3.2, phase 1
+    stage 4b) is `GET /api/jobs/complete`'s own use -- that endpoint is paginated but unbounded
+    in total row count, so it never inlines the ~4KB `output_tail` blob, the identical trap
+    `api/history.py`'s own docstring names for its own list endpoint. `has_output_tail` is
+    always populated regardless (`row["output_tail"] is not None`), so the row's expand panel
+    has one signal to decide whether an on-demand fetch (`GET /api/history/jobs/{id}/output`) is
+    worth making, whichever endpoint the row came from.
+    """
     return JobOut(
         id=row["id"],
         item_id=row["item_id"],
@@ -132,7 +141,8 @@ def _job_out(row: dict) -> JobOut:
         eta_s=row.get("eta_s"),
         exit_code=row["exit_code"],
         error_class=row["error_class"],
-        output_tail=row["output_tail"],
+        output_tail=row["output_tail"] if include_output_tail else None,
+        has_output_tail=row["output_tail"] is not None,
         # 2026-08-15 (prompts/2026-08-15-transfers-single-line-rows-with-detail.md): the
         # item-level facts the Transfers row's expand panel needs -- see `TransferQueue.
         # list_jobs()`'s own docstring for the join these come from. `arr_instance_name`/
@@ -154,6 +164,46 @@ def _job_out(row: dict) -> JobOut:
 async def list_jobs(request: Request) -> JobsResponse:
     rows = await request.app.state.queue.list_jobs()
     return JobsResponse(jobs=[_job_out(r) for r in rows])
+
+
+# --- The Queue tab's Complete box (2026-08-19, docs/transfers-redesign-spec.md §3.2, phase 1
+# stage 4b) -- terminal jobs, split out of `list_jobs()`'s bounded row set into their own
+# server-paginated endpoint, 50/page, newest-finished first. Same `LIMIT`/`OFFSET` clamp shape
+# `api/history.py._clamp_paging` uses -- kept as its own tiny copy here rather than importing
+# that module's private helper, since the two endpoints' response shapes (and default/max page
+# sizes) are otherwise independent. -------------------------------------------------------------
+
+COMPLETE_JOBS_DEFAULT_LIMIT = 50
+COMPLETE_JOBS_MAX_LIMIT = 200
+
+
+def _clamp_complete_paging(limit: int, offset: int) -> tuple[int, int]:
+    return max(1, min(limit, COMPLETE_JOBS_MAX_LIMIT)), max(0, offset)
+
+
+@router.get("/api/jobs/complete", response_model=CompleteJobsResponse)
+async def list_complete_jobs(
+    request: Request,
+    name_filter: str | None = None,
+    limit: int = COMPLETE_JOBS_DEFAULT_LIMIT,
+    offset: int = 0,
+) -> CompleteJobsResponse:
+    """The Complete box's own fetch -- `TransferQueue.list_complete_jobs`'s own docstring has
+    the full reasoning (why this is split from `list_jobs()`, the `MAX(id)`-per-item rule, why
+    `output_tail` is never inlined here). `name_filter` is the server-side twin of the Active
+    box's client-side `lib/transferPanel.ts.filterTransferJobs` -- case-insensitive substring
+    over `rel_path`, empty string matching every row, `None`/omitted meaning no filter at all.
+    """
+    limit, offset = _clamp_complete_paging(limit, offset)
+    rows, total = await request.app.state.queue.list_complete_jobs(
+        limit=limit, offset=offset, name_filter=name_filter
+    )
+    return CompleteJobsResponse(
+        jobs=[_job_out(r, include_output_tail=False) for r in rows],
+        total=total,
+        limit=limit,
+        offset=offset,
+    )
 
 
 @router.post("/api/jobs", response_model=JobOut, status_code=201)
@@ -221,15 +271,23 @@ async def dismiss_all_jobs(
 
     2026-08-19 (`prompts/2026-08-19-transfers-name-filter.md`): `body.job_ids`, when given,
     scopes the bulk dismiss to that explicit set of job ids instead -- the name filter's own
-    "Dismiss list" button, again reusing this one endpoint rather than adding a second. Mutually
-    exclusive with `queue_id` at the request-model level (`DismissAllRequest`'s own validator,
-    a 422 if a caller sends both); this handler just threads whichever one was given straight
-    through to `dismiss_all_terminal`.
+    "Dismiss list" button, again reusing this one endpoint rather than adding a second.
+
+    2026-08-19 (docs/transfers-redesign-spec.md §3.2, phase 1 stage 4b): `body.name_filter`
+    supersedes `job_ids` for "Dismiss list" now that the Complete box (`GET /api/jobs/complete`)
+    is server-paginated -- a filter can match more rows than one page's worth of ids can name.
+    See `DismissAllRequest.name_filter`'s own docstring for the full reasoning and
+    `TransferQueue.dismiss_all_terminal`'s for the SQL.
+
+    All three scopes are mutually exclusive at the request-model level (`DismissAllRequest`'s
+    own validator, a 422 if a caller names more than one); this handler just threads whichever
+    one was given straight through to `dismiss_all_terminal`.
     """
     queue_id = body.queue_id if body is not None else None
     job_ids = body.job_ids if body is not None else None
+    name_filter = body.name_filter if body is not None else None
     dismissed = await request.app.state.queue.dismiss_all_terminal(
-        queue_id=queue_id, job_ids=job_ids
+        queue_id=queue_id, job_ids=job_ids, name_filter=name_filter
     )
     return DismissAllResponse(dismissed=dismissed)
 

@@ -802,7 +802,22 @@ class JobOut(BaseModel):
     exit_code: int | None = None
     error_class: str | None = None
     # DESIGN.md §9.2: "Failed rows show the error class and the captured lftp output tail."
+    # `null` on a row from `GET /api/jobs/complete` (2026-08-19, docs/transfers-redesign-spec.md
+    # §3.2, phase 1 stage 4b) -- that endpoint is paginated but *unbounded* in total row count,
+    # so it never inlines this blob (~4KB/row), the identical trap `api/history.py`'s own
+    # docstring names for its own list endpoint. `GET /api/jobs` (the Active/pending box) stays
+    # bounded by construction (`core/queue.py.list_jobs`'s own docstring) and keeps inlining it
+    # unchanged. `has_output_tail` below is the one signal a row's expand panel needs to decide
+    # whether to fetch it on demand -- true from either endpoint, so the panel doesn't need to
+    # know which box a row came from.
     output_tail: str | None = None
+    # Mirrors `HistoryJobOut.has_output_tail` -- always populated (from `output_tail is not
+    # None` server-side), regardless of whether `output_tail` itself was inlined. The Transfers
+    # row's expand panel (`TransfersPage.tsx.RowDetailPanel`) fetches on demand via the existing
+    # `GET /api/history/jobs/{id}/output` (same `job` table, same id) exactly when this is `true`
+    # and `output_tail` came back `null` -- one on-demand fetch path shared with History's own,
+    # rather than a second endpoint that does the same thing.
+    has_output_tail: bool = False
     # 2026-08-15 (prompts/2026-08-15-transfers-single-line-rows-with-detail.md): the item-level
     # facts the Transfers row's new expand panel needs for its Processing/*arr groups. Inlined
     # here rather than fetched separately -- `list_jobs()`'s row set is bounded by construction
@@ -837,6 +852,24 @@ class JobsResponse(BaseModel):
     jobs: list[JobOut]
 
 
+class CompleteJobsResponse(BaseModel):
+    """`GET /api/jobs/complete` (2026-08-19, docs/transfers-redesign-spec.md §3.2, phase 1 stage
+    4b) -- the Queue tab's **Complete** box: terminal (`succeeded`/`failed`/`cancelled`), not
+    dismissed, one row per item (the same "most recent job wins" rule `core/queue.py.list_jobs`
+    already applies -- see `TransferQueue.list_complete_jobs`'s own docstring), newest-finished
+    first, **server-side paginated**. Same `total`/`limit`/`offset` shape
+    `api/history.py.HistoryJobsResponse` already established -- reused deliberately rather than
+    inventing a second pagination idiom (`total` is the full filtered count, ignoring the page,
+    so the frontend can render numbered pages -- `lib/pagination.ts` -- without a second
+    unbounded query).
+    """
+
+    jobs: list[JobOut]
+    total: int
+    limit: int
+    offset: int
+
+
 class DismissAllRequest(BaseModel):
     """`POST /api/jobs/dismiss-all`'s optional JSON body (2026-08-17, the Transfers page's
     per-queue-group "Dismiss Queue" control, `prompts/2026-08-17-transfers-dismiss-per-queue.md`)
@@ -859,18 +892,36 @@ class DismissAllRequest(BaseModel):
     `TransferQueue.dismiss_all_terminal`'s own comment for why that distinction has to be made
     explicitly rather than falling out of an `if job_ids:` truthiness check.
 
-    `job_ids` and `queue_id` are mutually exclusive -- a request naming both is rejected with a
-    422 (`_job_ids_and_queue_id_are_mutually_exclusive` below) rather than guessing an
-    intersection of the two scopes.
+    `name_filter` (2026-08-19, phase 1 stage 4b) supersedes `job_ids` for "Dismiss list" now
+    that the Complete box (`CompleteJobsResponse` above) is server-paginated: the filter can
+    match far more rows than are loaded on the current page, so an explicit id list can only
+    express "dismiss this one page's worth", not what the button promises ("dismiss everything
+    the filter matches"). `name_filter` carries the *same* text the Complete box's own listing
+    query is filtering on, so the server dismisses exactly what the box is currently showing,
+    across every page -- `TransferQueue.dismiss_all_terminal`'s own comment has the matching SQL,
+    built from the identical predicate `TransferQueue.list_complete_jobs` uses (never two
+    versions of "what counts as a match" that could drift apart), same case-insensitive
+    substring-over-`rel_path` semantics as the client-side `filterTransferJobs`. An empty string
+    is a real value here (matches every `rel_path`, same as an empty client-side filter matching
+    every row) -- it is `None`, not `""`, that means "no filter given", the same "unset means
+    unchanged" convention every other optional field on this model already uses.
+
+    `job_ids`, `queue_id`, and `name_filter` are mutually exclusive -- a request naming more than
+    one is rejected with a 422 (`_scopes_are_mutually_exclusive` below) rather than guessing an
+    intersection of the scopes.
     """
 
     queue_id: int | None = None
     job_ids: list[int] | None = None
+    name_filter: str | None = None
 
     @model_validator(mode="after")
-    def _job_ids_and_queue_id_are_mutually_exclusive(self) -> "DismissAllRequest":
-        if self.queue_id is not None and self.job_ids is not None:
-            raise ValueError("queue_id and job_ids are mutually exclusive -- pass at most one")
+    def _scopes_are_mutually_exclusive(self) -> "DismissAllRequest":
+        given = sum(scope is not None for scope in (self.queue_id, self.job_ids, self.name_filter))
+        if given > 1:
+            raise ValueError(
+                "queue_id, job_ids, and name_filter are mutually exclusive -- pass at most one"
+            )
         return self
 
 

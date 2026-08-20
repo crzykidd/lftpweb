@@ -2,6 +2,7 @@ import { Fragment, useEffect, useMemo, useState } from 'react'
 import {
   dismissAllJobs,
   dismissJob,
+  getHistoryJobOutput,
   getItemEvents,
   getTransferSettings,
   moveJob,
@@ -15,10 +16,12 @@ import { ArrIcon, ArrRowChip } from '../components/LifecycleIcons'
 import { ItemDrawer } from '../components/ItemDrawer'
 import { StartNowMenu } from '../components/StartNowMenu'
 import { StateChip } from '../components/StateChip'
+import { useCompleteJobs } from '../hooks/useCompleteJobs'
 import { useJobs } from '../hooks/useJobs'
 import { useLiveModel } from '../hooks/useLiveModel'
 import { arrHoverLabel } from '../lib/fileTree'
 import { formatRelativeTimeIntl } from '../lib/format'
+import { ACTIVE_PAGE_SIZE, COMPLETE_PAGE_SIZE, pageCount, pageWindow, paginateClientSide } from '../lib/pagination'
 import { queueDisplayName } from '../lib/queueDisplayName'
 import type { StartNowRatePercent } from '../lib/startNow'
 import {
@@ -28,7 +31,6 @@ import {
   canMoveDown,
   canMoveUp,
   completedTimeLabel,
-  dismissableJobIds,
   filterTransferJobs,
   hasArrGroup,
   isDismissable,
@@ -377,6 +379,59 @@ function PanelFieldList({ fields, emptyText }: { fields: PanelField[]; emptyText
   )
 }
 
+/** A failed row's captured lftp output (2026-08-19, docs/transfers-redesign-spec.md §3.2, phase
+ * 1 stage 4b) -- inline when `job.output_tail` already carries it (the Active/pending box's own
+ * rows, from the bounded `GET /api/jobs`, unchanged), fetched on demand via the existing `GET
+ * /api/history/jobs/{id}/output` (`getHistoryJobOutput`) when it doesn't (a Complete-box row,
+ * from the paginated `GET /api/jobs/complete`, which never inlines this ~4KB blob -- see
+ * `JobOut.has_output_tail`'s own comment). One component instead of branching inline in
+ * `RowDetailPanel` below, and the same "fetch once, on expand" shape this panel's own item-
+ * events `useEffect` already establishes a few lines down.
+ */
+function FailedOutputPanel({ job }: { job: JobOut }) {
+  const needsFetch = job.output_tail == null && job.has_output_tail
+  const [output, setOutput] = useState<string | null>(job.output_tail)
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+
+  useEffect(() => {
+    if (!needsFetch) {
+      setOutput(job.output_tail)
+      return
+    }
+    let cancelled = false
+    setLoading(true)
+    setError(null)
+    getHistoryJobOutput(job.id)
+      .then((res) => {
+        if (!cancelled) setOutput(res.output_tail)
+      })
+      .catch((err: unknown) => {
+        if (!cancelled) setError(err instanceof Error ? err.message : String(err))
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false)
+      })
+    return () => {
+      cancelled = true
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [job.id, needsFetch])
+
+  return (
+    <div className="mt-2 rounded-md border border-red-200 bg-red-50 p-2 text-red-800 dark:border-red-900 dark:bg-red-950/40 dark:text-red-300">
+      <p className="font-medium">{job.error_class ?? 'UNKNOWN'}</p>
+      {loading && <p className="mt-1 opacity-75">Loading captured output…</p>}
+      {error && <p className="mt-1 text-xs">Couldn't load captured output: {error}</p>}
+      {output && (
+        <pre className="mt-1 max-h-32 overflow-auto whitespace-pre-wrap break-words font-mono text-[11px] opacity-90">
+          {output}
+        </pre>
+      )}
+    </div>
+  )
+}
+
 const ITEM_EVENTS_LIMIT = 20
 
 /** The Transfers row's expand panel (2026-08-15) -- three groups, per the task's own line-up:
@@ -425,16 +480,7 @@ function RowDetailPanel({ job, live, fileCount }: { job: JobOut; live: LiveProgr
           Transfer
         </h4>
         <PanelFieldList fields={transferFields} emptyText="Nothing to show yet." />
-        {job.state === 'failed' && (
-          <div className="mt-2 rounded-md border border-red-200 bg-red-50 p-2 text-red-800 dark:border-red-900 dark:bg-red-950/40 dark:text-red-300">
-            <p className="font-medium">{job.error_class ?? 'UNKNOWN'}</p>
-            {job.output_tail && (
-              <pre className="mt-1 max-h-32 overflow-auto whitespace-pre-wrap break-words font-mono text-[11px] opacity-90">
-                {job.output_tail}
-              </pre>
-            )}
-          </div>
-        )}
+        {job.state === 'failed' && <FailedOutputPanel job={job} />}
       </div>
 
       <div>
@@ -488,6 +534,54 @@ function RowDetailPanel({ job, live, fileCount }: { job: JobOut; live: LiveProgr
   )
 }
 
+/** Numbered pages, SAB-style (2026-08-19, docs/transfers-redesign-spec.md §3.2, phase 1 stage
+ * 4b) -- `1 2 3 4 ›`, the task's own example. All the boundary arithmetic (the visible window,
+ * whether ‹/› are enabled) lives in `lib/pagination.ts` and is unit-tested there; this component
+ * is pure layout over that. Renders nothing at all for a single-page box -- a pager with one,
+ * disabled page number is clutter, not a control.
+ */
+function Pager({ current, count, onChange }: { current: number; count: number; onChange: (page: number) => void }) {
+  if (count <= 1) return null
+  const visible = pageWindow(current, count)
+  return (
+    <div className="flex items-center gap-1">
+      <button
+        type="button"
+        disabled={current <= 1}
+        onClick={() => onChange(current - 1)}
+        aria-label="Previous page"
+        className="rounded-md border border-zinc-300 px-2 py-1 text-xs font-medium text-zinc-700 hover:bg-zinc-50 disabled:opacity-50 dark:border-zinc-700 dark:text-zinc-200 dark:hover:bg-zinc-900"
+      >
+        ‹
+      </button>
+      {visible.map((p) => (
+        <button
+          key={p}
+          type="button"
+          aria-current={p === current ? 'page' : undefined}
+          onClick={() => onChange(p)}
+          className={
+            p === current
+              ? 'rounded-md border border-indigo-400 bg-indigo-50 px-2 py-1 text-xs font-semibold text-indigo-800 dark:border-indigo-700 dark:bg-indigo-900/40 dark:text-indigo-300'
+              : 'rounded-md border border-zinc-300 px-2 py-1 text-xs font-medium text-zinc-700 hover:bg-zinc-50 dark:border-zinc-700 dark:text-zinc-200 dark:hover:bg-zinc-900'
+          }
+        >
+          {p}
+        </button>
+      ))}
+      <button
+        type="button"
+        disabled={current >= count}
+        onClick={() => onChange(current + 1)}
+        aria-label="Next page"
+        className="rounded-md border border-zinc-300 px-2 py-1 text-xs font-medium text-zinc-700 hover:bg-zinc-50 disabled:opacity-50 dark:border-zinc-700 dark:text-zinc-200 dark:hover:bg-zinc-900"
+      >
+        ›
+      </button>
+    </div>
+  )
+}
+
 /** DESIGN.md §9.2 Transfers page -- the job queue. Rows stay deliberately plain (queued /
  * downloading / downloaded, with STOPPED/FAILED surfacing only where they apply); the item
  * drawer opens per row for the full per-file breakdown.
@@ -513,8 +607,20 @@ export function TransfersPage() {
   // The name filter (2026-08-19, prompts/2026-08-19-transfers-name-filter.md) -- plain
   // `useState`, deliberately not persisted (no localStorage, no URL param): it clears on reload
   // and on navigating away, matching the Files page's own text filter and the Logs filter. A
-  // stale filter hiding active transfers after a reload would be its own confusion.
+  // stale filter hiding active transfers after a reload would be its own confusion. Drives the
+  // Active/pending box (below) directly and instantly -- that box is client-side over an
+  // already-loaded, bounded set, so there's nothing to debounce.
   const [search, setSearch] = useState('')
+  // The Complete box's own copy of `search`, debounced (2026-08-19, docs/transfers-redesign-
+  // spec.md §3.2, phase 1 stage 4b) -- that box is now server-paginated (`useCompleteJobs`
+  // below), so every keystroke would otherwise fire its own request. "Dismiss list" also reads
+  // this, not `search` directly, so the count it shows and the filter text it sends to
+  // `dismiss_all_terminal` always match what the Complete box is actually displaying.
+  const [debouncedSearch, setDebouncedSearch] = useState('')
+  useEffect(() => {
+    const id = setTimeout(() => setDebouncedSearch(search), 250)
+    return () => clearTimeout(id)
+  }, [search])
   // "Dismiss list" -- its own busy/error/outcome trio, same shape "Dismiss all"'s
   // dismissingAll/dismissAllError/dismissAllCount above already use (the page's existing
   // notification convention), kept separate rather than reusing those three: "Dismiss list" is
@@ -525,6 +631,11 @@ export function TransfersPage() {
   const [dismissingList, setDismissingList] = useState(false)
   const [dismissListError, setDismissListError] = useState<string | null>(null)
   const [dismissListCount, setDismissListCount] = useState<number | null>(null)
+  // Two paginated boxes (2026-08-19, docs/transfers-redesign-spec.md §3.2, phase 1 stage 4b) --
+  // 1-based, independent page state per box. `lib/pagination.ts` owns every bit of the
+  // boundary/window arithmetic; this page only ever stores "which page" and hands it there.
+  const [activePage, setActivePage] = useState(1)
+  const [completePage, setCompletePage] = useState(1)
 
   const nodesByQueue = useMemo(() => {
     const map = new Map<number, FileNode[]>()
@@ -552,35 +663,78 @@ export function TransfersPage() {
     }
   }, [])
 
-  // Row order (2026-08-16, `lib/transferPanel.ts.sortTransferRows`'s own docstring): active rows
-  // keep `jobs`' own scheduler order untouched, terminal rows sort newest-completed-first --
-  // **replaces** the previous implicit order for terminal rows, which was the same `rank DESC,
-  // queued_at ASC` scheduler order active rows still use (meaningless for a row that's already
-  // finished). `queuePositions` below deliberately keeps reading `jobs` itself, not this sorted
-  // view -- a queue position is about the real future run order, unaffected by how terminal rows
-  // happen to be displayed.
-  const sortedJobs = useMemo(() => sortTransferRows(jobs), [jobs])
+  // --- Active / pending box (2026-08-19, docs/transfers-redesign-spec.md §3.2, phase 1 stage
+  // 4b) -- client-side paginated, 20/page, over `jobs` narrowed to `queued`/`running` only.
+  // `jobs` itself (`useJobs`/`GET /api/jobs`, `core/queue.py.list_jobs`) is deliberately
+  // unchanged by this task (see docs/decisions.md for why keeping it was chosen over narrowing
+  // it) -- it still carries each item's most recent terminal job too; this box simply doesn't
+  // render those any more, since the Complete box below owns them now. -------------------------
 
-  // The name filter (2026-08-19) -- applied to `sortedJobs`, producing the flat, globally-
-  // ordered row set the page renders directly (grouping by queue was dropped 2026-08-19,
-  // docs/transfers-redesign-spec.md §3.1, phase 1 stage 4a -- see docs/decisions.md for the
-  // reversal and its cause). `filterTransferJobs` returns `sortedJobs` itself, by identity,
-  // whenever `search` is empty/whitespace-only, so this is a no-op `useMemo` recompute rather
-  // than a fresh array on every render while the filter isn't in use.
-  const filteredJobs = useMemo(() => filterTransferJobs(sortedJobs, search), [sortedJobs, search])
+  const activeJobs = useMemo(
+    () => jobs.filter((j) => j.state === 'queued' || j.state === 'running'),
+    [jobs],
+  )
+  // Row order (2026-08-16, `lib/transferPanel.ts.sortTransferRows`'s own docstring): running
+  // before queued, in `jobs`' own scheduler order -- unaffected by this task, since `activeJobs`
+  // never contains a terminal row for `sortTransferRows`'s own newest-first branch to act on.
+  const sortedActiveJobs = useMemo(() => sortTransferRows(activeJobs), [activeJobs])
+  // The name filter, applied instantly (client-side, bounded set) -- `filterTransferJobs`
+  // returns `sortedActiveJobs` itself, by identity, whenever `search` is empty/whitespace-only,
+  // so this is a no-op `useMemo` recompute rather than a fresh array on every render while the
+  // filter isn't in use.
+  const filteredActiveJobs = useMemo(() => filterTransferJobs(sortedActiveJobs, search), [sortedActiveJobs, search])
   const filterActive = search.trim() !== ''
-  const filterSummary = transferFilterSummary(filteredJobs.length, sortedJobs.length, search)
-  // The ids "Dismiss list" would act on -- every currently-filtered row that's actually
-  // dismissable (terminal). Also drives the button's own disabled/enabled + count reading below.
-  const filteredDismissableIds = useMemo(() => dismissableJobIds(filteredJobs), [filteredJobs])
+  const activeFilterSummary = transferFilterSummary(filteredActiveJobs.length, sortedActiveJobs.length, search)
+  const activePageCount = pageCount(filteredActiveJobs.length, ACTIVE_PAGE_SIZE)
+  const activePageJobs = useMemo(
+    () => paginateClientSide(filteredActiveJobs, activePage, ACTIVE_PAGE_SIZE),
+    [filteredActiveJobs, activePage],
+  )
+  // Reset to page 1 when the filter text changes (task's own instruction) -- keyed on `search`
+  // alone, never on `jobs` (which changes every ~2s poll tick regardless of the filter), so
+  // typing resets the page but a background refresh never does.
+  useEffect(() => {
+    setActivePage(1)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [search])
+  // Clamp rather than render an empty box (task's own instruction) -- the filter narrows (or
+  // jobs finish and leave the active set) while on a page that no longer exists.
+  useEffect(() => {
+    if (activePage > activePageCount) setActivePage(activePageCount)
+  }, [activePage, activePageCount])
+
+  // --- Complete box (2026-08-19, docs/transfers-redesign-spec.md §3.2, phase 1 stage 4b) --
+  // server-side paginated and filtered, 50/page, newest-finished first
+  // (`useCompleteJobs`/`GET /api/jobs/complete`). ------------------------------------------
+
+  const {
+    jobs: completeJobs,
+    total: completeTotal,
+    loading: completeLoading,
+    error: completeError,
+    refresh: refreshComplete,
+  } = useCompleteJobs(completePage, debouncedSearch)
+  const completeFilterActive = debouncedSearch.trim() !== ''
+  const completePageCount = pageCount(completeTotal, COMPLETE_PAGE_SIZE)
+  // Same reset-on-filter-change/clamp-on-narrow pair as the Active box above, keyed on the
+  // debounced filter text and the server-reported total respectively.
+  useEffect(() => {
+    setCompletePage(1)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [debouncedSearch])
+  useEffect(() => {
+    if (completePage > completePageCount) setCompletePage(completePageCount)
+  }, [completePage, completePageCount])
 
   // Queue position (2026-08-13, item 4): `jobs` (`useJobs`/`GET /api/jobs`) already comes back
   // in the real run order (`core/queue.py.list_jobs`'s `ORDER BY queue_position ASC, id ASC`,
   // 2026-08-19 -- was `rank DESC, queued_at ASC`) -- no new endpoint, just counting the
-  // `queued` rows in the order already returned.
-  // Running/failed/cancelled rows are in the same list (`list_jobs`'s own docstring) but never
-  // get a position: a running job isn't waiting, and a failed/cancelled one isn't in line at
-  // all.
+  // `queued` rows in the order already returned. Read off `jobs` (not `activeJobs`/`sortedActive
+  // Jobs`), same as before this task -- a queue position is about the real future run order and
+  // must stay correct regardless of how either box happens to be filtered/paginated for display.
+  // A Complete-box row's id is never a key in this map (it's never `queued`), so `Row`'s own
+  // `queuePosition` prop -- and therefore its chevrons -- naturally never render there, with no
+  // extra branching needed at either call site below.
   const queuePositions = useMemo(() => {
     const positions = new Map<number, number>()
     let n = 0
@@ -591,11 +745,22 @@ export function TransfersPage() {
   }, [jobs])
   const queuedCount = queuePositions.size
 
+  // Every row action refreshes both boxes, not just `jobs` (2026-08-19, phase 1 stage 4b) --
+  // a Retry on a Complete-box row, for instance, supersedes that item's old terminal job (so it
+  // must disappear from the Complete box) and creates a fresh `queued` one (so it must appear in
+  // the Active box); a Stop on an Active-box row lands it in `cancelled`, which the Complete box
+  // must then pick up. Cheaper than reasoning per-action about which one box could possibly be
+  // affected -- both fetches are already cheap, polled ones.
+  const refreshAll = () => {
+    refresh()
+    refreshComplete()
+  }
+
   const withBusy = async (jobId: number, action: () => Promise<unknown>) => {
     setBusyIds((prev) => new Set(prev).add(jobId))
     try {
       await action()
-      refresh()
+      refreshAll()
     } finally {
       setBusyIds((prev) => {
         const next = new Set(prev)
@@ -638,7 +803,7 @@ export function TransfersPage() {
     try {
       const res = await dismissAllJobs()
       setDismissAllCount(res.dismissed)
-      refresh()
+      refreshAll()
     } catch (err) {
       setDismissAllError(errorMessage(err))
     } finally {
@@ -647,26 +812,37 @@ export function TransfersPage() {
   }
 
   /** "Dismiss list" (2026-08-19, prompts/2026-08-19-transfers-name-filter.md) -- the name
-   * filter's own dedicated control, dismissing exactly the terminal rows the filter currently
-   * matches (`filteredDismissableIds`, `lib/transferPanel.ts.dismissableJobIds`) in **one**
-   * request (`dismissAllJobs(undefined, jobIds)` -> `core/queue.py.dismiss_all_terminal
-   * (job_ids=...)`), never a client-side loop over each row's own `/dismiss` call. A new,
-   * separate control -- not a re-scoping of "Clear all failed"/"Dismiss all" above, which keep
-   * their existing whole-list meaning untouched by this task. Supersedes the per-queue "Dismiss
-   * Queue" control (v0.2.3, `278e10f`), removed 2026-08-19 alongside grouping (docs/transfers-
-   * redesign-spec.md §3.1) -- filter to a queue, then this does the same job. No confirmation
-   * dialog: dismiss only ever sets `dismissed_at` on an already-terminal job row, never touches
-   * `item.state`, never deletes bytes, and never touches the remote.
+   * filter's own dedicated control. A new, separate control -- not a re-scoping of "Clear all
+   * failed"/"Dismiss all" above, which keep their existing whole-list meaning untouched by this
+   * task. Supersedes the per-queue "Dismiss Queue" control (v0.2.3, `278e10f`), removed
+   * 2026-08-19 alongside grouping (docs/transfers-redesign-spec.md §3.1) -- filter to a queue,
+   * then this does the same job. No confirmation dialog: dismiss only ever sets `dismissed_at`
+   * on an already-terminal job row, never touches `item.state`, never deletes bytes, and never
+   * touches the remote.
+   *
+   * **Re-scoped from an explicit id list to the filter text itself, 2026-08-19** (docs/
+   * transfers-redesign-spec.md §3.2, phase 1 stage 4b), the moment the Complete box became
+   * server-paginated: `filteredDismissableIds` (the old scope) only ever named the ids on the
+   * page currently loaded, which is not what this button promises once a filter can match more
+   * than one page's worth. `dismissAllJobs(undefined, undefined, debouncedSearch)` ->
+   * `core/queue.py.dismiss_all_terminal(name_filter=...)` dismisses every matching row
+   * server-side in one request, still never a client-side loop over each row's own `/dismiss`
+   * call. Uses `debouncedSearch`, not `search`, so this always dismisses exactly what the
+   * Complete box is currently showing (`completeTotal` is that same query's own matching
+   * count) -- never a half-typed filter the box hasn't caught up to yet.
    */
   const handleDismissList = async () => {
-    if (filteredDismissableIds.length === 0) return
+    if (!completeFilterActive || completeTotal === 0) return
     setDismissingList(true)
     setDismissListError(null)
     setDismissListCount(null)
     try {
-      const res = await dismissAllJobs(undefined, filteredDismissableIds)
+      // Trimmed, matching `useCompleteJobs`'s own trim before it reaches `getCompleteJobs` --
+      // otherwise a filter with incidental leading/trailing whitespace could dismiss a
+      // different set of rows than the Complete box is actually displaying.
+      const res = await dismissAllJobs(undefined, undefined, debouncedSearch.trim())
       setDismissListCount(res.dismissed)
-      refresh()
+      refreshAll()
     } catch (err) {
       setDismissListError(errorMessage(err))
     } finally {
@@ -698,22 +874,24 @@ export function TransfersPage() {
         else failures.push({ rel_path: job.rel_path, name: itemName(job.rel_path), error: errorMessage(result.reason) })
       })
       setDismissOutcome({ total: targets.length, succeeded, failures })
-      refresh()
+      refreshAll()
     } finally {
       setClearingAll(false)
     }
   }
 
-  // "Dismiss list"'s disabled/tooltip logic (2026-08-19) -- disabled while the filter is empty
-  // (nothing to scope it to), and disabled again once it's non-empty but matches no dismissable
-  // rows (every match is still running/queued) -- a live tooltip says which of the two it is, so
-  // a greyed-out button never reads as simply broken.
-  const dismissListDisabled = !filterActive || filteredDismissableIds.length === 0 || dismissingList
-  const dismissListTitle = !filterActive
+  // "Dismiss list"'s disabled/tooltip logic (2026-08-19) -- disabled while the (debounced)
+  // filter is empty (nothing to scope it to), and disabled again once it's non-empty but the
+  // Complete box's own query matched zero rows -- a live tooltip says which of the two it is, so
+  // a greyed-out button never reads as simply broken. Reads `completeTotal`, the exact count
+  // `core/queue.py.dismiss_all_terminal(name_filter=...)` would act on for this same text
+  // (`DismissAllRequest.name_filter`'s own docstring), not a client-side id count.
+  const dismissListDisabled = !completeFilterActive || completeTotal === 0 || dismissingList
+  const dismissListTitle = !completeFilterActive
     ? 'Type in the filter above to enable -- dismisses only the terminal rows it matches'
-    : filteredDismissableIds.length === 0
+    : completeTotal === 0
       ? "No dismissable rows match this filter -- everything matching is still queued or downloading"
-      : `Dismiss the ${filteredDismissableIds.length} matching row${filteredDismissableIds.length === 1 ? '' : 's'} that ${filteredDismissableIds.length === 1 ? 'is' : 'are'} finished -- records stay on the History page`
+      : `Dismiss the ${completeTotal} matching row${completeTotal === 1 ? '' : 's'} that ${completeTotal === 1 ? 'is' : 'are'} finished -- records stay on the History page`
 
   const drawerNodes = drawerJob ? (nodesByQueue.get(drawerJob.queue_id) ?? []) : []
 
@@ -741,10 +919,13 @@ export function TransfersPage() {
       )}
 
       {/* Name filter + "Dismiss list" (2026-08-19, prompts/2026-08-19-transfers-name-filter.md)
-       * -- start typing and only rows whose `rel_path` contains the text stay visible. "Dismiss
-       * list" is a separate control scoped to exactly what the filter currently matches --
-       * "Clear all failed"/"Dismiss all" below keep their existing whole-list meaning, untouched
-       * by this task, including while a filter is active. */}
+       * -- start typing and only rows whose `rel_path` contains the text stay visible: instantly
+       * in the Active/pending box below (client-side, bounded), after a short debounce in the
+       * Complete box (server-side, paginated -- `useCompleteJobs`). "Dismiss list" is a separate
+       * control scoped to exactly what the filter currently matches, server-side, across every
+       * page (2026-08-19, phase 1 stage 4b -- `handleDismissList`'s own docstring) -- "Clear all
+       * failed"/"Dismiss all" below keep their existing whole-list meaning, untouched by this
+       * task, including while a filter is active. */}
       <div className="flex flex-wrap items-center gap-2">
         <input
           type="text"
@@ -753,8 +934,8 @@ export function TransfersPage() {
           placeholder="Filter by name…"
           className="min-w-0 flex-1 rounded-md border border-zinc-300 px-2.5 py-1.5 text-sm text-zinc-900 placeholder:text-zinc-400 focus:border-indigo-400 focus:ring-1 focus:ring-indigo-400 focus:outline-none dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100 dark:placeholder:text-zinc-600"
         />
-        {filterSummary && (
-          <span className="shrink-0 text-xs text-zinc-500 dark:text-zinc-400">{filterSummary}</span>
+        {activeFilterSummary && (
+          <span className="shrink-0 text-xs text-zinc-500 dark:text-zinc-400">{activeFilterSummary}</span>
         )}
         <button
           type="button"
@@ -763,9 +944,7 @@ export function TransfersPage() {
           title={dismissListTitle}
           className="shrink-0 rounded-md border border-zinc-300 px-2.5 py-1.5 text-xs font-medium text-zinc-700 hover:bg-zinc-50 disabled:opacity-50 dark:border-zinc-700 dark:text-zinc-200 dark:hover:bg-zinc-900"
         >
-          {dismissingList
-            ? 'Dismissing…'
-            : `Dismiss list${filteredDismissableIds.length > 0 ? ` (${filteredDismissableIds.length})` : ''}`}
+          {dismissingList ? 'Dismissing…' : `Dismiss list${completeTotal > 0 ? ` (${completeTotal})` : ''}`}
         </button>
       </div>
 
@@ -845,18 +1024,23 @@ export function TransfersPage() {
         </div>
       )}
 
-      {jobs.length === 0 && (
+      {/* "Nothing queued or downloading" now reads off `activeJobs` (2026-08-19, phase 1 stage
+       * 4b), not `jobs` -- `jobs` still carries each item's most recent terminal job too
+       * (unchanged, docs/decisions.md), which would otherwise suppress this message the moment
+       * anything had ever finished, even with nothing currently active. */}
+      {activeJobs.length === 0 && (
         <div className="flex h-40 items-center justify-center rounded-lg border border-dashed border-zinc-300 text-zinc-400 dark:border-zinc-700 dark:text-zinc-600">
           Nothing queued or downloading — queue an item from Files.
         </div>
       )}
 
-      {/* The filter's own empty state (2026-08-19) -- distinct from the "nothing queued or
-       * downloading" state above: there *are* transfers, none of them just happen to match the
-       * filter text. */}
-      {jobs.length > 0 && filterActive && filteredJobs.length === 0 && (
+      {/* The filter's own empty state for the Active/pending box (2026-08-19) -- distinct from
+       * the "nothing queued or downloading" state above: there *are* active transfers, none of
+       * them just happen to match the filter text. The Complete box's own empty/no-match states
+       * render separately, inside that box below. */}
+      {activeJobs.length > 0 && filterActive && filteredActiveJobs.length === 0 && (
         <div className="flex h-40 flex-col items-center justify-center gap-2 rounded-lg border border-dashed border-zinc-300 text-zinc-400 dark:border-zinc-700 dark:text-zinc-600">
-          <span>No transfers match "{search.trim()}".</span>
+          <span>No active transfers match "{search.trim()}".</span>
           <button
             type="button"
             onClick={() => setSearch('')}
@@ -871,7 +1055,10 @@ export function TransfersPage() {
        * way to see the priority of the download queue" was the ask; the ordering already
        * existed (`rank DESC, queued_at ASC`) but nothing said so. Only shown once there's an
        * actual order to explain (2+ queued jobs) -- a single queued job's position is not
-       * interesting on its own. */}
+       * interesting on its own. Unaffected by the Active box's own client-side pagination
+       * (2026-08-19, phase 1 stage 4b) -- the chevrons still trade a job with its true neighbour
+       * in the global order even when that neighbour is a page away and not currently on screen.
+       */}
       {queuedCount > 1 && (
         <p className="text-xs text-zinc-500 dark:text-zinc-400">
           Queued jobs run in the order shown, top to bottom — use each row's{' '}
@@ -931,38 +1118,117 @@ export function TransfersPage() {
         </div>
       )}
 
-      {/* One globally-ordered list, no per-queue grouping (2026-08-19, docs/transfers-redesign-
-       * spec.md §3.1, phase 1 stage 4a). `core/scheduler.py` has zero references to `queue_id` --
-       * admission is one global line -- so grouping by queue visually implied each queue had its
-       * own line and its own ordering, which was false. It also fixes a stage-2 oddity: the ▲/▼
-       * chevrons already moved a job in the *global* order, so with grouping still in place they
-       * could appear to swap a job with something in a different group; now the row directly
-       * above is always the one being traded with. `Row`'s own queue badge (`queueDisplayName`)
-       * and fast-lane marker (`isFastLane`) replace the group header's queue name -- the name
-       * filter (2026-08-19, `e0befc5`) is what makes that safe to drop (see docs/decisions.md
-       * for the reversal). */}
-      {jobs.length > 0 && filteredJobs.length > 0 && (
-        <div className="overflow-hidden rounded-md border border-zinc-200 dark:border-zinc-800">
-          {filteredJobs.map((job) => (
-            <Row
-              key={job.id}
-              job={job}
-              nodes={nodesByQueue.get(job.queue_id) ?? []}
-              live={progressByJobId[job.id]}
-              queuePosition={queuePositions.get(job.id)}
-              queuedCount={queuedCount}
-              maxBandwidthBps={maxBandwidthBps}
-              onOpenDrawer={setDrawerJob}
-              onMove={handleMove}
-              onStartNow={handleStartNow}
-              onStop={handleStop}
-              onRetry={handleRetry}
-              onDismiss={handleDismiss}
-              busy={busyIds.has(job.id)}
-            />
-          ))}
+      {/* Two paginated boxes, no per-queue grouping (2026-08-19, docs/transfers-redesign-
+       * spec.md §3.1/§3.2, phase 1 stages 4a/4b). `core/scheduler.py` has zero references to
+       * `queue_id` -- admission is one global line -- so grouping by queue visually implied each
+       * queue had its own line and its own ordering, which was false. `Row`'s own queue badge
+       * (`queueDisplayName`) and fast-lane marker (`isFastLane`) replace the group header's
+       * queue name -- the name filter is what makes that safe to drop (docs/decisions.md).
+       *
+       * **Active / pending** -- client-side paginated (20/page): the ▲/▼ chevrons still always
+       * move a job in the *global* order, matching the caption above; within one page the row
+       * directly above is the one being traded with, same as the flat stage-4a list, though a
+       * move across a page boundary trades with a neighbour not currently on screen (an accepted
+       * consequence of paginating this box, not a bug).
+       *
+       * **Complete** -- server-side paginated (50/page), newest-finished first
+       * (`useCompleteJobs`/`GET /api/jobs/complete`). Rows shifting between pages as more work
+       * finishes is accepted and explicitly not a problem to solve (the spec's own words, same
+       * as SAB). `Row` itself needed no changes for this box: a terminal job's id is never a key
+       * in `queuePositions`, so its chevrons/Start-now/Stop simply don't render, the same
+       * `job.state === 'queued'`/`'running'` guards `Row` already had. */}
+      {activePageJobs.length > 0 && (
+        <div className="flex flex-col gap-2">
+          <h2 className="text-xs font-semibold tracking-wide text-zinc-500 uppercase dark:text-zinc-400">
+            Active / pending
+          </h2>
+          <div className="overflow-hidden rounded-md border border-zinc-200 dark:border-zinc-800">
+            {activePageJobs.map((job) => (
+              <Row
+                key={job.id}
+                job={job}
+                nodes={nodesByQueue.get(job.queue_id) ?? []}
+                live={progressByJobId[job.id]}
+                queuePosition={queuePositions.get(job.id)}
+                queuedCount={queuedCount}
+                maxBandwidthBps={maxBandwidthBps}
+                onOpenDrawer={setDrawerJob}
+                onMove={handleMove}
+                onStartNow={handleStartNow}
+                onStop={handleStop}
+                onRetry={handleRetry}
+                onDismiss={handleDismiss}
+                busy={busyIds.has(job.id)}
+              />
+            ))}
+          </div>
+          <div className="flex items-center justify-end">
+            <Pager current={activePage} count={activePageCount} onChange={setActivePage} />
+          </div>
         </div>
       )}
+
+      <div className="flex flex-col gap-2">
+        <h2 className="text-xs font-semibold tracking-wide text-zinc-500 uppercase dark:text-zinc-400">
+          Complete
+        </h2>
+
+        {completeError && (
+          <div className="flex items-center justify-between gap-3 rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-900 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-200">
+            <span>Couldn't load completed transfers: {completeError}</span>
+          </div>
+        )}
+
+        {!completeLoading && completeJobs.length === 0 && (
+          <div className="flex h-40 flex-col items-center justify-center gap-2 rounded-lg border border-dashed border-zinc-300 text-zinc-400 dark:border-zinc-700 dark:text-zinc-600">
+            {completeFilterActive ? (
+              <>
+                <span>No completed transfers match "{debouncedSearch.trim()}".</span>
+                <button
+                  type="button"
+                  onClick={() => setSearch('')}
+                  className="text-xs text-zinc-500 underline decoration-dotted hover:text-zinc-700 dark:text-zinc-400 dark:hover:text-zinc-200"
+                >
+                  Clear filter
+                </button>
+              </>
+            ) : (
+              <span>Nothing finished yet.</span>
+            )}
+          </div>
+        )}
+
+        {completeJobs.length > 0 && (
+          <div className="overflow-hidden rounded-md border border-zinc-200 dark:border-zinc-800">
+            {completeJobs.map((job) => (
+              <Row
+                key={job.id}
+                job={job}
+                nodes={nodesByQueue.get(job.queue_id) ?? []}
+                live={progressByJobId[job.id]}
+                queuePosition={queuePositions.get(job.id)}
+                queuedCount={queuedCount}
+                maxBandwidthBps={maxBandwidthBps}
+                onOpenDrawer={setDrawerJob}
+                onMove={handleMove}
+                onStartNow={handleStartNow}
+                onStop={handleStop}
+                onRetry={handleRetry}
+                onDismiss={handleDismiss}
+                busy={busyIds.has(job.id)}
+              />
+            ))}
+          </div>
+        )}
+
+        <div className="flex items-center justify-between gap-2">
+          <span className="text-xs text-zinc-500 dark:text-zinc-400">
+            {completeTotal > 0 &&
+              `Page ${completePage} of ${completePageCount} (${completeTotal} total)`}
+          </span>
+          <Pager current={completePage} count={completePageCount} onChange={setCompletePage} />
+        </div>
+      </div>
 
       {drawerJob && (
         <ItemDrawer

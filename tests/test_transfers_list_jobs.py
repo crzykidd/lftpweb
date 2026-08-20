@@ -76,6 +76,11 @@ def _queue(db) -> TransferQueue:
     return TransferQueue(db, "/config", EventBus())
 
 
+async def _set_finished_at(db, job_id: int, finished_at: str) -> None:
+    await db.execute("UPDATE job SET finished_at = ? WHERE id = ?", (finished_at, job_id))
+    await db.commit()
+
+
 async def test_list_jobs_includes_queued_and_running(db):
     queue_id = await _make_queue(db)
     item1 = await _make_item(db, queue_id, "a.txt")
@@ -762,3 +767,347 @@ async def test_retry_after_dismiss_produces_a_fresh_job_visible_again(db):
     ).fetchone()
     assert item_row["auto_queue_suppressed"] == 0
     assert item_row["suppressed_reason"] is None
+
+
+# --- list_complete_jobs: the Queue tab's Complete box (2026-08-19,
+# docs/transfers-redesign-spec.md §3.2, phase 1 stage 4b, prompts/2026-08-19-transfers-
+# paginated-boxes.md) -- terminal jobs, server-side paginated and filtered. ------------------
+
+
+async def test_list_complete_jobs_excludes_active_jobs(db):
+    queue_id = await _make_queue(db)
+    queued_item = await _make_item(db, queue_id, "a.txt", state="QUEUED")
+    await _make_job(db, queued_item, state="queued")
+    running_item = await _make_item(db, queue_id, "b.txt", state="DOWNLOADING")
+    await _make_job(db, running_item, state="running")
+    failed_item = await _make_item(db, queue_id, "c.txt", state="FAILED")
+    await _make_job(db, failed_item, state="failed")
+
+    rows, total = await _queue(db).list_complete_jobs(limit=50, offset=0)
+    assert total == 1
+    assert [r["rel_path"] for r in rows] == ["c.txt"]
+
+
+async def test_list_complete_jobs_excludes_dismissed_rows(db):
+    queue_id = await _make_queue(db)
+    item = await _make_item(db, queue_id, "gone.txt", state="FAILED")
+    job_id = await _make_job(db, item, state="failed")
+    q = _queue(db)
+    await q.dismiss_job(job_id)
+
+    rows, total = await q.list_complete_jobs(limit=50, offset=0)
+    assert total == 0
+    assert rows == []
+
+
+async def test_list_complete_jobs_excludes_superseded_terminal_job_after_retry(db):
+    """Same `MAX(id)`-per-item rule `list_jobs()` uses for its own terminal rows -- an item
+    that's been retried since its last terminal job must not show its old, superseded attempt
+    here, so a row is never visible in both the Active/pending box and this one at once.
+    """
+    queue_id = await _make_queue(db)
+    item = await _make_item(db, queue_id, "retried.txt", state="QUEUED")
+    await _make_job(db, item, state="failed", attempt=1)
+    await _make_job(db, item, state="queued", attempt=2)
+
+    rows, total = await _queue(db).list_complete_jobs(limit=50, offset=0)
+    assert total == 0
+    assert rows == []
+
+
+async def test_list_complete_jobs_orders_newest_finished_first(db):
+    queue_id = await _make_queue(db)
+    older_item = await _make_item(db, queue_id, "older.txt", state="FAILED")
+    older_job = await _make_job(db, older_item, state="failed")
+    await _set_finished_at(db, older_job, "2026-08-19T01:00:00.000000Z")
+    newer_item = await _make_item(db, queue_id, "newer.txt", state="DOWNLOADED")
+    newer_job = await _make_job(db, newer_item, state="succeeded")
+    await _set_finished_at(db, newer_job, "2026-08-19T02:00:00.000000Z")
+
+    rows, total = await _queue(db).list_complete_jobs(limit=50, offset=0)
+    assert total == 2
+    assert [r["rel_path"] for r in rows] == ["newer.txt", "older.txt"]
+
+
+async def test_list_complete_jobs_paginates(db):
+    queue_id = await _make_queue(db)
+    for i in range(5):
+        item = await _make_item(db, queue_id, f"item-{i}.txt", state="FAILED")
+        job_id = await _make_job(db, item, state="failed")
+        await _set_finished_at(db, job_id, f"2026-08-19T0{i}:00:00.000000Z")
+
+    q = _queue(db)
+    page1, total1 = await q.list_complete_jobs(limit=2, offset=0)
+    page2, total2 = await q.list_complete_jobs(limit=2, offset=2)
+    page3, total3 = await q.list_complete_jobs(limit=2, offset=4)
+    assert total1 == total2 == total3 == 5
+    # Newest (item-4) first, oldest (item-0) last -- three pages of 2/2/1, no overlap.
+    assert [r["rel_path"] for r in page1] == ["item-4.txt", "item-3.txt"]
+    assert [r["rel_path"] for r in page2] == ["item-2.txt", "item-1.txt"]
+    assert [r["rel_path"] for r in page3] == ["item-0.txt"]
+
+
+async def test_list_complete_jobs_name_filter_matches_case_insensitive_substring(db):
+    queue_id = await _make_queue(db)
+    matching = await _make_item(db, queue_id, "Married.At.First.Sight.S12E15", state="FAILED")
+    await _make_job(db, matching, state="failed")
+    other = await _make_item(db, queue_id, "other-release", state="FAILED")
+    await _make_job(db, other, state="failed")
+
+    rows, total = await _queue(db).list_complete_jobs(limit=50, offset=0, name_filter="married")
+    assert total == 1
+    assert rows[0]["rel_path"] == "Married.At.First.Sight.S12E15"
+
+
+async def test_list_complete_jobs_name_filter_empty_string_matches_everything(db):
+    queue_id = await _make_queue(db)
+    item = await _make_item(db, queue_id, "a.txt", state="FAILED")
+    await _make_job(db, item, state="failed")
+
+    rows, total = await _queue(db).list_complete_jobs(limit=50, offset=0, name_filter="")
+    assert total == 1
+    assert rows[0]["rel_path"] == "a.txt"
+
+
+async def test_list_complete_jobs_name_filter_no_match_returns_empty(db):
+    queue_id = await _make_queue(db)
+    item = await _make_item(db, queue_id, "a.txt", state="FAILED")
+    await _make_job(db, item, state="failed")
+
+    rows, total = await _queue(db).list_complete_jobs(
+        limit=50, offset=0, name_filter="zzz-no-such-release"
+    )
+    assert total == 0
+    assert rows == []
+
+
+# --- GET /api/jobs/complete: the route-level wiring ------------------------------------------
+
+
+async def test_list_complete_jobs_endpoint_paginates_and_reports_total(db):
+    queue_id = await _make_queue(db)
+    for i in range(3):
+        item = await _make_item(db, queue_id, f"item-{i}.txt", state="FAILED")
+        job_id = await _make_job(db, item, state="failed")
+        await _set_finished_at(db, job_id, f"2026-08-19T0{i}:00:00.000000Z")
+
+    q = _queue(db)
+    result = await jobs.list_complete_jobs(_FakeQueueRequest(q), limit=2, offset=0)
+    assert result.total == 3
+    assert result.limit == 2
+    assert result.offset == 0
+    assert [j.rel_path for j in result.jobs] == ["item-2.txt", "item-1.txt"]
+
+
+async def test_list_complete_jobs_endpoint_never_inlines_output_tail(db):
+    """The phase-6 unbounded-list trap `api/history.py`'s own docstring names -- this endpoint
+    is paginated but unbounded in total row count, so `output_tail` (~4KB/row) must never ride
+    along inline; `has_output_tail` is the on-demand-fetch signal instead.
+    """
+    queue_id = await _make_queue(db)
+    item = await _make_item(db, queue_id, "failed.txt", state="FAILED")
+    job_id = await _make_job(db, item, state="failed")
+    await db.execute(
+        "UPDATE job SET output_tail = 'some captured lftp output' WHERE id = ?", (job_id,)
+    )
+    await db.commit()
+
+    q = _queue(db)
+    result = await jobs.list_complete_jobs(_FakeQueueRequest(q))
+    assert len(result.jobs) == 1
+    assert result.jobs[0].output_tail is None
+    assert result.jobs[0].has_output_tail is True
+
+
+# --- _job_out(include_output_tail=...) --------------------------------------------------------
+
+
+def test_job_out_default_inlines_output_tail_and_reports_has_output_tail():
+    out = _job_out(_job_out_row(output_tail="some captured output"))
+    assert out.output_tail == "some captured output"
+    assert out.has_output_tail is True
+
+
+def test_job_out_include_output_tail_false_omits_blob_but_still_reports_has_output_tail():
+    out = _job_out(_job_out_row(output_tail="some captured output"), include_output_tail=False)
+    assert out.output_tail is None
+    assert out.has_output_tail is True
+
+
+def test_job_out_has_output_tail_false_when_none_captured():
+    out = _job_out(_job_out_row(output_tail=None))
+    assert out.output_tail is None
+    assert out.has_output_tail is False
+
+
+# --- dismiss_all_terminal(name_filter=...): "Dismiss list" over the paginated Complete box
+# (2026-08-19, docs/transfers-redesign-spec.md §3.2, phase 1 stage 4b,
+# prompts/2026-08-19-transfers-paginated-boxes.md) --------------------------------------------
+
+
+async def test_dismiss_all_terminal_name_filter_dismisses_only_matching_rows(db):
+    queue_id = await _make_queue(db)
+    matching = await _make_item(db, queue_id, "Married.At.First.Sight", state="FAILED")
+    matching_job = await _make_job(db, matching, state="failed")
+    other = await _make_item(db, queue_id, "unrelated-release", state="FAILED")
+    other_job = await _make_job(db, other, state="failed")
+
+    q = _queue(db)
+    dismissed = await q.dismiss_all_terminal(name_filter="married")
+    assert dismissed == 1
+
+    matching_row = await (
+        await db.execute("SELECT dismissed_at FROM job WHERE id = ?", (matching_job,))
+    ).fetchone()
+    other_row = await (
+        await db.execute("SELECT dismissed_at FROM job WHERE id = ?", (other_job,))
+    ).fetchone()
+    assert matching_row["dismissed_at"] is not None
+    assert other_row["dismissed_at"] is None
+
+
+async def test_dismiss_all_terminal_name_filter_acts_on_every_match_not_just_one_page(db):
+    """The whole point of moving "Dismiss list" onto a server-side filter (task's own framing):
+    a filter can match more rows than fit on one Complete-box page (50/page). This seeds more
+    than one page's worth of matching rows and asserts every one of them is dismissed in the
+    single bulk call, not just a page's worth.
+    """
+    queue_id = await _make_queue(db)
+    job_ids = []
+    for i in range(60):
+        item = await _make_item(db, queue_id, f"match-release-{i}", state="FAILED")
+        job_ids.append(await _make_job(db, item, state="failed"))
+    # One deliberately non-matching row, to prove the filter is actually selective.
+    other = await _make_item(db, queue_id, "totally-different", state="FAILED")
+    other_job = await _make_job(db, other, state="failed")
+
+    q = _queue(db)
+    dismissed = await q.dismiss_all_terminal(name_filter="match-release")
+    assert dismissed == 60
+
+    for job_id in job_ids:
+        row = await (
+            await db.execute("SELECT dismissed_at FROM job WHERE id = ?", (job_id,))
+        ).fetchone()
+        assert row["dismissed_at"] is not None
+    other_row = await (
+        await db.execute("SELECT dismissed_at FROM job WHERE id = ?", (other_job,))
+    ).fetchone()
+    assert other_row["dismissed_at"] is None
+
+
+async def test_dismiss_all_terminal_name_filter_no_match_dismisses_nothing_not_everything(db):
+    """The load-bearing guarantee this task calls out explicitly: an empty *result* (the filter
+    text matches zero dismissable rows) must dismiss nothing -- it must never degrade into "no
+    filter was effectively applied, so dismiss everything." Seeds several real dismissable rows
+    so a bug that silently dropped the filter clause would be caught dismissing them.
+    """
+    queue_id = await _make_queue(db)
+    for i in range(3):
+        item = await _make_item(db, queue_id, f"real-release-{i}", state="FAILED")
+        await _make_job(db, item, state="failed")
+
+    q = _queue(db)
+    dismissed = await q.dismiss_all_terminal(name_filter="zzz-nothing-matches-this")
+    assert dismissed == 0
+
+    rows = await (await db.execute("SELECT dismissed_at FROM job")).fetchall()
+    assert all(r["dismissed_at"] is None for r in rows)
+
+
+async def test_dismiss_all_terminal_name_filter_never_touches_an_active_job(db):
+    queue_id = await _make_queue(db)
+    queued_item = await _make_item(db, queue_id, "queued-release", state="QUEUED")
+    queued_job = await _make_job(db, queued_item, state="queued")
+
+    q = _queue(db)
+    dismissed = await q.dismiss_all_terminal(name_filter="queued")
+    assert dismissed == 0
+
+    row = await (
+        await db.execute("SELECT dismissed_at FROM job WHERE id = ?", (queued_job,))
+    ).fetchone()
+    assert row["dismissed_at"] is None
+
+
+async def test_dismiss_all_terminal_name_filter_matches_the_same_predicate_as_the_listing(db):
+    """`dismiss_all_terminal`'s `name_filter` branch deliberately re-adds the `MAX(id)`-per-item
+    restriction `list_complete_jobs` filters its own listing on -- so a superseded terminal
+    attempt (an item that's been retried and is active again) is never swept up by a filter
+    dismiss just because its old, no-longer-visible row happens to match the text. Without that
+    restriction this would dismiss the stale row too, since the plain terminal-state guard alone
+    doesn't know about superseding.
+    """
+    queue_id = await _make_queue(db)
+    item = await _make_item(db, queue_id, "retried-release", state="QUEUED")
+    old_failed = await _make_job(db, item, state="failed", attempt=1)
+    await _make_job(db, item, state="queued", attempt=2)
+
+    q = _queue(db)
+    dismissed = await q.dismiss_all_terminal(name_filter="retried")
+    assert dismissed == 0
+
+    row = await (
+        await db.execute("SELECT dismissed_at FROM job WHERE id = ?", (old_failed,))
+    ).fetchone()
+    assert row["dismissed_at"] is None
+
+
+async def test_dismiss_all_terminal_name_filter_count_matches_list_complete_jobs_total(db):
+    """The property `DismissAllRequest.name_filter`'s own docstring promises: for the same
+    filter text, `dismiss_all_terminal`'s dismissed count and `list_complete_jobs`'s `total`
+    always agree, since both are built from the identical predicate.
+    """
+    queue_id = await _make_queue(db)
+    for i in range(4):
+        item = await _make_item(db, queue_id, f"agreement-release-{i}", state="FAILED")
+        await _make_job(db, item, state="failed")
+    # A superseded row matching the same text -- must be excluded from both sides identically.
+    superseded_item = await _make_item(db, queue_id, "agreement-release-retried", state="QUEUED")
+    await _make_job(db, superseded_item, state="failed", attempt=1)
+    await _make_job(db, superseded_item, state="queued", attempt=2)
+
+    q = _queue(db)
+    _, total = await q.list_complete_jobs(limit=50, offset=0, name_filter="agreement-release")
+    dismissed = await q.dismiss_all_terminal(name_filter="agreement-release")
+    assert dismissed == total == 4
+
+
+async def test_dismiss_all_request_rejects_name_filter_with_job_ids():
+    with pytest.raises(pydantic.ValidationError, match="mutually exclusive"):
+        DismissAllRequest(name_filter="x", job_ids=[1])
+
+
+async def test_dismiss_all_request_rejects_name_filter_with_queue_id():
+    with pytest.raises(pydantic.ValidationError, match="mutually exclusive"):
+        DismissAllRequest(name_filter="x", queue_id=1)
+
+
+async def test_dismiss_all_request_name_filter_alone_is_valid():
+    req = DismissAllRequest(name_filter="married")
+    assert req.name_filter == "married"
+    assert req.job_ids is None
+    assert req.queue_id is None
+
+
+async def test_dismiss_all_jobs_endpoint_threads_name_filter_through_to_the_queue(db):
+    queue_id = await _make_queue(db)
+    matching = await _make_item(db, queue_id, "married-release", state="FAILED")
+    matching_job = await _make_job(db, matching, state="failed")
+    other = await _make_item(db, queue_id, "other-release", state="FAILED")
+    other_job = await _make_job(db, other, state="failed")
+
+    q = _queue(db)
+    result = await jobs.dismiss_all_jobs(
+        _FakeQueueRequest(q), DismissAllRequest(name_filter="married")
+    )
+    assert result.dismissed == 1
+
+    matching_row = await (
+        await db.execute("SELECT dismissed_at FROM job WHERE id = ?", (matching_job,))
+    ).fetchone()
+    other_row = await (
+        await db.execute("SELECT dismissed_at FROM job WHERE id = ?", (other_job,))
+    ).fetchone()
+    assert matching_row["dismissed_at"] is not None
+    assert other_row["dismissed_at"] is None

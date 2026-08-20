@@ -16,6 +16,7 @@ import type {
   BackupListResponse,
   BackupSettingsIn,
   BackupSettingsOut,
+  CompleteJobsResponse,
   DeleteItemResponse,
   DismissAllResponse,
   DownloadPrefixSettingsIn,
@@ -296,6 +297,27 @@ export function getJobs(): Promise<JobsResponse> {
   return getJson<JobsResponse>('/api/jobs')
 }
 
+/** The Queue tab's Complete box (2026-08-19, docs/transfers-redesign-spec.md §3.2, phase 1
+ * stage 4b) -- `getJobs` above stays the Active/pending box's own bounded fetch, unchanged;
+ * terminal jobs live here now, server-side paginated and (optionally) filtered. Same
+ * `queryString` helper `getHistoryJobs` already uses below, for the same reason: an
+ * `undefined` field is simply omitted from the query string rather than sent as the literal
+ * string `"undefined"`.
+ */
+export function getCompleteJobs(params: {
+  nameFilter?: string
+  limit?: number
+  offset?: number
+}): Promise<CompleteJobsResponse> {
+  return getJson<CompleteJobsResponse>(
+    `/api/jobs/complete${queryString({
+      name_filter: params.nameFilter,
+      limit: params.limit,
+      offset: params.offset,
+    })}`,
+  )
+}
+
 /** Manual queue (§4.7): always wins over auto-queue suppression. `startNow` requests the
  * "start now at max bandwidth" admission path (§4.5) at the moment of queueing.
  */
@@ -345,20 +367,41 @@ export function dismissJob(jobId: number): Promise<void> {
  * prompts/2026-08-17-transfers-dismiss-per-queue.md) scopes the same bulk call to one queue's
  * own terminal jobs. Omitted (the pre-existing call every caller before this task still makes)
  * sends no body at all -- byte-for-byte the original request -- matching
- * `api/jobs.py.dismiss_all_jobs`'s own "omitted body means every queue" contract.
+ * `api/jobs.py.dismiss_all_jobs`'s own "omitted body means every queue" contract. No caller in
+ * this app passes it any more (the per-queue "Dismiss Queue" control it served was removed
+ * 2026-08-19 alongside grouping, docs/transfers-redesign-spec.md §3.1) -- kept on the client
+ * exactly because the server-side scope (`DismissAllRequest.queue_id`) is kept too, per the
+ * same task's own instruction not to remove it.
  *
- * `jobIds` (2026-08-19, the name filter's own "Dismiss list" button,
- * prompts/2026-08-19-transfers-name-filter.md) scopes the same bulk call to an explicit set of
- * job ids instead -- one request carrying `lib/transferPanel.ts.dismissableJobIds`'s own output,
- * never a client-side loop over `dismissJob`. Mutually exclusive with `queueId` (`models.py.
- * DismissAllRequest`'s own validator rejects a request naming both); no caller in this app
- * passes both. Threaded the same "omitted means not sent" way `queueId` already is, not a
- * second function -- both scopes are optional narrowings of the same one bulk call.
+ * `jobIds` (2026-08-19, prompts/2026-08-19-transfers-name-filter.md) scopes the same bulk call
+ * to an explicit set of job ids -- kept on both the client and server for the identical reason
+ * `queueId` is (`DismissAllRequest.job_ids`'s own docstring). No caller in this app passes it
+ * either as of phase 1 stage 4b: "Dismiss list" now uses `nameFilter` below instead, since the
+ * Complete box it scopes is server-paginated and an explicit id list can only ever name one
+ * page's worth (`nameFilter`'s own comment).
+ *
+ * `nameFilter` (2026-08-19, docs/transfers-redesign-spec.md §3.2, phase 1 stage 4b) --
+ * "Dismiss list"'s own scope now that the Complete box is server-paginated: the same filter
+ * text the box's own `getCompleteJobs` call is showing, so the server dismisses every matching
+ * row, not just the current page (`models.py.DismissAllRequest.name_filter`'s own docstring has
+ * the full reasoning). An empty string is a real, sendable value (`nameFilter === ''` would
+ * mean "matches every row"), so this only omits the field when `nameFilter` is `undefined` --
+ * `!= null`, not truthiness.
+ *
+ * All three scopes are mutually exclusive (`DismissAllRequest`'s own validator rejects a
+ * request naming more than one); no caller in this app passes more than one. Threaded the same
+ * "omitted means not sent" way every scope on this call already is, not three functions --
+ * they're all optional narrowings of the same one bulk call.
  */
-export function dismissAllJobs(queueId?: number, jobIds?: number[]): Promise<DismissAllResponse> {
-  const body: { queue_id?: number; job_ids?: number[] } = {}
+export function dismissAllJobs(
+  queueId?: number,
+  jobIds?: number[],
+  nameFilter?: string,
+): Promise<DismissAllResponse> {
+  const body: { queue_id?: number; job_ids?: number[]; name_filter?: string } = {}
   if (queueId != null) body.queue_id = queueId
   if (jobIds != null) body.job_ids = jobIds
+  if (nameFilter != null) body.name_filter = nameFilter
   return sendJson<DismissAllResponse>(
     '/api/jobs/dismiss-all',
     'POST',

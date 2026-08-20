@@ -57,6 +57,17 @@ Skeleton for the next roll:
   Queue** button (v0.2.3) is **superseded, not merely deleted** — the name filter plus
   **Dismiss list** does the same job: filter to a queue, dismiss the list. This reverses the
   2026-08-16 "group rows by queue" decision; see `docs/decisions.md` for why.
+- **The Transfers page splits into two paginated boxes** (`docs/transfers-redesign-spec.md`
+  §3.2, phase 1 stage 4b): **Active / pending** (queued/running, 20/page, client-side — the set
+  is bounded and already loaded) and **Complete** (finished, 50/page, newest-finished first,
+  **server-side** via the new `GET /api/jobs/complete`), numbered pages, SAB-style. Rows shifting
+  between pages as work completes is expected, not a bug. The name filter now runs server-side
+  for the Complete box (it can no longer see everything client-side once it's paginated), and
+  **Dismiss list** carries that same filter text to the server (`dismiss_all_terminal`'s new
+  `name_filter` scope) so it dismisses every matching row across every page, not just the one
+  currently on screen — the id-list scope it used before this change could only ever name a
+  single page's worth. An empty filter result still dismisses nothing, never everything, the
+  same guarantee the id-list scope already gave.
 
 ### Changed
 

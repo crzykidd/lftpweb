@@ -303,8 +303,7 @@ export function hasArrGroup(job: JobOut): boolean {
  * Lives here, not in `TransfersPage.tsx` (where it shipped 2026-08-13), since 2026-08-17
  * (prompts/2026-08-17-transfers-dismiss-per-queue.md) -- originally so the (now-removed,
  * 2026-08-19) group header's own "Dismiss Queue" control could reuse it without `lib/` importing
- * from `pages/`; `dismissableJobIds` below is the same reasoning applied to "Dismiss list."
- * `TransfersPage.tsx` re-exports this name so its own existing import (and
+ * from `pages/`. `TransfersPage.tsx` re-exports this name so its own existing import (and
  * `TransfersPage.test.ts`'s) keeps working unchanged.
  */
 export function isDismissable(state: JobOut['state']): boolean {
@@ -356,17 +355,28 @@ export function isFastLane(job: JobOut): boolean {
 export const FAST_LANE_HINT =
   'Small file -- transfers on its own lane and may start before higher-numbered items'
 
-// --- Name filter + "Dismiss list" (2026-08-19, prompts/2026-08-19-transfers-name-filter.md):
-// a busy install's Transfers page has no way to narrow a long list. Pure logic only, same
-// discipline this whole file already follows -- `TransfersPage.tsx` applies this before
-// rendering the flat, globally-ordered list. -----------------------------------------------
+// --- Name filter (2026-08-19, prompts/2026-08-19-transfers-name-filter.md): a busy install's
+// Transfers page has no way to narrow a long list. Pure logic only, same discipline this whole
+// file already follows. -----------------------------------------------------------------------
+//
+// **Split into a client-side half and a server-side half 2026-08-19** (docs/transfers-redesign-
+// spec.md §3.2, phase 1 stage 4b, prompts/2026-08-19-transfers-paginated-boxes.md), when the
+// Queue tab split into two paginated boxes: `filterTransferJobs` below still runs client-side
+// over the Active/pending box (bounded, already fully loaded), but the Complete box is now
+// server-paginated, so its own filtering happens in SQL (`core/queue.py.list_complete_jobs`'s
+// `name_filter`, same substring semantics) and its own "Dismiss list" carries that filter text
+// straight through (`DismissAllRequest.name_filter`) rather than an explicit id list -- a
+// filter can match more rows than fit on one page, so an id list can only ever say "this page",
+// not "everything the filter matches". `dismissableJobIds` (the old id-list helper "Dismiss
+// list" used before this task) is gone with it -- nothing calls it any more.
 
 /** Case-insensitive substring filter over `rel_path` only -- **not** `queue_name` too, since a
  * queue named e.g. "movies" would otherwise make every row in it match the word "movies", which
  * is not what a name filter means. `JobOut` has no separate `name` field; `rel_path` is the
  * item's path within the queue and already contains the name, so a substring match over it
  * covers both a bare name and a nested one (`at.first.sight` matches literally, same as any
- * other substring -- no glob/regex parsing).
+ * other substring -- no glob/regex parsing). The server-side half of this same contract
+ * (`core/queue.py.list_complete_jobs`'s `name_filter`) mirrors it exactly for the Complete box.
  *
  * An empty/whitespace-only `search` returns `jobs` **unchanged and by identity**, not a copy --
  * same "don't churn a downstream `useMemo` for a no-op filter" reasoning `FileTree.tsx`'s own
@@ -377,17 +387,6 @@ export function filterTransferJobs(jobs: JobOut[], search: string): JobOut[] {
   const needle = search.trim().toLowerCase()
   if (!needle) return jobs
   return jobs.filter((job) => job.rel_path.toLowerCase().includes(needle))
-}
-
-/** The "Dismiss list" button's own id list (2026-08-19) -- every id in `jobs` that
- * `isDismissable` allows, reusing that exact predicate rather than re-deriving the terminal-
- * state set a third time. Callers pass this straight to `dismissAllJobs`'s `job_ids` param
- * (`api/client.ts`) as **one** request -- `core/queue.py.dismiss_all_terminal`'s own docstring
- * is explicit that this is a single server-side `UPDATE`, never a client-side loop over every
- * dismissable row's own `/dismiss` call.
- */
-export function dismissableJobIds(jobs: JobOut[]): number[] {
-  return jobs.filter((job) => isDismissable(job.state)).map((job) => job.id)
 }
 
 /** The name filter's own "showing N of M" readout, alongside the input. Same shape as the Logs

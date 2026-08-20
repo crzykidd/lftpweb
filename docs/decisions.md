@@ -6,6 +6,53 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-19 — Transfers page: two paginated boxes, `list_jobs()` kept unchanged, "Dismiss list"
+re-scoped to a server-side filter
+
+`prompts/done/2026-08-19-transfers-paginated-boxes.md`, phase 1 stage 4b of
+`docs/transfers-redesign-spec.md` §3.2, building on stage 4a below.
+
+**`core/queue.py.list_jobs()` was kept unchanged rather than narrowed to `queued`/`running`
+only.** The task explicitly asked for a decision here and to check every caller first. Found
+three: `GET /api/jobs` (the route this task narrows the *rendering* of, not the endpoint itself),
+`queue_item`, and `retry_item` — the latter two only ever look up the row for the job id they
+just created, which is always `queued`, so narrowing `list_jobs()` would not have broken either.
+Kept it anyway: DESIGN.md §9.2 requires a failed row's error class/output tail to stay reachable
+from the same place a `queued`/`running` row is, other future callers may reasonably want "the
+row set Transfers considers current" without re-deriving the terminal-superseding `MAX(id)` rule,
+and narrowing a widely-named method the same session a new paginated endpoint is landing is
+exactly the kind of two-things-at-once change this codebase's own standards ask sessions to
+avoid. The new `TransferQueue.list_complete_jobs()` duplicates `list_jobs()`'s join shape and its
+`MAX(id)`-per-item rule rather than building on top of it, since the two now differ in what they
+paginate/filter and in never inlining `output_tail`. The consequence named openly: `GET /api/jobs`
+is not itself newly bounded by this task — a very long-lived, never-dismissed backlog of terminal
+jobs could still make that endpoint's payload large over time, the same latent characteristic
+`list_jobs()` already had before this task, just no longer the thing the Active/pending box's own
+render cost depends on (it simply stops rendering the terminal rows that endpoint still returns).
+Revisiting `list_jobs()` to narrow it is a reasonable follow-up once the Complete box has been
+lived with, not a defect introduced here.
+
+**"Dismiss list" re-scoped from an explicit job-id list to a server-side filter string.** Before
+this task, "Dismiss list" sent the ids of every dismissable row the (client-side, fully-loaded)
+filtered list contained. Once the Complete box is server-paginated, that no longer expresses the
+button's own promise — a filter can match more rows than fit on one 50-row page, and an id list
+can only ever name what's currently loaded. `DismissAllRequest` gained `name_filter`, mutually
+exclusive with the existing `queue_id`/`job_ids` (both kept, unchanged, since other/future
+callers may still want them — the task's own instruction). `dismiss_all_terminal`'s `name_filter`
+branch is the one exception to that method's own "never restrict to `MAX(id)`, a superseded row
+being swept up is harmless" rule (its docstring already stated for `job_ids`/`queue_id`): it
+deliberately *does* re-add the `MAX(id)`-per-item restriction, built from the identical predicate
+`list_complete_jobs` filters its own listing on, specifically so a filter's dismissed count and
+the Complete box's own reported `total` for that same text can never drift apart — a property that
+matters here and didn't for `job_ids`/`queue_id`, because those two scopes are always given an
+explicit id list or queue id the frontend already loaded (never recomputed server-side against
+the whole table the way a filter string is). The pre-existing "`job_ids: []` must dismiss
+nothing, never everything" guard needed no change for the new path — an unmatched filter's
+subquery naturally yields zero rows for `id IN (...)` to match, verified directly by test rather
+than assumed from the SQL shape.
+
+---
+
 ## 2026-08-19 — Transfers page: dropped per-queue grouping for one globally-ordered list
 (reverses the 2026-08-16 grouping decision)
 

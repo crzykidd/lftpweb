@@ -597,7 +597,18 @@ export interface JobOut {
   eta_s: number | null
   exit_code: number | null
   error_class: string | null
+  // `null` on a row from `getCompleteJobs` (2026-08-19, docs/transfers-redesign-spec.md §3.2,
+  // phase 1 stage 4b) -- that endpoint is paginated but unbounded in total row count, so it
+  // never inlines this ~4KB blob (the identical trap `HistoryJobOut`'s own comment names for
+  // History's list endpoint). `getJobs` (the Active/pending box) stays bounded by construction
+  // and keeps inlining it unchanged. `has_output_tail` below is the one signal a row's expand
+  // panel needs to decide whether to fetch it on demand, regardless of which endpoint it came
+  // from.
   output_tail: string | null
+  // Mirrors `HistoryJobOut.has_output_tail` -- always populated. `TransfersPage.tsx.
+  // RowDetailPanel` fetches on demand via the existing `getHistoryJobOutput` (same `job` table,
+  // same id) exactly when this is `true` and `output_tail` came back `null`.
+  has_output_tail: boolean
   // 2026-08-15 (prompts/2026-08-15-transfers-single-line-rows-with-detail.md): the item-level
   // facts the Transfers row's expand panel needs -- see `api/jobs.py._job_out`/`core/queue.py.
   // list_jobs`'s own comments for the join these ride on. Mirrors `FileNode.verified_at`/
@@ -626,6 +637,18 @@ export interface JobOut {
 
 export interface JobsResponse {
   jobs: JobOut[]
+}
+
+/** `GET /api/jobs/complete` (2026-08-19, docs/transfers-redesign-spec.md §3.2, phase 1 stage
+ * 4b) -- the Queue tab's **Complete** box, server-side paginated. Same `total`/`limit`/`offset`
+ * shape `HistoryJobsResponse` already established below -- reused rather than a second
+ * pagination idiom; `lib/pagination.ts` is the pure page-arithmetic this response feeds.
+ */
+export interface CompleteJobsResponse {
+  jobs: JobOut[]
+  total: number
+  limit: number
+  offset: number
 }
 
 /** `POST /api/jobs/dismiss-all` (2026-08-15) -- the bulk counterpart to `dismissJob`. */

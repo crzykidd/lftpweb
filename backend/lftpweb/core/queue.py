@@ -160,6 +160,17 @@ def _parent_rel(rel_path: str) -> str | None:
     return rel_path.rsplit("/", 1)[0]
 
 
+def _like_escape(value: str) -> str:
+    """Escapes `%`/`_`/`\\` so a `LIKE ... ESCAPE '\\'` pattern built from user text matches a
+    **literal** substring, never a glob -- the same "no glob/regex parsing" contract
+    `lib/transferPanel.ts.filterTransferJobs`'s own docstring states for its client-side
+    counterpart. Callers build the pattern as `f"%{_like_escape(needle.lower())}%"` and compare
+    against `LOWER(rel_path)`, mirroring that function's `toLowerCase()` case-insensitivity
+    rather than relying on SQLite's own `LIKE`, which only case-folds ASCII by default.
+    """
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 def resolve_forced_rate_fraction(row: Any) -> float | None:
     """The one place that reads both `job.forced_rate_fraction` (migration 022) and
     `job.forced_full_rate` (migration 001) off a `job` row, so every reader -- `_admit` below,
@@ -1250,7 +1261,10 @@ class TransferQueue:
         await self.db.commit()
 
     async def dismiss_all_terminal(
-        self, queue_id: int | None = None, job_ids: Sequence[int] | None = None
+        self,
+        queue_id: int | None = None,
+        job_ids: Sequence[int] | None = None,
+        name_filter: str | None = None,
     ) -> int:
         """The bulk counterpart to `dismiss_job` above (2026-08-15, "Dismiss all" at the top of
         the Transfers page) -- one `UPDATE`, not a per-job loop, per the task's own preference
@@ -1263,7 +1277,9 @@ class TransferQueue:
         doesn't restrict itself to each item's *most recent* job (`list_jobs()`'s `MAX(id)`
         superseding rule) -- an older, already-superseded terminal row is never shown on
         Transfers regardless of its `dismissed_at`, so dismissing it too is harmless and keeps
-        this one plain `UPDATE ... WHERE` rather than a second copy of that subquery.
+        this one plain `UPDATE ... WHERE` rather than a second copy of that subquery. This one
+        rule has exactly one exception: `name_filter` below, which re-adds the restriction on
+        purpose, for a different reason.
 
         `queue_id` (2026-08-17, the group-header "Dismiss Queue" control,
         `prompts/2026-08-17-transfers-dismiss-per-queue.md`) restricts the same `UPDATE` to one
@@ -1289,6 +1305,26 @@ class TransferQueue:
         early return before the `UPDATE` is even built, both because it is the correct answer
         and because `... AND id IN ()` is not valid SQL to begin with.
 
+        `name_filter` (2026-08-19, docs/transfers-redesign-spec.md §3.2, phase 1 stage 4b)
+        supersedes `job_ids` for "Dismiss list" once the Complete box is server-paginated: a
+        filter can match more rows than are loaded on any one page, so an explicit id list can
+        only ever express "dismiss this page", not "dismiss everything the filter matches" --
+        `DismissAllRequest.name_filter`'s own docstring has the full reasoning. Case-insensitive
+        substring match against `item.rel_path` (`_like_escape`, above -- the same literal-
+        substring, no-glob contract `lib/transferPanel.ts.filterTransferJobs` states for its
+        client-side counterpart), an empty string matching every row (same as an empty
+        client-side filter). Unlike every other scope on this method, this one **does** add the
+        `list_jobs()`-style `MAX(id)`-per-item restriction back in -- deliberately, so this
+        `UPDATE`'s own `WHERE` is built from *exactly* the same predicate
+        `TransferQueue.list_complete_jobs` filters its listing on. That is what lets
+        `CompleteJobsResponse.total` for a given filter always equal the count this dismisses:
+        without it, "Dismiss list" could silently sweep up an already-superseded terminal row
+        the user was never shown (a stale `failed` attempt on an item that has since been
+        retried and is queued/running again) -- harmless in the `job_ids`/`queue_id` cases above
+        (their inputs are already the exact set the frontend loaded, so a superseded row was
+        never a candidate to begin with), but a real drift here since `name_filter` is
+        recomputed server-side against the *whole* table, not a client-supplied id list.
+
         Returns the actual row count affected (`cursor.rowcount`), the same "report the real
         number" convention `api/history.py`'s clear-history endpoints already use.
         """
@@ -1304,6 +1340,12 @@ class TransferQueue:
             placeholders = ",".join("?" for _ in job_ids)
             where.append(f"id IN ({placeholders})")
             params.extend(job_ids)
+        if name_filter is not None:
+            where.append("id = (SELECT MAX(j2.id) FROM job j2 WHERE j2.item_id = job.item_id)")
+            where.append(
+                "item_id IN (SELECT id FROM item WHERE LOWER(rel_path) LIKE ? ESCAPE '\\')"
+            )
+            params.append(f"%{_like_escape(name_filter.lower())}%")
 
         cursor = await self.db.execute(
             f"UPDATE job SET dismissed_at = ? WHERE {' AND '.join(where)}", params
@@ -2679,6 +2721,73 @@ class TransferQueue:
                 d["eta_s"] = p.eta_s
             out.append(d)
         return out
+
+    async def list_complete_jobs(
+        self, *, limit: int, offset: int, name_filter: str | None = None
+    ) -> tuple[list[dict], int]:
+        """The Queue tab's **Complete** box (2026-08-19, docs/transfers-redesign-spec.md §3.2,
+        phase 1 stage 4b) -- `list_jobs()`'s terminal half, split out, server-side paginated,
+        and newest-finished-first, rather than inlined into that method's already-bounded row
+        set. Same join shape and the identical `MAX(j2.id)`-per-item "one row per item, most
+        recent job wins" rule `list_jobs()` uses for its own terminal rows (that method's own
+        docstring) -- an item that has been retried since its last terminal job stops appearing
+        here the moment the new job exists, the same "superseded" reasoning, so a row never
+        shows in both the Active/pending box and this one at once.
+
+        Unlike `list_jobs()`, this is genuinely unbounded in total row count (a busy install
+        accumulates thousands of terminal jobs over time) -- the same shape `api/history.py`'s
+        own endpoints are built around, which is why the return type mirrors theirs: the
+        matching page of rows *and* `total`, the full filtered count ignoring the page, so the
+        frontend can render numbered pages (`lib/pagination.ts`) without a second unbounded
+        query. `api/jobs.py`'s caller strips `output_tail` back out of each row before building
+        `JobOut` -- the identical `has_output_tail`-only convention `api/history.py` already
+        uses, for the identical reason (never inline a ~4KB blob on every row of an unbounded
+        list).
+
+        `name_filter` (optional) is a case-insensitive substring match against `item.rel_path`
+        (`_like_escape`, module-level above) -- the server-side twin of the client-side
+        `lib/transferPanel.ts.filterTransferJobs`'s own semantics, now that this box's rows are
+        no longer all loaded at once for a client-side filter to run over. Built from the exact
+        same predicate `dismiss_all_terminal`'s own `name_filter` branch uses, so "Dismiss
+        list"'s dismissed count always matches what this method reports as `total` for the same
+        filter text -- see that method's own docstring for why that agreement matters.
+        """
+        where = [
+            "job.state IN ('failed','cancelled','succeeded')",
+            "job.dismissed_at IS NULL",
+            "job.id = (SELECT MAX(j2.id) FROM job j2 WHERE j2.item_id = job.item_id)",
+        ]
+        params: list[Any] = []
+        if name_filter is not None:
+            where.append("LOWER(item.rel_path) LIKE ? ESCAPE '\\'")
+            params.append(f"%{_like_escape(name_filter.lower())}%")
+        where_sql = " AND ".join(where)
+
+        count_cursor = await self.db.execute(
+            f"SELECT COUNT(*) AS c FROM job JOIN item ON item.id = job.item_id WHERE {where_sql}",
+            params,
+        )
+        count_row = await count_cursor.fetchone()
+        total = count_row["c"] if count_row is not None else 0
+
+        cursor = await self.db.execute(
+            "SELECT job.*, item.rel_path, item.is_dir, item.queue_id, item.remote_size, "
+            "       item.verified_at, item.extracted_at, item.remote_deleted_at, "
+            "       item.arr_status, item.arr_status_at, "
+            "       path_queue.name AS queue_name, path_queue.short_name AS queue_short_name, "
+            "       arr_instance.name AS arr_instance_name, "
+            "       arr_instance.kind AS arr_instance_kind "
+            "FROM job "
+            "JOIN item ON item.id = job.item_id "
+            "JOIN path_queue ON path_queue.id = item.queue_id "
+            "LEFT JOIN arr_instance ON arr_instance.id = path_queue.arr_instance_id "
+            f"WHERE {where_sql} "
+            "ORDER BY COALESCE(job.finished_at, job.queued_at) DESC, job.id DESC "
+            "LIMIT ? OFFSET ?",
+            [*params, limit, offset],
+        )
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows], total
 
     def stats(self, settings: TransferSettings) -> dict:
         current_speed = sum(self._last_speeds.get(job_id, 0.0) for job_id in self._running)

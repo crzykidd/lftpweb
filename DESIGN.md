@@ -1994,6 +1994,22 @@ Some.Release.S03E04.2160p    [downloading]   18 files   62%   4.1 MB/s   ETA 12m
   the ▲/▼ chevrons below always moved a job in this same global order, so a grouped view could
   make a move appear to swap a job with something in a different group; in the flat list the row
   directly above is always the one being traded with.
+- **Two paginated boxes, not one flat list** (2026-08-19, `docs/transfers-redesign-spec.md` §3.2,
+  phase 1 stage 4b): **Active / pending** (queued/running, 20/page, client-side — the set is
+  bounded and already loaded) and **Complete** (terminal, one row per item — the same
+  most-recent-job-wins rule as before — 50/page, newest-finished first, **server-side** via
+  `GET /api/jobs/complete`). Numbered pages, SAB-style. Rows shifting between pages as work
+  completes is accepted, not a bug — the same behavior SAB itself has. The name filter now has
+  two halves: unchanged (client-side, instant) for the Active box, but server-side (debounced) for
+  the Complete box, since a client-side filter over only the loaded page would silently stop
+  seeing most of the matches the moment that box became paginated. **Dismiss list** follows the
+  same split — it now sends the filter *text* to the server (`dismiss_all_terminal`'s
+  `name_filter` scope), not an explicit id list, so it dismisses every matching row across every
+  page rather than only the one page an id list could ever name; an empty filter result still
+  dismisses nothing, never everything, the same guarantee the id-list scope gave before this
+  change. `GET /api/jobs`/`list_jobs()` itself is unchanged by this split (see docs/decisions.md
+  for why keeping it, rather than narrowing it to active-only, was chosen) — the Active box just
+  no longer renders the terminal rows it still returns.
 - **▲ up one / ▼ down one / ▲▲ to top** on each queued row (§4.5's "Queue order and priority" —
   stage 2, 2026-08-19, `prompts/2026-08-19-queue-reorder-chevrons.md`; replaced a single "Move to
   top" button); default order is oldest-first. **Each still-queued row shows its actual run
@@ -2018,19 +2034,24 @@ Some.Release.S03E04.2160p    [downloading]   18 files   62%   4.1 MB/s   ETA 12m
   actions already are) — scoped to `failed` only, not `cancelled`, since a stopped job is a
   deliberate Stop click, not the kind of unattended pile-up a permanent-error class like
   `REMOTE_GONE` can become. No confirmation dialog on either: nothing is destroyed.
-- **A name filter**, in the page toolbar above the row list (2026-08-19) — start typing and
+- **A name filter**, in the page toolbar above the two boxes (2026-08-19) — start typing and
   only rows whose `rel_path` contains that text (case-insensitive substring, no glob/regex)
-  stay visible; a "showing N of M" readout appears alongside it once it's non-empty. Not
-  persisted — no `localStorage`, no URL param — matching the Files page's own text filter and
-  the Logs filter, since a stale filter hiding active transfers after a reload would be its own
-  confusion. Alongside the input, **Dismiss list** dismisses exactly the terminal rows the
+  stay visible; a "showing N of M" readout appears alongside it once it's non-empty for the
+  Active box. Not persisted — no `localStorage`, no URL param — matching the Files page's own
+  text filter and the Logs filter, since a stale filter hiding active transfers after a reload
+  would be its own confusion. **Runs client-side, instantly, for the Active/pending box; runs
+  server-side, debounced, for the Complete box** (phase 1 stage 4b, above) once that box became
+  paginated — a client-side filter over one loaded page would otherwise silently stop seeing most
+  of the matches. Alongside the input, **Dismiss list** dismisses exactly the terminal rows the
   filter currently matches, in one bulk request (`core/queue.py.dismiss_all_terminal`'s
-  `job_ids` scope, never a client-side loop over each row's own dismiss) — greyed out while the
-  filter is empty, and again if it matches no dismissable rows, with a tooltip naming which. It
-  is a new, separate control: any other bulk dismiss action on this page keeps its own existing
-  whole-list meaning, unaffected by whether a filter happens to be active. It also supersedes
-  the per-queue **Dismiss Queue** control (v0.2.3, `278e10f`), removed 2026-08-19 alongside
-  grouping — filter to a queue, then Dismiss list does the same job.
+  `name_filter` scope, sent as the same filter text the Complete box's own query is using — not
+  an id list, which could only ever name one page's worth once that box was paginated; never a
+  client-side loop over each row's own dismiss either way) — greyed out while the filter is
+  empty, and again if it matches no dismissable rows, with a tooltip naming which. It is a new,
+  separate control: any other bulk dismiss action on this page keeps its own existing whole-list
+  meaning, unaffected by whether a filter happens to be active. It also supersedes the per-queue
+  **Dismiss Queue** control (v0.2.3, `278e10f`), removed 2026-08-19 alongside grouping — filter
+  to a queue, then Dismiss list does the same job.
 
 **Item drawer.** A **side drawer** — not a modal, because file lists get long and the queue
 should stay visible — listing the files inside that item: name, size, transferred, per-file
