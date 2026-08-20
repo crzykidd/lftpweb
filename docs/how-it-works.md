@@ -48,7 +48,7 @@ check out — the item becomes DOWNLOADED and post-processing runs.
 **From the disk, not from lftp.**
 
 Progress is local bytes measured against the remote size the last scan recorded. An in-flight
-file is sampled about once a second, including each file inside a multi-file release, which is
+file is sampled every few seconds, including each file inside a multi-file release, which is
 where the live rate and ETA come from. lftp's own output is captured and kept, but it is used for
 diagnosing failures — not for tracking progress.
 

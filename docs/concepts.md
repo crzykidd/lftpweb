@@ -1,9 +1,11 @@
 # Concepts
 
-The ten things that actually trip people up, and what to do about each.
+The twelve things that actually trip people up, and what to do about each.
 
 ```jump
 Nothing is downloading at all — the queue is paused|#pause
+It says Downloaded but it's still under Active/pending|#pipeline
+What "Mark complete" / "Mark failed" actually does|#manual-outcome
 Nothing downloaded for a minute|#settle
 A finished item looks broken for ten minutes|#removal-grace
 An item won't re-download|#suppression
@@ -48,6 +50,61 @@ queue (the ▲/▼/▲▲ controls on each row) so the item you actually want ne
 unpause. **Start now** is the one control that's turned off while paused (with the reason in its
 tooltip) — oversubscribing past the ceiling to force one item through would defeat the pause you
 just asked for.
+
+## It says Downloaded but it's still under Active/pending — why? {#pipeline}
+
+Because "the job finished" and "the release is done" are not the same claim, and the
+[Transfers → Queue](/transfers/queue) tab's two boxes split on the second one.
+
+The transfer itself — lftp exiting, every byte landing on disk — is necessary but not
+sufficient. Verify, extract, a Sonarr/Radarr import, and (on a `move` queue) the deferred
+seedbox delete all continue after the job is done, and a row stays in **Active/pending** for as
+long as any of them is still working. This is deliberate and applies the same way whether or
+not the queue is bound to an `*arr` — a large release's own verify/extract step takes real time
+even with nothing to notify, so there's one rule for "done," not a shorter one for untracked
+queues.
+
+The row says exactly what it's waiting on, instead of one vague "in progress":
+
+| Label | What's actually happening |
+|---|---|
+| **Verifying** | Checking the downloaded bytes against a `.sfv`/`.md5` sidecar, or reading the whole file as the weaker fallback. |
+| **Extracting** | Unpacking the release's archives. |
+| **Processing** | Some other post-processing step is running — most often the move to a Final destination. |
+| **Awaiting import** | Verify/extract already succeeded and the queue is bound to a Sonarr/Radarr instance. lftpweb has told it "your files are here" and is waiting for a **confirmed** import — the *arr's own queue record finishing *and* its history agreeing, checked twice — not the first ambiguous signal. |
+| **Deleting source** | A `move` queue's confirmed-import delete is running or retrying. |
+
+Only once none of those apply does the row move to **Complete**. Every one of these waits has a
+bound underneath it — a live worker's existence, a *currently enabled* `*arr` instance, an age
+backstop — specifically so a row can't sit in Active/pending forever with nothing actually
+working on it. If one somehow does, that's what [Mark complete / Mark
+failed](#manual-outcome) below is for.
+
+## What "Mark complete" / "Mark failed" actually does {#manual-outcome}
+
+Every row in Active/pending whose own transfer has already finished carries a **Mark complete**
+/ **Mark failed** menu, with **Undo**. It's the human override for the case the bounds described
+[above](#pipeline) exist to prevent but occasionally don't in practice — a release genuinely
+wedged on something that is never going to resolve on its own.
+
+**It is a classification only, and nothing more.** Clicking it:
+
+- Moves the row into Complete (or flags it failed), so it stops sitting in Active/pending.
+- Writes an audit `event` and puts a **Marked complete** / **Marked failed** chip on the row, so
+  it never quietly reads like an ordinary finish.
+
+**It deliberately never does any of the following:**
+
+- **Delete the seedbox source** on a `move` queue. The delete ladder still waits for a genuinely
+  *confirmed* import (or nothing at all, on a queue with no `*arr` binding) — clicking this is
+  not that confirmation.
+- **Count as a confirmed Sonarr/Radarr import.** `arr_status` is untouched.
+- **Trigger notify, cleanup, retention, or any other post-processing step.**
+- **Change auto-queue's eligibility** for the item.
+
+If the real outcome turns up later anyway — the `*arr` finally confirms the import, say — it
+does **not** silently overwrite your manual call. **Undo** is the only way back to letting the
+pipeline decide for itself.
 
 ## Why nothing downloaded for a minute — the settle gate {#settle}
 

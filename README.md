@@ -48,7 +48,7 @@ Every verify outcome, every remote delete, and every delete withheld — with th
 - Named **path queues** — one remote → local mapping each, with their own settings
 - Queue transfers manually, watch live progress, stop them, resume from the partial;
   multi-select with shift-range and bulk Queue/Stop/Delete that reports partial failure
-  honestly ("7 of 10 queued, these 3 failed because …"), plus text/state/"missing only" filters,
+  honestly ("7 of 10 queued, these 3 failed because …"), plus text/state/lifecycle-facet filters,
   on the Files page. The delete dialog offers two independent, checkbox-driven scopes — Delete
   local copy, and (2026-08-16) Delete source (seedbox), the first manual remote-delete in the
   app, for cleaning up a failed or never-imported item without SSHing into the seedbox by hand.
@@ -107,12 +107,24 @@ Every verify outcome, every remote delete, and every delete withheld — with th
   (filterable on its own, since that one usually needs a look). Stragglers are cleaned up from
   the app: the delete dialog offers independent **Local** and **Source (seedbox)** scopes, so
   failed or abandoned releases can be cleared from both sides without ever SSHing in
-- The Queue tab's Complete box: every completed/failed/cancelled transfer, paginated and
-  filterable, with a scoped name filter (2026-08-19) and a "Dismiss list" button that
-  bulk-dismisses only the matching finished rows. The Events page is the separate audit-event
-  log — every verify/extract/move outcome and every remote delete or delete withheld, filterable
-  and grouped by queue, plus a per-item deep link from a Queue or Files row's item drawer
-  (2026-08-20)
+- **Transfers is the main section, with Queue and Files tabs** (`/transfers/queue`,
+  `/transfers/files` — the old standalone Files nav entry and `/files` both redirect here). The
+  Queue tab is **one globally-ordered list, not one section per queue** — admission is entirely
+  queue-agnostic, so grouping by queue implied per-queue lines that never existed. Two paginated
+  boxes, each with its own 10/20/50 page-size selector: **Active/pending**, which holds a row
+  until its *whole pipeline* finishes (verify, extract, a confirmed Sonarr/Radarr import, a
+  deferred seedbox delete — not just the transfer, so a row can read "Awaiting import" long after
+  lftp itself is done), and **Complete**. Rows carry a compact queue badge, a fast-lane badge
+  when they qualify, **▲ up one / ▼ down one / ▲▲ to top** reordering, and expand to per-file
+  progress. A name filter, a scoped "Dismiss list", and the Complete box's own "Dismiss" outcome
+  menu (All/Downloaded/Failed/Stopped) round it out. A **Mark complete / Mark failed** menu (with
+  Undo) is a manual, classification-only escape hatch for a row genuinely wedged on something
+  that will never resolve — it never deletes a source, confirms an import, or touches auto-queue.
+  **A site-wide Pause** (Pause after current / Pause now) stops new admissions without touching
+  what's already running or queued; reordering keeps working while paused, since curating the
+  order and then unpausing is the point. **History is now Events** (`/events`, `/history`
+  redirects) — the audit-event log only, filterable and grouped by queue, with a per-item deep
+  link from a Queue or Files row's item drawer
 - Rotating log viewer, on-demand `VACUUM INTO` database backups (scheduled + manual), and a
   header readout for seedbox reachability and scheduler liveness (`/api/health`)
 - Credentials encrypted at rest
@@ -120,11 +132,13 @@ Every verify outcome, every remote delete, and every delete withheld — with th
   password login or trust a reverse proxy's identity header, both from Settings → Auth. See
   "Locked out?" below before you flip it on.
 - **In-app user documentation**, under **Docs** in the left nav: a quick start walking the real
-  first-run sequence, and a Concepts page covering the eight things that actually confuse people
-  (the settle gate, the removal grace period, auto-queue suppression, the difference between
-  Dismiss / Clear history / Reset item tracking, the lifecycle icons, `copy` vs `move`,
-  inherit-vs-override on the post-processing toggles, and the Sonarr/Radarr icon). Every step
-  links straight to the settings page it describes.
+  first-run sequence, and a Concepts page covering the twelve things that actually confuse people
+  (the queue being paused, why a row still reads "Awaiting import" instead of Complete, what
+  Mark complete/Mark failed does and doesn't do, the settle gate, the removal grace period,
+  auto-queue suppression, the difference between Dismiss / Clear events / Reset item tracking,
+  the lifecycle icons, `copy` vs `move`, inherit-vs-override on the post-processing toggles, the
+  Sonarr/Radarr icon, and what's in a support bundle). Every step links straight to the settings
+  page it describes.
   Per-field help popups (`FieldHelp`) are being applied across the settings surface, starting
   with the fields whose wrong answer costs you data
 
