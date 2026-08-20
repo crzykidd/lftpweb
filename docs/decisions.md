@@ -6,6 +6,92 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-19 — Auto-queue re-queued a release the *arr had just imported: the grace period
+now covers *partial* local absence, and an *arr-handed item is never picked up again
+
+`prompts/done/2026-08-19-autoqueue-requeues-imported-item.md`, production bundle
+`lftpweb-support-0.2.6-20260819T205145Z.zip` (v0.2.6, `move` queue `dc-tv`, bound to Sonarr).
+
+**Step 1 — what the trigger state actually was, established before anything was edited.**
+`PARTIAL`, proved two ways rather than assumed:
+
+- *By elimination through the code path.* Verify read `SKIPPED`, and
+  `postprocess._run_verify`'s `SKIPPED` branch writes `state = 'DOWNLOADED'` — a member of
+  `mount_sentinel.COMPLETE_STATES`. With that previous state and a healthy mount (auto-queue did
+  queue an item, so the mount gate passed), every other structural reading is already excluded:
+  `REMOTE_ONLY` is held at `DOWNLOADED` by `resolve_absence`, `DOWNLOADED`/`LOCAL_ONLY` are not
+  in `ELIGIBLE_STATES`, and a path in neither tree goes through the vanished sweep to the same
+  hold. `PARTIAL` — the one reading with no grace-period protection at all — is the only state
+  that both persists and is eligible.
+- *By the physical evidence.* Item 3304447 is a 38-episode season pack: `arr_imported` records
+  38 import history events at 16:49:15Z, and auto-queue re-queued it at **16:44:12Z**, i.e. with
+  the import demonstrably still in flight and some episodes moved out and some not — `PARTIAL`
+  by construction. For item 3354306, Sonarr's own log corroborates the timing the bundle's *arr
+  logs were thought not to cover: its "Import failed, path does not exist" retry for that exact
+  path fires every ~90s for three hours and **stops after 18:14:12Z**, while the neighbouring
+  releases' retries continue — so the import landed inside the 18:15:24–18:16:04 window, before
+  the 18:16:06 auto-queue pass. `arr_cleanup` then removed a local copy that still existed at
+  18:22:33, i.e. Sonarr left residue behind rather than emptying the directory.
+
+So the prompt's hypothesis was right, but it is recorded here as *established* rather than
+assumed, because the fix keys on the difference.
+
+**Fix, two halves, both narrow.**
+
+1. **`mount_sentinel.resolve_absence` grew a `PARTIAL` branch** — the partial half of the same
+   §7.3 grace period. It fires only on `is_local_shrink`: previous state in `COMPLETE_STATES`
+   **and** the last-persisted `remote_size` equal to this pass's. Both clauses are load-bearing.
+   The first is what keeps a genuinely interrupted transfer re-queueable — an interrupted
+   transfer is `PARTIAL`/`STOPPED`/`FAILED` beforehand, never complete — and the second is what
+   keeps §3.2 rule 4 (the remote *grew*, so there really is more to fetch) reading `PARTIAL` on
+   the first pass with no hold. `engine._previous_states` now also selects `remote_size` to
+   supply it.
+2. **`autoqueue.ARR_IMPORT_INELIGIBLE_STATUSES`** — `notified`/`imported`/`cleaned` are excluded
+   in the eligibility query itself. `detected` is deliberately absent: `arrsync._match_items`
+   writes it as soon as the *arr's own download client reports the release on the seedbox, long
+   before lftpweb has fetched anything, so excluding it would disable auto-queue for *arr-tracked
+   releases entirely. `dropped`/`gone` are absent for the same reason.
+
+**Why both, rather than either alone.** The grace period is general (it works on a queue with no
+*arr binding at all) but time-bounded at ~10 minutes — and the season-pack import in this same
+incident took ~19 minutes, so half 1 alone would have released that item and re-queued it
+anyway. The *arr gate has no time bound but does nothing for an untracked queue. Each covers the
+other's gap; neither is redundant.
+
+**Where a shrink lands when the window elapses: `PARTIAL`, not `REMOVED_LOCAL` — rejected
+alternative.** Promoting it to `REMOVED_LOCAL` would have closed the untracked-queue gap for
+good, and was rejected on two grounds: it asserts the local copy is gone when residue is
+demonstrably still on disk (`local_delete.py`'s retention query keys on `COMPLETE_STATES`, so
+those leftovers would then never be swept), and it removes the escape hatch a genuinely damaged
+local copy needs — an item that lost bytes and is never coming back must eventually be
+re-fetchable without a manual click. The residual gap is named in README's "Known gaps" instead
+of being closed by a state that lies.
+
+**Known imprecision, recorded rather than silently taken: the removal countdown in the UI.**
+`api/settings_postprocess.py`'s `/removal-grace` endpoint publishes `COMPLETE_STATES` as the
+eligible set, deliberately reading it straight off `mount_sentinel` so the UI can only ever
+offer a countdown for a row the backend really is running a clock for. That stays true — the
+shrink branch gates on the same set — but a shrink-held row now shows the same countdown while
+resting on a *different* outcome: total absence lands on `REMOVED_LOCAL`, a shrink lands back on
+`PARTIAL`. The signal ("something outside lftpweb is taking this item's local copy apart, and
+here is how long before we act on it") is right either way; only the implied destination is.
+Giving the two clocks separate labels would mean threading a new signal through `item_view` and
+the Files row for a distinction the countdown never named out loud in the first place — not done
+here.
+
+**Deferred, not fixed: `arrsync._maybe_cleanup`'s "an active job exists for this item"
+withhold.** It parked cleanup for 97 minutes in the worse of the two cases and wrote 92
+`arr_cleanup_withheld` events doing it. Considered and deliberately left alone: with the two
+halves above, auto-queue can no longer manufacture such a job for an *arr-tracked item, and the
+jobs that remain are either genuinely running (where refusing to delete local files underneath a
+live transfer is exactly right) or manually queued (a deliberate user action, where deleting the
+local copy the user just asked to re-fetch is the wrong call). Narrowing the withhold to
+`running` only, or teaching cleanup to cancel a stale queued job, are both real options — they
+are just a different, larger change than this defect requires, and either could delete local
+content out from under a transfer that was about to start.
+
+---
+
 ## 2026-08-19 — Support bundle *arr log fetch: order by `lastWriteTime` across every series,
 not by filename within one
 
@@ -284,6 +370,22 @@ suppressed rather than reaching the pipeline — the same outcome a manual Queue
 today. Rare enough (needs both a crash after completion and an external remote delete in the
 same window) that it isn't worth a special-cased "verify local completeness without asking the
 remote" path; recorded here rather than silently left unhandled.
+
+> **Amended 2026-08-19** (`prompts/done/2026-08-19-autoqueue-requeues-imported-item.md`,
+> production bundle `lftpweb-support-0.2.6-20260819T205145Z.zip`). Two things above were wrong
+> about this shape, and both are corrected by the entry at the top of this file rather than
+> here. **It is not rare, and it is not cosmetic.** The *startup-rescue* path this paragraph is
+> about genuinely does need a crash; but the identical end state — a re-queued job for a
+> complete-local item whose remote is about to go — was reached with no crash at all, twice in
+> one afternoon, by **auto-queue** picking up the `PARTIAL` reading an *arr importer produces
+> while it moves a finished release out. And the cost is not just "misses the pipeline": the
+> doomed job blocks `arrsync._maybe_cleanup` ("an active job exists for this item") for as long
+> as it waits for a slot — 97 minutes and 92 withheld-cleanup events in the worse of the two
+> cases. The re-queue itself is now prevented at its source (§7.3's grace period extended to
+> partial absence; auto-queue skipping an item the *arr already holds), which is a stronger fix
+> than the "verify local completeness without asking the remote" path considered and declined
+> here. This paragraph's own narrow case — crash, then an external remote delete before the next
+> restart — remains accepted as written.
 
 ---
 

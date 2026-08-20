@@ -454,7 +454,23 @@ Nine rules that are easy to get wrong and that want review:
      read `LOCAL_ONLY` within one scan interval, losing everything §6 had just recorded.
    - **Content partially present** (structural `PARTIAL`): the structural state wins and the
      outcome is dropped. Rule 2 is absolute, and an outcome is a stronger claim still; the item
-     is genuinely re-queueable again.
+     is genuinely re-queueable again — **but not necessarily this instant** (corrected
+     2026-08-19, production defect). `PARTIAL` has two causes that this bullet used to treat as
+     one. The remote **grew** (rule 4) and there is genuinely more to fetch; or a *complete*
+     local copy is being taken apart — an importer moving a finished release into the library
+     one file at a time, which is the ordinary, expected end of every successful transfer
+     (§7.2). The second is the same event as the "content absent" bullet below, caught a few
+     seconds earlier, and it gets the same treatment: §7.3's grace period, holding the previous
+     state while the clock runs. It is keyed on **"was complete, then shrank"** — the previous
+     state asserts every byte was here *and* the remote total is unchanged — never on `PARTIAL`
+     alone, because `PARTIAL` being immediately re-queueable is how a genuinely interrupted
+     transfer resumes, and no interrupted transfer ever has a complete-local previous state.
+     When the window elapses the `PARTIAL` is published after all, deliberately, rather than
+     landing on `REMOVED_LOCAL`: content really is still on disk, and a locally damaged copy has
+     to stay re-fetchable. Auto-queue getting hold of such an item is what this correction is
+     about: on a `move` queue it re-fetched a release whose seedbox source was deleted moments
+     later on confirmed import, and the doomed job blocked the *arr cleanup for as long as it
+     sat in the queue.
    - **Content absent** (structural `REMOTE_ONLY`): §7.3's grace period decides, and all six
      post-processing states ride it exactly the way `DOWNLOADED` does — the item holds its
      outcome for the whole window and then lands on `REMOVED_LOCAL`. This half is not
@@ -962,7 +978,15 @@ all excluded, `STOPPED`/`FAILED`/`REMOVED_BOTH` by the flag rather than by their
 plain `REMOVED_LOCAL` usually carries it clear, but because the state itself is left out of the
 eligible set; `AutoQueueSettings.re_download_externally_removed` (site-level, default `False`,
 §3.2 rule 3) is the opt-in that adds it back in, for anyone who wants an item something outside
-lftpweb removed to be re-fetched. It additionally skips an item whose remote fingerprint has not
+lftpweb removed to be re-fetched. **It also skips any item the bound `*arr` has already been
+handed** (added 2026-08-19, production defect): `arr_status` of `notified`, `imported`, or
+`cleaned` — all three only reachable *after* this codebase's own pipeline completed for that
+item — is ineligible, whatever the state reads. `detected` is deliberately not in that list and
+must never be: an item is matched against the `*arr`'s queue record long before lftpweb has
+fetched a byte of it (the `*arr`'s queue is populated by its own download client on the seedbox),
+so excluding `detected` would stop auto-queue fetching `*arr`-tracked releases at all. Like the
+settle gate, this is a skip and not a suppression — a manual Queue click is untouched. It
+additionally skips an item whose remote fingerprint has not
 settled (§3.3), leaving it for a later pass. Before evaluating anything at all for a queue, the
 queue's local root must pass the mount gate (§7.3); if it
 does not, the whole pass is skipped for that queue and the reason is surfaced, rather than each
@@ -1417,6 +1441,15 @@ them distinguishable, because a bind mount that didn't come up has no sentinel i
 - **Grace period.** Absence must persist across several consecutive scans — default ~10 minutes,
   tracked via `item.first_missing_at` — before it counts. An import in progress, a move across
   filesystems, or a momentarily-unreadable directory must not be able to trigger a delete.
+  **Absence is not all-or-nothing** (2026-08-19, production defect): an importer takes a release
+  apart one file at a time, so the reading between "complete" and "gone" is `PARTIAL`, and the
+  same clock covers it — see §3.2 rule 9's "content partially present" bullet for the narrow
+  "was complete, then shrank" key and for why a shrink that outlives the window is released as
+  `PARTIAL` rather than promoted to `REMOVED_LOCAL`. That release is deliberate and it is the
+  limit of this rail: an external removal slower than the window is still re-queueable. On an
+  *arr-bound queue the second half of that fix covers it with no time bound (auto-queue skips
+  any item whose `arr_status` is past the hand-off — §4.7); on an untracked queue it is an open
+  gap, named in README's "Known gaps."
   **A `rel_path` can leave both trees at once, and that case runs through this same machinery.**
   The reconciler's node set is `remote_tree ∪ local_tree`, so a path in neither produces no node
   — and the persist pass only ever visits nodes. `move` mode manufactures exactly that shape

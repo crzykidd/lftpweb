@@ -48,6 +48,11 @@ Five things this module must get right, in order of consequence:
    regardless of `state`. A *manual* Queue click is untouched (same "explicit
    action beats a heuristic" reasoning as the settle gate above) -- once SAB finishes and
    renames the directory, the plain name becomes eligible normally, no special-casing needed.
+6. **An item the bound *arr has already been handed is never picked up again** (2026-08-19,
+   `prompts/done/2026-08-19-autoqueue-requeues-imported-item.md`, production defect).
+   `ARR_IMPORT_INELIGIBLE_STATUSES` -- `notified`/`imported`/`cleaned`, never `detected` -- is
+   applied in the eligibility query, alongside the state and suppression clauses. See that
+   constant's own comment for the incident and for why `detected` must stay eligible.
 
 **Retroactive by construction.** DESIGN.md §4.7: "adding a pattern re-evaluates the whole
 known model, not just future scans." This module re-queries every eligible top-level item in
@@ -117,6 +122,38 @@ logger = logging.getLogger(__name__)
 # eligible and never clears suppression.
 ELIGIBLE_STATES = ("REMOTE_ONLY", "PARTIAL")
 ELIGIBLE_STATES_WITH_EXTERNALLY_REMOVED = ELIGIBLE_STATES + ("REMOVED_LOCAL",)
+
+# `item.arr_status` values that mean "the bound *arr owns this release now" -- auto-queue never
+# picks such an item up again, whatever its `state` reads (2026-08-19,
+# `prompts/done/2026-08-19-autoqueue-requeues-imported-item.md`).
+#
+# Production, v0.2.6, `move` queue bound to Sonarr: an item finished, post-processing renamed it
+# to its final name and pushed the scan command, Sonarr began moving the media file out, and the
+# next scan read the leftovers as `PARTIAL` -- eligible -- so auto-queue re-queued a release
+# whose seedbox source `core/arrsync.py` was about to delete on the confirmed import. The job sat
+# in the queue for 97 minutes (the second occurrence), blocked `_maybe_cleanup` the whole time
+# ("an active job exists for this item"), and then failed `REMOTE_GONE` on 0 bytes.
+#
+# `core/mount_sentinel.py`'s `PARTIAL` grace branch is the general half of this fix and is not
+# *arr-specific; this is the half with no time bound. It matters because an import is not
+# guaranteed to be quick: the same incident's season-pack case took ~19 minutes to move 38
+# episodes out, longer than `mount_sentinel.DEFAULT_GRACE_S`, so the grace branch alone would
+# have released it back to `PARTIAL` and re-queued it anyway.
+#
+# **`detected` is deliberately absent**, and that is the load-bearing part: an item is matched
+# against the *arr's queue record (`arr_status = 'detected'`) by `core/arrsync.py._match_items`
+# long *before* lftpweb has downloaded it -- the *arr's queue is populated by its own download
+# client on the seedbox, on its own schedule -- so making `detected` ineligible would stop
+# auto-queue fetching *arr-tracked releases at all, which is the entire feature. Only the three
+# statuses that can only be reached *after* this codebase's own pipeline completed
+# (`arrnotify.notify_arr` writes `notified`; `arrsync` writes `imported`, then `cleaned`) are
+# listed. `dropped`/`gone` are absent for the same reason as `detected`: both are reachable for
+# an item lftpweb has not finished, or ever started, downloading.
+#
+# Not a suppression: `auto_queue_suppressed` is untouched, so a *manual* Queue click still works
+# (same "an explicit user action beats a heuristic" line the settle gate and the `_UNPACK_`
+# exclusion already draw), and nothing here needs clearing by hand later.
+ARR_IMPORT_INELIGIBLE_STATUSES = ("notified", "imported", "cleaned")
 
 SETTING_KEY = "autoqueue_settings"
 
@@ -266,8 +303,15 @@ class AutoQueue:
             # here. Made explicit so the claim is true by construction rather than by every
             # other module continuing to agree with it forever.
             "AND NOT EXISTS (SELECT 1 FROM job WHERE job.item_id = item.id "
-            "AND job.state IN ('queued', 'running'))",
-            (queue.id, *eligible_states),
+            "AND job.state IN ('queued', 'running')) "
+            # The *arr hand-off gate (2026-08-19) -- see `ARR_IMPORT_INELIGIBLE_STATUSES`.
+            # `COALESCE` because `arr_status` is NULL for every item on an unbound queue (and
+            # for an unmatched item on a bound one), and SQLite's `NOT IN` over a NULL left-hand
+            # side is NULL, not true -- without it this clause would silently exclude every
+            # untracked item in the system.
+            f"AND COALESCE(item.arr_status, '') NOT IN "
+            f"({','.join('?' for _ in ARR_IMPORT_INELIGIBLE_STATUSES)})",
+            (queue.id, *eligible_states, *ARR_IMPORT_INELIGIBLE_STATUSES),
         )
         rows = await cursor.fetchall()
 

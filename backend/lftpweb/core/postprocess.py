@@ -155,6 +155,17 @@ def outcome_survives_rescan(
       the remote grew (rule 4), or something took files away -- so the item is genuinely
       re-queueable, and "VERIFIED" would be a claim about content that is no longer there.
       Rule 2's "never DOWNLOADED" is absolute, and an outcome is a stronger claim still.
+      **This function's answer is still `False` for `PARTIAL`, but it is no longer the last
+      word** (2026-08-19, `prompts/done/2026-08-19-autoqueue-requeues-imported-item.md`): the
+      "something took files away" half of that sentence is exactly what an *arr importer does,
+      one file at a time, to a release this pipeline finished seconds earlier, and treating it
+      as immediately re-queueable re-fetched a release whose source was about to be deleted.
+      `core/mount_sentinel.py.resolve_absence` -- which `core/engine.py._persist` consults
+      right after this returns `False` -- now runs the *same* §7.3 grace period over a
+      `PARTIAL` reading whose remote total is unchanged and whose previous state asserted
+      completeness ("was complete, then shrank"). The precedence here is unchanged; the
+      *timing* is. A `PARTIAL` from a remote that genuinely grew, and every genuinely
+      interrupted transfer, are untouched -- see `mount_sentinel.is_local_shrink`.
     - `REMOTE_ONLY` is absence, which is *not* decided here: it goes to `resolve_absence`, so
       an item whose local copy was moved out by an importer still reaches `REMOVED_LOCAL`
       through §7.3's grace period rather than being frozen on its outcome forever.

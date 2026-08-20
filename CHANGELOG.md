@@ -35,6 +35,23 @@ Skeleton for the next roll:
 ### Changed
 ### Fixed
 
+- **Auto-queue no longer re-downloads a release the *arr has just imported.** Found in
+  production on a `move` queue bound to Sonarr: an item finished, post-processing renamed it and
+  told Sonarr to scan, and Sonarr began moving the media file into the library — leaving the
+  release directory reading `PARTIAL`, which auto-queue treated as "an interrupted transfer,
+  pick it back up." The re-queued job sat in the queue until a slot freed, by which time the
+  seedbox source had been deleted on the confirmed import, so it failed `REMOTE_GONE` on zero
+  bytes; worse, while it waited it blocked the *arr cleanup for the whole time (97 minutes, in
+  one of the two observed cases). Two independent fixes: the ~10-minute local-absence grace
+  period now covers a *partial* loss of local content, not only a total one — keyed strictly on
+  "was complete, and the remote total is unchanged, and local shrank", so a genuinely
+  interrupted transfer still resumes on the very next pass and a release whose remote *grew* is
+  still fetched immediately — and auto-queue now skips any item whose bound *arr has already
+  been handed it (`arr_status` of `notified`, `imported`, or `cleaned`), which has no time bound
+  and so also covers a slow import like a 38-episode season pack. A manual Queue click is
+  unaffected by either. Not fully closed: on a queue with **no** *arr binding, an external
+  removal that takes longer than the grace window can still trigger one re-queue — see README's
+  "Known gaps."
 - **Support bundle *arr log fetch now spends its per-instance budget on the newest files, not
   the biggest stale ones.** The fetch order was a filename/rotation-suffix sort, which orders
   correctly *within* one log series (`sonarr.*`, `sonarr.debug.*`, `sonarr.trace.*`) but

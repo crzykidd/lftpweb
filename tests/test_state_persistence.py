@@ -196,18 +196,114 @@ async def test_an_outcome_survives_repeated_scans_not_just_the_first(tmp_path, m
 @pytest.mark.parametrize(
     "persisted_state", ["VERIFIED", "CORRUPT", "EXTRACTED", "EXTRACT_FAILED", "DOWNLOADED"]
 )
-async def test_partial_wins_over_an_outcome(tmp_path, monkeypatch, persisted_state):
+async def test_partial_wins_over_an_outcome_when_the_remote_grew(
+    tmp_path, monkeypatch, persisted_state
+):
     """§3.2 rule 2 is absolute: local short of remote is PARTIAL, never DOWNLOADED -- and an
-    outcome is a stronger claim than DOWNLOADED, so it cannot survive one either. The remote
-    grew (rule 4) or something took bytes away; either way the item is re-queueable again and
-    saying "VERIFIED" would be a claim about content that is no longer all there.
+    outcome is a stronger claim than DOWNLOADED, so it cannot survive one either. This is the
+    rule 4 shape -- the remote **grew**, so the last persisted `remote_size` is smaller than
+    what this scan sees -- and it must reach `PARTIAL` on the *first* pass, with no grace-period
+    hold: there really is more to fetch, and saying "VERIFIED" would claim the whole of a
+    release we now only have part of.
+    """
+    engine, q, host, db, item_id = await _make_engine(
+        tmp_path, monkeypatch, local_size=SIZE // 2, state=persisted_state
+    )
+    # The remote total this item's state was last computed against, i.e. before the growth
+    # the fixture's remote tree (`SIZE`) represents.
+    await db.execute("UPDATE item SET remote_size = ? WHERE id = ?", (SIZE // 2, item_id))
+    await db.commit()
+    try:
+        await engine.scan_queue(q, host)
+        assert (await _state_of(db, item_id)) == ("PARTIAL", None)
+    finally:
+        await db.close()
+
+
+@pytest.mark.parametrize(
+    "persisted_state", ["VERIFIED", "CORRUPT", "EXTRACTED", "EXTRACT_FAILED", "DOWNLOADED"]
+)
+async def test_a_shrinking_local_copy_holds_its_state_for_the_grace_period(
+    tmp_path, monkeypatch, persisted_state
+):
+    """The other reading of the same `PARTIAL` (2026-08-19,
+    `prompts/done/2026-08-19-autoqueue-requeues-imported-item.md`): the remote total is
+    **unchanged** and the previous state asserted completeness, so nothing grew -- local
+    content left. That is an importer mid-import, not a transfer that stopped short, and it
+    runs through §7.3's grace period exactly as total absence does.
+
+    After the window elapses the fresh `PARTIAL` is released, deliberately: `REMOVED_LOCAL`
+    would lie about content that is still on disk, and a genuinely damaged local copy has to
+    stay re-fetchable.
     """
     engine, q, host, db, item_id = await _make_engine(
         tmp_path, monkeypatch, local_size=SIZE // 2, state=persisted_state
     )
     try:
         await engine.scan_queue(q, host)
-        assert (await _state_of(db, item_id))[0] == "PARTIAL"
+        state, first_missing_at = await _state_of(db, item_id)
+        assert state == persisted_state, "a shrinking local copy must not read PARTIAL at once"
+        assert first_missing_at is not None, "the grace clock should have started"
+
+        # A second pass inside the window changes nothing and does not restart the clock.
+        await engine.scan_queue(q, host)
+        assert (await _state_of(db, item_id)) == (persisted_state, first_missing_at)
+
+        await db.execute(
+            "UPDATE item SET first_missing_at = STRFTIME('%Y-%m-%dT%H:%M:%fZ', 'now', ?) "
+            "WHERE id = ?",
+            (f"-{int(DEFAULT_GRACE_S) + 60} seconds", item_id),
+        )
+        await db.commit()
+
+        await engine.scan_queue(q, host)
+        assert (await _state_of(db, item_id)) == ("PARTIAL", None)
+    finally:
+        await db.close()
+
+
+async def test_a_local_copy_restored_during_the_shrink_grace_clears_the_clock(
+    tmp_path, monkeypatch
+):
+    """The reverse transition, for the partial half: content coming back must clear the clock
+    outright, not leave a half-run countdown that lands early the next time anything shrinks.
+    """
+    engine, q, host, db, item_id = await _make_engine(
+        tmp_path, monkeypatch, local_size=SIZE // 2, state="VERIFIED"
+    )
+    try:
+        await engine.scan_queue(q, host)
+        assert (await _state_of(db, item_id))[1] is not None
+
+        monkeypatch.setattr(
+            engine_module.local_scan,
+            "scan_local",
+            lambda root, **_kwargs: _local_tree(SIZE),  # noqa: ARG005
+        )
+        await engine.scan_queue(q, host)
+        assert (await _state_of(db, item_id)) == ("VERIFIED", None)
+    finally:
+        await db.close()
+
+
+@pytest.mark.parametrize("persisted_state", ["PARTIAL", "REMOTE_ONLY", "STOPPED", "FAILED"])
+async def test_a_genuinely_interrupted_transfer_still_reads_partial_immediately(
+    tmp_path, monkeypatch, persisted_state
+):
+    """**The guard test.** `PARTIAL` being re-queueable is how an interrupted transfer resumes;
+    a fix that held *those* back would be far worse than the defect it closes. None of these
+    previous states asserts "every byte was here", so the shrink branch must not fire for any of
+    them -- the fresh reading wins on the first pass, with no clock started.
+
+    `STOPPED`/`FAILED` reach this path only when unsuppressed (a suppressed row never reaches
+    the persist loop at all -- §3.2 rule 9), which is exactly the re-queueable case.
+    """
+    engine, q, host, db, item_id = await _make_engine(
+        tmp_path, monkeypatch, local_size=SIZE // 2, state=persisted_state
+    )
+    try:
+        await engine.scan_queue(q, host)
+        assert (await _state_of(db, item_id)) == ("PARTIAL", None)
     finally:
         await db.close()
 
@@ -493,13 +589,19 @@ async def test_partial_wins_over_the_outcome_even_with_remote_deleted(tmp_path, 
     `remote_deleted_at` only ever refines a `LOCAL_ONLY` reading -- see
     `test_outcome_survives_rescan_local_only_with_remote_deleted` in tests/test_postprocess.py
     for the direct pure-function version of this same case; this is the engine-level twin.
+
+    Driven from the rule 4 (remote grew) side so it keeps testing *precedence* alone: the
+    shrink grace period added 2026-08-19 sits behind `outcome_survives_rescan`, and a bare
+    `PARTIAL` here would now be held for ten minutes for a reason that has nothing to do with
+    `remote_deleted_at` -- see `test_a_shrinking_local_copy_holds_its_state_for_the_grace_period`
+    for that half.
     """
     engine, q, host, db, item_id = await _make_engine(
         tmp_path, monkeypatch, local_size=SIZE // 2, state="EXTRACTED"
     )
     await db.execute(
-        "UPDATE item SET remote_deleted_at = ? WHERE id = ?",
-        ("2026-08-13T00:00:00.000000Z", item_id),
+        "UPDATE item SET remote_deleted_at = ?, remote_size = ? WHERE id = ?",
+        ("2026-08-13T00:00:00.000000Z", SIZE // 2, item_id),
     )
     await db.commit()
     try:

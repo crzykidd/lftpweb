@@ -269,6 +269,16 @@ and known limitations, recorded in full in `docs/decisions.md` and `prompts/open
   location) only appears from the Files page.** `TransfersPage.tsx` opens the same drawer but
   doesn't have the owning queue's `local_path` loaded, so that one panel simply doesn't render
   there — every other section of the drawer is unaffected.
+- **On a queue with no *arr binding, an external removal slower than ~10 minutes can still
+  trigger one re-queue.** When something outside lftpweb takes a finished release apart — an
+  importer, a script, a person — the item reads `PARTIAL` in between, and `PARTIAL` is how a
+  genuinely interrupted transfer is resumed. Since 2026-08-19 that reading is held for the
+  local-absence grace period (~10 minutes) when the item was previously complete and the remote
+  total hasn't changed, which covers the ordinary case; when the window lapses it is published
+  as `PARTIAL` after all, on purpose, so a locally damaged copy stays re-fetchable. On an
+  *arr-bound queue the `arr_status` hand-off covers the rest with no time limit; on an untracked
+  queue a removal that takes longer than the window is re-queued once. Stop the job, or delete
+  the item, to settle it.
 - **The Sonarr/Radarr integration UI has never been click-tested in a browser.** No agent that
   built it (backend, notify/cleanup, or this UI pass) can render a page — see `docs/decisions.md`
   for the standing reason every Settings page in this project carries the same caveat. The item

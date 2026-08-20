@@ -374,6 +374,77 @@ async def test_re_download_externally_removed_setting_never_resurrects_our_own_d
     assert recorder.enqueued == []
 
 
+# --- The *arr hand-off gate (2026-08-19) ---------------------------------------------------
+#
+# `prompts/done/2026-08-19-autoqueue-requeues-imported-item.md`, production v0.2.6: a `move`
+# queue bound to Sonarr re-queued a release seconds after its own transfer succeeded, because
+# the importer moving the media file out left the release directory reading `PARTIAL` -- an
+# eligible state. The job then waited for a slot (97 minutes, in the worse of the two cases),
+# blocked `core/arrsync.py._maybe_cleanup` the whole time, and failed `REMOTE_GONE`.
+
+
+@pytest.mark.parametrize("arr_status", ["notified", "imported", "cleaned"])
+@pytest.mark.parametrize("state", ["REMOTE_ONLY", "PARTIAL"])
+async def test_an_item_the_arr_already_has_is_never_auto_queued(db, tmp_path, arr_status, state):
+    """No time bound, deliberately: the grace period in `core/mount_sentinel.py` covers the
+    seconds-long import, but a 38-episode season pack took ~19 minutes to move out -- longer
+    than the window -- so the general fix alone would have released it and re-queued it anyway.
+    Both eligible states are covered because the incident produced `PARTIAL` and the same shape
+    reaches `REMOTE_ONLY` once the last file leaves.
+    """
+    from lftpweb.core.mount_sentinel import write_if_needed
+
+    write_if_needed(str(tmp_path))
+    queue_id = await _make_queue(db, tmp_path)
+    item_id = await _make_item(db, queue_id, "Release.One", state=state)
+    await db.execute("UPDATE item SET arr_status = ? WHERE id = ?", (arr_status, item_id))
+    await db.commit()
+    recorder = _Recorder()
+    aq = AutoQueue(db, recorder)
+
+    assert await aq.on_scan(_mounted_config(queue_id, tmp_path)) == 0
+    assert recorder.enqueued == []
+
+
+@pytest.mark.parametrize("arr_status", ["detected", "dropped", "gone"])
+async def test_an_arr_status_that_predates_the_hand_off_stays_eligible(db, tmp_path, arr_status):
+    """**The load-bearing half.** `detected` is written by `core/arrsync.py._match_items` as
+    soon as the *arr's own download client reports the release on the seedbox -- long before
+    lftpweb has fetched a single byte -- so making it ineligible would stop auto-queue fetching
+    *arr-tracked releases at all. `dropped`/`gone` are reachable for an item lftpweb never
+    finished (or never started) too.
+    """
+    from lftpweb.core.mount_sentinel import write_if_needed
+
+    write_if_needed(str(tmp_path))
+    queue_id = await _make_queue(db, tmp_path)
+    item_id = await _make_item(db, queue_id, "Release.One")
+    await db.execute("UPDATE item SET arr_status = ? WHERE id = ?", (arr_status, item_id))
+    await db.commit()
+    recorder = _Recorder()
+    aq = AutoQueue(db, recorder)
+
+    assert await aq.on_scan(_mounted_config(queue_id, tmp_path)) == 1
+    assert recorder.enqueued == [item_id]
+
+
+async def test_an_untracked_item_with_a_null_arr_status_is_unaffected(db, tmp_path):
+    """SQLite's `NOT IN` over a NULL left-hand side is NULL, not true -- without the `COALESCE`
+    in the eligibility query this clause would silently exclude every item on every queue that
+    isn't bound to an *arr at all, i.e. the default install.
+    """
+    from lftpweb.core.mount_sentinel import write_if_needed
+
+    write_if_needed(str(tmp_path))
+    queue_id = await _make_queue(db, tmp_path)
+    item_id = await _make_item(db, queue_id, "Release.One")
+    recorder = _Recorder()
+    aq = AutoQueue(db, recorder)
+
+    assert await aq.on_scan(_mounted_config(queue_id, tmp_path)) == 1
+    assert recorder.enqueued == [item_id]
+
+
 async def test_manual_clear_of_suppression_makes_a_stopped_item_eligible_again(db, tmp_path):
     from lftpweb.core.mount_sentinel import write_if_needed
 
