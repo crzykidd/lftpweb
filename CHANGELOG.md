@@ -75,6 +75,16 @@ Skeleton for the next roll:
   WebSocket connection the page already has open, so expanding several rows at once never means
   several independent polls. A `pget` (single-file) job has no children and doesn't offer this
   group — its own progress is already the row's collapsed-line figure.
+- **Transfers is now the main nav section, with Queue and Files as tabs beneath it**
+  (`docs/transfers-redesign-spec.md` §2, phase 1 stage 6) — navigation only, nothing about
+  either page's rendering, fetching, filters, pagination, expansion, or actions changed. Files is
+  demoted, not removed or merged into Queue: it stays the only view of `REMOTE_ONLY` items that
+  never entered the pipeline (no pattern matched, or auto-queue was off), the only home for
+  Delete, and the only tree-shaped view of the remote. Queue (`/transfers/queue`) is the default
+  tab — "the working surface now" — and Files moves to `/transfers/files`; the old standalone
+  `/files` route now redirects there rather than 404ing. Each tab has its own URL, so it's
+  linkable and survives a reload, the same pattern Settings' and Docs' tabs already use
+  (`nav.ts.tabsForPath`).
 
 ### Changed
 

@@ -1726,20 +1726,25 @@ reasserting itself, visible at all; both are changes no writer pushes, because n
 ┌─ header ───────────────────────────────────────────────────────────────┐
 │  ▲ 8.2 MB/s    ⣿ 9.0 / 10 allocated    ⏳ 12 queued (48 GB)    24h: 310 GB │
 ├──────────┬─────────────────────────────────────────────────────────────┤
-│  Files   │  [ Connection · Queues · Transfer · Post-processing ·        │
-│  Xfers   │    Logs · Backup · Auth ]        ← tabs, only where a        │
-│  History │                                    section has >1 page       │
+│ Transfers│  [ Queue · Files ]              ← Transfers has tabs too     │
+│  History │                                                              │
 │ Dashboard│                                                              │
-│  Settings│                                                              │
-│  Docs    │  [ Quick start · Concepts ]   ← Docs has tabs too            │
-│ ──────── │                                                              │
-│ v0.0.1 ↗ │  ← bottom-left, links to the GitHub release notes            │
+│  Settings│  [ Connection · Queues · Transfer · Post-processing ·        │
+│  Docs    │    Logs · Backup · Auth ]        ← tabs, only where a        │
+│ ──────── │                                    section has >1 page       │
+│ v0.0.1 ↗ │  [ Quick start · Concepts ]   ← Docs has tabs too            │
 └──────────┴─────────────────────────────────────────────────────────────┘
 ```
 
 - **Left panel for section nav**; **tabs across the top** only where a section has more than one
-  page. Settings and **Docs** (2026-08-13) are the two that need them; `nav.ts.tabsForPath` maps
-  a route to its tab strip, so `Layout.tsx` has one lookup rather than a branch per section.
+  page. **Transfers** (2026-08-20, `docs/transfers-redesign-spec.md` §2, phase 1 stage 6),
+  Settings, and **Docs** (2026-08-13) are the three that need them; `nav.ts.tabsForPath` maps a
+  route to its tab strip, so `Layout.tsx` has one lookup rather than a branch per section.
+  **Transfers is the main section** and its two tabs are **Queue** (the working surface — what
+  is moving, and in what order) and **Files** (the full merged remote/local tree — the only view
+  of things with no job yet, and the only home for Delete). Queue is the default tab and the
+  app's own landing route. Files was a separate top-level nav entry before this task; `/files`
+  still redirects to `/transfers/files` so nothing that links or bookmarks the old path breaks.
 - **Docs is in-app user documentation, not architecture.** `DESIGN.md` (this file) is for people
   changing the code and `README.md` is for people who have not deployed yet; the Docs section
   serves the third audience neither reaches — someone with a *running* instance who does not know
@@ -1790,7 +1795,8 @@ Dashboard is the detail.
 
 ### 9.2 Pages
 
-**Files** — virtualized tree (must stay smooth at 10k+ rows), per row: state chip, progress
+**Files** (`/transfers/files`, the Transfers section's second tab since 2026-08-20 — §9.1) —
+virtualized tree (must stay smooth at 10k+ rows), per row: state chip, progress
 bar, size, speed, ETA. Grouped by queue, collapsible per queue. Expand/collapse, multi-select
 with shift-range, bulk *Queue / Stop / Delete*, text search, state filter, and a lifecycle
 facet filter (below) — composed together, never a second filtering path. Delete's own dialog
@@ -1972,7 +1978,8 @@ mean. The card is portal-rendered, not a child of the row (the row can scroll ou
 virtualized list, or unmount, while it's showing), hides on any scroll, and never intercepts a
 click meant for the row, a sort header, or a column resize handle.
 
-**Transfers** — the job queue. Rows stay deliberately plain:
+**Transfers** (`/transfers/queue`, the section's default/first tab since 2026-08-20 — §9.1) —
+the job queue. Rows stay deliberately plain:
 
 ```
 Some.Release.S03E04.2160p    [downloading]   18 files   62%   4.1 MB/s   ETA 12m

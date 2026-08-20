@@ -74,7 +74,7 @@ filesystem only, no SSH round trip — so progress and file-count changes on scr
 between full scans. It never advances the settle gate's own two-scan check (that still needs a
 real remote scan), and it never gives an _on-demand only_ queue a timer of its own.
 
-**Rescan now**, at the top of the [Files](/files) page, forces a full pass across every queue
+**Rescan now**, at the top of the [Files](/transfers/files) page, forces a full pass across every queue
 immediately instead of waiting. Each queue's heading shows how long ago it was last scanned, and
 surfaces a scan error or warning right there rather than only in the log.
 
@@ -84,9 +84,10 @@ surfaces a scan error or warning right there rather than only in the log.
 
 ## 5. Queue a transfer by hand
 
-On the [Files](/files) page, each row has a **Queue** button; select multiple rows (shift-click
-for a range) to queue, stop, delete, or reset them in bulk. Watch progress on the row's own
-inline bar, or on the [Transfers](/transfers) page. Progress is derived from bytes on disk
+On the [Files](/transfers/files) page, each row has a **Queue** button; select multiple rows
+(shift-click for a range) to queue, stop, delete, or reset them in bulk. Watch progress on the
+row's own inline bar, or on the [Transfers](/transfers/queue) page. Progress is derived from
+bytes on disk
 versus the known remote size, so a stopped transfer resumes from its partial rather than
 restarting.
 

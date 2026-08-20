@@ -122,8 +122,8 @@ intended.
 | `deleted_source` | You manually deleted the seedbox copy from the Files page's delete dialog (Delete source), without also deleting the local copy — so a release that later reappears under the same path is not silently fetched right back. A combined delete (both boxes checked) is recorded as `deleted_local` instead, the more complete fact about a row whose local copy is also gone. |
 
 **Suppression only ever stops auto-queue.** A manual **Queue** click on the
-[Files](/files) page is never filtered by it, and using **Retry** on a failed job from
-[Transfers](/transfers) lifts it.
+[Files](/transfers/files) page is never filtered by it, and using **Retry** on a failed job from
+[Transfers](/transfers/queue) lifts it.
 
 A suppressed row whose local copy _lftpweb itself deleted_, and whose remote copy is still
 there, shows **Re-Download** instead of Queue. It is the same click — the different word is
@@ -146,9 +146,9 @@ radii. This is the table to check before clicking one.
 
 | Action | Where | What it removes | What survives |
 |---|---|---|---|
-| **Dismiss** | [Transfers](/transfers) | Nothing. It flags one failed or cancelled job as dismissed so it stops cluttering the Transfers list. | Everything — the job is still in History, marked dismissed. Reversible in the sense that nothing was lost. |
+| **Dismiss** | [Transfers](/transfers/queue) | Nothing. It flags one failed or cancelled job as dismissed so it stops cluttering the Transfers list. | Everything — the job is still in History, marked dismissed. Reversible in the sense that nothing was lost. |
 | **Clear history** | [History](/history) | Transfer records and audit events — one row, everything matching your current filter, or everything. No category is protected, including remote-delete audit entries. | Every item, every suppression flag, every local file. Clearing History changes nothing about what will or will not download next. |
-| **Reset item tracking** | [Files](/files) | The item record itself and its whole subtree — plus its settle bookkeeping and archive-cleanup bookkeeping. Its transfer records go too, as an unavoidable consequence of the item row going. | Your local files, untouched. Audit events stay in History but lose their link back to the item. |
+| **Reset item tracking** | [Files](/transfers/files) | The item record itself and its whole subtree — plus its settle bookkeeping and archive-cleanup bookkeeping. Its transfer records go too, as an unavoidable consequence of the item row going. | Your local files, untouched. Audit events stay in History but lose their link back to the item. |
 
 Put plainly: **Dismiss tidies a list. Clear history deletes records. Reset item tracking forgets
 a path** — it makes lftpweb treat that path as brand new on the next scan, which is the only one

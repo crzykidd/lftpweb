@@ -348,7 +348,7 @@ stages are split small.
 | 4a | — grouping dropped, one flat globally-ordered list, per-row queue badge + fast-lane marker (frontend only, plus `JobOut.queue_short_name`) — **done 2026-08-19** | 3 |
 | 4b | — two paginated boxes (20 active/pending client-side, 50 complete server-side, reusing `api/history.py`'s paginator) — **done 2026-08-19** (`prompts/done/2026-08-19-transfers-paginated-boxes.md`) | 4a |
 | 5 | **Row expansion to per-file progress**, children fetched lazily on expand — **done 2026-08-20, browser-unverified** (`GET /api/items/{id}/children`, `prompts/done/2026-08-20-transfers-row-file-progress.md`) | 4a |
-| 6 | **Tabs** — Transfers as main section with Queue + Files tabs | 4a |
+| 6 | **Tabs** — Transfers as main section with Queue + Files tabs — **done 2026-08-20, browser-unverified** (`prompts/done/2026-08-20-transfers-queue-files-tabs.md`) | 4a |
 | 7 | **History → Events** — drop the jobs list, add the per-item deep link (frontend only) | 4a, 6 |
 
 Stage 1 carries the real architectural risk; 3 and 4 are low-risk and independently useful.
