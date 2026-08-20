@@ -77,6 +77,72 @@ than a first. Two things that bit the first time and will bit again:
 
 ## Where we are
 
+### 🚧 Transfers redesign — phase 1 in progress on `dev` (2026-08-19/20), 5 of 7 stages landed
+
+**`docs/transfers-redesign-spec.md` is the plan and the reasoning — read it before touching the
+Transfers page, `core/scheduler.py`, or the queue ordering.** It is a *proposal document*, not a
+description of reality; `DESIGN.md` still describes what exists. Design settled with the user
+over a long session on 2026-08-19; the spec records the decisions, the two earlier decisions it
+**reverses**, the open questions, and a staged build order.
+
+**The shape being built:** Transfers becomes the main section with **Queue** and **Files** tabs;
+History becomes **Events** (audit log only, with a per-item deep link); the queue is **one
+globally-ordered ungrouped list**, not one section per queue. That last one is a *correctness*
+fix, not taste — `core/scheduler.py` contains **zero** references to `queue_id`, so admission is
+entirely global and grouping by queue implied per-queue lines that never existed.
+
+**Phase 2 (download clients — SAB, then ruTorrent) is specced in §4 but deliberately NOT started.**
+It is written down only so phase 1 doesn't paint it into a corner. Governing principle if it is
+ever picked up: **advisory only** — a client may skip work (satisfy the settle gate), withhold
+work (block a known-bad transfer), or explain, but may **never write `item.state`**. And "absent
+from the client is not a verdict" — the v0.2.4 `dropped` incident is the proof.
+
+| Stage | What | Commit |
+|---|---|---|
+| 1 | **Queue order model** — `rank DESC, queued_at ASC` (a *boost*) replaced by a dense fractional `job.queue_position REAL` (a *position*). **Migration 023.** Backfill reproduces the old order exactly (`ROW_NUMBER() OVER (ORDER BY rank DESC, queued_at ASC, id ASC)`); `COALESCE(queue_position, 1e18)` sorts a stray NULL **last**, not first. **`rank` was deliberately NOT dropped** — `_rescue_position` still reads it as a boosted/natural discriminator, so a future "drop rank" cleanup has a prerequisite | `32dff87` |
+| 2 | **Chevron reordering** — ▲▲/▲/▼ on queued rows, one `POST /api/jobs/{id}/move` taking a direction. Handles the click-race (job started running → 409, never reorder a running job whose allocation is fixed at spawn) and **position exhaustion** (repeated midpoint insertion → renormalize + retry; tested with `math.nextafter`-adjacent floats, asserting its own premise) | `91860cf` |
+| 3 | **Queue short display name** — nullable `path_queue.short_name`, **migration 024**, max 10 chars, no backfill (never truncate `DC-Movies`/`DC-Music` into the same `DC-M`), no uniqueness (a display hint, not an identifier). Icons deliberately deferred — a curated set needs a `NOTICE` licence entry, bundling, and dark/light legibility, and would never cover every category anyway | `4d2417a` |
+| 4a | **Grouping dropped** — one flat globally-ordered list, muted queue badge per row (`queueDisplayName`), fast-lane badge on small-lane rows explaining why `#9` can start before `#2`. Removed `groupJobsByQueue`/`GroupHeader`/per-queue "Dismiss Queue" (superseded by the filter + "Dismiss list", not lost) — History's own grouping and `HISTORY_COLLAPSED_QUEUES_KEY` untouched | `4465344` |
+| 4b | **Two paginated boxes** — Active/pending 20/page client-side, Complete 50/page **server-side** (`GET /api/jobs/complete`, reusing `api/history.py`'s pagination shape, never inlining `output_tail`). **The non-obvious part:** paginating server-side silently broke the client-side name filter and "Dismiss list" — a filter that only sees one page while appearing to filter everything. Both moved server-side; `DismissAllRequest` gained `name_filter`, mutually exclusive with `queue_id`/`job_ids`, with the "empty result dismisses **nothing**, never everything" guard tested directly | `7cf34ba` |
+
+**Remaining: stage 5** (rows expand to per-file progress — the data already exists via
+`_publish_child_progress`; children must be fetched **lazily on expand**, never inlined into the
+jobs list), **stage 6** (Transfers/Files tabs), **stage 7** (History → Events; the events endpoint
+already accepts an `item_id` filter, so the deep link is frontend wiring only).
+
+**Browser status (user-checked on a real `:dev` pull, 2026-08-20): confirmed working — the split
+Active/Complete view, the short display name, the chevrons, the name filters, the Complete box,
+and the item drawer's per-file history.** The chevron check was the one behavioural claim no test
+could reach: before 4a a global move could swap a row with something in another group and look
+inert. **Still unverified, and both need volume rather than variety:** the fast-lane badge (needs
+a sub-10 MB item to turn up), and **"Dismiss list" against a filter matching more than one 50-row
+Complete page** — 4b's core correctness claim, which cannot misbehave visibly until the completed
+set actually spans two pages.
+
+Tests after stage 4b: **1462 backend / 524 frontend, 0 skipped.**
+
+### 2026-08-19 — two production defects found in a support bundle, both fixed
+
+Diagnosed from `private_data/debug_logs/lftpweb-support-0.2.6-20260819T205145Z.zip` (production,
+v0.2.6). The user reported "2 failed jobs but everything looks cleaned up" — it was four, and they
+were two different stories. Two (`INTERRUPTED`, 14:43) were the v0.2.6 startup rescue working
+correctly. Two (`REMOTE_GONE`) were a real defect:
+
+| What | Commit |
+|---|---|
+| **Auto-queue re-queued a release the *arr had just imported.** Job succeeds → post-processing renames to final name → Sonarr (retrying import every ~90s for three hours, because SAB finished on the seedbox long before lftpweb transferred) imports within seconds and moves the media file out → next scan reads **`PARTIAL`** → auto-queue re-queues → `move` mode deletes the seedbox source on confirmed import → the queued job finally gets a slot and fails `REMOTE_GONE`. Worse, the doomed job **blocked `arr_cleanup` for 97 minutes** (92 `arr_cleanup_withheld` events) because cleanup withholds while "an active job exists". Root cause: `ELIGIBLE_STATES = ("REMOTE_ONLY", "PARTIAL")` but `resolve_absence` only ever intercepted `REMOTE_ONLY` — `PARTIAL` had **no grace-period protection at all**. Fixed in two narrow halves: a `PARTIAL` branch on the grace period keyed on `is_local_shrink` ("was complete **and** remote size unchanged **and** local shrank" — so an interrupted transfer, never complete, is untouched), plus auto-queue skipping `notified`/`imported`/`cleaned` items. Both were needed: the grace period expires in ~10 min and the season-pack import took ~19; the *arr gate has no time bound but does nothing on an unbound queue | `27f629b` |
+| **Support bundle spent its 20 MB *arr-log budget on nine-day-stale logs.** `_log_file_sort_key` sorted by rotation suffix, so bare names (`sonarr.txt`, `sonarr.debug.txt`, `sonarr.trace.txt`) all read as "non-rotated" and tie-broke **alphabetically** — `debug` < `trace` < `txt`, so a dormant debug/trace series sorted *ahead* of the current log. 6 of 12 files were dropped, including the ones covering the incident. Now sorts by the *arr's own `lastWriteTime` descending across every series (it was always in the response, just never read); missing timestamps sort **last**, never first; `TRUNCATED.txt` prints timestamps for fetched and skipped alike | `c0cb4f1` |
+
+**The user's own hypothesis was right and is worth recording:** Sonarr *did* re-grab the episode
+from a different NZB (14:49:50Z `...BAE-xpost` failed on the SAB side, 15:13:52Z
+`...BAE[rarbg]-xpost` grabbed instead) — but three hours before the re-queue, so it explained the
+item's provenance, not the defect. **Do not predict remote paths from release names**: SAB renames
+on unpack and on re-grab.
+
+**Accepted gaps, named not hidden** (README "Known gaps", DESIGN.md §7.3): a queue with **no *arr
+binding** whose external removal outlasts the grace window still gets one re-queue; an
+`imported`/`cleaned` item whose remote legitimately grows is no longer auto-queued.
+
 ### Post-v0.2.6 work on `dev` (2026-08-19) — the README's safety-rails section, and all of v0.2.6 confirmed in use
 
 | What | Commit |
