@@ -16,6 +16,7 @@ import type {
   BackupListResponse,
   BackupSettingsIn,
   BackupSettingsOut,
+  CompleteJobsResponse,
   DeleteItemResponse,
   DismissAllResponse,
   DownloadPrefixSettingsIn,
@@ -32,6 +33,7 @@ import type {
   HostIn,
   HostOut,
   HostTestRequest,
+  ItemChildrenResponse,
   ItemEventsResponse,
   JobOut,
   JobsResponse,
@@ -50,6 +52,7 @@ import type {
   PatternPreviewResponse,
   PostprocessSettingsIn,
   PostprocessSettingsOut,
+  PreflightResponse,
   QueueAutoQueueStatus,
   QueueResetRequest,
   RemovalGraceSettingsOut,
@@ -296,6 +299,27 @@ export function getJobs(): Promise<JobsResponse> {
   return getJson<JobsResponse>('/api/jobs')
 }
 
+/** The Queue tab's Complete box (2026-08-19, docs/transfers-redesign-spec.md §3.2, phase 1
+ * stage 4b) -- `getJobs` above stays the Active/pending box's own bounded fetch, unchanged;
+ * terminal jobs live here now, server-side paginated and (optionally) filtered. Same
+ * `queryString` helper `getHistoryJobs` already uses below, for the same reason: an
+ * `undefined` field is simply omitted from the query string rather than sent as the literal
+ * string `"undefined"`.
+ */
+export function getCompleteJobs(params: {
+  nameFilter?: string
+  limit?: number
+  offset?: number
+}): Promise<CompleteJobsResponse> {
+  return getJson<CompleteJobsResponse>(
+    `/api/jobs/complete${queryString({
+      name_filter: params.nameFilter,
+      limit: params.limit,
+      offset: params.offset,
+    })}`,
+  )
+}
+
 /** Manual queue (§4.7): always wins over auto-queue suppression. `startNow` requests the
  * "start now at max bandwidth" admission path (§4.5) at the moment of queueing.
  */
@@ -309,6 +333,22 @@ export function stopJob(jobId: number): Promise<void> {
 
 export function moveJobToTop(jobId: number): Promise<void> {
   return sendJson<void>(`/api/jobs/${jobId}/move-to-top`, 'POST')
+}
+
+/** The chevron reorder controls (2026-08-19, docs/transfers-redesign-spec.md §3.4 stage 2,
+ * prompts/2026-08-19-queue-reorder-chevrons.md) -- ▲ up one / ▼ down one / ▲▲ to top, one
+ * endpoint for all three (`api/jobs.py.move_job`) rather than three near-identical calls.
+ * `sendJson` throws on a non-2xx response -- a 404 (unknown job) or 409 (the job is no longer
+ * `queued`, e.g. it started running between the page render and the click) both surface as a
+ * thrown `Error`, the same shape every other job action on this page already reports through
+ * `withBusy`. Already-at-the-edge and a single-job queue are silent 204 no-ops server-side, not
+ * errors -- the frontend's own `canMoveUp`/`canMoveDown` (`lib/transferPanel.ts`) additionally
+ * disable the buttons for those cases so the request is rarely even sent.
+ */
+export type MoveDirection = 'up' | 'down' | 'top'
+
+export function moveJob(jobId: number, direction: MoveDirection): Promise<void> {
+  return sendJson<void>(`/api/jobs/${jobId}/move`, 'POST', { direction })
 }
 
 /** Dismiss a terminal (`failed`/`cancelled`) job from the Transfers page (2026-08-13,
@@ -329,13 +369,56 @@ export function dismissJob(jobId: number): Promise<void> {
  * prompts/2026-08-17-transfers-dismiss-per-queue.md) scopes the same bulk call to one queue's
  * own terminal jobs. Omitted (the pre-existing call every caller before this task still makes)
  * sends no body at all -- byte-for-byte the original request -- matching
- * `api/jobs.py.dismiss_all_jobs`'s own "omitted body means every queue" contract.
+ * `api/jobs.py.dismiss_all_jobs`'s own "omitted body means every queue" contract. No caller in
+ * this app passes it any more (the per-queue "Dismiss Queue" control it served was removed
+ * 2026-08-19 alongside grouping, docs/transfers-redesign-spec.md §3.1) -- kept on the client
+ * exactly because the server-side scope (`DismissAllRequest.queue_id`) is kept too, per the
+ * same task's own instruction not to remove it.
+ *
+ * `jobIds` (2026-08-19, prompts/2026-08-19-transfers-name-filter.md) scopes the same bulk call
+ * to an explicit set of job ids -- kept on both the client and server for the identical reason
+ * `queueId` is (`DismissAllRequest.job_ids`'s own docstring). No caller in this app passes it
+ * either as of phase 1 stage 4b: "Dismiss list" now uses `nameFilter` below instead, since the
+ * Complete box it scopes is server-paginated and an explicit id list can only ever name one
+ * page's worth (`nameFilter`'s own comment).
+ *
+ * `nameFilter` (2026-08-19, docs/transfers-redesign-spec.md §3.2, phase 1 stage 4b) --
+ * "Dismiss list"'s own scope now that the Complete box is server-paginated: the same filter
+ * text the box's own `getCompleteJobs` call is showing, so the server dismisses every matching
+ * row, not just the current page (`models.py.DismissAllRequest.name_filter`'s own docstring has
+ * the full reasoning). An empty string is a real, sendable value (`nameFilter === ''` would
+ * mean "matches every row"), so this only omits the field when `nameFilter` is `undefined` --
+ * `!= null`, not truthiness.
+ *
+ * `outcome` (2026-08-20, follow-up to phase 1 stage 4b, the Complete box's own "Dismiss" menu,
+ * `lib/transferPanel.ts.dismissMenuOptions`) narrows the same bulk call to one terminal state.
+ * **Composes with `nameFilter`** -- unlike `queueId`/`jobIds`, both may be sent together
+ * (`models.py.DismissAllRequest`'s own restructured validator allows it; see that model's
+ * docstring and `docs/decisions.md` for the decided reasoning). `TransfersPage.tsx.
+ * handleDismissOutcome` sends the box's own current (debounced) name filter alongside whichever
+ * outcome the user picked, so the dismiss always matches what the box is currently showing.
+ *
+ * `queueId` and `jobIds` stay mutually exclusive with every other scope, including each other
+ * (`DismissAllRequest`'s own validator rejects an incoherent combination); no caller in this app
+ * sends either alongside `outcome`/`nameFilter`. Threaded the same "omitted means not sent" way
+ * every scope on this call already is, not five functions -- they're all optional narrowings
+ * (or, for `queueId`/`jobIds`, exclusive scopes) of the same one bulk call.
  */
-export function dismissAllJobs(queueId?: number): Promise<DismissAllResponse> {
+export function dismissAllJobs(
+  queueId?: number,
+  jobIds?: number[],
+  nameFilter?: string,
+  outcome?: JobOut['state'],
+): Promise<DismissAllResponse> {
+  const body: { queue_id?: number; job_ids?: number[]; name_filter?: string; outcome?: string } = {}
+  if (queueId != null) body.queue_id = queueId
+  if (jobIds != null) body.job_ids = jobIds
+  if (nameFilter != null) body.name_filter = nameFilter
+  if (outcome != null) body.outcome = outcome
   return sendJson<DismissAllResponse>(
     '/api/jobs/dismiss-all',
     'POST',
-    queueId != null ? { queue_id: queueId } : undefined,
+    Object.keys(body).length > 0 ? body : undefined,
   )
 }
 
@@ -345,6 +428,19 @@ export function dismissAllJobs(queueId?: number): Promise<DismissAllResponse> {
  */
 export function getItemEvents(itemId: number, limit?: number): Promise<ItemEventsResponse> {
   return getJson<ItemEventsResponse>(`/api/items/${itemId}/events${limit != null ? `?limit=${limit}` : ''}`)
+}
+
+/** The Transfers row's per-file expansion (2026-08-20, docs/transfers-redesign-spec.md §3.3,
+ * phase 1 stage 5) -- fetched once, when a directory row's panel is expanded, never eagerly for
+ * the whole jobs list (`api/jobs.py.item_children`'s own docstring; the same "on demand" shape
+ * `getItemEvents` above already establishes for this page). The response is already capped
+ * server-side (`ItemChildrenResponse.total` says the true count); once expanded, live updates
+ * come from the WebSocket this page already has open (`useLiveModel`'s `item_delta`/
+ * `child_progress` messages, merged client-side by `lib/transferPanel.ts.mergeFileListChildren`)
+ * rather than a second call here -- see `TransfersPage.tsx`'s own comment on why.
+ */
+export function getItemChildren(itemId: number): Promise<ItemChildrenResponse> {
+  return getJson<ItemChildrenResponse>(`/api/items/${itemId}/children`)
 }
 
 /** "Start now" (DESIGN.md §4.5), now a menu -- 10%/25%/50%/75%/Max of the site total limit
@@ -366,8 +462,48 @@ export function startJobNow(
   )
 }
 
+/** The Transfers -> Queue tab's Pause control (2026-08-20, `prompts/2026-08-20-queue-pause.md`).
+ * `stopRunning` omitted/`false` is "pause after current" -- running jobs finish normally, nothing
+ * new is admitted. `true` is "pause now" -- additionally stops every in-flight transfer and
+ * returns it to `queued` at its same position (`core/queue.py.TransferQueue.pause`).
+ */
+export function pauseQueue(stopRunning = false): Promise<void> {
+  return sendJson<void>('/api/queue/pause', 'POST', { stop_running: stopRunning })
+}
+
+/** Resume admission immediately, in queue-position order. */
+export function unpauseQueue(): Promise<void> {
+  return sendJson<void>('/api/queue/unpause', 'POST')
+}
+
+/** The Queue tab's Preflight box (docs/transfers-redesign-spec.md §4, prefigured; this task's
+ * own handoff prompt, prompts/done/2026-08-20-preflight-box.md) -- `hooks/usePreflight.ts` polls
+ * this, same "hand-rolled fetch + poll hook, never TanStack Query" convention `useJobs`/
+ * `usePoll` already establish for this page.
+ */
+export function getPreflight(): Promise<PreflightResponse> {
+  return getJson<PreflightResponse>('/api/queue/preflight')
+}
+
 export function retryItem(itemId: number): Promise<JobOut> {
   return sendJson<JobOut>(`/api/items/${itemId}/retry`, 'POST')
+}
+
+/** Manually resolve a wedged row out of the Queue tab's Active/pending box (2026-08-20,
+ * docs/transfers-redesign-spec.md §3.2's pipeline-completion rule) -- `'complete'`/`'failed'` to
+ * file it with that outcome, `null` to undo a resolution set by mistake.
+ *
+ * **A classification only.** It moves a row between two boxes on a page and is evidence of
+ * nothing: it never advances the `move`-mode delete ladder, is never read as a confirmed *arr
+ * import, and never triggers notify/cleanup/post-processing. See `api/jobs.py.resolve_item` and
+ * migration 025 for the full constraint. Rejects (409) while the item's own transfer is still
+ * queued or running -- Stop is the control for that.
+ */
+export function resolveItem(
+  itemId: number,
+  outcome: 'complete' | 'failed' | null,
+): Promise<{ item_id: number; manual_outcome: string | null; manual_outcome_at: string | null }> {
+  return sendJson(`/api/items/${itemId}/resolve`, 'POST', { outcome })
 }
 
 /** Stop-by-item (DESIGN.md §9.2's Files-page Stop action) -- the Files page only knows the
@@ -507,31 +643,19 @@ export function getHistoryEvents(filter: HistoryEventsFilter = {}): Promise<Hist
 
 // --- History: clearing (2026-08-13, prompts/2026-08-13-clear-history.md) ------------------
 //
-// A *different* action from `dismissJob` above: dismiss only hides a row from Transfers and
-// leaves History untouched; these delete the row from History outright, and it's irreversible
-// -- every caller must confirm first (DESIGN.md's own instruction; see HistoryJobsSection /
-// HistoryEventsSection for the confirmation panel). Bulk clears run server-side as one
-// request (not a `Promise.allSettled` loop over ids) -- there's nothing per-row that can fail
-// independently the way a stop-then-delete race can, so one `DELETE ... WHERE` is simpler and
-// is what `api/history.py`'s own docstring documents as the choice made here.
-
-/** Clear one job record from History. Rejects (throws) for a `queued`/`running` job -- an
- * active transfer is not history and the server enforces this itself (409), not just this
- * button being hidden.
- */
-export function clearHistoryJob(jobId: number): Promise<HistoryClearResponse> {
-  return sendJson<HistoryClearResponse>(`/api/history/jobs/${jobId}`, 'DELETE')
-}
-
-/** Clear every job matching `filter` -- the same filter shape `getHistoryJobs` takes. No
- * filter at all clears every terminal job ("clear all"); `state` alone is "clear by outcome".
- * Never reaches an active job regardless of filter -- see the server-side docstring.
- */
-export function clearHistoryJobs(
-  filter: Omit<HistoryJobsFilter, 'limit' | 'offset'> = {},
-): Promise<HistoryClearResponse> {
-  return sendJson<HistoryClearResponse>(`/api/history/jobs${queryString(filter)}`, 'DELETE')
-}
+// `clearHistoryJob`/`clearHistoryJobs` (job clearing) were removed 2026-08-20
+// (docs/transfers-redesign-spec.md §2, phase 1 stage 7) when `HistoryJobsSection.tsx` -- their
+// only caller -- was deleted along with the rest of History's own `job` list; the backend
+// `DELETE /api/history/jobs[/{id}]` endpoints they called stay (docs/decisions.md), just with
+// no remaining frontend caller. `clearHistoryEvent`/`clearHistoryEvents` below are unaffected --
+// `EventsSection.tsx` (formerly `HistoryEventsSection.tsx`) still calls them. A *different*
+// action from `dismissJob` above: dismiss only hides a row from Transfers and leaves the
+// underlying `job`/`event` rows untouched; these delete a row outright, and it's irreversible --
+// every caller must confirm first (DESIGN.md's own instruction; see `EventsSection.tsx` for the
+// confirmation panel). Bulk clears run server-side as one request (not a `Promise.allSettled`
+// loop over ids) -- there's nothing per-row that can fail independently the way a stop-then-
+// delete race can, so one `DELETE ... WHERE` is simpler and is what `api/history.py`'s own
+// docstring documents as the choice made here.
 
 /** Clear one event record from History -- no "active" concept the way jobs have, so this
  * always either deletes the row or 404s.

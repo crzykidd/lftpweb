@@ -38,8 +38,56 @@ _QUEUE_SELECT_COLUMNS = (
     "id, host_id, name, remote_path, local_path, staging_path, enabled, sync_mode, "
     "auto_queue_enabled, auto_queue_patterns_only, auto_verify, auto_extract, auto_move, "
     "auto_delete_archives, scan_interval_s, download_prefix_enabled, download_prefix, "
-    "arr_instance_id, arr_delete_completed, arr_visible_path"
+    "arr_instance_id, arr_delete_completed, arr_visible_path, short_name"
 )
+
+# Migration 024 (docs/transfers-redesign-spec.md §3.6). Chosen from the UI's own constraint,
+# not an arbitrary round number: this feature's own worked example is `DC-Movies` -> `MOV`
+# (3 chars), and the longest realistic short forms the task anticipated -- `AudioBk`, `TV-4K`,
+# `Software` -- all fit inside 10 with room to spare for the compact per-row badge stage 4
+# renders once Transfers drops its per-queue grouping. Not the 8-12 range's upper end: nothing
+# about this feature needs it, and a tighter cap keeps every future badge render provably
+# non-wrapping without needing to know the badge's actual pixel width.
+MAX_SHORT_NAME_LEN = 10
+
+
+def resolve_queue_display_name(short_name: str | None, name: str) -> str:
+    """ "What do we display for this queue" -- the one place the `short_name or name` fallback
+    is computed (docs/transfers-redesign-spec.md §3.6). Not called anywhere in this task --
+    stage 4 renders it on Transfers rows once grouping drops and there's a single list to
+    render into -- but lives here now, alongside the field itself, so that call site (and any
+    other future one) has exactly one fallback to import rather than re-deriving
+    `short_name or name` ad hoc at each.
+    """
+    return short_name or name
+
+
+def _normalized_short_name(value: str | None) -> str | None:
+    """Trim; empty-after-trim collapses to `None` (not `""`) so "cleared" has exactly one
+    representation on the wire and in the DB -- the same "one representation" discipline
+    `download_prefix`'s inherit-vs-override handling already follows, applied here to "no short
+    name set" instead of "inherit." Whitespace-only input (an accidental space-bar tap) reads
+    identically to leaving the field empty. Always run before `_reject_invalid_short_name`
+    below, so the length cap applies to what will actually be stored, not the raw input.
+    """
+    if value is None:
+        return None
+    trimmed = value.strip()
+    return trimmed or None
+
+
+def _reject_invalid_short_name(value: str | None) -> None:
+    """`short_name` is a **display hint, not an identifier** -- deliberately no uniqueness
+    check here: two queues may legitimately share one (e.g. two `move`-mode 4K movie queues
+    both wanting `MOV`), and rejecting a duplicate while someone is mid-typing would be a
+    surprising failure for a field that carries no correctness weight. The only save-time rule
+    is the length cap, checked against the already-`_normalized_short_name`-trimmed value.
+    """
+    if value is not None and len(value) > MAX_SHORT_NAME_LEN:
+        raise HTTPException(
+            status_code=400,
+            detail=f"short_name must be at most {MAX_SHORT_NAME_LEN} characters",
+        )
 
 
 def _nullable_bool(value: int | None) -> bool | None:
@@ -74,6 +122,7 @@ def _queue_out_from_row(row) -> PathQueueOut:
         arr_instance_id=row["arr_instance_id"],
         arr_delete_completed=bool(row["arr_delete_completed"]),
         arr_visible_path=row["arr_visible_path"],
+        short_name=row["short_name"],
     )
 
 
@@ -244,6 +293,8 @@ async def create_queue(body: PathQueueIn, request: Request) -> PathQueueOut:
     _reject_invalid_scan_interval(body.scan_interval_s)
     _reject_invalid_download_prefix(body)
     _reject_invalid_local_paths(body)
+    short_name_value = _normalized_short_name(body.short_name)
+    _reject_invalid_short_name(short_name_value)
     db = request.app.state.db
     await _validate_arr_binding(db, body.arr_instance_id, body.arr_delete_completed)
     host_row = await _get_host_row(db)
@@ -256,8 +307,8 @@ async def create_queue(body: PathQueueIn, request: Request) -> PathQueueOut:
         "enabled, sync_mode, auto_queue_enabled, auto_queue_patterns_only, "
         "auto_verify, auto_extract, auto_move, auto_delete_archives, scan_interval_s, "
         "download_prefix_enabled, download_prefix, "
-        "arr_instance_id, arr_delete_completed, arr_visible_path) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "arr_instance_id, arr_delete_completed, arr_visible_path, short_name) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             host_row["id"],
             body.name,
@@ -278,6 +329,7 @@ async def create_queue(body: PathQueueIn, request: Request) -> PathQueueOut:
             body.arr_instance_id,
             1 if body.arr_delete_completed else 0,
             body.arr_visible_path,
+            short_name_value,
         ),
     )
     await db.commit()
@@ -346,6 +398,8 @@ async def update_queue(queue_id: int, body: PathQueueIn, request: Request) -> Pa
     _reject_unimplemented_sync_mode(body.sync_mode)
     _reject_invalid_scan_interval(body.scan_interval_s)
     _reject_invalid_local_paths(body)
+    short_name_value = _normalized_short_name(body.short_name)
+    _reject_invalid_short_name(short_name_value)
     db = request.app.state.db
     await _validate_arr_binding(db, body.arr_instance_id, body.arr_delete_completed)
     await _reject_invalid_remote_path(request, body.remote_path)
@@ -389,7 +443,8 @@ async def update_queue(queue_id: int, body: PathQueueIn, request: Request) -> Pa
         "enabled = ?, sync_mode = ?, auto_queue_enabled = ?, auto_queue_patterns_only = ?, "
         "auto_verify = ?, auto_extract = ?, auto_move = ?, auto_delete_archives = ?, "
         "scan_interval_s = ?, download_prefix_enabled = ?, download_prefix = ?, "
-        "arr_instance_id = ?, arr_delete_completed = ?, arr_visible_path = ? WHERE id = ?",
+        "arr_instance_id = ?, arr_delete_completed = ?, arr_visible_path = ?, "
+        "short_name = ? WHERE id = ?",
         (
             body.name,
             body.remote_path,
@@ -411,6 +466,7 @@ async def update_queue(queue_id: int, body: PathQueueIn, request: Request) -> Pa
             body.arr_instance_id,
             1 if body.arr_delete_completed else 0,
             body.arr_visible_path,
+            short_name_value,
             queue_id,
         ),
     )

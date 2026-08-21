@@ -117,7 +117,7 @@ import logging
 import posixpath
 import re
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -140,6 +140,7 @@ from lftpweb.core.events import EventBus
 from lftpweb.core.itemview import item_view
 from lftpweb.core.local_delete import DeleteInFlight, _do_remove_from_disk, _physical_local_root
 from lftpweb.core.postprocess import perform_remote_delete
+from lftpweb.core.preflight import PreflightHold, PreflightRow
 
 logger = logging.getLogger(__name__)
 
@@ -226,6 +227,175 @@ def _derive_arr_root(output_path: str, item_name: str) -> str:
     if normalized.endswith(suffix):
         return normalized[: -len(suffix)]
     return posixpath.dirname(normalized)
+
+
+# --- Preflight (docs/transfers-redesign-spec.md §4, prefigured -- this task's own handoff
+# prompt, prompts/done/2026-08-20-preflight-box.md) -- releases a bound *arr instance already
+# knows about that have not yet reached this seedbox's completed folder, so lftpweb has no
+# `item` and no work to do on them yet. **A pure projection of this poller's own latest pass, no
+# table, no migration, no persistence** -- every field a row needs is already sitting in the
+# `QueueRecord.raw` this module fetches every ~60s and otherwise discards the moment a record
+# matches nothing (`_match_items`'s own "candidates" loop never looks at these at all).
+#
+# **This section is where every *arr-specific piece of the Preflight box lives, deliberately.**
+# `core/preflight.py` owns the box's *shared* shape (`PreflightRow`, the flap-tolerance
+# `PreflightHold`) precisely so a second source -- non-*arr items held by the settle gate,
+# `core/settle.py`, already planned as an immediate follow-up -- can be added there without
+# reshaping anything here: matching against `item` names, `arr_visible_path` prefix attribution,
+# and the *arr's own `trackedDownloadState`/`downloadId` vocabulary all stay behind this module's
+# own boundary, never leaking into the shared row/cache types. ---------------------------------
+
+
+def _record_identity(record: QueueRecord) -> str:
+    """A stable key for one queue record across polls, for `_update_preflight`'s own
+    `PreflightHold` below. `download_id` when the client provides one (the normal case -- every
+    *arr-tracked download carries its client's own key, docs/transfers-redesign-spec.md §4.4);
+    falls back to the normalized title (`_normalize_name`, already used by `_record_matches_item`
+    above) for the rare record that doesn't, so a poll-to-poll identity still exists rather than
+    the row re-appearing as "new" every single pass.
+    """
+    if record.download_id:
+        return f"id:{record.download_id}"
+    return f"title:{_normalize_name(record.title)}"
+
+
+def _visible_path_contains(arr_visible_path: str, output_path: str) -> bool:
+    """Whether `output_path` (the *arr's own reported directory for a queue record) sits under
+    `arr_visible_path` (a bound queue's `local_path`, translated into that same *arr's own
+    namespace -- `path_queue.arr_visible_path`, already configured on the user's production
+    queues per the v0.2.2 diagnosis). A component-boundary check, not a bare `str.startswith`,
+    so `/data/tv` does not spuriously swallow `/data/tvshows/...` -- both sides' trailing
+    slashes are normalized away first so a configured value with or without one behaves
+    identically.
+    """
+    root = arr_visible_path.rstrip("/")
+    if not root:
+        return False
+    candidate = output_path.rstrip("/")
+    return candidate == root or candidate.startswith(root + "/")
+
+
+def _record_matches_any_item(record: QueueRecord, item_names: frozenset[str]) -> bool:
+    """The one implementation of "does this queue record match a real lftpweb item," shared by
+    `_preflight_candidates` below (the per-pass exclusion/retirement check) and
+    `ArrSyncScheduler.preflight_rows`'s own request-time re-check (2026-08-21, "a handed-over
+    release lingers in Preflight for up to 20-30s" -- the poll-cadence term left over after the
+    2026-08-21 evict-on-handover fix). Both call sites answer the identical question against the
+    identical `_record_matches_item`; a second, independent definition here would let the two
+    drift, and drift in either direction is a real user-visible defect -- a row wrongly
+    reappearing (drift one way) or a row wrongly vanishing while its download is still genuinely
+    in progress (drift the other way).
+    """
+    return any(_record_matches_item(record, name) for name in item_names)
+
+
+def _preflight_candidates(
+    records: list[QueueRecord],
+    queues: list[aiosqlite.Row],
+    item_names: frozenset[str],
+) -> tuple[list[tuple[int, QueueRecord]], list[QueueRecord]]:
+    """Every queue record worth projecting into the Preflight box this pass, paired with the
+    queue id it was attributed to -- plus, separately, every record just **retired** by matching
+    a real lftpweb item (2026-08-21, "a handed-over release lingers in Preflight for up to
+    150s"). Returns `(candidates, retired)`. The handoff prompt's own two rules for `candidates`,
+    applied in order:
+
+    1. **"Records that match an lftpweb item are ignored"** -- `item_names` is every top-level
+       `item.rel_path` across *every* queue this instance is bound to (gathered fresh by
+       `_update_preflight` below, after this pass's own `_match_items` has already run for all of
+       them), checked with the exact same `_record_matches_item` the real matcher uses. A record
+       this pass just matched into a real item is already excluded here -- the handoff prompt's
+       own "no duplicate at handover" requirement, satisfied by construction rather than a
+       separate check. **This is also the one branch that means "retired,"** not merely absent:
+       the record now corresponds to a real `item` row, a known and terminal reason for it to
+       stop being a Preflight row, so it goes in `retired` too -- `_update_preflight` passes that
+       straight to `PreflightHold.update`'s own `retired` set so this row is evicted immediately
+       rather than held for `PREFLIGHT_HOLD_S` alongside a genuinely-missing one.
+    2. **Attribution is `arr_visible_path` prefix-matching, and silence is correct when it
+       doesn't resolve.** A record with an `outputPath` is attributed to whichever bound queue's
+       `arr_visible_path` contains it (most-specific/longest match wins, for the unlikely case of
+       two nested visible paths); a record with **no** `outputPath` at all (the *arr does not
+       always populate it) is attributed to the instance's one bound queue only when there is
+       exactly one -- never a guess between two or more (the handoff prompt's own instruction).
+       No match at all -- omitted, not a fallback guess -- because the sharp risk here is
+       promising a file that never arrives.
+
+    **Already-`imported`-at-the-*arr-level records are excluded too**
+    (`tracked_download_state == TRACKED_DOWNLOAD_STATE_IMPORTED`) -- the box's own stated scope
+    is "still downloading" (step 1 of the handoff prompt's "What to do"), and a record this far
+    along is also the one most likely to become a real lftpweb item on literally the next scan;
+    dropping it here is one more guard against the same "visible twice" failure mode, on top of
+    (not instead of) the item-match check above. **Deliberately not added to `retired`** -- this
+    record has not necessarily become any lftpweb item yet (attribution could still fail, or no
+    item has been scanned into existence for it at all), so there is no known-terminal fact to
+    signal yet; a record excluded for this reason that never becomes a real item simply falls out
+    through the ordinary hold-then-expire path once it stops appearing altogether, unchanged.
+    """
+    out: list[tuple[int, QueueRecord]] = []
+    retired: list[QueueRecord] = []
+    for record in records:
+        if record.tracked_download_state == TRACKED_DOWNLOAD_STATE_IMPORTED:
+            continue
+        if _record_matches_any_item(record, item_names):
+            retired.append(record)
+            continue
+
+        queue_id: int | None = None
+        if record.output_path:
+            best_len = -1
+            for queue in queues:
+                visible = queue["arr_visible_path"]
+                if not visible or not _visible_path_contains(visible, record.output_path):
+                    continue
+                visible_len = len(visible.rstrip("/"))
+                if visible_len > best_len:
+                    best_len = visible_len
+                    queue_id = queue["id"]
+        elif len(queues) == 1:
+            queue_id = queues[0]["id"]
+
+        if queue_id is not None:
+            out.append((queue_id, record))
+    return out, retired
+
+
+# .NET `TimeSpan.ToString()`'s default format -- what a v3 queue record's own `timeleft` field is
+# ("`[d.]hh:mm:ss[.fffffff]`") -- **not verified against a live Sonarr/Radarr instance** (unlike
+# `TRACKED_DOWNLOAD_STATE_IMPORTING`/`_IMPORTED` above, this codebase's own module docstring only
+# records that verification for `trackedDownloadState`). Tolerates the documented default shape
+# and returns `None` for anything else rather than guessing at an undocumented one.
+_TIMELEFT_RE = re.compile(
+    r"^(?:(?P<days>\d+)\.)?(?P<hours>\d{1,2}):(?P<minutes>\d{2}):(?P<seconds>\d{2})(?:\.\d+)?$"
+)
+
+
+def _parse_timeleft(value: object) -> float | None:
+    """`QueueRecord.raw["timeleft"]` -> seconds remaining, for `PreflightRow.remaining_s`
+    (2026-08-21, "we missed the remaining time"). Reads straight from `raw` -- no extra request,
+    per the handoff prompt's own instruction; `estimatedCompletionTime` (an absolute timestamp)
+    was the other field available on the same record but is **not** used here: it would require
+    trusting the *arr's clock against this process's own, and a fresh recomputation every request
+    (`now` vs. a timestamp read once per ~60s poll) would make the figure visibly count down
+    unevenly between polls, whereas `timeleft` is already the duration the *arr itself computed
+    and is rendered through this codebase's *own* `formatEta`/`transferLineValue` shape exactly
+    once it's a plain number of seconds -- one clock (this process's own render), not two.
+
+    `None` for anything not shaped like the documented default .NET `TimeSpan.ToString()` format
+    (unparseable), for a missing/non-string value (absent), and for a parsed `00:00:00` (a
+    paused/stalled download client item reports this -- meaningless, never a real "0s left," per
+    the handoff prompt's own "never a fabricated or zero estimate" instruction).
+    """
+    if not isinstance(value, str) or not value:
+        return None
+    match = _TIMELEFT_RE.match(value.strip())
+    if match is None:
+        return None
+    days = int(match.group("days") or 0)
+    hours = int(match.group("hours"))
+    minutes = int(match.group("minutes"))
+    seconds = int(match.group("seconds"))
+    total = days * 86400 + hours * 3600 + minutes * 60 + seconds
+    return float(total) if total > 0 else None
 
 
 # Association states a fresh queue record is allowed to match against: never-associated, or a
@@ -471,6 +641,27 @@ class ArrSyncScheduler:
         # than the bound technically allows, never fewer -- the same safe direction
         # `_notify_attempts` above already relies on.
         self._scan_command_checks: dict[int, int] = {}
+        # Preflight (this task) -- one `PreflightHold` (`core/preflight.py`) per bound *arr
+        # instance id, the flap-tolerant cache of that instance's own last-seen preflight rows.
+        # In-memory only, the same "restart loses it, and that's the safe direction" reasoning as
+        # every other dict above: a restart just empties the box until the next poll (≤60s),
+        # which the handoff prompt's own reasoning accepts explicitly rather than adding
+        # persistence to avoid it. `_update_preflight` is the only writer; `preflight_rows` is
+        # the only reader.
+        self._preflight_holds: dict[int, PreflightHold] = {}
+        # This instance's own last poll pass's records, keyed by `_record_identity`, and the
+        # bound+enabled queue ids that pass attributed against -- both refreshed by
+        # `_update_preflight` alongside the hold above, and read by `preflight_rows`' own
+        # request-time retirement re-check (2026-08-21, "eviction latency": retirement was only
+        # *decided* once per *arr poll, `ArrSettings.poll_interval_s` defaulting to 60s, even
+        # though the underlying question -- "does a matching `item` now exist" -- is purely
+        # local and answerable on every request). In-memory only, same "restart loses it, and
+        # that's the safe direction" reasoning as every other dict here: a restart just means
+        # the very next request's retirement re-check has nothing to test against until the
+        # first poll lands, falling back to "not retired" (see `preflight_rows`), which is
+        # exactly today's pre-fix behaviour, never worse.
+        self._last_records: dict[int, dict[str, QueueRecord]] = {}
+        self._last_queue_ids: dict[int, list[int]] = {}
 
     async def start(self) -> None:
         if self._task is None:
@@ -565,6 +756,142 @@ class ArrSyncScheduler:
                     # attempt after backoff.
                     await self._handle_failure(instance_id, instance["name"], exc)
                     return
+
+            # Preflight (this task) -- after every one of this instance's bound queues has been
+            # processed above, so a record `_match_items` just matched into a real item *this
+            # very pass* is already excluded from `item_names` below (freshly queried, not the
+            # `items` snapshot any one `_process_queue` call took) -- the handoff prompt's own
+            # "no duplicate at handover" requirement, holding by construction rather than a
+            # separate check. Never reached if the loop above returned early on a mid-pass
+            # failure -- this instance's cache simply keeps its last-known contents until a
+            # future pass succeeds end to end, the same "unreachable ⇒ keep last known status"
+            # direction docs/transfers-redesign-spec.md §4.2 states for phase 2's download
+            # clients, applied here too.
+            await self._update_preflight(instance, queues, records)
+
+    async def _item_names_for_queue_ids(self, queue_ids: list[int]) -> frozenset[str]:
+        """Every top-level `item.rel_path` across `queue_ids` -- the one query behind "does a
+        matching lftpweb item exist," shared by `_update_preflight` below (fed its already-
+        fetched `queues`) and `preflight_rows`' own request-time re-check (fed
+        `_last_queue_ids`, the same set as of this instance's last poll pass -- queue *binding*
+        changes are already covered by `preflight_rows`' own caller-supplied
+        `enabled_instance_ids`, so this method only ever needs to be freshest about `item`
+        existence, the thing this whole fix is about).
+        """
+        if not queue_ids:
+            return frozenset()
+        placeholders = ",".join("?" for _ in queue_ids)
+        cursor = await self.db.execute(
+            f"SELECT rel_path FROM item WHERE queue_id IN ({placeholders}) "  # noqa: S608 - placeholders only, no user input
+            "AND instr(rel_path, '/') = 0",
+            queue_ids,
+        )
+        return frozenset(r["rel_path"] for r in await cursor.fetchall())
+
+    async def _update_preflight(
+        self, instance: aiosqlite.Row, queues: list[aiosqlite.Row], records: list[QueueRecord]
+    ) -> None:
+        """Refresh this instance's own `PreflightHold` (`core/preflight.py`) from this pass's
+        already-fetched `records` -- see `_preflight_candidates`'s own docstring for the
+        matching/attribution/retirement rules and `PreflightHold.update`'s for the flap-tolerance
+        hold (and the retirement fast path) applied here.
+        """
+        queue_ids = [q["id"] for q in queues]
+        if not queue_ids:
+            return
+        item_names = await self._item_names_for_queue_ids(queue_ids)
+
+        # `queue_id` -> the full `path_queue` row it names, so a candidate's queue tag
+        # (2026-08-21, "the columns moved around") can be filled in without a second query --
+        # `queues` is already `SELECT *`, fetched once per instance per pass by the caller.
+        queue_by_id = {q["id"]: q for q in queues}
+
+        candidates, retired_records = _preflight_candidates(records, queues, item_names)
+        seen: dict[str, PreflightRow] = {}
+        for queue_id, record in candidates:
+            queue_row = queue_by_id[queue_id]
+            seen[_record_identity(record)] = PreflightRow(
+                source="arr",
+                queue_id=queue_id,
+                queue_name=queue_row["name"],
+                queue_short_name=queue_row["short_name"],
+                title=record.title,
+                status_label=record.tracked_download_state,
+                source_label=instance["name"],
+                source_kind=instance["kind"],
+                size_bytes=record.raw.get("size"),
+                size_remaining_bytes=record.raw.get("sizeleft"),
+                remaining_s=_parse_timeleft(record.raw.get("timeleft")),
+                download_client=record.raw.get("downloadClient"),
+                # This source's own wait isn't bound by scan count -- `remaining_s` above
+                # already says what it can (`core/preflight.py.PreflightRow.wait_scans`'s own
+                # docstring), so both stay unset rather than a fabricated pair.
+                wait_scans=None,
+                wait_since=None,
+            )
+        retired = {_record_identity(record) for record in retired_records}
+        hold = self._preflight_holds.setdefault(instance["id"], PreflightHold())
+        hold.update(seen, now=time.monotonic(), retired=retired)
+
+        # For `preflight_rows`' own request-time retirement re-check below -- this pass's raw
+        # records (not just the ones that became candidates) keyed the same way the hold itself
+        # is, and the queue ids `item_names` above was just computed against, so a later call
+        # with no intervening poll can still re-run the identical predicate.
+        self._last_records[instance["id"]] = {_record_identity(r): r for r in records}
+        self._last_queue_ids[instance["id"]] = queue_ids
+
+    async def preflight_rows(self, enabled_instance_ids: Iterable[int]) -> list[PreflightRow]:
+        """The Preflight box's own read (`api/jobs.py`'s `GET /api/queue/preflight`) -- every
+        currently-held row from an instance id in `enabled_instance_ids`. That set is the
+        caller's own live "is this instance still enabled, with at least one enabled bound
+        queue" check -- an instance disabled (or every one of its queues disabled) after being
+        cached simply stops being returned immediately, rather than lingering for
+        `core/preflight.py.PREFLIGHT_HOLD_S` for no reason.
+
+        **Now `async`, and now also a request-time retirement check** (2026-08-21, "eviction
+        latency"): `_update_preflight`'s own `retired` set already evicts a row the instant a
+        *poll pass* discovers the hand-over, but the poll only runs every
+        `ArrSettings.poll_interval_s` (60s by default) -- an item that lands between two polls
+        still sat here, visibly duplicated against its own new Active/pending row, for up to
+        that whole interval. The underlying question, "does a matching `item` exist now," is
+        purely local state, so this re-asks it on every call: for each held row whose identity
+        this instance's last poll pass also saw a raw `QueueRecord` for, re-run
+        `_record_matches_any_item` (the exact same predicate `_preflight_candidates` uses,
+        never a second definition) against a freshly-queried `item_names` set. A held row with
+        no corresponding last-seen record (the flap-tolerance case -- it went missing from a
+        poll and is being held blind) is passed through unfiltered, same as before this fix:
+        there is nothing to re-test it against, and "keep showing it" is the flap-tolerance
+        cache's whole point.
+
+        This is a **read-side filter only** -- it never mutates `_preflight_holds`. The next
+        real poll pass still does the authoritative eviction via `retired`; skipping that here
+        would mean a row that never gets asked about again (no further `GET` calls) never
+        actually leaves the hold, which is fine (nothing reads it) but would be a needless
+        divergence from "one writer" if this method wrote to it too.
+
+        Sorted by title, case-insensitively -- the *arr's own queue carries no cross-release
+        priority signal worth surfacing here (unlike the real transfer queue's `queue_position`),
+        so alphabetical is the stable, boring default rather than an invented one.
+        """
+        allowed = set(enabled_instance_ids)
+        rows: list[PreflightRow] = []
+        for instance_id, hold in self._preflight_holds.items():
+            if instance_id not in allowed:
+                continue
+            last_records = self._last_records.get(instance_id, {})
+            item_names: frozenset[str] | None = None
+            for identity, row in hold.items():
+                record = last_records.get(identity)
+                if record is not None:
+                    if item_names is None:
+                        item_names = await self._item_names_for_queue_ids(
+                            self._last_queue_ids.get(instance_id, [])
+                        )
+                    if _record_matches_any_item(record, item_names):
+                        continue  # a real item now exists -- retire from the response
+                rows.append(row)
+        rows.sort(key=lambda r: r.title.casefold())
+        return rows
 
     async def _handle_failure(self, instance_id: int, instance_name: str, exc: Exception) -> None:
         """One WARNING, one event row, then back off -- never blocks or slows the loop for

@@ -27,6 +27,17 @@ Two independent mechanisms:
    decision function — `core/engine.py._persist` is the only I/O around it (reading/writing
    `item.state`/`item.first_missing_at`) — so the state machine is unit-testable without a
    filesystem or a database.
+
+   **Absence is not all-or-nothing (2026-08-19, `prompts/done/2026-08-19-autoqueue-requeues-
+   imported-item.md`).** The same grace period covers a *partial* loss of local content, for
+   exactly the same reason it covers a total one: an importer takes a release apart one file
+   at a time, and the reading in between is `PARTIAL`, not `REMOTE_ONLY`. Production, v0.2.6,
+   a `move` queue bound to Sonarr: the item finished, post-processing renamed it to its final
+   name, Sonarr moved the media file out seconds later, the next scan read `PARTIAL` — an
+   auto-queue-eligible state with no grace-period protection at all — and re-queued a release
+   whose seedbox source was about to be deleted on confirmed import. See `resolve_absence`'s
+   own docstring for the narrow key ("was complete, remote unchanged, local shrank") that
+   keeps this from touching a genuinely interrupted transfer.
 """
 
 from __future__ import annotations
@@ -114,6 +125,55 @@ def write_if_needed(local_path: str) -> None:
         logger.warning("could not write mount sentinel at %s: %s", local_path, exc)
 
 
+def _elapsed_grace(prev_first_missing_at: str, now: datetime, grace_s: float) -> bool:
+    first_missing = datetime.fromisoformat(prev_first_missing_at.replace("Z", "+00:00"))
+    return (now - first_missing).total_seconds() >= grace_s
+
+
+def _stamp(now: datetime) -> str:
+    return now.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
+def is_local_shrink(
+    *,
+    prev_state: str | None,
+    structural_state: str,
+    prev_remote_size: int | None,
+    remote_size: int | None,
+) -> bool:
+    """The "was complete, then shrank" key -- the *only* thing `resolve_absence`'s `PARTIAL`
+    branch is allowed to fire on, and deliberately never `PARTIAL` alone.
+
+    `PARTIAL` being auto-queue-eligible is load-bearing: it is how a genuinely interrupted
+    transfer resumes (`core/queue.py._reap_one`'s incomplete-on-exit-zero branch writes it on
+    purpose, and the startup rescue leans on it). Suppressing re-queue for a real partial would
+    be a far worse regression than the defect this exists to fix, so all three clauses matter:
+
+    - **`prev_state` in `_COMPLETE_PREV_STATES`.** An interrupted transfer never reaches one of
+      these -- they are exactly the states that assert "every byte was here." An item whose
+      transfer stopped short is `PARTIAL`/`STOPPED`/`FAILED`/`REMOTE_ONLY` beforehand, so this
+      clause alone already excludes it.
+    - **The remote did not change.** §3.2 rule 4: remote size is a moving target, and a
+      *previously complete* item legitimately re-reads `PARTIAL` when the remote **grew** (a new
+      file appeared upstream in the release directory). That is genuinely re-queueable and must
+      stay so -- so a `remote_size` that differs from the last persisted one, in either
+      direction, means "the comparison changed on the remote side" and this returns `False`.
+    - **Both sizes actually known.** `None` on either side is "no information", never an
+      inferred shrink; the fresh reading is trusted as-is, exactly as before this branch
+      existed.
+
+    With the remote unchanged and the previous state asserting completeness, the only thing that
+    can have moved is local content leaving -- an importer, a human, a script.
+    """
+    return (
+        structural_state == "PARTIAL"
+        and prev_state in _COMPLETE_PREV_STATES
+        and prev_remote_size is not None
+        and remote_size is not None
+        and remote_size == prev_remote_size
+    )
+
+
 def resolve_absence(
     *,
     prev_state: str | None,
@@ -122,11 +182,14 @@ def resolve_absence(
     mount_ok: bool,
     now: datetime,
     grace_s: float = DEFAULT_GRACE_S,
+    prev_remote_size: int | None = None,
+    remote_size: int | None = None,
 ) -> tuple[str, str | None] | None:
     """Decide whether a fresh `REMOTE_ONLY` reading from `core/reconcile.py` should instead
     be persisted as the previous state (grace period still running, or the mount gate refuses
     to even start the clock) or `REMOVED_LOCAL` (grace period elapsed — DESIGN.md §3.2 rule
-    3).
+    3) — and, since 2026-08-19, the same question for a fresh `PARTIAL` reading that means
+    "a complete local copy is being taken apart," not "a transfer stopped short."
 
     Returns `None` when the fresh structural state should be trusted as-is — including every
     case where the item never reached a complete-local state in the first place, and the
@@ -144,7 +207,40 @@ def resolve_absence(
     `prev_state == 'REMOVED_LOCAL'` is sticky regardless of `mount_ok` — the mount gate's job
     is to keep a dropped mount from *starting* this transition, not to undo one that was
     already correctly made while the mount was healthy.
+
+    **The `PARTIAL` branch and where it lands.** `prev_remote_size`/`remote_size` are what open
+    it (`is_local_shrink` above is the whole gate; omit them and this function behaves exactly
+    as it did before the branch existed). While the clock runs, the item holds `prev_state`,
+    same as total absence. When the clock **elapses** it returns `None` — the fresh `PARTIAL`
+    is released and the item becomes re-queueable again — deliberately *not* `REMOVED_LOCAL`:
+
+    - `PARTIAL` is the truth about the disk. Some content really is still there, and
+      `REMOVED_LOCAL` asserts it isn't — a claim `core/local_delete.py`'s retention sweep and
+      the Files page both read literally (`COMPLETE_STATES` is the retention query's own
+      eligible set, so a `REMOVED_LOCAL` row's leftovers would never be swept).
+    - It keeps the escape hatch. A local copy that genuinely lost bytes — a truncated file, a
+      half-deleted directory nobody is coming back for — must eventually be re-fetchable
+      without a manual click; holding `DOWNLOADED` forever would wedge it.
+
+    The cost is stated rather than hidden: an external removal that takes **longer than the
+    grace window** still releases to `PARTIAL` and is still auto-queue-eligible. On an *arr-
+    bound queue `core/autoqueue.py`'s `ARR_IMPORT_INELIGIBLE_STATUSES` covers that case with no
+    time bound at all; on an untracked queue it remains an open gap (README "Known gaps").
     """
+    if is_local_shrink(
+        prev_state=prev_state,
+        structural_state=structural_state,
+        prev_remote_size=prev_remote_size,
+        remote_size=remote_size,
+    ):
+        if not mount_ok:
+            return (prev_state, prev_first_missing_at)
+        if prev_first_missing_at is None:
+            return (prev_state, _stamp(now))
+        if _elapsed_grace(prev_first_missing_at, now, grace_s):
+            return None
+        return (prev_state, prev_first_missing_at)
+
     if structural_state != "REMOTE_ONLY" or prev_state not in _STICKY_PREV_STATES:
         return None
 
@@ -158,11 +254,9 @@ def resolve_absence(
         return (prev_state, prev_first_missing_at)
 
     if prev_first_missing_at is None:
-        return (prev_state, now.strftime("%Y-%m-%dT%H:%M:%S.%fZ"))
+        return (prev_state, _stamp(now))
 
-    first_missing = datetime.fromisoformat(prev_first_missing_at.replace("Z", "+00:00"))
-    elapsed = (now - first_missing).total_seconds()
-    if elapsed >= grace_s:
+    if _elapsed_grace(prev_first_missing_at, now, grace_s):
         return ("REMOVED_LOCAL", prev_first_missing_at)
     return (prev_state, prev_first_missing_at)
 

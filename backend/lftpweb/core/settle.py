@@ -327,25 +327,66 @@ async def save_settle_records(
         )
 
 
-async def is_settled_in_db(
-    db: "aiosqlite.Connection", queue_id: int, rel_path: str, *, now: float | None = None
-) -> bool:
-    """Single-item settle check -- the shape `core/autoqueue.py` and
-    `core/queue.py._reap_one` both need, without loading a whole queue's records for one
-    lookup. Reflects the state as of the most recent scan; a job can finish mid scan-interval,
-    so this is the best information available, not a live recomputation. Checks both
-    `REQUIRED_SETTLE_SCANS` and `SETTLE_MIN_AGE_S` -- see `is_settled`, which this mirrors for
-    the DB-row shape rather than a `SettleRecord`.
+@dataclass(frozen=True)
+class SettleProgress:
+    """A single item's own settle counters, read straight off `item_settle` -- the shape
+    `core/autoqueue.py`'s Preflight projection needs (`core/preflight.py.PreflightRow.
+    wait_scans`/`wait_since`) but `is_settled_in_db` below doesn't, since that function only
+    ever needs a yes/no answer. `first_matched_at` is left as the raw ISO-8601 string the
+    `updated_at` column already stores (`_format_iso`'s own output shape) -- no epoch round-
+    trip here, since this record's one caller (the Preflight row) wants an ISO string for the
+    wire, not a float to do arithmetic on.
+    """
+
+    matched_scans: int
+    first_matched_at: str
+
+
+async def settle_progress_in_db(
+    db: "aiosqlite.Connection", queue_id: int, rel_path: str
+) -> SettleProgress | None:
+    """Single-row read of one item's own settle counters -- the same `item_settle` row
+    `is_settled_in_db` below reads, factored out as its own function so a caller that wants the
+    raw progress (not just the gate's yes/no) doesn't have to re-query. `None` when there is no
+    row yet -- `is_settled_from_progress` already treats that as "not settled" (the gate's own
+    conservative default); this mirrors that by giving the caller nothing to show rather than a
+    fabricated zero.
     """
     cursor = await db.execute(
         "SELECT matched_scans, updated_at FROM item_settle WHERE queue_id = ? AND rel_path = ?",
         (queue_id, rel_path),
     )
     row = await cursor.fetchone()
-    if row is None or row["matched_scans"] < REQUIRED_SETTLE_SCANS:
+    if row is None:
+        return None
+    return SettleProgress(matched_scans=row["matched_scans"], first_matched_at=row["updated_at"])
+
+
+def is_settled_from_progress(progress: SettleProgress | None, *, now: float | None = None) -> bool:
+    """The gate's own yes/no check, over an already-read `SettleProgress` -- factored out of
+    `is_settled_in_db` below so `core/autoqueue.py.on_scan` can read a row's progress exactly
+    once per pass and get both the gate decision and the Preflight tooltip's own inputs from it,
+    rather than querying twice. Checks both `REQUIRED_SETTLE_SCANS` and `SETTLE_MIN_AGE_S` -- see
+    `is_settled`, which this mirrors for the DB-row shape rather than a `SettleRecord`.
+    """
+    if progress is None or progress.matched_scans < REQUIRED_SETTLE_SCANS:
         return False
     now = time.time() if now is None else now
-    return (now - _parse_iso(row["updated_at"])) >= SETTLE_MIN_AGE_S
+    return (now - _parse_iso(progress.first_matched_at)) >= SETTLE_MIN_AGE_S
+
+
+async def is_settled_in_db(
+    db: "aiosqlite.Connection", queue_id: int, rel_path: str, *, now: float | None = None
+) -> bool:
+    """Single-item settle check -- the shape `core/queue.py._reap_one` needs, without loading a
+    whole queue's records for one lookup. Reflects the state as of the most recent scan; a job
+    can finish mid scan-interval, so this is the best information available, not a live
+    recomputation. A thin wrapper over `settle_progress_in_db` + `is_settled_from_progress` above
+    -- unchanged behavior, just factored so `core/autoqueue.py.on_scan` can reuse the read half
+    on its own (see that function's own docstring for why).
+    """
+    progress = await settle_progress_in_db(db, queue_id, rel_path)
+    return is_settled_from_progress(progress, now=now)
 
 
 # --- Settings (JSON in `setting`, the same pattern `core/postprocess.py.PostprocessSettings`

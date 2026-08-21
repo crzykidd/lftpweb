@@ -57,11 +57,80 @@ export interface TreeEntry extends FileNode {
  * `local_size` only when `remote_size` is unknown -- the latter matters once a `move` queue
  * deletes a completed directory's verified remote copy and its `remote_size` goes NULL. Both are
  * already rollups from `core/reconcile.py`. Shared so `Row`, the hover tooltip, and the `size`
- * sort key all read one function and can't disagree about what "size" means. */
-export function nodeDisplaySize(entry: TreeEntry): number | null {
+ * sort key all read one function and can't disagree about what "size" means.
+ *
+ * Takes the three fields it actually reads, not the whole `TreeEntry` (2026-08-20,
+ * docs/transfers-redesign-spec.md §3.3 stage 5) -- widened so the Transfers row's own file-list
+ * expansion can call this on a plain `FileNode` (no `depth`/`children`/`speed_bps` to fabricate)
+ * without forking a second copy of the same two-line rule. Every existing `TreeEntry` caller
+ * still satisfies this structurally; nothing about the signature narrowed for them. */
+export function nodeDisplaySize(entry: {
+  is_dir: boolean
+  remote_size: number | null
+  local_size: number | null
+}): number | null {
   return entry.is_dir
     ? (entry.remote_size ?? entry.local_size)
     : (entry.local_size ?? entry.remote_size)
+}
+
+/** The state chip's inline fill (2026-08-13, moved here from `FileTree.tsx` 2026-08-20 so the
+ * Transfers row's own file-list expansion can share it, docs/transfers-redesign-spec.md §3.3
+ * stage 5): only where a percentage means something. `DOWNLOADING`/`PARTIAL` are the two states
+ * an in-progress read is actually informative for -- a complete item doesn't need a 100% bar,
+ * and `REMOTE_ONLY`/`EXCLUDED` have no denominator that means anything yet. A **leaf file**
+ * inside a mirroring directory never reaches `DOWNLOADING` itself (`core/queue.py.
+ * _publish_child_progress`'s own leaf rule puts it at `PARTIAL`), which is exactly why `PARTIAL`
+ * is on this list too -- both `FileTree.tsx`'s own rows and a Transfers row's child rows need
+ * the identical rule. `percentValue` already guards the `NaN`/divide-by-zero cases (no or
+ * non-positive `remote_size`), so a queue whose `remote_size` hasn't arrived yet just shows no
+ * bar rather than a broken one. */
+export function stateProgressPercent(
+  state: string,
+  localSize: number | null,
+  remoteSize: number | null,
+): number | null {
+  if (state !== 'DOWNLOADING' && state !== 'PARTIAL') return null
+  return percentValue(localSize, remoteSize)
+}
+
+/** What a **child** file's own row should read while its parent job is running (2026-08-21,
+ * user's browser review: "the sidebar for active file ... I think it should show downloading
+ * and the chip should show progress. Not Partial"). A leaf file inside a mirroring directory
+ * never reaches a persisted `state` of `DOWNLOADING` itself -- `core/queue.py._spawn_decision`
+ * is the only writer of that value, and it only ever writes it for the job's own top-level item
+ * (confirmed: a running `mirror`'s child rows cap out at `PARTIAL`/`DOWNLOADED`,
+ * `_publish_child_progress`'s own CASE). `PARTIAL` is structurally correct for a partly-written
+ * child, but wrong to *read* while lftp is actively writing it -- "Downloading" is what a human
+ * needs to see there, matching the parent row's own `chipStateFor` (`TransfersPage.tsx`).
+ *
+ * **Only** a child that is both currently `PARTIAL` and whose job is currently running maps to
+ * `DOWNLOADING`. Do not blanket-map every child of a running job: a `mirror` works through a
+ * release's files progressively -- some children already complete, some untouched, typically one
+ * in flight -- so mapping them all would relabel finished files as still downloading. A `PARTIAL`
+ * child whose job is *not* running (stopped, failed, paused) correctly stays `PARTIAL` -- that is
+ * precisely the "stopped part-way" case the state exists to express.
+ *
+ * **Display only** -- never writes `item.state` or touches anything the backend state machine
+ * persists (DESIGN.md §3.2). The two surfaces that show a child file's state --
+ * `TransfersPage.tsx`'s Queue-row file-list expansion (`FileListRow`) and the item drawer's file
+ * view (`ItemDrawer.tsx`'s `Row`) -- both call this one function so they can't drift.
+ */
+export function childDisplayState(state: string, jobRunning: boolean): string {
+  return state === 'PARTIAL' && jobRunning ? 'DOWNLOADING' : state
+}
+
+/** Whether a `child_progress` sample is still fresh enough to trust (2026-08-14, "per-file
+ * speed inside a mirror"; factored out 2026-08-20 so the Transfers row's own file-list
+ * expansion can share the exact freshness window `buildTree` below already uses, rather than a
+ * second copy of `now - receivedAt <= CHILD_SPEED_FRESHNESS_MS`, docs/transfers-redesign-
+ * spec.md §3.3 stage 5) -- `null` for an absent sample or one older than
+ * `CHILD_SPEED_FRESHNESS_MS`. */
+export function freshChildSpeedBps(
+  sample: ChildSpeedSample | undefined,
+  now: number = Date.now(),
+): number | null {
+  return sample != null && now - sample.receivedAt <= CHILD_SPEED_FRESHNESS_MS ? sample.speedBps : null
 }
 
 /** The Speed column's text for one row -- prefers the row's own **job-level** rate and falls back
@@ -117,10 +186,7 @@ export function buildTree(
       depth: parent ? parent.depth + 1 : 0,
       children: [],
       speed_bps: node.id != null ? (speedByItemId[node.id] ?? null) : null,
-      child_speed_bps:
-        childSample != null && now - childSample.receivedAt <= CHILD_SPEED_FRESHNESS_MS
-          ? childSample.speedBps
-          : null,
+      child_speed_bps: freshChildSpeedBps(childSample, now),
       eta_s: node.id != null ? (etaByItemId[node.id] ?? null) : null,
     }
     byPath.set(node.rel_path, entry)

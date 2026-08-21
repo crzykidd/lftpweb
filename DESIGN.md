@@ -250,8 +250,11 @@ job(
   id, item_id, kind TEXT,           -- 'mirror' | 'pget'
   state TEXT,                        -- queued|running|succeeded|failed|cancelled
   lane TEXT,                         -- 'main' | 'small'   (§4.5 fast lane)
-  rank REAL, attempt INT,            -- sortable rank; order is rank DESC, queued_at ASC
-  queued_at,
+  rank REAL,                         -- vestigial as of migration 023 -- see queue_position below
+  attempt INT,
+  queued_at,                         -- no longer an ordering input; still the queued-wait readout
+  queue_position REAL,               -- migration 023: dense fractional order; order is
+                                      -- queue_position ASC, id ASC (§4.5 "Queue order and priority")
   pid NULL, argv JSON, lftp_settings JSON,
   bytes_start, bytes_done, bytes_total,
   rate_limit_bps NULL,               -- the allocation this process was spawned with (§4.5)
@@ -274,10 +277,15 @@ Three notes on the shape:
   credentials, and connection tuning are set once. Speed and concurrency are site-level too
   (§4.5). Only what legitimately varies per path is per-queue: `sync_mode`, auto-queue,
   patterns, post-processing toggles, and staging path. §9.3 lists which knob sits where.
-- **`rank` is a sortable real, not an integer priority level.** Default ordering is
-  oldest-first (`rank DESC, queued_at ASC` with equal ranks); **Move to top** assigns a rank
-  above every queued row. Storing a sortable value means arbitrary drag-reorder is a later UI
-  change rather than a schema migration.
+- **`queue_position` is a dense fractional order (migration 023, 2026-08-19,
+  docs/transfers-redesign-spec.md §3.4), not an integer priority level.** Ordering is
+  `queue_position ASC, id ASC`; a move between two neighbours takes their midpoint (one
+  `UPDATE`, no renumbering of any other row), so per-row "move up one / down one" is a later UI
+  change rather than a schema migration. Replaces the older `rank DESC, queued_at ASC` boost
+  scheme, which could support "Move to top" but not "move up one" (§4.5's "Queue order and
+  priority" has the three concrete reasons why). `rank` is left in the schema, unread for
+  ordering, and `queued_at` keeps its original meaning as the queued-wait readout's source —
+  neither column was dropped; see migration 023's own comment.
 - **`sync_mode` subsumes the old `auto_delete_remote` boolean.** There is exactly one switch
   governing whether we touch the remote, with three values, not a mode plus an overlapping
   flag. `copy` is the default and never deletes anything remote.
@@ -454,7 +462,23 @@ Nine rules that are easy to get wrong and that want review:
      read `LOCAL_ONLY` within one scan interval, losing everything §6 had just recorded.
    - **Content partially present** (structural `PARTIAL`): the structural state wins and the
      outcome is dropped. Rule 2 is absolute, and an outcome is a stronger claim still; the item
-     is genuinely re-queueable again.
+     is genuinely re-queueable again — **but not necessarily this instant** (corrected
+     2026-08-19, production defect). `PARTIAL` has two causes that this bullet used to treat as
+     one. The remote **grew** (rule 4) and there is genuinely more to fetch; or a *complete*
+     local copy is being taken apart — an importer moving a finished release into the library
+     one file at a time, which is the ordinary, expected end of every successful transfer
+     (§7.2). The second is the same event as the "content absent" bullet below, caught a few
+     seconds earlier, and it gets the same treatment: §7.3's grace period, holding the previous
+     state while the clock runs. It is keyed on **"was complete, then shrank"** — the previous
+     state asserts every byte was here *and* the remote total is unchanged — never on `PARTIAL`
+     alone, because `PARTIAL` being immediately re-queueable is how a genuinely interrupted
+     transfer resumes, and no interrupted transfer ever has a complete-local previous state.
+     When the window elapses the `PARTIAL` is published after all, deliberately, rather than
+     landing on `REMOVED_LOCAL`: content really is still on disk, and a locally damaged copy has
+     to stay re-fetchable. Auto-queue getting hold of such an item is what this correction is
+     about: on a `move` queue it re-fetched a release whose seedbox source was deleted moments
+     later on confirmed import, and the doomed job blocked the *arr cleanup for as long as it
+     sat in the queue.
    - **Content absent** (structural `REMOTE_ONLY`): §7.3's grace period decides, and all six
      post-processing states ride it exactly the way `DOWNLOADED` does — the item holds its
      outcome for the whole window and then lands on `REMOVED_LOCAL`. This half is not
@@ -825,12 +849,55 @@ drains. You do not drift back to one-at-full while work is waiting.
 
 #### Queue order and priority
 
-Ordering is `priority DESC, queued_at ASC` — so the **default is oldest-first**, and priority is
-invisible until someone uses it. The one action exposed is **Move to top**, which sets that
-item's rank above everything currently queued.
+Ordering is `queue_position ASC, id ASC` (migration 023, 2026-08-19,
+docs/transfers-redesign-spec.md §3.4/§3.5) — a dense fractional total order, one value per
+queued job, assigned on insert (`MAX(queue_position) + 1` — **the default is oldest-first**,
+since that's the same order `queued_at` would have given) and rewritten on reorder. **Move to
+top** takes `MIN(queue_position) - 1`; **"move up one" / "move down one"** (stage 2, 2026-08-19,
+`prompts/2026-08-19-queue-reorder-chevrons.md`) take the midpoint (`position_between`) between the
+job's two adjacent neighbours in that same global order — one `UPDATE`, no renumbering of
+anything else. All three actions sit behind one endpoint, `POST /api/jobs/{id}/move` (body
+`{"direction": "up" | "down" | "top"}`, `core/queue.py.TransferQueue.move_job`), which reuses
+`move_to_top` verbatim for `"top"` rather than a second implementation. Already-at-an-edge and a
+single-job queue are silent no-ops; a job that stopped being `queued` between the page rendering
+its chevrons and the click (started running, or reached a terminal state) is rejected (409) —
+reordering a running job is meaningless, since its allocation is fixed at spawn and never
+re-shaped (this section's own invariant, above). Repeated midpoint bisection between the same two
+neighbours eventually produces a value float precision can't distinguish from one of its bounds;
+`move_job` detects that and renormalizes the whole queued set (rewritten 1.0, 2.0, 3.0… in current
+order) before retrying, rather than silently degrading or corrupting the order. This replaced an
+earlier `rank DESC, queued_at ASC` boost scheme (`rank` defaulting to 0, "Move to top" setting
+`rank = MAX(rank) + 1`) that fit "Move to top" but could not support "move up one": two adjacent
+rank-0 jobs could only be swapped by swapping `queued_at` (which corrupts the queued-wait readout
+the column is also used for), the zone boundary made "up one" actually mean "vault above the
+entire backlog," and rank inside the boosted zone encoded recency-of-boost, not position. `rank`
+stays in the schema (unread for ordering, but still written by `move_to_top` — the one durable
+"was this job ever explicitly boosted" marker `_rescue_position` reads) and `queued_at` keeps its
+original meaning as the queued-wait readout's source — see migration 023's own comment for why
+neither column was dropped.
 
-Store the rank as a sortable value rather than an integer level, so full drag-reorder becomes a
-UI addition later instead of a schema migration.
+**Positions are global across both lanes** — the main and fast lanes admit from independent
+pools (below), but the ordering key is one shared sequence, so the chevron UI (stage 2) and the
+displayed queue number always agree. One consequence to accept: a fast-lane item can display a
+higher position number than a main-lane item it's about to start ahead of, since the numbering
+doesn't split by lane (§3.5's "fast lane makes today's numbering slightly dishonest" — decided to
+keep one `1..N` numbering with a fast-lane badge, not two numbering schemes). A second, related
+consequence held only through stage 2 and 3: the Transfers page still grouped rows by queue at
+that point, so a chevron move's *global* scope did not always swap a row with the one immediately
+above/below it *on screen* — only with its actual neighbour in the shared position order, which
+could sit in a different queue's group. **Resolved at stage 4a** (2026-08-19,
+`docs/transfers-redesign-spec.md` §3.1) — grouping is gone, the page renders one flat,
+globally-ordered list, and a chevron move now always swaps with the row directly above/below it
+on screen, matching its actual neighbour in the shared position order.
+
+**The v0.2.6 startup rescue re-derives its position, not just its `queued_at`.** An interrupted
+item is re-queued carrying its original `queued_at` forward (unchanged — still what keeps the
+Transfers page's queued-wait readout honest), but under the position model that alone no longer
+places anything; `TransferQueue._rescue_position` (`core/queue.py`) finds the two natural-zone
+(`rank = 0`) neighbours that `queued_at` would have fallen between and takes their midpoint,
+deliberately excluding boosted (`rank != 0`) jobs from that search so a rescued job can never
+land ahead of an explicit Move to top (see that method's own docstring for the counterexample
+this rules out).
 
 #### The fast lane
 
@@ -875,6 +942,49 @@ percentage meaningless** — the four fraction options are disabled in the UI wi
 API refuses a fraction request outright (409) rather than silently substituting Max; Max itself
 is exempt from this check and always works, reusing whatever `max_bandwidth` already is.
 
+#### Pausing admission
+
+A site-wide **Pause** (2026-08-20, `prompts/2026-08-20-queue-pause.md`), independent of any
+single job's Start now/Stop: while paused, `_admit()` (`core/queue.py`) refuses to run at all —
+a caller-side early return, before it ever gathers `(running, queue)` or calls `admit()` above.
+**`admit()` itself carries no pause concept** and is never called while paused; every worked
+example in this section holds exactly as written, both while paused (they simply never run) and
+once resumed. The alternative — a `paused` flag threaded through `SchedulerSettings` — was
+rejected for exactly that reason: it would touch the one function this whole design keeps
+deliberately pure and mentioning `queue_id` zero times, for a decision that only the caller needs
+to make.
+
+Persisted (a `setting` row, not a migration — the same key/value store every other site-level
+setting in `core/queue.py`/`core/autoqueue.py`/etc. already uses) so a container restart does not
+quietly resume a queue someone paused on purpose.
+
+Two entry modes, one paused state:
+
+- **Pause after current** — running jobs are left alone and finish normally; nothing new is
+  admitted from here on.
+- **Pause now** — additionally SIGTERMs every in-flight lftp child (concurrently, the same
+  reasoning as graceful shutdown, §10.3) and returns each one to `queued`, **in place**: same
+  `queue_position`, same `attempt`, same row. This is deliberately the graceful-shutdown model
+  plus the v0.2.6 startup rescue's re-queue — **not** §4.6's stop semantics. Stop sets
+  `auto_queue_suppressed` on purpose (§4.6); reusing it here would suppress every paused-now item
+  and it would never come back on unpause, the opposite of what pausing means. A SIGTERM'd lftp
+  exits non-zero, but that exit is never run through the failure-classification path
+  (`lftp.classify_output`) at all — the same short-circuit `stop_job`'s own `stop_requested`
+  branch already uses — so a pause never produces a `FAILED` row or an `error_class`.
+
+**Auto-queue, manual Queue clicks, reaping, progress publishing, scanning, and post-processing
+all keep running while paused** — only admission stops. Pause means "stop moving bytes," not
+"stop noticing things": a release that ages off the seedbox during a pause would otherwise be
+missed, and an already-downloaded item's verify/extract/import must not stall just because the
+transfer engine is paused.
+
+**Reordering (this section's own "Queue order and priority," above) stays fully live while
+paused — this is the point of pausing, not an oversight.** Pause is the moment to curate the
+order: stop everything, rearrange the queue so the right item is next, then unpause. The chevrons
+and `POST /api/jobs/{id}/move` carry no pause check at all, and "Start now"'s own 409 guard
+(`core/queue.py.QueuePausedError`, disabled client-side with a reason in the tooltip too) is
+scoped to `start_now` alone, so it cannot accidentally catch the reorder endpoint.
+
 #### Residual inefficiency, stated plainly
 
 Because allocations are never re-shaped, a job admitted at B/2 keeps B/2 after its partner
@@ -908,6 +1018,15 @@ for too much". Therefore:
 
 **Stopping is a user action, and it is terminal.** It is never a pause, and it never leads to
 an automatic retry.
+
+**This is a genuinely different action from the site-wide Pause (§4.5's "Pausing admission"),
+despite both sending the same SIGTERM.** Stop is per-job and permanent — the rule right below is
+what makes it mean anything — while "pause now" is site-wide and always reversible: it returns
+every affected job straight to `queued`, never sets `auto_queue_suppressed`, and never touches
+`STOPPED`/`FAILED`. Conflating the two was the single easiest way to get pause wrong (found while
+scoping `prompts/2026-08-20-queue-pause.md`): reusing this section's stop semantics for "pause
+now" would suppress every item that happened to be running at the moment of pausing, and none of
+them would come back on unpause.
 
 - **Running job:** SIGTERM to that one PID (§4.1). Not SIGKILL — SIGTERM lets lftp flush its
   `.lftp-pget-status` sidecar so the partial is resumable (§4.4). SIGKILL only after a grace
@@ -962,7 +1081,15 @@ all excluded, `STOPPED`/`FAILED`/`REMOVED_BOTH` by the flag rather than by their
 plain `REMOVED_LOCAL` usually carries it clear, but because the state itself is left out of the
 eligible set; `AutoQueueSettings.re_download_externally_removed` (site-level, default `False`,
 §3.2 rule 3) is the opt-in that adds it back in, for anyone who wants an item something outside
-lftpweb removed to be re-fetched. It additionally skips an item whose remote fingerprint has not
+lftpweb removed to be re-fetched. **It also skips any item the bound `*arr` has already been
+handed** (added 2026-08-19, production defect): `arr_status` of `notified`, `imported`, or
+`cleaned` — all three only reachable *after* this codebase's own pipeline completed for that
+item — is ineligible, whatever the state reads. `detected` is deliberately not in that list and
+must never be: an item is matched against the `*arr`'s queue record long before lftpweb has
+fetched a byte of it (the `*arr`'s queue is populated by its own download client on the seedbox),
+so excluding `detected` would stop auto-queue fetching `*arr`-tracked releases at all. Like the
+settle gate, this is a skip and not a suppression — a manual Queue click is untouched. It
+additionally skips an item whose remote fingerprint has not
 settled (§3.3), leaving it for a later pass. Before evaluating anything at all for a queue, the
 queue's local root must pass the mount gate (§7.3); if it
 does not, the whole pass is skipped for that queue and the reason is surfaced, rather than each
@@ -1417,6 +1544,15 @@ them distinguishable, because a bind mount that didn't come up has no sentinel i
 - **Grace period.** Absence must persist across several consecutive scans — default ~10 minutes,
   tracked via `item.first_missing_at` — before it counts. An import in progress, a move across
   filesystems, or a momentarily-unreadable directory must not be able to trigger a delete.
+  **Absence is not all-or-nothing** (2026-08-19, production defect): an importer takes a release
+  apart one file at a time, so the reading between "complete" and "gone" is `PARTIAL`, and the
+  same clock covers it — see §3.2 rule 9's "content partially present" bullet for the narrow
+  "was complete, then shrank" key and for why a shrink that outlives the window is released as
+  `PARTIAL` rather than promoted to `REMOVED_LOCAL`. That release is deliberate and it is the
+  limit of this rail: an external removal slower than the window is still re-queueable. On an
+  *arr-bound queue the second half of that fix covers it with no time bound (auto-queue skips
+  any item whose `arr_status` is past the hand-off — §4.7); on an untracked queue it is an open
+  gap, named in README's "Known gaps."
   **A `rel_path` can leave both trees at once, and that case runs through this same machinery.**
   The reconciler's node set is `remote_tree ∪ local_tree`, so a path in neither produces no node
   — and the persist pass only ever visits nodes. `move` mode manufactures exactly that shape
@@ -1642,20 +1778,25 @@ reasserting itself, visible at all; both are changes no writer pushes, because n
 ┌─ header ───────────────────────────────────────────────────────────────┐
 │  ▲ 8.2 MB/s    ⣿ 9.0 / 10 allocated    ⏳ 12 queued (48 GB)    24h: 310 GB │
 ├──────────┬─────────────────────────────────────────────────────────────┤
-│  Files   │  [ Connection · Queues · Transfer · Post-processing ·        │
-│  Xfers   │    Logs · Backup · Auth ]        ← tabs, only where a        │
-│  History │                                    section has >1 page       │
+│ Transfers│  [ Queue · Files ]              ← Transfers has tabs too     │
+│  Events  │                                                              │
 │ Dashboard│                                                              │
-│  Settings│                                                              │
-│  Docs    │  [ Quick start · Concepts ]   ← Docs has tabs too            │
-│ ──────── │                                                              │
-│ v0.0.1 ↗ │  ← bottom-left, links to the GitHub release notes            │
+│  Settings│  [ Connection · Queues · Transfer · Post-processing ·        │
+│  Docs    │    Logs · Backup · Auth ]        ← tabs, only where a        │
+│ ──────── │                                    section has >1 page       │
+│ v0.0.1 ↗ │  [ Quick start · Concepts ]   ← Docs has tabs too            │
 └──────────┴─────────────────────────────────────────────────────────────┘
 ```
 
 - **Left panel for section nav**; **tabs across the top** only where a section has more than one
-  page. Settings and **Docs** (2026-08-13) are the two that need them; `nav.ts.tabsForPath` maps
-  a route to its tab strip, so `Layout.tsx` has one lookup rather than a branch per section.
+  page. **Transfers** (2026-08-20, `docs/transfers-redesign-spec.md` §2, phase 1 stage 6),
+  Settings, and **Docs** (2026-08-13) are the three that need them; `nav.ts.tabsForPath` maps a
+  route to its tab strip, so `Layout.tsx` has one lookup rather than a branch per section.
+  **Transfers is the main section** and its two tabs are **Queue** (the working surface — what
+  is moving, and in what order) and **Files** (the full merged remote/local tree — the only view
+  of things with no job yet, and the only home for Delete). Queue is the default tab and the
+  app's own landing route. Files was a separate top-level nav entry before this task; `/files`
+  still redirects to `/transfers/files` so nothing that links or bookmarks the old path breaks.
 - **Docs is in-app user documentation, not architecture.** `DESIGN.md` (this file) is for people
   changing the code and `README.md` is for people who have not deployed yet; the Docs section
   serves the third audience neither reaches — someone with a *running* instance who does not know
@@ -1706,7 +1847,8 @@ Dashboard is the detail.
 
 ### 9.2 Pages
 
-**Files** — virtualized tree (must stay smooth at 10k+ rows), per row: state chip, progress
+**Files** (`/transfers/files`, the Transfers section's second tab since 2026-08-20 — §9.1) —
+virtualized tree (must stay smooth at 10k+ rows), per row: state chip, progress
 bar, size, speed, ETA. Grouped by queue, collapsible per queue. Expand/collapse, multi-select
 with shift-range, bulk *Queue / Stop / Delete*, text search, state filter, and a lifecycle
 facet filter (below) — composed together, never a second filtering path. Delete's own dialog
@@ -1888,7 +2030,8 @@ mean. The card is portal-rendered, not a child of the row (the row can scroll ou
 virtualized list, or unmount, while it's showing), hides on any scroll, and never intercepts a
 click meant for the row, a sort header, or a column resize handle.
 
-**Transfers** — the job queue. Rows stay deliberately plain:
+**Transfers** (`/transfers/queue`, the section's default/first tab since 2026-08-20 — §9.1) —
+the job queue. Rows stay deliberately plain:
 
 ```
 Some.Release.S03E04.2160p    [downloading]   18 files   62%   4.1 MB/s   ETA 12m
@@ -1897,29 +2040,206 @@ Some.Release.S03E04.2160p    [downloading]   18 files   62%   4.1 MB/s   ETA 12m
 - Visible status vocabulary is **queued / downloading / downloaded**. The other internal states
   (§3.2) surface only on rows where they actually apply, rather than expanding everyone's
   mental model to twelve chips.
-- **Move to top** on each row (§4.5); default order is oldest-first. **Each still-queued row
-  shows its actual run position** (2026-08-13) — a small `#N` ordinal, 1/2/3… in the order
-  `GET /api/jobs` already returns them (`rank DESC, queued_at ASC`), plus a one-line caption
-  once there is more than one queued job that the list order *is* the queue order. The
-  capability (ordering, Move to top, Start now) existed before this and was invisible; nothing
-  new was added server-side, the list was already sorted. `rank` grows monotonically on every
-  "Move to top" with no compaction — not a practical problem at 64-bit `INTEGER` width.
+- **One globally-ordered list, no per-queue grouping** (2026-08-19,
+  `docs/transfers-redesign-spec.md` §3.1, phase 1 stage 4a — reverses the 2026-08-16 per-queue
+  grouping, `docs/decisions.md`). `core/scheduler.py` has zero references to `queue_id`; there is
+  exactly one global admission line, so grouping by queue visually implied each queue had its own
+  ordering, which was false. Each row instead carries a compact, muted **queue badge**
+  (`short_name` if the queue has one, Settings → Queues, else its full name — the row's `title`
+  always carries the full name) and, for a job admitted from the small-item fast lane (§4.5,
+  under `small_item_threshold_bytes`, 10 MB default), a **fast lane** marker whose tooltip
+  explains that it may start before a lower-numbered main-lane job — one `1..N` numbering
+  throughout, not a second numbering scheme. Dropping grouping also resolves a stage-2 oddity:
+  the ▲/▼ chevrons below always moved a job in this same global order, so a grouped view could
+  make a move appear to swap a job with something in a different group; in the flat list the row
+  directly above is always the one being traded with.
+- **Two paginated boxes, not one flat list** (2026-08-19, `docs/transfers-redesign-spec.md` §3.2,
+  phase 1 stage 4b): **Active / pending** (client-side — the set is bounded and
+  already loaded) and **Complete** (one row per item — the same most-recent-job-wins
+  rule as before — newest-finished first, **server-side** via `GET /api/jobs/complete`). Numbered
+  pages, SAB-style. Each box carries its own "Show 10/20/50" page-size selector, both defaulting
+  to **20** and independently remembered per browser (2026-08-20, a follow-up from the user's
+  first real look at the finished page — the Complete box originally defaulted to 50, but 50
+  proved too many rows at once in practice once seen on screen; a stale/invalid stored size falls
+  back to the default). Changing either box's size resets it to page 1. Rows shifting between
+  pages as work completes is accepted, not a bug — the same behavior SAB itself has. The name filter now has
+  two halves: unchanged (client-side, instant) for the Active box, but server-side (debounced) for
+  the Complete box, since a client-side filter over only the loaded page would silently stop
+  seeing most of the matches the moment that box became paginated. **Dismiss list** follows the
+  same split — it now sends the filter *text* to the server (`dismiss_all_terminal`'s
+  `name_filter` scope), not an explicit id list, so it dismisses every matching row across every
+  page rather than only the one page an id list could ever name; an empty filter result still
+  dismisses nothing, never everything, the same guarantee the id-list scope gave before this
+  change. `GET /api/jobs`/`list_jobs()` itself is unchanged by this split (see docs/decisions.md
+  for why keeping it, rather than narrowing it to active-only, was chosen) — the Active box just
+  no longer renders the terminal rows it still returns. **Both boxes render the identical
+  "Page X of Y (Z total)" readout and always render their own shell** (2026-08-20, a follow-up
+  from the user's browser review) — the Complete box had the readout unconditionally from the
+  start, but the Active box originally had neither the readout nor a shell at all once it had
+  zero rows to show (empty queue, or a filter matching nothing); one shared
+  `lib/pagination.ts.pageReadout` now backs both, and both boxes' header/empty-state/page-size-
+  selector/pager render unconditionally, the empty state living inside the shell rather than as
+  a separate top-level block above it.
+- **The two boxes split on pipeline completion, not job termination** (2026-08-20, a follow-up to
+  phase 1 stage 4b from the user's browser review — `docs/transfers-redesign-spec.md` §3.2,
+  `prompts/done/2026-08-20-active-box-holds-inflight-pipeline.md`). Stage 4b split them the
+  moment lftp exited, so a row sat under "Complete" while its release demonstrably was not:
+  verify, extract, the staging move, the *arr's confirmed import and the deferred source delete
+  all continue past the job. The user's own words: *"Shouldn't a job live in that state until the
+  sonarr/radarr hook lands if they are enabled? Currently they move to complete but they
+  technically aren't."* Applied **consistently whether or not a queue is *arr-bound** — one
+  definition of done, chosen explicitly over a narrower *arr-only rule, since post-processing a
+  large release is not instant either. **The predicate is server-side and defined exactly once**
+  (`core/pipeline_flight.py`): `list_jobs()` projects it as `pipeline_in_flight`,
+  `GET /api/jobs/complete` excludes it from both its listing and its `total`, and
+  `dismiss_all_terminal` excludes the same items — the client never re-derives it, because the
+  Active box is client-side while the Complete box is server-paginated and two encodings of one
+  rule would drift a row into both boxes or neither. **Rather than one vague label, the row says
+  what it is waiting on** — *Verifying / Extracting / Processing / Awaiting import / Deleting
+  source*, from the same `CASE` that does the splitting. **Every blocking condition has a bounded
+  exit**: post-processing keys off the live worker's existence (`in_flight_item_ids()`), never a
+  transient state string, so a crashed worker can't wedge a row; the *arr condition requires a
+  *currently enabled* instance, so disabling Sonarr releases everything waiting on it; and both
+  the *arr wait and the deferred-source-delete wait carry age backstops for the cases the
+  pipeline's own ladders can't reach (a permanently unreachable *arr; a source-delete retry that
+  paused without clearing `remote_delete_pending` — see that module's own docstring). An
+  in-flight row is **not dismissable**, at the API as well as in the UI.
+- **"Mark complete" / "Mark failed" — the manual escape hatch** (2026-08-20, same task,
+  migration 025) on an in-flight row whose own transfer has finished, plus an **Undo** on a row
+  already resolved. Automatic exits are necessary but not sufficient: a genuinely wedged item
+  needs a human override, or the Active box slowly fills with rows nothing is working on and
+  stops being trustworthy. **It is a classification only, and that constraint is not
+  negotiable** — it writes `item.manual_outcome`, read by the split predicate and by nothing
+  else. It must never advance the `move`-mode delete ladder or cause a source delete, never be
+  read as a confirmed *arr import or write `arr_status`, never trigger notify/cleanup/retention/
+  post-processing, and never alter auto-queue's eligibility (§7.3 makes the irreversible delete
+  wait on a *confirmed* import held across two consecutive poller passes precisely because a
+  hunch is not evidence). Every resolution writes an audit `event`, and the row carries a
+  **Marked complete / Marked failed** chip so it never silently reads as a normal completion. A
+  real terminal outcome arriving later does **not** supersede it (`docs/decisions.md`,
+  2026-08-20).
+- **▲ up one / ▼ down one / ▲▲ to top** on each queued row (§4.5's "Queue order and priority" —
+  stage 2, 2026-08-19, `prompts/2026-08-19-queue-reorder-chevrons.md`; replaced a single "Move to
+  top" button); default order is oldest-first. **Each still-queued row shows its actual run
+  position** (2026-08-13) — a small `#N` ordinal, 1/2/3… in the order `GET /api/jobs` already
+  returns them (`queue_position ASC, id ASC`), plus a one-line caption once there is more than one
+  queued job that the list order *is* the queue order. `▲`/`▲▲` are disabled on the first queued
+  row and `▼` on the last — the position number already tells the user where they are, and the
+  backend's own edge-case handling makes an out-of-turn request a no-op regardless.
 - **Start now**, a per-row menu (10% / 25% / 50% / 75% / Max of the site total limit,
   2026-08-19 — §4.5's "Start now" section has the fraction math), with its oversubscription
   behavior explained inline the first time it's used. The percent options are disabled with a
   hint when no site bandwidth limit is configured; Max always works.
 - Failures show the error class plus the captured lftp output tail.
-- **Dismiss**, on a `failed`/`cancelled` row (2026-08-13) — a display-only action that stops
-  the row showing on this page (`job.dismissed_at`) without deleting the `job` row or touching
-  the item's own state/suppression. Added after a user hit a `REMOTE_GONE` failure — the
+- **Dismiss**, on a `failed`/`cancelled`/`succeeded` row (2026-08-13) — a display-only action
+  that stops the row showing on this page (`job.dismissed_at`) without deleting the `job` row or
+  touching the item's own state/suppression. Added after a user hit a `REMOTE_GONE` failure — the
   remote files were genuinely gone, and Retry was the only action this page offered, which is
-  exactly wrong for that case. History (below) keeps showing a dismissed job regardless — it
-  reads the same table and dismissal was never meant to erase what happened, only to declutter
-  this page. **Clear all failed** dismisses every currently-`failed` row in one action
-  (`Promise.allSettled`, honest about partial failure the same way the Files page's bulk
-  actions already are) — scoped to `failed` only, not `cancelled`, since a stopped job is a
-  deliberate Stop click, not the kind of unattended pile-up a permanent-error class like
-  `REMOTE_GONE` can become. No confirmation dialog on either: nothing is destroyed.
+  exactly wrong for that case. Dismissal was never meant to erase what happened, only to
+  declutter this page -- the `job` row itself is untouched and stays reachable one item at a
+  time from that item's own drawer (§9.2, above). **As of 2026-08-20 (`docs/transfers-redesign-
+  spec.md` §2, phase 1 stage 7) no page lists every dismissed job across the whole install any
+  longer** -- the old History page's job list, which used to be that page, was dropped when
+  History became Events; the Complete box below already excluded dismissed rows before and after
+  (README's Known gaps names this). **The bulk "Dismiss" control lives in the Complete box's own
+  header** (2026-08-20, a follow-up to phase 1 stage 4b from the user's browser review,
+  `prompts/done/2026-08-20-transfers-dismiss-menu-and-counts.md`) — moved down from the page top,
+  where it originally sat, to sit beside the rows it acts on. It's a keyboard-navigable dropdown
+  (the same popover pattern the "Start now" menu already established, not a second one): **All**,
+  **Downloaded**, **Failed**, **Stopped** — one bulk `UPDATE` per choice
+  (`core/queue.py.dismiss_all_terminal`), never a client-side loop over each row's own dismiss.
+  This **folds in the old "Clear all failed"** control (v0.2.4): its whole job — dismiss every
+  currently-`failed` row — is now exactly "Dismiss → Failed", done atomically server-side
+  instead of a `Promise.allSettled` fan-out that could partially fail per row. **The chosen
+  outcome composes with the page's name filter** (decided 2026-08-20, `docs/decisions.md`): both
+  narrow the same dismissable set, so "the failed ones matching `Married`" is one request, not
+  two exclusive scopes — `job_ids`/`queue_id` (see below) stay mutually exclusive with
+  everything, since each already names an explicit or whole-queue scope rather than a narrowing.
+  An outcome matching zero rows still dismisses nothing, never everything — the same guarantee
+  the name filter's own empty match already gives, now proven for the composed case too. No
+  confirmation dialog: nothing is destroyed.
+- **A name filter**, in the page toolbar above the two boxes (2026-08-19) — start typing and
+  only rows whose `rel_path` contains that text (case-insensitive substring, no glob/regex)
+  stay visible; a "showing N of M" readout appears alongside it once it's non-empty for the
+  Active box. Not persisted — no `localStorage`, no URL param — matching the Files page's own
+  text filter and the Logs filter, since a stale filter hiding active transfers after a reload
+  would be its own confusion. **Runs client-side, instantly, for the Active/pending box; runs
+  server-side, debounced, for the Complete box** (phase 1 stage 4b, above) once that box became
+  paginated — a client-side filter over one loaded page would otherwise silently stop seeing most
+  of the matches. Alongside the input, **Dismiss list** dismisses exactly the terminal rows the
+  filter currently matches, in one bulk request (`core/queue.py.dismiss_all_terminal`'s
+  `name_filter` scope, sent as the same filter text the Complete box's own query is using — not
+  an id list, which could only ever name one page's worth once that box was paginated; never a
+  client-side loop over each row's own dismiss either way) — greyed out while the filter is
+  empty, and again if it matches no dismissable rows, with a tooltip naming which. It is a
+  separate control from the Complete box's own "Dismiss" menu (above) and keeps its own
+  unchanged, name-filter-only meaning regardless of that menu's last-chosen outcome — the menu
+  itself, unlike this control, *does* pick up whatever filter text is currently active (the
+  decided composition, above). It also supersedes the per-queue **Dismiss Queue** control
+  (v0.2.3, `278e10f`), removed 2026-08-19 alongside grouping — filter to a queue, then Dismiss
+  list does the same job.
+- **A directory row's expand panel gains a Files group, showing per-file progress** (2026-08-20,
+  `docs/transfers-redesign-spec.md` §3.3, phase 1 stage 5) — "the thing Files is currently used
+  for, moved to where the ordering lives." Not a second data source: `core/queue.py.
+  _publish_child_progress` already computes/persists/publishes each child file's size, state,
+  and rate from the same walk the running job performs; `GET /api/items/{id}/children`
+  (`core/itemview.py.item_view`, capped at 500, generous default 200) is a second on-demand
+  renderer of it, following the same "fetch once, on expand, never inline on the jobs list"
+  pattern `GET /api/history/jobs/{id}/output` already established — a season pack has dozens of
+  children, and the two boxes' row caps only bound the *jobs* list, not what any one row's own
+  subtree could inline onto it. Once expanded, a row does **not** re-poll this endpoint for live
+  updates — it overlays the same `item_delta`/`child_progress` WebSocket messages the Files page
+  already receives (the page's single `useLiveModel()` call, already open), so N expanded rows
+  never mean N independent polls. **One expand affordance, one panel, multiple sections** — Files
+  joins Transfer/Processing/*arr inside the existing chevron-toggled panel rather than getting a
+  second toggle, so a failed *and* directory row can show captured output and its per-file
+  breakdown from the one click that already opens everything else. A `pget` (single-file) job has
+  no children by construction (`is_dir = false` at the top level) and does not offer this group at
+  all — its own progress is already the row's one collapsed-line figure.
+- **A "Preflight" box, at the very top of the tab, above Active/pending** (2026-08-20,
+  `docs/transfers-redesign-spec.md` §4, prefigured; widened the same day by
+  `prompts/2026-08-20-preflight-waiting-sources.md`) — things a configured source already knows
+  about but lftpweb has no `item` and no work to do on yet, first in the pipeline. **A pure
+  projection, from two sources**: the *arr poller's own latest poll (`core/arrsync.py`, a release
+  the *arr already knows about that hasn't reached this seedbox's completed folder yet) and the
+  settle gate's own eligibility check (`core/autoqueue.py.AutoQueue`, an item that would be
+  auto-queued this very pass if only its remote fingerprint had held still — it shows the item's
+  own known remote size, `remote — 22 GB`). No table, no migration, nothing persisted for either:
+  a release that drops out of the *arr's queue, or an item that settles or gets suppressed, simply
+  stops being projected next pass. Attribution is *arr-specific (`arr_visible_path` prefix-
+  matching a record's `outputPath` against each bound queue; no match, or an ambiguous no-
+  `outputPath` record against more than one bound queue, is silently omitted rather than guessed)
+  for the first source, and reuses the settle gate's own eligibility query verbatim for the
+  second — a suppressed item or a pattern-unmatched `REMOTE_ONLY` item never earns a row from
+  either source, on purpose: neither is waiting, nothing is coming for them, and showing them
+  would turn Preflight into a second Files tree. **When both sources describe the same release,
+  the settle row wins** — it means the bytes are actually on the seedbox, known and sized,
+  strictly more information than an *arr queue record; in practice the *arr source already
+  excludes any release that is already an `item` row (which a settle-gated item always is), so
+  this is defense in depth against a title mismatch, not the primary mechanism. The *arr source
+  carries a brief flap-tolerance hold (150s) — the same discipline the amber `dropped` state
+  applies to a real item, for the identical SABnzbd-blank-queue-blip reason — since its own report
+  can go briefly missing for reasons unrelated to the underlying fact changing; the settle source
+  needs no such hold, since it's recomputed fresh from this same process's own persisted state
+  every successful scan pass, with no external flakiness to smooth over. A record/item that
+  matches a real lftpweb item, or gets an active job, is never projected at all, so a release is
+  never visible twice at once. **A mount-gated queue is a banner on the box, not rows** — one line
+  naming the queue and `core/autoqueue.py.AutoQueue.gated`'s own reason, since the entire queue's
+  auto-queue pass is blocked at once and fifty identical rows would bury the single fact that
+  matters; the banner and the row list are independent, so a mount-gated queue shows its banner
+  even when neither row source is otherwise configured. **Five rows by default, expandable and
+  paged** (reusing the same `Pager`/`pageReadout` the two boxes below already use, no separate
+  page-size selector — a 5-row box has no "I want to see more at once" use case a growing job
+  history has) — **zero rows reads as a single "Nothing in preflight." line, never reserved empty
+  space**, and the row list disappears entirely when no row source is configured at all (the
+  banner can still show on its own), rather than showing that line forever for a user with nothing
+  to project. **Rows are inert by construction** — no queue position, no chevrons, no Dismiss/
+  Start now/Stop — there is no `item` and no `job` behind one yet, and the separate box (rather
+  than a flag on the existing row type) is what makes that structural. **The row/box shape is
+  deliberately source-agnostic**: `source`/`source_label`/`source_kind` name which upstream a row
+  came from rather than assuming it's always the *arr, and `core/preflight.py` itself may never
+  name either source by construction — the merge/precedence logic above lives one layer up, in
+  `api/jobs.py`, the one place allowed to know both exist.
 
 **Item drawer.** A **side drawer** — not a modal, because file lists get long and the queue
 should stay visible — listing the files inside that item: name, size, transferred, per-file
@@ -1939,34 +2259,51 @@ both sides where each exists (`local_mtime` is the local counterpart to `remote_
 newest-child rollup answers a question the byte-comparison model asks), the lifecycle chronology
 from `first_seen_at` through `state_changed_at` rendered in the order it actually happened, and a
 bounded recent-history panel — the last handful of transfer attempts and audit events, including
-the delete trail. History is fetched **once, when the drawer opens**, never per row and never
-eagerly for a tree.
+the delete trail. That panel is fetched **once, when the drawer opens**, never per row and never
+eagerly for a tree. **A per-item Events deep link** sits in the drawer's own header (2026-08-20,
+`docs/transfers-redesign-spec.md` §2, phase 1 stage 7) — one click further to the full,
+unbounded, filterable log for this item, which is what lets the bounded panel here stay bounded
+without being the only way to see everything that happened to one item. The panel's own *events*
+half is now a strict subset of what that link opens; its *jobs* (attempt-history) half is not --
+no other page lists one item's own transfer attempts, so it stays.
 
-**History** — **its own page**, not a panel: the `job` and `event` tables, **grouped by queue**,
-filterable by state, error class, date range, and event kind. This is where remote deletes are
-reviewed, so it must render the delete audit trail (§7.3) legibly — what was deleted, from
-which queue, under which mode, and what gated it. The only view that answers "what did it
-remove last night". A row a Transfers-page Dismiss removed from that page still shows here
-(same table, dismissal is display-only) with a quiet **dismissed** marker — worth surfacing,
-since it's the only page that can answer "why is this no longer on Transfers."
+**Events** — **its own page**, not a panel: the `event` table (audit log only, DESIGN.md §7.3/
+§7.4), filterable by queue, kind, level, and date range, plus a per-item filter carried in the
+URL (the deep link above) rather than component state, so the filtered view is linkable,
+reloadable, and back-button friendly. Formerly **History**, a two-section page pairing this
+event log with its own `job` list; the `job` list was dropped 2026-08-20
+(`docs/transfers-redesign-spec.md` §2, phase 1 stage 7) once the Queue tab's Complete box (stage
+4b) already covered "what finished, in what order" -- keeping both was the exact overlapping-
+answer duplication the redesign exists to remove. `/history` still resolves to this page (a
+redirect, `App.tsx`), and the underlying `job` table and its `GET /api/history/jobs*` endpoints
+are untouched -- only the page that listed them is gone (docs/decisions.md). One consequence: a
+row a Transfers-page Dismiss hid isn't listed anywhere anymore -- its `job` row is untouched
+(dismissal was always display-only), reachable one item at a time from that item's own drawer,
+but no page lists every dismissed job across the whole install any longer (README's Known gaps).
+This page is where remote deletes are reviewed, so it must render the delete audit trail (§7.3)
+legibly — what was deleted, from which queue, under which mode, and what gated it. The only view
+that answers "what did it remove last night".
 
 **Clear** (2026-08-13) — the different, irreversible sibling of Dismiss: one row, everything
-matching the current filter ("by outcome" falls out of that for free — filter by `state` or
-`kind`/`level`, then clear), or everything, deleting the `job`/`event` rows outright rather than
-just hiding them. Confirmed before running (unlike Dismiss, which destroys nothing). No category
-is protected — the delete-audit events clear the same as anything else; see docs/decisions.md
-for why the obvious "protect the audit trail" alternative was considered and rejected. **Not to
-be confused with the Files page's "Reset item tracking"** (2026-08-13, above) — that forgets an
-`item` row so a path can be re-fetched; this page's Clear only ever touches `job`/`event` rows
-and is explicitly barred from touching `item` (next sentence) — clearing here must never change
-what the next scan does. Bulk
-clears run as one server-side `DELETE ... WHERE`, built from the same filter the matching `GET`
-uses, rather than a client-side loop over ids. **Never touches `item`**, `auto_queue_suppressed`,
-or `suppressed_reason` — clearing is bookkeeping, not behavior, and cannot change what the next
-scan does — and has no effect on the Dashboard (§10.4's `metric_sample`/`metric_heartbeat` carry
-no `job`/`event` reference and are never touched). Logs and backups are separate and out of
-scope. An active (`queued`/`running`) job is not history and is rejected server-side, not just
-hidden from the button.
+matching the current filter ("by outcome" falls out of that for free — filter by `kind`/`level`,
+then clear), or everything, deleting `event` rows outright rather than just hiding them.
+Confirmed before running (unlike Dismiss, which destroys nothing). No category is protected —
+the delete-audit events clear the same as anything else; see docs/decisions.md for why the
+obvious "protect the audit trail" alternative was considered and rejected. **Not to be confused
+with the Files page's "Reset item tracking"** (2026-08-13, above) — that forgets an `item` row
+so a path can be re-fetched; this page's Clear only ever touches `event` rows and is explicitly
+barred from touching `item` (next sentence) — clearing here must never change what the next scan
+does. Bulk clears run as one server-side `DELETE ... WHERE`, built from the same filter the
+matching `GET` uses, rather than a client-side loop over ids. **Never touches `item`**,
+`auto_queue_suppressed`, or `suppressed_reason` — clearing is bookkeeping, not behavior, and
+cannot change what the next scan does — and has no effect on the Dashboard (§10.4's
+`metric_sample`/`metric_heartbeat` carry no `job`/`event` reference and are never touched). Logs
+and backups are separate and out of scope. `GET`/`DELETE /api/history/jobs*` (job clearing
+included) are unaffected by this page's redesign and still exist server-side — `docs/decisions.
+md` records the decision to leave them, since `GET` still has a live frontend caller (the item
+drawer's own attempt-history panel, above) and an active (`queued`/`running`) job was already
+rejected server-side there, not just hidden from a button — but this page (and its own Clear
+button) no longer surfaces or calls any of them.
 
 **Dashboard** — throughput over time, from the sample store in §10.4: bytes moved per hour over
 the last 24 h, broken down by queue with a site total, and speed over a selectable 1 h / 12 h /
@@ -2009,7 +2346,7 @@ best-effort: an unconfigured, unreachable, or credentials-needing-re-entry host 
 save, only a live seedbox that clearly reports the directory missing does. A mistyped path used
 to surface only as a log line the next time auto-queue's mount gate silently refused to act; the
 same gating/recovery transition is now also an audit-trail event (`core/autoqueue.py.on_scan`,
-once per episode), visible on History → Events.
+once per episode), visible on the Events page.
 
 ### 9.3 Advanced options exposed
 
@@ -2093,8 +2430,9 @@ That is worth a backup.
 
 ### 10.3 Health and shutdown
 
-- **`HEALTHCHECK`** on `/api/health` — reports DB reachability, host reachability, and whether
-  the scheduler loop is live.
+- **`HEALTHCHECK`** on `/api/health` — reports DB reachability, host reachability, whether
+  the scheduler loop is live, and whether admission is paused (`queue_paused`, §4.5's "Pausing
+  admission" — a deliberate, healthy state, folded into neither `status` nor `scheduler_alive`).
 - **Graceful shutdown:** SIGTERM propagates to in-flight lftp children so their `-c` resume
   state is clean and the next start resumes rather than restarts.
 
@@ -2262,7 +2600,7 @@ backend/lftpweb/
   core/itemview.py    core/settle.py     core/mount_sentinel.py
   core/audit.py       core/metrics.py    core/logtail.py
   remote_agent/scan_fs.py          # stdlib-only fallback scanner
-frontend/   Vite app — routes Files / Transfers / History / Dashboard / Settings / Docs
+frontend/   Vite app — routes Transfers (Queue/Files tabs) / Events / Dashboard / Settings / Docs
 tests/      unit + integration
 private_data/   gitignored — local scratch, test fixtures, sample trees, scratch compose (§12.1)
 ```

@@ -10,6 +10,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from lftpweb.core.mount_sentinel import (
+    COMPLETE_STATES,
     DEFAULT_GRACE_S,
     SENTINEL_NAME,
     check,
@@ -235,6 +236,11 @@ def test_presence_is_not_this_functions_decision(prev_state, structural_state):
     # Content still present is not absence: whether an outcome outranks a fresh DOWNLOADED is
     # decided by core/postprocess.py.outcome_survives_rescan, applied by core/engine.py before
     # this function is consulted. Returning None here keeps the two halves from overlapping.
+    #
+    # `PARTIAL` is in the parametrization on purpose even though 2026-08-19 gave it a branch of
+    # its own: without `prev_remote_size`/`remote_size` there is no evidence of a *shrink*, and
+    # "no information" must never be read as one -- so this call, and every caller that predates
+    # those two arguments, behaves exactly as it always did.
     assert (
         resolve_absence(
             prev_state=prev_state,
@@ -245,6 +251,88 @@ def test_presence_is_not_this_functions_decision(prev_state, structural_state):
         )
         is None
     )
+
+
+# --- resolve_absence(): the *partial* half of the same grace period (2026-08-19) -----------
+#
+# `prompts/done/2026-08-19-autoqueue-requeues-imported-item.md`, production v0.2.6: an importer
+# takes a finished release apart one file at a time, so the reading between "complete" and
+# "gone" is PARTIAL -- an auto-queue-eligible state that had no grace-period protection at all,
+# and re-queued a release whose seedbox source was about to be deleted on confirmed import.
+#
+# Every test below pins the *narrowness* of the key as hard as the behaviour, because PARTIAL
+# being re-queueable is how a genuinely interrupted transfer resumes.
+
+
+def _shrink(**overrides):
+    kwargs = {
+        "prev_state": "DOWNLOADED",
+        "prev_first_missing_at": None,
+        "structural_state": "PARTIAL",
+        "mount_ok": True,
+        "now": datetime.now(UTC),
+        "prev_remote_size": 1_000,
+        "remote_size": 1_000,
+    }
+    kwargs.update(overrides)
+    return resolve_absence(**kwargs)
+
+
+@pytest.mark.parametrize("prev_state", sorted(COMPLETE_STATES))
+def test_a_shrink_from_any_complete_state_starts_the_clock_and_holds_that_state(prev_state):
+    state, first_missing_at = _shrink(prev_state=prev_state)
+    assert state == prev_state
+    assert first_missing_at is not None
+
+
+@pytest.mark.parametrize("prev_state", sorted(COMPLETE_STATES))
+def test_a_shrink_past_the_grace_window_releases_the_fresh_partial(prev_state):
+    now = datetime.now(UTC)
+    stale = (now - timedelta(seconds=DEFAULT_GRACE_S + 1)).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    # Deliberately None (= "trust PARTIAL"), never REMOVED_LOCAL: content is still on disk, and
+    # a damaged local copy must stay re-fetchable. See resolve_absence's own docstring.
+    assert _shrink(prev_state=prev_state, prev_first_missing_at=stale, now=now) is None
+
+
+def test_a_shrink_within_the_grace_window_does_not_restart_the_clock():
+    now = datetime.now(UTC)
+    started = (now - timedelta(seconds=60)).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    assert _shrink(prev_first_missing_at=started, now=now) == ("DOWNLOADED", started)
+
+
+@pytest.mark.parametrize(
+    "prev_state", ["PARTIAL", "REMOTE_ONLY", "STOPPED", "FAILED", "REMOVED_LOCAL", "LOCAL_ONLY"]
+)
+def test_a_partial_from_a_state_that_never_asserted_completeness_is_untouched(prev_state):
+    """The guard. A transfer that stopped short is `PARTIAL`/`STOPPED`/`FAILED` beforehand,
+    never one of `COMPLETE_STATES` -- so the branch cannot reach it, and re-queue still works.
+    """
+    assert _shrink(prev_state=prev_state) is None
+
+
+@pytest.mark.parametrize(("prev_remote_size", "remote_size"), [(500, 1_000), (1_000, 500)])
+def test_a_changed_remote_total_is_not_a_shrink(prev_remote_size, remote_size):
+    """§3.2 rule 4: remote size is a moving target. A previously-complete item whose remote
+    **grew** genuinely has more to fetch and must read PARTIAL at once, with no hold.
+    """
+    assert _shrink(prev_remote_size=prev_remote_size, remote_size=remote_size) is None
+
+
+@pytest.mark.parametrize(("prev_remote_size", "remote_size"), [(None, 1_000), (1_000, None)])
+def test_an_unknown_remote_total_is_never_inferred_to_be_a_shrink(prev_remote_size, remote_size):
+    assert _shrink(prev_remote_size=prev_remote_size, remote_size=remote_size) is None
+
+
+def test_the_mount_gate_refuses_to_start_the_shrink_clock_too():
+    state, first_missing_at = _shrink(mount_ok=False)
+    assert state == "DOWNLOADED"
+    assert first_missing_at is None
+
+
+def test_the_mount_gate_freezes_a_running_shrink_clock_rather_than_letting_it_expire():
+    now = datetime.now(UTC)
+    stale = (now - timedelta(seconds=DEFAULT_GRACE_S + 1)).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    assert _shrink(mount_ok=False, prev_first_missing_at=stale, now=now) == ("DOWNLOADED", stale)
 
 
 # --- resolve_vanished(): the "no opinion" fallback for a path in neither tree at all --------

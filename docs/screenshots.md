@@ -5,6 +5,33 @@ trust it?". This page is everything else — the screens you spend time in once 
 
 All captured against a real seedbox with deliberately generic release names.
 
+## The redesigned Queue tab
+
+![Transfers → Queue, showing the Active/pending and Complete boxes](images/queue-tab.png)
+
+Transfers is the main section now, with **Queue** and **Files** as tabs beneath it. The Queue
+tab is one globally-ordered list — no more one section per queue, because admission was always
+global and grouping implied per-queue lines that never existed.
+
+Two boxes, each paginated with its own 10/20/50 page-size selector: **Active/pending**, which
+holds a row until its *whole pipeline* finishes, not just its transfer — a downloaded release
+waiting on a confirmed Sonarr/Radarr import reads **Awaiting import** here, not Complete, for
+exactly as long as that's true — and **Complete**, everything actually finished. Each row carries
+a queue badge, a fast-lane badge when it qualifies, and **▲ / ▼ / ▲▲** reordering; a directory row
+expands to the same per-file progress the Files page shows, without leaving this page to see it.
+
+## Pausing the queue to curate the order
+
+![Transfers → Queue with the amber "Queue paused" banner, rows being reordered](images/queue-paused.png)
+
+**Pause after current** lets whatever's running finish and admits nothing new; **Pause now** also
+stops in-flight transfers immediately, leaving them resumable — not cancelled, not counted as
+stopped. The point of pausing is visible in this shot: reordering (the same ▲ / ▼ / ▲▲ chevrons)
+keeps working the whole time, so you stop everything, click the item you actually want next to
+the top of the queue, and unpause. "Start now" is the one control turned off here —
+oversubscribing past the ceiling to force one item through would defeat the pause you just
+asked for.
+
 ## What one item is actually doing
 
 ![The item detail drawer, showing a release mid-transfer](images/item-drawer.png)
@@ -23,13 +50,17 @@ path looks odd.
 Behind it, the Files tree shows the same release expanded: each episode carries its own live rate
 and ETA, because progress is sampled per file rather than for the job as a whole.
 
+The drawer's header also carries an **Events** link straight to this item's own filtered audit
+trail — one click further than the bounded recent-history panel already shown here, for when you
+need the unbounded log rather than the last handful of entries.
+
 ## Throughput over time
 
 ![The Dashboard, showing bytes per hour and transfer speed](images/dashboard.png)
 
 Bytes transferred per hour over 24 hours, split by queue, and a live transfer-speed chart with
 1h / 12h / 24h ranges. Both are drawn from lftpweb's own sampling table, independent of the
-History page — clearing history does not touch them.
+Events page — clearing events does not touch them.
 
 ## Transfer tuning, and what it actually means
 

@@ -42,6 +42,16 @@ const STYLES: Record<string, string> = {
   // Amber, like PARTIAL/DOWNLOADING's in-progress fill: this is also "still becoming what it
   // will be," just one step earlier -- before anything has even been queued.
   SETTLING: 'bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300',
+  // 2026-08-21 (prompts/2026-08-21-progress-fill-on-queue-and-preflight-chips.md): Preflight's
+  // *arr "Waiting" chip -- a release a download client outside lftpweb is fetching, per the
+  // *arr's own queue record. Same exact amber as `SETTLING` above (both "still becoming what it
+  // will be," per that state's own comment) -- the two are meant to look like the same family at
+  // a glance, differing only in whether `FILL_STYLES` below gives this one a bar. **Not**
+  // `PARTIAL`'s bucket: `PARTIAL` means "partially transferred by lftpweb itself," and this
+  // percent is a different client's own progress -- conflating the two would be exactly the
+  // vocabulary confusion the "Waiting" label (`lib/preflight.ts.ARR_CHIP_LABELS`) was introduced
+  // to fix.
+  WAITING: 'bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300',
   // Also not a real `item.state` (2026-08-14, prompts/2026-08-14-removal-grace-countdown.md):
   // `FileTree.tsx`'s Row substitutes this whenever `lib/format.ts.isRemovalGracePending` is
   // true for the row -- a previously-complete item (DOWNLOADED or a post-processing outcome)
@@ -71,20 +81,33 @@ const FALLBACK_STYLE = 'bg-zinc-100 text-zinc-700 dark:bg-zinc-800 dark:text-zin
 // partial in it that shows a color background that keeps ticking up ... Something sexy looking"
 // -- SABnzbd named as the reference point. The fill is a second, more saturated shade of the
 // same chip color (never a different hue), so text stays legible whether it's sitting on the
-// filled or unfilled portion -- the two shades were chosen close enough in lightness for that,
-// but this is unverified against a real browser (no UI access in this environment).
+// filled or unfilled portion -- the two shades were chosen close enough in lightness for that.
+// Unverified when first written; the user has since confirmed in a real browser that the
+// `PARTIAL`/`DOWNLOADING` pairs read fine (2026-08-21 browser review). `WAITING` below reuses
+// `PARTIAL`'s exact shade pair rather than inventing a third, still-unverified one.
 const FILL_STYLES: Record<string, string> = {
   PARTIAL: 'bg-amber-300 dark:bg-amber-700/80',
   DOWNLOADING: 'bg-blue-300 dark:bg-blue-700/80',
+  // 2026-08-21: `WAITING`'s own fill, for Preflight's *arr "Waiting" chip (the remote download
+  // client's own progress, not lftpweb's) -- a `SETTLING` row keeps no entry here at all, on
+  // purpose (a settle wait has no honest percentage; its detail is its tooltip, not a bar).
+  // Deliberately the **exact same values as `PARTIAL`'s fill**, not a new shade: the pairing
+  // comment above says the fill/base gap was "unverified against a real browser" when written,
+  // but the user has since confirmed the `PARTIAL`/`DOWNLOADING` pairs read fine in practice --
+  // reusing `PARTIAL`'s already-confirmed amber-100/amber-300 (light) and amber-900/40/amber-
+  // 700/80 (dark) jump for this new bucket carries that same confirmed legibility forward,
+  // rather than introducing a second, still-unverified amber relationship.
+  WAITING: 'bg-amber-300 dark:bg-amber-700/80',
 }
 
 interface StateChipProps {
   state: string
   /** 0-100, or `null`/`undefined` for no bar at all. Only ever meaningful for `PARTIAL`/
-   * `DOWNLOADING` (`FileTree.tsx`'s `stateProgressPercent` is the one place that decides
-   * that) -- a state with no entry in `FILL_STYLES` renders as a plain chip regardless of what
-   * `percent` is passed, so a caller can pass a percent for every row without checking the
-   * state itself.
+   * `DOWNLOADING` (`lib/fileTree.ts`'s `stateProgressPercent` is the one place that decides
+   * that for a Files/Transfers row) or `WAITING` (`lib/preflight.ts`'s `preflightFillPercent`,
+   * for a Preflight *arr row) -- a state with no entry in `FILL_STYLES` renders as a plain chip
+   * regardless of what `percent` is passed, so a caller can pass a percent for every row without
+   * checking the state itself.
    */
   percent?: number | null
   /** Overrides the displayed text without changing which `STYLES`/`FILL_STYLES` bucket `state`

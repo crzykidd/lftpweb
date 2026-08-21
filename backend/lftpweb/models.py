@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 # Input length caps (audit S3, docs/audit-v0.1.0.md). Chosen deliberately *generous* -- large
 # enough that no legitimate value is ever rejected, small enough that an attacker can't hand the
@@ -39,6 +39,11 @@ class HealthResponse(BaseModel):
     # yet (a fresh install), distinct from `False` (a host is configured but unreachable).
     host_reachable: bool | None = None
     scheduler_alive: bool = True
+    # 2026-08-20 (`prompts/2026-08-20-queue-pause.md`): whether admission is paused
+    # (`core/queue.py.TransferQueue.paused`). The header bar and the Queue tab's own banner both
+    # read this -- "a queue that silently does nothing is a support question waiting to happen"
+    # is the task's own reasoning for surfacing it here alongside `scheduler_alive`.
+    queue_paused: bool = False
     # 2026-08-16 (docs/decisions.md): also not in §12's literal shape, same reasoning as
     # `repo_url` above -- `config.Settings.build_sha`/`.build_channel` are baked at image
     # *build* time (docker/Dockerfile's `runtime` stage, .github/workflows/publish.yml), and
@@ -216,6 +221,20 @@ class PathQueueIn(BaseModel):
     # sentinel. Optional even when an instance is bound: it is only read by phase B's notify
     # push, not by matching.
     arr_visible_path: str | None = Field(default=None, max_length=MAX_PATH_LEN)
+    # Migration 024 (docs/transfers-redesign-spec.md §3.6, phase 1 stage 3,
+    # prompts/done/2026-08-19-queue-short-display-name.md). `None` (the default, and every
+    # existing queue's value after the migration -- nullable with **no backfill**) means "no
+    # short name set": every read falls back to the full `name` via
+    # `api/settings_queues.py.resolve_queue_display_name`, the one place that fallback is
+    # computed. An explicit value is a per-queue display hint for the compact per-row label
+    # stage 4 renders once Transfers drops its per-queue grouping (`DC-Movies` -> `MOV`) --
+    # deliberately **not** an identifier: no uniqueness constraint, two queues may share one.
+    # Trimmed and empty-after-trim-normalized-to-`None` at save time
+    # (`api/settings_queues.py._normalized_short_name`), and length-capped there too
+    # (`MAX_SHORT_NAME_LEN`) rather than via this field's own `Field(max_length=...)` -- unlike
+    # every other capped field on this model, the cap here must apply to the *trimmed* value,
+    # and an over-length value must not be rejected before trimming has a chance to fix it.
+    short_name: str | None = None
 
 
 class PathQueueOut(PathQueueIn):
@@ -438,6 +457,42 @@ class DeleteItemResponse(BaseModel):
     bytes_freed: int | None = None
     source_deleted: bool | None = None
     source_reason: str | None = None
+
+
+# --- Manual pipeline resolution (2026-08-20, docs/transfers-redesign-spec.md §3.2's
+# pipeline-completion rule, migration 025) ------------------------------------------------------
+#
+# The escape hatch for a genuinely wedged row in the Queue tab's Active/pending box. Every
+# blocking condition has a bounded automatic exit (`core/pipeline_flight.py`), but automatic exits
+# are necessary rather than sufficient, and a box that can silently accumulate rows nothing is
+# working on stops being trustworthy.
+
+
+class ResolveItemRequest(BaseModel):
+    """`POST /api/items/{item_id}/resolve`'s body. `outcome` is `'complete'`/`'failed'` to file
+    the row out of Active with that outcome, or **`null` to undo** a resolution set by mistake --
+    the row then goes straight back through the normal predicate as if it had never been touched.
+
+    **This is a CLASSIFICATION ONLY and that is not negotiable.** It moves a row between two
+    boxes on a page; it is evidence of nothing. See migration 025's own comment for the explicit
+    list (it must never advance the `move`-mode delete ladder, never be read as a confirmed *arr
+    import, never trigger notify/cleanup/retention/post-processing, never alter auto-queue's
+    eligibility). DESIGN.md §7.3 makes a source delete wait for a *confirmed* import held across
+    two consecutive poller passes precisely because that delete is irreversible; a user clicking a
+    button on a hunch is not that evidence.
+    """
+
+    outcome: Literal["complete", "failed"] | None = None
+
+
+class ResolveItemResponse(BaseModel):
+    """Echoes what is now stored on the item, so the caller never has to guess whether an undo
+    landed. `manual_outcome` is `null` after an undo.
+    """
+
+    item_id: int
+    manual_outcome: str | None
+    manual_outcome_at: str | None
 
 
 # --- Reset item tracking (2026-08-13, prompts/2026-08-13-reset-item-tracking.md) -----------
@@ -735,16 +790,46 @@ class StartNowRequest(BaseModel):
     rate_percent: Literal[10, 25, 50, 75, 100] | None = None
 
 
+# The chevron reorder actions (2026-08-19, docs/transfers-redesign-spec.md §3.4 stage 2,
+# `prompts/2026-08-19-queue-reorder-chevrons.md`) -- `POST /api/jobs/{id}/move`'s required body.
+# One endpoint, one request shape, rather than three near-identical routes; anything outside the
+# three directions is a 422 for free via `Literal`, the same pattern `StartNowRequest` above uses
+# for its own five-option menu.
+MoveDirection = Literal["up", "down", "top"]
+
+
+class MoveJobRequest(BaseModel):
+    direction: MoveDirection
+
+
+# The Transfers -> Queue tab's Pause control (2026-08-20, `prompts/2026-08-20-queue-pause.md`):
+# `POST /api/queue/pause`'s body -- "pause after current" (`stop_running=False`, the default)
+# leaves running jobs alone; "pause now" (`stop_running=True`) also SIGTERMs and requeues them
+# (`core/queue.py.TransferQueue.pause`). `POST /api/queue/unpause` takes no body.
+class QueuePauseRequest(BaseModel):
+    stop_running: bool = False
+
+
 class JobOut(BaseModel):
     id: int
     item_id: int
     queue_id: int
     queue_name: str
+    # The queue's short display name (migration 024, `path_queue.short_name`) -- `null` when
+    # unset, same fallback-to-`queue_name` convention `api/settings_queues.py.
+    # resolve_queue_display_name` / `lib/queueDisplayName.ts` already both define. Added
+    # 2026-08-19 (docs/transfers-redesign-spec.md §3.6, phase 1 stage 4a) so a Transfers row can
+    # show a queue badge without grouping rows by queue.
+    queue_short_name: str | None
     rel_path: str
     is_dir: bool
     kind: str
     state: str
     lane: str
+    # Vestigial for ordering as of migration 023 (`queue_position`, below, is the ordering key
+    # now) -- kept in the API response unchanged since it's still a real, still-written column
+    # (docs/transfers-redesign-spec.md §3.4, migration 023's own comment on why `rank` wasn't
+    # dropped). Not read by the frontend for sorting.
     rank: float
     attempt: int
     queued_at: str
@@ -766,7 +851,22 @@ class JobOut(BaseModel):
     exit_code: int | None = None
     error_class: str | None = None
     # DESIGN.md §9.2: "Failed rows show the error class and the captured lftp output tail."
+    # `null` on a row from `GET /api/jobs/complete` (2026-08-19, docs/transfers-redesign-spec.md
+    # §3.2, phase 1 stage 4b) -- that endpoint is paginated but *unbounded* in total row count,
+    # so it never inlines this blob (~4KB/row), the identical trap `api/history.py`'s own
+    # docstring names for its own list endpoint. `GET /api/jobs` (the Active/pending box) stays
+    # bounded by construction (`core/queue.py.list_jobs`'s own docstring) and keeps inlining it
+    # unchanged. `has_output_tail` below is the one signal a row's expand panel needs to decide
+    # whether to fetch it on demand -- true from either endpoint, so the panel doesn't need to
+    # know which box a row came from.
     output_tail: str | None = None
+    # Mirrors `HistoryJobOut.has_output_tail` -- always populated (from `output_tail is not
+    # None` server-side), regardless of whether `output_tail` itself was inlined. The Transfers
+    # row's expand panel (`TransfersPage.tsx.RowDetailPanel`) fetches on demand via the existing
+    # `GET /api/history/jobs/{id}/output` (same `job` table, same id) exactly when this is `true`
+    # and `output_tail` came back `null` -- one on-demand fetch path shared with History's own,
+    # rather than a second endpoint that does the same thing.
+    has_output_tail: bool = False
     # 2026-08-15 (prompts/2026-08-15-transfers-single-line-rows-with-detail.md): the item-level
     # facts the Transfers row's new expand panel needs for its Processing/*arr groups. Inlined
     # here rather than fetched separately -- `list_jobs()`'s row set is bounded by construction
@@ -795,10 +895,161 @@ class JobOut(BaseModel):
     # the one field that reliably says "this is a Sonarr instance" vs. "this is a Radarr
     # instance". `null` under the same condition `arr_instance_name` is null.
     arr_instance_kind: str | None = None
+    # **Which box this row belongs in** (2026-08-20, docs/transfers-redesign-spec.md §3.2's
+    # pipeline-completion rule) -- `true` = Active/pending, `false` = Complete. Computed
+    # server-side by `core/pipeline_flight.py`, the *same* expression `GET /api/jobs/complete`
+    # filters its listing and its `total` on, and shipped as a field rather than re-derived on
+    # the client on purpose: the Active box is client-side over `GET /api/jobs` and the Complete
+    # box is a server-side paginated query, so a second encoding of this rule would drift and put
+    # a row in both boxes or neither. The frontend's own rule is exactly
+    # `job.state === 'queued' || job.state === 'running' || job.pipeline_in_flight`, and the first
+    # two disjuncts are already inside this flag -- they're kept client-side only so the box still
+    # renders sensibly against a response from an older server.
+    pipeline_in_flight: bool = False
+    # What the row is waiting on, when it is in flight and its own state chip doesn't already say
+    # ('verifying' | 'extracting' | 'processing' | 'awaiting_import' | 'deleting_source', or
+    # `null`). Derived from the same clauses as `pipeline_in_flight` in one `CASE`
+    # (`core/pipeline_flight.waiting_reason_expr`), so the label and the box can never disagree.
+    # `null` for a `queued`/`running` row -- the state chip already says "QUEUED"/"DOWNLOADING".
+    # An unrecognized value degrades to the raw string on the row, the same tolerance
+    # `arr_instance_kind` above documents.
+    pipeline_waiting_reason: str | None = None
+    # The manual escape hatch (migration 025) -- `'complete'`/`'failed'` once a human has resolved
+    # this item out of the Active box, `null` otherwise. **A classification only**: nothing but
+    # `core/pipeline_flight.py` reads it, and migration 025's own comment lists what it must never
+    # be mistaken for. Surfaced here so the row can *show* it was manually resolved rather than
+    # looking like a normal completion -- otherwise the audit trail says one thing and the UI
+    # another.
+    manual_outcome: str | None = None
+    manual_outcome_at: str | None = None
 
 
 class JobsResponse(BaseModel):
     jobs: list[JobOut]
+
+
+# --- Preflight (docs/transfers-redesign-spec.md §4, prefigured; this task's own handoff prompt,
+# prompts/done/2026-08-20-preflight-box.md, plus its follow-up
+# prompts/2026-08-20-preflight-waiting-sources.md) -- the Queue tab's third, small box: things
+# lftpweb already knows about but has no work to do on yet. **Source-agnostic by construction**:
+# the *arr poller (`core/arrsync.py`) and the settle gate's own eligibility check
+# (`core/autoqueue.py.AutoQueue`) are the two sources wired up, and `source`/`source_label`/
+# `source_kind` name *which* one a given row came from rather than any field here assuming it's
+# always the *arr -- see `core/preflight.py.PreflightRow` for the projection this response wraps
+# (no table, no migration, nothing persisted) and its own docstring for the full reasoning on why
+# nothing source-specific belongs at this layer. `gated_queues` (below) is a different shape
+# entirely -- a whole queue blocked, not an item waiting -- and deliberately lives on this
+# response rather than as rows, per the user's own decision (`docs/decisions.md`). --------------
+
+
+class PreflightRowOut(BaseModel):
+    """One Preflight box row. Deliberately thin -- no `id`, no `queue_position`, no
+    `bytes_done`: there is no `item` and no `job` behind this row yet, and the handoff prompt's
+    own "the rows are inert, and the box is what makes that structural" is exactly why nothing
+    here invites a per-row control (chevrons, Dismiss, Start now, Stop) that would need one.
+    """
+
+    # `'arr'` or `'settle'` today (`core/preflight.py.PreflightSource`); widened, not replaced,
+    # if a further source ever lands. The frontend's own *arr-specific rendering (the brand-logo
+    # chip) is gated on this, never inferred from `source_kind` alone.
+    source: str
+    queue_id: int
+    # The bound queue's own display identity (2026-08-21, "the columns moved around" fix) -- so
+    # this row can show the same queue tag every other row on the page shows
+    # (`lib/queueDisplayName.ts.queueDisplayName(queue_short_name, queue_name)`). Mirrors
+    # `core/preflight.py.PreflightRow`'s own two fields of the same name field for field.
+    queue_name: str
+    queue_short_name: str | None
+    title: str
+    # Free-form, source-owned display text for "what state is this in" -- an *arr row's own
+    # `trackedDownloadState` (e.g. `"downloading"`), verbatim; `null` when the source didn't
+    # report one. Display-only advisory text, never a state this codebase's own state machine
+    # reads or reasons about.
+    status_label: str | None
+    # The upstream's own display name (an *arr instance's configured name, e.g. `"Sonarr"`) and,
+    # when the source has one, a brand/variant hint for the row's chip (`'sonarr'`/`'radarr'` for
+    # *arr; `null` for a source with no logo of its own).
+    source_label: str
+    source_kind: str | None
+    # A known total size and, when the source can compute one, how much is left to arrive --
+    # both `null` when the source has neither (**never a request to enrich one that lacks it**,
+    # the handoff prompt's own instruction). An *arr row's own `size`/`sizeleft`, when its
+    # response happened to carry them.
+    size_bytes: int | None
+    size_remaining_bytes: int | None
+    # How many seconds until this row's own source expects its wait to clear (2026-08-21,
+    # "we missed the remaining time") -- an *arr row's own `timeleft`
+    # (`core/arrsync.py._parse_timeleft`), rendered through the same `formatEta`/`transferLineValue`
+    # shape the Transfers row already uses for its own ETA. `null` when the source has no
+    # meaningful estimate this pass (frequently true -- a paused/stalled download client item, or
+    # a settle-gated row, whose own remaining figure is `size_bytes` above, not a time) -- never a
+    # fabricated or zero figure.
+    remaining_s: float | None
+    # The download client actually fetching this release (2026-08-21, user's own words:
+    # "tooltip maybe we should show the arr details ... Downloading from '<download client
+    # name>' from arr") -- an *arr row's own `downloadClient`; `null` for a settle row (no
+    # separate download client in that source's own model) or an *arr row whose response didn't
+    # carry one. Display-only provenance for a chip tooltip.
+    download_client: str | None
+    # A generic "how far along has this row's own wait gotten" detail for the chip's own hover
+    # tooltip (2026-08-21, "the settling chip should have a mouseover that shows time details")
+    # -- `core/preflight.py.PreflightRow.wait_scans`/`wait_since`'s own docstring has the full
+    # reasoning. `wait_since` is already an ISO-8601 string on this side (`core/settle.py.
+    # SettleProgress.first_matched_at`), so no further conversion happens at this layer. `null`
+    # for an *arr row (its own wait isn't bound by scan count) or a settle row with no
+    # `item_settle` history yet -- both fields together, never one alone.
+    wait_scans: int | None
+    wait_since: str | None
+
+
+class PreflightGatedQueueOut(BaseModel):
+    """One entry in the Preflight box's mount-gate banner (this task,
+    prompts/2026-08-20-preflight-waiting-sources.md, decided with the user) -- **a banner line,
+    not a row**: `core/autoqueue.py.AutoQueue.gated` blocks a queue's *entire* auto-queue pass at
+    once, so the useful fact is "this queue is blocked and why," never one row per affected item
+    (fifty identical rows would bury the single fact that matters). `reason` is
+    `AutoQueue.gated`'s own string, verbatim -- never recomposed here, so the banner and the
+    existing Settings -> Queues status readout (`QueueAutoQueueStatus.gated_reason`) can never
+    say different things about the same gating episode.
+    """
+
+    queue_name: str
+    reason: str
+
+
+class PreflightResponse(BaseModel):
+    """`GET /api/queue/preflight`. `source_configured=False` (with `rows` always empty in that
+    case) means "no row source is configured at all" (no bound, enabled *arr instance anywhere,
+    **and** no queue has the settle gate + auto-queue both live) -- the frontend hides the box's
+    row list for that case rather than showing an empty "Nothing in preflight" that would be
+    meaningless for a user with nothing configured. `gated_queues` is independent of
+    `source_configured` and can be non-empty even when it's `False` -- the mount gate can block a
+    queue's auto-queue pass whether or not either row source happens to be configured, so the
+    frontend shows the box whenever *either* `source_configured` or `gated_queues` has something
+    to say (`components/PreflightBox.tsx`).
+    """
+
+    source_configured: bool
+    rows: list[PreflightRowOut]
+    gated_queues: list[PreflightGatedQueueOut] = []
+
+
+class CompleteJobsResponse(BaseModel):
+    """`GET /api/jobs/complete` (2026-08-19, docs/transfers-redesign-spec.md §3.2, phase 1 stage
+    4b) -- the Queue tab's **Complete** box: terminal (`succeeded`/`failed`/`cancelled`), not
+    dismissed, one row per item (the same "most recent job wins" rule `core/queue.py.list_jobs`
+    already applies -- see `TransferQueue.list_complete_jobs`'s own docstring), newest-finished
+    first, **server-side paginated**. Same `total`/`limit`/`offset` shape
+    `api/history.py.HistoryJobsResponse` already established -- reused deliberately rather than
+    inventing a second pagination idiom (`total` is the full filtered count, ignoring the page,
+    so the frontend can render numbered pages -- `lib/pagination.ts` -- without a second
+    unbounded query).
+    """
+
+    jobs: list[JobOut]
+    total: int
+    limit: int
+    offset: int
 
 
 class DismissAllRequest(BaseModel):
@@ -809,9 +1060,83 @@ class DismissAllRequest(BaseModel):
     -- every queue -- so every caller that predates this task (including every existing test
     that calls `dismiss_all_jobs` with no body) is unaffected. The same "optional body, omitted
     means unchanged" shape `DeleteItemRequest` above already set (2026-08-16).
+
+    `job_ids` (2026-08-19, the Transfers page's name filter and its own "Dismiss list" button,
+    `prompts/2026-08-19-transfers-name-filter.md`) scopes the same bulk dismiss to an explicit
+    set of job ids instead of a whole queue -- "Dismiss list" sends the ids of exactly the
+    terminal rows the filter currently matches (`lib/transferPanel.ts.dismissableJobIds`) as
+    **one** request, never a client-side loop over each row's own `/dismiss` call (see
+    `TransferQueue.dismiss_all_terminal`'s own docstring). Omitted entirely, or `job_ids: null`,
+    means exactly today's pre-existing behavior -- the same "optional field, omitted means
+    unchanged" shape `queue_id` above already set, so every caller that predates this task is
+    unaffected. `job_ids: []` is a real, deliberate "match nothing" input (an empty filter
+    result), not "no filter" -- it dismisses zero rows, never every row; see
+    `TransferQueue.dismiss_all_terminal`'s own comment for why that distinction has to be made
+    explicitly rather than falling out of an `if job_ids:` truthiness check.
+
+    `name_filter` (2026-08-19, phase 1 stage 4b) supersedes `job_ids` for "Dismiss list" now
+    that the Complete box (`CompleteJobsResponse` above) is server-paginated: the filter can
+    match far more rows than are loaded on the current page, so an explicit id list can only
+    express "dismiss this one page's worth", not what the button promises ("dismiss everything
+    the filter matches"). `name_filter` carries the *same* text the Complete box's own listing
+    query is filtering on, so the server dismisses exactly what the box is currently showing,
+    across every page -- `TransferQueue.dismiss_all_terminal`'s own comment has the matching SQL,
+    built from the identical predicate `TransferQueue.list_complete_jobs` uses (never two
+    versions of "what counts as a match" that could drift apart), same case-insensitive
+    substring-over-`rel_path` semantics as the client-side `filterTransferJobs`. An empty string
+    is a real value here (matches every `rel_path`, same as an empty client-side filter matching
+    every row) -- it is `None`, not `""`, that means "no filter given", the same "unset means
+    unchanged" convention every other optional field on this model already uses.
+
+    `outcome` (2026-08-20, follow-up to phase 1 stage 4b from the user's browser review,
+    `prompts/2026-08-20-transfers-dismiss-menu-and-counts.md`) narrows the same bulk dismiss to
+    one terminal outcome -- the Complete box's own "Dismiss" menu, "all, downloaded, failed (or
+    whatever the completed status are)" in the user's own words. One of the three states
+    `TransferQueue.dismiss_job`'s own guard (and `lib/transferPanel.ts.isDismissable` on the
+    frontend) already allows: `succeeded`/`failed`/`cancelled`. `None` (the default, and every
+    call before this task) means no outcome restriction -- unchanged behavior for every existing
+    caller.
+
+    **Decided by the user (2026-08-20): `outcome` and `name_filter` COMPOSE rather than being
+    mutually exclusive.** Both are *narrowings* of the same dismissable set, not alternative
+    scopes -- "dismiss the failed ones matching `Married`" is a coherent request the Complete
+    box's own header now has to express (the outcome menu lives inside the same box the name
+    filter already narrows), so a request naming both is valid and dismisses their intersection.
+    See `TransferQueue.dismiss_all_terminal`'s own docstring for the SQL and
+    `docs/decisions.md` for the fuller reasoning, including why `queue_id` was *not* given the
+    same treatment.
+
+    **`job_ids` and `queue_id` stay mutually exclusive with everything, including each other.**
+    `job_ids` already names exactly which rows to dismiss -- composing a narrowing alongside an
+    explicit id list is meaningless (and `outcome`/`name_filter` are exactly that: narrowings of
+    an implicit set, not restrictions on an explicit one). `queue_id` is arguably also a
+    narrowing (dropping it into the composing group would be consistent), but it has had no
+    caller since per-queue grouping was dropped in phase 1 stage 4a -- kept mutually exclusive
+    the way it always was, since widening it costs real validator complexity for a scope nothing
+    sends. The restructured validator (`_scopes_are_coherent` below) checks this in two tiers
+    -- `job_ids`/`queue_id` against each other, then `job_ids`/`queue_id` against
+    `outcome`/`name_filter` -- rather than one flat "name more than one of four" rule, which
+    would have wrongly rejected `outcome` + `name_filter` together.
     """
 
     queue_id: int | None = None
+    job_ids: list[int] | None = None
+    name_filter: str | None = None
+    outcome: Literal["succeeded", "failed", "cancelled"] | None = None
+
+    @model_validator(mode="after")
+    def _scopes_are_coherent(self) -> "DismissAllRequest":
+        exclusive_scopes = sum(scope is not None for scope in (self.queue_id, self.job_ids))
+        if exclusive_scopes > 1:
+            raise ValueError("queue_id and job_ids are mutually exclusive -- pass at most one")
+        narrowings_given = sum(scope is not None for scope in (self.outcome, self.name_filter))
+        if exclusive_scopes > 0 and narrowings_given > 0:
+            raise ValueError(
+                "queue_id/job_ids are mutually exclusive with outcome/name_filter -- job_ids "
+                "already names exactly which rows to dismiss, and queue_id has no caller that "
+                "composes with a narrowing"
+            )
+        return self
 
 
 class DismissAllResponse(BaseModel):
@@ -841,6 +1166,31 @@ class ItemEventOut(BaseModel):
 
 class ItemEventsResponse(BaseModel):
     events: list[ItemEventOut]
+
+
+class ItemChildrenResponse(BaseModel):
+    """`GET /api/items/{id}/children` (2026-08-20, docs/transfers-redesign-spec.md §3.3, phase 1
+    stage 5) -- the Transfers row's on-demand per-file expansion, "the thing Files is currently
+    used for, moved to where the ordering lives" (the spec's own words).
+
+    **Fetched only when a row expands, never inlined into the jobs list** -- the exact trap
+    `api/history.py`'s own module docstring names for `output_tail`: a season pack has dozens of
+    children, and the Active/Complete boxes are bounded by row count, not by how large any one
+    row's own subtree is. `api/jobs.py.item_children` is the fetch this response belongs to; see
+    its docstring for the query and the cap.
+
+    `children` is `FileNode` -- the exact same `core/itemview.py.item_view` projection every
+    other consumer of the `item` table reads through (`GET /api/files`, the WebSocket, this
+    endpoint), never a second shape invented for this one panel. `total` is the true descendant
+    file count regardless of the cap, so a capped response can still say "showing N of total"
+    honestly -- the same `total`/`limit`/`offset` shape `HistoryJobsResponse`/
+    `CompleteJobsResponse` already use, reused rather than a fourth paging idiom.
+    """
+
+    children: list[FileNode] = Field(default_factory=list)
+    total: int
+    limit: int
+    offset: int
 
 
 class TransferSettingsOut(BaseModel):

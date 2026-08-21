@@ -37,4 +37,11 @@ against placeholder image paths. GitHub-only by design: it is not wired to an in
 because screenshots of the app are useless inside the app. Images live in
 [`images/`](images/) — see that directory's own README for the exact filenames expected.
 
+**[`transfers-redesign-spec.md`](transfers-redesign-spec.md)** — a **proposal, not built yet**:
+where the Transfers/Files/History surfaces are going (Transfers as the main section with Queue
+and Files tabs, one globally-ordered ungrouped queue list, History becoming Events) and the
+advisory download-client integration (SAB first, ruTorrent after) that feeds pre-arrival rows
+into it. Carries the reasoning, the two earlier decisions it reverses, the open questions, and a
+staged build order. `DESIGN.md` still describes what actually exists.
+
 Architecture lives in [`../DESIGN.md`](../DESIGN.md), not here.

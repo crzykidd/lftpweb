@@ -36,6 +36,11 @@ import { FieldHelp } from '../../components/FieldHelp'
 import { PathBrowseDialog } from '../../components/PathBrowseDialog'
 import { remoteBrowseDisabled } from '../../lib/pathBrowse'
 
+// Mirrors `api/settings_queues.py.MAX_SHORT_NAME_LEN` (migration 024) -- a soft `maxLength` hint
+// on the input only, not authoritative; the backend is the real enforcement point and rejects
+// anything over its own cap with a 400 regardless of what this constant says.
+const MAX_QUEUE_SHORT_NAME_LEN = 10
+
 const inputClasses =
   'w-full rounded-md border border-zinc-300 bg-white px-2.5 py-1.5 text-sm text-zinc-900 outline-none focus:border-zinc-500 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100'
 const labelClasses = 'text-sm font-medium text-zinc-700 dark:text-zinc-300'
@@ -95,6 +100,10 @@ interface FormState {
   arr_instance_id: number | null
   arr_delete_completed: boolean
   arr_visible_path: string
+  // Migration 024 (docs/transfers-redesign-spec.md §3.6) -- `''` (not `null`) as its own
+  // form-state empty value, the same convention `staging_path`/`arr_visible_path` above
+  // already use, converted to `null` at submit time.
+  short_name: string
 }
 
 const EMPTY_FORM: FormState = {
@@ -116,6 +125,7 @@ const EMPTY_FORM: FormState = {
   arr_instance_id: null,
   arr_delete_completed: false,
   arr_visible_path: '',
+  short_name: '',
 }
 
 /** Settings → Transfer's site-wide "folder prefix during transfer" default, fetched here so
@@ -611,6 +621,7 @@ export function QueuesTab() {
       arr_instance_id: queue.arr_instance_id,
       arr_delete_completed: queue.arr_delete_completed,
       arr_visible_path: queue.arr_visible_path ?? '',
+      short_name: queue.short_name ?? '',
     })
   }
 
@@ -662,6 +673,7 @@ export function QueuesTab() {
       arr_instance_id: form.arr_instance_id,
       arr_delete_completed: form.arr_delete_completed,
       arr_visible_path: form.arr_visible_path || null,
+      short_name: form.short_name || null,
     }
     try {
       if (editingId != null) {
@@ -771,6 +783,22 @@ export function QueuesTab() {
         <label className="flex flex-col gap-1">
           <span className={labelClasses}>Name</span>
           <input className={inputClasses} value={form.name} onChange={(e) => update('name', e.target.value)} />
+        </label>
+        <label className="flex flex-col gap-1">
+          <span className={labelClasses}>
+            Short name (optional)
+            <span className="ml-2 font-normal text-zinc-500 dark:text-zinc-400">
+              — a compact per-row label for the Transfers page (e.g. "DC-Movies" → "MOV").
+              Defaults to the full name above when left blank.
+            </span>
+          </span>
+          <input
+            className={`${inputClasses} max-w-32`}
+            maxLength={MAX_QUEUE_SHORT_NAME_LEN}
+            value={form.short_name}
+            onChange={(e) => update('short_name', e.target.value)}
+            placeholder={form.name || 'defaults to the full name'}
+          />
         </label>
         <label className="flex flex-col gap-1">
           <span className={labelClasses}>Remote path</span>

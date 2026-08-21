@@ -6,6 +6,935 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-21 — Preflight retirement moves to request time: local state needs no *arr dependency
+
+`prompts/2026-08-21-preflight-eviction-latency.md`, from the user's browser review ("it does take
+20-30 seconds for items to be removed from preflight after it shows in active ... sometimes it is
+fast and sometimes it is slow"). Extends the "evict-on-handover" entry below rather than
+contradicting it: that fix removed the 150s flap-tolerance hold from the retirement path; this
+task removes the other term that was still underneath it -- the *poll cadence* itself.
+
+**Retirement is decided at request time now, not only once per *arr poll pass.** The question
+"should this row still show" is really "does a matching `item` row exist now" -- purely local
+database state, answerable on every `GET /api/queue/preflight` regardless of when the *arr was
+last polled. Before this, `ArrSyncScheduler.preflight_rows` was a synchronous read of the
+in-memory hold; the hold's own `retired` set (the previous fix) only got recomputed inside
+`_update_preflight`, which only runs once per `ArrSettings.poll_interval_s` (60s default). An
+item landing right after a poll waited nearly the full interval before the *next* poll noticed;
+one landing right before a poll felt instant -- exactly the "sometimes fast, sometimes slow"
+variance the user named, and the tell that pointed at cadence rather than at the hold itself.
+
+**`preflight_rows` became `async` to do this** -- it now re-queries `item` fresh (via the
+existing `_item_names_for_queue_ids` helper, extracted from `_update_preflight` so both paths
+share one query) and re-runs the *arr match predicate against each held row whose identity this
+instance's last poll pass also fetched a raw `QueueRecord` for. A held row with no such record
+(the flap-tolerance case -- it went missing from a poll and is being held blind) passes through
+unfiltered, unchanged from before: there is nothing to re-test it against, and "keep showing it"
+is that cache's entire point. This is a read-side filter only; it never mutates the hold itself,
+so the next real poll's own `retired` set remains the authoritative writer -- "one writer"
+(`PreflightHold.update`) still holds.
+
+**The match predicate is now a named, shared function, `_record_matches_any_item`** (`core/
+arrsync.py`), wrapping the pre-existing `_record_matches_item` -- used by both
+`_preflight_candidates` (the per-poll path) and `preflight_rows` (the new request-time path).
+Rejected: reimplementing a second, title-only check at the request-time call site using only
+`PreflightRow.title` (the shared row type carries no `output_path`). That would have silently
+weakened matching for a record whose only match signal is its `outputPath` basename (a renamed
+release whose title doesn't normalize-equal the item name) -- accepted for the per-poll path
+(full `QueueRecord` available) but wrong to reintroduce as a second, weaker definition at the
+other call site. Instead `ArrSyncScheduler` now caches each instance's last-fetched
+`QueueRecord`s (keyed by `_record_identity`, the same identity the hold itself uses) and its last
+bound+enabled queue ids, so the request-time check can call the *exact* same predicate with the
+*exact* same record data the poll pass had, just re-evaluated against a fresher `item_names` set.
+
+**`core/preflight.py` gained one small, source-agnostic addition: `PreflightHold.items()`**,
+returning `(identity, row)` pairs alongside the existing `rows()`. Needed so `preflight_rows` can
+look up each row's own last-seen record by identity without reaching into the hold's private
+`_entries` dict. Says nothing about what an identity *means* -- same contract as `update`'s own
+`retired` set -- so the module's five-tasks-running "no `arr`/`settle` reference in code" streak
+holds; the *arr-specific predicate itself lives entirely in `core/arrsync.py`.
+
+**The *arr poll rate was deliberately left untouched.** The 0-60s term this task removes was
+never about the *arr being too slow to ask -- lftpweb already had every fact it needed locally,
+just wasn't asking itself the question until the next scheduled poll. Raising the poll rate would
+have hammered someone else's API to fix a purely local latency, and the interval is a
+user-facing setting with its own reasons (also unrelated to the settle source, which was never on
+this path -- it replaces its own rows wholesale every scan and needed no change here).
+
+**Frontend poll dropped from 15s to 5s** (`hooks/usePreflight.ts`), matching `StatsHeader.tsx`'s
+health-poll cadence. Before this task, 15s was chosen specifically because the box's data
+couldn't change faster than the *arr's own ~60s poll; with the endpoint no longer bounded by
+that, the frontend's own interval became the dominant remaining delay, so it was tightened to
+match the other "advisory, cheap-to-poll" data on the page rather than left at a stale value.
+
+---
+
+## 2026-08-21 — A separate `WAITING` fill bucket for Preflight's *arr chip; `SETTLING` deliberately
+gets none
+
+`prompts/2026-08-21-progress-fill-on-queue-and-preflight-chips.md`, from the user's browser
+review ("no % is good it is small but the chip updating makes it dynamic and cool. Same with
+waiting.").
+
+**`WAITING` is its own `StateChip` state key, not a reuse of `PARTIAL`'s bucket.** `PARTIAL`
+means "partially transferred by lftpweb itself"; an *arr "Waiting" row's percent is a *different
+client's* own progress, reported secondhand by the *arr. Folding the two into one `FILL_STYLES`
+bucket would have been exactly the vocabulary confusion the "Waiting" label itself was introduced
+to fix one task earlier (`prompts/done/2026-08-21-preflight-label-and-page-size.md`).
+
+**`WAITING`'s fill reuses `PARTIAL`'s exact two shades** (`bg-amber-300 dark:bg-amber-700/80`
+over `bg-amber-100 dark:bg-amber-900/40`) rather than inventing a third amber pairing. The
+`FILL_STYLES` module comment recorded that the base/fill lightness gap was "unverified against a
+real browser" when first written (2026-08-13); the user has since confirmed in a real browser
+that it reads fine for `PARTIAL`/`DOWNLOADING`. Reusing those exact values carries that confirmed
+legibility forward for `WAITING` instead of shipping a second, still-unverified relationship.
+
+**`SETTLING` gets no `FILL_STYLES` entry, on purpose, unchanged by this task.** A settling
+release is not downloading — lftpweb is waiting for its own remote fingerprint to stop changing,
+and there is no honest percentage to show. Its detail already lives in its countdown tooltip
+(the previous day's task). Finished shape: Waiting fills and ticks; Settling does not; both stay
+the same amber `STYLES` entry, so a glance still reads "one waiting-row family," per the previous
+task's own settled reasoning.
+
+**Preflight's fill percent (`lib/preflight.ts.preflightFillPercent`) is a new pure helper, not
+inlined in `PreflightBox.tsx`,** reusing `lib/format.ts.percentValue` for the actual division
+rather than a second copy of it. Absent `size_bytes`/`size_remaining_bytes`, a non-positive
+total, a negative remaining figure, or a remaining figure exceeding the total (a stale/
+inconsistent *arr record) all resolve to `null` — "no bar" — rather than `0%`, a full bar, or a
+computed `NaN%`: the *arr frequently omits size on a paused or stalled client item, and a
+zero-width bar would misread as a stalled download rather than as absent information.
+
+**The Queue row's own percent (`lib/transferPanel.ts.queueRowPercent`) reuses `lib/fileTree.ts.
+stateProgressPercent`** — the same function the Files tree and a Transfers row's child-file
+expansion already use — fed the row's own `bytes_done`/`bytes_total` (with the identical
+live-progress-over-job fallback `transferLineValue` already applies) in place of a Files row's
+local/remote size, rather than a second definition of "how full is this chip." It checks
+`job.state === 'running'` directly instead of importing `TransfersPage.tsx`'s `chipStateFor` —
+that would have made a `lib/` module depend on a page module, which nothing else in this codebase
+does.
+
+**The user has explicitly approved the percent appearing twice on a Queue row** — once in the
+chip (`Downloading 45%`) and once in the figure column (`45% · 40 MB/s · 25m left`) — so neither
+was suppressed or deduplicated.
+
+---
+
+## 2026-08-21 — Preflight row columns, chip vocabulary, and evict-on-handover: what "remaining
+time" means per source, one colour for the whole box, and a `retired` set on the hold
+
+`prompts/2026-08-21-preflight-row-columns.md`, from the user's first real browser look at the
+shipped box. Column-alignment work; the frontend half is unverified in a real browser (no page
+render in this environment) — a human still needs to eyeball it.
+
+**`remaining_s` is a new, genuinely generic field on the shared `PreflightRow`, but only the *arr
+source populates it today.** Considered giving the settle source a computed value too (`min_age_s
+- elapsed`, once its own scan-count requirement is met) so both sources would exercise the same
+figure-column code path. **Rejected**: the settle gate's remaining wait is bound by *scan count*
+before it's ever bound by wall-clock time (`REQUIRED_SETTLE_SCANS` first, `SETTLE_MIN_AGE_S`
+only once that's met) — a queue's own scan cadence isn't fixed enough to turn "N more scans
+needed" into a trustworthy seconds figure without fabricating one, which the handoff prompt
+explicitly rules out. The settle source's own already-existing remaining figure is `size_bytes`
+("remote — 22 GB") — it keeps carrying exactly that, unchanged, and `remaining_s` stays `null`
+for every settle row. The field is deliberately not named `arr_timeleft_s` or similar precisely
+so a future source *can* populate it if it ever has a real, non-fabricated estimate to give.
+
+**Every Preflight row — *arr or settle — uses `StateChip`'s `SETTLING` amber, not a per-source
+colour.** The handoff prompt's own reasoning, confirmed rather than second-guessed: once an *arr
+row's chip stopped showing the *arr's raw state word and started speaking lftpweb's own
+vocabulary ("Waiting for download," not "downloading"), the earlier worry about borrowing one
+system's status colours for another system's states no longer applies — a Preflight row is a
+*waiting* row whatever it's waiting on. One colour reads as "this box is the waiting room," which
+is the box's own point; a rainbow of per-state colours here would suggest distinctions (this
+release is more/less urgent than that one) the box has no actual basis for.
+
+**An *arr row's chip vocabulary is limited to the two `trackedDownloadState` values this codebase
+has actually verified live** (`downloading` → "Waiting for download", `importing` → "Importing",
+per `core/arrclient.py`'s own module docstring on what's been checked against a real Sonarr).
+Anything else falls through to the source's own raw word, verbatim, rather than a guessed
+lftpweb-perspective label — the handoff prompt's explicit "do not invent a state the *arr does
+not report." `importing` needed its own word rather than collapsing into "Waiting for download":
+a release in that state has already finished arriving and Sonarr/Radarr is mid-import, which is
+not "waiting on a download client" at all.
+
+**`timeleft` over `estimatedCompletionTime` for the *arr's own remaining-time field.** The v3
+queue record carries both; `estimatedCompletionTime` is an absolute timestamp that would need
+comparing against this process's own clock on every request, making the figure tick unevenly
+between the *arr's own ~60s poll and this page's independent poll cadence (and trusting the *arr
+host's clock against this one). `timeleft` is already a duration the *arr computed itself —
+rendered once through this codebase's own `formatEta`, one clock, no comparison needed. Parsed
+defensively (the documented default .NET `TimeSpan.ToString()` shape, `[d.]hh:mm:ss[.ffffff]`) —
+unlike `trackedDownloadState`, this codebase has not verified `timeleft`'s wire format against a
+live instance, so anything not shaped like the documented default returns `None` rather than
+guessing at an undocumented one. A parsed `00:00:00` (a paused/stalled download client item) is
+also treated as absent — never a fabricated "0s left."
+
+**The retired signal is a `retired` set argument on `PreflightHold.update`, not a separate
+`retire()` method.** `update` is already documented as "the only writer, called once per refresh
+with every row that source currently sees" — a second method would mean two calls per pass with
+an implicit ordering dependency between them (does `retire` need to run before or after
+`update`?) for no real benefit. One call, two sets (`seen`, `retired`), keeps the "one write per
+refresh" discipline intact. The signal itself is drawn in `core/arrsync.py._preflight_candidates`
+— exactly where a record is already excluded for matching a real item — rather than in
+`core/preflight.py`, which stays exactly as source-agnostic as before: it knows "a caller can
+mark some absent keys as retired," never *why* a record retires.
+
+**Queue identity (`queue_name`/`queue_short_name`) required widening `QueueConfig`/
+`QueueAutoConfig` in `core/engine.py`, not just `core/preflight.py`.** `QueueAutoConfig` is
+deliberately a trimmed subset of `QueueConfig` (its own docstring), and neither carried
+`short_name` before this task — only `core/arrsync.py`'s side had it for free, via its own
+`SELECT *` against `path_queue`. Widening both dataclasses with one more optional, defaulted
+field is the same kind of addition `QueueAutoConfig.name` itself already was ("a mid-run scope
+addition... exists solely so `on_scan`'s own audit events can name the queue") — judged worth
+doing rather than working around, since the alternative (deriving queue names via a second query
+in `api/jobs.py` instead of on the row itself) would have meant one of the two sources not
+actually populating its own row's queue identity, contradicting the handoff prompt's explicit
+"both sources must populate it."
+
+---
+
+## 2026-08-20 — Preflight's second source (settle-gated releases): the boundary held without
+reshaping; the mount-gate signal is a banner, never rows; settle wins over *arr on a tie
+
+`prompts/2026-08-20-preflight-waiting-sources.md`, the immediate follow-up the previous task's own
+`docs/decisions.md` entry (below) named before it was built. Browser-unverified (no page render).
+
+**The source-agnostic boundary `core/preflight.py` was built against held, unchanged.** Adding
+the settle gate as a second source needed nothing more than: build `PreflightRow(source="settle",
+...)`, own the matching/attribution logic (which item earns a row, and why) in the module that
+already computes it, feed a per-queue cache, and OR a second "is this source configured" query
+into the endpoint with its rows merged in. `PreflightRow`, `PreflightSource` (widened from
+`Literal["arr"]` to `Literal["arr", "settle"]`, per its own "widen, don't replace" comment), and
+`PreflightHold` needed zero shape changes — confirmation the first task's boundary was drawn in
+the right place, not merely a lucky guess.
+
+**The settle source lives in `core/autoqueue.py`, not a new module.** The natural home is wherever
+"would this item be auto-queued right now" is already decided — `AutoQueue.on_scan`'s own
+eligibility query (pattern match, no active job, unsuppressed, not *arr-owned, not an in-progress
+unpack) already computes every fact a settle-preflight row needs; a separate module would have had
+to re-derive or duplicate that same query. `on_scan` now builds a `PreflightRow` at the exact point
+it would otherwise `continue` past a still-settling item, so "reached the settle check at all"
+already proves every other exclusion (suppressed, pattern-unmatched, active job) has already been
+satisfied — the two OUT exclusions the task named hold *by construction*, not by an extra check.
+
+**The settle source deliberately does not use `PreflightHold`'s flap tolerance.** That cache exists
+to smooth a *source's own report* going briefly missing for reasons unrelated to the underlying
+fact (the *arr's SABnzbd blank-queue blip) — arr's own eligibility recomputation, needed anyway.
+The settle source's "is this item still gated" question is answered fresh from this same process's
+own persisted state (`item_settle`, `auto_queue_suppressed`, `job`) on every successful scan pass;
+there's no external flakiness to tolerate, and a flap-tolerant hold would only introduce a stale-
+row risk a plain full-replace doesn't have. `AutoQueue._settle_preflight` is a plain
+`dict[queue_id, dict[item_id, PreflightRow]]`, wholesale-replaced per queue on every `on_scan` call
+that reaches the eligibility loop, and explicitly popped (not left to expire) the instant that
+queue's own pass returns early for either existing early-exit reason (auto-queue off, mount-gated)
+— stronger than the "no duplicate at handover" guarantee the *arr source settled for, at no extra
+complexity.
+
+**Mount-gated queues are a banner (`PreflightResponse.gated_queues`), never rows — decided with the
+user, non-negotiable.** `AutoQueue.gated` blocks a queue's *entire* auto-queue pass at once; a row
+per affected item would bury the one fact that matters behind however many identical entries a
+busy queue happens to have sitting eligible. The banner is orthogonal to `source_configured` (a
+mount-gated queue shows its banner whether or not either row source happens to be configured) and
+reuses `AutoQueue.gated`'s own reason string verbatim — never recomposed — so it can never drift
+from the existing `GET /api/settings/queues/{id}/autoqueue-status` readout describing the same
+gating episode.
+
+**Cross-source precedence: a settle row wins over an *arr row for the same release.** Decided with
+the user, per the task's own steer ("the settle-gated one has strictly more information — it is
+actually on the seedbox"). Implemented once, in a pure `_merge_preflight_rows` helper in
+`api/jobs.py` (the one place allowed to know both sources exist, per `core/preflight.py`'s own
+docstring) — identity is `(queue_id, title)`, and a settle row's presence for that pair drops the
+matching *arr row before the merged set is sorted. In practice this rarely fires: `core/arrsync.py.
+_preflight_candidates` already excludes any release that matches an existing `item` row regardless
+of state, and a settle-gated item always *is* one — so the precedence rule is defense against a
+genuine title/attribution mismatch between the two sources, not the primary de-duplication
+mechanism. **Row ordering across the merged set is alphabetical by title, case-insensitive** — the
+same boring default each source already applies within itself, re-applied globally rather than
+grouping by source in an arbitrary, equally-defensible-either-way order.
+
+---
+
+## 2026-08-20 — Preflight: a pure in-memory projection (no table), source-agnostic row shape,
+`arr_visible_path` attribution, a flap-tolerance hold that can never accumulate
+
+`prompts/done/2026-08-20-preflight-box.md`, the Transfers → Queue tab's third, small box
+(docs/transfers-redesign-spec.md §4, prefigured). Browser-unverified (no page render).
+
+**A pure projection of the *arr poller's own latest pass — no table, no migration, no
+persistence.** The alternative (an ephemeral `item`-adjacent table, closer to §4.6's original
+"pending entries" sketch) was rejected: `core/arrsync.py`'s poller already fetches every queue
+record every ~60s and `QueueRecord.raw` already keeps the full response dict for exactly this
+kind of later use; a record that matches nothing is discarded today, and those discarded records
+are this box's entire contents. Persisting them would mean owning a second write path, a second
+place a stale row could linger, and a restart-recovery story to get right — for data that is
+already being handed to this process fresh every poll interval. The explicit cost accepted: a
+restart empties the box until the next poll (≤60s). That is judged acceptable, not a defect to
+paper over with persistence.
+
+**Row/cache shape is source-agnostic by construction, in a new `core/preflight.py`, ahead of a
+second source that isn't built yet.** Mid-task, the user named an immediate follow-up: non-*arr
+items held by the settle gate (`core/settle.py`) — a release still uploading to the seedbox,
+with a known remote size but no *arr involvement at all. Rather than ship `PreflightRow` with
+*arr-flavored field names (`instance_name`, `tracked_download_state`, `size`/`sizeleft`) and
+rename them later, the row carries a `source` discriminator plus free-form `source_label`/
+`source_kind`/`status_label`/`size_bytes`/`size_remaining_bytes` that no *arr-specific code
+reads or writes. `core/arrsync.py` builds `PreflightRow(source="arr", ...)` and owns every
+*arr-specific piece (matching against `item` names, `arr_visible_path` prefix attribution,
+`downloadId`/`trackedDownloadState` vocabulary); `core/preflight.py` owns only the shared shape
+and the flap-tolerance cache (`PreflightHold`). The API layer (`PreflightRowOut`/
+`PreflightResponse`, `GET /api/queue/preflight`) mirrors that split — the endpoint path and
+response shape name nothing *arr-specific, only its live `source_configured` query does today,
+by necessity (it's the only source), with the endpoint's own docstring stating plainly that a
+second source would add its own check and OR it in, not reshape the endpoint. The frontend
+matches: `components/PreflightBox.tsx` renders the real Sonarr/Radarr brand logo only behind an
+explicit `row.source === 'arr'` check, falling back to a plain text chip (`source_label`) for
+anything else.
+
+**Attribution is `arr_visible_path` prefix-matching, and silence is deliberately the answer for
+"can't tell."** A record with an `outputPath` is attributed to whichever bound queue's
+`arr_visible_path` contains it (component-boundary check, not `str.startswith` — `/data/tv` must
+not swallow `/data/tvshows/...`; most-specific/longest match wins for the unlikely nested case).
+A record with no `outputPath` at all (the *arr does not always populate it) is attributed only
+when the instance has exactly one bound queue — never a guess between two or more. No match at
+all is omitted, never a fallback guess: the sharp risk named in the handoff prompt is promising a
+release that never arrives, which is worse than showing nothing. An already-`imported`-at-the-
+*arr-level record is excluded too, on top of (not instead of) the "already matches a real item"
+exclusion — one more guard against the exact "visible twice" failure mode the no-duplicate-at-
+handover requirement names, since a record that far along is also the one most likely to become
+a real item on literally the next scan.
+
+**No duplicate at handover holds by construction, not by a separate check.** `_update_preflight`
+runs after every one of an instance's bound queues has already been processed for that pass, and
+queries `item` fresh (not the stale per-queue snapshot `_match_items` took) — so a record
+`_match_items` just matched into a real item *this very pass* is already excluded from the
+preflight candidate set before a `PreflightRow` for it is ever built. There is no window in a
+single pass where both a preflight row and a real item exist for the same release.
+
+**Flap tolerance (`PreflightHold`, `PREFLIGHT_HOLD_S = 150.0`) is a property of the box, not of
+the *arr projection** — deliberately generalized into `core/preflight.py` rather than left as an
+`core/arrsync.py`-local cache, since the user's own framing was that *why* a row briefly stops
+being reported differs per source (the *arr's own SABnzbd blank-queue blip vs. a settle-gated
+item simply starting to transfer) but the box's tolerance for a brief gap shouldn't. A row missed
+for up to the hold window keeps showing from its last-seen data; still missing past it is deleted
+from the cache outright, every pass, unconditionally — there is no third state and no persisted
+flag, so this can never itself become a second accumulation risk on top of whatever a source
+already guards against (the amber `dropped` state's own `DROPPED_GONE_GRACE_S` ladder, for the
+*arr).
+
+**`preflight_rows(enabled_instance_ids)` filters by a caller-supplied live set, not by a stored
+enabled flag on the row/cache itself** — an instance disabled (or every one of its bound queues
+disabled) stops being returned the instant the caller's own live query says so, rather than
+lingering in the box for up to `PREFLIGHT_HOLD_S` after a config change for no reason. The
+"no source configured" hide-the-whole-box case is the same query, one level up: `GET
+/api/queue/preflight` checks live whether any enabled *arr instance has an enabled bound queue at
+all, independent of whatever the scheduler's cache currently holds.
+
+**Frontend: `Pager` extracted to `components/Pager.tsx`** (previously private to
+`TransfersPage.tsx`) so `PreflightBox` could reuse the identical component per the handoff
+prompt's own "reuse the existing pager ... rather than a third pagination idiom" — behavior is
+byte-identical, only the file moved. **No per-box page-size selector on Preflight** (unlike
+Active/Complete's "Show 10/20/50"): decided against, since a box whose collapsed default is 5
+rows doesn't share the "I want more/fewer at once" use case a growing job history has, and a
+third independent size preference was judged not worth the added chrome for a box meant to stay
+out of the way. Fixed at the same 20 the other two boxes settled on instead.
+
+---
+
+## 2026-08-20 — Pausing: a caller-side gate in `_admit()`, "pause now" reuses the shutdown/
+rescue model rather than stop, a `setting` row rather than a migration
+
+`prompts/2026-08-20-queue-pause.md`, a user request for a site-wide Pause control on the
+Transfers → Queue tab. Browser-unverified (no page render).
+
+**The admission gate lives in `core/queue.py._admit()`, not in `core/scheduler.py.admit()`.**
+The prompt asked which to pick; the caller-side skip won because `admit()` is deliberately pure,
+has worked examples in DESIGN.md §4.5 that a pause flag would need to either extend or leave
+silently untested, and mentions `queue_id` zero times by design (§12's scheduler/queue split).
+`_admit()` simply returns before gathering `(running, queue)` at all when paused — no log line
+either (an "admitted none" log fires only for a *surprising* zero; a paused queue admitting
+nothing is exactly what was asked for, and the banner/health readout already say so
+continuously).
+
+**"Pause now" reuses the graceful-shutdown model (§10.3) plus the v0.2.6 startup rescue's
+re-queue, explicitly not `stop_job`'s §4.6 semantics.** This was the prompt's own named trap:
+stop sets `auto_queue_suppressed` on purpose, so reusing it would suppress every item that
+happened to be running at the moment of pausing and none of them would come back on unpause.
+The mechanism: a new `pause_requested` flag on `_RunningProcess` (mirroring `stop_requested`),
+SIGTERM'd concurrently (same reasoning as `stop()`'s own fan-out), and a new branch in
+`_reap_one` that short-circuits *before* the exit-code classification path — a SIGTERM'd lftp
+exits non-zero, and running that exit through `lftp.classify_output` would produce a `FAILED`
+row and an `error_class` for a pause, exactly the failure mode the prompt called out as "the
+most likely way to get this wrong." Unlike the startup rescue, this never re-derives
+`queue_position` via `_rescue_position` — that method exists because a restart destroys the
+interrupted job's row, forcing a fresh insert; here the row survives untouched throughout (only
+`job.state` ever changes at admission), so flipping `state` back to `queued` finds it exactly
+where it already was.
+
+**Persistence: a new `setting` row (`queue_pause_state`), not a migration.** Same key/value
+pattern every other site-level setting in this codebase already uses (`TransferSettings`,
+`AutoQueueSettings`, etc., each its own small dataclass + `SETTING_KEY` constant) — a single
+bool needs no schema of its own. Which entry mode was used to pause is deliberately **not**
+persisted: once paused, "after current" and "now" are indistinguishable from that point on (the
+one-time extra work "now" does is already finished by the time the state is read again), so
+there is nothing left for the mode to mean.
+
+**Start now's 409 guard lives only in `start_now()`, not in a shared pre-check**, so it cannot
+accidentally catch `move_job` — reordering was the user's own explicit reasoning for why Start
+now doesn't need to work while paused ("you should be able to move things up in the queue while
+paused... rearrange before unpausing"), and the prompt named the risk of a shared guard
+by name.
+
+---
+
+## 2026-08-20 — The Active/Complete split predicate lives server-side as SQL text; the paused
+source delete is bounded by age, not by its event; a manual resolution is never superseded
+
+`prompts/done/2026-08-20-active-box-holds-inflight-pipeline.md`, a follow-up to phase 1 stage 4b
+of `docs/transfers-redesign-spec.md` §3.2 from the user's browser review, browser-unverified.
+
+**The predicate is one SQL string in `core/pipeline_flight.py`, not a Python function and not a
+client-side rule.** Three callers have to agree on it: `list_jobs()` (which the client-side
+Active box reads), `list_complete_jobs()` (a *server-side paginated* query with its own `total`),
+and `dismiss_all_terminal()` (whose dismissed count already has a test asserting it matches that
+`total`). Two of those are `WHERE` clauses that must be evaluated in SQL — `list_complete_jobs`
+cannot filter in Python without breaking its own `total` — so a Python predicate would have
+needed a SQL twin, which is precisely the drift the task warns about (a row in both boxes or
+neither). Making it SQL text pasted into all three, and *exposing the classification as a field*
+rather than letting the client re-derive it, means there is exactly one encoding. **Literals, not
+bound parameters**: one of the three callers is an `UPDATE ... WHERE item_id NOT IN (subquery)`
+and the same clause appears more than once inside the reason `CASE`, so threading a
+positionally-correct parameter list through all of it is bookkeeping that fails silently.
+Everything interpolated is a module constant or an `int()` of an in-process id.
+
+**Rejected: a Python mirror for testability.** The tests go through the real queries instead,
+which is what actually proves the property that matters (a row is in exactly one box).
+
+**The `JobOut.item_state` field the task suggested was not added.** The classification *and* its
+label are computed server-side from the item's state; shipping the raw state as well would create
+a second place the client could derive a label from, which is the same drift in miniature.
+
+**The paused source delete is bounded by age, not by reading its own event.**
+`_sweep_stranded_source_deletes` pauses after `MAX_SOURCE_DELETE_RETRY_ATTEMPTS` and deliberately
+leaves `remote_delete_pending` set (so a manual Files-page delete or a restart's clean in-memory
+slate can still act), so the pause is **not** readable from the item row — a naive
+"`remote_delete_pending` non-null ⇒ still in flight" test blocks forever. It *is* technically
+distinguishable: one `remote_delete_retries_paused` event row is persisted. That was rejected as
+the signal for two reasons. `event` has no index on `item_id` (migration 001 indexes `ts` only),
+so an `EXISTS` subquery would table-scan the audit log on an endpoint the browser polls every
+~2s. And the event is not authoritative anyway: the retry state is in-memory, so a restart
+resumes sweeping with no event to say the pause ended. Chosen instead: block only while
+`arr_status_at` is younger than `SOURCE_DELETE_WAIT_MAX_S` (1h), comfortably past the ~20-minute
+retry ladder. The same reasoning produced `ARR_WAIT_MAX_S` (24h, deliberately longer than
+`DROPPED_GONE_GRACE_S` so it never pre-empts the `dropped → gone` ladder) for the genuinely
+reachable case of an *enabled* instance whose *arr is permanently unreachable — the poller
+retries forever by design, so nothing ever moves the item off `notified`.
+
+**Unknown reads as "not blocking", everywhere.** A NULL or unparseable `arr_status_at`, or no
+bound instance, files the row as Complete. Failing that direction leaves a visible, dismissable
+row with honest chips; failing the other way wedges it where nothing can clear it.
+
+**A real terminal outcome does NOT supersede a manual one.** The two honest options were "the
+manual outcome stands" and "a real outcome supersedes the guess"; the first was chosen. Superseding
+can only ever move a row *back into Active* after the user deliberately filed it, which is exactly
+the "this box can't be trusted" failure the whole change exists to fix, and it would make the
+predicate non-monotone under a 2s poll. Nothing is lost by standing pat: the real outcome is still
+written to the item's own columns, still drawn on the row's *arr chip, and still in the Events
+trail. Reversibility comes from an explicit **Undo** (`resolve_item` with `outcome: null`)
+instead — the user un-resolves a row they resolved by mistake, rather than the system silently
+deciding it knew better.
+
+**A manual outcome deliberately does not override an active job.** The predicate is
+`job.state IN ('queued','running') OR (manual_outcome IS NULL AND <item busy>)`, so a genuinely
+running transfer can never be hidden by a classification button; `resolve_item` refuses the write
+with a 409 besides. Stop is the control for that.
+
+**In-flight rows sort between `running` and `queued`.** They are terminal-state jobs, so
+`sortTransferRows`' existing partition would have put them in the newest-finished-first tail
+*below the entire queued backlog* — page 11 of a busy queue, where the user would never see the
+thing they are being told is still moving.
+
+---
+
+## 2026-08-20 — Dismiss menu: `outcome` composes with `name_filter`, stays exclusive with
+`job_ids`/`queue_id`; "Clear all failed" folded into "Dismiss → Failed"
+
+`prompts/done/2026-08-20-transfers-dismiss-menu-and-counts.md`, a follow-up to phase 1 stage 4b
+of `docs/transfers-redesign-spec.md` §3.2 from the user's browser review, browser-unverified.
+
+**`DismissAllRequest.outcome` composes with `name_filter` — decided by the user, explicitly,
+not inferred.** Both are *narrowings* of the same dismissable set ("dismiss the failed ones
+matching `Married`" is one coherent request), not alternative scopes. The previous validator
+(`_scopes_are_mutually_exclusive`) rejected any request naming more than one of `queue_id`/
+`job_ids`/`name_filter`; a fourth field could not simply extend that same flat rule without
+also, wrongly, rejecting `outcome` + `name_filter` together. Restructured into two tiers instead
+(`_scopes_are_coherent`, `models.py`): `queue_id`/`job_ids` are checked against each other first
+(still mutually exclusive), then checked as a pair against `outcome`/`name_filter` together
+(still mutually exclusive with *both* of those, but not with each other). `outcome` and
+`name_filter` themselves are never checked against each other at all — composing is simply
+"pass the validator with nothing to reject."
+
+**`queue_id` was *not* given the same composing treatment**, even though it's arguably also a
+narrowing (dropping it into the composing group would have been internally consistent). It has
+had zero callers since per-queue grouping was dropped in phase 1 stage 4a — nothing on the
+frontend has sent it in months — so widening its validator relationship purely for symmetry
+would add real complexity (a third participant in the composing tier, more branches to test) for
+a scope nothing exercises. Kept mutually exclusive with everything, exactly as it always was.
+If a caller for `queue_id` ever returns, this is the first thing to revisit.
+
+**`job_ids` stays mutually exclusive with everything, including the new field** — it already
+names the exact rows to dismiss; a narrowing alongside an explicit id list is a contradiction in
+terms, not a composable input the way `outcome`/`name_filter` are narrowings of an *implicit*
+set.
+
+**`outcome` does not add `name_filter`'s `MAX(id)`-per-item restriction on its own.** An
+`outcome`-only dismiss is a narrowing of `dismiss_all_terminal`'s own pre-existing "dismiss every
+terminal row, superseded or not" behavior with no filter at all (harmless: a superseded row is
+never shown regardless of whether it also gets dismissed) — not a promise to match
+`list_complete_jobs`'s listing predicate the way `name_filter` alone already is. Once
+`name_filter` is also given, the restriction applies the normal way and the composed case gets
+the same total/dismissed-count agreement `name_filter` alone already guaranteed
+(`test_dismiss_all_terminal_name_filter_count_matches_list_complete_jobs_total`, extended rather
+than duplicated to cover the composed case, per the task's own instruction not to write a
+parallel test that could drift).
+
+**`list_complete_jobs` gained an `outcome` parameter with no frontend caller.** The Complete
+box's "Dismiss" menu deliberately does not fetch a live per-outcome count — the task's own
+instruction was "if per-outcome counts are not already available, do not add a query to get
+them, leave the labels plain," so only "All" shows a count (reusing `completeTotal`, already on
+hand). `list_complete_jobs(outcome=...)` exists purely so the count/dismissed-set identity test
+above can exercise the composed case against the real listing predicate, not a hand-rolled SQL
+count in the test that could itself drift from the real query. `GET /api/jobs/complete` was
+*not* widened to accept `outcome` as a query param — there is no caller for it, and adding
+unused public API surface for a test's convenience isn't worth it.
+
+**"Clear all failed" is folded into the Dismiss menu's "Failed" option, not kept alongside it.**
+The task invited a decision here rather than dictating one. Its old scope (`failed` only, not
+`cancelled` — a stopped job is a deliberate Stop click, not the kind of unattended pile-up a
+permanent-error class can become) is now exactly `outcome="failed"`, and the new path is a
+strict improvement: one atomic server-side `UPDATE` instead of a client-side
+`Promise.allSettled` fan-out over each row's own `/dismiss` call, with the same load-bearing
+zero-match guard the rest of `dismiss_all_terminal` already has. The only thing lost is
+per-row partial-failure reporting ("cleared 4 of 5, 1 failed: <reason>") — accepted as
+reasonable, since a single bulk `UPDATE` genuinely can't partially fail per row (it either runs
+or it doesn't), the same reasoning the original "Dismiss all" control was already built on.
+
+---
+
+## 2026-08-20 — History → Events: keep the `job` endpoints, don't gut the drawer, deep link lives
+in the drawer header
+
+`prompts/done/2026-08-20-history-becomes-events.md`, phase 1 stage 7 (the last) of
+`docs/transfers-redesign-spec.md` §2, browser-unverified.
+
+**Keep `GET`/`DELETE /api/history/jobs*` — the prompt's own premise that `GET` "loses its only
+frontend consumer" was checked and found wrong.** `HistoryJobsSection.tsx` (deleted this task)
+was not the only caller: `ItemDrawer.tsx`'s `HistoryPanel` also calls `getHistoryJobs({item_id,
+limit: 10})` for its own bounded per-item attempt-history list, unrelated to the page being
+renamed. Removing the `GET` endpoint would have broken the drawer. Once that correction stood,
+the honest scope of "now-unused" shrank to just the `DELETE` (clear) siblings, which really did
+lose their only caller (`HistoryJobsSection`'s own "Clear" button). Decided to leave those too,
+for three reasons: (1) stage 7 is explicitly scoped **"frontend only"** in the build-order table
+(`docs/transfers-redesign-spec.md` §7) — no backend change was asked for; (2) they're harmless
+and already tested; (3) cutting only the jobs-clear surface while leaving the still-live
+events-clear surface (`DELETE /api/history/events*`, still called by the new `EventsSection.tsx`)
+would be an asymmetry with no functional gain, indistinguishable from an oversight to a later
+reader. The frontend-only `clearHistoryJob`/`clearHistoryJobs` wrapper functions in
+`api/client.ts` *were* removed — unlike a backend endpoint, a dead TS export has no
+"someone might curl it" argument in its favor, and it had zero remaining callers anywhere,
+including tests.
+
+**The per-item Events deep link lives in `ItemDrawer.tsx`'s header, not directly on a Files or
+Transfers row**, despite the spec's own wording ("a row... gets an affordance"). Both rows'
+layouts are already tight and explicitly browser-unverified: `FileTree.tsx`'s row comments call
+its columns "already tight" (one prior task trimmed labels specifically because they were
+clipping), and `TransfersPage.tsx`'s row went through a dedicated "crowding" fix (2026-08-15)
+to get down to one line plus an expand panel. Adding a new element to either, with no browser in
+this environment to check the result against, is exactly the risk both of those precedents exist
+to avoid. `ItemDrawer.tsx` is already the one shared surface both rows open on a single click
+(its own module comment: "one drawer, keyed on an item, opened from two places... rather than two
+overlapping detail surfaces") — putting the link there costs one extra click from a row (open the
+drawer, then click Events) in exchange for zero layout risk on either row. If a human confirms
+the collapsed-row placement is wanted after looking at this in a browser, that's a small, isolated
+follow-up (new `EventsLinkButton.tsx` already exists and is reusable as-is).
+
+**The drawer's own events panel is not gutted, but is now a documented duplicate.**
+`ItemDrawer.tsx`'s `HistoryPanel` shows the last 10 events for an item; the new deep link opens
+the unbounded, filterable, superset view of the exact same data. The task's own instruction was
+"do not gut the drawer in this task" — so `HistoryPanel` is unchanged, and the redundancy is
+recorded here and in the handoff prompt's own report rather than acted on. The panel's *jobs*
+half (attempt history) is not redundant with anything — no other page lists one item's own
+transfer attempts — so even a future trim should only ever touch the events half.
+
+`prompts/done/2026-08-20-transfers-row-file-progress.md`, phase 1 stage 5 of
+`docs/transfers-redesign-spec.md` §3.3, browser-unverified.
+
+**The bound: `GET /api/items/{id}/children` caps at 500, defaults to 200.** The task explicitly
+asked for a decision rather than a silent unbounded list. `500` was chosen to match
+`api/history.py.MAX_LIMIT` — the closest existing precedent in this codebase for "how big a
+capped list gets before an explicit backstop kicks in" — rather than inventing a new number with
+no anchor. `200` as the default is generous over the realistic case the spec itself names ("a
+season pack has dozens of children") without inheriting the pathological-release cap by default.
+Unlike `api/history.py`, there is no "load more" affordance in the UI for this endpoint's own
+`limit`/`offset` — out of scope for this stage; a capped release shows a plain "Showing N of
+total files" note (`lib/transferPanel.ts.fileListCapNote`) rather than a paging control.
+
+**Live updates while expanded: overlay the already-open WebSocket, never re-poll the new
+endpoint.** `TransfersPage.tsx` already makes exactly one `useLiveModel()` call (checked before
+assuming, per the task's own instruction) and already threads its `queues`-derived
+`nodesByQueue` down to `Row` for `fileCountFor`. `child_progress`/`item_delta` messages already
+carry every child file's live state (`core/queue.py._publish_child_progress` publishes children
+through `item_delta`, not a separate message) — confirmed by reading `core/engine.py.snapshot()`/
+`_project`, which send *every* item row per queue, not just top-level ones. So the fix was to
+widen what the page's one existing hook call reads (`childSpeedByItemId`, previously
+unused on this page) rather than add a second subscription or a per-row poller. The REST
+endpoint supplies the initial, *bounded* row set on expand (matching the History-output
+precedent, and giving a definitive read even before the WS has synced a queue); `lib/
+transferPanel.ts.mergeFileListChildren` then looks up each of those exact rel_paths in the live
+`nodes` array on every render, overlaying fresher `state`/`local_size`, never re-deriving the
+*set* of rows shown from the live (unbounded) tree — that would silently drop the cap the moment
+`nodes` had more entries than the fetch capped at. Consequence: N expanded rows read the one
+already-open socket; none of them are a second request, ever.
+
+**Coexistence with the Complete box's existing failed-output expansion: one panel, one chevron,
+a new section, not a second toggle.** `RowDetailPanel` already had three groups (Transfer/
+Processing/*arr) behind the one chevron `Row` already renders, with the failed-job output panel
+nested *inside* the Transfer group. Files joins as a fourth group, gated on `job.is_dir`
+(`lib/transferPanel.ts.showsFileList`) — so a failed *and* directory row shows its captured
+output and its per-file breakdown from the same click, and nothing on this page grew a second
+expand affordance.
+
+**A `pget` (single-file) job: the affordance is omitted entirely, not rendered empty.** Its own
+progress is already the row's one collapsed-line figure and its own state chip; a one-row
+"expansion" repeating those two facts would be a second place to look for information already
+stated, not new information. `showsFileList` gates on `job.is_dir`, which is already on the wire
+and matches the backend's own gate (`item.is_dir` decides whether `GET /api/items/{id}/children`
+even queries for descendants).
+
+**Reuse, not a second copy**: `nodeDisplaySize`/`stateProgressPercent` moved from `FileTree.tsx`
+into `lib/fileTree.ts` (widened to take the three plain fields they read rather than a full
+`TreeEntry`), and the `child_progress` freshness gate (`now - receivedAt <= 
+CHILD_SPEED_FRESHNESS_MS`) was factored out of `buildTree` into `freshChildSpeedBps` — both used
+by the Files page's own rows and this new panel, so the two surfaces cannot drift on when a
+percent or a rate is honest to show.
+
+---
+
+## 2026-08-19 — Transfers page: two paginated boxes, `list_jobs()` kept unchanged, "Dismiss list"
+re-scoped to a server-side filter
+
+`prompts/done/2026-08-19-transfers-paginated-boxes.md`, phase 1 stage 4b of
+`docs/transfers-redesign-spec.md` §3.2, building on stage 4a below.
+
+**`core/queue.py.list_jobs()` was kept unchanged rather than narrowed to `queued`/`running`
+only.** The task explicitly asked for a decision here and to check every caller first. Found
+three: `GET /api/jobs` (the route this task narrows the *rendering* of, not the endpoint itself),
+`queue_item`, and `retry_item` — the latter two only ever look up the row for the job id they
+just created, which is always `queued`, so narrowing `list_jobs()` would not have broken either.
+Kept it anyway: DESIGN.md §9.2 requires a failed row's error class/output tail to stay reachable
+from the same place a `queued`/`running` row is, other future callers may reasonably want "the
+row set Transfers considers current" without re-deriving the terminal-superseding `MAX(id)` rule,
+and narrowing a widely-named method the same session a new paginated endpoint is landing is
+exactly the kind of two-things-at-once change this codebase's own standards ask sessions to
+avoid. The new `TransferQueue.list_complete_jobs()` duplicates `list_jobs()`'s join shape and its
+`MAX(id)`-per-item rule rather than building on top of it, since the two now differ in what they
+paginate/filter and in never inlining `output_tail`. The consequence named openly: `GET /api/jobs`
+is not itself newly bounded by this task — a very long-lived, never-dismissed backlog of terminal
+jobs could still make that endpoint's payload large over time, the same latent characteristic
+`list_jobs()` already had before this task, just no longer the thing the Active/pending box's own
+render cost depends on (it simply stops rendering the terminal rows that endpoint still returns).
+Revisiting `list_jobs()` to narrow it is a reasonable follow-up once the Complete box has been
+lived with, not a defect introduced here.
+
+**"Dismiss list" re-scoped from an explicit job-id list to a server-side filter string.** Before
+this task, "Dismiss list" sent the ids of every dismissable row the (client-side, fully-loaded)
+filtered list contained. Once the Complete box is server-paginated, that no longer expresses the
+button's own promise — a filter can match more rows than fit on one 50-row page, and an id list
+can only ever name what's currently loaded. `DismissAllRequest` gained `name_filter`, mutually
+exclusive with the existing `queue_id`/`job_ids` (both kept, unchanged, since other/future
+callers may still want them — the task's own instruction). `dismiss_all_terminal`'s `name_filter`
+branch is the one exception to that method's own "never restrict to `MAX(id)`, a superseded row
+being swept up is harmless" rule (its docstring already stated for `job_ids`/`queue_id`): it
+deliberately *does* re-add the `MAX(id)`-per-item restriction, built from the identical predicate
+`list_complete_jobs` filters its own listing on, specifically so a filter's dismissed count and
+the Complete box's own reported `total` for that same text can never drift apart — a property that
+matters here and didn't for `job_ids`/`queue_id`, because those two scopes are always given an
+explicit id list or queue id the frontend already loaded (never recomputed server-side against
+the whole table the way a filter string is). The pre-existing "`job_ids: []` must dismiss
+nothing, never everything" guard needed no change for the new path — an unmatched filter's
+subquery naturally yields zero rows for `id IN (...)` to match, verified directly by test rather
+than assumed from the SQL shape.
+
+---
+
+## 2026-08-19 — Transfers page: dropped per-queue grouping for one globally-ordered list
+(reverses the 2026-08-16 grouping decision)
+
+`prompts/done/2026-08-19-transfers-single-ordered-list.md`, phase 1 stage 4a of
+`docs/transfers-redesign-spec.md` §3.1/§3.5/§3.6.
+
+**This reverses `prompts/done/2026-08-16-transfers-group-by-queue.md`**, which grouped Transfers
+rows by queue because "per-row queue labels make the page busy." That reasoning was sound in a
+world with no filter. The name filter (`e0befc5`, 2026-08-19) changes it: a row needs far less
+queue signal once a queue can be isolated on demand, and a compact per-row queue badge costs less
+than the header/collapse machinery grouping needed. **The deeper reason grouping goes: it was
+never just a display preference — `core/scheduler.py` has zero references to `queue_id`, so
+there is exactly one global admission line. Grouping by queue visually implied each queue had its
+own line and its own ordering, which was false**, and it is why positions inside one group read
+`#3`, `#7`, `#11` — the numbering was always honest; the grouping was the lie.
+
+**Also reverses the per-queue "Dismiss Queue" control** (v0.2.3, `278e10f`) — superseded, not
+merely deleted, by the name filter's own **Dismiss list** (`e0befc5`): filter to a queue, dismiss
+the list does the identical job without a group header to hang the button on.
+
+**Confirmed, not assumed: this also fixes the stage-2 chevron oddity.** Stage 2
+(`prompts/done/2026-08-19-queue-reorder-chevrons.md`) moved a job in the *global* queue order
+while the page still grouped rows by queue, so ▲/▼ could appear to swap a job with something in a
+*different* group. `sortTransferRows` places all `queued` rows contiguously (running first,
+then queued in the exact order `queuePositions` numbers them, then terminal), so once grouping
+is gone the row immediately above position N in the DOM is always position N-1 — verified by
+inspection of `TransfersPage.tsx`'s render order, not just asserted.
+
+**Deletion, not deprecation, for the client-side grouping helpers.** `groupJobsByQueue`,
+`GroupHeader`, `groupHasDismissable`, `queueGroupSummary` (and its private `outcomeCounts`), and
+the Transfers-specific collapse storage (`readCollapsedQueues`/`writeCollapsedQueues`,
+`transfers.collapsedQueues`) are removed outright along with their tests, rather than left
+unused — `lib/transferPanel.ts` is shared with the History page, which still groups by queue and
+still needs `isQueueCollapsed`/`withQueueCollapsed`/`QueueCollapseMap`/`formatQueueGroupCounts`/
+`QueueGroupCounts`; those stayed, confirmed live by grep before removal.
+
+**Backend: `JobOut` gained `queue_short_name`, no new endpoint.** The queue badge needs
+`path_queue.short_name` per row; `lane` was already on `JobOut` (added earlier for the fast-lane
+badge's use here). Both are simple field additions onto the existing, already-joined
+`list_jobs()` query — within the task's explicit scope guard (field additions permitted, a new
+endpoint or response-shape change was not).
+
+---
+
+## 2026-08-19 — Chevron reordering: kept `POST /api/jobs/{id}/move-to-top` alongside the new
+`POST /api/jobs/{id}/move`
+
+`prompts/done/2026-08-19-queue-reorder-chevrons.md`, phase 1 stage 2 of
+`docs/transfers-redesign-spec.md` §3.4. The task's own instruction was "reuse the existing
+move-to-top implementation for `top` — do not write a second one," which the new endpoint honors
+at the *core* layer: `TransferQueue.move_job(..., "top")` calls `move_to_top` directly rather than
+duplicating its `position_between(None, MIN(...))` logic. It says nothing about the pre-existing
+HTTP route, though, and the two are now genuinely redundant from the frontend's point of view —
+`TransfersPage.tsx`'s chevrons call the new `/move` endpoint exclusively (including for "to top"),
+so `/move-to-top` is reachable only by a caller outside this codebase.
+
+**Decided: leave `/move-to-top` in place, unused by the frontend, rather than remove it.**
+Removing a live API route is a separate, bigger decision than "add chevrons" — it risks breaking
+some future or external caller for no gain this task needs, and the route costs nothing to keep
+(it's a thin wrapper already fully covered by `tests/test_queue_position.py`'s `move_to_top`
+tests). If a future session confirms nothing depends on it, removing it then is a clean, separate
+change.
+
+**Also decided: `move_job`'s error mapping is 404 for an unknown job, 409 for a known job that's
+no longer `queued`.** Matches `dismiss_job`'s existing "the job exists, the request just isn't
+valid for its current state" distinction (`api/jobs.py`) rather than inventing a new convention.
+
+---
+
+## 2026-08-19 — Queue ordering moved from `rank`/boost to a dense `queue_position` model
+
+`prompts/done/2026-08-19-queue-position-order-model.md`, phase 1 stage 1 of
+`docs/transfers-redesign-spec.md` §3.4/§3.5. Refactor, not a behavior change: the queue's run
+order must come out identical to today for every existing scenario.
+
+**The model.** `job.queue_position REAL` (migration 023), ordering `queue_position ASC, id ASC`.
+New jobs take `MAX(queue_position) + 1`; Move to top takes `MIN(queue_position) - 1`; a future
+move-between-neighbours takes their midpoint. One primitive, `position_between(lower, upper)`
+(`core/queue.py`), backs all three plus the rescue re-derivation below — the "prove the midpoint
+primitive now, even with no chevron caller yet" instruction from the prompt is satisfied by that
+function's own direct unit tests (`tests/test_queue_position.py`) rather than by inventing a
+fake caller.
+
+**`rank` was kept, not dropped — and kept *meaningful*, not just present.** SQLite can't drop a
+column without a full table rebuild this codebase has never done for `job`, so the column stays
+either way. The live decision was whether to also keep *writing* it. Reading `rank` for ordering
+had to stop (that's the whole point of the task), but `move_to_top` still writes it, because
+`TransferQueue._rescue_position` needs a way to tell "was this job ever explicitly boosted"
+apart from "this is a natural-zone job whose `queue_position` happens to be small" — and
+`queue_position` alone can't answer that (a boosted job's position is deliberately decoupled
+from any FIFO meaning). `rank = 0` is the cheapest possible answer that already existed. This is
+a narrow, deliberate exception to "rank is vestigial for ordering," not an oversight — recorded
+here because the prompt's own "surface, don't silently resolve" instruction flagged it as worth
+calling out explicitly rather than leaving implicit in a docstring.
+
+**Why the rescue needed re-deriving, not just re-plumbing.** The v0.2.6 fix
+(`prompts/done/2026-08-19-rescue-requeue-keeps-queue-position.md`) carried a re-queued job's
+original `queued_at` forward so `rank DESC, queued_at ASC` put it back in its old place, and
+never touched `rank` so it could never outrank an explicit Move to top. Under a position model
+`queued_at` carries no positional weight at all, so "carry it forward" does nothing on its own.
+The replacement, `_rescue_position`, finds the two *natural-zone* (`rank = 0`) neighbours the
+original `queued_at` falls between and takes their `position_between` midpoint —
+**deliberately excluding boosted jobs from that search.** A first draft that compared the
+rescued job's `queued_at` against *every* queued job (boosted included) breaks: a job boosted to
+the very front can have any `queued_at` at all, including one *later* than the rescued job's —
+which a naive comparison would treat as a valid "right neighbour," landing the rescued job
+*ahead* of an explicit Move to top. `tests/test_queue_orphans.py`'s
+`test_requeued_interrupted_item_never_lands_ahead_of_a_boosted_job_with_a_later_queued_at` is
+the regression test for exactly this, written before the fallback logic was finalized (per the
+prompt's "write the §5 test first" instruction) — it caught the naive version failing before the
+excluded-boosted-zone version replaced it.
+
+**Backfill exactness: downgraded mid-task from a hard requirement to a nice-to-have, kept
+anyway because it was cheap.** The original acceptance criterion was that migration 023 must
+reproduce the *exact* pre-migration order (`rank DESC, queued_at ASC, id ASC`) for every
+existing row, so an upgrade never reshuffles a real backlog. Partway through, the user relaxed
+this explicitly: a fresh install has no backlog to reshuffle, and exact-order preservation was
+told to be a "nice-to-have, not an acceptance criterion" — take the simple path (e.g. order by
+id) if exactness fights the SQL. It didn't: `ROW_NUMBER() OVER (ORDER BY rank DESC, queued_at
+ASC, id ASC)` in a single correlated `UPDATE` is not awkward SQL, so the exact-order backfill
+shipped as originally designed (migration 023's own comment records this history). What did
+**not** relax, and is enforced by `COALESCE(job.queue_position, 1e18)` everywhere the column is
+read for ordering: every row ends up with a real, usable position, and a legacy/test row that
+somehow ends up NULL sorts *last*, never jumps the queue via SQLite's default NULL-sorts-first
+behavior.
+
+## 2026-08-19 — Auto-queue re-queued a release the *arr had just imported: the grace period
+now covers *partial* local absence, and an *arr-handed item is never picked up again
+
+`prompts/done/2026-08-19-autoqueue-requeues-imported-item.md`, production bundle
+`lftpweb-support-0.2.6-20260819T205145Z.zip` (v0.2.6, `move` queue `dc-tv`, bound to Sonarr).
+
+**Step 1 — what the trigger state actually was, established before anything was edited.**
+`PARTIAL`, proved two ways rather than assumed:
+
+- *By elimination through the code path.* Verify read `SKIPPED`, and
+  `postprocess._run_verify`'s `SKIPPED` branch writes `state = 'DOWNLOADED'` — a member of
+  `mount_sentinel.COMPLETE_STATES`. With that previous state and a healthy mount (auto-queue did
+  queue an item, so the mount gate passed), every other structural reading is already excluded:
+  `REMOTE_ONLY` is held at `DOWNLOADED` by `resolve_absence`, `DOWNLOADED`/`LOCAL_ONLY` are not
+  in `ELIGIBLE_STATES`, and a path in neither tree goes through the vanished sweep to the same
+  hold. `PARTIAL` — the one reading with no grace-period protection at all — is the only state
+  that both persists and is eligible.
+- *By the physical evidence.* Item 3304447 is a 38-episode season pack: `arr_imported` records
+  38 import history events at 16:49:15Z, and auto-queue re-queued it at **16:44:12Z**, i.e. with
+  the import demonstrably still in flight and some episodes moved out and some not — `PARTIAL`
+  by construction. For item 3354306, Sonarr's own log corroborates the timing the bundle's *arr
+  logs were thought not to cover: its "Import failed, path does not exist" retry for that exact
+  path fires every ~90s for three hours and **stops after 18:14:12Z**, while the neighbouring
+  releases' retries continue — so the import landed inside the 18:15:24–18:16:04 window, before
+  the 18:16:06 auto-queue pass. `arr_cleanup` then removed a local copy that still existed at
+  18:22:33, i.e. Sonarr left residue behind rather than emptying the directory.
+
+So the prompt's hypothesis was right, but it is recorded here as *established* rather than
+assumed, because the fix keys on the difference.
+
+**Fix, two halves, both narrow.**
+
+1. **`mount_sentinel.resolve_absence` grew a `PARTIAL` branch** — the partial half of the same
+   §7.3 grace period. It fires only on `is_local_shrink`: previous state in `COMPLETE_STATES`
+   **and** the last-persisted `remote_size` equal to this pass's. Both clauses are load-bearing.
+   The first is what keeps a genuinely interrupted transfer re-queueable — an interrupted
+   transfer is `PARTIAL`/`STOPPED`/`FAILED` beforehand, never complete — and the second is what
+   keeps §3.2 rule 4 (the remote *grew*, so there really is more to fetch) reading `PARTIAL` on
+   the first pass with no hold. `engine._previous_states` now also selects `remote_size` to
+   supply it.
+2. **`autoqueue.ARR_IMPORT_INELIGIBLE_STATUSES`** — `notified`/`imported`/`cleaned` are excluded
+   in the eligibility query itself. `detected` is deliberately absent: `arrsync._match_items`
+   writes it as soon as the *arr's own download client reports the release on the seedbox, long
+   before lftpweb has fetched anything, so excluding it would disable auto-queue for *arr-tracked
+   releases entirely. `dropped`/`gone` are absent for the same reason.
+
+**Why both, rather than either alone.** The grace period is general (it works on a queue with no
+*arr binding at all) but time-bounded at ~10 minutes — and the season-pack import in this same
+incident took ~19 minutes, so half 1 alone would have released that item and re-queued it
+anyway. The *arr gate has no time bound but does nothing for an untracked queue. Each covers the
+other's gap; neither is redundant.
+
+**Where a shrink lands when the window elapses: `PARTIAL`, not `REMOVED_LOCAL` — rejected
+alternative.** Promoting it to `REMOVED_LOCAL` would have closed the untracked-queue gap for
+good, and was rejected on two grounds: it asserts the local copy is gone when residue is
+demonstrably still on disk (`local_delete.py`'s retention query keys on `COMPLETE_STATES`, so
+those leftovers would then never be swept), and it removes the escape hatch a genuinely damaged
+local copy needs — an item that lost bytes and is never coming back must eventually be
+re-fetchable without a manual click. The residual gap is named in README's "Known gaps" instead
+of being closed by a state that lies.
+
+**Known imprecision, recorded rather than silently taken: the removal countdown in the UI.**
+`api/settings_postprocess.py`'s `/removal-grace` endpoint publishes `COMPLETE_STATES` as the
+eligible set, deliberately reading it straight off `mount_sentinel` so the UI can only ever
+offer a countdown for a row the backend really is running a clock for. That stays true — the
+shrink branch gates on the same set — but a shrink-held row now shows the same countdown while
+resting on a *different* outcome: total absence lands on `REMOVED_LOCAL`, a shrink lands back on
+`PARTIAL`. The signal ("something outside lftpweb is taking this item's local copy apart, and
+here is how long before we act on it") is right either way; only the implied destination is.
+Giving the two clocks separate labels would mean threading a new signal through `item_view` and
+the Files row for a distinction the countdown never named out loud in the first place — not done
+here.
+
+**Deferred, not fixed: `arrsync._maybe_cleanup`'s "an active job exists for this item"
+withhold.** It parked cleanup for 97 minutes in the worse of the two cases and wrote 92
+`arr_cleanup_withheld` events doing it. Considered and deliberately left alone: with the two
+halves above, auto-queue can no longer manufacture such a job for an *arr-tracked item, and the
+jobs that remain are either genuinely running (where refusing to delete local files underneath a
+live transfer is exactly right) or manually queued (a deliberate user action, where deleting the
+local copy the user just asked to re-fetch is the wrong call). Narrowing the withhold to
+`running` only, or teaching cleanup to cancel a stale queued job, are both real options — they
+are just a different, larger change than this defect requires, and either could delete local
+content out from under a transfer that was about to start.
+
+---
+
+## 2026-08-19 — Support bundle *arr log fetch: order by `lastWriteTime` across every series,
+not by filename within one
+
+`prompts/done/2026-08-19-support-bundle-log-recency.md`, production evidence: bundle
+`lftpweb-support-0.2.6-20260819T205145Z.zip`, taken to diagnose two `REMOTE_GONE` jobs. Its
+`arr-Sonarr/TRUNCATED.txt` reported 6 of 12 log files not fetched, skipped "oldest first" —
+except three of the six *skipped* files were current and three of the *fetched* files were nine
+days stale, from a debug/trace session that had since been switched off. The files that would
+have shown what Sonarr did during the incident window were among the six dropped.
+
+**Root cause, confirmed before fixing (not assumed):** `arrclient.log_files()` already returns
+`lastWriteTime` unmodified — the *arr wire format was never the problem. The bug was entirely
+in `supportbundle.py`'s `_log_file_sort_key`, which ordered by filename: non-rotated names
+first (`sonarr.txt`, `sonarr.debug.txt`, `sonarr.trace.txt`), then rotations by ascending
+numeric suffix. That's correct *within* one series (`sonarr.1.txt` is indeed older than
+`sonarr.txt`) but has no way to compare *across* series — `sonarr.debug.txt` and
+`sonarr.trace.txt` both read as "non-rotated" and sort purely alphabetically ahead of the live
+`sonarr.*` series' own rotated files, regardless of which series is actually dormant. Verified
+against the evidence table: alphabetically, `debug` < `trace` < `txt`, so the old sort fetches
+`sonarr.debug.txt` first even when it's stale and `sonarr.txt` is current — exactly the
+inversion production hit.
+
+**Fix: sort every candidate file by the *arr's own `lastWriteTime`, descending, across the
+whole listing at once** — never by filename or rotation-suffix pattern, and never per-series.
+A file with no usable timestamp (missing field, unparseable) sorts **last**, never first —
+"unknown age" must never outrank a file the *arr positively reports as recent. Two regression
+tests (`tests/test_support_bundle_api.py`) assert this against `tests/fake_arr.py`'s new
+per-file `lastWriteTime` control (`log_file_last_write_times`), and both were checked to
+actually fail against the pre-fix code before the fix landed, not just pass after it.
+
+**Left the ~20 MB budget itself alone** — this incident was entirely about what the budget
+buys, not how big it is; the prompt was explicit that raising the cap was out of scope for this
+task. **`TRUNCATED.txt` now carries a timestamp for every file it names, fetched and skipped
+alike** — the pre-fix "skipped, oldest first" listed only filenames, which was actively
+misleading here (skipped files were newer than fetched ones); a reader now sees the actual
+recency at a glance instead of having to cross-reference file contents to find out it was
+wrong.
+
+---
+
+## 2026-08-19 — Transfers name filter: "Dismiss list" gets its own state trio, not a share of
+"Dismiss all"'s
+
+`prompts/done/2026-08-19-transfers-name-filter.md`. The task said to "reuse the page's existing
+busy/error/outcome state conventions for the other dismiss controls" without saying which of
+two readings that means: literally share `dismissingAll`/`dismissAllError`/`dismissAllCount`
+between "Dismiss all" and the new "Dismiss list", or give "Dismiss list" its own three state
+variables that follow the identical *shape* (a busy flag, an error string, a dismissed-count
+banner, the same inline emerald/amber notification markup).
+
+**Went with the second reading** — `dismissingList`/`dismissListError`/`dismissListCount`,
+separate from `dismissAllCount` et al. The two controls sit in different parts of the toolbar
+and can be clicked independently (a filtered dismiss, then a moment later an unrelated "Dismiss
+all" click, or vice versa); sharing one flag would make one control's busy/error/outcome state
+silently clobber the other's mid-flight, and — since "Dismiss all"/"Dismiss Queue" are the task's
+own explicit "leave completely unchanged" controls — reusing their state variables risked
+coupling a new control's behavior to code this task was told not to touch.
+
 ## 2026-08-19 — "Start now" becomes a menu: fraction-of-site-limit, 409-not-silent-Max,
 widened field + a parallel DB column, no migration for "no site limit configured"
 
@@ -226,6 +1155,22 @@ suppressed rather than reaching the pipeline — the same outcome a manual Queue
 today. Rare enough (needs both a crash after completion and an external remote delete in the
 same window) that it isn't worth a special-cased "verify local completeness without asking the
 remote" path; recorded here rather than silently left unhandled.
+
+> **Amended 2026-08-19** (`prompts/done/2026-08-19-autoqueue-requeues-imported-item.md`,
+> production bundle `lftpweb-support-0.2.6-20260819T205145Z.zip`). Two things above were wrong
+> about this shape, and both are corrected by the entry at the top of this file rather than
+> here. **It is not rare, and it is not cosmetic.** The *startup-rescue* path this paragraph is
+> about genuinely does need a crash; but the identical end state — a re-queued job for a
+> complete-local item whose remote is about to go — was reached with no crash at all, twice in
+> one afternoon, by **auto-queue** picking up the `PARTIAL` reading an *arr importer produces
+> while it moves a finished release out. And the cost is not just "misses the pipeline": the
+> doomed job blocks `arrsync._maybe_cleanup` ("an active job exists for this item") for as long
+> as it waits for a slot — 97 minutes and 92 withheld-cleanup events in the worse of the two
+> cases. The re-queue itself is now prevented at its source (§7.3's grace period extended to
+> partial absence; auto-queue skipping an item the *arr already holds), which is a stronger fix
+> than the "verify local completeness without asking the remote" path considered and declined
+> here. This paragraph's own narrow case — crash, then an external remote delete before the next
+> restart — remains accepted as written.
 
 ---
 

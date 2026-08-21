@@ -1,29 +1,36 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import type { HistoryJobOut, HistoryQueueSummaryOut, JobOut, JobState } from '../api/types'
+import type { FileNode, JobOut, JobState } from '../api/types'
+import type { ChildSpeedSample } from '../hooks/useLiveModel'
 import {
   type LiveProgress,
+  DISMISS_OUTCOMES,
+  DISMISS_OUTCOME_LABELS,
+  FAST_LANE_HINT,
+  canDismiss,
+  canMoveDown,
+  canMoveUp,
+  canResolveManually,
+  childDisplayName,
   completedTimeLabel,
-  decrementHistoryQueueSummary,
-  failedJobPanelContent,
-  formatQueueGroupCounts,
-  groupHasDismissable,
-  groupHistoryJobsByQueue,
-  groupJobsByQueue,
+  dismissMenuOptions,
+  fileListCapNote,
+  filterTransferJobs,
   hasArrGroup,
-  historyQueueGroupCounts,
   isDismissable,
-  isQueueCollapsed,
+  isFastLane,
+  isPipelineInFlight,
+  manualOutcomeLabel,
+  mergeFileListChildren,
   processingGroupFields,
-  queueGroupSummary,
-  readCollapsedQueues,
-  readHistoryCollapsedQueues,
+  queueRowPercent,
+  resolveMenuOptions,
+  showsFileList,
   sortTransferRows,
+  transferFilterSummary,
   transferGroupFields,
   transferLineValue,
   transferredSummary,
-  withQueueCollapsed,
-  writeCollapsedQueues,
-  writeHistoryCollapsedQueues,
+  waitingReasonLabel,
 } from './transferPanel'
 
 // 2026-08-15 (prompts/2026-08-15-transfers-single-line-rows-with-detail.md): "one line per
@@ -38,6 +45,7 @@ function job(state: JobState, overrides: Partial<JobOut> = {}): JobOut {
     item_id: 1,
     queue_id: 1,
     queue_name: 'test',
+    queue_short_name: null,
     rel_path: 'Release',
     is_dir: true,
     kind: 'mirror',
@@ -59,6 +67,7 @@ function job(state: JobState, overrides: Partial<JobOut> = {}): JobOut {
     exit_code: null,
     error_class: null,
     output_tail: null,
+    has_output_tail: false,
     verified_at: null,
     extracted_at: null,
     remote_deleted_at: null,
@@ -107,6 +116,31 @@ describe('transferLineValue -- the row-collapse decision', () => {
     expect(transferLineValue(job('queued', { bytes_total: 5000 }))).toBe('4.9 KB')
     expect(transferLineValue(job('queued', { bytes_total: null }))).toBe('—')
     expect(transferLineValue(job('failed', { bytes_total: null }))).toBe('—')
+  })
+})
+
+describe('queueRowPercent -- the Queue row\'s own chip fill', () => {
+  it('reads the same percent transferLineValue renders as text, from the job\'s own bytes', () => {
+    expect(queueRowPercent(job('running', { bytes_done: 250, bytes_total: 1000 }))).toBe(25)
+  })
+
+  it('prefers the live reading over the job\'s own, same fallback transferLineValue uses', () => {
+    const live: LiveProgress = { bytes_done: 900, bytes_total: 1000, speed_bps: 1024, eta_s: 5 }
+    expect(queueRowPercent(job('running', { bytes_done: 100, bytes_total: 1000 }), live)).toBe(90)
+  })
+
+  it('is null for a queued job -- not yet running, nothing to fill', () => {
+    expect(queueRowPercent(job('queued', { bytes_total: 1000 }))).toBeNull()
+  })
+
+  it('is null for a terminal job -- the chip shows an outcome, not a percent', () => {
+    expect(queueRowPercent(job('succeeded', { bytes_done: 1000, bytes_total: 1000 }))).toBeNull()
+    expect(queueRowPercent(job('failed', { bytes_done: 500, bytes_total: 1000 }))).toBeNull()
+    expect(queueRowPercent(job('cancelled', { bytes_done: 500, bytes_total: 1000 }))).toBeNull()
+  })
+
+  it('is null while running with no total known yet, rather than a NaN%', () => {
+    expect(queueRowPercent(job('running', { bytes_done: 100, bytes_total: null }))).toBeNull()
   })
 })
 
@@ -374,51 +408,11 @@ describe('sortTransferRows -- the Transfers page\'s row order', () => {
   })
 })
 
-// 2026-08-16 (prompts/2026-08-16-transfers-group-by-queue.md): "group rows by queue,
-// collapsible with remembered state" -- grouping, header aggregates, and collapse persistence,
-// all as pure functions per the task's own instruction.
-
-describe('groupJobsByQueue', () => {
-  it('groups jobs by queue id, one group per queue with at least one visible job', () => {
-    const a1 = job('running', { id: 1, queue_id: 1, queue_name: 'Alpha' })
-    const b1 = job('queued', { id: 2, queue_id: 2, queue_name: 'Bravo' })
-    const a2 = job('failed', { id: 3, queue_id: 1, queue_name: 'Alpha' })
-
-    const groups = groupJobsByQueue([a1, b1, a2])
-    expect(groups).toHaveLength(2)
-    expect(groups.find((g) => g.queueId === 1)?.jobs.map((j) => j.id)).toEqual([1, 3])
-    expect(groups.find((g) => g.queueId === 2)?.jobs.map((j) => j.id)).toEqual([2])
-  })
-
-  it('orders groups by queue name, not by first-seen order', () => {
-    const zulu = job('running', { id: 1, queue_id: 9, queue_name: 'Zulu' })
-    const alpha = job('running', { id: 2, queue_id: 1, queue_name: 'Alpha' })
-
-    const groups = groupJobsByQueue([zulu, alpha])
-    expect(groups.map((g) => g.queueName)).toEqual(['Alpha', 'Zulu'])
-  })
-
-  it('keeps each group\'s within-group order exactly as passed in', () => {
-    const running = job('running', { id: 1, queue_id: 1, queue_name: 'Alpha' })
-    const queued = job('queued', { id: 2, queue_id: 1, queue_name: 'Alpha' })
-    const terminal = job('succeeded', { id: 3, queue_id: 1, queue_name: 'Alpha' })
-
-    // Callers always pass `sortTransferRows`'s own output -- passing an already-decided order
-    // here and asserting it survives untouched is the contract this function must not break.
-    const groups = groupJobsByQueue([running, queued, terminal])
-    expect(groups[0].jobs.map((j) => j.id)).toEqual([1, 2, 3])
-  })
-
-  it('returns no groups for an empty job list', () => {
-    expect(groupJobsByQueue([])).toEqual([])
-  })
-})
-
 // 2026-08-17 (prompts/2026-08-17-transfers-dismiss-per-queue.md): `isDismissable` moved here
-// from `TransfersPage.tsx` so `groupHasDismissable` below can reuse it without `lib/` importing
-// from `pages/` -- see that function's own docstring. `TransfersPage.test.ts`'s pre-existing
-// `isDismissable` coverage keeps passing unchanged (the page re-exports the same function), so
-// this only adds the states this task's move didn't already have direct coverage for.
+// from `TransfersPage.tsx` -- see that function's own docstring. `TransfersPage.test.ts`'s
+// pre-existing `isDismissable` coverage keeps passing unchanged (the page re-exports the same
+// function), so this only adds the states this task's move didn't already have direct coverage
+// for.
 describe('isDismissable', () => {
   it('is true for a terminal state -- failed, cancelled, succeeded', () => {
     expect(isDismissable('failed')).toBe(true)
@@ -432,343 +426,441 @@ describe('isDismissable', () => {
   })
 })
 
-describe('groupHasDismissable -- the group header\'s "Dismiss Queue" visibility', () => {
-  it('is true once at least one job in the group is dismissable', () => {
-    const jobs = [job('running', { id: 1 }), job('failed', { id: 2 })]
-    expect(groupHasDismissable(jobs)).toBe(true)
-  })
-
-  it('is false when every job in the group is still active', () => {
-    const jobs = [job('running', { id: 1 }), job('queued', { id: 2 })]
-    expect(groupHasDismissable(jobs)).toBe(false)
-  })
-
-  it('is false for an empty group', () => {
-    expect(groupHasDismissable([])).toBe(false)
+// 2026-08-20 (follow-up to phase 1 stage 4b from the user's browser review,
+// prompts/2026-08-20-transfers-dismiss-menu-and-counts.md): the Complete box's "Dismiss" menu --
+// "all, downloaded, failed (or whatever the completed status are)", the user's own words.
+describe('DISMISS_OUTCOMES -- the menu\'s own state vocabulary', () => {
+  it('is exactly the three states isDismissable allows, nothing more and nothing less', () => {
+    for (const state of DISMISS_OUTCOMES) {
+      expect(isDismissable(state)).toBe(true)
+    }
+    for (const state of ['queued', 'running'] as const) {
+      expect(DISMISS_OUTCOMES).not.toContain(state)
+    }
   })
 })
 
-describe('queueGroupSummary', () => {
-  it('counts each state into its outcome bucket, including cancelled as stopped', () => {
+describe('dismissMenuOptions -- the Dismiss menu\'s option list', () => {
+  it('lists "All" first, then one option per dismissable outcome', () => {
+    const options = dismissMenuOptions()
+    expect(options[0]).toEqual({ outcome: null, label: 'All' })
+    expect(options.slice(1).map((o) => o.outcome)).toEqual([...DISMISS_OUTCOMES])
+  })
+
+  it('labels each outcome the same way the row\'s own state chip does', () => {
+    const options = dismissMenuOptions()
+    expect(options.find((o) => o.outcome === 'succeeded')?.label).toBe('Downloaded')
+    expect(options.find((o) => o.outcome === 'failed')?.label).toBe('Failed')
+    expect(options.find((o) => o.outcome === 'cancelled')?.label).toBe('Stopped')
+  })
+
+  it('has a label for every outcome it lists, drawn from DISMISS_OUTCOME_LABELS', () => {
+    for (const option of dismissMenuOptions()) {
+      if (option.outcome != null) {
+        expect(option.label).toBe(DISMISS_OUTCOME_LABELS[option.outcome])
+      }
+    }
+  })
+})
+
+// 2026-08-19 (docs/transfers-redesign-spec.md §3.5, phase 1 stage 4a): the fast-lane marker's
+// own predicate -- a single ordered list intermixes lanes, so a row needs to say why it can start
+// before a lower-numbered one.
+describe('isFastLane', () => {
+  it('is true for a job admitted from the small lane', () => {
+    expect(isFastLane(job('queued', { lane: 'small' }))).toBe(true)
+  })
+
+  it('is false for a main-lane job', () => {
+    expect(isFastLane(job('queued', { lane: 'main' }))).toBe(false)
+  })
+
+  it('does not depend on job state -- a running or terminal fast-lane job is still fast-lane', () => {
+    expect(isFastLane(job('running', { lane: 'small' }))).toBe(true)
+    expect(isFastLane(job('succeeded', { lane: 'small' }))).toBe(true)
+  })
+})
+
+describe('FAST_LANE_HINT', () => {
+  it('explains why, not just that -- names both the size threshold and the ordering consequence', () => {
+    expect(FAST_LANE_HINT).toMatch(/small/i)
+    expect(FAST_LANE_HINT).toMatch(/start before/i)
+  })
+})
+
+// 2026-08-19 (prompts/2026-08-19-queue-reorder-chevrons.md): the chevron reorder controls' own
+// enabled/disabled logic -- "can this row move" pulled out of `TransfersPage.tsx`'s `Row` so it's
+// unit-testable without mounting anything (README.md's Known gaps: no component rendering).
+describe('canMoveUp -- the ▲/▲▲ chevrons\' enabled state', () => {
+  it('is false for the first queued row -- nothing above it to trade places with', () => {
+    expect(canMoveUp(1)).toBe(false)
+  })
+
+  it('is true for any row past the first', () => {
+    expect(canMoveUp(2)).toBe(true)
+    expect(canMoveUp(9)).toBe(true)
+  })
+
+  it('is false for a non-queued row (no position at all)', () => {
+    expect(canMoveUp(undefined)).toBe(false)
+  })
+})
+
+describe('canMoveDown -- the ▼ chevron\'s enabled state', () => {
+  it('is false for the last queued row -- nothing below it to trade places with', () => {
+    expect(canMoveDown(3, 3)).toBe(false)
+  })
+
+  it('is true for any row before the last', () => {
+    expect(canMoveDown(1, 3)).toBe(true)
+    expect(canMoveDown(2, 3)).toBe(true)
+  })
+
+  it('is false for a non-queued row (no position at all)', () => {
+    expect(canMoveDown(undefined, 3)).toBe(false)
+  })
+
+  it('is false when it is the only queued row', () => {
+    expect(canMoveDown(1, 1)).toBe(false)
+  })
+})
+
+// 2026-08-19 (prompts/2026-08-19-transfers-name-filter.md): the Transfers page's name filter --
+// `rel_path`-only substring match, empty-search identity passthrough, and the "Dismiss list"
+// button's own id list.
+describe('filterTransferJobs -- the name filter', () => {
+  it('matches case-insensitively', () => {
+    const jobs = [job('queued', { id: 1, rel_path: 'Married.At.First.Sight.S01' })]
+    expect(filterTransferJobs(jobs, 'married')).toEqual(jobs)
+    expect(filterTransferJobs(jobs, 'MARRIED')).toEqual(jobs)
+  })
+
+  it('matches a dotted literal like a plain substring -- no glob/regex parsing', () => {
     const jobs = [
-      job('running', { id: 1 }),
-      job('queued', { id: 2 }),
-      job('queued', { id: 3 }),
-      job('succeeded', { id: 4 }),
-      job('failed', { id: 5 }),
-      job('cancelled', { id: 6 }),
+      job('queued', { id: 1, rel_path: 'Married.At.First.Sight.S01E02' }),
+      job('queued', { id: 2, rel_path: 'Some.Other.Release' }),
     ]
-    const summary = queueGroupSummary(jobs, {})
-    expect(summary.counts).toEqual({ active: 1, queued: 2, succeeded: 1, failed: 1, stopped: 1 })
+    expect(filterTransferJobs(jobs, 'at.first.sight')).toEqual([jobs[0]])
   })
 
-  it('sums bytes_done across the group, preferring the live reading for a running job', () => {
-    const running = job('running', { id: 1, bytes_done: 100 })
-    const queued = job('queued', { id: 2, bytes_done: 50 })
-    const live: Record<number, LiveProgress> = {
-      1: { bytes_done: 400, bytes_total: 1000, speed_bps: 0, eta_s: null },
-    }
-    const summary = queueGroupSummary([running, queued], live)
-    expect(summary.totalBytesDone).toBe(450) // 400 (live) + 50 (queued's own bytes_done)
+  it('returns the exact same array by identity for an empty search', () => {
+    const jobs = [job('queued', { id: 1 })]
+    expect(filterTransferJobs(jobs, '')).toBe(jobs)
   })
 
-  it('falls back to the job\'s own bytes_done when no live sample has arrived for it yet', () => {
-    const running = job('running', { id: 1, bytes_done: 100 })
-    const summary = queueGroupSummary([running], {})
-    expect(summary.totalBytesDone).toBe(100)
+  it('returns the exact same array by identity for a whitespace-only search', () => {
+    const jobs = [job('queued', { id: 1 })]
+    expect(filterTransferJobs(jobs, '   ')).toBe(jobs)
   })
 
-  it('combines the current rate only across running jobs, summing live over polled speed_bps', () => {
-    const runningWithLive = job('running', { id: 1, speed_bps: 999 })
-    const runningNoLive = job('running', { id: 2, speed_bps: 2048 })
-    const queued = job('queued', { id: 3, speed_bps: null })
-    const live: Record<number, LiveProgress> = {
-      1: { bytes_done: 0, bytes_total: null, speed_bps: 1024, eta_s: null },
-    }
-    const summary = queueGroupSummary([runningWithLive, runningNoLive, queued], live)
-    expect(summary.combinedRateBps).toBe(1024 + 2048)
+  it('returns an empty array when nothing matches', () => {
+    const jobs = [job('queued', { id: 1, rel_path: 'Some.Release' })]
+    expect(filterTransferJobs(jobs, 'nope')).toEqual([])
   })
 
-  it('reports no combined rate when nothing in the group is running', () => {
-    const queued = job('queued', { id: 1 })
-    const succeeded = job('succeeded', { id: 2 })
-    const summary = queueGroupSummary([queued, succeeded], {})
-    expect(summary.combinedRateBps).toBeNull()
+  it('matches only rel_path, never queue_name -- a "movies" queue must not make every row in it match "movies"', () => {
+    const jobs = [job('queued', { id: 1, rel_path: 'Some.Release', queue_name: 'movies' })]
+    expect(filterTransferJobs(jobs, 'movies')).toEqual([])
+  })
+
+  it('matches a nested path, not just the trailing name', () => {
+    const jobs = [job('queued', { id: 1, rel_path: 'Show.S01/Show.S01E01.mkv' })]
+    expect(filterTransferJobs(jobs, 'show.s01e01')).toEqual(jobs)
+  })
+
+  it('preserves input order', () => {
+    const jobs = [
+      job('queued', { id: 1, rel_path: 'Zebra.Release' }),
+      job('queued', { id: 2, rel_path: 'Apple.Release' }),
+    ]
+    expect(filterTransferJobs(jobs, 'release')).toEqual(jobs)
   })
 })
 
-describe('formatQueueGroupCounts', () => {
-  it('lists every non-zero bucket in a fixed order', () => {
-    const text = formatQueueGroupCounts({ active: 1, queued: 2, succeeded: 3, failed: 0, stopped: 1 })
-    expect(text).toBe('1 active, 2 queued, 3 succeeded, 1 stopped')
+describe('transferFilterSummary', () => {
+  it('is null while the search is empty', () => {
+    expect(transferFilterSummary(3, 12, '')).toBeNull()
   })
 
-  it('omits every zero-count bucket -- "to keep it quiet"', () => {
-    const text = formatQueueGroupCounts({ active: 0, queued: 0, succeeded: 5, failed: 0, stopped: 0 })
-    expect(text).toBe('5 succeeded')
+  it('is null for a whitespace-only search', () => {
+    expect(transferFilterSummary(3, 12, '   ')).toBeNull()
   })
 
-  it('renders an empty string when every bucket is zero', () => {
-    expect(formatQueueGroupCounts({ active: 0, queued: 0, succeeded: 0, failed: 0, stopped: 0 })).toBe('')
-  })
-})
-
-describe('per-queue collapse persistence', () => {
-  afterEach(() => {
-    localStorage.clear()
+  it('reports shown of total once the search is non-empty', () => {
+    expect(transferFilterSummary(3, 12, 'married')).toBe('Showing 3 of 12 transfers')
   })
 
-  it('reads a queue with no stored preference as expanded (not collapsed) by default', () => {
-    expect(isQueueCollapsed({}, 42)).toBe(false)
-  })
-
-  it('withQueueCollapsed(..., true) marks a queue collapsed; (..., false) clears it back out', () => {
-    const collapsed = withQueueCollapsed({}, 1, true)
-    expect(isQueueCollapsed(collapsed, 1)).toBe(true)
-
-    const expanded = withQueueCollapsed(collapsed, 1, false)
-    expect(isQueueCollapsed(expanded, 1)).toBe(false)
-    // Expanded is the default -- clearing back to it drops the entry rather than storing `false`.
-    expect(expanded).toEqual({})
-  })
-
-  it('round-trips a collapse map through the actual localStorage read/write helpers', () => {
-    expect(readCollapsedQueues()).toEqual({})
-    const map = withQueueCollapsed({}, 7, true)
-    writeCollapsedQueues(map)
-    expect(readCollapsedQueues()).toEqual({ '7': true })
-    expect(isQueueCollapsed(readCollapsedQueues(), 7)).toBe(true)
-  })
-
-  it('a queue that disappears from the payload keeps its stored preference for when it returns', () => {
-    // Nothing about `withQueueCollapsed`/`isQueueCollapsed` reads the current job list -- the
-    // map is only ever consulted by queue id, so a queue with zero visible jobs right now still
-    // reads its previously-stored preference exactly like one that's still present.
-    writeCollapsedQueues(withQueueCollapsed({}, 3, true))
-    const storedLater = readCollapsedQueues()
-    expect(isQueueCollapsed(storedLater, 3)).toBe(true)
+  it('uses the singular "transfer" for a total of exactly one', () => {
+    expect(transferFilterSummary(1, 1, 'x')).toBe('Showing 1 of 1 transfer')
   })
 })
 
-// 2026-08-16 (prompts/2026-08-16-history-jobs-group-collapse.md): the History jobs section's own
-// per-queue collapse reuses `isQueueCollapsed`/`withQueueCollapsed` (covered above -- shape-
-// agnostic, no reason to retest) but writes to a *different* storage key than Transfers' --
-// "a queue collapsed on Transfers is not implicitly collapsed on History" (the task's own
-// instruction). These tests cover exactly that separation, plus the read/write round-trip
-// through the History-specific helpers themselves.
-describe('History jobs section: per-queue collapse persistence, separate namespace from Transfers', () => {
-  afterEach(() => {
-    localStorage.clear()
-  })
+// 2026-08-20 (docs/transfers-redesign-spec.md §3.3, phase 1 stage 5): the Transfers row's
+// per-file expansion -- "the thing Files is currently used for, moved to where the ordering
+// lives." Pure functions only, same discipline as every other describe block in this file.
 
-  it('round-trips through the History-specific localStorage helpers', () => {
-    expect(readHistoryCollapsedQueues()).toEqual({})
-    const map = withQueueCollapsed({}, 9, true)
-    writeHistoryCollapsedQueues(map)
-    expect(readHistoryCollapsedQueues()).toEqual({ '9': true })
-    expect(isQueueCollapsed(readHistoryCollapsedQueues(), 9)).toBe(true)
-  })
+const DIM_FACETS = {
+  remote: { level: 'dim' as const, reason: 'absent' },
+  local: { level: 'dim' as const, reason: 'missing' },
+  verified: { level: 'dim' as const, reason: 'unverified' },
+  extracted: { level: 'dim' as const, reason: 'not_extracted' },
+}
 
-  it('collapsing a queue on Transfers does not collapse it on History, and vice versa', () => {
-    writeCollapsedQueues(withQueueCollapsed({}, 5, true))
-    expect(isQueueCollapsed(readHistoryCollapsedQueues(), 5)).toBe(false)
-
-    writeHistoryCollapsedQueues(withQueueCollapsed({}, 6, true))
-    expect(isQueueCollapsed(readCollapsedQueues(), 6)).toBe(false)
-  })
-})
-
-// 2026-08-16: `historyQueueGroupCounts` reshapes the server's `HistoryQueueSummaryOut` onto
-// `QueueGroupCounts` so `formatQueueGroupCounts` (already tested above) can render it -- History
-// reuses that exact formatter rather than a parallel one.
-describe('historyQueueGroupCounts -- reshaping the server summary for formatQueueGroupCounts', () => {
-  function summary(overrides: Partial<HistoryQueueSummaryOut> = {}): HistoryQueueSummaryOut {
-    return {
-      queue_id: 1,
-      queue_name: 'tv',
-      succeeded: 0,
-      failed: 0,
-      cancelled: 0,
-      total_bytes_done: 0,
-      ...overrides,
-    }
-  }
-
-  it('maps succeeded/failed straight across and cancelled onto the stopped bucket', () => {
-    const counts = historyQueueGroupCounts(summary({ succeeded: 3, failed: 1, cancelled: 2 }))
-    expect(counts).toEqual({ active: 0, queued: 0, succeeded: 3, failed: 1, stopped: 2 })
-  })
-
-  it('always reports zero active/queued -- History has no such bucket', () => {
-    const counts = historyQueueGroupCounts(summary({ succeeded: 10 }))
-    expect(counts.active).toBe(0)
-    expect(counts.queued).toBe(0)
-  })
-
-  it('composes with formatQueueGroupCounts to omit zero buckets', () => {
-    const text = formatQueueGroupCounts(historyQueueGroupCounts(summary({ succeeded: 5 })))
-    expect(text).toBe('5 succeeded')
-  })
-})
-
-// 2026-08-16: `groupHistoryJobsByQueue`/`decrementHistoryQueueSummary` -- the pure logic behind
-// `HistoryJobsSection.tsx`'s flattened, virtualized, collapsible queue groups. Pulled out of the
-// component into this module specifically so it's reachable without mounting anything (the
-// project's whole component-testing story, README.md's Known gaps).
-
-function historyJob(state: HistoryJobOut['state'], overrides: Partial<HistoryJobOut> = {}): HistoryJobOut {
+function fileNode(rel_path: string, overrides: Partial<FileNode> = {}): FileNode {
   return {
     id: 1,
-    item_id: 1,
-    queue_id: 1,
-    queue_name: 'tv',
-    rel_path: 'Show/episode.mkv',
+    rel_path,
     is_dir: false,
-    kind: 'pget',
-    state,
-    attempt: 1,
-    queued_at: '2026-08-16T00:00:00.000000Z',
-    started_at: '2026-08-16T00:00:01.000000Z',
-    finished_at: '2026-08-16T00:01:00.000000Z',
-    bytes_total: 1000,
-    bytes_done: 1000,
-    exit_code: 0,
-    error_class: null,
-    has_output_tail: false,
-    dismissed_at: null,
+    state: 'PARTIAL',
+    substate: null,
+    suppressed_reason: null,
+    remote_size: 1000,
+    local_size: 500,
+    remote_mtime: null,
+    local_mtime: null,
+    state_changed_at: null,
+    first_seen_at: null,
+    settle_matched_scans: null,
+    settle_first_matched_at: null,
+    settle_total_bytes: null,
+    settle_first_observed_at: null,
+    settle_last_changed_at: null,
+    downloaded_at: null,
+    verified_at: null,
+    extracted_at: null,
+    first_missing_at: null,
+    remote_deleted_at: null,
+    pending_download_prefix: null,
+    deleted_archive_at: null,
     arr_status: null,
     arr_status_at: null,
-    arr_instance_name: null,
-    arr_instance_kind: null,
+    facets: DIM_FACETS,
     ...overrides,
   }
 }
 
-describe('groupHistoryJobsByQueue -- flattening + collapse filtering for the virtualizer', () => {
-  it('inserts one header row per queue, preserving input order within each queue', () => {
-    const jobs = [
-      historyJob('succeeded', { id: 1, queue_id: 1, queue_name: 'tv' }),
-      historyJob('failed', { id: 2, queue_id: 1, queue_name: 'tv' }),
-      historyJob('succeeded', { id: 3, queue_id: 2, queue_name: 'movies' }),
-    ]
-    const rows = groupHistoryJobsByQueue(jobs, {})
-    expect(rows).toEqual([
-      { kind: 'header', queueId: 1, queueName: 'tv' },
-      { kind: 'job', job: jobs[0] },
-      { kind: 'job', job: jobs[1] },
-      { kind: 'header', queueId: 2, queueName: 'movies' },
-      { kind: 'job', job: jobs[2] },
-    ])
+describe('showsFileList -- whether a row offers the per-file expansion', () => {
+  it('a directory (mirror) job offers it', () => {
+    expect(showsFileList(job('running', { is_dir: true }))).toBe(true)
   })
 
-  it('emits a new header whenever the queue changes, even if the same queue reappears later', () => {
-    // `jobs` is assumed pre-sorted by the caller (the server's own newest-first order) -- this
-    // function only groups *consecutive* runs, it never re-sorts, so a queue that appears twice
-    // non-consecutively gets a second, separate header row rather than being merged with its
-    // earlier appearance. Documents the actual (simple, linear-scan) behaviour rather than a
-    // stronger "true grouping" guarantee this function doesn't provide.
-    const jobs = [
-      historyJob('succeeded', { id: 1, queue_id: 1, queue_name: 'tv' }),
-      historyJob('succeeded', { id: 2, queue_id: 2, queue_name: 'movies' }),
-      historyJob('succeeded', { id: 3, queue_id: 1, queue_name: 'tv' }),
-    ]
-    const rows = groupHistoryJobsByQueue(jobs, {})
-    expect(rows.filter((r) => r.kind === 'header')).toHaveLength(3)
-  })
-
-  it('a collapsed queue keeps its header row but drops every job row', () => {
-    const jobs = [
-      historyJob('succeeded', { id: 1, queue_id: 1, queue_name: 'tv' }),
-      historyJob('failed', { id: 2, queue_id: 1, queue_name: 'tv' }),
-      historyJob('succeeded', { id: 3, queue_id: 2, queue_name: 'movies' }),
-    ]
-    const collapsed = withQueueCollapsed({}, 1, true)
-    const rows = groupHistoryJobsByQueue(jobs, collapsed)
-    expect(rows).toEqual([
-      { kind: 'header', queueId: 1, queueName: 'tv' },
-      { kind: 'header', queueId: 2, queueName: 'movies' },
-      { kind: 'job', job: jobs[2] },
-    ])
-  })
-
-  it('defaults every queue to expanded -- an empty collapse map drops nothing', () => {
-    const jobs = [historyJob('succeeded', { id: 1 })]
-    const rows = groupHistoryJobsByQueue(jobs, {})
-    expect(rows.filter((r) => r.kind === 'job')).toHaveLength(1)
-  })
-
-  it('an empty job list produces an empty row array', () => {
-    expect(groupHistoryJobsByQueue([], {})).toEqual([])
+  it('a single-file (pget) job does not -- it has no children by construction', () => {
+    expect(showsFileList(job('running', { is_dir: false }))).toBe(false)
   })
 })
 
-describe('decrementHistoryQueueSummary -- local update after a single-row clear', () => {
-  function summary(overrides: Partial<HistoryQueueSummaryOut> = {}): HistoryQueueSummaryOut {
-    return {
-      queue_id: 1,
-      queue_name: 'tv',
-      succeeded: 2,
-      failed: 1,
-      cancelled: 1,
-      total_bytes_done: 4000,
-      ...overrides,
-    }
-  }
-
-  it('decrements the bucket matching the cleared job\'s state and its total_bytes_done', () => {
-    const cleared = historyJob('failed', { queue_id: 1, bytes_done: 1000 })
-    const result = decrementHistoryQueueSummary([summary()], cleared)
-    expect(result).toEqual([summary({ failed: 0, total_bytes_done: 3000 })])
+describe('childDisplayName -- a child row\'s name relative to its job', () => {
+  it('strips the job\'s own rel_path prefix', () => {
+    expect(childDisplayName('Release/Season 01/e01.mkv', 'Release')).toBe('Season 01/e01.mkv')
   })
 
-  it('decrements cancelled and succeeded buckets the same way', () => {
-    const clearedCancelled = historyJob('cancelled', { queue_id: 1, bytes_done: 500 })
-    expect(decrementHistoryQueueSummary([summary()], clearedCancelled)).toEqual([
-      summary({ cancelled: 0, total_bytes_done: 3500 }),
-    ])
-
-    const clearedSucceeded = historyJob('succeeded', { queue_id: 1, bytes_done: 500 })
-    expect(decrementHistoryQueueSummary([summary()], clearedSucceeded)).toEqual([
-      summary({ succeeded: 1, total_bytes_done: 3500 }),
-    ])
+  it('strips a single-level prefix down to the bare filename', () => {
+    expect(childDisplayName('Release/e01.mkv', 'Release')).toBe('e01.mkv')
   })
 
-  it('leaves every other queue\'s summary untouched', () => {
-    const other = summary({ queue_id: 2, queue_name: 'movies' })
-    const cleared = historyJob('failed', { queue_id: 1, bytes_done: 1000 })
-    const result = decrementHistoryQueueSummary([summary(), other], cleared)
-    expect(result[1]).toEqual(other)
-  })
-
-  it('clamps at zero rather than going negative when the summary is already stale', () => {
-    const cleared = historyJob('failed', { queue_id: 1, bytes_done: 999999 })
-    const result = decrementHistoryQueueSummary([summary({ failed: 0, total_bytes_done: 100 })], cleared)
-    expect(result[0].failed).toBe(0)
-    expect(result[0].total_bytes_done).toBe(0)
+  it('falls back to the untouched rel_path if the expected prefix is absent (defensive)', () => {
+    expect(childDisplayName('Other/e01.mkv', 'Release')).toBe('Other/e01.mkv')
   })
 })
 
-// 2026-08-17 (prompts/2026-08-17-interrupted-job-popout-explains-itself.md): the
-// fetch-vs-static-empty-state decision behind `HistoryJobsSection.tsx`'s failed-row expand
-// panel, pulled out as a pure function so it's reachable without mounting anything (the same
-// "no component rendering tested here" discipline every other describe block in this file
-// follows).
-describe('failedJobPanelContent -- fetch vs. static empty state for a failed row\'s panel', () => {
-  it('says "fetch" when the row has a captured output tail', () => {
-    const job = historyJob('failed', { error_class: 'AUTH_FAILED', has_output_tail: true })
-    expect(failedJobPanelContent(job)).toEqual({ kind: 'fetch' })
+describe('fileListCapNote -- the "showing N of total" line', () => {
+  it('is null when nothing was capped', () => {
+    expect(fileListCapNote(30, 30)).toBeNull()
   })
 
-  it('says "static" with the row\'s own error_class when there is no output tail to fetch', () => {
-    // The case a container-restart INTERRUPTED job hit before this task: `has_output_tail`
-    // false meant `handleToggle` never fetched, `output` stayed `null` forever, and the old
-    // render logic (gated on `output` being non-null) never showed anything at all.
-    const job = historyJob('failed', { error_class: 'INTERRUPTED', has_output_tail: false })
-    expect(failedJobPanelContent(job)).toEqual({ kind: 'static', errorClass: 'INTERRUPTED' })
+  it('names both numbers when the server-side cap trimmed the list', () => {
+    expect(fileListCapNote(500, 812)).toBe('Showing 500 of 812 files.')
+  })
+})
+
+describe('mergeFileListChildren -- overlaying live WS state onto the fetched, capped row set', () => {
+  it('prefers the live node\'s state/sizes over the initially-fetched ones, by rel_path', () => {
+    const fetched = [fileNode('Release/a.mkv', { state: 'PARTIAL', local_size: 100, remote_size: 1000 })]
+    const live = [fileNode('Release/a.mkv', { state: 'DOWNLOADED', local_size: 1000, remote_size: 1000 })]
+    const rows = mergeFileListChildren(fetched, live, {})
+    expect(rows).toEqual([
+      { id: 1, rel_path: 'Release/a.mkv', state: 'DOWNLOADED', remote_size: 1000, local_size: 1000, speed_bps: null },
+    ])
   })
 
-  it('carries a null error_class through to the static case rather than guessing', () => {
-    const job = historyJob('failed', { error_class: null, has_output_tail: false })
-    expect(failedJobPanelContent(job)).toEqual({ kind: 'static', errorClass: null })
+  it('keeps the fetched row as-is when the live tree has nothing for that rel_path yet', () => {
+    const fetched = [fileNode('Release/a.mkv', { state: 'PARTIAL', local_size: 100, remote_size: 1000 })]
+    const rows = mergeFileListChildren(fetched, [], {})
+    expect(rows[0]).toMatchObject({ state: 'PARTIAL', local_size: 100 })
+  })
+
+  it('never grows or shrinks the row set -- the fetched, capped list is the fixed set', () => {
+    const fetched = [fileNode('Release/a.mkv'), fileNode('Release/b.mkv', { id: 2 })]
+    // A live tree with an extra file (`c.mkv`) that was never part of the fetched/capped set --
+    // it must not appear, since the cap's whole point is a bounded row count.
+    const live = [...fetched, fileNode('Release/c.mkv', { id: 3 })]
+    const rows = mergeFileListChildren(fetched, live, {})
+    expect(rows.map((r) => r.rel_path)).toEqual(['Release/a.mkv', 'Release/b.mkv'])
+  })
+
+  it('attaches a fresh child_progress sample as this row\'s speed_bps, by item id', () => {
+    const fetched = [fileNode('Release/a.mkv', { id: 7 })]
+    const samples: Record<number, ChildSpeedSample> = { 7: { speedBps: 4096, receivedAt: 1000 } }
+    const rows = mergeFileListChildren(fetched, fetched, samples, 1000)
+    expect(rows[0].speed_bps).toBe(4096)
+  })
+
+  it('reads null for a stale child_progress sample rather than a phantom rate', () => {
+    const fetched = [fileNode('Release/a.mkv', { id: 7 })]
+    const samples: Record<number, ChildSpeedSample> = { 7: { speedBps: 4096, receivedAt: 1000 } }
+    const rows = mergeFileListChildren(fetched, fetched, samples, 1000 + 60_000)
+    expect(rows[0].speed_bps).toBeNull()
+  })
+
+  it('reads null for a row with no id at all, rather than throwing', () => {
+    const fetched = [fileNode('Release/a.mkv', { id: null })]
+    const rows = mergeFileListChildren(fetched, fetched, {}, 1000)
+    expect(rows[0].speed_bps).toBeNull()
+  })
+})
+
+// --- The pipeline-completion split (2026-08-20, docs/transfers-redesign-spec.md §3.2,
+// prompts/done/2026-08-20-active-box-holds-inflight-pipeline.md) ------------------------------
+//
+// The rule itself is server-side (`core/pipeline_flight.py`) and deliberately not reimplemented
+// here -- the Active box is client-side while the Complete box is a server-paginated query with
+// its own `total`, so two independently written tests would drift. What *is* tested here is the
+// page's own use of the server's answer: which box a row lands in, what the row says it is
+// waiting on, and which controls it offers.
+
+describe('isPipelineInFlight -- which box a row belongs in', () => {
+  it('holds a succeeded job whose pipeline is still running in the Active box', () => {
+    expect(isPipelineInFlight(job('succeeded', { pipeline_in_flight: true }))).toBe(true)
+  })
+
+  it('files a succeeded job whose pipeline is finished under Complete', () => {
+    expect(isPipelineInFlight(job('succeeded', { pipeline_in_flight: false }))).toBe(false)
+  })
+
+  it('never moves a queued or running job out of Active, whatever the flag says', () => {
+    expect(isPipelineInFlight(job('queued', { pipeline_in_flight: false }))).toBe(true)
+    expect(isPipelineInFlight(job('running', { pipeline_in_flight: false }))).toBe(true)
+  })
+
+  it('degrades a missing flag to "complete" rather than wedging the row in Active', () => {
+    // An older server that doesn't send the field at all -- the same fail-safe direction the
+    // server-side predicate takes for anything it can't bound.
+    expect(isPipelineInFlight(job('failed'))).toBe(false)
+  })
+})
+
+describe('waitingReasonLabel -- the row says what it is waiting on', () => {
+  it('maps each reason the server can send to its own wording', () => {
+    expect(waitingReasonLabel('verifying')).toBe('Verifying')
+    expect(waitingReasonLabel('extracting')).toBe('Extracting')
+    expect(waitingReasonLabel('processing')).toBe('Processing')
+    expect(waitingReasonLabel('awaiting_import')).toBe('Awaiting import')
+    expect(waitingReasonLabel('deleting_source')).toBe('Deleting source')
+  })
+
+  it('renders nothing when there is no reason (a queued/running row says it on its state chip)', () => {
+    expect(waitingReasonLabel(null)).toBeNull()
+    expect(waitingReasonLabel(undefined)).toBeNull()
+    expect(waitingReasonLabel('')).toBeNull()
+  })
+
+  it('falls back to the raw value for a reason this build does not know yet', () => {
+    expect(waitingReasonLabel('awaiting_something_new')).toBe('awaiting_something_new')
+  })
+})
+
+describe('canDismiss -- an in-flight row is not dismissable', () => {
+  it('offers Dismiss on a terminal row whose pipeline is done', () => {
+    expect(canDismiss(job('succeeded', { pipeline_in_flight: false }))).toBe(true)
+    expect(canDismiss(job('failed'))).toBe(true)
+  })
+
+  it('withholds it while the pipeline is still in flight', () => {
+    // `core/queue.py.dismiss_job` rejects this with a 409 now, and `list_jobs()` drops a
+    // dismissed job unconditionally -- so allowing the click is how a row vanishes from *both*
+    // boxes at once.
+    expect(canDismiss(job('succeeded', { pipeline_in_flight: true }))).toBe(false)
+  })
+
+  it('still withholds it from an active job, exactly as isDismissable always did', () => {
+    expect(canDismiss(job('queued'))).toBe(false)
+    expect(canDismiss(job('running'))).toBe(false)
+  })
+})
+
+describe('canResolveManually -- where the escape hatch is offered', () => {
+  it('offers it on an in-flight row that is no longer transferring', () => {
+    expect(canResolveManually(job('succeeded', { pipeline_in_flight: true }))).toBe(true)
+  })
+
+  it('never offers it on a genuinely queued or running job', () => {
+    // A transfer that is actually running is not something a classification button gets to hide
+    // -- Stop is the control for that, and `api/jobs.py.resolve_item` refuses the write besides.
+    expect(canResolveManually(job('queued'))).toBe(false)
+    expect(canResolveManually(job('running'))).toBe(false)
+  })
+
+  it('never offers it on a row that has already reached Complete', () => {
+    expect(canResolveManually(job('succeeded', { pipeline_in_flight: false }))).toBe(false)
+  })
+})
+
+describe('manualOutcomeLabel -- a hand-resolved row must not look like a normal completion', () => {
+  it('names the outcome that was chosen', () => {
+    expect(manualOutcomeLabel(job('succeeded', { manual_outcome: 'complete' }))).toBe('Marked complete')
+    expect(manualOutcomeLabel(job('failed', { manual_outcome: 'failed' }))).toBe('Marked failed')
+  })
+
+  it('renders nothing for a row nobody touched', () => {
+    expect(manualOutcomeLabel(job('succeeded'))).toBeNull()
+  })
+})
+
+describe('resolveMenuOptions', () => {
+  it('offers the two outcomes, complete first', () => {
+    expect(resolveMenuOptions()).toEqual([
+      { outcome: 'complete', label: 'Mark complete' },
+      { outcome: 'failed', label: 'Mark failed' },
+    ])
+  })
+
+  it('adds the undo option only once a row actually carries a manual outcome', () => {
+    expect(resolveMenuOptions(true).map((o) => o.outcome)).toEqual(['complete', 'failed', null])
+  })
+})
+
+describe('sortTransferRows -- in-flight post-transfer rows sit with the running ones', () => {
+  it('places a still-processing row above the queued backlog, not below it', () => {
+    // Otherwise it sorts into the newest-finished-first tail beneath the whole backlog -- page 11
+    // of a busy queue, where the user never sees the thing they're being told is still moving.
+    const running = job('running', { id: 1 })
+    const processing = job('succeeded', {
+      id: 2,
+      pipeline_in_flight: true,
+      finished_at: '2026-08-20T10:00:00.000000Z',
+    })
+    const queued = job('queued', { id: 3 })
+    const done = job('succeeded', {
+      id: 4,
+      pipeline_in_flight: false,
+      finished_at: '2026-08-20T11:00:00.000000Z',
+    })
+    expect(sortTransferRows([done, queued, processing, running]).map((j) => j.id)).toEqual([
+      1, 2, 3, 4,
+    ])
+  })
+
+  it('orders several in-flight rows newest-finished first, same as the terminal tail', () => {
+    const older = job('succeeded', {
+      id: 1,
+      pipeline_in_flight: true,
+      finished_at: '2026-08-20T09:00:00.000000Z',
+    })
+    const newer = job('succeeded', {
+      id: 2,
+      pipeline_in_flight: true,
+      finished_at: '2026-08-20T10:00:00.000000Z',
+    })
+    expect(sortTransferRows([older, newer]).map((j) => j.id)).toEqual([2, 1])
   })
 })

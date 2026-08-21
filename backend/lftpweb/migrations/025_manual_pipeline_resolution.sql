@@ -1,0 +1,43 @@
+-- The manual escape hatch for the Queue tab's Active/pending box (2026-08-20,
+-- docs/transfers-redesign-spec.md §3.2's "pipeline completion, not job termination" rule,
+-- prompts/done/2026-08-20-active-box-holds-inflight-pipeline.md).
+--
+-- The Active box now holds a row until its *whole pipeline* finishes -- post-processing, the
+-- *arr's confirmed import, the deferred source delete -- rather than until lftp exits. Every
+-- blocking condition has a bounded automatic exit (`core/pipeline_flight.py`), but automatic
+-- exits are necessary, not sufficient: a genuinely wedged item needs a human override, or the
+-- box slowly fills with rows nothing is working on and stops being trustworthy.
+--
+-- **This column is a CLASSIFICATION ONLY, and that is not negotiable.** It is read by exactly
+-- one thing: `core/pipeline_flight.py`'s split predicate, which treats a manually-resolved item
+-- as no longer in flight. It must never be read as evidence by any other subsystem. In
+-- particular it must never:
+--
+--   * advance the `move`-mode delete ladder or cause a seedbox source to be deleted
+--     (DESIGN.md §7.3 makes that delete wait on a *confirmed* import held across two consecutive
+--     poller passes precisely because it is irreversible; a user clicking a button on a hunch is
+--     not that evidence);
+--   * be treated as a confirmed *arr import, or write `item.arr_status`;
+--   * trigger notify, cleanup, retention eligibility, or post-processing;
+--   * alter auto-queue's own eligibility rules.
+--
+-- Neither `core/postprocess.py` nor `core/arrsync.py` reads either column, by design. If a
+-- future change makes one of them want to, that is the signal that something has gone wrong.
+--
+-- **Reversible.** `api/jobs.py.resolve_item` can clear both columns back to NULL ("Undo"), which
+-- puts the row straight back through the normal predicate. A *real* terminal outcome arriving
+-- later does **not** clear them -- see that endpoint's own docstring and `docs/decisions.md`
+-- (2026-08-20) for why "the manual outcome stands" was chosen over "a real outcome supersedes
+-- the guess": a row the user deliberately filed must never jump back into Active hours later,
+-- and the real outcome is still recorded on the item's own columns, the row's *arr chip, and the
+-- Events page regardless.
+--
+-- Plain `ADD COLUMN`s, no table rebuild: `manual_outcome`'s CHECK is new (not a widening of an
+-- existing one), so SQLite can add it in place.
+ALTER TABLE item ADD COLUMN manual_outcome TEXT
+    CHECK (manual_outcome IS NULL OR manual_outcome IN ('complete', 'failed'));
+
+-- When the manual outcome above was set, in `core/audit.py`'s own
+-- '%Y-%m-%dT%H:%M:%S.%fZ' wall-clock convention. NULL exactly when `manual_outcome` is NULL;
+-- the two are always written (and cleared) together.
+ALTER TABLE item ADD COLUMN manual_outcome_at TEXT;

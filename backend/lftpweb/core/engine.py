@@ -225,6 +225,10 @@ class QueueConfig:
     # reader of these two on this dataclass.
     download_prefix_enabled: bool | None = None
     download_prefix: str | None = None
+    # Migration 024 ("a short display name per queue") -- threaded through here (2026-08-21,
+    # "the columns moved around" fix) solely so `QueueAutoConfig` below can carry it on to a
+    # settle-gated Preflight row's own queue tag; nothing in this module reads it directly.
+    short_name: str | None = None
 
 
 async def load_host_config(db: aiosqlite.Connection, config_dir: str) -> HostConfig | None:
@@ -287,7 +291,7 @@ async def load_queues(db: aiosqlite.Connection) -> list[QueueConfig]:
     cursor = await db.execute(
         "SELECT id, host_id, name, remote_path, local_path, staging_path, enabled, sync_mode, "
         "auto_queue_enabled, auto_queue_patterns_only, scan_interval_s, "
-        "download_prefix_enabled, download_prefix FROM path_queue ORDER BY id"
+        "download_prefix_enabled, download_prefix, short_name FROM path_queue ORDER BY id"
     )
     rows = await cursor.fetchall()
     return [
@@ -312,6 +316,7 @@ async def load_queues(db: aiosqlite.Connection) -> list[QueueConfig]:
                 else bool(row["download_prefix_enabled"])
             ),
             download_prefix=row["download_prefix"],
+            short_name=row["short_name"],
         )
         for row in rows
     ]
@@ -857,6 +862,7 @@ class Engine:
                     QueueAutoConfig(
                         id=q.id,
                         name=q.name,
+                        short_name=q.short_name,
                         local_path=q.local_path,
                         auto_queue_enabled=q.auto_queue_enabled,
                         patterns_only=q.auto_queue_patterns_only,
@@ -960,6 +966,7 @@ class Engine:
                     QueueAutoConfig(
                         id=q.id,
                         name=q.name,
+                        short_name=q.short_name,
                         local_path=q.local_path,
                         auto_queue_enabled=q.auto_queue_enabled,
                         patterns_only=q.auto_queue_patterns_only,
@@ -1108,11 +1115,11 @@ class Engine:
 
     async def _previous_states(
         self, queue_id: int
-    ) -> dict[str, tuple[str, str | None, str | None, str | None, str | None]]:
-        """`rel_path -> (state, substate, first_missing_at, remote_deleted_at, arr_status)` as
-        currently persisted, for the grace-period decision below, (prompts/open-issues.md #2's
-        stuck-item follow-up) the settle-gate release check, and (2026-08-13,
-        `prompts/2026-08-13-move-mode-outcome-survives-local-only.md`)
+    ) -> dict[str, tuple[str, str | None, str | None, str | None, str | None, int | None]]:
+        """`rel_path -> (state, substate, first_missing_at, remote_deleted_at, arr_status,
+        remote_size)` as currently persisted, for the grace-period decision below,
+        (prompts/open-issues.md #2's stuck-item follow-up) the settle-gate release check, and
+        (2026-08-13, `prompts/2026-08-13-move-mode-outcome-survives-local-only.md`)
         `postprocess.outcome_survives_rescan`'s `LOCAL_ONLY` refinement, which needs to tell "a
         never-tracked local file" from "the remote copy this codebase deleted on purpose" apart.
         One query per scan, same shape as `_protected_rel_paths`.
@@ -1121,10 +1128,18 @@ class Engine:
         "vanished from both trees" sweep's own signal, alongside `remote_deleted_at`, to tell a
         `move`-queue arr-cleaned item's `LOCAL_ONLY` resting state apart from a genuinely
         never-tracked local file's -- see that sweep's own comment for why.
+
+        `remote_size` (2026-08-19, `prompts/done/2026-08-19-autoqueue-requeues-imported-item.md`)
+        is what lets the grace period tell a *previously complete* item whose local content is
+        being taken apart from one whose **remote grew** (§3.2 rule 4) -- both read `PARTIAL`,
+        and only the second is genuinely re-queueable. See
+        `core/mount_sentinel.py.is_local_shrink`. Read from the same row the persist loop is
+        about to overwrite, so it is the *last persisted* remote total, i.e. the one the
+        previous state was computed against.
         """
         cursor = await self.db.execute(
-            "SELECT rel_path, state, substate, first_missing_at, remote_deleted_at, arr_status "
-            "FROM item WHERE queue_id = ?",
+            "SELECT rel_path, state, substate, first_missing_at, remote_deleted_at, arr_status, "
+            "remote_size FROM item WHERE queue_id = ?",
             (queue_id,),
         )
         rows = await cursor.fetchall()
@@ -1135,6 +1150,7 @@ class Engine:
                 row["first_missing_at"],
                 row["remote_deleted_at"],
                 row["arr_status"],
+                row["remote_size"],
             )
             for row in rows
         }
@@ -1238,7 +1254,9 @@ class Engine:
                 # exactly as absolute as it always was. `auto_queue_suppressed` itself is never
                 # touched by this branch -- see that function's own docstring for why the
                 # eligibility flag and the state text are deliberately two separate questions.
-                prev_state, _, _, _, _ = previous.get(rel_path, (None, None, None, None, None))
+                prev_state, _, _, _, _, _ = previous.get(
+                    rel_path, (None, None, None, None, None, None)
+                )
                 corrected_state = (
                     local_delete.reconsider_removed_state(
                         prev_state,
@@ -1288,7 +1306,8 @@ class Engine:
                 prev_first_missing_at,
                 prev_remote_deleted_at,
                 _prev_arr_status,
-            ) = previous.get(rel_path, (None, None, None, None, None))
+                prev_remote_size,
+            ) = previous.get(rel_path, (None, None, None, None, None, None))
             if postprocess.outcome_survives_rescan(
                 prev_state, node.structural_state, remote_deleted_at=prev_remote_deleted_at
             ):
@@ -1301,12 +1320,19 @@ class Engine:
                 # same reason the branch below clears it: local presence is not in question.
                 state, first_missing_at = prev_state, None
             else:
+                # `prev_remote_size`/`remote_size` (2026-08-19) open `resolve_absence`'s
+                # `PARTIAL` branch -- the *partial* half of the same local-absence grace period
+                # (§7.3), for a previously-complete item an importer is taking apart one file at
+                # a time. Passed only here, never in the vanished-row sweep below, which has no
+                # fresh structural reading at all and synthesizes `REMOTE_ONLY` on purpose.
                 override = mount_sentinel.resolve_absence(
                     prev_state=prev_state,
                     prev_first_missing_at=prev_first_missing_at,
                     structural_state=node.structural_state,
                     mount_ok=mount_ok,
                     now=now,
+                    prev_remote_size=prev_remote_size,
+                    remote_size=node.remote_size,
                 )
                 state = override[0] if override is not None else node.structural_state
                 first_missing_at = override[1] if override is not None else None
@@ -1439,6 +1465,7 @@ class Engine:
                 prev_first_missing_at,
                 _prev_remote_deleted_at,
                 prev_arr_status,
+                _prev_remote_size,
             ) = previous[rel_path]
             # 2026-08-15 (prompts/2026-08-15-cleaned-item-grace-visibility.md): a `move`-queue
             # item this codebase's own arr cleanup just cleaned rests at `prev_state ==

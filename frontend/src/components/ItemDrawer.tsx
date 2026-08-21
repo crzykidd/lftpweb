@@ -2,6 +2,7 @@ import { useVirtualizer } from '@tanstack/react-virtual'
 import { Fragment, useEffect, useMemo, useRef, useState } from 'react'
 import { getHistoryEvents, getHistoryJobs, getRemovalGraceSettings } from '../api/client'
 import type { FileNode, HistoryEventOut, HistoryJobOut, RemovalGraceSettingsOut } from '../api/types'
+import { childDisplayState, stateProgressPercent } from '../lib/fileTree'
 import {
   bothSidesRows,
   formatBytes,
@@ -13,6 +14,7 @@ import {
   removalGraceLabel,
 } from '../lib/format'
 import { averageSpeedBps, elapsedSeconds } from '../lib/transferTiming'
+import { EventsLinkButton } from './EventsLinkButton'
 import { StateChip } from './StateChip'
 
 const ROW_HEIGHT_PX = 40
@@ -377,9 +379,25 @@ function HistoryPanel({ itemId }: { itemId: number }) {
   )
 }
 
-function Row({ node, rootRelPath }: { node: FileNode; rootRelPath: string }) {
+function Row({
+  node,
+  rootRelPath,
+  jobRunning,
+}: {
+  node: FileNode
+  rootRelPath: string
+  // Whether this item's own job is currently running (2026-08-21, user's browser review: "the
+  // sidebar for active file ... it should show downloading and the chip should show progress.
+  // Not Partial") -- derived by `ItemDrawer` from `rootNode.state === 'DOWNLOADING'` (the
+  // top-level item's own persisted state while its job runs, `core/queue.py._spawn_decision`),
+  // not threaded in as a separate job prop: every row here already reads from `nodes`, which
+  // already carries that fact. See `childDisplayState` (`lib/fileTree.ts`) for the actual rule.
+  jobRunning: boolean
+}) {
   const label = node.rel_path === rootRelPath ? node.rel_path : node.rel_path.slice(rootRelPath.length + 1)
   const transferred = node.local_size ?? 0
+  const displayState = childDisplayState(node.state, jobRunning)
+  const percent = stateProgressPercent(displayState, node.local_size, node.remote_size)
   return (
     <div
       className="flex items-center gap-3 border-b border-zinc-100 px-3 text-sm dark:border-zinc-900"
@@ -396,7 +414,11 @@ function Row({ node, rootRelPath }: { node: FileNode; rootRelPath: string }) {
         {formatPercent(node.local_size, node.remote_size)}
       </span>
       <span className="w-28 shrink-0 text-right">
-        <StateChip state={node.state} />
+        {/* `percent` (2026-08-21, same review) -- this chip previously showed the bare state
+         * word with no fill at all, unlike `TransfersPage.tsx`'s Queue-row file-list expansion
+         * (`FileListRow`), which has always passed one. Both surfaces should read the same way
+         * for the same fact ("both surfaces must agree" -- see `childDisplayState`'s docstring). */}
+        <StateChip state={displayState} percent={percent} />
       </span>
     </div>
   )
@@ -429,6 +451,13 @@ export function ItemDrawer({
   // files (and excludes directories entirely). A directory's own size/mtime/lifecycle facts
   // live on its own row, matched by the exact rel_path the caller opened the drawer for.
   const rootNode = useMemo(() => nodes.find((n) => n.rel_path === rootRelPath) ?? null, [nodes, rootRelPath])
+  // Whether this item's own job is currently running (2026-08-21, `Row`'s own docstring above)
+  // -- read straight off `rootNode`, already fetched for the panels above, rather than a new
+  // job prop: the top-level item's own `state` is the one place `DOWNLOADING` is ever actually
+  // persisted (`core/queue.py._spawn_decision`), so this is true for exactly the child rows
+  // below whose job is live right now, whether this drawer was opened from `TransfersPage.tsx`
+  // (which has a `JobOut` to hand) or `FileTree.tsx` (which doesn't).
+  const jobRunning = rootNode?.state === 'DOWNLOADING'
   const scrollRef = useRef<HTMLDivElement>(null)
 
   const virtualizer = useVirtualizer({
@@ -483,13 +512,24 @@ export function ItemDrawer({
               {files.length} file{files.length === 1 ? '' : 's'}
             </p>
           </div>
-          <button
-            type="button"
-            onClick={onClose}
-            className="rounded-md border border-zinc-300 px-2.5 py-1 text-sm text-zinc-700 hover:bg-zinc-50 dark:border-zinc-700 dark:text-zinc-200 dark:hover:bg-zinc-900"
-          >
-            Close
-          </button>
+          <div className="flex shrink-0 items-center gap-3">
+            {/* The per-item Events deep link (2026-08-20, docs/transfers-redesign-spec.md §2,
+             * phase 1 stage 7) -- lives here, in the drawer's own header, rather than on the
+             * Files/Transfers row that opened it: both of those rows' layouts are already tight
+             * and browser-unverified (`FileTree.tsx`'s own "already tight... clipping" note;
+             * `TransfersPage.tsx`'s row-crowding fix), so adding a new element to either without
+             * a way to check the result is exactly the risk this avoids. The drawer is already
+             * the one shared surface both rows open on a single click (its own module comment,
+             * below), so this is always one click further from wherever this drawer was opened. */}
+            {itemId != null && <EventsLinkButton itemId={itemId} label={title} />}
+            <button
+              type="button"
+              onClick={onClose}
+              className="rounded-md border border-zinc-300 px-2.5 py-1 text-sm text-zinc-700 hover:bg-zinc-50 dark:border-zinc-700 dark:text-zinc-200 dark:hover:bg-zinc-900"
+            >
+              Close
+            </button>
+          </div>
         </div>
 
         {/* Both sides, the lifecycle chronology, and a little history -- all item-level
@@ -530,7 +570,7 @@ export function ItemDrawer({
                       transform: `translateY(${virtualRow.start}px)`,
                     }}
                   >
-                    <Row node={node} rootRelPath={rootRelPath} />
+                    <Row node={node} rootRelPath={rootRelPath} jobRunning={jobRunning} />
                   </div>
                 )
               })}

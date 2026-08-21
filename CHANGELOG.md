@@ -30,6 +30,326 @@ Skeleton for the next roll:
 ### Deprecated
 ### Removed
 
+## [0.3.0] — 2026-08-21
+
+### Added
+
+- **The Queue row's own chip fills and ticks again, and Preflight's "Waiting" chip now fills as
+  the remote client downloads**: the single-line Transfers row lost its state chip's percent when
+  it collapsed to one line (2026-08-15) — it's back (`Downloading 45%`, alongside the figure
+  column's own `45% · 40 MB/s · 25m left`, both shown deliberately). Preflight's *arr "Waiting"
+  chip gets its own fillable amber bucket (`WAITING`, `components/StateChip.tsx`), fed the *arr's
+  own `size`/`sizeleft` queue fields — visibility into a download happening entirely outside
+  lftpweb. `Settling` deliberately keeps no fill (its detail is its tooltip, not a bar); a row
+  with no size data from the *arr renders a plain chip, never `0%` or a fabricated bar.
+- **The Preflight box gains a second source (settle-gated releases) and a mount-gate banner**
+  (`docs/transfers-redesign-spec.md` §4, `prompts/2026-08-20-preflight-waiting-sources.md`): an
+  item that would be auto-queued right now if only its remote fingerprint had settled shows up
+  as a row with its known remote size (`remote — 22 GB`), alongside the existing *arr-sourced
+  rows — the settle gate held these releases back invisibly before, with no signal anywhere on
+  the Queue tab. When a settle row and an *arr row would describe the same release, the settle
+  row wins (it's confirmed bytes on the seedbox, not just a queue entry). A queue whose local
+  root fails the mount sentinel now also gets one banner line on the box naming the queue and
+  why — its entire auto-queue pass is skipped at once, so a row per affected item would bury the
+  one fact that matters. A suppressed item or a pattern-unmatched `REMOTE_ONLY` item still never
+  appears in Preflight from either source — nothing is coming for either, so showing them would
+  turn the box into a second Files tree.
+- **A name filter on the Transfers page**: start typing and only rows whose name contains that
+  text stay visible (case-insensitive, matches a dotted release name literally). A **"Dismiss
+  list"** button beside it bulk-dismisses exactly the finished rows the filter currently matches,
+  in one request — greyed out until the filter matches at least one dismissable row. The filter
+  itself doesn't persist across a reload, matching the Files page's own text filter and the Logs
+  filter.
+- **Per-row queue reordering on the Transfers page**: **▲ up one**, **▼ down one**, and **▲▲ to
+  top** on each queued row, replacing the previous single "Move to top" button
+  (`docs/transfers-redesign-spec.md` §3.4, phase 1 stage 2). One endpoint,
+  `POST /api/jobs/{id}/move`, backs all three. Disabled at the front/back of the global queue
+  order (the position number already says so); an out-of-turn request against the backend itself
+  (a second tab, a stale render) is a silent no-op rather than an error, and a job that started
+  running or finished between the page render and the click is rejected instead of silently
+  reordering a job whose bandwidth allocation is already fixed. The move's scope is global — now
+  that the Transfers page renders one flat, globally-ordered list (below), a move always swaps a
+  row with the one shown directly above/below it on screen.
+- **A short display name per queue** (Settings → Queues, `docs/transfers-redesign-spec.md` §3.6,
+  phase 1 stage 3): an optional, per-queue label (e.g. "DC-Movies" → "MOV") for the compact
+  per-row queue badge the Transfers page now renders (below). Trimmed at save time, capped at 10
+  characters, and not required to be unique — it's a display hint, not an identifier. Leaving it
+  blank falls back to the queue's full name.
+- **The Transfers page drops per-queue grouping for one globally-ordered list**
+  (`docs/transfers-redesign-spec.md` §3.1, phase 1 stage 4a) — `core/scheduler.py` has zero
+  references to `queue_id`; admission is one global line, and grouping visually implied each
+  queue had its own ordering, which was false. Each row now carries a compact queue badge (its
+  short name if set, else its full name, always in the row's `title`) and, for a job admitted
+  from the small-item fast lane, a **fast lane** marker explaining that it may start before a
+  lower-numbered main-lane job. This also resolves the stage-2 chevron oddity above: with
+  grouping gone, ▲/▼ always trade with the row directly on screen. The per-queue **Dismiss
+  Queue** button (v0.2.3) is **superseded, not merely deleted** — the name filter plus
+  **Dismiss list** does the same job: filter to a queue, dismiss the list. This reverses the
+  2026-08-16 "group rows by queue" decision; see `docs/decisions.md` for why.
+- **The Transfers page splits into two paginated boxes** (`docs/transfers-redesign-spec.md`
+  §3.2, phase 1 stage 4b): **Active / pending** (queued/running, client-side — the set is bounded
+  and already loaded) and **Complete** (finished, newest-finished first, **server-side** via the
+  new `GET /api/jobs/complete`), numbered pages, SAB-style. Rows shifting between pages as work
+  completes is expected, not a bug. The name filter now runs server-side for the Complete box (it
+  can no longer see everything client-side once it's paginated), and **Dismiss list** carries
+  that same filter text to the server (`dismiss_all_terminal`'s new `name_filter` scope) so it
+  dismisses every matching row across every page, not just the one currently on screen — the
+  id-list scope it used before this change could only ever name a single page's worth. An empty
+  filter result still dismisses nothing, never everything, the same guarantee the id-list scope
+  already gave. **Each box now also carries its own "Show 10/20/50" rows-per-page selector**
+  (2026-08-20, a follow-up from the user's first real look at the finished page,
+  `prompts/done/2026-08-20-transfers-page-size-selector.md`), independently remembered per
+  browser (`localStorage`, invalid/stale stored values fall back to the default). Both boxes now
+  default to **20** — the Complete box changes from a fixed 50, per the user's own call once they
+  saw it on screen ("50 is too many rows at once in practice"). Changing a box's size always
+  resets it to page 1 rather than trying to preserve scroll position or compute an equivalent
+  page.
+- **"Dismiss" moves into the Complete box header and becomes an outcome menu**
+  (2026-08-20, a follow-up to phase 1 stage 4b from the user's browser review,
+  `prompts/done/2026-08-20-transfers-dismiss-menu-and-counts.md`): the old page-top "Dismiss
+  all" button sat far from the rows it acted on ("the dismissall button should move down the
+  top of the completed section"); it's now a keyboard-navigable dropdown right there — **All**,
+  **Downloaded**, **Failed**, **Stopped** — reusing the site bandwidth "Start now" menu's own
+  popover pattern rather than a new one. **Folds in "Clear all failed"**, whose whole job is now
+  exactly "Dismiss → Failed" done server-side and atomically instead of a client-side
+  `Promise.allSettled` loop over each row. **The outcome filter composes with the name filter**
+  (both narrow the same set; `job_ids`/`queue_id` stay mutually exclusive with everything, as
+  before) — `DismissAllRequest` gains an `outcome` field and its mutual-exclusion validator is
+  restructured to allow that composition (see `docs/decisions.md`). An outcome matching zero
+  rows still dismisses nothing, never everything — the same guarantee `name_filter`'s own empty
+  match already gave, now extended to the composed case. Per-outcome counts aren't fetched (the
+  Complete box's total is server-paginated and doesn't have them cheaply available) — only
+  "All" shows a count, reusing the box's own already-known total.
+- **The Active/pending box gets the same "Page X of Y (Z total)" readout the Complete box
+  already had** (2026-08-20, same follow-up) — a real inconsistency the user's browser review
+  caught, not a design choice: the Complete box showed it unconditionally, the Active box showed
+  nothing. Both boxes now read it from one shared `lib/pagination.ts.pageReadout` so the wording
+  can't drift between them again. **The Active box's entire shell (header, empty state,
+  page-size selector, pager) now always renders**, matching the Complete box's own always-on
+  shell — previously an empty or fully-filtered Active box vanished outright, taking its
+  page-size selector with it.
+- **A directory row's expand panel on the Transfers page now shows per-file progress**
+  (`docs/transfers-redesign-spec.md` §3.3, phase 1 stage 5) — the thing the Files page was
+  previously the only way to see, moved to where the ordering lives. Expanding a row fetches its
+  files once (`GET /api/items/{id}/children`, capped at 500) and keeps them live from the same
+  WebSocket connection the page already has open, so expanding several rows at once never means
+  several independent polls. A `pget` (single-file) job has no children and doesn't offer this
+  group — its own progress is already the row's collapsed-line figure.
+- **Transfers is now the main nav section, with Queue and Files as tabs beneath it**
+  (`docs/transfers-redesign-spec.md` §2, phase 1 stage 6) — navigation only, nothing about
+  either page's rendering, fetching, filters, pagination, expansion, or actions changed. Files is
+  demoted, not removed or merged into Queue: it stays the only view of `REMOTE_ONLY` items that
+  never entered the pipeline (no pattern matched, or auto-queue was off), the only home for
+  Delete, and the only tree-shaped view of the remote. Queue (`/transfers/queue`) is the default
+  tab — "the working surface now" — and Files moves to `/transfers/files`; the old standalone
+  `/files` route now redirects there rather than 404ing. Each tab has its own URL, so it's
+  linkable and survives a reload, the same pattern Settings' and Docs' tabs already use
+  (`nav.ts.tabsForPath`).
+- **History becomes Events** (`docs/transfers-redesign-spec.md` §2, phase 1 stage 7, the last
+  stage of phase 1) — now the audit-event log only: every verify/extract/move outcome, every
+  remote delete, and every delete withheld, with the reason. Its own `job` list is gone; the
+  Queue tab's Complete box already covers "what finished, in what order" (stage 4b), so the two
+  were answering the same question. `/history` still resolves to this page (a redirect,
+  `App.tsx`) so nothing that links or bookmarks the old path breaks — the same pattern stage 6
+  set for `/files` → `/transfers/files`.
+- **A per-item Events deep link, in the item drawer's own header** — one click to the full,
+  unbounded, filterable event log for exactly this item, pre-filtered via the URL (`?item_id=`)
+  so the resulting view is linkable, reloadable, and back-button friendly. The Events page shows
+  plainly when it's filtered this way, with one click back to the unfiltered log.
+- **"Mark complete" / "Mark failed" on an in-flight Transfers row**, with **Undo** — the manual
+  escape hatch for a release that has genuinely wedged somewhere in its pipeline. **It is a
+  classification only**: it files the row under Complete and does nothing else. It never deletes
+  the seedbox source, is never read as a confirmed Sonarr/Radarr import, and never triggers
+  post-processing, notify, or cleanup — a source delete is irreversible and still waits on real,
+  twice-confirmed evidence, never on a button click. Every resolution is written to the Events
+  log, and the row carries a **Marked complete**/**Marked failed** chip so it never quietly
+  reads as a normal completion.
+- **A site-wide Pause control at the top of the Transfers → Queue tab** (`prompts/2026-08-20-
+  queue-pause.md`): **Pause after current** leaves running transfers alone and admits nothing
+  new; **Pause now** additionally stops every in-flight transfer and returns each one to
+  `queued` at its same position, ready to resume — not restart — from the same bytes once
+  unpaused. Deliberately **not** the same thing as Stop: a paused-now item never carries
+  `auto_queue_suppressed` and never reads `STOPPED`/`FAILED`, so nothing needs a manual re-queue
+  to come back. Auto-queue, manual Queue clicks, reaping, post-processing, and scanning all keep
+  running while paused — only admission itself stops — and reordering (the ▲/▼/▲▲ chevrons)
+  stays fully live, which is the point: pause, rearrange the queue, then unpause. Persisted
+  across a restart. An unmistakable amber banner marks the paused state on the Queue tab, and
+  the header bar's health readout gets a matching **● queue paused** badge. "Start now" is
+  disabled (with a reason in the tooltip) and rejected server-side (409) while paused.
+- **A "Preflight" box at the top of the Transfers → Queue tab** (`docs/transfers-redesign-spec.md`
+  §4, prefigured) — things a bound *arr instance already knows about that haven't reached this
+  seedbox's completed folder yet, so there is nothing here for lftpweb to do work on. **A pure
+  projection of the *arr poller's own latest ~60s poll — no table, no migration, nothing
+  persisted**: a release that drops out of the *arr's queue simply stops being projected, with a
+  brief flap-tolerance hold (150s) so a single missed poll (the same SABnzbd blank-queue blip
+  behind the amber `dropped` state) doesn't blink a row out and back. Attribution is
+  `arr_visible_path` prefix-matching a record's `outputPath` against each bound queue; a record
+  matching no queue is silently omitted (never a guess), and a record that already matches a
+  real lftpweb item never appears here at all, so a release is never visible twice at once. Five
+  rows by default, expandable and paged (reusing the existing pager) past that; zero rows reads
+  as a single "Nothing in preflight." line rather than reserved empty space, and the whole box
+  disappears when no source is configured. Rows are inert by construction — no queue position,
+  no chevrons, no Dismiss/Start now/Stop — there is no `item` and no `job` behind one yet. The
+  row/box shape (`core/preflight.py`) is deliberately source-agnostic: the *arr poller is the
+  only source wired up so far, ahead of an already-planned settle-gate source as a follow-up.
+- **Preflight rows now read as the top of the same table as Active/pending and Complete**, from
+  the user's first browser look at the shipped box: *"we missed the remaining time on the
+  preflight list. and we moved the columns around. it should still have the tag and the column
+  for status on arr icon. arr icon is at the first of the line now."* Column order now mirrors
+  every other Transfers row — queue tag, title, state chip, *arr chip, then a right-aligned
+  figure — instead of leading with the *arr logo and carrying no queue tag at all (added:
+  `PreflightRow` now carries the bound queue's own name/short-name, so it can show the identical
+  tag every other row does). An *arr row now shows its remaining time too, parsed from the *arr's
+  own `timeleft`, through the same "`<duration> left`" figure the Transfers row already uses for
+  its own ETA — omitted whenever the *arr has no meaningful estimate (a paused/stalled download
+  client item), never a fabricated or zero figure. Every row's chip is now rendered through the
+  same `StateChip` component the rest of the app uses — the box previously hand-rolled a flat
+  grey span, which is why "Settling" read as a different kind of thing from everywhere else it
+  appears; it now gets `StateChip`'s existing amber, the same colour a Preflight row gets
+  regardless of source, since every row here is "waiting," whatever it's waiting on. An *arr
+  row's chip also now speaks lftpweb's own vocabulary instead of the *arr's raw wire word — the
+  *arr's own `"downloading"` becomes **"Waiting"** (renamed again just below, from an interim
+  "Waiting for download"; lftpweb is doing nothing here, just watching the *arr's own download
+  client work) and `"importing"` becomes **"Importing"**; the *arr's own detail moves to the
+  chip's tooltip instead — `Downloading from "<download client>" — reported by <instance>`.
+- **The *arr chip's label shortens to "Waiting", the Settling chip gets a tooltip of its own,
+  and the Preflight box gains a "Show 5/10/20" page-size selector** — three follow-ups from the
+  user's live browser review. *"Waiting for download"* still read as ambiguous ("lftpweb is
+  waiting to download it" vs. "waiting for the download client to finish"); after considering
+  "Waiting for remote client" and asking to shorten it, the user picked **"Waiting"** — seven
+  characters, matching sibling chip `Settling` in shape (one word, present tense), and saying
+  nothing about *where* since the *arr brand logo, the box's own name, and the existing tooltip
+  already carry that. The `Settling` chip was the one asymmetry left — no tooltip at all — so it
+  now gets one too, reusing `lib/format.ts.settleWaitLabel` **verbatim** (the same "Waiting for
+  changes — 1 of 2 scans, 35s of 60s" sentence the Files tree and the lifecycle R-icon tooltip
+  already share) rather than a third copy of that wording; `PreflightRow` carries the settle
+  gate's own `matched_scans`/`updated_at` pair (generic `wait_scans`/`wait_since` fields, unset
+  for an *arr row) so the countdown stays live between polls instead of freezing at a pre-baked
+  string. Finally, the box's own "Show all (N)" expand-then-page toggle is replaced outright by
+  a persisted **5/10/20** selector (`preflight.pageSize`), matching the "we should have a drop
+  down on preflight like the rest" request — smaller than the other two boxes' 10/20/50 since
+  this box is smaller by intent, reusing the same `Pager`/`pageReadout` and a `PageSizeSelect`
+  now shared with the Active/Complete boxes rather than a second independent control.
+
+### Changed
+
+- **The Transfers page's two boxes now split on *pipeline* completion, not on the transfer
+  exiting** (`docs/transfers-redesign-spec.md` §3.2) — the user's own report: *"Shouldn't a job
+  live in that state until the sonarr/radarr hook lands if they are enabled? Currently they move
+  to complete but they technically aren't."* A release's work continues well past lftp:
+  verifying, extracting, the move out of staging, waiting for the *arr to actually import it, and
+  deleting the seedbox source. Those rows now stay under **Active / pending** and **say what
+  they're waiting on** — *Verifying*, *Extracting*, *Processing*, *Awaiting import*, *Deleting
+  source* — instead of sitting under Complete while the release plainly wasn't. Applied to every
+  queue, whether or not it's bound to a Sonarr/Radarr instance: one definition of "done".
+  Nothing can get stuck there — disabling an *arr instance immediately releases everything
+  waiting on it, a post-processing step that died with the app doesn't hold a row, and every
+  remaining wait is time-bounded. A row that's still in flight can no longer be dismissed
+  (including by the bulk Dismiss menu), since dismissing something still being worked on would
+  make it vanish from both boxes at once; use "Mark complete"/"Mark failed" if it really is
+  stuck. In-flight rows sort next to the running ones rather than beneath the whole queued
+  backlog.
+
+- **The transfer queue's ordering internals moved from a `rank`/boost scheme to a dense
+  `queue_position` model** (migration 023, `docs/transfers-redesign-spec.md` §3.4/§3.5,
+  phase 1 stage 1) — the prerequisite for the upcoming per-row "move up one / down one"
+  reordering. No user-visible change on its own: existing queues are backfilled in the same
+  order they'd have run in before, "Move to top" behaves identically, and the v0.2.6
+  startup-rescue ordering (re-queuing an interrupted item back to its original place in line)
+  was re-derived and re-proven by test rather than merely ported.
+
+### Fixed
+
+- **A handed-over release now disappears from Preflight within a few seconds, not 20-30s and
+  sometimes longer.** From the user's browser review: "it does take 20-30 seconds for items to
+  be removed from preflight after it shows in active — sometimes it is fast and sometimes it is
+  slow." The variance was the tell: the previous evict-on-handover fix (below) removed the 150s
+  flap-tolerance hold, but retirement was still only *decided* once per *arr poll pass
+  (`ArrSettings.poll_interval_s`, 60s default) — an item landing right after a poll waited nearly
+  a full interval, one landing right before felt instant, plus the frontend's own 15s poll on
+  top. The underlying question, "does a matching `item` exist now," is purely local state, so
+  `ArrSyncScheduler.preflight_rows` (now `async`) re-asks it on every `GET /api/queue/preflight`
+  call rather than only on the next poll — the same `_record_matches_any_item` predicate
+  `_preflight_candidates` already used, extracted into one shared function so the two paths can
+  never drift. The frontend's own poll also drops from 15s to 5s (`hooks/usePreflight.ts`), now
+  the dominant remaining delay since the endpoint itself is no longer bounded by the *arr's own
+  cadence. Flap tolerance (a merely-absent row still held for the full 150s) and the settle
+  source (unaffected, still a wholesale per-scan replace) are both unchanged. *arr poll rate
+  itself is untouched — this needed no more requests to the *arr, only a cheap local re-check.
+- **A handed-over release no longer lingers in Preflight for up to 150s alongside its own new
+  Active/pending row.** Found by reading the code, not observed in a browser: `core/arrsync.py`'s
+  Preflight cache couldn't tell "this record just matched a real lftpweb item" (a known, terminal
+  reason to stop showing it) apart from "the *arr's report simply didn't mention it this pass"
+  (the SABnzbd blank-queue blip the cache's flap-tolerance hold exists to absorb) — both looked
+  identical to the hold, so a just-handed-over release sat duplicated in both boxes until the
+  150s hold expired. `PreflightHold.update` now takes a `retired` set alongside the rows it still
+  sees, and evicts anything in it immediately; a record that's merely missing still gets the full
+  150s tolerance, unchanged. The settle-gated source was never affected — it replaces its rows
+  wholesale on every scan pass rather than using this hold at all, which this incident is the
+  concrete evidence for having been the right call.
+- **Auto-queue no longer re-downloads a release the *arr has just imported.** Found in
+  production on a `move` queue bound to Sonarr: an item finished, post-processing renamed it and
+  told Sonarr to scan, and Sonarr began moving the media file into the library — leaving the
+  release directory reading `PARTIAL`, which auto-queue treated as "an interrupted transfer,
+  pick it back up." The re-queued job sat in the queue until a slot freed, by which time the
+  seedbox source had been deleted on the confirmed import, so it failed `REMOTE_GONE` on zero
+  bytes; worse, while it waited it blocked the *arr cleanup for the whole time (97 minutes, in
+  one of the two observed cases). Two independent fixes: the ~10-minute local-absence grace
+  period now covers a *partial* loss of local content, not only a total one — keyed strictly on
+  "was complete, and the remote total is unchanged, and local shrank", so a genuinely
+  interrupted transfer still resumes on the very next pass and a release whose remote *grew* is
+  still fetched immediately — and auto-queue now skips any item whose bound *arr has already
+  been handed it (`arr_status` of `notified`, `imported`, or `cleaned`), which has no time bound
+  and so also covers a slow import like a 38-episode season pack. A manual Queue click is
+  unaffected by either. Not fully closed: on a queue with **no** *arr binding, an external
+  removal that takes longer than the grace window can still trigger one re-queue — see README's
+  "Known gaps."
+- **Support bundle *arr log fetch now spends its per-instance budget on the newest files, not
+  the biggest stale ones.** The fetch order was a filename/rotation-suffix sort, which orders
+  correctly *within* one log series (`sonarr.*`, `sonarr.debug.*`, `sonarr.trace.*`) but
+  interleaves *across* series purely by name — a dormant debug/trace series' own stale files
+  could sort ahead of a live series' current file. Seen in production: a ~20 MB budget was
+  spent entirely on three files from a switched-off debug/trace session, all nine days stale,
+  while the files covering the actual incident window were dropped. Now sorted by the *arr's
+  own reported `lastWriteTime`, newest first, across every series at once; a file with no
+  usable timestamp sorts last, never first. `TRUNCATED.txt` now lists a last-modified timestamp
+  for both the fetched and the skipped files.
+- **A file actively being written now reads "Downloading," not "Partial," in both the Queue
+  row's file-list expansion and the item drawer.** The user's browser review: *"the sidebar for
+  active file ... I think it should show downloading and the chip should show progress. Not
+  Partial."* A leaf file inside a mirroring directory never gets a persisted `state` of
+  `DOWNLOADING` itself (only its parent job's own top-level item does) — its state caps at
+  `PARTIAL`/`DOWNLOADED`, which is structurally correct but misleading to read while lftp is
+  actively writing it. A new shared helper, `childDisplayState`
+  (`frontend/src/lib/fileTree.ts`), maps a child to `DOWNLOADING` only when it is **both**
+  currently `PARTIAL` **and** owned by a job that is currently `running` — not every child of a
+  running job, since a `mirror` works through a release's files progressively and most children
+  are complete or untouched at any given moment. Both surfaces (`TransfersPage.tsx`'s
+  `FileListRow`, `ItemDrawer.tsx`'s `Row`) call the one function, so they can't drift; the
+  drawer's chip also gains the progress-fill bar the Queue-row expansion already had. Display
+  only — `item.state` and the backend state machine are unchanged.
+- **The Active box no longer pads itself out to roughly five empty rows when nothing is
+  transferring.** The user's browser review: *"Active box shrinks to one row when 1 active item.
+  then expands to 5 rows when nothing is going on ... We should keep this at one row always and
+  only expand when we have more rows."* The empty state was a fixed-height (`h-40`) dashed
+  panel — the emptiest state took the most room, pushing the Complete box down. The Complete box
+  shared the identical panel for its own "nothing finished yet"/filter-empty states, so it had
+  the same defect. Both now render a single line, matching the rule already applied to the
+  Preflight box ("Nothing in preflight.") rather than inventing a second empty-state idiom.
+
+### Security
+### Deprecated
+
+### Removed
+
+- **The old History page's job list** (`docs/transfers-redesign-spec.md` §2, phase 1 stage 7) —
+  superseded by the Queue tab's Complete box (stage 4b). One consequence named rather than
+  hidden (README's Known gaps): a dismissed job no longer appears on any list page. Its `job`
+  row is untouched — dismissal was always display-only — and stays reachable one item at a time
+  from that item's own drawer, but nothing lists every dismissed job across the whole install
+  any longer. The underlying `GET`/`DELETE /api/history/jobs*` endpoints are unaffected —
+  `docs/decisions.md` records why they're staying.
+
 ## [0.2.6] — 2026-08-18
 
 ### Added

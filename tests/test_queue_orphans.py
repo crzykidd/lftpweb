@@ -596,22 +596,34 @@ async def test_stranded_downloaded_item_from_an_earlier_restart_is_requeued(db, 
 
 async def _admission_order_item_ids(db) -> list[int]:
     """The exact ordering query `_admit` uses (`core/queue.py`) -- deliberately not a
-    re-implementation of `rank DESC, queued_at ASC`, so this test fails if that query itself
+    re-implementation of `queue_position ASC, id ASC`, so this test fails if that query itself
     ever changes rather than only if a second, independent copy of the sort does.
+
+    2026-08-19 (docs/transfers-redesign-spec.md §3.4): was `rank DESC, queued_at ASC` before the
+    position model replaced it as the queue's ordering key.
     """
     cursor = await db.execute(
         "SELECT job.item_id FROM job WHERE job.state = 'queued' "
-        "ORDER BY job.rank DESC, job.queued_at ASC"
+        "ORDER BY COALESCE(job.queue_position, 1e18) ASC, job.id ASC"
     )
     rows = await cursor.fetchall()
     return [r["item_id"] for r in rows]
 
 
 async def test_requeued_interrupted_item_keeps_its_original_queue_position(db, tmp_path):
-    """The production scenario itself: an item that was actively downloading (hence `running`,
-    hence among the *oldest* jobs by definition) must resume ahead of items that were merely
-    `queued` (never started) with newer -- but still older-than-now -- timestamps, once the
-    interrupted job's original `queued_at` is preserved rather than replaced with a fresh now().
+    """The production scenario itself, and the acceptance criterion for the position-model
+    refactor (2026-08-19, docs/transfers-redesign-spec.md §3.4/§3.5): an item that was actively
+    downloading (hence `running`, hence among the *oldest* jobs by definition) must resume ahead
+    of items that were merely `queued` (never started) with newer -- but still older-than-now --
+    timestamps.
+
+    Before the position model, this worked because the interrupted job's original `queued_at`
+    was preserved and `rank DESC, queued_at ASC` sorted purely on it within the (rank-0) natural
+    zone. Under `queue_position ASC`, `_rescue_position` must re-derive the equivalent *place* --
+    this test proves it does, by giving the two "merely queued" jobs the `queue_position` values
+    a real migration/insert history would already have given them (ascending, matching their own
+    `queued_at` order -- `mid` before `new`), then checking the rescued job's fresh position
+    lands strictly between "nothing" (it's earliest) and `mid`.
     """
     local_dir = tmp_path / "local"
     local_dir.mkdir()
@@ -632,21 +644,24 @@ async def test_requeued_interrupted_item_keeps_its_original_queue_position(db, t
 
     # Two items that were merely queued (never started) at restart, with their own older-than-
     # now but newer-than-the-interrupted-job timestamps -- exactly the "everything that hadn't
-    # even started" the incident describes.
+    # even started" the incident describes. `queue_position` set ascending to match, as a real
+    # backfill/insert history already would have.
     mid_item_id = await _make_item_row(
         db, queue_id, "Was.Queued.Mid", is_dir=True, remote_size=1000
     )
     await db.execute(
-        "INSERT INTO job (item_id, kind, state, lane, rank, attempt, forced_full_rate, queued_at) "
-        "VALUES (?, 'mirror', 'queued', 'main', 0, 1, 0, '2020-06-01T00:00:00.000000Z')",
+        "INSERT INTO job (item_id, kind, state, lane, rank, attempt, forced_full_rate, queued_at, "
+        "queue_position) VALUES (?, 'mirror', 'queued', 'main', 0, 1, 0, "
+        "'2020-06-01T00:00:00.000000Z', 2.0)",
         (mid_item_id,),
     )
     new_item_id = await _make_item_row(
         db, queue_id, "Was.Queued.New", is_dir=True, remote_size=1000
     )
     await db.execute(
-        "INSERT INTO job (item_id, kind, state, lane, rank, attempt, forced_full_rate, queued_at) "
-        "VALUES (?, 'mirror', 'queued', 'main', 0, 1, 0, '2020-07-01T00:00:00.000000Z')",
+        "INSERT INTO job (item_id, kind, state, lane, rank, attempt, forced_full_rate, queued_at, "
+        "queue_position) VALUES (?, 'mirror', 'queued', 'main', 0, 1, 0, "
+        "'2020-07-01T00:00:00.000000Z', 3.0)",
         (new_item_id,),
     )
     await db.commit()
@@ -656,17 +671,95 @@ async def test_requeued_interrupted_item_keeps_its_original_queue_position(db, t
 
     order = await _admission_order_item_ids(db)
     assert order == [old_item_id, mid_item_id, new_item_id], (
-        "the re-queued interrupted item must be admitted first, backdated to its original "
-        "queued_at -- not last, behind items that had merely been queued"
+        "the re-queued interrupted item must be admitted first, re-positioned to where its "
+        "original queued_at would have placed it -- not last, behind items that had merely "
+        "been queued"
     )
 
-    # The re-queued row's own `queued_at` must equal the interrupted job's, not today's now().
+    # The re-queued row's own `queued_at` must equal the interrupted job's, not today's now()
+    # -- unaffected by the position-model refactor, still the queued-wait readout's source.
     requeued = await (
         await db.execute(
-            "SELECT queued_at FROM job WHERE item_id = ? AND state = 'queued'", (old_item_id,)
+            "SELECT queued_at, queue_position FROM job WHERE item_id = ? AND state = 'queued'",
+            (old_item_id,),
         )
     ).fetchone()
     assert requeued["queued_at"] == "2020-01-01T00:00:00.000000Z"
+    # No natural-zone job has an older queued_at, and there are no boosted jobs -- the rescued
+    # job belongs immediately before `mid` (position 2.0): position_between(None, 2.0) == 1.0.
+    assert requeued["queue_position"] == 1.0
+
+
+async def test_requeued_interrupted_item_never_lands_ahead_of_a_boosted_job_with_a_later_queued_at(
+    db, tmp_path
+):
+    """The counterexample `_rescue_position`'s "exclude boosted jobs from the neighbour search"
+    rule exists to rule out (2026-08-19, this task): a job that was explicitly "moved to top"
+    can have *any* `queued_at` at all -- including one *after* the rescued job's original
+    timestamp, which would make it look like a valid "right neighbour" under a naive comparison
+    across every queued job, not just the natural zone.
+
+    Setup: `boosted` was moved to top long ago (`rank = 1`, `queue_position = -3.0`, deliberately
+    far to the front) but was originally queued *after* `old` (the item being rescued) --
+    `boosted.queued_at` is *later* than `old`'s original `queued_at`. A `natural` job sits behind
+    it. A naive search that didn't exclude boosted jobs would pick `boosted` as the "right
+    neighbour" (smallest `queue_position` among jobs with `queued_at > old`'s) and compute
+    `position_between(None, -3.0) == -4.0` -- landing the rescued job *ahead* of an explicit
+    Move to top. The correct result instead picks `natural` as the right neighbour and lands
+    `old` behind `boosted`, exactly as the acceptance criterion (§5) requires.
+    """
+    local_dir = tmp_path / "local"
+    local_dir.mkdir()
+    write_if_needed(str(local_dir))
+    host_id = await _make_host_row(db)
+    queue_id = await _make_queue_row(db, host_id, local_dir)
+
+    old_item_id = await _make_item_row(
+        db, queue_id, "Was.Downloading", is_dir=True, remote_size=1000
+    )
+    await db.execute("UPDATE item SET state = 'DOWNLOADING' WHERE id = ?", (old_item_id,))
+    await db.execute(
+        "INSERT INTO job (item_id, kind, state, lane, rank, attempt, forced_full_rate, queued_at) "
+        "VALUES (?, 'mirror', 'running', 'main', 0, 1, 0, '2020-03-01T00:00:00.000000Z')",
+        (old_item_id,),
+    )
+
+    boosted_item_id = await _make_item_row(db, queue_id, "Boosted", is_dir=True, remote_size=1000)
+    await db.execute(
+        "INSERT INTO job (item_id, kind, state, lane, rank, attempt, forced_full_rate, queued_at, "
+        "queue_position) VALUES (?, 'mirror', 'queued', 'main', 1, 1, 0, "
+        "'2020-06-01T00:00:00.000000Z', -3.0)",
+        (boosted_item_id,),
+    )
+
+    natural_item_id = await _make_item_row(db, queue_id, "Natural", is_dir=True, remote_size=1000)
+    await db.execute(
+        "INSERT INTO job (item_id, kind, state, lane, rank, attempt, forced_full_rate, queued_at, "
+        "queue_position) VALUES (?, 'mirror', 'queued', 'main', 0, 1, 0, "
+        "'2020-07-01T00:00:00.000000Z', 5.0)",
+        (natural_item_id,),
+    )
+    await db.commit()
+
+    q = await _queue_for(db, tmp_path)
+    await q._reconcile_orphaned_jobs()
+
+    order = await _admission_order_item_ids(db)
+    assert order == [boosted_item_id, old_item_id, natural_item_id], (
+        "the rescued job must never land ahead of the explicitly-boosted job, regardless of "
+        "either job's queued_at"
+    )
+
+    requeued = await (
+        await db.execute(
+            "SELECT queue_position FROM job WHERE item_id = ? AND state = 'queued'",
+            (old_item_id,),
+        )
+    ).fetchone()
+    # position_between(boosted_max=-3.0, right=5.0) == 1.0 -- the correct midpoint, not the
+    # naive (and wrong) position_between(None, -3.0) == -4.0 a comparison including `boosted`
+    # would have produced.
+    assert requeued["queue_position"] == 1.0
 
 
 async def test_enqueue_item_without_override_still_stamps_now(db, tmp_path):

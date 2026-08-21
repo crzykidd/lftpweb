@@ -69,12 +69,15 @@ class _Recorder:
         return item_id
 
 
-def _mounted_config(queue_id, local_path, *, enabled=True, patterns_only=False, name="q"):
+def _mounted_config(
+    queue_id, local_path, *, enabled=True, patterns_only=False, name="q", short_name=None
+):
     # `name="q"` matches `_make_queue`'s own hardcoded queue name -- see `QueueAutoConfig`'s own
     # docstring for why `on_scan`'s mount-gate audit events need it at all.
     return QueueAutoConfig(
         id=queue_id,
         name=name,
+        short_name=short_name,
         local_path=str(local_path),
         auto_queue_enabled=enabled,
         patterns_only=patterns_only,
@@ -372,6 +375,77 @@ async def test_re_download_externally_removed_setting_never_resurrects_our_own_d
     queued = await aq.on_scan(_mounted_config(queue_id, tmp_path))
     assert queued == 0
     assert recorder.enqueued == []
+
+
+# --- The *arr hand-off gate (2026-08-19) ---------------------------------------------------
+#
+# `prompts/done/2026-08-19-autoqueue-requeues-imported-item.md`, production v0.2.6: a `move`
+# queue bound to Sonarr re-queued a release seconds after its own transfer succeeded, because
+# the importer moving the media file out left the release directory reading `PARTIAL` -- an
+# eligible state. The job then waited for a slot (97 minutes, in the worse of the two cases),
+# blocked `core/arrsync.py._maybe_cleanup` the whole time, and failed `REMOTE_GONE`.
+
+
+@pytest.mark.parametrize("arr_status", ["notified", "imported", "cleaned"])
+@pytest.mark.parametrize("state", ["REMOTE_ONLY", "PARTIAL"])
+async def test_an_item_the_arr_already_has_is_never_auto_queued(db, tmp_path, arr_status, state):
+    """No time bound, deliberately: the grace period in `core/mount_sentinel.py` covers the
+    seconds-long import, but a 38-episode season pack took ~19 minutes to move out -- longer
+    than the window -- so the general fix alone would have released it and re-queued it anyway.
+    Both eligible states are covered because the incident produced `PARTIAL` and the same shape
+    reaches `REMOTE_ONLY` once the last file leaves.
+    """
+    from lftpweb.core.mount_sentinel import write_if_needed
+
+    write_if_needed(str(tmp_path))
+    queue_id = await _make_queue(db, tmp_path)
+    item_id = await _make_item(db, queue_id, "Release.One", state=state)
+    await db.execute("UPDATE item SET arr_status = ? WHERE id = ?", (arr_status, item_id))
+    await db.commit()
+    recorder = _Recorder()
+    aq = AutoQueue(db, recorder)
+
+    assert await aq.on_scan(_mounted_config(queue_id, tmp_path)) == 0
+    assert recorder.enqueued == []
+
+
+@pytest.mark.parametrize("arr_status", ["detected", "dropped", "gone"])
+async def test_an_arr_status_that_predates_the_hand_off_stays_eligible(db, tmp_path, arr_status):
+    """**The load-bearing half.** `detected` is written by `core/arrsync.py._match_items` as
+    soon as the *arr's own download client reports the release on the seedbox -- long before
+    lftpweb has fetched a single byte -- so making it ineligible would stop auto-queue fetching
+    *arr-tracked releases at all. `dropped`/`gone` are reachable for an item lftpweb never
+    finished (or never started) too.
+    """
+    from lftpweb.core.mount_sentinel import write_if_needed
+
+    write_if_needed(str(tmp_path))
+    queue_id = await _make_queue(db, tmp_path)
+    item_id = await _make_item(db, queue_id, "Release.One")
+    await db.execute("UPDATE item SET arr_status = ? WHERE id = ?", (arr_status, item_id))
+    await db.commit()
+    recorder = _Recorder()
+    aq = AutoQueue(db, recorder)
+
+    assert await aq.on_scan(_mounted_config(queue_id, tmp_path)) == 1
+    assert recorder.enqueued == [item_id]
+
+
+async def test_an_untracked_item_with_a_null_arr_status_is_unaffected(db, tmp_path):
+    """SQLite's `NOT IN` over a NULL left-hand side is NULL, not true -- without the `COALESCE`
+    in the eligibility query this clause would silently exclude every item on every queue that
+    isn't bound to an *arr at all, i.e. the default install.
+    """
+    from lftpweb.core.mount_sentinel import write_if_needed
+
+    write_if_needed(str(tmp_path))
+    queue_id = await _make_queue(db, tmp_path)
+    item_id = await _make_item(db, queue_id, "Release.One")
+    recorder = _Recorder()
+    aq = AutoQueue(db, recorder)
+
+    assert await aq.on_scan(_mounted_config(queue_id, tmp_path)) == 1
+    assert recorder.enqueued == [item_id]
 
 
 async def test_manual_clear_of_suppression_makes_a_stopped_item_eligible_again(db, tmp_path):
@@ -674,3 +748,284 @@ async def test_settle_gate_on_with_no_settle_row_yet_is_conservative(db, tmp_pat
     queued = await aq.on_scan(_mounted_config(queue_id, tmp_path))
     assert queued == 0
     assert recorder.enqueued == []
+
+
+# --- Preflight (this task, prompts/2026-08-20-preflight-waiting-sources.md) -- the settle
+# gate's own eligibility check above, projected as the Preflight box's second source ----------
+
+
+async def test_settle_gated_item_projects_a_preflight_row(db, tmp_path):
+    """The "IN" case this task names: an item that would be auto-queued this very pass if only
+    its remote fingerprint had held still earns a `source='settle'` row, carrying the item's own
+    known remote size (`remote — 22 GB`'s shape) and nothing "left" -- it is already fully
+    present remotely.
+    """
+    from lftpweb.core.mount_sentinel import write_if_needed
+    from lftpweb.core.settle import SettleSettings, save_settle_settings
+
+    await save_settle_settings(db, SettleSettings(enabled=True))
+    write_if_needed(str(tmp_path))
+    queue_id = await _make_queue(db, tmp_path)
+    await _make_item(db, queue_id, "Release.One")
+    await _set_settle_record(db, queue_id, "Release.One", matched_scans=1)  # not yet settled
+    aq = AutoQueue(db, _Recorder())
+
+    queued = await aq.on_scan(_mounted_config(queue_id, tmp_path))
+    assert queued == 0
+
+    rows = aq.preflight_rows({queue_id})
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.source == "settle"
+    assert row.queue_id == queue_id
+    assert row.title == "Release.One"
+    assert row.status_label == "Settling"
+    assert row.source_label == "q"  # `_make_queue`'s own hardcoded queue name
+    assert row.source_kind is None
+    assert row.size_bytes == 100  # `_make_item`'s own hardcoded remote_size
+    assert row.size_remaining_bytes is None
+    # The tooltip's own inputs (2026-08-21, "the settling chip should have a mouseover that
+    # shows time details") -- read straight off the same `item_settle` row `_set_settle_record`
+    # just wrote, via `settle.settle_progress_in_db`.
+    assert row.wait_scans == 1
+    assert row.wait_since is not None
+
+
+async def test_settle_gated_item_with_no_settle_row_yet_projects_wait_fields_as_none(db, tmp_path):
+    """An item with no `item_settle` row yet (the settle-aware scan path hasn't run for it) is
+    still gated conservatively (`test_settle_gate_on_with_no_settle_row_yet_is_conservative`),
+    but there is genuinely nothing to report for the tooltip's own inputs -- both fall through
+    to `None` together, never a fabricated pair.
+    """
+    from lftpweb.core.mount_sentinel import write_if_needed
+    from lftpweb.core.settle import SettleSettings, save_settle_settings
+
+    await save_settle_settings(db, SettleSettings(enabled=True))
+    write_if_needed(str(tmp_path))
+    queue_id = await _make_queue(db, tmp_path)
+    await _make_item(db, queue_id, "Release.One")
+    aq = AutoQueue(db, _Recorder())
+
+    queued = await aq.on_scan(_mounted_config(queue_id, tmp_path))
+    assert queued == 0
+
+    rows = aq.preflight_rows({queue_id})
+    assert len(rows) == 1
+    assert rows[0].wait_scans is None
+    assert rows[0].wait_since is None
+
+
+async def test_settled_item_does_not_project_a_row(db, tmp_path):
+    """The instant the gate releases an item, it stops being projected -- a settled item is
+    actually enqueued this same pass, not merely no-longer-gated.
+    """
+    from lftpweb.core.mount_sentinel import write_if_needed
+    from lftpweb.core.settle import SettleSettings, save_settle_settings
+
+    await save_settle_settings(db, SettleSettings(enabled=True))
+    write_if_needed(str(tmp_path))
+    queue_id = await _make_queue(db, tmp_path)
+    await _make_item(db, queue_id, "Release.One")
+    await _set_settle_record(db, queue_id, "Release.One", matched_scans=2, updated_at=_LONG_AGO)
+    aq = AutoQueue(db, _Recorder())
+
+    queued = await aq.on_scan(_mounted_config(queue_id, tmp_path))
+    assert queued == 1
+    assert aq.preflight_rows({queue_id}) == []
+
+
+async def test_settle_disabled_never_projects_a_row_even_though_unsettled(db, tmp_path):
+    from lftpweb.core.mount_sentinel import write_if_needed
+
+    # `db` fixture already disables the settle gate -- see its own comment.
+    write_if_needed(str(tmp_path))
+    queue_id = await _make_queue(db, tmp_path)
+    await _make_item(db, queue_id, "Release.One")
+    await _set_settle_record(db, queue_id, "Release.One", matched_scans=1)
+    aq = AutoQueue(db, _Recorder())
+
+    queued = await aq.on_scan(_mounted_config(queue_id, tmp_path))
+    assert queued == 1, "settle off -- nothing holds this item back"
+    assert aq.preflight_rows({queue_id}) == []
+
+
+async def test_suppressed_item_never_appears_in_settle_preflight(db, tmp_path):
+    """The first OUT exclusion this task names: a suppressed item is not waiting -- nothing is
+    coming for it -- so it must never earn a settle-preflight row, even while genuinely
+    unsettled.
+    """
+    from lftpweb.core.mount_sentinel import write_if_needed
+    from lftpweb.core.settle import SettleSettings, save_settle_settings
+
+    await save_settle_settings(db, SettleSettings(enabled=True))
+    write_if_needed(str(tmp_path))
+    queue_id = await _make_queue(db, tmp_path)
+    await _make_item(db, queue_id, "Release.One", suppressed=1)
+    await _set_settle_record(db, queue_id, "Release.One", matched_scans=1)
+    aq = AutoQueue(db, _Recorder())
+
+    await aq.on_scan(_mounted_config(queue_id, tmp_path))
+    assert aq.preflight_rows({queue_id}) == []
+
+
+async def test_pattern_unmatched_item_never_appears_in_settle_preflight(db, tmp_path):
+    """The second OUT exclusion this task names: a pattern-unmatched item is not wanted at all,
+    whether or not the settle gate would otherwise have held it back -- including it would make
+    Preflight a second Files tree.
+    """
+    from lftpweb.core.mount_sentinel import write_if_needed
+    from lftpweb.core.settle import SettleSettings, save_settle_settings
+
+    await save_settle_settings(db, SettleSettings(enabled=True))
+    write_if_needed(str(tmp_path))
+    queue_id = await _make_queue(db, tmp_path)
+    await _make_item(db, queue_id, "Some.Release.SAMPLE")
+    await _set_settle_record(db, queue_id, "Some.Release.SAMPLE", matched_scans=1)
+    await db.execute(
+        "INSERT INTO pattern (queue_id, kind, expr) VALUES (?, 'skip', '*SAMPLE*')", (queue_id,)
+    )
+    await db.commit()
+    aq = AutoQueue(db, _Recorder())
+
+    await aq.on_scan(_mounted_config(queue_id, tmp_path))
+    assert aq.preflight_rows({queue_id}) == []
+
+
+async def test_active_job_excludes_an_item_from_settle_preflight(db, tmp_path):
+    """No duplicate at handover to a real job -- the same guarantee `core/arrsync.py`'s own
+    Preflight source has to make. An item with a job already `queued`/`running` never reaches
+    the settle check at all (the eligibility query's own `NOT EXISTS`), so it can never earn a
+    settle row while a real Active/pending row already exists for it.
+    """
+    from lftpweb.core.mount_sentinel import write_if_needed
+    from lftpweb.core.settle import SettleSettings, save_settle_settings
+
+    await save_settle_settings(db, SettleSettings(enabled=True))
+    write_if_needed(str(tmp_path))
+    queue_id = await _make_queue(db, tmp_path)
+    item_id = await _make_item(db, queue_id, "Release.One")
+    await _set_settle_record(db, queue_id, "Release.One", matched_scans=1)
+    await db.execute(
+        "INSERT INTO job (item_id, kind, state, lane, rank, attempt, forced_full_rate) "
+        "VALUES (?, 'mirror', 'queued', 'main', 0, 1, 0)",
+        (item_id,),
+    )
+    await db.commit()
+    aq = AutoQueue(db, _Recorder())
+
+    await aq.on_scan(_mounted_config(queue_id, tmp_path))
+    assert aq.preflight_rows({queue_id}) == []
+
+
+async def test_disabling_auto_queue_immediately_clears_that_queues_settle_preflight(db, tmp_path):
+    from lftpweb.core.mount_sentinel import write_if_needed
+    from lftpweb.core.settle import SettleSettings, save_settle_settings
+
+    await save_settle_settings(db, SettleSettings(enabled=True))
+    write_if_needed(str(tmp_path))
+    queue_id = await _make_queue(db, tmp_path)
+    await _make_item(db, queue_id, "Release.One")
+    await _set_settle_record(db, queue_id, "Release.One", matched_scans=1)
+    aq = AutoQueue(db, _Recorder())
+
+    await aq.on_scan(_mounted_config(queue_id, tmp_path))
+    assert len(aq.preflight_rows({queue_id})) == 1
+
+    # Turning auto-queue off is "the user choosing not to run it at all," not a gate recovery --
+    # the queue's own settle-preflight rows must go the same pass, not linger.
+    await aq.on_scan(_mounted_config(queue_id, tmp_path, enabled=False))
+    assert aq.preflight_rows({queue_id}) == []
+
+
+async def test_mount_gating_immediately_clears_that_queues_settle_preflight(db, tmp_path):
+    """A mount-gated queue is represented by the banner, never by its own stale settle rows --
+    showing both would bury the one fact that matters behind rows nothing is actually true of
+    any more (`on_scan` never even reached the settle check this pass).
+    """
+    from lftpweb.core.settle import SettleSettings, save_settle_settings
+
+    await save_settle_settings(db, SettleSettings(enabled=True))
+    # Deliberately no `write_if_needed` -- the mount sentinel is absent, so this queue is
+    # mount-gated from the very first pass.
+    queue_id = await _make_queue(db, tmp_path)
+    await _make_item(db, queue_id, "Release.One")
+    await _set_settle_record(db, queue_id, "Release.One", matched_scans=1)
+    aq = AutoQueue(db, _Recorder())
+
+    await aq.on_scan(_mounted_config(queue_id, tmp_path))
+    assert queue_id in aq.gated
+    assert aq.preflight_rows({queue_id}) == []
+
+
+async def test_settle_preflight_rows_filtered_to_the_caller_supplied_active_queue_ids(db, tmp_path):
+    """`preflight_rows`' own filter -- the caller's live "is this queue still eligible right now"
+    check (`api/jobs.py.get_preflight`) -- rather than this cache re-deriving it, mirroring
+    `ArrSyncScheduler.preflight_rows`' identical contract.
+    """
+    from lftpweb.core.mount_sentinel import write_if_needed
+    from lftpweb.core.settle import SettleSettings, save_settle_settings
+
+    await save_settle_settings(db, SettleSettings(enabled=True))
+    write_if_needed(str(tmp_path))
+    queue_id = await _make_queue(db, tmp_path)
+    await _make_item(db, queue_id, "Release.One")
+    await _set_settle_record(db, queue_id, "Release.One", matched_scans=1)
+    aq = AutoQueue(db, _Recorder())
+
+    await aq.on_scan(_mounted_config(queue_id, tmp_path))
+    assert len(aq.preflight_rows({queue_id})) == 1
+    assert aq.preflight_rows(set()) == []
+    assert aq.preflight_rows({queue_id + 999}) == []
+
+
+async def test_multiple_queues_settle_preflight_rows_sorted_by_title(db, tmp_path):
+    from lftpweb.core.mount_sentinel import write_if_needed
+    from lftpweb.core.settle import SettleSettings, save_settle_settings
+
+    await save_settle_settings(db, SettleSettings(enabled=True))
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
+    write_if_needed(str(tmp_path / "a"))
+    write_if_needed(str(tmp_path / "b"))
+    queue_a = await _make_queue(db, tmp_path / "a")
+    queue_b = await _make_queue(db, tmp_path / "b")
+    await _make_item(db, queue_a, "Zebra.Release")
+    await _make_item(db, queue_b, "Apple.Release")
+    await _set_settle_record(db, queue_a, "Zebra.Release", matched_scans=1)
+    await _set_settle_record(db, queue_b, "Apple.Release", matched_scans=1)
+    aq = AutoQueue(db, _Recorder())
+
+    await aq.on_scan(_mounted_config(queue_a, tmp_path / "a"))
+    await aq.on_scan(_mounted_config(queue_b, tmp_path / "b"))
+
+    titles = [r.title for r in aq.preflight_rows({queue_a, queue_b})]
+    assert titles == ["Apple.Release", "Zebra.Release"]
+
+
+async def test_settle_row_carries_the_queue_tag_and_size_but_no_remaining_time(db, tmp_path):
+    """2026-08-21 ("we moved the columns around" / "we missed the remaining time"): a settle row
+    must carry the same queue-tag identity every other row on the page shows, and its own
+    "remaining figure" is the size it already had (`size_bytes`, "remote — 22 GB") -- there is no
+    time-based estimate to give here (the gate is bound by *scan count*, not a wall-clock
+    estimate this codebase has any business fabricating), so `remaining_s` must stay `None`
+    rather than a guess.
+    """
+    from lftpweb.core.mount_sentinel import write_if_needed
+    from lftpweb.core.settle import SettleSettings, save_settle_settings
+
+    await save_settle_settings(db, SettleSettings(enabled=True))
+    write_if_needed(str(tmp_path))
+    queue_id = await _make_queue(db, tmp_path)
+    await _make_item(db, queue_id, "Release.One")
+    await _set_settle_record(db, queue_id, "Release.One", matched_scans=1)  # not yet settled
+    aq = AutoQueue(db, _Recorder())
+
+    await aq.on_scan(_mounted_config(queue_id, tmp_path, name="DC-TV", short_name="TV"))
+
+    rows = aq.preflight_rows({queue_id})
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.queue_name == "DC-TV"
+    assert row.queue_short_name == "TV"
+    assert row.size_bytes == 100  # `_make_item`'s own hardcoded remote_size, unchanged
+    assert row.remaining_s is None

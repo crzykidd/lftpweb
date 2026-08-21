@@ -10,6 +10,9 @@ export interface HealthResponse {
   // host exists but the pooled connection last failed").
   host_reachable: boolean | null
   scheduler_alive: boolean
+  // 2026-08-20 (prompts/2026-08-20-queue-pause.md): whether admission is paused -- the header
+  // bar and the Transfers -> Queue tab's own banner both read this.
+  queue_paused: boolean
   // 2026-08-16 (docs/decisions.md): baked at image build time, `null` for every build that
   // never baked them (local dev, compose dev stack, a manual `docker build` with no
   // `--build-arg`) -- see `lib/versionBadge.ts` for how the nav's version readout uses them.
@@ -146,6 +149,14 @@ export interface PathQueueIn {
   // namespaces") -- `null` means "same namespace, no translation," never an empty-string
   // sentinel.
   arr_visible_path: string | null
+  // Migration 024 (docs/transfers-redesign-spec.md §3.6, phase 1 stage 3). `null` (the
+  // default, and every existing queue's value) means "no short name set" -- every display
+  // falls back to the full `name` (`lib/queueDisplayName.ts.queueDisplayName`). A per-queue
+  // display hint for the compact per-row label stage 4 renders once Transfers drops its
+  // per-queue grouping (`DC-Movies` -> `MOV`) -- not an identifier, so two queues may share
+  // one. The backend trims and normalizes empty-after-trim to `null`, and rejects anything
+  // over its own length cap.
+  short_name: string | null
 }
 
 export interface PathQueueOut extends PathQueueIn {
@@ -558,6 +569,10 @@ export interface JobOut {
   item_id: number
   queue_id: number
   queue_name: string
+  // The queue's short display name (migration 024, `path_queue.short_name`) -- `null` when
+  // unset. Added 2026-08-19 (docs/transfers-redesign-spec.md §3.6, phase 1 stage 4a) for the
+  // ungrouped Transfers row's queue badge (`lib/queueDisplayName.ts`).
+  queue_short_name: string | null
   rel_path: string
   is_dir: boolean
   kind: JobKind
@@ -585,7 +600,18 @@ export interface JobOut {
   eta_s: number | null
   exit_code: number | null
   error_class: string | null
+  // `null` on a row from `getCompleteJobs` (2026-08-19, docs/transfers-redesign-spec.md §3.2,
+  // phase 1 stage 4b) -- that endpoint is paginated but unbounded in total row count, so it
+  // never inlines this ~4KB blob (the identical trap `HistoryJobOut`'s own comment names for
+  // History's list endpoint). `getJobs` (the Active/pending box) stays bounded by construction
+  // and keeps inlining it unchanged. `has_output_tail` below is the one signal a row's expand
+  // panel needs to decide whether to fetch it on demand, regardless of which endpoint it came
+  // from.
   output_tail: string | null
+  // Mirrors `HistoryJobOut.has_output_tail` -- always populated. `TransfersPage.tsx.
+  // RowDetailPanel` fetches on demand via the existing `getHistoryJobOutput` (same `job` table,
+  // same id) exactly when this is `true` and `output_tail` came back `null`.
+  has_output_tail: boolean
   // 2026-08-15 (prompts/2026-08-15-transfers-single-line-rows-with-detail.md): the item-level
   // facts the Transfers row's expand panel needs -- see `api/jobs.py._job_out`/`core/queue.py.
   // list_jobs`'s own comments for the join these ride on. Mirrors `FileNode.verified_at`/
@@ -610,10 +636,122 @@ export interface JobOut {
   // `FileNode.arr_status`'s own comment gives -- an unrecognized value degrades to a text chip
   // rather than being rejected at the type level.
   arr_instance_kind: string | null
+  // **Which box this row belongs in** (2026-08-20, docs/transfers-redesign-spec.md §3.2's
+  // pipeline-completion rule) -- `true` = Active/pending, `false` = Complete. Computed
+  // server-side by `core/pipeline_flight.py`, the same expression `GET /api/jobs/complete`
+  // filters its listing *and its `total`* on. Never re-derived here: the Active box is
+  // client-side and the Complete box is server-paginated, so a second encoding of the rule would
+  // drift and put a row in both boxes or neither. Optional so a response from an older server
+  // still type-checks and degrades to "complete" -- the same fail-safe direction the predicate
+  // itself takes for anything unknown.
+  pipeline_in_flight?: boolean
+  // What the row is waiting on ('verifying' | 'extracting' | 'processing' | 'awaiting_import' |
+  // 'deleting_source'), or `null`. From the *same* `CASE` as `pipeline_in_flight`, so the label
+  // and the box can never disagree. `null` for a queued/running row -- the state chip already
+  // says DOWNLOADING/QUEUED. `string | null`, not a literal union, for the same
+  // unrecognized-value-degrades-gracefully reason `arr_instance_kind` above documents.
+  pipeline_waiting_reason?: string | null
+  // The manual escape hatch (migration 025) -- 'complete' | 'failed' once a human resolved this
+  // item out of the Active box. **A classification only**; the row shows it so a manual
+  // resolution never silently reads as a normal completion.
+  manual_outcome?: string | null
+  manual_outcome_at?: string | null
 }
 
 export interface JobsResponse {
   jobs: JobOut[]
+}
+
+/** `GET /api/queue/preflight` (docs/transfers-redesign-spec.md §4, prefigured; this task's own
+ * handoff prompt, prompts/done/2026-08-20-preflight-box.md, plus its follow-up
+ * prompts/2026-08-20-preflight-waiting-sources.md) -- one row for something lftpweb already
+ * knows about but has no work to do on yet. **Source-agnostic by construction**: the *arr
+ * poller and the settle gate's own eligibility check are the two sources wired up --
+ * `source`/`source_label`/`source_kind` are how a row names *which* upstream it came from, never
+ * a field of their own assuming it's always the *arr. `components/PreflightBox.tsx`'s
+ * `SourceChip` -- gated on `row.source === 'arr'` -- is where *arr-specific rendering lives, not
+ * here.
+ *
+ * Deliberately thin, matching the backend's own `PreflightRowOut` (`backend/lftpweb/models.py`)
+ * field for field -- no `id`, no `queue_position`, no `bytes_done`: there is no `item` and no
+ * `job` behind a row here, and the handoff prompt's own "the rows are inert, and the box is what
+ * makes that structural" is exactly why nothing here invites a per-row control that would need
+ * one.
+ */
+export interface PreflightRowOut {
+  source: string
+  queue_id: number
+  // The bound queue's own display identity (2026-08-21, "we moved the columns around" fix) --
+  // mirrors `JobOut.queue_name`/`queue_short_name` so `lib/queueDisplayName.ts.
+  // queueDisplayName` renders this row's tag identically to every Transfers row's own tag.
+  queue_name: string
+  queue_short_name: string | null
+  title: string
+  status_label: string | null
+  source_label: string
+  source_kind: string | null
+  size_bytes: number | null
+  size_remaining_bytes: number | null
+  // How many seconds until this row's own source expects its wait to clear (2026-08-21, "we
+  // missed the remaining time") -- an *arr row's own `timeleft`, rendered through the same
+  // `formatEta`/`transferLineValue` shape the Transfers row already uses for its own ETA. `null`
+  // when the source has no meaningful estimate this pass -- never a fabricated or zero figure. A
+  // settle-gated row always carries `null` here -- its own remaining figure is `size_bytes`
+  // above ("remote -- 22 GB"), not a time.
+  remaining_s: number | null
+  // The download client actually fetching this release, from the *arr's own point of view --
+  // an *arr row's own `downloadClient`, read server-side straight from its queue record's `raw`.
+  // `null` for a settle row (no separate download client in that source's own model) or an *arr
+  // row whose response didn't happen to carry one. Display-only provenance for the chip tooltip
+  // (`lib/preflight.ts.preflightChipTooltip`), never branched on.
+  download_client: string | null
+  // A generic "how far along has this row's own wait gotten" detail for the chip's own hover
+  // tooltip (2026-08-21, "the settling chip should have a mouseover that shows time details")
+  // -- `backend/lftpweb/core/preflight.py.PreflightRow.wait_scans`/`wait_since`'s own docstring
+  // has the full reasoning. `wait_since` is already an ISO-8601 string on the wire
+  // (`core/settle.py.SettleProgress.first_matched_at`). `null` for an *arr row (its own wait
+  // isn't bound by scan count) or a settle row with no `item_settle` history yet -- both
+  // fields together, never one alone. Fed straight into `lib/format.ts.settleWaitLabel` by
+  // `lib/preflight.ts.preflightChipTooltip`, the same helper the Files tree and the lifecycle
+  // R-icon tooltip already share, rather than a third copy of that wording.
+  wait_scans: number | null
+  wait_since: string | null
+}
+
+/** One line of the Preflight box's mount-gate banner (2026-08-20,
+ * prompts/2026-08-20-preflight-waiting-sources.md, decided with the user) -- **a banner, not
+ * rows**: `core/autoqueue.py.AutoQueue.gated` blocks a queue's whole auto-queue pass at once, so
+ * this names the queue and the reason once, never one row per affected item. `reason` is
+ * `AutoQueue.gated`'s own string, verbatim.
+ */
+export interface PreflightGatedQueueOut {
+  queue_name: string
+  reason: string
+}
+
+/** `source_configured=false` (with `rows` always empty in that case) means "no row source is
+ * configured at all" -- `components/PreflightBox.tsx` hides the row list for that case rather
+ * than showing an empty "Nothing in preflight" that would be meaningless for a user with nothing
+ * configured. `gated_queues` is independent of `source_configured` -- the mount gate can block a
+ * queue whether or not either row source is configured, so the box itself renders whenever
+ * *either* has something to say.
+ */
+export interface PreflightResponse {
+  source_configured: boolean
+  rows: PreflightRowOut[]
+  gated_queues: PreflightGatedQueueOut[]
+}
+
+/** `GET /api/jobs/complete` (2026-08-19, docs/transfers-redesign-spec.md §3.2, phase 1 stage
+ * 4b) -- the Queue tab's **Complete** box, server-side paginated. Same `total`/`limit`/`offset`
+ * shape `HistoryJobsResponse` already established below -- reused rather than a second
+ * pagination idiom; `lib/pagination.ts` is the pure page-arithmetic this response feeds.
+ */
+export interface CompleteJobsResponse {
+  jobs: JobOut[]
+  total: number
+  limit: number
+  offset: number
 }
 
 /** `POST /api/jobs/dismiss-all` (2026-08-15) -- the bulk counterpart to `dismissJob`. */
@@ -635,6 +773,21 @@ export interface ItemEventOut {
 
 export interface ItemEventsResponse {
   events: ItemEventOut[]
+}
+
+/** `GET /api/items/{id}/children` (2026-08-20, docs/transfers-redesign-spec.md §3.3, phase 1
+ * stage 5) -- the Transfers row's on-demand per-file expansion. `children` is `FileNode`, the
+ * same `core/itemview.py.item_view` projection every other consumer of the `item` table reads
+ * through -- never a second shape invented for this one panel. `total`/`limit`/`offset` are the
+ * same paging trio `HistoryJobsResponse`/`CompleteJobsResponse` already use: `total` is the true
+ * descendant-file count regardless of the server-side cap (`api/jobs.py.
+ * ITEM_CHILDREN_MAX_LIMIT`), so a capped response can still say "showing N of total" honestly.
+ */
+export interface ItemChildrenResponse {
+  children: FileNode[]
+  total: number
+  limit: number
+  offset: number
 }
 
 export interface QueueItemRequest {

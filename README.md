@@ -8,7 +8,7 @@ progress, auto-queue on patterns, and optionally verify, extract, and relocate f
 
 > ## Beta
 >
-> **Version `0.2.6`.** All 9 build phases are built, covered by backend unit and integration
+> **Version `0.3.0`.** All 9 build phases are built, covered by backend unit and integration
 > tests plus a frontend unit suite, and exercised manually through the UI against a real
 > seedbox. This is a **beta** — there is no upgrade path guaranteed between beta releases,
 > and the database schema may still change between them. See
@@ -38,7 +38,7 @@ Remote and local as one tree, with live per-file progress, speed, and ETA:
 
 Every verify outcome, every remote delete, and every delete withheld — with the reason:
 
-![The History page showing the audit trail](docs/images/history-audit-trail.png)
+![The Events page showing the audit trail](docs/images/history-audit-trail.png)
 
 **[More screenshots →](docs/screenshots.md)**
 
@@ -48,7 +48,7 @@ Every verify outcome, every remote delete, and every delete withheld — with th
 - Named **path queues** — one remote → local mapping each, with their own settings
 - Queue transfers manually, watch live progress, stop them, resume from the partial;
   multi-select with shift-range and bulk Queue/Stop/Delete that reports partial failure
-  honestly ("7 of 10 queued, these 3 failed because …"), plus text/state/"missing only" filters,
+  honestly ("7 of 10 queued, these 3 failed because …"), plus text/state/lifecycle-facet filters,
   on the Files page. The delete dialog offers two independent, checkbox-driven scopes — Delete
   local copy, and (2026-08-16) Delete source (seedbox), the first manual remote-delete in the
   app, for cleaning up a failed or never-imported item without SSHing into the seedbox by hand.
@@ -87,7 +87,7 @@ Every verify outcome, every remote delete, and every delete withheld — with th
   cannot bless a truncated file), extract (`7zz` for zip/7z/tar/gz/bz2/xz, `unrar` for rar/rar5
   — see `NOTICE`), and `move` mode's remote delete — fired only after the *last* enabled check
   passes (completeness → verify → extract → *arr import when tracked), all with an audited trail
-  on the History page. Extraction stages into `_UNPACK_` and merges into place only on full
+  on the Events page. Extraction stages into `_UNPACK_` and merges into place only on full
   success, is gated on cheap filesystem preconditions first (zero-length head volume, a gap in a
   multi-volume rar set), and can optionally delete a release's spent archive volumes once they
   have extracted — off by default
@@ -102,13 +102,29 @@ Every verify outcome, every remote delete, and every delete withheld — with th
   confirmed import** — files exist on both sides until the *arr has the release, so any failure
   is inspectable on both ends — and the optional per-queue "Delete when imported" toggle then
   removes the local working copy too, leaving the row visible with a "Processed" countdown
-  before it ages out. The logo chip carries the outcome everywhere (Files, Transfers, History):
+  before it ages out. The logo chip carries the outcome everywhere (Files, Queue, Events):
   green check once imported, red mark if a release left the *arr's queue without ever importing
   (filterable on its own, since that one usually needs a look). Stragglers are cleaned up from
   the app: the delete dialog offers independent **Local** and **Source (seedbox)** scopes, so
   failed or abandoned releases can be cleared from both sides without ever SSHing in
-- The History page: every completed/failed/cancelled transfer and every audit event
-  (including remote deletes and deletes withheld), filterable and grouped by queue
+- **Transfers is the main section, with Queue and Files tabs** (`/transfers/queue`,
+  `/transfers/files` — the old standalone Files nav entry and `/files` both redirect here). The
+  Queue tab is **one globally-ordered list, not one section per queue** — admission is entirely
+  queue-agnostic, so grouping by queue implied per-queue lines that never existed. Two paginated
+  boxes, each with its own 10/20/50 page-size selector: **Active/pending**, which holds a row
+  until its *whole pipeline* finishes (verify, extract, a confirmed Sonarr/Radarr import, a
+  deferred seedbox delete — not just the transfer, so a row can read "Awaiting import" long after
+  lftp itself is done), and **Complete**. Rows carry a compact queue badge, a fast-lane badge
+  when they qualify, **▲ up one / ▼ down one / ▲▲ to top** reordering, and expand to per-file
+  progress. A name filter, a scoped "Dismiss list", and the Complete box's own "Dismiss" outcome
+  menu (All/Downloaded/Failed/Stopped) round it out. A **Mark complete / Mark failed** menu (with
+  Undo) is a manual, classification-only escape hatch for a row genuinely wedged on something
+  that will never resolve — it never deletes a source, confirms an import, or touches auto-queue.
+  **A site-wide Pause** (Pause after current / Pause now) stops new admissions without touching
+  what's already running or queued; reordering keeps working while paused, since curating the
+  order and then unpausing is the point. **History is now Events** (`/events`, `/history`
+  redirects) — the audit-event log only, filterable and grouped by queue, with a per-item deep
+  link from a Queue or Files row's item drawer
 - Rotating log viewer, on-demand `VACUUM INTO` database backups (scheduled + manual), and a
   header readout for seedbox reachability and scheduler liveness (`/api/health`)
 - Credentials encrypted at rest
@@ -116,11 +132,13 @@ Every verify outcome, every remote delete, and every delete withheld — with th
   password login or trust a reverse proxy's identity header, both from Settings → Auth. See
   "Locked out?" below before you flip it on.
 - **In-app user documentation**, under **Docs** in the left nav: a quick start walking the real
-  first-run sequence, and a Concepts page covering the eight things that actually confuse people
-  (the settle gate, the removal grace period, auto-queue suppression, the difference between
-  Dismiss / Clear history / Reset item tracking, the lifecycle icons, `copy` vs `move`,
-  inherit-vs-override on the post-processing toggles, and the Sonarr/Radarr icon). Every step
-  links straight to the settings page it describes.
+  first-run sequence, and a Concepts page covering the thirteen things that actually confuse
+  people (the queue being paused, why a row still reads "Awaiting import" instead of Complete,
+  what Mark complete/Mark failed does and doesn't do, the settle gate, the removal grace period,
+  auto-queue suppression, the difference between Dismiss / Clear events / Reset item tracking,
+  the lifecycle icons, `copy` vs `move`, inherit-vs-override on the post-processing toggles, the
+  Sonarr/Radarr icon, why a release sits in Preflight instead of downloading, and what's in a
+  support bundle). Every step links straight to the settings page it describes.
   Per-field help popups (`FieldHelp`) are being applied across the settings surface, starting
   with the fields whose wrong answer costs you data
 
@@ -138,6 +156,79 @@ database itself, the install secret, or host-key pins. One caveat worth knowing 
 attach one anywhere public: an included *arr instance's log files are carried **exactly as that
 *arr wrote them** — lftpweb doesn't rewrite another app's own logs — so give them a glance before
 sharing. Full contents, one part per checkbox: **[docs/concepts.md](docs/concepts.md#support-bundle)**.
+
+## Safety rails: when a volume drops or a remote stops answering
+
+> Both failure modes have the same shape — *something that is still there stops being visible* —
+> and in both, the naive reading is destructive. A dropped NFS mount makes every downloaded item
+> look locally absent, which reads as "re-download the whole library." An *arr that answers a
+> queue poll with nothing makes every tracked release look abandoned, which reads as "give up and
+> strand the source on the seedbox." Neither is allowed to follow from a single bad reading.
+
+### A local volume that drops out
+
+**The mount sentinel.** After every scan that finds a queue's local root present, readable and
+writable, lftpweb writes a marker file (`.lftpweb-mount-ok`) at that root. The marker lives on the
+*share*, so it vanishes with the share. An empty directory and an unmounted share are
+indistinguishable by content alone — that is the whole reason the file exists. lftpweb also never
+creates the root itself, because `mkdir` on a mount point succeeds happily against whatever
+filesystem is underneath it.
+
+A queue whose root fails that check is blocked from acting at all — for the entire queue, not item
+by item. That covers auto-queue (the whole pass, not just the transitions that look risky), manual
+and scheduled local deletes, retention's expiry sweep and its orphaned-extraction-debris sweep,
+spent-archive cleanup after extraction, the *arr "delete when imported" cleanup, and re-queueing
+items a restart marked interrupted. Blanket-per-queue on purpose: a brand-new queue whose root
+never mounted has no history to compare against — every item reads "remote only" on the very first
+scan — so only a blanket gate stops auto-queue transferring an entire remote tree into a directory
+that isn't really there.
+
+**The removal grace period.** An item that had a complete local copy and is now locally absent does
+not become "never downloaded." It keeps showing its last known state — including a failure state
+like `CORRUPT`, so you don't lose the thing you need to see — and only transitions to
+`REMOVED_LOCAL` once absence has persisted for about ten minutes across consecutive scans. While
+the mount gate is failing, that clock never even starts. A transition made while the mount was
+healthy is sticky: the gate exists to stop a bad transition beginning, not to undo a correct one.
+
+### A seedbox or Sonarr/Radarr that stops answering
+
+**A failed remote scan persists nothing.** The pass aborts before any write, the last-known-good
+remote tree is kept in cache rather than discarded, every item keeps its state, and the failure
+surfaces as a scan error in the header readout and the UI. Don't invent data, don't throw away good
+data either.
+
+**A partial remote scan is partial success, not failure.** GNU `find` exits nonzero the moment it
+can't read one subdirectory, but still prints everything else — so any nonzero exit *with usable
+output* is treated as a partial scan, and only an exit with no output at all is a real failure. The
+settle gate holds rather than resets on a partial scan, so a transient unreadable subtree can't
+restart a release's settle clock.
+
+**An unreachable Sonarr/Radarr backs off, per instance.** One warning and one audit event, then
+capped exponential backoff from 60 seconds up to 30 minutes. Nothing is committed on a failed poll,
+and one dead instance never slows the others. Every *arr HTTP call carries a 10-second timeout.
+
+**A release vanishing from the Sonarr/Radarr queue doesn't go straight to terminal.** It commits an
+amber `dropped` state — "removed from the *arr's queue Xm ago — rechecking" — re-examined every pass
+for six hours. The same download reappearing sends it back to `detected`; an import turning up in
+history promotes it to `imported`, with the source delete and cleanup then proceeding normally; only
+six hours with neither signal commits `gone`. A poller runs on its own clock, slower than an
+upstream client's momentary blip, so both halves of a two-pass confirmation can land inside the same
+bad window — the grace state is what makes that survivable.
+
+**The source delete waits for a confirmed import, never an ambiguous one** — the *arr's own queue
+record finished and import history, held across two consecutive checks. Files exist on both sides
+until then, so any failure is inspectable from both ends.
+
+**A deferred source delete retries rather than firing once** (five attempts, growing backoff), so a
+transient SSH failure can't strand a remote copy permanently; it pauses with one clear event rather
+than logging a failure every minute for as long as a seedbox stays down. Local cleanup is withheld
+while a source delete is still owed, making "delete source → delete local" an enforced order rather
+than a hoped-for one. Rows that were stranded before these rails existed heal themselves — a `gone`
+row still owing a source delete is re-checked against import history, bounded to ten attempts with
+backoff, and promoted to `imported` if the import turns up.
+
+Every withheld action writes an audit event, so the Events page can always tell you *why* something
+didn't happen.
 
 ## What doesn't yet
 
@@ -165,9 +256,15 @@ and known limitations, recorded in full in `docs/decisions.md` and `prompts/open
   RAR compressor exists in this project's toolchain, so the fixture can't be built. The
   equivalent 7zz path *is* tested against a real encrypted zip; the rar path is assumed correct
   by analogy, which is weaker than every other claim here.
-- **History date filters are UTC calendar days.** No timezone handling exists anywhere —
+- **Events date filters are UTC calendar days.** No timezone handling exists anywhere —
   timestamps are stored UTC and rendered with `toLocaleString()`. Away from UTC, "yesterday" can
   include a few hours of today.
+- **A dismissed job has no list page that shows it anymore.** Before the Events rename
+  (2026-08-20), the old History page's job list showed every terminal job including dismissed
+  ones; that list is gone (the Queue tab's Complete box, its replacement, filters dismissed jobs
+  out, same as it always has). The job row itself is untouched — dismissal was never deletion —
+  and is still reachable one item at a time, from that item's drawer, but nothing lists every
+  dismissed job across the whole install anymore.
 - **API keys and session tokens are hashed with SHA-256, not argon2id.** Deliberate: a key is
   256 bits of `secrets.token_urlsafe`, not a guessable secret, so argon2's slowness would add
   latency and buy nothing.
@@ -194,6 +291,16 @@ and known limitations, recorded in full in `docs/decisions.md` and `prompts/open
   location) only appears from the Files page.** `TransfersPage.tsx` opens the same drawer but
   doesn't have the owning queue's `local_path` loaded, so that one panel simply doesn't render
   there — every other section of the drawer is unaffected.
+- **On a queue with no *arr binding, an external removal slower than ~10 minutes can still
+  trigger one re-queue.** When something outside lftpweb takes a finished release apart — an
+  importer, a script, a person — the item reads `PARTIAL` in between, and `PARTIAL` is how a
+  genuinely interrupted transfer is resumed. Since 2026-08-19 that reading is held for the
+  local-absence grace period (~10 minutes) when the item was previously complete and the remote
+  total hasn't changed, which covers the ordinary case; when the window lapses it is published
+  as `PARTIAL` after all, on purpose, so a locally damaged copy stays re-fetchable. On an
+  *arr-bound queue the `arr_status` hand-off covers the rest with no time limit; on an untracked
+  queue a removal that takes longer than the window is re-queued once. Stop the job, or delete
+  the item, to settle it.
 - **The Sonarr/Radarr integration UI has never been click-tested in a browser.** No agent that
   built it (backend, notify/cleanup, or this UI pass) can render a page — see `docs/decisions.md`
   for the standing reason every Settings page in this project carries the same caveat. The item

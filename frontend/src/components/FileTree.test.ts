@@ -9,6 +9,7 @@ import {
   canConfirmDelete,
   canDeleteLocal,
   CHILD_SPEED_FRESHNESS_MS,
+  childDisplayState,
   clampColumnWidth,
   columnMinWidth,
   defaultColumnWidths,
@@ -18,12 +19,14 @@ import {
   effectiveSpeedLabel,
   effectiveSpeedSortValue,
   flatten,
+  freshChildSpeedBps,
   hasLocalContent,
   isCollapsePreference,
   isColumnWidths,
   isSortPreference,
   matchesFacetFilter,
   mergeColumnWidths,
+  nodeDisplaySize,
   RESIZABLE_COLUMNS,
   resolveCollapsed,
   rowAction,
@@ -31,6 +34,7 @@ import {
   shouldOfferSourceScope,
   showsCopyQueueSourceWarning,
   sortTree,
+  stateProgressPercent,
   type TreeEntry,
 } from '../lib/fileTree'
 
@@ -1074,5 +1078,86 @@ describe('effectiveDeleteScope', () => {
     const remoteOnlyRow = node('remote-only-row', true, { state: 'REMOTE_ONLY', remote_size: 3000, local_size: null })
     expect(effectiveDeleteScope(localRow, checked)).toEqual({ local: true, source: true })
     expect(effectiveDeleteScope(remoteOnlyRow, checked)).toEqual({ local: false, source: true })
+  })
+})
+
+// `stateProgressPercent`/`nodeDisplaySize`/`freshChildSpeedBps` (2026-08-20, docs/transfers-
+// redesign-spec.md §3.3 stage 5): all three moved/widened so the Transfers row's own file-list
+// expansion (`lib/transferPanel.ts`) can share them rather than forking a second copy -- see
+// each function's own docstring in `lib/fileTree.ts`.
+describe('stateProgressPercent', () => {
+  it('DOWNLOADING and PARTIAL are the only states with a meaningful percent', () => {
+    expect(stateProgressPercent('DOWNLOADING', 50, 100)).toBe(50)
+    expect(stateProgressPercent('PARTIAL', 25, 100)).toBe(25)
+  })
+
+  it('every other state reads null regardless of the sizes', () => {
+    expect(stateProgressPercent('REMOTE_ONLY', 0, 100)).toBeNull()
+    expect(stateProgressPercent('DOWNLOADED', 100, 100)).toBeNull()
+    expect(stateProgressPercent('EXCLUDED', null, null)).toBeNull()
+  })
+})
+
+// `childDisplayState` (2026-08-21, prompts/done/2026-08-21-child-state-and-active-box-height.md)
+// -- the shared mapping `TransfersPage.tsx`'s Queue-row file-list expansion (`FileListRow`) and
+// `ItemDrawer.tsx`'s per-file `Row` both call, so a partly-transferred child of a *running* job
+// reads "Downloading" rather than the structurally-correct-but-misleading "Partial". The matrix
+// here is the exact one the user's own report and the handoff prompt both called out as easy to
+// get wrong (blanket-mapping every child of a running job, not just the one actually in flight).
+describe('childDisplayState', () => {
+  it('maps PARTIAL to DOWNLOADING only when the job is running', () => {
+    expect(childDisplayState('PARTIAL', true)).toBe('DOWNLOADING')
+  })
+
+  it('leaves a PARTIAL child alone when its job is not running -- stopped/failed/paused', () => {
+    expect(childDisplayState('PARTIAL', false)).toBe('PARTIAL')
+  })
+
+  it('never touches a complete child, running job or not', () => {
+    expect(childDisplayState('DOWNLOADED', true)).toBe('DOWNLOADED')
+    expect(childDisplayState('DOWNLOADED', false)).toBe('DOWNLOADED')
+  })
+
+  it('never touches an untouched child, running job or not', () => {
+    expect(childDisplayState('REMOTE_ONLY', true)).toBe('REMOTE_ONLY')
+    expect(childDisplayState('REMOTE_ONLY', false)).toBe('REMOTE_ONLY')
+  })
+
+  it('passes through any other state unchanged', () => {
+    expect(childDisplayState('EXCLUDED', true)).toBe('EXCLUDED')
+    expect(childDisplayState('FAILED', true)).toBe('FAILED')
+  })
+})
+
+describe('nodeDisplaySize', () => {
+  it('a file prefers local_size, falling back to remote_size', () => {
+    expect(nodeDisplaySize({ is_dir: false, local_size: 10, remote_size: 20 })).toBe(10)
+    expect(nodeDisplaySize({ is_dir: false, local_size: null, remote_size: 20 })).toBe(20)
+  })
+
+  it('a directory prefers remote_size, falling back to local_size', () => {
+    expect(nodeDisplaySize({ is_dir: true, local_size: 10, remote_size: 20 })).toBe(20)
+    expect(nodeDisplaySize({ is_dir: true, local_size: 10, remote_size: null })).toBe(10)
+  })
+
+  it('accepts a plain FileNode, not just a full TreeEntry', () => {
+    const plain: FileNode = node('a.mkv', false, { local_size: 5, remote_size: 10 })
+    expect(nodeDisplaySize(plain)).toBe(5)
+  })
+})
+
+describe('freshChildSpeedBps', () => {
+  it('an absent sample reads null', () => {
+    expect(freshChildSpeedBps(undefined, 1000)).toBeNull()
+  })
+
+  it('a sample within the freshness window reads its rate', () => {
+    const sample: ChildSpeedSample = { speedBps: 1234, receivedAt: 1000 }
+    expect(freshChildSpeedBps(sample, 1000 + CHILD_SPEED_FRESHNESS_MS)).toBe(1234)
+  })
+
+  it('a sample older than the freshness window reads null', () => {
+    const sample: ChildSpeedSample = { speedBps: 1234, receivedAt: 1000 }
+    expect(freshChildSpeedBps(sample, 1000 + CHILD_SPEED_FRESHNESS_MS + 1)).toBeNull()
   })
 })

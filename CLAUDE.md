@@ -11,7 +11,7 @@ truth and its sections are numbered for reference. The one decision everything h
 (local bytes vs. known remote size) and each transfer is its own short-lived lftp process. Do
 not reintroduce `jobs -v` parsing as a source of truth (§1.2 explains why).
 
-**Status:** beta `0.2.6`, all 9 build phases complete (`DESIGN.md` §13) plus three sessions of
+**Status:** beta `0.3.0`, all 9 build phases complete (`DESIGN.md` §13) plus three sessions of
 fixes driven by real use against a real seedbox — it connects, scans, reconciles, transfers,
 auto-queues, post-processes, and has auth, ops (logs/backups/health), and a Files page that has
 been used in anger. Real gaps remain, named in `README.md`'s "Known gaps."
@@ -55,6 +55,17 @@ honor by default:
 - **Do not add `Co-authored-by:` trailers** unless the user explicitly asks.
 - **Doc updates ship in the same commit as the code they describe** — never as a
   follow-up commit.
+- **Never run a verification gate in the background — always foreground, with a generous
+  explicit timeout.** The full `pytest` run takes ~3.5 minutes. A **spawned subagent never
+  receives a background-task completion notification**, so an agent that backgrounds a gate
+  waits on a signal that cannot arrive and stalls indefinitely. This has now happened to
+  several agents in this repo. Run each gate as its own foreground command and read its exit
+  code directly.
+- **Run `uv run pytest` from the REPO ROOT, never from `backend/`.** `testpaths` is defined in
+  the root `pyproject.toml` and `tests/` is a sibling of `backend/`, not inside it — so running
+  from `backend/` collects **zero** tests and exits 0, which is indistinguishable from a pass at
+  a glance. Same for `ruff`. And `ruff check` passing is **not** `ruff format --check` passing:
+  they are separate gates, run both and read each exit code.
 - **Never bypass hooks** (no `--no-verify`, `--no-gpg-sign`, etc.) unless the user
   explicitly asks. If a hook fails, fix the underlying issue.
 - **Stable releases are tagged from `main` only.** Don't tag from `dev`.

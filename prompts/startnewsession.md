@@ -77,7 +77,216 @@ than a first. Two things that bit the first time and will bit again:
 
 ## Where we are
 
-### Post-v0.2.5 work on `dev` (2026-08-19) — first-restart feedback + two queue-view features, pushed, unreleased
+### 🚦 2026-08-20/21 — queue **Pause**, the **Preflight** box, and the docs catch-up
+
+Everything below is on `dev` and pushed. `main` is still `v0.2.6` — **the gap is now large: 34+
+commits and three migrations (023/024/025).** Tests: **1585 backend / 607 frontend, 0 skipped.**
+
+**Queue pause** (`07e2471`) — *Pause after current* and *Pause now*, persisted in a `setting` row
+(no migration), surfaced in `/api/health`. **The trap it had to avoid:** stop deliberately sets
+`auto_queue_suppressed` (§4.6), so reusing the stop path would have suppressed every running item
+and they would never come back on unpause. Instead it models the graceful-shutdown path — a
+`pause_requested` flag checked in `_reap_one` **before** exit-code classification, so a SIGTERM'd
+lftp is never classified `FAILED`; the job returns to `queued` keeping its `queue_position`,
+`attempt` and partial bytes. Proven by an **e2e test against a real lftp transfer** on the fake
+seedbox. Decided with the user: auto-queue keeps queueing while paused; **Start now is disabled
++ 409'd**; **reordering stays live while paused** — that is the whole workflow ("curate the order,
+then unpause").
+
+**Docs catch-up** (`ab17d85`) — quick-start / concepts / README / DESIGN brought in line with the
+redesign. Concepts grew from 10 to 13 entries. **The screenshots are stale and a human must retake
+them**: five are merely dated (pre-redesign nav), but README's second hero is *actively
+self-contradicting* — captioned "The Events page" while showing the removed History page and its
+deleted jobs list. A prioritised shot list with pre-written captions is in
+`docs/screenshot-plan.md`; the user is shooting them **2026-08-21 evening**, and until then the
+README deliberately keeps the old images.
+
+**The Preflight box** — a third, small box at the top of the Queue tab: things lftpweb knows about
+but has no work to do on yet. **Zero new integration** — the *arr poller already fetched these
+records every 60 s and discarded the unmatched ones; `QueueRecord.raw` had kept the full dict for
+exactly this. Built as a **pure projection, no table, no persistence** — which is what makes
+accumulation structurally impossible.
+
+| What | Commit |
+|---|---|
+| The box, *arr-sourced, with a **source-agnostic boundary** (`core/preflight.py` names neither `arr` nor `settle` in code, and has survived five tasks that way). Attribution by component-boundary prefix match of `output_path` against `arr_visible_path`; anything unattributable is **silently omitted** — promising a release that never arrives is worse than showing nothing | `42e4f61` |
+| **Settle-gated releases** join as a second source through that boundary (only `PreflightSource` widened), plus a **mount-gate banner** — one line per blocked queue, not fifty identical rows. Deliberately excluded: suppressed items and pattern-unmatched `REMOTE_ONLY` — neither is *waiting*, nothing is coming for them | `e785de0` |
+| Row **columns aligned** with the rows below (queue tag → title → *arr chip → `w-44` figure), queue name added to the row shape, remaining time from the *arr's `timeleft`, chips routed through **`StateChip`** — plus **evict-on-handover** | `d02fc0d` |
+| Chip shortened to **"Waiting"**, **Settling gained a live tooltip** (reuses `format.ts.settleWaitLabel`, fed *inputs* not a baked string so it ticks while hovered), and the expand became a **5/10/20 selector**; `PageSizeSelect` extracted so all three boxes share it | `8d56035` |
+| The **ticking progress fill** returns to the Queue row's chip (it was never passed a `percent`) and comes to Preflight's "Waiting" chip, via a new fillable `WAITING` state reusing `PARTIAL`'s **confirmed** amber pair. `SETTLING` deliberately has **no** fill — nothing is downloading | `82197a5` |
+| **Eviction latency**: retirement is now decided **at request time**, not once per 60 s *arr poll — the cause of "sometimes fast, sometimes slow." The match predicate is extracted and shared so the two call sites cannot drift. Frontend poll 15 s → 5 s | `703bf63` |
+
+**✅ User-verified in the browser (2026-08-20/21):** the full **Preflight → Active → Complete**
+transition is smooth; "Awaiting import" appears in Active and moves to Complete once the *arr
+finishes; the split view, short names, chevrons, filters, drawer history and multi-page Complete
+all work. **Unverified:** everything from `8d56035` onward (the "Waiting" chip, the Settling
+tooltip, the 5/10/20 selector, the progress fills), plus the fast-lane badge and "Dismiss list"
+across more than one 50-row page.
+
+**One judgement call left open for the user:** at **zero rows** the Preflight footer still renders,
+so an empty box is "Nothing in preflight." *plus* a small selector row rather than the strict
+single line originally asked for. One line to suppress if it reads as clutter.
+
+**Operational note now in `CLAUDE.md`** (`e58a46d`, `7a20f0b`): run `pytest` from the **repo root**
+(from `backend/` it collects **zero** tests and looks like a pass), `ruff check` is not
+`ruff format --check`, and **never background a gate** — a spawned subagent receives no completion
+notification and stalls forever. That last one still bit **three** agents today despite being
+written down; a hook that rejects a backgrounded `pytest` would fix it properly.
+
+### 2026-08-20 — Active/pending now holds a row until its whole *pipeline* finishes (✅ user-verified 2026-08-21)
+
+A follow-up to phase 1 stage 4b from the user's browser review, and the biggest behavioural change
+in the redesign so far. The two boxes used to split on **job termination** — lftp exits 0, the row
+moves to Complete — but verify/extract, the *arr's confirmed import, and the deferred source delete
+all continue past that, so a row sat under "Complete" while the release plainly was not. The user's
+own words: *"Shouldn't a job live in that state until the sonarr/radarr hook lands if they are
+enabled?"* Applied **consistently whether or not a queue is *arr-bound** — one definition of done,
+chosen explicitly over a narrower *arr-only rule. `prompts/done/2026-08-20-active-box-holds-
+inflight-pipeline.md`; **migration 025**.
+
+**The one thing to know before touching this: the predicate is ONE SQL string in
+`core/pipeline_flight.py`.** Three callers paste it verbatim — `list_jobs()` projects it as
+`pipeline_in_flight`, `list_complete_jobs()` puts `NOT (...)` in *both* its page query and its
+`COUNT(*)`, and `dismiss_all_terminal()` excludes the same item ids. The client never re-derives
+it. That is not stylistic: the Active box is client-side and the Complete box is server-paginated
+with its own `total`, so a second encoding drifts a row into **both boxes or neither**. The
+waiting-reason label (*Verifying / Extracting / Processing / Awaiting import / Deleting source*)
+comes out of the same `CASE`, so the label and the box cannot disagree.
+
+**Every blocking condition has a bounded exit, and that is the design constraint, not a nicety** —
+a box that can accumulate rows nothing is working on is worse than the bug this fixed. Post-
+processing keys off `in_flight_item_ids()` (the live worker), never the transient state string, so
+a crashed worker can't wedge a row. The *arr condition requires a **currently enabled** instance.
+Two age backstops (`ARR_WAIT_MAX_S` 24h, deliberately > `DROPPED_GONE_GRACE_S`;
+`SOURCE_DELETE_WAIT_MAX_S` 1h) cover what the pipeline's own ladders can't reach — notably the
+**paused source-delete retry**, which leaves `remote_delete_pending` set on purpose and is
+therefore invisible in item state. `tests/test_pipeline_flight.py` asserts both properties (exactly
+one box; nothing blocks forever) over a state matrix, not case by case.
+
+**"Mark complete" / "Mark failed" (+ Undo) is a CLASSIFICATION ONLY** — `item.manual_outcome`,
+read by the predicate and nothing else. It must never advance the `move`-mode delete ladder, be
+read as a confirmed *arr import, or trigger notify/cleanup/post-processing. Neither
+`core/postprocess.py` nor `core/arrsync.py` reads it; if a change makes one of them want to, that
+is the signal something has gone wrong. A real terminal outcome later does **not** supersede it
+(`docs/decisions.md` has the reasoning); Undo is the way back.
+
+**✅ Verified by the user on a real `:dev` pull, 2026-08-20** — the headline claim of this task,
+end to end: a downloaded item shows **"Awaiting import"** under Active/pending and then **moves to
+Complete once the *arr finishes processing it**. The transition, not just the label. Also
+confirmed the same day: the **multi-page Complete section**.
+
+Tests after this task: **1510 backend / 566 frontend, 0 skipped.**
+
+### 2026-08-20 — the browser-review batch (all three from the user's first real look at phase 1)
+
+Three follow-ups from the user reviewing the finished redesign, each its own prompt in
+`prompts/done/2026-08-20-*`:
+
+| What | Commit |
+|---|---|
+| **Page-size selector (10/20/50) per box**, remembered per browser (`transfers.activePageSize`/`transfers.completePageSize`), **both defaulting to 20** — the Complete box drops from its old fixed 50, the user's call after seeing it on screen. Stored values are validated on read (`isPageSize`), so a stale or hand-edited entry falls back to 20 rather than being trusted. Size change resets to page 1 deliberately — no scroll preservation, no equivalent-page arithmetic. `useCompleteJobs`'s existing `requestIdRef` race guard was **confirmed** to cover a size change, not assumed | `444e252` |
+| **Dismiss becomes an outcome menu in the Complete box header** (All / Downloaded / Failed / Stopped), moved down from the page top to sit with the rows it acts on. **Outcome and `name_filter` compose** (AND-ed — the user's explicit call), `job_ids` stays exclusive with both; `queue_id` deliberately not widened since it has had no caller since grouping was dropped. **"Clear all failed" was folded in**, not merely deleted — its old scope is exactly the menu's "Failed", now one server-side `UPDATE` instead of a client-side fan-out. Both boxes share one `pageReadout()` so the wording can't drift, and the Active box now always renders its shell with an honest empty state instead of vanishing | `35ce8ec` |
+| **Active/pending holds a row until its whole pipeline finishes** — see the section above | `bd614c0` |
+
+### ✅ Transfers redesign — phase 1 COMPLETE on `dev` (2026-08-19/20), all 7 stages landed
+
+**`docs/transfers-redesign-spec.md` is the plan and the reasoning — read it before touching the
+Transfers page, `core/scheduler.py`, or the queue ordering.** It is a *proposal document*, not a
+description of reality; `DESIGN.md` still describes what exists. Design settled with the user
+over a long session on 2026-08-19; the spec records the decisions, the two earlier decisions it
+**reverses**, the open questions, and a staged build order.
+
+**The shape being built:** Transfers becomes the main section with **Queue** and **Files** tabs;
+History becomes **Events** (audit log only, with a per-item deep link); the queue is **one
+globally-ordered ungrouped list**, not one section per queue. That last one is a *correctness*
+fix, not taste — `core/scheduler.py` contains **zero** references to `queue_id`, so admission is
+entirely global and grouping by queue implied per-queue lines that never existed.
+
+**Phase 2 (download clients — SAB, then ruTorrent) is specced in §4 but deliberately NOT started.**
+It is written down only so phase 1 doesn't paint it into a corner. Governing principle if it is
+ever picked up: **advisory only** — a client may skip work (satisfy the settle gate), withhold
+work (block a known-bad transfer), or explain, but may **never write `item.state`**. And "absent
+from the client is not a verdict" — the v0.2.4 `dropped` incident is the proof.
+
+| Stage | What | Commit |
+|---|---|---|
+| 1 | **Queue order model** — `rank DESC, queued_at ASC` (a *boost*) replaced by a dense fractional `job.queue_position REAL` (a *position*). **Migration 023.** Backfill reproduces the old order exactly (`ROW_NUMBER() OVER (ORDER BY rank DESC, queued_at ASC, id ASC)`); `COALESCE(queue_position, 1e18)` sorts a stray NULL **last**, not first. **`rank` was deliberately NOT dropped** — `_rescue_position` still reads it as a boosted/natural discriminator, so a future "drop rank" cleanup has a prerequisite | `32dff87` |
+| 2 | **Chevron reordering** — ▲▲/▲/▼ on queued rows, one `POST /api/jobs/{id}/move` taking a direction. Handles the click-race (job started running → 409, never reorder a running job whose allocation is fixed at spawn) and **position exhaustion** (repeated midpoint insertion → renormalize + retry; tested with `math.nextafter`-adjacent floats, asserting its own premise) | `91860cf` |
+| 3 | **Queue short display name** — nullable `path_queue.short_name`, **migration 024**, max 10 chars, no backfill (never truncate `DC-Movies`/`DC-Music` into the same `DC-M`), no uniqueness (a display hint, not an identifier). Icons deliberately deferred — a curated set needs a `NOTICE` licence entry, bundling, and dark/light legibility, and would never cover every category anyway | `4d2417a` |
+| 4a | **Grouping dropped** — one flat globally-ordered list, muted queue badge per row (`queueDisplayName`), fast-lane badge on small-lane rows explaining why `#9` can start before `#2`. Removed `groupJobsByQueue`/`GroupHeader`/per-queue "Dismiss Queue" (superseded by the filter + "Dismiss list", not lost) — History's own grouping and `HISTORY_COLLAPSED_QUEUES_KEY` untouched | `4465344` |
+| 4b | **Two paginated boxes** — Active/pending 20/page client-side, Complete 50/page **server-side** (`GET /api/jobs/complete`, reusing `api/history.py`'s pagination shape, never inlining `output_tail`). **The non-obvious part:** paginating server-side silently broke the client-side name filter and "Dismiss list" — a filter that only sees one page while appearing to filter everything. Both moved server-side; `DismissAllRequest` gained `name_filter`, mutually exclusive with `queue_id`/`job_ids`, with the "empty result dismisses **nothing**, never everything" guard tested directly | `7cf34ba` |
+
+**Remaining: stage 5** (rows expand to per-file progress — the data already exists via
+`_publish_child_progress`; children must be fetched **lazily on expand**, never inlined into the
+jobs list), **stage 6** (Transfers/Files tabs), **stage 7** (History → Events; the events endpoint
+already accepts an `item_id` filter, so the deep link is frontend wiring only).
+
+**Browser status (user-checked on a real `:dev` pull, 2026-08-20): confirmed working — the split
+Active/Complete view, the short display name, the chevrons, the name filters, the Complete box,
+and the item drawer's per-file history.** The chevron check was the one behavioural claim no test
+could reach: before 4a a global move could swap a row with something in another group and look
+inert. **Still unverified, and both need volume rather than variety:** the fast-lane badge (needs
+a sub-10 MB item to turn up), and **"Dismiss list" against a filter matching more than one 50-row
+Complete page** — 4b's core correctness claim, which cannot misbehave visibly until the completed
+set actually spans two pages.
+
+Tests after stage 4b: **1462 backend / 524 frontend, 0 skipped.**
+
+### 2026-08-19 — two production defects found in a support bundle, both fixed
+
+Diagnosed from `private_data/debug_logs/lftpweb-support-0.2.6-20260819T205145Z.zip` (production,
+v0.2.6). The user reported "2 failed jobs but everything looks cleaned up" — it was four, and they
+were two different stories. Two (`INTERRUPTED`, 14:43) were the v0.2.6 startup rescue working
+correctly. Two (`REMOTE_GONE`) were a real defect:
+
+| What | Commit |
+|---|---|
+| **Auto-queue re-queued a release the *arr had just imported.** Job succeeds → post-processing renames to final name → Sonarr (retrying import every ~90s for three hours, because SAB finished on the seedbox long before lftpweb transferred) imports within seconds and moves the media file out → next scan reads **`PARTIAL`** → auto-queue re-queues → `move` mode deletes the seedbox source on confirmed import → the queued job finally gets a slot and fails `REMOTE_GONE`. Worse, the doomed job **blocked `arr_cleanup` for 97 minutes** (92 `arr_cleanup_withheld` events) because cleanup withholds while "an active job exists". Root cause: `ELIGIBLE_STATES = ("REMOTE_ONLY", "PARTIAL")` but `resolve_absence` only ever intercepted `REMOTE_ONLY` — `PARTIAL` had **no grace-period protection at all**. Fixed in two narrow halves: a `PARTIAL` branch on the grace period keyed on `is_local_shrink` ("was complete **and** remote size unchanged **and** local shrank" — so an interrupted transfer, never complete, is untouched), plus auto-queue skipping `notified`/`imported`/`cleaned` items. Both were needed: the grace period expires in ~10 min and the season-pack import took ~19; the *arr gate has no time bound but does nothing on an unbound queue | `27f629b` |
+| **Support bundle spent its 20 MB *arr-log budget on nine-day-stale logs.** `_log_file_sort_key` sorted by rotation suffix, so bare names (`sonarr.txt`, `sonarr.debug.txt`, `sonarr.trace.txt`) all read as "non-rotated" and tie-broke **alphabetically** — `debug` < `trace` < `txt`, so a dormant debug/trace series sorted *ahead* of the current log. 6 of 12 files were dropped, including the ones covering the incident. Now sorts by the *arr's own `lastWriteTime` descending across every series (it was always in the response, just never read); missing timestamps sort **last**, never first; `TRUNCATED.txt` prints timestamps for fetched and skipped alike | `c0cb4f1` |
+
+**The user's own hypothesis was right and is worth recording:** Sonarr *did* re-grab the episode
+from a different NZB (14:49:50Z `...BAE-xpost` failed on the SAB side, 15:13:52Z
+`...BAE[rarbg]-xpost` grabbed instead) — but three hours before the re-queue, so it explained the
+item's provenance, not the defect. **Do not predict remote paths from release names**: SAB renames
+on unpack and on re-grab.
+
+**Accepted gaps, named not hidden** (README "Known gaps", DESIGN.md §7.3): a queue with **no *arr
+binding** whose external removal outlasts the grace window still gets one re-queue; an
+`imported`/`cleaned` item whose remote legitimately grows is no longer auto-queued.
+
+### Post-v0.2.6 work on `dev` (2026-08-19) — the README's safety-rails section, and all of v0.2.6 confirmed in use
+
+| What | Commit |
+|---|---|
+| **README gains "Safety rails: when a volume drops or a remote stops answering"** — a user-facing write-up of the two failure families that were only documented in code and `docs/decisions.md` before: the mount sentinel (what `.lftpweb-mount-ok` is, why an empty dir and an unmounted share are indistinguishable without it, and the six things a failed check blocks blanket-per-queue) plus the removal grace period; then the remote side — a failed remote scan persisting nothing and keeping its cached tree, partial-`find` success, per-instance *arr backoff (60 s → 30 min, 10 s call timeout), the amber `dropped` 6 h grace state, confirmed-import-only source deletes, and the bounded delete-retry/self-heal sweeps. Written from the code, not the brief. Scope calls the user made during review: **no table** (prose only), **no production-incident anecdotes** (the mechanisms stand on their own), **no NFS mount-option guidance**, and **no "hung vs. dropped mount" caveat** — the sentinel catching a dropped mount but blocking on a half-alive NFS server is real and deliberately left unsaid. Two bolded lead-ins say "Sonarr/Radarr" rather than `*arr` purely because an unmatched `*` inside `**…**` mis-renders | `c7e2d6e` |
+
+**Verification landed the same day, and v0.2.6 is now fully witnessed** (see the v0.2.6 blocks
+below for the detail): the user pulled `:dev` and confirmed all three items — the **Start-now
+fraction menu**, the **Transfers-row ETA**, and finally the **rescue re-queue ordering**, seen
+on a real restart with a live queue and behaving as designed. That last one had been the batch's
+one unwitnessed item precisely because it only manifests on a mid-download restart; it was
+watched for opportunistically rather than staged, and the opportunity arrived.
+
+### 🚀 v0.2.6 released 2026-08-18 (local; third same-day release) — the queue-view batch ships
+
+PR #12 (`dev` → `main`, merged `f90ed70`), tag `v0.2.6`, release notes = the `[0.2.6]`
+CHANGELOG section verbatim; `:latest`/`:0.2.6`/`:0` published on the release event. Contents:
+exactly the three items in the section below (`62dbb46`/`31216a8`/`2d9c620`), **released
+browser-unverified** (flagged to the user pre-merge) — migration **022** runs on first start.
+**All three have since been confirmed by the user on 2026-08-19**: the Start-now fraction menu,
+the Transfers-row ETA, and the rescue re-queue ordering (that last on a real restart with a live
+queue — the only way it manifests). Nothing in this release remains unwitnessed.
+Tests at release: **1339 backend / 488 frontend, 0 skipped.** GitHub Actions fought
+back twice more this cut: the PR push's duplicate Test-suite job wedged `pending` ~15 min
+(cancel + rerun, green in 4m13s — third dispatch wedge this week), then the post-merge main
+CI's Test suite hung ~18 min inside `apt-get update` (dead runner mirror; job has no
+`timeout-minutes`, GitHub's default is 6h — cancel + rerun, green in 4m). **CI diagnosis
+recorded:** every push with an open PR runs CI twice (`push: [dev]` + `pull_request: [main]`,
+no `concurrency` group), doubling the stall lottery; hardening options named but deliberately
+deferred (concurrency group per-commit; `timeout-minutes` + apt retries on the lftp install
+step) — queue them if the stalls outlive GitHub's bad week.
+
+### Post-v0.2.5 work on `dev` (2026-08-19 UTC) — first-restart feedback + two queue-view features (released as v0.2.6 above)
 
 The first production restart onto v0.2.5 (heavy queue) surfaced a positioning flaw in the
 day-old startup rescue, and live queue-watching prompted two features. Each its own prompt in
@@ -89,9 +298,10 @@ day-old startup rescue, and live queue-watching prompted two features. Each its 
 | **Transfers row shows time-to-completion** — a `running` row's collapsed line now reads "45% · 40 MB/s · 25m left" (live WS `eta_s` with job-row fallback, omitted while null; figure container widened `w-32→w-44`). One figure added, row economy otherwise untouched | `31216a8` |
 | **"Start now" is a 10%/25%/50%/75%/Max menu** of the site bandwidth limit — §4.5 extension (DESIGN.md updated as such): fraction × site limit computed once at admission, other allocations never reshaped; `fraction=1.0` is byte-identical to the old Max path. **Migration 022** (`job.forced_rate_fraction REAL`, old `forced_full_rate` kept + written in lockstep — SQLite can't retype a column; parallel column, single Python-layer field). Fractions with no site limit: options disabled with a hint AND server-side 409 (never a silent Max). New `StartNowMenu.tsx` (keyboard-navigable, built on the existing popover mechanics — no new dependency), pure `lib/startNow.ts` | `2d9c620` |
 
-Tests after the batch: **1339 backend / 488 frontend, 0 skipped.** Unviewed: the ETA figure,
-the Start-now menu (keyboard nav + disabled hint), and a real fraction transfer's actual
-throughput — all await the user's next `:dev` pull. Also answered from code this session
+Tests after the batch: **1339 backend / 488 frontend, 0 skipped.** **Verification status
+(user-checked 2026-08-19): all three items confirmed working** — the Start-now fraction menu,
+the Transfers-row ETA, and the rescue re-queue ordering, the last observed on a real restart
+with a live queue rather than a staged one. Also answered from code this session
 (no change needed): Move-to-top and Start-now are ordering/allocation-only — both spawn the
 same `mirror -c` at the same `.downloading-` physical dir, so an existing partial resumes,
 never restarts.

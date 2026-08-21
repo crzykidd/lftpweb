@@ -1,0 +1,22 @@
+-- A short display name per queue (2026-08-19, docs/transfers-redesign-spec.md §3.6, phase 1
+-- stage 3, prompts/done/2026-08-19-queue-short-display-name.md). Stage 4 drops the Transfers
+-- page's per-queue grouping in favour of one globally-ordered list; once grouping is gone each
+-- row still needs to say which queue it belongs to, cheaply -- "per-row queue labels make the
+-- page busy" was the finding that motivated grouping in the first place
+-- (prompts/done/2026-08-16-transfers-group-by-queue.md). `DC-Movies` -> `MOV`.
+--
+-- **Nullable, no backfill.** `NULL` means "no short name set" -- every read falls back to the
+-- full `name` (`api/settings_queues.py.resolve_queue_display_name`, the one place that
+-- fallback is computed). Existing queues are never truncated into an invented short name:
+-- `DC-Movies` and `DC-Music` would both collapse to `DC-M`, and a silently wrong label is worse
+-- than a long one.
+--
+-- **No uniqueness constraint.** This is a display hint, not an identifier -- two queues may
+-- legitimately share a short name, and rejecting a duplicate at save time would be a surprising
+-- failure while typing for a field that carries no correctness weight.
+--
+-- Save-time validation (trim, empty-after-trim -> NULL, length cap) lives in
+-- `api/settings_queues.py._normalized_short_name` / `_reject_invalid_short_name`, not a DB
+-- `CHECK` -- consistent with every other `path_queue` field this project validates at the API
+-- layer rather than the schema layer (e.g. `download_prefix`, `local_path`/`staging_path`).
+ALTER TABLE path_queue ADD COLUMN short_name TEXT;

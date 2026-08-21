@@ -19,13 +19,12 @@ from __future__ import annotations
 
 import asyncio
 import io
-import re
 import shutil
 import sys
 import zipfile
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import PurePosixPath
 from typing import Any
 
@@ -53,11 +52,6 @@ ARR_LOG_BYTE_BUDGET = 20 * 1024 * 1024
 # ceiling against one pathological huge file consuming the whole budget in a single download,
 # and needs no separately-tuned number to do that job.
 ARR_LOG_PER_FILE_BYTE_CAP = ARR_LOG_BYTE_BUDGET
-
-# Rotated *arr log filename suffix -- `sonarr.1.txt`, `sonarr.debug.2.txt`, etc. Ascending
-# numbers are progressively older rotations on the *arr's own side; a filename with no such
-# suffix (`sonarr.txt`, `sonarr.debug.txt`) is the current, newest file.
-_ROTATION_SUFFIX_RE = re.compile(r"\.(\d+)\.[^.]+$")
 
 
 def bundle_filename(version: str, now: datetime) -> str:
@@ -167,18 +161,67 @@ async def queue_disk_usage(queues: Sequence[QueuePaths]) -> list[dict[str, Any]]
     return await asyncio.to_thread(_all)
 
 
-def _log_file_sort_key(filename: str) -> tuple[int, int, str]:
-    """Newest-first fetch order for one *arr instance's log-file listing (2026-08-17 polish):
-    non-rotated names first (`sonarr.txt`, `sonarr.debug.txt`), then rotations in ascending
-    numeric order (`sonarr.1.txt` before `sonarr.2.txt`) -- so when the instance-level budget
-    runs out partway through, what's already been kept is the most recent material, not
-    whatever order the *arr's own listing happened to return. Falls back to a plain alphabetic
-    sort within either group for a filename this pattern doesn't recognize.
+@dataclass(frozen=True)
+class _ArrLogFile:
+    """One `/api/v3/log/file` record, narrowed to what the fetch loop needs: `filename` to
+    request, and `last_write` -- the *arr's own `lastWriteTime`, parsed -- to decide fetch
+    order. `None` for `last_write` means "the *arr didn't report a usable timestamp for this
+    file," not "this file is old" or "this file is new" -- callers must never treat it as
+    either (`_log_file_sort_key` below sorts it last, deliberately, never first).
     """
-    match = _ROTATION_SUFFIX_RE.search(filename)
-    if match is None:
-        return (0, 0, filename)
-    return (1, int(match.group(1)), filename)
+
+    filename: str
+    last_write: datetime | None
+
+
+def _parse_arr_timestamp(value: Any) -> datetime | None:
+    """Parse one *arr log-file record's `lastWriteTime` into a comparable, timezone-aware
+    `datetime` -- `None` for anything not a non-empty ISO-8601 string (missing field, `null`,
+    or a value this codebase hasn't seen the *arr emit), so a record with no usable timestamp
+    reads as "unknown age" to the caller rather than raising. `datetime.fromisoformat` (3.11+)
+    already accepts the *arr's own wire format directly -- a trailing `Z` and .NET's
+    sub-microsecond fractional-second precision (`lastWriteTime` is serialized from a .NET
+    `DateTime`, which ticks in 100ns units) both parse without any manual normalization; a
+    fraction longer than 6 digits is silently truncated to microsecond precision, which is
+    far finer than this comparison (day-to-week staleness) ever needs.
+    """
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+
+
+def _log_file_sort_key(entry: _ArrLogFile) -> tuple[int, float, str]:
+    """Newest-first fetch order for one *arr instance's log-file listing, **across every
+    rotation series at once** (2026-08-19 fix, see docs/decisions.md -- a real production
+    bundle's evidence is there). Sorted by the *arr's own reported `lastWriteTime`, descending.
+
+    **Why not sort by filename/rotation-suffix pattern (the pre-fix behavior):** that orders
+    correctly *within* one series (`sonarr.1.txt` is indeed older than `sonarr.txt`) but has no
+    way to compare *across* series -- `sonarr.debug.txt` and `sonarr.trace.txt` are both
+    "non-rotated," so they sort ahead of rotated files from the live `sonarr.*` series purely by
+    filename, even when the debug/trace series is dormant and every file in it is stale. That is
+    exactly what happened in production: a large, 9-day-stale `trace` series consumed the whole
+    per-instance budget ahead of the files that actually covered the incident window.
+
+    A file with no usable timestamp (`entry.last_write is None`) sorts **last**, never first --
+    an unknown age must never outrank a file the *arr positively reports as recent. Filename is
+    the final tiebreak only, for deterministic output when two files share a timestamp.
+    """
+    if entry.last_write is None:
+        return (1, 0.0, entry.filename)
+    return (0, -entry.last_write.timestamp(), entry.filename)
+
+
+def _format_arr_timestamp(value: datetime | None) -> str:
+    """Render one `_ArrLogFile.last_write` for a human reading `TRUNCATED.txt` -- ISO-8601, or
+    an explicit "no timestamp reported" rather than a blank, so a missing timestamp reads as a
+    finding (the *arr's own response was incomplete) rather than a formatting accident.
+    """
+    return value.isoformat() if value is not None else "no timestamp reported"
 
 
 def _safe_zip_component(name: str, *, fallback: str) -> str:
@@ -191,6 +234,31 @@ def _safe_zip_component(name: str, *, fallback: str) -> str:
     component = PurePosixPath(name).name  # strips any directory components, "..", trailing "/"
     component = component.lstrip(".").strip()
     return component or fallback
+
+
+def _truncated_report(*, ordered: Sequence[_ArrLogFile], attempted: int, budget_mb: int) -> bytes:
+    """`TRUNCATED.txt`'s body: which files fit the per-instance budget and which didn't, each
+    listed with the *arr's own `lastWriteTime` (2026-08-19 fix). The pre-fix version named only
+    filenames, "skipped, oldest first" -- actively misleading against the production evidence
+    this fix exists for: three of the *fetched* files were nine days stale, and three of the
+    *skipped* files were current. Listing a timestamp for both sets lets a future reader see at
+    a glance whether the budget was well spent, without cross-referencing file contents to find
+    out.
+    """
+    fetched, skipped = ordered[:attempted], ordered[attempted:]
+    lines = [
+        f"{len(skipped)} of {len(ordered)} log file(s) not fetched: the ~{budget_mb} MB "
+        f"per-instance budget was exhausted after {attempted} file(s) were attempted "
+        "(successes and per-file errors alike).",
+        "",
+        "Fetched, newest last-modified first:",
+        *(f"  {e.filename}  ({_format_arr_timestamp(e.last_write)})" for e in fetched),
+        "",
+        "Skipped, newest last-modified first -- these would have been fetched next:",
+        *(f"  {e.filename}  ({_format_arr_timestamp(e.last_write)})" for e in skipped),
+        "",
+    ]
+    return "\n".join(lines).encode()
 
 
 async def fetch_arr_instance_logs(
@@ -211,9 +279,11 @@ async def fetch_arr_instance_logs(
 
     **The `ARR_LOG_BYTE_BUDGET` is a running total across every file in this instance, not a
     per-file number** (the bug this fixes: one Sonarr with 53 debug files produced a 54 MB
-    uncompressed folder). Files are fetched newest-first (`_log_file_sort_key`) so once the
-    budget is exhausted, what's already kept is the most recent material; the remaining files
-    are named in a `TRUNCATED.txt` marker rather than silently dropped. Each individual
+    uncompressed folder). Files are fetched by `lastWriteTime`, newest first, **across every
+    rotation series at once** (`_log_file_sort_key` -- 2026-08-19 fix, see docs/decisions.md)
+    so once the budget is exhausted, what's already kept is the genuinely most recent material
+    regardless of which series it came from; the remaining files are named, with their own
+    timestamps, in a `TRUNCATED.txt` marker rather than silently dropped. Each individual
     download is still capped at `ARR_LOG_PER_FILE_BYTE_CAP` -- the instance-level budget is the
     binding constraint, this is just a floor against one huge file consuming it in one shot.
     """
@@ -226,21 +296,26 @@ async def fetch_arr_instance_logs(
                 parts[f"{prefix}/NO-LOG-FILES.txt"] = b"the instance reported no log files\n"
                 return parts
 
-            filenames = (
-                f["filename"] for f in files if isinstance(f.get("filename"), str) and f["filename"]
-            )
-            ordered = sorted(filenames, key=_log_file_sort_key)
+            entries = [
+                _ArrLogFile(
+                    filename=f["filename"],
+                    last_write=_parse_arr_timestamp(f.get("lastWriteTime")),
+                )
+                for f in files
+                if isinstance(f.get("filename"), str) and f["filename"]
+            ]
+            ordered = sorted(entries, key=_log_file_sort_key)
 
             instance_bytes = 0
             attempted = 0
-            for filename in ordered:
+            for entry in ordered:
                 if instance_bytes >= ARR_LOG_BYTE_BUDGET:
                     break
                 attempted += 1
-                safe_name = _safe_zip_component(filename, fallback="log.txt")
+                safe_name = _safe_zip_component(entry.filename, fallback="log.txt")
                 try:
                     content, truncated = await client.download_log_file(
-                        filename, max_bytes=ARR_LOG_PER_FILE_BYTE_CAP
+                        entry.filename, max_bytes=ARR_LOG_PER_FILE_BYTE_CAP
                     )
                 except ArrClientError as exc:
                     parts[f"{prefix}/{safe_name}.FETCH-ERROR.txt"] = f"{exc}\n".encode()
@@ -252,15 +327,11 @@ async def fetch_arr_instance_logs(
                 parts[f"{prefix}/{safe_name}"] = content
                 instance_bytes += len(content)
 
-            skipped = len(ordered) - attempted
-            if skipped > 0:
+            if attempted < len(ordered):
                 budget_mb = ARR_LOG_BYTE_BUDGET // (1024 * 1024)
-                parts[f"{prefix}/TRUNCATED.txt"] = (
-                    f"{skipped} of {len(ordered)} log file(s) not fetched: the ~{budget_mb} MB "
-                    f"per-instance budget was exhausted after {attempted} file(s) were "
-                    "attempted (successes and per-file errors alike). Skipped, oldest first: "
-                    f"{', '.join(ordered[attempted:])}\n"
-                ).encode()
+                parts[f"{prefix}/TRUNCATED.txt"] = _truncated_report(
+                    ordered=ordered, attempted=attempted, budget_mb=budget_mb
+                )
     except ArrClientError as exc:
         parts[f"{prefix}/FETCH-FAILED.txt"] = f"{exc}\n".encode()
     return parts

@@ -2,7 +2,7 @@ import { Navigate, Route, Routes } from 'react-router-dom'
 import { Layout } from './components/Layout'
 import { FilesPage } from './pages/FilesPage'
 import { TransfersPage } from './pages/TransfersPage'
-import { HistoryPage } from './pages/HistoryPage'
+import { EventsPage } from './pages/EventsPage'
 import { DashboardPage } from './pages/DashboardPage'
 import { LoginPage } from './pages/LoginPage'
 import { ConnectionTab } from './pages/settings/ConnectionTab'
@@ -37,10 +37,31 @@ function App() {
   return (
     <Routes>
       <Route element={<Layout />}>
-        <Route index element={<Navigate to="/files" replace />} />
-        <Route path="files" element={<FilesPage />} />
-        <Route path="transfers" element={<TransfersPage />} />
-        <Route path="history" element={<HistoryPage />} />
+        {/* Transfers is the main section (2026-08-20, docs/transfers-redesign-spec.md §2, phase
+         * 1 stage 6): Queue and Files are now tabs beneath it rather than two separate top-level
+         * nav entries -- see `nav.ts.TRANSFERS_TABS`. Queue is the default tab ("the working
+         * surface now," the task's own instruction), so both the section root and the app's own
+         * landing route resolve there. */}
+        <Route index element={<Navigate to="/transfers/queue" replace />} />
+        {/* `/files` was the standalone Files route before this task. Kept as a redirect, not
+         * removed, so nothing that already links or bookmarks it 404s -- see
+         * `docs/quick-start.md`/`docs/concepts.md`, which link here by the old path too (updated
+         * to the new one in this same change, but a stale bookmark or an external link still
+         * lands correctly). */}
+        <Route path="files" element={<Navigate to="/transfers/files" replace />} />
+        <Route path="transfers">
+          <Route index element={<Navigate to="/transfers/queue" replace />} />
+          <Route path="queue" element={<TransfersPage />} />
+          <Route path="files" element={<FilesPage />} />
+        </Route>
+        <Route path="events" element={<EventsPage />} />
+        {/* `/history` was the standalone History route before this task (2026-08-20,
+         * docs/transfers-redesign-spec.md §2, phase 1 stage 7): the page it named is now
+         * Events, its jobs list dropped since the Queue tab's Complete box already covers
+         * "what finished, in what order" (stage 4b). Kept as a redirect, not removed, so nothing
+         * that already links or bookmarks it 404s -- the exact `/files` -> `/transfers/files`
+         * pattern stage 6 established (see the comment above `Route path="files"` above). */}
+        <Route path="history" element={<Navigate to="/events" replace />} />
         <Route path="dashboard" element={<DashboardPage />} />
         <Route path="settings">
           <Route index element={<Navigate to="/settings/connection" replace />} />
@@ -63,7 +84,7 @@ function App() {
           <Route path="concepts" element={<ConceptsPage />} />
           <Route path="release-notes" element={<ReleaseNotesPage />} />
         </Route>
-        <Route path="*" element={<Navigate to="/files" replace />} />
+        <Route path="*" element={<Navigate to="/transfers/queue" replace />} />
       </Route>
     </Routes>
   )

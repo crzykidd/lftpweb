@@ -20,6 +20,7 @@ import asyncio
 import json
 import logging
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -39,6 +40,11 @@ from lftpweb.core import (
 )
 from lftpweb.core.events import EventBus
 from lftpweb.core.itemview import ITEM_VIEW_COLUMNS, ItemView, item_view
+from lftpweb.core.pipeline_flight import (
+    in_flight_expr,
+    item_pipeline_busy_subquery,
+    waiting_reason_expr,
+)
 from lftpweb.core.local_delete import _physical_local_root
 from lftpweb.core.metrics import RunningJobBytes, ThroughputSampler
 from lftpweb.core.progress import ActiveJob, JobProgress, ProgressSampler, child_speed_bps
@@ -109,6 +115,31 @@ class NoSiteLimitConfiguredError(Exception):
     """
 
 
+class QueuePausedError(Exception):
+    """Raised by `TransferQueue.start_now` while the queue is paused (this task, 2026-08-20,
+    `prompts/2026-08-20-queue-pause.md`). "Start now" is the oversubscription escape hatch
+    (DESIGN.md §4.5) -- letting it through while paused would silently defeat the pause the
+    user just asked for, the same "an explicit user action beats a heuristic" question §4.7
+    already answers the other way for manual Queue clicks (those still enqueue while paused;
+    only *admission* is gated). `api/jobs.py.start_now` turns this into a 409, disjoint from
+    `JobNotQueuedError`'s 409 below and from `move_job`'s own guard -- reordering a queued job
+    stays fully functional while paused (this task's own settled decision: pause is the moment
+    you curate the order), so this check lives only in `start_now`, never in `move_job`.
+    """
+
+
+class JobNotQueuedError(Exception):
+    """Raised by `TransferQueue.move_job` when `job_id` is no longer `queued` -- it started
+    running, or reached a terminal state, sometime between the Transfers page rendering its
+    chevrons and the click landing (2026-08-19, docs/transfers-redesign-spec.md §3.4 stage 2,
+    `prompts/2026-08-19-queue-reorder-chevrons.md`). Reordering a running job is meaningless:
+    its allocation is fixed at spawn and never re-shaped (DESIGN.md §4.5's invariant), and a
+    terminal job isn't in line at all. `api/jobs.py.move_job` turns this into a 409, matching
+    `JobNotDismissableError`'s own "the job exists, the request just isn't valid for its current
+    state" convention above -- never a 404, which would wrongly suggest the job itself is gone.
+    """
+
+
 # Progress sampling cadence -- deliberately *not* the ~1 Hz `tick_s` everything else in this
 # module runs at (reap/admit/stop stay at `tick_s`, §4.4/DESIGN.md §4.4):
 #
@@ -147,6 +178,17 @@ def _parent_rel(rel_path: str) -> str | None:
     return rel_path.rsplit("/", 1)[0]
 
 
+def _like_escape(value: str) -> str:
+    """Escapes `%`/`_`/`\\` so a `LIKE ... ESCAPE '\\'` pattern built from user text matches a
+    **literal** substring, never a glob -- the same "no glob/regex parsing" contract
+    `lib/transferPanel.ts.filterTransferJobs`'s own docstring states for its client-side
+    counterpart. Callers build the pattern as `f"%{_like_escape(needle.lower())}%"` and compare
+    against `LOWER(rel_path)`, mirroring that function's `toLowerCase()` case-insensitivity
+    rather than relying on SQLite's own `LIKE`, which only case-folds ASCII by default.
+    """
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 def resolve_forced_rate_fraction(row: Any) -> float | None:
     """The one place that reads both `job.forced_rate_fraction` (migration 022) and
     `job.forced_full_rate` (migration 001) off a `job` row, so every reader -- `_admit` below,
@@ -166,6 +208,37 @@ def resolve_forced_rate_fraction(row: Any) -> float | None:
     if fraction is not None:
         return float(fraction)
     return 1.0 if row["forced_full_rate"] else None
+
+
+def position_between(lower: float | None, upper: float | None) -> float:
+    """A fresh `job.queue_position` for a spot in the queue's dense ordering
+    (`queue_position ASC`, `migrations/023_queue_position.sql`) -- the one primitive every
+    writer of the column uses, so the arithmetic exists in exactly one place. `lower` is the
+    position of the row immediately before the new one belongs (`None` = insert before
+    everything); `upper` is the row immediately after (`None` = insert after everything). Both
+    `None` means an empty ordering.
+
+    - `_insert_job`'s default (append at the back): `position_between(MAX(queue_position), None)`.
+    - `move_to_top`: `position_between(None, MIN(queue_position))`.
+    - `_rescue_position` (the v0.2.6 startup-rescue re-derivation, below): the midpoint between
+      the natural-zone neighbours the rescued job's original `queued_at` falls between.
+    - **Not yet called by any chevron** -- this is stage 1 of
+      docs/transfers-redesign-spec.md §3.4; stage 2's "move up one / down one" will call this
+      directly with the row's immediate neighbours. Exercised today only via the three callers
+      above and this module's own tests, per the spec's "prove the primitive now" instruction.
+
+    No rebalancing: repeated midpoint bisection between the same two neighbours converges on
+    float precision after ~50 successive inserts at the same spot, which is an existing,
+    accepted property of the fractional-key design (DESIGN.md §4.5's "occasional rebalance"),
+    not a new limitation this function introduces.
+    """
+    if lower is None and upper is None:
+        return 1.0
+    if lower is None:
+        return upper - 1.0
+    if upper is None:
+        return lower + 1.0
+    return (lower + upper) / 2.0
 
 
 def _parent_rel_path(full_path: str) -> str:
@@ -250,6 +323,50 @@ async def save_transfer_settings(db: aiosqlite.Connection, settings: TransferSet
     await db.commit()
 
 
+@dataclass(frozen=True)
+class QueuePauseState:
+    """Whether admission is paused (this task, 2026-08-20,
+    `prompts/2026-08-20-queue-pause.md`) -- persisted the same way as every other site-level
+    setting in this module (`TransferSettings` above): a small dataclass, JSON in `setting`,
+    under its own key. A dedicated `setting` row rather than a migration -- a single bool needs
+    no schema of its own, and this codebase already has a generic key/value store built for
+    exactly this shape (every other `core/*.py` module's own `SETTING_KEY` constant).
+
+    **Which entry mode ("pause after current" vs "pause now") was used is deliberately not
+    part of this state.** Once paused, the two modes are indistinguishable from here on:
+    nothing new is admitted either way, and "pause now" already finished doing its one-time
+    extra work (returning running jobs to `queued`, see `TransferQueue._pause_running_jobs`)
+    by the time this is read again. There is nothing left for the entry mode to mean.
+    """
+
+    paused: bool = False
+
+
+PAUSE_SETTING_KEY = "queue_pause_state"
+
+
+async def load_queue_pause_state(db: aiosqlite.Connection) -> QueuePauseState:
+    cursor = await db.execute("SELECT value FROM setting WHERE key = ?", (PAUSE_SETTING_KEY,))
+    row = await cursor.fetchone()
+    if row is None:
+        return QueuePauseState()
+    try:
+        data = json.loads(row["value"])
+    except (ValueError, TypeError):
+        return QueuePauseState()
+    return QueuePauseState(paused=bool(data.get("paused", False)))
+
+
+async def save_queue_pause_state(db: aiosqlite.Connection, state: QueuePauseState) -> None:
+    payload = json.dumps({"paused": state.paused})
+    await db.execute(
+        "INSERT INTO setting (key, value, updated_at) VALUES (?, ?, STRFTIME('%Y-%m-%dT%H:%M:%fZ','now')) "
+        "ON CONFLICT (key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+        (PAUSE_SETTING_KEY, payload),
+    )
+    await db.commit()
+
+
 @dataclass
 class _RunningProcess:
     job_id: int
@@ -275,6 +392,10 @@ class _RunningProcess:
     # module's docstring for why `bytes_done` alone can't be differenced by job id.
     bytes_start: int = 0
     stop_requested: bool = False
+    # "Pause now" (this task, 2026-08-20) -- mirrors `stop_requested` above, but `_reap_one`
+    # routes it to a different outcome: back to `queued` in place, not `STOPPED`/suppressed.
+    # See `TransferQueue._pause_running_jobs` and `_reap_one`'s own `paused` branch.
+    pause_requested: bool = False
 
 
 class TransferQueue:
@@ -369,9 +490,17 @@ class TransferQueue:
         # state instead of once per second for as long as it lasts (see `_admit` below).
         self.credentials_need_reentry = False
 
+        # Pause (this task, 2026-08-20, `prompts/2026-08-20-queue-pause.md`) -- cached
+        # in-memory, same shape as `credentials_need_reentry` above, so `_admit`'s gate and
+        # `/api/health` never pay a DB read on the hot path. Loaded from its persisted setting
+        # row in `start()` below (so a restart doesn't quietly resume everything); every write
+        # goes through `pause()`/`unpause()`, which update both the row and this cache together.
+        self._paused = False
+
     # --- lifecycle ---------------------------------------------------------------------
 
     async def start(self) -> None:
+        self._paused = (await load_queue_pause_state(self.db)).paused
         await self._reconcile_orphaned_jobs()
         if self._task is None:
             self._task = asyncio.create_task(self._loop(), name="lftpweb-transfer-queue-loop")
@@ -499,16 +628,18 @@ class TransferQueue:
         one is covered by `_requeue_stranded_downloaded` on the *next* startup (auto-queue itself
         structurally cannot see a `DOWNLOADED` item -- it isn't in `ELIGIBLE_STATES`).
 
-        **`queued_at` preserves queue position** (2026-08-19,
+        **`queued_at` preserves the queued-wait readout** (2026-08-19,
         prompts/2026-08-19-rescue-requeue-keeps-queue-position.md): the caller passes the
         interrupted job's own original `queued_at` -- for rule 1 that's the row this sweep just
         marked INTERRUPTED, for rule 2 (`_requeue_stranded_downloaded`) it's the most recent
-        interrupted job it already keyed off. A running item was, by definition, already among
-        the oldest jobs in line (`rank DESC, queued_at ASC`, `core/scheduler.py`); backdating the
-        fresh row to that same timestamp puts it back at (or near) the front instead of behind
-        every job that hadn't even started, and is honest besides -- the item genuinely has been
-        waiting since then, so the Transfers page's queued-wait readout tells the truth. `rank`
-        is never touched here, so this still can't outrank an explicit "Move to top".
+        interrupted job it already keyed off. It is honest besides -- the item genuinely has been
+        waiting since then, so the Transfers page's queued-wait readout tells the truth.
+
+        **`_rescue_position` re-derives the actual queue *place*** (2026-08-19, this task --
+        under the position model, `queued_at` alone no longer places anything; see that method's
+        own docstring for how the neighbours are found and why boosted jobs are excluded from the
+        search). `rank` is never touched here, so this still can't outrank an explicit
+        "Move to top".
         """
         item = await self._fetch_item(item_id)
         if item is None:
@@ -530,7 +661,8 @@ class TransferQueue:
                 )
             return
         try:
-            job_id = await self.enqueue_item(item_id, queued_at=queued_at)
+            position = await self._rescue_position(queued_at)
+            job_id = await self.enqueue_item(item_id, queued_at=queued_at, queue_position=position)
         except Exception:
             logger.exception("startup re-queue of item %d after an interrupted job failed", item_id)
             return
@@ -548,6 +680,72 @@ class TransferQueue:
                 + ("" if freshly_interrupted else " (stranded by an earlier restart)")
             ),
         )
+
+    async def _rescue_position(self, original_queued_at: str) -> float:
+        """Re-derive the `queue_position` the v0.2.6 startup rescue needs, now that
+        `queued_at` is no longer an ordering input (2026-08-19, this task -- the acceptance
+        criterion for `docs/transfers-redesign-spec.md`'s stage 1, and the one thing in this
+        task that already shipped to production and must not regress).
+
+        **The old fix, and why it stopped placing anything.** Before this task, the rescue
+        carried the interrupted job's own `queued_at` forward and left `rank` at its default
+        (0) -- under `rank DESC, queued_at ASC` that was enough: rank-0 rows sort purely by
+        `queued_at`, so backdating it put the row back among the natural-zone jobs exactly
+        where it belonged, and rank 0 could never outrank a `rank > 0` "Move to top". Under
+        `queue_position ASC`, `queued_at` carries no positional weight at all -- this method is
+        what replaces it: find the two *natural-zone* jobs the original `queued_at` falls
+        between, and take their `queue_position` midpoint (`position_between`, above).
+
+        **Restricted to `rank = 0` jobs -- this is load-bearing, not incidental.** `rank`
+        is otherwise dead for ordering as of this task (migration 023's own comment), but it is
+        still written by `move_to_top` and stays the one reliable "was this job ever explicitly
+        boosted" marker. Natural-zone (`rank = 0`) jobs are the only ones whose `queue_position`
+        is guaranteed ordered the same as their `queued_at` -- they only ever get a position by
+        appending at the back (`_insert_job`'s default) or by this very method's own midpoint
+        insert, both of which preserve that correlation by construction. A boosted job's
+        position carries no such relationship to its `queued_at` -- it could have been queued
+        long ago and boosted just now, or boosted long ago and left with an old timestamp -- so
+        comparing the rescued job's `queued_at` against a boosted job's can pick the wrong
+        neighbour and land the rescued job ahead of an explicit "Move to top". Concretely: a job
+        boosted to `queue_position = -3` with `queued_at` *after* the rescued job's original
+        timestamp would, under a naive comparison across all queued jobs, look like a valid
+        "right neighbour" -- and the midpoint would land the rescued job in front of it. Excluding
+        boosted jobs from the search entirely is what rules that out; see
+        tests/test_queue_orphans.py's rescue-position tests for the worked counterexample.
+
+        The natural-zone neighbours bracket the position; `MAX(queue_position)` over boosted
+        (`rank != 0`) jobs is the floor a rescued job must never cross, folded in via
+        `position_between` exactly like every other caller of that primitive.
+        """
+        cursor = await self.db.execute(
+            "SELECT queue_position FROM job WHERE state = 'queued' AND rank = 0 "
+            "AND queued_at <= ? ORDER BY queue_position DESC LIMIT 1",
+            (original_queued_at,),
+        )
+        left = await cursor.fetchone()
+        cursor = await self.db.execute(
+            "SELECT queue_position FROM job WHERE state = 'queued' AND rank = 0 "
+            "AND queued_at > ? ORDER BY queue_position ASC LIMIT 1",
+            (original_queued_at,),
+        )
+        right = await cursor.fetchone()
+        cursor = await self.db.execute(
+            "SELECT MAX(queue_position) AS m FROM job WHERE state = 'queued' AND rank != 0"
+        )
+        boosted_max = (await cursor.fetchone())["m"]
+
+        if left is not None and right is not None:
+            return position_between(left["queue_position"], right["queue_position"])
+        if right is not None:
+            # No natural-zone job has an older `queued_at` -- the rescued job belongs at the
+            # very front of the natural zone, immediately after the last boosted job (if any).
+            return position_between(boosted_max, right["queue_position"])
+        if left is not None:
+            # No natural-zone job has a newer `queued_at` -- the rescued job belongs at the
+            # back of the natural zone.
+            return position_between(left["queue_position"], None)
+        # No natural-zone jobs currently queued at all -- park it right after any boosted ones.
+        return position_between(boosted_max, None)
 
     async def _requeue_stranded_downloaded(
         self,
@@ -684,6 +882,110 @@ class TransferQueue:
                     result,
                 )
 
+    @property
+    def paused(self) -> bool:
+        """Whether admission is currently paused (this task, 2026-08-20,
+        `prompts/2026-08-20-queue-pause.md`) -- `/api/health`'s `queue_paused` and
+        `start_now`'s 409 guard both read this. Backed by `self._paused`, kept in memory and
+        loaded from its persisted `setting` row at `start()`; every write goes through
+        `pause()`/`unpause()` below, which update the row and this cache together.
+        """
+        return self._paused
+
+    async def pause(self, *, stop_running: bool) -> None:
+        """Pause admission (this task -- the two "Pause after current" / "Pause now" entry
+        modes from the Transfers -> Queue tab control).
+
+        **The admission gate lives in `_admit()`, not in `core/scheduler.py.admit()`.** The
+        caller (this module) simply skips calling the scheduler at all while paused, rather
+        than threading a new flag through `SchedulerSettings`/`admit()`. `admit()` is a
+        deliberately pure function with worked examples in DESIGN.md §4.5 that mention nothing
+        about pause; a caller-side skip leaves that function, and every one of those examples,
+        completely untouched. Reaping, progress publishing, scanning, and auto-queue are
+        unaffected either way -- only `_admit()`'s own body is short-circuited (see its own
+        gate, right at the top).
+
+        `stop_running=False` ("pause after current"): running jobs are left alone and finish
+        naturally; nothing new is admitted from here on.
+
+        `stop_running=True` ("pause now"): additionally, every in-flight lftp child is
+        SIGTERM'd and its job returned straight to `queued`, in place -- see
+        `_pause_running_jobs` for why this is the graceful-shutdown model (§10.3) plus the
+        v0.2.6 startup rescue's re-queue, and explicitly **not** `stop_job`'s §4.6 stop
+        semantics (auto_queue_suppressed, `STOPPED`) -- reusing stop would suppress every
+        paused-now item and it would never come back on unpause, the opposite of what pausing
+        means.
+
+        Auto-queue and manual Queue clicks keep enqueueing while paused (DESIGN.md §4.7:
+        "always wins," untouched by this task) -- the queue simply builds up and is worked
+        through once admission resumes.
+        """
+        await save_queue_pause_state(self.db, QueuePauseState(paused=True))
+        self._paused = True
+        await audit.record_event(
+            self.db,
+            level="info",
+            kind="queue_paused",
+            message=(
+                "transfer queue paused ('pause now' -- running transfers were stopped and "
+                "requeued)"
+                if stop_running
+                else "transfer queue paused after current (nothing new admitted; running "
+                "transfers finish normally)"
+            ),
+        )
+        if stop_running:
+            await self._pause_running_jobs()
+
+    async def unpause(self) -> None:
+        """Resume admission immediately, in `queue_position` order -- `request_tick()` wakes
+        the loop rather than waiting up to `tick_s` for the next scheduled pass.
+        """
+        await save_queue_pause_state(self.db, QueuePauseState(paused=False))
+        self._paused = False
+        await audit.record_event(
+            self.db, level="info", kind="queue_unpaused", message="transfer queue unpaused"
+        )
+        self.request_tick()
+
+    async def _pause_running_jobs(self) -> None:
+        """ "Pause now"'s per-job half: SIGTERM every in-flight lftp child, concurrently -- the
+        exact same reasoning as `stop()`'s graceful shutdown above (independent processes,
+        nothing to serialize, and a queue full of running jobs must not take `N * grace_s` to
+        pause). The difference from `stop()` is what happens after each child exits:
+        `_reap_one` sees `pause_requested` and returns the job straight to `queued` **in
+        place** rather than tearing this process down.
+
+        Never re-derives `queue_position` (unlike the startup rescue's own `_rescue_position`
+        --- that one exists because a restart already destroyed the interrupted job's row,
+        forcing a *fresh* row to be inserted and re-placed). Here the job row survives
+        untouched throughout; only `job.state` ever changes at admission
+        (`_spawn_decision`'s `UPDATE job SET state = 'running', ...` never touches
+        `queue_position`), so simply flipping the state back to `queued` finds the row exactly
+        where it already was -- no neighbour search needed.
+        """
+        running = list(self._running.values())
+        if not running:
+            return
+
+        async def _pause_one(proc: _RunningProcess) -> None:
+            proc.pause_requested = True
+            try:
+                await lftp.terminate(proc.spawned, grace_s=10.0)
+            finally:
+                await self._reap_one(proc)
+
+        results = await asyncio.gather(
+            *(_pause_one(proc) for proc in running), return_exceptions=True
+        )
+        for proc, result in zip(running, results, strict=True):
+            if isinstance(result, Exception):
+                logger.warning(
+                    "job %s: error pausing lftp child (SIGTERM/requeue): %r",
+                    proc.job_id,
+                    result,
+                )
+
     def request_tick(self) -> None:
         self._wake.set()
 
@@ -712,7 +1014,12 @@ class TransferQueue:
     # --- public actions (called by api/jobs.py) -----------------------------------------
 
     async def enqueue_item(
-        self, item_id: int, *, forced_full_rate: bool = False, queued_at: str | None = None
+        self,
+        item_id: int,
+        *,
+        forced_full_rate: bool = False,
+        queued_at: str | None = None,
+        queue_position: float | None = None,
     ) -> int:
         """Manual queue (DESIGN.md §4.7): always wins, clears suppression, resets `attempt`.
         Returns the `job.id` -- a fresh one, or (see below) an existing active one.
@@ -729,10 +1036,17 @@ class TransferQueue:
         this task, and every caller today except the startup rescue below) stamps today's
         now, byte-for-byte the pre-existing behavior -- same opt-in-parameter pattern as
         `core/postprocess.py.perform_remote_delete`'s `caller`. The startup rescue passes the
-        *interrupted* job's own original `queued_at` so a transfer that was mid-download at
-        restart re-enters the queue at (or near) the front rather than the back -- see
-        `_requeue_interrupted_item` for why. `rank` is untouched either way (still defaults to
-        0 via `_insert_job`), so this never outranks an explicit "Move to top".
+        *interrupted* job's own original `queued_at` so the Transfers page's queued-wait
+        readout stays honest -- see `_requeue_interrupted_item` for why.
+
+        **`queue_position` override** (2026-08-19, this task -- replaces "carrying `queued_at`
+        forward" as what actually places a rescued job in line, now that position rather than
+        `queued_at` is the ordering key): `None` (every caller except the startup rescue) appends
+        at the back via `_insert_job`'s own default. The rescue passes `_rescue_position`'s
+        result instead, so the re-queued row lands where its original `queued_at` would have put
+        it -- between the same neighbours -- while never landing ahead of an explicit "Move to
+        top". `rank` is untouched either way (still defaults to 0 via `_insert_job`), which is
+        what makes that guarantee hold -- see `_rescue_position`'s own docstring.
 
         **Idempotent, not rejecting** (2026-08-13,
         prompts/2026-08-13-lftp-timestamped-temp-files.md's root cause). This used to insert a
@@ -782,6 +1096,7 @@ class TransferQueue:
             attempt=1,
             forced_rate_fraction=1.0 if forced_full_rate else None,
             queued_at=queued_at,
+            queue_position=queue_position,
         )
         await self.db.execute(
             "UPDATE item SET state = 'QUEUED', auto_queue_suppressed = 0, suppressed_reason = NULL, "
@@ -845,16 +1160,177 @@ class TransferQueue:
             self.request_tick()
 
     async def move_to_top(self, job_id: int) -> None:
+        """`position_between(None, MIN(queue_position))` -- one `UPDATE`, no renumbering of any
+        other row (2026-08-19, docs/transfers-redesign-spec.md §3.4). Behaviorally identical to
+        the pre-position-model implementation from the user's point of view: this job now sorts
+        before every other queued job.
+
+        **`rank` is still bumped too**, even though it is otherwise dead for ordering as of this
+        task (migration 023's own comment) -- it is the one durable "was this job ever explicitly
+        boosted" marker, and `TransferQueue._rescue_position` reads it (only it, nothing else
+        does) to keep the startup rescue from ever landing a re-queued job ahead of a job moved
+        to top here. Not read back by this method itself; kept in lockstep purely for that
+        reader.
+        """
         cursor = await self.db.execute(
-            "SELECT COALESCE(MAX(rank), 0) AS max_rank FROM job WHERE state = 'queued'"
+            "SELECT MIN(queue_position) AS min_pos, COALESCE(MAX(rank), 0) AS max_rank "
+            "FROM job WHERE state = 'queued'"
         )
         row = await cursor.fetchone()
+        new_position = position_between(None, row["min_pos"])
         new_rank = (row["max_rank"] or 0) + 1
         await self.db.execute(
-            "UPDATE job SET rank = ? WHERE id = ? AND state = 'queued'", (new_rank, job_id)
+            "UPDATE job SET queue_position = ?, rank = ? WHERE id = ? AND state = 'queued'",
+            (new_position, new_rank, job_id),
         )
         await self.db.commit()
         self.request_tick()
+
+    async def move_job(self, job_id: int, direction: str) -> None:
+        """The chevron reorder actions (2026-08-19, docs/transfers-redesign-spec.md §3.4 stage
+        2, `prompts/2026-08-19-queue-reorder-chevrons.md`): `direction` is `'up'`, `'down'`, or
+        `'top'`. One method, not three near-identical ones -- `api/jobs.py` exposes it behind a
+        single `POST /api/jobs/{id}/move` endpoint.
+
+        **`'top'` reuses `move_to_top` verbatim** -- no second implementation of "front of the
+        line" exists. It only adds the same not-queued guard `'up'`/`'down'` need below (
+        `move_to_top` itself has no such guard -- its own `UPDATE ... WHERE id = ? AND state =
+        'queued'` just silently no-ops on a non-queued row, which was fine when its only caller
+        was a UI button that already hid itself for a non-queued row; this method's callers need
+        an explicit signal instead, per the task's own "reject cleanly" instruction).
+
+        **`'up'`/`'down'` resolve the target's adjacent neighbour in the same lane-agnostic
+        global position order the scheduler uses** (`queue_position ASC, id ASC` over `state =
+        'queued'`, identical to `_admit`'s own ordering query), then set the moved job's position
+        to the midpoint (`position_between`) between that neighbour and the neighbour's own
+        next-outward neighbour -- a standard swap-by-midpoint reorder. Concretely, for `'up'`
+        moving a job from index `i` to `i-1`: the new position lands between index `i-2`'s
+        position (or unbounded, if `i-1` is already the front) and index `i-1`'s own position,
+        which is exactly what makes the two rows trade places without touching either neighbour's
+        stored value.
+
+        **Edge cases, each covered by its own test in `tests/test_queue_position.py`:**
+
+        - Already at the front (`'up'`) or back (`'down'`) of the *global* queued order: a no-op
+          that returns normally, not an error. The UI disables the control here, but this method
+          cannot rely on that -- a second tab, or a stale render, can still send the request.
+        - Only one job queued: both directions are trivially the "already at the edge" case
+          above.
+        - `job_id` not found at all: `ValueError` (matches every other not-found guard in this
+          class -- `api/jobs.py` maps it to 404).
+        - `job_id` exists but is not `queued` (running, or already terminal -- started or
+          finished between the page rendering its position and the click landing):
+          `JobNotQueuedError` (`api/jobs.py` maps it to 409). Reordering a running job is
+          meaningless: DESIGN.md §4.5's invariant is that its allocation is fixed at spawn and
+          never re-shaped, so there is nothing here for a position change to affect.
+        - **Concurrent moves.** Two `move_job` calls racing each other can each read the same
+          neighbour positions before either commits, in principle landing two jobs on the exact
+          same `queue_position`. This is survivable, not corrupting: every reader of
+          `queue_position` (`_admit`, `list_jobs`, this method's own neighbour query) orders
+          `queue_position ASC, id ASC`, so `id` is the deterministic final tiebreak regardless of
+          how many rows share a position -- see `tests/test_queue_position.py`'s duplicate-
+          position test. No lock is taken here for the same reason `_insert_job`/`move_to_top`
+          never have: SQLite's own single-writer serialization already makes each individual
+          `UPDATE` atomic, and a stale-neighbour race merely produces "close enough" ordering for
+          one tick, never two rows silently colliding into an unreadable state.
+
+        **Position exhaustion.** Repeated midpoint bisection between the same two neighbours
+        halves the gap between them every time, and eventually produces a value float precision
+        cannot distinguish from one of its own bounds (`position_between`'s own docstring calls
+        this out as an accepted property of the fractional-key design, "occasional rebalance").
+        Detected here by comparing the computed midpoint back against the two bounds that
+        produced it -- if it lands on either one, the *entire* queued set is renormalized to
+        1.0, 2.0, 3.0... in current order (`_renormalize_queue_positions`, below) and this method
+        retries once against the now evenly-spaced positions, which cannot exhaust on the very
+        next bisection.
+        """
+        if direction == "top":
+            row = await self._fetch_job(job_id)
+            if row is None:
+                raise ValueError(f"job {job_id} not found")
+            if row["state"] != "queued":
+                raise JobNotQueuedError(f"job {job_id} is not queued (state={row['state']!r})")
+            await self.move_to_top(job_id)
+            return
+
+        if direction not in ("up", "down"):
+            raise ValueError(f"unknown move direction {direction!r}")
+
+        cursor = await self.db.execute(
+            "SELECT id, queue_position FROM job WHERE state = 'queued' "
+            "ORDER BY queue_position ASC, id ASC"
+        )
+        rows = await cursor.fetchall()
+        ids = [r["id"] for r in rows]
+        positions = [r["queue_position"] for r in rows]
+
+        try:
+            index = ids.index(job_id)
+        except ValueError:
+            row = await self._fetch_job(job_id)
+            if row is None:
+                raise ValueError(f"job {job_id} not found") from None
+            raise JobNotQueuedError(
+                f"job {job_id} is not queued (state={row['state']!r})"
+            ) from None
+
+        if direction == "up":
+            if index == 0:
+                return  # already at the front of the global order -- no-op
+            neighbour_idx, outward_idx = index - 1, index - 2
+        else:
+            if index == len(ids) - 1:
+                return  # already at the back of the global order -- no-op
+            neighbour_idx, outward_idx = index + 1, index + 2
+
+        neighbour_pos = positions[neighbour_idx]
+        outward_pos = positions[outward_idx] if 0 <= outward_idx < len(positions) else None
+
+        if direction == "up":
+            lower, upper = outward_pos, neighbour_pos
+        else:
+            lower, upper = neighbour_pos, outward_pos
+        new_position = position_between(lower, upper)
+
+        # Exhaustion only ever arises from a genuine two-bound midpoint -- an unbounded insert
+        # (`lower`/`upper` None) always lands 1.0 away from its one real bound, never adjacent to
+        # it in float terms.
+        exhausted = (
+            lower is not None
+            and upper is not None
+            and (new_position <= lower or new_position >= upper)
+        )
+        if exhausted:
+            await self._renormalize_queue_positions()
+            await self.move_job(job_id, direction)
+            return
+
+        await self.db.execute(
+            "UPDATE job SET queue_position = ? WHERE id = ? AND state = 'queued'",
+            (new_position, job_id),
+        )
+        await self.db.commit()
+        self.request_tick()
+
+    async def _renormalize_queue_positions(self) -> None:
+        """Collapse whatever float precision `move_job`'s repeated midpoint bisection has
+        exhausted: rewrite every `queued` job's `queue_position` as 1.0, 2.0, 3.0... in its
+        current `queue_position ASC, id ASC` order. Purely a precision reset, not a reordering --
+        every row keeps its relative place, so a caller that re-derives its own neighbours
+        immediately afterward (`move_job`'s own retry) computes the identical move it was already
+        trying to make, just against evenly-spaced inputs that cannot be adjacent in float terms.
+        `rank`/`queued_at` are untouched; this only ever rewrites `queue_position`, the one column
+        bisection can exhaust.
+        """
+        cursor = await self.db.execute(
+            "SELECT id FROM job WHERE state = 'queued' ORDER BY queue_position ASC, id ASC"
+        )
+        rows = await cursor.fetchall()
+        for i, row in enumerate(rows, start=1):
+            await self.db.execute(
+                "UPDATE job SET queue_position = ? WHERE id = ?", (float(i), row["id"])
+            )
+        await self.db.commit()
 
     async def start_now(self, job_id: int, *, rate_percent: int | None = None) -> bool:
         """The "Start now" action (DESIGN.md §4.5), now a menu (2026-08-19,
@@ -877,7 +1353,19 @@ class TransferQueue:
         "not really configured" needs no new sentinel or migration to the settings row itself.
         Max (`fraction == 1.0`) is exempt from this check -- it reuses whatever
         `max_bandwidth_bps` already is, unconditionally, exactly as the pre-fraction path did.
+
+        **Refused (409, `QueuePausedError`) while the queue is paused** (this task, 2026-08-20):
+        paused means paused -- oversubscribing past the ceiling to force one item through would
+        silently defeat the pause the user just asked for. Checked before anything else below,
+        so it applies unconditionally, the same "belt-and-braces" shape (disabled client-side
+        *and* rejected server-side) `NoSiteLimitConfiguredError` already uses for its own case.
+        Reordering (`move_job`) is a separate method entirely and is untouched by this check --
+        it stays fully usable while paused (this task's own settled decision).
         """
+        if self._paused:
+            raise QueuePausedError(
+                "start-now is unavailable while the transfer queue is paused -- unpause first"
+            )
         row = await self._fetch_job(job_id)
         if row is None or row["state"] != "queued":
             return False
@@ -950,6 +1438,15 @@ class TransferQueue:
         have dismiss also clear suppression — don't; that path already exists and is called
         Retry (`retry_item` above, "always wins, clears suppression, resets `attempt`"), which
         is the deliberate, visible way to say "actually, try again."
+
+        **Nor an item whose pipeline is still in flight** (2026-08-20, docs/transfers-redesign-
+        spec.md §3.2's pipeline-completion rule) — a job can exit 0 while verify/extract, the
+        *arr's confirmed import, or the deferred source delete are all still outstanding, and that
+        row now lives in the Active/pending box. Dismissing something still being worked on makes
+        no sense, and it is also how a row would vanish from *both* boxes (`list_jobs()` excludes
+        a dismissed job unconditionally). Same `JobNotDismissableError` → 409 shape as the active
+        states above, and the same "the UI not offering the button is a courtesy, this is the
+        guard" reasoning. `core/pipeline_flight.py` owns the test itself.
         """
         row = await self._fetch_job(job_id)
         if row is None:
@@ -959,10 +1456,40 @@ class TransferQueue:
                 f"job {job_id} is {row['state']!r}; only a failed, cancelled, or succeeded "
                 "job can be dismissed"
             )
+        if await self.item_pipeline_busy(row["item_id"]):
+            raise JobNotDismissableError(
+                f"job {job_id} has finished but its item's pipeline is still in flight "
+                "(post-processing, an *arr import, or a deferred source delete) — it is still "
+                "shown under Active/pending and can be dismissed once that finishes, or "
+                "resolved manually"
+            )
         await self.db.execute("UPDATE job SET dismissed_at = ? WHERE id = ?", (_now_iso(), job_id))
         await self.db.commit()
 
-    async def dismiss_all_terminal(self, queue_id: int | None = None) -> int:
+    async def item_pipeline_busy(self, item_id: int) -> bool:
+        """Whether one item is still in flight by the shared predicate
+        (`core/pipeline_flight.item_pipeline_busy_subquery`) — the single-item read `dismiss_job`
+        above and `api/jobs.py.resolve_item` both need, expressed against the same SQL the two
+        listing queries use rather than as a fourth hand-written version of the rule.
+
+        The *item* half only: neither caller has a job row in scope, and both already know
+        whatever they need about job state separately.
+        """
+        cursor = await self.db.execute(
+            "SELECT 1 FROM ("
+            f"{item_pipeline_busy_subquery(self._postprocess_in_flight_ids())}"
+            ") AS busy WHERE busy.id = ?",
+            (item_id,),
+        )
+        return await cursor.fetchone() is not None
+
+    async def dismiss_all_terminal(
+        self,
+        queue_id: int | None = None,
+        job_ids: Sequence[int] | None = None,
+        name_filter: str | None = None,
+        outcome: str | None = None,
+    ) -> int:
         """The bulk counterpart to `dismiss_job` above (2026-08-15, "Dismiss all" at the top of
         the Transfers page) -- one `UPDATE`, not a per-job loop, per the task's own preference
         for a bulk endpoint over a client-side `Promise.allSettled` fan-out.
@@ -974,7 +1501,9 @@ class TransferQueue:
         doesn't restrict itself to each item's *most recent* job (`list_jobs()`'s `MAX(id)`
         superseding rule) -- an older, already-superseded terminal row is never shown on
         Transfers regardless of its `dismissed_at`, so dismissing it too is harmless and keeps
-        this one plain `UPDATE ... WHERE` rather than a second copy of that subquery.
+        this one plain `UPDATE ... WHERE` rather than a second copy of that subquery. This one
+        rule has exactly one exception: `name_filter` below, which re-adds the restriction on
+        purpose, for a different reason.
 
         `queue_id` (2026-08-17, the group-header "Dismiss Queue" control,
         `prompts/2026-08-17-transfers-dismiss-per-queue.md`) restricts the same `UPDATE` to one
@@ -985,22 +1514,112 @@ class TransferQueue:
         `queue_id` naming no queue that exists simply matches zero rows -- the same "nothing to
         do, not an error" answer an empty/all-dismissed queue already gives; this never 404s.
 
+        `job_ids` (2026-08-19, the Transfers page's name filter and its own "Dismiss list"
+        button, `prompts/2026-08-19-transfers-name-filter.md`) restricts the same `UPDATE` to an
+        explicit set of job ids -- `None` (the default) means no id restriction at all, exactly
+        today's pre-existing behavior. `job_ids` is a *narrowing* of the same terminal-state
+        `WHERE`, never an override of it: an id naming a `queued`/`running` job simply matches
+        zero rows for that id, the identical "the client's list can only ask for a subset of
+        what the guard already allows" contract `DismissAllRequest`'s own docstring states.
+
+        **An empty `job_ids` list (`[]`, as opposed to `None`) must dismiss nothing and return
+        `0` -- it must never degrade into "no filter, so dismiss everything."** This is the
+        dangerous edge of this whole change: `[]` is a real, deliberate "the current filter
+        matches zero dismissable rows" input, not "no restriction was given." Handled with an
+        early return before the `UPDATE` is even built, both because it is the correct answer
+        and because `... AND id IN ()` is not valid SQL to begin with.
+
+        `name_filter` (2026-08-19, docs/transfers-redesign-spec.md §3.2, phase 1 stage 4b)
+        supersedes `job_ids` for "Dismiss list" once the Complete box is server-paginated: a
+        filter can match more rows than are loaded on any one page, so an explicit id list can
+        only ever express "dismiss this page", not "dismiss everything the filter matches" --
+        `DismissAllRequest.name_filter`'s own docstring has the full reasoning. Case-insensitive
+        substring match against `item.rel_path` (`_like_escape`, above -- the same literal-
+        substring, no-glob contract `lib/transferPanel.ts.filterTransferJobs` states for its
+        client-side counterpart), an empty string matching every row (same as an empty
+        client-side filter). Unlike every other scope on this method, this one **does** add the
+        `list_jobs()`-style `MAX(id)`-per-item restriction back in -- deliberately, so this
+        `UPDATE`'s own `WHERE` is built from *exactly* the same predicate
+        `TransferQueue.list_complete_jobs` filters its listing on. That is what lets
+        `CompleteJobsResponse.total` for a given filter always equal the count this dismisses:
+        without it, "Dismiss list" could silently sweep up an already-superseded terminal row
+        the user was never shown (a stale `failed` attempt on an item that has since been
+        retried and is queued/running again) -- harmless in the `job_ids`/`queue_id` cases above
+        (their inputs are already the exact set the frontend loaded, so a superseded row was
+        never a candidate to begin with), but a real drift here since `name_filter` is
+        recomputed server-side against the *whole* table, not a client-supplied id list.
+
+        `outcome` (2026-08-20, follow-up to phase 1 stage 4b,
+        `prompts/2026-08-20-transfers-dismiss-menu-and-counts.md`) restricts the same `UPDATE`
+        to one terminal state -- the Complete box's own "Dismiss" menu ("all, downloaded, failed
+        (or whatever the completed status are)", the user's own words). `None` (the default)
+        means no state restriction beyond the base `state IN (...)` guard already applies --
+        unchanged behavior for every caller that predates this task.
+
+        **`outcome` composes with `name_filter` -- decided by the user, 2026-08-20** (recorded
+        in `docs/decisions.md`): both narrow the same set, so a request naming both dismisses
+        their intersection (`AND`ed into the same `WHERE`, not two separate queries reconciled
+        after the fact). `DismissAllRequest`'s own validator is what keeps `job_ids`/`queue_id`
+        out of this composition -- this method trusts its caller to have already enforced that,
+        the same way it trusts the `job_ids == []` guard above to have already been checked by
+        the time any of these branches run.
+
+        `outcome` deliberately does **not** add the `name_filter` branch's `MAX(id)`-per-item
+        restriction on its own (only `name_filter` does, whether or not `outcome` is also given)
+        -- an `outcome`-only dismiss is a narrowing of this method's own pre-existing "dismiss
+        every terminal row, superseded or not" behavior (see the module docstring above for why
+        that's harmless with no filter at all), not a promise to match `list_complete_jobs`'s
+        listing predicate the way `name_filter` alone is. Once `name_filter` is also given, the
+        combined `WHERE` picks up the restriction the normal way, which is what keeps
+        `list_complete_jobs(name_filter=..., outcome=...)`'s `total` and this method's
+        `(name_filter=..., outcome=...)` dismissed count in agreement -- the same property
+        `name_filter` alone already guarantees, now extended to the composed case (see
+        `docs/decisions.md` and the paired test,
+        `test_dismiss_all_terminal_name_filter_count_matches_list_complete_jobs_total`).
+
+        **An item whose pipeline is still in flight is never dismissed** (2026-08-20,
+        docs/transfers-redesign-spec.md §3.2's pipeline-completion rule) -- dismissing something
+        still being worked on makes no sense, and this `UPDATE`'s count has to keep matching
+        `list_complete_jobs`'s `total`, which now excludes those rows too. Same one expression
+        (`core/pipeline_flight.item_pipeline_busy_subquery`), reached through a subquery because
+        an `UPDATE job` has no `item`/`arr_instance` join of its own. Only the *item* half is
+        needed here: this `WHERE` already restricts to terminal jobs, for which the job half is
+        false by construction. This applies to **every** scope, `job_ids` included -- an explicit
+        id naming an in-flight row simply matches nothing, the same "a narrowing can only ask for
+        a subset of what the guard already allows" contract every other scope has.
+
         Returns the actual row count affected (`cursor.rowcount`), the same "report the real
         number" convention `api/history.py`'s clear-history endpoints already use.
         """
-        if queue_id is None:
-            cursor = await self.db.execute(
-                "UPDATE job SET dismissed_at = ? "
-                "WHERE state IN ('failed','cancelled','succeeded') AND dismissed_at IS NULL",
-                (_now_iso(),),
+        if job_ids is not None and len(job_ids) == 0:
+            return 0
+
+        where = [
+            "state IN ('failed','cancelled','succeeded')",
+            "dismissed_at IS NULL",
+            f"item_id NOT IN ({item_pipeline_busy_subquery(self._postprocess_in_flight_ids())})",
+        ]
+        params: list[Any] = [_now_iso()]
+        if queue_id is not None:
+            where.append("item_id IN (SELECT id FROM item WHERE queue_id = ?)")
+            params.append(queue_id)
+        if job_ids is not None:
+            placeholders = ",".join("?" for _ in job_ids)
+            where.append(f"id IN ({placeholders})")
+            params.extend(job_ids)
+        if outcome is not None:
+            where.append("state = ?")
+            params.append(outcome)
+        if name_filter is not None:
+            where.append("id = (SELECT MAX(j2.id) FROM job j2 WHERE j2.item_id = job.item_id)")
+            where.append(
+                "item_id IN (SELECT id FROM item WHERE LOWER(rel_path) LIKE ? ESCAPE '\\')"
             )
-        else:
-            cursor = await self.db.execute(
-                "UPDATE job SET dismissed_at = ? "
-                "WHERE state IN ('failed','cancelled','succeeded') AND dismissed_at IS NULL "
-                "AND item_id IN (SELECT id FROM item WHERE queue_id = ?)",
-                (_now_iso(), queue_id),
-            )
+            params.append(f"%{_like_escape(name_filter.lower())}%")
+
+        cursor = await self.db.execute(
+            f"UPDATE job SET dismissed_at = ? WHERE {' AND '.join(where)}", params
+        )
         await self.db.commit()
         return cursor.rowcount
 
@@ -1062,6 +1681,48 @@ class TransferQueue:
                 (exit_code, tail[-lftp.OUTPUT_TAIL_BYTES :], finished_at, proc.job_id),
             )
             await self._suppress_item(proc.item_id, reason="user_stopped", state="STOPPED")
+            await self.db.commit()
+            await self._publish_item_state(proc.item_id)
+            proc.spawned.cleanup()
+            return
+
+        if proc.pause_requested:
+            # "Pause now" (this task, 2026-08-20, `prompts/2026-08-20-queue-pause.md`) -- the
+            # job returns straight to `queued`, **in place**: `queue_position` is never touched
+            # here (`_pause_running_jobs`'s own docstring has why no neighbour search is
+            # needed), `attempt` is unchanged (this is a resume, not a retry), and neither
+            # `auto_queue_suppressed` nor `STOPPED` is ever set -- the one thing this whole task
+            # exists to get right. Reusing `stop_job`'s §4.6 semantics (the branch just above)
+            # would suppress the item and it would never come back on unpause -- the exact
+            # opposite of what "pause" means.
+            #
+            # **A SIGTERM'd lftp exits non-zero, but `exit_code`/`error_class` are deliberately
+            # never written here.** This branch returns before the exit-code classification
+            # below and the retry/failure bookkeeping it drives, exactly like the `stopped`
+            # branch above -- a pause must never produce a `FAILED` row or an `error_class`.
+            #
+            # `forced_full_rate`/`forced_rate_fraction` are cleared: a job admitted via "Start
+            # now" goes back through ordinary admission on unpause, rather than silently
+            # re-oversubscribing the instant it resumes.
+            await self.db.execute(
+                "UPDATE job SET state = 'queued', pid = NULL, started_at = NULL, "
+                "rate_limit_bps = NULL, forced_full_rate = 0, forced_rate_fraction = NULL, "
+                "output_tail = ? WHERE id = ?",
+                (tail[-lftp.OUTPUT_TAIL_BYTES :], proc.job_id),
+            )
+            await self.db.execute("UPDATE item SET state = 'QUEUED' WHERE id = ?", (proc.item_id,))
+            await audit.record_event(
+                self.db,
+                level="info",
+                item_id=proc.item_id,
+                job_id=proc.job_id,
+                kind="paused_now_requeued",
+                message=(
+                    f"job {proc.job_id} for {proc.rel_path!r}: stopped by 'pause now' -- "
+                    "returned to queued at its same position; partial bytes on disk are kept "
+                    "and the next attempt resumes from them"
+                ),
+            )
             await self.db.commit()
             await self._publish_item_state(proc.item_id)
             proc.spawned.cleanup()
@@ -1786,6 +2447,15 @@ class TransferQueue:
         await self.metrics.tick(running)
 
     async def _admit(self) -> None:
+        # The pause gate (this task, 2026-08-20) -- a caller-side skip, not a flag threaded
+        # into `scheduler.admit()` (see `pause()`'s own docstring for why). Deliberately no log
+        # line here: unlike "admitted none" below (a *surprising* zero that needs explaining),
+        # a paused queue admitting nothing is exactly what was asked for, and the paused banner
+        # / health readout already say so continuously -- logging it every tick would just be
+        # per-second noise for as long as the pause lasts.
+        if self._paused:
+            return
+
         settings = await load_transfer_settings(self.db)
         sched_settings = settings.scheduler_settings()
 
@@ -1795,9 +2465,11 @@ class TransferQueue:
         ]
         now = time.monotonic()
         cursor = await self.db.execute(
-            "SELECT job.id, job.item_id, job.lane, job.rank, job.queued_at, "
+            "SELECT job.id, job.item_id, job.lane, "
+            "       COALESCE(job.queue_position, 1e18) AS queue_position, "
             "       job.forced_full_rate, job.forced_rate_fraction "
-            "FROM job WHERE job.state = 'queued' ORDER BY job.rank DESC, job.queued_at ASC"
+            "FROM job WHERE job.state = 'queued' "
+            "ORDER BY COALESCE(job.queue_position, 1e18) ASC, job.id ASC"
         )
         rows = await cursor.fetchall()
         queue: list[scheduler.QueuedJob] = []
@@ -1810,9 +2482,14 @@ class TransferQueue:
         # `enqueue_item` calls, or a row inserted directly (as a test does, or as some future
         # caller might), still lands here as two `queued` rows for one `item_id`, and this is
         # the layer that refuses to let both become processes regardless of how they got there.
-        # `rows` is already ordered `rank DESC, queued_at ASC`, so the row kept for admission is
-        # the one that would have been served first anyway; the other stays `queued` and is
-        # picked up on a later tick, once the running one is no longer active.
+        # `rows` is already ordered `queue_position ASC, id ASC`
+        # (2026-08-19, docs/transfers-redesign-spec.md §3.4 -- replaces `rank DESC, queued_at
+        # ASC`), so the row kept for admission is the one that would have been served first
+        # anyway; the other stays `queued` and is picked up on a later tick, once the running
+        # one is no longer active. `COALESCE(..., 1e18)` is defensive, not load-bearing in
+        # production -- `_insert_job` never leaves the column NULL -- but it keeps a
+        # hand-crafted row (a test building one directly) sorting *last* rather than first,
+        # which is what SQLite's own NULL-sorts-first default would otherwise do.
         active_item_ids = {p.item_id for p in self._running.values()}
         for row in rows:
             if row["id"] in self._running:
@@ -1826,8 +2503,7 @@ class TransferQueue:
                 scheduler.QueuedJob(
                     id=row["id"],
                     lane=row["lane"],
-                    rank=row["rank"],
-                    queued_at=row["queued_at"],
+                    queue_position=row["queue_position"],
                     forced_rate_fraction=resolve_forced_rate_fraction(row),
                 )
             )
@@ -2162,6 +2838,7 @@ class TransferQueue:
         attempt: int,
         forced_rate_fraction: float | None = None,
         queued_at: str | None = None,
+        queue_position: float | None = None,
     ) -> int:
         """`queued_at=None` (every caller before 2026-08-19) lets the column's own
         `DEFAULT (STRFTIME(...))` stamp now, unchanged. A caller may pass an explicit value to
@@ -2171,19 +2848,50 @@ class TransferQueue:
         prompts/done/2026-08-19-start-now-bandwidth-fractions.md) writes both columns in
         lockstep -- `forced_full_rate = 1` iff `forced_rate_fraction is not None` -- migration
         022's own contract for keeping the two in agreement.
+
+        `queue_position=None` (every caller except the startup rescue, this task) appends at the
+        back -- `position_between(MAX(queue_position over queued jobs), None)`, the position
+        model's replacement for "new jobs sort last under `queued_at ASC`"
+        (`migrations/023_queue_position.sql`). The rescue passes an explicit, pre-computed
+        position instead (`_rescue_position`) so the re-queued row lands where its original
+        `queued_at` would have placed it, not at the back.
         """
         forced_full_rate = 1 if forced_rate_fraction is not None else 0
+        if queue_position is None:
+            cursor = await self.db.execute(
+                "SELECT MAX(queue_position) AS m FROM job WHERE state = 'queued'"
+            )
+            row = await cursor.fetchone()
+            queue_position = position_between(row["m"], None)
         if queued_at is None:
             cursor = await self.db.execute(
                 "INSERT INTO job (item_id, kind, state, lane, rank, attempt, forced_full_rate, "
-                "forced_rate_fraction) VALUES (?, ?, 'queued', ?, 0, ?, ?, ?)",
-                (item_id, kind, lane, attempt, forced_full_rate, forced_rate_fraction),
+                "forced_rate_fraction, queue_position) VALUES (?, ?, 'queued', ?, 0, ?, ?, ?, ?)",
+                (
+                    item_id,
+                    kind,
+                    lane,
+                    attempt,
+                    forced_full_rate,
+                    forced_rate_fraction,
+                    queue_position,
+                ),
             )
         else:
             cursor = await self.db.execute(
                 "INSERT INTO job (item_id, kind, state, lane, rank, attempt, forced_full_rate, "
-                "forced_rate_fraction, queued_at) VALUES (?, ?, 'queued', ?, 0, ?, ?, ?, ?)",
-                (item_id, kind, lane, attempt, forced_full_rate, forced_rate_fraction, queued_at),
+                "forced_rate_fraction, queued_at, queue_position) VALUES (?, ?, 'queued', ?, 0, ?, "
+                "?, ?, ?, ?)",
+                (
+                    item_id,
+                    kind,
+                    lane,
+                    attempt,
+                    forced_full_rate,
+                    forced_rate_fraction,
+                    queued_at,
+                    queue_position,
+                ),
             )
         await self.db.commit()
         return cursor.lastrowid
@@ -2255,6 +2963,32 @@ class TransferQueue:
 
     # --- read models for api/jobs.py --------------------------------------------------------
 
+    def _postprocess_in_flight_ids(self) -> frozenset[int]:
+        """`PostprocessPipeline.in_flight_item_ids()`, read straight off the pipeline this queue
+        already holds a reference to (`self.postprocess`, set after construction by `app.py`;
+        `None` in most tests and in a process where post-processing was never wired).
+
+        Read *here*, in the read models themselves, rather than plumbed in from `api/jobs.py` --
+        `dismiss_all_terminal` needs the same set and has no request context to take it from, and
+        one lookup site is one fewer place for the three callers to disagree. `api/jobs.py`'s own
+        `_busy_context` stays as it is: that one feeds `core/local_delete.py`'s guards, an
+        unrelated consumer of the same set.
+        """
+        if self.postprocess is None:
+            return frozenset()
+        ids = self.postprocess.in_flight_item_ids()
+        return frozenset(ids) if ids else frozenset()
+
+    def _in_flight_select(self) -> str:
+        """The two computed columns both listing queries project, built once so their aliases
+        (and the expressions behind them) can't drift apart -- `core/pipeline_flight.py`.
+        """
+        ids = self._postprocess_in_flight_ids()
+        return (
+            f"{in_flight_expr(ids)} AS pipeline_in_flight, "
+            f"{waiting_reason_expr(ids)} AS pipeline_waiting_reason"
+        )
+
     async def list_jobs(self) -> list[dict]:
         """The Transfers page's row set (DESIGN.md §9.2). Not just `queued`/`running`:
         §9.2 explicitly requires "failed rows show the error class and the captured lftp
@@ -2300,12 +3034,31 @@ class TransferQueue:
         `arr_instance.kind` (`'sonarr'`/`'radarr'`) — the collapsed row's new brand-logo chip
         needs to know *which* logo to draw; `arr_instance_name` alone is free-text the user can
         rename to anything, so it can't drive that choice on its own.
+
+        **2026-08-19** (docs/transfers-redesign-spec.md §3.6, phase 1 stage 4a): also joins
+        `path_queue.short_name AS queue_short_name` — the ungrouped Transfers row's queue badge
+        (`api/jobs.py._job_out`, `lib/queueDisplayName.ts`) needs a queue's short name per row
+        now that grouping (and its once-per-queue header) is gone.
+
+        **2026-08-20** (docs/transfers-redesign-spec.md §3.2's pipeline-completion rule): also
+        projects `pipeline_in_flight`/`pipeline_waiting_reason` from
+        `core/pipeline_flight.py` — the *one* definition of "still moving," shared verbatim with
+        `list_complete_jobs`'s own `NOT (...)` and `dismiss_all_terminal`'s exclusion, so the two
+        boxes can never disagree about which one a row belongs in. Deliberately computed here and
+        shipped as a field rather than re-derived on the client: a second encoding of this rule is
+        exactly the drift the split cannot survive. `item.manual_outcome`/`manual_outcome_at`
+        (migration 025) ride along so the row can *show* it was manually resolved rather than
+        looking like a normal completion, and `item.state` is joined only because the reason
+        expression reads it (never projected — see `models.py.JobOut`).
         """
         cursor = await self.db.execute(
             "SELECT job.*, item.rel_path, item.is_dir, item.queue_id, item.remote_size, "
             "       item.verified_at, item.extracted_at, item.remote_deleted_at, "
             "       item.arr_status, item.arr_status_at, "
-            "       path_queue.name AS queue_name, arr_instance.name AS arr_instance_name, "
+            "       item.manual_outcome, item.manual_outcome_at, "
+            f"       {self._in_flight_select()}, "
+            "       path_queue.name AS queue_name, path_queue.short_name AS queue_short_name, "
+            "       arr_instance.name AS arr_instance_name, "
             "       arr_instance.kind AS arr_instance_kind "
             "FROM job "
             "JOIN item ON item.id = job.item_id "
@@ -2315,7 +3068,7 @@ class TransferQueue:
             "   OR (job.state IN ('failed','cancelled','succeeded') "
             "       AND job.dismissed_at IS NULL "
             "       AND job.id = (SELECT MAX(j2.id) FROM job j2 WHERE j2.item_id = job.item_id)) "
-            "ORDER BY job.rank DESC, job.queued_at ASC"
+            "ORDER BY COALESCE(job.queue_position, 1e18) ASC, job.id ASC"
         )
         rows = await cursor.fetchall()
         out = []
@@ -2328,6 +3081,112 @@ class TransferQueue:
                 d["eta_s"] = p.eta_s
             out.append(d)
         return out
+
+    async def list_complete_jobs(
+        self,
+        *,
+        limit: int,
+        offset: int,
+        name_filter: str | None = None,
+        outcome: str | None = None,
+    ) -> tuple[list[dict], int]:
+        """The Queue tab's **Complete** box (2026-08-19, docs/transfers-redesign-spec.md §3.2,
+        phase 1 stage 4b) -- `list_jobs()`'s terminal half, split out, server-side paginated,
+        and newest-finished-first, rather than inlined into that method's already-bounded row
+        set. Same join shape and the identical `MAX(j2.id)`-per-item "one row per item, most
+        recent job wins" rule `list_jobs()` uses for its own terminal rows (that method's own
+        docstring) -- an item that has been retried since its last terminal job stops appearing
+        here the moment the new job exists, the same "superseded" reasoning, so a row never
+        shows in both the Active/pending box and this one at once.
+
+        Unlike `list_jobs()`, this is genuinely unbounded in total row count (a busy install
+        accumulates thousands of terminal jobs over time) -- the same shape `api/history.py`'s
+        own endpoints are built around, which is why the return type mirrors theirs: the
+        matching page of rows *and* `total`, the full filtered count ignoring the page, so the
+        frontend can render numbered pages (`lib/pagination.ts`) without a second unbounded
+        query. `api/jobs.py`'s caller strips `output_tail` back out of each row before building
+        `JobOut` -- the identical `has_output_tail`-only convention `api/history.py` already
+        uses, for the identical reason (never inline a ~4KB blob on every row of an unbounded
+        list).
+
+        `name_filter` (optional) is a case-insensitive substring match against `item.rel_path`
+        (`_like_escape`, module-level above) -- the server-side twin of the client-side
+        `lib/transferPanel.ts.filterTransferJobs`'s own semantics, now that this box's rows are
+        no longer all loaded at once for a client-side filter to run over. Built from the exact
+        same predicate `dismiss_all_terminal`'s own `name_filter` branch uses, so "Dismiss
+        list"'s dismissed count always matches what this method reports as `total` for the same
+        filter text -- see that method's own docstring for why that agreement matters.
+
+        `outcome` (2026-08-20, follow-up to phase 1 stage 4b,
+        `prompts/2026-08-20-transfers-dismiss-menu-and-counts.md`) restricts the listing to one
+        terminal state, the same vocabulary `dismiss_all_terminal`'s own `outcome` narrows to.
+        **Not currently reachable from `GET /api/jobs/complete`** -- the Complete box's "Dismiss"
+        menu deliberately does not fetch a live per-outcome count (the task's own instruction:
+        "if per-outcome counts are not already available, do not add a query to get them"), so
+        no frontend caller passes this. It exists here purely so `dismiss_all_terminal`'s
+        `(name_filter=..., outcome=...)` composed case can be tested against the identical
+        predicate this method would use, the same "count and dismissed set built from one
+        predicate" property `name_filter` alone already has a test for
+        (`test_dismiss_all_terminal_name_filter_count_matches_list_complete_jobs_total`,
+        extended rather than duplicated for this case).
+
+        **2026-08-20: terminal is no longer the same thing as complete** (docs/transfers-redesign-
+        spec.md §3.2's pipeline-completion rule). An item whose lftp job exited 0 but whose
+        verify/extract, *arr import, or deferred source delete is still outstanding belongs in the
+        *Active* box, so it is excluded from both this listing **and its `total`** by
+        `NOT (core/pipeline_flight.in_flight_expr(...))` -- the identical expression `list_jobs`
+        projects as `pipeline_in_flight`, so a row is in exactly one box by construction rather
+        than by two rules that happen to agree today. The count query grew the same
+        `path_queue`/`arr_instance` joins the page query already had, purely so that one
+        expression can be evaluated identically in both.
+        """
+        in_flight = self._postprocess_in_flight_ids()
+        where = [
+            "job.state IN ('failed','cancelled','succeeded')",
+            "job.dismissed_at IS NULL",
+            "job.id = (SELECT MAX(j2.id) FROM job j2 WHERE j2.item_id = job.item_id)",
+            f"NOT {in_flight_expr(in_flight)}",
+        ]
+        params: list[Any] = []
+        if name_filter is not None:
+            where.append("LOWER(item.rel_path) LIKE ? ESCAPE '\\'")
+            params.append(f"%{_like_escape(name_filter.lower())}%")
+        if outcome is not None:
+            where.append("job.state = ?")
+            params.append(outcome)
+        where_sql = " AND ".join(where)
+
+        count_cursor = await self.db.execute(
+            "SELECT COUNT(*) AS c FROM job "
+            "JOIN item ON item.id = job.item_id "
+            "JOIN path_queue ON path_queue.id = item.queue_id "
+            "LEFT JOIN arr_instance ON arr_instance.id = path_queue.arr_instance_id "
+            f"WHERE {where_sql}",
+            params,
+        )
+        count_row = await count_cursor.fetchone()
+        total = count_row["c"] if count_row is not None else 0
+
+        cursor = await self.db.execute(
+            "SELECT job.*, item.rel_path, item.is_dir, item.queue_id, item.remote_size, "
+            "       item.verified_at, item.extracted_at, item.remote_deleted_at, "
+            "       item.arr_status, item.arr_status_at, "
+            "       item.manual_outcome, item.manual_outcome_at, "
+            f"       {self._in_flight_select()}, "
+            "       path_queue.name AS queue_name, path_queue.short_name AS queue_short_name, "
+            "       arr_instance.name AS arr_instance_name, "
+            "       arr_instance.kind AS arr_instance_kind "
+            "FROM job "
+            "JOIN item ON item.id = job.item_id "
+            "JOIN path_queue ON path_queue.id = item.queue_id "
+            "LEFT JOIN arr_instance ON arr_instance.id = path_queue.arr_instance_id "
+            f"WHERE {where_sql} "
+            "ORDER BY COALESCE(job.finished_at, job.queued_at) DESC, job.id DESC "
+            "LIMIT ? OFFSET ?",
+            [*params, limit, offset],
+        )
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows], total
 
     def stats(self, settings: TransferSettings) -> dict:
         current_speed = sum(self._last_speeds.get(job_id, 0.0) for job_id in self._running)

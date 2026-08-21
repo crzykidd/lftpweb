@@ -86,13 +86,22 @@ function StartNowMenuList({
 
 export function StartNowMenu({
   disabled,
+  title,
   maxBandwidthBps,
   onSelect,
 }: {
-  /** The row's own busy state (a request already in flight) -- distinct from an *option's* own
-   * `disabled` (no site limit for a fraction), which `lib/startNow.ts` decides per-option.
+  /** The row's own busy state (a request already in flight) or the queue being paused --
+   * distinct from an *option's* own `disabled` (no site limit for a fraction), which
+   * `lib/startNow.ts` decides per-option.
    */
   disabled: boolean
+  /** Shown as a hover tooltip on the (disabled) button itself -- e.g. "unavailable while the
+   * transfer queue is paused" (2026-08-20, prompts/2026-08-20-queue-pause.md). A disabled menu
+   * with no reason attached is the "disabled button alone is not the guard" trap in reverse: the
+   * server-side 409 is the real guard, but a disabled control with nothing explaining why reads
+   * as broken, not as "this is deliberate."
+   */
+  title?: string
   maxBandwidthBps: number | null | undefined
   onSelect: (ratePercent: StartNowRatePercent | undefined) => void
 }) {
@@ -214,6 +223,7 @@ export function StartNowMenu({
         ref={buttonRef}
         type="button"
         disabled={disabled}
+        title={title}
         aria-haspopup="menu"
         aria-expanded={open}
         aria-controls={open ? id : undefined}

@@ -30,7 +30,11 @@ Five things this module must get right, in order of consequence:
    stops auto-queue from spawning a transfer for an item that is still visibly arriving. A
    *manual* Queue click bypasses this check entirely (`core/queue.py.enqueue_item` doesn't
    consult it) -- an explicit user action beats a heuristic -- but still can't reach
-   `DOWNLOADED` early, because the gate's other half lives in `core/queue.py._reap_one`.
+   `DOWNLOADED` early, because the gate's other half lives in `core/queue.py._reap_one`. **An
+   item skipped for this reason alone is also projected into the Preflight box** (this module's
+   own "Preflight" section below, prompts/2026-08-20-preflight-waiting-sources.md) -- it is
+   exactly "would be queued this pass if only the gate weren't holding it," the box's own
+   definition of "waiting."
 5. **`_UNPACK_`/`_FAILED_` top-level items are never auto-queued** (2026-08-15,
    `prompts/done/2026-08-15-arr-eventtype-and-unpack-autoqueue.md`; "show it, don't grab it,"
    user decision same date, `docs/decisions.md`). The user's seedbox runs SABnzbd, which stages
@@ -48,6 +52,11 @@ Five things this module must get right, in order of consequence:
    regardless of `state`. A *manual* Queue click is untouched (same "explicit
    action beats a heuristic" reasoning as the settle gate above) -- once SAB finishes and
    renames the directory, the plain name becomes eligible normally, no special-casing needed.
+6. **An item the bound *arr has already been handed is never picked up again** (2026-08-19,
+   `prompts/done/2026-08-19-autoqueue-requeues-imported-item.md`, production defect).
+   `ARR_IMPORT_INELIGIBLE_STATUSES` -- `notified`/`imported`/`cleaned`, never `detected` -- is
+   applied in the eligibility query, alongside the state and suppression clauses. See that
+   constant's own comment for the incident and for why `detected` must stay eligible.
 
 **Retroactive by construction.** DESIGN.md §4.7: "adding a pattern re-evaluates the whole
 known model, not just future scans." This module re-queries every eligible top-level item in
@@ -61,13 +70,14 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
 
 import aiosqlite
 
 from lftpweb.core import audit, mount_sentinel, patterns, settle
 from lftpweb.core.extract import FAILED_PREFIX, UNPACK_PREFIX
+from lftpweb.core.preflight import PreflightRow
 
 logger = logging.getLogger(__name__)
 
@@ -117,6 +127,38 @@ logger = logging.getLogger(__name__)
 # eligible and never clears suppression.
 ELIGIBLE_STATES = ("REMOTE_ONLY", "PARTIAL")
 ELIGIBLE_STATES_WITH_EXTERNALLY_REMOVED = ELIGIBLE_STATES + ("REMOVED_LOCAL",)
+
+# `item.arr_status` values that mean "the bound *arr owns this release now" -- auto-queue never
+# picks such an item up again, whatever its `state` reads (2026-08-19,
+# `prompts/done/2026-08-19-autoqueue-requeues-imported-item.md`).
+#
+# Production, v0.2.6, `move` queue bound to Sonarr: an item finished, post-processing renamed it
+# to its final name and pushed the scan command, Sonarr began moving the media file out, and the
+# next scan read the leftovers as `PARTIAL` -- eligible -- so auto-queue re-queued a release
+# whose seedbox source `core/arrsync.py` was about to delete on the confirmed import. The job sat
+# in the queue for 97 minutes (the second occurrence), blocked `_maybe_cleanup` the whole time
+# ("an active job exists for this item"), and then failed `REMOTE_GONE` on 0 bytes.
+#
+# `core/mount_sentinel.py`'s `PARTIAL` grace branch is the general half of this fix and is not
+# *arr-specific; this is the half with no time bound. It matters because an import is not
+# guaranteed to be quick: the same incident's season-pack case took ~19 minutes to move 38
+# episodes out, longer than `mount_sentinel.DEFAULT_GRACE_S`, so the grace branch alone would
+# have released it back to `PARTIAL` and re-queued it anyway.
+#
+# **`detected` is deliberately absent**, and that is the load-bearing part: an item is matched
+# against the *arr's queue record (`arr_status = 'detected'`) by `core/arrsync.py._match_items`
+# long *before* lftpweb has downloaded it -- the *arr's queue is populated by its own download
+# client on the seedbox, on its own schedule -- so making `detected` ineligible would stop
+# auto-queue fetching *arr-tracked releases at all, which is the entire feature. Only the three
+# statuses that can only be reached *after* this codebase's own pipeline completed
+# (`arrnotify.notify_arr` writes `notified`; `arrsync` writes `imported`, then `cleaned`) are
+# listed. `dropped`/`gone` are absent for the same reason as `detected`: both are reachable for
+# an item lftpweb has not finished, or ever started, downloading.
+#
+# Not a suppression: `auto_queue_suppressed` is untouched, so a *manual* Queue click still works
+# (same "an explicit user action beats a heuristic" line the settle gate and the `_UNPACK_`
+# exclusion already draw), and nothing here needs clearing by hand later.
+ARR_IMPORT_INELIGIBLE_STATUSES = ("notified", "imported", "cleaned")
 
 SETTING_KEY = "autoqueue_settings"
 
@@ -185,6 +227,13 @@ class QueueAutoConfig:
     local_path: str
     auto_queue_enabled: bool
     patterns_only: bool
+    # Migration 024 ("a short display name per queue"), threaded through here (2026-08-21, "the
+    # columns moved around" fix) so a settle-gated Preflight row can carry the same queue tag
+    # every other row on the page shows (`core/preflight.py.PreflightRow.queue_short_name`).
+    # `None` -- both "no short name set" and every existing call site/test built before this
+    # field existed -- degrades to the queue's full `name`, the same fallback
+    # `lib/queueDisplayName.ts.queueDisplayName` already applies everywhere else.
+    short_name: str | None = None
 
 
 class AutoQueue:
@@ -197,6 +246,19 @@ class AutoQueue:
         # Absent entirely once the gate passes (or auto-queue is off) so its presence alone
         # is the "is this queue gated right now" signal the API exposes.
         self.gated: dict[int, str] = {}
+        # Preflight (prompts/2026-08-20-preflight-waiting-sources.md) -- one queue's
+        # settle-gated rows, keyed by item id, *replaced wholesale* on every `on_scan` pass that
+        # reaches the eligibility loop for that queue. See this module's own "Preflight" section
+        # for why this is a plain replace rather than `core/preflight.py.PreflightHold`'s
+        # flap-tolerant merge: unlike `core/arrsync.py`'s *arr source, whose own report can blink
+        # for a beat, this source's "is it still gated" question is answered fresh from this same
+        # process's own persisted state every pass, so a full replace is both simpler and
+        # strictly more correct -- no stale row can outlive the very next successful scan, which
+        # is exactly the "no duplicate at handover" guarantee this box promises. Popped for a
+        # queue entirely (not merely left stale) the instant that queue's own pass returns early
+        # -- auto-queue off, or mount-gated -- mirroring `self.gated`'s own "silent pop" idiom
+        # just above, since both mean "nothing about this queue is being evaluated right now."
+        self._settle_preflight: dict[int, dict[int, PreflightRow]] = {}
 
     async def on_scan(self, queue: QueueAutoConfig) -> int:
         """Evaluate one queue's newly- *and* previously-seen eligible items. Called after
@@ -209,6 +271,7 @@ class AutoQueue:
             # auto-queue *off* is not a gate recovery, it's the user choosing not to run it at
             # all, so there is nothing an "ungated" event would be reporting.
             self.gated.pop(queue.id, None)
+            self._settle_preflight.pop(queue.id, None)
             return 0
 
         if not mount_sentinel.check(queue.local_path):
@@ -230,6 +293,12 @@ class AutoQueue:
                     message=f"queue {queue.id} ('{queue.name}'): auto-queue disabled -- {reason}",
                 )
             self.gated[queue.id] = reason
+            # The whole queue is blocked -- surfaced as the Preflight box's own banner (this
+            # queue by name, with `reason` verbatim) rather than as rows, so any settle-gated
+            # rows already cached for it must go too: showing both a "this queue is blocked"
+            # banner and a stale per-item row from before it was blocked would be the exact
+            # "fifty rows burying the one fact that matters" shape the banner exists to avoid.
+            self._settle_preflight.pop(queue.id, None)
             return 0
         if self.gated.pop(queue.id, None) is not None:
             # A real recovery -- the gate was actually blocking this queue a moment ago, not
@@ -256,7 +325,7 @@ class AutoQueue:
         )
 
         cursor = await self.db.execute(
-            "SELECT id, rel_path, is_dir FROM item WHERE queue_id = ? "
+            "SELECT id, rel_path, is_dir, remote_size FROM item WHERE queue_id = ? "
             "AND instr(rel_path, '/') = 0 AND auto_queue_suppressed = 0 "
             f"AND state IN ({','.join('?' for _ in eligible_states)}) "
             # 2026-08-13 (prompts/2026-08-13-lftp-timestamped-temp-files.md): this module's own
@@ -266,12 +335,20 @@ class AutoQueue:
             # here. Made explicit so the claim is true by construction rather than by every
             # other module continuing to agree with it forever.
             "AND NOT EXISTS (SELECT 1 FROM job WHERE job.item_id = item.id "
-            "AND job.state IN ('queued', 'running'))",
-            (queue.id, *eligible_states),
+            "AND job.state IN ('queued', 'running')) "
+            # The *arr hand-off gate (2026-08-19) -- see `ARR_IMPORT_INELIGIBLE_STATUSES`.
+            # `COALESCE` because `arr_status` is NULL for every item on an unbound queue (and
+            # for an unmatched item on a bound one), and SQLite's `NOT IN` over a NULL left-hand
+            # side is NULL, not true -- without it this clause would silently exclude every
+            # untracked item in the system.
+            f"AND COALESCE(item.arr_status, '') NOT IN "
+            f"({','.join('?' for _ in ARR_IMPORT_INELIGIBLE_STATUSES)})",
+            (queue.id, *eligible_states, *ARR_IMPORT_INELIGIBLE_STATUSES),
         )
         rows = await cursor.fetchall()
 
         queued = 0
+        settle_gated: dict[int, PreflightRow] = {}
         for row in rows:
             # "Show it, don't grab it" (user decision, 2026-08-15, docs/decisions.md): a SAB
             # in-progress unpack staged under `_UNPACK_<name>` (or a `_FAILED_` leftover) on
@@ -290,12 +367,105 @@ class AutoQueue:
             # for the *next* pass rather than marked `auto_queue_suppressed`, since nothing
             # about the item itself is wrong; it just isn't done arriving. A no-op when the
             # setting is off (`load_settle_settings` defaults to disabled).
-            if settle_settings.enabled and not await settle.is_settled_in_db(
-                self.db, queue.id, row["rel_path"]
-            ):
+            #
+            # Reads this item's own settle progress once (rather than calling
+            # `settle.is_settled_in_db` and separately re-querying) so the same read serves both
+            # the eligibility check (`settle.is_settled_from_progress`) and, when it's not
+            # settled, the Preflight row's own tooltip inputs below
+            # (2026-08-21, "the settling chip should have a mouseover that shows time details").
+            settle_progress = (
+                await settle.settle_progress_in_db(self.db, queue.id, row["rel_path"])
+                if settle_settings.enabled
+                else None
+            )
+            if settle_settings.enabled and not settle.is_settled_from_progress(settle_progress):
+                # Preflight (prompts/2026-08-20-preflight-waiting-sources.md, this module's own
+                # "Preflight" section below) -- reached only once every *other* eligibility
+                # check above has already passed (pattern match, no active job via the query's
+                # own `NOT EXISTS`, unsuppressed, not *arr-owned, not an in-progress unpack), so
+                # this item would be enqueued THIS PASS if only the settle gate weren't holding
+                # it -- exactly "waiting," never "not wanted" (a suppressed item or a
+                # pattern-unmatched one never reaches this line at all). `status_label` reuses
+                # `FileNode.substate`'s existing "settling" wording (`core/itemview.py`) rather
+                # than inventing new vocabulary for the same state; `size_remaining_bytes` is
+                # `None` -- the release is already fully present remotely, there is nothing
+                # "left" from this source's own point of view (`core/preflight.py.PreflightRow`'s
+                # own docstring, the settle-gate example it names).
+                settle_gated[row["id"]] = PreflightRow(
+                    source="settle",
+                    queue_id=queue.id,
+                    queue_name=queue.name,
+                    queue_short_name=queue.short_name,
+                    title=row["rel_path"],
+                    status_label="Settling",
+                    source_label=queue.name,
+                    source_kind=None,
+                    size_bytes=row["remote_size"],
+                    size_remaining_bytes=None,
+                    # This gate is bound by *scan count*, not a wall-clock estimate --
+                    # `core/preflight.py.PreflightRow.remaining_s`'s own docstring is explicit
+                    # that fabricating one here would be exactly the "invented estimate" the
+                    # handoff prompt rules out. This source's own already-existing remaining
+                    # figure is `size_bytes` above (`preflightSizeLabel`'s "remote — 22 GB"), not
+                    # a time.
+                    remaining_s=None,
+                    # No separate download client in this source's own model -- lftpweb itself is
+                    # the thing that will fetch this release once the gate releases it.
+                    download_client=None,
+                    # The tooltip's own inputs (`core/preflight.py.PreflightRow.wait_scans`/
+                    # `wait_since`'s own docstring) -- `settle_progress` is `None` only when this
+                    # item has no `item_settle` row yet at all (never scanned with the settle-
+                    # aware path), which `is_settled_from_progress` above already treats as "not
+                    # settled" the same conservative way; both fields fall through to `None`
+                    # together in that case rather than a fabricated pair.
+                    wait_scans=settle_progress.matched_scans
+                    if settle_progress is not None
+                    else None,
+                    wait_since=settle_progress.first_matched_at
+                    if settle_progress is not None
+                    else None,
+                )
                 continue
             await self._enqueue_item(row["id"])
             queued += 1
+        # Wholesale replace, not a merge -- see `self._settle_preflight`'s own comment in
+        # `__init__` for why this source doesn't need `PreflightHold`'s flap tolerance. Written
+        # even when `settle_gated` is empty (settle off, or every eligible item settled) so a
+        # queue that just cleared its own gate doesn't wait for anything to expire.
+        self._settle_preflight[queue.id] = settle_gated
         if queued:
             logger.info("auto-queue: queued %d item(s) for queue %d", queued, queue.id)
         return queued
+
+    # --- Preflight (docs/transfers-redesign-spec.md §4; this task,
+    # prompts/2026-08-20-preflight-waiting-sources.md) -- the settle gate's own eligibility
+    # check above is also this box's second source: an item that would be auto-queued this very
+    # pass if only its remote fingerprint had held still. `core/preflight.py.PreflightRow` is
+    # the shared, source-agnostic row shape; everything about *how* an item earns one --
+    # pattern matching, suppression, the settle check itself -- stays in `on_scan` above,
+    # exactly where `core/arrsync.py`'s own "Preflight" section keeps its *arr-specific
+    # counterpart. ---------------------------------------------------------------------------
+
+    def preflight_rows(self, active_queue_ids: Iterable[int]) -> list[PreflightRow]:
+        """The Preflight box's own read (`api/jobs.py.get_preflight`) -- every currently-cached
+        settle-gated row for a queue id in `active_queue_ids`. That set is the caller's own live
+        "is this queue actually eligible for auto-queue right now" check (`auto_queue_enabled`
+        and not currently mount-gated) -- mirroring `ArrSyncScheduler.preflight_rows`' own
+        "filtered live by the caller, not by this cache's own staleness" contract, and
+        `self.gated`'s own existing "read reflects right now" idiom -- so a queue that just
+        turned auto-queue off or went mount-gated stops contributing immediately, the same
+        instant `self.gated`/`self._settle_preflight` themselves would already reflect it, not
+        after any hold window.
+
+        Sorted by title, case-insensitively -- the same boring-default rule
+        `ArrSyncScheduler.preflight_rows` already applies within its own source.
+        """
+        allowed = set(active_queue_ids)
+        rows = [
+            row
+            for queue_id, gated in self._settle_preflight.items()
+            if queue_id in allowed
+            for row in gated.values()
+        ]
+        rows.sort(key=lambda r: r.title.casefold())
+        return rows
