@@ -275,6 +275,20 @@ def _visible_path_contains(arr_visible_path: str, output_path: str) -> bool:
     return candidate == root or candidate.startswith(root + "/")
 
 
+def _record_matches_any_item(record: QueueRecord, item_names: frozenset[str]) -> bool:
+    """The one implementation of "does this queue record match a real lftpweb item," shared by
+    `_preflight_candidates` below (the per-pass exclusion/retirement check) and
+    `ArrSyncScheduler.preflight_rows`'s own request-time re-check (2026-08-21, "a handed-over
+    release lingers in Preflight for up to 20-30s" -- the poll-cadence term left over after the
+    2026-08-21 evict-on-handover fix). Both call sites answer the identical question against the
+    identical `_record_matches_item`; a second, independent definition here would let the two
+    drift, and drift in either direction is a real user-visible defect -- a row wrongly
+    reappearing (drift one way) or a row wrongly vanishing while its download is still genuinely
+    in progress (drift the other way).
+    """
+    return any(_record_matches_item(record, name) for name in item_names)
+
+
 def _preflight_candidates(
     records: list[QueueRecord],
     queues: list[aiosqlite.Row],
@@ -322,7 +336,7 @@ def _preflight_candidates(
     for record in records:
         if record.tracked_download_state == TRACKED_DOWNLOAD_STATE_IMPORTED:
             continue
-        if any(_record_matches_item(record, name) for name in item_names):
+        if _record_matches_any_item(record, item_names):
             retired.append(record)
             continue
 
@@ -635,6 +649,19 @@ class ArrSyncScheduler:
         # persistence to avoid it. `_update_preflight` is the only writer; `preflight_rows` is
         # the only reader.
         self._preflight_holds: dict[int, PreflightHold] = {}
+        # This instance's own last poll pass's records, keyed by `_record_identity`, and the
+        # bound+enabled queue ids that pass attributed against -- both refreshed by
+        # `_update_preflight` alongside the hold above, and read by `preflight_rows`' own
+        # request-time retirement re-check (2026-08-21, "eviction latency": retirement was only
+        # *decided* once per *arr poll, `ArrSettings.poll_interval_s` defaulting to 60s, even
+        # though the underlying question -- "does a matching `item` now exist" -- is purely
+        # local and answerable on every request). In-memory only, same "restart loses it, and
+        # that's the safe direction" reasoning as every other dict here: a restart just means
+        # the very next request's retirement re-check has nothing to test against until the
+        # first poll lands, falling back to "not retired" (see `preflight_rows`), which is
+        # exactly today's pre-fix behaviour, never worse.
+        self._last_records: dict[int, dict[str, QueueRecord]] = {}
+        self._last_queue_ids: dict[int, list[int]] = {}
 
     async def start(self) -> None:
         if self._task is None:
@@ -742,6 +769,25 @@ class ArrSyncScheduler:
             # clients, applied here too.
             await self._update_preflight(instance, queues, records)
 
+    async def _item_names_for_queue_ids(self, queue_ids: list[int]) -> frozenset[str]:
+        """Every top-level `item.rel_path` across `queue_ids` -- the one query behind "does a
+        matching lftpweb item exist," shared by `_update_preflight` below (fed its already-
+        fetched `queues`) and `preflight_rows`' own request-time re-check (fed
+        `_last_queue_ids`, the same set as of this instance's last poll pass -- queue *binding*
+        changes are already covered by `preflight_rows`' own caller-supplied
+        `enabled_instance_ids`, so this method only ever needs to be freshest about `item`
+        existence, the thing this whole fix is about).
+        """
+        if not queue_ids:
+            return frozenset()
+        placeholders = ",".join("?" for _ in queue_ids)
+        cursor = await self.db.execute(
+            f"SELECT rel_path FROM item WHERE queue_id IN ({placeholders}) "  # noqa: S608 - placeholders only, no user input
+            "AND instr(rel_path, '/') = 0",
+            queue_ids,
+        )
+        return frozenset(r["rel_path"] for r in await cursor.fetchall())
+
     async def _update_preflight(
         self, instance: aiosqlite.Row, queues: list[aiosqlite.Row], records: list[QueueRecord]
     ) -> None:
@@ -753,13 +799,7 @@ class ArrSyncScheduler:
         queue_ids = [q["id"] for q in queues]
         if not queue_ids:
             return
-        placeholders = ",".join("?" for _ in queue_ids)
-        cursor = await self.db.execute(
-            f"SELECT rel_path FROM item WHERE queue_id IN ({placeholders}) "  # noqa: S608 - placeholders only, no user input
-            "AND instr(rel_path, '/') = 0",
-            queue_ids,
-        )
-        item_names = frozenset(r["rel_path"] for r in await cursor.fetchall())
+        item_names = await self._item_names_for_queue_ids(queue_ids)
 
         # `queue_id` -> the full `path_queue` row it names, so a candidate's queue tag
         # (2026-08-21, "the columns moved around") can be filled in without a second query --
@@ -793,7 +833,14 @@ class ArrSyncScheduler:
         hold = self._preflight_holds.setdefault(instance["id"], PreflightHold())
         hold.update(seen, now=time.monotonic(), retired=retired)
 
-    def preflight_rows(self, enabled_instance_ids: Iterable[int]) -> list[PreflightRow]:
+        # For `preflight_rows`' own request-time retirement re-check below -- this pass's raw
+        # records (not just the ones that became candidates) keyed the same way the hold itself
+        # is, and the queue ids `item_names` above was just computed against, so a later call
+        # with no intervening poll can still re-run the identical predicate.
+        self._last_records[instance["id"]] = {_record_identity(r): r for r in records}
+        self._last_queue_ids[instance["id"]] = queue_ids
+
+    async def preflight_rows(self, enabled_instance_ids: Iterable[int]) -> list[PreflightRow]:
         """The Preflight box's own read (`api/jobs.py`'s `GET /api/queue/preflight`) -- every
         currently-held row from an instance id in `enabled_instance_ids`. That set is the
         caller's own live "is this instance still enabled, with at least one enabled bound
@@ -801,17 +848,48 @@ class ArrSyncScheduler:
         cached simply stops being returned immediately, rather than lingering for
         `core/preflight.py.PREFLIGHT_HOLD_S` for no reason.
 
+        **Now `async`, and now also a request-time retirement check** (2026-08-21, "eviction
+        latency"): `_update_preflight`'s own `retired` set already evicts a row the instant a
+        *poll pass* discovers the hand-over, but the poll only runs every
+        `ArrSettings.poll_interval_s` (60s by default) -- an item that lands between two polls
+        still sat here, visibly duplicated against its own new Active/pending row, for up to
+        that whole interval. The underlying question, "does a matching `item` exist now," is
+        purely local state, so this re-asks it on every call: for each held row whose identity
+        this instance's last poll pass also saw a raw `QueueRecord` for, re-run
+        `_record_matches_any_item` (the exact same predicate `_preflight_candidates` uses,
+        never a second definition) against a freshly-queried `item_names` set. A held row with
+        no corresponding last-seen record (the flap-tolerance case -- it went missing from a
+        poll and is being held blind) is passed through unfiltered, same as before this fix:
+        there is nothing to re-test it against, and "keep showing it" is the flap-tolerance
+        cache's whole point.
+
+        This is a **read-side filter only** -- it never mutates `_preflight_holds`. The next
+        real poll pass still does the authoritative eviction via `retired`; skipping that here
+        would mean a row that never gets asked about again (no further `GET` calls) never
+        actually leaves the hold, which is fine (nothing reads it) but would be a needless
+        divergence from "one writer" if this method wrote to it too.
+
         Sorted by title, case-insensitively -- the *arr's own queue carries no cross-release
         priority signal worth surfacing here (unlike the real transfer queue's `queue_position`),
         so alphabetical is the stable, boring default rather than an invented one.
         """
         allowed = set(enabled_instance_ids)
-        rows = [
-            row
-            for instance_id, hold in self._preflight_holds.items()
-            if instance_id in allowed
-            for row in hold.rows()
-        ]
+        rows: list[PreflightRow] = []
+        for instance_id, hold in self._preflight_holds.items():
+            if instance_id not in allowed:
+                continue
+            last_records = self._last_records.get(instance_id, {})
+            item_names: frozenset[str] | None = None
+            for identity, row in hold.items():
+                record = last_records.get(identity)
+                if record is not None:
+                    if item_names is None:
+                        item_names = await self._item_names_for_queue_ids(
+                            self._last_queue_ids.get(instance_id, [])
+                        )
+                    if _record_matches_any_item(record, item_names):
+                        continue  # a real item now exists -- retire from the response
+                rows.append(row)
         rows.sort(key=lambda r: r.title.casefold())
         return rows
 

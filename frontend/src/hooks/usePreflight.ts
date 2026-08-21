@@ -3,13 +3,16 @@ import { getPreflight } from '../api/client'
 import type { PreflightResponse } from '../api/types'
 import { usePoll } from './usePoll'
 
-// Slower than `useJobs`'s 2000ms -- the Preflight box's own data only changes as often as the
-// slowest source behind it refreshes (the *arr poller's own default is 60s,
-// `core/arrsync.py.ArrSettings.poll_interval_s`), so polling this endpoint at the same cadence
-// as the live transfer queue would just be extra requests for data that hasn't moved. Faster
-// than doing nothing between page loads, though -- close to `StatsHeader.tsx`/`WhatsNewDialog
-// .tsx`'s own 5000ms health poll, just widened since this box is advisory, not actionable.
-const POLL_INTERVAL_MS = 15000
+// Used to be 15000ms, chosen when this box's own eviction was only ever decided once per *arr
+// poll (`core/arrsync.py.ArrSettings.poll_interval_s`, 60s default) -- polling faster than that
+// just meant re-fetching data that hadn't moved yet. 2026-08-21 ("eviction latency") moved
+// retirement to request time in `GET /api/queue/preflight` itself (`ArrSyncScheduler.
+// preflight_rows` now re-asks "does a matching item exist" fresh on every call, not just once
+// per poll pass), so this endpoint's own freshness is no longer bounded by the *arr's cadence --
+// this interval is now the dominant remaining delay, so it drops to match `StatsHeader.tsx`/
+// `WhatsNewDialog.tsx`'s own 5000ms health poll. The endpoint itself stays cheap (a cached
+// projection plus a couple of small queries), so polling it this often is not a meaningful cost.
+const POLL_INTERVAL_MS = 5000
 
 /** The Queue tab's Preflight box (docs/transfers-redesign-spec.md §4, prefigured; this task's
  * own handoff prompt, prompts/done/2026-08-20-preflight-box.md). `undefined` until the first

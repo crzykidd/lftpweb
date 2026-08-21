@@ -620,7 +620,11 @@ async def get_preflight(request: Request) -> PreflightResponse:
     Every live query below is fresh, not read off either source's own cache, so a change (an
     instance disabled, a queue's auto-queue toggled off, the settle setting flipped) hides
     immediately rather than waiting for a cache to catch up -- `preflight_rows` on both sources
-    is filtered to exactly these same live sets for the identical reason. `source_configured =
+    is filtered to exactly these same live sets for the identical reason. `ArrSyncScheduler.
+    preflight_rows` is now itself `async` for the same reason (2026-08-21, "eviction latency"):
+    it re-asks "does a matching `item` exist" fresh on every call too, rather than only when the
+    *arr poller happens to run, closing the poll-interval-sized latency the earlier evict-on-
+    handover fix (`_update_preflight`'s own `retired` set) left behind. `source_configured =
     False` means "no row source is configured at all" -- the frontend hides the row list for
     that case rather than showing an empty "Nothing in preflight" that would be meaningless for a
     user with nothing configured (`gated_queues` is independent of this and can still be
@@ -636,7 +640,7 @@ async def get_preflight(request: Request) -> PreflightResponse:
 
     arr_sync = getattr(request.app.state, "arr_sync", None)
     arr_rows = (
-        arr_sync.preflight_rows(enabled_instance_ids)
+        await arr_sync.preflight_rows(enabled_instance_ids)
         if arr_sync is not None and enabled_instance_ids
         else []
     )

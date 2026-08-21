@@ -13,7 +13,8 @@ from datetime import UTC, datetime
 import aiosqlite
 import pytest
 
-from lftpweb.core.arrsync import ArrSyncScheduler, _parse_timeleft
+from lftpweb.core.arrclient import QueueRecord
+from lftpweb.core.arrsync import ArrSyncScheduler, _parse_timeleft, _record_matches_any_item
 from lftpweb.core.crypto import encrypt_secret
 from lftpweb.core.preflight import PREFLIGHT_HOLD_S
 from lftpweb.db import migrate
@@ -159,7 +160,7 @@ async def test_attributes_by_arr_visible_path_prefix_and_omits_no_match(
     scheduler = ArrSyncScheduler(db=db, config_dir=str(tmp_path))
     await scheduler.run_once()
 
-    rows = {r.title: r for r in scheduler.preflight_rows({instance_id})}
+    rows = {r.title: r for r in await scheduler.preflight_rows({instance_id})}
     assert set(rows) == {"Show.S01E01", "Movie.2024"}
     assert rows["Show.S01E01"].queue_id == tv_queue_id
     assert rows["Movie.2024"].queue_id == movies_queue_id
@@ -187,7 +188,7 @@ async def test_no_output_path_attributed_only_when_instance_has_one_queue(
     scheduler = ArrSyncScheduler(db=db, config_dir=str(tmp_path))
     await scheduler.run_once()
 
-    rows = scheduler.preflight_rows({instance_id})
+    rows = await scheduler.preflight_rows({instance_id})
     assert len(rows) == 1
     assert rows[0].title == "Single.Queue.Release"
     assert rows[0].queue_id == queue_id
@@ -210,7 +211,7 @@ async def test_no_output_path_omitted_when_instance_has_several_queues(
     scheduler = ArrSyncScheduler(db=db, config_dir=str(tmp_path))
     await scheduler.run_once()
 
-    assert scheduler.preflight_rows({instance_id}) == []
+    assert await scheduler.preflight_rows({instance_id}) == []
 
 
 async def test_size_and_sizeleft_carried_through_when_present(db, fake_arr_server, tmp_path):
@@ -233,7 +234,7 @@ async def test_size_and_sizeleft_carried_through_when_present(db, fake_arr_serve
     scheduler = ArrSyncScheduler(db=db, config_dir=str(tmp_path))
     await scheduler.run_once()
 
-    rows = scheduler.preflight_rows({instance_id})
+    rows = await scheduler.preflight_rows({instance_id})
     assert len(rows) == 1
     assert rows[0].size_bytes == 1_000_000
     assert rows[0].size_remaining_bytes == 250_000
@@ -258,7 +259,7 @@ async def test_already_imported_at_the_arr_level_is_never_projected(db, fake_arr
     scheduler = ArrSyncScheduler(db=db, config_dir=str(tmp_path))
     await scheduler.run_once()
 
-    assert scheduler.preflight_rows({instance_id}) == []
+    assert await scheduler.preflight_rows({instance_id}) == []
 
 
 # --- No duplicate at handover ------------------------------------------------------------------
@@ -294,7 +295,7 @@ async def test_a_matched_record_is_not_projected(db, fake_arr_server, tmp_path):
     row = await cursor.fetchone()
     assert row["arr_status"] == "detected"
 
-    assert scheduler.preflight_rows({instance_id}) == []
+    assert await scheduler.preflight_rows({instance_id}) == []
 
 
 # --- Flap tolerance -----------------------------------------------------------------------------
@@ -325,20 +326,20 @@ async def test_flap_tolerance_holds_across_one_missed_poll_then_expires(
 
     scheduler = ArrSyncScheduler(db=db, config_dir=str(tmp_path))
     await scheduler.run_once()
-    assert [r.title for r in scheduler.preflight_rows({instance_id})] == ["Flaky.Release"]
+    assert [r.title for r in await scheduler.preflight_rows({instance_id})] == ["Flaky.Release"]
 
     # The *arr's own queue blanks out for a beat (the real production shape) -- one missed pass,
     # well inside the hold window.
     fake_arr_server.state.queue_records = []
     clock["t"] += 60.0
     await scheduler.run_once()
-    assert [r.title for r in scheduler.preflight_rows({instance_id})] == ["Flaky.Release"]
+    assert [r.title for r in await scheduler.preflight_rows({instance_id})] == ["Flaky.Release"]
 
     # Still missing, now past `PREFLIGHT_HOLD_S` total -- the row must finally clear, and must
     # not have been resurrected by the intervening held pass.
     clock["t"] += PREFLIGHT_HOLD_S
     await scheduler.run_once()
-    assert scheduler.preflight_rows({instance_id}) == []
+    assert await scheduler.preflight_rows({instance_id}) == []
 
 
 async def test_reappearance_within_the_hold_window_refreshes_rather_than_duplicates(
@@ -369,7 +370,7 @@ async def test_reappearance_within_the_hold_window_refreshes_rather_than_duplica
     clock["t"] += 5.0
     await scheduler.run_once()
 
-    rows = scheduler.preflight_rows({instance_id})
+    rows = await scheduler.preflight_rows({instance_id})
     assert [r.title for r in rows] == ["Flaky.Release.2"]  # exactly one row, never two
 
 
@@ -397,9 +398,9 @@ async def test_preflight_rows_filters_to_the_caller_supplied_instance_set(
     scheduler = ArrSyncScheduler(db=db, config_dir=str(tmp_path))
     await scheduler.run_once()
 
-    assert len(scheduler.preflight_rows({instance_id})) == 1
-    assert scheduler.preflight_rows(set()) == []
-    assert scheduler.preflight_rows({instance_id + 999}) == []
+    assert len(await scheduler.preflight_rows({instance_id})) == 1
+    assert await scheduler.preflight_rows(set()) == []
+    assert await scheduler.preflight_rows({instance_id + 999}) == []
 
 
 # --- Queue tag (2026-08-21, "we moved the columns around") -------------------------------------
@@ -429,7 +430,7 @@ async def test_queue_name_and_short_name_are_carried_on_the_row(db, fake_arr_ser
     scheduler = ArrSyncScheduler(db=db, config_dir=str(tmp_path))
     await scheduler.run_once()
 
-    rows = scheduler.preflight_rows({instance_id})
+    rows = await scheduler.preflight_rows({instance_id})
     assert len(rows) == 1
     assert rows[0].queue_name == "DC-TV"
     assert rows[0].queue_short_name == "TV"
@@ -448,7 +449,7 @@ async def test_queue_short_name_is_none_when_not_set(db, fake_arr_server, tmp_pa
     scheduler = ArrSyncScheduler(db=db, config_dir=str(tmp_path))
     await scheduler.run_once()
 
-    rows = scheduler.preflight_rows({instance_id})
+    rows = await scheduler.preflight_rows({instance_id})
     assert rows[0].queue_name == "q"  # `_seed_queue`'s own default
     assert rows[0].queue_short_name is None
 
@@ -499,7 +500,7 @@ async def test_remaining_time_present_absent_and_unparseable_end_to_end(
     scheduler = ArrSyncScheduler(db=db, config_dir=str(tmp_path))
     await scheduler.run_once()
 
-    rows = {r.title: r for r in scheduler.preflight_rows({instance_id})}
+    rows = {r.title: r for r in await scheduler.preflight_rows({instance_id})}
     assert rows["Has.Timeleft"].remaining_s == 180.0
     assert rows["No.Timeleft"].remaining_s is None
     assert rows["Bad.Timeleft"].remaining_s is None
@@ -527,7 +528,7 @@ async def test_download_client_is_carried_through_when_present(db, fake_arr_serv
     scheduler = ArrSyncScheduler(db=db, config_dir=str(tmp_path))
     await scheduler.run_once()
 
-    rows = {r.title: r for r in scheduler.preflight_rows({instance_id})}
+    rows = {r.title: r for r in await scheduler.preflight_rows({instance_id})}
     assert rows["Has.Client"].download_client == "SABnzbd"
     assert rows["No.Client"].download_client is None
     # An *arr row's own wait isn't bound by scan count -- `wait_scans`/`wait_since`
@@ -566,7 +567,7 @@ async def test_retired_row_evicts_immediately_not_held(db, fake_arr_server, tmp_
 
     scheduler = ArrSyncScheduler(db=db, config_dir=str(tmp_path))
     await scheduler.run_once()
-    assert [r.title for r in scheduler.preflight_rows({instance_id})] == ["Show.S01E01"]
+    assert [r.title for r in await scheduler.preflight_rows({instance_id})] == ["Show.S01E01"]
 
     # The release lands: a real `item` row now exists with the matching name, so this pass's own
     # `_preflight_candidates` excludes the record for matching it -- the ordinary "no duplicate
@@ -576,7 +577,7 @@ async def test_retired_row_evicts_immediately_not_held(db, fake_arr_server, tmp_
     await scheduler.run_once()
 
     # Must be gone THIS pass, not held for PREFLIGHT_HOLD_S alongside a genuinely-missing row.
-    assert scheduler.preflight_rows({instance_id}) == []
+    assert await scheduler.preflight_rows({instance_id}) == []
 
 
 async def test_a_merely_missing_row_still_holds_for_the_full_window(
@@ -605,15 +606,188 @@ async def test_a_merely_missing_row_still_holds_for_the_full_window(
 
     scheduler = ArrSyncScheduler(db=db, config_dir=str(tmp_path))
     await scheduler.run_once()
-    assert [r.title for r in scheduler.preflight_rows({instance_id})] == ["Flaky.Release.3"]
+    assert [r.title for r in await scheduler.preflight_rows({instance_id})] == ["Flaky.Release.3"]
 
     # Blip -- no matching item exists anywhere, so this is "merely absent," not "retired."
     fake_arr_server.state.queue_records = []
     clock["t"] += 1.0
     await scheduler.run_once()
-    assert [r.title for r in scheduler.preflight_rows({instance_id})] == ["Flaky.Release.3"]
+    assert [r.title for r in await scheduler.preflight_rows({instance_id})] == ["Flaky.Release.3"]
 
     # Only past the full hold window does it finally clear.
     clock["t"] += PREFLIGHT_HOLD_S
     await scheduler.run_once()
-    assert scheduler.preflight_rows({instance_id}) == []
+    assert await scheduler.preflight_rows({instance_id}) == []
+
+
+# --- Request-time retirement (2026-08-21, "it does take 20-30 seconds ... sometimes fast and
+# sometimes slow") -- the poll-cadence term left behind by the evict-on-handover fix above.
+# `test_retired_row_evicts_immediately_not_held` proves the per-*poll* fast path; this proves
+# retirement no longer needs a poll pass to happen at all. ---------------------------------------
+
+
+async def test_retirement_happens_at_request_time_with_no_poller_pass_in_between(
+    db, fake_arr_server, tmp_path, monkeypatch
+):
+    """The central fix. Before it, `preflight_rows` was a pure read of the in-memory hold --
+    whether a row was "retired" was decided exactly once per `_update_preflight` call, i.e. once
+    per `ArrSettings.poll_interval_s` (60s default). A release that lands locally right after a
+    poll sat here, duplicated against its own new Active/pending row, for up to that whole
+    interval (plus the frontend's own poll on top). This test seeds the matching `item` directly
+    -- never calling `run_once()` a second time -- so it can only pass if `preflight_rows` itself
+    re-asks "does a matching item exist" on every call, against the live database, not just once
+    per poll pass. Confirmed failing against pre-fix code before implementing the fix.
+    """
+    host_id = await _seed_host(db)
+    instance_id = await _seed_instance(
+        db, str(tmp_path), base_url=fake_arr_server.base_url, api_key=fake_arr_server.state.api_key
+    )
+    queue_id = await _seed_queue(
+        db, host_id, arr_instance_id=instance_id, arr_visible_path="/data/tv"
+    )
+
+    fake_arr_server.state.queue_records = [
+        _queue_record(
+            download_id="latency1", title="Show.S01E01", output_path="/data/tv/Show.S01E01"
+        )
+    ]
+
+    clock = {"t": 1_000.0}
+    monkeypatch.setattr("lftpweb.core.arrsync.time.monotonic", lambda: clock["t"])
+
+    scheduler = ArrSyncScheduler(db=db, config_dir=str(tmp_path))
+    await scheduler.run_once()
+    assert [r.title for r in await scheduler.preflight_rows({instance_id})] == ["Show.S01E01"]
+
+    # The release lands locally -- no second `run_once()`, no clock advance, no poll of any kind.
+    await _seed_item(db, queue_id, "Show.S01E01")
+
+    assert await scheduler.preflight_rows({instance_id}) == []
+
+
+async def test_a_row_with_no_last_seen_record_is_unaffected_by_the_request_time_check(
+    db, fake_arr_server, tmp_path, monkeypatch
+):
+    """The request-time check must not regress flap tolerance: a row currently held blind (its
+    identity went missing from the *arr's own last-fetched records, the SABnzbd-blip case) has
+    nothing to re-test the predicate against and must keep showing, exactly as
+    `test_a_merely_missing_row_still_holds_for_the_full_window` already proves for the poll-driven
+    path -- this proves the *new* per-request filter doesn't accidentally drop it either.
+    """
+    host_id = await _seed_host(db)
+    instance_id = await _seed_instance(
+        db, str(tmp_path), base_url=fake_arr_server.base_url, api_key=fake_arr_server.state.api_key
+    )
+    await _seed_queue(db, host_id, arr_instance_id=instance_id, arr_visible_path="/data/tv")
+
+    fake_arr_server.state.queue_records = [
+        _queue_record(
+            download_id="blind1", title="Blind.Release", output_path="/data/tv/Blind.Release"
+        )
+    ]
+
+    clock = {"t": 1_000.0}
+    monkeypatch.setattr("lftpweb.core.arrsync.time.monotonic", lambda: clock["t"])
+
+    scheduler = ArrSyncScheduler(db=db, config_dir=str(tmp_path))
+    await scheduler.run_once()
+
+    # Blip -- the record vanishes from the *arr's own report, so this instance's last-seen
+    # records no longer carry this identity at all.
+    fake_arr_server.state.queue_records = []
+    clock["t"] += 1.0
+    await scheduler.run_once()
+
+    assert [r.title for r in await scheduler.preflight_rows({instance_id})] == ["Blind.Release"]
+
+
+# --- The shared predicate (this task: "extract and share the match predicate; do not
+# reimplement it") -- `_record_matches_any_item` is the one function both `_preflight_candidates`
+# (the per-poll path) and `preflight_rows` (the request-time path, above) call; this exercises it
+# directly with a table of cases so both paths are provably answering the identical question. ----
+
+
+@pytest.mark.parametrize(
+    ("output_path", "title", "item_names", "expected"),
+    [
+        # No items at all -- never a match, regardless of the record's own fields.
+        ("/data/tv/Show.S01E01", "Show.S01E01", frozenset(), False),
+        # Exact basename-of-output_path match.
+        ("/data/tv/Show.S01E01", "Some Other Title", frozenset({"Show.S01E01"}), True),
+        # Normalized-title fallback (case-fold, `.`/`_`/space equivalence) when there's no
+        # output_path at all.
+        (None, "Show.S01E01", frozenset({"show s01e01"}), True),
+        # Neither the basename nor the normalized title matches anything in the set.
+        ("/data/tv/Show.S01E01", "Show.S01E01", frozenset({"Unrelated.Release"}), False),
+        # Matches one of several candidate item names, not just the first.
+        (
+            "/data/tv/Show.S01E01",
+            "Show.S01E01",
+            frozenset({"Unrelated.Release", "Show.S01E01"}),
+            True,
+        ),
+    ],
+)
+def test_record_matches_any_item_table(output_path, title, item_names, expected):
+    record = QueueRecord(
+        download_id="d1",
+        title=title,
+        output_path=output_path,
+        tracked_download_state="downloading",
+        raw={},
+    )
+    assert _record_matches_any_item(record, item_names) is expected
+
+
+async def test_shared_predicate_agrees_at_both_call_sites(db, fake_arr_server, tmp_path):
+    """Same record, same item-name fact, checked through both real call sites --
+    `_preflight_candidates`' per-poll retirement (via a real `run_once()`) and `preflight_rows`'
+    own request-time re-check (via a second call with the item seeded in between, no second
+    poll) -- both must agree it is a match, because both call the identical
+    `_record_matches_any_item`, never two independent definitions.
+    """
+    host_id = await _seed_host(db)
+    instance_id = await _seed_instance(
+        db, str(tmp_path), base_url=fake_arr_server.base_url, api_key=fake_arr_server.state.api_key
+    )
+    queue_id = await _seed_queue(
+        db, host_id, arr_instance_id=instance_id, arr_visible_path="/data/tv"
+    )
+
+    fake_arr_server.state.queue_records = [
+        _queue_record(
+            download_id="shared1", title="Show.S01E01", output_path="/data/tv/Show.S01E01"
+        )
+    ]
+
+    scheduler = ArrSyncScheduler(db=db, config_dir=str(tmp_path))
+
+    # Path 1: the item already exists before the poll ever runs -- `_preflight_candidates`'
+    # own per-pass retirement never even lets the row appear.
+    await _seed_item(db, queue_id, "Show.S01E01")
+    await scheduler.run_once()
+    assert await scheduler.preflight_rows({instance_id}) == []
+
+    # Path 2: the identical record/item-name fact, but discovered by `preflight_rows`' own
+    # request-time re-check instead -- a fresh scheduler with no item yet, one poll, then the
+    # item lands, no second poll.
+    scheduler2 = ArrSyncScheduler(db=db, config_dir=str(tmp_path))
+    host_id2 = await _seed_host(db)
+    instance_id2 = await _seed_instance(
+        db,
+        str(tmp_path),
+        base_url=fake_arr_server.base_url,
+        api_key=fake_arr_server.state.api_key,
+    )
+    queue_id2 = await _seed_queue(
+        db, host_id2, arr_instance_id=instance_id2, arr_visible_path="/data/tv2"
+    )
+    fake_arr_server.state.queue_records = [
+        _queue_record(
+            download_id="shared2", title="Show.S02E02", output_path="/data/tv2/Show.S02E02"
+        )
+    ]
+    await scheduler2.run_once()
+    assert [r.title for r in await scheduler2.preflight_rows({instance_id2})] == ["Show.S02E02"]
+    await _seed_item(db, queue_id2, "Show.S02E02")
+    assert await scheduler2.preflight_rows({instance_id2}) == []

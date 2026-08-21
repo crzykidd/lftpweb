@@ -177,3 +177,14 @@ class PreflightHold:
 
     def rows(self) -> list[PreflightRow]:
         return [entry.row for entry in self._entries.values()]
+
+    def items(self) -> list[tuple[str, PreflightRow]]:
+        """`rows()` widened with each row's own identity key (2026-08-21, "eviction latency"
+        fix) -- for a caller that needs to re-test a held row against something keyed by that
+        same identity (`core/arrsync.py.ArrSyncScheduler.preflight_rows`'s own request-time
+        retirement re-check, against its last-seen `QueueRecord` per identity) without this
+        class exposing its private `_entries` dict directly. Still says nothing about what an
+        identity *means* -- that stays the caller's own business, per this module's own
+        source-agnostic contract.
+        """
+        return [(key, entry.row) for key, entry in self._entries.items()]

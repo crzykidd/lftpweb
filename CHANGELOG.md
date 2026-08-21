@@ -251,6 +251,22 @@ Skeleton for the next roll:
 
 ### Fixed
 
+- **A handed-over release now disappears from Preflight within a few seconds, not 20-30s and
+  sometimes longer.** From the user's browser review: "it does take 20-30 seconds for items to
+  be removed from preflight after it shows in active — sometimes it is fast and sometimes it is
+  slow." The variance was the tell: the previous evict-on-handover fix (below) removed the 150s
+  flap-tolerance hold, but retirement was still only *decided* once per *arr poll pass
+  (`ArrSettings.poll_interval_s`, 60s default) — an item landing right after a poll waited nearly
+  a full interval, one landing right before felt instant, plus the frontend's own 15s poll on
+  top. The underlying question, "does a matching `item` exist now," is purely local state, so
+  `ArrSyncScheduler.preflight_rows` (now `async`) re-asks it on every `GET /api/queue/preflight`
+  call rather than only on the next poll — the same `_record_matches_any_item` predicate
+  `_preflight_candidates` already used, extracted into one shared function so the two paths can
+  never drift. The frontend's own poll also drops from 15s to 5s (`hooks/usePreflight.ts`), now
+  the dominant remaining delay since the endpoint itself is no longer bounded by the *arr's own
+  cadence. Flap tolerance (a merely-absent row still held for the full 150s) and the settle
+  source (unaffected, still a wholesale per-scan replace) are both unchanged. *arr poll rate
+  itself is untouched — this needed no more requests to the *arr, only a cheap local re-check.
 - **A handed-over release no longer lingers in Preflight for up to 150s alongside its own new
   Active/pending row.** Found by reading the code, not observed in a browser: `core/arrsync.py`'s
   Preflight cache couldn't tell "this record just matched a real lftpweb item" (a known, terminal

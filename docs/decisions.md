@@ -6,6 +6,69 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-21 — Preflight retirement moves to request time: local state needs no *arr dependency
+
+`prompts/2026-08-21-preflight-eviction-latency.md`, from the user's browser review ("it does take
+20-30 seconds for items to be removed from preflight after it shows in active ... sometimes it is
+fast and sometimes it is slow"). Extends the "evict-on-handover" entry below rather than
+contradicting it: that fix removed the 150s flap-tolerance hold from the retirement path; this
+task removes the other term that was still underneath it -- the *poll cadence* itself.
+
+**Retirement is decided at request time now, not only once per *arr poll pass.** The question
+"should this row still show" is really "does a matching `item` row exist now" -- purely local
+database state, answerable on every `GET /api/queue/preflight` regardless of when the *arr was
+last polled. Before this, `ArrSyncScheduler.preflight_rows` was a synchronous read of the
+in-memory hold; the hold's own `retired` set (the previous fix) only got recomputed inside
+`_update_preflight`, which only runs once per `ArrSettings.poll_interval_s` (60s default). An
+item landing right after a poll waited nearly the full interval before the *next* poll noticed;
+one landing right before a poll felt instant -- exactly the "sometimes fast, sometimes slow"
+variance the user named, and the tell that pointed at cadence rather than at the hold itself.
+
+**`preflight_rows` became `async` to do this** -- it now re-queries `item` fresh (via the
+existing `_item_names_for_queue_ids` helper, extracted from `_update_preflight` so both paths
+share one query) and re-runs the *arr match predicate against each held row whose identity this
+instance's last poll pass also fetched a raw `QueueRecord` for. A held row with no such record
+(the flap-tolerance case -- it went missing from a poll and is being held blind) passes through
+unfiltered, unchanged from before: there is nothing to re-test it against, and "keep showing it"
+is that cache's entire point. This is a read-side filter only; it never mutates the hold itself,
+so the next real poll's own `retired` set remains the authoritative writer -- "one writer"
+(`PreflightHold.update`) still holds.
+
+**The match predicate is now a named, shared function, `_record_matches_any_item`** (`core/
+arrsync.py`), wrapping the pre-existing `_record_matches_item` -- used by both
+`_preflight_candidates` (the per-poll path) and `preflight_rows` (the new request-time path).
+Rejected: reimplementing a second, title-only check at the request-time call site using only
+`PreflightRow.title` (the shared row type carries no `output_path`). That would have silently
+weakened matching for a record whose only match signal is its `outputPath` basename (a renamed
+release whose title doesn't normalize-equal the item name) -- accepted for the per-poll path
+(full `QueueRecord` available) but wrong to reintroduce as a second, weaker definition at the
+other call site. Instead `ArrSyncScheduler` now caches each instance's last-fetched
+`QueueRecord`s (keyed by `_record_identity`, the same identity the hold itself uses) and its last
+bound+enabled queue ids, so the request-time check can call the *exact* same predicate with the
+*exact* same record data the poll pass had, just re-evaluated against a fresher `item_names` set.
+
+**`core/preflight.py` gained one small, source-agnostic addition: `PreflightHold.items()`**,
+returning `(identity, row)` pairs alongside the existing `rows()`. Needed so `preflight_rows` can
+look up each row's own last-seen record by identity without reaching into the hold's private
+`_entries` dict. Says nothing about what an identity *means* -- same contract as `update`'s own
+`retired` set -- so the module's five-tasks-running "no `arr`/`settle` reference in code" streak
+holds; the *arr-specific predicate itself lives entirely in `core/arrsync.py`.
+
+**The *arr poll rate was deliberately left untouched.** The 0-60s term this task removes was
+never about the *arr being too slow to ask -- lftpweb already had every fact it needed locally,
+just wasn't asking itself the question until the next scheduled poll. Raising the poll rate would
+have hammered someone else's API to fix a purely local latency, and the interval is a
+user-facing setting with its own reasons (also unrelated to the settle source, which was never on
+this path -- it replaces its own rows wholesale every scan and needed no change here).
+
+**Frontend poll dropped from 15s to 5s** (`hooks/usePreflight.ts`), matching `StatsHeader.tsx`'s
+health-poll cadence. Before this task, 15s was chosen specifically because the box's data
+couldn't change faster than the *arr's own ~60s poll; with the endpoint no longer bounded by
+that, the frontend's own interval became the dominant remaining delay, so it was tightened to
+match the other "advisory, cheap-to-poll" data on the page rather than left at a stale value.
+
+---
+
 ## 2026-08-21 — A separate `WAITING` fill bucket for Preflight's *arr chip; `SETTLING` deliberately
 gets none
 
