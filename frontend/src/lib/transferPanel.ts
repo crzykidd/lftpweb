@@ -285,14 +285,23 @@ export function completedTimeLabel(job: JobOut): { value: string; title: string 
  * position from the input array, i.e. `list_jobs`'s own `rank`/`queued_at` order -- a reasonable
  * fallback, and never a re-shuffle on every poll for jobs that didn't actually move.
  *
- * **2026-08-20: a fourth partition, between running and queued** (docs/transfers-redesign-spec.md
- * §3.2's pipeline-completion rule) -- a row whose lftp job has finished but whose *pipeline* has
- * not (`pipeline_in_flight`: verifying, extracting, awaiting import, deleting source) now stays
- * in the Active box, and it is a terminal-state job, so it would otherwise sort into the
- * newest-finished-first tail *below the entire queued backlog* -- page 11 of a busy queue, where
- * the user would never see the thing they are being told is still moving. It belongs with
- * `running`: both are work actively happening right now, and neither has a queue position. Same
- * newest-first ordering within the partition as the terminal tail, for the same reason.
+ * **2026-08-20: a fourth partition** (docs/transfers-redesign-spec.md §3.2's pipeline-completion
+ * rule) -- a row whose lftp job has finished but whose *pipeline* has not
+ * (`pipeline_in_flight`: verifying, extracting, awaiting import, deleting source) stays in the
+ * Active box even though it is a terminal-state job, so it needs a partition of its own rather
+ * than falling into the newest-finished-first tail. Same newest-first ordering within it.
+ *
+ * **2026-08-21: that partition moved below `queued`, at the user's direction.** It first sat
+ * between `running` and `queued` on the reasoning that both are "work happening right now."
+ * The user's reading is better: a pipeline-in-flight row is lftpweb *waiting on someone else*
+ * (usually an *arr import), whereas `queued` is lftpweb's own genuinely-next work. So the order
+ * reads now / next / parked: **running, queued, processing, terminal.**
+ *
+ * **The tradeoff this accepts, stated so it isn't rediscovered as a bug:** with a deep backlog
+ * and 20 rows to a page, a processing row can now land pages below the fold -- exactly what the
+ * original placement was avoiding. Judged acceptable because such rows are transient (minutes)
+ * and few, and because burying "waiting on Sonarr" is less costly than pushing the actual
+ * upcoming queue order out of view. Flip the two segments back if that proves wrong.
  */
 export function sortTransferRows(jobs: JobOut[]): JobOut[] {
   const running: JobOut[] = []
@@ -314,7 +323,7 @@ export function sortTransferRows(jobs: JobOut[]): JobOut[] {
       if (bTime == null) return -1
       return bTime - aTime // newest first
     })
-  return [...running, ...newestFirst(processing), ...queued, ...newestFirst(terminal)]
+  return [...running, ...queued, ...newestFirst(processing), ...newestFirst(terminal)]
 }
 
 /** Whether the panel's ***arr** group should render at all -- "hidden entirely when the queue
