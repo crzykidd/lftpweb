@@ -77,7 +77,63 @@ than a first. Two things that bit the first time and will bit again:
 
 ## Where we are
 
-### 2026-08-20 — Active/pending now holds a row until its whole *pipeline* finishes (browser-unverified)
+### 🚦 2026-08-20/21 — queue **Pause**, the **Preflight** box, and the docs catch-up
+
+Everything below is on `dev` and pushed. `main` is still `v0.2.6` — **the gap is now large: 34+
+commits and three migrations (023/024/025).** Tests: **1585 backend / 607 frontend, 0 skipped.**
+
+**Queue pause** (`07e2471`) — *Pause after current* and *Pause now*, persisted in a `setting` row
+(no migration), surfaced in `/api/health`. **The trap it had to avoid:** stop deliberately sets
+`auto_queue_suppressed` (§4.6), so reusing the stop path would have suppressed every running item
+and they would never come back on unpause. Instead it models the graceful-shutdown path — a
+`pause_requested` flag checked in `_reap_one` **before** exit-code classification, so a SIGTERM'd
+lftp is never classified `FAILED`; the job returns to `queued` keeping its `queue_position`,
+`attempt` and partial bytes. Proven by an **e2e test against a real lftp transfer** on the fake
+seedbox. Decided with the user: auto-queue keeps queueing while paused; **Start now is disabled
++ 409'd**; **reordering stays live while paused** — that is the whole workflow ("curate the order,
+then unpause").
+
+**Docs catch-up** (`ab17d85`) — quick-start / concepts / README / DESIGN brought in line with the
+redesign. Concepts grew from 10 to 13 entries. **The screenshots are stale and a human must retake
+them**: five are merely dated (pre-redesign nav), but README's second hero is *actively
+self-contradicting* — captioned "The Events page" while showing the removed History page and its
+deleted jobs list. A prioritised shot list with pre-written captions is in
+`docs/screenshot-plan.md`; the user is shooting them **2026-08-21 evening**, and until then the
+README deliberately keeps the old images.
+
+**The Preflight box** — a third, small box at the top of the Queue tab: things lftpweb knows about
+but has no work to do on yet. **Zero new integration** — the *arr poller already fetched these
+records every 60 s and discarded the unmatched ones; `QueueRecord.raw` had kept the full dict for
+exactly this. Built as a **pure projection, no table, no persistence** — which is what makes
+accumulation structurally impossible.
+
+| What | Commit |
+|---|---|
+| The box, *arr-sourced, with a **source-agnostic boundary** (`core/preflight.py` names neither `arr` nor `settle` in code, and has survived five tasks that way). Attribution by component-boundary prefix match of `output_path` against `arr_visible_path`; anything unattributable is **silently omitted** — promising a release that never arrives is worse than showing nothing | `42e4f61` |
+| **Settle-gated releases** join as a second source through that boundary (only `PreflightSource` widened), plus a **mount-gate banner** — one line per blocked queue, not fifty identical rows. Deliberately excluded: suppressed items and pattern-unmatched `REMOTE_ONLY` — neither is *waiting*, nothing is coming for them | `e785de0` |
+| Row **columns aligned** with the rows below (queue tag → title → *arr chip → `w-44` figure), queue name added to the row shape, remaining time from the *arr's `timeleft`, chips routed through **`StateChip`** — plus **evict-on-handover** | `d02fc0d` |
+| Chip shortened to **"Waiting"**, **Settling gained a live tooltip** (reuses `format.ts.settleWaitLabel`, fed *inputs* not a baked string so it ticks while hovered), and the expand became a **5/10/20 selector**; `PageSizeSelect` extracted so all three boxes share it | `8d56035` |
+| The **ticking progress fill** returns to the Queue row's chip (it was never passed a `percent`) and comes to Preflight's "Waiting" chip, via a new fillable `WAITING` state reusing `PARTIAL`'s **confirmed** amber pair. `SETTLING` deliberately has **no** fill — nothing is downloading | `82197a5` |
+| **Eviction latency**: retirement is now decided **at request time**, not once per 60 s *arr poll — the cause of "sometimes fast, sometimes slow." The match predicate is extracted and shared so the two call sites cannot drift. Frontend poll 15 s → 5 s | `703bf63` |
+
+**✅ User-verified in the browser (2026-08-20/21):** the full **Preflight → Active → Complete**
+transition is smooth; "Awaiting import" appears in Active and moves to Complete once the *arr
+finishes; the split view, short names, chevrons, filters, drawer history and multi-page Complete
+all work. **Unverified:** everything from `8d56035` onward (the "Waiting" chip, the Settling
+tooltip, the 5/10/20 selector, the progress fills), plus the fast-lane badge and "Dismiss list"
+across more than one 50-row page.
+
+**One judgement call left open for the user:** at **zero rows** the Preflight footer still renders,
+so an empty box is "Nothing in preflight." *plus* a small selector row rather than the strict
+single line originally asked for. One line to suppress if it reads as clutter.
+
+**Operational note now in `CLAUDE.md`** (`e58a46d`, `7a20f0b`): run `pytest` from the **repo root**
+(from `backend/` it collects **zero** tests and looks like a pass), `ruff check` is not
+`ruff format --check`, and **never background a gate** — a spawned subagent receives no completion
+notification and stalls forever. That last one still bit **three** agents today despite being
+written down; a hook that rejects a backgrounded `pytest` would fix it properly.
+
+### 2026-08-20 — Active/pending now holds a row until its whole *pipeline* finishes (✅ user-verified 2026-08-21)
 
 A follow-up to phase 1 stage 4b from the user's browser review, and the biggest behavioural change
 in the redesign so far. The two boxes used to split on **job termination** — lftp exits 0, the row
