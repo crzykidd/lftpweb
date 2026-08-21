@@ -32,6 +32,8 @@ def _row(source: str, queue_id: int, title: str, **overrides) -> PreflightRow:
         "size_remaining_bytes": None,
         "remaining_s": None,
         "download_client": None,
+        "wait_scans": None,
+        "wait_since": None,
     }
     fields.update(overrides)
     return PreflightRow(source=source, queue_id=queue_id, title=title, **fields)

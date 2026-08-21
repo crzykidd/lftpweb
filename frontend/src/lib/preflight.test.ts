@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import {
+  isPreflightPageSize,
   preflightChipLabel,
   preflightChipTooltip,
   preflightRemainingLabel,
@@ -67,7 +68,7 @@ describe('preflightRemainingLabel', () => {
 
 describe('preflightChipLabel', () => {
   it('translates the verified "downloading" trackedDownloadState into lftpweb\'s own perspective', () => {
-    expect(preflightChipLabel({ source: 'arr', status_label: 'downloading' })).toBe('Waiting for download')
+    expect(preflightChipLabel({ source: 'arr', status_label: 'downloading' })).toBe('Waiting')
   })
 
   it('translates the verified "importing" trackedDownloadState into its own word', () => {
@@ -90,40 +91,108 @@ describe('preflightChipLabel', () => {
 describe('preflightChipTooltip', () => {
   it('names the download client and the reporting instance when both are known', () => {
     expect(
-      preflightChipTooltip({
-        source: 'arr',
-        status_label: 'downloading',
-        download_client: 'SABnzbd',
-        source_label: 'Sonarr',
-      }),
+      preflightChipTooltip(
+        {
+          source: 'arr',
+          status_label: 'downloading',
+          download_client: 'SABnzbd',
+          source_label: 'Sonarr',
+          wait_scans: null,
+          wait_since: null,
+        },
+        null,
+      ),
     ).toBe('Downloading from "SABnzbd" — reported by Sonarr')
   })
 
   it('falls back to naming just the instance when there is no download client', () => {
     expect(
-      preflightChipTooltip({
-        source: 'arr',
-        status_label: 'downloading',
-        download_client: null,
-        source_label: 'Sonarr',
-      }),
+      preflightChipTooltip(
+        {
+          source: 'arr',
+          status_label: 'downloading',
+          download_client: null,
+          source_label: 'Sonarr',
+          wait_scans: null,
+          wait_since: null,
+        },
+        null,
+      ),
     ).toBe('Reported by Sonarr')
-  })
-
-  it('is null for a settle row -- nothing *arr to attribute', () => {
-    expect(
-      preflightChipTooltip({
-        source: 'settle',
-        status_label: 'Settling',
-        download_client: null,
-        source_label: 'TV',
-      }),
-    ).toBeNull()
   })
 
   it('is null for a status-less *arr row', () => {
     expect(
-      preflightChipTooltip({ source: 'arr', status_label: null, download_client: null, source_label: 'Sonarr' }),
+      preflightChipTooltip(
+        {
+          source: 'arr',
+          status_label: null,
+          download_client: null,
+          source_label: 'Sonarr',
+          wait_scans: null,
+          wait_since: null,
+        },
+        null,
+      ),
     ).toBeNull()
+  })
+
+  it('reuses the shared settle-wait sentence for a settle row -- never null, unlike the *arr branch', () => {
+    expect(
+      preflightChipTooltip(
+        {
+          source: 'settle',
+          status_label: 'Settling',
+          download_client: null,
+          source_label: 'TV',
+          wait_scans: 1,
+          wait_since: '2026-08-21T00:00:00.000000Z',
+        },
+        { enabled: true, required_scans: 2, min_age_s: 60 },
+      ),
+    ).toMatch(/^Waiting for changes -- 1 of 2 scans, \d+s of 60s$/)
+  })
+
+  it('degrades to the bare sentence for a settle row with no progress yet', () => {
+    expect(
+      preflightChipTooltip(
+        {
+          source: 'settle',
+          status_label: 'Settling',
+          download_client: null,
+          source_label: 'TV',
+          wait_scans: null,
+          wait_since: null,
+        },
+        { enabled: true, required_scans: 2, min_age_s: 60 },
+      ),
+    ).toBe('Waiting for changes')
+  })
+})
+
+describe('isPreflightPageSize', () => {
+  it('accepts each of this box\'s own offered sizes -- 5/10/20, not the other boxes\' 10/20/50', () => {
+    expect(isPreflightPageSize(5)).toBe(true)
+    expect(isPreflightPageSize(10)).toBe(true)
+    expect(isPreflightPageSize(20)).toBe(true)
+  })
+
+  it('rejects a size only the other two boxes offer -- 50 is not in this box\'s own list', () => {
+    expect(isPreflightPageSize(50)).toBe(false)
+  })
+
+  it('rejects a hand-edited or out-of-range number', () => {
+    expect(isPreflightPageSize(999)).toBe(false)
+    expect(isPreflightPageSize(0)).toBe(false)
+    expect(isPreflightPageSize(-5)).toBe(false)
+  })
+
+  it('rejects a non-number entirely -- a stale/foreign localStorage value', () => {
+    expect(isPreflightPageSize('20')).toBe(false)
+    expect(isPreflightPageSize('abc')).toBe(false)
+    expect(isPreflightPageSize(null)).toBe(false)
+    expect(isPreflightPageSize(undefined)).toBe(false)
+    expect(isPreflightPageSize({})).toBe(false)
+    expect(isPreflightPageSize([5])).toBe(false)
   })
 })

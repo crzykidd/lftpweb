@@ -784,6 +784,35 @@ async def test_settle_gated_item_projects_a_preflight_row(db, tmp_path):
     assert row.source_kind is None
     assert row.size_bytes == 100  # `_make_item`'s own hardcoded remote_size
     assert row.size_remaining_bytes is None
+    # The tooltip's own inputs (2026-08-21, "the settling chip should have a mouseover that
+    # shows time details") -- read straight off the same `item_settle` row `_set_settle_record`
+    # just wrote, via `settle.settle_progress_in_db`.
+    assert row.wait_scans == 1
+    assert row.wait_since is not None
+
+
+async def test_settle_gated_item_with_no_settle_row_yet_projects_wait_fields_as_none(db, tmp_path):
+    """An item with no `item_settle` row yet (the settle-aware scan path hasn't run for it) is
+    still gated conservatively (`test_settle_gate_on_with_no_settle_row_yet_is_conservative`),
+    but there is genuinely nothing to report for the tooltip's own inputs -- both fall through
+    to `None` together, never a fabricated pair.
+    """
+    from lftpweb.core.mount_sentinel import write_if_needed
+    from lftpweb.core.settle import SettleSettings, save_settle_settings
+
+    await save_settle_settings(db, SettleSettings(enabled=True))
+    write_if_needed(str(tmp_path))
+    queue_id = await _make_queue(db, tmp_path)
+    await _make_item(db, queue_id, "Release.One")
+    aq = AutoQueue(db, _Recorder())
+
+    queued = await aq.on_scan(_mounted_config(queue_id, tmp_path))
+    assert queued == 0
+
+    rows = aq.preflight_rows({queue_id})
+    assert len(rows) == 1
+    assert rows[0].wait_scans is None
+    assert rows[0].wait_since is None
 
 
 async def test_settled_item_does_not_project_a_row(db, tmp_path):

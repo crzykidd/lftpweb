@@ -991,6 +991,15 @@ class PreflightRowOut(BaseModel):
     # separate download client in that source's own model) or an *arr row whose response didn't
     # carry one. Display-only provenance for a chip tooltip.
     download_client: str | None
+    # A generic "how far along has this row's own wait gotten" detail for the chip's own hover
+    # tooltip (2026-08-21, "the settling chip should have a mouseover that shows time details")
+    # -- `core/preflight.py.PreflightRow.wait_scans`/`wait_since`'s own docstring has the full
+    # reasoning. `wait_since` is already an ISO-8601 string on this side (`core/settle.py.
+    # SettleProgress.first_matched_at`), so no further conversion happens at this layer. `null`
+    # for an *arr row (its own wait isn't bound by scan count) or a settle row with no
+    # `item_settle` history yet -- both fields together, never one alone.
+    wait_scans: int | None
+    wait_since: str | None
 
 
 class PreflightGatedQueueOut(BaseModel):

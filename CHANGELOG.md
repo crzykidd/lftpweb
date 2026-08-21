@@ -191,10 +191,28 @@ Skeleton for the next roll:
   appears; it now gets `StateChip`'s existing amber, the same colour a Preflight row gets
   regardless of source, since every row here is "waiting," whatever it's waiting on. An *arr
   row's chip also now speaks lftpweb's own vocabulary instead of the *arr's raw wire word — the
-  *arr's own `"downloading"` becomes **"Waiting for download"** (lftpweb is doing nothing here,
-  just watching the *arr's own download client work) and `"importing"` becomes **"Importing"**;
-  the *arr's own detail moves to the chip's tooltip instead — `Downloading from "<download
-  client>" — reported by <instance>`.
+  *arr's own `"downloading"` becomes **"Waiting"** (renamed again just below, from an interim
+  "Waiting for download"; lftpweb is doing nothing here, just watching the *arr's own download
+  client work) and `"importing"` becomes **"Importing"**; the *arr's own detail moves to the
+  chip's tooltip instead — `Downloading from "<download client>" — reported by <instance>`.
+- **The *arr chip's label shortens to "Waiting", the Settling chip gets a tooltip of its own,
+  and the Preflight box gains a "Show 5/10/20" page-size selector** — three follow-ups from the
+  user's live browser review. *"Waiting for download"* still read as ambiguous ("lftpweb is
+  waiting to download it" vs. "waiting for the download client to finish"); after considering
+  "Waiting for remote client" and asking to shorten it, the user picked **"Waiting"** — seven
+  characters, matching sibling chip `Settling` in shape (one word, present tense), and saying
+  nothing about *where* since the *arr brand logo, the box's own name, and the existing tooltip
+  already carry that. The `Settling` chip was the one asymmetry left — no tooltip at all — so it
+  now gets one too, reusing `lib/format.ts.settleWaitLabel` **verbatim** (the same "Waiting for
+  changes — 1 of 2 scans, 35s of 60s" sentence the Files tree and the lifecycle R-icon tooltip
+  already share) rather than a third copy of that wording; `PreflightRow` carries the settle
+  gate's own `matched_scans`/`updated_at` pair (generic `wait_scans`/`wait_since` fields, unset
+  for an *arr row) so the countdown stays live between polls instead of freezing at a pre-baked
+  string. Finally, the box's own "Show all (N)" expand-then-page toggle is replaced outright by
+  a persisted **5/10/20** selector (`preflight.pageSize`), matching the "we should have a drop
+  down on preflight like the rest" request — smaller than the other two boxes' 10/20/50 since
+  this box is smaller by intent, reusing the same `Pager`/`pageReadout` and a `PageSizeSelect`
+  now shared with the Active/Complete boxes rather than a second independent control.
 
 ### Changed
 

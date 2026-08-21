@@ -1,16 +1,21 @@
-import { useState } from 'react'
-import type { PreflightResponse, PreflightRowOut } from '../api/types'
+import { useEffect, useState } from 'react'
+import { getSettleSettings } from '../api/client'
+import type { PreflightResponse, PreflightRowOut, SettleSettingsOut } from '../api/types'
 import { pageCount, pageReadout, paginateClientSide } from '../lib/pagination'
 import {
-  PREFLIGHT_DEFAULT_ROWS,
-  PREFLIGHT_EXPANDED_PAGE_SIZE,
+  isPreflightPageSize,
+  PREFLIGHT_DEFAULT_PAGE_SIZE,
+  PREFLIGHT_PAGE_SIZE_OPTIONS,
   preflightChipLabel,
   preflightChipTooltip,
   preflightRemainingLabel,
+  type PreflightPageSize,
 } from '../lib/preflight'
 import { queueDisplayName } from '../lib/queueDisplayName'
+import { readLocalStorage, writeLocalStorage } from '../lib/storage'
 import { ArrBrandMark } from './LifecycleIcons'
 import { Pager } from './Pager'
+import { PageSizeSelect } from './PageSizeSelect'
 import { StateChip } from './StateChip'
 
 /** A row's own *arr chip -- **the one place *arr-specific rendering is allowed in this
@@ -54,9 +59,9 @@ function SourceChip({ row }: { row: PreflightRowOut }) {
  * same sequence and the same `w-44` width every other row on the page uses, so three boxes
  * stacked in one view read as one table rather than three different layouts.
  */
-function PreflightRowView({ row }: { row: PreflightRowOut }) {
+function PreflightRowView({ row, settle }: { row: PreflightRowOut; settle: SettleSettingsOut | null }) {
   const chipLabel = preflightChipLabel(row)
-  const chipTooltip = preflightChipTooltip(row)
+  const chipTooltip = preflightChipTooltip(row, settle)
   const figureLabel = preflightRemainingLabel(row)
   return (
     <div className="flex flex-wrap items-center gap-3 border-b border-zinc-200 px-3 py-2 text-sm last:border-b-0 dark:border-zinc-800">
@@ -114,10 +119,11 @@ function GatedQueueBanner({ gated }: { gated: PreflightResponse['gated_queues'] 
 }
 
 /** The Queue tab's third, small box (docs/transfers-redesign-spec.md §4, prefigured; this task's
- * own handoff prompt, prompts/done/2026-08-20-preflight-box.md, plus its follow-up
- * prompts/2026-08-20-preflight-waiting-sources.md) -- things a configured source already knows
- * about but lftpweb has no work to do on yet, sitting above Active/pending because it is first
- * in the pipeline. `TransfersPage.tsx` feeds this `usePreflight()`'s return value directly,
+ * own handoff prompt, prompts/done/2026-08-20-preflight-box.md, plus its follow-ups
+ * prompts/2026-08-20-preflight-waiting-sources.md and
+ * prompts/2026-08-21-preflight-label-and-page-size.md) -- things a configured source already
+ * knows about but lftpweb has no work to do on yet, sitting above Active/pending because it is
+ * first in the pipeline. `TransfersPage.tsx` feeds this `usePreflight()`'s return value directly,
  * unchanged.
  *
  * **Hidden entirely while `response` hasn't loaded yet, or neither `source_configured` nor
@@ -128,54 +134,60 @@ function GatedQueueBanner({ gated }: { gated: PreflightResponse['gated_queues'] 
  * show, and stays gone for a user with neither.
  *
  * **Scales to its content, not to a reserved row count** -- zero rows collapses to the header
- * plus one line ("Nothing in preflight."), never five rows' worth of empty space; the row list
- * itself is exactly as tall as it has rows, up to `PREFLIGHT_DEFAULT_ROWS` while collapsed. This
- * box sits above the two main ones, so wasted vertical space here pushes real work off-screen --
- * tightness matters more here than anywhere else on the page (the handoff prompt's own words).
+ * plus one line ("Nothing in preflight."), never a page's worth of empty space; the row list
+ * itself is exactly as tall as it has rows, up to the selected page size. This box sits above the
+ * two main ones, so wasted vertical space here pushes real work off-screen -- tightness matters
+ * more here than anywhere else on the page (the handoff prompt's own words).
  *
- * **Expand, then page** -- collapsed shows the first `PREFLIGHT_DEFAULT_ROWS` with no footer at
- * all (nothing to page through yet); "Show all (N)" past that switches to `Pager`/`pageReadout`
- * (`lib/pagination.ts`, the exact same components the Active/Complete boxes use -- "reuse the
- * existing pager ... rather than a third pagination idiom" was the task's own instruction) at a
- * fixed `PREFLIGHT_EXPANDED_PAGE_SIZE`. No per-box "Show 10/20/50" selector here -- see
- * `lib/preflight.ts`'s own comment on `PREFLIGHT_EXPANDED_PAGE_SIZE` for why a 5-row-by-default
- * box doesn't want one.
+ * **A "Show 5/10/20" selector, not an expand button** (2026-08-21, "we should have a drop down
+ * on preflight like the rest, show 5/10/20 etc" -- a follow-up to the first task's own deliberate
+ * skip: a 5-row box was judged not to share a growing job history's "see more at once" need,
+ * which the user's own real use has now settled the other way). Replaces the previous "Show all
+ * (N)" expand-then-page toggle outright rather than sitting beside it -- two controls doing
+ * overlapping jobs on one small box is worse than either alone. Persisted per browser
+ * (`preflight.pageSize`, `lib/storage.ts`, validated on read via `isPreflightPageSize` exactly as
+ * `transfers.activePageSize`/`completePageSize` already are), and reuses `Pager`/`pageReadout`/
+ * `PageSizeSelect` -- the identical components the Active/Complete boxes use ("reuse the existing
+ * pager ... rather than a third pagination idiom" was the first task's own instruction, extended
+ * here to the selector too).
  */
 export function PreflightBox({ response }: { response: PreflightResponse | undefined }) {
-  const [expanded, setExpanded] = useState(false)
+  const [pageSize, setPageSizeState] = useState<PreflightPageSize>(
+    () => readLocalStorage('preflight.pageSize', isPreflightPageSize) ?? PREFLIGHT_DEFAULT_PAGE_SIZE,
+  )
   const [page, setPage] = useState(1)
+  const setPageSize = (next: PreflightPageSize) => {
+    setPageSizeState(next)
+    writeLocalStorage('preflight.pageSize', next)
+    setPage(1)
+  }
+
+  // The settle-wait tooltip's own site-wide constants (`lib/format.ts.settleWaitLabel`'s
+  // `required_scans`/`min_age_s`) -- the identical `GET /api/settings/settle` fetch
+  // `FileTree.tsx` already makes for the same helper, `null` until it resolves or forever on
+  // failure, both of which `preflightChipTooltip` degrades gracefully for (never blocks the box
+  // from rendering).
+  const [settleSettings, setSettleSettings] = useState<SettleSettingsOut | null>(null)
+  useEffect(() => {
+    getSettleSettings()
+      .then(setSettleSettings)
+      .catch(() => {
+        // Degrades gracefully -- see the comment above.
+      })
+  }, [])
 
   if (response == null) return null
   if (!response.source_configured && response.gated_queues.length === 0) return null
 
   const rows = response.rows
-  const count = pageCount(rows.length, PREFLIGHT_EXPANDED_PAGE_SIZE)
-  const pageRows = expanded
-    ? paginateClientSide(rows, page, PREFLIGHT_EXPANDED_PAGE_SIZE)
-    : rows.slice(0, PREFLIGHT_DEFAULT_ROWS)
-  const canExpand = rows.length > PREFLIGHT_DEFAULT_ROWS
-
-  const collapse = () => {
-    setExpanded(false)
-    setPage(1)
-  }
+  const count = pageCount(rows.length, pageSize)
+  const pageRows = paginateClientSide(rows, page, pageSize)
 
   return (
     <div className="flex flex-col gap-2">
-      <div className="flex items-center justify-between gap-2">
-        <h2 className="text-xs font-semibold tracking-wide text-zinc-500 uppercase dark:text-zinc-400">
-          Preflight
-        </h2>
-        {expanded && (
-          <button
-            type="button"
-            onClick={collapse}
-            className="shrink-0 text-xs text-zinc-500 underline decoration-dotted hover:text-zinc-700 dark:text-zinc-400 dark:hover:text-zinc-200"
-          >
-            Show less
-          </button>
-        )}
-      </div>
+      <h2 className="text-xs font-semibold tracking-wide text-zinc-500 uppercase dark:text-zinc-400">
+        Preflight
+      </h2>
 
       <GatedQueueBanner gated={response.gated_queues} />
 
@@ -197,30 +209,32 @@ export function PreflightBox({ response }: { response: PreflightResponse | undef
                 <PreflightRowView
                   key={`${row.source}:${row.queue_id}:${row.title}:${index}`}
                   row={row}
+                  settle={settleSettings}
                 />
               ))}
             </div>
           )}
 
-          {!expanded && canExpand && (
-            <button
-              type="button"
-              onClick={() => setExpanded(true)}
-              className="self-start text-xs text-zinc-500 underline decoration-dotted hover:text-zinc-700 dark:text-zinc-400 dark:hover:text-zinc-200"
-            >
-              Show all ({rows.length})
-            </button>
-          )}
+          {/* The selector itself is never gated on row count (unlike the old "Show all (N)"
+           * expand, which only appeared past a fixed collapsed-row threshold) -- it's hidden
+           * only by the same rule the whole row list already is, `response.source_configured`.
+           * `Pager` and `pageReadout` already degrade to nothing on their own (`count <= 1`,
+           * `total <= 0`) when there's nothing yet to page through. */}
+          <div className="flex items-center justify-between gap-2">
+            <span className="text-xs text-zinc-500 dark:text-zinc-400">
+              {pageReadout(page, count, rows.length)}
+            </span>
+            <div className="flex items-center gap-2">
+              <PageSizeSelect
+                id="preflight"
+                value={pageSize}
+                options={PREFLIGHT_PAGE_SIZE_OPTIONS}
+                onChange={setPageSize}
+              />
+              <Pager current={page} count={count} onChange={setPage} />
+            </div>
+          </div>
         </>
-      )}
-
-      {response.source_configured && expanded && (
-        <div className="flex items-center justify-between gap-2">
-          <span className="text-xs text-zinc-500 dark:text-zinc-400">
-            {pageReadout(page, count, rows.length)}
-          </span>
-          <Pager current={page} count={count} onChange={setPage} />
-        </div>
       )}
     </div>
   )

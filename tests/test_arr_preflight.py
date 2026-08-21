@@ -530,6 +530,10 @@ async def test_download_client_is_carried_through_when_present(db, fake_arr_serv
     rows = {r.title: r for r in scheduler.preflight_rows({instance_id})}
     assert rows["Has.Client"].download_client == "SABnzbd"
     assert rows["No.Client"].download_client is None
+    # An *arr row's own wait isn't bound by scan count -- `wait_scans`/`wait_since`
+    # (`core/preflight.py.PreflightRow`'s own docstring) stay unset for either row.
+    assert rows["Has.Client"].wait_scans is None
+    assert rows["Has.Client"].wait_since is None
 
 
 # --- Evict on handover (2026-08-21, "a handed-over release lingers in Preflight for up to

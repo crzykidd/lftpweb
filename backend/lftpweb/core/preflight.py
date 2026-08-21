@@ -103,6 +103,23 @@ class PreflightRow:
     # *is* the thing fetching it) and for an *arr row whose response didn't happen to carry one.
     # Display-only provenance for a chip tooltip, never branched on.
     download_client: str | None
+    # A generic "how far along has this row's own wait gotten" detail for the chip's own hover
+    # tooltip (2026-08-21, "the settling chip should have a mouseover that shows time details") --
+    # deliberately named after neither condition a caller might compute it from, the same way
+    # `size_bytes`/`remaining_s` above are shared vocabulary rather than either source's own
+    # words. A row whose wait is bound by *scan count* populates both: `wait_scans` is how many
+    # consecutive matching observations have been made so far, `wait_since` is the ISO-8601
+    # timestamp the current streak began at (`core/autoqueue.py.on_scan` populates both from
+    # `core/settle.py`'s own `matched_scans`/`updated_at` pair). Rendered client-side through
+    # `lib/format.ts.settleWaitLabel` -- the exact "Waiting for changes -- 1 of 2 scans, 35s of
+    # 60s" wording the Files tree and the lifecycle R-icon tooltip already share, given the site-
+    # wide scan-count/wall-clock constants (`GET /api/settings/settle`) that helper also needs --
+    # so a third copy of that sentence is never written here or anywhere else. An *arr row's own
+    # wait isn't bound by scan count at all (`remaining_s` above already covers what it can say),
+    # so it leaves both `None` -- never a fabricated pair for a row with nothing to add. Both are
+    # `None` together, or neither is; a caller never sees one set without the other.
+    wait_scans: int | None
+    wait_since: str | None
 
 
 # Comfortably longer than a poll-driven source's own refresh cadence (the *arr poller's default

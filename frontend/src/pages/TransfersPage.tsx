@@ -21,6 +21,7 @@ import { ArrIcon, ArrRowChip } from '../components/LifecycleIcons'
 import { DismissMenu } from '../components/DismissMenu'
 import { ItemDrawer } from '../components/ItemDrawer'
 import { Pager } from '../components/Pager'
+import { PageSizeSelect } from '../components/PageSizeSelect'
 import { PauseMenu } from '../components/PauseMenu'
 import { PreflightBox } from '../components/PreflightBox'
 import { ResolveMenu } from '../components/ResolveMenu'
@@ -771,44 +772,6 @@ function RowDetailPanel({
   )
 }
 
-/** "Show 10/20/50" rows-per-page selector (2026-08-20, prompts/2026-08-20-transfers-page-size-
- * selector.md), one independent instance per box. Unlike `Pager` above, this is **always
- * rendered** whenever its box is -- a control that vanishes once the row count drops is hard to
- * find again, and there's no crowding argument here to outweigh that (it sits in the same footer
- * row as the pager/page-count text, which already tolerates a variable-width neighbour). `id` is
- * per-box (`"active"`/`"complete"`) so the two `<label>`s' `htmlFor` never collide.
- */
-function PageSizeSelect({
-  id,
-  value,
-  onChange,
-}: {
-  id: string
-  value: PageSize
-  onChange: (size: PageSize) => void
-}) {
-  const selectId = `transfers-page-size-${id}`
-  return (
-    <div className="flex items-center gap-1.5">
-      <label htmlFor={selectId} className="text-xs text-zinc-500 dark:text-zinc-400">
-        Show
-      </label>
-      <select
-        id={selectId}
-        value={value}
-        onChange={(e) => onChange(Number(e.target.value) as PageSize)}
-        className="rounded-md border border-zinc-300 bg-white px-1.5 py-1 text-xs font-medium text-zinc-700 hover:bg-zinc-50 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-200 dark:hover:bg-zinc-800"
-      >
-        {PAGE_SIZE_OPTIONS.map((size) => (
-          <option key={size} value={size}>
-            {size}
-          </option>
-        ))}
-      </select>
-    </div>
-  )
-}
-
 /** DESIGN.md §9.2 Transfers page -- the job queue. Rows stay deliberately plain (queued /
  * downloading / downloaded, with STOPPED/FAILED surfacing only where they apply); the item
  * drawer opens per row for the full per-file breakdown.
@@ -1456,7 +1419,12 @@ export function TransfersPage() {
             {pageReadout(activePage, activePageCount, filteredActiveJobs.length)}
           </span>
           <div className="flex items-center gap-2">
-            <PageSizeSelect id="active" value={activePageSize} onChange={setActivePageSize} />
+            <PageSizeSelect
+              id="active"
+              value={activePageSize}
+              options={PAGE_SIZE_OPTIONS}
+              onChange={setActivePageSize}
+            />
             <Pager current={activePage} count={activePageCount} onChange={setActivePage} />
           </div>
         </div>
@@ -1566,7 +1534,12 @@ export function TransfersPage() {
             {pageReadout(completePage, completePageCount, completeTotal)}
           </span>
           <div className="flex items-center gap-2">
-            <PageSizeSelect id="complete" value={completePageSize} onChange={setCompletePageSize} />
+            <PageSizeSelect
+              id="complete"
+              value={completePageSize}
+              options={PAGE_SIZE_OPTIONS}
+              onChange={setCompletePageSize}
+            />
             <Pager current={completePage} count={completePageCount} onChange={setCompletePage} />
           </div>
         </div>

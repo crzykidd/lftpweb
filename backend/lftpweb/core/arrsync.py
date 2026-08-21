@@ -783,6 +783,11 @@ class ArrSyncScheduler:
                 size_remaining_bytes=record.raw.get("sizeleft"),
                 remaining_s=_parse_timeleft(record.raw.get("timeleft")),
                 download_client=record.raw.get("downloadClient"),
+                # This source's own wait isn't bound by scan count -- `remaining_s` above
+                # already says what it can (`core/preflight.py.PreflightRow.wait_scans`'s own
+                # docstring), so both stay unset rather than a fabricated pair.
+                wait_scans=None,
+                wait_since=None,
             )
         retired = {_record_identity(record) for record in retired_records}
         hold = self._preflight_holds.setdefault(instance["id"], PreflightHold())

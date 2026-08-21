@@ -705,6 +705,17 @@ export interface PreflightRowOut {
   // row whose response didn't happen to carry one. Display-only provenance for the chip tooltip
   // (`lib/preflight.ts.preflightChipTooltip`), never branched on.
   download_client: string | null
+  // A generic "how far along has this row's own wait gotten" detail for the chip's own hover
+  // tooltip (2026-08-21, "the settling chip should have a mouseover that shows time details")
+  // -- `backend/lftpweb/core/preflight.py.PreflightRow.wait_scans`/`wait_since`'s own docstring
+  // has the full reasoning. `wait_since` is already an ISO-8601 string on the wire
+  // (`core/settle.py.SettleProgress.first_matched_at`). `null` for an *arr row (its own wait
+  // isn't bound by scan count) or a settle row with no `item_settle` history yet -- both
+  // fields together, never one alone. Fed straight into `lib/format.ts.settleWaitLabel` by
+  // `lib/preflight.ts.preflightChipTooltip`, the same helper the Files tree and the lifecycle
+  // R-icon tooltip already share, rather than a third copy of that wording.
+  wait_scans: number | null
+  wait_since: string | null
 }
 
 /** One line of the Preflight box's mount-gate banner (2026-08-20,

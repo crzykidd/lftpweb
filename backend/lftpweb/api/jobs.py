@@ -695,6 +695,8 @@ async def get_preflight(request: Request) -> PreflightResponse:
                 size_remaining_bytes=r.size_remaining_bytes,
                 remaining_s=r.remaining_s,
                 download_client=r.download_client,
+                wait_scans=r.wait_scans,
+                wait_since=r.wait_since,
             )
             for r in rows
         ],

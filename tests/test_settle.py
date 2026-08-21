@@ -346,6 +346,60 @@ async def test_is_settled_in_db_requires_the_age_floor_too(db):
     assert await settle.is_settled_in_db(db, queue_id, "Release", now=_T0 + settle.SETTLE_MIN_AGE_S)
 
 
+async def test_settle_progress_in_db_is_none_with_no_row(db):
+    """The Preflight box's own read (`core/autoqueue.py.on_scan`) must degrade to `None`, not
+    raise, for an item with no `item_settle` row yet -- the same "never scanned" case
+    `is_settled_in_db` already treats as conservatively not settled.
+    """
+    queue_id = await _make_queue(db)
+    assert await settle.settle_progress_in_db(db, queue_id, "Release") is None
+
+
+async def test_settle_progress_in_db_reads_matched_scans_and_first_matched_at(db):
+    """`matched_scans`/`first_matched_at` round-trip through `settle_progress_in_db` exactly as
+    `is_settled_in_db` reads them internally -- this is the read `core/preflight.py.
+    PreflightRow.wait_scans`/`wait_since` are populated from, so it must agree with the gate's
+    own numbers rather than a second, independently-computed pair.
+    """
+    queue_id = await _make_queue(db)
+    await settle.save_settle_records(
+        db,
+        queue_id,
+        {
+            "Release": settle.SettleRecord(
+                fingerprint=(2, 250, 5.0), matched_scans=1, first_matched_at=_T0
+            )
+        },
+    )
+    await db.commit()
+
+    progress = await settle.settle_progress_in_db(db, queue_id, "Release")
+    assert progress is not None
+    assert progress.matched_scans == 1
+    # `first_matched_at` comes back as the raw ISO-8601 string the column stores, not a float --
+    # `is_settled_from_progress` is the one place that parses it back.
+    assert isinstance(progress.first_matched_at, str)
+    assert settle.is_settled_from_progress(progress, now=_T0) is False
+    assert (
+        settle.is_settled_from_progress(progress, now=_T0 + 1_000_000.0) is False
+    )  # count too low
+
+    await settle.save_settle_records(
+        db,
+        queue_id,
+        {
+            "Release": settle.SettleRecord(
+                fingerprint=(2, 250, 5.0), matched_scans=2, first_matched_at=_T0
+            )
+        },
+    )
+    await db.commit()
+    progress = await settle.settle_progress_in_db(db, queue_id, "Release")
+    assert progress is not None
+    assert progress.matched_scans == 2
+    assert settle.is_settled_from_progress(progress, now=_T0 + settle.SETTLE_MIN_AGE_S) is True
+
+
 async def test_settle_settings_default_on_and_round_trip(db):
     """prompts/2026-08-12-settle-gate-followups.md item 3: the default flipped from off to on
     -- a real behavior change, asserted here rather than left to drift back unnoticed.

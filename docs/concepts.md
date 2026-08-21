@@ -442,10 +442,11 @@ A few things about both kinds of row worth knowing:
   every eligible item in it, not one at a time — so Preflight shows one line naming the queue and
   why, rather than a row per affected release. This banner can appear even when the row list below
   it is empty or the box would otherwise have nothing configured to show.
-- **Five rows show by default**; "Show all" expands the box and pages through the rest the same
-  way the two boxes below it do. With nothing pending, the row list just says "Nothing in
-  preflight." — and if no source is configured at all, the row list doesn't show up (the
-  mount-gate banner, if any, still does).
+- **A "Show 5/10/20" selector controls how many rows show at once**, defaulting to 5 and
+  persisted per browser — the same selector, and the same `Pager`, the two boxes below it use,
+  just with a smaller default set of choices since this box is smaller by intent. With nothing
+  pending, the row list just says "Nothing in preflight." — and if no source is configured at
+  all, the row list doesn't show up (the mount-gate banner, if any, still does).
 - **Rows here have no controls** — no Stop, no Dismiss, no reordering. There's nothing to act on
   yet; once the real transfer exists, it gets the full set of controls on the list below.
 

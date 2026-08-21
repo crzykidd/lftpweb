@@ -367,9 +367,18 @@ class AutoQueue:
             # for the *next* pass rather than marked `auto_queue_suppressed`, since nothing
             # about the item itself is wrong; it just isn't done arriving. A no-op when the
             # setting is off (`load_settle_settings` defaults to disabled).
-            if settle_settings.enabled and not await settle.is_settled_in_db(
-                self.db, queue.id, row["rel_path"]
-            ):
+            #
+            # Reads this item's own settle progress once (rather than calling
+            # `settle.is_settled_in_db` and separately re-querying) so the same read serves both
+            # the eligibility check (`settle.is_settled_from_progress`) and, when it's not
+            # settled, the Preflight row's own tooltip inputs below
+            # (2026-08-21, "the settling chip should have a mouseover that shows time details").
+            settle_progress = (
+                await settle.settle_progress_in_db(self.db, queue.id, row["rel_path"])
+                if settle_settings.enabled
+                else None
+            )
+            if settle_settings.enabled and not settle.is_settled_from_progress(settle_progress):
                 # Preflight (prompts/2026-08-20-preflight-waiting-sources.md, this module's own
                 # "Preflight" section below) -- reached only once every *other* eligibility
                 # check above has already passed (pattern match, no active job via the query's
@@ -403,6 +412,18 @@ class AutoQueue:
                     # No separate download client in this source's own model -- lftpweb itself is
                     # the thing that will fetch this release once the gate releases it.
                     download_client=None,
+                    # The tooltip's own inputs (`core/preflight.py.PreflightRow.wait_scans`/
+                    # `wait_since`'s own docstring) -- `settle_progress` is `None` only when this
+                    # item has no `item_settle` row yet at all (never scanned with the settle-
+                    # aware path), which `is_settled_from_progress` above already treats as "not
+                    # settled" the same conservative way; both fields fall through to `None`
+                    # together in that case rather than a fabricated pair.
+                    wait_scans=settle_progress.matched_scans
+                    if settle_progress is not None
+                    else None,
+                    wait_since=settle_progress.first_matched_at
+                    if settle_progress is not None
+                    else None,
                 )
                 continue
             await self._enqueue_item(row["id"])
