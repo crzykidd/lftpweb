@@ -305,6 +305,28 @@ Skeleton for the next roll:
   own reported `lastWriteTime`, newest first, across every series at once; a file with no
   usable timestamp sorts last, never first. `TRUNCATED.txt` now lists a last-modified timestamp
   for both the fetched and the skipped files.
+- **A file actively being written now reads "Downloading," not "Partial," in both the Queue
+  row's file-list expansion and the item drawer.** The user's browser review: *"the sidebar for
+  active file ... I think it should show downloading and the chip should show progress. Not
+  Partial."* A leaf file inside a mirroring directory never gets a persisted `state` of
+  `DOWNLOADING` itself (only its parent job's own top-level item does) — its state caps at
+  `PARTIAL`/`DOWNLOADED`, which is structurally correct but misleading to read while lftp is
+  actively writing it. A new shared helper, `childDisplayState`
+  (`frontend/src/lib/fileTree.ts`), maps a child to `DOWNLOADING` only when it is **both**
+  currently `PARTIAL` **and** owned by a job that is currently `running` — not every child of a
+  running job, since a `mirror` works through a release's files progressively and most children
+  are complete or untouched at any given moment. Both surfaces (`TransfersPage.tsx`'s
+  `FileListRow`, `ItemDrawer.tsx`'s `Row`) call the one function, so they can't drift; the
+  drawer's chip also gains the progress-fill bar the Queue-row expansion already had. Display
+  only — `item.state` and the backend state machine are unchanged.
+- **The Active box no longer pads itself out to roughly five empty rows when nothing is
+  transferring.** The user's browser review: *"Active box shrinks to one row when 1 active item.
+  then expands to 5 rows when nothing is going on ... We should keep this at one row always and
+  only expand when we have more rows."* The empty state was a fixed-height (`h-40`) dashed
+  panel — the emptiest state took the most room, pushing the Complete box down. The Complete box
+  shared the identical panel for its own "nothing finished yet"/filter-empty states, so it had
+  the same defect. Both now render a single line, matching the rule already applied to the
+  Preflight box ("Nothing in preflight.") rather than inventing a second empty-state idiom.
 
 ### Security
 ### Deprecated

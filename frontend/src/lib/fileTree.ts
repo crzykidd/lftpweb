@@ -94,6 +94,32 @@ export function stateProgressPercent(
   return percentValue(localSize, remoteSize)
 }
 
+/** What a **child** file's own row should read while its parent job is running (2026-08-21,
+ * user's browser review: "the sidebar for active file ... I think it should show downloading
+ * and the chip should show progress. Not Partial"). A leaf file inside a mirroring directory
+ * never reaches a persisted `state` of `DOWNLOADING` itself -- `core/queue.py._spawn_decision`
+ * is the only writer of that value, and it only ever writes it for the job's own top-level item
+ * (confirmed: a running `mirror`'s child rows cap out at `PARTIAL`/`DOWNLOADED`,
+ * `_publish_child_progress`'s own CASE). `PARTIAL` is structurally correct for a partly-written
+ * child, but wrong to *read* while lftp is actively writing it -- "Downloading" is what a human
+ * needs to see there, matching the parent row's own `chipStateFor` (`TransfersPage.tsx`).
+ *
+ * **Only** a child that is both currently `PARTIAL` and whose job is currently running maps to
+ * `DOWNLOADING`. Do not blanket-map every child of a running job: a `mirror` works through a
+ * release's files progressively -- some children already complete, some untouched, typically one
+ * in flight -- so mapping them all would relabel finished files as still downloading. A `PARTIAL`
+ * child whose job is *not* running (stopped, failed, paused) correctly stays `PARTIAL` -- that is
+ * precisely the "stopped part-way" case the state exists to express.
+ *
+ * **Display only** -- never writes `item.state` or touches anything the backend state machine
+ * persists (DESIGN.md §3.2). The two surfaces that show a child file's state --
+ * `TransfersPage.tsx`'s Queue-row file-list expansion (`FileListRow`) and the item drawer's file
+ * view (`ItemDrawer.tsx`'s `Row`) -- both call this one function so they can't drift.
+ */
+export function childDisplayState(state: string, jobRunning: boolean): string {
+  return state === 'PARTIAL' && jobRunning ? 'DOWNLOADING' : state
+}
+
 /** Whether a `child_progress` sample is still fresh enough to trust (2026-08-14, "per-file
  * speed inside a mirror"; factored out 2026-08-20 so the Transfers row's own file-list
  * expansion can share the exact freshness window `buildTree` below already uses, rather than a

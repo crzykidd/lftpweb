@@ -33,7 +33,7 @@ import type { ChildSpeedSample } from '../hooks/useLiveModel'
 import { useLiveModel } from '../hooks/useLiveModel'
 import { usePoll } from '../hooks/usePoll'
 import { usePreflight } from '../hooks/usePreflight'
-import { arrHoverLabel, nodeDisplaySize, stateProgressPercent } from '../lib/fileTree'
+import { arrHoverLabel, childDisplayState, nodeDisplaySize, stateProgressPercent } from '../lib/fileTree'
 import { childSpeedLabel, formatBytes, formatRelativeTimeIntl } from '../lib/format'
 import {
   ACTIVE_PAGE_SIZE,
@@ -562,8 +562,21 @@ const ITEM_EVENTS_LIMIT = 20
  * presentation logic (`stateProgressPercent`/`nodeDisplaySize`/`childSpeedLabel`/`formatBytes`,
  * all from `lib/fileTree.ts`/`lib/format.ts`) -- see this file's own module comment.
  */
-function FileListRow({ row, jobRelPath }: { row: ReturnType<typeof mergeFileListChildren>[number]; jobRelPath: string }) {
-  const percent = stateProgressPercent(row.state, row.local_size, row.remote_size)
+function FileListRow({
+  row,
+  jobRelPath,
+  jobRunning,
+}: {
+  row: ReturnType<typeof mergeFileListChildren>[number]
+  jobRelPath: string
+  // Whether this row's own job is currently `running` (2026-08-21, `childDisplayState`'s own
+  // docstring, `lib/fileTree.ts`) -- the one extra fact the chip needs to tell "actively
+  // downloading" apart from "stopped part-way," which `row.state` alone can't (a child's
+  // persisted state caps at `PARTIAL` either way).
+  jobRunning: boolean
+}) {
+  const displayState = childDisplayState(row.state, jobRunning)
+  const percent = stateProgressPercent(displayState, row.local_size, row.remote_size)
   const size = nodeDisplaySize({ is_dir: false, local_size: row.local_size, remote_size: row.remote_size })
   const speedLabel = childSpeedLabel(row.speed_bps)
   return (
@@ -571,7 +584,7 @@ function FileListRow({ row, jobRelPath }: { row: ReturnType<typeof mergeFileList
       <span className="min-w-0 flex-1 truncate text-zinc-700 dark:text-zinc-300" title={row.rel_path}>
         {childDisplayName(row.rel_path, jobRelPath)}
       </span>
-      <StateChip state={row.state} percent={percent} />
+      <StateChip state={displayState} percent={percent} />
       <span className="w-16 shrink-0 text-right text-zinc-500 dark:text-zinc-400">
         {size != null ? formatBytes(size) : '—'}
       </span>
@@ -649,7 +662,7 @@ function FileListGroup({
       {rows.length > 0 && (
         <ul className="flex flex-col divide-y divide-zinc-100 dark:divide-zinc-800">
           {rows.map((row) => (
-            <FileListRow key={row.rel_path} row={row} jobRelPath={job.rel_path} />
+            <FileListRow key={row.rel_path} row={row} jobRelPath={job.rel_path} jobRunning={job.state === 'running'} />
           ))}
         </ul>
       )}
@@ -1373,18 +1386,23 @@ export function TransfersPage() {
          * had ever finished, even with nothing currently active. Wording widened 2026-08-20:
          * this box now also holds rows whose transfer is done but whose pipeline isn't
          * (verifying, extracting, awaiting import, deleting source), so "nothing queued or
-         * downloading" no longer described everything its absence rules out. */}
+         * downloading" no longer described everything its absence rules out.
+         *
+         * **One line, not a padded `h-40` block** (2026-08-21, user's browser review: "Active
+         * box shrinks to one row when 1 active item. then expands to 5 rows when nothing is
+         * going on ... only expand when we have more rows up to the max show size") -- height
+         * follows content, always; zero rows is the *emptiest* state and must take the least
+         * room, not the most. Matches `PreflightBox.tsx`'s own "Nothing in preflight." line,
+         * the same rule already applied there, rather than a second empty-state idiom. */}
         {activeJobs.length === 0 && (
-          <div className="flex h-40 items-center justify-center rounded-lg border border-dashed border-zinc-300 text-zinc-400 dark:border-zinc-700 dark:text-zinc-600">
-            Nothing in flight — queue an item from Files.
-          </div>
+          <p className="text-sm text-zinc-400 dark:text-zinc-600">Nothing in flight — queue an item from Files.</p>
         )}
 
         {/* The filter's own empty state for this box (2026-08-19) -- distinct from the "nothing
          * in flight" one above: there *are* active transfers, none of them just happen to match
-         * the filter text. */}
+         * the filter text. Same one-line treatment as the empty-queue state above. */}
         {activeJobs.length > 0 && filterActive && filteredActiveJobs.length === 0 && (
-          <div className="flex h-40 flex-col items-center justify-center gap-2 rounded-lg border border-dashed border-zinc-300 text-zinc-400 dark:border-zinc-700 dark:text-zinc-600">
+          <p className="flex flex-wrap items-center gap-2 text-sm text-zinc-400 dark:text-zinc-600">
             <span>No active transfers match "{search.trim()}".</span>
             <button
               type="button"
@@ -1393,7 +1411,7 @@ export function TransfersPage() {
             >
               Clear filter
             </button>
-          </div>
+          </p>
         )}
 
         {activePageJobs.length > 0 && (
@@ -1492,8 +1510,12 @@ export function TransfersPage() {
           </div>
         )}
 
+        {/* One line, not a padded `h-40` block -- the same fix and the same reasoning as the
+         * Active box's own empty state above (2026-08-21): this box shared the identical
+         * `h-40` dashed panel, so it padded out to the same five-ish rows of empty space
+         * whenever nothing had finished yet. */}
         {!completeLoading && completeJobs.length === 0 && (
-          <div className="flex h-40 flex-col items-center justify-center gap-2 rounded-lg border border-dashed border-zinc-300 text-zinc-400 dark:border-zinc-700 dark:text-zinc-600">
+          <p className="flex flex-wrap items-center gap-2 text-sm text-zinc-400 dark:text-zinc-600">
             {completeFilterActive ? (
               <>
                 <span>No completed transfers match "{debouncedSearch.trim()}".</span>
@@ -1508,7 +1530,7 @@ export function TransfersPage() {
             ) : (
               <span>Nothing finished yet.</span>
             )}
-          </div>
+          </p>
         )}
 
         {completeJobs.length > 0 && (

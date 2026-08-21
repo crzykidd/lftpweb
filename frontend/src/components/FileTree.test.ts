@@ -9,6 +9,7 @@ import {
   canConfirmDelete,
   canDeleteLocal,
   CHILD_SPEED_FRESHNESS_MS,
+  childDisplayState,
   clampColumnWidth,
   columnMinWidth,
   defaultColumnWidths,
@@ -1094,6 +1095,37 @@ describe('stateProgressPercent', () => {
     expect(stateProgressPercent('REMOTE_ONLY', 0, 100)).toBeNull()
     expect(stateProgressPercent('DOWNLOADED', 100, 100)).toBeNull()
     expect(stateProgressPercent('EXCLUDED', null, null)).toBeNull()
+  })
+})
+
+// `childDisplayState` (2026-08-21, prompts/done/2026-08-21-child-state-and-active-box-height.md)
+// -- the shared mapping `TransfersPage.tsx`'s Queue-row file-list expansion (`FileListRow`) and
+// `ItemDrawer.tsx`'s per-file `Row` both call, so a partly-transferred child of a *running* job
+// reads "Downloading" rather than the structurally-correct-but-misleading "Partial". The matrix
+// here is the exact one the user's own report and the handoff prompt both called out as easy to
+// get wrong (blanket-mapping every child of a running job, not just the one actually in flight).
+describe('childDisplayState', () => {
+  it('maps PARTIAL to DOWNLOADING only when the job is running', () => {
+    expect(childDisplayState('PARTIAL', true)).toBe('DOWNLOADING')
+  })
+
+  it('leaves a PARTIAL child alone when its job is not running -- stopped/failed/paused', () => {
+    expect(childDisplayState('PARTIAL', false)).toBe('PARTIAL')
+  })
+
+  it('never touches a complete child, running job or not', () => {
+    expect(childDisplayState('DOWNLOADED', true)).toBe('DOWNLOADED')
+    expect(childDisplayState('DOWNLOADED', false)).toBe('DOWNLOADED')
+  })
+
+  it('never touches an untouched child, running job or not', () => {
+    expect(childDisplayState('REMOTE_ONLY', true)).toBe('REMOTE_ONLY')
+    expect(childDisplayState('REMOTE_ONLY', false)).toBe('REMOTE_ONLY')
+  })
+
+  it('passes through any other state unchanged', () => {
+    expect(childDisplayState('EXCLUDED', true)).toBe('EXCLUDED')
+    expect(childDisplayState('FAILED', true)).toBe('FAILED')
   })
 })
 
