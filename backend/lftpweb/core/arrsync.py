@@ -279,9 +279,12 @@ def _preflight_candidates(
     records: list[QueueRecord],
     queues: list[aiosqlite.Row],
     item_names: frozenset[str],
-) -> list[tuple[int, QueueRecord]]:
+) -> tuple[list[tuple[int, QueueRecord]], list[QueueRecord]]:
     """Every queue record worth projecting into the Preflight box this pass, paired with the
-    queue id it was attributed to. The handoff prompt's own two rules, applied in order:
+    queue id it was attributed to -- plus, separately, every record just **retired** by matching
+    a real lftpweb item (2026-08-21, "a handed-over release lingers in Preflight for up to
+    150s"). Returns `(candidates, retired)`. The handoff prompt's own two rules for `candidates`,
+    applied in order:
 
     1. **"Records that match an lftpweb item are ignored"** -- `item_names` is every top-level
        `item.rel_path` across *every* queue this instance is bound to (gathered fresh by
@@ -289,7 +292,11 @@ def _preflight_candidates(
        them), checked with the exact same `_record_matches_item` the real matcher uses. A record
        this pass just matched into a real item is already excluded here -- the handoff prompt's
        own "no duplicate at handover" requirement, satisfied by construction rather than a
-       separate check.
+       separate check. **This is also the one branch that means "retired,"** not merely absent:
+       the record now corresponds to a real `item` row, a known and terminal reason for it to
+       stop being a Preflight row, so it goes in `retired` too -- `_update_preflight` passes that
+       straight to `PreflightHold.update`'s own `retired` set so this row is evicted immediately
+       rather than held for `PREFLIGHT_HOLD_S` alongside a genuinely-missing one.
     2. **Attribution is `arr_visible_path` prefix-matching, and silence is correct when it
        doesn't resolve.** A record with an `outputPath` is attributed to whichever bound queue's
        `arr_visible_path` contains it (most-specific/longest match wins, for the unlikely case of
@@ -304,13 +311,19 @@ def _preflight_candidates(
     is "still downloading" (step 1 of the handoff prompt's "What to do"), and a record this far
     along is also the one most likely to become a real lftpweb item on literally the next scan;
     dropping it here is one more guard against the same "visible twice" failure mode, on top of
-    (not instead of) the item-match check above.
+    (not instead of) the item-match check above. **Deliberately not added to `retired`** -- this
+    record has not necessarily become any lftpweb item yet (attribution could still fail, or no
+    item has been scanned into existence for it at all), so there is no known-terminal fact to
+    signal yet; a record excluded for this reason that never becomes a real item simply falls out
+    through the ordinary hold-then-expire path once it stops appearing altogether, unchanged.
     """
     out: list[tuple[int, QueueRecord]] = []
+    retired: list[QueueRecord] = []
     for record in records:
         if record.tracked_download_state == TRACKED_DOWNLOAD_STATE_IMPORTED:
             continue
         if any(_record_matches_item(record, name) for name in item_names):
+            retired.append(record)
             continue
 
         queue_id: int | None = None
@@ -329,7 +342,46 @@ def _preflight_candidates(
 
         if queue_id is not None:
             out.append((queue_id, record))
-    return out
+    return out, retired
+
+
+# .NET `TimeSpan.ToString()`'s default format -- what a v3 queue record's own `timeleft` field is
+# ("`[d.]hh:mm:ss[.fffffff]`") -- **not verified against a live Sonarr/Radarr instance** (unlike
+# `TRACKED_DOWNLOAD_STATE_IMPORTING`/`_IMPORTED` above, this codebase's own module docstring only
+# records that verification for `trackedDownloadState`). Tolerates the documented default shape
+# and returns `None` for anything else rather than guessing at an undocumented one.
+_TIMELEFT_RE = re.compile(
+    r"^(?:(?P<days>\d+)\.)?(?P<hours>\d{1,2}):(?P<minutes>\d{2}):(?P<seconds>\d{2})(?:\.\d+)?$"
+)
+
+
+def _parse_timeleft(value: object) -> float | None:
+    """`QueueRecord.raw["timeleft"]` -> seconds remaining, for `PreflightRow.remaining_s`
+    (2026-08-21, "we missed the remaining time"). Reads straight from `raw` -- no extra request,
+    per the handoff prompt's own instruction; `estimatedCompletionTime` (an absolute timestamp)
+    was the other field available on the same record but is **not** used here: it would require
+    trusting the *arr's clock against this process's own, and a fresh recomputation every request
+    (`now` vs. a timestamp read once per ~60s poll) would make the figure visibly count down
+    unevenly between polls, whereas `timeleft` is already the duration the *arr itself computed
+    and is rendered through this codebase's *own* `formatEta`/`transferLineValue` shape exactly
+    once it's a plain number of seconds -- one clock (this process's own render), not two.
+
+    `None` for anything not shaped like the documented default .NET `TimeSpan.ToString()` format
+    (unparseable), for a missing/non-string value (absent), and for a parsed `00:00:00` (a
+    paused/stalled download client item reports this -- meaningless, never a real "0s left," per
+    the handoff prompt's own "never a fabricated or zero estimate" instruction).
+    """
+    if not isinstance(value, str) or not value:
+        return None
+    match = _TIMELEFT_RE.match(value.strip())
+    if match is None:
+        return None
+    days = int(match.group("days") or 0)
+    hours = int(match.group("hours"))
+    minutes = int(match.group("minutes"))
+    seconds = int(match.group("seconds"))
+    total = days * 86400 + hours * 3600 + minutes * 60 + seconds
+    return float(total) if total > 0 else None
 
 
 # Association states a fresh queue record is allowed to match against: never-associated, or a
@@ -695,8 +747,8 @@ class ArrSyncScheduler:
     ) -> None:
         """Refresh this instance's own `PreflightHold` (`core/preflight.py`) from this pass's
         already-fetched `records` -- see `_preflight_candidates`'s own docstring for the
-        matching/attribution rules and `PreflightHold.update`'s for the flap-tolerance hold
-        applied here.
+        matching/attribution/retirement rules and `PreflightHold.update`'s for the flap-tolerance
+        hold (and the retirement fast path) applied here.
         """
         queue_ids = [q["id"] for q in queues]
         if not queue_ids:
@@ -709,20 +761,32 @@ class ArrSyncScheduler:
         )
         item_names = frozenset(r["rel_path"] for r in await cursor.fetchall())
 
+        # `queue_id` -> the full `path_queue` row it names, so a candidate's queue tag
+        # (2026-08-21, "the columns moved around") can be filled in without a second query --
+        # `queues` is already `SELECT *`, fetched once per instance per pass by the caller.
+        queue_by_id = {q["id"]: q for q in queues}
+
+        candidates, retired_records = _preflight_candidates(records, queues, item_names)
         seen: dict[str, PreflightRow] = {}
-        for queue_id, record in _preflight_candidates(records, queues, item_names):
+        for queue_id, record in candidates:
+            queue_row = queue_by_id[queue_id]
             seen[_record_identity(record)] = PreflightRow(
                 source="arr",
                 queue_id=queue_id,
+                queue_name=queue_row["name"],
+                queue_short_name=queue_row["short_name"],
                 title=record.title,
                 status_label=record.tracked_download_state,
                 source_label=instance["name"],
                 source_kind=instance["kind"],
                 size_bytes=record.raw.get("size"),
                 size_remaining_bytes=record.raw.get("sizeleft"),
+                remaining_s=_parse_timeleft(record.raw.get("timeleft")),
+                download_client=record.raw.get("downloadClient"),
             )
+        retired = {_record_identity(record) for record in retired_records}
         hold = self._preflight_holds.setdefault(instance["id"], PreflightHold())
-        hold.update(seen, now=time.monotonic())
+        hold.update(seen, now=time.monotonic(), retired=retired)
 
     def preflight_rows(self, enabled_instance_ids: Iterable[int]) -> list[PreflightRow]:
         """The Preflight box's own read (`api/jobs.py`'s `GET /api/queue/preflight`) -- every

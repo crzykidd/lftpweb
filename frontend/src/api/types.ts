@@ -681,12 +681,30 @@ export interface JobsResponse {
 export interface PreflightRowOut {
   source: string
   queue_id: number
+  // The bound queue's own display identity (2026-08-21, "we moved the columns around" fix) --
+  // mirrors `JobOut.queue_name`/`queue_short_name` so `lib/queueDisplayName.ts.
+  // queueDisplayName` renders this row's tag identically to every Transfers row's own tag.
+  queue_name: string
+  queue_short_name: string | null
   title: string
   status_label: string | null
   source_label: string
   source_kind: string | null
   size_bytes: number | null
   size_remaining_bytes: number | null
+  // How many seconds until this row's own source expects its wait to clear (2026-08-21, "we
+  // missed the remaining time") -- an *arr row's own `timeleft`, rendered through the same
+  // `formatEta`/`transferLineValue` shape the Transfers row already uses for its own ETA. `null`
+  // when the source has no meaningful estimate this pass -- never a fabricated or zero figure. A
+  // settle-gated row always carries `null` here -- its own remaining figure is `size_bytes`
+  // above ("remote -- 22 GB"), not a time.
+  remaining_s: number | null
+  // The download client actually fetching this release, from the *arr's own point of view --
+  // an *arr row's own `downloadClient`, read server-side straight from its queue record's `raw`.
+  // `null` for a settle row (no separate download client in that source's own model) or an *arr
+  // row whose response didn't happen to carry one. Display-only provenance for the chip tooltip
+  // (`lib/preflight.ts.preflightChipTooltip`), never branched on.
+  download_client: string | null
 }
 
 /** One line of the Preflight box's mount-gate banner (2026-08-20,

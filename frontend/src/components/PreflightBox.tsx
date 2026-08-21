@@ -1,19 +1,35 @@
 import { useState } from 'react'
 import type { PreflightResponse, PreflightRowOut } from '../api/types'
 import { pageCount, pageReadout, paginateClientSide } from '../lib/pagination'
-import { PREFLIGHT_DEFAULT_ROWS, PREFLIGHT_EXPANDED_PAGE_SIZE, preflightSizeLabel, preflightStatusLabel } from '../lib/preflight'
+import {
+  PREFLIGHT_DEFAULT_ROWS,
+  PREFLIGHT_EXPANDED_PAGE_SIZE,
+  preflightChipLabel,
+  preflightChipTooltip,
+  preflightRemainingLabel,
+} from '../lib/preflight'
+import { queueDisplayName } from '../lib/queueDisplayName'
 import { ArrBrandMark } from './LifecycleIcons'
 import { Pager } from './Pager'
+import { StateChip } from './StateChip'
 
-/** A row's own source chip -- **the one place *arr-specific rendering is allowed in this
+/** A row's own *arr chip -- **the one place *arr-specific rendering is allowed in this
  * component**, gated on `row.source === 'arr'` (docs/transfers-redesign-spec.md §4's settle-gate
  * follow-up, prefigured, is why this check exists at all rather than always drawing a brand
  * logo). The real Sonarr/Radarr logo for an *arr row with a recognized `source_kind`; a plain
- * text chip using the source's own `source_label` for everything else -- an *arr row with an
- * unrecognized kind, or any future non-*arr source, which has no logo of its own to draw.
+ * text chip using the source's own `source_label` for an *arr row with an unrecognized kind.
+ *
+ * **Renders nothing at all for a non-*arr row** (2026-08-21, "the columns moved around" fix,
+ * user's own report: "it should still have the tag and the column for status on arr icon") --
+ * `TransfersPage.tsx`'s own `Row` leaves this exact slot empty whenever a row has nothing to put
+ * there (`waiting`/`manual`/`ArrRowChip` all follow the same "render nothing, let the row's own
+ * `flex-1` title absorb the slack" idiom, never a reserved blank box), so a settle row's own
+ * "column for status on arr icon" is genuinely empty here too, the same way, rather than
+ * repeating the queue name a second time in a chip of its own.
  */
 function SourceChip({ row }: { row: PreflightRowOut }) {
-  if (row.source === 'arr' && (row.source_kind === 'sonarr' || row.source_kind === 'radarr')) {
+  if (row.source !== 'arr') return null
+  if (row.source_kind === 'sonarr' || row.source_kind === 'radarr') {
     return <ArrBrandMark kind={row.source_kind} title={row.source_label} />
   }
   return (
@@ -31,23 +47,47 @@ function SourceChip({ row }: { row: PreflightRowOut }) {
  * component taking no handler props at all) no way for Dismiss/Start now/Stop/Retry to ever
  * reach a row here. There is no `item` and no `job` behind it yet, so there is nothing for any
  * of those controls to act on.
+ *
+ * **Column order mirrors `TransfersPage.tsx`'s own `Row`** (2026-08-21, the user's first browser
+ * look at the shipped box: "we moved the columns around ... arr icon is at the first of the line
+ * now") -- queue tag, title, state chip, *arr chip, then the right-aligned figure column, the
+ * same sequence and the same `w-44` width every other row on the page uses, so three boxes
+ * stacked in one view read as one table rather than three different layouts.
  */
 function PreflightRowView({ row }: { row: PreflightRowOut }) {
-  const statusLabel = preflightStatusLabel(row.status_label)
-  const sizeLabel = preflightSizeLabel(row)
+  const chipLabel = preflightChipLabel(row)
+  const chipTooltip = preflightChipTooltip(row)
+  const figureLabel = preflightRemainingLabel(row)
   return (
     <div className="flex flex-wrap items-center gap-3 border-b border-zinc-200 px-3 py-2 text-sm last:border-b-0 dark:border-zinc-800">
-      <SourceChip row={row} />
+      {/* Queue tag (2026-08-21) -- the same compact, muted locator `Row`'s own queue badge is,
+       * using the identical `queueDisplayName` short-name fallback so this row's tag always
+       * agrees with Settings -> Queues and with every Transfers row for the same queue. Missing
+       * entirely before this task -- `PreflightRow` carried `queue_id` but no name at all. */}
+      <span
+        className="max-w-[8rem] shrink-0 truncate rounded bg-zinc-100 px-1.5 py-0.5 text-[10px] font-medium text-zinc-500 dark:bg-zinc-800 dark:text-zinc-400"
+        title={row.queue_name}
+      >
+        {queueDisplayName(row.queue_short_name, row.queue_name)}
+      </span>
       <span className="min-w-0 flex-1 truncate text-zinc-700 dark:text-zinc-300" title={row.title}>
         {row.title}
       </span>
-      {statusLabel && (
-        <span className="shrink-0 rounded-full bg-zinc-100 px-1.5 py-0.5 text-[10px] font-medium text-zinc-500 dark:bg-zinc-800 dark:text-zinc-400">
-          {statusLabel}
+      {/* The state chip (2026-08-21, "the settling is just a soft grey chip now") -- routed
+       * through `StateChip` (`SETTLING`'s existing amber, never a hand-rolled grey span) rather
+       * than bypassing it, the actual defect the user's report named. Every Preflight row, *arr
+       * or settle, uses the same `SETTLING` colour -- "a Preflight row is a waiting row whatever
+       * its source" (this task's own reasoning); only the label text (`preflightChipLabel`) and
+       * the tooltip (`preflightChipTooltip`) differ by source. */}
+      {chipLabel && <StateChip state="SETTLING" label={chipLabel} title={chipTooltip ?? undefined} />}
+      <SourceChip row={row} />
+      {/* The figure column -- `w-44`, matching `Row`'s own (widened from `w-32` when its ETA
+       * figure was added; the same reason applies here: `preflightRemainingLabel` can make this
+       * the longest figure this box ever shows, once both a size and a remaining time exist). */}
+      {figureLabel && (
+        <span className="w-44 shrink-0 whitespace-nowrap text-right text-xs text-zinc-500 dark:text-zinc-400">
+          {figureLabel}
         </span>
-      )}
-      {sizeLabel && (
-        <span className="w-28 shrink-0 text-right text-xs text-zinc-500 dark:text-zinc-400">{sizeLabel}</span>
       )}
     </div>
   )

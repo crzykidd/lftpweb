@@ -69,12 +69,15 @@ class _Recorder:
         return item_id
 
 
-def _mounted_config(queue_id, local_path, *, enabled=True, patterns_only=False, name="q"):
+def _mounted_config(
+    queue_id, local_path, *, enabled=True, patterns_only=False, name="q", short_name=None
+):
     # `name="q"` matches `_make_queue`'s own hardcoded queue name -- see `QueueAutoConfig`'s own
     # docstring for why `on_scan`'s mount-gate audit events need it at all.
     return QueueAutoConfig(
         id=queue_id,
         name=name,
+        short_name=short_name,
         local_path=str(local_path),
         auto_queue_enabled=enabled,
         patterns_only=patterns_only,
@@ -968,3 +971,32 @@ async def test_multiple_queues_settle_preflight_rows_sorted_by_title(db, tmp_pat
 
     titles = [r.title for r in aq.preflight_rows({queue_a, queue_b})]
     assert titles == ["Apple.Release", "Zebra.Release"]
+
+
+async def test_settle_row_carries_the_queue_tag_and_size_but_no_remaining_time(db, tmp_path):
+    """2026-08-21 ("we moved the columns around" / "we missed the remaining time"): a settle row
+    must carry the same queue-tag identity every other row on the page shows, and its own
+    "remaining figure" is the size it already had (`size_bytes`, "remote — 22 GB") -- there is no
+    time-based estimate to give here (the gate is bound by *scan count*, not a wall-clock
+    estimate this codebase has any business fabricating), so `remaining_s` must stay `None`
+    rather than a guess.
+    """
+    from lftpweb.core.mount_sentinel import write_if_needed
+    from lftpweb.core.settle import SettleSettings, save_settle_settings
+
+    await save_settle_settings(db, SettleSettings(enabled=True))
+    write_if_needed(str(tmp_path))
+    queue_id = await _make_queue(db, tmp_path)
+    await _make_item(db, queue_id, "Release.One")
+    await _set_settle_record(db, queue_id, "Release.One", matched_scans=1)  # not yet settled
+    aq = AutoQueue(db, _Recorder())
+
+    await aq.on_scan(_mounted_config(queue_id, tmp_path, name="DC-TV", short_name="TV"))
+
+    rows = aq.preflight_rows({queue_id})
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.queue_name == "DC-TV"
+    assert row.queue_short_name == "TV"
+    assert row.size_bytes == 100  # `_make_item`'s own hardcoded remote_size, unchanged
+    assert row.remaining_s is None

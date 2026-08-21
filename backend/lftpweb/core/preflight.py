@@ -18,8 +18,13 @@ anything the first task shipped -- see `docs/decisions.md` for how that held up 
 missing for reasons unrelated to the underlying fact changing -- `core/arrsync.py` is the one
 user of it: a row missing from a poll for up to `PREFLIGHT_HOLD_S` keeps showing rather than
 blinking out and back in, because a download client's own queue can blank out for a beat (the
-*arr's own SABnzbd production incident, `core/arrsync.py`'s module docstring, 2026-08-18). **Not
-every source needs this.** `core/autoqueue.py`'s settle-gated rows are computed fresh from this
+*arr's own SABnzbd production incident, `core/arrsync.py`'s module docstring, 2026-08-18).
+**Retirement is the one thing that skips the hold entirely** (2026-08-21, "a handed-over release
+lingers in Preflight for up to 150s"): `update`'s own `retired` set is for a row a source knows is
+gone for a *known* reason -- handed over to a real item -- as opposed to merely missing from this
+one pass for a reason the source can't tell apart from a blip. See `update`'s own docstring for
+the two-bucket split; the caller (`core/arrsync.py._preflight_candidates`) is where that
+distinction is actually drawn, never here. **Not every source needs this.** `core/autoqueue.py`'s settle-gated rows are computed fresh from this
 same process's own persisted state on every successful scan pass, with no external flakiness to
 smooth over, so that source replaces its rows wholesale each pass instead of holding them here --
 see that module's own "Preflight" section for why a full replace is strictly more correct for a
@@ -31,6 +36,7 @@ source already guards against on its own.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Literal
 
@@ -49,6 +55,17 @@ class PreflightRow:
 
     source: PreflightSource
     queue_id: int
+    # The bound queue's own display identity (2026-08-21, "the columns moved around" fix) --
+    # common to every source, so it lives here rather than being re-derived per source or, worse,
+    # left off entirely (the defect this task fixes: a Preflight row had `queue_id` but no name,
+    # so it couldn't show the queue tag every other row on the page shows). `queue_name` is the
+    # queue's full `name`; `queue_short_name` mirrors `api/settings_queues.py.
+    # resolve_queue_display_name`'s own `short_name` field (`None` for "no short name set") so
+    # the frontend's existing `lib/queueDisplayName.ts.queueDisplayName(short, name)` fallback
+    # renders this row's tag identically to every Transfers row's own tag, with no second
+    # fallback rule invented here.
+    queue_name: str
+    queue_short_name: str | None
     title: str
     # Free-form, source-owned display text for "what state is this in" -- an *arr row's own
     # `trackedDownloadState` (e.g. `"downloading"`), a settle-gate row's own wording (e.g.
@@ -68,6 +85,24 @@ class PreflightRow:
     # remote_size` -- there is nothing "left" from that source's own point of view.
     size_bytes: int | None
     size_remaining_bytes: int | None
+    # How many seconds until this row's own source expects its wait to clear -- generic in name
+    # (unlike `size_bytes`/`size_remaining_bytes` above, it happens to be populated by exactly
+    # one source today, the same way those two happen to be populated by both): an *arr row
+    # reads its own queue record's `timeleft` (`core/arrsync.py._parse_timeleft`); a settle-gated
+    # row leaves this `None` -- the gate's remaining wait is bound by *scan count*, not a wall-
+    # clock estimate this codebase has any business fabricating (`core/autoqueue.py`'s own
+    # "Preflight" section), and its already-existing remaining figure is `size_bytes` above, not
+    # a time. `None` for "the source has no meaningful estimate this pass" -- never a fabricated
+    # or zero figure (the handoff prompt's own instruction), so a caller renders nothing rather
+    # than a wrong number.
+    remaining_s: float | None
+    # The download client actually fetching this release, from the *arr's own point of view
+    # (2026-08-21, user's own words: "tooltip maybe we should show the arr details. Downloading
+    # from '<download client name>' from arr") -- an *arr row's own `downloadClient`; `None` for
+    # a settle row (there is no separate download client in that source's own model -- lftpweb
+    # *is* the thing fetching it) and for an *arr row whose response didn't happen to carry one.
+    # Display-only provenance for a chip tooltip, never branched on.
+    download_client: str | None
 
 
 # Comfortably longer than a poll-driven source's own refresh cadence (the *arr poller's default
@@ -99,16 +134,28 @@ class PreflightHold:
     def __init__(self) -> None:
         self._entries: dict[str, _HoldEntry] = {}
 
-    def update(self, seen: dict[str, PreflightRow], *, now: float) -> None:
+    def update(
+        self, seen: dict[str, PreflightRow], *, now: float, retired: Iterable[str] = ()
+    ) -> None:
         """`seen` is this refresh's complete set, keyed by identity -- every key present gets its
-        entry refreshed (row data replaced, `last_seen` bumped to `now`); every key *not*
-        present is held unless it has already been missing longer than `PREFLIGHT_HOLD_S`, in
-        which case it is deleted outright. There is no third state.
+        entry refreshed (row data replaced, `last_seen` bumped to `now`).
+
+        Every key *not* present falls into one of two buckets (2026-08-21, the "a handed-over
+        release lingers in Preflight for up to 150s" fix): `retired` is this refresh's own set of
+        identities the source knows are gone for a *known* reason -- handed over to a real item,
+        for `core/arrsync.py`'s own caller -- and those are deleted immediately, with no smoothing
+        at all: there is nothing transient here to hold across. Anything else missing from `seen`
+        and absent from `retired` is **merely absent** -- the source has no idea why, which is
+        precisely the SABnzbd blank-queue blip this cache exists to absorb -- and keeps today's
+        behaviour: held until it has been missing longer than `PREFLIGHT_HOLD_S`, then deleted.
+        There is no third state, and a key never needs to appear in both `seen` and `retired` in
+        the same call -- a row a source still sees this pass was not, by definition, just retired.
         """
         for key, row in seen.items():
             self._entries[key] = _HoldEntry(row=row, last_seen=now)
+        retired_set = set(retired)
         for key in [k for k in self._entries if k not in seen]:
-            if now - self._entries[key].last_seen > PREFLIGHT_HOLD_S:
+            if key in retired_set or now - self._entries[key].last_seen > PREFLIGHT_HOLD_S:
                 del self._entries[key]
 
     def rows(self) -> list[PreflightRow]:

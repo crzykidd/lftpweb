@@ -227,6 +227,13 @@ class QueueAutoConfig:
     local_path: str
     auto_queue_enabled: bool
     patterns_only: bool
+    # Migration 024 ("a short display name per queue"), threaded through here (2026-08-21, "the
+    # columns moved around" fix) so a settle-gated Preflight row can carry the same queue tag
+    # every other row on the page shows (`core/preflight.py.PreflightRow.queue_short_name`).
+    # `None` -- both "no short name set" and every existing call site/test built before this
+    # field existed -- degrades to the queue's full `name`, the same fallback
+    # `lib/queueDisplayName.ts.queueDisplayName` already applies everywhere else.
+    short_name: str | None = None
 
 
 class AutoQueue:
@@ -378,12 +385,24 @@ class AutoQueue:
                 settle_gated[row["id"]] = PreflightRow(
                     source="settle",
                     queue_id=queue.id,
+                    queue_name=queue.name,
+                    queue_short_name=queue.short_name,
                     title=row["rel_path"],
                     status_label="Settling",
                     source_label=queue.name,
                     source_kind=None,
                     size_bytes=row["remote_size"],
                     size_remaining_bytes=None,
+                    # This gate is bound by *scan count*, not a wall-clock estimate --
+                    # `core/preflight.py.PreflightRow.remaining_s`'s own docstring is explicit
+                    # that fabricating one here would be exactly the "invented estimate" the
+                    # handoff prompt rules out. This source's own already-existing remaining
+                    # figure is `size_bytes` above (`preflightSizeLabel`'s "remote — 22 GB"), not
+                    # a time.
+                    remaining_s=None,
+                    # No separate download client in this source's own model -- lftpweb itself is
+                    # the thing that will fetch this release once the gate releases it.
+                    download_client=None,
                 )
                 continue
             await self._enqueue_item(row["id"])

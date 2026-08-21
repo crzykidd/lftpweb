@@ -225,6 +225,10 @@ class QueueConfig:
     # reader of these two on this dataclass.
     download_prefix_enabled: bool | None = None
     download_prefix: str | None = None
+    # Migration 024 ("a short display name per queue") -- threaded through here (2026-08-21,
+    # "the columns moved around" fix) solely so `QueueAutoConfig` below can carry it on to a
+    # settle-gated Preflight row's own queue tag; nothing in this module reads it directly.
+    short_name: str | None = None
 
 
 async def load_host_config(db: aiosqlite.Connection, config_dir: str) -> HostConfig | None:
@@ -287,7 +291,7 @@ async def load_queues(db: aiosqlite.Connection) -> list[QueueConfig]:
     cursor = await db.execute(
         "SELECT id, host_id, name, remote_path, local_path, staging_path, enabled, sync_mode, "
         "auto_queue_enabled, auto_queue_patterns_only, scan_interval_s, "
-        "download_prefix_enabled, download_prefix FROM path_queue ORDER BY id"
+        "download_prefix_enabled, download_prefix, short_name FROM path_queue ORDER BY id"
     )
     rows = await cursor.fetchall()
     return [
@@ -312,6 +316,7 @@ async def load_queues(db: aiosqlite.Connection) -> list[QueueConfig]:
                 else bool(row["download_prefix_enabled"])
             ),
             download_prefix=row["download_prefix"],
+            short_name=row["short_name"],
         )
         for row in rows
     ]
@@ -857,6 +862,7 @@ class Engine:
                     QueueAutoConfig(
                         id=q.id,
                         name=q.name,
+                        short_name=q.short_name,
                         local_path=q.local_path,
                         auto_queue_enabled=q.auto_queue_enabled,
                         patterns_only=q.auto_queue_patterns_only,
@@ -960,6 +966,7 @@ class Engine:
                     QueueAutoConfig(
                         id=q.id,
                         name=q.name,
+                        short_name=q.short_name,
                         local_path=q.local_path,
                         auto_queue_enabled=q.auto_queue_enabled,
                         patterns_only=q.auto_queue_patterns_only,

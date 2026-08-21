@@ -6,6 +6,79 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-21 — Preflight row columns, chip vocabulary, and evict-on-handover: what "remaining
+time" means per source, one colour for the whole box, and a `retired` set on the hold
+
+`prompts/2026-08-21-preflight-row-columns.md`, from the user's first real browser look at the
+shipped box. Column-alignment work; the frontend half is unverified in a real browser (no page
+render in this environment) — a human still needs to eyeball it.
+
+**`remaining_s` is a new, genuinely generic field on the shared `PreflightRow`, but only the *arr
+source populates it today.** Considered giving the settle source a computed value too (`min_age_s
+- elapsed`, once its own scan-count requirement is met) so both sources would exercise the same
+figure-column code path. **Rejected**: the settle gate's remaining wait is bound by *scan count*
+before it's ever bound by wall-clock time (`REQUIRED_SETTLE_SCANS` first, `SETTLE_MIN_AGE_S`
+only once that's met) — a queue's own scan cadence isn't fixed enough to turn "N more scans
+needed" into a trustworthy seconds figure without fabricating one, which the handoff prompt
+explicitly rules out. The settle source's own already-existing remaining figure is `size_bytes`
+("remote — 22 GB") — it keeps carrying exactly that, unchanged, and `remaining_s` stays `null`
+for every settle row. The field is deliberately not named `arr_timeleft_s` or similar precisely
+so a future source *can* populate it if it ever has a real, non-fabricated estimate to give.
+
+**Every Preflight row — *arr or settle — uses `StateChip`'s `SETTLING` amber, not a per-source
+colour.** The handoff prompt's own reasoning, confirmed rather than second-guessed: once an *arr
+row's chip stopped showing the *arr's raw state word and started speaking lftpweb's own
+vocabulary ("Waiting for download," not "downloading"), the earlier worry about borrowing one
+system's status colours for another system's states no longer applies — a Preflight row is a
+*waiting* row whatever it's waiting on. One colour reads as "this box is the waiting room," which
+is the box's own point; a rainbow of per-state colours here would suggest distinctions (this
+release is more/less urgent than that one) the box has no actual basis for.
+
+**An *arr row's chip vocabulary is limited to the two `trackedDownloadState` values this codebase
+has actually verified live** (`downloading` → "Waiting for download", `importing` → "Importing",
+per `core/arrclient.py`'s own module docstring on what's been checked against a real Sonarr).
+Anything else falls through to the source's own raw word, verbatim, rather than a guessed
+lftpweb-perspective label — the handoff prompt's explicit "do not invent a state the *arr does
+not report." `importing` needed its own word rather than collapsing into "Waiting for download":
+a release in that state has already finished arriving and Sonarr/Radarr is mid-import, which is
+not "waiting on a download client" at all.
+
+**`timeleft` over `estimatedCompletionTime` for the *arr's own remaining-time field.** The v3
+queue record carries both; `estimatedCompletionTime` is an absolute timestamp that would need
+comparing against this process's own clock on every request, making the figure tick unevenly
+between the *arr's own ~60s poll and this page's independent poll cadence (and trusting the *arr
+host's clock against this one). `timeleft` is already a duration the *arr computed itself —
+rendered once through this codebase's own `formatEta`, one clock, no comparison needed. Parsed
+defensively (the documented default .NET `TimeSpan.ToString()` shape, `[d.]hh:mm:ss[.ffffff]`) —
+unlike `trackedDownloadState`, this codebase has not verified `timeleft`'s wire format against a
+live instance, so anything not shaped like the documented default returns `None` rather than
+guessing at an undocumented one. A parsed `00:00:00` (a paused/stalled download client item) is
+also treated as absent — never a fabricated "0s left."
+
+**The retired signal is a `retired` set argument on `PreflightHold.update`, not a separate
+`retire()` method.** `update` is already documented as "the only writer, called once per refresh
+with every row that source currently sees" — a second method would mean two calls per pass with
+an implicit ordering dependency between them (does `retire` need to run before or after
+`update`?) for no real benefit. One call, two sets (`seen`, `retired`), keeps the "one write per
+refresh" discipline intact. The signal itself is drawn in `core/arrsync.py._preflight_candidates`
+— exactly where a record is already excluded for matching a real item — rather than in
+`core/preflight.py`, which stays exactly as source-agnostic as before: it knows "a caller can
+mark some absent keys as retired," never *why* a record retires.
+
+**Queue identity (`queue_name`/`queue_short_name`) required widening `QueueConfig`/
+`QueueAutoConfig` in `core/engine.py`, not just `core/preflight.py`.** `QueueAutoConfig` is
+deliberately a trimmed subset of `QueueConfig` (its own docstring), and neither carried
+`short_name` before this task — only `core/arrsync.py`'s side had it for free, via its own
+`SELECT *` against `path_queue`. Widening both dataclasses with one more optional, defaulted
+field is the same kind of addition `QueueAutoConfig.name` itself already was ("a mid-run scope
+addition... exists solely so `on_scan`'s own audit events can name the queue") — judged worth
+doing rather than working around, since the alternative (deriving queue names via a second query
+in `api/jobs.py` instead of on the row itself) would have meant one of the two sources not
+actually populating its own row's queue identity, contradicting the handoff prompt's explicit
+"both sources must populate it."
+
+---
+
 ## 2026-08-20 — Preflight's second source (settle-gated releases): the boundary held without
 reshaping; the mount-gate signal is a banner, never rows; settle wins over *arr on a tie
 

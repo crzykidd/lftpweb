@@ -175,6 +175,26 @@ Skeleton for the next roll:
   no chevrons, no Dismiss/Start now/Stop — there is no `item` and no `job` behind one yet. The
   row/box shape (`core/preflight.py`) is deliberately source-agnostic: the *arr poller is the
   only source wired up so far, ahead of an already-planned settle-gate source as a follow-up.
+- **Preflight rows now read as the top of the same table as Active/pending and Complete**, from
+  the user's first browser look at the shipped box: *"we missed the remaining time on the
+  preflight list. and we moved the columns around. it should still have the tag and the column
+  for status on arr icon. arr icon is at the first of the line now."* Column order now mirrors
+  every other Transfers row — queue tag, title, state chip, *arr chip, then a right-aligned
+  figure — instead of leading with the *arr logo and carrying no queue tag at all (added:
+  `PreflightRow` now carries the bound queue's own name/short-name, so it can show the identical
+  tag every other row does). An *arr row now shows its remaining time too, parsed from the *arr's
+  own `timeleft`, through the same "`<duration> left`" figure the Transfers row already uses for
+  its own ETA — omitted whenever the *arr has no meaningful estimate (a paused/stalled download
+  client item), never a fabricated or zero figure. Every row's chip is now rendered through the
+  same `StateChip` component the rest of the app uses — the box previously hand-rolled a flat
+  grey span, which is why "Settling" read as a different kind of thing from everywhere else it
+  appears; it now gets `StateChip`'s existing amber, the same colour a Preflight row gets
+  regardless of source, since every row here is "waiting," whatever it's waiting on. An *arr
+  row's chip also now speaks lftpweb's own vocabulary instead of the *arr's raw wire word — the
+  *arr's own `"downloading"` becomes **"Waiting for download"** (lftpweb is doing nothing here,
+  just watching the *arr's own download client work) and `"importing"` becomes **"Importing"**;
+  the *arr's own detail moves to the chip's tooltip instead — `Downloading from "<download
+  client>" — reported by <instance>`.
 
 ### Changed
 
@@ -205,6 +225,17 @@ Skeleton for the next roll:
 
 ### Fixed
 
+- **A handed-over release no longer lingers in Preflight for up to 150s alongside its own new
+  Active/pending row.** Found by reading the code, not observed in a browser: `core/arrsync.py`'s
+  Preflight cache couldn't tell "this record just matched a real lftpweb item" (a known, terminal
+  reason to stop showing it) apart from "the *arr's report simply didn't mention it this pass"
+  (the SABnzbd blank-queue blip the cache's flap-tolerance hold exists to absorb) — both looked
+  identical to the hold, so a just-handed-over release sat duplicated in both boxes until the
+  150s hold expired. `PreflightHold.update` now takes a `retired` set alongside the rows it still
+  sees, and evicts anything in it immediately; a record that's merely missing still gets the full
+  150s tolerance, unchanged. The settle-gated source was never affected — it replaces its rows
+  wholesale on every scan pass rather than using this hold at all, which this incident is the
+  concrete evidence for having been the right call.
 - **Auto-queue no longer re-downloads a release the *arr has just imported.** Found in
   production on a `move` queue bound to Sonarr: an item finished, post-processing renamed it and
   told Sonarr to scan, and Sonarr began moving the media file into the library — leaving the

@@ -685,12 +685,16 @@ async def get_preflight(request: Request) -> PreflightResponse:
             PreflightRowOut(
                 source=r.source,
                 queue_id=r.queue_id,
+                queue_name=r.queue_name,
+                queue_short_name=r.queue_short_name,
                 title=r.title,
                 status_label=r.status_label,
                 source_label=r.source_label,
                 source_kind=r.source_kind,
                 size_bytes=r.size_bytes,
                 size_remaining_bytes=r.size_remaining_bytes,
+                remaining_s=r.remaining_s,
+                download_client=r.download_client,
             )
             for r in rows
         ],

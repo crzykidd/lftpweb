@@ -13,7 +13,7 @@ from datetime import UTC, datetime
 import aiosqlite
 import pytest
 
-from lftpweb.core.arrsync import ArrSyncScheduler
+from lftpweb.core.arrsync import ArrSyncScheduler, _parse_timeleft
 from lftpweb.core.crypto import encrypt_secret
 from lftpweb.core.preflight import PREFLIGHT_HOLD_S
 from lftpweb.db import migrate
@@ -48,11 +48,13 @@ async def _seed_queue(
     arr_instance_id: int | None = None,
     local_path: str = "/l",
     arr_visible_path: str | None = None,
+    name: str = "q",
+    short_name: str | None = None,
 ) -> int:
     cursor = await db.execute(
         "INSERT INTO path_queue (host_id, name, remote_path, local_path, enabled, "
-        "arr_instance_id, arr_visible_path) VALUES (?, 'q', '/r', ?, 1, ?, ?)",
-        (host_id, local_path, arr_instance_id, arr_visible_path),
+        "arr_instance_id, arr_visible_path, short_name) VALUES (?, ?, '/r', ?, 1, ?, ?, ?)",
+        (host_id, name, local_path, arr_instance_id, arr_visible_path, short_name),
     )
     await db.commit()
     return cursor.lastrowid
@@ -102,6 +104,8 @@ def _queue_record(
     tracked_download_state: str = "downloading",
     size: int | None = None,
     sizeleft: int | None = None,
+    timeleft: str | None = None,
+    download_client: str | None = None,
 ):
     record: dict = {
         "downloadId": download_id,
@@ -113,6 +117,10 @@ def _queue_record(
         record["size"] = size
     if sizeleft is not None:
         record["sizeleft"] = sizeleft
+    if timeleft is not None:
+        record["timeleft"] = timeleft
+    if download_client is not None:
+        record["downloadClient"] = download_client
     return record
 
 
@@ -392,3 +400,216 @@ async def test_preflight_rows_filters_to_the_caller_supplied_instance_set(
     assert len(scheduler.preflight_rows({instance_id})) == 1
     assert scheduler.preflight_rows(set()) == []
     assert scheduler.preflight_rows({instance_id + 999}) == []
+
+
+# --- Queue tag (2026-08-21, "we moved the columns around") -------------------------------------
+
+
+async def test_queue_name_and_short_name_are_carried_on_the_row(db, fake_arr_server, tmp_path):
+    """`PreflightRow` used to carry `queue_id` with no name at all, so an *arr row could not
+    show the queue tag every other Transfers row shows (`lib/queueDisplayName.ts.
+    queueDisplayName`). Both the full name and the short-name fallback must survive onto the row.
+    """
+    host_id = await _seed_host(db)
+    instance_id = await _seed_instance(
+        db, str(tmp_path), base_url=fake_arr_server.base_url, api_key=fake_arr_server.state.api_key
+    )
+    await _seed_queue(
+        db,
+        host_id,
+        arr_instance_id=instance_id,
+        arr_visible_path="/data/tv",
+        name="DC-TV",
+        short_name="TV",
+    )
+
+    fake_arr_server.state.queue_records = [
+        _queue_record(download_id="q1", title="Show.S01E01", output_path="/data/tv/Show.S01E01")
+    ]
+    scheduler = ArrSyncScheduler(db=db, config_dir=str(tmp_path))
+    await scheduler.run_once()
+
+    rows = scheduler.preflight_rows({instance_id})
+    assert len(rows) == 1
+    assert rows[0].queue_name == "DC-TV"
+    assert rows[0].queue_short_name == "TV"
+
+
+async def test_queue_short_name_is_none_when_not_set(db, fake_arr_server, tmp_path):
+    host_id = await _seed_host(db)
+    instance_id = await _seed_instance(
+        db, str(tmp_path), base_url=fake_arr_server.base_url, api_key=fake_arr_server.state.api_key
+    )
+    await _seed_queue(db, host_id, arr_instance_id=instance_id, arr_visible_path="/data/tv")
+
+    fake_arr_server.state.queue_records = [
+        _queue_record(download_id="q1", title="Show.S01E01", output_path="/data/tv/Show.S01E01")
+    ]
+    scheduler = ArrSyncScheduler(db=db, config_dir=str(tmp_path))
+    await scheduler.run_once()
+
+    rows = scheduler.preflight_rows({instance_id})
+    assert rows[0].queue_name == "q"  # `_seed_queue`'s own default
+    assert rows[0].queue_short_name is None
+
+
+# --- Remaining time (2026-08-21, "we missed the remaining time") -------------------------------
+
+
+def test_parse_timeleft_present_absent_and_unparseable():
+    """`_parse_timeleft` is the pure boundary between the *arr's own `timeleft` wire string and
+    `PreflightRow.remaining_s` -- unit-tested directly, per this codebase's own convention for
+    pure helpers, alongside the end-to-end coverage below.
+    """
+    assert _parse_timeleft("00:03:00") == 180.0
+    assert _parse_timeleft("1.02:00:00") == 1 * 86400 + 2 * 3600  # the "[d.]hh:mm:ss" form
+    assert _parse_timeleft("00:00:05.500000") == 5.0  # fractional seconds truncate, not round
+    assert _parse_timeleft(None) is None  # absent
+    assert _parse_timeleft("") is None  # absent
+    assert _parse_timeleft("not-a-duration") is None  # unparseable
+    assert _parse_timeleft("00:00:00") is None  # paused/stalled -- never a fabricated "0s left"
+
+
+async def test_remaining_time_present_absent_and_unparseable_end_to_end(
+    db, fake_arr_server, tmp_path
+):
+    host_id = await _seed_host(db)
+    instance_id = await _seed_instance(
+        db, str(tmp_path), base_url=fake_arr_server.base_url, api_key=fake_arr_server.state.api_key
+    )
+    await _seed_queue(db, host_id, arr_instance_id=instance_id, arr_visible_path="/data/tv")
+
+    fake_arr_server.state.queue_records = [
+        _queue_record(
+            download_id="present",
+            title="Has.Timeleft",
+            output_path="/data/tv/Has.Timeleft",
+            timeleft="00:03:00",
+        ),
+        _queue_record(
+            download_id="absent", title="No.Timeleft", output_path="/data/tv/No.Timeleft"
+        ),
+        _queue_record(
+            download_id="garbage",
+            title="Bad.Timeleft",
+            output_path="/data/tv/Bad.Timeleft",
+            timeleft="not-a-duration",
+        ),
+    ]
+    scheduler = ArrSyncScheduler(db=db, config_dir=str(tmp_path))
+    await scheduler.run_once()
+
+    rows = {r.title: r for r in scheduler.preflight_rows({instance_id})}
+    assert rows["Has.Timeleft"].remaining_s == 180.0
+    assert rows["No.Timeleft"].remaining_s is None
+    assert rows["Bad.Timeleft"].remaining_s is None
+
+
+async def test_download_client_is_carried_through_when_present(db, fake_arr_server, tmp_path):
+    """The chip tooltip's own provenance detail (2026-08-21, user's own words: "Downloading from
+    '<download client name>' from arr") -- read from `raw`, no extra request.
+    """
+    host_id = await _seed_host(db)
+    instance_id = await _seed_instance(
+        db, str(tmp_path), base_url=fake_arr_server.base_url, api_key=fake_arr_server.state.api_key
+    )
+    await _seed_queue(db, host_id, arr_instance_id=instance_id, arr_visible_path="/data/tv")
+
+    fake_arr_server.state.queue_records = [
+        _queue_record(
+            download_id="withclient",
+            title="Has.Client",
+            output_path="/data/tv/Has.Client",
+            download_client="SABnzbd",
+        ),
+        _queue_record(download_id="noclient", title="No.Client", output_path="/data/tv/No.Client"),
+    ]
+    scheduler = ArrSyncScheduler(db=db, config_dir=str(tmp_path))
+    await scheduler.run_once()
+
+    rows = {r.title: r for r in scheduler.preflight_rows({instance_id})}
+    assert rows["Has.Client"].download_client == "SABnzbd"
+    assert rows["No.Client"].download_client is None
+
+
+# --- Evict on handover (2026-08-21, "a handed-over release lingers in Preflight for up to
+# 150s") -- confirmed by reading the code, not observed in a browser --------------------------
+
+
+async def test_retired_row_evicts_immediately_not_held(db, fake_arr_server, tmp_path, monkeypatch):
+    """The defect: `_preflight_candidates` excludes a record the moment it matches a real
+    `item`, but before the 2026-08-21 fix `_update_preflight` couldn't tell that apart from the
+    record simply going missing for a beat -- so a just-handed-over release sat in the cache,
+    duplicated alongside its own new Active/pending row, until `PREFLIGHT_HOLD_S` (150s) elapsed.
+    This asserts the row is gone the very next pass, seconds later, not merely eventually.
+    """
+    host_id = await _seed_host(db)
+    instance_id = await _seed_instance(
+        db, str(tmp_path), base_url=fake_arr_server.base_url, api_key=fake_arr_server.state.api_key
+    )
+    queue_id = await _seed_queue(
+        db, host_id, arr_instance_id=instance_id, arr_visible_path="/data/tv"
+    )
+
+    fake_arr_server.state.queue_records = [
+        _queue_record(
+            download_id="handoff1", title="Show.S01E01", output_path="/data/tv/Show.S01E01"
+        )
+    ]
+
+    clock = {"t": 1_000.0}
+    monkeypatch.setattr("lftpweb.core.arrsync.time.monotonic", lambda: clock["t"])
+
+    scheduler = ArrSyncScheduler(db=db, config_dir=str(tmp_path))
+    await scheduler.run_once()
+    assert [r.title for r in scheduler.preflight_rows({instance_id})] == ["Show.S01E01"]
+
+    # The release lands: a real `item` row now exists with the matching name, so this pass's own
+    # `_preflight_candidates` excludes the record for matching it -- the ordinary "no duplicate
+    # at handover" rule -- but unlike a genuine blip, this is a *known* reason, not silence.
+    await _seed_item(db, queue_id, "Show.S01E01")
+    clock["t"] += 1.0  # nowhere near PREFLIGHT_HOLD_S
+    await scheduler.run_once()
+
+    # Must be gone THIS pass, not held for PREFLIGHT_HOLD_S alongside a genuinely-missing row.
+    assert scheduler.preflight_rows({instance_id}) == []
+
+
+async def test_a_merely_missing_row_still_holds_for_the_full_window(
+    db, fake_arr_server, tmp_path, monkeypatch
+):
+    """The flap-tolerance side of the same fix must survive untouched: a record that simply
+    disappears from the *arr's own report (no matching item, the SABnzbd blank-queue blip this
+    hold exists for) is still held for the full `PREFLIGHT_HOLD_S`, not evicted early just
+    because eviction now has a fast path. Guards against a fix that (wrongly) evicts anything
+    absent from `seen`, not just what is actually `retired`.
+    """
+    host_id = await _seed_host(db)
+    instance_id = await _seed_instance(
+        db, str(tmp_path), base_url=fake_arr_server.base_url, api_key=fake_arr_server.state.api_key
+    )
+    await _seed_queue(db, host_id, arr_instance_id=instance_id, arr_visible_path="/data/tv")
+
+    fake_arr_server.state.queue_records = [
+        _queue_record(
+            download_id="flap3", title="Flaky.Release.3", output_path="/data/tv/Flaky.Release.3"
+        )
+    ]
+
+    clock = {"t": 1_000.0}
+    monkeypatch.setattr("lftpweb.core.arrsync.time.monotonic", lambda: clock["t"])
+
+    scheduler = ArrSyncScheduler(db=db, config_dir=str(tmp_path))
+    await scheduler.run_once()
+    assert [r.title for r in scheduler.preflight_rows({instance_id})] == ["Flaky.Release.3"]
+
+    # Blip -- no matching item exists anywhere, so this is "merely absent," not "retired."
+    fake_arr_server.state.queue_records = []
+    clock["t"] += 1.0
+    await scheduler.run_once()
+    assert [r.title for r in scheduler.preflight_rows({instance_id})] == ["Flaky.Release.3"]
+
+    # Only past the full hold window does it finally clear.
+    clock["t"] += PREFLIGHT_HOLD_S
+    await scheduler.run_once()
+    assert scheduler.preflight_rows({instance_id}) == []

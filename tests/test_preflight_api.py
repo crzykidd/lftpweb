@@ -23,11 +23,15 @@ from lftpweb.main import app
 
 def _row(source: str, queue_id: int, title: str, **overrides) -> PreflightRow:
     fields = {
+        "queue_name": "q",
+        "queue_short_name": None,
         "status_label": None,
         "source_label": "x",
         "source_kind": None,
         "size_bytes": None,
         "size_remaining_bytes": None,
+        "remaining_s": None,
+        "download_client": None,
     }
     fields.update(overrides)
     return PreflightRow(source=source, queue_id=queue_id, title=title, **fields)

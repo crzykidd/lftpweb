@@ -954,6 +954,12 @@ class PreflightRowOut(BaseModel):
     # chip) is gated on this, never inferred from `source_kind` alone.
     source: str
     queue_id: int
+    # The bound queue's own display identity (2026-08-21, "the columns moved around" fix) -- so
+    # this row can show the same queue tag every other row on the page shows
+    # (`lib/queueDisplayName.ts.queueDisplayName(queue_short_name, queue_name)`). Mirrors
+    # `core/preflight.py.PreflightRow`'s own two fields of the same name field for field.
+    queue_name: str
+    queue_short_name: str | None
     title: str
     # Free-form, source-owned display text for "what state is this in" -- an *arr row's own
     # `trackedDownloadState` (e.g. `"downloading"`), verbatim; `null` when the source didn't
@@ -971,6 +977,20 @@ class PreflightRowOut(BaseModel):
     # response happened to carry them.
     size_bytes: int | None
     size_remaining_bytes: int | None
+    # How many seconds until this row's own source expects its wait to clear (2026-08-21,
+    # "we missed the remaining time") -- an *arr row's own `timeleft`
+    # (`core/arrsync.py._parse_timeleft`), rendered through the same `formatEta`/`transferLineValue`
+    # shape the Transfers row already uses for its own ETA. `null` when the source has no
+    # meaningful estimate this pass (frequently true -- a paused/stalled download client item, or
+    # a settle-gated row, whose own remaining figure is `size_bytes` above, not a time) -- never a
+    # fabricated or zero figure.
+    remaining_s: float | None
+    # The download client actually fetching this release (2026-08-21, user's own words:
+    # "tooltip maybe we should show the arr details ... Downloading from '<download client
+    # name>' from arr") -- an *arr row's own `downloadClient`; `null` for a settle row (no
+    # separate download client in that source's own model) or an *arr row whose response didn't
+    # carry one. Display-only provenance for a chip tooltip.
+    download_client: str | None
 
 
 class PreflightGatedQueueOut(BaseModel):
