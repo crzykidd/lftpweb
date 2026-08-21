@@ -44,6 +44,12 @@ class HealthResponse(BaseModel):
     # read this -- "a queue that silently does nothing is a support question waiting to happen"
     # is the task's own reasoning for surfacing it here alongside `scheduler_alive`.
     queue_paused: bool = False
+    # 2026-08-21 (`prompts/2026-08-21-pause-for-duration.md`): the absolute ISO-8601 UTC
+    # deadline a timed pause (1/10/30/60 minute dropdown) resumes at, or `None` for an
+    # indefinite pause (or no pause at all) -- `core/queue.py.TransferQueue.paused_until`. The
+    # UI reads this to show "resumes at HH:MM" rather than a bare "paused" that would otherwise
+    # look identical to an indefinite one.
+    queue_paused_until: str | None = None
     # 2026-08-16 (docs/decisions.md): also not in §12's literal shape, same reasoning as
     # `repo_url` above -- `config.Settings.build_sha`/`.build_channel` are baked at image
     # *build* time (docker/Dockerfile's `runtime` stage, .github/workflows/publish.yml), and
@@ -802,12 +808,25 @@ class MoveJobRequest(BaseModel):
     direction: MoveDirection
 
 
+# The Transfers -> Queue tab's Pause dropdown menu's four offered durations (2026-08-21,
+# `prompts/2026-08-21-pause-for-duration.md`) -- minutes, converted to seconds before reaching
+# `TransferQueue.pause`'s `duration_s`. Anything outside this set is a 422 for free via
+# `Literal`, the same pattern `StartNowRequest.rate_percent` already uses for its own menu.
+PauseDurationMinutes = Literal[1, 10, 30, 60]
+
+
 # The Transfers -> Queue tab's Pause control (2026-08-20, `prompts/2026-08-20-queue-pause.md`):
 # `POST /api/queue/pause`'s body -- "pause after current" (`stop_running=False`, the default)
 # leaves running jobs alone; "pause now" (`stop_running=True`) also SIGTERMs and requeues them
 # (`core/queue.py.TransferQueue.pause`). `POST /api/queue/unpause` takes no body.
+#
+# `duration_minutes` (2026-08-21, `prompts/2026-08-21-pause-for-duration.md`): `None` (the
+# default, unchanged from before this task) is an indefinite pause -- the dropdown of durations
+# extends this control, it does not replace "pause until I say otherwise". Combines with either
+# `stop_running` value; the two are independent axes of the same call.
 class QueuePauseRequest(BaseModel):
     stop_running: bool = False
+    duration_minutes: PauseDurationMinutes | None = None
 
 
 class JobOut(BaseModel):

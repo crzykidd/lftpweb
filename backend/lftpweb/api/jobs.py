@@ -556,9 +556,20 @@ async def pause_queue(request: Request, body: QueuePauseRequest | None = None) -
     `core/queue.py.TransferQueue.pause`'s own docstring for why `stop_job`'s §4.6 semantics
     would be wrong here). Idempotent: pausing an already-paused queue with `stop_running=true`
     still stops whatever is running at the moment of the call.
+
+    `duration_minutes` (2026-08-21, `prompts/2026-08-21-pause-for-duration.md`): one of
+    `{1, 10, 30, 60}`, or omitted/`null` for an indefinite pause (unchanged default). Converted
+    to seconds here rather than in `core/queue.py`, which takes a plain `duration_s: float` so
+    it has no opinion on what unit the API's dropdown happens to offer. Re-pausing an
+    already-paused queue **replaces** whatever deadline was set before, it does not stack.
     """
     stop_running = body.stop_running if body is not None else False
-    await request.app.state.queue.pause(stop_running=stop_running)
+    duration_s = (
+        body.duration_minutes * 60
+        if body is not None and body.duration_minutes is not None
+        else None
+    )
+    await request.app.state.queue.pause(stop_running=stop_running, duration_s=duration_s)
 
 
 @router.post("/api/queue/unpause", status_code=204)

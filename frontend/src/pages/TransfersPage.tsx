@@ -34,7 +34,7 @@ import { useLiveModel } from '../hooks/useLiveModel'
 import { usePoll } from '../hooks/usePoll'
 import { usePreflight } from '../hooks/usePreflight'
 import { arrHoverLabel, childDisplayState, nodeDisplaySize, stateProgressPercent } from '../lib/fileTree'
-import { childSpeedLabel, formatBytes, formatRelativeTimeIntl } from '../lib/format'
+import { childSpeedLabel, formatBytes, formatRelativeTimeIntl, pauseResumeLabel } from '../lib/format'
 import {
   ACTIVE_PAGE_SIZE,
   COMPLETE_PAGE_SIZE,
@@ -832,6 +832,13 @@ export function TransfersPage() {
   const health = usePoll(healthFetcher, 5000)
   const [pauseBusy, setPauseBusy] = useState(false)
   const [pauseError, setPauseError] = useState<string | null>(null)
+  // Pause-for-a-duration (2026-08-21, prompts/2026-08-21-pause-for-duration.md): the dropdown's
+  // current choice, applied to whichever entry mode ("Pause after current" / "Pause now") is
+  // picked next -- `''` (the default) is "until I unpause", the indefinite pause this dropdown
+  // extends rather than replaces. Deliberately not reset after a pause is issued: re-opening the
+  // dropdown to re-pick "10 minutes" every time would be the annoying default, not the useful
+  // one.
+  const [pauseDuration, setPauseDuration] = useState<'' | '1' | '10' | '30' | '60'>('')
   // The Complete box's "Dismiss" menu (2026-08-20, follow-up to phase 1 stage 4b -- see
   // `handleDismissOutcome`'s own docstring below) -- replaces both the old page-top "Dismiss
   // all" button (`dismissingAll`/`dismissAllError`/`dismissAllCount`, same three-state shape
@@ -1074,7 +1081,8 @@ export function TransfersPage() {
     setPauseBusy(true)
     setPauseError(null)
     try {
-      await pauseQueue(mode === 'now')
+      const durationMinutes = pauseDuration === '' ? undefined : Number(pauseDuration)
+      await pauseQueue(mode === 'now', durationMinutes as 1 | 10 | 30 | 60 | undefined)
       refreshAll()
     } catch (err) {
       setPauseError(err instanceof Error ? err.message : String(err))
@@ -1219,12 +1227,22 @@ export function TransfersPage() {
        * waiting to happen" is the task's own reasoning for making the paused state unmistakable
        * rather than a quiet badge. Reordering (the chevrons below) and auto-queue/manual Queue
        * clicks keep working while paused -- only admission itself stops -- so this banner reads
-       * as "nothing new is starting," not "nothing is happening." */}
+       * as "nothing new is starting," not "nothing is happening."
+       *
+       * The duration dropdown (2026-08-21, prompts/2026-08-21-pause-for-duration.md) sits next
+       * to the Pause control rather than inside `PauseMenu.tsx` -- both entry modes ("Pause
+       * after current" / "Pause now") stay exactly as they were, this just picks what deadline,
+       * if any, whichever one is chosen next carries. `''` (the default) is "until I unpause",
+       * so the two-option menu's existing behavior is unchanged unless a duration is picked
+       * first. Once paused, the deadline (if any) is shown via `pauseResumeLabel` rather than
+       * a bare "paused" -- a queue about to restart itself in 40 minutes has to say so. */}
       <div className="flex flex-wrap items-center gap-3">
         {health?.queue_paused ? (
           <>
             <span className="flex items-center gap-1.5 rounded-md border border-amber-300 bg-amber-50 px-2.5 py-1 text-xs font-medium text-amber-900 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-200">
               ● Queue paused — nothing new is being admitted
+              {pauseResumeLabel(health.queue_paused_until ?? null) &&
+                ` (${pauseResumeLabel(health.queue_paused_until ?? null)})`}
             </span>
             <button
               type="button"
@@ -1236,7 +1254,27 @@ export function TransfersPage() {
             </button>
           </>
         ) : (
-          <PauseMenu disabled={pauseBusy} onSelect={handlePause} />
+          <>
+            <div className="flex items-center gap-1.5">
+              <label htmlFor="pause-duration" className="text-xs text-zinc-500 dark:text-zinc-400">
+                For
+              </label>
+              <select
+                id="pause-duration"
+                value={pauseDuration}
+                onChange={(e) => setPauseDuration(e.target.value as typeof pauseDuration)}
+                disabled={pauseBusy}
+                className="rounded-md border border-zinc-300 bg-white px-1.5 py-1 text-xs font-medium text-zinc-700 hover:bg-zinc-50 disabled:opacity-50 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-200 dark:hover:bg-zinc-800"
+              >
+                <option value="">until I unpause</option>
+                <option value="1">1 minute</option>
+                <option value="10">10 minutes</option>
+                <option value="30">30 minutes</option>
+                <option value="60">60 minutes</option>
+              </select>
+            </div>
+            <PauseMenu disabled={pauseBusy} onSelect={handlePause} />
+          </>
         )}
         {pauseError && (
           <span className="text-xs text-red-600 dark:text-red-400">

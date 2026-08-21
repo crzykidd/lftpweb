@@ -466,9 +466,19 @@ export function startJobNow(
  * `stopRunning` omitted/`false` is "pause after current" -- running jobs finish normally, nothing
  * new is admitted. `true` is "pause now" -- additionally stops every in-flight transfer and
  * returns it to `queued` at its same position (`core/queue.py.TransferQueue.pause`).
+ *
+ * `durationMinutes` (2026-08-21, `prompts/2026-08-21-pause-for-duration.md`) is one of the
+ * dropdown's four offered durations, or `undefined` for an indefinite pause (the default,
+ * unchanged) -- combines with either `stopRunning` value.
  */
-export function pauseQueue(stopRunning = false): Promise<void> {
-  return sendJson<void>('/api/queue/pause', 'POST', { stop_running: stopRunning })
+export function pauseQueue(
+  stopRunning = false,
+  durationMinutes?: 1 | 10 | 30 | 60,
+): Promise<void> {
+  return sendJson<void>('/api/queue/pause', 'POST', {
+    stop_running: stopRunning,
+    duration_minutes: durationMinutes ?? null,
+  })
 }
 
 /** Resume admission immediately, in queue-position order. */

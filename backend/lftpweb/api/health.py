@@ -38,6 +38,9 @@ async def health(request: Request) -> HealthResponse:
     # (the scheduler loop is still alive, admission is just refused) -- it is not folded into
     # `status`/`scheduler_alive` below, only reported as its own field.
     queue_paused = bool(queue is not None and queue.paused)
+    # 2026-08-21 (`prompts/2026-08-21-pause-for-duration.md`): the deadline a timed pause
+    # resumes at, or `None` for an indefinite pause / no pause at all.
+    queue_paused_until = queue.paused_until if queue is not None else None
 
     status = "ok" if db_ok and scheduler_alive and host_reachable is not False else "degraded"
 
@@ -50,6 +53,7 @@ async def health(request: Request) -> HealthResponse:
         host_reachable=host_reachable,
         scheduler_alive=scheduler_alive,
         queue_paused=queue_paused,
+        queue_paused_until=queue_paused_until,
         build_sha=settings.build_sha,
         build_channel=settings.build_channel,
     )

@@ -1,10 +1,15 @@
 ---
 name: 2026-08-21-pause-for-duration
-status: pending          # pending | completed | failed
+status: completed          # pending | completed | failed
 created: 2026-08-21
 model: sonnet            # opus = research/planning, sonnet = coding
-completed:               # filled when the work is done
-result:                  # one-line summary of the outcome
+completed: 2026-08-21
+result: Pause-duration dropdown (1/10/30/60 min, "until I unpause" default) shipped, combinable
+  with both entry modes. Stored deadline (`QueuePauseState.paused_until`, ISO-8601 UTC), never a
+  timer -- expiry enforced in `TransferQueue.tick()` (not the engine's scan loop, which can sleep
+  indefinitely) and also checked synchronously in `start()` for restart correctness. Re-pause
+  replaces the deadline; manual unpause and expiry both clear it. 1602 backend / 615 frontend
+  tests, 0 skipped. Browser-unverified.
 ---
 
 # Task: pause the queue for a fixed duration, then resume automatically

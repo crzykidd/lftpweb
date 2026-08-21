@@ -985,6 +985,43 @@ and `POST /api/jobs/{id}/move` carry no pause check at all, and "Start now"'s ow
 (`core/queue.py.QueuePausedError`, disabled client-side with a reason in the tooltip too) is
 scoped to `start_now` alone, so it cannot accidentally catch the reorder endpoint.
 
+#### Pausing for a fixed duration
+
+A dropdown (2026-08-21, `prompts/2026-08-21-pause-for-duration.md`) offering **1 / 10 / 30 / 60
+minutes**, combinable with either entry mode above — "pause now for 10 minutes" and "pause after
+current indefinitely" are the same `TransferQueue.pause()` call with different arguments.
+**Indefinite pause stays the default**; the dropdown extends it, it does not replace "pause until
+I say otherwise".
+
+**A stored absolute deadline (`QueuePauseState.paused_until`, an ISO-8601 UTC string), not a
+countdown or a running timer.** A timer dies with the process; a persisted deadline makes
+restart-correctness fall out for free with no catch-up logic:
+
+- Restart **before** the deadline → still paused, and it expires on schedule.
+- Restart **after** the deadline (the app was down past it) → comes back **unpaused**, the honest
+  answer — a ten-minute pause must not silently become an eight-hour one because the container
+  restarted. Checked twice for this reason: once synchronously in `TransferQueue.start()` (so
+  this holds the instant `start()` returns, before the scheduler loop has run even once), and
+  again every tick thereafter (below) for the ordinary case.
+
+**Re-pausing always replaces `paused_until` outright — it never stacks or extends.** Calling
+`pause()` again while already paused overwrites whatever deadline existed, including clearing it
+back to indefinite (`duration_s` omitted). **Manual `unpause()` always clears the deadline too** —
+a stale deadline that later re-paused the queue after someone had already unpaused it by hand
+would be baffling.
+
+**Expiry is enforced from `TransferQueue.tick()` (`_expire_pause_if_due`), not from
+`core/engine.py`'s scan loop**, despite the engine loop being the other "runs continuously"
+candidate: `Engine._loop` can legitimately sleep with no wake-up scheduled at all when every
+queue is on-demand-only (`_next_wake_delay` returns `None` in that case), whereas
+`TransferQueue._loop` always wakes at least every `tick_s` (~1s) regardless of what else is or
+isn't due. That is the only one of the two loops that can promise "fires without a page open, on
+the backend's own clock" unconditionally. Expiry records its own audit event
+(`queue_pause_expired`), distinct from a manual `queue_unpaused`, so "why did it start again" is
+answerable from the Events page without guessing whether a human clicked Unpause. The Queue tab's
+banner and the header badge both show the deadline itself ("resumes at HH:MM") whenever one is
+set, not a bare "paused" indistinguishable from an indefinite one.
+
 #### Residual inefficiency, stated plainly
 
 Because allocations are never re-shaped, a job admitted at B/2 keeps B/2 after its partner

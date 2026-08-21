@@ -22,7 +22,7 @@ import logging
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -337,9 +337,20 @@ class QueuePauseState:
     nothing new is admitted either way, and "pause now" already finished doing its one-time
     extra work (returning running jobs to `queued`, see `TransferQueue._pause_running_jobs`)
     by the time this is read again. There is nothing left for the entry mode to mean.
+
+    `paused_until` (2026-08-21, `prompts/2026-08-21-pause-for-duration.md`) is an **absolute
+    ISO-8601 UTC deadline, not a countdown or a running timer** -- the same "just a wall-clock
+    string in a `setting` row" idiom `core/auth.py`'s session `expires_at` already uses, and for
+    the same restart-correctness reason: a timer dies with the process, but a stored deadline
+    makes "still paused if we come back before it, unpaused if we come back after" fall out for
+    free, with no catch-up logic and no timer reconstruction. `None` means "paused indefinitely,
+    until someone unpauses" -- the default this dropdown-of-durations extends, never replaces.
+    Comparable directly against `_now_iso()`'s own format via plain string `<=` (both are
+    zero-padded `%Y-%m-%dT%H:%M:%S.%fZ`, so lexical order matches chronological order).
     """
 
     paused: bool = False
+    paused_until: str | None = None
 
 
 PAUSE_SETTING_KEY = "queue_pause_state"
@@ -354,11 +365,14 @@ async def load_queue_pause_state(db: aiosqlite.Connection) -> QueuePauseState:
         data = json.loads(row["value"])
     except (ValueError, TypeError):
         return QueuePauseState()
-    return QueuePauseState(paused=bool(data.get("paused", False)))
+    return QueuePauseState(
+        paused=bool(data.get("paused", False)),
+        paused_until=data.get("paused_until"),
+    )
 
 
 async def save_queue_pause_state(db: aiosqlite.Connection, state: QueuePauseState) -> None:
-    payload = json.dumps({"paused": state.paused})
+    payload = json.dumps({"paused": state.paused, "paused_until": state.paused_until})
     await db.execute(
         "INSERT INTO setting (key, value, updated_at) VALUES (?, ?, STRFTIME('%Y-%m-%dT%H:%M:%fZ','now')) "
         "ON CONFLICT (key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
@@ -496,11 +510,24 @@ class TransferQueue:
         # row in `start()` below (so a restart doesn't quietly resume everything); every write
         # goes through `pause()`/`unpause()`, which update both the row and this cache together.
         self._paused = False
+        # The duration extension (2026-08-21, `prompts/2026-08-21-pause-for-duration.md`) --
+        # `None` while paused indefinitely, an ISO-8601 UTC deadline otherwise. Same
+        # load/cache/write-together discipline as `self._paused`; see `QueuePauseState`'s own
+        # docstring for why this is a stored deadline rather than a running timer.
+        self._paused_until: str | None = None
 
     # --- lifecycle ---------------------------------------------------------------------
 
     async def start(self) -> None:
-        self._paused = (await load_queue_pause_state(self.db)).paused
+        pause_state = await load_queue_pause_state(self.db)
+        self._paused = pause_state.paused
+        self._paused_until = pause_state.paused_until
+        # Restart-after-deadline (2026-08-21, `prompts/2026-08-21-pause-for-duration.md`):
+        # checked here too, synchronously, not only on the scheduler loop's first `tick()` --
+        # "the app was down past the deadline" must resolve to unpaused the instant `start()`
+        # returns (what `/api/health` reads immediately after), rather than depending on
+        # `self._task` getting a chance to run first.
+        await self._expire_pause_if_due()
         await self._reconcile_orphaned_jobs()
         if self._task is None:
             self._task = asyncio.create_task(self._loop(), name="lftpweb-transfer-queue-loop")
@@ -892,7 +919,17 @@ class TransferQueue:
         """
         return self._paused
 
-    async def pause(self, *, stop_running: bool) -> None:
+    @property
+    def paused_until(self) -> str | None:
+        """The absolute ISO-8601 UTC deadline a timed pause expires at, or `None` for an
+        indefinite pause (or no pause at all) -- `/api/health`'s `queue_paused_until`, read by
+        the Queue tab's banner and the header badge so a queue that will resume itself in N
+        minutes says so, rather than reading as plain "paused" (this task,
+        `prompts/2026-08-21-pause-for-duration.md`).
+        """
+        return self._paused_until
+
+    async def pause(self, *, stop_running: bool, duration_s: float | None = None) -> None:
         """Pause admission (this task -- the two "Pause after current" / "Pause now" entry
         modes from the Transfers -> Queue tab control).
 
@@ -916,22 +953,43 @@ class TransferQueue:
         paused-now item and it would never come back on unpause, the opposite of what pausing
         means.
 
+        `duration_s` (2026-08-21, `prompts/2026-08-21-pause-for-duration.md`): `None` (the
+        default) is an indefinite pause, unchanged from before this task. A number of seconds
+        computes an absolute deadline (`datetime.now(UTC) + duration_s`, stored as a
+        `QueuePauseState.paused_until` string) that `tick()`'s own `_expire_pause_if_due` checks
+        every ~1s and auto-unpauses past. **Independent of `stop_running`** -- either entry mode
+        combines with either duration, so "pause now for 10 minutes" and "pause after current
+        indefinitely" are both just this one method with different arguments. **Re-pausing
+        always overwrites `paused_until` with whatever this call computes (or `None`), rather
+        than stacking/extending an existing deadline** -- calling this while already paused
+        replaces the deadline outright, including clearing it back to indefinite by calling with
+        `duration_s=None`.
+
         Auto-queue and manual Queue clicks keep enqueueing while paused (DESIGN.md §4.7:
         "always wins," untouched by this task) -- the queue simply builds up and is worked
         through once admission resumes.
         """
-        await save_queue_pause_state(self.db, QueuePauseState(paused=True))
+        paused_until = (
+            (datetime.now(UTC) + timedelta(seconds=duration_s)).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+            if duration_s is not None
+            else None
+        )
+        await save_queue_pause_state(
+            self.db, QueuePauseState(paused=True, paused_until=paused_until)
+        )
         self._paused = True
+        self._paused_until = paused_until
+        duration_note = f", resuming automatically at {paused_until}" if paused_until else ""
         await audit.record_event(
             self.db,
             level="info",
             kind="queue_paused",
             message=(
-                "transfer queue paused ('pause now' -- running transfers were stopped and "
-                "requeued)"
+                f"transfer queue paused ('pause now' -- running transfers were stopped and "
+                f"requeued){duration_note}"
                 if stop_running
-                else "transfer queue paused after current (nothing new admitted; running "
-                "transfers finish normally)"
+                else f"transfer queue paused after current (nothing new admitted; running "
+                f"transfers finish normally){duration_note}"
             ),
         )
         if stop_running:
@@ -939,14 +997,52 @@ class TransferQueue:
 
     async def unpause(self) -> None:
         """Resume admission immediately, in `queue_position` order -- `request_tick()` wakes
-        the loop rather than waiting up to `tick_s` for the next scheduled pass.
+        the loop rather than waiting up to `tick_s` for the next scheduled pass. **Manual
+        unpause always clears `paused_until`** (2026-08-21) -- a stale deadline that later
+        re-paused the queue on its own, sometime after a manual unpause already resumed it,
+        would be baffling; there is nothing left for a leftover deadline to mean once admission
+        has already resumed for any reason.
         """
-        await save_queue_pause_state(self.db, QueuePauseState(paused=False))
+        await self._clear_pause(kind="queue_unpaused", message="transfer queue unpaused")
+
+    async def _clear_pause(self, *, kind: str, message: str) -> None:
+        """Shared by manual `unpause()` and `_expire_pause_if_due`'s automatic resume below --
+        both are "clear the paused state entirely," differing only in the audit event they
+        record.
+        """
+        await save_queue_pause_state(self.db, QueuePauseState(paused=False, paused_until=None))
         self._paused = False
-        await audit.record_event(
-            self.db, level="info", kind="queue_unpaused", message="transfer queue unpaused"
-        )
+        self._paused_until = None
+        await audit.record_event(self.db, level="info", kind=kind, message=message)
         self.request_tick()
+
+    async def _expire_pause_if_due(self) -> None:
+        """Called at the top of every `tick()` (~1s cadence, DESIGN.md §4.4) -- **this is where
+        a timed pause's deadline is enforced**, decided over `core/engine.py`'s scan loop
+        because that loop can legitimately sleep indefinitely (every queue on-demand-only, or no
+        enabled queues at all -- `Engine._next_wake_delay` returns `None` in that case) while
+        this one never does: `TransferQueue._loop` always wakes at least every `tick_s`
+        regardless of what is or isn't due, which is exactly the "fires without a page open, on
+        the backend's own clock" guarantee this needs (this task,
+        `prompts/2026-08-21-pause-for-duration.md`).
+
+        A no-op unless paused with a deadline that has passed -- `paused_until` is a wall-clock
+        ISO-8601 UTC string, directly comparable against `_now_iso()`'s own output via plain `<=`
+        (§`QueuePauseState`'s docstring has why that's safe). Expiry is a state change worth its
+        own audit event, distinct from a manual `queue_unpaused` -- so "why did it start again"
+        is answerable from the Events page without guessing whether a human clicked Unpause.
+        """
+        if not self._paused or self._paused_until is None:
+            return
+        if self._paused_until > _now_iso():
+            return
+        await self._clear_pause(
+            kind="queue_pause_expired",
+            message=(
+                f"transfer queue pause expired (was set to resume at {self._paused_until}); "
+                "admission resumed automatically"
+            ),
+        )
 
     async def _pause_running_jobs(self) -> None:
         """ "Pause now"'s per-job half: SIGTERM every in-flight lftp child, concurrently -- the
@@ -1643,6 +1739,9 @@ class TransferQueue:
     # --- one scheduling tick -------------------------------------------------------------
 
     async def tick(self) -> None:
+        # Pause-duration expiry (this task, 2026-08-21) -- checked first so an expired deadline
+        # resumes admission in the same tick that notices it, rather than one tick late.
+        await self._expire_pause_if_due()
         await self._reap_finished()
         await self._sample_and_publish_progress()
         await self._sample_metrics()

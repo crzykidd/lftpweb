@@ -52,6 +52,18 @@ unpause. **Start now** is the one control that's turned off while paused (with t
 tooltip) — oversubscribing past the ceiling to force one item through would defeat the pause you
 just asked for.
 
+**Pausing for a fixed duration.** Next to the Pause control is a dropdown — *until I unpause*
+(the default), or *1 / 10 / 30 / 60 minutes* — that applies to whichever of the two modes above
+you pick next. Once paused with a duration set, the banner and header badge both say **when**:
+"Queue paused — nothing new is being admitted (resumes at 14:32)". When that time arrives, the
+queue unpauses itself automatically, on the server's own clock — no page needs to be open for it
+to happen, and a restart before the deadline keeps the pause (and the deadline) intact, exactly
+as an indefinite pause survives a restart. A restart *after* the deadline already passed comes
+back unpaused rather than resuming a stale pause. Re-picking a duration (or picking *until I
+unpause*) while already paused replaces the deadline outright — it never stacks two pauses on
+top of each other. Manually clicking **Unpause** also clears any deadline that was set, same as
+you'd expect.
+
 ## It says Downloaded but it's still under Active/pending — why? {#pipeline}
 
 Because "the job finished" and "the release is done" are not the same claim, and the

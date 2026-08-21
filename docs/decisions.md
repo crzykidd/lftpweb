@@ -6,6 +6,52 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-21 — Pause-for-a-duration: a stored deadline, expired from `TransferQueue`'s own tick
+
+`prompts/2026-08-21-pause-for-duration.md` (issue #14, duration half), extending queue pause
+(`07e2471`, shipped in `v0.3.0`). User request: a dropdown of 1/10/30/60 minutes next to the
+existing Pause control, combinable with both entry modes, indefinite pause staying the default.
+
+**Stored an absolute ISO-8601 UTC timestamp (`QueuePauseState.paused_until`), not a countdown or
+a running `asyncio` timer.** A timer dies with the process; a persisted deadline makes restart
+correctness fall out for free — paused before the deadline stays paused (deadline intact), an app
+that comes back *after* the deadline resumes unpaused rather than silently re-honoring a stale
+pause, and there is no catch-up logic or timer reconstruction to get wrong. Comparable directly
+against the same `_now_iso()`-format string every other timestamp in `core/queue.py` already
+uses, via plain `<=` — zero-padded ISO-8601 UTC sorts lexically the same as chronologically, the
+same trick `core/auth.py`'s session `expires_at` already relies on. Tests write a known past
+timestamp directly into the persisted state (mirroring `tests/test_auth.py`'s own session-expiry
+tests) rather than monkeypatching the wall clock or sleeping — "prefer an injected clock" from
+the task brief, satisfied by treating the stored string itself as the injection point.
+
+**Expiry is enforced from `TransferQueue.tick()` (`_expire_pause_if_due`), not `core/engine.py`'s
+scan loop**, even though the engine loop was the obvious first guess ("the engine tick... already
+runs continuously"). It doesn't, unconditionally: `Engine._loop`'s own `_next_wake_delay` can
+return `None` — sleep with no wake scheduled at all — when every queue is on-demand-only or
+disabled, which is a real, supported configuration in this codebase (`docs/decisions.md`'s own
+per-queue scan-interval entries). `TransferQueue._loop` has no such escape: it calls `tick()` and
+then waits at most `self.tick_s` (~1s) before doing it again, forever, for as long as the process
+runs. That is the only "fires without a page open, on the backend's own clock, no matter what" of
+the two, so the expiry check lives there instead — checked first in `tick()`'s own body, before
+reap/progress/admit, so an expired deadline resumes admission in the same tick it's noticed.
+
+**Also checked synchronously inside `TransferQueue.start()`, not only on the loop's first
+`tick()`.** `asyncio.create_task` schedules the loop but doesn't run it before `start()` returns,
+and `/api/health` can be read the instant the process comes up — "the app was down past the
+deadline comes back unpaused" needs to be true immediately, not eventually-after-the-first-tick.
+Both call sites share one private method (`_expire_pause_if_due`) rather than duplicating the
+comparison.
+
+**Re-pausing always replaces `paused_until` outright.** `pause()` recomputes the deadline (or
+`None`) from scratch on every call and always overwrites the persisted/cached value — there was
+no separate "extend" or "stack" code path to reject, because the method never had one to begin
+with; the replace behavior the task asked for was already what a naive implementation would do,
+so no special-casing was needed. Manual `unpause()` and automatic expiry share a
+`_clear_pause` helper that always sets `paused_until` back to `None`, so a stale deadline can
+never survive past whichever path resumed admission.
+
+---
+
 ## 2026-08-21 — Preflight retirement moves to request time: local state needs no *arr dependency
 
 `prompts/2026-08-21-preflight-eviction-latency.md`, from the user's browser review ("it does take

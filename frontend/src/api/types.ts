@@ -13,6 +13,9 @@ export interface HealthResponse {
   // 2026-08-20 (prompts/2026-08-20-queue-pause.md): whether admission is paused -- the header
   // bar and the Transfers -> Queue tab's own banner both read this.
   queue_paused: boolean
+  // 2026-08-21 (prompts/2026-08-21-pause-for-duration.md): the absolute ISO-8601 UTC deadline
+  // a timed pause resumes at, or `null` for an indefinite pause (or no pause at all).
+  queue_paused_until: string | null
   // 2026-08-16 (docs/decisions.md): baked at image build time, `null` for every build that
   // never baked them (local dev, compose dev stack, a manual `docker build` with no
   // `--build-arg`) -- see `lib/versionBadge.ts` for how the nav's version readout uses them.

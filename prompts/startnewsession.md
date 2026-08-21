@@ -137,7 +137,7 @@ only in a session transcript.
 proves the pending-row concept against a real feed, and its source-agnostic boundary held through
 six tasks — so a SAB adapter is now an *enrichment of a working box*, not a new foundation.
 
-### On `dev` since the release (2 commits)
+### On `dev` since the release (3 commits)
 
 **Active/pending row sort changed to running → queued → still-processing** (`6822138`, changelog
 `2c97582`). A pipeline-in-flight row is lftpweb *waiting on someone else*; `queued` is its own
@@ -145,6 +145,15 @@ next work. **The tradeoff this accepts is written down in three places** (the `s
 docstring, its test, and #19): on a deep backlog at 20 rows a page a processing row can now land
 below the fold, which is exactly what the original placement avoided. Flipping it back is one
 line if that proves wrong.
+
+**Queue pause gained a duration dropdown** (issue #14, `prompts/done/2026-08-21-pause-for-
+duration.md`) — 1/10/30/60 minutes alongside the existing "until I unpause" default, combinable
+with both entry modes. A stored absolute deadline (`QueuePauseState.paused_until`), never a
+timer, so restart correctness falls out for free; expired from `TransferQueue.tick()` (not the
+engine's scan loop, which can sleep indefinitely when every queue is on-demand-only) and also
+checked synchronously in `start()` so "came back after the deadline" resumes unpaused the instant
+the process is up, not only after the first tick. 1602 backend / 615 frontend tests, 0 skipped.
+Browser-unverified.
 
 ### 🚦 2026-08-20/21 — queue **Pause**, the **Preflight** box, and the docs catch-up (all in v0.3.0)
 

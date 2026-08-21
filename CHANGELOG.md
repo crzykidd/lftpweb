@@ -25,6 +25,16 @@ Skeleton for the next roll:
 
 ### Added
 
+- **Pause the transfer queue for a fixed duration** — a dropdown (1 / 10 / 30 / 60 minutes,
+  alongside the existing default "until I unpause") next to the Queue tab's Pause control,
+  combinable with both entry modes (*pause after current* / *pause now*). The deadline is a
+  stored absolute timestamp, not a running timer, so it survives a restart correctly: paused
+  before the deadline stays paused, but an app that comes back *after* the deadline resumes
+  unpaused rather than quietly re-honoring a stale pause. Expiry is enforced on the transfer
+  queue's own ~1s tick, so the queue resumes itself on schedule with no page open, and records
+  its own audit event distinct from a manual unpause. The paused banner and header badge both
+  show the deadline ("resumes at HH:MM") whenever one is set.
+
 ### Changed
 
 - **Active/pending now sorts running → queued → still-processing**, rather than placing

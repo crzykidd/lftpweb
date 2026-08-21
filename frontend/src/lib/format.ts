@@ -584,6 +584,21 @@ export function removalGraceShortLabel(
 
 const GRACE_TIME_FORMAT: Intl.DateTimeFormatOptions = { hour: '2-digit', minute: '2-digit' }
 
+/** "resumes at 17:35" for a timed queue pause's deadline (2026-08-21,
+ * prompts/2026-08-21-pause-for-duration.md, `HealthResponse.queue_paused_until`) -- `null` for
+ * an indefinite pause, in which case this returns `null` too so callers can omit the clause
+ * entirely rather than print a meaningless "resumes at" for "until I unpause". An absolute
+ * local time, not a live countdown -- the Queue tab/header badge already re-render every health
+ * poll (5s), so this stays accurate without a client-side ticking interval (the "expensive
+ * mistake" `formatRelativeTimeIntl`'s own docstring names).
+ */
+export function pauseResumeLabel(pausedUntil: string | null): string | null {
+  if (pausedUntil == null) return null
+  const resumeDate = new Date(pausedUntil)
+  if (!Number.isFinite(resumeDate.getTime())) return null
+  return `resumes at ${resumeDate.toLocaleTimeString([], GRACE_TIME_FORMAT)}`
+}
+
 /** The full sentence, for the chip's `title` (hover) and the item drawer -- e.g. "Local copy
  * gone since 17:35. Treated as removed in 1m unless it comes back." Degrades the second
  * clause to "soon" (never a stuck/negative number) under exactly the conditions
