@@ -25,6 +25,18 @@ Skeleton for the next roll:
 
 ### Added
 
+- **The Preflight box gains a second source (settle-gated releases) and a mount-gate banner**
+  (`docs/transfers-redesign-spec.md` §4, `prompts/2026-08-20-preflight-waiting-sources.md`): an
+  item that would be auto-queued right now if only its remote fingerprint had settled shows up
+  as a row with its known remote size (`remote — 22 GB`), alongside the existing *arr-sourced
+  rows — the settle gate held these releases back invisibly before, with no signal anywhere on
+  the Queue tab. When a settle row and an *arr row would describe the same release, the settle
+  row wins (it's confirmed bytes on the seedbox, not just a queue entry). A queue whose local
+  root fails the mount sentinel now also gets one banner line on the box naming the queue and
+  why — its entire auto-queue pass is skipped at once, so a row per affected item would bury the
+  one fact that matters. A suppressed item or a pattern-unmatched `REMOTE_ONLY` item still never
+  appears in Preflight from either source — nothing is coming for either, so showing them would
+  turn the box into a second Files tree.
 - **A name filter on the Transfers page**: start typing and only rows whose name contains that
   text stay visible (case-insensitive, matches a dotted release name literally). A **"Dismiss
   list"** button beside it bulk-dismisses exactly the finished rows the filter currently matches,

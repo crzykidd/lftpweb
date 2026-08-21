@@ -2197,28 +2197,49 @@ Some.Release.S03E04.2160p    [downloading]   18 files   62%   4.1 MB/s   ETA 12m
   no children by construction (`is_dir = false` at the top level) and does not offer this group at
   all — its own progress is already the row's one collapsed-line figure.
 - **A "Preflight" box, at the very top of the tab, above Active/pending** (2026-08-20,
-  `docs/transfers-redesign-spec.md` §4, prefigured) — things a configured source already knows
+  `docs/transfers-redesign-spec.md` §4, prefigured; widened the same day by
+  `prompts/2026-08-20-preflight-waiting-sources.md`) — things a configured source already knows
   about but lftpweb has no `item` and no work to do on yet, first in the pipeline. **A pure
-  projection of the *arr poller's own latest poll** (`core/preflight.py`/`core/arrsync.py`) —
-  no table, no migration, nothing persisted: a release that drops out of the *arr's queue simply
-  stops being projected next pass. Attribution is `arr_visible_path` prefix-matching a record's
-  `outputPath` against each bound queue; no match (or an ambiguous no-`outputPath` record against
-  more than one bound queue) is silently omitted rather than guessed, since promising a release
-  that never arrives is worse than showing nothing. A brief flap-tolerance hold (150s) — the same
-  discipline the amber `dropped` state applies to a real item, for the identical SABnzbd-blank-
-  queue-blip reason — keeps one missed poll from blinking a row out and back; a record that
-  matches a real lftpweb item is never projected at all, so a release is never visible twice at
-  once. **Five rows by default, expandable and paged** (reusing the same `Pager`/`pageReadout` the
-  two boxes below already use, no separate page-size selector — a 5-row box has no "I want to see
-  more at once" use case a growing job history has) — **zero rows reads as a single "Nothing in
-  preflight." line, never reserved empty space**, and the box disappears entirely when no source
-  is configured at all, rather than showing that line forever for a user with nothing to project.
-  **Rows are inert by construction** — no queue position, no chevrons, no Dismiss/Start now/Stop —
-  there is no `item` and no `job` behind one yet, and the separate box (rather than a flag on the
-  existing row type) is what makes that structural. **The row/box shape is deliberately
-  source-agnostic**: `source`/`source_label`/`source_kind` name which upstream a row came from
-  rather than assuming it's always the *arr, since a second source (non-*arr items held by the
-  settle gate, `core/settle.py`) is an already-planned immediate follow-up.
+  projection, from two sources**: the *arr poller's own latest poll (`core/arrsync.py`, a release
+  the *arr already knows about that hasn't reached this seedbox's completed folder yet) and the
+  settle gate's own eligibility check (`core/autoqueue.py.AutoQueue`, an item that would be
+  auto-queued this very pass if only its remote fingerprint had held still — it shows the item's
+  own known remote size, `remote — 22 GB`). No table, no migration, nothing persisted for either:
+  a release that drops out of the *arr's queue, or an item that settles or gets suppressed, simply
+  stops being projected next pass. Attribution is *arr-specific (`arr_visible_path` prefix-
+  matching a record's `outputPath` against each bound queue; no match, or an ambiguous no-
+  `outputPath` record against more than one bound queue, is silently omitted rather than guessed)
+  for the first source, and reuses the settle gate's own eligibility query verbatim for the
+  second — a suppressed item or a pattern-unmatched `REMOTE_ONLY` item never earns a row from
+  either source, on purpose: neither is waiting, nothing is coming for them, and showing them
+  would turn Preflight into a second Files tree. **When both sources describe the same release,
+  the settle row wins** — it means the bytes are actually on the seedbox, known and sized,
+  strictly more information than an *arr queue record; in practice the *arr source already
+  excludes any release that is already an `item` row (which a settle-gated item always is), so
+  this is defense in depth against a title mismatch, not the primary mechanism. The *arr source
+  carries a brief flap-tolerance hold (150s) — the same discipline the amber `dropped` state
+  applies to a real item, for the identical SABnzbd-blank-queue-blip reason — since its own report
+  can go briefly missing for reasons unrelated to the underlying fact changing; the settle source
+  needs no such hold, since it's recomputed fresh from this same process's own persisted state
+  every successful scan pass, with no external flakiness to smooth over. A record/item that
+  matches a real lftpweb item, or gets an active job, is never projected at all, so a release is
+  never visible twice at once. **A mount-gated queue is a banner on the box, not rows** — one line
+  naming the queue and `core/autoqueue.py.AutoQueue.gated`'s own reason, since the entire queue's
+  auto-queue pass is blocked at once and fifty identical rows would bury the single fact that
+  matters; the banner and the row list are independent, so a mount-gated queue shows its banner
+  even when neither row source is otherwise configured. **Five rows by default, expandable and
+  paged** (reusing the same `Pager`/`pageReadout` the two boxes below already use, no separate
+  page-size selector — a 5-row box has no "I want to see more at once" use case a growing job
+  history has) — **zero rows reads as a single "Nothing in preflight." line, never reserved empty
+  space**, and the row list disappears entirely when no row source is configured at all (the
+  banner can still show on its own), rather than showing that line forever for a user with nothing
+  to project. **Rows are inert by construction** — no queue position, no chevrons, no Dismiss/
+  Start now/Stop — there is no `item` and no `job` behind one yet, and the separate box (rather
+  than a flag on the existing row type) is what makes that structural. **The row/box shape is
+  deliberately source-agnostic**: `source`/`source_label`/`source_kind` name which upstream a row
+  came from rather than assuming it's always the *arr, and `core/preflight.py` itself may never
+  name either source by construction — the merge/precedence logic above lives one layer up, in
+  `api/jobs.py`, the one place allowed to know both exist.
 
 **Item drawer.** A **side drawer** — not a modal, because file lists get long and the queue
 should stay visible — listing the files inside that item: name, size, transferred, per-file

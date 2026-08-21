@@ -1,12 +1,13 @@
 // Pure helpers for the Queue tab's Preflight box (docs/transfers-redesign-spec.md §4,
-// prefigured; this task's own handoff prompt, prompts/done/2026-08-20-preflight-box.md) --
-// "something lftpweb already knows about but has no work to do on yet." Kept source-agnostic,
-// matching `PreflightRowOut` itself (`api/types.ts`): the *arr poller is the only source wired
-// up so far, but a second is already planned as an immediate follow-up (non-*arr items held by
-// the settle gate, which will read something like "remote — 22 GB") -- nothing here assumes a
-// row always came from the *arr. This project's whole component-testing story is `lib/*.test.ts`
-// (README.md's Known gaps: no component rendering is tested), so the box's own display logic
-// lives here, unit-tested, rather than inlined in `components/PreflightBox.tsx`.
+// prefigured; this task's own handoff prompt, prompts/done/2026-08-20-preflight-box.md, plus its
+// follow-up prompts/2026-08-20-preflight-waiting-sources.md) -- "something lftpweb already knows
+// about but has no work to do on yet." Kept source-agnostic, matching `PreflightRowOut` itself
+// (`api/types.ts`): the *arr poller and the settle gate's own eligibility check are the two
+// sources wired up (a settle row reads "remote — 22 GB", per `preflightSizeLabel` below) --
+// nothing here assumes a row always came from the *arr. This project's whole component-testing
+// story is `lib/*.test.ts` (README.md's Known gaps: no component rendering is tested), so the
+// box's own display logic lives here, unit-tested, rather than inlined in
+// `components/PreflightBox.tsx`.
 
 import type { PreflightRowOut } from '../api/types'
 import { formatBytes } from './format'

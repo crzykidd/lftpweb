@@ -2,27 +2,29 @@
 this task's own handoff prompt, prompts/done/2026-08-20-preflight-box.md) -- "something lftpweb
 already knows about but has no work to do on yet," independent of *which* upstream told it so.
 
-**The *arr poller (`core/arrsync.py`) is the only source wired up so far.** A second is already
-planned as an immediate follow-up: non-*arr items sitting in the settle gate
-(`core/settle.py` -- a release still being uploaded to the seedbox, held until its remote
-fingerprint holds still across two scans plus 60s). Those rows differ in an important way: they
-*do* have a remote presence and a known remote size (they'll read something like "remote — 22
-GB"), whereas an *arr queue record has no remote presence at all yet. **Nothing in this module
-may name *arr, or any other single source, by construction** -- `PreflightRow.source` is the one
-place a caller learns which source a row came from, and `source_label`/`source_kind`/
-`status_label` are free-form, source-owned display text this module never interprets. Keeping
-that boundary here (rather than baking *arr's own vocabulary into the shared row/cache shape) is
-what lets the settle-gate follow-up add itself without reshaping anything this task ships.
+**Two sources are wired up: the *arr poller (`core/arrsync.py`), and the settle gate's own
+eligibility check (`core/autoqueue.py.AutoQueue`, added by
+prompts/2026-08-20-preflight-waiting-sources.md).** A settle-gated row differs from an *arr row
+in an important way: it *does* have a remote presence and a known remote size (it reads
+"remote — 22 GB"), whereas an *arr queue record has no remote presence at all yet. **Nothing in
+this module may name *arr, the settle gate, or any other single source, by construction** --
+`PreflightRow.source` is the one place a caller learns which source a row came from, and
+`source_label`/`source_kind`/`status_label` are free-form, source-owned display text this module
+never interprets. Keeping that boundary here (rather than baking either source's own vocabulary
+into the shared row/cache shape) is what let the settle-gate source add itself without reshaping
+anything the first task shipped -- see `docs/decisions.md` for how that held up in practice.
 
-`PreflightHold` is the flap-tolerance cache every source uses (only `core/arrsync.py` does, so
-far) -- a row missing from a source's latest refresh for up to `PREFLIGHT_HOLD_S` keeps showing
-rather than blinking out and back in. *Why* a row briefly stops being reported differs per
-source -- a download client's own queue blanking out for a beat (the *arr's own SABnzbd
-production incident, `core/arrsync.py`'s module docstring, 2026-08-18) for one source, a release
-simply starting to transfer (and so leaving the settle gate) for another -- but the box's own
-tolerance for a brief reporting gap is the same idea either way, so it lives here once rather
-than being re-derived per source. A row not refreshed within the hold window is deleted from the
-cache outright, never merely marked stale -- there is no persisted state and no further
+`PreflightHold` is the flap-tolerance cache a source uses when its own report can go briefly
+missing for reasons unrelated to the underlying fact changing -- `core/arrsync.py` is the one
+user of it: a row missing from a poll for up to `PREFLIGHT_HOLD_S` keeps showing rather than
+blinking out and back in, because a download client's own queue can blank out for a beat (the
+*arr's own SABnzbd production incident, `core/arrsync.py`'s module docstring, 2026-08-18). **Not
+every source needs this.** `core/autoqueue.py`'s settle-gated rows are computed fresh from this
+same process's own persisted state on every successful scan pass, with no external flakiness to
+smooth over, so that source replaces its rows wholesale each pass instead of holding them here --
+see that module's own "Preflight" section for why a full replace is strictly more correct for a
+source with no flap risk to guard against. A row not refreshed within the hold window is deleted
+from the cache outright, never merely marked stale -- there is no persisted state and no further
 escalation, so this can never itself become a second accumulation risk on top of whatever a given
 source already guards against on its own.
 """
@@ -32,8 +34,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
-# Widened, not replaced, when a second source lands -- see this module's own docstring.
-PreflightSource = Literal["arr"]
+# Widened, not replaced, when a new source lands -- see this module's own docstring.
+PreflightSource = Literal["arr", "settle"]
 
 
 @dataclass(frozen=True)

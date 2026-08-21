@@ -399,29 +399,53 @@ Hover the mark for which instance matched it and when.
 ## Why is this in Preflight and not downloading? {#preflight}
 
 The Transfers → Queue tab's small **Preflight** box, at the very top, is for one thing: something
-a configured source already knows about, that hasn't landed in the seedbox's completed folder
-yet — so lftpweb genuinely has no work to do on it. Today the only source is a bound, enabled
-*arr instance: if Sonarr or Radarr already shows a release grabbed and downloading, but nothing
-has appeared in the seedbox folder lftpweb watches, it shows up here instead of on the real
-Transfers list. A row here is not stuck, not an error, and needs no action — it just hasn't
-arrived yet.
+lftpweb already knows about that it genuinely has no work to do on yet. There are two different
+reasons an item can land here, and the box shows both:
 
-A few things about it worth knowing:
+**It's on a bound *arr instance's own download queue, but hasn't reached the seedbox yet.** If
+Sonarr or Radarr already shows a release grabbed and downloading, but nothing has appeared in the
+seedbox folder lftpweb watches, it shows up here instead of on the real Transfers list. A row
+here is not stuck, not an error, and needs no action — it just hasn't arrived yet.
+
+**It's already on the seedbox, but still being confirmed stable (the "settle gate").** A seedbox
+can still be writing a multi-file release one file at a time when lftpweb's scan first sees it —
+if it started downloading right then, it could grab an incomplete copy. The settle gate holds a
+matched release back until its remote fingerprint (file count, total bytes, newest file's
+timestamp) has held still for two consecutive scans, at least 60 seconds apart. While it's held,
+you'll see it here with its known **remote size** (`remote — 22 GB`) rather than a percentage —
+the whole release is already present on the seedbox, lftpweb just hasn't finished confirming
+nothing is still landing. This row only ever appears for something that would otherwise be
+auto-queued right now (it matches a pattern, the queue has auto-queue on, nothing else is holding
+it back) — a suppressed item, or a `REMOTE_ONLY` item nothing has asked for, never shows up here
+even while it's technically unsettled, since nothing is actually waiting to fetch it.
+
+A few things about both kinds of row worth knowing:
 
 - **It only ever shows what's still on its way.** The moment lftpweb actually sees the release
-  (it lands in the watched folder and becomes a real item), the Preflight row disappears and the
-  real item takes its place — never both at once.
+  (it lands in the watched folder and becomes a real item), or the settle gate releases a matched
+  item and it gets a real transfer, the Preflight row disappears and the real item/transfer takes
+  its place — never both at once. If an *arr row and a settle row both describe the same release
+  (only possible if the two don't quite agree on its name), the settle row wins — it's actual
+  bytes on the seedbox, not just a queue entry.
 - **A release that isn't coming to this queue at all never appears.** An *arr instance's download
   queue can include other categories, or other download clients, that have nothing to do with
   this install. Preflight only shows a release once it can tell which of your queues it belongs
   to (matching the *arr's own reported folder against each queue's configured path); anything it
   can't confidently place is left off rather than guessed at.
-- **A row can flicker briefly out of sight and come straight back — that's expected**, the same
-  as the amber pending-dot case above: download clients occasionally report an empty queue for a
-  beat, and Preflight tolerates one missed check before it would ever drop a row for real.
+- **An *arr row can flicker briefly out of sight and come straight back — that's expected**, the
+  same as the amber pending-dot case above: download clients occasionally report an empty queue
+  for a beat, and Preflight tolerates one missed check before it would ever drop a row for real.
+  The settle-gated kind doesn't need this tolerance — it's recomputed fresh from lftpweb's own
+  database on every scan, so there's nothing external to flicker.
+- **A mount-gated queue shows a banner instead, not a wall of rows.** If a queue's local root is
+  missing, unreadable, or hasn't completed a scan yet, its *entire* auto-queue pass is skipped —
+  every eligible item in it, not one at a time — so Preflight shows one line naming the queue and
+  why, rather than a row per affected release. This banner can appear even when the row list below
+  it is empty or the box would otherwise have nothing configured to show.
 - **Five rows show by default**; "Show all" expands the box and pages through the rest the same
-  way the two boxes below it do. With nothing pending, the box just says "Nothing in preflight."
-  — and if no source is configured at all, the box doesn't show up on the page at all.
+  way the two boxes below it do. With nothing pending, the row list just says "Nothing in
+  preflight." — and if no source is configured at all, the row list doesn't show up (the
+  mount-gate banner, if any, still does).
 - **Rows here have no controls** — no Stop, no Dismiss, no reordering. There's nothing to act on
   yet; once the real transfer exists, it gets the full set of controls on the list below.
 

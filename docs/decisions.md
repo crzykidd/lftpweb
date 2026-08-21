@@ -6,6 +6,67 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-20 — Preflight's second source (settle-gated releases): the boundary held without
+reshaping; the mount-gate signal is a banner, never rows; settle wins over *arr on a tie
+
+`prompts/2026-08-20-preflight-waiting-sources.md`, the immediate follow-up the previous task's own
+`docs/decisions.md` entry (below) named before it was built. Browser-unverified (no page render).
+
+**The source-agnostic boundary `core/preflight.py` was built against held, unchanged.** Adding
+the settle gate as a second source needed nothing more than: build `PreflightRow(source="settle",
+...)`, own the matching/attribution logic (which item earns a row, and why) in the module that
+already computes it, feed a per-queue cache, and OR a second "is this source configured" query
+into the endpoint with its rows merged in. `PreflightRow`, `PreflightSource` (widened from
+`Literal["arr"]` to `Literal["arr", "settle"]`, per its own "widen, don't replace" comment), and
+`PreflightHold` needed zero shape changes — confirmation the first task's boundary was drawn in
+the right place, not merely a lucky guess.
+
+**The settle source lives in `core/autoqueue.py`, not a new module.** The natural home is wherever
+"would this item be auto-queued right now" is already decided — `AutoQueue.on_scan`'s own
+eligibility query (pattern match, no active job, unsuppressed, not *arr-owned, not an in-progress
+unpack) already computes every fact a settle-preflight row needs; a separate module would have had
+to re-derive or duplicate that same query. `on_scan` now builds a `PreflightRow` at the exact point
+it would otherwise `continue` past a still-settling item, so "reached the settle check at all"
+already proves every other exclusion (suppressed, pattern-unmatched, active job) has already been
+satisfied — the two OUT exclusions the task named hold *by construction*, not by an extra check.
+
+**The settle source deliberately does not use `PreflightHold`'s flap tolerance.** That cache exists
+to smooth a *source's own report* going briefly missing for reasons unrelated to the underlying
+fact (the *arr's SABnzbd blank-queue blip) — arr's own eligibility recomputation, needed anyway.
+The settle source's "is this item still gated" question is answered fresh from this same process's
+own persisted state (`item_settle`, `auto_queue_suppressed`, `job`) on every successful scan pass;
+there's no external flakiness to tolerate, and a flap-tolerant hold would only introduce a stale-
+row risk a plain full-replace doesn't have. `AutoQueue._settle_preflight` is a plain
+`dict[queue_id, dict[item_id, PreflightRow]]`, wholesale-replaced per queue on every `on_scan` call
+that reaches the eligibility loop, and explicitly popped (not left to expire) the instant that
+queue's own pass returns early for either existing early-exit reason (auto-queue off, mount-gated)
+— stronger than the "no duplicate at handover" guarantee the *arr source settled for, at no extra
+complexity.
+
+**Mount-gated queues are a banner (`PreflightResponse.gated_queues`), never rows — decided with the
+user, non-negotiable.** `AutoQueue.gated` blocks a queue's *entire* auto-queue pass at once; a row
+per affected item would bury the one fact that matters behind however many identical entries a
+busy queue happens to have sitting eligible. The banner is orthogonal to `source_configured` (a
+mount-gated queue shows its banner whether or not either row source happens to be configured) and
+reuses `AutoQueue.gated`'s own reason string verbatim — never recomposed — so it can never drift
+from the existing `GET /api/settings/queues/{id}/autoqueue-status` readout describing the same
+gating episode.
+
+**Cross-source precedence: a settle row wins over an *arr row for the same release.** Decided with
+the user, per the task's own steer ("the settle-gated one has strictly more information — it is
+actually on the seedbox"). Implemented once, in a pure `_merge_preflight_rows` helper in
+`api/jobs.py` (the one place allowed to know both sources exist, per `core/preflight.py`'s own
+docstring) — identity is `(queue_id, title)`, and a settle row's presence for that pair drops the
+matching *arr row before the merged set is sorted. In practice this rarely fires: `core/arrsync.py.
+_preflight_candidates` already excludes any release that matches an existing `item` row regardless
+of state, and a settle-gated item always *is* one — so the precedence rule is defense against a
+genuine title/attribution mismatch between the two sources, not the primary de-duplication
+mechanism. **Row ordering across the merged set is alphabetical by title, case-insensitive** — the
+same boring default each source already applies within itself, re-applied globally rather than
+grouping by source in an arbitrary, equally-defensible-either-way order.
+
+---
+
 ## 2026-08-20 — Preflight: a pure in-memory projection (no table), source-agnostic row shape,
 `arr_visible_path` attribution, a flap-tolerance hold that can never accumulate
 

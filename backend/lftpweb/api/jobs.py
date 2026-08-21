@@ -14,10 +14,11 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
 
-from lftpweb.core import audit, local_delete
+from lftpweb.core import audit, local_delete, settle
 from lftpweb.core.itemview import ITEM_VIEW_COLUMNS_QUALIFIED, item_view
 from lftpweb.core.lftp import build_transfer_command, effective_tuning_settings
 from lftpweb.core.postprocess import perform_remote_delete
+from lftpweb.core.preflight import PreflightRow
 from lftpweb.core.queue import (
     JobNotDismissableError,
     JobNotQueuedError,
@@ -45,6 +46,7 @@ from lftpweb.models import (
     JobOut,
     JobsResponse,
     MoveJobRequest,
+    PreflightGatedQueueOut,
     PreflightResponse,
     PreflightRowOut,
     QueueItemRequest,
@@ -567,27 +569,62 @@ async def unpause_queue(request: Request) -> None:
     await request.app.state.queue.unpause()
 
 
+def _merge_preflight_rows(
+    arr_rows: list[PreflightRow], settle_rows: list[PreflightRow]
+) -> list[PreflightRow]:
+    """Cross-source composition for `get_preflight` below -- the one place allowed to know both
+    sources exist (`core/preflight.py`'s own docstring: nothing in that module may name either
+    one). Two decisions, both made with the user (`docs/decisions.md`):
+
+    **A settle row wins over an *arr row for the same release.** A settle-gated row means the
+    bytes are actually on the seedbox, sized and fingerprinted; an *arr row only means the *arr's
+    own queue mentions a download that hasn't reached here yet -- strictly less information about
+    the identical release. In practice `core/arrsync.py._preflight_candidates` already excludes
+    any record matching an existing `item` row regardless of state, and a settle-gated item
+    always *is* one, so this only ever fires on a genuine title/attribution mismatch between the
+    two sources -- cheap insurance against showing the same release twice, not the primary
+    mechanism. Identity is `(queue_id, title)`, the same pair both sources already expose.
+
+    **Ordering is alphabetical by title, case-insensitively, across the merged set** -- the same
+    boring-default rule `ArrSyncScheduler.preflight_rows`/`AutoQueue.preflight_rows` each already
+    apply within their own source, re-applied here so it stays true globally rather than grouping
+    by source in an arbitrary order (arr-then-settle or the reverse would just move the same
+    arbitrariness up a level).
+    """
+    settle_identities = {(r.queue_id, r.title) for r in settle_rows}
+    filtered_arr = [r for r in arr_rows if (r.queue_id, r.title) not in settle_identities]
+    merged = [*filtered_arr, *settle_rows]
+    merged.sort(key=lambda r: r.title.casefold())
+    return merged
+
+
 @router.get("/api/queue/preflight", response_model=PreflightResponse)
 async def get_preflight(request: Request) -> PreflightResponse:
     """The Queue tab's Preflight box (docs/transfers-redesign-spec.md §4, prefigured; this
-    task's own handoff prompt, prompts/done/2026-08-20-preflight-box.md) -- things lftpweb
-    already knows about but has no work to do on yet. **A pure projection**, source-agnostic at
-    this layer (`core/preflight.py.PreflightRow`) -- no table, no migration, nothing persisted.
+    task's own handoff prompt, prompts/done/2026-08-20-preflight-box.md, plus its follow-up
+    prompts/2026-08-20-preflight-waiting-sources.md) -- things lftpweb already knows about but
+    has no work to do on yet. **A pure projection**, source-agnostic at this layer
+    (`core/preflight.py.PreflightRow`) -- no table, no migration, nothing persisted.
 
-    **Only one source is wired up so far: the *arr poller** (`core/arrsync.py.
-    ArrSyncScheduler.preflight_rows`, fed by `_update_preflight`'s attribution rule and
-    flap-tolerance hold). The live query below (does an enabled *arr instance with an enabled
-    bound queue exist) is therefore *arr-specific by necessity today; a second source (non-*arr
-    items held by the settle gate, `core/settle.py`, an already-planned immediate follow-up)
-    would add its own "is this source active" check here and OR it into `source_configured`/
-    merge its own rows into `rows`, rather than this endpoint's shape changing.
+    **Two sources are wired up: the *arr poller** (`core/arrsync.py.ArrSyncScheduler.
+    preflight_rows`, fed by `_update_preflight`'s attribution rule and flap-tolerance hold) **and
+    the settle gate's own eligibility check** (`core/autoqueue.py.AutoQueue.preflight_rows`, fed
+    by `on_scan`'s wholesale-replace cache). Each is gated by its own live "is this source
+    configured at all" query below -- an enabled *arr instance with an enabled bound queue for
+    the first, the settle gate on plus at least one auto-queue-enabled queue for the second --
+    ORed together into `source_configured` rather than either query changing the other's shape.
+    `_merge_preflight_rows` above is where the two sources' rows meet: cross-source precedence
+    and the final ordering, so neither `core/arrsync.py` nor `core/autoqueue.py` has to know the
+    other exists.
 
-    `source_configured` is a fresh, live query -- not read off the scheduler's cache -- so an
-    instance disabled (or every one of its bound queues disabled) a moment ago hides immediately
-    rather than waiting for the cache to catch up: `preflight_rows` is filtered to exactly this
-    same set for the identical reason. `source_configured=False` means "no source is configured
-    at all" -- the frontend hides the whole box for that case rather than showing an empty
-    "Nothing in preflight" that would be meaningless for a user with nothing configured.
+    Every live query below is fresh, not read off either source's own cache, so a change (an
+    instance disabled, a queue's auto-queue toggled off, the settle setting flipped) hides
+    immediately rather than waiting for a cache to catch up -- `preflight_rows` on both sources
+    is filtered to exactly these same live sets for the identical reason. `source_configured =
+    False` means "no row source is configured at all" -- the frontend hides the row list for
+    that case rather than showing an empty "Nothing in preflight" that would be meaningless for a
+    user with nothing configured (`gated_queues` is independent of this and can still be
+    non-empty -- see `PreflightResponse`'s own docstring).
     """
     db = request.app.state.db
     cursor = await db.execute(
@@ -598,13 +635,52 @@ async def get_preflight(request: Request) -> PreflightResponse:
     enabled_instance_ids = {row["id"] for row in await cursor.fetchall()}
 
     arr_sync = getattr(request.app.state, "arr_sync", None)
-    rows = (
+    arr_rows = (
         arr_sync.preflight_rows(enabled_instance_ids)
         if arr_sync is not None and enabled_instance_ids
         else []
     )
+
+    # The settle-gated source (this task) -- `core/autoqueue.py.AutoQueue` owns the eligibility
+    # query the settle gate itself sits inside, so it also owns this projection; see that
+    # module's own "Preflight" section. `queue_names` doubles as the live "is this queue
+    # currently auto-queue-eligible at all" set both for filtering settle rows and for naming
+    # the mount-gate banner below -- one query answers both questions.
+    engine = getattr(request.app.state, "engine", None)
+    autoqueue = getattr(engine, "autoqueue", None) if engine is not None else None
+
+    settle_settings = await settle.load_settle_settings(db)
+    cursor = await db.execute(
+        "SELECT id, name FROM path_queue WHERE enabled = 1 AND auto_queue_enabled = 1"
+    )
+    auto_queue_rows = await cursor.fetchall()
+    queue_names = {row["id"]: row["name"] for row in auto_queue_rows}
+
+    gated_ids = set(autoqueue.gated) if autoqueue is not None else set()
+    active_settle_queue_ids = queue_names.keys() - gated_ids
+    settle_rows = (
+        autoqueue.preflight_rows(active_settle_queue_ids)
+        if autoqueue is not None and settle_settings.enabled
+        else []
+    )
+    settle_configured = settle_settings.enabled and bool(queue_names)
+
+    rows = _merge_preflight_rows(arr_rows, settle_rows)
+
+    # The mount-gate banner (decided with the user: one line per gated queue, never one row per
+    # affected item) -- `AutoQueue.gated`'s own reason string, verbatim, named against a queue
+    # still in `queue_names` so a queue disabled since it was last gated doesn't linger here.
+    gated_queues = sorted(
+        (
+            PreflightGatedQueueOut(queue_name=queue_names[qid], reason=reason)
+            for qid, reason in (autoqueue.gated.items() if autoqueue is not None else ())
+            if qid in queue_names
+        ),
+        key=lambda g: g.queue_name.casefold(),
+    )
+
     return PreflightResponse(
-        source_configured=bool(enabled_instance_ids),
+        source_configured=bool(enabled_instance_ids) or settle_configured,
         rows=[
             PreflightRowOut(
                 source=r.source,
@@ -618,6 +694,7 @@ async def get_preflight(request: Request) -> PreflightResponse:
             )
             for r in rows
         ],
+        gated_queues=gated_queues,
     )
 
 

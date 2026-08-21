@@ -663,13 +663,14 @@ export interface JobsResponse {
 }
 
 /** `GET /api/queue/preflight` (docs/transfers-redesign-spec.md §4, prefigured; this task's own
- * handoff prompt, prompts/done/2026-08-20-preflight-box.md) -- one row for something lftpweb
- * already knows about but has no work to do on yet. **Source-agnostic by construction**: the
- * *arr poller is the only source wired up so far, but a second is already planned as an
- * immediate follow-up (non-*arr items held by the settle gate) -- `source`/`source_label`/
- * `source_kind` are how a row names *which* upstream it came from, never a field of their own
- * assuming it's always the *arr. `lib/preflight.ts`'s own `isArrPreflightRow` (or an equivalent
- * `source === 'arr'` check) is where *arr-specific rendering lives, not here.
+ * handoff prompt, prompts/done/2026-08-20-preflight-box.md, plus its follow-up
+ * prompts/2026-08-20-preflight-waiting-sources.md) -- one row for something lftpweb already
+ * knows about but has no work to do on yet. **Source-agnostic by construction**: the *arr
+ * poller and the settle gate's own eligibility check are the two sources wired up --
+ * `source`/`source_label`/`source_kind` are how a row names *which* upstream it came from, never
+ * a field of their own assuming it's always the *arr. `components/PreflightBox.tsx`'s
+ * `SourceChip` -- gated on `row.source === 'arr'` -- is where *arr-specific rendering lives, not
+ * here.
  *
  * Deliberately thin, matching the backend's own `PreflightRowOut` (`backend/lftpweb/models.py`)
  * field for field -- no `id`, no `queue_position`, no `bytes_done`: there is no `item` and no
@@ -688,14 +689,28 @@ export interface PreflightRowOut {
   size_remaining_bytes: number | null
 }
 
-/** `source_configured=false` (with `rows` always empty in that case) means "no source is
- * configured at all" -- `components/PreflightBox.tsx` hides the whole box for that case rather
+/** One line of the Preflight box's mount-gate banner (2026-08-20,
+ * prompts/2026-08-20-preflight-waiting-sources.md, decided with the user) -- **a banner, not
+ * rows**: `core/autoqueue.py.AutoQueue.gated` blocks a queue's whole auto-queue pass at once, so
+ * this names the queue and the reason once, never one row per affected item. `reason` is
+ * `AutoQueue.gated`'s own string, verbatim.
+ */
+export interface PreflightGatedQueueOut {
+  queue_name: string
+  reason: string
+}
+
+/** `source_configured=false` (with `rows` always empty in that case) means "no row source is
+ * configured at all" -- `components/PreflightBox.tsx` hides the row list for that case rather
  * than showing an empty "Nothing in preflight" that would be meaningless for a user with nothing
- * configured.
+ * configured. `gated_queues` is independent of `source_configured` -- the mount gate can block a
+ * queue whether or not either row source is configured, so the box itself renders whenever
+ * *either* has something to say.
  */
 export interface PreflightResponse {
   source_configured: boolean
   rows: PreflightRowOut[]
+  gated_queues: PreflightGatedQueueOut[]
 }
 
 /** `GET /api/jobs/complete` (2026-08-19, docs/transfers-redesign-spec.md §3.2, phase 1 stage

@@ -53,16 +53,39 @@ function PreflightRowView({ row }: { row: PreflightRowOut }) {
   )
 }
 
+/** The mount-gate banner (2026-08-20, prompts/2026-08-20-preflight-waiting-sources.md, decided
+ * with the user) -- one line per queue `core/autoqueue.py.AutoQueue.gated` is currently blocking
+ * entirely, never one row per affected item (fifty identical rows would bury the single fact
+ * that matters). `reason` is the backend's own string, verbatim -- shown as-is, never
+ * reformatted, matching `preflightStatusLabel`'s own "a source's own wording renders exactly as
+ * written" rule for row status text.
+ */
+function GatedQueueBanner({ gated }: { gated: PreflightResponse['gated_queues'] }) {
+  if (gated.length === 0) return null
+  return (
+    <div className="flex flex-col gap-1 rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-xs text-amber-900 dark:border-amber-800 dark:bg-amber-950 dark:text-amber-200">
+      {gated.map((g) => (
+        <p key={g.queue_name}>
+          <span className="font-semibold">{g.queue_name}:</span> {g.reason}
+        </p>
+      ))}
+    </div>
+  )
+}
+
 /** The Queue tab's third, small box (docs/transfers-redesign-spec.md §4, prefigured; this task's
- * own handoff prompt, prompts/done/2026-08-20-preflight-box.md) -- things a configured source
- * already knows about but lftpweb has no work to do on yet, sitting above Active/pending because
- * it is first in the pipeline. `TransfersPage.tsx` feeds this `usePreflight()`'s return value
- * directly, unchanged.
+ * own handoff prompt, prompts/done/2026-08-20-preflight-box.md, plus its follow-up
+ * prompts/2026-08-20-preflight-waiting-sources.md) -- things a configured source already knows
+ * about but lftpweb has no work to do on yet, sitting above Active/pending because it is first
+ * in the pipeline. `TransfersPage.tsx` feeds this `usePreflight()`'s return value directly,
+ * unchanged.
  *
- * **Hidden entirely while `response` hasn't loaded yet, or `source_configured` is false** -- the
- * handoff prompt's own explicit case: with no bound, enabled source anywhere, "Nothing in
- * preflight" would be permanently true and meaningless, so the box doesn't exist for that user
- * at all rather than showing an empty shell forever.
+ * **Hidden entirely while `response` hasn't loaded yet, or neither `source_configured` nor
+ * `gated_queues` has anything to say** -- the first task's own explicit case (with no row source
+ * configured anywhere, "Nothing in preflight" would be permanently true and meaningless)
+ * widened, not replaced, by the mount-gate banner: a queue can be mount-gated whether or not
+ * either row source is configured, so the box exists whenever *either* half has something to
+ * show, and stays gone for a user with neither.
  *
  * **Scales to its content, not to a reserved row count** -- zero rows collapses to the header
  * plus one line ("Nothing in preflight."), never five rows' worth of empty space; the row list
@@ -82,7 +105,8 @@ export function PreflightBox({ response }: { response: PreflightResponse | undef
   const [expanded, setExpanded] = useState(false)
   const [page, setPage] = useState(1)
 
-  if (response == null || !response.source_configured) return null
+  if (response == null) return null
+  if (!response.source_configured && response.gated_queues.length === 0) return null
 
   const rows = response.rows
   const count = pageCount(rows.length, PREFLIGHT_EXPANDED_PAGE_SIZE)
@@ -113,32 +137,44 @@ export function PreflightBox({ response }: { response: PreflightResponse | undef
         )}
       </div>
 
-      {/* Zero rows -- one line, not a padded empty-state block (unlike the Active/Complete
-       * boxes' own `h-40` dashed panels): "Keeps interface tight" is the user's own reasoning
-       * for why this box in particular must not reserve space it isn't using. */}
-      {rows.length === 0 && (
-        <p className="text-sm text-zinc-400 dark:text-zinc-600">Nothing in preflight.</p>
+      <GatedQueueBanner gated={response.gated_queues} />
+
+      {/* The row list only exists when a row source is actually configured -- a queue can be
+       * mount-gated (the banner above) whether or not either source is, and "Nothing in
+       * preflight" would be a meaningless thing to say to a user with no source at all. */}
+      {response.source_configured && (
+        <>
+          {/* Zero rows -- one line, not a padded empty-state block (unlike the Active/Complete
+           * boxes' own `h-40` dashed panels): "Keeps interface tight" is the user's own
+           * reasoning for why this box in particular must not reserve space it isn't using. */}
+          {rows.length === 0 && (
+            <p className="text-sm text-zinc-400 dark:text-zinc-600">Nothing in preflight.</p>
+          )}
+
+          {pageRows.length > 0 && (
+            <div className="overflow-hidden rounded-md border border-zinc-200 dark:border-zinc-800">
+              {pageRows.map((row, index) => (
+                <PreflightRowView
+                  key={`${row.source}:${row.queue_id}:${row.title}:${index}`}
+                  row={row}
+                />
+              ))}
+            </div>
+          )}
+
+          {!expanded && canExpand && (
+            <button
+              type="button"
+              onClick={() => setExpanded(true)}
+              className="self-start text-xs text-zinc-500 underline decoration-dotted hover:text-zinc-700 dark:text-zinc-400 dark:hover:text-zinc-200"
+            >
+              Show all ({rows.length})
+            </button>
+          )}
+        </>
       )}
 
-      {pageRows.length > 0 && (
-        <div className="overflow-hidden rounded-md border border-zinc-200 dark:border-zinc-800">
-          {pageRows.map((row, index) => (
-            <PreflightRowView key={`${row.source}:${row.queue_id}:${row.title}:${index}`} row={row} />
-          ))}
-        </div>
-      )}
-
-      {!expanded && canExpand && (
-        <button
-          type="button"
-          onClick={() => setExpanded(true)}
-          className="self-start text-xs text-zinc-500 underline decoration-dotted hover:text-zinc-700 dark:text-zinc-400 dark:hover:text-zinc-200"
-        >
-          Show all ({rows.length})
-        </button>
-      )}
-
-      {expanded && (
+      {response.source_configured && expanded && (
         <div className="flex items-center justify-between gap-2">
           <span className="text-xs text-zinc-500 dark:text-zinc-400">
             {pageReadout(page, count, rows.length)}

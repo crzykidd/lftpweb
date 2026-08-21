@@ -929,14 +929,17 @@ class JobsResponse(BaseModel):
 
 
 # --- Preflight (docs/transfers-redesign-spec.md §4, prefigured; this task's own handoff prompt,
-# prompts/done/2026-08-20-preflight-box.md) -- the Queue tab's third, small box: things lftpweb
-# already knows about but has no work to do on yet. **Source-agnostic by construction**: the
-# *arr poller (`core/arrsync.py`) is the only source wired up so far, but a second is already
-# planned as an immediate follow-up (non-*arr items held by the settle gate, `core/settle.py`),
-# so `source`/`source_label`/`source_kind` name *which* upstream a row came from rather than any
-# field here assuming it's always the *arr -- see `core/preflight.py.PreflightRow` for the
-# projection this response wraps (no table, no migration, nothing persisted) and its own
-# docstring for the full reasoning on why nothing *arr-specific belongs at this layer. ----------
+# prompts/done/2026-08-20-preflight-box.md, plus its follow-up
+# prompts/2026-08-20-preflight-waiting-sources.md) -- the Queue tab's third, small box: things
+# lftpweb already knows about but has no work to do on yet. **Source-agnostic by construction**:
+# the *arr poller (`core/arrsync.py`) and the settle gate's own eligibility check
+# (`core/autoqueue.py.AutoQueue`) are the two sources wired up, and `source`/`source_label`/
+# `source_kind` name *which* one a given row came from rather than any field here assuming it's
+# always the *arr -- see `core/preflight.py.PreflightRow` for the projection this response wraps
+# (no table, no migration, nothing persisted) and its own docstring for the full reasoning on why
+# nothing source-specific belongs at this layer. `gated_queues` (below) is a different shape
+# entirely -- a whole queue blocked, not an item waiting -- and deliberately lives on this
+# response rather than as rows, per the user's own decision (`docs/decisions.md`). --------------
 
 
 class PreflightRowOut(BaseModel):
@@ -946,9 +949,9 @@ class PreflightRowOut(BaseModel):
     here invites a per-row control (chevrons, Dismiss, Start now, Stop) that would need one.
     """
 
-    # `'arr'` today; widened, not replaced, when the settle-gate source lands
-    # (`core/preflight.py.PreflightSource`). The frontend's own *arr-specific rendering (the
-    # brand-logo chip) is gated on this, never inferred from `source_kind` alone.
+    # `'arr'` or `'settle'` today (`core/preflight.py.PreflightSource`); widened, not replaced,
+    # if a further source ever lands. The frontend's own *arr-specific rendering (the brand-logo
+    # chip) is gated on this, never inferred from `source_kind` alone.
     source: str
     queue_id: int
     title: str
@@ -970,15 +973,36 @@ class PreflightRowOut(BaseModel):
     size_remaining_bytes: int | None
 
 
+class PreflightGatedQueueOut(BaseModel):
+    """One entry in the Preflight box's mount-gate banner (this task,
+    prompts/2026-08-20-preflight-waiting-sources.md, decided with the user) -- **a banner line,
+    not a row**: `core/autoqueue.py.AutoQueue.gated` blocks a queue's *entire* auto-queue pass at
+    once, so the useful fact is "this queue is blocked and why," never one row per affected item
+    (fifty identical rows would bury the single fact that matters). `reason` is
+    `AutoQueue.gated`'s own string, verbatim -- never recomposed here, so the banner and the
+    existing Settings -> Queues status readout (`QueueAutoQueueStatus.gated_reason`) can never
+    say different things about the same gating episode.
+    """
+
+    queue_name: str
+    reason: str
+
+
 class PreflightResponse(BaseModel):
     """`GET /api/queue/preflight`. `source_configured=False` (with `rows` always empty in that
-    case) means "no source is configured at all" (today: no bound, enabled *arr instance exists
-    anywhere) -- the frontend hides the whole box for that case rather than showing an empty
-    "Nothing in preflight" that would be meaningless for a user with nothing configured.
+    case) means "no row source is configured at all" (no bound, enabled *arr instance anywhere,
+    **and** no queue has the settle gate + auto-queue both live) -- the frontend hides the box's
+    row list for that case rather than showing an empty "Nothing in preflight" that would be
+    meaningless for a user with nothing configured. `gated_queues` is independent of
+    `source_configured` and can be non-empty even when it's `False` -- the mount gate can block a
+    queue's auto-queue pass whether or not either row source happens to be configured, so the
+    frontend shows the box whenever *either* `source_configured` or `gated_queues` has something
+    to say (`components/PreflightBox.tsx`).
     """
 
     source_configured: bool
     rows: list[PreflightRowOut]
+    gated_queues: list[PreflightGatedQueueOut] = []
 
 
 class CompleteJobsResponse(BaseModel):
