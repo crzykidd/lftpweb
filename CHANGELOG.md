@@ -24,7 +24,17 @@ Skeleton for the next roll:
 ## [Unreleased]
 
 ### Added
+
 ### Changed
+
+- **Active/pending now sorts running → queued → still-processing**, rather than placing
+  pipeline-in-flight rows (verifying, extracting, awaiting import, deleting source) between
+  running and queued. A processing row is lftpweb *waiting on someone else* — usually an *arr
+  import — while `queued` is its own genuinely-next work, so the list reads now / next / parked.
+  The tradeoff, recorded rather than left to be rediscovered: on a deep backlog at 20 rows a
+  page, a processing row can now land pages below the fold, which is what the original placement
+  avoided. Accepted because such rows are transient and few.
+
 ### Fixed
 ### Security
 ### Deprecated
