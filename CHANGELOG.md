@@ -24,6 +24,15 @@ Skeleton for the next roll:
 ## [Unreleased]
 
 ### Added
+### Changed
+### Fixed
+### Security
+### Deprecated
+### Removed
+
+## [0.3.0] — 2026-08-21
+
+### Added
 
 - **The Queue row's own chip fills and ticks again, and Preflight's "Waiting" chip now fills as
   the remote client downloads**: the single-line Transfers row lost its state chip's percent when
