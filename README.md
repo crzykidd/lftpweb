@@ -132,13 +132,13 @@ Every verify outcome, every remote delete, and every delete withheld — with th
   password login or trust a reverse proxy's identity header, both from Settings → Auth. See
   "Locked out?" below before you flip it on.
 - **In-app user documentation**, under **Docs** in the left nav: a quick start walking the real
-  first-run sequence, and a Concepts page covering the twelve things that actually confuse people
-  (the queue being paused, why a row still reads "Awaiting import" instead of Complete, what
-  Mark complete/Mark failed does and doesn't do, the settle gate, the removal grace period,
+  first-run sequence, and a Concepts page covering the thirteen things that actually confuse
+  people (the queue being paused, why a row still reads "Awaiting import" instead of Complete,
+  what Mark complete/Mark failed does and doesn't do, the settle gate, the removal grace period,
   auto-queue suppression, the difference between Dismiss / Clear events / Reset item tracking,
   the lifecycle icons, `copy` vs `move`, inherit-vs-override on the post-processing toggles, the
-  Sonarr/Radarr icon, and what's in a support bundle). Every step links straight to the settings
-  page it describes.
+  Sonarr/Radarr icon, why a release sits in Preflight instead of downloading, and what's in a
+  support bundle). Every step links straight to the settings page it describes.
   Per-field help popups (`FieldHelp`) are being applied across the settings surface, starting
   with the fields whose wrong answer costs you data
 

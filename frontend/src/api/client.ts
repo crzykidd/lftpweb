@@ -52,6 +52,7 @@ import type {
   PatternPreviewResponse,
   PostprocessSettingsIn,
   PostprocessSettingsOut,
+  PreflightResponse,
   QueueAutoQueueStatus,
   QueueResetRequest,
   RemovalGraceSettingsOut,
@@ -473,6 +474,15 @@ export function pauseQueue(stopRunning = false): Promise<void> {
 /** Resume admission immediately, in queue-position order. */
 export function unpauseQueue(): Promise<void> {
   return sendJson<void>('/api/queue/unpause', 'POST')
+}
+
+/** The Queue tab's Preflight box (docs/transfers-redesign-spec.md §4, prefigured; this task's
+ * own handoff prompt, prompts/done/2026-08-20-preflight-box.md) -- `hooks/usePreflight.ts` polls
+ * this, same "hand-rolled fetch + poll hook, never TanStack Query" convention `useJobs`/
+ * `usePoll` already establish for this page.
+ */
+export function getPreflight(): Promise<PreflightResponse> {
+  return getJson<PreflightResponse>('/api/queue/preflight')
 }
 
 export function retryItem(itemId: number): Promise<JobOut> {

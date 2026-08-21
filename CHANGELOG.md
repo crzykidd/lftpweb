@@ -147,6 +147,22 @@ Skeleton for the next roll:
   across a restart. An unmistakable amber banner marks the paused state on the Queue tab, and
   the header bar's health readout gets a matching **● queue paused** badge. "Start now" is
   disabled (with a reason in the tooltip) and rejected server-side (409) while paused.
+- **A "Preflight" box at the top of the Transfers → Queue tab** (`docs/transfers-redesign-spec.md`
+  §4, prefigured) — things a bound *arr instance already knows about that haven't reached this
+  seedbox's completed folder yet, so there is nothing here for lftpweb to do work on. **A pure
+  projection of the *arr poller's own latest ~60s poll — no table, no migration, nothing
+  persisted**: a release that drops out of the *arr's queue simply stops being projected, with a
+  brief flap-tolerance hold (150s) so a single missed poll (the same SABnzbd blank-queue blip
+  behind the amber `dropped` state) doesn't blink a row out and back. Attribution is
+  `arr_visible_path` prefix-matching a record's `outputPath` against each bound queue; a record
+  matching no queue is silently omitted (never a guess), and a record that already matches a
+  real lftpweb item never appears here at all, so a release is never visible twice at once. Five
+  rows by default, expandable and paged (reusing the existing pager) past that; zero rows reads
+  as a single "Nothing in preflight." line rather than reserved empty space, and the whole box
+  disappears when no source is configured. Rows are inert by construction — no queue position,
+  no chevrons, no Dismiss/Start now/Stop — there is no `item` and no `job` behind one yet. The
+  row/box shape (`core/preflight.py`) is deliberately source-agnostic: the *arr poller is the
+  only source wired up so far, ahead of an already-planned settle-gate source as a follow-up.
 
 ### Changed
 

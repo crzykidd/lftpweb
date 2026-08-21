@@ -6,6 +6,92 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-20 — Preflight: a pure in-memory projection (no table), source-agnostic row shape,
+`arr_visible_path` attribution, a flap-tolerance hold that can never accumulate
+
+`prompts/done/2026-08-20-preflight-box.md`, the Transfers → Queue tab's third, small box
+(docs/transfers-redesign-spec.md §4, prefigured). Browser-unverified (no page render).
+
+**A pure projection of the *arr poller's own latest pass — no table, no migration, no
+persistence.** The alternative (an ephemeral `item`-adjacent table, closer to §4.6's original
+"pending entries" sketch) was rejected: `core/arrsync.py`'s poller already fetches every queue
+record every ~60s and `QueueRecord.raw` already keeps the full response dict for exactly this
+kind of later use; a record that matches nothing is discarded today, and those discarded records
+are this box's entire contents. Persisting them would mean owning a second write path, a second
+place a stale row could linger, and a restart-recovery story to get right — for data that is
+already being handed to this process fresh every poll interval. The explicit cost accepted: a
+restart empties the box until the next poll (≤60s). That is judged acceptable, not a defect to
+paper over with persistence.
+
+**Row/cache shape is source-agnostic by construction, in a new `core/preflight.py`, ahead of a
+second source that isn't built yet.** Mid-task, the user named an immediate follow-up: non-*arr
+items held by the settle gate (`core/settle.py`) — a release still uploading to the seedbox,
+with a known remote size but no *arr involvement at all. Rather than ship `PreflightRow` with
+*arr-flavored field names (`instance_name`, `tracked_download_state`, `size`/`sizeleft`) and
+rename them later, the row carries a `source` discriminator plus free-form `source_label`/
+`source_kind`/`status_label`/`size_bytes`/`size_remaining_bytes` that no *arr-specific code
+reads or writes. `core/arrsync.py` builds `PreflightRow(source="arr", ...)` and owns every
+*arr-specific piece (matching against `item` names, `arr_visible_path` prefix attribution,
+`downloadId`/`trackedDownloadState` vocabulary); `core/preflight.py` owns only the shared shape
+and the flap-tolerance cache (`PreflightHold`). The API layer (`PreflightRowOut`/
+`PreflightResponse`, `GET /api/queue/preflight`) mirrors that split — the endpoint path and
+response shape name nothing *arr-specific, only its live `source_configured` query does today,
+by necessity (it's the only source), with the endpoint's own docstring stating plainly that a
+second source would add its own check and OR it in, not reshape the endpoint. The frontend
+matches: `components/PreflightBox.tsx` renders the real Sonarr/Radarr brand logo only behind an
+explicit `row.source === 'arr'` check, falling back to a plain text chip (`source_label`) for
+anything else.
+
+**Attribution is `arr_visible_path` prefix-matching, and silence is deliberately the answer for
+"can't tell."** A record with an `outputPath` is attributed to whichever bound queue's
+`arr_visible_path` contains it (component-boundary check, not `str.startswith` — `/data/tv` must
+not swallow `/data/tvshows/...`; most-specific/longest match wins for the unlikely nested case).
+A record with no `outputPath` at all (the *arr does not always populate it) is attributed only
+when the instance has exactly one bound queue — never a guess between two or more. No match at
+all is omitted, never a fallback guess: the sharp risk named in the handoff prompt is promising a
+release that never arrives, which is worse than showing nothing. An already-`imported`-at-the-
+*arr-level record is excluded too, on top of (not instead of) the "already matches a real item"
+exclusion — one more guard against the exact "visible twice" failure mode the no-duplicate-at-
+handover requirement names, since a record that far along is also the one most likely to become
+a real item on literally the next scan.
+
+**No duplicate at handover holds by construction, not by a separate check.** `_update_preflight`
+runs after every one of an instance's bound queues has already been processed for that pass, and
+queries `item` fresh (not the stale per-queue snapshot `_match_items` took) — so a record
+`_match_items` just matched into a real item *this very pass* is already excluded from the
+preflight candidate set before a `PreflightRow` for it is ever built. There is no window in a
+single pass where both a preflight row and a real item exist for the same release.
+
+**Flap tolerance (`PreflightHold`, `PREFLIGHT_HOLD_S = 150.0`) is a property of the box, not of
+the *arr projection** — deliberately generalized into `core/preflight.py` rather than left as an
+`core/arrsync.py`-local cache, since the user's own framing was that *why* a row briefly stops
+being reported differs per source (the *arr's own SABnzbd blank-queue blip vs. a settle-gated
+item simply starting to transfer) but the box's tolerance for a brief gap shouldn't. A row missed
+for up to the hold window keeps showing from its last-seen data; still missing past it is deleted
+from the cache outright, every pass, unconditionally — there is no third state and no persisted
+flag, so this can never itself become a second accumulation risk on top of whatever a source
+already guards against (the amber `dropped` state's own `DROPPED_GONE_GRACE_S` ladder, for the
+*arr).
+
+**`preflight_rows(enabled_instance_ids)` filters by a caller-supplied live set, not by a stored
+enabled flag on the row/cache itself** — an instance disabled (or every one of its bound queues
+disabled) stops being returned the instant the caller's own live query says so, rather than
+lingering in the box for up to `PREFLIGHT_HOLD_S` after a config change for no reason. The
+"no source configured" hide-the-whole-box case is the same query, one level up: `GET
+/api/queue/preflight` checks live whether any enabled *arr instance has an enabled bound queue at
+all, independent of whatever the scheduler's cache currently holds.
+
+**Frontend: `Pager` extracted to `components/Pager.tsx`** (previously private to
+`TransfersPage.tsx`) so `PreflightBox` could reuse the identical component per the handoff
+prompt's own "reuse the existing pager ... rather than a third pagination idiom" — behavior is
+byte-identical, only the file moved. **No per-box page-size selector on Preflight** (unlike
+Active/Complete's "Show 10/20/50"): decided against, since a box whose collapsed default is 5
+rows doesn't share the "I want more/fewer at once" use case a growing job history has, and a
+third independent size preference was judged not worth the added chrome for a box meant to stay
+out of the way. Fixed at the same 20 the other two boxes settled on instead.
+
+---
+
 ## 2026-08-20 — Pausing: a caller-side gate in `_admit()`, "pause now" reuses the shutdown/
 rescue model rather than stop, a `setting` row rather than a migration
 

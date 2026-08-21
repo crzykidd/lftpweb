@@ -1,6 +1,6 @@
 # Concepts
 
-The twelve things that actually trip people up, and what to do about each.
+The thirteen things that actually trip people up, and what to do about each.
 
 ```jump
 Nothing is downloading at all — the queue is paused|#pause
@@ -14,6 +14,7 @@ The lifecycle icons|#icons
 copy vs move|#copy-move
 Inherit vs override|#inherit
 The Sonarr/Radarr icon|#arr-integration
+Why is this in Preflight and not downloading?|#preflight
 What's in a support bundle|#support-bundle
 ```
 
@@ -394,6 +395,35 @@ Hover the mark for which instance matched it and when.
 > anything as finished. A release simply vanishing from the *arr's queue with no import evidence
 > is never treated as imported — that is exactly the amber-pending case above, and only turns red
 > once it has genuinely sat unconfirmed for the full 6-hour window.
+
+## Why is this in Preflight and not downloading? {#preflight}
+
+The Transfers → Queue tab's small **Preflight** box, at the very top, is for one thing: something
+a configured source already knows about, that hasn't landed in the seedbox's completed folder
+yet — so lftpweb genuinely has no work to do on it. Today the only source is a bound, enabled
+*arr instance: if Sonarr or Radarr already shows a release grabbed and downloading, but nothing
+has appeared in the seedbox folder lftpweb watches, it shows up here instead of on the real
+Transfers list. A row here is not stuck, not an error, and needs no action — it just hasn't
+arrived yet.
+
+A few things about it worth knowing:
+
+- **It only ever shows what's still on its way.** The moment lftpweb actually sees the release
+  (it lands in the watched folder and becomes a real item), the Preflight row disappears and the
+  real item takes its place — never both at once.
+- **A release that isn't coming to this queue at all never appears.** An *arr instance's download
+  queue can include other categories, or other download clients, that have nothing to do with
+  this install. Preflight only shows a release once it can tell which of your queues it belongs
+  to (matching the *arr's own reported folder against each queue's configured path); anything it
+  can't confidently place is left off rather than guessed at.
+- **A row can flicker briefly out of sight and come straight back — that's expected**, the same
+  as the amber pending-dot case above: download clients occasionally report an empty queue for a
+  beat, and Preflight tolerates one missed check before it would ever drop a row for real.
+- **Five rows show by default**; "Show all" expands the box and pages through the rest the same
+  way the two boxes below it do. With nothing pending, the box just says "Nothing in preflight."
+  — and if no source is configured at all, the box doesn't show up on the page at all.
+- **Rows here have no controls** — no Stop, no Dismiss, no reordering. There's nothing to act on
+  yet; once the real transfer exists, it gets the full set of controls on the list below.
 
 ## What's in a support bundle {#support-bundle}
 

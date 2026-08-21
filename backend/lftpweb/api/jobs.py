@@ -45,6 +45,8 @@ from lftpweb.models import (
     JobOut,
     JobsResponse,
     MoveJobRequest,
+    PreflightResponse,
+    PreflightRowOut,
     QueueItemRequest,
     QueuePauseRequest,
     QueueResetRequest,
@@ -563,6 +565,60 @@ async def unpause_queue(request: Request) -> None:
     `core/queue.py.TransferQueue.unpause`.
     """
     await request.app.state.queue.unpause()
+
+
+@router.get("/api/queue/preflight", response_model=PreflightResponse)
+async def get_preflight(request: Request) -> PreflightResponse:
+    """The Queue tab's Preflight box (docs/transfers-redesign-spec.md §4, prefigured; this
+    task's own handoff prompt, prompts/done/2026-08-20-preflight-box.md) -- things lftpweb
+    already knows about but has no work to do on yet. **A pure projection**, source-agnostic at
+    this layer (`core/preflight.py.PreflightRow`) -- no table, no migration, nothing persisted.
+
+    **Only one source is wired up so far: the *arr poller** (`core/arrsync.py.
+    ArrSyncScheduler.preflight_rows`, fed by `_update_preflight`'s attribution rule and
+    flap-tolerance hold). The live query below (does an enabled *arr instance with an enabled
+    bound queue exist) is therefore *arr-specific by necessity today; a second source (non-*arr
+    items held by the settle gate, `core/settle.py`, an already-planned immediate follow-up)
+    would add its own "is this source active" check here and OR it into `source_configured`/
+    merge its own rows into `rows`, rather than this endpoint's shape changing.
+
+    `source_configured` is a fresh, live query -- not read off the scheduler's cache -- so an
+    instance disabled (or every one of its bound queues disabled) a moment ago hides immediately
+    rather than waiting for the cache to catch up: `preflight_rows` is filtered to exactly this
+    same set for the identical reason. `source_configured=False` means "no source is configured
+    at all" -- the frontend hides the whole box for that case rather than showing an empty
+    "Nothing in preflight" that would be meaningless for a user with nothing configured.
+    """
+    db = request.app.state.db
+    cursor = await db.execute(
+        "SELECT DISTINCT arr_instance.id FROM arr_instance "
+        "JOIN path_queue ON path_queue.arr_instance_id = arr_instance.id "
+        "WHERE arr_instance.enabled = 1 AND path_queue.enabled = 1"
+    )
+    enabled_instance_ids = {row["id"] for row in await cursor.fetchall()}
+
+    arr_sync = getattr(request.app.state, "arr_sync", None)
+    rows = (
+        arr_sync.preflight_rows(enabled_instance_ids)
+        if arr_sync is not None and enabled_instance_ids
+        else []
+    )
+    return PreflightResponse(
+        source_configured=bool(enabled_instance_ids),
+        rows=[
+            PreflightRowOut(
+                source=r.source,
+                queue_id=r.queue_id,
+                title=r.title,
+                status_label=r.status_label,
+                source_label=r.source_label,
+                source_kind=r.source_kind,
+                size_bytes=r.size_bytes,
+                size_remaining_bytes=r.size_remaining_bytes,
+            )
+            for r in rows
+        ],
+    )
 
 
 @router.post("/api/items/{item_id}/stop", response_model=dict)

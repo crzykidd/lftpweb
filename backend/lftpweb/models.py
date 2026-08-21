@@ -928,6 +928,59 @@ class JobsResponse(BaseModel):
     jobs: list[JobOut]
 
 
+# --- Preflight (docs/transfers-redesign-spec.md §4, prefigured; this task's own handoff prompt,
+# prompts/done/2026-08-20-preflight-box.md) -- the Queue tab's third, small box: things lftpweb
+# already knows about but has no work to do on yet. **Source-agnostic by construction**: the
+# *arr poller (`core/arrsync.py`) is the only source wired up so far, but a second is already
+# planned as an immediate follow-up (non-*arr items held by the settle gate, `core/settle.py`),
+# so `source`/`source_label`/`source_kind` name *which* upstream a row came from rather than any
+# field here assuming it's always the *arr -- see `core/preflight.py.PreflightRow` for the
+# projection this response wraps (no table, no migration, nothing persisted) and its own
+# docstring for the full reasoning on why nothing *arr-specific belongs at this layer. ----------
+
+
+class PreflightRowOut(BaseModel):
+    """One Preflight box row. Deliberately thin -- no `id`, no `queue_position`, no
+    `bytes_done`: there is no `item` and no `job` behind this row yet, and the handoff prompt's
+    own "the rows are inert, and the box is what makes that structural" is exactly why nothing
+    here invites a per-row control (chevrons, Dismiss, Start now, Stop) that would need one.
+    """
+
+    # `'arr'` today; widened, not replaced, when the settle-gate source lands
+    # (`core/preflight.py.PreflightSource`). The frontend's own *arr-specific rendering (the
+    # brand-logo chip) is gated on this, never inferred from `source_kind` alone.
+    source: str
+    queue_id: int
+    title: str
+    # Free-form, source-owned display text for "what state is this in" -- an *arr row's own
+    # `trackedDownloadState` (e.g. `"downloading"`), verbatim; `null` when the source didn't
+    # report one. Display-only advisory text, never a state this codebase's own state machine
+    # reads or reasons about.
+    status_label: str | None
+    # The upstream's own display name (an *arr instance's configured name, e.g. `"Sonarr"`) and,
+    # when the source has one, a brand/variant hint for the row's chip (`'sonarr'`/`'radarr'` for
+    # *arr; `null` for a source with no logo of its own).
+    source_label: str
+    source_kind: str | None
+    # A known total size and, when the source can compute one, how much is left to arrive --
+    # both `null` when the source has neither (**never a request to enrich one that lacks it**,
+    # the handoff prompt's own instruction). An *arr row's own `size`/`sizeleft`, when its
+    # response happened to carry them.
+    size_bytes: int | None
+    size_remaining_bytes: int | None
+
+
+class PreflightResponse(BaseModel):
+    """`GET /api/queue/preflight`. `source_configured=False` (with `rows` always empty in that
+    case) means "no source is configured at all" (today: no bound, enabled *arr instance exists
+    anywhere) -- the frontend hides the whole box for that case rather than showing an empty
+    "Nothing in preflight" that would be meaningless for a user with nothing configured.
+    """
+
+    source_configured: bool
+    rows: list[PreflightRowOut]
+
+
 class CompleteJobsResponse(BaseModel):
     """`GET /api/jobs/complete` (2026-08-19, docs/transfers-redesign-spec.md §3.2, phase 1 stage
     4b) -- the Queue tab's **Complete** box: terminal (`succeeded`/`failed`/`cancelled`), not

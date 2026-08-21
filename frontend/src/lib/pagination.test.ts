@@ -164,7 +164,7 @@ describe('pageReadout -- the "Page X of Y (Z total)" readout shared by both Queu
     expect(pageReadout(1, 1, -3)).toBeNull()
   })
 
-  it('renders even when count is 1 -- independent of `Pager`\'s own count<=1 guard, which lives in TransfersPage.tsx, not here', () => {
+  it('renders even when count is 1 -- independent of `Pager`\'s own count<=1 guard, which lives in components/Pager.tsx, not here', () => {
     expect(pageReadout(1, 1, 3)).toBe('Page 1 of 1 (3 total)')
   })
 })

@@ -117,7 +117,7 @@ import logging
 import posixpath
 import re
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -140,6 +140,7 @@ from lftpweb.core.events import EventBus
 from lftpweb.core.itemview import item_view
 from lftpweb.core.local_delete import DeleteInFlight, _do_remove_from_disk, _physical_local_root
 from lftpweb.core.postprocess import perform_remote_delete
+from lftpweb.core.preflight import PreflightHold, PreflightRow
 
 logger = logging.getLogger(__name__)
 
@@ -226,6 +227,109 @@ def _derive_arr_root(output_path: str, item_name: str) -> str:
     if normalized.endswith(suffix):
         return normalized[: -len(suffix)]
     return posixpath.dirname(normalized)
+
+
+# --- Preflight (docs/transfers-redesign-spec.md §4, prefigured -- this task's own handoff
+# prompt, prompts/done/2026-08-20-preflight-box.md) -- releases a bound *arr instance already
+# knows about that have not yet reached this seedbox's completed folder, so lftpweb has no
+# `item` and no work to do on them yet. **A pure projection of this poller's own latest pass, no
+# table, no migration, no persistence** -- every field a row needs is already sitting in the
+# `QueueRecord.raw` this module fetches every ~60s and otherwise discards the moment a record
+# matches nothing (`_match_items`'s own "candidates" loop never looks at these at all).
+#
+# **This section is where every *arr-specific piece of the Preflight box lives, deliberately.**
+# `core/preflight.py` owns the box's *shared* shape (`PreflightRow`, the flap-tolerance
+# `PreflightHold`) precisely so a second source -- non-*arr items held by the settle gate,
+# `core/settle.py`, already planned as an immediate follow-up -- can be added there without
+# reshaping anything here: matching against `item` names, `arr_visible_path` prefix attribution,
+# and the *arr's own `trackedDownloadState`/`downloadId` vocabulary all stay behind this module's
+# own boundary, never leaking into the shared row/cache types. ---------------------------------
+
+
+def _record_identity(record: QueueRecord) -> str:
+    """A stable key for one queue record across polls, for `_update_preflight`'s own
+    `PreflightHold` below. `download_id` when the client provides one (the normal case -- every
+    *arr-tracked download carries its client's own key, docs/transfers-redesign-spec.md §4.4);
+    falls back to the normalized title (`_normalize_name`, already used by `_record_matches_item`
+    above) for the rare record that doesn't, so a poll-to-poll identity still exists rather than
+    the row re-appearing as "new" every single pass.
+    """
+    if record.download_id:
+        return f"id:{record.download_id}"
+    return f"title:{_normalize_name(record.title)}"
+
+
+def _visible_path_contains(arr_visible_path: str, output_path: str) -> bool:
+    """Whether `output_path` (the *arr's own reported directory for a queue record) sits under
+    `arr_visible_path` (a bound queue's `local_path`, translated into that same *arr's own
+    namespace -- `path_queue.arr_visible_path`, already configured on the user's production
+    queues per the v0.2.2 diagnosis). A component-boundary check, not a bare `str.startswith`,
+    so `/data/tv` does not spuriously swallow `/data/tvshows/...` -- both sides' trailing
+    slashes are normalized away first so a configured value with or without one behaves
+    identically.
+    """
+    root = arr_visible_path.rstrip("/")
+    if not root:
+        return False
+    candidate = output_path.rstrip("/")
+    return candidate == root or candidate.startswith(root + "/")
+
+
+def _preflight_candidates(
+    records: list[QueueRecord],
+    queues: list[aiosqlite.Row],
+    item_names: frozenset[str],
+) -> list[tuple[int, QueueRecord]]:
+    """Every queue record worth projecting into the Preflight box this pass, paired with the
+    queue id it was attributed to. The handoff prompt's own two rules, applied in order:
+
+    1. **"Records that match an lftpweb item are ignored"** -- `item_names` is every top-level
+       `item.rel_path` across *every* queue this instance is bound to (gathered fresh by
+       `_update_preflight` below, after this pass's own `_match_items` has already run for all of
+       them), checked with the exact same `_record_matches_item` the real matcher uses. A record
+       this pass just matched into a real item is already excluded here -- the handoff prompt's
+       own "no duplicate at handover" requirement, satisfied by construction rather than a
+       separate check.
+    2. **Attribution is `arr_visible_path` prefix-matching, and silence is correct when it
+       doesn't resolve.** A record with an `outputPath` is attributed to whichever bound queue's
+       `arr_visible_path` contains it (most-specific/longest match wins, for the unlikely case of
+       two nested visible paths); a record with **no** `outputPath` at all (the *arr does not
+       always populate it) is attributed to the instance's one bound queue only when there is
+       exactly one -- never a guess between two or more (the handoff prompt's own instruction).
+       No match at all -- omitted, not a fallback guess -- because the sharp risk here is
+       promising a file that never arrives.
+
+    **Already-`imported`-at-the-*arr-level records are excluded too**
+    (`tracked_download_state == TRACKED_DOWNLOAD_STATE_IMPORTED`) -- the box's own stated scope
+    is "still downloading" (step 1 of the handoff prompt's "What to do"), and a record this far
+    along is also the one most likely to become a real lftpweb item on literally the next scan;
+    dropping it here is one more guard against the same "visible twice" failure mode, on top of
+    (not instead of) the item-match check above.
+    """
+    out: list[tuple[int, QueueRecord]] = []
+    for record in records:
+        if record.tracked_download_state == TRACKED_DOWNLOAD_STATE_IMPORTED:
+            continue
+        if any(_record_matches_item(record, name) for name in item_names):
+            continue
+
+        queue_id: int | None = None
+        if record.output_path:
+            best_len = -1
+            for queue in queues:
+                visible = queue["arr_visible_path"]
+                if not visible or not _visible_path_contains(visible, record.output_path):
+                    continue
+                visible_len = len(visible.rstrip("/"))
+                if visible_len > best_len:
+                    best_len = visible_len
+                    queue_id = queue["id"]
+        elif len(queues) == 1:
+            queue_id = queues[0]["id"]
+
+        if queue_id is not None:
+            out.append((queue_id, record))
+    return out
 
 
 # Association states a fresh queue record is allowed to match against: never-associated, or a
@@ -471,6 +575,14 @@ class ArrSyncScheduler:
         # than the bound technically allows, never fewer -- the same safe direction
         # `_notify_attempts` above already relies on.
         self._scan_command_checks: dict[int, int] = {}
+        # Preflight (this task) -- one `PreflightHold` (`core/preflight.py`) per bound *arr
+        # instance id, the flap-tolerant cache of that instance's own last-seen preflight rows.
+        # In-memory only, the same "restart loses it, and that's the safe direction" reasoning as
+        # every other dict above: a restart just empties the box until the next poll (≤60s),
+        # which the handoff prompt's own reasoning accepts explicitly rather than adding
+        # persistence to avoid it. `_update_preflight` is the only writer; `preflight_rows` is
+        # the only reader.
+        self._preflight_holds: dict[int, PreflightHold] = {}
 
     async def start(self) -> None:
         if self._task is None:
@@ -565,6 +677,74 @@ class ArrSyncScheduler:
                     # attempt after backoff.
                     await self._handle_failure(instance_id, instance["name"], exc)
                     return
+
+            # Preflight (this task) -- after every one of this instance's bound queues has been
+            # processed above, so a record `_match_items` just matched into a real item *this
+            # very pass* is already excluded from `item_names` below (freshly queried, not the
+            # `items` snapshot any one `_process_queue` call took) -- the handoff prompt's own
+            # "no duplicate at handover" requirement, holding by construction rather than a
+            # separate check. Never reached if the loop above returned early on a mid-pass
+            # failure -- this instance's cache simply keeps its last-known contents until a
+            # future pass succeeds end to end, the same "unreachable ⇒ keep last known status"
+            # direction docs/transfers-redesign-spec.md §4.2 states for phase 2's download
+            # clients, applied here too.
+            await self._update_preflight(instance, queues, records)
+
+    async def _update_preflight(
+        self, instance: aiosqlite.Row, queues: list[aiosqlite.Row], records: list[QueueRecord]
+    ) -> None:
+        """Refresh this instance's own `PreflightHold` (`core/preflight.py`) from this pass's
+        already-fetched `records` -- see `_preflight_candidates`'s own docstring for the
+        matching/attribution rules and `PreflightHold.update`'s for the flap-tolerance hold
+        applied here.
+        """
+        queue_ids = [q["id"] for q in queues]
+        if not queue_ids:
+            return
+        placeholders = ",".join("?" for _ in queue_ids)
+        cursor = await self.db.execute(
+            f"SELECT rel_path FROM item WHERE queue_id IN ({placeholders}) "  # noqa: S608 - placeholders only, no user input
+            "AND instr(rel_path, '/') = 0",
+            queue_ids,
+        )
+        item_names = frozenset(r["rel_path"] for r in await cursor.fetchall())
+
+        seen: dict[str, PreflightRow] = {}
+        for queue_id, record in _preflight_candidates(records, queues, item_names):
+            seen[_record_identity(record)] = PreflightRow(
+                source="arr",
+                queue_id=queue_id,
+                title=record.title,
+                status_label=record.tracked_download_state,
+                source_label=instance["name"],
+                source_kind=instance["kind"],
+                size_bytes=record.raw.get("size"),
+                size_remaining_bytes=record.raw.get("sizeleft"),
+            )
+        hold = self._preflight_holds.setdefault(instance["id"], PreflightHold())
+        hold.update(seen, now=time.monotonic())
+
+    def preflight_rows(self, enabled_instance_ids: Iterable[int]) -> list[PreflightRow]:
+        """The Preflight box's own read (`api/jobs.py`'s `GET /api/queue/preflight`) -- every
+        currently-held row from an instance id in `enabled_instance_ids`. That set is the
+        caller's own live "is this instance still enabled, with at least one enabled bound
+        queue" check -- an instance disabled (or every one of its queues disabled) after being
+        cached simply stops being returned immediately, rather than lingering for
+        `core/preflight.py.PREFLIGHT_HOLD_S` for no reason.
+
+        Sorted by title, case-insensitively -- the *arr's own queue carries no cross-release
+        priority signal worth surfacing here (unlike the real transfer queue's `queue_position`),
+        so alphabetical is the stable, boring default rather than an invented one.
+        """
+        allowed = set(enabled_instance_ids)
+        rows = [
+            row
+            for instance_id, hold in self._preflight_holds.items()
+            if instance_id in allowed
+            for row in hold.rows()
+        ]
+        rows.sort(key=lambda r: r.title.casefold())
+        return rows
 
     async def _handle_failure(self, instance_id: int, instance_name: str, exc: Exception) -> None:
         """One WARNING, one event row, then back off -- never blocks or slows the loop for

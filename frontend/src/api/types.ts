@@ -662,6 +662,42 @@ export interface JobsResponse {
   jobs: JobOut[]
 }
 
+/** `GET /api/queue/preflight` (docs/transfers-redesign-spec.md §4, prefigured; this task's own
+ * handoff prompt, prompts/done/2026-08-20-preflight-box.md) -- one row for something lftpweb
+ * already knows about but has no work to do on yet. **Source-agnostic by construction**: the
+ * *arr poller is the only source wired up so far, but a second is already planned as an
+ * immediate follow-up (non-*arr items held by the settle gate) -- `source`/`source_label`/
+ * `source_kind` are how a row names *which* upstream it came from, never a field of their own
+ * assuming it's always the *arr. `lib/preflight.ts`'s own `isArrPreflightRow` (or an equivalent
+ * `source === 'arr'` check) is where *arr-specific rendering lives, not here.
+ *
+ * Deliberately thin, matching the backend's own `PreflightRowOut` (`backend/lftpweb/models.py`)
+ * field for field -- no `id`, no `queue_position`, no `bytes_done`: there is no `item` and no
+ * `job` behind a row here, and the handoff prompt's own "the rows are inert, and the box is what
+ * makes that structural" is exactly why nothing here invites a per-row control that would need
+ * one.
+ */
+export interface PreflightRowOut {
+  source: string
+  queue_id: number
+  title: string
+  status_label: string | null
+  source_label: string
+  source_kind: string | null
+  size_bytes: number | null
+  size_remaining_bytes: number | null
+}
+
+/** `source_configured=false` (with `rows` always empty in that case) means "no source is
+ * configured at all" -- `components/PreflightBox.tsx` hides the whole box for that case rather
+ * than showing an empty "Nothing in preflight" that would be meaningless for a user with nothing
+ * configured.
+ */
+export interface PreflightResponse {
+  source_configured: boolean
+  rows: PreflightRowOut[]
+}
+
 /** `GET /api/jobs/complete` (2026-08-19, docs/transfers-redesign-spec.md §3.2, phase 1 stage
  * 4b) -- the Queue tab's **Complete** box, server-side paginated. Same `total`/`limit`/`offset`
  * shape `HistoryJobsResponse` already established below -- reused rather than a second

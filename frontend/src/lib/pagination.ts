@@ -112,7 +112,7 @@ export function paginateClientSide<T>(items: readonly T[], page: number, pageSiz
  *
  * `null` while `total <= 0` -- an empty box has nothing to page through, reproducing the
  * Complete box's own pre-existing `completeTotal > 0` guard exactly. Deliberately independent
- * of `Pager`'s own `count <= 1` guard (`TransfersPage.tsx`) -- a single-page box still has a
+ * of `Pager`'s own `count <= 1` guard (`components/Pager.tsx`) -- a single-page box still has a
  * real total worth reading ("Page 1 of 1 (3 total)"), even though `Pager` itself renders
  * nothing for it; the two guards protect different things and must stay separate.
  */

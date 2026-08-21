@@ -20,7 +20,9 @@ import type { FileNode, ItemEventOut, JobOut } from '../api/types'
 import { ArrIcon, ArrRowChip } from '../components/LifecycleIcons'
 import { DismissMenu } from '../components/DismissMenu'
 import { ItemDrawer } from '../components/ItemDrawer'
+import { Pager } from '../components/Pager'
 import { PauseMenu } from '../components/PauseMenu'
+import { PreflightBox } from '../components/PreflightBox'
 import { ResolveMenu } from '../components/ResolveMenu'
 import { StartNowMenu } from '../components/StartNowMenu'
 import { StateChip } from '../components/StateChip'
@@ -29,6 +31,7 @@ import { useJobs } from '../hooks/useJobs'
 import type { ChildSpeedSample } from '../hooks/useLiveModel'
 import { useLiveModel } from '../hooks/useLiveModel'
 import { usePoll } from '../hooks/usePoll'
+import { usePreflight } from '../hooks/usePreflight'
 import { arrHoverLabel, nodeDisplaySize, stateProgressPercent } from '../lib/fileTree'
 import { childSpeedLabel, formatBytes, formatRelativeTimeIntl } from '../lib/format'
 import {
@@ -38,7 +41,6 @@ import {
   isPageSize,
   pageCount,
   pageReadout,
-  pageWindow,
   paginateClientSide,
 } from '../lib/pagination'
 import type { PageSize } from '../lib/pagination'
@@ -769,54 +771,6 @@ function RowDetailPanel({
   )
 }
 
-/** Numbered pages, SAB-style (2026-08-19, docs/transfers-redesign-spec.md §3.2, phase 1 stage
- * 4b) -- `1 2 3 4 ›`, the task's own example. All the boundary arithmetic (the visible window,
- * whether ‹/› are enabled) lives in `lib/pagination.ts` and is unit-tested there; this component
- * is pure layout over that. Renders nothing at all for a single-page box -- a pager with one,
- * disabled page number is clutter, not a control.
- */
-function Pager({ current, count, onChange }: { current: number; count: number; onChange: (page: number) => void }) {
-  if (count <= 1) return null
-  const visible = pageWindow(current, count)
-  return (
-    <div className="flex items-center gap-1">
-      <button
-        type="button"
-        disabled={current <= 1}
-        onClick={() => onChange(current - 1)}
-        aria-label="Previous page"
-        className="rounded-md border border-zinc-300 px-2 py-1 text-xs font-medium text-zinc-700 hover:bg-zinc-50 disabled:opacity-50 dark:border-zinc-700 dark:text-zinc-200 dark:hover:bg-zinc-900"
-      >
-        ‹
-      </button>
-      {visible.map((p) => (
-        <button
-          key={p}
-          type="button"
-          aria-current={p === current ? 'page' : undefined}
-          onClick={() => onChange(p)}
-          className={
-            p === current
-              ? 'rounded-md border border-indigo-400 bg-indigo-50 px-2 py-1 text-xs font-semibold text-indigo-800 dark:border-indigo-700 dark:bg-indigo-900/40 dark:text-indigo-300'
-              : 'rounded-md border border-zinc-300 px-2 py-1 text-xs font-medium text-zinc-700 hover:bg-zinc-50 dark:border-zinc-700 dark:text-zinc-200 dark:hover:bg-zinc-900'
-          }
-        >
-          {p}
-        </button>
-      ))}
-      <button
-        type="button"
-        disabled={current >= count}
-        onClick={() => onChange(current + 1)}
-        aria-label="Next page"
-        className="rounded-md border border-zinc-300 px-2 py-1 text-xs font-medium text-zinc-700 hover:bg-zinc-50 disabled:opacity-50 dark:border-zinc-700 dark:text-zinc-200 dark:hover:bg-zinc-900"
-      >
-        ›
-      </button>
-    </div>
-  )
-}
-
 /** "Show 10/20/50" rows-per-page selector (2026-08-20, prompts/2026-08-20-transfers-page-size-
  * selector.md), one independent instance per box. Unlike `Pager` above, this is **always
  * rendered** whenever its box is -- a control that vanishes once the row count drops is hard to
@@ -867,6 +821,12 @@ export function TransfersPage() {
   // per call, and this page already has exactly one call, so widening what it reads costs nothing
   // in request volume no matter how many rows a user expands.
   const { queues, progressByJobId, childSpeedByItemId } = useLiveModel()
+  // The Preflight box (docs/transfers-redesign-spec.md §4, prefigured; this task's own handoff
+  // prompt, prompts/done/2026-08-20-preflight-box.md) -- its own poll, independent of `useJobs`'s
+  // 2s cadence, since its data changes far more slowly (`hooks/usePreflight.ts`'s own comment).
+  // `undefined` until the first response lands; `PreflightBox` itself decides what to render for
+  // that and for "no source configured."
+  const preflight = usePreflight()
   const [busyIds, setBusyIds] = useState<Set<number>>(new Set())
   const [drawerJob, setDrawerJob] = useState<JobOut | null>(null)
   const [startNowNotice, setStartNowNotice] = useState(false)
@@ -1321,6 +1281,13 @@ export function TransfersPage() {
           </button>
         </div>
       )}
+
+      {/* Preflight (docs/transfers-redesign-spec.md §4, prefigured; this task's own handoff
+       * prompt, prompts/done/2026-08-20-preflight-box.md) -- first in the pipeline, so it sits
+       * above every other box on this tab, including the filter/pause controls' own subject
+       * matter (Active/Complete). Renders nothing at all until it has data and a configured
+       * source to show -- see `components/PreflightBox.tsx`'s own docstring. */}
+      <PreflightBox response={preflight} />
 
       {/* Name filter + "Dismiss list" (2026-08-19, prompts/2026-08-19-transfers-name-filter.md)
        * -- start typing and only rows whose `rel_path` contains the text stay visible: instantly

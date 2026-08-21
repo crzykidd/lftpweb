@@ -365,6 +365,44 @@ display*, retired once the real item appears and takes over.
 reads it for correctness, and truncating it is always safe. That framing is what stops it
 quietly becoming a second source of truth.
 
+### 4.6a A first instance of this pattern already shipped, ahead of phase 2 — the "Preflight" box
+(2026-08-20)
+
+**Not phase 2 work — a separate, smaller feature that prefigures it**, built and shipped
+2026-08-20 (`prompts/done/2026-08-20-preflight-box.md`) while phase 1 was still the only phase
+underway. Same shape as §4.6's "pending entries are not `item` rows," same underlying discipline
+as §4.2's "absent is not a verdict," but sourced from the *arr poller (`core/arrsync.py`) rather
+than a download client, and — the one real difference from §4.6's original sketch — **held in
+memory, not a table at all**: the poller already fetches every queue record every ~60s and
+discards the ones that match nothing, so there is nothing to persist that isn't already being
+handed to the process fresh every poll interval.
+
+**The row/cache shape (`core/preflight.py`) is deliberately source-agnostic, specifically so this
+section's own SAB/ruTorrent work can plug into it without a reshape.** `PreflightRow` carries a
+`source` discriminator (`'arr'` today) plus free-form `source_label`/`source_kind`/
+`status_label`/`size_bytes`/`size_remaining_bytes` — no field assumes it's always the *arr. This
+matters here specifically because a **second source is already the named next step**: non-*arr
+items held by the settle gate (`core/settle.py`) — a release still uploading to the seedbox, with
+a known remote size (it'll read something like "remote — 22 GB") but no download-client
+involvement at all. When §4's own SAB/ruTorrent integration is eventually built, its pending
+entries are a third source into the same box, following the identical contract: build a
+`PreflightRow` with `source` set to whatever this section eventually names the download-client
+source, own its own attribution/matching logic behind its own module boundary (the way
+`core/arrsync.py` owns `arr_visible_path` prefix-matching and never leaks it into
+`core/preflight.py`), and feed a `PreflightHold` for the flap-tolerance discipline every source
+gets for free rather than re-deriving.
+
+**`PreflightHold`'s flap tolerance (150s) is the box's own property, not the *arr projection's**
+— generalized into `core/preflight.py` for exactly this reason: *why* a row briefly stops being
+reported differs per source (the *arr's own download-client queue blanking out for a beat, per
+this module's own docstring, vs. a settle-gated item simply starting to transfer and leaving the
+gate), but the box's tolerance for a brief reporting gap should be the same idea regardless of
+which source is reporting.
+
+See `docs/decisions.md` (2026-08-20) for the fuller reasoning, including why persistence was
+rejected even for the ephemeral shape §4.6 above describes, and why the endpoint's own
+`source_configured` check stays *arr-specific *today* by necessity rather than by design.
+
 ### 4.7 Adapter interface
 
 Build the pluggable abstraction properly, **ship one adapter (SAB) first**. ruTorrent and others
