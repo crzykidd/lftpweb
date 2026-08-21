@@ -10,7 +10,7 @@
 // `components/PreflightBox.tsx`.
 
 import type { PreflightRowOut, SettleSettingsOut } from '../api/types'
-import { formatBytes, formatEta, settleWaitLabel } from './format'
+import { formatBytes, formatEta, percentValue, settleWaitLabel } from './format'
 
 /** The page-size selector's own default -- "5 rows by default" is the user's own original
  * words for this box, unchanged by the selector's arrival (2026-08-21, "we should have a drop
@@ -57,6 +57,55 @@ export function preflightSizeLabel(
   const done = Math.max(0, total - remaining)
   const percent = Math.round((done / total) * 100)
   return `${percent}% of ${formatBytes(total)}`
+}
+
+/** The *arr "Waiting" chip's own fill percent (2026-08-21, "we get that detail from arr so we
+ * should include it behind the chip") -- derived from the exact same `size_bytes`/
+ * `size_remaining_bytes` pair `preflightSizeLabel` above already renders as text, never a second
+ * request. Reuses `lib/format.ts.percentValue` (the same "done over total" arithmetic every other
+ * percent helper in this codebase shares) rather than a second copy of that division.
+ *
+ * **Absent, zero-or-negative, or nonsensical data all render as `null` -- "no bar" -- never `0%`,
+ * a full bar, or a computed `NaN%`.** The *arr frequently omits size on a paused or stalled
+ * client item, and a zero-width bar would read as a stalled download rather than absent
+ * information (this task's own handoff prompt): `remaining == null` is exactly that "the source
+ * didn't report a remaining figure" case, distinct from `preflightSizeLabel`'s own reading of the
+ * same absence (which shows the bare total there, since a size with nothing "left" is a
+ * meaningful thing to say in text -- a bar has no such degenerate-but-honest rendering). A
+ * `remaining` that is negative or exceeds `total` is a stale/inconsistent *arr record, not a
+ * real in-progress read -- also `null`, rather than clamping it into a number that looks
+ * confident but means nothing.
+ */
+export function preflightFillPercent(
+  row: Pick<PreflightRowOut, 'size_bytes' | 'size_remaining_bytes'>,
+): number | null {
+  const total = row.size_bytes
+  const remaining = row.size_remaining_bytes
+  if (total == null || remaining == null || remaining < 0 || remaining > total) return null
+  return percentValue(total - remaining, total)
+}
+
+/** Which `StateChip` state key a Preflight row's chip renders through (2026-08-21) -- `'WAITING'`
+ * (its own fillable amber bucket, `components/StateChip.tsx`'s `FILL_STYLES.WAITING`) for exactly
+ * the one *arr status this box translates to that label (`preflightChipLabel`'s own `downloading`
+ * -> `'Waiting'` mapping, `ARR_CHIP_LABELS` below); `'SETTLING'` for every other row, *arr or
+ * settle alike -- unchanged from before this task.
+ *
+ * **Deliberately not `PARTIAL`.** `PARTIAL` means "partially transferred by lftpweb itself"; this
+ * row's percent is a *different client's* own progress, reported secondhand by the *arr --
+ * folding the two into one bucket would be exactly the vocabulary confusion the "Waiting" label
+ * was introduced to fix.
+ *
+ * An *arr row past `downloading` (`importing`, or an unrecognized status shown verbatim by
+ * `preflightChipLabel`'s own fallthrough) keeps `SETTLING`'s plain amber, same as a settle row --
+ * this codebase has only verified `downloading`'s own size/remaining fields live against a real
+ * Sonarr, so a state it hasn't verified gets no fill rather than a guessed one. A settle row
+ * itself also never fills: it is not downloading anything, and its detail lives in its tooltip
+ * (`preflightChipTooltip` below), not a bar -- the handoff prompt's own explicit "Waiting fills
+ * and ticks; Settling does not."
+ */
+export function preflightChipState(row: Pick<PreflightRowOut, 'source' | 'status_label'>): 'WAITING' | 'SETTLING' {
+  return row.source === 'arr' && row.status_label === 'downloading' ? 'WAITING' : 'SETTLING'
 }
 
 /** Capitalizes a source's own free-form status text for display (`"downloading"` ->

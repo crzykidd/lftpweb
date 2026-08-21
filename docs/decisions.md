@@ -6,6 +6,56 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-21 — A separate `WAITING` fill bucket for Preflight's *arr chip; `SETTLING` deliberately
+gets none
+
+`prompts/2026-08-21-progress-fill-on-queue-and-preflight-chips.md`, from the user's browser
+review ("no % is good it is small but the chip updating makes it dynamic and cool. Same with
+waiting.").
+
+**`WAITING` is its own `StateChip` state key, not a reuse of `PARTIAL`'s bucket.** `PARTIAL`
+means "partially transferred by lftpweb itself"; an *arr "Waiting" row's percent is a *different
+client's* own progress, reported secondhand by the *arr. Folding the two into one `FILL_STYLES`
+bucket would have been exactly the vocabulary confusion the "Waiting" label itself was introduced
+to fix one task earlier (`prompts/done/2026-08-21-preflight-label-and-page-size.md`).
+
+**`WAITING`'s fill reuses `PARTIAL`'s exact two shades** (`bg-amber-300 dark:bg-amber-700/80`
+over `bg-amber-100 dark:bg-amber-900/40`) rather than inventing a third amber pairing. The
+`FILL_STYLES` module comment recorded that the base/fill lightness gap was "unverified against a
+real browser" when first written (2026-08-13); the user has since confirmed in a real browser
+that it reads fine for `PARTIAL`/`DOWNLOADING`. Reusing those exact values carries that confirmed
+legibility forward for `WAITING` instead of shipping a second, still-unverified relationship.
+
+**`SETTLING` gets no `FILL_STYLES` entry, on purpose, unchanged by this task.** A settling
+release is not downloading — lftpweb is waiting for its own remote fingerprint to stop changing,
+and there is no honest percentage to show. Its detail already lives in its countdown tooltip
+(the previous day's task). Finished shape: Waiting fills and ticks; Settling does not; both stay
+the same amber `STYLES` entry, so a glance still reads "one waiting-row family," per the previous
+task's own settled reasoning.
+
+**Preflight's fill percent (`lib/preflight.ts.preflightFillPercent`) is a new pure helper, not
+inlined in `PreflightBox.tsx`,** reusing `lib/format.ts.percentValue` for the actual division
+rather than a second copy of it. Absent `size_bytes`/`size_remaining_bytes`, a non-positive
+total, a negative remaining figure, or a remaining figure exceeding the total (a stale/
+inconsistent *arr record) all resolve to `null` — "no bar" — rather than `0%`, a full bar, or a
+computed `NaN%`: the *arr frequently omits size on a paused or stalled client item, and a
+zero-width bar would misread as a stalled download rather than as absent information.
+
+**The Queue row's own percent (`lib/transferPanel.ts.queueRowPercent`) reuses `lib/fileTree.ts.
+stateProgressPercent`** — the same function the Files tree and a Transfers row's child-file
+expansion already use — fed the row's own `bytes_done`/`bytes_total` (with the identical
+live-progress-over-job fallback `transferLineValue` already applies) in place of a Files row's
+local/remote size, rather than a second definition of "how full is this chip." It checks
+`job.state === 'running'` directly instead of importing `TransfersPage.tsx`'s `chipStateFor` —
+that would have made a `lib/` module depend on a page module, which nothing else in this codebase
+does.
+
+**The user has explicitly approved the percent appearing twice on a Queue row** — once in the
+chip (`Downloading 45%`) and once in the figure column (`45% · 40 MB/s · 25m left`) — so neither
+was suppressed or deduplicated.
+
+---
+
 ## 2026-08-21 — Preflight row columns, chip vocabulary, and evict-on-handover: what "remaining
 time" means per source, one colour for the whole box, and a `retired` set on the hold
 

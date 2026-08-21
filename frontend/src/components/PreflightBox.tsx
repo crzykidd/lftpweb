@@ -7,7 +7,9 @@ import {
   PREFLIGHT_DEFAULT_PAGE_SIZE,
   PREFLIGHT_PAGE_SIZE_OPTIONS,
   preflightChipLabel,
+  preflightChipState,
   preflightChipTooltip,
+  preflightFillPercent,
   preflightRemainingLabel,
   type PreflightPageSize,
 } from '../lib/preflight'
@@ -63,6 +65,8 @@ function PreflightRowView({ row, settle }: { row: PreflightRowOut; settle: Settl
   const chipLabel = preflightChipLabel(row)
   const chipTooltip = preflightChipTooltip(row, settle)
   const figureLabel = preflightRemainingLabel(row)
+  const chipState = preflightChipState(row)
+  const fillPercent = preflightFillPercent(row)
   return (
     <div className="flex flex-wrap items-center gap-3 border-b border-zinc-200 px-3 py-2 text-sm last:border-b-0 dark:border-zinc-800">
       {/* Queue tag (2026-08-21) -- the same compact, muted locator `Row`'s own queue badge is,
@@ -81,10 +85,18 @@ function PreflightRowView({ row, settle }: { row: PreflightRowOut; settle: Settl
       {/* The state chip (2026-08-21, "the settling is just a soft grey chip now") -- routed
        * through `StateChip` (`SETTLING`'s existing amber, never a hand-rolled grey span) rather
        * than bypassing it, the actual defect the user's report named. Every Preflight row, *arr
-       * or settle, uses the same `SETTLING` colour -- "a Preflight row is a waiting row whatever
-       * its source" (this task's own reasoning); only the label text (`preflightChipLabel`) and
-       * the tooltip (`preflightChipTooltip`) differ by source. */}
-      {chipLabel && <StateChip state="SETTLING" label={chipLabel} title={chipTooltip ?? undefined} />}
+       * or settle, reads the same amber (`preflightChipState` -> `WAITING`/`SETTLING`, both
+       * `STYLES` entries are the identical amber) -- "a Preflight row is a waiting row whatever
+       * its source" (this task's own reasoning); only the label text (`preflightChipLabel`), the
+       * tooltip (`preflightChipTooltip`), and now whether it fills (`preflightFillPercent`,
+       * 2026-08-21 follow-up: "we get that detail from arr so we should include it behind the
+       * chip") differ by source/status. `fillPercent` is passed unconditionally, same idiom
+       * `StateChipProps.percent`'s own docstring recommends -- `SETTLING` has no `FILL_STYLES`
+       * entry, so it renders plain regardless of what's passed; only a `WAITING` row (an *arr
+       * release actively downloading at a remote client) ever actually shows a bar. */}
+      {chipLabel && (
+        <StateChip state={chipState} percent={fillPercent} label={chipLabel} title={chipTooltip ?? undefined} />
+      )}
       <SourceChip row={row} />
       {/* The figure column -- `w-44`, matching `Row`'s own (widened from `w-32` when its ETA
        * figure was added; the same reason applies here: `preflightRemainingLabel` can make this

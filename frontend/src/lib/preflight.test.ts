@@ -2,7 +2,9 @@ import { describe, expect, it } from 'vitest'
 import {
   isPreflightPageSize,
   preflightChipLabel,
+  preflightChipState,
   preflightChipTooltip,
+  preflightFillPercent,
   preflightRemainingLabel,
   preflightSizeLabel,
   preflightStatusLabel,
@@ -167,6 +169,54 @@ describe('preflightChipTooltip', () => {
         { enabled: true, required_scans: 2, min_age_s: 60 },
       ),
     ).toBe('Waiting for changes')
+  })
+})
+
+describe('preflightFillPercent -- the "Waiting" chip\'s own bar', () => {
+  it('is the done-over-total percent once both figures are known', () => {
+    expect(preflightFillPercent({ size_bytes: 1_000_000, size_remaining_bytes: 250_000 })).toBe(75)
+  })
+
+  it('is null when the total is absent -- never a placeholder', () => {
+    expect(preflightFillPercent({ size_bytes: null, size_remaining_bytes: 100 })).toBeNull()
+  })
+
+  it('is null when the remaining figure is absent -- a paused/stalled client item, per the *arr', () => {
+    expect(preflightFillPercent({ size_bytes: 1_000_000, size_remaining_bytes: null })).toBeNull()
+  })
+
+  it('is null for a non-positive total -- never a divide-by-zero NaN%', () => {
+    expect(preflightFillPercent({ size_bytes: 0, size_remaining_bytes: 0 })).toBeNull()
+  })
+
+  it('is null when remaining exceeds total -- a stale/inconsistent *arr record, never a negative bar', () => {
+    expect(preflightFillPercent({ size_bytes: 1000, size_remaining_bytes: 2000 })).toBeNull()
+  })
+
+  it('is null for a negative remaining figure -- nonsensical, not clamped to a fake number', () => {
+    expect(preflightFillPercent({ size_bytes: 1000, size_remaining_bytes: -1 })).toBeNull()
+  })
+
+  it('is 100 when the remaining figure has reached zero', () => {
+    expect(preflightFillPercent({ size_bytes: 1000, size_remaining_bytes: 0 })).toBe(100)
+  })
+})
+
+describe('preflightChipState -- which StateChip bucket a row\'s chip renders through', () => {
+  it('is WAITING for the one *arr status this box translates to "Waiting"', () => {
+    expect(preflightChipState({ source: 'arr', status_label: 'downloading' })).toBe('WAITING')
+  })
+
+  it('is SETTLING for an *arr row past downloading -- importing has nothing to fill', () => {
+    expect(preflightChipState({ source: 'arr', status_label: 'importing' })).toBe('SETTLING')
+  })
+
+  it('is SETTLING for an *arr row with an unverified status shown verbatim', () => {
+    expect(preflightChipState({ source: 'arr', status_label: 'paused' })).toBe('SETTLING')
+  })
+
+  it('is SETTLING for a settle row -- deliberately never fills', () => {
+    expect(preflightChipState({ source: 'settle', status_label: 'Settling' })).toBe('SETTLING')
   })
 })
 

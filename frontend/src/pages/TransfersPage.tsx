@@ -68,6 +68,7 @@ import {
   manualOutcomeLabel,
   mergeFileListChildren,
   processingGroupFields,
+  queueRowPercent,
   resolveMenuOptions,
   showsFileList,
   sortTransferRows,
@@ -252,7 +253,14 @@ function Row({
         >
           {itemName(job.rel_path)}
         </button>
-        <StateChip state={chipStateFor(job)} />
+        {/* 2026-08-21 ("we lost that"): this row's own ticking fill, the one place on this page
+         * that lost it when the single-line collapse (2026-08-15) moved everything else into the
+         * expand panel. `queueRowPercent` reuses `lib/fileTree.ts.stateProgressPercent` fed this
+         * row's own bytes-done/bytes-total, the same number `transferLineValue` below already
+         * renders as text -- showing it twice (chip + figure column) is explicitly wanted, not a
+         * duplication to fix ("no % is good it is small but the chip updating makes it dynamic
+         * and cool"). */}
+        <StateChip state={chipStateFor(job)} percent={queueRowPercent(job, live)} />
         {/* What this row is still waiting on (2026-08-20, docs/transfers-redesign-spec.md §3.2's
          * pipeline-completion rule) -- Verifying / Extracting / Processing / Awaiting import /
          * Deleting source. The point of the Queue tab is to say what is moving *and why*, so a

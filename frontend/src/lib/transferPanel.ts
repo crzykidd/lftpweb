@@ -15,7 +15,7 @@ import type { FileNode, JobOut } from '../api/types'
 // `ChildSpeedSample` is `useLiveModel.ts`'s own shape, imported for its type only -- the same
 // "pull the field types out, not the whole hook" split `LiveProgress` above already establishes.
 import type { ChildSpeedSample } from '../hooks/useLiveModel'
-import { freshChildSpeedBps } from './fileTree'
+import { freshChildSpeedBps, stateProgressPercent } from './fileTree'
 import { formatBytes, formatEta, formatPercent, formatRate, formatRelativeTimeIntl } from './format'
 import { averageSpeedBps, elapsedSeconds, isNotableQueuedWait, queuedWaitSeconds } from './transferTiming'
 
@@ -61,6 +61,27 @@ export function transferLineValue(job: JobOut, live?: LiveProgress): string {
     return eta != null ? `${base} · ${formatEta(eta)} left` : base
   }
   return job.bytes_total != null ? formatBytes(job.bytes_total) : '—'
+}
+
+/** The Queue row's own chip fill percent (2026-08-21, "the downloading chip in files uses a bar
+ * to show % as well. we lost that") -- the same number `transferLineValue` above already renders
+ * as text (`45% · 40 MB/s`), reused rather than re-derived, fed through `lib/fileTree.ts.
+ * stateProgressPercent` -- the one place that already decides what a percent means for a chip --
+ * in place of writing a second definition of that rule for this row. `bytesDone`/`bytesTotal`
+ * take the identical live-progress-over-job fallback `transferLineValue` uses, so the chip's own
+ * number can never disagree with the figure column sitting right beside it (the user has
+ * explicitly approved seeing the same percent twice, in the chip and in the figure column).
+ *
+ * Only a `running` job ever gets a state `stateProgressPercent` has a fill for (`chipStateFor`
+ * maps `running` to `'DOWNLOADING'`; every other job state maps to something with no
+ * `FILL_STYLES` entry) -- checked directly here rather than importing `chipStateFor` from
+ * `TransfersPage.tsx`, which would make this lib module depend on a page module.
+ */
+export function queueRowPercent(job: JobOut, live?: LiveProgress): number | null {
+  if (job.state !== 'running') return null
+  const bytesDone = live?.bytes_done ?? job.bytes_done
+  const bytesTotal = (live?.bytes_total ?? job.bytes_total) ?? job.bytes_total
+  return stateProgressPercent('DOWNLOADING', bytesDone, bytesTotal)
 }
 
 /** One row of the expand panel -- a plain label/value pair, optionally with a longer `title` for

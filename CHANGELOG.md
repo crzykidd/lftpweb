@@ -25,6 +25,14 @@ Skeleton for the next roll:
 
 ### Added
 
+- **The Queue row's own chip fills and ticks again, and Preflight's "Waiting" chip now fills as
+  the remote client downloads**: the single-line Transfers row lost its state chip's percent when
+  it collapsed to one line (2026-08-15) — it's back (`Downloading 45%`, alongside the figure
+  column's own `45% · 40 MB/s · 25m left`, both shown deliberately). Preflight's *arr "Waiting"
+  chip gets its own fillable amber bucket (`WAITING`, `components/StateChip.tsx`), fed the *arr's
+  own `size`/`sizeleft` queue fields — visibility into a download happening entirely outside
+  lftpweb. `Settling` deliberately keeps no fill (its detail is its tooltip, not a bar); a row
+  with no size data from the *arr renders a plain chip, never `0%` or a fabricated bar.
 - **The Preflight box gains a second source (settle-gated releases) and a mount-gate banner**
   (`docs/transfers-redesign-spec.md` §4, `prompts/2026-08-20-preflight-waiting-sources.md`): an
   item that would be auto-queued right now if only its remote fingerprint had settled shows up

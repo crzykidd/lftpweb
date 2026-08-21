@@ -22,6 +22,7 @@ import {
   manualOutcomeLabel,
   mergeFileListChildren,
   processingGroupFields,
+  queueRowPercent,
   resolveMenuOptions,
   showsFileList,
   sortTransferRows,
@@ -115,6 +116,31 @@ describe('transferLineValue -- the row-collapse decision', () => {
     expect(transferLineValue(job('queued', { bytes_total: 5000 }))).toBe('4.9 KB')
     expect(transferLineValue(job('queued', { bytes_total: null }))).toBe('—')
     expect(transferLineValue(job('failed', { bytes_total: null }))).toBe('—')
+  })
+})
+
+describe('queueRowPercent -- the Queue row\'s own chip fill', () => {
+  it('reads the same percent transferLineValue renders as text, from the job\'s own bytes', () => {
+    expect(queueRowPercent(job('running', { bytes_done: 250, bytes_total: 1000 }))).toBe(25)
+  })
+
+  it('prefers the live reading over the job\'s own, same fallback transferLineValue uses', () => {
+    const live: LiveProgress = { bytes_done: 900, bytes_total: 1000, speed_bps: 1024, eta_s: 5 }
+    expect(queueRowPercent(job('running', { bytes_done: 100, bytes_total: 1000 }), live)).toBe(90)
+  })
+
+  it('is null for a queued job -- not yet running, nothing to fill', () => {
+    expect(queueRowPercent(job('queued', { bytes_total: 1000 }))).toBeNull()
+  })
+
+  it('is null for a terminal job -- the chip shows an outcome, not a percent', () => {
+    expect(queueRowPercent(job('succeeded', { bytes_done: 1000, bytes_total: 1000 }))).toBeNull()
+    expect(queueRowPercent(job('failed', { bytes_done: 500, bytes_total: 1000 }))).toBeNull()
+    expect(queueRowPercent(job('cancelled', { bytes_done: 500, bytes_total: 1000 }))).toBeNull()
+  })
+
+  it('is null while running with no total known yet, rather than a NaN%', () => {
+    expect(queueRowPercent(job('running', { bytes_done: 100, bytes_total: null }))).toBeNull()
   })
 })
 
