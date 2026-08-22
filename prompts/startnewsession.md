@@ -208,12 +208,13 @@ in `prompts/`.** A written handoff prompt is linked from its issue. **Read the i
 something is untracked**, and open one for anything deferred rather than letting it live only in a
 session transcript.
 
-**Only three are open.** #14/#15/#16/#17/#19 all shipped in v0.3.1 and were closed 2026-08-22.
+**Four are open.** #14/#15/#16/#17/#19 all shipped in v0.3.1 and were closed 2026-08-22; #22 was opened 2026-08-22.
 
 | Issue | What | Prompt |
 |---|---|---|
 | [#18](https://github.com/crzykidd/lftpweb/issues/18) | **Phase 2 — the download-client connector framework (SAB, then ruTorrent).** In progress: **stage 0 of 5 landed 2026-08-22** | `docs/download-client-framework-spec.md` is the governing spec; stage 0's own prompt is in `prompts/done/2026-08-22-client-framework-stage0.md` |
 | [#21](https://github.com/crzykidd/lftpweb/issues/21) | Torrent manager — seeding overview, per-site stop-seeding rules, space reclamation. **Depends on #18** | `docs/torrent-manager-spec.md` |
+| [#22](https://github.com/crzykidd/lftpweb/issues/22) | Startup log shows only `__version__`, so a `dev` build announces the last *released* version and cannot be told apart from a real release. `build_sha`/`build_channel` already exist in config and are already surfaced by `/api/health` and the support bundle | — |
 | [#1](https://github.com/crzykidd/lftpweb/issues/1) | (older) Decide item-row lifetime — nothing ever deletes `item` rows | — |
 
 ### 🚀 v0.3.1 released 2026-08-22 — a day of queue-control work, browser-tested before the cut
