@@ -90,9 +90,48 @@ than a first. Two things that bit the first time and will bit again:
 
 ## Where we are
 
-### 👉 NEXT UP: #18, the download-client connector framework
+### 👉 IN PROGRESS: #18, the download-client connector framework — **stage 0 landed 2026-08-22**
 
-**The user is starting a fresh session specifically to build this.** Read, in this order:
+**[`docs/download-client-framework-spec.md`](../docs/download-client-framework-spec.md) is now the
+governing document for this work — read it before anything else in this section.** Written
+2026-08-22 from a long design session with the user; 15 numbered sections, six staged deliverables.
+It supersedes `docs/transfers-redesign-spec.md` §4's sketch (which remains correct, just thinner)
+and is the input `docs/torrent-manager-spec.md` (#21) depends on.
+
+**The four decisions that shaped it, all the user's:**
+
+1. **Deletion never goes through the client.** `remove` means *unregister, leave the data*; lftpweb
+   deletes the bytes itself over SSH (`core/remote.py.delete_path`), verifies by re-stat, and logs
+   an event. This deletes `remove_with_data` from the vocabulary entirely and removes rTorrent's
+   `erasedata`-hook detection — the survey's worst corner — from the design. Spec §10.
+2. **A disk review scan** over the client's base paths: `B − A − C` → debris, `A − B` → broken
+   seeds. Review-only; never auto-deletes. Spec §11.
+3. **The reference workflow is documented, and it is load-bearing** (spec §1.1): SAB and rTorrent
+   share a completed folder, SAB *extracts* into it, rTorrent *hardlinks* into it. This forces
+   inode-based claiming (§11.1b), union-across-clients set arithmetic (§11.1a), and link-aware
+   freed-space prediction (§10.5). A README write-up of this preferred setup is a stage 1
+   deliverable.
+4. **Base paths are user-configured** with the existing `core/browse.py` remote picker; the
+   client's own `list_base_paths` is a prefill only. Save-time validation matters here because a
+   base path is the boundary the delete containment check authorises removal *within*. Spec §8.2.
+
+**Stage 0 is built** (`core/clients/`, first subpackage under a previously flat `core/`): the
+`Operation`/`Field` closed enums, tri-state `Capability` with caveat notes, the three-layer
+`CapabilitySet` merge, the three-way error taxonomy, the registry, a fake adapter, and a 33-test
+conformance suite. **1718 backend tests, 0 skipped.** No API, no migration, no poller, no real
+client — stage 1 is the SABnzbd adapter.
+
+**The single most important invariant in stage 0:** `base.py.degrade_from_error` degrades a
+capability **only** on `CapabilityUnavailable`. A `ClientUnreachable` or a bare `ClientError`
+changes nothing, ever — that is §4.2's "absent from the client is not a verdict" applied to
+configuration, and it is what stops one bad network minute from permanently disabling a feature.
+
+**Live validation loop:** https://lftpweb.crzynet.com answers `/api/health`, `/api/history/events`,
+`/api/logs/*`, `/api/settings/*` and `/api/files` unauthenticated from the dev host, so a deployed
+stage can be verified by reading its own events rather than by relaying output. It runs **SAB and
+rTorrent** today, sharing the TV completed folder.
+
+Background reading, in this order:
 
 1. **[`docs/download-client-api-survey.md`](../docs/download-client-api-survey.md)** — what
    rTorrent/ruTorrent, qBittorrent, Transmission, Deluge and SABnzbd can each actually report, from
@@ -128,7 +167,7 @@ session transcript.
 
 | Issue | What | Prompt |
 |---|---|---|
-| [#18](https://github.com/crzykidd/lftpweb/issues/18) | **Phase 2 — the download-client connector framework (SAB, then ruTorrent).** The next thing being built | none yet; `docs/download-client-api-survey.md` + spec §4 are the input |
+| [#18](https://github.com/crzykidd/lftpweb/issues/18) | **Phase 2 — the download-client connector framework (SAB, then ruTorrent).** In progress: **stage 0 of 5 landed 2026-08-22** | `docs/download-client-framework-spec.md` is the governing spec; stage 0's own prompt is in `prompts/done/2026-08-22-client-framework-stage0.md` |
 | [#21](https://github.com/crzykidd/lftpweb/issues/21) | Torrent manager — seeding overview, per-site stop-seeding rules, space reclamation. **Depends on #18** | `docs/torrent-manager-spec.md` |
 | [#1](https://github.com/crzykidd/lftpweb/issues/1) | (older) Decide item-row lifetime — nothing ever deletes `item` rows | — |
 

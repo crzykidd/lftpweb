@@ -6,6 +6,75 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-22 — download-client connector framework, stage 0 (issue #18/#21 foundation)
+
+`prompts/done/2026-08-22-client-framework-stage0.md`, building
+`docs/download-client-framework-spec.md`'s interface layer: `backend/lftpweb/core/clients/`
+(`errors.py`, `models.py`, `base.py`, `__init__.py`) plus `tests/fake_client.py` and
+`tests/test_clients_framework.py`. No real client is contacted — SABnzbd is stage 1.
+
+**Operation vs. field, restated in code terms.** `Operation` (13 members) governs what a
+caller may *ask the client to do*; `Field` (12 members, deliberately excluding the four
+always-present `Transfer` attributes — `client_id`/`name`/`phase`/`raw_status` — which are
+never subject to capability declaration at all) governs what a returned record may *carry*.
+Keeping them as two separate closed `StrEnum`s rather than one flat vocabulary is what lets
+`CapabilitySet.supports()` answer "can I call `recheck`?" and "can I filter on `seed_time_s`?"
+without either question polluting the other's enum with irrelevant members.
+
+**`remove_with_data` is absent from `Operation` because deletion is not a connector's job at
+all** (spec §10.1): `remove` unregisters the item and leaves the data; lftpweb deletes the
+bytes itself over SSH, as a separate step no connector ever sees. This also means stage 0 never
+had to model the ruTorrent `erasedata`-plugin mess the survey found — that entire failure mode
+left the vocabulary before it was ever drawn.
+
+**The no-database-handle guarantee is structural, not documented discipline**: `DownloadClient.
+__init__(self, *, config: Mapping[str, Any])` takes connection config only. There is no
+optional `session`/`conn` parameter to "just this once" pass a database handle through — adding
+one is a design regression, not a convenience, per the class's own docstring.
+
+**`core/clients/` is the first subpackage under `core/`**, previously flat. Justified the same
+way the spec flags it: 7–10 adapter modules plus four framework modules would make a flat
+`core/` unreadable, and this is called out rather than done silently.
+
+**Three further decisions made during the build, not dictated verbatim by the spec:**
+
+1. **`CapabilitySet` exposes two different merge operations, not one**, because "a connector's
+   static declaration overriding a baseline" (spec §5, authoring time, may raise or lower
+   support freely) and "a probed/runtime-degraded layer narrowing a static declaration" (spec
+   §4.1, runtime, may only lower) are genuinely different operations that the spec's prose
+   uses the word "override" for interchangeably. `overridden()` is unconstrained (baseline →
+   connector's own static truth); `narrowed_by()` enforces the rank check (`NONE < DERIVED <
+   NATIVE`) and is the only path `degrade_from_error()` is allowed to use. Conflating them
+   into one method would have made the narrowing rule impossible to also use for legitimate
+   authoring-time overrides in the opposite direction.
+2. **`project_transfer()` turns spec §2.2's "a connector must never declare a field it cannot
+   populate" from an assertion every connector's author must remember into a structural
+   guarantee**: it nulls any field a connector's own `capabilities` declares `Support.NONE`,
+   and every connector's parser is expected to route its output through it once. This is the
+   same move spec §1 already makes for the database-handle rule — enforce it in the shape of
+   the code, not by convention — generalized to a second rule the spec only stated as an
+   assertion to test for.
+3. **The three error types are not fully flat siblings**: `ClientError` is the taxonomy's base
+   class (raised directly for "failed, but neither of the other two reasons applies"), with
+   `ClientUnreachable` and `CapabilityUnavailable` as subclasses. The conformance suite checks
+   `type(exc)` rather than `isinstance`, so this hierarchy doesn't weaken "only three types
+   escape" into a tautology — but it does mean a caller that only wants "catch anything
+   connector-related" can catch `ClientError` alone, which the spec's flat table doesn't rule
+   out and the taxonomy's own contrast with `ArrClientError` (which *is* one flat class)
+   suggested was in scope.
+
+**Two things flagged back to the spec rather than silently resolved (see the stage-0 report
+for the full detail):** the exact per-key mapping from spec §5's prose ("queue, history,
+categories, paths, free space, pause, remove") onto `USENET_BASELINE`/`TORRENT_BASELINE`'s 25
+precise enum entries is this module's own reasonable reading, not a literal transcription —
+`list_files`/`set_label`/`resume` in particular aren't named in that prose at all. And spec
+§6.2's "no field is declared that the connector cannot populate" and "only the three error
+types escape" conformance checks can only be made genuinely registry-generic once a second
+connector with its own controllable failure/data state exists (stage 1's fake SABnzbd) — stage
+0 tests both directly against `FakeDownloadClient` instead.
+
+---
+
 ## 2026-08-21 — bandwidth is two values: reversing "one control, one setting" one day later
 
 `prompts/done/2026-08-21-bandwidth-ceiling-and-autocommit.md`, reversing
