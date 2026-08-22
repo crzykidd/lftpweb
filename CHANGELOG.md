@@ -48,15 +48,21 @@ Skeleton for the next roll:
   "pause for 30 minutes" you set, and says plainly that nothing was restarted. The slider still
   refuses a limit of 0 (which is not "unlimited" — it would stop the queue admitting anything at
   all) or one below the configured minimum share floor.
-- **Pause the transfer queue for a fixed duration** — a dropdown (1 / 10 / 30 / 60 minutes,
-  alongside the existing default "until I unpause") next to the Queue tab's Pause control,
-  combinable with both entry modes (*pause after current* / *pause now*). The deadline is a
-  stored absolute timestamp, not a running timer, so it survives a restart correctly: paused
-  before the deadline stays paused, but an app that comes back *after* the deadline resumes
-  unpaused rather than quietly re-honoring a stale pause. Expiry is enforced on the transfer
-  queue's own ~1s tick, so the queue resumes itself on schedule with no page open, and records
-  its own audit event distinct from a manual unpause. The paused banner and header badge both
-  show the deadline ("resumes at HH:MM") whenever one is set.
+- **Pause the transfer queue for a fixed duration, from one dropdown** — the Queue tab's Pause
+  control is a single list: **"Till I unpause"** (the default, first), then **1 / 10 / 30 / 60
+  minutes**. Picking an entry pauses immediately — the selection *is* the action, with no second
+  click. A persistent checkbox beside it, **"Pause after active", unchecked by default**, is what
+  used to be a second menu (*pause after current* vs *pause now*): checked waits for whatever is
+  already running to finish before the pause takes effect, unchecked (the default) also stops
+  what's running right away, returning it to `queued` at the same position so it resumes — not
+  restarts — once unpaused. The checkbox is disabled, with the reason on hover, whenever nothing
+  is running: with zero active transfers the two modes are identical, so offering the choice would
+  be noise. The deadline is a stored absolute timestamp, not a running timer, so it survives a
+  restart correctly: paused before the deadline stays paused, but an app that comes back *after*
+  the deadline resumes unpaused rather than quietly re-honoring a stale pause. Expiry is enforced
+  on the transfer queue's own ~1s tick, so the queue resumes itself on schedule with no page open,
+  and records its own audit event distinct from a manual unpause. The paused banner and header
+  badge both show the deadline ("resumes at HH:MM") whenever one is set.
 - **A paused or retried-after-interruption row now shows its own progress** — `QUEUED 45%`, in
   the same fillable chip the running row already uses, so a paused-now item visibly keeps the
   bytes it already downloaded rather than looking like it lost them. Gated on the row genuinely

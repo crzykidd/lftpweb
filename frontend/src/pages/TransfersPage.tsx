@@ -47,6 +47,12 @@ import {
   paginateClientSide,
 } from '../lib/pagination'
 import type { PageSize } from '../lib/pagination'
+import {
+  PAUSE_AFTER_ACTIVE_UNAVAILABLE_HINT,
+  type PauseDurationMinutes,
+  isPauseAfterActiveAvailable,
+  pauseStopRunning,
+} from '../lib/pause'
 import { queueDisplayName } from '../lib/queueDisplayName'
 import type { StartNowRatePercent } from '../lib/startNow'
 import { readLocalStorage, writeLocalStorage } from '../lib/storage'
@@ -852,13 +858,16 @@ export function TransfersPage() {
   const health = usePoll(healthFetcher, 5000)
   const [pauseBusy, setPauseBusy] = useState(false)
   const [pauseError, setPauseError] = useState<string | null>(null)
-  // Pause-for-a-duration (2026-08-21, prompts/2026-08-21-pause-for-duration.md): the dropdown's
-  // current choice, applied to whichever entry mode ("Pause after current" / "Pause now") is
-  // picked next -- `''` (the default) is "until I unpause", the indefinite pause this dropdown
-  // extends rather than replaces. Deliberately not reset after a pause is issued: re-opening the
-  // dropdown to re-pick "10 minutes" every time would be the annoying default, not the useful
-  // one.
-  const [pauseDuration, setPauseDuration] = useState<'' | '1' | '10' | '30' | '60'>('')
+  // Pause control redesign (2026-08-21, prompts/2026-08-21-pause-control-redesign.md, findings 2
+  // and 3 of prompts/test-findings-2026-08-21.md): the duration `<select>` and the two-entry
+  // "after current"/"now" `PauseMenu` are gone, replaced by one dropdown (`PauseMenu`, now
+  // duration-only -- see its own docstring) plus this persistent checkbox. Unchecked by default
+  // (the user's explicit call) -- pause now. Deliberately not reset after a pause is issued, same
+  // reasoning the old `pauseDuration` state had: re-toggling it back every time would be the
+  // annoying default, not the useful one. `lib/pause.ts.pauseStopRunning` is what actually turns
+  // this into the request's `stopRunning`, collapsing to "pause now" once nothing is running
+  // regardless of what this is set to (finding 2).
+  const [pauseAfterActive, setPauseAfterActive] = useState(false)
   // The Complete box's "Dismiss" menu (2026-08-20, follow-up to phase 1 stage 4b -- see
   // `handleDismissOutcome`'s own docstring below) -- replaces both the old page-top "Dismiss
   // all" button (`dismissingAll`/`dismissAllError`/`dismissAllCount`, same three-state shape
@@ -1078,18 +1087,23 @@ export function TransfersPage() {
     return withBusy(job.id, () => startJobNow(job.id, ratePercent))
   }
 
-  /** The Pause control (2026-08-20, prompts/2026-08-20-queue-pause.md) -- not per-row, so it
-   * doesn't go through `withBusy`/`busyIds` (those are keyed by job id); a page-level busy flag
-   * disables the control itself for the duration of the request instead. `refreshAll()` on
-   * success so a "pause now" is reflected immediately (jobs that were `running` a moment ago now
-   * read `queued`) rather than waiting for the next poll tick.
+  /** The Pause control (2026-08-20, prompts/2026-08-20-queue-pause.md; redesigned 2026-08-21,
+   * prompts/2026-08-21-pause-control-redesign.md) -- not per-row, so it doesn't go through
+   * `withBusy`/`busyIds` (those are keyed by job id); a page-level busy flag disables the control
+   * itself for the duration of the request instead. `refreshAll()` on success so a "pause now" is
+   * reflected immediately (jobs that were `running` a moment ago now read `queued`) rather than
+   * waiting for the next poll tick.
+   *
+   * Fires the instant a `PauseMenu` entry is picked -- the selection *is* the action now, no
+   * second click. `pauseAfterActive` (the checkbox) is read here, at selection time, rather than
+   * threaded through the menu itself: `lib/pause.ts.pauseStopRunning` turns it into `stopRunning`,
+   * collapsing to "pause now" if nothing is running regardless of the checkbox (finding 2).
    */
-  const handlePause = async (mode: 'after_current' | 'now') => {
+  const handlePauseSelect = async (durationMinutes: PauseDurationMinutes) => {
     setPauseBusy(true)
     setPauseError(null)
     try {
-      const durationMinutes = pauseDuration === '' ? undefined : Number(pauseDuration)
-      await pauseQueue(mode === 'now', durationMinutes as 1 | 10 | 30 | 60 | undefined)
+      await pauseQueue(pauseStopRunning(pauseAfterActive, runningCount), durationMinutes)
       refreshAll()
     } catch (err) {
       setPauseError(err instanceof Error ? err.message : String(err))
@@ -1228,21 +1242,26 @@ export function TransfersPage() {
 
   return (
     <div className="flex flex-col gap-3">
-      {/* Pause (2026-08-20, prompts/2026-08-20-queue-pause.md): the control lives at the very
-       * top of the Queue tab, above every other control on this page -- pausing is a page-level
-       * action, not a per-row one, and "a queue that silently does nothing is a support question
-       * waiting to happen" is the task's own reasoning for making the paused state unmistakable
-       * rather than a quiet badge. Reordering (the chevrons below) and auto-queue/manual Queue
-       * clicks keep working while paused -- only admission itself stops -- so this banner reads
-       * as "nothing new is starting," not "nothing is happening."
+      {/* Pause (2026-08-20, prompts/2026-08-20-queue-pause.md; redesigned 2026-08-21,
+       * prompts/2026-08-21-pause-control-redesign.md): the control lives at the very top of the
+       * Queue tab, above every other control on this page -- pausing is a page-level action, not
+       * a per-row one, and "a queue that silently does nothing is a support question waiting to
+       * happen" is the task's own reasoning for making the paused state unmistakable rather than
+       * a quiet badge. Reordering (the chevrons below) and auto-queue/manual Queue clicks keep
+       * working while paused -- only admission itself stops -- so this banner reads as "nothing
+       * new is starting," not "nothing is happening."
        *
-       * The duration dropdown (2026-08-21, prompts/2026-08-21-pause-for-duration.md) sits next
-       * to the Pause control rather than inside `PauseMenu.tsx` -- both entry modes ("Pause
-       * after current" / "Pause now") stay exactly as they were, this just picks what deadline,
-       * if any, whichever one is chosen next carries. `''` (the default) is "until I unpause",
-       * so the two-option menu's existing behavior is unchanged unless a duration is picked
-       * first. Once paused, the deadline (if any) is shown via `pauseResumeLabel` rather than
-       * a bare "paused" -- a queue about to restart itself in 40 minutes has to say so. */}
+       * **One dropdown, selection is the action; the checkbox is the mode.** Before this task,
+       * the duration `<select>` did nothing until a separate two-entry `PauseMenu` was then
+       * clicked ("Pause after current" / "Pause now") -- two controls, two steps, the user's own
+       * "confusing" complaint. `PauseMenu` is now a single list (its own docstring has the
+       * order/entries) and picking any entry pauses immediately; "Pause after active" is the
+       * persistent checkbox that used to be the menu's second level, unchecked by default (pause
+       * now). Disabled with a reason on hover when nothing is running (finding 2 of
+       * prompts/test-findings-2026-08-21.md) -- with zero running transfers "after active" and
+       * "now" are identical, so the choice would be noise. Once paused, the deadline (if any) is
+       * shown via `pauseResumeLabel` rather than a bare "paused" -- a queue about to restart
+       * itself in 40 minutes has to say so. */}
       <div className="flex flex-wrap items-center gap-3">
         {health?.queue_paused ? (
           <>
@@ -1262,25 +1281,24 @@ export function TransfersPage() {
           </>
         ) : (
           <>
-            <div className="flex items-center gap-1.5">
-              <label htmlFor="pause-duration" className="text-xs text-zinc-500 dark:text-zinc-400">
-                For
-              </label>
-              <select
-                id="pause-duration"
-                value={pauseDuration}
-                onChange={(e) => setPauseDuration(e.target.value as typeof pauseDuration)}
-                disabled={pauseBusy}
-                className="rounded-md border border-zinc-300 bg-white px-1.5 py-1 text-xs font-medium text-zinc-700 hover:bg-zinc-50 disabled:opacity-50 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-200 dark:hover:bg-zinc-800"
-              >
-                <option value="">until I unpause</option>
-                <option value="1">1 minute</option>
-                <option value="10">10 minutes</option>
-                <option value="30">30 minutes</option>
-                <option value="60">60 minutes</option>
-              </select>
-            </div>
-            <PauseMenu disabled={pauseBusy} onSelect={handlePause} />
+            <PauseMenu disabled={pauseBusy} onSelect={(d) => void handlePauseSelect(d)} />
+            <label
+              className="flex items-center gap-1.5 text-xs text-zinc-600 dark:text-zinc-400"
+              title={
+                isPauseAfterActiveAvailable(runningCount)
+                  ? undefined
+                  : PAUSE_AFTER_ACTIVE_UNAVAILABLE_HINT
+              }
+            >
+              <input
+                type="checkbox"
+                checked={pauseAfterActive}
+                disabled={pauseBusy || !isPauseAfterActiveAvailable(runningCount)}
+                onChange={(e) => setPauseAfterActive(e.target.checked)}
+                className="h-3.5 w-3.5 rounded border-zinc-300 accent-zinc-700 disabled:opacity-50 dark:border-zinc-700 dark:accent-zinc-300"
+              />
+              Pause after active
+            </label>
           </>
         )}
         {pauseError && (

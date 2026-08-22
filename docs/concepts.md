@@ -28,12 +28,20 @@ Before chasing the settle gate or a suppression flag below, check the top of
 possibly a while ago) paused the transfer queue, and it survives a container restart on purpose —
 so "I don't remember pausing it" doesn't rule it out.
 
-Pausing has two flavors, both reached from the same **Pause** control:
+Pausing is one dropdown plus a checkbox. Click **Pause** and pick an entry — **Till I unpause**
+(the default, first) or **1 / 10 / 30 / 60 minutes** — and the pause happens the instant you pick
+it; there's no separate button to then click. The checkbox beside the dropdown, **"Pause after
+active"** (unchecked by default), is what decides the other question — what happens to anything
+already running:
 
-| Mode | What it does |
+| "Pause after active" | What it does |
 |---|---|
-| **Pause after current** | Nothing new starts. Whatever is already running keeps going to completion. |
-| **Pause now** | Also stops whatever is running, immediately — but leaves it **ready to resume**, not restarted. The partial bytes on disk are untouched, and unpausing picks it back up from exactly where it left off, at the front of the queue it was already holding a place in. |
+| **Unchecked** (the default) | Also stops whatever is running, immediately — but leaves it **ready to resume**, not restarted. The partial bytes on disk are untouched, and unpausing picks it back up from exactly where it left off, at the front of the queue it was already holding a place in. |
+| **Checked** | Nothing new starts. Whatever is already running keeps going to completion. |
+
+**The checkbox is disabled, with the reason on hover, whenever nothing is running.** With zero
+active transfers, checked and unchecked pause the queue identically, so offering the choice would
+be noise.
 
 **This is deliberately not the same thing as Stop.** A paused-now item never carries the
 `user_stopped` suppression flag (see [auto-queue suppression](#suppression) below) and never
@@ -64,12 +72,11 @@ unpause. **Start now** is the one control that's turned off while paused (with t
 tooltip) — oversubscribing past the ceiling to force one item through would defeat the pause you
 just asked for.
 
-**Pausing for a fixed duration.** Next to the Pause control is a dropdown — *until I unpause*
-(the default), or *1 / 10 / 30 / 60 minutes* — that applies to whichever of the two modes above
-you pick next. Once paused with a duration set, the banner and header badge both say **when**:
-"Queue paused — nothing new is being admitted (resumes at 14:32)". When that time arrives, the
-queue unpauses itself automatically, on the server's own clock — no page needs to be open for it
-to happen, and a restart before the deadline keeps the pause (and the deadline) intact, exactly
+**The deadline persists like the pause itself.** Once paused with a duration set, the banner and
+header badge both say **when**: "Queue paused — nothing new is being admitted (resumes at
+14:32)". When that time arrives, the queue unpauses itself automatically, on the server's own
+clock — no page needs to be open for it to happen, and a restart before the deadline keeps the
+pause (and the deadline) intact, exactly
 as an indefinite pause survives a restart. A restart *after* the deadline already passed comes
 back unpaused rather than resuming a stale pause. Re-picking a duration (or picking *until I
 unpause*) while already paused replaces the deadline outright — it never stacks two pauses on

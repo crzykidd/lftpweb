@@ -137,7 +137,18 @@ only in a session transcript.
 proves the pending-row concept against a real feed, and its source-agnostic boundary held through
 six tasks — so a SAB adapter is now an *enrichment of a working box*, not a new foundation.
 
-### On `dev` since the release (8 commits)
+### On `dev` since the release (9 commits)
+
+**The Pause control collapsed to one dropdown plus a checkbox** (findings 2 and 3 of
+`prompts/test-findings-2026-08-21.md`, `prompts/done/2026-08-21-pause-control-redesign.md`) —
+`PauseMenu.tsx` is now a single "Till I unpause" / 1 / 10 / 30 / 60-minute list where picking an
+entry pauses immediately, replacing the old duration `<select>` + separate two-entry menu that
+needed a second click; the "after current" vs "now" fork is now a persistent "Pause after active"
+checkbox (unchecked by default) beside it, disabled with a hover reason whenever nothing is
+running (`lib/pause.ts.isPauseAfterActiveAvailable`) since the two modes are then identical.
+Backend untouched, exactly as scoped — `pauseQueue`'s existing `stopRunning`/`durationMinutes`
+contract is unchanged; `lib/pause.ts.pauseStopRunning` just decides what to pass it. 1675
+backend / 671 frontend tests, 0 skipped. Browser-unverified.
 
 **Bandwidth became two values, and the slider commits itself** (findings 1 and 4 of
 `prompts/test-findings-2026-08-21.md`, `prompts/done/2026-08-21-bandwidth-ceiling-and-autocommit.md`)

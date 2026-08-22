@@ -61,7 +61,7 @@ Remaining questions for that work:
 - Settings → Transfer then shows/edits only the max; the two surfaces stop being the same number,
   so the "both surfaces reflect each other" behavior needs restating rather than deleting.
 
-## 2. "Pause after current" should not be offered when nothing is running — **open**
+## 2. "Pause after current" should not be offered when nothing is running — **done**
 
 With zero running transfers, *Pause after current* and *Pause now* are the same action, so offering
 both is noise at best and misleading at worst. Hide it (or disable it with a reason) when the
@@ -73,7 +73,7 @@ Interacts with the duration dropdown from `1791af8` — the two live in the same
 running is the **"Pause after active" checkbox**, not a menu entry. Same rule, new control. Fix the
 two together.
 
-## 3. Redesign the pause control as one dropdown + a checkbox — **open**
+## 3. Redesign the pause control as one dropdown + a checkbox — **done**
 
 > *"The pause for x minutes dialog is confusing. Currently I select it and then I have to hit the
 > pause button, but really it should just do a pause on selection of an item. … Maybe just a simple
@@ -101,6 +101,16 @@ rather than a fork buried in a menu. Replaces both the duration `<select>` and t
 Backend is unaffected — both entry modes and the `paused_until` deadline already exist and keep
 their semantics. **This is a frontend control redesign**, plus finding 2's rule applied to the new
 checkbox.
+
+**Built 2026-08-21** (`prompts/done/2026-08-21-pause-control-redesign.md`), together with finding
+2 — they are the same control. `PauseMenu.tsx` is now the single "Till I unpause" / 1 / 10 / 30 /
+60-minute list, and selecting an entry calls `pauseQueue` immediately; the checkbox
+("Pause after active", unchecked by default) lives in `TransfersPage.tsx` beside it and is
+disabled — with the reason on hover — whenever nothing is running (`lib/pause.ts.
+isPauseAfterActiveAvailable`). The backend is untouched, exactly as scoped: `pauseQueue`'s
+existing `stopRunning`/`durationMinutes` contract is unchanged, `lib/pause.ts.pauseStopRunning`
+just decides what to pass it, collapsing to "pause now" once the running count is zero regardless
+of the checkbox's last value.
 
 ## 4. Bandwidth slider: too many clicks — checkbox + debounced auto-commit — **done**
 
