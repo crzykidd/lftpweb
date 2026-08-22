@@ -137,7 +137,17 @@ only in a session transcript.
 proves the pending-row concept against a real feed, and its source-agnostic boundary held through
 six tasks — so a SAB adapter is now an *enrichment of a working box*, not a new foundation.
 
-### On `dev` since the release (10 commits)
+### On `dev` since the release (11 commits)
+
+**Settings → Integrations' *arr poll-interval card was renamed and re-explained** (finding 6 of
+`prompts/test-findings-2026-08-21.md`, `prompts/done/2026-08-21-poll-cadence-labelling.md`) — the
+card was headed "Poll cadence" (internal vocabulary naming neither Sonarr nor Radarr) with help
+text giving only the floor and default; it is now "How often to check Sonarr/Radarr", with a
+`FieldHelp` popover explaining the consequence (Preflight's progress ticks once per check; a
+finished item needs two consecutive checks to leave "Awaiting import", so the lag is roughly
+twice the interval) and the cost (one extra request per enabled instance, every interval).
+Wording and placement only — the 10s default, 5s floor, 3600s ceiling, and the API and its
+validation are unchanged. 1685 backend / 680 frontend tests, 0 skipped. Browser-unverified.
 
 **The Dashboard's bytes chart gained a group-by control, and its per-range defaults changed**
 (finding 5 of `prompts/test-findings-2026-08-21.md`,

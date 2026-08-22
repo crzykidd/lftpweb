@@ -137,6 +137,17 @@ Skeleton for the next roll:
   configured value is untouched.
 
 ### Fixed
+
+- **The *arr poll-interval control was unlabeled and unexplained.** A user who had asked for the
+  setting and knew it had shipped went looking on Settings → Integrations and could not find it.
+  The card was headed "Poll cadence" — internal vocabulary that named neither Sonarr nor Radarr,
+  so it read as unrelated plumbing on a page otherwise all about them — and its help text gave
+  only the floor and default, not what changing it does. Now headed **"How often to check
+  Sonarr/Radarr"**, with the field's `FieldHelp` explaining the two things that actually get
+  faster (a Preflight row's progress, and how soon a finished item leaves "Awaiting import" — that
+  needs two consecutive checks, so the observed lag is roughly twice the interval) and what it
+  costs (one extra request per enabled instance, every interval). Wording and placement only —
+  the 10s default, 5s floor, 3600s ceiling and validation are unchanged.
 ### Security
 ### Deprecated
 ### Removed

@@ -238,7 +238,7 @@ than a day was redefined as the fraction of days in it that were up (not a heart
 average) — the one definition that works whether the underlying days came from the raw tables or
 `metric_daily`.
 
-## 6. The poll-cadence setting is unfindable and unexplained — **open**
+## 6. The poll-cadence setting is unfindable and unexplained — **done**
 
 > *"I don't know what the poll cadence setting is or where to find it."*
 
@@ -265,3 +265,13 @@ them.
 
 **Related and worth folding in:** `FieldHelp.tsx` exists for exactly this kind of explanation and is
 already used elsewhere in Settings — reuse it rather than growing the paragraph under the field.
+
+**Built 2026-08-21** (`prompts/done/2026-08-21-poll-cadence-labelling.md`): the card is now headed
+**"How often to check Sonarr/Radarr"** (was "Poll cadence") with a lead-in sentence stating it
+applies to every enabled instance, not just the first row of the table below it — kept at the top
+of the page rather than moved, since there's nowhere else for a setting that isn't about any one
+instance to live. The field label is now "Check interval (seconds)" with a `FieldHelp` popover
+explaining the consequence (Preflight's progress ticks once per check; a finished item needs two
+consecutive checks to leave "Awaiting import", so the observed lag is roughly twice the interval)
+and the cost (one extra request per enabled instance, every interval). Wording/placement only — no
+change to the 10s default, 5s floor, 3600s ceiling, or the API/validation.

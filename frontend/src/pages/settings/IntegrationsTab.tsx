@@ -9,6 +9,7 @@ import {
   updateArrInstance,
 } from '../../api/client'
 import type { ArrInstanceOut, ArrKind, ArrPollSettingsOut, ArrTestResponse } from '../../api/types'
+import { FieldHelp } from '../../components/FieldHelp'
 
 const inputClasses =
   'w-full rounded-md border border-zinc-300 bg-white px-2.5 py-1.5 text-sm text-zinc-900 outline-none focus:border-zinc-500 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100'
@@ -46,13 +47,30 @@ const POLL_INTERVAL_MAX_S = 3600
 
 const POLL_SETTINGS_EMPTY: ArrPollSettingsOut = { poll_interval_s: 10 }
 
-/** Settings → Integrations's poll cadence section (2026-08-21, issue #16,
+/** Settings → Integrations's poll-interval section (2026-08-21, issue #16,
  * `prompts/done/2026-08-21-arr-poll-cadence.md`) -- `core/arrsync.py.ArrSettings.
  * poll_interval_s` exposed here for the first time; before this it was DB-only, a default that
  * got written down rather than ever a user choice. Same self-contained load/save shape
  * `TransferTab.tsx`'s `SettleGateSection`/`DownloadPrefixSection` already establish for a
  * site-level setting that isn't part of a bigger form: its own `GET`/`PUT` cycle, a draft value
  * distinct from the last-saved one so typing doesn't fight the server response.
+ *
+ * **Relabelled 2026-08-21** (`prompts/done/2026-08-21-poll-cadence-labelling.md`, finding 6 of
+ * `prompts/test-findings-2026-08-21.md`): the user who asked for this setting and knew it had
+ * shipped could not find it. Two causes, both wording/placement, no behaviour change --
+ * `poll_interval_s`, its 10s default, 5s floor, 3600s ceiling and validation are untouched.
+ * 1. "Poll cadence" named nothing -- it's internal vocabulary that doesn't mention Sonarr/Radarr,
+ *    so on a page full of *arr configuration it read as unrelated plumbing. The heading now
+ *    names the action and its target the way the rest of this page already does.
+ * 2. The help text explained the floor and default -- mechanism, not consequence. It now says
+ *    what actually gets faster (Preflight's progress, how soon an item leaves "Awaiting
+ *    import") and what it costs (one more request per enabled instance per pass), reusing
+ *    `FieldHelp` the way every other field on this page's siblings already do rather than
+ *    growing the paragraph under the input.
+ * Kept at the top of the page rather than moved: it is site-wide, sitting above the per-instance
+ * list only because there's nowhere else for a setting that isn't about any one instance to go.
+ * The heading and lead-in sentence below now say "every enabled instance" explicitly so it can't
+ * read as belonging to the first row of the table underneath it.
  */
 function PollCadenceSection() {
   // One field, fully represented by `draft` -- unlike `DownloadPrefixSection` above (which also
@@ -95,20 +113,38 @@ function PollCadenceSection() {
 
   return (
     <div className="flex flex-col gap-3 rounded-md border border-zinc-200 p-4 dark:border-zinc-800">
-      <h3 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">Poll cadence</h3>
+      <h3 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">
+        How often to check Sonarr/Radarr
+      </h3>
       <p className={hintClasses}>
-        How often lftpweb asks each enabled instance for its download queue -- this is what
-        drives Preflight's progress fields and how quickly an import is confirmed (two
-        consecutive passes must agree, so confirmation takes up to roughly twice this value).
-        This costs one HTTP request per bound instance per pass for a normal-sized queue, so a
-        faster cadence is cheap; a queue that grows past 250 in-progress items is logged once as
-        an event when that happens, not silently absorbed.
+        One setting for <strong>every enabled instance</strong> below, not just the first one in
+        the list.
       </p>
       {loading ? (
         <p className="text-sm text-zinc-500 dark:text-zinc-400">Loading…</p>
       ) : (
         <label className="flex flex-col gap-1">
-          <span className={labelClasses}>Poll interval (seconds)</span>
+          <span className={labelClasses}>
+            Check interval (seconds)
+            <FieldHelp label="Check interval (seconds)">
+              <p>
+                How often lftpweb asks each enabled Sonarr/Radarr instance for its download
+                queue.
+              </p>
+              <p>
+                A shorter interval makes two things happen sooner: a <strong>Preflight</strong>{' '}
+                row's progress ticks once per check, so it visibly updates more often; and a
+                finished item leaves <strong>"Awaiting import"</strong> sooner -- that needs{' '}
+                <strong>two consecutive checks</strong> to agree before lftpweb confirms it, so
+                the actual delay you see is roughly <strong>twice</strong> this number, not equal
+                to it.
+              </p>
+              <p>
+                The cost: one extra request per enabled instance, every interval -- it grows with
+                how many instances you have turned on, not with how many items are downloading.
+              </p>
+            </FieldHelp>
+          </span>
           <input
             type="number"
             min={POLL_INTERVAL_MIN_S}
@@ -122,9 +158,8 @@ function PollCadenceSection() {
         </label>
       )}
       <p className={hintClasses}>
-        Default {POLL_SETTINGS_EMPTY.poll_interval_s}s. Floored at {POLL_INTERVAL_MIN_S}s against
-        a near-zero value; capped at {POLL_INTERVAL_MAX_S}s ({POLL_INTERVAL_MAX_S / 60} minutes)
-        since there is no real reason to want it slower.
+        Default {POLL_SETTINGS_EMPTY.poll_interval_s}s. Floored at {POLL_INTERVAL_MIN_S}s; capped
+        at {POLL_INTERVAL_MAX_S}s ({POLL_INTERVAL_MAX_S / 60} minutes).
       </p>
       {error && <p className="text-sm text-red-600 dark:text-red-400">{error}</p>}
       {saved && !error && <p className="text-sm text-emerald-600 dark:text-emerald-400">Saved.</p>}
