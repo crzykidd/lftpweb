@@ -1,9 +1,10 @@
 # Concepts
 
-The thirteen things that actually trip people up, and what to do about each.
+The fifteen things that actually trip people up, and what to do about each.
 
 ```jump
 Nothing is downloading at all — the queue is paused|#pause
+Changing the bandwidth limit restarted my transfers|#bandwidth
 It says Downloaded but it's still under Active/pending|#pipeline
 What "Mark complete" / "Mark failed" actually does|#manual-outcome
 Nothing downloaded for a minute|#settle
@@ -16,6 +17,7 @@ Inherit vs override|#inherit
 The Sonarr/Radarr icon|#arr-integration
 Why is this in Preflight and not downloading?|#preflight
 What's in a support bundle|#support-bundle
+Why old Dashboard detail disappears but the total doesn't|#daily-rollups
 ```
 
 ## Nothing is downloading at all — the queue is paused {#pause}
@@ -26,17 +28,35 @@ Before chasing the settle gate or a suppression flag below, check the top of
 possibly a while ago) paused the transfer queue, and it survives a container restart on purpose —
 so "I don't remember pausing it" doesn't rule it out.
 
-Pausing has two flavors, both reached from the same **Pause** control:
+Pausing is one dropdown plus a checkbox. Click **Pause** and pick an entry — **Till I unpause**
+(the default, first) or **1 / 10 / 30 / 60 minutes** — and the pause happens the instant you pick
+it; there's no separate button to then click. The checkbox beside the dropdown, **"Pause after
+active"** (unchecked by default), is what decides the other question — what happens to anything
+already running:
 
-| Mode | What it does |
+| "Pause after active" | What it does |
 |---|---|
-| **Pause after current** | Nothing new starts. Whatever is already running keeps going to completion. |
-| **Pause now** | Also stops whatever is running, immediately — but leaves it **ready to resume**, not restarted. The partial bytes on disk are untouched, and unpausing picks it back up from exactly where it left off, at the front of the queue it was already holding a place in. |
+| **Unchecked** (the default) | Also stops whatever is running, immediately — but leaves it **ready to resume**, not restarted. The partial bytes on disk are untouched, and unpausing picks it back up from exactly where it left off, at the front of the queue it was already holding a place in. |
+| **Checked** | Nothing new starts. Whatever is already running keeps going to completion. |
+
+**The checkbox is disabled, with the reason on hover, whenever nothing is running.** With zero
+active transfers, checked and unchecked pause the queue identically, so offering the choice would
+be noise.
 
 **This is deliberately not the same thing as Stop.** A paused-now item never carries the
 `user_stopped` suppression flag (see [auto-queue suppression](#suppression) below) and never
 reads `STOPPED`. It doesn't need a Retry click to come back — unpausing alone is enough, because
 pausing was never a decision about *that item*, only about *right now*.
+
+**The Queue row shows that non-destructiveness, not just states it.** A paused-now row's chip
+reads something like **`QUEUED 45%`**, with the same amber fill the running row's own chip uses —
+not the blue "actively transferring" one, since nothing is moving while it sits paused. That
+percentage is a snapshot, not a countdown: it doesn't tick on its own, because nothing is sampling
+a paused item's bytes; it only updates the next time the row re-renders with fresh data. The same
+figure shows for a **retried** item that was interrupted partway (its previous attempt failed with
+bytes already on disk) — the signal is "this row already has real progress on disk," not "the
+queue happens to be paused right now," so both situations read identically. A queued row with
+nothing downloaded yet looks exactly as it always has — no `0%`, no fill.
 
 **What keeps running anyway.** Pausing only ever stops new transfers from starting. It does not
 stop:
@@ -51,6 +71,73 @@ queue (the ▲/▼/▲▲ controls on each row) so the item you actually want ne
 unpause. **Start now** is the one control that's turned off while paused (with the reason in its
 tooltip) — oversubscribing past the ceiling to force one item through would defeat the pause you
 just asked for.
+
+**The deadline persists like the pause itself.** Once paused with a duration set, the banner and
+header badge both say **when**: "Queue paused — nothing new is being admitted (resumes at
+14:32)". When that time arrives, the queue unpauses itself automatically, on the server's own
+clock — no page needs to be open for it to happen, and a restart before the deadline keeps the
+pause (and the deadline) intact, exactly
+as an indefinite pause survives a restart. A restart *after* the deadline already passed comes
+back unpaused rather than resuming a stale pause. Re-picking a duration (or picking *until I
+unpause*) while already paused replaces the deadline outright — it never stacks two pauses on
+top of each other. Manually clicking **Unpause** also clears any deadline that was set, same as
+you'd expect.
+
+## Changing the bandwidth limit restarted my transfers {#bandwidth}
+
+That's the checkbox next to the slider, and it's the only way it could have worked.
+
+**There are two bandwidth numbers, and they do different jobs.**
+
+| Where | What it is |
+|---|---|
+| **Settings → Transfer → Max bandwidth** | The **ceiling** for the whole instance. Nothing ever goes faster than this. |
+| **The slider on [Transfers → Queue](/transfers/queue)** | A **throttle** *within* that ceiling — "run at 10 MB/s for now", when the ceiling is 100. |
+
+The slider can never be dragged above the ceiling; that is what "the max is the max" means. Lower
+the ceiling below where the throttle currently sits and the throttle comes down with it. Raise the
+ceiling again and only the ceiling moves — your throttle stays where you put it, and you can drag
+it back up whenever you like. There is still exactly **one** set of these numbers for the whole
+instance, never one per queue.
+
+**The throttle sticks.** It is saved, not a temporary override: it survives a restart, an empty
+queue, and unpausing. It stays where you left it until you move it.
+
+**The slider applies itself.** Let go of it and a line appears — *"Bandwidth update to 10 MB/s
+applied in 5 seconds…"* — counting down. When it reaches zero the change is made and the same line
+tells you what happened. Move the slider again during the countdown and it starts over, so if you
+change your mind just drag it back to where it was and nothing is saved at all. There is no Apply
+button to hunt for and no Cancel button to need.
+
+**The checkbox is the important part.**
+
+| "Apply to new items only" | What happens |
+|---|---|
+| **Checked** (the default) | The new limit is saved. Nothing running is touched — each transfer keeps the speed it started at. The next thing that starts uses the new limit. |
+| **Unchecked** | The new limit is saved, **and** every running transfer is stopped and immediately restarted at the new speed. |
+
+**Why the second one has to interrupt.** lftp is handed its speed limit when it starts and gives
+us no way to change it afterwards — there is no dial to turn on a transfer that's already
+running. So the only way to give a running transfer a different limit is to stop it and start it
+again under the new one. Unchecking the box is you saying that's fine; the banner afterwards
+names exactly how many transfers were restarted.
+
+**Nothing is lost when it does.** A restarted transfer picks up from the bytes already on disk —
+it does not re-download what it already had. It keeps its place in the queue, its attempt count
+doesn't advance, and it is never marked **Failed** or **Stopped**. It's the same machinery as
+**Pause now**, which is deliberate.
+
+**If the queue is paused, unchecking the box won't restart it.** With the queue paused, the
+number is saved and nothing else happens: it will not unpause you, and it will not cancel or
+shorten a "pause for 30 minutes" you set. (It also won't stop anything still running under a
+*Pause after current* — you asked for those to finish, so they finish.) The banner says so
+outright rather than claiming a restart that didn't happen, and the new limit applies to
+everything that starts once the pause ends.
+
+**Zero is not "unlimited."** A limit of 0 would leave the scheduler with no room to hand out and
+it would never start anything, so the slider won't go there — and it won't go below the minimum
+share floor from Settings → Transfer either, for the same reason. If you want a very high
+ceiling, set a very high number in Settings → Transfer.
 
 ## It says Downloaded but it's still under Active/pending — why? {#pipeline}
 
@@ -482,3 +569,38 @@ it's obvious at a glance whether the budget bought recent material. *arr log fil
 exactly as that *arr wrote them — unredacted, since lftpweb doesn't rewrite another app's own
 logs — so give one a glance before sharing it publicly. Building a bundle writes one audit event
 so there is always a record of when one was made and what it contained.
+
+## Why old Dashboard detail disappears but the total doesn't {#daily-rollups}
+
+The Dashboard's 24h/7d/30d charts read *raw* samples taken roughly every 30 seconds — enough
+detail to see a transfer's own shape, but far too much to keep for a year (30 days' worth is
+already tens of thousands of rows). Those raw rows are pruned after **30 days by default**
+(configurable, up to 30) — which is why picking a range further back than that shows nothing for
+the older part of it.
+
+The **total downloaded** figure at the top of the page, and the **90d**/**1y** chart ranges,
+read a *second*, much smaller table instead — one row per queue per day, kept for **13 months**.
+Every closed day gets rolled up into it (summed from the same raw samples) before its detailed
+rows are ever pruned, so the day's total survives even once the minute-by-minute detail behind
+it is gone. That is the whole trade: the *shape* of a transfer from nine months ago is gone for
+good, but *how much* moved that day isn't.
+
+A day the container was only partly running shows up distinctly — a thin marker on that day's
+bar, and "partial day, ~N% covered" in the chart's accessible table — rather than looking like
+either a normal quiet day or a total gap. A day with **no** marker and no bars simply never ran
+at all (before this feature existed, or the app was off that whole day); a day with bars but no
+marker ran the whole day.
+
+Both the daily table's 13-month window and the "past raw retention" boundary above are UTC
+calendar days — this app stores everything in UTC with no timezone handling anywhere, the same
+caveat History's date filters already carry. Away from UTC, "today" and "yesterday" can be off
+by a few hours.
+
+**How wide a bar is, is now its own choice** (2026-08-21, chart grouping) — a group-by dropdown
+(hour / day / week / month) sits over the bytes chart, defaulting per range (24h hourly, 7d/30d
+daily, 90d/1y weekly) rather than one fixed width per range. Week and month bars are summed from
+daily totals on the fly, whichever table already has that day's total (raw for 24h/7d/30d,
+the daily table for 90d/1y) — no separate weekly or monthly table exists. The one thing the
+dropdown can't offer is hourly detail at 90d/1y: raw samples are long since pruned by then and
+the daily table never recorded sub-day detail to begin with, so that option is greyed out with a
+reason instead of quietly handing back something coarser.

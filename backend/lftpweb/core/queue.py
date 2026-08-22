@@ -21,8 +21,8 @@ import json
 import logging
 import time
 from collections.abc import Sequence
-from dataclasses import dataclass
-from datetime import UTC, datetime
+from dataclasses import dataclass, replace
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -110,8 +110,8 @@ class NoSiteLimitConfiguredError(Exception):
     meaningless -- `api/jobs.py.start_now` turns this into a 409 naming the reason, rather than
     silently substituting Max, which is the one outcome the task's own settled decisions rule
     out explicitly. Max itself (`rate_percent` omitted or `100`) never raises this: it reuses
-    whatever `max_bandwidth_bps` already is, unconditionally, exactly as the pre-fraction
-    "Start now at max bandwidth" path always did.
+    whatever the effective limit already is (`TransferSettings.effective_bandwidth_bps`),
+    unconditionally, exactly as the pre-fraction "Start now at max bandwidth" path always did.
     """
 
 
@@ -125,6 +125,34 @@ class QueuePausedError(Exception):
     `JobNotQueuedError`'s 409 below and from `move_job`'s own guard -- reordering a queued job
     stays fully functional while paused (this task's own settled decision: pause is the moment
     you curate the order), so this check lives only in `start_now`, never in `move_job`.
+    """
+
+
+class SiteBandwidthTooLowError(Exception):
+    """Raised by `TransferQueue.set_site_bandwidth` for a limit the scheduler cannot work
+    with (2026-08-21, `prompts/done/2026-08-21-bandwidth-from-the-queue-page.md`) -- the Queue
+    tab's bandwidth slider writes the *throttle* (`TransferSettings.throttle_bandwidth_bps`,
+    2026-08-21), bounded to `[min_share_floor_bps, max_bandwidth_bps]`. **Only the lower bound
+    raises**: a value above the ceiling is clamped to it (`set_site_bandwidth`'s own docstring
+    says why a race deserves a clamp rather than an error), while these two quietly wedge
+    admission and so must be refused rather than written:
+
+    - **`<= 0` is not "unlimited."** DESIGN.md §4.5's headroom is `B - reserve - allocated`, so
+      `B = 0` makes `headroom <= 0` on every pass and the main lane admits **nothing, ever** --
+      the exact silent-deadlock shape the `B/2` reserve clamp exists to prevent (that clamp's
+      own docstring on `TransferSettings.effective_small_lane_reserve_bps`). `<= 0` reads as
+      "no site limit configured" for `start_now`'s fraction check, which is a different
+      question entirely and is why the confusion is worth a hard error here.
+    - **Below `min_share_floor_bps`** the ceiling is under the per-job floor the same settings
+      object declares, i.e. the very first admission already violates it. The floor is reused
+      as the bound rather than inventing a new one (the task's own instruction).
+
+    `api/jobs.py.set_queue_bandwidth` turns this into a 400 -- a bad value, not a state
+    conflict, so deliberately not the 409 `QueuePausedError`/`JobNotQueuedError` use.
+    **Settings -> Transfer's own `PUT /api/settings/transfer` is unchanged and still
+    unvalidated**: that surface is the expert one (it can express a deliberately odd
+    configuration, and every test that sets `min_share_floor_bps=0` goes through it); the
+    slider is the safe one.
     """
 
 
@@ -254,6 +282,24 @@ class TransferSettings:
     """Site-level settings (DESIGN.md §4.5's table + §9.3's parallelism knobs), persisted as
     JSON in `setting`. One instance = one site (DESIGN.md §4.5: "one container serves one
     site... not per-queue").
+
+    **Bandwidth is two values, not one** (2026-08-21,
+    `prompts/done/2026-08-21-bandwidth-ceiling-and-autocommit.md`, DESIGN.md §4.5's "The ceiling and
+    the throttle"):
+
+    - `max_bandwidth_bps` -- the **ceiling** (§4.5's `B`). Settings -> Transfer owns it, and its
+      meaning is unchanged from the day it was written.
+    - `throttle_bandwidth_bps` -- the **throttle**, the Queue tab's slider. `None` (the default,
+      and what every pre-existing settings row deserializes to) means "no throttle, run at the
+      ceiling", so an upgrade changes nothing about behaviour and no migration is needed.
+
+    `effective_bandwidth_bps()` below is the one the scheduler allocates against; **nothing
+    outside this class should read `max_bandwidth_bps` to decide how fast anything may go.**
+
+    Why two, when one day earlier this was deliberately one value edited by two surfaces
+    (`prompts/done/2026-08-21-bandwidth-from-the-queue-page.md`): capping the slider at the value
+    the slider itself edits is circular -- lower it once and the ceiling drops with it, so it can
+    never be raised back from the Queue page. A ratchet. See `docs/decisions.md`.
     """
 
     max_bandwidth_bps: int = 10_000_000
@@ -268,9 +314,26 @@ class TransferSettings:
     max_attempts: int = DEFAULT_MAX_ATTEMPTS
     retry_backoff_base_s: float = DEFAULT_RETRY_BACKOFF_BASE_S
     extra_lftp_settings: str = ""
+    # The Queue-tab throttle. `None` = follow the ceiling. Never above `max_bandwidth_bps`:
+    # `save_transfer_settings` clamps it on every write (so lowering the ceiling permanently
+    # clamps the throttle rather than letting a later ceiling *raise* restore an old, higher
+    # throttle), and `effective_bandwidth_bps` clamps again on read as belt-and-braces.
+    throttle_bandwidth_bps: int | None = None
+
+    def effective_bandwidth_bps(self) -> int:
+        """**The limit actually in force** -- what `admit()` allocates against, what a "start
+        now" fraction is a fraction *of*, and what the fast-lane reserve is carved out of.
+
+        The throttle when one is set (never above the ceiling), the ceiling otherwise. Unset is
+        the upgrade path and the ordinary state: with no throttle this returns exactly
+        `max_bandwidth_bps`, so every worked example in DESIGN.md §4.5 holds byte-for-byte.
+        """
+        if self.throttle_bandwidth_bps is None:
+            return self.max_bandwidth_bps
+        return min(self.throttle_bandwidth_bps, self.max_bandwidth_bps)
 
     def effective_small_lane_reserve_bps(self) -> int:
-        """The fast lane's slice of the ceiling, never more than half of it.
+        """The fast lane's slice of the limit in force, never more than half of it.
 
         The half-of-B clamp is load-bearing, not defensive. DESIGN.md §4.5 originally
         specified "10% of B, min 1 MB/s" — but that floor is unconditional, so any ceiling at
@@ -278,17 +341,31 @@ class TransferSettings:
         admitted nothing, ever. Jobs queued and sat there with no error and no log line. The
         fast lane exists to stop small items being blocked; it must never be able to block
         everything else instead.
+
+        **`B` here is the *effective* limit, not the ceiling** (2026-08-21, the two-value
+        model above). Deriving the reserve from the ceiling while the scheduler allocates
+        against a lower throttle would resurrect that exact trap through the new door: a 100
+        MB/s ceiling throttled to 1 MB/s would reserve 10 MB/s against a 1 MB/s budget, and the
+        main lane would again admit nothing, ever. The alternative -- bounding the throttle
+        below at twice the ceiling-derived reserve -- would forbid throttling a gigabit ceiling
+        below 25 MB/s, which is precisely the thing the slider exists to do.
         """
+        limit = self.effective_bandwidth_bps()
         raw = (
             self.small_lane_reserve_bps
             if self.small_lane_reserve_bps is not None
-            else max(round(self.max_bandwidth_bps * 0.10), 1_000_000)
+            else max(round(limit * 0.10), 1_000_000)
         )
-        return min(raw, self.max_bandwidth_bps // 2)
+        return min(raw, limit // 2)
 
     def scheduler_settings(self) -> scheduler.SchedulerSettings:
+        # `SchedulerSettings.max_bandwidth_bps` is `B`, the budget `admit()` divides up -- and
+        # `B` is the limit *in force*, so the effective value is fed in here, at the call site.
+        # `core/scheduler.py` is deliberately untouched by the two-value model: it keeps one
+        # bandwidth number, its contract is unchanged, and §4.5's worked examples still read
+        # exactly as written.
         return scheduler.SchedulerSettings(
-            max_bandwidth_bps=self.max_bandwidth_bps,
+            max_bandwidth_bps=self.effective_bandwidth_bps(),
             max_concurrent_transfers=self.max_concurrent_transfers,
             small_item_threshold_bytes=self.small_item_threshold_bytes,
             small_lane_concurrency=self.small_lane_concurrency,
@@ -313,7 +390,35 @@ async def load_transfer_settings(db: aiosqlite.Connection) -> TransferSettings:
     return TransferSettings(**known)
 
 
-async def save_transfer_settings(db: aiosqlite.Connection, settings: TransferSettings) -> None:
+def clamp_throttle_to_ceiling(settings: TransferSettings) -> TransferSettings:
+    """`throttle_bandwidth_bps <= max_bandwidth_bps`, always (2026-08-21, the two-value model on
+    `TransferSettings`). Applied by `save_transfer_settings` below, so **every** writer of the
+    settings row goes through it and no surface can persist a throttle above the ceiling --
+    including `PUT /api/settings/transfer`, which is how the ceiling gets *lowered* in the first
+    place.
+
+    Clamping on write, not only on read, is the load-bearing half: a read-side clamp alone would
+    keep the old, higher throttle in the row, so raising the ceiling again later would silently
+    *raise the throttle back* -- and "raising the ceiling raises the ceiling only" is one of the
+    two rules this whole model exists to provide (the other being that lowering the ceiling
+    clamps the throttle). `effective_bandwidth_bps` clamps again on read anyway, for a row
+    written by an older build or edited by hand.
+    """
+    throttle = settings.throttle_bandwidth_bps
+    if throttle is None or throttle <= settings.max_bandwidth_bps:
+        return settings
+    return replace(settings, throttle_bandwidth_bps=settings.max_bandwidth_bps)
+
+
+async def save_transfer_settings(
+    db: aiosqlite.Connection, settings: TransferSettings
+) -> TransferSettings:
+    """Persists the settings row and **returns what was actually written** -- which is not
+    always what was passed: `clamp_throttle_to_ceiling` above may have lowered the throttle.
+    Callers that go on to render the result (`api/jobs.py.put_transfer_settings`) must use the
+    return value, not their own argument, or they will report a throttle the row does not hold.
+    """
+    settings = clamp_throttle_to_ceiling(settings)
     payload = json.dumps({f: getattr(settings, f) for f in TransferSettings.__dataclass_fields__})
     await db.execute(
         "INSERT INTO setting (key, value, updated_at) VALUES (?, ?, STRFTIME('%Y-%m-%dT%H:%M:%fZ','now')) "
@@ -321,6 +426,7 @@ async def save_transfer_settings(db: aiosqlite.Connection, settings: TransferSet
         (SETTING_KEY, payload),
     )
     await db.commit()
+    return settings
 
 
 @dataclass(frozen=True)
@@ -337,9 +443,47 @@ class QueuePauseState:
     nothing new is admitted either way, and "pause now" already finished doing its one-time
     extra work (returning running jobs to `queued`, see `TransferQueue._pause_running_jobs`)
     by the time this is read again. There is nothing left for the entry mode to mean.
+
+    `paused_until` (2026-08-21, `prompts/2026-08-21-pause-for-duration.md`) is an **absolute
+    ISO-8601 UTC deadline, not a countdown or a running timer** -- the same "just a wall-clock
+    string in a `setting` row" idiom `core/auth.py`'s session `expires_at` already uses, and for
+    the same restart-correctness reason: a timer dies with the process, but a stored deadline
+    makes "still paused if we come back before it, unpaused if we come back after" fall out for
+    free, with no catch-up logic and no timer reconstruction. `None` means "paused indefinitely,
+    until someone unpauses" -- the default this dropdown-of-durations extends, never replaces.
+    Comparable directly against `_now_iso()`'s own format via plain string `<=` (both are
+    zero-padded `%Y-%m-%dT%H:%M:%S.%fZ`, so lexical order matches chronological order).
     """
 
     paused: bool = False
+    paused_until: str | None = None
+
+
+@dataclass(frozen=True)
+class BandwidthChangeOutcome:
+    """What `TransferQueue.set_site_bandwidth` actually did (2026-08-21,
+    `prompts/done/2026-08-21-bandwidth-from-the-queue-page.md`) -- the Queue tab's slider needs
+    to tell the user "12 transfers were re-admitted" or "nothing was interrupted, the queue is
+    paused," and neither is inferable from a 204.
+
+    `effective_bandwidth_bps` is the throttle **as applied** -- not necessarily what was asked
+    for, since a request above the ceiling is clamped to it rather than refused (2026-08-21, the
+    two-value model on `TransferSettings`). The banner reads this, never the requested number,
+    so what it announces is always what is in force.
+
+    `interrupted` is how many in-flight lftp children were stopped and re-queued in place so the
+    scheduler could hand them a fresh allocation against the new ceiling (DESIGN.md §4.5: a
+    running job's allocation is fixed at spawn, so re-admission is the *only* way to change it).
+    `0` for a future-items-only change, and also `0` when there was simply nothing running.
+
+    `skipped_because_paused` is the one case where "apply to in-progress" deliberately does
+    nothing beyond writing the setting -- see `set_site_bandwidth`'s own docstring for why a
+    paused queue is left completely alone.
+    """
+
+    effective_bandwidth_bps: int
+    interrupted: int = 0
+    skipped_because_paused: bool = False
 
 
 PAUSE_SETTING_KEY = "queue_pause_state"
@@ -354,11 +498,14 @@ async def load_queue_pause_state(db: aiosqlite.Connection) -> QueuePauseState:
         data = json.loads(row["value"])
     except (ValueError, TypeError):
         return QueuePauseState()
-    return QueuePauseState(paused=bool(data.get("paused", False)))
+    return QueuePauseState(
+        paused=bool(data.get("paused", False)),
+        paused_until=data.get("paused_until"),
+    )
 
 
 async def save_queue_pause_state(db: aiosqlite.Connection, state: QueuePauseState) -> None:
-    payload = json.dumps({"paused": state.paused})
+    payload = json.dumps({"paused": state.paused, "paused_until": state.paused_until})
     await db.execute(
         "INSERT INTO setting (key, value, updated_at) VALUES (?, ?, STRFTIME('%Y-%m-%dT%H:%M:%fZ','now')) "
         "ON CONFLICT (key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
@@ -496,11 +643,35 @@ class TransferQueue:
         # row in `start()` below (so a restart doesn't quietly resume everything); every write
         # goes through `pause()`/`unpause()`, which update both the row and this cache together.
         self._paused = False
+        # The duration extension (2026-08-21, `prompts/2026-08-21-pause-for-duration.md`) --
+        # `None` while paused indefinitely, an ISO-8601 UTC deadline otherwise. Same
+        # load/cache/write-together discipline as `self._paused`; see `QueuePauseState`'s own
+        # docstring for why this is a stored deadline rather than a running timer.
+        self._paused_until: str | None = None
+        # The bandwidth slider's "also apply to in-progress" re-admit window (2026-08-21,
+        # `prompts/done/2026-08-21-bandwidth-from-the-queue-page.md`) -- **in-memory only, never
+        # persisted, and deliberately not `self._paused`**. While `set_site_bandwidth` is
+        # SIGTERMing the running children so they can be re-admitted at the new ceiling, a
+        # concurrent `tick()` must not race into the slots they are vacating; but borrowing the
+        # real pause flag for that would mean writing (and then having to un-write) the
+        # persisted pause state, which is exactly how a user's "pause for 30 minutes" would get
+        # silently cancelled. A separate transient hold keeps the two concepts disjoint: this
+        # one lasts milliseconds and survives nothing, `self._paused` is durable and only ever
+        # a user's (or an expiry's) decision.
+        self._admission_hold = False
 
     # --- lifecycle ---------------------------------------------------------------------
 
     async def start(self) -> None:
-        self._paused = (await load_queue_pause_state(self.db)).paused
+        pause_state = await load_queue_pause_state(self.db)
+        self._paused = pause_state.paused
+        self._paused_until = pause_state.paused_until
+        # Restart-after-deadline (2026-08-21, `prompts/2026-08-21-pause-for-duration.md`):
+        # checked here too, synchronously, not only on the scheduler loop's first `tick()` --
+        # "the app was down past the deadline" must resolve to unpaused the instant `start()`
+        # returns (what `/api/health` reads immediately after), rather than depending on
+        # `self._task` getting a chance to run first.
+        await self._expire_pause_if_due()
         await self._reconcile_orphaned_jobs()
         if self._task is None:
             self._task = asyncio.create_task(self._loop(), name="lftpweb-transfer-queue-loop")
@@ -892,7 +1063,17 @@ class TransferQueue:
         """
         return self._paused
 
-    async def pause(self, *, stop_running: bool) -> None:
+    @property
+    def paused_until(self) -> str | None:
+        """The absolute ISO-8601 UTC deadline a timed pause expires at, or `None` for an
+        indefinite pause (or no pause at all) -- `/api/health`'s `queue_paused_until`, read by
+        the Queue tab's banner and the header badge so a queue that will resume itself in N
+        minutes says so, rather than reading as plain "paused" (this task,
+        `prompts/2026-08-21-pause-for-duration.md`).
+        """
+        return self._paused_until
+
+    async def pause(self, *, stop_running: bool, duration_s: float | None = None) -> None:
         """Pause admission (this task -- the two "Pause after current" / "Pause now" entry
         modes from the Transfers -> Queue tab control).
 
@@ -916,22 +1097,43 @@ class TransferQueue:
         paused-now item and it would never come back on unpause, the opposite of what pausing
         means.
 
+        `duration_s` (2026-08-21, `prompts/2026-08-21-pause-for-duration.md`): `None` (the
+        default) is an indefinite pause, unchanged from before this task. A number of seconds
+        computes an absolute deadline (`datetime.now(UTC) + duration_s`, stored as a
+        `QueuePauseState.paused_until` string) that `tick()`'s own `_expire_pause_if_due` checks
+        every ~1s and auto-unpauses past. **Independent of `stop_running`** -- either entry mode
+        combines with either duration, so "pause now for 10 minutes" and "pause after current
+        indefinitely" are both just this one method with different arguments. **Re-pausing
+        always overwrites `paused_until` with whatever this call computes (or `None`), rather
+        than stacking/extending an existing deadline** -- calling this while already paused
+        replaces the deadline outright, including clearing it back to indefinite by calling with
+        `duration_s=None`.
+
         Auto-queue and manual Queue clicks keep enqueueing while paused (DESIGN.md §4.7:
         "always wins," untouched by this task) -- the queue simply builds up and is worked
         through once admission resumes.
         """
-        await save_queue_pause_state(self.db, QueuePauseState(paused=True))
+        paused_until = (
+            (datetime.now(UTC) + timedelta(seconds=duration_s)).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+            if duration_s is not None
+            else None
+        )
+        await save_queue_pause_state(
+            self.db, QueuePauseState(paused=True, paused_until=paused_until)
+        )
         self._paused = True
+        self._paused_until = paused_until
+        duration_note = f", resuming automatically at {paused_until}" if paused_until else ""
         await audit.record_event(
             self.db,
             level="info",
             kind="queue_paused",
             message=(
-                "transfer queue paused ('pause now' -- running transfers were stopped and "
-                "requeued)"
+                f"transfer queue paused ('pause now' -- running transfers were stopped and "
+                f"requeued){duration_note}"
                 if stop_running
-                else "transfer queue paused after current (nothing new admitted; running "
-                "transfers finish normally)"
+                else f"transfer queue paused after current (nothing new admitted; running "
+                f"transfers finish normally){duration_note}"
             ),
         )
         if stop_running:
@@ -939,14 +1141,187 @@ class TransferQueue:
 
     async def unpause(self) -> None:
         """Resume admission immediately, in `queue_position` order -- `request_tick()` wakes
-        the loop rather than waiting up to `tick_s` for the next scheduled pass.
+        the loop rather than waiting up to `tick_s` for the next scheduled pass. **Manual
+        unpause always clears `paused_until`** (2026-08-21) -- a stale deadline that later
+        re-paused the queue on its own, sometime after a manual unpause already resumed it,
+        would be baffling; there is nothing left for a leftover deadline to mean once admission
+        has already resumed for any reason.
         """
-        await save_queue_pause_state(self.db, QueuePauseState(paused=False))
+        await self._clear_pause(kind="queue_unpaused", message="transfer queue unpaused")
+
+    async def _clear_pause(self, *, kind: str, message: str) -> None:
+        """Shared by manual `unpause()` and `_expire_pause_if_due`'s automatic resume below --
+        both are "clear the paused state entirely," differing only in the audit event they
+        record.
+        """
+        await save_queue_pause_state(self.db, QueuePauseState(paused=False, paused_until=None))
         self._paused = False
+        self._paused_until = None
+        await audit.record_event(self.db, level="info", kind=kind, message=message)
+        self.request_tick()
+
+    async def _expire_pause_if_due(self) -> None:
+        """Called at the top of every `tick()` (~1s cadence, DESIGN.md §4.4) -- **this is where
+        a timed pause's deadline is enforced**, decided over `core/engine.py`'s scan loop
+        because that loop can legitimately sleep indefinitely (every queue on-demand-only, or no
+        enabled queues at all -- `Engine._next_wake_delay` returns `None` in that case) while
+        this one never does: `TransferQueue._loop` always wakes at least every `tick_s`
+        regardless of what is or isn't due, which is exactly the "fires without a page open, on
+        the backend's own clock" guarantee this needs (this task,
+        `prompts/2026-08-21-pause-for-duration.md`).
+
+        A no-op unless paused with a deadline that has passed -- `paused_until` is a wall-clock
+        ISO-8601 UTC string, directly comparable against `_now_iso()`'s own output via plain `<=`
+        (§`QueuePauseState`'s docstring has why that's safe). Expiry is a state change worth its
+        own audit event, distinct from a manual `queue_unpaused` -- so "why did it start again"
+        is answerable from the Events page without guessing whether a human clicked Unpause.
+        """
+        if not self._paused or self._paused_until is None:
+            return
+        if self._paused_until > _now_iso():
+            return
+        await self._clear_pause(
+            kind="queue_pause_expired",
+            message=(
+                f"transfer queue pause expired (was set to resume at {self._paused_until}); "
+                "admission resumed automatically"
+            ),
+        )
+
+    async def set_site_bandwidth(
+        self, bandwidth_bps: int, *, apply_to_running: bool
+    ) -> BandwidthChangeOutcome:
+        """The Queue tab's bandwidth slider (2026-08-21,
+        `prompts/done/2026-08-21-bandwidth-from-the-queue-page.md`) -- **the site-wide
+        *throttle*, never a per-queue limit** (DESIGN.md §4.5: "one container serves one site...
+        A queue governs *what* and *where*, never *how fast*").
+
+        **It no longer writes `max_bandwidth_bps`** (2026-08-21,
+        `prompts/done/2026-08-21-bandwidth-ceiling-and-autocommit.md`). That field is Settings ->
+        Transfer's ceiling and this method never touches it; the slider writes
+        `throttle_bandwidth_bps`, bounded to `[min_share_floor_bps, max_bandwidth_bps]`, and the
+        scheduler allocates against `effective_bandwidth_bps()`. The one-value design this
+        replaces made the slider's own ceiling drop every time the slider was lowered -- a
+        ratchet the user could not undo from the Queue page (`docs/decisions.md`).
+
+        **A request above the ceiling is clamped, not refused.** The UI's slider maximum tracks
+        the ceiling live, so the only ways here are a race (the ceiling was lowered in Settings
+        between this page's last poll and the drag) or a direct API call. Erroring on the race
+        would show the user a failure for something they cannot see; the applied value is
+        returned, so the banner and the optimistic echo both state what is actually in force.
+        Values *below* the floor stay hard errors -- that is a value the scheduler cannot work
+        with at all, not a stale bound.
+
+        **Why "apply to in-progress" has to stop and re-admit, and why that does not weaken
+        §4.5's invariant.** A running job's allocation is fixed at spawn: `lftp -c` exits with
+        its transfer and offers no control channel, so `net:limit-total-rate` cannot be retuned
+        mid-flight, and `core/scheduler.py` is deliberately built so that limitation never
+        arises (it is *given* `running` allocations and never re-shapes one). Nothing here
+        changes that. Re-admission is not an exception to the invariant, it is the invariant
+        being obeyed: the job stops being a running job, becomes a queued one again, and is
+        admitted afresh -- at which point the scheduler hands it a *new* allocation the ordinary
+        way, from the current settings. `core/scheduler.py` is untouched by this feature.
+
+        **Reuses "pause now"'s per-job half verbatim** (`_pause_running_jobs`, below): SIGTERM,
+        back to `queued` **in place** -- same row, same `queue_position`, same `attempt`, same
+        partial bytes on disk, never `auto_queue_suppressed`, never a `FAILED`/`STOPPED` row.
+        There is deliberately no second stop-and-respawn path. What it does *not* reuse is
+        `pause()`/`unpause()` themselves -- see the paused case below.
+
+        Three outcomes:
+
+        - `apply_to_running=False` (the default, and the safe one): the throttle is written and
+          nothing is interrupted. Running jobs keep the allocation they were admitted with,
+          exactly as before this feature existed; the new limit governs the next admission.
+        - `apply_to_running=True` while **not** paused: the throttle is written, then every
+          in-flight child is stopped and re-queued, and admission is woken so the scheduler
+          re-admits them against the new limit. Jobs already running at a forced "Start now"
+          fraction recompute that fraction against the *new effective* limit on re-admission
+          -- correct and intended: the fraction is a share of the limit actually in force
+          (§4.5's Start now), so a job asked for "50%" should follow that limit when it moves.
+        - `apply_to_running=True` while **paused**: the setting is written and **nothing else
+          happens at all** -- no child is stopped, and the persisted pause state (including a
+          timed pause's `paused_until` deadline) is not read, written, or cleared. This is the
+          single most important behavior in this method, for two independent reasons. (1) A
+          literal "pause now, then unpause" implementation would *resume a queue the user
+          deliberately paused*, and would overwrite -- hence silently cancel -- a "pause for 30
+          minutes" deadline they had set (2026-08-21,
+          `prompts/done/2026-08-21-pause-for-duration.md`). (2) A paused queue can still have
+          running jobs: "pause after current" leaves them alone on purpose. Stopping those would
+          turn the user's "pause after current" into a "pause now" *and* strand the jobs as
+          `queued` with admission closed, so they would not resume until the pause ended. The
+          caller is told (`skipped_because_paused`) so the UI can say so rather than imply
+          transfers were re-admitted. The new limit applies to everything admitted once the
+          pause ends, which is what a paused user actually wanted.
+
+        Rejected: raising instead of writing the setting while paused. Changing the *number*
+        while paused is a perfectly reasonable thing to do (curating before resuming is what
+        pausing is for, §4.5) -- only the interruption is meaningless there.
+        """
+        settings = await load_transfer_settings(self.db)
+        if bandwidth_bps <= 0:
+            raise SiteBandwidthTooLowError(
+                "a site bandwidth limit of 0 is not 'unlimited' -- it makes headroom zero on "
+                "every scheduling pass, so nothing would ever be admitted"
+            )
+        if bandwidth_bps < settings.min_share_floor_bps:
+            raise SiteBandwidthTooLowError(
+                f"site bandwidth limit {bandwidth_bps} B/s is below the minimum share floor "
+                f"({settings.min_share_floor_bps} B/s), so the first admission would already "
+                "violate it"
+            )
+        applied = min(bandwidth_bps, settings.max_bandwidth_bps)
+
+        await save_transfer_settings(self.db, replace(settings, throttle_bandwidth_bps=applied))
+
+        if not apply_to_running:
+            await audit.record_event(
+                self.db,
+                level="info",
+                kind="queue_bandwidth_changed",
+                message=(
+                    f"site bandwidth throttle set to {applied} B/s (ceiling "
+                    f"{settings.max_bandwidth_bps} B/s; applies to newly admitted transfers, "
+                    "running transfers keep the allocation they started with)"
+                ),
+            )
+            self.request_tick()
+            return BandwidthChangeOutcome(effective_bandwidth_bps=applied)
+
+        if self._paused:
+            await audit.record_event(
+                self.db,
+                level="info",
+                kind="queue_bandwidth_changed",
+                message=(
+                    f"site bandwidth throttle set to {applied} B/s; 'apply to in-progress' "
+                    "had nothing to do because the queue is paused -- the pause (and any resume "
+                    "deadline) was left exactly as it was"
+                ),
+            )
+            return BandwidthChangeOutcome(
+                effective_bandwidth_bps=applied, skipped_because_paused=True
+            )
+
+        interrupted = len(self._running)
+        if interrupted:
+            self._admission_hold = True
+            try:
+                await self._pause_running_jobs()
+            finally:
+                self._admission_hold = False
         await audit.record_event(
-            self.db, level="info", kind="queue_unpaused", message="transfer queue unpaused"
+            self.db,
+            level="info",
+            kind="queue_bandwidth_changed",
+            message=(
+                f"site bandwidth throttle set to {applied} B/s; {interrupted} running "
+                "transfer(s) stopped and re-queued in place so they re-admit at the new limit "
+                "(they resume from the bytes already on disk)"
+            ),
         )
         self.request_tick()
+        return BandwidthChangeOutcome(effective_bandwidth_bps=applied, interrupted=interrupted)
 
     async def _pause_running_jobs(self) -> None:
         """ "Pause now"'s per-job half: SIGTERM every in-flight lftp child, concurrently -- the
@@ -955,6 +1330,15 @@ class TransferQueue:
         pause). The difference from `stop()` is what happens after each child exits:
         `_reap_one` sees `pause_requested` and returns the job straight to `queued` **in
         place** rather than tearing this process down.
+
+        **A second caller as of 2026-08-21** (`set_site_bandwidth`, above): "change the site
+        bandwidth limit and apply it to in-progress transfers" needs exactly this -- stop each
+        child, return its job to `queued` in place with its partial bytes intact -- so that the
+        scheduler can re-admit it at the new ceiling. That caller does **not** touch the
+        persisted pause state; it holds admission with `self._admission_hold` for the duration
+        instead. Nothing in this method is pause-specific beyond its name, which is kept because
+        `_RunningProcess.pause_requested` and `_reap_one`'s branch are named for the original
+        caller and renaming three things to describe two callers would be churn, not clarity.
 
         Never re-derives `queue_position` (unlike the startup rescue's own `_rescue_position`
         --- that one exists because a restart already destroyed the interrupted job's row,
@@ -1347,12 +1731,16 @@ class TransferQueue:
         **A fraction requires a configured site bandwidth limit.** `10 MB/s at 25%` is a real
         number; `25% of nothing` is not -- raises `NoSiteLimitConfiguredError` rather than
         silently admitting at Max instead, which the task's settled decisions rule out by name.
-        "No site limit configured" reads as `max_bandwidth_bps <= 0` (docs/decisions.md has the
-        call): the Settings -> Transfer field already treats 0 as the degenerate "admits
+        "No site limit configured" reads as `effective_bandwidth_bps() <= 0` (docs/decisions.md
+        has the call): the Settings -> Transfer field already treats 0 as the degenerate "admits
         nothing, ever" ceiling (`TransferTab.tsx`'s own reserve-clamp warning), so 0 doubling as
         "not really configured" needs no new sentinel or migration to the settings row itself.
-        Max (`fraction == 1.0`) is exempt from this check -- it reuses whatever
-        `max_bandwidth_bps` already is, unconditionally, exactly as the pre-fraction path did.
+        **The *effective* limit, not the ceiling** (2026-08-21, the two-value model on
+        `TransferSettings`): the fraction is computed at admission as `fraction x B` where `B`
+        is what the scheduler is allocating against, so the availability check has to ask about
+        the same number the arithmetic will use. Max (`fraction == 1.0`) is exempt from this
+        check -- it reuses whatever the limit already is, unconditionally, exactly as the
+        pre-fraction path did.
 
         **Refused (409, `QueuePausedError`) while the queue is paused** (this task, 2026-08-20):
         paused means paused -- oversubscribing past the ceiling to force one item through would
@@ -1372,7 +1760,7 @@ class TransferQueue:
         fraction = (rate_percent or 100) / 100.0
         if fraction != 1.0:
             settings = await load_transfer_settings(self.db)
-            if settings.max_bandwidth_bps <= 0:
+            if settings.effective_bandwidth_bps() <= 0:
                 raise NoSiteLimitConfiguredError(
                     "start-now at a fraction requires a configured site bandwidth limit "
                     "(Settings -> Transfer -> Max bandwidth) -- none is set"
@@ -1643,6 +2031,9 @@ class TransferQueue:
     # --- one scheduling tick -------------------------------------------------------------
 
     async def tick(self) -> None:
+        # Pause-duration expiry (this task, 2026-08-21) -- checked first so an expired deadline
+        # resumes admission in the same tick that notices it, rather than one tick late.
+        await self._expire_pause_if_due()
         await self._reap_finished()
         await self._sample_and_publish_progress()
         await self._sample_metrics()
@@ -2455,6 +2846,13 @@ class TransferQueue:
         # per-second noise for as long as the pause lasts.
         if self._paused:
             return
+        # The bandwidth re-admit's transient hold (2026-08-21,
+        # `prompts/done/2026-08-21-bandwidth-from-the-queue-page.md`) -- same caller-side skip,
+        # same silence, but it lasts only as long as `set_site_bandwidth` is tearing the running
+        # children down; without it a tick landing mid-teardown could fill the slots being
+        # vacated before every child had let go of its old allocation.
+        if self._admission_hold:
+            return
 
         settings = await load_transfer_settings(self.db)
         sched_settings = settings.scheduler_settings()
@@ -3050,9 +3448,24 @@ class TransferQueue:
         (migration 025) ride along so the row can *show* it was manually resolved rather than
         looking like a normal completion, and `item.state` is joined only because the reason
         expression reads it (never projected — see `models.py.JobOut`).
+
+        **2026-08-21** (prompts/done/2026-08-21-paused-item-progress.md, issue #14's second
+        half): also joins `item.local_size` -- a paused/queued row's own `job.bytes_done` is only
+        trustworthy while that row is the same one the progress sampler last wrote (pause-now's
+        in-place `queued` transition, `_reap_one`'s pause branch above). A *fresh*
+        `queued` job row created by a manual retry (`enqueue_item`, a new `job.id`) starts at
+        `bytes_done = 0` by column default even though the item may already carry real partial
+        bytes on disk from the attempt that was interrupted -- exactly the "attempt > 1, partial
+        bytes on disk" case this task calls out as deserving the same display as pause. `item.
+        local_size` is the one number the scanner/reconciler (never this request path, DESIGN.md
+        §1.3) keeps current regardless of which job row is live, so `api/jobs.py._job_out` reads
+        it as the queued-row fallback -- the identical shape `_job_out`'s own `bytes_total`
+        fallback to `item.remote_size` already established for the same "queued, never spawned"
+        gap.
         """
         cursor = await self.db.execute(
             "SELECT job.*, item.rel_path, item.is_dir, item.queue_id, item.remote_size, "
+            "       item.local_size, "
             "       item.verified_at, item.extracted_at, item.remote_deleted_at, "
             "       item.arr_status, item.arr_status_at, "
             "       item.manual_outcome, item.manual_outcome_at, "
@@ -3194,5 +3607,9 @@ class TransferQueue:
         return {
             "current_speed_bps": int(current_speed),
             "allocated_bps": int(allocated),
-            "ceiling_bps": settings.max_bandwidth_bps,
+            # The limit *in force*, not `max_bandwidth_bps` (2026-08-21, the two-value model on
+            # `TransferSettings`) -- the header reads "allocated / ceiling", and allocation is
+            # measured against the effective limit, so showing the un-throttled ceiling here
+            # would make a fully-allocated throttled queue read as 10% utilised.
+            "ceiling_bps": settings.effective_bandwidth_bps(),
         }

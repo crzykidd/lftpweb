@@ -1096,6 +1096,23 @@ describe('stateProgressPercent', () => {
     expect(stateProgressPercent('DOWNLOADED', 100, 100)).toBeNull()
     expect(stateProgressPercent('EXCLUDED', null, null)).toBeNull()
   })
+
+  // `QUEUED` (2026-08-21, prompts/done/2026-08-21-paused-item-progress.md, issue #14's second
+  // half): a paused-in-place or freshly-retried-after-interruption row that already has real
+  // partial bytes on disk shows that progress -- gated on `localSize` genuinely being nonzero,
+  // not merely known, since `percentValue(0, total)` would otherwise resolve to `0`, not `null`.
+  it('QUEUED reads the percent when the row genuinely has partial bytes on disk', () => {
+    expect(stateProgressPercent('QUEUED', 45, 100)).toBe(45)
+  })
+
+  it('QUEUED reads null with no local bytes at all -- a plain never-started queued row', () => {
+    expect(stateProgressPercent('QUEUED', null, 100)).toBeNull()
+    expect(stateProgressPercent('QUEUED', 0, 100)).toBeNull()
+  })
+
+  it('QUEUED reads null with no known remote size -- no honest denominator to show', () => {
+    expect(stateProgressPercent('QUEUED', 45, null)).toBeNull()
+  })
 })
 
 // `childDisplayState` (2026-08-21, prompts/done/2026-08-21-child-state-and-active-box-height.md)

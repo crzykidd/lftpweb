@@ -44,6 +44,12 @@ class HealthResponse(BaseModel):
     # read this -- "a queue that silently does nothing is a support question waiting to happen"
     # is the task's own reasoning for surfacing it here alongside `scheduler_alive`.
     queue_paused: bool = False
+    # 2026-08-21 (`prompts/2026-08-21-pause-for-duration.md`): the absolute ISO-8601 UTC
+    # deadline a timed pause (1/10/30/60 minute dropdown) resumes at, or `None` for an
+    # indefinite pause (or no pause at all) -- `core/queue.py.TransferQueue.paused_until`. The
+    # UI reads this to show "resumes at HH:MM" rather than a bare "paused" that would otherwise
+    # look identical to an indefinite one.
+    queue_paused_until: str | None = None
     # 2026-08-16 (docs/decisions.md): also not in §12's literal shape, same reasoning as
     # `repo_url` above -- `config.Settings.build_sha`/`.build_channel` are baked at image
     # *build* time (docker/Dockerfile's `runtime` stage, .github/workflows/publish.yml), and
@@ -802,12 +808,70 @@ class MoveJobRequest(BaseModel):
     direction: MoveDirection
 
 
+# The Transfers -> Queue tab's Pause dropdown menu's four offered durations (2026-08-21,
+# `prompts/2026-08-21-pause-for-duration.md`) -- minutes, converted to seconds before reaching
+# `TransferQueue.pause`'s `duration_s`. Anything outside this set is a 422 for free via
+# `Literal`, the same pattern `StartNowRequest.rate_percent` already uses for its own menu.
+PauseDurationMinutes = Literal[1, 10, 30, 60]
+
+
 # The Transfers -> Queue tab's Pause control (2026-08-20, `prompts/2026-08-20-queue-pause.md`):
 # `POST /api/queue/pause`'s body -- "pause after current" (`stop_running=False`, the default)
 # leaves running jobs alone; "pause now" (`stop_running=True`) also SIGTERMs and requeues them
 # (`core/queue.py.TransferQueue.pause`). `POST /api/queue/unpause` takes no body.
+#
+# `duration_minutes` (2026-08-21, `prompts/2026-08-21-pause-for-duration.md`): `None` (the
+# default, unchanged from before this task) is an indefinite pause -- the dropdown of durations
+# extends this control, it does not replace "pause until I say otherwise". Combines with either
+# `stop_running` value; the two are independent axes of the same call.
 class QueuePauseRequest(BaseModel):
     stop_running: bool = False
+    duration_minutes: PauseDurationMinutes | None = None
+
+
+class QueueBandwidthRequest(BaseModel):
+    """`POST /api/queue/bandwidth` -- the Transfers -> Queue tab's bandwidth slider (2026-08-21,
+    `prompts/done/2026-08-21-bandwidth-from-the-queue-page.md`). Sets the **site-wide throttle**
+    (`TransferSettings.throttle_bandwidth_bps`) -- the limit the scheduler actually allocates
+    against, bounded above by Settings -> Transfer's `max_bandwidth_bps` ceiling (2026-08-21,
+    `prompts/done/2026-08-21-bandwidth-ceiling-and-autocommit.md`). Still site-wide, still never a
+    per-queue limit (DESIGN.md §4.5: one site, one set of transfer knobs).
+
+    **It no longer writes the ceiling.** Until 2026-08-21 this endpoint and Settings -> Transfer
+    edited the same single number, which made the slider's own upper bound unstateable: capping
+    it at the value it edits is a ratchet (see that prompt, and `docs/decisions.md`).
+
+    `apply_to_running` defaults to `False`, the safe option: write the number, interrupt
+    nothing. `True` additionally stops and re-queues every in-flight transfer so the scheduler
+    re-admits it against the new limit -- see `core/queue.py.TransferQueue.set_site_bandwidth`
+    for why that is the only way a running job's allocation can change, and for what it does
+    (and pointedly does not do) while the queue is paused.
+
+    The lower bound is enforced in `set_site_bandwidth` against the *current*
+    `min_share_floor_bps`, not here, since it depends on another setting's value; `gt=0` is the
+    cheap half that can be checked without a DB read. The *upper* bound is not a validation at
+    all -- a value above the ceiling is clamped to it and the applied value comes back in the
+    response.
+    """
+
+    effective_bandwidth_bps: int = Field(..., gt=0)
+    apply_to_running: bool = False
+
+
+class QueueBandwidthResponse(BaseModel):
+    """What the slider's apply actually did -- `core/queue.py.BandwidthChangeOutcome`, one for
+    one. `effective_bandwidth_bps` is the throttle **as applied** (clamped to the ceiling if the
+    request exceeded it), which is what the banner announces and what the UI echoes optimistically
+    until its next settings poll. `interrupted` is how many running transfers were stopped and
+    re-queued (always `0` for a future-items-only change, and for an apply-to-in-progress with
+    nothing running); `skipped_because_paused` marks the case where the setting was written but
+    the queue's pause was deliberately left untouched -- the banner must then say nothing was
+    restarted rather than report a restart that did not happen.
+    """
+
+    effective_bandwidth_bps: int
+    interrupted: int
+    skipped_because_paused: bool
 
 
 class JobOut(BaseModel):
@@ -1193,7 +1257,16 @@ class ItemChildrenResponse(BaseModel):
     offset: int
 
 
-class TransferSettingsOut(BaseModel):
+class TransferSettingsIn(BaseModel):
+    """The twelve fields Settings -> Transfer owns and writes. **`throttle_bandwidth_bps` is
+    deliberately absent** (2026-08-21,
+    `prompts/done/2026-08-21-bandwidth-ceiling-and-autocommit.md`): the Queue tab's slider owns the
+    throttle through `POST /api/queue/bandwidth`, and this PUT writes the whole object, so
+    including it would let a stale Settings form silently undo a throttle set minutes later on
+    another page. `api/jobs.py.put_transfer_settings` carries the stored throttle forward
+    untouched (clamping it if this PUT lowered the ceiling beneath it).
+    """
+
     max_bandwidth_bps: int
     max_concurrent_transfers: int
     small_item_threshold_bytes: int
@@ -1208,8 +1281,19 @@ class TransferSettingsOut(BaseModel):
     extra_lftp_settings: str
 
 
-class TransferSettingsIn(TransferSettingsOut):
-    pass
+class TransferSettingsOut(TransferSettingsIn):
+    """...plus the one read-only number the two-value bandwidth model adds: the limit actually
+    in force (`core/queue.py.TransferSettings.effective_bandwidth_bps`). Equal to
+    `max_bandwidth_bps` when no throttle is set, which is the default and the upgrade path.
+
+    Exposed as the *resolved* value rather than the raw nullable throttle so every consumer --
+    the Queue slider's position, the "Start now" fraction check, Settings -> Transfer's own
+    "a throttle is in force" note, the support bundle -- reads one number and cannot disagree
+    about what `None` means. "Is a throttle set?" stays answerable: it is
+    `effective_bandwidth_bps < max_bandwidth_bps`.
+    """
+
+    effective_bandwidth_bps: int
 
 
 # --- Settings -> Transfer's "effective lftp settings" readout (2026-08-14,
@@ -1418,12 +1502,46 @@ class MetricsBucketOut(BaseModel):
     up: bool  # False = no heartbeat fell in this bucket -- lftpweb wasn't running (a gap)
     total_bytes: int | None  # None when up is False; sum of by_queue (incl. 0) otherwise
     by_queue: dict[int, int]  # queue_id -> bytes moved in this bucket; an omitted queue moved 0
+    # 2026-08-21 (daily rollups, prompts/done/2026-08-21-daily-metric-rollups.md): fraction
+    # (0.0-1.0) of a full day's expected heartbeats actually observed -- only set for a
+    # daily-granularity bucket sourced from `metric_daily` (the 90d/1y ranges at `group=day`),
+    # `None` for every bucket sourced from the raw tables (1h/12h/24h/7d/30d at `group=hour` or
+    # `group=day`), where `up` alone is already exact at that bucket's own width. Lets the UI
+    # distinguish a genuinely quiet day (`up: true`, `coverage` near 1.0, `total_bytes: 0`) from
+    # a day lftpweb was mostly down (`coverage` well under 1.0) -- both would otherwise look
+    # identical.
+    #
+    # 2026-08-21 (chart grouping, prompts/done/2026-08-21-chart-grouping.md): for a `week`/`month`
+    # bucket (any range), this means something different -- the fraction of *days* in the bucket
+    # that were `up`, not a heartbeat-density average (`api/metrics.py._aggregate_day_points`'s
+    # docstring has the full reasoning: raw-table days only ever carry a boolean up/down at that
+    # granularity, so a day-count fraction is the one definition that means the same thing
+    # regardless of which table the underlying days came from).
+    coverage: float | None = None
 
 
 class MetricsThroughputResponse(BaseModel):
     range: str
+    # 2026-08-21 (chart grouping): the bucket width actually used, decoupled from `range` (which
+    # only says how far back) -- "hour"/"day"/"week"/"month" for the bytes-chart-groupable ranges
+    # (24h/7d/30d/90d/1y, api/metrics.py._GROUPABLE_RANGES); `None` for the speed chart's own
+    # untouched fixed-width ranges (1h/12h), whose single bucket width `bucket_seconds` alone
+    # already fully describes.
+    group: str | None = None
     bucket_seconds: int
     buckets: list[MetricsBucketOut]
+
+
+class MetricsTotalOut(BaseModel):
+    """The Dashboard's "total downloaded" readout (task: "a user can have the option to just see
+    their total downloaded amount"). `since_day` is the earliest UTC calendar day
+    (`'YYYY-MM-DD'`) this total actually covers -- `None` when there is no rolled-up history yet
+    (a fresh install) -- so the UI can say "since <date>" rather than implying an unbounded
+    history.
+    """
+
+    total_bytes: int
+    since_day: str | None
 
 
 # --- Auth (DESIGN.md §8, phase 8) --------------------------------------------------------
@@ -1562,6 +1680,27 @@ class ArrTestResponse(BaseModel):
     error_class: str | None
     message: str
     version: str | None = None
+
+
+class ArrPollSettingsOut(BaseModel):
+    """`GET`/`PUT /api/settings/arr/poll-interval` (2026-08-21, issue #16,
+    `prompts/done/2026-08-21-arr-poll-cadence.md`) -- `core/arrsync.py.ArrSettings` exposed on
+    the *arr settings surface for the first time; before this it was DB-only, a default that got
+    written down rather than ever a user choice. One field, same "narrow settings dataclass,
+    its own `Out`" shape every other site-level settings endpoint in this codebase uses
+    (`BackupSettingsOut`, `SettleSettingsOut`, ...).
+    """
+
+    poll_interval_s: float
+
+
+class ArrPollSettingsIn(ArrPollSettingsOut):
+    """`PUT` body. `api/settings_arr.py.put_arr_poll_settings` validates this server-side against
+    `ArrSyncScheduler.MIN_POLL_INTERVAL_S`/`core/arrsync.py.MAX_POLL_INTERVAL_S` -- the same
+    "validate server-side, not only in the browser" rule this task's own handoff prompt states
+    explicitly, mirroring `api/backup.py.put_backup_settings`'s inline range check rather than a
+    pydantic field constraint, so the error message can name the actual bound.
+    """
 
 
 # --- Support bundle (Settings -> Logs, 2026-08-17) ---------------------------------------

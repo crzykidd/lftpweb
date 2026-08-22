@@ -2150,11 +2150,135 @@ async def test_arr_settings_round_trip(db):
     from lftpweb.core.arrsync import ArrSettings, load_arr_settings, save_arr_settings
 
     default = await load_arr_settings(db)
-    assert default.poll_interval_s == 60.0
+    assert default.poll_interval_s == 10.0  # 2026-08-21, issue #16 -- down from 60.0
 
     await save_arr_settings(db, ArrSettings(poll_interval_s=15.0))
     reloaded = await load_arr_settings(db)
     assert reloaded.poll_interval_s == 15.0
+
+
+async def test_arr_settings_existing_install_with_no_stored_row_gets_the_new_default(db):
+    """The existing-installs call (docs/decisions.md, 2026-08-21): leave any stored value
+    alone, do not backfill. `save_arr_settings` had zero call sites anywhere in this codebase
+    before this task (grepped to confirm), so no real install can have a persisted
+    `arr_settings` row from ordinary use -- every existing install simply has no row, falls
+    through to the dataclass default, and gets 10.0 for free the moment the code default
+    changes, with no migration needed.
+    """
+    from lftpweb.core.arrsync import load_arr_settings
+
+    cursor = await db.execute("SELECT value FROM setting WHERE key = 'arr_settings'")
+    assert await cursor.fetchone() is None  # no row -- nothing to migrate
+
+    settings = await load_arr_settings(db)
+    assert settings.poll_interval_s == 10.0
+
+
+async def test_arr_settings_a_previously_persisted_value_is_left_alone(db):
+    """The other half of the same call: if a row *does* exist (this task's own build leaves the
+    door open for the hypothetical -- a hand-edited DB, say), it is never overwritten. The
+    stored value always wins over the code default, exactly as before this task.
+    """
+    from lftpweb.core.arrsync import ArrSettings, load_arr_settings, save_arr_settings
+
+    await save_arr_settings(db, ArrSettings(poll_interval_s=60.0))
+    reloaded = await load_arr_settings(db)
+    assert reloaded.poll_interval_s == 60.0
+
+
+async def test_loop_clamps_a_configured_interval_below_the_floor(monkeypatch, db):
+    """The 5s floor (`ArrSyncScheduler.MIN_POLL_INTERVAL_S`) still clamps a smaller configured
+    value -- unchanged by this task, but now load-bearing in a way it wasn't when the default
+    (60s) was always comfortably above it: a user can now actually configure a below-floor
+    value through the settings dataclass (even though the API itself rejects one -- this is the
+    scheduler's own last-resort defense, independent of that validation).
+    """
+    import asyncio
+
+    from lftpweb.core.arrsync import ArrSettings, ArrSyncScheduler, save_arr_settings
+
+    await save_arr_settings(db, ArrSettings(poll_interval_s=2.0))
+    scheduler = ArrSyncScheduler(db=db, config_dir="/tmp")
+
+    captured: list[float] = []
+
+    async def fake_sleep(delay: float) -> None:
+        captured.append(delay)
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr("lftpweb.core.arrsync.asyncio.sleep", fake_sleep)
+    await scheduler.start()
+    try:
+        await scheduler._task
+    except asyncio.CancelledError:
+        pass
+    finally:
+        scheduler._task = None  # already finished; stop() would otherwise re-await it
+
+    assert captured == [scheduler.MIN_POLL_INTERVAL_S]
+
+
+async def test_loop_uses_the_configured_interval_when_above_the_floor(monkeypatch, db):
+    import asyncio
+
+    from lftpweb.core.arrsync import ArrSettings, ArrSyncScheduler, save_arr_settings
+
+    await save_arr_settings(db, ArrSettings(poll_interval_s=25.0))
+    scheduler = ArrSyncScheduler(db=db, config_dir="/tmp")
+
+    captured: list[float] = []
+
+    async def fake_sleep(delay: float) -> None:
+        captured.append(delay)
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr("lftpweb.core.arrsync.asyncio.sleep", fake_sleep)
+    await scheduler.start()
+    try:
+        await scheduler._task
+    except asyncio.CancelledError:
+        pass
+    finally:
+        scheduler._task = None
+
+    assert captured == [25.0]
+
+
+# --- Multi-page queue observation (2026-08-21, issue #16's "guard the multi-page case") -------
+
+
+async def test_multi_page_queue_observation_writes_one_event_and_rearms_on_recovery(db):
+    """The "one request per pass" property the new 10s default leans on
+    (`ArrSettings.poll_interval_s`'s own docstring, docs/decisions.md) holds only while a bound
+    instance's queue fits in one `PAGE_SIZE` page. `_observe_queue_page_count` is the
+    observational guard for the case where it doesn't: exercised directly here (not through a
+    real 250+-record fake *arr queue -- see `test_arrclient.py` for real HTTP pagination
+    coverage) since it is a pure per-instance check over a record count already fetched.
+    """
+    from lftpweb.core.arrclient import PAGE_SIZE
+    from lftpweb.core.arrsync import ArrSyncScheduler
+
+    scheduler = ArrSyncScheduler(db=db, config_dir="/tmp")
+
+    # A single page -- no event, nothing recorded as warned.
+    await scheduler._observe_queue_page_count(1, "Sonarr", PAGE_SIZE)
+    assert await _event_kinds(db) == []
+    assert 1 not in scheduler._multi_page_warned
+
+    # Crosses into a second page -- one event, and the instance is marked warned.
+    await scheduler._observe_queue_page_count(1, "Sonarr", PAGE_SIZE + 1)
+    assert await _event_kinds(db) == ["arr_queue_multi_page"]
+    assert 1 in scheduler._multi_page_warned
+
+    # Still multi-page next pass -- no second event (don't spam every pass).
+    await scheduler._observe_queue_page_count(1, "Sonarr", PAGE_SIZE + 5)
+    assert await _event_kinds(db) == ["arr_queue_multi_page"]
+
+    # Drops back to one page -- rearmed, and a later recurrence is reported again.
+    await scheduler._observe_queue_page_count(1, "Sonarr", PAGE_SIZE)
+    assert 1 not in scheduler._multi_page_warned
+    await scheduler._observe_queue_page_count(1, "Sonarr", PAGE_SIZE + 1)
+    assert await _event_kinds(db) == ["arr_queue_multi_page", "arr_queue_multi_page"]
 
 
 # --- Migration -------------------------------------------------------------------------------

@@ -72,16 +72,28 @@ export function transferLineValue(job: JobOut, live?: LiveProgress): string {
  * number can never disagree with the figure column sitting right beside it (the user has
  * explicitly approved seeing the same percent twice, in the chip and in the figure column).
  *
- * Only a `running` job ever gets a state `stateProgressPercent` has a fill for (`chipStateFor`
- * maps `running` to `'DOWNLOADING'`; every other job state maps to something with no
- * `FILL_STYLES` entry) -- checked directly here rather than importing `chipStateFor` from
+ * A `running` job maps to `stateProgressPercent`'s `'DOWNLOADING'` bucket; a **`queued`** job
+ * (2026-08-21, prompts/done/2026-08-21-paused-item-progress.md, issue #14's second half) now
+ * maps to its own `'QUEUED'` bucket -- a paused-in-place or freshly-retried-after-interruption
+ * row that already has partial bytes on disk. `job.bytes_done`/`job.bytes_total` only, never
+ * `live` -- `_publish_child_progress` (the WebSocket's one source of live progress) speaks only
+ * for a *running* job, so a queued row has nothing to prefer over what the server already
+ * projected (`core/queue.py.list_jobs`'s own `item.local_size`/`remote_size` fallback for a
+ * queued row, `api/jobs.py._job_out`). Every other job state (`failed`/`cancelled`/`succeeded`)
+ * maps to something with no `FILL_STYLES` entry, so this returns `null` for those without
+ * needing its own branch. Checked directly here rather than importing `chipStateFor` from
  * `TransfersPage.tsx`, which would make this lib module depend on a page module.
  */
 export function queueRowPercent(job: JobOut, live?: LiveProgress): number | null {
-  if (job.state !== 'running') return null
-  const bytesDone = live?.bytes_done ?? job.bytes_done
-  const bytesTotal = (live?.bytes_total ?? job.bytes_total) ?? job.bytes_total
-  return stateProgressPercent('DOWNLOADING', bytesDone, bytesTotal)
+  if (job.state === 'running') {
+    const bytesDone = live?.bytes_done ?? job.bytes_done
+    const bytesTotal = (live?.bytes_total ?? job.bytes_total) ?? job.bytes_total
+    return stateProgressPercent('DOWNLOADING', bytesDone, bytesTotal)
+  }
+  if (job.state === 'queued') {
+    return stateProgressPercent('QUEUED', job.bytes_done, job.bytes_total)
+  }
+  return null
 }
 
 /** One row of the expand panel -- a plain label/value pair, optionally with a longer `title` for
@@ -285,14 +297,23 @@ export function completedTimeLabel(job: JobOut): { value: string; title: string 
  * position from the input array, i.e. `list_jobs`'s own `rank`/`queued_at` order -- a reasonable
  * fallback, and never a re-shuffle on every poll for jobs that didn't actually move.
  *
- * **2026-08-20: a fourth partition, between running and queued** (docs/transfers-redesign-spec.md
- * §3.2's pipeline-completion rule) -- a row whose lftp job has finished but whose *pipeline* has
- * not (`pipeline_in_flight`: verifying, extracting, awaiting import, deleting source) now stays
- * in the Active box, and it is a terminal-state job, so it would otherwise sort into the
- * newest-finished-first tail *below the entire queued backlog* -- page 11 of a busy queue, where
- * the user would never see the thing they are being told is still moving. It belongs with
- * `running`: both are work actively happening right now, and neither has a queue position. Same
- * newest-first ordering within the partition as the terminal tail, for the same reason.
+ * **2026-08-20: a fourth partition** (docs/transfers-redesign-spec.md §3.2's pipeline-completion
+ * rule) -- a row whose lftp job has finished but whose *pipeline* has not
+ * (`pipeline_in_flight`: verifying, extracting, awaiting import, deleting source) stays in the
+ * Active box even though it is a terminal-state job, so it needs a partition of its own rather
+ * than falling into the newest-finished-first tail. Same newest-first ordering within it.
+ *
+ * **2026-08-21: that partition moved below `queued`, at the user's direction.** It first sat
+ * between `running` and `queued` on the reasoning that both are "work happening right now."
+ * The user's reading is better: a pipeline-in-flight row is lftpweb *waiting on someone else*
+ * (usually an *arr import), whereas `queued` is lftpweb's own genuinely-next work. So the order
+ * reads now / next / parked: **running, queued, processing, terminal.**
+ *
+ * **The tradeoff this accepts, stated so it isn't rediscovered as a bug:** with a deep backlog
+ * and 20 rows to a page, a processing row can now land pages below the fold -- exactly what the
+ * original placement was avoiding. Judged acceptable because such rows are transient (minutes)
+ * and few, and because burying "waiting on Sonarr" is less costly than pushing the actual
+ * upcoming queue order out of view. Flip the two segments back if that proves wrong.
  */
 export function sortTransferRows(jobs: JobOut[]): JobOut[] {
   const running: JobOut[] = []
@@ -314,7 +335,7 @@ export function sortTransferRows(jobs: JobOut[]): JobOut[] {
       if (bTime == null) return -1
       return bTime - aTime // newest first
     })
-  return [...running, ...newestFirst(processing), ...queued, ...newestFirst(terminal)]
+  return [...running, ...queued, ...newestFirst(processing), ...newestFirst(terminal)]
 }
 
 /** Whether the panel's ***arr** group should render at all -- "hidden entirely when the queue

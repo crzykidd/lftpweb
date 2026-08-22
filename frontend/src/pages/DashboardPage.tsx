@@ -1,11 +1,25 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import { getMetricsSettings, getThroughput, listQueues } from '../api/client'
-import type { BytesRange, MetricsThroughputResponse, PathQueueOut, SpeedRange } from '../api/types'
+import { getMetricsSettings, getMetricsTotal, getThroughput, listQueues } from '../api/client'
+import type {
+  BytesRange,
+  MetricsGroup,
+  MetricsThroughputResponse,
+  MetricsTotalOut,
+  PathQueueOut,
+  SpeedRange,
+} from '../api/types'
 import { BytesChart } from '../components/charts/BytesChart'
 import { SpeedLineChart } from '../components/charts/SpeedLineChart'
 import { assignQueueColorSlots, colorVarForSlot } from '../components/charts/queueColors'
 import { usePoll } from '../hooks/usePoll'
-import { retentionNoteForRange } from '../lib/bytesChart'
+import {
+  groupOptionsForRange,
+  isMetricsGroup,
+  resolveGroupForRange,
+  retentionNoteForRange,
+  totalSinceLabel,
+} from '../lib/bytesChart'
+import { formatBytes } from '../lib/format'
 import { readLocalStorage, writeLocalStorage } from '../lib/storage'
 
 const SPEED_RANGES: { value: SpeedRange; label: string }[] = [
@@ -18,11 +32,28 @@ const SPEED_RANGES: { value: SpeedRange; label: string }[] = [
 // prompts/done/2026-08-17-bytes-chart-7d-30d-ranges-and-total.md) -- independent of Chart 2's
 // `SPEED_RANGES` above, both in storage key and in option list (`api/types.ts`'s
 // `BytesRange`/`SpeedRange` split).
+// 90d/1y (2026-08-21, daily rollups, prompts/done/2026-08-21-daily-metric-rollups.md) read
+// `metric_daily` server-side (api/metrics.py's `_DAILY_RANGES`) instead of the raw tables --
+// nothing here needs to know that; they're just two more buttons feeding the same
+// `getThroughput`/`BytesChart`.
 const BYTES_RANGES: { value: BytesRange; label: string }[] = [
   { value: '24h', label: '24h' },
   { value: '7d', label: '7d' },
   { value: '30d', label: '30d' },
+  { value: '90d', label: '90d' },
+  { value: '1y', label: '1y' },
 ]
+
+// The bytes chart's group-by control (2026-08-21, chart grouping,
+// prompts/done/2026-08-21-chart-grouping.md) -- a per-range default (`DEFAULT_GROUP_FOR_RANGE`),
+// overridable here; not every option is available at every range
+// (`groupOptionsForRange`/`resolveGroupForRange`, `lib/bytesChart.ts`).
+const GROUP_LABELS: Record<MetricsGroup, string> = {
+  hour: 'Hour',
+  day: 'Day',
+  week: 'Week',
+  month: 'Month',
+}
 
 // Refreshed on the same order of cadence as the rest of the app's polled pages (StatsHeader:
 // 5s for numbers that change every tick; History's manual refresh for a paginated list). A
@@ -45,7 +76,7 @@ function isSpeedRange(value: unknown): value is SpeedRange {
 // Chart 1's own remembered timeframe (`dashboard.bytesRange`, distinct key from Chart 2's
 // `dashboard.range` above) -- same synchronous-read-before-first-paint pattern, so this chart
 // never flashes 24h before jumping to a saved 7d/30d.
-const BYTES_RANGE_VALUES: BytesRange[] = ['24h', '7d', '30d']
+const BYTES_RANGE_VALUES: BytesRange[] = ['24h', '7d', '30d', '90d', '1y']
 function isBytesRange(value: unknown): value is BytesRange {
   return typeof value === 'string' && (BYTES_RANGE_VALUES as string[]).includes(value)
 }
@@ -57,6 +88,22 @@ function isBytesRange(value: unknown): value is BytesRange {
  * (2026-08-17, prompts/done/2026-08-17-bytes-chart-7d-30d-ranges-and-total.md): bytes
  * transferred (with a range total) over 24h/7d/30d, and speed over a selectable 1h/12h/24h
  * window, per queue or site-wide.
+ *
+ * **"Total downloaded" readout, and 90d/1y bytes-chart ranges** (2026-08-21, daily rollups,
+ * prompts/done/2026-08-21-daily-metric-rollups.md) -- the user's own ask by name: a long-horizon
+ * running total that survives past raw retention, backed by the new `metric_daily` table
+ * (`GET /api/metrics/total`, `GET /api/metrics/throughput?range=90d|1y`). Reuses `BytesChart`
+ * unchanged for the two new ranges -- they're just two more buttons and the same response
+ * shape, one-day buckets throughout.
+ *
+ * **Chart 1's own group-by control** (2026-08-21, chart grouping,
+ * prompts/done/2026-08-21-chart-grouping.md) -- range (how far back) and grouping (how wide a
+ * bar: hour/day/week/month) are independent choices, with a per-range default
+ * (`lib/bytesChart.ts.DEFAULT_GROUP_FOR_RANGE`) rather than a fixed bucket width per range. Not
+ * every grouping is available at every range (hourly is impossible at 90d/1y -- no sub-day data
+ * survives that far back at any retention setting); the dropdown disables the unavailable option
+ * with a reason, and the server independently rejects it too. Chart 2 (speed) is untouched --
+ * it keeps its own fixed 1h/12h/24h bucket widths and has no group-by control.
  */
 export function DashboardPage() {
   const [queues, setQueues] = useState<PathQueueOut[]>([])
@@ -73,6 +120,22 @@ export function DashboardPage() {
     setBytesRangeState(next)
     writeLocalStorage('dashboard.bytesRange', next)
   }
+
+  // The group-by control (2026-08-21, chart grouping, prompts/done/2026-08-21-chart-grouping.md)
+  // -- one stored key (the last group a human explicitly picked), resolved against whichever
+  // range is currently selected on every read (`resolveGroupForRange`) rather than trusted
+  // outright: a stale value (hand-edited, or valid for a previously-selected range but not this
+  // one -- e.g. `hour` while viewing `24h`, then the range changes to `90d`, where hourly is
+  // unavailable) falls back to that range's own default instead of being sent to the server.
+  const [bytesGroupStored, setBytesGroupStored] = useState<MetricsGroup | null>(
+    () => readLocalStorage('dashboard.bytesGroup', isMetricsGroup) ?? null,
+  )
+  const bytesGroup = resolveGroupForRange(bytesRange, bytesGroupStored)
+  const setBytesGroup = (next: MetricsGroup) => {
+    setBytesGroupStored(next)
+    writeLocalStorage('dashboard.bytesGroup', next)
+  }
+  const groupOptions = groupOptionsForRange(bytesRange)
   const [speedRange, setSpeedRangeState] = useState<SpeedRange>(
     () => readLocalStorage('dashboard.range', isSpeedRange) ?? '24h',
   )
@@ -105,11 +168,22 @@ export function DashboardPage() {
       })
   }, [])
 
-  const dailyFetcher = useCallback(() => getThroughput(bytesRange), [bytesRange])
+  const dailyFetcher = useCallback(
+    () => getThroughput(bytesRange, undefined, bytesGroup),
+    [bytesRange, bytesGroup],
+  )
   const daily = usePoll<MetricsThroughputResponse>(dailyFetcher, POLL_INTERVAL_MS)
 
   const speedFetcher = useCallback(() => getThroughput(speedRange, queueId), [speedRange, queueId])
   const speed = usePoll<MetricsThroughputResponse>(speedFetcher, POLL_INTERVAL_MS)
+
+  // The task's own ask, by name: "a user can have the option to just see their total
+  // downloaded amount." Site-wide (no `queueId` filter) regardless of Chart 2's own queue
+  // selector -- this is the headline number, not a per-queue one. Same poll cadence as the
+  // charts (`core/metrics.py.total_bytes` folds in today's not-yet-rolled-up raw samples, so
+  // it's already live; polling just keeps it current across a long-open tab).
+  const totalFetcher = useCallback(() => getMetricsTotal(), [])
+  const total = usePoll<MetricsTotalOut>(totalFetcher, POLL_INTERVAL_MS)
 
   const colorSlots = useMemo(() => assignQueueColorSlots(queues), [queues])
   const selectedQueueName = queueId != null ? queues.find((q) => q.id === queueId)?.name : undefined
@@ -121,8 +195,37 @@ export function DashboardPage() {
 
   return (
     <div className="flex flex-col gap-6">
+      <section className="flex items-baseline justify-between gap-2 rounded-lg border border-zinc-200 p-4 dark:border-zinc-800">
+        <span className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">
+          Total downloaded
+        </span>
+        {total ? (
+          <span className="text-sm text-zinc-500 dark:text-zinc-400">
+            <span className="text-base font-semibold text-zinc-900 dark:text-zinc-100">
+              {formatBytes(total.total_bytes)}
+            </span>{' '}
+            {totalSinceLabel(total.since_day)}
+          </span>
+        ) : (
+          <span className="text-sm text-zinc-400 dark:text-zinc-600">Loading…</span>
+        )}
+      </section>
+
       <section className="flex flex-col gap-2 rounded-lg border border-zinc-200 p-4 dark:border-zinc-800">
-        <div className="flex justify-end">
+        <div className="flex flex-wrap items-center justify-end gap-2">
+          <select
+            className={selectClasses}
+            value={bytesGroup}
+            onChange={(e) => setBytesGroup(e.target.value as MetricsGroup)}
+            aria-label="Group by"
+          >
+            {groupOptions.map((opt) => (
+              <option key={opt.value} value={opt.value} disabled={!opt.available} title={opt.reason}>
+                {GROUP_LABELS[opt.value]}
+                {!opt.available ? ' (unavailable)' : ''}
+              </option>
+            ))}
+          </select>
           <div className="flex overflow-hidden rounded-md border border-zinc-300 dark:border-zinc-700">
             {BYTES_RANGES.map((r) => (
               <button
@@ -145,7 +248,7 @@ export function DashboardPage() {
         {daily ? (
           <BytesChart
             buckets={daily.buckets}
-            bucketSeconds={daily.bucket_seconds}
+            group={daily.group ?? bytesGroup}
             queues={queues}
             retentionNote={retentionNote}
           />

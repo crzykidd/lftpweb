@@ -11,10 +11,61 @@ from datetime import UTC, datetime
 from fastapi import APIRouter, HTTPException, Request
 
 from lftpweb.core.arrclient import ArrClient, ArrClientError
+from lftpweb.core.arrsync import (
+    MAX_POLL_INTERVAL_S,
+    ArrSettings,
+    ArrSyncScheduler,
+    load_arr_settings,
+    save_arr_settings,
+)
 from lftpweb.core.crypto import DecryptionError, decrypt_secret, encrypt_secret
-from lftpweb.models import ArrInstanceIn, ArrInstanceOut, ArrTestResponse
+from lftpweb.models import (
+    ArrInstanceIn,
+    ArrInstanceOut,
+    ArrPollSettingsIn,
+    ArrPollSettingsOut,
+    ArrTestResponse,
+)
 
 router = APIRouter(prefix="/api/settings")
+
+
+# --- Poll cadence (2026-08-21, issue #16, `prompts/done/2026-08-21-arr-poll-cadence.md`) -------
+#
+# `core/arrsync.py.ArrSettings` exposed here for the first time -- registered ahead of the
+# `/arr/{instance_id}` routes below purely for readability (Starlette's `int` path converter
+# already only matches digit segments, so `poll-interval` could never be swallowed by
+# `{instance_id}` regardless of registration order).
+
+
+@router.get("/arr/poll-interval", response_model=ArrPollSettingsOut)
+async def get_arr_poll_settings(request: Request) -> ArrPollSettingsOut:
+    settings = await load_arr_settings(request.app.state.db)
+    return ArrPollSettingsOut(poll_interval_s=settings.poll_interval_s)
+
+
+@router.put("/arr/poll-interval", response_model=ArrPollSettingsOut)
+async def put_arr_poll_settings(body: ArrPollSettingsIn, request: Request) -> ArrPollSettingsOut:
+    """Server-side range check -- the browser's own input validation is never trusted alone
+    (this task's own handoff prompt). Below `ArrSyncScheduler.MIN_POLL_INTERVAL_S` the scheduler
+    would silently clamp anyway (`_loop`'s own `max(...)`), but rejecting it here means the
+    Settings page can tell the user *why* rather than saving a value that quietly doesn't take
+    effect as configured.
+    """
+    if body.poll_interval_s < ArrSyncScheduler.MIN_POLL_INTERVAL_S:
+        raise HTTPException(
+            status_code=422,
+            detail=(f"poll_interval_s must be >= {ArrSyncScheduler.MIN_POLL_INTERVAL_S:g}"),
+        )
+    if body.poll_interval_s > MAX_POLL_INTERVAL_S:
+        raise HTTPException(
+            status_code=422,
+            detail=f"poll_interval_s must be <= {MAX_POLL_INTERVAL_S:g}",
+        )
+    settings = ArrSettings(poll_interval_s=body.poll_interval_s)
+    await save_arr_settings(request.app.state.db, settings)
+    return ArrPollSettingsOut(poll_interval_s=settings.poll_interval_s)
+
 
 _INSTANCE_COLUMNS = (
     "id, name, kind, base_url, api_key_enc, enabled, notify_on_complete, created_at, updated_at"

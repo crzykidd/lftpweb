@@ -2,11 +2,14 @@ import { useEffect, useState } from 'react'
 import {
   createArrInstance,
   deleteArrInstance,
+  getArrPollSettings,
   listArrInstances,
+  putArrPollSettings,
   testArrInstance,
   updateArrInstance,
 } from '../../api/client'
-import type { ArrInstanceOut, ArrKind, ArrTestResponse } from '../../api/types'
+import type { ArrInstanceOut, ArrKind, ArrPollSettingsOut, ArrTestResponse } from '../../api/types'
+import { FieldHelp } from '../../components/FieldHelp'
 
 const inputClasses =
   'w-full rounded-md border border-zinc-300 bg-white px-2.5 py-1.5 text-sm text-zinc-900 outline-none focus:border-zinc-500 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100'
@@ -33,6 +36,143 @@ const EMPTY_FORM: FormState = {
   api_key: '',
   enabled: false,
   notify_on_complete: false,
+}
+
+// Client-side hints only -- the authoritative range check is server-side
+// (`api/settings_arr.py.put_arr_poll_settings`, `core/arrsync.py.ArrSyncScheduler.
+// MIN_POLL_INTERVAL_S` / `MAX_POLL_INTERVAL_S`). Mirrored here only so the input's own
+// `min`/`max` attributes and the hint text agree with what the server will actually accept.
+const POLL_INTERVAL_MIN_S = 5
+const POLL_INTERVAL_MAX_S = 3600
+
+const POLL_SETTINGS_EMPTY: ArrPollSettingsOut = { poll_interval_s: 10 }
+
+/** Settings → Integrations's poll-interval section (2026-08-21, issue #16,
+ * `prompts/done/2026-08-21-arr-poll-cadence.md`) -- `core/arrsync.py.ArrSettings.
+ * poll_interval_s` exposed here for the first time; before this it was DB-only, a default that
+ * got written down rather than ever a user choice. Same self-contained load/save shape
+ * `TransferTab.tsx`'s `SettleGateSection`/`DownloadPrefixSection` already establish for a
+ * site-level setting that isn't part of a bigger form: its own `GET`/`PUT` cycle, a draft value
+ * distinct from the last-saved one so typing doesn't fight the server response.
+ *
+ * **Relabelled 2026-08-21** (`prompts/done/2026-08-21-poll-cadence-labelling.md`, finding 6 of
+ * `prompts/test-findings-2026-08-21.md`): the user who asked for this setting and knew it had
+ * shipped could not find it. Two causes, both wording/placement, no behaviour change --
+ * `poll_interval_s`, its 10s default, 5s floor, 3600s ceiling and validation are untouched.
+ * 1. "Poll cadence" named nothing -- it's internal vocabulary that doesn't mention Sonarr/Radarr,
+ *    so on a page full of *arr configuration it read as unrelated plumbing. The heading now
+ *    names the action and its target the way the rest of this page already does.
+ * 2. The help text explained the floor and default -- mechanism, not consequence. It now says
+ *    what actually gets faster (Preflight's progress, how soon an item leaves "Awaiting
+ *    import") and what it costs (one more request per enabled instance per pass), reusing
+ *    `FieldHelp` the way every other field on this page's siblings already do rather than
+ *    growing the paragraph under the input.
+ * Kept at the top of the page rather than moved: it is site-wide, sitting above the per-instance
+ * list only because there's nowhere else for a setting that isn't about any one instance to go.
+ * The heading and lead-in sentence below now say "every enabled instance" explicitly so it can't
+ * read as belonging to the first row of the table underneath it.
+ */
+function PollCadenceSection() {
+  // One field, fully represented by `draft` -- unlike `DownloadPrefixSection` above (which also
+  // tracks a separate `enabled` toggle not covered by its own draft string), there is no second
+  // piece of server state to hold onto here, so a distinct `settings` object would just mirror
+  // `draft` and go unused.
+  const [draft, setDraft] = useState(String(POLL_SETTINGS_EMPTY.poll_interval_s))
+  const [loading, setLoading] = useState(true)
+  const [saving, setSaving] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const [saved, setSaved] = useState(false)
+
+  useEffect(() => {
+    getArrPollSettings()
+      .then((s) => setDraft(String(s.poll_interval_s)))
+      .finally(() => setLoading(false))
+  }, [])
+
+  const handleSave = async () => {
+    const parsed = Number(draft)
+    setError(null)
+    setSaved(false)
+    if (!Number.isFinite(parsed) || parsed < POLL_INTERVAL_MIN_S || parsed > POLL_INTERVAL_MAX_S) {
+      setError(
+        `Enter a number between ${POLL_INTERVAL_MIN_S} and ${POLL_INTERVAL_MAX_S} seconds.`,
+      )
+      return
+    }
+    setSaving(true)
+    try {
+      const result = await putArrPollSettings({ poll_interval_s: parsed })
+      setDraft(String(result.poll_interval_s))
+      setSaved(true)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  return (
+    <div className="flex flex-col gap-3 rounded-md border border-zinc-200 p-4 dark:border-zinc-800">
+      <h3 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">
+        How often to check Sonarr/Radarr
+      </h3>
+      <p className={hintClasses}>
+        One setting for <strong>every enabled instance</strong> below, not just the first one in
+        the list.
+      </p>
+      {loading ? (
+        <p className="text-sm text-zinc-500 dark:text-zinc-400">Loading…</p>
+      ) : (
+        <label className="flex flex-col gap-1">
+          <span className={labelClasses}>
+            Check interval (seconds)
+            <FieldHelp label="Check interval (seconds)">
+              <p>
+                How often lftpweb asks each enabled Sonarr/Radarr instance for its download
+                queue.
+              </p>
+              <p>
+                A shorter interval makes two things happen sooner: a <strong>Preflight</strong>{' '}
+                row's progress ticks once per check, so it visibly updates more often; and a
+                finished item leaves <strong>"Awaiting import"</strong> sooner -- that needs{' '}
+                <strong>two consecutive checks</strong> to agree before lftpweb confirms it, so
+                the actual delay you see is roughly <strong>twice</strong> this number, not equal
+                to it.
+              </p>
+              <p>
+                The cost: one extra request per enabled instance, every interval -- it grows with
+                how many instances you have turned on, not with how many items are downloading.
+              </p>
+            </FieldHelp>
+          </span>
+          <input
+            type="number"
+            min={POLL_INTERVAL_MIN_S}
+            max={POLL_INTERVAL_MAX_S}
+            step={1}
+            className={inputClasses + ' max-w-32'}
+            value={draft}
+            disabled={saving}
+            onChange={(e) => setDraft(e.target.value)}
+          />
+        </label>
+      )}
+      <p className={hintClasses}>
+        Default {POLL_SETTINGS_EMPTY.poll_interval_s}s. Floored at {POLL_INTERVAL_MIN_S}s; capped
+        at {POLL_INTERVAL_MAX_S}s ({POLL_INTERVAL_MAX_S / 60} minutes).
+      </p>
+      {error && <p className="text-sm text-red-600 dark:text-red-400">{error}</p>}
+      {saved && !error && <p className="text-sm text-emerald-600 dark:text-emerald-400">Saved.</p>}
+      <button
+        type="button"
+        disabled={saving || loading}
+        onClick={handleSave}
+        className={buttonClasses}
+      >
+        {saving ? 'Saving…' : 'Save'}
+      </button>
+    </div>
+  )
 }
 
 /** Settings → Integrations (new, docs/arr-integration-spec.md): Sonarr/Radarr instance CRUD
@@ -171,6 +311,8 @@ export function IntegrationsTab() {
       </p>
 
       {error && <p className="text-sm text-red-600 dark:text-red-400">{error}</p>}
+
+      <PollCadenceSection />
 
       <div className="overflow-hidden rounded-md border border-zinc-200 dark:border-zinc-800">
         <table className="w-full text-sm">

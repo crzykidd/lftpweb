@@ -6,6 +6,413 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-21 — bandwidth is two values: reversing "one control, one setting" one day later
+
+`prompts/done/2026-08-21-bandwidth-ceiling-and-autocommit.md`, reversing
+`prompts/done/2026-08-21-bandwidth-from-the-queue-page.md`'s central decision after the user
+browser-tested it (`prompts/test-findings-2026-08-21.md`, findings 1 and 4).
+
+**The reversed decision.** The Queue-tab slider shipped as "a second surface onto one setting":
+it and Settings → Transfer edited the same `max_bandwidth_bps`. That was deliberate and written
+down. The user's first reaction on using it was *"the max on this should never exceed the max set
+in transfer settings. That is the max."*
+
+**Why the obvious fix is impossible, which is the whole reason this needed a data-model change
+rather than a bounds tweak.** Capping the slider at the value the slider itself edits is
+circular: drag to 10 MB/s and the ceiling becomes 10 MB/s, so the slider can never be dragged
+back up. **A ratchet, one-way, unrecoverable from that page.** The user's own test expectation —
+*"if I drag to 10mb then it stays till I move back to max"* — is unsatisfiable under one value,
+because there is no "max" left to move back to. So: a **ceiling** (`max_bandwidth_bps`, Settings
+→ Transfer) and a **throttle** (`throttle_bandwidth_bps`, the slider), with
+`effective_bandwidth_bps()` = the throttle if set, else the ceiling.
+
+**No migration.** `TransferSettings` is a dataclass serialized as JSON into a `setting` row, and
+`load_transfer_settings` takes only the keys present, so a row written by any earlier build
+deserializes with `throttle_bandwidth_bps=None` — which reads as "no throttle, run at the
+ceiling," i.e. byte-for-byte the old behaviour. A migration would have had nothing to do.
+
+**The clamp is applied on write, not on read.** `save_transfer_settings` runs
+`clamp_throttle_to_ceiling` on every write. A read-side clamp alone would satisfy "lowering the
+ceiling clamps the throttle" while silently failing its partner rule: the old, higher throttle
+would still be sitting in the row, so raising the ceiling again would *restore* it. Both rules
+have to hold, so the clamp has to be a fact in the row.
+
+**The fast-lane reserve had to follow the effective limit, not the ceiling** — this was the one
+non-obvious consequence. §4.5's reserve is "10% of B, min 1 MB/s, capped at B/2", and the B/2 cap
+exists because an unconditional 1 MB/s floor against a small B produces `headroom <= 0` and a main
+lane that admits nothing, ever, with no error and no log line. Deriving the reserve from the
+*ceiling* while the scheduler allocates against a lower *throttle* recreates exactly that
+deadlock through the new door (a 100 MB/s ceiling throttled to 1 MB/s reserves 10 MB/s against a
+1 MB/s budget). The alternative considered and rejected — bounding the throttle below at twice
+the ceiling-derived reserve — would forbid throttling a gigabit ceiling below 25 MB/s, which is
+precisely the thing the slider exists to do.
+
+**Over-ceiling requests are clamped, not refused.** The slider's maximum tracks the ceiling live
+(the Transfers page already polls the settings every 5s), so the only routes to an over-ceiling
+request are a race — the ceiling was lowered in Settings between that poll and the drag — or a
+direct API call. Erroring on the race shows the user a failure for a bound they cannot see;
+clamping and returning the applied value keeps the banner honest. Below `min_share_floor` stays a
+hard 400: that is a value the scheduler genuinely cannot work with.
+
+**The confirmation dialog was deleted on purpose, and the user was asked first.** The unchecked
+"also restart running transfers" path is the one visibly destructive control on the page, and it
+previously confirmed before acting. Finding 4 flagged that tension rather than resolving it; the
+user accepted the recommendation — **default the checkbox to checked, and treat a deliberate
+uncheck as the act of consent** — plus a *post-action* banner reporting what actually happened.
+The banner therefore has to be exactly honest about the paused case, where the backend
+deliberately skips re-admission and returns `skipped_because_paused`: claiming a restart that did
+not happen would be strictly worse than the dialog that was removed.
+
+**Five seconds is long for a debounce, and that is why it is counted down on screen.** A silent
+five-second wait reads as broken; a visible countdown reads as deliberate, and doubles as the
+cancel affordance (keep dragging, or drag back to the original value, and nothing commits) — which
+is what let the Cancel button go too, the click this finding existed to remove. The commit is a
+deadline compared against `Date.now()` rather than a `setTimeout`, the same reasoning
+`QueuePauseState.paused_until` uses: a slow tick or a backgrounded tab can delay it, never lose it.
+
+---
+
+## 2026-08-21 — *arr poll cadence (issue #16): why the split was rejected, existing installs,
+## and leaving `PREFLIGHT_HOLD_S` alone
+
+`prompts/done/2026-08-21-arr-poll-cadence.md`, closing issue #16 ("Preflight progress updating in
+one-minute jumps, and import detection lagging 30–60s").
+
+**Issue #16's own premise was false, and rejecting the cadence split it proposed follows directly
+from that, not from a preference for simplicity.** The issue's core argument was that dropping
+the poll interval from 60s to 5s would be "12× the request rate against Sonarr/Radarr," and from
+there floated three mitigations: splitting the cadence (queue vs. history), an adaptive scheme,
+or answering from local state instead of polling harder. Reading `core/arrsync.py` and
+`core/arrclient.py` before building (as the handoff prompt required) showed the premise doesn't
+hold: `ArrClient.queue_records()` costs exactly one HTTP request per bound instance per pass for
+any queue that fits in one `PAGE_SIZE` (250) page — the normal case — so a 6× cadence is six
+requests a minute per instance, not one per item. `ArrClient.import_events()` is unaffected
+entirely: it's an exact `downloadId` lookup, called only for items already past `_check_import`'s
+requirement 1 (the queue record is gone or `imported`), so its volume tracks release
+*transitions*, never poll frequency. And both symptoms the issue named — Preflight's progress
+fields and the two-consecutive-passes import-confirmation guard — are gated on this same queue
+poll, so lowering it fixes both at once. With the premise false, every mitigation issue #16
+proposed was solving a cost that doesn't exist: a queue/history cadence split would separate two
+things that already scale independently; an adaptive scheme would add real complexity to chase a
+request-volume problem this shape doesn't have; and a local-observation trick would substitute
+guesswork for the "ask the *arr, then confirm on two passes" honesty the design already has.
+**Default landed at 10s** (down from 60s), not lower — the 5s floor
+(`ArrSyncScheduler.MIN_POLL_INTERVAL_S`) stays a floor, not the new default, since there's no
+evidence a real install needs to go faster than 10s and headroom against a misconfigured
+near-zero value is worth keeping.
+
+**The one genuinely different cost — a queue past 250 in-progress items — gets an observational
+guard, not adaptive backoff.** The "one request per pass" property above holds only up to one
+`PAGE_SIZE` page; a queue that ever needs a second page really does cost more at a faster cadence.
+Built the cheapest honest option: `ArrSyncScheduler._observe_queue_page_count` writes one
+`arr_queue_multi_page` INFO event the first time a pass crosses the threshold (edge-triggered —
+it re-arms if the queue drops back under 250 and rearms silence again on a sustained condition,
+the same "don't write an event every pass for a continuing problem" idiom
+`_sweep_stranded_source_deletes` already established), and nothing else changes: the poller still
+walks every page regardless, and no cadence adjustment reads this signal. Building adaptive
+backoff for a queue size nobody running this software has actually hit would be solving a
+hypothetical; the event exists so it stops being one the moment it's real.
+
+**Existing installs: left alone, no migration.** `poll_interval_s` was never exposed in the API
+or UI before this task, so in principle a persisted value could be "not a real user choice" and
+worth overwriting on upgrade. In practice the question is moot: grepping the codebase before this
+change found `save_arr_settings` had **zero call sites** anywhere outside its own definition — no
+code path, ever, wrote a `setting` row for this key. Every real install therefore has no row at
+all and falls straight through `load_arr_settings` to the dataclass default, which already means
+the new 10s value takes effect immediately on upgrade with no migration needed — the practical
+outcome the "actively move installs forward" option would have delivered anyway, without writing
+a backfill that overwrites a `setting` row based on it merely matching an old default (a
+precedent worth not setting for a case that structurally cannot occur through normal use). If a
+row somehow exists — hand-edited DB, say — it is left untouched, same as any other persisted
+setting.
+
+**`core/preflight.py.PREFLIGHT_HOLD_S` (150s) was not lowered to match.** It exists so one missed
+*arr refresh never blinks a Preflight row out and back, sized as "a couple of passes' worth of
+margin" over the poller's old 60s default. At the new 10s default it's now ~15 passes of margin
+instead of ~2.5 — more generous, not less safe — and there is no user-visible cost to that
+slack (a row that's actually gone still clears within the same wall-clock window, since the
+constant itself didn't change). Lowering it to preserve the old *pass-count* margin would be
+solving a problem that doesn't exist yet; left alone until real use says otherwise.
+
+## 2026-08-21 — Queue tab "Rescan now": shared hook, and why it carries no timestamp
+
+`prompts/done/2026-08-21-queue-tab-rescan-button.md`, closing the first half of issue #19. The
+Files tab has had "Rescan now" since early on; the Queue tab had no way to trigger a scan at all,
+which stopped making sense once v0.3.0 made Queue the default landing page.
+
+**Extracted `FilesPage.tsx`'s rescan logic into `hooks/useRescan.ts`, used by both pages,** rather
+than pasting the baseline-sequence dance into a second component. The hook's state transitions
+(`startRescan`/`rescanRequestFailed`/`observeScanComplete`) are plain functions over a
+`{ rescanning, baselineSeq }` value, tested directly the same way this repo already tests other
+page-adjacent logic (`pages/TransfersPage.test.ts`) — no component-rendering harness needed or
+added.
+
+**No "scanned Xs ago" reading next to the Queue tab's button**, unlike the Files page's per-queue
+heading. The Files tab can honestly show one timestamp per queue section; the Queue tab's list is
+a single, globally-ordered, ungrouped view (v0.3.0 dropped grouping because admission is global —
+`core/scheduler.py` has zero references to `queue_id`), so there is no single queue's `scanned_at`
+that would honestly represent "when was everything last looked at." Inventing one (e.g. the
+oldest, or newest, per-queue value) would read as an instance-wide answer while actually being one
+queue's own timestamp — left out rather than shipped misleading.
+
+**Placement: its own row, below Pause and `BandwidthControl`, not folded into either.** Those two
+are admission knobs — the same "page-level control" category, per `BandwidthControl`'s own
+comment in `TransfersPage.tsx` — while rescan is a scan trigger, a different kind of whole-instance
+action. Grouping it with them by proximity (same page-level control area, top of the tab) without
+merging it into their visual grouping keeps that distinction legible.
+
+## 2026-08-21 — Daily per-queue metric rollups: one table, rollup-before-prune, UTC days, and
+## why coverage lives on the row
+
+`prompts/done/2026-08-21-daily-metric-rollups.md`. User's ask, by name: "a year table that has
+daily totals from each queue ... so that a user can have the option to just see their total
+downloaded amount later." `core/metrics.py`'s raw tables (`metric_sample`/`metric_heartbeat`,
+2026-08-12) keep 7-30 days by design — 365 days of ~30s samples is on the order of a million
+heartbeat rows, and nobody needs 30-second granularity from nine months ago. The task was
+explicitly parked until `0.3.0` shipped (it adds a migration, a scheduler change, and new UI to
+an already-large release) and picked up the same day the release cut.
+
+**One daily table (`metric_daily`, migration 026), not daily + weekly.** A daily row is one per
+queue per day — ~790 rows for two queues over 13 months, trivial. Weekly/monthly views are
+summed from daily on read; keeping a second pre-aggregated table risks the two disagreeing with
+each other, the same "two things that can drift apart" argument that kept `metric_sample`'s own
+site-total un-materialized (2026-08-12 entry, further down).
+
+**Raw retention default raised 7 → 30 days, folded into this task rather than shipped
+separately.** The Dashboard's own offered `30d` chart range was ~77% empty out of the box before
+this; raising the default is what makes it work without the user having to know to go change a
+setting first. `MAX_RETENTION_DAYS` stays 30 — the daily table, not a higher raw ceiling, is
+what serves anything longer now.
+
+**Rollup MUST run before pruning the raw tables — the only part of this feature that can
+destroy data.** `MetricsRetentionScheduler.run_once` (`core/metrics.py`) calls
+`rollup_recent_days` then `prune_metrics`, in that order, in the same function call, every
+cycle — not two independently-scheduled loops that happen to usually run in a safe order.
+`tests/test_metrics.py::test_rollup_runs_before_prune_in_run_once` seeds a day old enough to be
+deleted by that same call's own `prune_metrics` and asserts both halves at once: the daily row
+holds the *real* byte total (proving rollup read the raw rows while they still existed), and the
+raw rows are gone afterward (proving prune ran second, in the same call). `lookback_days` for
+the rollup is `settings.retention_days` — the currently configured raw retention — so every day
+still present in raw gets a chance to be rolled up before this same call's prune can reach it.
+
+**Idempotent by recomputation, not by increment.** `rollup_day` always upserts `bytes`/
+`heartbeat_count` as a fresh `SUM(...)` over the raw tables for that `(queue_id, day)`, keyed by
+a `PRIMARY KEY (queue_id, day)` — re-rolling an already-rolled day (which happens every single
+hourly cycle, by construction, since there's no separate "already done" bookkeeping) overwrites
+with the same or an updated total, never adds to what was already stored. This is also the
+startup-backfill mechanism: there is no separate backfill entry point, `rollup_recent_days` is
+just always called with the current retention window as its lookback, so a day nobody has ever
+rolled up (the app was down, or this feature just shipped into a database with a week of raw
+data already sitting in it) is picked up the same way an already-rolled day is re-confirmed.
+
+**Coverage (`heartbeat_count`) rides along on the same row, not a second table.** The whole point
+of keeping `metric_sample`/`metric_heartbeat` separate (2026-08-12 entry) is that a bucket with
+heartbeats but no sample is a real, informative zero, and a bucket with no heartbeat at all is a
+gap — and a bytes-only daily row throws that distinction away: a day the container was off for
+20 hours would read identically to a genuinely quiet day. `heartbeat_count` is the count of
+`metric_heartbeat` rows that fell on that UTC day, site-wide (heartbeats aren't per-queue, so
+every queue's row for the same day carries the same count) — cheaper than trying to store
+"seconds of coverage" and just as informative for "was this day mostly up or mostly down," which
+is all it needs to answer. **Rejected: seconds of coverage, computed from `tick_s`.**
+`tick_s` (`TransferQueue`'s own tick interval) is a site tuning knob, not a recorded-per-day
+fact — a site that changes it would silently invalidate any stored "seconds" figure for days
+rolled up under the old cadence. A raw count sidesteps that: `EXPECTED_HEARTBEATS_PER_DAY`
+(a documented approximation assuming the common ~1 Hz/30s-sample default) is only applied at
+*read* time, by the API, to turn a count into a fraction for the UI — never baked into the
+stored row. A day absent from `metric_daily` entirely (zero heartbeats) gets no row for any
+queue, same gap semantics carried up a level: no row means no data, not a measured zero.
+
+**UTC calendar days, not a real timezone setting.** Everything in this codebase is stored UTC
+with no timezone handling anywhere (README's Known gaps already documents this for Events'
+date filters) — a daily rollup boundary at UTC midnight is the existing convention, not a new
+one. A real timezone setting would be a separate, larger feature touching History's/Events'
+filters too; out of scope here, and not built. Flagged rather than silently decided: for a
+running *total downloaded* the UTC boundary barely matters (a byte lands in "today" or
+"yesterday," never lost), but "what did I pull yesterday" can be off by a few hours away from
+UTC. If this proves untenable in practice, that's a user call, not an agent one.
+
+**"Total downloaded" is `metric_daily`, summed, plus today's own not-yet-rolled raw samples —
+not a separately maintained running counter.** A counter that's incremented on every write is
+one more thing that can drift from the tables it's supposedly summarizing (the same argument
+against a second pre-aggregated weekly table, above, and against `metric_sample`'s own
+never-materialized site total, 2026-08-12). Folding in today's raw total keeps the number live
+without waiting for the next UTC-midnight rollup; the trade-off (a scheduler that's been down for
+several days won't retroactively include an unrolled *yesterday* until it restarts and its first
+`run_once` catches up) was accepted rather than built around, since normal operation makes it
+self-healing within the hour and the alternative was a second, more expensive query on every
+read of a number nobody watches sub-hourly.
+
+**90d/1y bytes-chart ranges read `metric_daily` directly, not the raw tables** — `_DAILY_RANGES`
+in `api/metrics.py`, a second dict from `_RANGES` rather than folded in, since raw retention (30
+days max) can never serve either one. 30d itself was deliberately left reading the raw tables
+unchanged (the default-retention-to-30 decision above is what makes it work now), rather than
+switched onto the daily table too — changing 30d's data source would have also meant reworking
+the frontend's `retentionNoteForRange`/`BYTES_RANGE_DAYS` logic for a range that already works
+correctly with the simpler fix. 90d/1y are new ranges instead, and `retentionNoteForRange`
+explicitly excludes both from the raw-retention note (`DAILY_TABLE_RANGES` in
+`lib/bytesChart.ts`) since the note's whole premise — the range outrunning the user's configured
+*raw* retention — doesn't apply to a range sourced from a fixed, non-configurable 13-month table.
+
+---
+
+## 2026-08-21 — Bandwidth from the Queue page: re-admit, never retune; and never touch a pause
+
+`prompts/done/2026-08-21-bandwidth-from-the-queue-page.md`. User's request: a slider on the Queue
+tab, with an option to apply a change to future items or to in-progress ones, "in progress will
+do a pause and unpause to reset the queue speed."
+
+**In-place adjustment was not possible, and the mechanism the user proposed is the right one.**
+`lftp -c` exits with its transfer and exposes no control channel, so `net:limit-total-rate` cannot
+be changed mid-flight — which is precisely why DESIGN.md §4.5 fixes an allocation at admission and
+never re-shapes it. The only way to give a running job a different allocation is to stop it and
+let the scheduler admit it again. **This is the invariant being obeyed, not an exception to it**:
+the job stops being a running job before it gets a new number, and `core/scheduler.py` was not
+touched at all. (The Phase 3 stdin-pipe experiment in §4.5 remains the thing that would make a
+true live retune possible; still unverified, still not leaned on.)
+
+**Reused `_pause_running_jobs` verbatim rather than writing a second stop-and-respawn path.** It
+already does exactly the required thing — SIGTERM, back to `queued` in place, no failure
+classification, no `auto_queue_suppressed`, partial bytes intact — and reusing it makes the resume
+behavior inherited rather than re-argued. The method keeps its pause-flavored name and grew a
+second-caller note; renaming it plus `_RunningProcess.pause_requested` plus `_reap_one`'s branch
+would have been churn, not clarity.
+
+**Did *not* implement "apply to in-progress" as a literal `pause(stop_running=True)` +
+`unpause()`.** Two independent reasons, either fatal on its own. (1) The pause-for-duration work
+landed the same day (`prompts/done/2026-08-21-pause-for-duration.md`): `pause()` overwrites
+`paused_until` and `unpause()` clears it, so a bandwidth change would have silently cancelled a
+user's "pause for 30 minutes" — and unpaused a queue they deliberately paused. (2) **A paused
+queue can still have running jobs**, because "pause after current" leaves them alone on purpose;
+stopping those would upgrade the user's chosen entry mode into "pause now" *and* strand them as
+`queued` with admission closed.
+
+**So a paused queue is left completely alone: write the setting, touch nothing else**, and report
+`skipped_because_paused` so the UI says so instead of implying transfers were re-admitted.
+Rejected the alternative of *refusing* the change while paused — changing the number while paused
+is reasonable (curating before resuming is what pausing is for); only the interruption is
+meaningless there.
+
+**Admission is held during the teardown by a transient `_admission_hold`, not by the real pause
+flag.** In-memory, never persisted, released in a `finally`. It keeps "the user paused" and "the
+scheduler is briefly busy" disjoint, which is the whole reason the pause state survives a
+bandwidth change.
+
+**Its own endpoint (`POST /api/queue/bandwidth`), not a flag on `PUT /api/settings/transfer`.**
+That PUT takes the whole twelve-field settings object; driving it from the Queue tab would mean
+read-modify-writing eleven fields the page doesn't display and clobbering a concurrent Settings
+edit while doing it.
+
+**Bounds reuse `min_share_floor_bps` rather than inventing one, and `<= 0` is a hard error.**
+Zero is *not* unlimited — it makes headroom zero on every pass, so the main lane admits nothing,
+ever: the same silent-deadlock shape the `B/2` reserve cap was added to prevent (and distinct
+from `<= 0`'s *other* meaning, "no site limit configured," which gates "Start now" fractions).
+The new endpoint validates; **`PUT /api/settings/transfer` deliberately stays unvalidated** — it
+is the expert surface, and several tests legitimately set `min_share_floor_bps=0` through it.
+
+**Judgement call, flagged:** the two surfaces sync by the Transfers page *polling*
+`GET /api/settings/transfer` every 5s (it previously fetched once on mount, purely for the "Start
+now" fraction gate). Cheap next to the 2s `GET /api/jobs` this page already makes, and it is what
+makes "changing it in one place is visible in the other without a reload" true rather than
+true-on-navigation.
+
+---
+
+## 2026-08-21 — Paused-item progress: gate on partial bytes, not on the queue being paused
+
+`prompts/done/2026-08-21-paused-item-progress.md` (issue #14, progress half), landing right
+after the duration half above. User's words on the issue: showing `Queued 45%` would make pause
+visibly non-destructive.
+
+**Gated the display on "this row has partial bytes on disk," never on "the queue happens to be
+paused right now."** A job re-queued after an interrupted attempt (`attempt > 1`, real bytes
+already on disk from the attempt that died) is in the identical situation to a paused-now row and
+reads the same way — simpler than threading "is the queue paused" through the display logic, and
+more honest: the point isn't that pause exists, it's that the bytes are still there.
+
+**Backend: reused `item.local_size`, joined into `list_jobs()`, rather than trusting `job.
+bytes_done` for every queued row.** `job.bytes_done` is only current for the *same* job row the
+progress sampler last wrote to — true for a paused-in-place row (pause-now returns the existing
+job to `queued` without touching `bytes_done`), but **not** for a fresh retry: `enqueue_item`
+inserts a brand-new `job` row, whose `bytes_done` starts at the column's own `0` default,
+even though the item it belongs to may already carry real partial bytes. `item.local_size` is
+the one number the scanner/reconciler keeps current regardless of which job row is live
+(DESIGN.md §1.3 — never a fresh filesystem stat on the request path, just the join). `api/jobs.py.
+_job_out` prefers it over `job.bytes_done` for a `queued` row only, the identical shape its
+existing `bytes_total → item.remote_size` fallback already established for the same "queued,
+nothing frozen yet" gap — no new endpoint, no new column, one join and one conditional.
+
+**Frontend: extended the one shared `stateProgressPercent` (`lib/fileTree.ts`) rather than
+special-casing the Transfers row.** Both the Files page and the Transfers/Queue row already
+funnel "does this state get a percent, and what of" through that single function; adding a
+`QUEUED` branch there fixes both surfaces at once, rather than writing a second definition of
+the rule for just the Queue row (`transferPanel.ts.queueRowPercent` already carried an explicit
+comment against exactly that kind of drift). The `QUEUED` branch needed its own `if`, not a
+share of the existing `DOWNLOADING`/`PARTIAL` check: `percentValue(0, total)` resolves to `0`,
+not `null`, which is correct for a `DOWNLOADING` row that only just started but wrong here, where
+the signal is "there is already something on disk" — a plain never-started queued row must render
+exactly as it always has, not `QUEUED 0%`. So the `QUEUED` branch treats a falsy `localSize`
+(`null`, `undefined`, or `0`) as "nothing to show," same silence as the other two states already
+give a job with no reading yet.
+
+**`FILL_STYLES.QUEUED` got its own indigo pair (`indigo-300` / `indigo-700/80`), not `PARTIAL`/
+`WAITING`'s amber.** `QUEUED`'s base chip color (`STYLES.QUEUED`) is indigo, and `StateChip.tsx`'s
+own fill-color rule is explicit: "a second, more saturated shade of the same chip color, never a
+different hue." `WAITING` gets away with reusing `PARTIAL`'s amber because it was *given*
+`PARTIAL`'s amber base too (its own comment says so) — `QUEUED` wasn't, and repainting every
+queued row's base color (even ones with nothing downloaded) to make an amber fill match would
+have been a far bigger visual change than this task asked for. The `100→300` / `900/40→700/80`
+jump is the same numeric shift every other pair here uses, just on `QUEUED`'s own hue —
+**unverified in a real browser** (no UI access in this environment), unlike the amber pairs,
+which the user has already confirmed live.
+
+---
+
+## 2026-08-21 — Pause-for-a-duration: a stored deadline, expired from `TransferQueue`'s own tick
+
+`prompts/2026-08-21-pause-for-duration.md` (issue #14, duration half), extending queue pause
+(`07e2471`, shipped in `v0.3.0`). User request: a dropdown of 1/10/30/60 minutes next to the
+existing Pause control, combinable with both entry modes, indefinite pause staying the default.
+
+**Stored an absolute ISO-8601 UTC timestamp (`QueuePauseState.paused_until`), not a countdown or
+a running `asyncio` timer.** A timer dies with the process; a persisted deadline makes restart
+correctness fall out for free — paused before the deadline stays paused (deadline intact), an app
+that comes back *after* the deadline resumes unpaused rather than silently re-honoring a stale
+pause, and there is no catch-up logic or timer reconstruction to get wrong. Comparable directly
+against the same `_now_iso()`-format string every other timestamp in `core/queue.py` already
+uses, via plain `<=` — zero-padded ISO-8601 UTC sorts lexically the same as chronologically, the
+same trick `core/auth.py`'s session `expires_at` already relies on. Tests write a known past
+timestamp directly into the persisted state (mirroring `tests/test_auth.py`'s own session-expiry
+tests) rather than monkeypatching the wall clock or sleeping — "prefer an injected clock" from
+the task brief, satisfied by treating the stored string itself as the injection point.
+
+**Expiry is enforced from `TransferQueue.tick()` (`_expire_pause_if_due`), not `core/engine.py`'s
+scan loop**, even though the engine loop was the obvious first guess ("the engine tick... already
+runs continuously"). It doesn't, unconditionally: `Engine._loop`'s own `_next_wake_delay` can
+return `None` — sleep with no wake scheduled at all — when every queue is on-demand-only or
+disabled, which is a real, supported configuration in this codebase (`docs/decisions.md`'s own
+per-queue scan-interval entries). `TransferQueue._loop` has no such escape: it calls `tick()` and
+then waits at most `self.tick_s` (~1s) before doing it again, forever, for as long as the process
+runs. That is the only "fires without a page open, on the backend's own clock, no matter what" of
+the two, so the expiry check lives there instead — checked first in `tick()`'s own body, before
+reap/progress/admit, so an expired deadline resumes admission in the same tick it's noticed.
+
+**Also checked synchronously inside `TransferQueue.start()`, not only on the loop's first
+`tick()`.** `asyncio.create_task` schedules the loop but doesn't run it before `start()` returns,
+and `/api/health` can be read the instant the process comes up — "the app was down past the
+deadline comes back unpaused" needs to be true immediately, not eventually-after-the-first-tick.
+Both call sites share one private method (`_expire_pause_if_due`) rather than duplicating the
+comparison.
+
+**Re-pausing always replaces `paused_until` outright.** `pause()` recomputes the deadline (or
+`None`) from scratch on every call and always overwrites the persisted/cached value — there was
+no separate "extend" or "stack" code path to reject, because the method never had one to begin
+with; the replace behavior the task asked for was already what a naive implementation would do,
+so no special-casing was needed. Manual `unpause()` and automatic expiry share a
+`_clear_pause` helper that always sets `paused_until` back to `None`, so a stale deadline can
+never survive past whichever path resumed admission.
+
+---
+
 ## 2026-08-21 — Preflight retirement moves to request time: local state needs no *arr dependency
 
 `prompts/2026-08-21-preflight-eviction-latency.md`, from the user's browser review ("it does take

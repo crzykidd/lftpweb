@@ -15,6 +15,7 @@ import {
   isRemovalGracePending,
   isStillArriving,
   mbToBytes,
+  pauseResumeLabel,
   percentValue,
   REMOVAL_GRACE_ELIGIBLE_STATES,
   removalGraceLabel,
@@ -640,6 +641,25 @@ describe('removalGraceShortLabel / removalGraceLabel', () => {
     expect(removalGraceLabel({ first_missing_at: null, arr_status: 'cleaned' }, grace)).toBe(
       'Processed by the *arr; local copy removed.',
     )
+  })
+})
+
+describe('pauseResumeLabel', () => {
+  it('formats a deadline as an absolute local time', () => {
+    const pausedUntil = '2026-08-21T18:05:00.000000Z'
+    const expected = new Date(pausedUntil).toLocaleTimeString([], {
+      hour: '2-digit',
+      minute: '2-digit',
+    })
+    expect(pauseResumeLabel(pausedUntil)).toBe(`resumes at ${expected}`)
+  })
+
+  it('returns null for an indefinite pause', () => {
+    expect(pauseResumeLabel(null)).toBeNull()
+  })
+
+  it('returns null rather than fabricating a time for a bad timestamp', () => {
+    expect(pauseResumeLabel('not-a-date')).toBeNull()
   })
 })
 

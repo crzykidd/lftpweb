@@ -4,6 +4,8 @@ import type {
   ApiKeyOut,
   ArrInstanceIn,
   ArrInstanceOut,
+  ArrPollSettingsIn,
+  ArrPollSettingsOut,
   ArrTestResponse,
   AuthSessionOut,
   AuthSettingsIn,
@@ -40,10 +42,12 @@ import type {
   LoginIn,
   LogFilesResponse,
   LogTailResponse,
+  MetricsGroup,
   MetricsRange,
   MetricsSettingsIn,
   MetricsSettingsOut,
   MetricsThroughputResponse,
+  MetricsTotalOut,
   PathQueueIn,
   PathQueueOut,
   PatternIn,
@@ -54,6 +58,7 @@ import type {
   PostprocessSettingsOut,
   PreflightResponse,
   QueueAutoQueueStatus,
+  QueueBandwidthResponse,
   QueueResetRequest,
   RemovalGraceSettingsOut,
   ResetItemResponse,
@@ -231,6 +236,18 @@ export function deleteArrInstance(id: number): Promise<void> {
  */
 export function testArrInstance(id: number): Promise<ArrTestResponse> {
   return sendJson<ArrTestResponse>(`/api/settings/arr/${id}/test`, 'POST')
+}
+
+/** *arr poll cadence (2026-08-21, issue #16) -- `core/arrsync.py.ArrSettings.poll_interval_s`
+ * exposed here for the first time. Server-side validated on `PUT`; see `ArrPollSettingsOut`'s
+ * own docstring.
+ */
+export function getArrPollSettings(): Promise<ArrPollSettingsOut> {
+  return getJson<ArrPollSettingsOut>('/api/settings/arr/poll-interval')
+}
+
+export function putArrPollSettings(body: ArrPollSettingsIn): Promise<ArrPollSettingsOut> {
+  return sendJson<ArrPollSettingsOut>('/api/settings/arr/poll-interval', 'PUT', body)
 }
 
 // --- Settings -> Post-processing (phase 5, DESIGN.md §6) --------------------------------
@@ -466,14 +483,49 @@ export function startJobNow(
  * `stopRunning` omitted/`false` is "pause after current" -- running jobs finish normally, nothing
  * new is admitted. `true` is "pause now" -- additionally stops every in-flight transfer and
  * returns it to `queued` at its same position (`core/queue.py.TransferQueue.pause`).
+ *
+ * `durationMinutes` (2026-08-21, `prompts/2026-08-21-pause-for-duration.md`) is one of the
+ * dropdown's four offered durations, or `undefined` for an indefinite pause (the default,
+ * unchanged) -- combines with either `stopRunning` value.
  */
-export function pauseQueue(stopRunning = false): Promise<void> {
-  return sendJson<void>('/api/queue/pause', 'POST', { stop_running: stopRunning })
+export function pauseQueue(
+  stopRunning = false,
+  durationMinutes?: 1 | 10 | 30 | 60,
+): Promise<void> {
+  return sendJson<void>('/api/queue/pause', 'POST', {
+    stop_running: stopRunning,
+    duration_minutes: durationMinutes ?? null,
+  })
 }
 
 /** Resume admission immediately, in queue-position order. */
 export function unpauseQueue(): Promise<void> {
   return sendJson<void>('/api/queue/unpause', 'POST')
+}
+
+/** The Queue tab's bandwidth slider (2026-08-21,
+ * `prompts/done/2026-08-21-bandwidth-from-the-queue-page.md`) -- writes the **site-wide
+ * throttle**, bounded above by the `max_bandwidth_bps` ceiling Settings -> Transfer owns
+ * (2026-08-21, `prompts/done/2026-08-21-bandwidth-ceiling-and-autocommit.md`). Still site-wide,
+ * never a per-queue limit (DESIGN.md §4.5: one site, one set of transfer knobs).
+ *
+ * Its own endpoint rather than `putTransferSettings` because that PUT takes the whole
+ * twelve-field settings object: sending it from here would mean read-modify-writing eleven
+ * fields this page doesn't display, clobbering a concurrent Settings edit in the process.
+ *
+ * `applyToRunning` additionally stops and re-queues every in-flight transfer so the scheduler
+ * re-admits it at the new limit -- a real interruption, which the "Apply to new items only"
+ * checkbox (checked by default) is the deliberate opt-out from. A value above the ceiling is
+ * clamped server-side; the response's `effective_bandwidth_bps` is what was applied.
+ */
+export function setQueueBandwidth(
+  effectiveBandwidthBps: number,
+  applyToRunning: boolean,
+): Promise<QueueBandwidthResponse> {
+  return sendJson<QueueBandwidthResponse>('/api/queue/bandwidth', 'POST', {
+    effective_bandwidth_bps: effectiveBandwidthBps,
+    apply_to_running: applyToRunning,
+  })
 }
 
 /** The Queue tab's Preflight box (docs/transfers-redesign-spec.md §4, prefigured; this task's
@@ -767,14 +819,26 @@ export function putMetricsSettings(body: MetricsSettingsIn): Promise<MetricsSett
  * all-queues breakdown + site total (bytes/hour bar chart, "All queues" speed line); pass it
  * for one queue's own series (speed line with a queue selected). Server-side bucketed
  * (core/metrics.py) -- never raw rows to aggregate here.
+ *
+ * `group` (2026-08-21, chart grouping) is the bytes chart's group-by control -- omitted, the
+ * server picks that range's own default (`api/metrics.py._DEFAULT_GROUP`); the speed chart never
+ * passes one, since its `1h`/`12h` ranges have no group-by control at all.
  */
 export function getThroughput(
   range: MetricsRange,
   queueId?: number,
+  group?: MetricsGroup,
 ): Promise<MetricsThroughputResponse> {
   return getJson<MetricsThroughputResponse>(
-    `/api/metrics/throughput${queryString({ range, queue_id: queueId })}`,
+    `/api/metrics/throughput${queryString({ range, queue_id: queueId, group })}`,
   )
+}
+
+/** Dashboard's "total downloaded" readout (2026-08-21, daily rollups) -- omit `queueId` for the
+ * site-wide total, pass it for one queue's own.
+ */
+export function getMetricsTotal(queueId?: number): Promise<MetricsTotalOut> {
+  return getJson<MetricsTotalOut>(`/api/metrics/total${queryString({ queue_id: queueId })}`)
 }
 
 // --- Auth (phase 8, DESIGN.md §8) ---------------------------------------------------------

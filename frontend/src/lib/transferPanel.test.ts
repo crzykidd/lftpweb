@@ -129,8 +129,25 @@ describe('queueRowPercent -- the Queue row\'s own chip fill', () => {
     expect(queueRowPercent(job('running', { bytes_done: 100, bytes_total: 1000 }), live)).toBe(90)
   })
 
-  it('is null for a queued job -- not yet running, nothing to fill', () => {
-    expect(queueRowPercent(job('queued', { bytes_total: 1000 }))).toBeNull()
+  it('is null for a queued job with no local bytes -- a plain never-started row', () => {
+    expect(queueRowPercent(job('queued', { bytes_done: 0, bytes_total: 1000 }))).toBeNull()
+  })
+
+  // 2026-08-21 (prompts/done/2026-08-21-paused-item-progress.md, issue #14's second half): a
+  // paused-in-place row (or one freshly retried after an interrupted attempt) reads its own
+  // partial bytes the same way a running row does -- "Queued 45%", making pause visibly
+  // non-destructive rather than looking like the item lost its progress.
+  it('reads the percent for a queued job that already has partial bytes on disk', () => {
+    expect(queueRowPercent(job('queued', { bytes_done: 450, bytes_total: 1000 }))).toBe(45)
+  })
+
+  it('never prefers a live reading for a queued job -- live progress only ever speaks for running', () => {
+    const live: LiveProgress = { bytes_done: 900, bytes_total: 1000, speed_bps: 1024, eta_s: 5 }
+    expect(queueRowPercent(job('queued', { bytes_done: 450, bytes_total: 1000 }), live)).toBe(45)
+  })
+
+  it('is null for a queued job with no known remote size -- no honest denominator', () => {
+    expect(queueRowPercent(job('queued', { bytes_done: 450, bytes_total: null }))).toBeNull()
   })
 
   it('is null for a terminal job -- the chip shows an outcome, not a percent', () => {
@@ -829,10 +846,19 @@ describe('resolveMenuOptions', () => {
   })
 })
 
-describe('sortTransferRows -- in-flight post-transfer rows sit with the running ones', () => {
-  it('places a still-processing row above the queued backlog, not below it', () => {
-    // Otherwise it sorts into the newest-finished-first tail beneath the whole backlog -- page 11
-    // of a busy queue, where the user never sees the thing they're being told is still moving.
+describe('sortTransferRows -- in-flight post-transfer rows sort as "parked", below the queue', () => {
+  it('orders now / next / parked -- running, then queued, then still-processing', () => {
+    // **Reversed 2026-08-21 at the user's direction.** This partition originally sat *between*
+    // `running` and `queued`, on the reasoning that both are "work happening right now" and a
+    // processing row would otherwise be buried beneath the backlog. The user's reading is
+    // better: a pipeline-in-flight row is lftpweb *waiting on someone else* (usually an *arr
+    // import), while `queued` is lftpweb's own genuinely-next work -- so waiting belongs below
+    // next, not above it.
+    //
+    // The tradeoff that buys, recorded here and in `sortTransferRows`'s own docstring so it is
+    // not rediscovered as a bug: on a deep backlog at 20 rows a page, a processing row can now
+    // land pages below the fold. Accepted because such rows are transient and few, and burying
+    // "waiting on Sonarr" costs less than pushing the real upcoming queue order out of view.
     const running = job('running', { id: 1 })
     const processing = job('succeeded', {
       id: 2,
@@ -845,8 +871,9 @@ describe('sortTransferRows -- in-flight post-transfer rows sit with the running 
       pipeline_in_flight: false,
       finished_at: '2026-08-20T11:00:00.000000Z',
     })
+    // running(1), queued(3), processing(2), terminal(4) -- not the 1,2,3,4 this asserted before.
     expect(sortTransferRows([done, queued, processing, running]).map((j) => j.id)).toEqual([
-      1, 2, 3, 4,
+      1, 3, 2, 4,
     ])
   })
 

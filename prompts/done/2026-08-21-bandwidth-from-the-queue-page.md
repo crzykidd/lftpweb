@@ -1,10 +1,15 @@
 ---
 name: 2026-08-21-bandwidth-from-the-queue-page
-status: pending          # pending | completed | failed
+status: completed        # pending | completed | failed
 created: 2026-08-21
 model: opus              # design-sensitive: touches §4.5's central invariant
-completed:               # filled when the work is done
-result:                  # one-line summary of the outcome
+completed: 2026-08-21
+result: >
+  Queue-tab bandwidth slider onto the site-wide max_bandwidth_bps, with future-items-only and
+  also-apply-to-in-progress; the latter re-admits via pause-now's own stop path rather than
+  retuning, leaving §4.5's invariant and core/scheduler.py untouched, and leaves an already-paused
+  queue (including a timed pause's deadline) completely alone. 1637 backend / 645 frontend, 0
+  skipped.
 ---
 
 # Task: change the site bandwidth limit from the Queue page, optionally applying it to running transfers

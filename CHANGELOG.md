@@ -30,6 +30,137 @@ Skeleton for the next roll:
 ### Deprecated
 ### Removed
 
+## [0.3.1] — 2026-08-22
+
+### Added
+
+- **Throttle the site bandwidth from the Queue page** — a slider next to the Pause control that
+  runs *within* the Settings → Transfer maximum rather than replacing it. There are now two
+  numbers with two jobs: Settings → Transfer sets the **ceiling** for the whole instance, and this
+  slider sets a **throttle** below it. The slider can never exceed the ceiling; lowering the
+  ceiling below the throttle brings the throttle down with it, and raising the ceiling afterwards
+  moves only the ceiling, so a throttle can always be dragged back up to it. Still one set of
+  numbers for the whole instance, never one per queue. The throttle is saved, not a temporary
+  override: it survives a restart, an empty queue and unpausing, and it is what the scheduler
+  actually allocates against — including "Start now" percentages, which are a share of the limit
+  in force, not of the ceiling.
+  **The slider applies itself.** Let go and a line counts down — *"Bandwidth update to 10 MB/s
+  applied in 5 seconds…"* — then becomes the result. Moving the slider again restarts the
+  countdown, so dragging back to where you started cancels the change entirely; there is no Apply
+  button and no Cancel button. A checkbox beside it, **"Apply to new items only", checked by
+  default**, chooses what happens to transfers already running: checked interrupts nothing (they
+  keep the speed they started at — by design, since lftp offers no way to retune a running
+  transfer), unchecked stops each one and immediately restarts it at the new limit, resuming from
+  the bytes already downloaded — never re-downloading, never marked failed or stopped. The banner
+  then reports the real count. If the queue is paused, unchecking the box deliberately does
+  nothing beyond saving the number — it will not resume a queue you paused, will not cancel a
+  "pause for 30 minutes" you set, and says plainly that nothing was restarted. The slider still
+  refuses a limit of 0 (which is not "unlimited" — it would stop the queue admitting anything at
+  all) or one below the configured minimum share floor.
+- **Pause the transfer queue for a fixed duration, from one dropdown** — the Queue tab's Pause
+  control is a single list: **"Till I unpause"** (the default, first), then **1 / 10 / 30 / 60
+  minutes**. Picking an entry pauses immediately — the selection *is* the action, with no second
+  click. A persistent checkbox beside it, **"Pause after active", unchecked by default**, is what
+  used to be a second menu (*pause after current* vs *pause now*): checked waits for whatever is
+  already running to finish before the pause takes effect, unchecked (the default) also stops
+  what's running right away, returning it to `queued` at the same position so it resumes — not
+  restarts — once unpaused. The checkbox is disabled, with the reason on hover, whenever nothing
+  is running: with zero active transfers the two modes are identical, so offering the choice would
+  be noise. The deadline is a stored absolute timestamp, not a running timer, so it survives a
+  restart correctly: paused before the deadline stays paused, but an app that comes back *after*
+  the deadline resumes unpaused rather than quietly re-honoring a stale pause. Expiry is enforced
+  on the transfer queue's own ~1s tick, so the queue resumes itself on schedule with no page open,
+  and records its own audit event distinct from a manual unpause. The paused banner and header
+  badge both show the deadline ("resumes at HH:MM") whenever one is set.
+- **A paused or retried-after-interruption row now shows its own progress** — `QUEUED 45%`, in
+  the same fillable chip the running row already uses, so a paused-now item visibly keeps the
+  bytes it already downloaded rather than looking like it lost them. Gated on the row genuinely
+  having partial bytes on disk, not on the queue being paused: a job re-queued after an
+  interrupted attempt reads the same way. A queued row with nothing downloaded yet is unchanged —
+  no `0%`, no fill. The fill never ticks on its own — nothing samples a paused item's bytes — so
+  it never suggests the item is actively transferring.
+- **Daily per-queue throughput rollups, and a "total downloaded" readout on the Dashboard** — the
+  raw sample store (`metric_sample`/`metric_heartbeat`) is kept only a matter of weeks by design,
+  nowhere near enough for "how much have I downloaded this year." A new daily table
+  (`metric_daily`, one row per queue per UTC calendar day) is rolled up from the raw tables every
+  hour, kept 13 months, and now backs a headline "total downloaded" number at the top of the
+  Dashboard plus two new bytes-chart ranges, **90d** and **1y**, alongside the existing
+  24h/7d/30d. A day the app was only partly running (heartbeat coverage below ~95%) is marked
+  distinctly from a fully-covered quiet day, both in the chart and its accessible table, so a
+  genuinely idle day is never confused with a mostly-down one. Rollup always runs before the raw
+  tables are pruned, in the same cycle — the only part of this feature that could otherwise lose
+  data — and backfills automatically on first run after upgrading into it.
+- **A group-by control on the Dashboard's bytes chart** — hour / day / week / month, independent
+  of the range selector. Defaults changed to match: 7d now defaults to daily bars (was 6-hour),
+  90d and 1y now default to weekly (was daily); 24h and 30d were already right and are unchanged.
+  Week and month bars are summed from daily totals on read — no new table. **Hourly grouping is
+  disabled, with a reason, at 90d/1y** — raw history is only kept 30 days and the daily rollup
+  table is one-day granularity by construction, so there's no sub-day data that far back at any
+  retention setting; the server rejects the combination too, it isn't just greyed out client-side.
+  A week/month bar's "coverage" marker (partial vs. fully-covered vs. down) is the fraction of
+  days in that bar that had any activity, same idle-vs-down distinction as before, just aggregated
+  up a level.
+- **"Rescan now" on the Queue tab** — v0.3.0 made Queue the default landing page, but triggering a
+  scan still meant switching to Files. The button lives with the other page-level controls at the
+  top (below Pause/Bandwidth, in its own row), rescans every queue exactly like the Files tab's
+  button (there is no per-queue choice — admission is global, so the Queue tab has no per-queue
+  structure to hang one off), and shares the same `useRescan` hook and `POST /api/files/rescan`
+  endpoint rather than a second implementation. No "scanned Xs ago" reading here: the Queue tab's
+  list is single and ungrouped, so there's no one queue's timestamp that would honestly stand in
+  for all of them the way the Files page's per-section reading does.
+- **The *arr poll interval is now a Settings → Integrations control** (closes #16) —
+  `core/arrsync.py.ArrSettings.poll_interval_s` was DB-only before this, never exposed in the API
+  or UI, so any stored value was a default that got written down rather than an actual user
+  choice. Now a `GET`/`PUT /api/settings/arr/poll-interval` field, validated server-side against a
+  5s floor (unchanged, `ArrSyncScheduler.MIN_POLL_INTERVAL_S`) and a new 3600s ceiling. A queue
+  that ever grows past one page (250 in-progress items) writes one `arr_queue_multi_page` event
+  the first time that happens per instance — the poll still walks every page, this is purely
+  observational, and no adaptive cadence was built.
+
+### Changed
+
+- **The *arr poll interval's default dropped from 60s to 10s** (closes #16 — "Preflight progress
+  updating in one-minute jumps, and import detection lagging 30–60s"). The issue's own premise —
+  that a faster cadence multiplies request volume against Sonarr/Radarr — doesn't hold for this
+  poller's actual shape: the queue poll is one HTTP request per bound instance per pass for any
+  normal-sized queue (`ArrClient.queue_records()`'s own single-page walk), so six times the
+  cadence is six requests a minute per instance, not one per item; history lookups are unaffected
+  — exact, by `downloadId`, and only for items already past the queue-presence check. Both symptoms
+  the issue named are gated on this same queue poll, so this one change fixes both, and import
+  confirmation (which needs two consecutive passes to agree) now takes roughly 20s instead of up
+  to a minute. No cadence split, adaptive scheme, or local-observation trick was needed — see
+  `docs/decisions.md` for the full reasoning. Every existing install already had no persisted
+  value (the setting was never reachable to write one), so this takes effect immediately on
+  upgrade with nothing to migrate.
+
+- **Active/pending now sorts running → queued → still-processing**, rather than placing
+  pipeline-in-flight rows (verifying, extracting, awaiting import, deleting source) between
+  running and queued. A processing row is lftpweb *waiting on someone else* — usually an *arr
+  import — while `queued` is its own genuinely-next work, so the list reads now / next / parked.
+  The tradeoff, recorded rather than left to be rediscovered: on a deep backlog at 20 rows a
+  page, a processing row can now land pages below the fold, which is what the original placement
+  avoided. Accepted because such rows are transient and few.
+- **Raw throughput retention default raised from 7 to 30 days** (`MAX_RETENTION_DAYS` stays 30),
+  so the Dashboard's own offered `30d` chart range is populated out of the box instead of arriving
+  mostly empty. Only affects installs that have never touched the setting; an explicitly
+  configured value is untouched.
+
+### Fixed
+
+- **The *arr poll-interval control was unlabeled and unexplained.** A user who had asked for the
+  setting and knew it had shipped went looking on Settings → Integrations and could not find it.
+  The card was headed "Poll cadence" — internal vocabulary that named neither Sonarr nor Radarr,
+  so it read as unrelated plumbing on a page otherwise all about them — and its help text gave
+  only the floor and default, not what changing it does. Now headed **"How often to check
+  Sonarr/Radarr"**, with the field's `FieldHelp` explaining the two things that actually get
+  faster (a Preflight row's progress, and how soon a finished item leaves "Awaiting import" — that
+  needs two consecutive checks, so the observed lag is roughly twice the interval) and what it
+  costs (one extra request per enabled instance, every interval). Wording and placement only —
+  the 10s default, 5s floor, 3600s ceiling and validation are unchanged.
+### Security
+### Deprecated
+### Removed
+
 ## [0.3.0] — 2026-08-21
 
 ### Added

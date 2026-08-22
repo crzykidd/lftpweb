@@ -35,6 +35,19 @@ set once, at spawn (`core/queue.py`'s `_admit`, mirroring the same value written
 at a job's first tick and can only grow with bytes *that job* actually moved. A retry gets a
 brand new job id, so it starts its own tracking at zero and can never inherit a dead job's
 history; see `ThroughputSampler.tick()` and `tests/test_metrics.py`'s restart-mid-flight test.
+
+**Daily rollups** (2026-08-21, prompts/done/2026-08-21-daily-metric-rollups.md; docs/decisions.md
+carries the one-table, rollup-before-prune, and UTC-day reasoning). The two raw tables above are
+kept only a matter of days -- nowhere near long enough to answer "how much have I downloaded
+this year." `metric_daily` (migration 026) is one row per `(queue_id, day)`, `day` a UTC
+calendar date, recomputed from the raw tables and upserted -- never incremented, so re-rolling an
+already-rolled day is a no-op. `heartbeat_count` on that row carries the idle-vs-down distinction
+up to daily granularity: full coverage with zero bytes is a genuinely quiet day; partial coverage
+means the day was mostly down; a day absent from the table entirely had zero heartbeats (never
+rolled up, or since pruned). **Rollup MUST run before pruning the raw tables** --
+`MetricsRetentionScheduler.run_once` calls `rollup_recent_days` then `prune_metrics`, in that
+order, in the same function call, every cycle -- a day rolled up after its raw rows are gone has
+nothing left to sum. See `rollup_day`/`rollup_recent_days`/`prune_daily_metrics` below.
 """
 
 from __future__ import annotations
@@ -61,9 +74,29 @@ logger = logging.getLogger(__name__)
 SAMPLE_INTERVAL_TICKS = 30
 
 SETTING_KEY = "metrics_settings"
-DEFAULT_RETENTION_DAYS = 7
+# 2026-08-21 (prompts/done/2026-08-21-daily-metric-rollups.md, decided with the user): 7 -> 30
+# so the Dashboard's own offered `30d` range (api/metrics.py._RANGES) works out of the box,
+# rather than arriving ~77% empty. `MAX_RETENTION_DAYS` is unchanged -- 30 stays the raw-table
+# ceiling; `metric_daily` below is what serves anything longer.
+DEFAULT_RETENTION_DAYS = 30
 MIN_RETENTION_DAYS = 1
 MAX_RETENTION_DAYS = 30
+
+# The daily table's own retention (2026-08-21, "keep daily rows for 13 months" -- long enough
+# for a year-over-year glance) -- independent of the raw tables' `*_RETENTION_DAYS` above, and
+# not user-configurable (the task asked for configurable *raw* retention only; see
+# docs/decisions.md). 396 days ~= 13 * 30.4 -- a fixed day count, not a calendar-month
+# calculation, matching every other day-based retention window in this codebase.
+DAILY_RETENTION_DAYS = 396
+
+# Coverage baseline for `heartbeat_count` (see `rollup_day`): at the ~1 Hz `tick_s` default
+# (`main.py`'s `settings.transfer_tick_s`) a heartbeat lands every `SAMPLE_INTERVAL_TICKS`
+# ticks, i.e. ~30s, so a fully-covered UTC day sees about this many. `tick_s` is a site tuning
+# knob (not exposed here) -- a site that has changed it will see `heartbeat_count` read as a
+# different fraction of "full" by that same factor. That's a documented approximation, not a
+# per-day recorded fact (no history of `tick_s` changes is kept anywhere), and it's good enough
+# for "was this day mostly up or mostly down," which is all coverage is for.
+EXPECTED_HEARTBEATS_PER_DAY = 86400 // SAMPLE_INTERVAL_TICKS
 
 
 def _now_iso() -> str:
@@ -255,6 +288,182 @@ async def heartbeat_buckets(
     return {r["bucket_epoch"] for r in rows}
 
 
+# --- Daily rollups (module docstring's "Daily rollups" section; migration 026) -------------
+
+
+def _utc_today() -> str:
+    """Today's UTC calendar date, `'YYYY-MM-DD'` -- the one date `rollup_day` must never be
+    asked to roll up (it's still accumulating), and the upper bound `rollup_recent_days` walks
+    up to but never reaches.
+    """
+    return datetime.now(UTC).strftime("%Y-%m-%d")
+
+
+def _day_bounds(day: str) -> tuple[str, str]:
+    """Half-open `[start_ts, end_ts)` covering one UTC calendar day (`'YYYY-MM-DD'`), in the
+    same ISO timestamp shape every other `ts` column in this module uses -- so it can be handed
+    straight to `queue_breakdown`-style `ts >= ? AND ts < ?` queries against the raw tables.
+    """
+    start = f"{day}T00:00:00.000000Z"
+    end = (datetime.strptime(day, "%Y-%m-%d").replace(tzinfo=UTC) + timedelta(days=1)).strftime(
+        "%Y-%m-%dT%H:%M:%S.%fZ"
+    )
+    return start, end
+
+
+async def rollup_day(db: aiosqlite.Connection, day: str) -> int:
+    """Recompute and upsert `metric_daily` rows for one **closed** UTC calendar day
+    (`'YYYY-MM-DD'`), one row per currently-existing queue. Always recomputed from
+    `metric_sample`/`metric_heartbeat` -- never incremented -- so calling this twice for the
+    same day is a no-op the second time (idempotency, task item 2): the upsert is keyed on
+    `(queue_id, day)` and overwrites `bytes`/`heartbeat_count` with freshly summed values every
+    time, rather than adding to whatever was there before.
+
+    Returns the number of `(queue_id, day)` rows written. That's 0 exactly when this day had
+    zero heartbeats site-wide -- entirely down, nothing to roll up -- consistent with
+    `metric_sample`'s own gap semantics: no row means no data for that day, not a measured zero.
+    It is also the caller's responsibility, not this function's, to never pass today's own date
+    (`rollup_recent_days` enforces that); this function has no way to tell "today, still open"
+    from "a past day with no heartbeats" and does not try.
+    """
+    start_ts, end_ts = _day_bounds(day)
+
+    cur = await db.execute(
+        "SELECT COUNT(*) AS c FROM metric_heartbeat WHERE ts >= ? AND ts < ?",
+        (start_ts, end_ts),
+    )
+    heartbeat_count = (await cur.fetchone())["c"]
+    if heartbeat_count == 0:
+        return 0
+
+    cur = await db.execute("SELECT id FROM path_queue")
+    queue_ids = [r["id"] for r in await cur.fetchall()]
+    if not queue_ids:
+        return 0
+
+    cur = await db.execute(
+        "SELECT queue_id, SUM(bytes_delta) AS bytes FROM metric_sample "
+        "WHERE ts >= ? AND ts < ? GROUP BY queue_id",
+        (start_ts, end_ts),
+    )
+    bytes_by_queue = {r["queue_id"]: r["bytes"] for r in await cur.fetchall()}
+
+    updated_at = _now_iso()
+    for queue_id in queue_ids:
+        await db.execute(
+            "INSERT INTO metric_daily (queue_id, day, bytes, heartbeat_count, updated_at) "
+            "VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT (queue_id, day) DO UPDATE SET "
+            "bytes = excluded.bytes, heartbeat_count = excluded.heartbeat_count, "
+            "updated_at = excluded.updated_at",
+            (queue_id, day, bytes_by_queue.get(queue_id, 0), heartbeat_count, updated_at),
+        )
+    await db.commit()
+    return len(queue_ids)
+
+
+async def rollup_recent_days(db: aiosqlite.Connection, lookback_days: int) -> int:
+    """Roll up every closed UTC day from `lookback_days` ago through yesterday, inclusive --
+    never today (task item 2: today is still accumulating). `rollup_day` is idempotent, so this
+    doubles as both the steady-state rollup (called every cycle from
+    `MetricsRetentionScheduler.run_once`, right before `prune_metrics`) and the startup backfill
+    the task calls for: a day nobody has ever rolled up yet (the app was down for a stretch, or
+    this feature was just installed with days of raw data already sitting there) is picked up
+    the same way an already-rolled day is re-confirmed -- there is no separate "which days are
+    missing a row" bookkeeping to get wrong.
+
+    `lookback_days` should be at least the currently-configured raw retention
+    (`run_once` passes exactly `settings.retention_days`) so that every day still present in the
+    raw tables gets a chance to be rolled up here before `prune_metrics` -- called immediately
+    after, in the same `run_once` invocation -- can ever delete it. Returns the total number of
+    `(queue_id, day)` rows written across every day walked, for the caller to log.
+    """
+    today = _utc_today()
+    now = datetime.now(UTC)
+    total = 0
+    for offset in range(lookback_days, 0, -1):
+        day = (now - timedelta(days=offset)).strftime("%Y-%m-%d")
+        if day >= today:
+            continue  # defensive: offset >= 1 already guarantees this, but never roll up today
+        total += await rollup_day(db, day)
+    return total
+
+
+async def daily_totals(
+    db: aiosqlite.Connection, *, start_day: str, end_day: str, queue_id: int | None = None
+) -> list[tuple[str, int, int, int]]:
+    """`(day, queue_id, bytes, heartbeat_count)` rows for the inclusive day range
+    `[start_day, end_day]` (both `'YYYY-MM-DD'`) -- the long-horizon counterpart to
+    `queue_breakdown` above, read by `api/metrics.py`'s 90d/1y ranges once a range outruns what
+    the raw tables' own retention can ever serve. `queue_id=None` returns every queue's rows
+    (the site-total-broken-down-by-queue shape); a real `queue_id` filters to one queue's own
+    daily series -- the identical two shapes `queue_breakdown` serves for the raw table.
+    """
+    where = ["day >= ?", "day <= ?"]
+    params: list[Any] = [start_day, end_day]
+    if queue_id is not None:
+        where.append("queue_id = ?")
+        params.append(queue_id)
+    where_sql = " AND ".join(where)
+    cursor = await db.execute(
+        f"SELECT day, queue_id, bytes, heartbeat_count FROM metric_daily WHERE {where_sql} "
+        "ORDER BY day, queue_id",
+        params,
+    )
+    rows = await cursor.fetchall()
+    return [(r["day"], r["queue_id"], r["bytes"], r["heartbeat_count"]) for r in rows]
+
+
+async def total_bytes(
+    db: aiosqlite.Connection, *, queue_id: int | None = None
+) -> tuple[int, str | None]:
+    """The "total downloaded" figure the task's user request asked for by name -- all bytes
+    moved, as far back as retained history goes. Two pieces, added together:
+
+    - `metric_daily`, summed -- every rolled-up closed day still within `DAILY_RETENTION_DAYS`;
+    - today's own not-yet-rolled-up raw samples (`metric_sample`, filtered to today's UTC
+      calendar day) -- so the number is live and doesn't sit stale until the next rollup cycle
+      crosses UTC midnight.
+
+    A day that was rolled up and later pruned (past 13 months), or one that predates the very
+    first heartbeat this instance ever wrote, is simply gone -- this is "total we still have a
+    record of," not a promise of every byte ever moved since install. `since_day` (the earliest
+    day present in `metric_daily`, `None` on an empty table) lets the caller say "since <date>"
+    honestly instead of implying an unbounded history.
+
+    This deliberately does *not* try to detect "yesterday was never rolled up yet" (e.g. the
+    scheduler hasn't completed its first cycle since a restart) and fold that in too -- normal
+    operation rolls up every closed day within one `run_once` cycle of startup, so that gap is
+    self-healing within the hour and not worth a second, more expensive query here.
+    """
+    where_q = "WHERE queue_id = ?" if queue_id is not None else ""
+    params: list[Any] = [queue_id] if queue_id is not None else []
+    cursor = await db.execute(
+        f"SELECT COALESCE(SUM(bytes), 0) AS total, MIN(day) AS since_day "
+        f"FROM metric_daily {where_q}",
+        params,
+    )
+    row = await cursor.fetchone()
+    daily_total: int = row["total"]
+    since_day: str | None = row["since_day"]
+
+    today = _utc_today()
+    start_ts, end_ts = _day_bounds(today)
+    where_today = ["ts >= ?", "ts < ?"]
+    params_today: list[Any] = [start_ts, end_ts]
+    if queue_id is not None:
+        where_today.append("queue_id = ?")
+        params_today.append(queue_id)
+    cursor = await db.execute(
+        "SELECT COALESCE(SUM(bytes_delta), 0) AS total FROM metric_sample "
+        f"WHERE {' AND '.join(where_today)}",
+        params_today,
+    )
+    today_total: int = (await cursor.fetchone())["total"]
+
+    return daily_total + today_total, since_day
+
+
 # --- Retention/pruning ------------------------------------------------------------------------
 
 
@@ -274,12 +483,37 @@ async def prune_metrics(db: aiosqlite.Connection, retention_days: int) -> tuple[
     return samples_removed, heartbeats_removed
 
 
+async def prune_daily_metrics(
+    db: aiosqlite.Connection, retention_days: int = DAILY_RETENTION_DAYS
+) -> int:
+    """Delete `metric_daily` rows older than `retention_days` (default the 13-month decision) --
+    this table's own retention, entirely independent of `prune_metrics`'s raw-table one above
+    (different table, different cutoff, no shared bookkeeping). `day` is a plain `'YYYY-MM-DD'`
+    string, which sorts and compares correctly against another `'YYYY-MM-DD'` cutoff with a
+    simple `<` -- no `strftime` needed the way the full-timestamp raw tables require. Returns
+    the number of rows removed, for the caller to log.
+    """
+    cutoff = (datetime.now(UTC) - timedelta(days=retention_days)).strftime("%Y-%m-%d")
+    cursor = await db.execute("DELETE FROM metric_daily WHERE day < ?", (cutoff,))
+    removed = cursor.rowcount
+    await db.commit()
+    return removed
+
+
 class MetricsRetentionScheduler:
     """Background loop, same `_task`/`start()`/`stop()` shape as `core/backup.py.BackupScheduler`
     and `core/engine.py.Engine`. Unlike backups (whose scheduler tracks "was one already taken
     recently" because *taking* one is a real, costly action), pruning is idempotent and cheap --
     an indexed `DELETE ... WHERE ts < cutoff` that does nothing when there's nothing to prune --
     so this just runs on a fixed cadence with no "was it already done" bookkeeping to get wrong.
+
+    2026-08-21 (prompts/done/2026-08-21-daily-metric-rollups.md): this is also where the daily
+    rollup lives, deliberately folded into the *same* cycle as pruning rather than a second
+    independent loop -- `run_once` calls `rollup_recent_days` before `prune_metrics`, in that
+    order, every time, so "rollup happens before its raw data can be pruned" is a property of
+    this one function's body, not something that depends on two schedulers' cadences never
+    drifting apart. The first `run_once` (fired immediately on `start()`, via `_loop` below)
+    doubles as the startup backfill the task calls for -- no separate backfill entry point.
     """
 
     CHECK_INTERVAL_S = 3600.0  # hourly, same cadence BackupScheduler checks on
@@ -317,12 +551,31 @@ class MetricsRetentionScheduler:
 
     async def run_once(self) -> tuple[int, int]:
         settings = await load_metrics_settings(self.db)
+        # Rollup MUST run before prune -- the only part of this feature that can destroy data
+        # (task item 1), not merely be wrong. `prune_metrics` below deletes raw rows past
+        # `retention_days`; a day rolled up *after* that delete has already run has nothing left
+        # to sum and would roll up as a silent, permanent zero. Calling `rollup_recent_days`
+        # here, synchronously, immediately before `prune_metrics` -- in the same function, not on
+        # a separate schedule -- is what makes that ordering a guarantee rather than a scheduling
+        # coincidence; `tests/test_metrics.py`'s
+        # `test_rollup_runs_before_prune_in_run_once` pins exactly this.
+        # `lookback_days=settings.retention_days` means every day still present in the raw
+        # tables gets a chance to be rolled up in this same pass, before the prune call two lines
+        # down can ever touch it (`rollup_recent_days`'s own docstring has the full reasoning).
+        await rollup_recent_days(self.db, lookback_days=settings.retention_days)
         removed = await prune_metrics(self.db, settings.retention_days)
+        daily_removed = await prune_daily_metrics(self.db)
         if removed != (0, 0):
             logger.info(
                 "pruned %d metric sample(s) and %d heartbeat(s) beyond %d day retention",
                 removed[0],
                 removed[1],
                 settings.retention_days,
+            )
+        if daily_removed:
+            logger.info(
+                "pruned %d daily metric row(s) beyond %d day retention",
+                daily_removed,
+                DAILY_RETENTION_DAYS,
             )
         return removed

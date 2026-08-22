@@ -74,9 +74,12 @@ filesystem only, no SSH round trip — so progress and file-count changes on scr
 between full scans. It never advances the settle gate's own two-scan check (that still needs a
 real remote scan), and it never gives an _on-demand only_ queue a timer of its own.
 
-**Rescan now**, at the top of the [Files](/transfers/files) page, forces a full pass across every queue
-immediately instead of waiting. Each queue's heading shows how long ago it was last scanned, and
-surfaces a scan error or warning right there rather than only in the log.
+**Rescan now**, at the top of the [Files](/transfers/files) page (and, since v0.3.0's Queue tab
+became the default landing page, at the top of the [Queue](/transfers/queue) page too), forces a
+full pass across every queue immediately instead of waiting. On the Files page each queue's
+heading also shows how long ago it was last scanned, and surfaces a scan error or warning right
+there rather than only in the log — the Queue tab's button has no equivalent per-queue timestamp,
+since its list is single and ungrouped.
 
 > **Note:** A queue set to _on-demand only_ has no timer at all. Auto-queue only runs at the end
 > of a scan pass, so on such a queue nothing is picked up automatically until something forces a

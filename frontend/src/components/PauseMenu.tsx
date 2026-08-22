@@ -2,47 +2,34 @@ import type { CSSProperties, KeyboardEvent as ReactKeyboardEvent } from 'react'
 import { useEffect, useId, useLayoutEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { placePopover, POPOVER_EDGE_MARGIN_PX } from '../lib/popoverPosition'
+import { type PauseDurationMinutes, type PauseMenuOption, pauseMenuOptions } from '../lib/pause'
 
-// The Transfers -> Queue tab's Pause control (2026-08-20, `prompts/2026-08-20-queue-pause.md`)
-// -- two entry modes into one paused state:
+// The Transfers -> Queue tab's Pause control, redesigned 2026-08-21
+// (`prompts/2026-08-21-pause-control-redesign.md`, findings 2 and 3 of
+// `prompts/test-findings-2026-08-21.md`) -- **one dropdown, selection is the action.**
 //
-// - **Pause after current**: running transfers finish; nothing new is admitted.
-// - **Pause now**: also stops what's running, returning each job to `queued` at its same
-//   position so it resumes (not restarts) once unpaused.
+// Before this task there were two controls and two steps here: a separate duration `<select>`
+// that did nothing on its own, then this menu asking "after current" vs "now" and requiring its
+// own click. Both are gone. This is now a single list -- "Till I unpause", then 1/10/30/60
+// minutes (`lib/pause.ts.pauseMenuOptions`) -- and clicking (or Enter/Space-selecting) an entry
+// pauses immediately, with no confirm step. The "after current" vs "now" fork that used to be
+// this menu's second level is now `TransfersPage.tsx`'s persistent "Pause after active" checkbox,
+// which sits beside this button rather than inside it -- so `onSelect` here only ever carries
+// *how long*, never *which mode*; the caller reads the checkbox itself at selection time.
 //
 // Reuses `StartNowMenu.tsx`'s own menu mechanics verbatim (portal into `document.body` so no
 // ancestor's `overflow` can clip it, `lib/popoverPosition.ts` for placement, plain keyboard-
-// accessible `role="menu"`) rather than a new dependency or a hand-rolled variant -- the task's
-// own instruction. Unlike that menu, both options here are always enabled: there is no
-// per-option "disabled" state to compute (that menu's whole `lib/startNow.ts` doesn't have an
-// analogue here), so this component owns its two options directly rather than reading them from
-// a pure module.
+// accessible `role="menu"`) rather than a new dependency or a hand-rolled variant. Every entry is
+// always selectable -- unlike `StartNowMenu`, there is no per-option disabled state to compute,
+// so there is no pure `options` builder call needed beyond the static list itself.
 
 const buttonClasses =
   'rounded-md border border-zinc-300 px-2 py-1 text-xs font-medium text-zinc-700 hover:bg-zinc-50 disabled:opacity-50 dark:border-zinc-700 dark:text-zinc-200 dark:hover:bg-zinc-900'
 
-interface PauseOption {
-  key: 'after_current' | 'now'
-  label: string
-  hint: string
-}
-
-const PAUSE_OPTIONS: PauseOption[] = [
-  {
-    key: 'after_current',
-    label: 'Pause after current',
-    hint: 'Nothing new starts; running transfers finish normally.',
-  },
-  {
-    key: 'now',
-    label: 'Pause now',
-    hint: 'Also stops what is running -- resumes from the same bytes once unpaused.',
-  },
-]
-
 function PauseMenuList({
   id,
   anchorEl,
+  options,
   activeIndex,
   itemRefs,
   onSelect,
@@ -50,9 +37,10 @@ function PauseMenuList({
 }: {
   id: string
   anchorEl: HTMLElement
+  options: PauseMenuOption[]
   activeIndex: number
   itemRefs: React.MutableRefObject<Array<HTMLButtonElement | null>>
-  onSelect: (option: PauseOption) => void
+  onSelect: (option: PauseMenuOption) => void
   onItemKeyDown: (e: ReactKeyboardEvent<HTMLButtonElement>, index: number) => void
 }) {
   const listRef = useRef<HTMLDivElement>(null)
@@ -76,12 +64,12 @@ function PauseMenuList({
       id={id}
       role="menu"
       aria-label="Pause the transfer queue"
-      className="fixed z-50 flex min-w-[16rem] flex-col gap-0.5 rounded-md border border-zinc-200 bg-white p-1 text-sm shadow-lg dark:border-zinc-700 dark:bg-zinc-900"
+      className="fixed z-50 flex min-w-[10rem] flex-col gap-0.5 rounded-md border border-zinc-200 bg-white p-1 text-sm shadow-lg dark:border-zinc-700 dark:bg-zinc-900"
       style={style}
     >
-      {PAUSE_OPTIONS.map((option, index) => (
+      {options.map((option, index) => (
         <button
-          key={option.key}
+          key={option.label}
           ref={(el) => {
             itemRefs.current[index] = el
           }}
@@ -90,10 +78,9 @@ function PauseMenuList({
           tabIndex={index === activeIndex ? 0 : -1}
           onClick={() => onSelect(option)}
           onKeyDown={(e) => onItemKeyDown(e, index)}
-          className="flex flex-col items-start gap-0.5 rounded px-2 py-1.5 text-left text-zinc-700 hover:bg-zinc-100 focus:bg-zinc-100 focus:outline-none dark:text-zinc-200 dark:hover:bg-zinc-800 dark:focus:bg-zinc-800"
+          className="rounded px-2 py-1.5 text-left font-medium text-zinc-700 hover:bg-zinc-100 focus:bg-zinc-100 focus:outline-none dark:text-zinc-200 dark:hover:bg-zinc-800 dark:focus:bg-zinc-800"
         >
-          <span className="font-medium">{option.label}</span>
-          <span className="text-xs text-zinc-500 dark:text-zinc-400">{option.hint}</span>
+          {option.label}
         </button>
       ))}
     </div>
@@ -106,13 +93,19 @@ export function PauseMenu({
 }: {
   /** A pause/unpause request already in flight. */
   disabled: boolean
-  onSelect: (mode: 'after_current' | 'now') => void
+  /** Fires the instant an entry is chosen -- the selection *is* the pause action, no second
+   * click. Carries only the duration; the caller (`TransfersPage.tsx`) reads its own "Pause
+   * after active" checkbox at the moment of the call to decide `stopRunning`
+   * (`lib/pause.ts.pauseStopRunning`).
+   */
+  onSelect: (durationMinutes: PauseDurationMinutes) => void
 }) {
   const id = useId()
   const buttonRef = useRef<HTMLButtonElement>(null)
   const itemRefs = useRef<Array<HTMLButtonElement | null>>([])
   const [open, setOpen] = useState(false)
   const [activeIndex, setActiveIndex] = useState(0)
+  const options = pauseMenuOptions()
 
   const close = (focusButton: boolean) => {
     setOpen(false)
@@ -151,12 +144,12 @@ export function PauseMenu({
   }, [open, activeIndex])
 
   const moveActive = (delta: number) => {
-    setActiveIndex((prev) => (prev + delta + PAUSE_OPTIONS.length) % PAUSE_OPTIONS.length)
+    setActiveIndex((prev) => (prev + delta + options.length) % options.length)
   }
 
-  const select = (option: PauseOption) => {
+  const select = (option: PauseMenuOption) => {
     close(true)
-    onSelect(option.key)
+    onSelect(option.durationMinutes)
   }
 
   const handleButtonKeyDown = (e: ReactKeyboardEvent<HTMLButtonElement>) => {
@@ -165,7 +158,7 @@ export function PauseMenu({
       openAt(0)
     } else if (e.key === 'ArrowUp') {
       e.preventDefault()
-      openAt(PAUSE_OPTIONS.length - 1)
+      openAt(options.length - 1)
     }
   }
 
@@ -185,7 +178,7 @@ export function PauseMenu({
         break
       case 'End':
         e.preventDefault()
-        setActiveIndex(PAUSE_OPTIONS.length - 1)
+        setActiveIndex(options.length - 1)
         break
       case 'Escape':
         e.preventDefault()
@@ -197,7 +190,7 @@ export function PauseMenu({
       case 'Enter':
       case ' ':
         e.preventDefault()
-        select(PAUSE_OPTIONS[index])
+        select(options[index])
         break
       default:
         break
@@ -225,6 +218,7 @@ export function PauseMenu({
           <PauseMenuList
             id={id}
             anchorEl={buttonRef.current}
+            options={options}
             activeIndex={activeIndex}
             itemRefs={itemRefs}
             onSelect={select}

@@ -18,6 +18,7 @@ import {
 import type { MoveDirection } from '../api/client'
 import type { FileNode, ItemEventOut, JobOut } from '../api/types'
 import { ArrIcon, ArrRowChip } from '../components/LifecycleIcons'
+import { BandwidthControl } from '../components/BandwidthControl'
 import { DismissMenu } from '../components/DismissMenu'
 import { ItemDrawer } from '../components/ItemDrawer'
 import { Pager } from '../components/Pager'
@@ -33,8 +34,9 @@ import type { ChildSpeedSample } from '../hooks/useLiveModel'
 import { useLiveModel } from '../hooks/useLiveModel'
 import { usePoll } from '../hooks/usePoll'
 import { usePreflight } from '../hooks/usePreflight'
+import { useRescan } from '../hooks/useRescan'
 import { arrHoverLabel, childDisplayState, nodeDisplaySize, stateProgressPercent } from '../lib/fileTree'
-import { childSpeedLabel, formatBytes, formatRelativeTimeIntl } from '../lib/format'
+import { childSpeedLabel, formatBytes, formatRelativeTimeIntl, pauseResumeLabel } from '../lib/format'
 import {
   ACTIVE_PAGE_SIZE,
   COMPLETE_PAGE_SIZE,
@@ -45,6 +47,12 @@ import {
   paginateClientSide,
 } from '../lib/pagination'
 import type { PageSize } from '../lib/pagination'
+import {
+  PAUSE_AFTER_ACTIVE_UNAVAILABLE_HINT,
+  type PauseDurationMinutes,
+  isPauseAfterActiveAvailable,
+  pauseStopRunning,
+} from '../lib/pause'
 import { queueDisplayName } from '../lib/queueDisplayName'
 import type { StartNowRatePercent } from '../lib/startNow'
 import { readLocalStorage, writeLocalStorage } from '../lib/storage'
@@ -804,7 +812,11 @@ export function TransfersPage() {
   // more field off its return value. Not a second WebSocket: `useLiveModel` opens one connection
   // per call, and this page already has exactly one call, so widening what it reads costs nothing
   // in request volume no matter how many rows a user expands.
-  const { queues, progressByJobId, childSpeedByItemId } = useLiveModel()
+  // `scanCompleteSeq` (2026-08-21, prompts/2026-08-21-queue-tab-rescan-button.md) feeds this
+  // page's own "Rescan now" button below -- same `useLiveModel()` call as `queues`/
+  // `progressByJobId` above, not a second subscription.
+  const { queues, progressByJobId, childSpeedByItemId, scanCompleteSeq } = useLiveModel()
+  const { rescanning, triggerRescan } = useRescan(scanCompleteSeq)
   // The Preflight box (docs/transfers-redesign-spec.md §4, prefigured; this task's own handoff
   // prompt, prompts/done/2026-08-20-preflight-box.md) -- its own poll, independent of `useJobs`'s
   // 2s cadence, since its data changes far more slowly (`hooks/usePreflight.ts`'s own comment).
@@ -814,13 +826,27 @@ export function TransfersPage() {
   const [busyIds, setBusyIds] = useState<Set<number>>(new Set())
   const [drawerJob, setDrawerJob] = useState<JobOut | null>(null)
   const [startNowNotice, setStartNowNotice] = useState(false)
-  // Settings -> Transfer's site total limit (2026-08-19,
-  // prompts/done/2026-08-19-start-now-bandwidth-fractions.md) -- fetched once on mount, purely
-  // to decide whether the "Start now" menu's fraction options are enabled
-  // (`lib/startNow.ts.isSiteLimitConfigured`). `undefined` until the request resolves; every
-  // row's menu reads disabled in the meantime, same as "not configured" (`StartNowMenu`'s own
-  // fallback).
-  const [maxBandwidthBps, setMaxBandwidthBps] = useState<number | undefined>(undefined)
+  // Settings -> Transfer, polled (2026-08-19,
+  // prompts/done/2026-08-19-start-now-bandwidth-fractions.md, for the "Start now" menu's
+  // fraction options; **polled rather than fetched once** as of 2026-08-21,
+  // prompts/done/2026-08-21-bandwidth-from-the-queue-page.md, because of the bandwidth slider
+  // below. What that poll is *for* changed with the two-value model
+  // (prompts/done/2026-08-21-bandwidth-ceiling-and-autocommit.md): the two surfaces no longer
+  // show the same number, so this is no longer "keep them in sync" -- it is how the slider's
+  // **maximum tracks the ceiling live**, so lowering the ceiling in Settings -> Transfer
+  // shortens this slider's track without a reload). Same independent-poll pattern as `health` below;
+  // one cheap settings read every 5s alongside the 2s `GET /api/jobs` this page already makes.
+  // `undefined` until the first response lands: every "Start now" fraction reads disabled in the
+  // meantime, same as "not configured" (`StartNowMenu`'s own fallback), and the slider renders
+  // disabled.
+  const transferSettingsFetcher = useCallback(getTransferSettings, [])
+  const transferSettings = usePoll(transferSettingsFetcher, 5000)
+  // **The limit in force, not the ceiling** (2026-08-21,
+  // prompts/done/2026-08-21-bandwidth-ceiling-and-autocommit.md): a "Start now" fraction is
+  // computed at admission as `fraction x B`, and `B` is the effective limit, so the menu that
+  // offers those fractions has to ask about the same number the arithmetic will use -- otherwise
+  // it would offer "25%" of a ceiling nothing is running at.
+  const maxBandwidthBps = transferSettings?.effective_bandwidth_bps
   // Pause (2026-08-20, prompts/2026-08-20-queue-pause.md): `/api/health`'s `queue_paused` is
   // the one source of truth for whether the queue is currently paused -- polled independently
   // here, same "a second, independent one-shot/polled `getHealth()` call" pattern
@@ -832,6 +858,16 @@ export function TransfersPage() {
   const health = usePoll(healthFetcher, 5000)
   const [pauseBusy, setPauseBusy] = useState(false)
   const [pauseError, setPauseError] = useState<string | null>(null)
+  // Pause control redesign (2026-08-21, prompts/2026-08-21-pause-control-redesign.md, findings 2
+  // and 3 of prompts/test-findings-2026-08-21.md): the duration `<select>` and the two-entry
+  // "after current"/"now" `PauseMenu` are gone, replaced by one dropdown (`PauseMenu`, now
+  // duration-only -- see its own docstring) plus this persistent checkbox. Unchecked by default
+  // (the user's explicit call) -- pause now. Deliberately not reset after a pause is issued, same
+  // reasoning the old `pauseDuration` state had: re-toggling it back every time would be the
+  // annoying default, not the useful one. `lib/pause.ts.pauseStopRunning` is what actually turns
+  // this into the request's `stopRunning`, collapsing to "pause now" once nothing is running
+  // regardless of what this is set to (finding 2).
+  const [pauseAfterActive, setPauseAfterActive] = useState(false)
   // The Complete box's "Dismiss" menu (2026-08-20, follow-up to phase 1 stage 4b -- see
   // `handleDismissOutcome`'s own docstring below) -- replaces both the old page-top "Dismiss
   // all" button (`dismissingAll`/`dismissAllError`/`dismissAllCount`, same three-state shape
@@ -907,26 +943,6 @@ export function TransfersPage() {
     return map
   }, [queues])
 
-  // Fetched once, not polled -- the "Start now" menu only needs to know whether a site limit is
-  // configured at all, not track it live; a page reload after a Settings -> Transfer change
-  // picks up the new value, the same freshness every other one-shot settings read on this page
-  // already has. A failed fetch leaves `maxBandwidthBps` `undefined`, which every fraction
-  // option already treats as "not configured" (`lib/startNow.ts.isSiteLimitConfigured`) --
-  // Max stays available regardless, so there is nothing to show the user beyond that.
-  useEffect(() => {
-    let cancelled = false
-    getTransferSettings()
-      .then((settings) => {
-        if (!cancelled) setMaxBandwidthBps(settings.max_bandwidth_bps)
-      })
-      .catch(() => {
-        // Deliberately silent -- see the comment above.
-      })
-    return () => {
-      cancelled = true
-    }
-  }, [])
-
   // --- Active / pending box (2026-08-19, docs/transfers-redesign-spec.md §3.2, phase 1 stage
   // 4b) -- client-side paginated, 20/page, over `jobs`. `jobs` itself (`useJobs`/`GET
   // /api/jobs`, `core/queue.py.list_jobs`) is deliberately unchanged in shape (see
@@ -942,6 +958,13 @@ export function TransfersPage() {
   // by construction rather than by two client/server rules that happen to agree today. ---------
 
   const activeJobs = useMemo(() => jobs.filter(isPipelineInFlight), [jobs])
+  // How many transfers the bandwidth slider's "also apply to in-progress" would interrupt
+  // (2026-08-21, prompts/done/2026-08-21-bandwidth-from-the-queue-page.md). Read off `jobs`
+  // rather than fetched separately -- `state === 'running'` is exactly "has an lftp child right
+  // now", the same set `POST /api/queue/bandwidth` stops server-side. It's a *preview* for the
+  // confirmation, never the authority: the response's own `interrupted` is what the result
+  // notice reports, since only the server knows what was running when the request landed.
+  const runningCount = useMemo(() => jobs.filter((job) => job.state === 'running').length, [jobs])
   // Row order (2026-08-16, `lib/transferPanel.ts.sortTransferRows`'s own docstring): running
   // before queued, in `jobs`' own scheduler order -- unaffected by this task, since `activeJobs`
   // never contains a terminal row for `sortTransferRows`'s own newest-first branch to act on.
@@ -1064,17 +1087,23 @@ export function TransfersPage() {
     return withBusy(job.id, () => startJobNow(job.id, ratePercent))
   }
 
-  /** The Pause control (2026-08-20, prompts/2026-08-20-queue-pause.md) -- not per-row, so it
-   * doesn't go through `withBusy`/`busyIds` (those are keyed by job id); a page-level busy flag
-   * disables the control itself for the duration of the request instead. `refreshAll()` on
-   * success so a "pause now" is reflected immediately (jobs that were `running` a moment ago now
-   * read `queued`) rather than waiting for the next poll tick.
+  /** The Pause control (2026-08-20, prompts/2026-08-20-queue-pause.md; redesigned 2026-08-21,
+   * prompts/2026-08-21-pause-control-redesign.md) -- not per-row, so it doesn't go through
+   * `withBusy`/`busyIds` (those are keyed by job id); a page-level busy flag disables the control
+   * itself for the duration of the request instead. `refreshAll()` on success so a "pause now" is
+   * reflected immediately (jobs that were `running` a moment ago now read `queued`) rather than
+   * waiting for the next poll tick.
+   *
+   * Fires the instant a `PauseMenu` entry is picked -- the selection *is* the action now, no
+   * second click. `pauseAfterActive` (the checkbox) is read here, at selection time, rather than
+   * threaded through the menu itself: `lib/pause.ts.pauseStopRunning` turns it into `stopRunning`,
+   * collapsing to "pause now" if nothing is running regardless of the checkbox (finding 2).
    */
-  const handlePause = async (mode: 'after_current' | 'now') => {
+  const handlePauseSelect = async (durationMinutes: PauseDurationMinutes) => {
     setPauseBusy(true)
     setPauseError(null)
     try {
-      await pauseQueue(mode === 'now')
+      await pauseQueue(pauseStopRunning(pauseAfterActive, runningCount), durationMinutes)
       refreshAll()
     } catch (err) {
       setPauseError(err instanceof Error ? err.message : String(err))
@@ -1213,18 +1242,33 @@ export function TransfersPage() {
 
   return (
     <div className="flex flex-col gap-3">
-      {/* Pause (2026-08-20, prompts/2026-08-20-queue-pause.md): the control lives at the very
-       * top of the Queue tab, above every other control on this page -- pausing is a page-level
-       * action, not a per-row one, and "a queue that silently does nothing is a support question
-       * waiting to happen" is the task's own reasoning for making the paused state unmistakable
-       * rather than a quiet badge. Reordering (the chevrons below) and auto-queue/manual Queue
-       * clicks keep working while paused -- only admission itself stops -- so this banner reads
-       * as "nothing new is starting," not "nothing is happening." */}
+      {/* Pause (2026-08-20, prompts/2026-08-20-queue-pause.md; redesigned 2026-08-21,
+       * prompts/2026-08-21-pause-control-redesign.md): the control lives at the very top of the
+       * Queue tab, above every other control on this page -- pausing is a page-level action, not
+       * a per-row one, and "a queue that silently does nothing is a support question waiting to
+       * happen" is the task's own reasoning for making the paused state unmistakable rather than
+       * a quiet badge. Reordering (the chevrons below) and auto-queue/manual Queue clicks keep
+       * working while paused -- only admission itself stops -- so this banner reads as "nothing
+       * new is starting," not "nothing is happening."
+       *
+       * **One dropdown, selection is the action; the checkbox is the mode.** Before this task,
+       * the duration `<select>` did nothing until a separate two-entry `PauseMenu` was then
+       * clicked ("Pause after current" / "Pause now") -- two controls, two steps, the user's own
+       * "confusing" complaint. `PauseMenu` is now a single list (its own docstring has the
+       * order/entries) and picking any entry pauses immediately; "Pause after active" is the
+       * persistent checkbox that used to be the menu's second level, unchecked by default (pause
+       * now). Disabled with a reason on hover when nothing is running (finding 2 of
+       * prompts/test-findings-2026-08-21.md) -- with zero running transfers "after active" and
+       * "now" are identical, so the choice would be noise. Once paused, the deadline (if any) is
+       * shown via `pauseResumeLabel` rather than a bare "paused" -- a queue about to restart
+       * itself in 40 minutes has to say so. */}
       <div className="flex flex-wrap items-center gap-3">
         {health?.queue_paused ? (
           <>
             <span className="flex items-center gap-1.5 rounded-md border border-amber-300 bg-amber-50 px-2.5 py-1 text-xs font-medium text-amber-900 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-200">
               ● Queue paused — nothing new is being admitted
+              {pauseResumeLabel(health.queue_paused_until ?? null) &&
+                ` (${pauseResumeLabel(health.queue_paused_until ?? null)})`}
             </span>
             <button
               type="button"
@@ -1236,13 +1280,71 @@ export function TransfersPage() {
             </button>
           </>
         ) : (
-          <PauseMenu disabled={pauseBusy} onSelect={handlePause} />
+          <>
+            <PauseMenu disabled={pauseBusy} onSelect={(d) => void handlePauseSelect(d)} />
+            <label
+              className="flex items-center gap-1.5 text-xs text-zinc-600 dark:text-zinc-400"
+              title={
+                isPauseAfterActiveAvailable(runningCount)
+                  ? undefined
+                  : PAUSE_AFTER_ACTIVE_UNAVAILABLE_HINT
+              }
+            >
+              <input
+                type="checkbox"
+                checked={pauseAfterActive}
+                disabled={pauseBusy || !isPauseAfterActiveAvailable(runningCount)}
+                onChange={(e) => setPauseAfterActive(e.target.checked)}
+                className="h-3.5 w-3.5 rounded border-zinc-300 accent-zinc-700 disabled:opacity-50 dark:border-zinc-700 dark:accent-zinc-300"
+              />
+              Pause after active
+            </label>
+          </>
         )}
         {pauseError && (
           <span className="text-xs text-red-600 dark:text-red-400">
             Couldn't update the pause state: {pauseError}
           </span>
         )}
+      </div>
+
+      {/* The site bandwidth slider (2026-08-21,
+       * prompts/done/2026-08-21-bandwidth-from-the-queue-page.md, reshaped the same day by
+       * prompts/done/2026-08-21-bandwidth-ceiling-and-autocommit.md) -- directly under Pause,
+       * because the two are the same kind of control: page-level knobs on *admission*, not
+       * per-row actions. It throttles site-wide *within* the `max_bandwidth_bps` ceiling
+       * Settings -> Transfer owns (DESIGN.md §4.5), never a per-queue limit, and commits itself
+       * five visible seconds after the last change; the "Apply to new items only" checkbox
+       * (checked by default) is what chooses between leaving running transfers alone -- the §4.5
+       * invariant untouched -- and stopping and re-admitting every one of them at the new rate. */}
+      <BandwidthControl
+        settings={transferSettings}
+        runningCount={runningCount}
+        queuePaused={health?.queue_paused ?? false}
+      />
+
+      {/* Rescan now (2026-08-21, prompts/2026-08-21-queue-tab-rescan-button.md) -- the Files tab
+       * has had this since early on; the Queue tab had no way to make lftpweb look at the
+       * seedbox without switching tabs, which stopped making sense once Queue became the
+       * default landing page (v0.3.0). Grouped with Pause/Bandwidth above as a page-level
+       * control (it acts on every queue, not one box's rows) but kept in its own row rather than
+       * folded into either: those two are admission knobs (BandwidthControl's own comment), this
+       * is a scan trigger -- a different kind of "whole instance" action. Shares
+       * `hooks/useRescan.ts` with `FilesPage.tsx` rather than a second copy of the
+       * baseline-sequence dance; see that hook's own docstring for why this can't be a
+       * `setTimeout` or a blocking endpoint. No "scanned Xs ago" reading here -- the Files tab
+       * shows that per queue section, but the Queue tab's list is single, globally-ordered, and
+       * ungrouped (v0.3.0 dropped grouping because admission is global), so there is no one
+       * queue's timestamp that would honestly stand in for all of them. */}
+      <div>
+        <button
+          type="button"
+          onClick={triggerRescan}
+          disabled={rescanning}
+          className="rounded-md border border-zinc-300 px-3 py-1.5 text-sm font-medium text-zinc-700 hover:bg-zinc-50 disabled:opacity-50 dark:border-zinc-700 dark:text-zinc-200 dark:hover:bg-zinc-900"
+        >
+          {rescanning ? 'Rescanning…' : 'Rescan now'}
+        </button>
       </div>
 
       {startNowNotice && (

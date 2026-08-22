@@ -93,16 +93,17 @@ describe('parseDocSource', () => {
       expect(doc.sections.map((s) => s.stepNumber)).toEqual([1, 2, 3, 4, 5, 6])
     })
 
-    it('parses concepts.md into thirteen anchored sections matching its jump block', () => {
+    it('parses concepts.md into fifteen anchored sections matching its jump block', () => {
       const doc = parseDocSource(conceptsSource)
       expect(doc.title).toBe('Concepts')
-      expect(doc.sections).toHaveLength(13)
+      expect(doc.sections).toHaveLength(15)
       expect(doc.sections.every((s) => s.variant === 'section')).toBe(true)
       const sectionIds = doc.sections.map((s) => s.id)
       const jumpIds = (doc.jump ?? []).map((j) => j.id)
       expect(sectionIds).toEqual(jumpIds)
       expect(sectionIds).toEqual([
         'pause',
+        'bandwidth',
         'pipeline',
         'manual-outcome',
         'settle',
@@ -115,6 +116,7 @@ describe('parseDocSource', () => {
         'arr-integration',
         'preflight',
         'support-bundle',
+        'daily-rollups',
       ])
     })
   })

@@ -12,6 +12,7 @@ function health(overrides: Partial<HealthResponse> = {}): HealthResponse {
     host_reachable: null,
     scheduler_alive: true,
     queue_paused: false,
+    queue_paused_until: null,
     build_sha: null,
     build_channel: null,
     ...overrides,

@@ -2,7 +2,7 @@ import { useCallback } from 'react'
 import { Link } from 'react-router-dom'
 import { getHealth, getStats } from '../api/client'
 import { usePoll } from '../hooks/usePoll'
-import { formatBytes, formatRate } from '../lib/format'
+import { formatBytes, formatRate, pauseResumeLabel } from '../lib/format'
 
 const POLL_INTERVAL_MS = 5000
 
@@ -84,6 +84,8 @@ export function StatsHeader() {
               title="Nothing new is being admitted -- unpause from the Queue tab. Reaping, post-processing, scanning, and auto-queue all keep running."
             >
               ● queue paused
+              {pauseResumeLabel(health.queue_paused_until) &&
+                ` (${pauseResumeLabel(health.queue_paused_until)})`}
             </span>
           )}
         </div>

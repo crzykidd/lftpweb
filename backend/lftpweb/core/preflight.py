@@ -123,11 +123,13 @@ class PreflightRow:
 
 
 # Comfortably longer than a poll-driven source's own refresh cadence (the *arr poller's default
-# is 60s, `core/arrsync.py.ArrSettings.poll_interval_s`) -- a couple of passes' worth of margin,
-# so one missed refresh never blinks a row out and back. Short enough that a row genuinely gone
-# clears within a couple of minutes, not indefinitely. One constant for the whole box, not one
-# per source -- the tolerance a user should expect from "briefly not reported" is the same
-# regardless of which upstream is doing the reporting.
+# is 10s as of 2026-08-21's issue #16, down from 60s -- `core/arrsync.py.ArrSettings.
+# poll_interval_s`) -- more than a couple of passes' worth of margin at the new default (this
+# constant was not lowered to match; see docs/decisions.md for why leaving it at 150s is the
+# conservative call), so one missed refresh never blinks a row out and back. Short enough that a
+# row genuinely gone clears within a couple of minutes, not indefinitely. One constant for the
+# whole box, not one per source -- the tolerance a user should expect from "briefly not reported"
+# is the same regardless of which upstream is doing the reporting.
 PREFLIGHT_HOLD_S = 150.0
 
 

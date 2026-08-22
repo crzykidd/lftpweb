@@ -1,5 +1,5 @@
 import { useMemo } from 'react'
-import type { MetricsBucketOut, PathQueueOut } from '../../api/types'
+import type { MetricsBucketOut, MetricsGroup, PathQueueOut } from '../../api/types'
 import { bucketLabel, bytesChartTitle, sumBytesByQueue, sumTotalBytes } from '../../lib/bytesChart'
 import { formatBytes } from '../../lib/format'
 import { CHART_BLOCK_CLASSES, CHART_SVG_MAX_HEIGHT_CLASS } from './chartLayout'
@@ -18,10 +18,11 @@ const Y_GRIDLINES = 4
 
 interface BytesChartProps {
   buckets: MetricsBucketOut[]
-  // Drives labeling/title (`lib/bytesChart.ts`) -- 3600s (24h range), 21600s (7d), or 86400s
-  // (30d), per `api/metrics.py`'s `_RANGES`. Passed rather than re-derived from `buckets` so an
-  // empty response (no buckets at all) still knows what it would have shown.
-  bucketSeconds: number
+  // Drives labeling/title (`lib/bytesChart.ts`) -- the selected/echoed-back grouping
+  // (2026-08-21, chart grouping; `MetricsThroughputResponse.group`). Passed rather than
+  // re-derived from `buckets` so an empty response (no buckets at all) still knows what it
+  // would have shown.
+  group: MetricsGroup
   queues: PathQueueOut[]
   // Task prompt item 5 -- a one-line muted note when the selected range outruns configured
   // retention, or `null` to show nothing (`lib/bytesChart.ts.retentionNoteForRange`).
@@ -30,13 +31,15 @@ interface BytesChartProps {
 
 /** Chart 1 (DESIGN.md new section proposed; renamed from `BytesPerHourChart` 2026-08-17,
  * prompts/done/2026-08-17-bytes-chart-7d-30d-ranges-and-total.md, once it stopped being
- * per-hour-specific -- the 7d/30d ranges that task added bucket at 6h/1d instead) -- bytes
- * transferred over the selected range, stacked per queue with a range total. Hand-rolled
- * inline SVG, no charting dependency (docs/decisions.md) -- a `down` bucket (no heartbeat at
- * all, `up: false`) renders as a short muted dash at the baseline, never a zero-height bar, so
- * "nothing was transferring" and "lftpweb wasn't running" are never visually the same thing.
+ * per-hour-specific) -- bytes transferred over the selected range, stacked per queue with a
+ * range total. Bucket width is the selected/echoed-back `group` (2026-08-21, chart grouping,
+ * prompts/done/2026-08-21-chart-grouping.md) -- hour/day/week/month, independent of the range.
+ * Hand-rolled inline SVG, no charting dependency (docs/decisions.md) -- a `down` bucket (no
+ * heartbeat at all, `up: false`) renders as a short muted dash at the baseline, never a
+ * zero-height bar, so "nothing was transferring" and "lftpweb wasn't running" are never visually
+ * the same thing.
  */
-export function BytesChart({ buckets, bucketSeconds, queues, retentionNote }: BytesChartProps) {
+export function BytesChart({ buckets, group, queues, retentionNote }: BytesChartProps) {
   const colorSlots = useMemo(() => assignQueueColorSlots(queues), [queues])
   const queuesById = useMemo(() => new Map(queues.map((q) => [q.id, q])), [queues])
 
@@ -72,7 +75,7 @@ export function BytesChart({ buckets, bucketSeconds, queues, retentionNote }: By
   // prompt item 4: "same numbers, one place") rather than computed a second way.
   const totalsByQueue = useMemo(() => sumBytesByQueue(buckets), [buckets])
 
-  const title = bytesChartTitle(bucketSeconds)
+  const title = bytesChartTitle(group)
 
   // Thin the x-axis labels -- as many labels as buckets on a 760px-wide chart is unreadable
   // clutter (dataviz skill: "recessive grid/axes"). Show roughly every 4th bucket, plus the
@@ -139,7 +142,7 @@ export function BytesChart({ buckets, bucketSeconds, queues, retentionNote }: By
           {buckets.map((bucket, i) => {
             const x = PAD_LEFT + i * barSlot + (barSlot - barWidth) / 2
             const showLabel = i % labelEvery === 0 || i === buckets.length - 1
-            const label = bucketLabel(bucket.ts, bucketSeconds)
+            const label = bucketLabel(bucket.ts, group)
 
             if (!bucket.up) {
               return (
@@ -193,6 +196,24 @@ export function BytesChart({ buckets, bucketSeconds, queues, retentionNote }: By
                     </rect>
                   )
                 })}
+                {/* 2026-08-21 (daily rollups): a day with real but partial heartbeat coverage
+                 * (lftpweb was down part of the day) reads identically to a fully-covered quiet
+                 * day unless marked -- a thin muted cap at the very top of the bar, the same
+                 * visual language the down-bucket dash above uses, distinguishes "some data,
+                 * partial day" from "no data, down" and from "full day." Threshold at 0.95 so
+                 * ordinary rounding/clock-skew doesn't flag every day. */}
+                {bucket.coverage != null && bucket.coverage < 0.95 && (
+                  <rect
+                    x={x}
+                    y={baselineY - cumulative - 3}
+                    width={barWidth}
+                    height={3}
+                    rx={1}
+                    fill="var(--chart-gap-fill)"
+                  >
+                    <title>{`${label} — partial day, lftpweb was down part of the time (~${Math.round(bucket.coverage * 100)}% covered)`}</title>
+                  </rect>
+                )}
                 {showLabel && (
                   <text
                     x={x + barWidth / 2}
@@ -242,8 +263,14 @@ export function BytesChart({ buckets, bucketSeconds, queues, retentionNote }: By
         <tbody>
           {buckets.map((bucket) => (
             <tr key={bucket.ts}>
-              <td>{bucketLabel(bucket.ts, bucketSeconds)}</td>
-              <td>{bucket.up ? 'up' : 'lftpweb offline'}</td>
+              <td>{bucketLabel(bucket.ts, group)}</td>
+              <td>
+                {!bucket.up
+                  ? 'lftpweb offline'
+                  : bucket.coverage != null && bucket.coverage < 0.95
+                    ? `partial day, ~${Math.round(bucket.coverage * 100)}% covered`
+                    : 'up'}
+              </td>
               {activeQueueIds.map((qid) => (
                 <td key={qid}>{formatBytes(bucket.by_queue[String(qid)] ?? 0)}</td>
               ))}

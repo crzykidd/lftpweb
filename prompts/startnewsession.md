@@ -18,7 +18,9 @@ and optionally verifies / extracts / relocates finished items.
 
 - **Stack:** Python 3.13 / FastAPI / SQLite / asyncssh backend; React + TypeScript + Vite +
   Tailwind frontend; one Alpine container; lftp for transfers.
-- **First version:** `0.0.1`. Version lives in `backend/lftpweb/__init__.py`, bare (no `v`).
+- **Current version: `0.3.0`** (released 2026-08-21 — see "Where we are"). Version lives in
+  `backend/lftpweb/__init__.py`, **bare, no `v`**; the `v` prefix appears in exactly one place, the
+  git tag and matching GitHub release name.
 - **Licence: AGPL-3.0** (`LICENSE`). Bundled third-party programs in the image — lftp, OpenSSH,
   7-Zip, su-exec, tini — are aggregated, not linked, and are recorded in `NOTICE`.
 - **Repo: https://github.com/crzykidd/lftpweb** — public, created 2026-08-11.
@@ -41,6 +43,12 @@ length — it is the single most important thing to read before touching the tra
 3. **`docs/decisions.md`** — the "why" log, newest first. Check it before re-deriving anything;
    several decisions have non-obvious rejected alternatives.
 4. **`standards.md`** — which homelab standards this repo implements, pinned.
+5. **`docs/transfers-redesign-spec.md`** — the plan behind the Transfers/Queue/Preflight UI as it
+   exists today. **Phase 1 is built and released in `v0.3.0`**; §4 (phase 2, download clients) is
+   specced but deliberately not started. Read it before touching the Transfers page,
+   `core/scheduler.py`, the queue ordering, or `core/preflight.py`.
+6. **The open GitHub issues** — `gh issue list`. Since 2026-08-21 deferred work is tracked there,
+   not only in `prompts/`. Check before assuming something is untracked or unstarted.
 
 ---
 
@@ -77,10 +85,182 @@ than a first. Two things that bit the first time and will bit again:
 
 ## Where we are
 
-### 🚦 2026-08-20/21 — queue **Pause**, the **Preflight** box, and the docs catch-up
+### 🚀 v0.3.0 released 2026-08-21 — the Transfers redesign, Preflight, and queue Pause
 
-Everything below is on `dev` and pushed. `main` is still `v0.2.6` — **the gap is now large: 34+
-commits and three migrations (023/024/025).** Tests: **1585 backend / 607 frontend, 0 skipped.**
+**PR #13** (`dev` → `main`, merged `4eb6c16`), tag **`v0.3.0`**, release notes = the `[0.3.0]`
+CHANGELOG section verbatim (27,327 chars — well under the 65 k PR-body / 125 k release-body caps
+that bit `v0.1.0`). `:latest`/`:0.3.0`/`:0` published on the release event. **A completely clean
+cut** — every `main` workflow green (CI, image publish, CodeQL, registry retention), no bypasses,
+no re-runs, no stalls. First release this project has had where GitHub Actions didn't fight back.
+
+Tests at release: **1585 backend / 612 frontend, 0 skipped**, and the fake seedboxes were up
+during `/release-prep`'s local gate, so the integration suite genuinely ran rather than silently
+skipping. **Migrations 023, 024, 025** all run on first start; all additive, none destructive.
+
+Two deliberate calls at cut time, both the user's:
+
+- **Version `0.3.0`, not `0.4.0`.** `0.4.0` was typed; the skip was flagged (the procedure requires
+  confirmation on a minor bump) and the sequential number chosen.
+- **The changelog archive step was skipped.** Normally a minor bump archives every closed minor
+  series into `docs/CHANGELOG-<minor>.x.md` with summaries left behind. `0.1.x` and `0.2.x` stay
+  inline in full instead — `CHANGELOG.md` is long (the `[0.1.0]` section alone is ~100 k chars)
+  and will keep growing until someone decides to archive.
+
+**⚠ Shipped with stale screenshots, knowingly.** README's two hero images and the whole
+`docs/screenshots.md` gallery still show the pre-redesign UI. Five are merely dated (old nav);
+**one is actively self-contradicting** — README's second hero is captioned "The Events page
+showing the audit trail" while picturing the *removed* History page including its deleted jobs
+list. The user is reshooting; a prioritised shot list **with captions already written** is in
+`docs/screenshot-plan.md`, so the new files can be dropped in with no other edits.
+
+### 📋 Post-`0.3.0` work now lives in GitHub issues — check there first
+
+**New practice as of 2026-08-21, at the user's request: open work is tracked in GitHub issues, not
+only in `prompts/`.** A written handoff prompt is linked from its issue. **Read the issues before
+assuming something is untracked**, and open one for anything deferred rather than letting it live
+only in a session transcript.
+
+| Issue | What | Prompt |
+|---|---|---|
+| [#14](https://github.com/crzykidd/lftpweb/issues/14) | Queue pause polish — pause for 1/10/30/60 min; show progress on paused items | `prompts/2026-08-21-pause-for-duration.md` (duration half only) |
+| [#15](https://github.com/crzykidd/lftpweb/issues/15) | Change site bandwidth from the Queue page, optionally applying to running transfers | `prompts/2026-08-21-bandwidth-from-the-queue-page.md` |
+| [#16](https://github.com/crzykidd/lftpweb/issues/16) | *arr poll cadence — Preflight progress and import detection both lag the 60 s poll | none yet |
+| [#17](https://github.com/crzykidd/lftpweb/issues/17) | Long-horizon metrics — daily per-queue rollups + total-downloaded | `prompts/2026-08-21-daily-metric-rollups.md` |
+| [#18](https://github.com/crzykidd/lftpweb/issues/18) | Phase 2 — advisory download-client integration (SAB, then ruTorrent) | spec §4 |
+| [#19](https://github.com/crzykidd/lftpweb/issues/19) | Queue tab — add a rescan button; notes on the row sort order | none yet |
+| [#1](https://github.com/crzykidd/lftpweb/issues/1) | (older, still open) Decide item-row lifetime — nothing ever deletes `item` rows | — |
+
+**Three of those prompts are written and parked.** Each opens with a hard "do not start before
+`0.3.0` is cut" — that condition is now **satisfied**, so they are runnable.
+
+**Phase 2 (#18) got materially smaller than when it was specced.** The Preflight box already
+proves the pending-row concept against a real feed, and its source-agnostic boundary held through
+six tasks — so a SAB adapter is now an *enrichment of a working box*, not a new foundation.
+
+### On `dev` since the release (11 commits)
+
+**Settings → Integrations' *arr poll-interval card was renamed and re-explained** (finding 6 of
+`prompts/test-findings-2026-08-21.md`, `prompts/done/2026-08-21-poll-cadence-labelling.md`) — the
+card was headed "Poll cadence" (internal vocabulary naming neither Sonarr nor Radarr) with help
+text giving only the floor and default; it is now "How often to check Sonarr/Radarr", with a
+`FieldHelp` popover explaining the consequence (Preflight's progress ticks once per check; a
+finished item needs two consecutive checks to leave "Awaiting import", so the lag is roughly
+twice the interval) and the cost (one extra request per enabled instance, every interval).
+Wording and placement only — the 10s default, 5s floor, 3600s ceiling, and the API and its
+validation are unchanged. 1685 backend / 680 frontend tests, 0 skipped. Browser-unverified.
+
+**The Dashboard's bytes chart gained a group-by control, and its per-range defaults changed**
+(finding 5 of `prompts/test-findings-2026-08-21.md`,
+`prompts/done/2026-08-21-chart-grouping.md`) — range (how far back) and a new `group` param
+(hour/day/week/month, how wide a bar) are fully decoupled server-side (`api/metrics.py`'s old
+`_RANGES` tuple that coupled the two is gone); defaults now match the user's own ask (7d moves
+6-hour→daily, 90d/1y move daily→weekly, 24h/30d unchanged). Week/month bars are **summed from
+daily totals on read — no new table**. **Hourly grouping is rejected server-side (422), not
+silently downgraded, at 90d/1y** — raw history tops out at 30 days and `metric_daily` is one-day
+granularity by construction — and the same rule disables the option client-side with a reason.
+Coverage on a bucket wider than a day is redefined as the fraction of days in it that were up, not
+a heartbeat-density average. 1685 backend / 680 frontend tests, 0 skipped. Browser-unverified.
+
+**The Pause control collapsed to one dropdown plus a checkbox** (findings 2 and 3 of
+`prompts/test-findings-2026-08-21.md`, `prompts/done/2026-08-21-pause-control-redesign.md`) —
+`PauseMenu.tsx` is now a single "Till I unpause" / 1 / 10 / 30 / 60-minute list where picking an
+entry pauses immediately, replacing the old duration `<select>` + separate two-entry menu that
+needed a second click; the "after current" vs "now" fork is now a persistent "Pause after active"
+checkbox (unchecked by default) beside it, disabled with a hover reason whenever nothing is
+running (`lib/pause.ts.isPauseAfterActiveAvailable`) since the two modes are then identical.
+Backend untouched, exactly as scoped — `pauseQueue`'s existing `stopRunning`/`durationMinutes`
+contract is unchanged; `lib/pause.ts.pauseStopRunning` just decides what to pass it. 1675
+backend / 671 frontend tests, 0 skipped. Browser-unverified.
+
+**Bandwidth became two values, and the slider commits itself** (findings 1 and 4 of
+`prompts/test-findings-2026-08-21.md`, `prompts/done/2026-08-21-bandwidth-ceiling-and-autocommit.md`)
+— Settings → Transfer owns the ceiling, the Queue slider owns a persisted throttle within it
+(`TransferSettings.throttle_bandwidth_bps`, no migration), and `effective_bandwidth_bps()` is what
+the scheduler, the fast-lane reserve and Start-now fractions all use; the Apply buttons and the
+amber confirm dialog are gone, replaced by an "Apply to new items only" checkbox (checked) and a
+5-second visible countdown. **This reverses the previous day's "one control, one setting"**
+(`docs/decisions.md` has why: capping a slider at the value it edits is a ratchet). 1675 backend /
+663 frontend, 0 skipped. Browser-unverified.
+
+**Active/pending row sort changed to running → queued → still-processing** (`6822138`, changelog
+`2c97582`). A pipeline-in-flight row is lftpweb *waiting on someone else*; `queued` is its own
+next work. **The tradeoff this accepts is written down in three places** (the `sortTransferRows`
+docstring, its test, and #19): on a deep backlog at 20 rows a page a processing row can now land
+below the fold, which is exactly what the original placement avoided. Flipping it back is one
+line if that proves wrong.
+
+**Queue pause gained a duration dropdown** (issue #14, `prompts/done/2026-08-21-pause-for-
+duration.md`) — 1/10/30/60 minutes alongside the existing "until I unpause" default, combinable
+with both entry modes. A stored absolute deadline (`QueuePauseState.paused_until`), never a
+timer, so restart correctness falls out for free; expired from `TransferQueue.tick()` (not the
+engine's scan loop, which can sleep indefinitely when every queue is on-demand-only) and also
+checked synchronously in `start()` so "came back after the deadline" resumes unpaused the instant
+the process is up, not only after the first tick. 1602 backend / 615 frontend tests, 0 skipped.
+Browser-unverified.
+
+**A paused/queued row with partial bytes now shows its own progress** (issue #14, progress half,
+`prompts/done/2026-08-21-paused-item-progress.md`) — `QUEUED 45%` in the same fillable chip the
+running row uses, gated on the row genuinely having local bytes on disk, not on the queue being
+paused (a retry after an interrupted attempt reads the same way). Backend: `list_jobs()` now
+joins `item.local_size`; `_job_out` prefers it over `job.bytes_done` for a `queued` row only,
+mirroring the existing `bytes_total → item.remote_size` fallback. Frontend: `lib/fileTree.ts.
+stateProgressPercent` gained a `QUEUED` branch (shared by both the Files page and the Transfers
+row, one function, no drift), with its own zero-guard so a never-started queued row never shows
+`0%`; `StateChip.tsx`'s `FILL_STYLES.QUEUED` got its own indigo pair (`QUEUED`'s own base hue,
+never `PARTIAL`/`WAITING`'s amber, which would have mismatched the chip's own base color) —
+**unverified in a real browser**, unlike the already-confirmed amber pairs. 1608 backend / 621
+frontend tests, 0 skipped.
+
+**The site bandwidth limit is now settable from the Queue page** (`prompts/done/2026-08-21-
+bandwidth-from-the-queue-page.md`) — a slider next to Pause editing the *same* site-wide
+`max_bandwidth_bps` Settings → Transfer owns (`POST /api/queue/bandwidth`, new
+`TransferQueue.set_site_bandwidth`), with two applications: future-items-only (nothing
+interrupted, §4.5's invariant untouched) or also-in-progress, which reuses `_pause_running_jobs`
+to stop and re-admit each running job at the new ceiling — **re-admission, never an in-place
+retune, so `core/scheduler.py` is untouched**. A paused queue is left completely alone (setting
+written, no child stopped, `paused_until` never overwritten — a bandwidth change must not cancel
+someone's "pause for 30 minutes", and "pause after current"'s still-running jobs must not be
+stopped); admission is held during the teardown by a transient in-memory `_admission_hold`, never
+the persisted pause flag. Zero is rejected as a limit (it is not "unlimited" — it wedges
+admission), as is anything below `min_share_floor_bps`. 1637 backend / 645 frontend tests, 0
+skipped. **Browser-unverified.**
+
+**Daily per-queue metric rollups shipped** (`prompts/done/2026-08-21-daily-metric-rollups.md`) —
+a new `metric_daily` table (migration 026, one row per queue per UTC day, 13-month retention)
+rolled up from the raw sample store every hour, always before that hour's raw-table prune (the
+one part of this feature that could otherwise lose data, pinned by its own ordering test); backs
+a new "total downloaded" readout and 90d/1y bytes-chart ranges on the Dashboard, with a distinct
+marker for a day the app was only partly running. Raw retention default raised 7 → 30 days so
+the existing 30d range works out of the box. 1654 backend / 649 frontend tests, 0 skipped.
+**Browser-unverified.**
+
+**Queue tab gained "Rescan now"** (issue #19, first half; `prompts/done/2026-08-21-queue-tab-
+rescan-button.md`) — top of the tab, its own row below Pause/`BandwidthControl`, rescanning every
+queue exactly like the Files tab's button (no per-queue choice — admission is global). The
+baseline-sequence logic (`POST /api/files/rescan` returns 202 immediately; completion is only
+observable via `useLiveModel`'s `scanCompleteSeq`) moved out of `FilesPage.tsx` into a shared
+`hooks/useRescan.ts`, used by both pages now — no backend change. No "scanned Xs ago" reading on
+the Queue tab: its list is single and ungrouped, so no one queue's timestamp would honestly stand
+in for all of them (see `docs/decisions.md`). 1654 backend / 654 frontend tests, 0 skipped.
+**Browser-unverified.**
+
+**The *arr poll interval dropped from 60s to 10s and is now a Settings → Integrations control**
+(issue #16, `prompts/done/2026-08-21-arr-poll-cadence.md`) — issue #16's premise (a faster
+cadence multiplies *arr request volume) turned out false: the queue poll is one HTTP request per
+bound instance per pass for any normal-sized queue, so 6× the cadence is six requests a minute,
+not one per item, fixing both Preflight's coarse progress jumps and import-confirmation lag
+without a cadence split, adaptive scheme, or local-observation trick (reasoning in
+`docs/decisions.md`). `ArrSettings.poll_interval_s` now round-trips through `GET`/`PUT
+/api/settings/arr/poll-interval`, server-validated against the unchanged 5s floor
+(`ArrSyncScheduler.MIN_POLL_INTERVAL_S`) and a new 3600s ceiling; a queue that ever grows past one
+250-record page now writes one `arr_queue_multi_page` event, observational only, no adaptive
+backoff. Existing installs get the new default for free — `save_arr_settings` had zero call sites
+before this, so no real install had a persisted value to migrate. 1663 backend / 654 frontend
+tests, 0 skipped. **Browser-unverified.**
+
+### 🚦 2026-08-20/21 — queue **Pause**, the **Preflight** box, and the docs catch-up (all in v0.3.0)
+
+Tests at the time: **1585 backend / 607 frontend, 0 skipped.**
 
 **Queue pause** (`07e2471`) — *Pause after current* and *Pause now*, persisted in a `setting` row
 (no migration), surfaced in `/api/health`. **The trap it had to avoid:** stop deliberately sets
@@ -116,16 +296,32 @@ accumulation structurally impossible.
 | The **ticking progress fill** returns to the Queue row's chip (it was never passed a `percent`) and comes to Preflight's "Waiting" chip, via a new fillable `WAITING` state reusing `PARTIAL`'s **confirmed** amber pair. `SETTLING` deliberately has **no** fill — nothing is downloading | `82197a5` |
 | **Eviction latency**: retirement is now decided **at request time**, not once per 60 s *arr poll — the cause of "sometimes fast, sometimes slow." The match predicate is extracted and shared so the two call sites cannot drift. Frontend poll 15 s → 5 s | `703bf63` |
 
-**✅ User-verified in the browser (2026-08-20/21):** the full **Preflight → Active → Complete**
-transition is smooth; "Awaiting import" appears in Active and moves to Complete once the *arr
-finishes; the split view, short names, chevrons, filters, drawer history and multi-page Complete
-all work. **Unverified:** everything from `8d56035` onward (the "Waiting" chip, the Settling
-tooltip, the 5/10/20 selector, the progress fills), plus the fast-lane badge and "Dismiss list"
-across more than one 50-row page.
+**✅ User-verified in the browser (2026-08-20/21).** Confirmed working: the full **Preflight →
+Active → Complete** transition; "Awaiting import" appearing in Active and moving to Complete once
+the *arr finishes; the split Active/Complete view; short display names; chevrons; the name
+filters; multi-page Complete; the item drawer's per-file history; **nav** (tabs, redirects, Events);
+**progress fill**; **pause** — including *pause now*, surviving a backend restart, chevrons still
+working while paused, and unpause resuming with progress intact; and the Complete box scaling to
+content.
 
-**One judgement call left open for the user:** at **zero rows** the Preflight footer still renders,
-so an empty box is "Nothing in preflight." *plus* a small selector row rather than the strict
-single line originally asked for. One line to suppress if it reads as clutter.
+**Still unverified — nobody has looked at these:**
+
+- **Dismiss outcome menu** (All / Downloaded / Failed / Stopped) and its composition with the name
+  filter
+- **Mark complete / Mark failed + Undo** — and specifically that the seedbox source survives it
+- **Events per-item deep link** from the drawer
+- **Per-file expansion** inside a Queue row (distinct from the drawer view, which *is* confirmed)
+- **Page-size selectors** on the two Transfers boxes
+- Needs specific conditions: the **fast-lane badge** (a sub-10 MB item) and **"Dismiss list" across
+  more than one 50-row page**
+
+**The one thing worth watching throughout:** both boxes' "Page X of Y (Z total)" agreeing with the
+rows actually on screen. A disagreement there is the single symptom of the in-flight predicate
+drifting between the client-side Active box and the server-side Complete query — the failure mode
+`core/pipeline_flight.py` exists to prevent.
+
+**Resolved, no longer open:** the Preflight box's zero-row footer (header + "Nothing in preflight."
++ a small selector row) — **the user has accepted it as-is.** Do not "fix" it.
 
 **Operational note now in `CLAUDE.md`** (`e58a46d`, `7a20f0b`): run `pytest` from the **repo root**
 (from `backend/` it collects **zero** tests and looks like a pass), `ruff check` is not

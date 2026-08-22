@@ -9,6 +9,8 @@ stop-mid-transfer test).
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
+
 import aiosqlite
 import pytest
 from fastapi import HTTPException
@@ -137,6 +139,192 @@ async def test_unpaused_state_also_survives_a_restart(db):
         await q2.stop()
 
 
+# --- pause-for-a-duration: a stored deadline, not a countdown or a running timer -------------
+# (prompts/2026-08-21-pause-for-duration.md)
+
+
+async def test_pause_without_duration_is_indefinite(db):
+    """Unchanged default -- the dropdown adds durations, it does not replace "pause until I
+    say otherwise".
+    """
+    q = _queue_obj(db)
+    await q.pause(stop_running=False)
+    assert q.paused is True
+    assert q.paused_until is None
+    assert (await load_queue_pause_state(db)).paused_until is None
+
+
+async def test_pause_with_duration_computes_a_future_deadline(db):
+    q = _queue_obj(db)
+    before = datetime.now(UTC)
+    await q.pause(stop_running=False, duration_s=600)
+    after = datetime.now(UTC)
+
+    assert q.paused_until is not None
+    deadline = datetime.strptime(q.paused_until, "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=UTC)
+    assert before + timedelta(seconds=599) <= deadline <= after + timedelta(seconds=601)
+    # Persisted, not just cached in memory.
+    assert (await load_queue_pause_state(db)).paused_until == q.paused_until
+
+
+async def test_duration_combines_with_pause_after_current(db):
+    q = _queue_obj(db)
+    await q.pause(stop_running=False, duration_s=60)
+    assert q.paused is True
+    assert q.paused_until is not None
+
+
+async def test_duration_combines_with_pause_now(db):
+    # No running jobs -- `_pause_running_jobs` is a no-op with nothing in `self._running`, so
+    # this exercises the duration/entry-mode combination without a real lftp child. The SIGTERM-
+    # and-requeue mechanics of "pause now" itself are `test_queue_pause_e2e.py`'s job.
+    q = _queue_obj(db)
+    await q.pause(stop_running=True, duration_s=60)
+    assert q.paused is True
+    assert q.paused_until is not None
+
+
+async def test_unpause_clears_the_deadline(db):
+    q = _queue_obj(db)
+    await q.pause(stop_running=False, duration_s=600)
+    assert q.paused_until is not None
+
+    await q.unpause()
+
+    assert q.paused is False
+    assert q.paused_until is None
+    assert (await load_queue_pause_state(db)).paused_until is None
+
+
+async def test_re_pausing_replaces_rather_than_stacks_the_deadline(db):
+    q = _queue_obj(db)
+    await q.pause(stop_running=False, duration_s=600)
+    first_deadline = q.paused_until
+
+    await q.pause(stop_running=False, duration_s=60)
+    second_deadline = q.paused_until
+
+    assert second_deadline is not None
+    assert second_deadline != first_deadline
+    # A shorter duration from *now* -- proves this replaced the deadline outright rather than
+    # adding 60s on top of the existing 600s one.
+    assert second_deadline < first_deadline
+    assert (await load_queue_pause_state(db)).paused_until == second_deadline
+
+
+async def test_pausing_indefinitely_after_a_timed_pause_clears_the_deadline(db):
+    q = _queue_obj(db)
+    await q.pause(stop_running=False, duration_s=600)
+    assert q.paused_until is not None
+
+    await q.pause(stop_running=False)  # duration_s omitted -> indefinite, not "keep the old one"
+
+    assert q.paused_until is None
+    assert (await load_queue_pause_state(db)).paused_until is None
+
+
+async def test_restart_before_the_deadline_stays_paused_with_the_deadline_intact(db):
+    q1 = _queue_obj(db)
+    await q1.pause(stop_running=False, duration_s=3600)
+    deadline = q1.paused_until
+
+    q2 = _queue_obj(db)
+    await q2.start()
+    try:
+        assert q2.paused is True
+        assert q2.paused_until == deadline
+    finally:
+        await q2.stop()
+
+
+async def test_restart_after_the_deadline_comes_back_unpaused(db):
+    """ "App down past the deadline comes back unpaused" -- a ten-minute pause must not become
+    an eight-hour one because the container restarted while it was paused. Checked synchronously
+    in `start()` itself (not only on the scheduler's first tick), so this holds the instant
+    `start()` returns rather than depending on the loop task getting a chance to run first.
+    """
+    await save_queue_pause_state(
+        db, QueuePauseState(paused=True, paused_until="2000-01-01T00:00:00.000000Z")
+    )
+
+    q = _queue_obj(db)
+    await q.start()
+    try:
+        assert q.paused is False
+        assert q.paused_until is None
+        assert (await load_queue_pause_state(db)).paused is False
+    finally:
+        await q.stop()
+
+
+async def test_expire_pause_if_due_is_a_no_op_before_the_deadline(db):
+    q = _queue_obj(db)
+    await q.pause(stop_running=False, duration_s=3600)
+
+    await q._expire_pause_if_due()
+
+    assert q.paused is True
+    assert q.paused_until is not None
+
+
+async def test_expire_pause_if_due_resumes_admission_once_the_deadline_has_passed(db):
+    queue_id = await _make_queue_row(db)
+    job_id = await _make_queued_job(db, queue_id)
+    q = _queue_obj(db)
+    await q.pause(stop_running=False, duration_s=600)
+
+    # Force the deadline into the past directly, the same "just write the timestamp" idiom
+    # `core/auth.py`'s own session-expiry tests use for an absolute wall-clock deadline, rather
+    # than sleeping 600s or monkeypatching the wall clock.
+    past = "2000-01-01T00:00:00.000000Z"
+    await save_queue_pause_state(db, QueuePauseState(paused=True, paused_until=past))
+    q._paused_until = past
+
+    await q._expire_pause_if_due()
+
+    assert q.paused is False
+    assert q.paused_until is None
+    assert (await load_queue_pause_state(db)).paused is False
+
+    # Admission is no longer gated -- proven the same way `test_admit_is_a_no_op_while_paused`
+    # proves the opposite: `_admit()` gets past the pause check (no host configured, so it logs
+    # a warning and returns, but the job row is reached rather than skipped outright).
+    await q._admit()
+    row = await (await db.execute("SELECT state FROM job WHERE id = ?", (job_id,))).fetchone()
+    assert (
+        row["state"] == "queued"
+    )  # unchanged (no host configured) -- proves no crash, not a spawn
+
+    # A distinct audit event from a manual unpause -- "why did it start again" must be
+    # answerable without guessing whether a human clicked Unpause.
+    cursor = await db.execute("SELECT COUNT(*) AS n FROM event WHERE kind = 'queue_pause_expired'")
+    assert (await cursor.fetchone())["n"] == 1
+
+
+async def test_expire_pause_if_due_is_a_no_op_when_not_paused(db):
+    q = _queue_obj(db)
+    await q._expire_pause_if_due()
+    assert q.paused is False
+
+
+async def test_tick_expires_a_due_pause(db):
+    """The integration path -- `tick()` is what actually runs on the backend's own clock every
+    ~1s (`TransferQueue._loop`), unlike `core/engine.py`'s scan loop which can sleep indefinitely
+    when nothing is due. Calling `tick()` directly here stands in for that cadence without
+    sleeping in the test.
+    """
+    q = _queue_obj(db)
+    await q.pause(stop_running=False, duration_s=600)
+    past = "2000-01-01T00:00:00.000000Z"
+    await save_queue_pause_state(db, QueuePauseState(paused=True, paused_until=past))
+    q._paused_until = past
+
+    await q.tick()
+
+    assert q.paused is False
+    assert q.paused_until is None
+
+
 # --- the admission gate: a caller-side skip in `_admit()`, never reaching spawn -------------
 
 
@@ -258,7 +446,7 @@ class _RecordingQueue:
     def __init__(self, *, raises: Exception | None = None, paused: bool = False):
         self._raises = raises
         self.paused = paused
-        self.pause_calls: list[bool] = []
+        self.pause_calls: list[tuple[bool, float | None]] = []
         self.unpause_calls = 0
 
     async def start_now(self, job_id: int, *, rate_percent: int | None = None) -> bool:
@@ -266,8 +454,8 @@ class _RecordingQueue:
             raise self._raises
         return True
 
-    async def pause(self, *, stop_running: bool) -> None:
-        self.pause_calls.append(stop_running)
+    async def pause(self, *, stop_running: bool, duration_s: float | None = None) -> None:
+        self.pause_calls.append((stop_running, duration_s))
 
     async def unpause(self) -> None:
         self.unpause_calls += 1
@@ -286,13 +474,21 @@ async def test_start_now_api_maps_queue_paused_to_409():
 async def test_pause_api_defaults_to_pause_after_current():
     fake = _RecordingQueue()
     await jobs.pause_queue(_FakeRequest(fake), body=None)
-    assert fake.pause_calls == [False]
+    assert fake.pause_calls == [(False, None)]
 
 
 async def test_pause_api_passes_stop_running_through():
     fake = _RecordingQueue()
     await jobs.pause_queue(_FakeRequest(fake), body=QueuePauseRequest(stop_running=True))
-    assert fake.pause_calls == [True]
+    assert fake.pause_calls == [(True, None)]
+
+
+async def test_pause_api_converts_duration_minutes_to_seconds():
+    fake = _RecordingQueue()
+    await jobs.pause_queue(
+        _FakeRequest(fake), body=QueuePauseRequest(stop_running=False, duration_minutes=10)
+    )
+    assert fake.pause_calls == [(False, 600)]
 
 
 async def test_unpause_api_calls_unpause():
@@ -339,3 +535,23 @@ async def test_health_reports_not_paused_by_default(db):
 async def test_health_reports_unpaused_when_no_queue_is_wired_up(db):
     response = await health_api.health(_FakeHealthRequest(db, None))
     assert response.queue_paused is False
+
+
+async def test_health_reports_paused_until_for_a_timed_pause(db):
+    q = _queue_obj(db)
+    await q.pause(stop_running=False, duration_s=600)
+    response = await health_api.health(_FakeHealthRequest(db, q))
+    assert response.queue_paused_until == q.paused_until
+    assert response.queue_paused_until is not None
+
+
+async def test_health_reports_no_paused_until_for_an_indefinite_pause(db):
+    q = _queue_obj(db)
+    await q.pause(stop_running=False)
+    response = await health_api.health(_FakeHealthRequest(db, q))
+    assert response.queue_paused_until is None
+
+
+async def test_health_reports_no_paused_until_when_no_queue_is_wired_up(db):
+    response = await health_api.health(_FakeHealthRequest(db, None))
+    assert response.queue_paused_until is None

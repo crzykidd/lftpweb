@@ -245,6 +245,11 @@ deleted_archive(queue_id, rel_path, deleted_at, PRIMARY KEY(queue_id, rel_path))
 metric_sample(id, queue_id, ts, bytes_delta)   -- only when that queue moved bytes in a window
 metric_heartbeat(id, ts)                       -- one row per sample tick, unconditionally
 
+-- Daily rollups (§10.4, migration 026, 2026-08-21) -- long-horizon totals past raw retention.
+-- One row per queue per UTC calendar day; heartbeat_count carries idle-vs-down up to this
+-- granularity. Recomputed/upserted, never incremented; kept 13 months.
+metric_daily(queue_id, day, bytes, heartbeat_count, updated_at, PRIMARY KEY(queue_id, day))
+
 -- One row per transfer attempt — this is the audit trail SeedSync lacks
 job(
   id, item_id, kind TEXT,           -- 'mirror' | 'pget'
@@ -800,6 +805,45 @@ that is already running. Rather than working around that, the scheduler is desig
 limitation never arises: bandwidth is handed out at **admission** time and held for the job's
 lifetime. The missing control channel stops being a constraint and becomes the design.
 
+The one user-facing consequence — "I lowered the site limit, why is my transfer still going at
+the old speed?" — is answered by "Changing the site limit while transfers are running," below.
+That path does **not** weaken this invariant; it re-admits.
+
+#### The ceiling and the throttle
+
+**Bandwidth is two stored values, not one** (2026-08-21,
+`prompts/done/2026-08-21-bandwidth-ceiling-and-autocommit.md`):
+
+- **`max_bandwidth` — the ceiling.** Settings → Transfer owns it. Its meaning is exactly what
+  this section's table below has always said.
+- **`throttle_bandwidth` — the throttle.** The Queue tab's slider owns it, bounded to
+  `[min_share_floor, max_bandwidth]`. Unset (the default, and what every settings row written
+  before this date deserializes to) means "no throttle, run at the ceiling."
+
+**`B`, everywhere below, is the *effective* limit** — `TransferSettings.effective_bandwidth_bps`:
+the throttle when one is set, the ceiling otherwise. That is what `admit()` divides up, what the
+fast-lane reserve is carved out of, and what a "Start now" fraction is a fraction of. With no
+throttle the two are identical, so **every worked example in this section holds byte-for-byte**,
+and no migration was needed to introduce the second value (`TransferSettings` is JSON in a
+`setting` row; an absent key reads as the field's default).
+
+`core/scheduler.py` never learned about any of this. It still takes one bandwidth number;
+`TransferSettings.scheduler_settings()` feeds it the effective one at the call site.
+
+**Why two, when this was deliberately one value edited by two surfaces a day earlier?** Because
+"the slider must not exceed the Settings → Transfer maximum" is unstateable with one value:
+capping a slider at the number the slider itself edits is a **ratchet** — lower it once and the
+ceiling comes down with it, so it can never be raised back from the Queue page. See
+`docs/decisions.md` for the reversal in full.
+
+**Two rules follow from the bound, and both are enforced on write, not merely on read:**
+
+- **Lowering the ceiling clamps the throttle** — permanently. `save_transfer_settings` applies
+  `clamp_throttle_to_ceiling` on every write, so a clamp is a fact in the row rather than a
+  read-time correction that could be undone later.
+- **Raising the ceiling raises only the ceiling.** A read-side clamp alone would leave the old,
+  higher throttle in the row, and raising the ceiling again would silently restore it.
+
 #### Site-level settings
 
 One container serves one site (one seedbox), so these are global to the instance — **not**
@@ -807,7 +851,9 @@ per-queue. A queue governs *what* and *where*, never *how fast*.
 
 | Setting | Meaning | Default |
 |---|---|---|
-| `max_bandwidth` (B) | ceiling across everything | — |
+| `max_bandwidth` | the ceiling (Settings → Transfer) | — |
+| `throttle_bandwidth` | the Queue-tab throttle within it; unset = follow the ceiling | unset |
+| **B** (`effective_bandwidth`) | **the limit in force** — the throttle if set, else the ceiling | — |
 | `max_concurrent_transfers` (N) | main-lane slots | — |
 | `small_item_threshold` | fast-lane cutoff, by item's total remote size | 10 MB |
 | `small_lane_concurrency` | fast-lane slots | 2 |
@@ -912,6 +958,13 @@ headroom-is-zero to move a file it could have finished, alongside, in under a se
 The reserve is carved off B rather than left unmetered, so the total stays bounded by B. The
 cost is that the slice sits idle when no small items are running.
 
+**B here is the effective limit, throttle included** ("The ceiling and the throttle", above).
+Deriving the reserve from the ceiling while the scheduler allocates against a lower throttle
+would resurrect the deadlock below through a new door: a 100 MB/s ceiling throttled to 1 MB/s
+would reserve 10 MB/s against a 1 MB/s budget, and the main lane would admit nothing, ever. The
+alternative — bounding the throttle below at twice the ceiling-derived reserve — would forbid
+throttling a gigabit ceiling below 25 MB/s, which is exactly what the slider exists to do.
+
 **The `B/2` cap on the reserve is load-bearing, not defensive.** The "min 1 MB/s" floor is
 unconditional, so without the cap any ceiling at or below 1 MB/s yields a reserve ≥ B, hence
 `headroom ≤ 0`, hence the main lane admits nothing — **ever**. Jobs queue and sit there with no
@@ -933,14 +986,19 @@ work rather than by throttling what is running.
 
 **A menu, not a single button** (2026-08-19, deliberate design extension,
 prompts/done/2026-08-19-start-now-bandwidth-fractions.md): **10% / 25% / 50% / 75% / Max** of the
-site's `max_bandwidth` (this section's own table, above). The chosen fraction is computed once,
-at admission — `fraction × B`, rounded to the nearest whole byte/sec — and held for the job's
-lifetime exactly like any other allocation; the invariant above is untouched. Max
-(`fraction = 1.0`) is byte-for-byte the original "Start now at max bandwidth" behavior this menu
-replaces: same value, same code path. **No site limit configured (`max_bandwidth <= 0`) makes a
-percentage meaningless** — the four fraction options are disabled in the UI with a hint, and the
-API refuses a fraction request outright (409) rather than silently substituting Max; Max itself
-is exempt from this check and always works, reusing whatever `max_bandwidth` already is.
+site's limit. The chosen fraction is computed once, at admission — `fraction × B`, rounded to the
+nearest whole byte/sec — and held for the job's lifetime exactly like any other allocation; the
+invariant above is untouched. Max (`fraction = 1.0`) is byte-for-byte the original "Start now at
+max bandwidth" behavior this menu replaces: same value, same code path.
+
+**`B` is the *effective* limit** (2026-08-21, "The ceiling and the throttle", above), not the
+ceiling: 50% of a 100 MB/s ceiling throttled to 10 MB/s is **5 MB/s**. The fraction is defined as
+a share of the limit actually in force, so it must be computed against the same number `admit()`
+is dividing up — anything else would let one item oversubscribe past the throttle by a factor of
+ten while claiming to be taking half. **No site limit configured (`B <= 0`) makes a percentage
+meaningless** — the four fraction options are disabled in the UI with a hint, and the API refuses
+a fraction request outright (409) rather than silently substituting Max; Max itself is exempt
+from this check and always works, reusing whatever `B` already is.
 
 #### Pausing admission
 
@@ -984,6 +1042,149 @@ order: stop everything, rearrange the queue so the right item is next, then unpa
 and `POST /api/jobs/{id}/move` carry no pause check at all, and "Start now"'s own 409 guard
 (`core/queue.py.QueuePausedError`, disabled client-side with a reason in the tooltip too) is
 scoped to `start_now` alone, so it cannot accidentally catch the reorder endpoint.
+
+#### Pausing for a fixed duration
+
+A dropdown (2026-08-21, `prompts/2026-08-21-pause-for-duration.md`) offering **1 / 10 / 30 / 60
+minutes**, combinable with either entry mode above — "pause now for 10 minutes" and "pause after
+current indefinitely" are the same `TransferQueue.pause()` call with different arguments.
+**Indefinite pause stays the default**; the dropdown extends it, it does not replace "pause until
+I say otherwise".
+
+**A stored absolute deadline (`QueuePauseState.paused_until`, an ISO-8601 UTC string), not a
+countdown or a running timer.** A timer dies with the process; a persisted deadline makes
+restart-correctness fall out for free with no catch-up logic:
+
+- Restart **before** the deadline → still paused, and it expires on schedule.
+- Restart **after** the deadline (the app was down past it) → comes back **unpaused**, the honest
+  answer — a ten-minute pause must not silently become an eight-hour one because the container
+  restarted. Checked twice for this reason: once synchronously in `TransferQueue.start()` (so
+  this holds the instant `start()` returns, before the scheduler loop has run even once), and
+  again every tick thereafter (below) for the ordinary case.
+
+**Re-pausing always replaces `paused_until` outright — it never stacks or extends.** Calling
+`pause()` again while already paused overwrites whatever deadline existed, including clearing it
+back to indefinite (`duration_s` omitted). **Manual `unpause()` always clears the deadline too** —
+a stale deadline that later re-paused the queue after someone had already unpaused it by hand
+would be baffling.
+
+**Expiry is enforced from `TransferQueue.tick()` (`_expire_pause_if_due`), not from
+`core/engine.py`'s scan loop**, despite the engine loop being the other "runs continuously"
+candidate: `Engine._loop` can legitimately sleep with no wake-up scheduled at all when every
+queue is on-demand-only (`_next_wake_delay` returns `None` in that case), whereas
+`TransferQueue._loop` always wakes at least every `tick_s` (~1s) regardless of what else is or
+isn't due. That is the only one of the two loops that can promise "fires without a page open, on
+the backend's own clock" unconditionally. Expiry records its own audit event
+(`queue_pause_expired`), distinct from a manual `queue_unpaused`, so "why did it start again" is
+answerable from the Events page without guessing whether a human clicked Unpause. The Queue tab's
+banner and the header badge both show the deadline itself ("resumes at HH:MM") whenever one is
+set, not a bare "paused" indistinguishable from an indefinite one.
+
+#### Changing the site limit while transfers are running
+
+The Queue tab carries a **bandwidth slider** (2026-08-21,
+`prompts/done/2026-08-21-bandwidth-from-the-queue-page.md`) alongside the Pause control. It writes
+the **throttle** ("The ceiling and the throttle", above) through `POST /api/queue/bandwidth` —
+still site-wide, never a per-queue limit; the "one site, one set of transfer knobs" rule above is
+untouched.
+
+**The two surfaces are no longer the same number, and no longer need to reflect each other.**
+Settings → Transfer edits the ceiling; this slider throttles within it. What the Transfers page's
+5-second `GET /api/settings/transfer` poll now buys is that **the slider's maximum tracks the
+ceiling live** — lower the ceiling in Settings and this slider's track shortens without a reload,
+its handle clamped down with it. Settings → Transfer's own PUT still writes the whole
+twelve-field object, but the throttle is deliberately **not** one of those fields: the handler
+carries the stored throttle forward across the write, so a stale Settings form can no longer
+clobber a slider change (it can still overwrite the other eleven — ordinary last-write-wins,
+unchanged).
+
+**The throttle is a stored setting, not session state** (user-confirmed: *"if I drag to 10mb then
+it stays till I move back to max"*). Nothing resets it — not a restart, not an empty queue, not
+unpausing. The ceiling is what it can always be dragged back up to.
+
+**It commits itself, five visible seconds after the last change** (2026-08-21,
+`prompts/done/2026-08-21-bandwidth-ceiling-and-autocommit.md`). There is no Apply button, no
+Cancel, and no confirmation dialog — the previous shape was four interactions to change a number.
+Moving the slider again re-arms the countdown, so dragging back to where you started cancels for
+free; a banner counts the seconds down in place and then becomes the result line, never a second
+banner stacked under the first. The commit is a **deadline compared against the clock**, not a
+running timer, the same reasoning `paused_until` uses: a slow tick can delay it, never lose it.
+
+Two applications of a change, chosen by a checkbox beside the slider — **"Apply to new items
+only", checked by default**:
+
+- **Checked** (the default). The throttle is written; nothing is interrupted. Running jobs keep
+  the allocation they were admitted with — the invariant above, exactly as before. The next
+  admission uses the new limit.
+- **Unchecked.** The throttle is written, then every in-flight lftp child is **stopped and
+  re-queued in place**, and admission is woken so the scheduler re-admits each one against the new
+  limit.
+
+**The checkbox is the consent, and the banner is the report.** The unchecked path interrupts every
+running transfer, and it used to ask before acting; that confirmation is gone deliberately (user
+decision, 2026-08-21) on the reasoning that *a deliberate uncheck is a better guard than a dialog
+on every drag*. What replaced it is an honest after-the-fact statement built from the API's own
+response — "Bandwidth set to 10 MB/s — 3 running transfers restarted", the real count, never a
+generic phrase. **The paused case is the one that must not be got wrong**: the backend skips
+re-admission while paused (below) and says so with `skipped_because_paused`, and the banner then
+states that nothing was restarted. Reporting a restart that did not happen would be worse than
+the dialog that was removed.
+
+**A value above the ceiling is clamped, not refused.** The slider's own maximum tracks the
+ceiling, so the only routes to an over-ceiling request are a race (the ceiling was lowered in
+Settings between this page's last poll and the drag) or a direct API call. The response carries
+the value actually applied, which is what the banner announces. Below `min_share_floor` is still
+a hard 400 — that is a limit the scheduler cannot work with at all, not a stale bound.
+
+**Re-admission is the invariant being obeyed, not an exception to it.** There is no in-place
+retune and no control channel: the job stops being a running job, becomes a queued one again —
+same row, same `queue_position`, same `attempt`, same partial bytes on disk — and is then handed
+a *new* allocation the ordinary way, by `admit()`, from the current settings. `core/scheduler.py`
+is untouched by this feature; it never learns that anything unusual happened.
+
+**It reuses "pause now"'s per-job half verbatim** (`TransferQueue._pause_running_jobs`) rather
+than adding a second stop-and-respawn path — so it inherits that path's guarantees whole: a
+SIGTERM'd exit is never run through failure classification, so no `FAILED` row and no
+`error_class`; `auto_queue_suppressed` is never set (§4.6's stop semantics would be exactly
+wrong here); and the transfer resumes from its partial bytes rather than re-fetching. It does
+**not** reuse `pause()`/`unpause()` themselves — see below.
+
+**A paused queue is left completely alone.** With the checkbox unchecked on a paused queue, the
+setting is written and *nothing else happens*: no child is stopped, and the persisted pause
+state — including a timed pause's `paused_until` deadline ("Pausing for a fixed duration," above)
+— is not read, written, or cleared. Two independent reasons, either sufficient:
+
+1. A literal "pause now, then unpause" implementation would **resume a queue the user
+   deliberately paused**, and would overwrite — hence silently cancel — a "pause for 30 minutes"
+   they had set.
+2. **A paused queue can still have running jobs**: "pause after current" leaves them alone on
+   purpose. Stopping those would upgrade the user's "pause after current" into a "pause now"
+   *and* strand them as `queued` with admission closed, so they would not resume until the pause
+   ended.
+
+The API reports this back (`skipped_because_paused`) so the UI can say so rather than imply
+transfers were re-admitted. Changing the *number* while paused is still allowed and still
+useful — curating before resuming is what pausing is for.
+
+**Admission is held for the teardown by a transient, in-memory flag**
+(`TransferQueue._admission_hold`), deliberately *not* `self._paused`: it exists only so a tick
+landing mid-teardown cannot fill the slots being vacated, it lasts milliseconds, it is never
+persisted, and it keeps "the user paused the queue" and "the scheduler is briefly busy" as two
+disjoint concepts. `_admit()` short-circuits on it the same caller-side way it does for pause.
+
+**Interaction with "Start now" fractions.** A job already running at a forced fraction that is
+re-admitted recomputes `fraction × B` against the **new** effective limit. That is correct and
+intended: the fraction is defined as a share of the limit in force, so a job asked for "50%"
+should follow that limit when it moves.
+
+**Bounds.** The slider refuses two values rather than writing them and leaving a queue that
+silently does nothing: `<= 0` (**zero is not "unlimited"** — it makes `headroom <= 0` on every
+pass, so the main lane admits nothing, ever, the same silent-deadlock shape the `B/2` reserve cap
+above exists to prevent) and anything below `min_share_floor` (the throttle would sit under the
+per-job floor the same settings declare). The existing `min_share_floor` is reused as the bound
+rather than inventing a new one; the upper bound is the ceiling, and is clamped rather than
+refused (above). Settings → Transfer's own numeric field stays unvalidated on purpose — it is the
+expert surface, and can still express a deliberately odd configuration.
 
 #### Residual inefficiency, stated plainly
 
@@ -2313,6 +2514,21 @@ question. **Downtime renders as a gap, never as a zero**, in both charts; that d
 the whole reason the store keeps a separate liveness heartbeat (§10.4). **The selected
 timeframe is remembered per browser** (2026-08-13, `localStorage`), read synchronously on
 first render so the chart never paints the default range and then jumps to the saved one.
+**A "total downloaded" readout, and 90d/1y bytes-chart ranges** (2026-08-21, daily rollups,
+§10.4) sit above the charts — the long-horizon answer the raw sample store alone can't give,
+served from `metric_daily` instead. A day with only partial heartbeat coverage (lftpweb was down
+part of it) is marked distinctly from a fully-covered quiet day in both the chart and its
+accessible table, never rendered identically to either a full day or a true gap.
+
+**The bytes chart's bucket width is its own group-by control** (2026-08-21, chart grouping,
+§10.4) — hour, day, week, or month, independent of the range selector, with a per-range default
+(24h hourly, 7d/30d daily, 90d/1y weekly). Week and month bars are summed from daily totals on
+read, not a separate table. Not every grouping is available at every range: hourly is disabled,
+with a reason shown in the dropdown, at 90d/1y — raw history is only kept 30 days and the daily
+rollup table has no finer granularity to fall back on — and the server rejects the same
+combination too, so this is never just a client-side suggestion. A week/month bar's own coverage
+marker is the fraction of days in it that had any activity, the same idle-vs-down distinction
+carried up a level.
 
 **Settings** — tabbed:
 
@@ -2457,9 +2673,56 @@ accounting**, never from a second measurement and never from lftp's output (§1.
   disk. Differencing it by job id would render a restart as a phantom spike. Subtracting the
   job's own `bytes_start` makes the tracked quantity zero at its first tick and monotonic
   thereafter, so a new attempt can never inherit a dead one's history.
-- **Retention** in days, pruned on a fixed cadence — a cheap idempotent delete, never on a
-  request path. Both charts read pre-bucketed rows from one endpoint, with the bucket width
-  chosen per range so the bar chart and the 24 h line agree on what "one slice of time" means.
+- **Retention** in days (default 30, up to `MAX_RETENTION_DAYS`), pruned on a fixed cadence — a
+  cheap idempotent delete, never on a request path. Both charts read pre-bucketed rows from one
+  endpoint, with the bucket width chosen per range so the bar chart and the 24 h line agree on
+  what "one slice of time" means.
+
+**Daily rollups** (2026-08-21, `prompts/done/2026-08-21-daily-metric-rollups.md`) extend this
+past raw retention's reach. The user's ask, by name: a long-horizon "how much have I downloaded"
+total that survives past a few weeks of raw samples. `metric_daily` (migration 026) is one row
+per `(queue_id, day)` — `day` a UTC calendar date, `bytes` a fresh `SUM` over `metric_sample` for
+that queue/day, `heartbeat_count` the same idle-vs-down coverage signal carried up to daily
+granularity (a day with full coverage and zero bytes is a genuinely quiet day; partial coverage
+means the day was mostly down; an absent row means zero heartbeats at all) — kept 13 months, long
+enough for a year-over-year glance.
+
+- **Rollup runs before the raw-table prune, in the same scheduler cycle, every time** — the one
+  part of this feature that can destroy data. A day rolled up after its raw rows are already gone
+  has nothing left to sum.
+- **Idempotent by recomputation**, upserted on `(queue_id, day)` — re-rolling an already-rolled
+  day (which happens every cycle, since there's no separate "already done" bookkeeping) overwrites
+  with a fresh sum rather than incrementing. This doubles as the startup backfill: no separate
+  entry point, just the same call with the current retention window as its lookback.
+- **Never rolls up today** — only closed UTC days.
+- **90d/1y bytes-chart ranges, and the Dashboard's "total downloaded" readout**, are served from
+  this table instead of the raw ones, since raw retention can never reach that far back. 30d
+  itself is unchanged — the raised default above is what makes it work out of the box.
+- **UTC calendar days, not a timezone setting** — the existing convention (README's Known gaps),
+  not a new one; a real timezone setting is a separate, larger feature out of scope here.
+
+**Range and grouping are two separate axes** (2026-08-21, chart grouping,
+`prompts/done/2026-08-21-chart-grouping.md`). Before this, each range (`24h`/`7d`/`30d`/`90d`/`1y`)
+had exactly one fixed bucket width. Now `range` still says how far back, and a second choice,
+`group` (`hour`/`day`/`week`/`month`), says how wide a bar — with a per-range default (24h hourly,
+7d/30d daily, 90d/1y weekly) rather than one bucket width per range. Week and month bars are
+**summed from daily totals on read — no new table** (anticipated by the daily-rollup design
+above: "weekly is derivable by summing daily; keeping both risks the two disagreeing"), built
+from whichever table already has day granularity for that range (the raw tables for `24h`/`7d`/
+`30d`, `metric_daily` for `90d`/`1y`).
+
+**Hourly grouping is disabled — server-side, not just in the dropdown — at `90d`/`1y`.** Raw
+tables cap out at `MAX_RETENTION_DAYS` (30) regardless of the configured retention setting, and
+`metric_daily` is one-day granularity by construction, so there is no sub-day data that far back
+and no setting can produce one. Every other range/grouping combination is available — decoupling
+the two axes doesn't make every combination equally *useful* (a `month` bucket over a `24h` range
+is one degenerate bar), only that none of the others are architecturally *impossible* the way
+hourly-at-90d/1y is.
+
+**Coverage, for a bucket wider than a day, is the fraction of days in it that were up** — not a
+heartbeat-density average. A raw-table day only ever carries a boolean up/down at that
+granularity, so a day-count fraction is the one definition of "coverage" that means the same
+thing regardless of which table the underlying days came from.
 
 ---
 
@@ -2956,8 +3219,10 @@ the transition, all of them required: the *arr's own queue record for the releas
 (a record still reporting `trackedDownloadState: importing` is never "imported," no matter what
 history says), at least one history import event must corroborate the disappearance was a real
 import rather than a removal, and both signals must hold across **two consecutive poller
-passes** roughly a minute apart — a settle-gate-style quiescence guard, the same "unchanged for
-two observations" philosophy §1.3's own settle gate already applies to a remote fingerprint.
+passes** — roughly 20s apart at the 10s default (`ArrSettings.poll_interval_s`, configurable at
+Settings → Integrations, floored at 5s; 60s/roughly a minute apart before 2026-08-21's issue #16)
+— a settle-gate-style quiescence guard, the same "unchanged for two observations" philosophy
+§1.3's own settle gate already applies to a remote fingerprint.
 Cleanup (`core/arrsync.py`'s `_maybe_cleanup`) never runs on ambiguity: a queue record simply
 vanishing with no import event maps to `dropped`, not directly to `gone` (below) — the icon
 dims to an amber "rechecking" warning, nothing is deleted, ever.
@@ -3000,7 +3265,8 @@ because an *unexplained* absence means a decision is pending, renders "Processed
 `cleaned` row instead — same clock, different words, because this absence is deliberate and
 fully audited (`core/audit.py` event rows: `arr_matched`, `arr_notified`,
 `arr_notify_failed`, `arr_imported`, `arr_cleanup`, `arr_cleanup_withheld`,
-`arr_path_mismatch`, `arr_scan_command_failed`, `arr_queue_dropped`, `arr_gone_heal_giving_up`).
+`arr_path_mismatch`, `arr_scan_command_failed`, `arr_queue_dropped`, `arr_gone_heal_giving_up`,
+`arr_queue_multi_page`).
 
 **The notify push is not actually fire-and-forget, as of 2026-08-17.** A `POST /api/v3/command`
 201 only ever meant "command queued" — it says nothing about whether the *arr could act on the

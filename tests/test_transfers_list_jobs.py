@@ -53,11 +53,13 @@ async def _make_queue(db) -> int:
     return cursor.lastrowid
 
 
-async def _make_item(db, queue_id: int, rel_path: str, *, state: str = "QUEUED") -> int:
+async def _make_item(
+    db, queue_id: int, rel_path: str, *, state: str = "QUEUED", local_size: int = 0
+) -> int:
     cursor = await db.execute(
         "INSERT INTO item (queue_id, rel_path, is_dir, remote_size, local_size, state) "
-        "VALUES (?, ?, 0, 100, 0, ?)",
-        (queue_id, rel_path, state),
+        "VALUES (?, ?, 0, 100, ?, ?)",
+        (queue_id, rel_path, local_size, state),
     )
     await db.commit()
     return cursor.lastrowid
@@ -184,6 +186,42 @@ async def test_list_jobs_bytes_total_reflects_the_value_fixed_at_spawn_not_curre
     assert jobs[0]["bytes_done"] <= jobs[0]["bytes_total"]
 
 
+# --- issue #14's second half (prompts/done/2026-08-21-paused-item-progress.md): a queued row --
+# --- paused-in-place or freshly retried after an interruption -- carries `item.local_size` -----
+
+
+async def test_list_jobs_projects_item_local_size_for_a_queued_row(db):
+    """The join this task added (`core/queue.py.list_jobs`'s own docstring) -- `api/jobs.py.
+    _job_out` resolves the fallback, but the raw row has to carry the number for it to resolve
+    anything with.
+    """
+    queue_id = await _make_queue(db)
+    item = await _make_item(db, queue_id, "paused.txt", state="QUEUED", local_size=450)
+    await _make_job(db, item, state="queued")
+
+    jobs = await _queue(db).list_jobs()
+    assert len(jobs) == 1
+    assert jobs[0]["local_size"] == 450
+
+
+async def test_list_jobs_older_failed_attempt_superseded_still_carries_item_local_size(db):
+    """The exact "attempt > 1, partial bytes on disk" case the task names: a fresh retry job row
+    (`attempt=2`) starts at `job.bytes_done = 0` by column default, but the item's own
+    `local_size` -- left behind by the interrupted first attempt -- is unaffected by the retry
+    and still shows up on the row the retry's job replaces the old one with.
+    """
+    queue_id = await _make_queue(db)
+    item = await _make_item(db, queue_id, "retried.txt", state="QUEUED", local_size=450)
+    await _make_job(db, item, state="failed", attempt=1)
+    second_job = await _make_job(db, item, state="queued", attempt=2)
+
+    jobs = await _queue(db).list_jobs()
+    assert len(jobs) == 1
+    assert jobs[0]["id"] == second_job
+    assert jobs[0]["bytes_done"] == 0  # the fresh job row's own column, untouched
+    assert jobs[0]["local_size"] == 450  # what `_job_out` actually prefers for display
+
+
 # --- api/jobs.py._job_out: the same defect 4 fix, at the HTTP-shape layer -------------------
 
 
@@ -247,6 +285,45 @@ def test_job_out_falls_back_to_item_remote_size_when_job_bytes_total_is_null():
     """
     out = _job_out(_job_out_row(bytes_total=None, state="queued"))
     assert out.bytes_total == 500
+
+
+# --- issue #14's second half: `_job_out`'s `bytes_done` fallback for a queued row -----------
+
+
+def test_job_out_prefers_item_local_size_for_a_queued_row_when_it_is_known():
+    """The fresh-retry case this task exists for: `job.bytes_done` is the new job row's own `0`
+    default, but `item.local_size` (450) is what the interrupted first attempt actually left on
+    disk -- the row must show that, not the fresh job's own zero.
+    """
+    out = _job_out(_job_out_row(state="queued", bytes_done=0, bytes_total=1000, local_size=450))
+    assert out.bytes_done == 450
+
+
+def test_job_out_queued_fallback_is_a_no_op_when_the_two_already_agree():
+    """The pause-in-place case: `job.bytes_done` and `item.local_size` were written together by
+    the same progress-sampler UPDATE before the pause, so they already agree -- the fallback
+    changes nothing here, it just happens to read the same number twice.
+    """
+    out = _job_out(_job_out_row(state="queued", bytes_done=450, bytes_total=1000, local_size=450))
+    assert out.bytes_done == 450
+
+
+def test_job_out_queued_row_with_no_local_size_at_all_keeps_jobs_own_bytes_done():
+    """No `local_size` key on the row at all (a row shape that predates this join, or a genuinely
+    fresh item with nothing on disk yet) -- `.get`, not `row[...]`, so this falls back to `job.
+    bytes_done` rather than raising.
+    """
+    out = _job_out(_job_out_row(state="queued", bytes_done=0, bytes_total=1000))
+    assert out.bytes_done == 0
+
+
+def test_job_out_never_applies_the_queued_fallback_to_a_non_queued_row():
+    """A `running`/terminal row's own `job.bytes_done` is already the authoritative, sampled
+    figure (`DESIGN.md` §1.3) -- `item.local_size` must never override it just because it
+    happens to be present on the joined row.
+    """
+    out = _job_out(_job_out_row(state="succeeded", bytes_done=1000, bytes_total=1000, local_size=1))
+    assert out.bytes_done == 1000
 
 
 # --- _publish_item_state: one row, not the tree ---------------------------------------------

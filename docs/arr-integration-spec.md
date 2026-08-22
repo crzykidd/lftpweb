@@ -171,7 +171,8 @@ an attempt, since no exact lookup is possible for it.
      a courtesy.
   2. ≥1 history import event for the release (by `downloadId` when known) — proves the
      disappearance was an import, not a removal.
-  3. **Both signals must hold on two consecutive poller passes** (≥60s apart) — a
+  3. **Both signals must hold on two consecutive poller passes** (≥`poll_interval_s` apart —
+     10s default since 2026-08-21's issue #16, 5s floor, 60s before that) — a
      settle-gate-style quiescence guard, same philosophy as the transfer settle gate:
      defense against API races, restarts mid-import, and any *arr version whose
      queue-removal timing differs from the above. Cleanup is the irreversible step, so it
@@ -237,10 +238,15 @@ association when present — it makes the later history lookup exact instead of 
 
 A background loop in the `BackupScheduler` / `Engine` shape (`_task`/`start()`/`stop()`),
 **not** wired into the scan pass — scan cadence is per-queue and variable, and *arr polling
-wants its own clock. Default every **60s** (site setting, `ArrSettings` in `setting` like
-every other settings dataclass):
+wants its own clock. Default every **10s** (down from 60s, 2026-08-21's issue #16 — see
+docs/decisions.md; site setting, `ArrSettings` in `setting` like every other settings
+dataclass, floored at 5s by `ArrSyncScheduler.MIN_POLL_INTERVAL_S`, exposed at Settings →
+Integrations as of the same change):
 
-1. For each enabled instance with ≥1 bound queue: `GET /api/v3/queue` (one page walk).
+1. For each enabled instance with ≥1 bound queue: `GET /api/v3/queue` (one page walk for any
+   queue that fits in `PAGE_SIZE` (250) records — the normal case, one request per instance per
+   pass; a queue that ever needs a second page writes one `arr_queue_multi_page` INFO event,
+   2026-08-21, observational only — no adaptive backoff).
 2. Match records → items in bound queues; set `detected` on new matches.
 3. For items in `detected`/`notified`: check queue presence; on disappearance, query
    `/api/v3/history` (by `downloadId` when known, else by `sourceTitle`) for an import

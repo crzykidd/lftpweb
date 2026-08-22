@@ -1,10 +1,17 @@
 ---
 name: 2026-08-21-daily-metric-rollups
-status: pending          # pending | completed | failed
+status: completed          # pending | completed | failed
 created: 2026-08-21
 model: sonnet            # opus = research/planning, sonnet = coding
-completed:               # filled when the work is done
-result:                  # one-line summary of the outcome
+completed: 2026-08-21
+result: >
+  Added metric_daily (migration 026, one row per queue per UTC day, 13-month retention),
+  rolled up hourly from the raw tables strictly before prune_metrics (ordering pinned by a
+  dedicated test), with idempotent upsert and automatic startup backfill. Raised raw retention
+  default 7 -> 30 days. New GET /api/metrics/total and 90d/1y throughput ranges backed by the
+  daily table; Dashboard gained a "total downloaded" readout, two new chart-range buttons, and
+  a partial-coverage marker. 1654 backend / 649 frontend tests, 0 skipped (+17 backend / +4
+  frontend). Not committed -- prepared for the orchestrating session to review and commit.
 ---
 
 # Task: daily per-queue rollups, so "how much have I downloaded" survives past the raw retention window

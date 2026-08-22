@@ -24,6 +24,7 @@ from lftpweb.core.queue import (
     JobNotQueuedError,
     NoSiteLimitConfiguredError,
     QueuePausedError,
+    SiteBandwidthTooLowError,
     TransferSettings,
     load_transfer_settings,
     resolve_forced_rate_fraction,
@@ -49,6 +50,8 @@ from lftpweb.models import (
     PreflightGatedQueueOut,
     PreflightResponse,
     PreflightRowOut,
+    QueueBandwidthRequest,
+    QueueBandwidthResponse,
     QueueItemRequest,
     QueuePauseRequest,
     QueueResetRequest,
@@ -146,7 +149,22 @@ def _job_out(row: dict, *, include_output_tail: bool = True) -> JobOut:
         rate_limit_bps=row["rate_limit_bps"],
         forced_rate_fraction=resolve_forced_rate_fraction(row),
         bytes_start=row["bytes_start"],
-        bytes_done=row["bytes_done"],
+        # 2026-08-21 (prompts/done/2026-08-21-paused-item-progress.md, issue #14's second half):
+        # for a `queued` row only, prefer `item.local_size` (the scanner/reconciler's own current
+        # reading, DESIGN.md §1.3) over `job.bytes_done` when the row's own `local_size` is known
+        # -- a fresh retry's `job.bytes_done` starts at 0 even when the item already carries real
+        # partial bytes from an interrupted earlier attempt, while a paused-in-place row's
+        # `job.bytes_done` and `item.local_size` already agree (both written together by the same
+        # progress-sampler UPDATE, `TransferQueue._sample_and_publish_progress`), so this is a
+        # no-op for that case and a real fix for the fresh-retry one. Mirrors `bytes_total`'s own
+        # fallback to `item.remote_size` immediately below, for the identical "queued, nothing
+        # frozen yet" reason. `.get`, not `row[...]`: `_job_out` is also called on rows built by
+        # hand in tests that predate this join (see `_job_out_row()`), which never carry the key.
+        bytes_done=(
+            row["local_size"]
+            if row["state"] == "queued" and row.get("local_size") is not None
+            else row["bytes_done"]
+        ),
         # 2026-08-14 (prompts/2026-08-14-exit-zero-is-not-completion.md, defect 4): prefer the
         # value `core/queue.py._spawn_decision` froze on `job.bytes_total` at admission --
         # `job.bytes_done`'s own denominator, fixed at the same moment (§4.5's "fixed at spawn,
@@ -556,9 +574,58 @@ async def pause_queue(request: Request, body: QueuePauseRequest | None = None) -
     `core/queue.py.TransferQueue.pause`'s own docstring for why `stop_job`'s §4.6 semantics
     would be wrong here). Idempotent: pausing an already-paused queue with `stop_running=true`
     still stops whatever is running at the moment of the call.
+
+    `duration_minutes` (2026-08-21, `prompts/2026-08-21-pause-for-duration.md`): one of
+    `{1, 10, 30, 60}`, or omitted/`null` for an indefinite pause (unchanged default). Converted
+    to seconds here rather than in `core/queue.py`, which takes a plain `duration_s: float` so
+    it has no opinion on what unit the API's dropdown happens to offer. Re-pausing an
+    already-paused queue **replaces** whatever deadline was set before, it does not stack.
     """
     stop_running = body.stop_running if body is not None else False
-    await request.app.state.queue.pause(stop_running=stop_running)
+    duration_s = (
+        body.duration_minutes * 60
+        if body is not None and body.duration_minutes is not None
+        else None
+    )
+    await request.app.state.queue.pause(stop_running=stop_running, duration_s=duration_s)
+
+
+@router.post("/api/queue/bandwidth", response_model=QueueBandwidthResponse)
+async def set_queue_bandwidth(
+    body: QueueBandwidthRequest, request: Request
+) -> QueueBandwidthResponse:
+    """Transfers -> Queue tab's bandwidth slider (2026-08-21,
+    `prompts/done/2026-08-21-bandwidth-from-the-queue-page.md`). Writes the **site-wide
+    throttle** -- `TransferSettings.throttle_bandwidth_bps`, bounded above by the
+    `max_bandwidth_bps` ceiling `PUT /api/settings/transfer` owns (2026-08-21,
+    `prompts/done/2026-08-21-bandwidth-ceiling-and-autocommit.md`) -- and, with
+    `apply_to_running: true`, additionally stops and re-queues every in-flight transfer so the
+    scheduler re-admits it at the new limit (DESIGN.md §4.5: a running job's allocation is fixed
+    at spawn, so re-admission is the only mechanism there is).
+
+    Deliberately its own endpoint rather than a flag on the settings PUT: that PUT takes the
+    whole `TransferSettings` object, so the Queue tab would have to read-modify-write twelve
+    fields it does not display just to move one slider, and would clobber a concurrent Settings
+    edit while doing it. This one sends the one number it actually owns.
+
+    A limit the scheduler cannot work with (`<= 0`, or below `min_share_floor_bps`) is a 400
+    -- `core/queue.py.SiteBandwidthTooLowError`, whose docstring has why 0 is not "unlimited".
+    A value `<= 0` never reaches the handler at all (`QueueBandwidthRequest`'s own `gt=0` makes
+    it a 422); the queue-level check is the authority for the floor, which depends on another
+    setting. A value *above* the ceiling is not an error at all -- it is clamped, and the
+    response's `effective_bandwidth_bps` is the applied value.
+    """
+    try:
+        outcome = await request.app.state.queue.set_site_bandwidth(
+            body.effective_bandwidth_bps, apply_to_running=body.apply_to_running
+        )
+    except SiteBandwidthTooLowError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return QueueBandwidthResponse(
+        effective_bandwidth_bps=outcome.effective_bandwidth_bps,
+        interrupted=outcome.interrupted,
+        skipped_because_paused=outcome.skipped_because_paused,
+    )
 
 
 @router.post("/api/queue/unpause", status_code=204)
@@ -1293,7 +1360,13 @@ async def retry_item(item_id: int, request: Request) -> JobOut:
 
 
 def _settings_out(s: TransferSettings) -> TransferSettingsOut:
-    return TransferSettingsOut(**{f: getattr(s, f) for f in TransferSettings.__dataclass_fields__})
+    # Field-by-field off `TransferSettingsIn` rather than off the dataclass's own fields: the
+    # dataclass carries `throttle_bandwidth_bps`, which this response deliberately reports only
+    # in resolved form (`TransferSettingsOut`'s own docstring).
+    return TransferSettingsOut(
+        **{f: getattr(s, f) for f in TransferSettingsIn.model_fields},
+        effective_bandwidth_bps=s.effective_bandwidth_bps(),
+    )
 
 
 @router.get("/api/settings/transfer", response_model=TransferSettingsOut)
@@ -1304,8 +1377,23 @@ async def get_transfer_settings(request: Request) -> TransferSettingsOut:
 
 @router.put("/api/settings/transfer", response_model=TransferSettingsOut)
 async def put_transfer_settings(body: TransferSettingsIn, request: Request) -> TransferSettingsOut:
-    settings = TransferSettings(**body.model_dump())
-    await save_transfer_settings(request.app.state.db, settings)
+    """Settings -> Transfer's own save. Writes the twelve fields it owns and **carries the Queue
+    tab's throttle forward untouched** (2026-08-21,
+    `prompts/done/2026-08-21-bandwidth-ceiling-and-autocommit.md`) -- this form has no throttle field,
+    so rebuilding `TransferSettings` from the body alone would reset it to "no throttle" on every
+    save, which is exactly the cross-surface clobber the two-value model exists to avoid.
+
+    Lowering `max_bandwidth_bps` below the stored throttle **clamps the throttle**, permanently:
+    `save_transfer_settings` applies `clamp_throttle_to_ceiling` and returns what it wrote, so
+    the response already reflects the clamp and a later ceiling *raise* cannot restore the old
+    higher throttle.
+    """
+    db = request.app.state.db
+    stored = await load_transfer_settings(db)
+    settings = await save_transfer_settings(
+        db,
+        TransferSettings(**body.model_dump(), throttle_bandwidth_bps=stored.throttle_bandwidth_bps),
+    )
     q = getattr(request.app.state, "queue", None)
     if q is not None:
         q.request_tick()

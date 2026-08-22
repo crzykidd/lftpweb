@@ -13,6 +13,9 @@ export interface HealthResponse {
   // 2026-08-20 (prompts/2026-08-20-queue-pause.md): whether admission is paused -- the header
   // bar and the Transfers -> Queue tab's own banner both read this.
   queue_paused: boolean
+  // 2026-08-21 (prompts/2026-08-21-pause-for-duration.md): the absolute ISO-8601 UTC deadline
+  // a timed pause resumes at, or `null` for an indefinite pause (or no pause at all).
+  queue_paused_until: string | null
   // 2026-08-16 (docs/decisions.md): baked at image build time, `null` for every build that
   // never baked them (local dev, compose dev stack, a manual `docker build` with no
   // `--build-arg`) -- see `lib/versionBadge.ts` for how the nav's version readout uses them.
@@ -213,6 +216,18 @@ export interface ArrTestResponse {
   message: string
   version: string | null
 }
+
+/** `GET`/`PUT /api/settings/arr/poll-interval` (2026-08-21, issue #16) -- `core/arrsync.py.
+ * ArrSettings.poll_interval_s` exposed here for the first time; before this it was DB-only,
+ * never surfaced to a user. Server-side validated (`api/settings_arr.py.put_arr_poll_settings`)
+ * against a 5s floor and a 3600s ceiling -- this page must not rely on its own `min`/`max` input
+ * attributes alone.
+ */
+export interface ArrPollSettingsOut {
+  poll_interval_s: number
+}
+
+export type ArrPollSettingsIn = ArrPollSettingsOut
 
 // --- Settings -> Post-processing (phase 5, DESIGN.md §6) -------------------------------
 
@@ -797,11 +812,17 @@ export interface QueueItemRequest {
 
 // --- Settings -> Transfer (phase 3a API, DESIGN.md §4.5/§9.2/§9.3) -----------------------
 //
-// Mirrors `core/queue.py.TransferSettings` exactly -- twelve fields, one site-wide set
-// (DESIGN.md §4.5: "a queue governs what and where, never how fast"). Bandwidth/size fields
-// are `_bps`/`_bytes` on the wire; TransferTab.tsx converts to/from MB(/s) at the edge, this
-// type stays in the backend's native units so a round-trip through the API never drifts.
-export interface TransferSettingsOut {
+// Mirrors `core/queue.py.TransferSettings` -- twelve editable fields, one site-wide set
+// (DESIGN.md §4.5: "a queue governs what and where, never how fast"), plus one read-only
+// derived number (below). Bandwidth/size fields are `_bps`/`_bytes` on the wire; TransferTab.tsx
+// converts to/from MB(/s) at the edge, this type stays in the backend's native units so a
+// round-trip through the API never drifts.
+export interface TransferSettingsIn {
+  /** The **ceiling** -- Settings → Transfer's own field, and since 2026-08-21
+   * (`prompts/done/2026-08-21-bandwidth-ceiling-and-autocommit.md`) no longer the number the
+   * Queue tab's slider writes: that slider owns a *throttle* within this ceiling, and the limit
+   * actually in force is `effective_bandwidth_bps` on `TransferSettingsOut` below.
+   */
   max_bandwidth_bps: number
   max_concurrent_transfers: number
   small_item_threshold_bytes: number
@@ -819,7 +840,34 @@ export interface TransferSettingsOut {
   extra_lftp_settings: string
 }
 
-export type TransferSettingsIn = TransferSettingsOut
+/** ...plus the one read-only number the two-value bandwidth model adds. **The limit actually in
+ * force** -- the Queue-tab throttle when one is set, `max_bandwidth_bps` otherwise -- and what
+ * the scheduler allocates against, so it is what the slider displays and what a "Start now"
+ * fraction is a fraction of. Never sent back on a PUT: the throttle is
+ * `POST /api/queue/bandwidth`'s to write, and including it here would let a stale Settings form
+ * silently undo a throttle set on another page. "Is a throttle in force?" reads as
+ * `effective_bandwidth_bps < max_bandwidth_bps`.
+ */
+export interface TransferSettingsOut extends TransferSettingsIn {
+  effective_bandwidth_bps: number
+}
+
+/** `POST /api/queue/bandwidth`'s response (2026-08-21,
+ * `prompts/done/2026-08-21-bandwidth-from-the-queue-page.md`) -- what the Queue tab's bandwidth
+ * slider actually did. `effective_bandwidth_bps` is the throttle **as applied**, which is not
+ * always what was asked for: a value above the ceiling is clamped to it rather than refused, so
+ * the banner and the optimistic echo both read this rather than the requested number.
+ * `interrupted` is how many running transfers were stopped and re-queued so the scheduler could
+ * re-admit them against the new limit (`0` for a new-items-only change, and for an
+ * apply-to-in-progress with nothing running); `skipped_because_paused` marks the case where the
+ * number was written but the queue's pause -- including a timed pause's deadline -- was
+ * deliberately left untouched, and the banner must then say nothing was restarted.
+ */
+export interface QueueBandwidthResponse {
+  effective_bandwidth_bps: number
+  interrupted: number
+  skipped_because_paused: boolean
+}
 
 // --- Settings -> Transfer's "effective lftp settings" readout (2026-08-14,
 // prompts/2026-08-14-show-effective-lftp-settings.md) -------------------------------------
@@ -996,8 +1044,19 @@ export type MetricsSettingsIn = MetricsSettingsOut
 // union both narrower types feed into `MetricsThroughputResponse.range`/`getThroughput`, which
 // don't otherwise care which selector a given range came from.
 export type SpeedRange = '1h' | '12h' | '24h'
-export type BytesRange = '24h' | '7d' | '30d'
+// 2026-08-21 (daily rollups, prompts/done/2026-08-21-daily-metric-rollups.md): 90d/1y read the
+// new `metric_daily` table instead of the raw ones (api/metrics.py's `_DAILY_RANGES`) -- the
+// only thing that changes for the frontend is that `retentionNoteForRange` (lib/bytesChart.ts)
+// doesn't apply the raw-retention note to them.
+export type BytesRange = '24h' | '7d' | '30d' | '90d' | '1y'
 export type MetricsRange = SpeedRange | BytesRange
+
+// 2026-08-21 (chart grouping, prompts/done/2026-08-21-chart-grouping.md): the bytes chart's
+// group-by control -- independent of `BytesRange` (which only says how far back). Not every
+// value is available at every range (`lib/bytesChart.ts.groupOptionsForRange` mirrors
+// `api/metrics.py._AVAILABLE_GROUPS`; the server independently rejects the same combination,
+// never trust the client alone).
+export type MetricsGroup = 'hour' | 'day' | 'week' | 'month'
 
 export interface MetricsBucketOut {
   ts: string
@@ -1007,12 +1066,36 @@ export interface MetricsBucketOut {
   total_bytes: number | null
   // JSON object keys are always strings on the wire -- queue_id -> bytes moved this bucket.
   by_queue: Record<string, number>
+  // 2026-08-21: fraction (0.0-1.0) of a full day's expected heartbeats actually observed --
+  // only set on a daily-granularity bucket (the 90d/1y ranges at group=day, sourced from
+  // `metric_daily`); `null` for every raw-table-sourced bucket (group=hour or group=day at
+  // 1h/12h/24h/7d/30d), where `up` alone is already exact at that bucket's own width. Lets the
+  // UI tell a genuinely quiet day (`up: true`, `coverage` near 1.0) apart from one lftpweb was
+  // mostly down for (`coverage` well under 1.0).
+  //
+  // 2026-08-21 (chart grouping): for a `week`/`month` bucket (any range), this is instead the
+  // fraction of *days* in the bucket that were `up` -- see `api/metrics.py._aggregate_day_points`
+  // for why that's a different (and deliberately simpler) computation than the per-day case.
+  coverage?: number | null
 }
 
 export interface MetricsThroughputResponse {
   range: MetricsRange
+  // 2026-08-21 (chart grouping): the bucket width actually used -- `null` for the speed chart's
+  // own untouched fixed-width ranges (1h/12h), which don't have a group-by control.
+  group: MetricsGroup | null
   bucket_seconds: number
   buckets: MetricsBucketOut[]
+}
+
+// 2026-08-21 (daily rollups): the Dashboard's "total downloaded" readout --
+// `GET /api/metrics/total`, `core/metrics.py.total_bytes`.
+export interface MetricsTotalOut {
+  total_bytes: number
+  // Earliest UTC calendar day (`'YYYY-MM-DD'`) this total actually covers, or `null` when
+  // there's no rolled-up history yet (a fresh install) -- say "since <date>", never imply an
+  // unbounded history.
+  since_day: string | null
 }
 
 // --- Settings -> Logs (phase 7, DESIGN.md §10.1) -----------------------------------------
