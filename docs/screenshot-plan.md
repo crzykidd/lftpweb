@@ -4,6 +4,72 @@ Written 2026-08-14. **Revised 2026-08-20** after the Transfers redesign (Queue/F
 History becoming Events, one globally-ordered queue, the queue-pause feature) landed and made
 every screenshot currently in place either dated or, in one case, actively wrong.
 
+## ⚠ Read this first — corrections after v0.3.1 (2026-08-22)
+
+**The body of this plan predates v0.3.1 and is wrong in two places that will cost you time.**
+
+**1. The bandwidth prep advice is wrong for the demo tree.** The "drop the ceiling to ~10 MB/s"
+note below was written for the real ~30 GB tree. `make_demo_tree.py` emits files of 60–180 MB, so
+at 10 MB/s the largest finishes in **18 seconds** and no mid-transfer frame is composable. **Use
+~1 MB/s**, which gives 3–4 minutes per item. Also: as of v0.3.1 you can set this from the **Queue
+page slider** (a throttle *below* the Settings → Transfer ceiling) rather than editing the ceiling
+and having to put it back. The slider still refuses anything under `min_share_floor_bps`.
+
+**2. Shots #3 and #4 must be taken on a v0.3.1-or-later build.** The Queue tab gained three things
+this week that the shot notes below don't mention: the **bandwidth slider**, the **Rescan now**
+button, and a **redesigned pause control**. Shot #4's note still says "pause (either mode)" — that
+two-entry menu no longer exists. It is now a single dropdown (*Till I unpause / 1 / 10 / 30 / 60
+min*, selection acts immediately) plus a **"Pause after active"** checkbox, disabled when nothing
+is running. Photograph that shape.
+
+**Two shots worth adding, neither in the table below:**
+
+- **Settings → Integrations** — never photographed at all, and now carries the "How often to check
+  Sonarr/Radarr" card.
+- **Dashboard** — the existing entry says "optionally show the 7d/30d range selector," which is
+  stale. It now has a **Total downloaded** readout, a **group-by** dropdown (hour/day/week/month)
+  and **90d/1y** ranges. Needs real history behind it to look like anything.
+
+## Test data — generate it, don't source it
+
+```
+uv run python docker/test-seedbox/make_demo_tree.py
+```
+
+Writes to `private_data/seedbox-dropbox/` (bind-mounted at `/data/dropbox` on both fake seedboxes),
+idempotent, ~540 MB. Names are already deliberately generic —
+`Generic.Item.1.S01E01.1080p.WEB-DL.x264-DEMO` through `.4` — covering the four shapes worth
+photographing: a loose `.mkv` (`pget`), a dir with one `.mkv` + `.nfo`, **genuinely extractable**
+rar volumes, and a 4-file season pack.
+
+**If you want real titles that a *arr will actually match** (researched 2026-08-22), the list that
+survives someone looking closely at a public README is short:
+
+- **Blender open movies** — *Big Buck Bunny*, *Sintel*, *Tears of Steel*, *Elephants Dream*,
+  *Cosmos Laundromat*, *Spring*. CC-BY, published by the rights holder, officially torrented, real
+  TMDB entries. The 4K encodes are several hundred MB–1 GB, which photographs better than the demo
+  files.
+- **Sita Sings the Blues** — Nina Paley dedicated it to the public domain (CC0). Full-length, real
+  TMDB entry.
+- **Curated archive.org PD collections** (`publicmovies212`, Prelinger) — provenance documented.
+  As of 2026-01-01 US copyright has expired on everything published **1930 or earlier**.
+
+**What does not qualify, and why it keeps looking like it does:** presence on archive.org is not a
+licensing determination — community uploads are self-serve and unvetted, and the Archive runs on
+DMCA safe harbour (their own framing: it shields them "for the occasional user who uploads
+infringing content"). **PBS is not a route either** — it is a private non-profit, not a federal
+agency, so § 105 does not apply; the copyrights sit with WGBH/WETA/WNET and the production
+companies, and free streaming is a distribution choice, not a redistribution licence. Only
+clip-level federal footage inside a programme (NASA, NOAA, DoD) is PD in its own right.
+
+**The test that saves time:** who published the licence, and where can I read it? "It's available
+on X" is availability standing in for permission.
+
+**TV specifically: don't bother hunting.** Classic-TV public-domain status is murky and often
+per-episode, and the confident claims online mostly don't hold up. Use the generated tree for the
+Sonarr side — you are testing *arr matching and the transfer pipeline, not video content, and
+generated files give exact control over sizes and timing.
+
 ## Status: every existing screenshot needs retaking
 
 Six shots were captured 2026-08-14 — see [`images/README.md`](images/README.md) for which. All
