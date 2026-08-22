@@ -28,9 +28,16 @@ LANE_SMALL = "small"
 class SchedulerSettings:
     """Site-level transfer settings (DESIGN.md §4.5's table), persisted in `setting` and
     exposed via the settings API. All rates are bytes/sec; all sizes are bytes.
+
+    **`max_bandwidth_bps` is whatever budget the caller hands in, and this module asks no
+    further questions about where it came from.** Since 2026-08-21 the site has two bandwidth
+    numbers -- a ceiling and a Queue-tab throttle within it (DESIGN.md §4.5's "The ceiling and
+    the throttle") -- and `core/queue.py.TransferSettings.scheduler_settings` feeds the
+    *effective* one here, at the call site. Nothing about this dataclass, `admit()`, or §4.5's
+    worked examples changed for it: `B` was always "the budget", and it still is.
     """
 
-    max_bandwidth_bps: int  # B
+    max_bandwidth_bps: int  # B -- the limit in force (see the note above)
     max_concurrent_transfers: int  # N, main-lane slots
     small_item_threshold_bytes: int = 10_000_000  # 10 MB default (§4.5)
     small_lane_concurrency: int = 2

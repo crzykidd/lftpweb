@@ -503,23 +503,26 @@ export function unpauseQueue(): Promise<void> {
 }
 
 /** The Queue tab's bandwidth slider (2026-08-21,
- * `prompts/done/2026-08-21-bandwidth-from-the-queue-page.md`) -- writes the **site-wide**
- * `max_bandwidth_bps`, the same single value Settings -> Transfer owns (DESIGN.md §4.5: one
- * site, one set of transfer knobs), never a second or per-queue limit.
+ * `prompts/done/2026-08-21-bandwidth-from-the-queue-page.md`) -- writes the **site-wide
+ * throttle**, bounded above by the `max_bandwidth_bps` ceiling Settings -> Transfer owns
+ * (2026-08-21, `prompts/done/2026-08-21-bandwidth-ceiling-and-autocommit.md`). Still site-wide,
+ * never a per-queue limit (DESIGN.md §4.5: one site, one set of transfer knobs).
  *
  * Its own endpoint rather than `putTransferSettings` because that PUT takes the whole
  * twelve-field settings object: sending it from here would mean read-modify-writing eleven
  * fields this page doesn't display, clobbering a concurrent Settings edit in the process.
  *
  * `applyToRunning` additionally stops and re-queues every in-flight transfer so the scheduler
- * re-admits it at the new ceiling -- a real interruption, which is why the UI confirms it first.
+ * re-admits it at the new limit -- a real interruption, which the "Apply to new items only"
+ * checkbox (checked by default) is the deliberate opt-out from. A value above the ceiling is
+ * clamped server-side; the response's `effective_bandwidth_bps` is what was applied.
  */
 export function setQueueBandwidth(
-  maxBandwidthBps: number,
+  effectiveBandwidthBps: number,
   applyToRunning: boolean,
 ): Promise<QueueBandwidthResponse> {
   return sendJson<QueueBandwidthResponse>('/api/queue/bandwidth', 'POST', {
-    max_bandwidth_bps: maxBandwidthBps,
+    effective_bandwidth_bps: effectiveBandwidthBps,
     apply_to_running: applyToRunning,
   })
 }

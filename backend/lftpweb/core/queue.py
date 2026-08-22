@@ -110,8 +110,8 @@ class NoSiteLimitConfiguredError(Exception):
     meaningless -- `api/jobs.py.start_now` turns this into a 409 naming the reason, rather than
     silently substituting Max, which is the one outcome the task's own settled decisions rule
     out explicitly. Max itself (`rate_percent` omitted or `100`) never raises this: it reuses
-    whatever `max_bandwidth_bps` already is, unconditionally, exactly as the pre-fraction
-    "Start now at max bandwidth" path always did.
+    whatever the effective limit already is (`TransferSettings.effective_bandwidth_bps`),
+    unconditionally, exactly as the pre-fraction "Start now at max bandwidth" path always did.
     """
 
 
@@ -129,11 +129,13 @@ class QueuePausedError(Exception):
 
 
 class SiteBandwidthTooLowError(Exception):
-    """Raised by `TransferQueue.set_site_bandwidth` for a ceiling the scheduler cannot work
+    """Raised by `TransferQueue.set_site_bandwidth` for a limit the scheduler cannot work
     with (2026-08-21, `prompts/done/2026-08-21-bandwidth-from-the-queue-page.md`) -- the Queue
-    tab's bandwidth slider is a *bounded* second surface onto `max_bandwidth_bps`, so it must
-    refuse the two values that quietly wedge admission rather than write them and let the queue
-    sit there doing nothing:
+    tab's bandwidth slider writes the *throttle* (`TransferSettings.throttle_bandwidth_bps`,
+    2026-08-21), bounded to `[min_share_floor_bps, max_bandwidth_bps]`. **Only the lower bound
+    raises**: a value above the ceiling is clamped to it (`set_site_bandwidth`'s own docstring
+    says why a race deserves a clamp rather than an error), while these two quietly wedge
+    admission and so must be refused rather than written:
 
     - **`<= 0` is not "unlimited."** DESIGN.md §4.5's headroom is `B - reserve - allocated`, so
       `B = 0` makes `headroom <= 0` on every pass and the main lane admits **nothing, ever** --
@@ -280,6 +282,24 @@ class TransferSettings:
     """Site-level settings (DESIGN.md §4.5's table + §9.3's parallelism knobs), persisted as
     JSON in `setting`. One instance = one site (DESIGN.md §4.5: "one container serves one
     site... not per-queue").
+
+    **Bandwidth is two values, not one** (2026-08-21,
+    `prompts/done/2026-08-21-bandwidth-ceiling-and-autocommit.md`, DESIGN.md §4.5's "The ceiling and
+    the throttle"):
+
+    - `max_bandwidth_bps` -- the **ceiling** (§4.5's `B`). Settings -> Transfer owns it, and its
+      meaning is unchanged from the day it was written.
+    - `throttle_bandwidth_bps` -- the **throttle**, the Queue tab's slider. `None` (the default,
+      and what every pre-existing settings row deserializes to) means "no throttle, run at the
+      ceiling", so an upgrade changes nothing about behaviour and no migration is needed.
+
+    `effective_bandwidth_bps()` below is the one the scheduler allocates against; **nothing
+    outside this class should read `max_bandwidth_bps` to decide how fast anything may go.**
+
+    Why two, when one day earlier this was deliberately one value edited by two surfaces
+    (`prompts/done/2026-08-21-bandwidth-from-the-queue-page.md`): capping the slider at the value
+    the slider itself edits is circular -- lower it once and the ceiling drops with it, so it can
+    never be raised back from the Queue page. A ratchet. See `docs/decisions.md`.
     """
 
     max_bandwidth_bps: int = 10_000_000
@@ -294,9 +314,26 @@ class TransferSettings:
     max_attempts: int = DEFAULT_MAX_ATTEMPTS
     retry_backoff_base_s: float = DEFAULT_RETRY_BACKOFF_BASE_S
     extra_lftp_settings: str = ""
+    # The Queue-tab throttle. `None` = follow the ceiling. Never above `max_bandwidth_bps`:
+    # `save_transfer_settings` clamps it on every write (so lowering the ceiling permanently
+    # clamps the throttle rather than letting a later ceiling *raise* restore an old, higher
+    # throttle), and `effective_bandwidth_bps` clamps again on read as belt-and-braces.
+    throttle_bandwidth_bps: int | None = None
+
+    def effective_bandwidth_bps(self) -> int:
+        """**The limit actually in force** -- what `admit()` allocates against, what a "start
+        now" fraction is a fraction *of*, and what the fast-lane reserve is carved out of.
+
+        The throttle when one is set (never above the ceiling), the ceiling otherwise. Unset is
+        the upgrade path and the ordinary state: with no throttle this returns exactly
+        `max_bandwidth_bps`, so every worked example in DESIGN.md §4.5 holds byte-for-byte.
+        """
+        if self.throttle_bandwidth_bps is None:
+            return self.max_bandwidth_bps
+        return min(self.throttle_bandwidth_bps, self.max_bandwidth_bps)
 
     def effective_small_lane_reserve_bps(self) -> int:
-        """The fast lane's slice of the ceiling, never more than half of it.
+        """The fast lane's slice of the limit in force, never more than half of it.
 
         The half-of-B clamp is load-bearing, not defensive. DESIGN.md §4.5 originally
         specified "10% of B, min 1 MB/s" — but that floor is unconditional, so any ceiling at
@@ -304,17 +341,31 @@ class TransferSettings:
         admitted nothing, ever. Jobs queued and sat there with no error and no log line. The
         fast lane exists to stop small items being blocked; it must never be able to block
         everything else instead.
+
+        **`B` here is the *effective* limit, not the ceiling** (2026-08-21, the two-value
+        model above). Deriving the reserve from the ceiling while the scheduler allocates
+        against a lower throttle would resurrect that exact trap through the new door: a 100
+        MB/s ceiling throttled to 1 MB/s would reserve 10 MB/s against a 1 MB/s budget, and the
+        main lane would again admit nothing, ever. The alternative -- bounding the throttle
+        below at twice the ceiling-derived reserve -- would forbid throttling a gigabit ceiling
+        below 25 MB/s, which is precisely the thing the slider exists to do.
         """
+        limit = self.effective_bandwidth_bps()
         raw = (
             self.small_lane_reserve_bps
             if self.small_lane_reserve_bps is not None
-            else max(round(self.max_bandwidth_bps * 0.10), 1_000_000)
+            else max(round(limit * 0.10), 1_000_000)
         )
-        return min(raw, self.max_bandwidth_bps // 2)
+        return min(raw, limit // 2)
 
     def scheduler_settings(self) -> scheduler.SchedulerSettings:
+        # `SchedulerSettings.max_bandwidth_bps` is `B`, the budget `admit()` divides up -- and
+        # `B` is the limit *in force*, so the effective value is fed in here, at the call site.
+        # `core/scheduler.py` is deliberately untouched by the two-value model: it keeps one
+        # bandwidth number, its contract is unchanged, and §4.5's worked examples still read
+        # exactly as written.
         return scheduler.SchedulerSettings(
-            max_bandwidth_bps=self.max_bandwidth_bps,
+            max_bandwidth_bps=self.effective_bandwidth_bps(),
             max_concurrent_transfers=self.max_concurrent_transfers,
             small_item_threshold_bytes=self.small_item_threshold_bytes,
             small_lane_concurrency=self.small_lane_concurrency,
@@ -339,7 +390,35 @@ async def load_transfer_settings(db: aiosqlite.Connection) -> TransferSettings:
     return TransferSettings(**known)
 
 
-async def save_transfer_settings(db: aiosqlite.Connection, settings: TransferSettings) -> None:
+def clamp_throttle_to_ceiling(settings: TransferSettings) -> TransferSettings:
+    """`throttle_bandwidth_bps <= max_bandwidth_bps`, always (2026-08-21, the two-value model on
+    `TransferSettings`). Applied by `save_transfer_settings` below, so **every** writer of the
+    settings row goes through it and no surface can persist a throttle above the ceiling --
+    including `PUT /api/settings/transfer`, which is how the ceiling gets *lowered* in the first
+    place.
+
+    Clamping on write, not only on read, is the load-bearing half: a read-side clamp alone would
+    keep the old, higher throttle in the row, so raising the ceiling again later would silently
+    *raise the throttle back* -- and "raising the ceiling raises the ceiling only" is one of the
+    two rules this whole model exists to provide (the other being that lowering the ceiling
+    clamps the throttle). `effective_bandwidth_bps` clamps again on read anyway, for a row
+    written by an older build or edited by hand.
+    """
+    throttle = settings.throttle_bandwidth_bps
+    if throttle is None or throttle <= settings.max_bandwidth_bps:
+        return settings
+    return replace(settings, throttle_bandwidth_bps=settings.max_bandwidth_bps)
+
+
+async def save_transfer_settings(
+    db: aiosqlite.Connection, settings: TransferSettings
+) -> TransferSettings:
+    """Persists the settings row and **returns what was actually written** -- which is not
+    always what was passed: `clamp_throttle_to_ceiling` above may have lowered the throttle.
+    Callers that go on to render the result (`api/jobs.py.put_transfer_settings`) must use the
+    return value, not their own argument, or they will report a throttle the row does not hold.
+    """
+    settings = clamp_throttle_to_ceiling(settings)
     payload = json.dumps({f: getattr(settings, f) for f in TransferSettings.__dataclass_fields__})
     await db.execute(
         "INSERT INTO setting (key, value, updated_at) VALUES (?, ?, STRFTIME('%Y-%m-%dT%H:%M:%fZ','now')) "
@@ -347,6 +426,7 @@ async def save_transfer_settings(db: aiosqlite.Connection, settings: TransferSet
         (SETTING_KEY, payload),
     )
     await db.commit()
+    return settings
 
 
 @dataclass(frozen=True)
@@ -386,6 +466,11 @@ class BandwidthChangeOutcome:
     to tell the user "12 transfers were re-admitted" or "nothing was interrupted, the queue is
     paused," and neither is inferable from a 204.
 
+    `effective_bandwidth_bps` is the throttle **as applied** -- not necessarily what was asked
+    for, since a request above the ceiling is clamped to it rather than refused (2026-08-21, the
+    two-value model on `TransferSettings`). The banner reads this, never the requested number,
+    so what it announces is always what is in force.
+
     `interrupted` is how many in-flight lftp children were stopped and re-queued in place so the
     scheduler could hand them a fresh allocation against the new ceiling (DESIGN.md §4.5: a
     running job's allocation is fixed at spawn, so re-admission is the *only* way to change it).
@@ -396,7 +481,7 @@ class BandwidthChangeOutcome:
     paused queue is left completely alone.
     """
 
-    max_bandwidth_bps: int
+    effective_bandwidth_bps: int
     interrupted: int = 0
     skipped_because_paused: bool = False
 
@@ -1104,15 +1189,28 @@ class TransferQueue:
         )
 
     async def set_site_bandwidth(
-        self, max_bandwidth_bps: int, *, apply_to_running: bool
+        self, bandwidth_bps: int, *, apply_to_running: bool
     ) -> BandwidthChangeOutcome:
         """The Queue tab's bandwidth slider (2026-08-21,
-        `prompts/done/2026-08-21-bandwidth-from-the-queue-page.md`) -- **a second surface onto
-        the one site-wide `TransferSettings.max_bandwidth_bps`, never a new per-queue limit**
-        (DESIGN.md §4.5: "one container serves one site... A queue governs *what* and *where*,
-        never *how fast*"). Settings -> Transfer's own field writes the identical value through
-        `PUT /api/settings/transfer`; this method exists for the *second* half, which that PUT
-        cannot express.
+        `prompts/done/2026-08-21-bandwidth-from-the-queue-page.md`) -- **the site-wide
+        *throttle*, never a per-queue limit** (DESIGN.md §4.5: "one container serves one site...
+        A queue governs *what* and *where*, never *how fast*").
+
+        **It no longer writes `max_bandwidth_bps`** (2026-08-21,
+        `prompts/done/2026-08-21-bandwidth-ceiling-and-autocommit.md`). That field is Settings ->
+        Transfer's ceiling and this method never touches it; the slider writes
+        `throttle_bandwidth_bps`, bounded to `[min_share_floor_bps, max_bandwidth_bps]`, and the
+        scheduler allocates against `effective_bandwidth_bps()`. The one-value design this
+        replaces made the slider's own ceiling drop every time the slider was lowered -- a
+        ratchet the user could not undo from the Queue page (`docs/decisions.md`).
+
+        **A request above the ceiling is clamped, not refused.** The UI's slider maximum tracks
+        the ceiling live, so the only ways here are a race (the ceiling was lowered in Settings
+        between this page's last poll and the drag) or a direct API call. Erroring on the race
+        would show the user a failure for something they cannot see; the applied value is
+        returned, so the banner and the optimistic echo both state what is actually in force.
+        Values *below* the floor stay hard errors -- that is a value the scheduler cannot work
+        with at all, not a stale bound.
 
         **Why "apply to in-progress" has to stop and re-admit, and why that does not weaken
         §4.5's invariant.** A running job's allocation is fixed at spawn: `lftp -c` exits with
@@ -1132,15 +1230,15 @@ class TransferQueue:
 
         Three outcomes:
 
-        - `apply_to_running=False` (the default, and the safe one): the setting is written and
+        - `apply_to_running=False` (the default, and the safe one): the throttle is written and
           nothing is interrupted. Running jobs keep the allocation they were admitted with,
-          exactly as before this feature existed; the new ceiling governs the next admission.
-        - `apply_to_running=True` while **not** paused: the setting is written, then every
+          exactly as before this feature existed; the new limit governs the next admission.
+        - `apply_to_running=True` while **not** paused: the throttle is written, then every
           in-flight child is stopped and re-queued, and admission is woken so the scheduler
-          re-admits them against the new ceiling. Jobs already running at a forced "Start now"
-          fraction recompute that fraction against the *new* `max_bandwidth_bps` on re-admission
-          -- correct and intended: the fraction is a share of the site limit (§4.5's Start now),
-          so a job asked for "50% of the site limit" should follow the site limit when it moves.
+          re-admits them against the new limit. Jobs already running at a forced "Start now"
+          fraction recompute that fraction against the *new effective* limit on re-admission
+          -- correct and intended: the fraction is a share of the limit actually in force
+          (§4.5's Start now), so a job asked for "50%" should follow that limit when it moves.
         - `apply_to_running=True` while **paused**: the setting is written and **nothing else
           happens at all** -- no child is stopped, and the persisted pause state (including a
           timed pause's `paused_until` deadline) is not read, written, or cleared. This is the
@@ -1153,7 +1251,7 @@ class TransferQueue:
           turn the user's "pause after current" into a "pause now" *and* strand the jobs as
           `queued` with admission closed, so they would not resume until the pause ended. The
           caller is told (`skipped_because_paused`) so the UI can say so rather than imply
-          transfers were re-admitted. The new ceiling applies to everything admitted once the
+          transfers were re-admitted. The new limit applies to everything admitted once the
           pause ends, which is what a paused user actually wanted.
 
         Rejected: raising instead of writing the setting while paused. Changing the *number*
@@ -1161,21 +1259,20 @@ class TransferQueue:
         pausing is for, §4.5) -- only the interruption is meaningless there.
         """
         settings = await load_transfer_settings(self.db)
-        if max_bandwidth_bps <= 0:
+        if bandwidth_bps <= 0:
             raise SiteBandwidthTooLowError(
                 "a site bandwidth limit of 0 is not 'unlimited' -- it makes headroom zero on "
                 "every scheduling pass, so nothing would ever be admitted"
             )
-        if max_bandwidth_bps < settings.min_share_floor_bps:
+        if bandwidth_bps < settings.min_share_floor_bps:
             raise SiteBandwidthTooLowError(
-                f"site bandwidth limit {max_bandwidth_bps} B/s is below the minimum share floor "
+                f"site bandwidth limit {bandwidth_bps} B/s is below the minimum share floor "
                 f"({settings.min_share_floor_bps} B/s), so the first admission would already "
                 "violate it"
             )
+        applied = min(bandwidth_bps, settings.max_bandwidth_bps)
 
-        await save_transfer_settings(
-            self.db, replace(settings, max_bandwidth_bps=max_bandwidth_bps)
-        )
+        await save_transfer_settings(self.db, replace(settings, throttle_bandwidth_bps=applied))
 
         if not apply_to_running:
             await audit.record_event(
@@ -1183,12 +1280,13 @@ class TransferQueue:
                 level="info",
                 kind="queue_bandwidth_changed",
                 message=(
-                    f"site bandwidth limit set to {max_bandwidth_bps} B/s (applies to newly "
-                    "admitted transfers; running transfers keep the allocation they started with)"
+                    f"site bandwidth throttle set to {applied} B/s (ceiling "
+                    f"{settings.max_bandwidth_bps} B/s; applies to newly admitted transfers, "
+                    "running transfers keep the allocation they started with)"
                 ),
             )
             self.request_tick()
-            return BandwidthChangeOutcome(max_bandwidth_bps=max_bandwidth_bps)
+            return BandwidthChangeOutcome(effective_bandwidth_bps=applied)
 
         if self._paused:
             await audit.record_event(
@@ -1196,13 +1294,13 @@ class TransferQueue:
                 level="info",
                 kind="queue_bandwidth_changed",
                 message=(
-                    f"site bandwidth limit set to {max_bandwidth_bps} B/s; 'apply to in-progress' "
+                    f"site bandwidth throttle set to {applied} B/s; 'apply to in-progress' "
                     "had nothing to do because the queue is paused -- the pause (and any resume "
                     "deadline) was left exactly as it was"
                 ),
             )
             return BandwidthChangeOutcome(
-                max_bandwidth_bps=max_bandwidth_bps, skipped_because_paused=True
+                effective_bandwidth_bps=applied, skipped_because_paused=True
             )
 
         interrupted = len(self._running)
@@ -1217,13 +1315,13 @@ class TransferQueue:
             level="info",
             kind="queue_bandwidth_changed",
             message=(
-                f"site bandwidth limit set to {max_bandwidth_bps} B/s; {interrupted} running "
+                f"site bandwidth throttle set to {applied} B/s; {interrupted} running "
                 "transfer(s) stopped and re-queued in place so they re-admit at the new limit "
                 "(they resume from the bytes already on disk)"
             ),
         )
         self.request_tick()
-        return BandwidthChangeOutcome(max_bandwidth_bps=max_bandwidth_bps, interrupted=interrupted)
+        return BandwidthChangeOutcome(effective_bandwidth_bps=applied, interrupted=interrupted)
 
     async def _pause_running_jobs(self) -> None:
         """ "Pause now"'s per-job half: SIGTERM every in-flight lftp child, concurrently -- the
@@ -1633,12 +1731,16 @@ class TransferQueue:
         **A fraction requires a configured site bandwidth limit.** `10 MB/s at 25%` is a real
         number; `25% of nothing` is not -- raises `NoSiteLimitConfiguredError` rather than
         silently admitting at Max instead, which the task's settled decisions rule out by name.
-        "No site limit configured" reads as `max_bandwidth_bps <= 0` (docs/decisions.md has the
-        call): the Settings -> Transfer field already treats 0 as the degenerate "admits
+        "No site limit configured" reads as `effective_bandwidth_bps() <= 0` (docs/decisions.md
+        has the call): the Settings -> Transfer field already treats 0 as the degenerate "admits
         nothing, ever" ceiling (`TransferTab.tsx`'s own reserve-clamp warning), so 0 doubling as
         "not really configured" needs no new sentinel or migration to the settings row itself.
-        Max (`fraction == 1.0`) is exempt from this check -- it reuses whatever
-        `max_bandwidth_bps` already is, unconditionally, exactly as the pre-fraction path did.
+        **The *effective* limit, not the ceiling** (2026-08-21, the two-value model on
+        `TransferSettings`): the fraction is computed at admission as `fraction x B` where `B`
+        is what the scheduler is allocating against, so the availability check has to ask about
+        the same number the arithmetic will use. Max (`fraction == 1.0`) is exempt from this
+        check -- it reuses whatever the limit already is, unconditionally, exactly as the
+        pre-fraction path did.
 
         **Refused (409, `QueuePausedError`) while the queue is paused** (this task, 2026-08-20):
         paused means paused -- oversubscribing past the ceiling to force one item through would
@@ -1658,7 +1760,7 @@ class TransferQueue:
         fraction = (rate_percent or 100) / 100.0
         if fraction != 1.0:
             settings = await load_transfer_settings(self.db)
-            if settings.max_bandwidth_bps <= 0:
+            if settings.effective_bandwidth_bps() <= 0:
                 raise NoSiteLimitConfiguredError(
                     "start-now at a fraction requires a configured site bandwidth limit "
                     "(Settings -> Transfer -> Max bandwidth) -- none is set"
@@ -3505,5 +3607,9 @@ class TransferQueue:
         return {
             "current_speed_bps": int(current_speed),
             "allocated_bps": int(allocated),
-            "ceiling_bps": settings.max_bandwidth_bps,
+            # The limit *in force*, not `max_bandwidth_bps` (2026-08-21, the two-value model on
+            # `TransferSettings`) -- the header reads "allocated / ceiling", and allocation is
+            # measured against the effective limit, so showing the un-throttled ceiling here
+            # would make a fully-allocated throttled queue read as 10% utilised.
+            "ceiling_bps": settings.effective_bandwidth_bps(),
         }

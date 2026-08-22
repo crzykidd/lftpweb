@@ -595,31 +595,34 @@ async def set_queue_bandwidth(
     body: QueueBandwidthRequest, request: Request
 ) -> QueueBandwidthResponse:
     """Transfers -> Queue tab's bandwidth slider (2026-08-21,
-    `prompts/done/2026-08-21-bandwidth-from-the-queue-page.md`). Writes the **site-wide**
-    `max_bandwidth_bps` -- the same one value `PUT /api/settings/transfer` owns, never a second
-    setting -- and, with `apply_to_running: true`, additionally stops and re-queues every
-    in-flight transfer so the scheduler re-admits it at the new ceiling (DESIGN.md §4.5: a
-    running job's allocation is fixed at spawn, so re-admission is the only mechanism there is).
+    `prompts/done/2026-08-21-bandwidth-from-the-queue-page.md`). Writes the **site-wide
+    throttle** -- `TransferSettings.throttle_bandwidth_bps`, bounded above by the
+    `max_bandwidth_bps` ceiling `PUT /api/settings/transfer` owns (2026-08-21,
+    `prompts/done/2026-08-21-bandwidth-ceiling-and-autocommit.md`) -- and, with
+    `apply_to_running: true`, additionally stops and re-queues every in-flight transfer so the
+    scheduler re-admits it at the new limit (DESIGN.md §4.5: a running job's allocation is fixed
+    at spawn, so re-admission is the only mechanism there is).
 
     Deliberately its own endpoint rather than a flag on the settings PUT: that PUT takes the
     whole `TransferSettings` object, so the Queue tab would have to read-modify-write twelve
     fields it does not display just to move one slider, and would clobber a concurrent Settings
     edit while doing it. This one sends the one number it actually owns.
 
-    A ceiling the scheduler cannot work with (`<= 0`, or below `min_share_floor_bps`) is a 400
+    A limit the scheduler cannot work with (`<= 0`, or below `min_share_floor_bps`) is a 400
     -- `core/queue.py.SiteBandwidthTooLowError`, whose docstring has why 0 is not "unlimited".
     A value `<= 0` never reaches the handler at all (`QueueBandwidthRequest`'s own `gt=0` makes
     it a 422); the queue-level check is the authority for the floor, which depends on another
-    setting.
+    setting. A value *above* the ceiling is not an error at all -- it is clamped, and the
+    response's `effective_bandwidth_bps` is the applied value.
     """
     try:
         outcome = await request.app.state.queue.set_site_bandwidth(
-            body.max_bandwidth_bps, apply_to_running=body.apply_to_running
+            body.effective_bandwidth_bps, apply_to_running=body.apply_to_running
         )
     except SiteBandwidthTooLowError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return QueueBandwidthResponse(
-        max_bandwidth_bps=outcome.max_bandwidth_bps,
+        effective_bandwidth_bps=outcome.effective_bandwidth_bps,
         interrupted=outcome.interrupted,
         skipped_because_paused=outcome.skipped_because_paused,
     )
@@ -1357,7 +1360,13 @@ async def retry_item(item_id: int, request: Request) -> JobOut:
 
 
 def _settings_out(s: TransferSettings) -> TransferSettingsOut:
-    return TransferSettingsOut(**{f: getattr(s, f) for f in TransferSettings.__dataclass_fields__})
+    # Field-by-field off `TransferSettingsIn` rather than off the dataclass's own fields: the
+    # dataclass carries `throttle_bandwidth_bps`, which this response deliberately reports only
+    # in resolved form (`TransferSettingsOut`'s own docstring).
+    return TransferSettingsOut(
+        **{f: getattr(s, f) for f in TransferSettingsIn.model_fields},
+        effective_bandwidth_bps=s.effective_bandwidth_bps(),
+    )
 
 
 @router.get("/api/settings/transfer", response_model=TransferSettingsOut)
@@ -1368,8 +1377,23 @@ async def get_transfer_settings(request: Request) -> TransferSettingsOut:
 
 @router.put("/api/settings/transfer", response_model=TransferSettingsOut)
 async def put_transfer_settings(body: TransferSettingsIn, request: Request) -> TransferSettingsOut:
-    settings = TransferSettings(**body.model_dump())
-    await save_transfer_settings(request.app.state.db, settings)
+    """Settings -> Transfer's own save. Writes the twelve fields it owns and **carries the Queue
+    tab's throttle forward untouched** (2026-08-21,
+    `prompts/done/2026-08-21-bandwidth-ceiling-and-autocommit.md`) -- this form has no throttle field,
+    so rebuilding `TransferSettings` from the body alone would reset it to "no throttle" on every
+    save, which is exactly the cross-surface clobber the two-value model exists to avoid.
+
+    Lowering `max_bandwidth_bps` below the stored throttle **clamps the throttle**, permanently:
+    `save_transfer_settings` applies `clamp_throttle_to_ceiling` and returns what it wrote, so
+    the response already reflects the clamp and a later ceiling *raise* cannot restore the old
+    higher throttle.
+    """
+    db = request.app.state.db
+    stored = await load_transfer_settings(db)
+    settings = await save_transfer_settings(
+        db,
+        TransferSettings(**body.model_dump(), throttle_bandwidth_bps=stored.throttle_bandwidth_bps),
+    )
     q = getattr(request.app.state, "queue", None)
     if q is not None:
         q.request_tick()

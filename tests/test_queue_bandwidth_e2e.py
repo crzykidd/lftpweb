@@ -4,7 +4,7 @@ seedbox** (DESIGN.md §14) -- `prompts/done/2026-08-21-bandwidth-from-the-queue-
 The setting write, the validation floors, the already-paused cases and the transient admission
 hold are `tests/test_queue_bandwidth.py`'s job (no process needed for any of them). This file
 exists for the one claim that genuinely needs a real running lftp child: that stopping a
-transfer and re-admitting it hands it a **new allocation** computed from the new ceiling
+transfer and re-admitting it hands it a **new allocation** computed from the new throttle
 (DESIGN.md §4.5 -- the only mechanism there is, since a running job's allocation is fixed at
 spawn), and that it **resumes from the bytes already on disk** rather than starting over, with
 no `FAILED` row, no `error_class`, and no `auto_queue_suppressed`.
@@ -24,7 +24,12 @@ import pytest
 
 from lftpweb.core.events import EventBus
 from lftpweb.core.local_scan import effective_file_size
-from lftpweb.core.queue import TransferQueue, TransferSettings, save_transfer_settings
+from lftpweb.core.queue import (
+    TransferQueue,
+    TransferSettings,
+    load_transfer_settings,
+    save_transfer_settings,
+)
 from lftpweb.core.remote import HostConfig
 from lftpweb.core.settle import SettleSettings, save_settle_settings
 from lftpweb.db import migrate
@@ -118,11 +123,14 @@ async def db():
     await conn.close()
 
 
-async def _queue_for(db, tmp_path, *, max_bandwidth_bps: int) -> TransferQueue:
+async def _queue_for(
+    db, tmp_path, *, max_bandwidth_bps: int, throttle_bandwidth_bps: int | None = None
+) -> TransferQueue:
     await save_transfer_settings(
         db,
         TransferSettings(
             max_bandwidth_bps=max_bandwidth_bps,
+            throttle_bandwidth_bps=throttle_bandwidth_bps,
             max_concurrent_transfers=1,
             small_item_threshold_bytes=0,
             small_lane_reserve_bps=0,
@@ -176,7 +184,11 @@ async def test_apply_to_in_progress_re_admits_at_the_new_limit_and_resumes(db, t
     queue_id = await _make_queue_row(db, host_id, local_dir)
     item_id = await _make_item_row(db, queue_id, MOVIE_REL_PATH, remote_size=MOVIE_SIZE)
 
-    q = await _queue_for(db, tmp_path, max_bandwidth_bps=SLOW_BPS)
+    # The ceiling is the *fast* one throughout -- Settings -> Transfer owns it and this feature
+    # never writes it (2026-08-21, the two-value model). What starts slow is the **throttle**,
+    # and dragging it back up to the ceiling is exactly the move the one-value design made
+    # impossible (a ratchet -- see `prompts/done/2026-08-21-bandwidth-ceiling-and-autocommit.md`).
+    q = await _queue_for(db, tmp_path, max_bandwidth_bps=FAST_BPS, throttle_bandwidth_bps=SLOW_BPS)
     try:
         job_id = await q.enqueue_item(item_id)
         await q._admit()
@@ -186,7 +198,7 @@ async def test_apply_to_in_progress_re_admits_at_the_new_limit_and_resumes(db, t
         ).fetchone()
         assert row["state"] == "running"
         assert row["pid"] is not None
-        assert row["rate_limit_bps"] == SLOW_BPS, "admitted against the *old* ceiling"
+        assert row["rate_limit_bps"] == SLOW_BPS, "admitted against the *old* throttle"
 
         target = local_dir / "Movie.Title.2024.2160p" / "Movie.Title.2024.2160p.mkv"
 
@@ -238,7 +250,7 @@ async def test_apply_to_in_progress_re_admits_at_the_new_limit_and_resumes(db, t
         # The partial bytes are still on disk -- nothing was cleaned up.
         assert effective_file_size(target) >= partial_before
 
-        # Re-admission: a **new** allocation, computed from the new ceiling. This is the
+        # Re-admission: a **new** allocation, computed from the new throttle. This is the
         # invariant being obeyed, not bypassed -- the job stopped being a running job, so the
         # scheduler hands it a fresh allocation the ordinary way (§4.5).
         await q._admit()
@@ -252,6 +264,12 @@ async def test_apply_to_in_progress_re_admits_at_the_new_limit_and_resumes(db, t
         assert readmitted["state"] == "running"
         assert readmitted["rate_limit_bps"] == FAST_BPS
         assert readmitted["attempt"] == before["attempt"], "a resume, not a retry"
+
+        # ...and the ceiling itself never moved. The slider raised the throttle back to it;
+        # under the one-value design it could only ever have raised the ceiling with it.
+        settings_after = await load_transfer_settings(db)
+        assert settings_after.max_bandwidth_bps == FAST_BPS
+        assert settings_after.throttle_bandwidth_bps == FAST_BPS
 
         # **The resume proof.** lftp is spawned with `-c`, so a resumed transfer continues into
         # the existing partial file; a *restart* would truncate it back to zero first. Sampled
@@ -289,7 +307,11 @@ async def test_future_items_only_leaves_the_running_transfer_at_its_original_rat
     queue_id = await _make_queue_row(db, host_id, local_dir)
     item_id = await _make_item_row(db, queue_id, MOVIE_REL_PATH, remote_size=MOVIE_SIZE)
 
-    q = await _queue_for(db, tmp_path, max_bandwidth_bps=SLOW_BPS)
+    # The ceiling is the *fast* one throughout -- Settings -> Transfer owns it and this feature
+    # never writes it (2026-08-21, the two-value model). What starts slow is the **throttle**,
+    # and dragging it back up to the ceiling is exactly the move the one-value design made
+    # impossible (a ratchet -- see `prompts/done/2026-08-21-bandwidth-ceiling-and-autocommit.md`).
+    q = await _queue_for(db, tmp_path, max_bandwidth_bps=FAST_BPS, throttle_bandwidth_bps=SLOW_BPS)
     try:
         job_id = await q.enqueue_item(item_id)
         await q._admit()

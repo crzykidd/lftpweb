@@ -14,6 +14,7 @@ import type {
   DownloadPrefixSettingsOut,
   EffectiveLftpSettingsOut,
   SettleSettingsOut,
+  TransferSettingsIn,
   TransferSettingsOut,
 } from '../../api/types'
 import { FieldHelp } from '../../components/FieldHelp'
@@ -29,6 +30,7 @@ const hintClasses = 'text-xs text-zinc-500 dark:text-zinc-400'
 // same convention as PostProcessingTab.tsx's EMPTY.
 const EMPTY: TransferSettingsOut = {
   max_bandwidth_bps: 10_000_000,
+  effective_bandwidth_bps: 10_000_000,
   max_concurrent_transfers: 2,
   small_item_threshold_bytes: 10_000_000,
   small_lane_concurrency: 2,
@@ -124,7 +126,11 @@ function formFromSettings(s: TransferSettingsOut): FormState {
   }
 }
 
-function formToBody(f: FormState): TransferSettingsOut {
+// Returns `TransferSettingsIn`, not `...Out`: `effective_bandwidth_bps` is read-only and the
+// Queue tab's throttle is deliberately not this form's to write (2026-08-21,
+// `prompts/done/2026-08-21-bandwidth-ceiling-and-autocommit.md`) -- the backend carries the
+// stored throttle forward across this PUT, clamping it if the ceiling below it just moved.
+function formToBody(f: FormState): TransferSettingsIn {
   return {
     max_bandwidth_bps: mbToBytes(f.maxBandwidthMBps),
     max_concurrent_transfers: Math.max(0, Math.round(f.maxConcurrentTransfers)),
@@ -521,14 +527,32 @@ export function TransferTab() {
   // row with no `HostIn` field to set it. `null` here almost always means "unconfigured,"
   // not "no limit" -- see the note rendered below the readout.
   const [connectionLimit, setConnectionLimit] = useState<number | null>(null)
+  // The Queue tab's throttle, as the server last reported it (2026-08-21,
+  // `prompts/done/2026-08-21-bandwidth-ceiling-and-autocommit.md`). This form does not own it and
+  // never writes it -- it is here so the ceiling field can say plainly that a lower limit is
+  // currently in force, rather than leaving the user to wonder why transfers are slower than the
+  // number they are looking at. `null` = no throttle, running at the ceiling.
+  const [throttleBps, setThrottleBps] = useState<number | null>(null)
+
+  const absorb = (settings: TransferSettingsOut) => {
+    setForm(formFromSettings(settings))
+    setThrottleBps(
+      settings.effective_bandwidth_bps < settings.max_bandwidth_bps
+        ? settings.effective_bandwidth_bps
+        : null,
+    )
+  }
 
   useEffect(() => {
     Promise.all([getTransferSettings(), getHost()])
       .then(([settings, host]) => {
-        setForm(formFromSettings(settings))
+        absorb(settings)
         setConnectionLimit(host?.net_connection_limit ?? null)
       })
       .finally(() => setLoading(false))
+    // `absorb` closes over nothing that changes; re-running this on every render would refetch
+    // the settings in a loop.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   const update = <K extends keyof FormState>(key: K, value: FormState[K]) => {
@@ -541,7 +565,7 @@ export function TransferTab() {
     setSaving(true)
     try {
       const saved_ = await putTransferSettings(formToBody(form))
-      setForm(formFromSettings(saved_))
+      absorb(saved_)
       setSaved(true)
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err))
@@ -623,7 +647,7 @@ export function TransferTab() {
         <div className="flex flex-wrap gap-4">
           <NumberField
             label="Max bandwidth (MB/s)"
-            hint="Ceiling across everything (DESIGN.md §4.5)."
+            hint="Ceiling across everything (DESIGN.md §4.5). The Queue tab can throttle below it, never above."
             value={form.maxBandwidthMBps}
             step={0.1}
             onChange={(v) => update('maxBandwidthMBps', v)}
@@ -636,6 +660,16 @@ export function TransferTab() {
             onChange={(v) => update('minShareFloorMBps', v)}
           />
         </div>
+        {/* The two surfaces stopped being the same number on 2026-08-21 -- restated here rather
+         * than left implicit, since "I set 100 MB/s and it runs at 10" is otherwise unanswerable
+         * from this page. */}
+        {throttleBps != null && (
+          <p className={hintClasses}>
+            The Queue tab is currently throttling transfers to{' '}
+            <strong>{formatRate(throttleBps)}</strong> — this ceiling is the most that slider can
+            reach, and lowering it below the throttle lowers the throttle with it.
+          </p>
+        )}
       </div>
 
       <div className="flex flex-col gap-3 rounded-md border border-zinc-200 p-4 dark:border-zinc-800">

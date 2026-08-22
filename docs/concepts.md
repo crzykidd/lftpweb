@@ -78,40 +78,59 @@ you'd expect.
 
 ## Changing the bandwidth limit restarted my transfers {#bandwidth}
 
-That's the option you picked, and it's the only way it could have worked.
+That's the checkbox next to the slider, and it's the only way it could have worked.
 
-Under the Pause control on [Transfers → Queue](/transfers/queue) there's a **bandwidth limit**
-slider. It edits the *same* site-wide limit as Settings → Transfer — there is one bandwidth
-ceiling for the whole instance, not one per queue — so changing it in either place changes it
-everywhere. Dragging the handle doesn't save anything; it proposes a value, and then you choose
-how to apply it:
+**There are two bandwidth numbers, and they do different jobs.**
 
-| Option | What happens |
+| Where | What it is |
 |---|---|
-| **Apply to new transfers** | The new limit is saved. Nothing running is touched — each transfer keeps the speed it started at. The next thing that starts uses the new limit. |
-| **Also apply to in-progress** | The new limit is saved, **and** every running transfer is stopped and immediately restarted at the new speed. |
+| **Settings → Transfer → Max bandwidth** | The **ceiling** for the whole instance. Nothing ever goes faster than this. |
+| **The slider on [Transfers → Queue](/transfers/queue)** | A **throttle** *within* that ceiling — "run at 10 MB/s for now", when the ceiling is 100. |
+
+The slider can never be dragged above the ceiling; that is what "the max is the max" means. Lower
+the ceiling below where the throttle currently sits and the throttle comes down with it. Raise the
+ceiling again and only the ceiling moves — your throttle stays where you put it, and you can drag
+it back up whenever you like. There is still exactly **one** set of these numbers for the whole
+instance, never one per queue.
+
+**The throttle sticks.** It is saved, not a temporary override: it survives a restart, an empty
+queue, and unpausing. It stays where you left it until you move it.
+
+**The slider applies itself.** Let go of it and a line appears — *"Bandwidth update to 10 MB/s
+applied in 5 seconds…"* — counting down. When it reaches zero the change is made and the same line
+tells you what happened. Move the slider again during the countdown and it starts over, so if you
+change your mind just drag it back to where it was and nothing is saved at all. There is no Apply
+button to hunt for and no Cancel button to need.
+
+**The checkbox is the important part.**
+
+| "Apply to new items only" | What happens |
+|---|---|
+| **Checked** (the default) | The new limit is saved. Nothing running is touched — each transfer keeps the speed it started at. The next thing that starts uses the new limit. |
+| **Unchecked** | The new limit is saved, **and** every running transfer is stopped and immediately restarted at the new speed. |
 
 **Why the second one has to interrupt.** lftp is handed its speed limit when it starts and gives
 us no way to change it afterwards — there is no dial to turn on a transfer that's already
 running. So the only way to give a running transfer a different limit is to stop it and start it
-again under the new one. That's what the confirmation is telling you before you click it, and
-it names how many transfers it will interrupt.
+again under the new one. Unchecking the box is you saying that's fine; the banner afterwards
+names exactly how many transfers were restarted.
 
 **Nothing is lost when it does.** A restarted transfer picks up from the bytes already on disk —
 it does not re-download what it already had. It keeps its place in the queue, its attempt count
 doesn't advance, and it is never marked **Failed** or **Stopped**. It's the same machinery as
 **Pause now**, which is deliberate.
 
-**If the queue is paused, this button won't restart it.** With the queue paused, *Also apply to
-in-progress* saves the number and does nothing else: it will not unpause you, and it will not
-cancel or shorten a "pause for 30 minutes" you set. (It also won't stop anything still running
-under a *Pause after current* — you asked for those to finish, so they finish.) The new limit
-applies to everything that starts once the pause ends.
+**If the queue is paused, unchecking the box won't restart it.** With the queue paused, the
+number is saved and nothing else happens: it will not unpause you, and it will not cancel or
+shorten a "pause for 30 minutes" you set. (It also won't stop anything still running under a
+*Pause after current* — you asked for those to finish, so they finish.) The banner says so
+outright rather than claiming a restart that didn't happen, and the new limit applies to
+everything that starts once the pause ends.
 
 **Zero is not "unlimited."** A limit of 0 would leave the scheduler with no room to hand out and
 it would never start anything, so the slider won't go there — and it won't go below the minimum
 share floor from Settings → Transfer either, for the same reason. If you want a very high
-ceiling, set a very high number.
+ceiling, set a very high number in Settings → Transfer.
 
 ## It says Downloaded but it's still under Active/pending — why? {#pipeline}
 

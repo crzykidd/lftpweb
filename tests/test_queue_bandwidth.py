@@ -1,5 +1,10 @@
 """Change the site bandwidth limit from the Queue page
-(`prompts/done/2026-08-21-bandwidth-from-the-queue-page.md`, DESIGN.md §4.5).
+(`prompts/done/2026-08-21-bandwidth-from-the-queue-page.md`, DESIGN.md §4.5), and the **two-value
+model** that replaced its one-setting-two-surfaces design a day later
+(`prompts/done/2026-08-21-bandwidth-ceiling-and-autocommit.md`): Settings -> Transfer owns the
+`max_bandwidth_bps` *ceiling*, this slider owns the `throttle_bandwidth_bps` *throttle* within
+it, and `effective_bandwidth_bps()` -- the throttle when set, the ceiling otherwise -- is what
+the scheduler allocates against.
 
 DB/API-level only -- no lftp process or fake seedbox needed here: the setting write is a
 `setting` row, the validation floors are arithmetic, and "apply to in-progress" is
@@ -15,6 +20,8 @@ setting-only change leaves every running allocation exactly where it was.
 """
 
 from __future__ import annotations
+
+from dataclasses import replace
 
 import aiosqlite
 import pytest
@@ -119,23 +126,175 @@ async def _settings(db, **overrides) -> TransferSettings:
     return settings
 
 
-# --- the setting write itself ----------------------------------------------------------------
+# --- the ceiling and the throttle are two values ----------------------------------------------
 
 
-async def test_the_slider_writes_the_site_wide_max_bandwidth(db):
+async def test_effective_defaults_to_the_ceiling_when_no_throttle_is_set(db):
+    """The upgrade path, and the ordinary state: a settings row written before the throttle
+    existed has no `throttle_bandwidth_bps` key at all, deserializes to `None`, and behaves
+    byte-for-byte as it did before (no migration needed -- see the module docstring).
+    """
+    settings = await _settings(db, max_bandwidth_bps=10_000_000)
+
+    assert settings.throttle_bandwidth_bps is None
+    assert settings.effective_bandwidth_bps() == 10_000_000
+    assert settings.scheduler_settings().max_bandwidth_bps == 10_000_000
+
+
+async def test_a_settings_row_written_without_the_throttle_key_loads_as_unthrottled(db):
+    """Belt-and-braces on the no-migration claim: the literal JSON an older build wrote."""
+    import json as _json
+
+    await db.execute(
+        "INSERT INTO setting (key, value, updated_at) VALUES ('transfer_settings', ?, 'now')",
+        (_json.dumps({"max_bandwidth_bps": 7_000_000, "max_concurrent_transfers": 3}),),
+    )
+    await db.commit()
+
+    settings = await load_transfer_settings(db)
+    assert settings.throttle_bandwidth_bps is None
+    assert settings.effective_bandwidth_bps() == 7_000_000
+
+
+async def test_the_slider_writes_the_throttle_and_never_the_ceiling(db):
     await _settings(db, max_bandwidth_bps=10_000_000)
     q = _queue_obj(db)
 
     outcome = await q.set_site_bandwidth(4_000_000, apply_to_running=False)
 
-    assert outcome == BandwidthChangeOutcome(max_bandwidth_bps=4_000_000)
-    assert (await load_transfer_settings(db)).max_bandwidth_bps == 4_000_000
+    assert outcome == BandwidthChangeOutcome(effective_bandwidth_bps=4_000_000)
+    after = await load_transfer_settings(db)
+    assert after.max_bandwidth_bps == 10_000_000, "the ceiling is Settings -> Transfer's, not this"
+    assert after.throttle_bandwidth_bps == 4_000_000
+    assert after.effective_bandwidth_bps() == 4_000_000
+
+
+async def test_the_throttle_persists_across_a_restart(db):
+    """Confirmed by the user: "if I drag to 10mb then it stays till I move back to max." It is a
+    stored setting, not session state -- nothing resets it on restart, on an empty queue, or on
+    unpause. A fresh `TransferQueue` over the same database is exactly what a restart is here.
+    """
+    await _settings(db, max_bandwidth_bps=100_000_000)
+    await _queue_obj(db).set_site_bandwidth(10_000_000, apply_to_running=False)
+
+    reborn = await load_transfer_settings(db)
+
+    assert reborn.throttle_bandwidth_bps == 10_000_000
+    assert reborn.effective_bandwidth_bps() == 10_000_000
+    assert _queue_obj(db) is not None  # a new process's queue reads the same row
+
+
+async def test_the_slider_cannot_exceed_the_ceiling_server_side(db):
+    """Not merely a UI bound: the API clamps. The slider's maximum tracks the ceiling live, so
+    the only routes here are a race (ceiling lowered in Settings between poll and drag) or a
+    direct API call -- clamped rather than refused, with the applied value returned.
+    """
+    await _settings(db, max_bandwidth_bps=20_000_000)
+    q = _queue_obj(db)
+
+    outcome = await q.set_site_bandwidth(999_000_000, apply_to_running=False)
+
+    assert outcome.effective_bandwidth_bps == 20_000_000
+    after = await load_transfer_settings(db)
+    assert after.throttle_bandwidth_bps == 20_000_000
+    assert after.max_bandwidth_bps == 20_000_000
+
+
+async def test_lowering_the_ceiling_clamps_the_throttle(db):
+    await _settings(db, max_bandwidth_bps=100_000_000)
+    q = _queue_obj(db)
+    await q.set_site_bandwidth(50_000_000, apply_to_running=False)
+
+    settings = await load_transfer_settings(db)
+    await save_transfer_settings(db, replace(settings, max_bandwidth_bps=20_000_000))
+
+    after = await load_transfer_settings(db)
+    assert after.throttle_bandwidth_bps == 20_000_000
+    assert after.effective_bandwidth_bps() == 20_000_000
+
+
+async def test_raising_the_ceiling_again_does_not_raise_the_throttle(db):
+    """The other half of the clamp, and the reason it is applied on *write* rather than only on
+    read: a read-side clamp would leave the old 50 MB/s in the row, and raising the ceiling back
+    would silently restore it. Raising the ceiling raises the ceiling, nothing else.
+    """
+    await _settings(db, max_bandwidth_bps=100_000_000)
+    await _queue_obj(db).set_site_bandwidth(50_000_000, apply_to_running=False)
+
+    settings = await load_transfer_settings(db)
+    await save_transfer_settings(db, replace(settings, max_bandwidth_bps=20_000_000))
+    settings = await load_transfer_settings(db)
+    await save_transfer_settings(db, replace(settings, max_bandwidth_bps=100_000_000))
+
+    after = await load_transfer_settings(db)
+    assert after.throttle_bandwidth_bps == 20_000_000
+    assert after.effective_bandwidth_bps() == 20_000_000
+
+
+async def test_the_scheduler_allocates_against_the_throttle_not_the_ceiling(db):
+    """The whole point of the two-value model. §4.5's worked example ("1 item arrives alone ->
+    admitted at the full B") with a 100 MB/s ceiling throttled to 4 MB/s: `B` is 4 MB/s.
+    """
+    await _settings(
+        db, max_bandwidth_bps=100_000_000, small_lane_reserve_bps=0, max_concurrent_transfers=2
+    )
+    q = _queue_obj(db)
+
+    await q.set_site_bandwidth(4_000_000, apply_to_running=False)
+
+    sched_settings = (await load_transfer_settings(db)).scheduler_settings()
+    decisions = scheduler.admit(
+        sched_settings, [], [scheduler.QueuedJob(id=1, lane="main", queue_position=1.0)]
+    )
+    assert [d.rate_limit_bps for d in decisions] == [4_000_000]
+
+
+async def test_a_start_now_fraction_is_a_fraction_of_the_throttle(db):
+    """Migration 022's fractions are `fraction x site limit` at admission, and the limit in
+    force is the throttle -- 50% of a 100 MB/s ceiling throttled to 10 MB/s is 5 MB/s, not 50.
+    """
+    await _settings(
+        db, max_bandwidth_bps=100_000_000, small_lane_reserve_bps=0, max_concurrent_transfers=2
+    )
+    q = _queue_obj(db)
+    await q.set_site_bandwidth(10_000_000, apply_to_running=False)
+
+    sched_settings = (await load_transfer_settings(db)).scheduler_settings()
+    decisions = scheduler.admit(
+        sched_settings,
+        [],
+        [scheduler.QueuedJob(id=1, lane="main", queue_position=1.0, forced_rate_fraction=0.5)],
+    )
+    assert [d.rate_limit_bps for d in decisions] == [5_000_000]
+
+
+async def test_the_fast_lane_reserve_is_carved_out_of_the_throttle(db):
+    """A derived reserve follows the limit in force, or the reserve-exceeds-ceiling deadlock
+    (§4.5's `B/2` clamp) comes back through the new door: 10% of a 100 MB/s *ceiling* is 10
+    MB/s, which against a 1 MB/s throttle would make headroom negative on every pass and the
+    main lane would admit nothing, ever.
+    """
+    await _settings(db, max_bandwidth_bps=100_000_000, max_concurrent_transfers=2)
+    q = _queue_obj(db)
+
+    await q.set_site_bandwidth(2_000_000, apply_to_running=False)
+
+    settings = await load_transfer_settings(db)
+    assert settings.effective_small_lane_reserve_bps() == 1_000_000
+    decisions = scheduler.admit(
+        settings.scheduler_settings(),
+        [],
+        [scheduler.QueuedJob(id=1, lane="main", queue_position=1.0)],
+    )
+    assert [d.rate_limit_bps for d in decisions] == [1_000_000]
+
+
+# --- the setting write itself ----------------------------------------------------------------
 
 
 async def test_the_slider_leaves_every_other_transfer_setting_alone(db):
-    """One control, one setting (the task's own framing) -- this is the *same* site-wide value
-    Settings -> Transfer owns, so writing it must not read-modify-write the eleven fields the
-    Queue tab never shows.
+    """The slider owns exactly one field. Writing it must not read-modify-write the twelve
+    fields the Queue tab never shows -- the ceiling emphatically included.
     """
     original = await _settings(
         db,
@@ -157,17 +316,17 @@ async def test_the_slider_leaves_every_other_transfer_setting_alone(db):
     await q.set_site_bandwidth(3_000_000, apply_to_running=False)
 
     after = await load_transfer_settings(db)
-    assert after.max_bandwidth_bps == 3_000_000
+    assert after.throttle_bandwidth_bps == 3_000_000
     for field in TransferSettings.__dataclass_fields__:
-        if field == "max_bandwidth_bps":
+        if field == "throttle_bandwidth_bps":
             continue
         assert getattr(after, field) == getattr(original, field), field
 
 
 async def test_the_new_limit_is_what_the_next_admission_computes_from(db):
     """ "Future items only" has to actually mean something -- the scheduler reads the current
-    settings on every pass, so the very next admission uses the new ceiling. §4.5's worked
-    example, with the ceiling moved: one queued item, nothing running, N=2 -> it gets the whole
+    settings on every pass, so the very next admission uses the new limit. §4.5's worked
+    example, with the limit moved: one queued item, nothing running, N=2 -> it gets the whole
     headroom.
     """
     await _settings(
@@ -269,7 +428,7 @@ async def test_apply_to_running_with_nothing_running_interrupts_nothing(db, monk
 
     assert recorder.calls == 0
     assert outcome.interrupted == 0
-    assert (await load_transfer_settings(db)).max_bandwidth_bps == 2_000_000
+    assert (await load_transfer_settings(db)).effective_bandwidth_bps() == 2_000_000
 
 
 async def test_apply_to_running_never_touches_the_pause_state_when_not_paused(db, monkeypatch):
@@ -406,7 +565,7 @@ async def test_apply_to_running_while_paused_still_writes_the_new_limit(db):
 
     await q.set_site_bandwidth(2_000_000, apply_to_running=True)
 
-    assert (await load_transfer_settings(db)).max_bandwidth_bps == 2_000_000
+    assert (await load_transfer_settings(db)).effective_bandwidth_bps() == 2_000_000
 
 
 # --- validation floors ------------------------------------------------------------------------
@@ -419,7 +578,9 @@ async def test_zero_is_rejected_because_it_is_not_unlimited(db):
     with pytest.raises(SiteBandwidthTooLowError):
         await q.set_site_bandwidth(0, apply_to_running=False)
 
-    assert (await load_transfer_settings(db)).max_bandwidth_bps == 10_000_000
+    after = await load_transfer_settings(db)
+    assert after.throttle_bandwidth_bps is None
+    assert after.effective_bandwidth_bps() == 10_000_000
 
 
 async def test_a_negative_limit_is_rejected(db):
@@ -432,7 +593,8 @@ async def test_a_negative_limit_is_rejected(db):
 
 async def test_below_the_min_share_floor_is_rejected(db):
     """Reuses the existing `min_share_floor_bps` as the bound rather than inventing one -- a
-    ceiling under the per-job floor means the very first admission already violates it.
+    limit under the per-job floor means the very first admission already violates it. The floor
+    is the one bound that still *raises*; the ceiling above it clamps instead.
     """
     await _settings(db, max_bandwidth_bps=10_000_000, min_share_floor_bps=500_000)
     q = _queue_obj(db)
@@ -440,7 +602,7 @@ async def test_below_the_min_share_floor_is_rejected(db):
     with pytest.raises(SiteBandwidthTooLowError):
         await q.set_site_bandwidth(499_999, apply_to_running=False)
 
-    assert (await load_transfer_settings(db)).max_bandwidth_bps == 10_000_000
+    assert (await load_transfer_settings(db)).throttle_bandwidth_bps is None
 
 
 async def test_exactly_the_min_share_floor_is_accepted(db):
@@ -449,7 +611,7 @@ async def test_exactly_the_min_share_floor_is_accepted(db):
 
     await q.set_site_bandwidth(500_000, apply_to_running=False)
 
-    assert (await load_transfer_settings(db)).max_bandwidth_bps == 500_000
+    assert (await load_transfer_settings(db)).effective_bandwidth_bps() == 500_000
 
 
 async def test_a_rejected_value_never_stops_anything(db, monkeypatch):
@@ -470,26 +632,27 @@ async def test_a_rejected_value_never_stops_anything(db, monkeypatch):
 
 
 class _FakeRequest:
-    def __init__(self, queue) -> None:
+    def __init__(self, queue, db=None) -> None:
         class _App:
-            def __init__(self, queue) -> None:
+            def __init__(self, queue, db) -> None:
                 class _State:
                     pass
 
                 self.state = _State()
                 self.state.queue = queue
+                self.state.db = db
 
-        self.app = _App(queue)
+        self.app = _App(queue, db)
 
 
 class _RecordingQueue:
     def __init__(self, *, outcome: BandwidthChangeOutcome | None = None, raises=None) -> None:
         self.calls: list[tuple[int, bool]] = []
-        self.outcome = outcome or BandwidthChangeOutcome(max_bandwidth_bps=1)
+        self.outcome = outcome or BandwidthChangeOutcome(effective_bandwidth_bps=1)
         self.raises = raises
 
-    async def set_site_bandwidth(self, max_bandwidth_bps: int, *, apply_to_running: bool):
-        self.calls.append((max_bandwidth_bps, apply_to_running))
+    async def set_site_bandwidth(self, bandwidth_bps: int, *, apply_to_running: bool):
+        self.calls.append((bandwidth_bps, apply_to_running))
         if self.raises is not None:
             raise self.raises
         return self.outcome
@@ -498,7 +661,7 @@ class _RecordingQueue:
 async def test_bandwidth_api_defaults_to_future_items_only():
     fake = _RecordingQueue()
     await jobs.set_queue_bandwidth(
-        QueueBandwidthRequest(max_bandwidth_bps=5_000_000), _FakeRequest(fake)
+        QueueBandwidthRequest(effective_bandwidth_bps=5_000_000), _FakeRequest(fake)
     )
     assert fake.calls == [(5_000_000, False)]
 
@@ -506,7 +669,7 @@ async def test_bandwidth_api_defaults_to_future_items_only():
 async def test_bandwidth_api_passes_apply_to_running_through():
     fake = _RecordingQueue()
     await jobs.set_queue_bandwidth(
-        QueueBandwidthRequest(max_bandwidth_bps=5_000_000, apply_to_running=True),
+        QueueBandwidthRequest(effective_bandwidth_bps=5_000_000, apply_to_running=True),
         _FakeRequest(fake),
     )
     assert fake.calls == [(5_000_000, True)]
@@ -514,23 +677,25 @@ async def test_bandwidth_api_passes_apply_to_running_through():
 
 async def test_bandwidth_api_returns_the_outcome():
     fake = _RecordingQueue(
-        outcome=BandwidthChangeOutcome(max_bandwidth_bps=5_000_000, interrupted=3)
+        outcome=BandwidthChangeOutcome(effective_bandwidth_bps=5_000_000, interrupted=3)
     )
     response = await jobs.set_queue_bandwidth(
-        QueueBandwidthRequest(max_bandwidth_bps=5_000_000, apply_to_running=True),
+        QueueBandwidthRequest(effective_bandwidth_bps=5_000_000, apply_to_running=True),
         _FakeRequest(fake),
     )
-    assert response.max_bandwidth_bps == 5_000_000
+    assert response.effective_bandwidth_bps == 5_000_000
     assert response.interrupted == 3
     assert response.skipped_because_paused is False
 
 
 async def test_bandwidth_api_surfaces_the_paused_skip():
     fake = _RecordingQueue(
-        outcome=BandwidthChangeOutcome(max_bandwidth_bps=5_000_000, skipped_because_paused=True)
+        outcome=BandwidthChangeOutcome(
+            effective_bandwidth_bps=5_000_000, skipped_because_paused=True
+        )
     )
     response = await jobs.set_queue_bandwidth(
-        QueueBandwidthRequest(max_bandwidth_bps=5_000_000, apply_to_running=True),
+        QueueBandwidthRequest(effective_bandwidth_bps=5_000_000, apply_to_running=True),
         _FakeRequest(fake),
     )
     assert response.skipped_because_paused is True
@@ -541,7 +706,7 @@ async def test_bandwidth_api_maps_a_too_low_limit_to_400():
     fake = _RecordingQueue(raises=SiteBandwidthTooLowError("below the floor"))
     with pytest.raises(HTTPException) as exc_info:
         await jobs.set_queue_bandwidth(
-            QueueBandwidthRequest(max_bandwidth_bps=1), _FakeRequest(fake)
+            QueueBandwidthRequest(effective_bandwidth_bps=1), _FakeRequest(fake)
         )
     assert exc_info.value.status_code == 400
     assert "below the floor" in exc_info.value.detail
@@ -552,4 +717,58 @@ def test_bandwidth_request_rejects_a_non_positive_limit():
     handler ever runs. The floor check (which depends on `min_share_floor_bps`) is the queue's.
     """
     with pytest.raises(ValueError):
-        QueueBandwidthRequest(max_bandwidth_bps=0)
+        QueueBandwidthRequest(effective_bandwidth_bps=0)
+
+
+# --- Settings -> Transfer's own PUT, now that it no longer owns the whole number ---------------
+
+
+def _transfer_settings_in(**overrides):
+    from lftpweb.models import TransferSettingsIn
+
+    base = TransferSettings()
+    payload = {f: getattr(base, f) for f in TransferSettingsIn.model_fields}
+    payload.update(overrides)
+    return TransferSettingsIn(**payload)
+
+
+async def test_the_settings_put_carries_the_throttle_forward(db):
+    """Settings -> Transfer has no throttle field and writes the whole object, so rebuilding
+    `TransferSettings` from the body alone would silently clear a throttle set on the Queue tab
+    minutes earlier -- the cross-surface clobber the two-value model exists to avoid.
+    """
+    await _settings(db, max_bandwidth_bps=100_000_000)
+    await _queue_obj(db).set_site_bandwidth(10_000_000, apply_to_running=False)
+
+    out = await jobs.put_transfer_settings(
+        _transfer_settings_in(max_bandwidth_bps=100_000_000, max_concurrent_transfers=4),
+        _FakeRequest(None, db),
+    )
+
+    assert out.effective_bandwidth_bps == 10_000_000
+    after = await load_transfer_settings(db)
+    assert after.throttle_bandwidth_bps == 10_000_000
+    assert after.max_concurrent_transfers == 4
+
+
+async def test_lowering_the_ceiling_through_the_settings_put_clamps_the_throttle(db):
+    await _settings(db, max_bandwidth_bps=100_000_000)
+    await _queue_obj(db).set_site_bandwidth(50_000_000, apply_to_running=False)
+
+    out = await jobs.put_transfer_settings(
+        _transfer_settings_in(max_bandwidth_bps=20_000_000), _FakeRequest(None, db)
+    )
+
+    assert out.max_bandwidth_bps == 20_000_000
+    assert out.effective_bandwidth_bps == 20_000_000, "the response must report the clamp"
+    assert (await load_transfer_settings(db)).throttle_bandwidth_bps == 20_000_000
+
+
+async def test_the_settings_get_reports_the_effective_limit(db):
+    await _settings(db, max_bandwidth_bps=100_000_000)
+    await _queue_obj(db).set_site_bandwidth(10_000_000, apply_to_running=False)
+
+    out = await jobs.get_transfer_settings(_FakeRequest(None, db))
+
+    assert out.max_bandwidth_bps == 100_000_000
+    assert out.effective_bandwidth_bps == 10_000_000

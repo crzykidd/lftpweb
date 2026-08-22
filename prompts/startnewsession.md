@@ -139,6 +139,16 @@ six tasks — so a SAB adapter is now an *enrichment of a working box*, not a ne
 
 ### On `dev` since the release (8 commits)
 
+**Bandwidth became two values, and the slider commits itself** (findings 1 and 4 of
+`prompts/test-findings-2026-08-21.md`, `prompts/done/2026-08-21-bandwidth-ceiling-and-autocommit.md`)
+— Settings → Transfer owns the ceiling, the Queue slider owns a persisted throttle within it
+(`TransferSettings.throttle_bandwidth_bps`, no migration), and `effective_bandwidth_bps()` is what
+the scheduler, the fast-lane reserve and Start-now fractions all use; the Apply buttons and the
+amber confirm dialog are gone, replaced by an "Apply to new items only" checkbox (checked) and a
+5-second visible countdown. **This reverses the previous day's "one control, one setting"**
+(`docs/decisions.md` has why: capping a slider at the value it edits is a ratchet). 1675 backend /
+663 frontend, 0 skipped. Browser-unverified.
+
 **Active/pending row sort changed to running → queued → still-processing** (`6822138`, changelog
 `2c97582`). A pipeline-in-flight row is lftpweb *waiting on someone else*; `queued` is its own
 next work. **The tradeoff this accepts is written down in three places** (the `sortTransferRows`

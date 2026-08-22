@@ -823,16 +823,24 @@ export function TransfersPage() {
   // Settings -> Transfer, polled (2026-08-19,
   // prompts/done/2026-08-19-start-now-bandwidth-fractions.md, for the "Start now" menu's
   // fraction options; **polled rather than fetched once** as of 2026-08-21,
-  // prompts/done/2026-08-21-bandwidth-from-the-queue-page.md, because the bandwidth slider below
-  // now *edits* `max_bandwidth_bps` and the two surfaces -- here and Settings -> Transfer -- have
-  // to reflect each other without a reload). Same independent-poll pattern as `health` below;
+  // prompts/done/2026-08-21-bandwidth-from-the-queue-page.md, because of the bandwidth slider
+  // below. What that poll is *for* changed with the two-value model
+  // (prompts/done/2026-08-21-bandwidth-ceiling-and-autocommit.md): the two surfaces no longer
+  // show the same number, so this is no longer "keep them in sync" -- it is how the slider's
+  // **maximum tracks the ceiling live**, so lowering the ceiling in Settings -> Transfer
+  // shortens this slider's track without a reload). Same independent-poll pattern as `health` below;
   // one cheap settings read every 5s alongside the 2s `GET /api/jobs` this page already makes.
   // `undefined` until the first response lands: every "Start now" fraction reads disabled in the
   // meantime, same as "not configured" (`StartNowMenu`'s own fallback), and the slider renders
   // disabled.
   const transferSettingsFetcher = useCallback(getTransferSettings, [])
   const transferSettings = usePoll(transferSettingsFetcher, 5000)
-  const maxBandwidthBps = transferSettings?.max_bandwidth_bps
+  // **The limit in force, not the ceiling** (2026-08-21,
+  // prompts/done/2026-08-21-bandwidth-ceiling-and-autocommit.md): a "Start now" fraction is
+  // computed at admission as `fraction x B`, and `B` is the effective limit, so the menu that
+  // offers those fractions has to ask about the same number the arithmetic will use -- otherwise
+  // it would offer "25%" of a ceiling nothing is running at.
+  const maxBandwidthBps = transferSettings?.effective_bandwidth_bps
   // Pause (2026-08-20, prompts/2026-08-20-queue-pause.md): `/api/health`'s `queue_paused` is
   // the one source of truth for whether the queue is currently paused -- polled independently
   // here, same "a second, independent one-shot/polled `getHealth()` call" pattern
@@ -1283,13 +1291,14 @@ export function TransfersPage() {
       </div>
 
       {/* The site bandwidth slider (2026-08-21,
-       * prompts/done/2026-08-21-bandwidth-from-the-queue-page.md) -- directly under Pause,
+       * prompts/done/2026-08-21-bandwidth-from-the-queue-page.md, reshaped the same day by
+       * prompts/done/2026-08-21-bandwidth-ceiling-and-autocommit.md) -- directly under Pause,
        * because the two are the same kind of control: page-level knobs on *admission*, not
-       * per-row actions. It edits the one site-wide `max_bandwidth_bps` Settings -> Transfer
-       * also owns (DESIGN.md §4.5), never a per-queue limit, and offers the two genuinely
-       * different applications of a change: future items only (nothing is interrupted, the
-       * §4.5 invariant untouched) or also in-progress (every running transfer is stopped and
-       * re-admitted at the new rate, confirmed first because it is a real interruption). */}
+       * per-row actions. It throttles site-wide *within* the `max_bandwidth_bps` ceiling
+       * Settings -> Transfer owns (DESIGN.md §4.5), never a per-queue limit, and commits itself
+       * five visible seconds after the last change; the "Apply to new items only" checkbox
+       * (checked by default) is what chooses between leaving running transfers alone -- the §4.5
+       * invariant untouched -- and stopping and re-admitting every one of them at the new rate. */}
       <BandwidthControl
         settings={transferSettings}
         runningCount={runningCount}

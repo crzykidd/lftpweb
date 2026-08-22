@@ -812,11 +812,17 @@ export interface QueueItemRequest {
 
 // --- Settings -> Transfer (phase 3a API, DESIGN.md §4.5/§9.2/§9.3) -----------------------
 //
-// Mirrors `core/queue.py.TransferSettings` exactly -- twelve fields, one site-wide set
-// (DESIGN.md §4.5: "a queue governs what and where, never how fast"). Bandwidth/size fields
-// are `_bps`/`_bytes` on the wire; TransferTab.tsx converts to/from MB(/s) at the edge, this
-// type stays in the backend's native units so a round-trip through the API never drifts.
-export interface TransferSettingsOut {
+// Mirrors `core/queue.py.TransferSettings` -- twelve editable fields, one site-wide set
+// (DESIGN.md §4.5: "a queue governs what and where, never how fast"), plus one read-only
+// derived number (below). Bandwidth/size fields are `_bps`/`_bytes` on the wire; TransferTab.tsx
+// converts to/from MB(/s) at the edge, this type stays in the backend's native units so a
+// round-trip through the API never drifts.
+export interface TransferSettingsIn {
+  /** The **ceiling** -- Settings → Transfer's own field, and since 2026-08-21
+   * (`prompts/done/2026-08-21-bandwidth-ceiling-and-autocommit.md`) no longer the number the
+   * Queue tab's slider writes: that slider owns a *throttle* within this ceiling, and the limit
+   * actually in force is `effective_bandwidth_bps` on `TransferSettingsOut` below.
+   */
   max_bandwidth_bps: number
   max_concurrent_transfers: number
   small_item_threshold_bytes: number
@@ -834,18 +840,31 @@ export interface TransferSettingsOut {
   extra_lftp_settings: string
 }
 
-export type TransferSettingsIn = TransferSettingsOut
+/** ...plus the one read-only number the two-value bandwidth model adds. **The limit actually in
+ * force** -- the Queue-tab throttle when one is set, `max_bandwidth_bps` otherwise -- and what
+ * the scheduler allocates against, so it is what the slider displays and what a "Start now"
+ * fraction is a fraction of. Never sent back on a PUT: the throttle is
+ * `POST /api/queue/bandwidth`'s to write, and including it here would let a stale Settings form
+ * silently undo a throttle set on another page. "Is a throttle in force?" reads as
+ * `effective_bandwidth_bps < max_bandwidth_bps`.
+ */
+export interface TransferSettingsOut extends TransferSettingsIn {
+  effective_bandwidth_bps: number
+}
 
 /** `POST /api/queue/bandwidth`'s response (2026-08-21,
  * `prompts/done/2026-08-21-bandwidth-from-the-queue-page.md`) -- what the Queue tab's bandwidth
- * slider actually did. `interrupted` is how many running transfers were stopped and re-queued so
- * the scheduler could re-admit them against the new ceiling (`0` for a future-items-only change,
- * and for an apply-to-in-progress with nothing running); `skipped_because_paused` marks the case
- * where the number was written but the queue's pause -- including a timed pause's deadline -- was
- * deliberately left untouched.
+ * slider actually did. `effective_bandwidth_bps` is the throttle **as applied**, which is not
+ * always what was asked for: a value above the ceiling is clamped to it rather than refused, so
+ * the banner and the optimistic echo both read this rather than the requested number.
+ * `interrupted` is how many running transfers were stopped and re-queued so the scheduler could
+ * re-admit them against the new limit (`0` for a new-items-only change, and for an
+ * apply-to-in-progress with nothing running); `skipped_because_paused` marks the case where the
+ * number was written but the queue's pause -- including a timed pause's deadline -- was
+ * deliberately left untouched, and the banner must then say nothing was restarted.
  */
 export interface QueueBandwidthResponse {
-  max_bandwidth_bps: number
+  effective_bandwidth_bps: number
   interrupted: number
   skipped_because_paused: boolean
 }

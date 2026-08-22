@@ -6,6 +6,72 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-21 — bandwidth is two values: reversing "one control, one setting" one day later
+
+`prompts/done/2026-08-21-bandwidth-ceiling-and-autocommit.md`, reversing
+`prompts/done/2026-08-21-bandwidth-from-the-queue-page.md`'s central decision after the user
+browser-tested it (`prompts/test-findings-2026-08-21.md`, findings 1 and 4).
+
+**The reversed decision.** The Queue-tab slider shipped as "a second surface onto one setting":
+it and Settings → Transfer edited the same `max_bandwidth_bps`. That was deliberate and written
+down. The user's first reaction on using it was *"the max on this should never exceed the max set
+in transfer settings. That is the max."*
+
+**Why the obvious fix is impossible, which is the whole reason this needed a data-model change
+rather than a bounds tweak.** Capping the slider at the value the slider itself edits is
+circular: drag to 10 MB/s and the ceiling becomes 10 MB/s, so the slider can never be dragged
+back up. **A ratchet, one-way, unrecoverable from that page.** The user's own test expectation —
+*"if I drag to 10mb then it stays till I move back to max"* — is unsatisfiable under one value,
+because there is no "max" left to move back to. So: a **ceiling** (`max_bandwidth_bps`, Settings
+→ Transfer) and a **throttle** (`throttle_bandwidth_bps`, the slider), with
+`effective_bandwidth_bps()` = the throttle if set, else the ceiling.
+
+**No migration.** `TransferSettings` is a dataclass serialized as JSON into a `setting` row, and
+`load_transfer_settings` takes only the keys present, so a row written by any earlier build
+deserializes with `throttle_bandwidth_bps=None` — which reads as "no throttle, run at the
+ceiling," i.e. byte-for-byte the old behaviour. A migration would have had nothing to do.
+
+**The clamp is applied on write, not on read.** `save_transfer_settings` runs
+`clamp_throttle_to_ceiling` on every write. A read-side clamp alone would satisfy "lowering the
+ceiling clamps the throttle" while silently failing its partner rule: the old, higher throttle
+would still be sitting in the row, so raising the ceiling again would *restore* it. Both rules
+have to hold, so the clamp has to be a fact in the row.
+
+**The fast-lane reserve had to follow the effective limit, not the ceiling** — this was the one
+non-obvious consequence. §4.5's reserve is "10% of B, min 1 MB/s, capped at B/2", and the B/2 cap
+exists because an unconditional 1 MB/s floor against a small B produces `headroom <= 0` and a main
+lane that admits nothing, ever, with no error and no log line. Deriving the reserve from the
+*ceiling* while the scheduler allocates against a lower *throttle* recreates exactly that
+deadlock through the new door (a 100 MB/s ceiling throttled to 1 MB/s reserves 10 MB/s against a
+1 MB/s budget). The alternative considered and rejected — bounding the throttle below at twice
+the ceiling-derived reserve — would forbid throttling a gigabit ceiling below 25 MB/s, which is
+precisely the thing the slider exists to do.
+
+**Over-ceiling requests are clamped, not refused.** The slider's maximum tracks the ceiling live
+(the Transfers page already polls the settings every 5s), so the only routes to an over-ceiling
+request are a race — the ceiling was lowered in Settings between that poll and the drag — or a
+direct API call. Erroring on the race shows the user a failure for a bound they cannot see;
+clamping and returning the applied value keeps the banner honest. Below `min_share_floor` stays a
+hard 400: that is a value the scheduler genuinely cannot work with.
+
+**The confirmation dialog was deleted on purpose, and the user was asked first.** The unchecked
+"also restart running transfers" path is the one visibly destructive control on the page, and it
+previously confirmed before acting. Finding 4 flagged that tension rather than resolving it; the
+user accepted the recommendation — **default the checkbox to checked, and treat a deliberate
+uncheck as the act of consent** — plus a *post-action* banner reporting what actually happened.
+The banner therefore has to be exactly honest about the paused case, where the backend
+deliberately skips re-admission and returns `skipped_because_paused`: claiming a restart that did
+not happen would be strictly worse than the dialog that was removed.
+
+**Five seconds is long for a debounce, and that is why it is counted down on screen.** A silent
+five-second wait reads as broken; a visible countdown reads as deliberate, and doubles as the
+cancel affordance (keep dragging, or drag back to the original value, and nothing commits) — which
+is what let the Cancel button go too, the click this finding existed to remove. The commit is a
+deadline compared against `Date.now()` rather than a `setTimeout`, the same reasoning
+`QueuePauseState.paused_until` uses: a slow tick or a backgrounded tab can delay it, never lose it.
+
+---
+
 ## 2026-08-21 — *arr poll cadence (issue #16): why the split was rejected, existing installs,
 ## and leaving `PREFLIGHT_HOLD_S` alone
 

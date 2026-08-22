@@ -809,6 +809,41 @@ The one user-facing consequence — "I lowered the site limit, why is my transfe
 the old speed?" — is answered by "Changing the site limit while transfers are running," below.
 That path does **not** weaken this invariant; it re-admits.
 
+#### The ceiling and the throttle
+
+**Bandwidth is two stored values, not one** (2026-08-21,
+`prompts/done/2026-08-21-bandwidth-ceiling-and-autocommit.md`):
+
+- **`max_bandwidth` — the ceiling.** Settings → Transfer owns it. Its meaning is exactly what
+  this section's table below has always said.
+- **`throttle_bandwidth` — the throttle.** The Queue tab's slider owns it, bounded to
+  `[min_share_floor, max_bandwidth]`. Unset (the default, and what every settings row written
+  before this date deserializes to) means "no throttle, run at the ceiling."
+
+**`B`, everywhere below, is the *effective* limit** — `TransferSettings.effective_bandwidth_bps`:
+the throttle when one is set, the ceiling otherwise. That is what `admit()` divides up, what the
+fast-lane reserve is carved out of, and what a "Start now" fraction is a fraction of. With no
+throttle the two are identical, so **every worked example in this section holds byte-for-byte**,
+and no migration was needed to introduce the second value (`TransferSettings` is JSON in a
+`setting` row; an absent key reads as the field's default).
+
+`core/scheduler.py` never learned about any of this. It still takes one bandwidth number;
+`TransferSettings.scheduler_settings()` feeds it the effective one at the call site.
+
+**Why two, when this was deliberately one value edited by two surfaces a day earlier?** Because
+"the slider must not exceed the Settings → Transfer maximum" is unstateable with one value:
+capping a slider at the number the slider itself edits is a **ratchet** — lower it once and the
+ceiling comes down with it, so it can never be raised back from the Queue page. See
+`docs/decisions.md` for the reversal in full.
+
+**Two rules follow from the bound, and both are enforced on write, not merely on read:**
+
+- **Lowering the ceiling clamps the throttle** — permanently. `save_transfer_settings` applies
+  `clamp_throttle_to_ceiling` on every write, so a clamp is a fact in the row rather than a
+  read-time correction that could be undone later.
+- **Raising the ceiling raises only the ceiling.** A read-side clamp alone would leave the old,
+  higher throttle in the row, and raising the ceiling again would silently restore it.
+
 #### Site-level settings
 
 One container serves one site (one seedbox), so these are global to the instance — **not**
@@ -816,7 +851,9 @@ per-queue. A queue governs *what* and *where*, never *how fast*.
 
 | Setting | Meaning | Default |
 |---|---|---|
-| `max_bandwidth` (B) | ceiling across everything | — |
+| `max_bandwidth` | the ceiling (Settings → Transfer) | — |
+| `throttle_bandwidth` | the Queue-tab throttle within it; unset = follow the ceiling | unset |
+| **B** (`effective_bandwidth`) | **the limit in force** — the throttle if set, else the ceiling | — |
 | `max_concurrent_transfers` (N) | main-lane slots | — |
 | `small_item_threshold` | fast-lane cutoff, by item's total remote size | 10 MB |
 | `small_lane_concurrency` | fast-lane slots | 2 |
@@ -921,6 +958,13 @@ headroom-is-zero to move a file it could have finished, alongside, in under a se
 The reserve is carved off B rather than left unmetered, so the total stays bounded by B. The
 cost is that the slice sits idle when no small items are running.
 
+**B here is the effective limit, throttle included** ("The ceiling and the throttle", above).
+Deriving the reserve from the ceiling while the scheduler allocates against a lower throttle
+would resurrect the deadlock below through a new door: a 100 MB/s ceiling throttled to 1 MB/s
+would reserve 10 MB/s against a 1 MB/s budget, and the main lane would admit nothing, ever. The
+alternative — bounding the throttle below at twice the ceiling-derived reserve — would forbid
+throttling a gigabit ceiling below 25 MB/s, which is exactly what the slider exists to do.
+
 **The `B/2` cap on the reserve is load-bearing, not defensive.** The "min 1 MB/s" floor is
 unconditional, so without the cap any ceiling at or below 1 MB/s yields a reserve ≥ B, hence
 `headroom ≤ 0`, hence the main lane admits nothing — **ever**. Jobs queue and sit there with no
@@ -942,14 +986,19 @@ work rather than by throttling what is running.
 
 **A menu, not a single button** (2026-08-19, deliberate design extension,
 prompts/done/2026-08-19-start-now-bandwidth-fractions.md): **10% / 25% / 50% / 75% / Max** of the
-site's `max_bandwidth` (this section's own table, above). The chosen fraction is computed once,
-at admission — `fraction × B`, rounded to the nearest whole byte/sec — and held for the job's
-lifetime exactly like any other allocation; the invariant above is untouched. Max
-(`fraction = 1.0`) is byte-for-byte the original "Start now at max bandwidth" behavior this menu
-replaces: same value, same code path. **No site limit configured (`max_bandwidth <= 0`) makes a
-percentage meaningless** — the four fraction options are disabled in the UI with a hint, and the
-API refuses a fraction request outright (409) rather than silently substituting Max; Max itself
-is exempt from this check and always works, reusing whatever `max_bandwidth` already is.
+site's limit. The chosen fraction is computed once, at admission — `fraction × B`, rounded to the
+nearest whole byte/sec — and held for the job's lifetime exactly like any other allocation; the
+invariant above is untouched. Max (`fraction = 1.0`) is byte-for-byte the original "Start now at
+max bandwidth" behavior this menu replaces: same value, same code path.
+
+**`B` is the *effective* limit** (2026-08-21, "The ceiling and the throttle", above), not the
+ceiling: 50% of a 100 MB/s ceiling throttled to 10 MB/s is **5 MB/s**. The fraction is defined as
+a share of the limit actually in force, so it must be computed against the same number `admit()`
+is dividing up — anything else would let one item oversubscribe past the throttle by a factor of
+ten while claiming to be taking half. **No site limit configured (`B <= 0`) makes a percentage
+meaningless** — the four fraction options are disabled in the UI with a hint, and the API refuses
+a fraction request outright (409) rather than silently substituting Max; Max itself is exempt
+from this check and always works, reusing whatever `B` already is.
 
 #### Pausing admission
 
@@ -1034,23 +1083,58 @@ set, not a bare "paused" indistinguishable from an indefinite one.
 #### Changing the site limit while transfers are running
 
 The Queue tab carries a **bandwidth slider** (2026-08-21,
-`prompts/done/2026-08-21-bandwidth-from-the-queue-page.md`) alongside the Pause control. It edits
-the **same site-wide `max_bandwidth` this section's own table defines** — the value Settings →
-Transfer owns — through `POST /api/queue/bandwidth`. It is a *second surface onto one setting*,
-never a per-queue limit; the "one site, one set of transfer knobs" rule above is untouched. The
-two surfaces reflect each other because the Transfers page polls `GET /api/settings/transfer`
-alongside health, and Settings → Transfer re-reads it on mount. (Settings → Transfer's own PUT
-still writes the whole twelve-field object, so a stale Settings form saved afterwards can
-overwrite a slider change — ordinary last-write-wins, unchanged by this feature.)
+`prompts/done/2026-08-21-bandwidth-from-the-queue-page.md`) alongside the Pause control. It writes
+the **throttle** ("The ceiling and the throttle", above) through `POST /api/queue/bandwidth` —
+still site-wide, never a per-queue limit; the "one site, one set of transfer knobs" rule above is
+untouched.
 
-Two applications of a change, offered explicitly:
+**The two surfaces are no longer the same number, and no longer need to reflect each other.**
+Settings → Transfer edits the ceiling; this slider throttles within it. What the Transfers page's
+5-second `GET /api/settings/transfer` poll now buys is that **the slider's maximum tracks the
+ceiling live** — lower the ceiling in Settings and this slider's track shortens without a reload,
+its handle clamped down with it. Settings → Transfer's own PUT still writes the whole
+twelve-field object, but the throttle is deliberately **not** one of those fields: the handler
+carries the stored throttle forward across the write, so a stale Settings form can no longer
+clobber a slider change (it can still overwrite the other eleven — ordinary last-write-wins,
+unchanged).
 
-- **Future items only** (the default). The setting is written; nothing is interrupted. Running
-  jobs keep the allocation they were admitted with — the invariant above, exactly as before. The
-  next admission uses the new ceiling.
-- **Also apply to in-progress.** The setting is written, then every in-flight lftp child is
-  **stopped and re-queued in place**, and admission is woken so the scheduler re-admits each one
-  against the new ceiling.
+**The throttle is a stored setting, not session state** (user-confirmed: *"if I drag to 10mb then
+it stays till I move back to max"*). Nothing resets it — not a restart, not an empty queue, not
+unpausing. The ceiling is what it can always be dragged back up to.
+
+**It commits itself, five visible seconds after the last change** (2026-08-21,
+`prompts/done/2026-08-21-bandwidth-ceiling-and-autocommit.md`). There is no Apply button, no
+Cancel, and no confirmation dialog — the previous shape was four interactions to change a number.
+Moving the slider again re-arms the countdown, so dragging back to where you started cancels for
+free; a banner counts the seconds down in place and then becomes the result line, never a second
+banner stacked under the first. The commit is a **deadline compared against the clock**, not a
+running timer, the same reasoning `paused_until` uses: a slow tick can delay it, never lose it.
+
+Two applications of a change, chosen by a checkbox beside the slider — **"Apply to new items
+only", checked by default**:
+
+- **Checked** (the default). The throttle is written; nothing is interrupted. Running jobs keep
+  the allocation they were admitted with — the invariant above, exactly as before. The next
+  admission uses the new limit.
+- **Unchecked.** The throttle is written, then every in-flight lftp child is **stopped and
+  re-queued in place**, and admission is woken so the scheduler re-admits each one against the new
+  limit.
+
+**The checkbox is the consent, and the banner is the report.** The unchecked path interrupts every
+running transfer, and it used to ask before acting; that confirmation is gone deliberately (user
+decision, 2026-08-21) on the reasoning that *a deliberate uncheck is a better guard than a dialog
+on every drag*. What replaced it is an honest after-the-fact statement built from the API's own
+response — "Bandwidth set to 10 MB/s — 3 running transfers restarted", the real count, never a
+generic phrase. **The paused case is the one that must not be got wrong**: the backend skips
+re-admission while paused (below) and says so with `skipped_because_paused`, and the banner then
+states that nothing was restarted. Reporting a restart that did not happen would be worse than
+the dialog that was removed.
+
+**A value above the ceiling is clamped, not refused.** The slider's own maximum tracks the
+ceiling, so the only routes to an over-ceiling request are a race (the ceiling was lowered in
+Settings between this page's last poll and the drag) or a direct API call. The response carries
+the value actually applied, which is what the banner announces. Below `min_share_floor` is still
+a hard 400 — that is a limit the scheduler cannot work with at all, not a stale bound.
 
 **Re-admission is the invariant being obeyed, not an exception to it.** There is no in-place
 retune and no control channel: the job stops being a running job, becomes a queued one again —
@@ -1065,7 +1149,7 @@ SIGTERM'd exit is never run through failure classification, so no `FAILED` row a
 wrong here); and the transfer resumes from its partial bytes rather than re-fetching. It does
 **not** reuse `pause()`/`unpause()` themselves — see below.
 
-**A paused queue is left completely alone.** With "apply to in-progress" on a paused queue, the
+**A paused queue is left completely alone.** With the checkbox unchecked on a paused queue, the
 setting is written and *nothing else happens*: no child is stopped, and the persisted pause
 state — including a timed pause's `paused_until` deadline ("Pausing for a fixed duration," above)
 — is not read, written, or cleared. Two independent reasons, either sufficient:
@@ -1089,17 +1173,18 @@ persisted, and it keeps "the user paused the queue" and "the scheduler is briefl
 disjoint concepts. `_admit()` short-circuits on it the same caller-side way it does for pause.
 
 **Interaction with "Start now" fractions.** A job already running at a forced fraction that is
-re-admitted recomputes `fraction × B` against the **new** `max_bandwidth`. That is correct and
-intended: the fraction is defined as a share of the site limit, so a job asked for "50% of the
-site limit" should follow the site limit when it moves.
+re-admitted recomputes `fraction × B` against the **new** effective limit. That is correct and
+intended: the fraction is defined as a share of the limit in force, so a job asked for "50%"
+should follow that limit when it moves.
 
 **Bounds.** The slider refuses two values rather than writing them and leaving a queue that
 silently does nothing: `<= 0` (**zero is not "unlimited"** — it makes `headroom <= 0` on every
 pass, so the main lane admits nothing, ever, the same silent-deadlock shape the `B/2` reserve cap
-above exists to prevent) and anything below `min_share_floor` (the ceiling would sit under the
+above exists to prevent) and anything below `min_share_floor` (the throttle would sit under the
 per-job floor the same settings declare). The existing `min_share_floor` is reused as the bound
-rather than inventing a new one. Settings → Transfer's own numeric field stays unvalidated on
-purpose — it is the expert surface, and can still express a deliberately odd configuration.
+rather than inventing a new one; the upper bound is the ceiling, and is clamped rather than
+refused (above). Settings → Transfer's own numeric field stays unvalidated on purpose — it is the
+expert surface, and can still express a deliberately odd configuration.
 
 #### Residual inefficiency, stated plainly
 
