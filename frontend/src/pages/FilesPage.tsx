@@ -1,9 +1,10 @@
-import { useEffect, useRef, useState } from 'react'
-import { listArrInstances, listQueues, rescanFiles } from '../api/client'
+import { useEffect, useState } from 'react'
+import { listArrInstances, listQueues } from '../api/client'
 import type { ArrInstanceOut, PathQueueOut } from '../api/types'
 import { FileTree } from '../components/FileTree'
 import { QueueResetControls } from '../components/QueueResetControls'
 import { useLiveModel } from '../hooks/useLiveModel'
+import { useRescan } from '../hooks/useRescan'
 import { formatRelativeTime } from '../lib/format'
 
 /** DESIGN.md §9.2 Files page. Live updates over the one WebSocket (§9, DESIGN.md's delta
@@ -20,7 +21,7 @@ const EMPTY_SELECTION: Set<string> = new Set()
 
 export function FilesPage() {
   const { queues, state, scanCompleteSeq, speedByItemId, etaByItemId, childSpeedByItemId } = useLiveModel()
-  const [rescanning, setRescanning] = useState(false)
+  const { rescanning, triggerRescan } = useRescan(scanCompleteSeq)
 
   // The Files-page multi-select, lifted here from `FileTree.tsx` (2026-08-14,
   // prompts/2026-08-14-reset-panel-counts-and-layout.md) so `FileTree`'s own selection and
@@ -74,41 +75,6 @@ export function FilesPage() {
         // resolved, same shape as `queueConfigs`'s own failure.
       })
   }, [])
-  // The sequence value seen right before this rescan was requested -- `POST
-  // /api/files/rescan` (`api/files.py`) only sets the engine's wake event and returns 202
-  // immediately, so completion can only be observed on the wire, not from the response. A
-  // bare `setTimeout(…, 1000)` used to fake it, which was simply wrong on any tree that took
-  // longer than a second and stayed "Rescanning…" for exactly 1s even when a scan failed
-  // outright. See docs/decisions.md for why this is a WebSocket message rather than a
-  // blocking endpoint.
-  const rescanBaselineSeq = useRef<number | null>(null)
-
-  const handleRescan = async () => {
-    rescanBaselineSeq.current = scanCompleteSeq
-    setRescanning(true)
-    try {
-      await rescanFiles()
-    } catch {
-      // The request itself failed (network/HTTP) -- there will be no `scan_complete` to
-      // clear this, since the engine's wake event was never even set.
-      setRescanning(false)
-      rescanBaselineSeq.current = null
-    }
-  }
-
-  // Clears on the first `scan_complete` (any queue) whose sequence number moved past the
-  // baseline captured above -- not a timer. Every enabled queue gets its own scan_complete
-  // per pass (`core/engine.py.scan_all` iterates them in sequence), so on a multi-queue
-  // install this clears on the first queue to finish rather than waiting for all of them;
-  // DESIGN.md's rescan button is instance-wide, not per-queue, and there is no request id in
-  // the wire protocol to correlate a specific rescan to a specific completion.
-  useEffect(() => {
-    if (rescanning && rescanBaselineSeq.current !== null && scanCompleteSeq !== rescanBaselineSeq.current) {
-      setRescanning(false)
-      rescanBaselineSeq.current = null
-    }
-  }, [scanCompleteSeq, rescanning])
-
   return (
     <div className="flex flex-col gap-4">
       <div className="flex items-center justify-between">
@@ -119,7 +85,7 @@ export function FilesPage() {
         </div>
         <button
           type="button"
-          onClick={handleRescan}
+          onClick={triggerRescan}
           disabled={rescanning}
           className="rounded-md border border-zinc-300 px-3 py-1.5 text-sm font-medium text-zinc-700 hover:bg-zinc-50 disabled:opacity-50 dark:border-zinc-700 dark:text-zinc-200 dark:hover:bg-zinc-900"
         >

@@ -65,6 +65,14 @@ Skeleton for the next roll:
   genuinely idle day is never confused with a mostly-down one. Rollup always runs before the raw
   tables are pruned, in the same cycle — the only part of this feature that could otherwise lose
   data — and backfills automatically on first run after upgrading into it.
+- **"Rescan now" on the Queue tab** — v0.3.0 made Queue the default landing page, but triggering a
+  scan still meant switching to Files. The button lives with the other page-level controls at the
+  top (below Pause/Bandwidth, in its own row), rescans every queue exactly like the Files tab's
+  button (there is no per-queue choice — admission is global, so the Queue tab has no per-queue
+  structure to hang one off), and shares the same `useRescan` hook and `POST /api/files/rescan`
+  endpoint rather than a second implementation. No "scanned Xs ago" reading here: the Queue tab's
+  list is single and ungrouped, so there's no one queue's timestamp that would honestly stand in
+  for all of them the way the Files page's per-section reading does.
 
 ### Changed
 

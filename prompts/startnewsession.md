@@ -137,7 +137,7 @@ only in a session transcript.
 proves the pending-row concept against a real feed, and its source-agnostic boundary held through
 six tasks — so a SAB adapter is now an *enrichment of a working box*, not a new foundation.
 
-### On `dev` since the release (6 commits)
+### On `dev` since the release (7 commits)
 
 **Active/pending row sort changed to running → queued → still-processing** (`6822138`, changelog
 `2c97582`). A pipeline-in-flight row is lftpweb *waiting on someone else*; `queued` is its own
@@ -189,6 +189,16 @@ one part of this feature that could otherwise lose data, pinned by its own order
 a new "total downloaded" readout and 90d/1y bytes-chart ranges on the Dashboard, with a distinct
 marker for a day the app was only partly running. Raw retention default raised 7 → 30 days so
 the existing 30d range works out of the box. 1654 backend / 649 frontend tests, 0 skipped.
+**Browser-unverified.**
+
+**Queue tab gained "Rescan now"** (issue #19, first half; `prompts/done/2026-08-21-queue-tab-
+rescan-button.md`) — top of the tab, its own row below Pause/`BandwidthControl`, rescanning every
+queue exactly like the Files tab's button (no per-queue choice — admission is global). The
+baseline-sequence logic (`POST /api/files/rescan` returns 202 immediately; completion is only
+observable via `useLiveModel`'s `scanCompleteSeq`) moved out of `FilesPage.tsx` into a shared
+`hooks/useRescan.ts`, used by both pages now — no backend change. No "scanned Xs ago" reading on
+the Queue tab: its list is single and ungrouped, so no one queue's timestamp would honestly stand
+in for all of them (see `docs/decisions.md`). 1654 backend / 654 frontend tests, 0 skipped.
 **Browser-unverified.**
 
 ### 🚦 2026-08-20/21 — queue **Pause**, the **Preflight** box, and the docs catch-up (all in v0.3.0)

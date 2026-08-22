@@ -34,6 +34,7 @@ import type { ChildSpeedSample } from '../hooks/useLiveModel'
 import { useLiveModel } from '../hooks/useLiveModel'
 import { usePoll } from '../hooks/usePoll'
 import { usePreflight } from '../hooks/usePreflight'
+import { useRescan } from '../hooks/useRescan'
 import { arrHoverLabel, childDisplayState, nodeDisplaySize, stateProgressPercent } from '../lib/fileTree'
 import { childSpeedLabel, formatBytes, formatRelativeTimeIntl, pauseResumeLabel } from '../lib/format'
 import {
@@ -805,7 +806,11 @@ export function TransfersPage() {
   // more field off its return value. Not a second WebSocket: `useLiveModel` opens one connection
   // per call, and this page already has exactly one call, so widening what it reads costs nothing
   // in request volume no matter how many rows a user expands.
-  const { queues, progressByJobId, childSpeedByItemId } = useLiveModel()
+  // `scanCompleteSeq` (2026-08-21, prompts/2026-08-21-queue-tab-rescan-button.md) feeds this
+  // page's own "Rescan now" button below -- same `useLiveModel()` call as `queues`/
+  // `progressByJobId` above, not a second subscription.
+  const { queues, progressByJobId, childSpeedByItemId, scanCompleteSeq } = useLiveModel()
+  const { rescanning, triggerRescan } = useRescan(scanCompleteSeq)
   // The Preflight box (docs/transfers-redesign-spec.md §4, prefigured; this task's own handoff
   // prompt, prompts/done/2026-08-20-preflight-box.md) -- its own poll, independent of `useJobs`'s
   // 2s cadence, since its data changes far more slowly (`hooks/usePreflight.ts`'s own comment).
@@ -1290,6 +1295,30 @@ export function TransfersPage() {
         runningCount={runningCount}
         queuePaused={health?.queue_paused ?? false}
       />
+
+      {/* Rescan now (2026-08-21, prompts/2026-08-21-queue-tab-rescan-button.md) -- the Files tab
+       * has had this since early on; the Queue tab had no way to make lftpweb look at the
+       * seedbox without switching tabs, which stopped making sense once Queue became the
+       * default landing page (v0.3.0). Grouped with Pause/Bandwidth above as a page-level
+       * control (it acts on every queue, not one box's rows) but kept in its own row rather than
+       * folded into either: those two are admission knobs (BandwidthControl's own comment), this
+       * is a scan trigger -- a different kind of "whole instance" action. Shares
+       * `hooks/useRescan.ts` with `FilesPage.tsx` rather than a second copy of the
+       * baseline-sequence dance; see that hook's own docstring for why this can't be a
+       * `setTimeout` or a blocking endpoint. No "scanned Xs ago" reading here -- the Files tab
+       * shows that per queue section, but the Queue tab's list is single, globally-ordered, and
+       * ungrouped (v0.3.0 dropped grouping because admission is global), so there is no one
+       * queue's timestamp that would honestly stand in for all of them. */}
+      <div>
+        <button
+          type="button"
+          onClick={triggerRescan}
+          disabled={rescanning}
+          className="rounded-md border border-zinc-300 px-3 py-1.5 text-sm font-medium text-zinc-700 hover:bg-zinc-50 disabled:opacity-50 dark:border-zinc-700 dark:text-zinc-200 dark:hover:bg-zinc-900"
+        >
+          {rescanning ? 'Rescanning…' : 'Rescan now'}
+        </button>
+      </div>
 
       {startNowNotice && (
         <div className="flex items-start justify-between gap-3 rounded-md border border-amber-300 bg-amber-50 p-3 text-sm text-amber-900 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-200">

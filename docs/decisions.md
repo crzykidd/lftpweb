@@ -6,6 +6,33 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-21 — Queue tab "Rescan now": shared hook, and why it carries no timestamp
+
+`prompts/done/2026-08-21-queue-tab-rescan-button.md`, closing the first half of issue #19. The
+Files tab has had "Rescan now" since early on; the Queue tab had no way to trigger a scan at all,
+which stopped making sense once v0.3.0 made Queue the default landing page.
+
+**Extracted `FilesPage.tsx`'s rescan logic into `hooks/useRescan.ts`, used by both pages,** rather
+than pasting the baseline-sequence dance into a second component. The hook's state transitions
+(`startRescan`/`rescanRequestFailed`/`observeScanComplete`) are plain functions over a
+`{ rescanning, baselineSeq }` value, tested directly the same way this repo already tests other
+page-adjacent logic (`pages/TransfersPage.test.ts`) — no component-rendering harness needed or
+added.
+
+**No "scanned Xs ago" reading next to the Queue tab's button**, unlike the Files page's per-queue
+heading. The Files tab can honestly show one timestamp per queue section; the Queue tab's list is
+a single, globally-ordered, ungrouped view (v0.3.0 dropped grouping because admission is global —
+`core/scheduler.py` has zero references to `queue_id`), so there is no single queue's `scanned_at`
+that would honestly represent "when was everything last looked at." Inventing one (e.g. the
+oldest, or newest, per-queue value) would read as an instance-wide answer while actually being one
+queue's own timestamp — left out rather than shipped misleading.
+
+**Placement: its own row, below Pause and `BandwidthControl`, not folded into either.** Those two
+are admission knobs — the same "page-level control" category, per `BandwidthControl`'s own
+comment in `TransfersPage.tsx` — while rescan is a scan trigger, a different kind of whole-instance
+action. Grouping it with them by proximity (same page-level control area, top of the tab) without
+merging it into their visual grouping keeps that distinction legible.
+
 ## 2026-08-21 — Daily per-queue metric rollups: one table, rollup-before-prune, UTC days, and
 ## why coverage lives on the row
 
