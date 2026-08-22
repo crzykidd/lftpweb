@@ -28,39 +28,60 @@ does report, with caveats), **none**.
 | Size / path | native (`d.size_bytes`, `d.directory`, `d.base_path`) | native (`size`, `save_path`) | native (`totalSize`, `downloadDir`) | native (`total_size`, `save_path`) | native (history `storage`) |
 | Free space | native (`d.free_diskspace`) | native (`server_state.free_space_on_disk`) | native (`free-space`, **takes a path, returns free *and* total**) | native (`core.get_free_space(path)`) | native (`diskspace1`/`diskspace2` + totals, **on the queue call itself**) |
 | Stop | native (`d.stop` / `d.close`) | native (`/torrents/stop`) | native (`torrent-stop`) | native (`core.pause_torrent`) | n/a |
-| **Delete + data** | **NOT NATIVE — see §2** | native (`/torrents/delete?deleteFiles=true`) | native (`torrent-remove` + `delete-local-data`) | native (`core.remove_torrent(…, remove_data)`) | n/a |
+| **Delete + data** | **via hook, not core — see §2.** `d.custom5.set=1` + `d.delete_tied` + `d.erase`, in that order, in one `system.multicall` | native (`/torrents/delete?deleteFiles=true`) | native (`torrent-remove` + `delete-local-data`) | native (`core.remove_torrent(…, remove_data)`) | n/a |
 | Labels/categories | via `d.custom*` slots | native (`category`, `tags`) | native (`labels`) | native (`label` plugin) | native (category) |
 
-## 2. The finding that matters most: rTorrent cannot delete data
+## 2. rTorrent deletes data through a *hook*, not through the client
 
-**`d.erase` removes the item from rTorrent's session. It does not delete the files.** rTorrent has no
-"remove and delete data" primitive at all — the operation the torrent manager exists to perform.
+**rTorrent core has no "remove and delete data" primitive.** `d.erase` unregisters the item and
+leaves the files on disk. But that is not the end of the story, and an earlier draft of this document
+was wrong to stop there.
 
-ruTorrent bolts this on with its **`erasedata` plugin**, and that plugin has a long, well-documented
-history of failing:
+**There is a documented, scriptable API sequence** — the one the ruTorrent UI itself issues. Sent as
+a single `system.multicall`, in this order, with the info-hash as the parameter:
 
-- It **silently does nothing** when filesystem permissions are wrong — the torrent disappears from
-  the UI and the data stays on disk, with no error surfaced.
-- It **times out** on torrents with many files (reports cluster around 100+).
+| Step | Call | Why |
+|---|---|---|
+| 1 | `d.custom5.set` = `1` | The flag the `erasedata` plugin's hook reads to mean "delete the physical files too" |
+| 2 | `d.delete_tied` | Removes the tied `.torrent` from the session folder |
+| 3 | `d.erase` | Unregisters the item — **and fires `event.download.erased`**, which is what actually triggers file removal |
 
-For a feature whose entire purpose is reclaiming space, "the delete reported success and freed
-nothing" is the single worst failure mode available. And it lands on **rTorrent specifically — the
-client this project is targeting first.**
+**Order is load-bearing.** The flag must be set *before* `d.erase`, because `d.erase` is what fires
+the hook that reads it. Reversed, the torrent is unregistered and the data stays.
 
-**Three consequences, all of which should be designed in from the start:**
+### What this actually means for the connector
 
-1. **Never trust a delete's return value. Re-measure.** Free space (or the item's path) must be
-   checked after the operation, and a delete that freed nothing must be reported as a failure, not
-   logged as a success. This is the same instinct as §9's hardlink rule, but with a much more likely
-   trigger.
-2. **`delete_data` is a capability that can be declared and still not work** — the strongest possible
-   argument for §4a's "declared is not the same as working" rule, and for degrading a capability to
-   unavailable after a runtime failure.
-3. **A stop-only mode is worth having.** On a client that cannot reliably delete, stopping the
-   torrent and letting lftpweb's own SSH-side deletion remove the files may be the more honest path —
+**The deletion is performed by an `event.download.erased` handler that ruTorrent's `erasedata`
+plugin installs — not by rTorrent.** So the capability depends on the *deployment*, not on the
+client version:
+
+- **It must be detected, never assumed.** A bare rTorrent with no ruTorrent, or a ruTorrent with
+  `erasedata` disabled, will accept all three calls happily and delete nothing. There is no error.
+  This is a capability whose presence is an environment property — exactly the case §4a's runtime
+  degradation rule exists for.
+- **`d.custom5` is a general-purpose user slot.** ruTorrent's plugin claims it by convention, not by
+  reservation. If anything else in the user's setup writes `custom5`, there is a collision — worth a
+  glance at what a real seedbox has in there before relying on it.
+- **The known failure modes are failures of this hook path**, and they are well documented: the
+  plugin **silently does nothing** when filesystem permissions are wrong (torrent vanishes from the
+  UI, data stays, no error surfaced), and it **times out on torrents with many files** (reports
+  cluster around 100+). Both are invisible to the caller.
+
+**So the three consequences stand, and the first one gets stronger, not weaker:**
+
+1. **Never trust a delete's return value. Re-measure.** All three calls will report success on a
+   deployment where nothing was deleted. Free space — or better, the item's path — must be checked
+   afterward, and a delete that freed nothing reported as a failure. Same instinct as §9's hardlink
+   rule, with a far more likely trigger.
+2. **`delete_data` can be declared and still not work.** The strongest argument for §4a's "declared
+   is not the same as working," and for degrading a capability to unavailable after a runtime
+   failure.
+3. **A stop-only mode is worth having**, both as a fallback and possibly as the default here.
    lftpweb already deletes on the seedbox over SSH (`core/remote.py` issues `rm -rf`) and does it
-   reliably. Worth considering whether the connector's delete capability should be *optional* with
-   SSH as the fallback executor.
+   reliably, with a real error when it fails. Stopping the torrent through the API and deleting the
+   files over SSH may simply be the more honest path than trusting a hook that fails silently —
+   worth considering whether the connector's delete capability should be *optional*, with SSH as the
+   executor.
 
 ## 3. Other per-client traps worth knowing before designing the adapter
 
@@ -125,6 +146,6 @@ tracker data, which is precisely why capabilities must be per-function rather th
 - [qBittorrent sync/maindata `free_space_on_disk` discussion](https://github.com/qbittorrent/qBittorrent/discussions/15490) and [issue #16602](https://github.com/qbittorrent/qBittorrent/issues/16602)
 - [Transmission RPC specification](https://github.com/alvistack/transmission-transmission/blob/main/docs/rpc-spec.md)
 - [rTorrent commands reference](https://rtorrent-docs.readthedocs.io/en/latest/cmd-ref.html)
-- [ruTorrent `erasedata` plugin issues #1147](https://github.com/Novik/ruTorrent/issues/1147), [#1675](https://github.com/Novik/ruTorrent/issues/1675), [#1758](https://github.com/Novik/ruTorrent/issues/1758)
+- [ruTorrent `erasedata` plugin source](https://github.com/Novik/ruTorrent/tree/master/plugins/erasedata) and its issue history — [#1147](https://github.com/Novik/ruTorrent/issues/1147), [#1675](https://github.com/Novik/ruTorrent/issues/1675), [#1758](https://github.com/Novik/ruTorrent/issues/1758), [#2148](https://github.com/Novik/ruTorrent/issues/2148). The `d.custom5` / `event.download.erased` mechanism in §2 was supplied by the user (2026-08-21) and corroborated against these.
 - [Deluge Web JSON-RPC API](https://deluge.readthedocs.io/en/latest/reference/webapi.html) · [Deluge ticket #3276, system quota support](https://dev.deluge-torrent.org/ticket/3276)
 - [SABnzbd API reference](https://sabnzbd.org/wiki/configuration/5.1/api)
