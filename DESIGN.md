@@ -2520,6 +2520,16 @@ served from `metric_daily` instead. A day with only partial heartbeat coverage (
 part of it) is marked distinctly from a fully-covered quiet day in both the chart and its
 accessible table, never rendered identically to either a full day or a true gap.
 
+**The bytes chart's bucket width is its own group-by control** (2026-08-21, chart grouping,
+§10.4) — hour, day, week, or month, independent of the range selector, with a per-range default
+(24h hourly, 7d/30d daily, 90d/1y weekly). Week and month bars are summed from daily totals on
+read, not a separate table. Not every grouping is available at every range: hourly is disabled,
+with a reason shown in the dropdown, at 90d/1y — raw history is only kept 30 days and the daily
+rollup table has no finer granularity to fall back on — and the server rejects the same
+combination too, so this is never just a client-side suggestion. A week/month bar's own coverage
+marker is the fraction of days in it that had any activity, the same idle-vs-down distinction
+carried up a level.
+
 **Settings** — tabbed:
 
 | Tab | Contents |
@@ -2690,6 +2700,29 @@ enough for a year-over-year glance.
   itself is unchanged — the raised default above is what makes it work out of the box.
 - **UTC calendar days, not a timezone setting** — the existing convention (README's Known gaps),
   not a new one; a real timezone setting is a separate, larger feature out of scope here.
+
+**Range and grouping are two separate axes** (2026-08-21, chart grouping,
+`prompts/done/2026-08-21-chart-grouping.md`). Before this, each range (`24h`/`7d`/`30d`/`90d`/`1y`)
+had exactly one fixed bucket width. Now `range` still says how far back, and a second choice,
+`group` (`hour`/`day`/`week`/`month`), says how wide a bar — with a per-range default (24h hourly,
+7d/30d daily, 90d/1y weekly) rather than one bucket width per range. Week and month bars are
+**summed from daily totals on read — no new table** (anticipated by the daily-rollup design
+above: "weekly is derivable by summing daily; keeping both risks the two disagreeing"), built
+from whichever table already has day granularity for that range (the raw tables for `24h`/`7d`/
+`30d`, `metric_daily` for `90d`/`1y`).
+
+**Hourly grouping is disabled — server-side, not just in the dropdown — at `90d`/`1y`.** Raw
+tables cap out at `MAX_RETENTION_DAYS` (30) regardless of the configured retention setting, and
+`metric_daily` is one-day granularity by construction, so there is no sub-day data that far back
+and no setting can produce one. Every other range/grouping combination is available — decoupling
+the two axes doesn't make every combination equally *useful* (a `month` bucket over a `24h` range
+is one degenerate bar), only that none of the others are architecturally *impossible* the way
+hourly-at-90d/1y is.
+
+**Coverage, for a bucket wider than a day, is the fraction of days in it that were up** — not a
+heartbeat-density average. A raw-table day only ever carries a boolean up/down at that
+granularity, so a day-count fraction is the one definition of "coverage" that means the same
+thing regardless of which table the underlying days came from.
 
 ---
 

@@ -42,6 +42,7 @@ import type {
   LoginIn,
   LogFilesResponse,
   LogTailResponse,
+  MetricsGroup,
   MetricsRange,
   MetricsSettingsIn,
   MetricsSettingsOut,
@@ -818,13 +819,18 @@ export function putMetricsSettings(body: MetricsSettingsIn): Promise<MetricsSett
  * all-queues breakdown + site total (bytes/hour bar chart, "All queues" speed line); pass it
  * for one queue's own series (speed line with a queue selected). Server-side bucketed
  * (core/metrics.py) -- never raw rows to aggregate here.
+ *
+ * `group` (2026-08-21, chart grouping) is the bytes chart's group-by control -- omitted, the
+ * server picks that range's own default (`api/metrics.py._DEFAULT_GROUP`); the speed chart never
+ * passes one, since its `1h`/`12h` ranges have no group-by control at all.
  */
 export function getThroughput(
   range: MetricsRange,
   queueId?: number,
+  group?: MetricsGroup,
 ): Promise<MetricsThroughputResponse> {
   return getJson<MetricsThroughputResponse>(
-    `/api/metrics/throughput${queryString({ range, queue_id: queueId })}`,
+    `/api/metrics/throughput${queryString({ range, queue_id: queueId, group })}`,
   )
 }
 

@@ -1051,6 +1051,13 @@ export type SpeedRange = '1h' | '12h' | '24h'
 export type BytesRange = '24h' | '7d' | '30d' | '90d' | '1y'
 export type MetricsRange = SpeedRange | BytesRange
 
+// 2026-08-21 (chart grouping, prompts/done/2026-08-21-chart-grouping.md): the bytes chart's
+// group-by control -- independent of `BytesRange` (which only says how far back). Not every
+// value is available at every range (`lib/bytesChart.ts.groupOptionsForRange` mirrors
+// `api/metrics.py._AVAILABLE_GROUPS`; the server independently rejects the same combination,
+// never trust the client alone).
+export type MetricsGroup = 'hour' | 'day' | 'week' | 'month'
+
 export interface MetricsBucketOut {
   ts: string
   // `false` = no heartbeat fell in this bucket at all -- lftpweb wasn't running. Render as a
@@ -1060,15 +1067,23 @@ export interface MetricsBucketOut {
   // JSON object keys are always strings on the wire -- queue_id -> bytes moved this bucket.
   by_queue: Record<string, number>
   // 2026-08-21: fraction (0.0-1.0) of a full day's expected heartbeats actually observed --
-  // only set on a daily-granularity bucket (the 90d/1y ranges, sourced from `metric_daily`);
-  // `null` for every raw-table-sourced bucket (1h/12h/24h/7d/30d), where `up` alone is already
-  // exact at that bucket's own width. Lets the UI tell a genuinely quiet day (`up: true`,
-  // `coverage` near 1.0) apart from one lftpweb was mostly down for (`coverage` well under 1.0).
+  // only set on a daily-granularity bucket (the 90d/1y ranges at group=day, sourced from
+  // `metric_daily`); `null` for every raw-table-sourced bucket (group=hour or group=day at
+  // 1h/12h/24h/7d/30d), where `up` alone is already exact at that bucket's own width. Lets the
+  // UI tell a genuinely quiet day (`up: true`, `coverage` near 1.0) apart from one lftpweb was
+  // mostly down for (`coverage` well under 1.0).
+  //
+  // 2026-08-21 (chart grouping): for a `week`/`month` bucket (any range), this is instead the
+  // fraction of *days* in the bucket that were `up` -- see `api/metrics.py._aggregate_day_points`
+  // for why that's a different (and deliberately simpler) computation than the per-day case.
   coverage?: number | null
 }
 
 export interface MetricsThroughputResponse {
   range: MetricsRange
+  // 2026-08-21 (chart grouping): the bucket width actually used -- `null` for the speed chart's
+  // own untouched fixed-width ranges (1h/12h), which don't have a group-by control.
+  group: MetricsGroup | null
   bucket_seconds: number
   buckets: MetricsBucketOut[]
 }

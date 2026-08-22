@@ -1,11 +1,79 @@
 // Pure helpers for the Dashboard's bytes chart (2026-08-17,
 // prompts/done/2026-08-17-bytes-chart-7d-30d-ranges-and-total.md) -- the 7d/30d ranges this
 // task added mean the chart's bucket width is no longer always an hour, so the total, the
-// per-bucket label, and the title all have to scale with `bucket_seconds` (`api/metrics.py`'s
-// `_RANGES`) instead of assuming 3600. Kept pure and separate from `BytesChart.tsx` so the
-// range/label math is Vitest-testable without rendering SVG.
+// per-bucket label, and the title all have to scale with the selected grouping instead of
+// assuming 3600. Kept pure and separate from `BytesChart.tsx` so the range/label math is
+// Vitest-testable without rendering SVG.
+//
+// 2026-08-21 (chart grouping, prompts/done/2026-08-21-chart-grouping.md): `bucketLabel`/
+// `bytesChartTitle` now key off the explicit `MetricsGroup` the server echoes back
+// (`MetricsThroughputResponse.group`) rather than reverse-engineering a bucket width in seconds
+// -- a `week` bucket and a `month` bucket both need their own label shape, not just "coarser
+// than a day."
 
-import type { BytesRange, MetricsBucketOut } from '../api/types'
+import type { BytesRange, MetricsBucketOut, MetricsGroup } from '../api/types'
+
+export const METRICS_GROUP_VALUES: MetricsGroup[] = ['hour', 'day', 'week', 'month']
+export function isMetricsGroup(value: unknown): value is MetricsGroup {
+  return typeof value === 'string' && (METRICS_GROUP_VALUES as string[]).includes(value)
+}
+
+// The per-range default grouping (task table, from the user's own stated preference): 24h stays
+// hourly (already right), 7d moves from 6-hour to daily (the one default that actually changes),
+// 30d stays daily, 90d/1y move from daily to weekly. Mirrors `api/metrics.py._DEFAULT_GROUP` --
+// keep the two in sync.
+export const DEFAULT_GROUP_FOR_RANGE: Record<BytesRange, MetricsGroup> = {
+  '24h': 'hour',
+  '7d': 'day',
+  '30d': 'day',
+  '90d': 'week',
+  '1y': 'week',
+}
+
+export interface GroupOption {
+  value: MetricsGroup
+  available: boolean
+  // Only set when `available` is false -- shown as the disabled reason in the dropdown.
+  reason?: string
+}
+
+// Not every grouping is available at every range: hourly grouping is architecturally impossible
+// at 90d/1y (raw history tops out at 30 days and the daily rollup table is one-day granularity
+// by construction, so there is no sub-day data that far back at any retention setting). Every
+// other combination is available -- disabling a control for a real capability gap, never faking
+// one by silently downgrading (same discipline as `docs/download-client-api-survey.md` §4).
+// Mirrors `api/metrics.py._AVAILABLE_GROUPS` -- the server independently rejects the same
+// combination with a 422, so this is a UX convenience (grey it out with a reason), never the
+// only enforcement.
+export function groupOptionsForRange(range: BytesRange): GroupOption[] {
+  const hourlyUnavailable = range === '90d' || range === '1y'
+  return METRICS_GROUP_VALUES.map((value) => {
+    if (value === 'hour' && hourlyUnavailable) {
+      return {
+        value,
+        available: false,
+        reason: 'No hourly data this far back — raw history is only kept 30 days.',
+      }
+    }
+    return { value, available: true }
+  })
+}
+
+export function isGroupAvailableForRange(range: BytesRange, group: MetricsGroup): boolean {
+  return groupOptionsForRange(range).find((o) => o.value === group)?.available ?? false
+}
+
+/** Resolves a possibly-stale or hand-edited stored grouping against the *current* range --
+ * falls back to that range's own default rather than trusting it, the same discipline
+ * `DashboardPage`'s `isBytesRange`/`isSpeedRange` already apply to the range itself. Covers two
+ * cases: the stored value was valid for a previously-selected range but isn't available for the
+ * one now selected (e.g. `hour` stored while viewing `24h`, then the range changes to `90d`), and
+ * there is no stored value yet at all (`null`).
+ */
+export function resolveGroupForRange(range: BytesRange, stored: MetricsGroup | null): MetricsGroup {
+  if (stored != null && isGroupAvailableForRange(range, stored)) return stored
+  return DEFAULT_GROUP_FOR_RANGE[range]
+}
 
 /** Sum of `total_bytes` across every "up" bucket -- the range total the chart's header shows
  * ("Total: 84.2 GB"). A `down` bucket's `total_bytes` is always `null` (idle-vs-down,
@@ -32,33 +100,46 @@ export function sumBytesByQueue(buckets: MetricsBucketOut[]): Record<number, num
   return totals
 }
 
-/** Bucket-width-scaled label for an x-axis tick / bar tooltip (task prompt item 3) -- hourly
- * buckets (3600s, the 24h range) show a clock time exactly as the chart always has; 6-hour
- * buckets (21600s, the 7d range) show enough to place the bucket in its day (weekday + hour);
- * 1-day buckets (86400s, the 30d range) show just the date -- a clock time on a bucket that
- * spans a whole day would be false precision. Falls back to the raw `ts` on an unparsable date,
- * the same defensive shape `BytesChart`'s sibling `SpeedLineChart.formatTime` already uses.
+/** Grouping-scaled label for an x-axis tick / bar tooltip (task prompt item 3; regrouped
+ * 2026-08-21, chart grouping, to key off the explicit `MetricsGroup` rather than a bucket-width
+ * number) -- `hour` buckets show a clock time exactly as the chart always has; `day` buckets
+ * show just the date -- a clock time on a bucket that spans a whole day would be false
+ * precision; `week` buckets are named by the first day they cover (the same convention
+ * `api/metrics.py._aggregate_day_points` uses for a week/month bucket's own `ts`); `month`
+ * buckets show the month and year. Falls back to the raw `ts` on an unparsable date, the same
+ * defensive shape `BytesChart`'s sibling `SpeedLineChart.formatTime` already uses.
  */
-export function bucketLabel(ts: string, bucketSeconds: number): string {
+export function bucketLabel(ts: string, group: MetricsGroup): string {
   const d = new Date(ts)
   if (Number.isNaN(d.getTime())) return ts
-  if (bucketSeconds >= 86400) {
-    return d.toLocaleDateString([], { month: 'short', day: 'numeric' })
+  switch (group) {
+    case 'month':
+      return d.toLocaleDateString([], { month: 'short', year: 'numeric' })
+    case 'week':
+      return `Week of ${d.toLocaleDateString([], { month: 'short', day: 'numeric' })}`
+    case 'day':
+      return d.toLocaleDateString([], { month: 'short', day: 'numeric' })
+    case 'hour':
+    default:
+      return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
   }
-  if (bucketSeconds >= 21600) {
-    return d.toLocaleString([], { weekday: 'short', hour: '2-digit' })
-  }
-  return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
 }
 
-/** The chart title names what one bar actually represents -- it tracks the selected range's
- * bucket width (task prompt item 3), not just the range label the selector button beside it
- * already shows.
+/** The chart title names what one bar actually represents -- it tracks the selected grouping
+ * (task prompt item 3), not just the range label the selector button beside it already shows.
  */
-export function bytesChartTitle(bucketSeconds: number): string {
-  if (bucketSeconds >= 86400) return 'Bytes transferred — per day'
-  if (bucketSeconds >= 21600) return 'Bytes transferred — per 6 hours'
-  return 'Bytes transferred — per hour'
+export function bytesChartTitle(group: MetricsGroup): string {
+  switch (group) {
+    case 'month':
+      return 'Bytes transferred — per month'
+    case 'week':
+      return 'Bytes transferred — per week'
+    case 'day':
+      return 'Bytes transferred — per day'
+    case 'hour':
+    default:
+      return 'Bytes transferred — per hour'
+  }
 }
 
 /** How many days of history a bytes-chart range actually spans -- the retention-note gate

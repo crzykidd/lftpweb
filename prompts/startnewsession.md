@@ -137,7 +137,19 @@ only in a session transcript.
 proves the pending-row concept against a real feed, and its source-agnostic boundary held through
 six tasks — so a SAB adapter is now an *enrichment of a working box*, not a new foundation.
 
-### On `dev` since the release (9 commits)
+### On `dev` since the release (10 commits)
+
+**The Dashboard's bytes chart gained a group-by control, and its per-range defaults changed**
+(finding 5 of `prompts/test-findings-2026-08-21.md`,
+`prompts/done/2026-08-21-chart-grouping.md`) — range (how far back) and a new `group` param
+(hour/day/week/month, how wide a bar) are fully decoupled server-side (`api/metrics.py`'s old
+`_RANGES` tuple that coupled the two is gone); defaults now match the user's own ask (7d moves
+6-hour→daily, 90d/1y move daily→weekly, 24h/30d unchanged). Week/month bars are **summed from
+daily totals on read — no new table**. **Hourly grouping is rejected server-side (422), not
+silently downgraded, at 90d/1y** — raw history tops out at 30 days and `metric_daily` is one-day
+granularity by construction — and the same rule disables the option client-side with a reason.
+Coverage on a bucket wider than a day is redefined as the fraction of days in it that were up, not
+a heartbeat-density average. 1685 backend / 680 frontend tests, 0 skipped. Browser-unverified.
 
 **The Pause control collapsed to one dropdown plus a checkbox** (findings 2 and 3 of
 `prompts/test-findings-2026-08-21.md`, `prompts/done/2026-08-21-pause-control-redesign.md`) —

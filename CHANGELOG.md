@@ -81,6 +81,16 @@ Skeleton for the next roll:
   genuinely idle day is never confused with a mostly-down one. Rollup always runs before the raw
   tables are pruned, in the same cycle — the only part of this feature that could otherwise lose
   data — and backfills automatically on first run after upgrading into it.
+- **A group-by control on the Dashboard's bytes chart** — hour / day / week / month, independent
+  of the range selector. Defaults changed to match: 7d now defaults to daily bars (was 6-hour),
+  90d and 1y now default to weekly (was daily); 24h and 30d were already right and are unchanged.
+  Week and month bars are summed from daily totals on read — no new table. **Hourly grouping is
+  disabled, with a reason, at 90d/1y** — raw history is only kept 30 days and the daily rollup
+  table is one-day granularity by construction, so there's no sub-day data that far back at any
+  retention setting; the server rejects the combination too, it isn't just greyed out client-side.
+  A week/month bar's "coverage" marker (partial vs. fully-covered vs. down) is the fraction of
+  days in that bar that had any activity, same idle-vs-down distinction as before, just aggregated
+  up a level.
 - **"Rescan now" on the Queue tab** — v0.3.0 made Queue the default landing page, but triggering a
   scan still meant switching to Files. The button lives with the other page-level controls at the
   top (below Pause/Bandwidth, in its own row), rescans every queue exactly like the Files tab's

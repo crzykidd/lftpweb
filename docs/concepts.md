@@ -595,3 +595,12 @@ Both the daily table's 13-month window and the "past raw retention" boundary abo
 calendar days — this app stores everything in UTC with no timezone handling anywhere, the same
 caveat History's date filters already carry. Away from UTC, "today" and "yesterday" can be off
 by a few hours.
+
+**How wide a bar is, is now its own choice** (2026-08-21, chart grouping) — a group-by dropdown
+(hour / day / week / month) sits over the bytes chart, defaulting per range (24h hourly, 7d/30d
+daily, 90d/1y weekly) rather than one fixed width per range. Week and month bars are summed from
+daily totals on the fly, whichever table already has that day's total (raw for 24h/7d/30d,
+the daily table for 90d/1y) — no separate weekly or monthly table exists. The one thing the
+dropdown can't offer is hourly detail at 90d/1y: raw samples are long since pruned by then and
+the daily table never recorded sub-day detail to begin with, so that option is greyed out with a
+reason instead of quietly handing back something coarser.

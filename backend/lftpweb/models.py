@@ -1504,16 +1504,30 @@ class MetricsBucketOut(BaseModel):
     by_queue: dict[int, int]  # queue_id -> bytes moved in this bucket; an omitted queue moved 0
     # 2026-08-21 (daily rollups, prompts/done/2026-08-21-daily-metric-rollups.md): fraction
     # (0.0-1.0) of a full day's expected heartbeats actually observed -- only set for a
-    # daily-granularity bucket sourced from `metric_daily` (the 90d/1y ranges), `None` for every
-    # bucket sourced from the raw tables (1h/12h/24h/7d/30d), where `up` alone is already exact
-    # at that bucket's own width. Lets the UI distinguish a genuinely quiet day (`up: true`,
-    # `coverage` near 1.0, `total_bytes: 0`) from a day lftpweb was mostly down
-    # (`coverage` well under 1.0) -- both would otherwise look identical.
+    # daily-granularity bucket sourced from `metric_daily` (the 90d/1y ranges at `group=day`),
+    # `None` for every bucket sourced from the raw tables (1h/12h/24h/7d/30d at `group=hour` or
+    # `group=day`), where `up` alone is already exact at that bucket's own width. Lets the UI
+    # distinguish a genuinely quiet day (`up: true`, `coverage` near 1.0, `total_bytes: 0`) from
+    # a day lftpweb was mostly down (`coverage` well under 1.0) -- both would otherwise look
+    # identical.
+    #
+    # 2026-08-21 (chart grouping, prompts/done/2026-08-21-chart-grouping.md): for a `week`/`month`
+    # bucket (any range), this means something different -- the fraction of *days* in the bucket
+    # that were `up`, not a heartbeat-density average (`api/metrics.py._aggregate_day_points`'s
+    # docstring has the full reasoning: raw-table days only ever carry a boolean up/down at that
+    # granularity, so a day-count fraction is the one definition that means the same thing
+    # regardless of which table the underlying days came from).
     coverage: float | None = None
 
 
 class MetricsThroughputResponse(BaseModel):
     range: str
+    # 2026-08-21 (chart grouping): the bucket width actually used, decoupled from `range` (which
+    # only says how far back) -- "hour"/"day"/"week"/"month" for the bytes-chart-groupable ranges
+    # (24h/7d/30d/90d/1y, api/metrics.py._GROUPABLE_RANGES); `None` for the speed chart's own
+    # untouched fixed-width ranges (1h/12h), whose single bucket width `bucket_seconds` alone
+    # already fully describes.
+    group: str | None = None
     bucket_seconds: int
     buckets: list[MetricsBucketOut]
 

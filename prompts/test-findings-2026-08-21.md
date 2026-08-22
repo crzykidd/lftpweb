@@ -183,7 +183,7 @@ Notes for whoever builds it:
 - The countdown is also the last moment to change the checkbox; decide whether toggling it mid-count
   resets the timer (probably yes — it changes what is about to happen).
 
-## 5. Dashboard chart: per-range default bucketing, plus a "group by" dropdown — **open**
+## 5. Dashboard chart: per-range default bucketing, plus a "group by" dropdown — **done**
 
 > *"On dashboard this works, but maybe we do a dropdown or change the groups. 24h = hourly. 7 day =
 > daily. 30 day maybe daily, but 90 day and yearly is weekly I think… might be good to default to
@@ -222,6 +222,21 @@ disagreeing" — `prompts/done/2026-08-21-daily-metric-rollups.md`). No new tabl
 Structural note: `_RANGES` currently couples range to bucket width as one tuple. A group-by control
 means decoupling those two — range says *how far back*, grouping says *how wide a bar*. Worth doing
 deliberately rather than adding more entries to the dict.
+
+**Built 2026-08-21** (`prompts/done/2026-08-21-chart-grouping.md`): `range` and a new `group`
+query param (`hour`/`day`/`week`/`month`) are fully decoupled server-side (`api/metrics.py`'s old
+`_RANGES` tuple that coupled the two is gone; `_RANGE_HOURS`/`_DAILY_RANGES` now say how far back,
+`_DEFAULT_GROUP`/`_AVAILABLE_GROUPS` say how wide a bar and which widths exist per range). Defaults
+match the table above exactly (7d moves 6-hour→daily, 90d/1y move daily→weekly). Week/month bars
+are summed from daily totals on read (`_DayPoint`/`_aggregate_day_points`), sourced from whichever
+table already has day granularity for that range — no new table, no migration. **Hourly is
+rejected with a 422 at 90d/1y**, not silently downgraded, and the same rule disables the option
+client-side with a reason (`lib/bytesChart.ts.groupOptionsForRange`) — the dropdown lives on the
+Dashboard next to the range buttons, `dashboard.bytesGroup` in localStorage, validated against the
+current range on every read the same way the range itself already is. Coverage on a bucket wider
+than a day was redefined as the fraction of days in it that were up (not a heartbeat-density
+average) — the one definition that works whether the underlying days came from the raw tables or
+`metric_daily`.
 
 ## 6. The poll-cadence setting is unfindable and unexplained — **open**
 

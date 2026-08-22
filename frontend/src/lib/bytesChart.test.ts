@@ -1,8 +1,13 @@
 import { describe, expect, it } from 'vitest'
-import type { MetricsBucketOut } from '../api/types'
+import type { MetricsBucketOut, MetricsGroup } from '../api/types'
 import {
   bucketLabel,
   bytesChartTitle,
+  DEFAULT_GROUP_FOR_RANGE,
+  groupOptionsForRange,
+  isGroupAvailableForRange,
+  isMetricsGroup,
+  resolveGroupForRange,
   retentionNoteForRange,
   sumBytesByQueue,
   sumTotalBytes,
@@ -54,32 +59,112 @@ describe('sumBytesByQueue', () => {
 describe('bucketLabel', () => {
   const ts = '2026-08-17T06:30:00Z'
 
-  it('shows a clock time for hourly (3600s) buckets', () => {
-    expect(bucketLabel(ts, 3600)).toBe(new Date(ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }))
-  })
-
-  it('shows weekday + hour for 6-hour (21600s) buckets', () => {
-    expect(bucketLabel(ts, 21600)).toBe(
-      new Date(ts).toLocaleString([], { weekday: 'short', hour: '2-digit' }),
+  it('shows a clock time for hour grouping', () => {
+    expect(bucketLabel(ts, 'hour')).toBe(
+      new Date(ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
     )
   })
 
-  it('shows just the date for 1-day (86400s) buckets', () => {
-    expect(bucketLabel(ts, 86400)).toBe(
+  it('shows just the date for day grouping', () => {
+    expect(bucketLabel(ts, 'day')).toBe(
       new Date(ts).toLocaleDateString([], { month: 'short', day: 'numeric' }),
     )
   })
 
+  it('names the week grouping bucket by the first day it covers', () => {
+    expect(bucketLabel(ts, 'week')).toBe(
+      `Week of ${new Date(ts).toLocaleDateString([], { month: 'short', day: 'numeric' })}`,
+    )
+  })
+
+  it('shows month + year for month grouping', () => {
+    expect(bucketLabel(ts, 'month')).toBe(
+      new Date(ts).toLocaleDateString([], { month: 'short', year: 'numeric' }),
+    )
+  })
+
   it('falls back to the raw ts on an unparsable date', () => {
-    expect(bucketLabel('not-a-date', 3600)).toBe('not-a-date')
+    expect(bucketLabel('not-a-date', 'hour')).toBe('not-a-date')
   })
 })
 
 describe('bytesChartTitle', () => {
-  it('names the bucket width for each scale', () => {
-    expect(bytesChartTitle(3600)).toBe('Bytes transferred — per hour')
-    expect(bytesChartTitle(21600)).toBe('Bytes transferred — per 6 hours')
-    expect(bytesChartTitle(86400)).toBe('Bytes transferred — per day')
+  it('names the bucket width for each grouping', () => {
+    expect(bytesChartTitle('hour')).toBe('Bytes transferred — per hour')
+    expect(bytesChartTitle('day')).toBe('Bytes transferred — per day')
+    expect(bytesChartTitle('week')).toBe('Bytes transferred — per week')
+    expect(bytesChartTitle('month')).toBe('Bytes transferred — per month')
+  })
+})
+
+describe('isMetricsGroup', () => {
+  it('accepts the four known groupings', () => {
+    expect(isMetricsGroup('hour')).toBe(true)
+    expect(isMetricsGroup('day')).toBe(true)
+    expect(isMetricsGroup('week')).toBe(true)
+    expect(isMetricsGroup('month')).toBe(true)
+  })
+
+  it('rejects anything else, including a stale/hand-edited value', () => {
+    expect(isMetricsGroup('minute')).toBe(false)
+    expect(isMetricsGroup('')).toBe(false)
+    expect(isMetricsGroup(null)).toBe(false)
+    expect(isMetricsGroup(42)).toBe(false)
+  })
+})
+
+describe('DEFAULT_GROUP_FOR_RANGE', () => {
+  it('matches the task table -- 24h hourly, 7d/30d daily, 90d/1y weekly', () => {
+    expect(DEFAULT_GROUP_FOR_RANGE).toEqual({
+      '24h': 'hour',
+      '7d': 'day',
+      '30d': 'day',
+      '90d': 'week',
+      '1y': 'week',
+    })
+  })
+})
+
+describe('groupOptionsForRange / isGroupAvailableForRange', () => {
+  it('offers every grouping, all available, for the raw-table ranges', () => {
+    for (const range of ['24h', '7d', '30d'] as const) {
+      const options = groupOptionsForRange(range)
+      expect(options.map((o) => o.value)).toEqual(['hour', 'day', 'week', 'month'])
+      expect(options.every((o) => o.available)).toBe(true)
+    }
+  })
+
+  it('disables hour, with a reason, for 90d and 1y -- architecturally impossible', () => {
+    for (const range of ['90d', '1y'] as const) {
+      const options = groupOptionsForRange(range)
+      const hour = options.find((o) => o.value === 'hour')
+      expect(hour?.available).toBe(false)
+      expect(hour?.reason).toBeTruthy()
+      expect(isGroupAvailableForRange(range, 'hour')).toBe(false)
+
+      for (const value of ['day', 'week', 'month'] as MetricsGroup[]) {
+        expect(isGroupAvailableForRange(range, value)).toBe(true)
+      }
+    }
+  })
+})
+
+describe('resolveGroupForRange', () => {
+  it('falls back to the range default when nothing is stored', () => {
+    expect(resolveGroupForRange('24h', null)).toBe('hour')
+    expect(resolveGroupForRange('90d', null)).toBe('week')
+  })
+
+  it('keeps a stored grouping that is still available for the range', () => {
+    expect(resolveGroupForRange('30d', 'week')).toBe('week')
+    expect(resolveGroupForRange('90d', 'month')).toBe('month')
+  })
+
+  it('falls back rather than trusting a stored grouping that is unavailable for this range', () => {
+    // 'hour' was valid while a shorter range was selected, but the range changed to 90d/1y,
+    // where hourly is impossible -- must not be sent to the server as-is.
+    expect(resolveGroupForRange('90d', 'hour')).toBe('week')
+    expect(resolveGroupForRange('1y', 'hour')).toBe('week')
   })
 })
 
