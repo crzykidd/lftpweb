@@ -4,6 +4,8 @@ import type {
   ApiKeyOut,
   ArrInstanceIn,
   ArrInstanceOut,
+  ArrPollSettingsIn,
+  ArrPollSettingsOut,
   ArrTestResponse,
   AuthSessionOut,
   AuthSettingsIn,
@@ -233,6 +235,18 @@ export function deleteArrInstance(id: number): Promise<void> {
  */
 export function testArrInstance(id: number): Promise<ArrTestResponse> {
   return sendJson<ArrTestResponse>(`/api/settings/arr/${id}/test`, 'POST')
+}
+
+/** *arr poll cadence (2026-08-21, issue #16) -- `core/arrsync.py.ArrSettings.poll_interval_s`
+ * exposed here for the first time. Server-side validated on `PUT`; see `ArrPollSettingsOut`'s
+ * own docstring.
+ */
+export function getArrPollSettings(): Promise<ArrPollSettingsOut> {
+  return getJson<ArrPollSettingsOut>('/api/settings/arr/poll-interval')
+}
+
+export function putArrPollSettings(body: ArrPollSettingsIn): Promise<ArrPollSettingsOut> {
+  return sendJson<ArrPollSettingsOut>('/api/settings/arr/poll-interval', 'PUT', body)
 }
 
 // --- Settings -> Post-processing (phase 5, DESIGN.md §6) --------------------------------

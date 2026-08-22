@@ -1638,6 +1638,27 @@ class ArrTestResponse(BaseModel):
     version: str | None = None
 
 
+class ArrPollSettingsOut(BaseModel):
+    """`GET`/`PUT /api/settings/arr/poll-interval` (2026-08-21, issue #16,
+    `prompts/done/2026-08-21-arr-poll-cadence.md`) -- `core/arrsync.py.ArrSettings` exposed on
+    the *arr settings surface for the first time; before this it was DB-only, a default that got
+    written down rather than ever a user choice. One field, same "narrow settings dataclass,
+    its own `Out`" shape every other site-level settings endpoint in this codebase uses
+    (`BackupSettingsOut`, `SettleSettingsOut`, ...).
+    """
+
+    poll_interval_s: float
+
+
+class ArrPollSettingsIn(ArrPollSettingsOut):
+    """`PUT` body. `api/settings_arr.py.put_arr_poll_settings` validates this server-side against
+    `ArrSyncScheduler.MIN_POLL_INTERVAL_S`/`core/arrsync.py.MAX_POLL_INTERVAL_S` -- the same
+    "validate server-side, not only in the browser" rule this task's own handoff prompt states
+    explicitly, mirroring `api/backup.py.put_backup_settings`'s inline range check rather than a
+    pydantic field constraint, so the error message can name the actual bound.
+    """
+
+
 # --- Support bundle (Settings -> Logs, 2026-08-17) ---------------------------------------
 #
 # `POST /api/support-bundle` (`api/support_bundle.py`, `core/supportbundle.py`): a downloadable

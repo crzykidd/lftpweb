@@ -217,6 +217,18 @@ export interface ArrTestResponse {
   version: string | null
 }
 
+/** `GET`/`PUT /api/settings/arr/poll-interval` (2026-08-21, issue #16) -- `core/arrsync.py.
+ * ArrSettings.poll_interval_s` exposed here for the first time; before this it was DB-only,
+ * never surfaced to a user. Server-side validated (`api/settings_arr.py.put_arr_poll_settings`)
+ * against a 5s floor and a 3600s ceiling -- this page must not rely on its own `min`/`max` input
+ * attributes alone.
+ */
+export interface ArrPollSettingsOut {
+  poll_interval_s: number
+}
+
+export type ArrPollSettingsIn = ArrPollSettingsOut
+
 // --- Settings -> Post-processing (phase 5, DESIGN.md §6) -------------------------------
 
 export interface PostprocessSettingsOut {

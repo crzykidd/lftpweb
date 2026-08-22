@@ -134,3 +134,50 @@ def test_test_endpoint_requires_existing_instance(isolated_config):
     with TestClient(app) as client:
         resp = client.post("/api/settings/arr/999/test")
         assert resp.status_code == 404
+
+
+# --- Poll cadence (2026-08-21, issue #16, prompts/done/2026-08-21-arr-poll-cadence.md) ---------
+
+
+def test_poll_interval_default_and_round_trip(isolated_config):
+    with TestClient(app) as client:
+        resp = client.get("/api/settings/arr/poll-interval")
+        assert resp.status_code == 200
+        assert resp.json() == {"poll_interval_s": 10.0}  # down from 60.0, issue #16
+
+        resp = client.put("/api/settings/arr/poll-interval", json={"poll_interval_s": 30.0})
+        assert resp.status_code == 200
+        assert resp.json() == {"poll_interval_s": 30.0}
+
+        resp = client.get("/api/settings/arr/poll-interval")
+        assert resp.json() == {"poll_interval_s": 30.0}
+
+
+def test_poll_interval_rejects_below_the_floor(isolated_config):
+    with TestClient(app) as client:
+        resp = client.put("/api/settings/arr/poll-interval", json={"poll_interval_s": 1.0})
+        assert resp.status_code == 422
+
+        # Rejected -- the previously stored default must be untouched.
+        resp = client.get("/api/settings/arr/poll-interval")
+        assert resp.json() == {"poll_interval_s": 10.0}
+
+
+def test_poll_interval_rejects_above_the_ceiling(isolated_config):
+    with TestClient(app) as client:
+        resp = client.put("/api/settings/arr/poll-interval", json={"poll_interval_s": 999999.0})
+        assert resp.status_code == 422
+
+        resp = client.get("/api/settings/arr/poll-interval")
+        assert resp.json() == {"poll_interval_s": 10.0}
+
+
+def test_poll_interval_accepts_the_floor_and_ceiling_boundaries(isolated_config):
+    with TestClient(app) as client:
+        resp = client.put("/api/settings/arr/poll-interval", json={"poll_interval_s": 5.0})
+        assert resp.status_code == 200
+        assert resp.json() == {"poll_interval_s": 5.0}
+
+        resp = client.put("/api/settings/arr/poll-interval", json={"poll_interval_s": 3600.0})
+        assert resp.status_code == 200
+        assert resp.json() == {"poll_interval_s": 3600.0}

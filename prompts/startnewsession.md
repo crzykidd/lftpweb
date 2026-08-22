@@ -137,7 +137,7 @@ only in a session transcript.
 proves the pending-row concept against a real feed, and its source-agnostic boundary held through
 six tasks — so a SAB adapter is now an *enrichment of a working box*, not a new foundation.
 
-### On `dev` since the release (7 commits)
+### On `dev` since the release (8 commits)
 
 **Active/pending row sort changed to running → queued → still-processing** (`6822138`, changelog
 `2c97582`). A pipeline-in-flight row is lftpweb *waiting on someone else*; `queued` is its own
@@ -200,6 +200,20 @@ observable via `useLiveModel`'s `scanCompleteSeq`) moved out of `FilesPage.tsx` 
 the Queue tab: its list is single and ungrouped, so no one queue's timestamp would honestly stand
 in for all of them (see `docs/decisions.md`). 1654 backend / 654 frontend tests, 0 skipped.
 **Browser-unverified.**
+
+**The *arr poll interval dropped from 60s to 10s and is now a Settings → Integrations control**
+(issue #16, `prompts/done/2026-08-21-arr-poll-cadence.md`) — issue #16's premise (a faster
+cadence multiplies *arr request volume) turned out false: the queue poll is one HTTP request per
+bound instance per pass for any normal-sized queue, so 6× the cadence is six requests a minute,
+not one per item, fixing both Preflight's coarse progress jumps and import-confirmation lag
+without a cadence split, adaptive scheme, or local-observation trick (reasoning in
+`docs/decisions.md`). `ArrSettings.poll_interval_s` now round-trips through `GET`/`PUT
+/api/settings/arr/poll-interval`, server-validated against the unchanged 5s floor
+(`ArrSyncScheduler.MIN_POLL_INTERVAL_S`) and a new 3600s ceiling; a queue that ever grows past one
+250-record page now writes one `arr_queue_multi_page` event, observational only, no adaptive
+backoff. Existing installs get the new default for free — `save_arr_settings` had zero call sites
+before this, so no real install had a persisted value to migrate. 1663 backend / 654 frontend
+tests, 0 skipped. **Browser-unverified.**
 
 ### 🚦 2026-08-20/21 — queue **Pause**, the **Preflight** box, and the docs catch-up (all in v0.3.0)
 

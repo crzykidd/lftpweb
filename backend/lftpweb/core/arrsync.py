@@ -127,6 +127,7 @@ import aiosqlite
 
 from lftpweb.core import audit, extract, mount_sentinel
 from lftpweb.core.arrclient import (
+    PAGE_SIZE,
     TRACKED_DOWNLOAD_STATE_IMPORTED,
     ArrClient,
     ArrClientError,
@@ -148,16 +149,43 @@ logger = logging.getLogger(__name__)
 
 SETTING_KEY = "arr_settings"
 
+# Upper bound for `ArrSettings.poll_interval_s`, enforced server-side by `api/settings_arr.py`'s
+# PUT handler (2026-08-21, issue #16, `prompts/done/2026-08-21-arr-poll-cadence.md`). There is no
+# legitimate reason to want this *arr integration polled slower than once an hour -- this exists
+# to catch a fat-fingered value (an extra zero, minutes typed where seconds are expected), not to
+# express a real use case. `ArrSyncScheduler.MIN_POLL_INTERVAL_S` is the matching floor.
+MAX_POLL_INTERVAL_S = 3600.0
+
 
 @dataclass(frozen=True)
 class ArrSettings:
-    """Site-level poll cadence (docs/arr-integration-spec.md "The poller": "Default every 60s
-    (site setting, `ArrSettings` in `setting` like every other settings dataclass)"). Not itself
-    an on/off switch -- an instance's own `enabled` column is that (migration 018, "everything
-    defaults OFF"); this only governs how often an *enabled* instance's queue is polled.
+    """Site-level poll cadence (docs/arr-integration-spec.md "The poller"). Not itself an on/off
+    switch -- an instance's own `enabled` column is that (migration 018, "everything defaults
+    OFF"); this only governs how often an *enabled* instance's queue is polled.
+
+    **Default 10s, down from 60s** (2026-08-21, issue #16, `prompts/done/2026-08-21-arr-poll-
+    cadence.md`: "Preflight progress updating in one-minute jumps, and import detection lagging
+    30-60s"). The premise issue #16 argued from -- that a faster cadence multiplies request
+    volume against Sonarr/Radarr -- does not hold for this poller's actual shape: the queue poll
+    (`ArrClient.queue_records()`) costs exactly **one** HTTP request per bound instance per pass
+    for any queue that fits in one `PAGE_SIZE` (250) page, the normal case, so 6x the cadence is
+    six requests a minute per instance, not one per item. History
+    (`ArrClient.import_events()`) is unaffected by this change at all: it is an exact lookup by
+    `downloadId`, called only for items already past the queue-presence check
+    (`_check_import`'s requirement 1), so its volume tracks release *transitions*, never poll
+    frequency. Both symptoms issue #16 named are gated on this same queue poll -- Preflight's
+    progress fields and the two-consecutive-passes import-confirmation guard both read it --
+    so lowering it fixes both without a cadence split, an adaptive scheme, or a
+    local-observation trick (see docs/decisions.md, 2026-08-21, for the full reasoning behind
+    rejecting the split issue #16 itself proposed). Still clamped to
+    `ArrSyncScheduler.MIN_POLL_INTERVAL_S` (5s) against a misconfigured near-zero value -- 10s is
+    the new *default*, not a new floor. Exposed at Settings -> Integrations as of this change
+    (`GET`/`PUT /api/settings/arr/poll-interval`, server-side validated against
+    `MIN_POLL_INTERVAL_S`/`MAX_POLL_INTERVAL_S` above); before this it was DB-only, a default
+    that got written down rather than ever an actual user choice.
     """
 
-    poll_interval_s: float = 60.0
+    poll_interval_s: float = 10.0
 
 
 async def load_arr_settings(db: aiosqlite.Connection) -> ArrSettings:
@@ -169,7 +197,7 @@ async def load_arr_settings(db: aiosqlite.Connection) -> ArrSettings:
         data = json.loads(row["value"])
     except (ValueError, TypeError):
         return ArrSettings()
-    return ArrSettings(poll_interval_s=float(data.get("poll_interval_s", 60.0)))
+    return ArrSettings(poll_interval_s=float(data.get("poll_interval_s", 10.0)))
 
 
 async def save_arr_settings(db: aiosqlite.Connection, settings: ArrSettings) -> None:
@@ -234,7 +262,8 @@ def _derive_arr_root(output_path: str, item_name: str) -> str:
 # knows about that have not yet reached this seedbox's completed folder, so lftpweb has no
 # `item` and no work to do on them yet. **A pure projection of this poller's own latest pass, no
 # table, no migration, no persistence** -- every field a row needs is already sitting in the
-# `QueueRecord.raw` this module fetches every ~60s and otherwise discards the moment a record
+# `QueueRecord.raw` this module fetches every poll pass (~10s by default) and otherwise discards
+# the moment a record
 # matches nothing (`_match_items`'s own "candidates" loop never looks at these at all).
 #
 # **This section is where every *arr-specific piece of the Preflight box lives, deliberately.**
@@ -375,7 +404,8 @@ def _parse_timeleft(value: object) -> float | None:
     per the handoff prompt's own instruction; `estimatedCompletionTime` (an absolute timestamp)
     was the other field available on the same record but is **not** used here: it would require
     trusting the *arr's clock against this process's own, and a fresh recomputation every request
-    (`now` vs. a timestamp read once per ~60s poll) would make the figure visibly count down
+    (`now` vs. a timestamp read once per poll, ~10s by default) would make the figure visibly
+    count down
     unevenly between polls, whereas `timeleft` is already the duration the *arr itself computed
     and is rendered through this codebase's *own* `formatEta`/`transferLineValue` shape exactly
     once it's a plain number of seconds -- one clock (this process's own render), not two.
@@ -520,7 +550,7 @@ class _InstanceBackoff:
 # failing gets this many attempts, growing further apart each time (`INITIAL_BACKOFF_S`/
 # `BACKOFF_FACTOR`/`MAX_BACKOFF_S`, reused from `_InstanceBackoff` above rather than
 # reinvented), before this process pauses and writes one clear event rather than a
-# `remote_delete_failed` every ~60s pass for as long as a seedbox stays down.
+# `remote_delete_failed` every poll pass (~10s by default) for as long as a seedbox stays down.
 # `remote_delete_pending` is never cleared by pausing -- the manual Files-page delete or a
 # restart's clean in-memory slate (`_SourceDeleteRetryState`'s own docstring) can still act.
 MAX_SOURCE_DELETE_RETRY_ATTEMPTS = 5
@@ -633,6 +663,19 @@ class ArrSyncScheduler:
         # same in-memory "restart loses it, and that's the safe direction" reasoning as every
         # other per-process dict above (a restart just re-warns once more, never silently).
         self._path_mismatch_warned: set[tuple[int, str]] = set()
+        # Multi-page queue observation (2026-08-21, issue #16, `prompts/done/2026-08-21-arr-
+        # poll-cadence.md) -- the "one request per pass" property this task's own default-drop
+        # leans on (docs/decisions.md) holds only while an instance's queue fits in one
+        # `PAGE_SIZE` page; a queue that ever needs a second page is genuinely more expensive to
+        # poll at a faster cadence, and that is worth surfacing rather than silently absorbing.
+        # In-memory, edge-triggered per instance id -- warns once when a pass *first* observes
+        # more than `PAGE_SIZE` records, stays quiet on every subsequent multi-page pass (the
+        # same "don't write an event every pass for a continuing condition" idiom
+        # `_sweep_stranded_source_deletes` already established), and clears the moment a later
+        # pass drops back to one page, so a recurrence is reported again rather than treated as
+        # already-known forever. No adaptive backoff is built from this -- purely observational,
+        # per the handoff prompt's own instruction not to build a cadence nobody has needed yet.
+        self._multi_page_warned: set[int] = set()
         # Scan-command outcome check attempts, keyed by item id (2026-08-17,
         # `_check_scan_commands`'s own docstring) -- bounds the check to
         # `MAX_SCAN_COMMAND_CHECK_ATTEMPTS` passes, in memory: unlike `item.arr_scan_command_id`
@@ -644,7 +687,8 @@ class ArrSyncScheduler:
         # Preflight (this task) -- one `PreflightHold` (`core/preflight.py`) per bound *arr
         # instance id, the flap-tolerant cache of that instance's own last-seen preflight rows.
         # In-memory only, the same "restart loses it, and that's the safe direction" reasoning as
-        # every other dict above: a restart just empties the box until the next poll (≤60s),
+        # every other dict above: a restart just empties the box until the next poll (≤10s by
+        # default, 2026-08-21's issue #16; ≤60s before that),
         # which the handoff prompt's own reasoning accepts explicitly rather than adding
         # persistence to avoid it. `_update_preflight` is the only writer; `preflight_rows` is
         # the only reader.
@@ -653,8 +697,9 @@ class ArrSyncScheduler:
         # bound+enabled queue ids that pass attributed against -- both refreshed by
         # `_update_preflight` alongside the hold above, and read by `preflight_rows`' own
         # request-time retirement re-check (2026-08-21, "eviction latency": retirement was only
-        # *decided* once per *arr poll, `ArrSettings.poll_interval_s` defaulting to 60s, even
-        # though the underlying question -- "does a matching `item` now exist" -- is purely
+        # *decided* once per *arr poll, `ArrSettings.poll_interval_s` -- 10s by default as of
+        # 2026-08-21's issue #16 (60s before that), even though the underlying question -- "does
+        # a matching `item` now exist" -- is purely
         # local and answerable on every request). In-memory only, same "restart loses it, and
         # that's the safe direction" reasoning as every other dict here: a restart just means
         # the very next request's retirement re-check has nothing to test against until the
@@ -740,6 +785,7 @@ class ArrSyncScheduler:
                 return
 
             self._backoff.pop(instance_id, None)  # reachable again
+            await self._observe_queue_page_count(instance_id, instance["name"], len(records))
 
             for queue in queues:
                 try:
@@ -851,7 +897,8 @@ class ArrSyncScheduler:
         **Now `async`, and now also a request-time retirement check** (2026-08-21, "eviction
         latency"): `_update_preflight`'s own `retired` set already evicts a row the instant a
         *poll pass* discovers the hand-over, but the poll only runs every
-        `ArrSettings.poll_interval_s` (60s by default) -- an item that lands between two polls
+        `ArrSettings.poll_interval_s` (10s by default as of 2026-08-21's issue #16, 60s before
+        that) -- an item that lands between two polls
         still sat here, visibly duplicated against its own new Active/pending row, for up to
         that whole interval. The underlying question, "does a matching `item` exist now," is
         purely local state, so this re-asks it on every call: for each held row whose identity
@@ -923,6 +970,45 @@ class ArrSyncScheduler:
             message=(
                 f"*arr instance {instance_name!r} (id={instance_id}) unreachable: {exc}; "
                 f"backing off {delay:.0f}s"
+            ),
+        )
+
+    async def _observe_queue_page_count(
+        self, instance_id: int, instance_name: str, record_count: int
+    ) -> None:
+        """Observational only (2026-08-21, issue #16's own "guard the multi-page case") -- the
+        "one request per pass" property `ArrSettings.poll_interval_s`'s new 10s default leans on
+        (docs/decisions.md) holds only while `ArrClient.queue_records()` walked exactly one
+        `PAGE_SIZE` page; `record_count > PAGE_SIZE` is direct proof it walked more than one
+        (`queue_records`'s own pagination stops the instant the running count reaches the
+        server's reported total, never over-fetching). Never changes what the poller does --
+        no adaptive backoff, no cadence change, per the handoff prompt's own instruction not to
+        build one nobody has needed yet -- this only writes one INFO event so a queue that has
+        grown past a single page is visible in the audit trail rather than discovered by
+        surprise.
+        """
+        if record_count <= PAGE_SIZE:
+            self._multi_page_warned.discard(instance_id)  # back to one page -- rearm the warning
+            return
+        if instance_id in self._multi_page_warned:
+            return  # already reported for this instance; don't spam every pass
+        self._multi_page_warned.add(instance_id)
+        logger.info(
+            "*arr instance %d (%s) queue spans multiple pages (%d records, page size %d) -- "
+            "polling this instance now costs more than one request per pass",
+            instance_id,
+            instance_name,
+            record_count,
+            PAGE_SIZE,
+        )
+        await audit.record_event(
+            self.db,
+            level="info",
+            kind="arr_queue_multi_page",
+            message=(
+                f"*arr instance {instance_name!r} (id={instance_id}) queue spans multiple "
+                f"pages ({record_count} records, page size {PAGE_SIZE}) -- polling this "
+                "instance now costs more than one queue request per pass; no behavior change"
             ),
         )
 

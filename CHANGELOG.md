@@ -73,8 +73,30 @@ Skeleton for the next roll:
   endpoint rather than a second implementation. No "scanned Xs ago" reading here: the Queue tab's
   list is single and ungrouped, so there's no one queue's timestamp that would honestly stand in
   for all of them the way the Files page's per-section reading does.
+- **The *arr poll interval is now a Settings → Integrations control** (closes #16) —
+  `core/arrsync.py.ArrSettings.poll_interval_s` was DB-only before this, never exposed in the API
+  or UI, so any stored value was a default that got written down rather than an actual user
+  choice. Now a `GET`/`PUT /api/settings/arr/poll-interval` field, validated server-side against a
+  5s floor (unchanged, `ArrSyncScheduler.MIN_POLL_INTERVAL_S`) and a new 3600s ceiling. A queue
+  that ever grows past one page (250 in-progress items) writes one `arr_queue_multi_page` event
+  the first time that happens per instance — the poll still walks every page, this is purely
+  observational, and no adaptive cadence was built.
 
 ### Changed
+
+- **The *arr poll interval's default dropped from 60s to 10s** (closes #16 — "Preflight progress
+  updating in one-minute jumps, and import detection lagging 30–60s"). The issue's own premise —
+  that a faster cadence multiplies request volume against Sonarr/Radarr — doesn't hold for this
+  poller's actual shape: the queue poll is one HTTP request per bound instance per pass for any
+  normal-sized queue (`ArrClient.queue_records()`'s own single-page walk), so six times the
+  cadence is six requests a minute per instance, not one per item; history lookups are unaffected
+  — exact, by `downloadId`, and only for items already past the queue-presence check. Both symptoms
+  the issue named are gated on this same queue poll, so this one change fixes both, and import
+  confirmation (which needs two consecutive passes to agree) now takes roughly 20s instead of up
+  to a minute. No cadence split, adaptive scheme, or local-observation trick was needed — see
+  `docs/decisions.md` for the full reasoning. Every existing install already had no persisted
+  value (the setting was never reachable to write one), so this takes effect immediately on
+  upgrade with nothing to migrate.
 
 - **Active/pending now sorts running → queued → still-processing**, rather than placing
   pipeline-in-flight rows (verifying, extracting, awaiting import, deleting source) between

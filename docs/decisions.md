@@ -6,6 +6,68 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-21 — *arr poll cadence (issue #16): why the split was rejected, existing installs,
+## and leaving `PREFLIGHT_HOLD_S` alone
+
+`prompts/done/2026-08-21-arr-poll-cadence.md`, closing issue #16 ("Preflight progress updating in
+one-minute jumps, and import detection lagging 30–60s").
+
+**Issue #16's own premise was false, and rejecting the cadence split it proposed follows directly
+from that, not from a preference for simplicity.** The issue's core argument was that dropping
+the poll interval from 60s to 5s would be "12× the request rate against Sonarr/Radarr," and from
+there floated three mitigations: splitting the cadence (queue vs. history), an adaptive scheme,
+or answering from local state instead of polling harder. Reading `core/arrsync.py` and
+`core/arrclient.py` before building (as the handoff prompt required) showed the premise doesn't
+hold: `ArrClient.queue_records()` costs exactly one HTTP request per bound instance per pass for
+any queue that fits in one `PAGE_SIZE` (250) page — the normal case — so a 6× cadence is six
+requests a minute per instance, not one per item. `ArrClient.import_events()` is unaffected
+entirely: it's an exact `downloadId` lookup, called only for items already past `_check_import`'s
+requirement 1 (the queue record is gone or `imported`), so its volume tracks release
+*transitions*, never poll frequency. And both symptoms the issue named — Preflight's progress
+fields and the two-consecutive-passes import-confirmation guard — are gated on this same queue
+poll, so lowering it fixes both at once. With the premise false, every mitigation issue #16
+proposed was solving a cost that doesn't exist: a queue/history cadence split would separate two
+things that already scale independently; an adaptive scheme would add real complexity to chase a
+request-volume problem this shape doesn't have; and a local-observation trick would substitute
+guesswork for the "ask the *arr, then confirm on two passes" honesty the design already has.
+**Default landed at 10s** (down from 60s), not lower — the 5s floor
+(`ArrSyncScheduler.MIN_POLL_INTERVAL_S`) stays a floor, not the new default, since there's no
+evidence a real install needs to go faster than 10s and headroom against a misconfigured
+near-zero value is worth keeping.
+
+**The one genuinely different cost — a queue past 250 in-progress items — gets an observational
+guard, not adaptive backoff.** The "one request per pass" property above holds only up to one
+`PAGE_SIZE` page; a queue that ever needs a second page really does cost more at a faster cadence.
+Built the cheapest honest option: `ArrSyncScheduler._observe_queue_page_count` writes one
+`arr_queue_multi_page` INFO event the first time a pass crosses the threshold (edge-triggered —
+it re-arms if the queue drops back under 250 and rearms silence again on a sustained condition,
+the same "don't write an event every pass for a continuing problem" idiom
+`_sweep_stranded_source_deletes` already established), and nothing else changes: the poller still
+walks every page regardless, and no cadence adjustment reads this signal. Building adaptive
+backoff for a queue size nobody running this software has actually hit would be solving a
+hypothetical; the event exists so it stops being one the moment it's real.
+
+**Existing installs: left alone, no migration.** `poll_interval_s` was never exposed in the API
+or UI before this task, so in principle a persisted value could be "not a real user choice" and
+worth overwriting on upgrade. In practice the question is moot: grepping the codebase before this
+change found `save_arr_settings` had **zero call sites** anywhere outside its own definition — no
+code path, ever, wrote a `setting` row for this key. Every real install therefore has no row at
+all and falls straight through `load_arr_settings` to the dataclass default, which already means
+the new 10s value takes effect immediately on upgrade with no migration needed — the practical
+outcome the "actively move installs forward" option would have delivered anyway, without writing
+a backfill that overwrites a `setting` row based on it merely matching an old default (a
+precedent worth not setting for a case that structurally cannot occur through normal use). If a
+row somehow exists — hand-edited DB, say — it is left untouched, same as any other persisted
+setting.
+
+**`core/preflight.py.PREFLIGHT_HOLD_S` (150s) was not lowered to match.** It exists so one missed
+*arr refresh never blinks a Preflight row out and back, sized as "a couple of passes' worth of
+margin" over the poller's old 60s default. At the new 10s default it's now ~15 passes of margin
+instead of ~2.5 — more generous, not less safe — and there is no user-visible cost to that
+slack (a row that's actually gone still clears within the same wall-clock window, since the
+constant itself didn't change). Lowering it to preserve the old *pass-count* margin would be
+solving a problem that doesn't exist yet; left alone until real use says otherwise.
+
 ## 2026-08-21 — Queue tab "Rescan now": shared hook, and why it carries no timestamp
 
 `prompts/done/2026-08-21-queue-tab-rescan-button.md`, closing the first half of issue #19. The

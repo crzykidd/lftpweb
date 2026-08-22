@@ -2,11 +2,13 @@ import { useEffect, useState } from 'react'
 import {
   createArrInstance,
   deleteArrInstance,
+  getArrPollSettings,
   listArrInstances,
+  putArrPollSettings,
   testArrInstance,
   updateArrInstance,
 } from '../../api/client'
-import type { ArrInstanceOut, ArrKind, ArrTestResponse } from '../../api/types'
+import type { ArrInstanceOut, ArrKind, ArrPollSettingsOut, ArrTestResponse } from '../../api/types'
 
 const inputClasses =
   'w-full rounded-md border border-zinc-300 bg-white px-2.5 py-1.5 text-sm text-zinc-900 outline-none focus:border-zinc-500 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100'
@@ -33,6 +35,109 @@ const EMPTY_FORM: FormState = {
   api_key: '',
   enabled: false,
   notify_on_complete: false,
+}
+
+// Client-side hints only -- the authoritative range check is server-side
+// (`api/settings_arr.py.put_arr_poll_settings`, `core/arrsync.py.ArrSyncScheduler.
+// MIN_POLL_INTERVAL_S` / `MAX_POLL_INTERVAL_S`). Mirrored here only so the input's own
+// `min`/`max` attributes and the hint text agree with what the server will actually accept.
+const POLL_INTERVAL_MIN_S = 5
+const POLL_INTERVAL_MAX_S = 3600
+
+const POLL_SETTINGS_EMPTY: ArrPollSettingsOut = { poll_interval_s: 10 }
+
+/** Settings → Integrations's poll cadence section (2026-08-21, issue #16,
+ * `prompts/done/2026-08-21-arr-poll-cadence.md`) -- `core/arrsync.py.ArrSettings.
+ * poll_interval_s` exposed here for the first time; before this it was DB-only, a default that
+ * got written down rather than ever a user choice. Same self-contained load/save shape
+ * `TransferTab.tsx`'s `SettleGateSection`/`DownloadPrefixSection` already establish for a
+ * site-level setting that isn't part of a bigger form: its own `GET`/`PUT` cycle, a draft value
+ * distinct from the last-saved one so typing doesn't fight the server response.
+ */
+function PollCadenceSection() {
+  // One field, fully represented by `draft` -- unlike `DownloadPrefixSection` above (which also
+  // tracks a separate `enabled` toggle not covered by its own draft string), there is no second
+  // piece of server state to hold onto here, so a distinct `settings` object would just mirror
+  // `draft` and go unused.
+  const [draft, setDraft] = useState(String(POLL_SETTINGS_EMPTY.poll_interval_s))
+  const [loading, setLoading] = useState(true)
+  const [saving, setSaving] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const [saved, setSaved] = useState(false)
+
+  useEffect(() => {
+    getArrPollSettings()
+      .then((s) => setDraft(String(s.poll_interval_s)))
+      .finally(() => setLoading(false))
+  }, [])
+
+  const handleSave = async () => {
+    const parsed = Number(draft)
+    setError(null)
+    setSaved(false)
+    if (!Number.isFinite(parsed) || parsed < POLL_INTERVAL_MIN_S || parsed > POLL_INTERVAL_MAX_S) {
+      setError(
+        `Enter a number between ${POLL_INTERVAL_MIN_S} and ${POLL_INTERVAL_MAX_S} seconds.`,
+      )
+      return
+    }
+    setSaving(true)
+    try {
+      const result = await putArrPollSettings({ poll_interval_s: parsed })
+      setDraft(String(result.poll_interval_s))
+      setSaved(true)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  return (
+    <div className="flex flex-col gap-3 rounded-md border border-zinc-200 p-4 dark:border-zinc-800">
+      <h3 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">Poll cadence</h3>
+      <p className={hintClasses}>
+        How often lftpweb asks each enabled instance for its download queue -- this is what
+        drives Preflight's progress fields and how quickly an import is confirmed (two
+        consecutive passes must agree, so confirmation takes up to roughly twice this value).
+        This costs one HTTP request per bound instance per pass for a normal-sized queue, so a
+        faster cadence is cheap; a queue that grows past 250 in-progress items is logged once as
+        an event when that happens, not silently absorbed.
+      </p>
+      {loading ? (
+        <p className="text-sm text-zinc-500 dark:text-zinc-400">Loading…</p>
+      ) : (
+        <label className="flex flex-col gap-1">
+          <span className={labelClasses}>Poll interval (seconds)</span>
+          <input
+            type="number"
+            min={POLL_INTERVAL_MIN_S}
+            max={POLL_INTERVAL_MAX_S}
+            step={1}
+            className={inputClasses + ' max-w-32'}
+            value={draft}
+            disabled={saving}
+            onChange={(e) => setDraft(e.target.value)}
+          />
+        </label>
+      )}
+      <p className={hintClasses}>
+        Default {POLL_SETTINGS_EMPTY.poll_interval_s}s. Floored at {POLL_INTERVAL_MIN_S}s against
+        a near-zero value; capped at {POLL_INTERVAL_MAX_S}s ({POLL_INTERVAL_MAX_S / 60} minutes)
+        since there is no real reason to want it slower.
+      </p>
+      {error && <p className="text-sm text-red-600 dark:text-red-400">{error}</p>}
+      {saved && !error && <p className="text-sm text-emerald-600 dark:text-emerald-400">Saved.</p>}
+      <button
+        type="button"
+        disabled={saving || loading}
+        onClick={handleSave}
+        className={buttonClasses}
+      >
+        {saving ? 'Saving…' : 'Save'}
+      </button>
+    </div>
+  )
 }
 
 /** Settings → Integrations (new, docs/arr-integration-spec.md): Sonarr/Radarr instance CRUD
@@ -171,6 +276,8 @@ export function IntegrationsTab() {
       </p>
 
       {error && <p className="text-sm text-red-600 dark:text-red-400">{error}</p>}
+
+      <PollCadenceSection />
 
       <div className="overflow-hidden rounded-md border border-zinc-200 dark:border-zinc-800">
         <table className="w-full text-sm">

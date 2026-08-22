@@ -3101,8 +3101,10 @@ the transition, all of them required: the *arr's own queue record for the releas
 (a record still reporting `trackedDownloadState: importing` is never "imported," no matter what
 history says), at least one history import event must corroborate the disappearance was a real
 import rather than a removal, and both signals must hold across **two consecutive poller
-passes** roughly a minute apart — a settle-gate-style quiescence guard, the same "unchanged for
-two observations" philosophy §1.3's own settle gate already applies to a remote fingerprint.
+passes** — roughly 20s apart at the 10s default (`ArrSettings.poll_interval_s`, configurable at
+Settings → Integrations, floored at 5s; 60s/roughly a minute apart before 2026-08-21's issue #16)
+— a settle-gate-style quiescence guard, the same "unchanged for two observations" philosophy
+§1.3's own settle gate already applies to a remote fingerprint.
 Cleanup (`core/arrsync.py`'s `_maybe_cleanup`) never runs on ambiguity: a queue record simply
 vanishing with no import event maps to `dropped`, not directly to `gone` (below) — the icon
 dims to an amber "rechecking" warning, nothing is deleted, ever.
@@ -3145,7 +3147,8 @@ because an *unexplained* absence means a decision is pending, renders "Processed
 `cleaned` row instead — same clock, different words, because this absence is deliberate and
 fully audited (`core/audit.py` event rows: `arr_matched`, `arr_notified`,
 `arr_notify_failed`, `arr_imported`, `arr_cleanup`, `arr_cleanup_withheld`,
-`arr_path_mismatch`, `arr_scan_command_failed`, `arr_queue_dropped`, `arr_gone_heal_giving_up`).
+`arr_path_mismatch`, `arr_scan_command_failed`, `arr_queue_dropped`, `arr_gone_heal_giving_up`,
+`arr_queue_multi_page`).
 
 **The notify push is not actually fire-and-forget, as of 2026-08-17.** A `POST /api/v3/command`
 201 only ever meant "command queued" — it says nothing about whether the *arr could act on the
