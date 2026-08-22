@@ -72,16 +72,28 @@ export function transferLineValue(job: JobOut, live?: LiveProgress): string {
  * number can never disagree with the figure column sitting right beside it (the user has
  * explicitly approved seeing the same percent twice, in the chip and in the figure column).
  *
- * Only a `running` job ever gets a state `stateProgressPercent` has a fill for (`chipStateFor`
- * maps `running` to `'DOWNLOADING'`; every other job state maps to something with no
- * `FILL_STYLES` entry) -- checked directly here rather than importing `chipStateFor` from
+ * A `running` job maps to `stateProgressPercent`'s `'DOWNLOADING'` bucket; a **`queued`** job
+ * (2026-08-21, prompts/done/2026-08-21-paused-item-progress.md, issue #14's second half) now
+ * maps to its own `'QUEUED'` bucket -- a paused-in-place or freshly-retried-after-interruption
+ * row that already has partial bytes on disk. `job.bytes_done`/`job.bytes_total` only, never
+ * `live` -- `_publish_child_progress` (the WebSocket's one source of live progress) speaks only
+ * for a *running* job, so a queued row has nothing to prefer over what the server already
+ * projected (`core/queue.py.list_jobs`'s own `item.local_size`/`remote_size` fallback for a
+ * queued row, `api/jobs.py._job_out`). Every other job state (`failed`/`cancelled`/`succeeded`)
+ * maps to something with no `FILL_STYLES` entry, so this returns `null` for those without
+ * needing its own branch. Checked directly here rather than importing `chipStateFor` from
  * `TransfersPage.tsx`, which would make this lib module depend on a page module.
  */
 export function queueRowPercent(job: JobOut, live?: LiveProgress): number | null {
-  if (job.state !== 'running') return null
-  const bytesDone = live?.bytes_done ?? job.bytes_done
-  const bytesTotal = (live?.bytes_total ?? job.bytes_total) ?? job.bytes_total
-  return stateProgressPercent('DOWNLOADING', bytesDone, bytesTotal)
+  if (job.state === 'running') {
+    const bytesDone = live?.bytes_done ?? job.bytes_done
+    const bytesTotal = (live?.bytes_total ?? job.bytes_total) ?? job.bytes_total
+    return stateProgressPercent('DOWNLOADING', bytesDone, bytesTotal)
+  }
+  if (job.state === 'queued') {
+    return stateProgressPercent('QUEUED', job.bytes_done, job.bytes_total)
+  }
+  return null
 }
 
 /** One row of the expand panel -- a plain label/value pair, optionally with a longer `title` for

@@ -84,12 +84,30 @@ export function nodeDisplaySize(entry: {
  * is on this list too -- both `FileTree.tsx`'s own rows and a Transfers row's child rows need
  * the identical rule. `percentValue` already guards the `NaN`/divide-by-zero cases (no or
  * non-positive `remote_size`), so a queue whose `remote_size` hasn't arrived yet just shows no
- * bar rather than a broken one. */
+ * bar rather than a broken one.
+ *
+ * **`QUEUED` joined this list 2026-08-21** (prompts/done/2026-08-21-paused-item-progress.md,
+ * issue #14's second half): pause-now returns a job to `queued` *in place*, deliberately keeping
+ * its partial bytes on disk (`prompts/done/2026-08-20-queue-pause.md`) -- the whole point being
+ * that pause is non-destructive -- but before this a paused row rendered as plainly `QUEUED`,
+ * losing every sign of that. Gated on **having partial bytes**, not on *why* the row is queued
+ * (a manual retry after an interrupted attempt leaves an item in the identical situation, and
+ * reads the same way here), which is both simpler and more honest than checking whether the
+ * queue itself happens to be paused right now.
+ *
+ * Given its own `if`, not folded into the `DOWNLOADING`/`PARTIAL` check below, because it needs
+ * an extra guard those two don't: `percentValue(0, total)` resolves to `0`, not `null` --
+ * correct for a `DOWNLOADING` row that only just started, but wrong here, where the signal is
+ * "there is already something on disk." Without this, *every* queued row with a known
+ * `remote_size` would show a `QUEUED 0%` chip, not just the ones that actually have bytes
+ * already down. `localSize` falsy (`null`, `undefined`, or exactly `0`) means "nothing to show,"
+ * matching `PARTIAL`/`DOWNLOADING`'s own "no reading yet" silence. */
 export function stateProgressPercent(
   state: string,
   localSize: number | null,
   remoteSize: number | null,
 ): number | null {
+  if (state === 'QUEUED') return localSize ? percentValue(localSize, remoteSize) : null
   if (state !== 'DOWNLOADING' && state !== 'PARTIAL') return null
   return percentValue(localSize, remoteSize)
 }

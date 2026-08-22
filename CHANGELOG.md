@@ -34,6 +34,13 @@ Skeleton for the next roll:
   queue's own ~1s tick, so the queue resumes itself on schedule with no page open, and records
   its own audit event distinct from a manual unpause. The paused banner and header badge both
   show the deadline ("resumes at HH:MM") whenever one is set.
+- **A paused or retried-after-interruption row now shows its own progress** — `QUEUED 45%`, in
+  the same fillable chip the running row already uses, so a paused-now item visibly keeps the
+  bytes it already downloaded rather than looking like it lost them. Gated on the row genuinely
+  having partial bytes on disk, not on the queue being paused: a job re-queued after an
+  interrupted attempt reads the same way. A queued row with nothing downloaded yet is unchanged —
+  no `0%`, no fill. The fill never ticks on its own — nothing samples a paused item's bytes — so
+  it never suggests the item is actively transferring.
 
 ### Changed
 

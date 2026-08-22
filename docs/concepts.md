@@ -38,6 +38,16 @@ Pausing has two flavors, both reached from the same **Pause** control:
 reads `STOPPED`. It doesn't need a Retry click to come back — unpausing alone is enough, because
 pausing was never a decision about *that item*, only about *right now*.
 
+**The Queue row shows that non-destructiveness, not just states it.** A paused-now row's chip
+reads something like **`QUEUED 45%`**, with the same amber fill the running row's own chip uses —
+not the blue "actively transferring" one, since nothing is moving while it sits paused. That
+percentage is a snapshot, not a countdown: it doesn't tick on its own, because nothing is sampling
+a paused item's bytes; it only updates the next time the row re-renders with fresh data. The same
+figure shows for a **retried** item that was interrupted partway (its previous attempt failed with
+bytes already on disk) — the signal is "this row already has real progress on disk," not "the
+queue happens to be paused right now," so both situations read identically. A queued row with
+nothing downloaded yet looks exactly as it always has — no `0%`, no fill.
+
 **What keeps running anyway.** Pausing only ever stops new transfers from starting. It does not
 stop:
 

@@ -6,6 +6,56 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-21 — Paused-item progress: gate on partial bytes, not on the queue being paused
+
+`prompts/done/2026-08-21-paused-item-progress.md` (issue #14, progress half), landing right
+after the duration half above. User's words on the issue: showing `Queued 45%` would make pause
+visibly non-destructive.
+
+**Gated the display on "this row has partial bytes on disk," never on "the queue happens to be
+paused right now."** A job re-queued after an interrupted attempt (`attempt > 1`, real bytes
+already on disk from the attempt that died) is in the identical situation to a paused-now row and
+reads the same way — simpler than threading "is the queue paused" through the display logic, and
+more honest: the point isn't that pause exists, it's that the bytes are still there.
+
+**Backend: reused `item.local_size`, joined into `list_jobs()`, rather than trusting `job.
+bytes_done` for every queued row.** `job.bytes_done` is only current for the *same* job row the
+progress sampler last wrote to — true for a paused-in-place row (pause-now returns the existing
+job to `queued` without touching `bytes_done`), but **not** for a fresh retry: `enqueue_item`
+inserts a brand-new `job` row, whose `bytes_done` starts at the column's own `0` default,
+even though the item it belongs to may already carry real partial bytes. `item.local_size` is
+the one number the scanner/reconciler keeps current regardless of which job row is live
+(DESIGN.md §1.3 — never a fresh filesystem stat on the request path, just the join). `api/jobs.py.
+_job_out` prefers it over `job.bytes_done` for a `queued` row only, the identical shape its
+existing `bytes_total → item.remote_size` fallback already established for the same "queued,
+nothing frozen yet" gap — no new endpoint, no new column, one join and one conditional.
+
+**Frontend: extended the one shared `stateProgressPercent` (`lib/fileTree.ts`) rather than
+special-casing the Transfers row.** Both the Files page and the Transfers/Queue row already
+funnel "does this state get a percent, and what of" through that single function; adding a
+`QUEUED` branch there fixes both surfaces at once, rather than writing a second definition of
+the rule for just the Queue row (`transferPanel.ts.queueRowPercent` already carried an explicit
+comment against exactly that kind of drift). The `QUEUED` branch needed its own `if`, not a
+share of the existing `DOWNLOADING`/`PARTIAL` check: `percentValue(0, total)` resolves to `0`,
+not `null`, which is correct for a `DOWNLOADING` row that only just started but wrong here, where
+the signal is "there is already something on disk" — a plain never-started queued row must render
+exactly as it always has, not `QUEUED 0%`. So the `QUEUED` branch treats a falsy `localSize`
+(`null`, `undefined`, or `0`) as "nothing to show," same silence as the other two states already
+give a job with no reading yet.
+
+**`FILL_STYLES.QUEUED` got its own indigo pair (`indigo-300` / `indigo-700/80`), not `PARTIAL`/
+`WAITING`'s amber.** `QUEUED`'s base chip color (`STYLES.QUEUED`) is indigo, and `StateChip.tsx`'s
+own fill-color rule is explicit: "a second, more saturated shade of the same chip color, never a
+different hue." `WAITING` gets away with reusing `PARTIAL`'s amber because it was *given*
+`PARTIAL`'s amber base too (its own comment says so) — `QUEUED` wasn't, and repainting every
+queued row's base color (even ones with nothing downloaded) to make an amber fill match would
+have been a far bigger visual change than this task asked for. The `100→300` / `900/40→700/80`
+jump is the same numeric shift every other pair here uses, just on `QUEUED`'s own hue —
+**unverified in a real browser** (no UI access in this environment), unlike the amber pairs,
+which the user has already confirmed live.
+
+---
+
 ## 2026-08-21 — Pause-for-a-duration: a stored deadline, expired from `TransferQueue`'s own tick
 
 `prompts/2026-08-21-pause-for-duration.md` (issue #14, duration half), extending queue pause

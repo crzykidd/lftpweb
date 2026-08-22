@@ -137,7 +137,7 @@ only in a session transcript.
 proves the pending-row concept against a real feed, and its source-agnostic boundary held through
 six tasks — so a SAB adapter is now an *enrichment of a working box*, not a new foundation.
 
-### On `dev` since the release (3 commits)
+### On `dev` since the release (4 commits)
 
 **Active/pending row sort changed to running → queued → still-processing** (`6822138`, changelog
 `2c97582`). A pipeline-in-flight row is lftpweb *waiting on someone else*; `queued` is its own
@@ -154,6 +154,19 @@ engine's scan loop, which can sleep indefinitely when every queue is on-demand-o
 checked synchronously in `start()` so "came back after the deadline" resumes unpaused the instant
 the process is up, not only after the first tick. 1602 backend / 615 frontend tests, 0 skipped.
 Browser-unverified.
+
+**A paused/queued row with partial bytes now shows its own progress** (issue #14, progress half,
+`prompts/done/2026-08-21-paused-item-progress.md`) — `QUEUED 45%` in the same fillable chip the
+running row uses, gated on the row genuinely having local bytes on disk, not on the queue being
+paused (a retry after an interrupted attempt reads the same way). Backend: `list_jobs()` now
+joins `item.local_size`; `_job_out` prefers it over `job.bytes_done` for a `queued` row only,
+mirroring the existing `bytes_total → item.remote_size` fallback. Frontend: `lib/fileTree.ts.
+stateProgressPercent` gained a `QUEUED` branch (shared by both the Files page and the Transfers
+row, one function, no drift), with its own zero-guard so a never-started queued row never shows
+`0%`; `StateChip.tsx`'s `FILL_STYLES.QUEUED` got its own indigo pair (`QUEUED`'s own base hue,
+never `PARTIAL`/`WAITING`'s amber, which would have mismatched the chip's own base color) —
+**unverified in a real browser**, unlike the already-confirmed amber pairs. 1608 backend / 621
+frontend tests, 0 skipped.
 
 ### 🚦 2026-08-20/21 — queue **Pause**, the **Preflight** box, and the docs catch-up (all in v0.3.0)
 

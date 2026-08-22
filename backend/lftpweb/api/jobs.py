@@ -146,7 +146,22 @@ def _job_out(row: dict, *, include_output_tail: bool = True) -> JobOut:
         rate_limit_bps=row["rate_limit_bps"],
         forced_rate_fraction=resolve_forced_rate_fraction(row),
         bytes_start=row["bytes_start"],
-        bytes_done=row["bytes_done"],
+        # 2026-08-21 (prompts/done/2026-08-21-paused-item-progress.md, issue #14's second half):
+        # for a `queued` row only, prefer `item.local_size` (the scanner/reconciler's own current
+        # reading, DESIGN.md §1.3) over `job.bytes_done` when the row's own `local_size` is known
+        # -- a fresh retry's `job.bytes_done` starts at 0 even when the item already carries real
+        # partial bytes from an interrupted earlier attempt, while a paused-in-place row's
+        # `job.bytes_done` and `item.local_size` already agree (both written together by the same
+        # progress-sampler UPDATE, `TransferQueue._sample_and_publish_progress`), so this is a
+        # no-op for that case and a real fix for the fresh-retry one. Mirrors `bytes_total`'s own
+        # fallback to `item.remote_size` immediately below, for the identical "queued, nothing
+        # frozen yet" reason. `.get`, not `row[...]`: `_job_out` is also called on rows built by
+        # hand in tests that predate this join (see `_job_out_row()`), which never carry the key.
+        bytes_done=(
+            row["local_size"]
+            if row["state"] == "queued" and row.get("local_size") is not None
+            else row["bytes_done"]
+        ),
         # 2026-08-14 (prompts/2026-08-14-exit-zero-is-not-completion.md, defect 4): prefer the
         # value `core/queue.py._spawn_decision` froze on `job.bytes_total` at admission --
         # `job.bytes_done`'s own denominator, fixed at the same moment (§4.5's "fixed at spawn,

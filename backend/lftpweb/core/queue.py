@@ -3149,9 +3149,24 @@ class TransferQueue:
         (migration 025) ride along so the row can *show* it was manually resolved rather than
         looking like a normal completion, and `item.state` is joined only because the reason
         expression reads it (never projected — see `models.py.JobOut`).
+
+        **2026-08-21** (prompts/done/2026-08-21-paused-item-progress.md, issue #14's second
+        half): also joins `item.local_size` -- a paused/queued row's own `job.bytes_done` is only
+        trustworthy while that row is the same one the progress sampler last wrote (pause-now's
+        in-place `queued` transition, `_reap_one`'s pause branch above). A *fresh*
+        `queued` job row created by a manual retry (`enqueue_item`, a new `job.id`) starts at
+        `bytes_done = 0` by column default even though the item may already carry real partial
+        bytes on disk from the attempt that was interrupted -- exactly the "attempt > 1, partial
+        bytes on disk" case this task calls out as deserving the same display as pause. `item.
+        local_size` is the one number the scanner/reconciler (never this request path, DESIGN.md
+        §1.3) keeps current regardless of which job row is live, so `api/jobs.py._job_out` reads
+        it as the queued-row fallback -- the identical shape `_job_out`'s own `bytes_total`
+        fallback to `item.remote_size` already established for the same "queued, never spawned"
+        gap.
         """
         cursor = await self.db.execute(
             "SELECT job.*, item.rel_path, item.is_dir, item.queue_id, item.remote_size, "
+            "       item.local_size, "
             "       item.verified_at, item.extracted_at, item.remote_deleted_at, "
             "       item.arr_status, item.arr_status_at, "
             "       item.manual_outcome, item.manual_outcome_at, "

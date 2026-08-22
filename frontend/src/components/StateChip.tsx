@@ -98,16 +98,38 @@ const FILL_STYLES: Record<string, string> = {
   // 700/80 (dark) jump for this new bucket carries that same confirmed legibility forward,
   // rather than introducing a second, still-unverified amber relationship.
   WAITING: 'bg-amber-300 dark:bg-amber-700/80',
+  // 2026-08-21 (prompts/done/2026-08-21-paused-item-progress.md, issue #14's second half):
+  // `QUEUED`'s own fill -- pause-now is deliberately non-destructive (it keeps `queue_position`,
+  // `attempt`, and every partial byte already on disk, `prompts/done/2026-08-20-queue-pause.md`),
+  // but a paused row still rendered as plainly `QUEUED` before this, losing every sign that it
+  // is already partway there and will resume from exactly that point. `QUEUED`'s own base is
+  // indigo (`STYLES` above), unlike `WAITING` (which was given `PARTIAL`'s amber base itself so
+  // the two could share a fill) -- reusing `PARTIAL`'s amber *fill* here, over an indigo base,
+  // would be exactly the different-hue mismatch this map's own top comment rules out. So this
+  // gets its own same-hue pair instead: `indigo-300`/`indigo-700/80`, the identical 100→300
+  // (light) and 900/40→700/80 (dark) jump every other pair here already uses, just on `QUEUED`'s
+  // own hue. **Unverified in a real browser** (no UI access in this environment) -- unlike the
+  // amber pairs above, this exact indigo jump has not had a live legibility check yet.
+  //
+  // Not a new state or new machinery: `lib/fileTree.ts.stateProgressPercent`'s own `QUEUED`
+  // branch only ever returns a number when the row genuinely has local bytes on disk, so this
+  // bucket paints nothing extra for a row with none -- a plain never-started queued item looks
+  // exactly as it did before this task. Static, not ticking: nothing re-samples a queued job's
+  // bytes (only a *running* job's progress gets sampled,
+  // `core/queue.py._sample_and_publish_progress`), so this bar never implies the motion
+  // `SETTLING`'s own lack of a fill is careful to avoid -- it paints once, from a frozen number,
+  // and sits still, which is the honest picture for a paused/queued item.
+  QUEUED: 'bg-indigo-300 dark:bg-indigo-700/80',
 }
 
 interface StateChipProps {
   state: string
   /** 0-100, or `null`/`undefined` for no bar at all. Only ever meaningful for `PARTIAL`/
-   * `DOWNLOADING` (`lib/fileTree.ts`'s `stateProgressPercent` is the one place that decides
-   * that for a Files/Transfers row) or `WAITING` (`lib/preflight.ts`'s `preflightFillPercent`,
-   * for a Preflight *arr row) -- a state with no entry in `FILL_STYLES` renders as a plain chip
-   * regardless of what `percent` is passed, so a caller can pass a percent for every row without
-   * checking the state itself.
+   * `DOWNLOADING`/`QUEUED` (`lib/fileTree.ts`'s `stateProgressPercent` is the one place that
+   * decides that for a Files/Transfers row) or `WAITING` (`lib/preflight.ts`'s
+   * `preflightFillPercent`, for a Preflight *arr row) -- a state with no entry in `FILL_STYLES`
+   * renders as a plain chip regardless of what `percent` is passed, so a caller can pass a
+   * percent for every row without checking the state itself.
    */
   percent?: number | null
   /** Overrides the displayed text without changing which `STYLES`/`FILL_STYLES` bucket `state`

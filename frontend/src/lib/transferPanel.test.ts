@@ -129,8 +129,25 @@ describe('queueRowPercent -- the Queue row\'s own chip fill', () => {
     expect(queueRowPercent(job('running', { bytes_done: 100, bytes_total: 1000 }), live)).toBe(90)
   })
 
-  it('is null for a queued job -- not yet running, nothing to fill', () => {
-    expect(queueRowPercent(job('queued', { bytes_total: 1000 }))).toBeNull()
+  it('is null for a queued job with no local bytes -- a plain never-started row', () => {
+    expect(queueRowPercent(job('queued', { bytes_done: 0, bytes_total: 1000 }))).toBeNull()
+  })
+
+  // 2026-08-21 (prompts/done/2026-08-21-paused-item-progress.md, issue #14's second half): a
+  // paused-in-place row (or one freshly retried after an interrupted attempt) reads its own
+  // partial bytes the same way a running row does -- "Queued 45%", making pause visibly
+  // non-destructive rather than looking like the item lost its progress.
+  it('reads the percent for a queued job that already has partial bytes on disk', () => {
+    expect(queueRowPercent(job('queued', { bytes_done: 450, bytes_total: 1000 }))).toBe(45)
+  })
+
+  it('never prefers a live reading for a queued job -- live progress only ever speaks for running', () => {
+    const live: LiveProgress = { bytes_done: 900, bytes_total: 1000, speed_bps: 1024, eta_s: 5 }
+    expect(queueRowPercent(job('queued', { bytes_done: 450, bytes_total: 1000 }), live)).toBe(45)
+  })
+
+  it('is null for a queued job with no known remote size -- no honest denominator', () => {
+    expect(queueRowPercent(job('queued', { bytes_done: 450, bytes_total: null }))).toBeNull()
   })
 
   it('is null for a terminal job -- the chip shows an outcome, not a percent', () => {
