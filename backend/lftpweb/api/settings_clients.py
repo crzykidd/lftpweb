@@ -29,12 +29,18 @@ from lftpweb.core.clients import (
     get_client_class,
     registered_clients,
 )
+from lftpweb.core.clients.detection import (
+    DetectedBasePath,
+    report_base_paths,
+    verify_reported_paths,
+)
 from lftpweb.core.clients.errors import CapabilityUnavailable, ClientError, ClientUnreachable
 from lftpweb.core.crypto import DecryptionError, decrypt_secret, encrypt_secret
 from lftpweb.core.engine import load_host_config
 from lftpweb.models import (
     ClientConfigFieldOut,
     ClientTypeOut,
+    DetectedBasePathOut,
     DownloadClientBasePathIn,
     DownloadClientBasePathOut,
     DownloadClientCategoryIn,
@@ -207,8 +213,9 @@ async def _replace_base_paths(
     await db.execute("DELETE FROM download_client_base_path WHERE client_id = ?", (client_id,))
     for bp in base_paths:
         await db.execute(
-            "INSERT INTO download_client_base_path (client_id, path) VALUES (?, ?)",
-            (client_id, bp.path),
+            "INSERT INTO download_client_base_path (client_id, path, kind, client_path, source) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (client_id, bp.path, bp.kind, bp.client_path, bp.source),
         )
 
 
@@ -222,6 +229,79 @@ async def _replace_categories(
             "VALUES (?, ?, ?)",
             (client_id, cat.category, cat.queue_id),
         )
+
+
+# --------------------------------------------------------------------------------------------
+# Test-on-save (spec §3a, this task's own handoff prompt: "we should test at save and not save
+# if enabled and test failed -- this is how the *arr clients handle it"). `enabled: true` tests
+# the *submitted* config before anything is persisted; `enabled: false` never tests and always
+# saves -- the deliberate escape hatch for a client that is temporarily unreachable, so a user
+# is never locked out of editing (or disabling) their own broken instance.
+# --------------------------------------------------------------------------------------------
+
+
+async def _test_submitted_config_or_raise(
+    client_class: type[DownloadClient], config: dict[str, Any]
+):
+    """Construct the connector from the *submitted* config (never a stored row -- on create
+    there is no row yet) and call `test_connection()`. On success, returns the `ConnectionInfo`
+    for the caller to persist alongside the row it's about to write. On any failure --
+    `ClientUnreachable`, the base `ClientError`, or `CapabilityUnavailable` (all three subclass
+    `ClientError`, spec §4.2's taxonomy) -- raises an `HTTPException(400)` carrying the real
+    error class and message, **and never persists anything**: the caller must not have written
+    the row yet when this raises.
+
+    The message states the escape hatch explicitly (this task's own instruction: "the UI must
+    make it obvious") rather than leaving a user to discover that unchecking Enabled is how to
+    save a temporarily-broken instance.
+    """
+    client = client_class(config=config)
+    try:
+        return await client.test_connection()
+    except ClientError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error_class": type(exc).__name__,
+                "message": (
+                    f"connection test failed, so nothing was saved: {exc}. Uncheck Enabled to "
+                    "save anyway and fix it later, or fix the settings above and try again."
+                ),
+            },
+        ) from exc
+    finally:
+        aclose = getattr(client, "aclose", None)
+        if aclose is not None:
+            await aclose()
+
+
+def _resolve_secret_for_test(
+    client_class: type[DownloadClient],
+    config_dir,
+    submitted_config: dict[str, Any],
+    existing_secret_enc: str | None,
+) -> dict[str, Any]:
+    """The secret half of the config to actually test against on an update: the submitted
+    secret if the request named one (`_secret_provided`'s all-or-nothing rule), otherwise the
+    existing encrypted secret decrypted -- an update that omits every secret field is keeping
+    the stored value, and testing anything else would mean testing a config that isn't the one
+    about to be saved.
+    """
+    if existing_secret_enc is None or _secret_provided(client_class, submitted_config):
+        return _validate_and_build_secret(client_class, submitted_config)
+    try:
+        return json.loads(decrypt_secret(config_dir, existing_secret_enc))
+    except DecryptionError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error_class": "DecryptionError",
+                "message": (
+                    "the stored secret cannot be decrypted, so an enabled save cannot be "
+                    "tested; re-enter it above, or uncheck Enabled to save without testing."
+                ),
+            },
+        ) from exc
 
 
 # --------------------------------------------------------------------------------------------
@@ -243,11 +323,21 @@ async def _get_client_row(db, client_id: int):
 
 async def _get_base_paths(db, client_id: int) -> list[DownloadClientBasePathOut]:
     cursor = await db.execute(
-        "SELECT id, path FROM download_client_base_path WHERE client_id = ? ORDER BY id",
+        "SELECT id, path, kind, client_path, source FROM download_client_base_path "
+        "WHERE client_id = ? ORDER BY id",
         (client_id,),
     )
     rows = await cursor.fetchall()
-    return [DownloadClientBasePathOut(id=r["id"], path=r["path"]) for r in rows]
+    return [
+        DownloadClientBasePathOut(
+            id=r["id"],
+            path=r["path"],
+            kind=r["kind"],
+            client_path=r["client_path"],
+            source=r["source"],
+        )
+        for r in rows
+    ]
 
 
 async def _get_categories(db, client_id: int) -> list[DownloadClientCategoryOut]:
@@ -337,6 +427,12 @@ def _get_client_class_or_400(client_type: str) -> type[DownloadClient]:
 
 @router.post("/clients", response_model=DownloadClientOut, status_code=201)
 async def create_client_instance(body: DownloadClientIn, request: Request) -> DownloadClientOut:
+    """`body.enabled` gates a connectivity test against the *submitted* config before anything
+    is written (spec §3a) -- on create there is no row yet, so the connector is built straight
+    from the request body, never persist-then-test-then-rollback. A failing test raises before
+    the `INSERT` runs at all; a passing one persists the probed capabilities and version from
+    that same call, so a fresh instance never needs a separate Test click to show them.
+    """
     client_class = _get_client_class_or_400(body.client_type)
     non_secret = _validate_and_split_non_secret(client_class, body.config)
     secret = _validate_and_build_secret(client_class, body.config)
@@ -345,18 +441,29 @@ async def create_client_instance(body: DownloadClientIn, request: Request) -> Do
     await _validate_category_queue_ids(db, body.categories)
     await _reject_invalid_base_paths(request, [bp.path for bp in body.base_paths])
 
+    info = None
+    if body.enabled:
+        info = await _test_submitted_config_or_raise(client_class, {**non_secret, **secret})
+
     config_dir = request.app.state.config_dir
     secret_enc = encrypt_secret(config_dir, json.dumps(secret)) if secret else None
     now = _now_iso()
+    caps_json = json.dumps(_capabilities_to_json(client_class.capabilities)) if info else None
+    probed_at = now if info else None
+    version = info.version if info else None
     cursor = await db.execute(
         "INSERT INTO download_client (name, client_type, config_json, secret_enc, enabled, "
-        "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "capabilities_json, capabilities_probed_at, version, created_at, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             body.name,
             body.client_type,
             json.dumps(non_secret),
             secret_enc,
             1 if body.enabled else 0,
+            caps_json,
+            probed_at,
+            version,
             now,
             now,
         ),
@@ -379,6 +486,17 @@ async def update_client_instance(
     declared secret key(s), which follow `_secret_provided`'s all-or-nothing rule above: omit
     every secret key from `config` to keep the stored secret exactly as it was, name any one of
     them to replace the whole encrypted blob.
+
+    `body.enabled` gates the same test-before-persist rule as create (spec §3a): tested against
+    the submitted config (the new secret if one was sent, otherwise the existing one decrypted --
+    never a stripped-down stand-in for what will actually be saved), and a failing test raises
+    before the `UPDATE` runs, leaving the existing row completely untouched. **Disabling an
+    instance is the escape hatch and always succeeds**, even one that is currently broken --
+    `body.enabled = False` never tests at all, so unchecking Enabled is how a user recovers a
+    broken instance to fix it. A disabling save leaves any previously-probed capabilities/version
+    exactly as they were (not cleared -- they're still the last known truth); only a fresh
+    successful enabled test resets them, same "layer 3 cleared by the next successful probe"
+    rule the standalone `/test` endpoint follows.
     """
     db = request.app.state.db
     existing = await _get_client_row(db, client_id)
@@ -398,19 +516,49 @@ async def update_client_instance(
     await _validate_category_queue_ids(db, body.categories)
     await _reject_invalid_base_paths(request, [bp.path for bp in body.base_paths])
 
-    await db.execute(
-        "UPDATE download_client SET name = ?, client_type = ?, config_json = ?, "
-        "secret_enc = ?, enabled = ?, updated_at = ? WHERE id = ?",
-        (
-            body.name,
-            body.client_type,
-            json.dumps(non_secret),
-            secret_enc,
-            1 if body.enabled else 0,
-            _now_iso(),
-            client_id,
-        ),
-    )
+    info = None
+    if body.enabled:
+        test_secret = _resolve_secret_for_test(
+            client_class, config_dir, body.config, existing["secret_enc"]
+        )
+        info = await _test_submitted_config_or_raise(client_class, {**non_secret, **test_secret})
+
+    now = _now_iso()
+    if info is not None:
+        await db.execute(
+            "UPDATE download_client SET name = ?, client_type = ?, config_json = ?, "
+            "secret_enc = ?, enabled = ?, capabilities_json = ?, capabilities_probed_at = ?, "
+            "version = ?, updated_at = ? WHERE id = ?",
+            (
+                body.name,
+                body.client_type,
+                json.dumps(non_secret),
+                secret_enc,
+                1 if body.enabled else 0,
+                json.dumps(_capabilities_to_json(client_class.capabilities)),
+                now,
+                info.version,
+                now,
+                client_id,
+            ),
+        )
+    else:
+        # Not tested this time (disabled) -- previously-probed capabilities/version, if any,
+        # are left exactly as they were; only `name`/`client_type`/`config`/`secret`/`enabled`
+        # change.
+        await db.execute(
+            "UPDATE download_client SET name = ?, client_type = ?, config_json = ?, "
+            "secret_enc = ?, enabled = ?, updated_at = ? WHERE id = ?",
+            (
+                body.name,
+                body.client_type,
+                json.dumps(non_secret),
+                secret_enc,
+                1 if body.enabled else 0,
+                now,
+                client_id,
+            ),
+        )
     await _replace_base_paths(db, client_id, body.base_paths)
     await _replace_categories(db, client_id, body.categories)
     await db.commit()
@@ -434,14 +582,54 @@ async def delete_client_instance(client_id: int, request: Request) -> None:
 
 
 # --------------------------------------------------------------------------------------------
-# Test-connection, the probed capability layer, and the capture (spec §4.1, §13.3).
+# Test-connection, the probed capability layer, the capture (spec §4.1, §13.3), and base-path
+# detection (spec §8.2 correction, migration 028).
 # --------------------------------------------------------------------------------------------
+
+
+def _detected_to_out(detected: DetectedBasePath) -> DetectedBasePathOut:
+    return DetectedBasePathOut(
+        client_path=detected.client_path, kind=detected.kind, state=detected.state
+    )
+
+
+async def _detect_and_verify_base_paths(
+    request: Request, client: DownloadClient, capabilities: CapabilitySet
+) -> list[DetectedBasePath]:
+    """The full detect -> verify pass (spec §8.2 correction): `client.list_base_paths()`
+    (never treated as exhaustive or authoritative), each result checked over SSH via
+    `core.browse.remote_directory_error`. Reuses `api/browse.py`'s own pattern for obtaining an
+    SFTP client against the configured host -- never opens its own connection.
+
+    **A detection failure must never fail the connection test** -- reachability and detection
+    are different questions (spec §4.2's temperament). No host configured, undecryptable
+    credentials, or the connection attempt itself failing all fall back to `verify_reported_
+    paths(reported, sftp=None)`, which reports every entry `unverified`, never `not_found`: not
+    being able to look is not the seedbox saying no.
+    """
+    reported = await report_base_paths(client, capabilities)
+    if not reported:
+        return []
+    engine = getattr(request.app.state, "engine", None)
+    host = None
+    if engine is not None:
+        host = await load_host_config(request.app.state.db, request.app.state.config_dir)
+    if host is None or host.credentials_need_reentry:
+        return await verify_reported_paths(reported, None)
+    try:
+        conn = await engine.pool.get_connection(host)
+        async with conn.start_sftp_client() as sftp:
+            return await verify_reported_paths(reported, sftp)
+    except Exception:  # noqa: BLE001 - detection must never fail the connection test
+        return await verify_reported_paths(reported, None)
 
 
 @router.post("/clients/{client_id}/test", response_model=DownloadClientTestResponse)
 async def test_client_instance(client_id: int, request: Request) -> DownloadClientTestResponse:
     """Construct the registered connector, call `test_connection()`, and persist the resolved
-    capability set (spec §4.1) plus the client's own reported version.
+    capability set (spec §4.1) plus the client's own reported version. On a fresh success, also
+    detects and SSH-verifies this connector's own base paths (spec §8.2 correction) -- **only**
+    on success, since a connector that could not even be reached has nothing to detect from.
 
     **The redacted capture (spec §13.3) is not duplicated here.** `SabnzbdClient.test_connection`
     already writes it via `core/clients/capture.py` before doing anything else with the
@@ -519,6 +707,7 @@ async def test_client_instance(client_id: int, request: Request) -> DownloadClie
                 message=str(exc),
                 version=row["version"],
                 capabilities=_capabilities_to_json(degraded),
+                detected_base_paths=[],
             )
         except ClientUnreachable as exc:
             return DownloadClientTestResponse(
@@ -527,6 +716,7 @@ async def test_client_instance(client_id: int, request: Request) -> DownloadClie
                 message=str(exc),
                 version=row["version"],
                 capabilities=_capabilities_to_json(last_known),
+                detected_base_paths=[],
             )
         except ClientError as exc:
             return DownloadClientTestResponse(
@@ -535,7 +725,11 @@ async def test_client_instance(client_id: int, request: Request) -> DownloadClie
                 message=str(exc),
                 version=row["version"],
                 capabilities=_capabilities_to_json(last_known),
+                detected_base_paths=[],
             )
+        # Success -- detect base paths while the connector is still open (its own HTTP session
+        # is torn down in `finally`, below).
+        detected = await _detect_and_verify_base_paths(request, client, client_class.capabilities)
     finally:
         # Not part of the `DownloadClient` ABC (only `SabnzbdClient` itself declares
         # `aclose`/`__aenter__`/`__aexit__`) -- see this task's own report for why that is a
@@ -552,4 +746,5 @@ async def test_client_instance(client_id: int, request: Request) -> DownloadClie
         message="connected",
         version=info.version,
         capabilities=_capabilities_to_json(client_class.capabilities),
+        detected_base_paths=[_detected_to_out(d) for d in detected],
     )

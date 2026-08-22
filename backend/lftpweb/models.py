@@ -1740,12 +1740,34 @@ class ClientTypeOut(BaseModel):
 
 
 class DownloadClientBasePathIn(BaseModel):
+    """One base path to save (migration 028, spec §8.2 correction, 2026-08-22). `path` is the
+    SSH-visible path -- the only one `core.browse.remote_directory_error` validates and the
+    only one the §10.2 containment check and §11 scan ever read; `kind`/`client_path`/`source`
+    are provenance the settings UI carries so a re-detect can tell a manual row and an already-
+    resolved translation apart from a fresh proposal, never inputs this API validates against
+    each other.
+    """
+
     path: str = Field(max_length=MAX_PATH_LEN)
+    # The role this path plays (`core.clients.models.BasePathKind`) -- decides deletion
+    # semantics (spec §10.5): freeing a `content` root that is hardlinked from a seeding
+    # torrent frees nothing; freeing a `working` root frees the space and kills the seed.
+    # `unknown` is the honest default for a manually-added path no connector ever classified.
+    kind: Literal["content", "working", "unknown"] = "unknown"
+    # This path as the *client itself* sees it, when it differs from `path` -- mirrors
+    # `path_queue.arr_visible_path` (migration 018), inverted: `path` is the SSH-visible/
+    # authoritative side here, `client_path` is the foreign view kept only for display and
+    # diagnosis. `None` = no translation needed -- the client and lftpweb agree.
+    client_path: str | None = Field(default=None, max_length=MAX_PATH_LEN)
+    # Whether this row came from detection (the client's own `list_base_paths` answer,
+    # SSH-verified) or was typed by hand via the manual-add escape hatch. Lets a re-detect
+    # leave manual rows -- and any translation the user already supplied for a detected one --
+    # alone rather than clobbering them.
+    source: Literal["detected", "manual"] = "manual"
 
 
-class DownloadClientBasePathOut(BaseModel):
+class DownloadClientBasePathOut(DownloadClientBasePathIn):
     id: int
-    path: str
 
 
 class DownloadClientCategoryIn(BaseModel):
@@ -1804,6 +1826,25 @@ class DownloadClientOut(BaseModel):
     updated_at: str
 
 
+class DetectedBasePathOut(BaseModel):
+    """One entry in `DownloadClientTestResponse.detected_base_paths` (spec §8.2 correction,
+    migration 028) -- what the connector's own `list_base_paths` reported, and whether lftpweb
+    can see it at the same path over SSH. **Detection proposes; it never saves** -- turning one
+    of these into a saved `DownloadClientBasePathIn` (accepting it, or supplying the SSH-visible
+    equivalent for a `not_found` one) is a separate, explicit save the settings UI performs.
+    """
+
+    client_path: str
+    kind: Literal["content", "working", "unknown"]
+    # `verified` -- lftpweb sees it at the same path. `not_found` -- the seedbox clearly
+    # reports it missing or not a directory: the namespace mismatch, detected rather than asked
+    # about. `unverified` -- the stat failed for any other reason (permission, protocol, no SSH
+    # connection to try at all). **`not_found` and `unverified` are deliberately distinct** --
+    # collapsing them would tell a user their path is wrong when lftpweb simply could not look
+    # (`core.browse.remote_directory_error`'s own docstring draws this exact line).
+    state: Literal["verified", "not_found", "unverified"]
+
+
 class DownloadClientTestResponse(BaseModel):
     """`POST /api/settings/clients/{id}/test` -- the `ArrTestResponse` shape, widened with the
     resolved capability set (spec §4.1) test-connection persists. `capabilities` reflects
@@ -1812,6 +1853,11 @@ class DownloadClientTestResponse(BaseModel):
     narrowed by exactly one degraded key for `CapabilityUnavailable`, and reset to the
     connector's static declaration on a fresh success (layer 3 is cleared by the next successful
     probe, spec §4.1).
+
+    `detected_base_paths` is only ever populated on a fresh success (spec §8.2 correction) --
+    `[]` on any failed test (detection never runs against a connector that couldn't even be
+    reached) and `[]` for a connector that doesn't declare `list_base_paths`, which is not an
+    error either.
     """
 
     ok: bool
@@ -1819,6 +1865,7 @@ class DownloadClientTestResponse(BaseModel):
     message: str
     version: str | None = None
     capabilities: dict[str, Any] | None = None
+    detected_base_paths: list[DetectedBasePathOut] = Field(default_factory=list)
 
 
 # --- Support bundle (Settings -> Logs, 2026-08-17) ---------------------------------------

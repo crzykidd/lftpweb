@@ -56,6 +56,7 @@ from .capture import capture_response
 from .errors import CapabilityUnavailable, ClientError, ClientUnreachable
 from .models import (
     BasePath,
+    BasePathKind,
     ConnectionInfo,
     RemoveOutcome,
     SpaceInfo,
@@ -458,8 +459,11 @@ class SabnzbdClient(DownloadClient):
 
     async def list_base_paths(self) -> list[BasePath]:
         # Doc-derived, UNVERIFIED: `mode=get_config&section=misc` per vendor docs, reading
-        # `complete_dir`/`download_dir`. A prefill only (spec §8.2) -- never treated as
-        # exhaustive; missing/absent fields simply contribute nothing rather than raising.
+        # `complete_dir`/`download_dir`. Detected, not saved (spec §8.2 correction) -- the role
+        # (`kind`) is known because this connector knows which config key it read each path
+        # from; whether lftpweb can see either path at the same spot over SSH is a separate
+        # question `core.clients.detection` answers, not this method. Missing/absent fields
+        # simply contribute nothing rather than raising.
         _, data = await self._get("get_config", section="misc")
         misc = {}
         if isinstance(data, dict):
@@ -471,10 +475,10 @@ class SabnzbdClient(DownloadClient):
         paths: list[BasePath] = []
         complete_dir = misc.get("complete_dir")
         if complete_dir:
-            paths.append(BasePath(path=str(complete_dir), label="complete"))
+            paths.append(BasePath(path=str(complete_dir), kind=BasePathKind.CONTENT))
         download_dir = misc.get("download_dir")
         if download_dir:
-            paths.append(BasePath(path=str(download_dir), label="incomplete"))
+            paths.append(BasePath(path=str(download_dir), kind=BasePathKind.WORKING))
         return paths
 
     async def free_space(self, path: str) -> SpaceInfo:

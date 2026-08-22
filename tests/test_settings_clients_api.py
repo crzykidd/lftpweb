@@ -90,11 +90,19 @@ def _put_live_seedbox_host(client: TestClient) -> None:
 
 
 def _sab_body(**overrides):
+    """Defaults `enabled` to `False` -- most of this module's own tests use a `base_url` that
+    was never meant to be dialled (`sabnzbd.example.invalid`, or a live seedbox host with no
+    real SABnzbd behind it), and §3a's save-on-test now means an *enabled* save against a
+    config like that would be rejected outright. Tests that actually want the enabled +
+    connectivity-tested path pass `enabled=True` explicitly against a fixture that really
+    answers (`fake_sabnzbd_server`) or a controllable test-only connector (`_ProbeClient`,
+    below).
+    """
     body = {
         "name": "SABnzbd",
         "client_type": "sabnzbd",
         "config": {"base_url": "http://sabnzbd.example.invalid:8080", "api_key": "hunter2-key"},
-        "enabled": True,
+        "enabled": False,
     }
     body.update(overrides)
     return body
@@ -570,3 +578,164 @@ def test_a_fresh_success_resets_capabilities_to_the_static_declaration(isolated_
         # Layer 3 (runtime-degraded) is cleared by the next successful probe (spec §4.1) --
         # test_connection is back to native, not left at the prior degrade.
         assert body["capabilities"]["operations"]["test_connection"]["support"] == "native"
+
+
+# --- Save-on-test (spec §3a, this task's own handoff prompt) ---------------------------------
+#
+# "we should test at save and not save if enabled and test failed -- this is how the *arr
+# clients handle it": `enabled: true` tests the *submitted* config before persisting and
+# refuses to save anything on failure; `enabled: false` never tests and always saves -- the
+# deliberate escape hatch. `_ProbeClient` (above) drives the failure modes directly, the same
+# way the capability tests above do.
+
+
+def test_create_rejects_an_enabled_instance_whose_test_fails_and_persists_nothing(
+    isolated_config,
+):
+    with TestClient(app) as client:
+        resp = client.post("/api/settings/clients", json=_probe_body("unreachable", enabled=True))
+        assert 400 <= resp.status_code < 500, resp.text
+        detail = resp.json()["detail"]
+        assert detail["error_class"] == "ClientUnreachable"
+
+    # Not merely a 4xx -- nothing was persisted at all, checked against the real database file,
+    # not just the API's own (possibly-wrong) idea of what it did.
+    db_path = Path(isolated_config) / "lftpweb.db"
+    raw = sqlite3.connect(str(db_path))
+    try:
+        (count,) = raw.execute("SELECT COUNT(*) FROM download_client").fetchone()
+    finally:
+        raw.close()
+    assert count == 0
+
+
+def test_create_saves_a_disabled_instance_even_when_its_test_would_fail(isolated_config):
+    with TestClient(app) as client:
+        resp = client.post("/api/settings/clients", json=_probe_body("unreachable", enabled=False))
+        assert resp.status_code == 201, resp.text
+        assert resp.json()["enabled"] is False
+        # Never tested -- no capability/version readout from a save alone.
+        assert resp.json()["capabilities"] is None
+
+
+def test_create_success_populates_capabilities_and_version_without_a_separate_test_call(
+    isolated_config,
+):
+    with TestClient(app) as client:
+        resp = client.post("/api/settings/clients", json=_probe_body("ok", enabled=True))
+        assert resp.status_code == 201, resp.text
+        body = resp.json()
+        assert body["version"] == "9.9.9-probe"
+        assert body["capabilities"] is not None
+        assert body["capabilities"]["operations"]["test_connection"]["support"] == "native"
+        assert body["capabilities_probed_at"] is not None
+
+
+def test_update_rejects_an_enabled_instance_whose_test_fails_and_leaves_the_row_untouched(
+    isolated_config,
+):
+    with TestClient(app) as client:
+        resp = client.post("/api/settings/clients", json=_probe_body("ok", enabled=True))
+        client_id = resp.json()["id"]
+        before = client.get("/api/settings/clients").json()[0]
+
+        resp = client.put(
+            f"/api/settings/clients/{client_id}",
+            json=_probe_body("unreachable", enabled=True, name="Renamed"),
+        )
+        assert 400 <= resp.status_code < 500, resp.text
+        assert resp.json()["detail"]["error_class"] == "ClientUnreachable"
+
+        after = client.get("/api/settings/clients").json()[0]
+        assert after == before  # completely untouched, name included
+
+
+def test_update_that_disables_a_previously_enabled_broken_instance_succeeds(isolated_config):
+    """The escape hatch: an enabled instance that has since gone bad can still be edited and
+    saved, as long as the edit disables it. Its previously-probed capabilities are left exactly
+    as they were -- not tested again (disabled never tests), not cleared either.
+    """
+    with TestClient(app) as client:
+        resp = client.post("/api/settings/clients", json=_probe_body("ok", enabled=True))
+        client_id = resp.json()["id"]
+        probed_before = client.get("/api/settings/clients").json()[0]["capabilities"]
+        assert probed_before is not None
+
+        resp = client.put(
+            f"/api/settings/clients/{client_id}",
+            json=_probe_body("unreachable", enabled=False),
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["enabled"] is False
+        assert body["capabilities"] == probed_before
+
+
+# --- Base-path detection on test-connection (spec §8.2 correction, migration 028) -------------
+
+
+def test_a_detection_failure_does_not_fail_the_connection_test(isolated_config):
+    """`_ProbeClient` declares `Operation.LIST_BASE_PATHS` (it inherits `USENET_BASELINE`
+    unmodified) but its own `list_base_paths` raises `NotImplementedError` -- reachability and
+    detection are different questions (spec §4.2's temperament): `test_connection` (mode "ok")
+    still succeeds, and detection simply contributes nothing rather than failing the test.
+    (`tests/test_clients_detection.py` separately covers the other "detects nothing" case: a
+    connector that never declares the capability at all.)
+    """
+    with TestClient(app) as client:
+        resp = client.post("/api/settings/clients", json=_probe_body("ok"))
+        client_id = resp.json()["id"]
+
+        resp = client.post(f"/api/settings/clients/{client_id}/test")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["ok"] is True
+        assert body["detected_base_paths"] == []
+
+
+def test_test_connection_detects_sabnzbds_base_paths_as_unverified_with_no_host_configured(
+    isolated_config, fake_sabnzbd_server
+):
+    """No host configured at all -- every detected path reports `unverified`, never
+    `not_found`: not being able to look over SSH is not the seedbox saying no. Also proves
+    detection proposes without saving: `base_paths` on the stored row stays empty.
+    """
+    fake_sabnzbd_server.state.misc_complete_dir = "/downloads/complete"
+    fake_sabnzbd_server.state.misc_download_dir = "/downloads/incomplete"
+    with TestClient(app) as client:
+        resp = client.post("/api/settings/clients", json=_sab_body_for(fake_sabnzbd_server))
+        client_id = resp.json()["id"]
+
+        resp = client.post(f"/api/settings/clients/{client_id}/test")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["ok"] is True
+        by_path = {d["client_path"]: d for d in body["detected_base_paths"]}
+        assert by_path["/downloads/complete"]["kind"] == "content"
+        assert by_path["/downloads/complete"]["state"] == "unverified"
+        assert by_path["/downloads/incomplete"]["kind"] == "working"
+        assert by_path["/downloads/incomplete"]["state"] == "unverified"
+
+        # Detection proposes; it never saves.
+        stored = client.get("/api/settings/clients").json()[0]
+        assert stored["base_paths"] == []
+
+
+@pytest.mark.skipif(not SEEDBOX_UP, reason=_SEEDBOX_SKIP_REASON)
+def test_test_connection_distinguishes_verified_from_not_found_against_the_live_seedbox(
+    isolated_config, fake_sabnzbd_server
+):
+    fake_sabnzbd_server.state.misc_complete_dir = "/data/pickup"
+    fake_sabnzbd_server.state.misc_download_dir = "/data/pickup/does-not-exist-anywhere"
+    with TestClient(app) as client:
+        _put_live_seedbox_host(client)
+        resp = client.post("/api/settings/clients", json=_sab_body_for(fake_sabnzbd_server))
+        client_id = resp.json()["id"]
+
+        resp = client.post(f"/api/settings/clients/{client_id}/test")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["ok"] is True
+        by_path = {d["client_path"]: d["state"] for d in body["detected_base_paths"]}
+        assert by_path["/data/pickup"] == "verified"
+        assert by_path["/data/pickup/does-not-exist-anywhere"] == "not_found"

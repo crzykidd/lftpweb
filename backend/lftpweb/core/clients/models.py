@@ -133,17 +133,38 @@ class RemoveOutcome:
     detail: str | None = None
 
 
+class BasePathKind(StrEnum):
+    """The role one `BasePath` plays (spec §8.2 correction, migration 028) -- not cosmetic:
+    it decides what deleting there means (spec §10.5).
+
+    - **`CONTENT`** -- finished content lands here; lftpweb syncs from it; commonly shared
+      between clients and overlapping a queue's `remote_path`. SAB's `complete_dir`. Removing a
+      file here that is hardlinked from a seeding torrent frees nothing.
+    - **`WORKING`** -- the client's own working/seeding storage. SAB's `download_dir`
+      (incomplete); rTorrent's `directory.default` when that connector lands. Removing a file
+      here frees the space and kills the seed.
+    - **`UNKNOWN`** -- a connector that reports a path but cannot say what it is for, or a
+      manually-added path the user hasn't classified. The honest default, never a guess.
+    """
+
+    CONTENT = "content"
+    WORKING = "working"
+    UNKNOWN = "unknown"
+
+
 @dataclass(frozen=True)
 class BasePath:
-    """One entry from `list_base_paths` (spec §2.1, §8.2) -- **a prefill, not the source of
-    truth**. The user's own configured base paths (spec §8.2) are what the disk-review scan
-    (spec §11) actually trusts; rTorrent's own `directory.default` will never mention the
-    completed folder it hardlinks into (spec §1.1), so a client's own answer here is
-    necessarily incomplete and no caller may treat this list as exhaustive.
+    """One entry from `list_base_paths` (spec §2.1, §8.2) -- **detected, then SSH-verified**,
+    never saved on the strength of the client's own report alone (spec §8.2 correction,
+    2026-08-22: the earlier "user-configured, client is a prefill" reasoning was wrong -- see
+    that section's rewrite for why). `kind` is the connector's own answer for *what* this path
+    is (it knows which config key it read the path from); *whether lftpweb can see it at the
+    same path over SSH* is a separate question `core.clients.detection` answers, never this
+    connector.
     """
 
     path: str
-    label: str | None = None
+    kind: BasePathKind = BasePathKind.UNKNOWN
 
 
 # A run of exactly 40 hex characters is a SHA-1 infohash's length -- the only id shape this

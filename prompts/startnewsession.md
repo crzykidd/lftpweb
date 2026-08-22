@@ -139,6 +139,23 @@ capability readout (derived labelled as derived with its note; missing capabilit
 stated reason; a failed test renders last-known rather than blanking). Plus **README's "Recommended
 seedbox layout"** section. **1794 backend / 697 frontend tests, 0 skipped.**
 
+**Base paths are DETECTED, not typed** (2026-08-22, **migration 028**) — a correction to an earlier
+wrong call, recorded as a reversal in spec §8.2 and `docs/decisions.md`. The client already reports
+its own directories *and* their roles (`content` vs `working`, because the connector knows which
+config key it read each from), so the flow is **detect → SSH-verify → confirm**. The one thing a
+client cannot know is whether lftpweb sees a path at the same spot over SSH — that is
+path-namespace translation, the same problem `path_queue.arr_visible_path` already solves for the
+*arr, and it is now *detected* rather than asked about up front. **`verified` / `not_found` /
+`unverified` are three distinct states and must never be collapsed** — "the seedbox says it isn't
+there" is a fact; "lftpweb couldn't look" is not the same fact, and `core/browse.py.
+remote_directory_error` draws that line deliberately.
+
+**Saving an ENABLED client tests it first and persists nothing on failure** (user's requirement,
+matching how the *arr apps behave). `enabled: false` never tests and always saves — **that is the
+deliberate escape hatch**, so a temporarily-unreachable client can still be edited (uncheck, save,
+fix, re-enable). There is deliberately **no force/save-anyway flag**. A successful save also
+persists the probed capabilities, so no second Test click is needed.
+
 **👉 THE NEXT REAL-WORLD STEP is not more code — it is running a capture against the live SAB.**
 Settings → Clients → add the SABnzbd instance → Test. Then read the capture and work through spec
 **§13.4's twelve guesses**. Note the capture is currently at DEBUG, so it needs

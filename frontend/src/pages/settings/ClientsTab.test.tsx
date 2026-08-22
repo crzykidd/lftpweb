@@ -193,6 +193,7 @@ describe('ClientsTab', () => {
       message: 'connection refused',
       version: null,
       capabilities: lastKnown,
+      detected_base_paths: [],
     }
     mockTestClientInstance.mockResolvedValue(failedResult)
     const root = await mount(container)

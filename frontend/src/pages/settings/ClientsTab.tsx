@@ -11,15 +11,28 @@ import {
 } from '../../api/client'
 import type {
   ClientTypeOut,
+  DetectedBasePathOut,
   DownloadClientOut,
   DownloadClientTestResponse,
   HostOut,
   PathQueueOut,
 } from '../../api/types'
+import {
+  acceptedPathFor,
+  buildAcceptedBasePath,
+  isDetectedRowAccepted,
+  type BasePathDraft,
+} from '../../lib/clientBasePathDetection'
 import { capabilityRows, type CapabilityRow } from '../../lib/clientCapabilities'
 import { inferCategoryMappings } from '../../lib/clientCategoryInference'
 import { remoteBrowseDisabled } from '../../lib/pathBrowse'
 import { PathBrowseDialog } from '../../components/PathBrowseDialog'
+
+const BASE_PATH_KIND_LABELS: Record<BasePathDraft['kind'], string> = {
+  content: 'content',
+  working: 'working',
+  unknown: 'unclassified',
+}
 
 const inputClasses =
   'w-full rounded-md border border-zinc-300 bg-white px-2.5 py-1.5 text-sm text-zinc-900 outline-none focus:border-zinc-500 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100'
@@ -49,7 +62,11 @@ interface FormState {
   // pre-fills a real value here, only ever `''`.
   secrets: Record<string, string>
   enabled: boolean
-  basePaths: string[]
+  // Detected from the client and SSH-verified, not typed in (spec §8.2 correction) -- each
+  // draft carries its own `kind`/`client_path`/`source` provenance, not just a bare string, so
+  // a re-detect can tell a manual row and an already-resolved translation apart from a fresh
+  // proposal (see `lib/clientBasePathDetection.ts`).
+  basePaths: BasePathDraft[]
   categories: CategoryDraft[]
 }
 
@@ -219,6 +236,101 @@ function CapabilityReadout({ capabilities }: { capabilities: DownloadClientOut['
   )
 }
 
+/** One detected base path, with its accept/translate action -- spec §8.2 correction's "detect
+ * -> verify -> confirm": `verified` is one click; `not_found` states the reason plainly and
+ * asks for the SSH-visible equivalent, with the same Browse… picker the manual-add field uses;
+ * `unverified` says lftpweb couldn't check and offers to accept anyway, never as a failure.
+ * Already-accepted rows (by `lib/clientBasePathDetection.ts`'s own check) show what they were
+ * accepted as, with no further action -- re-running detection must not clobber that.
+ */
+function DetectedBasePathRow({
+  row,
+  basePaths,
+  notFoundDraft,
+  onNotFoundDraftChange,
+  onAccept,
+  onBrowse,
+}: {
+  row: DetectedBasePathOut
+  basePaths: readonly BasePathDraft[]
+  notFoundDraft: string
+  onNotFoundDraftChange: (value: string) => void
+  onAccept: (sshPath: string) => void
+  onBrowse: () => void
+}) {
+  const acceptedAs = acceptedPathFor(row, basePaths)
+  const kindLabel = BASE_PATH_KIND_LABELS[row.kind]
+
+  if (acceptedAs != null) {
+    return (
+      <li className="flex flex-col gap-0.5">
+        <span className="font-mono text-xs text-zinc-500 dark:text-zinc-400">
+          {row.client_path} <span className="text-zinc-400 dark:text-zinc-600">({kindLabel})</span>
+        </span>
+        <span className="text-xs text-emerald-600 dark:text-emerald-400">
+          Added as <span className="font-mono">{acceptedAs}</span>
+        </span>
+      </li>
+    )
+  }
+
+  if (row.state === 'verified') {
+    return (
+      <li className="flex items-center gap-2">
+        <span className="font-mono text-xs">
+          {row.client_path} <span className="text-zinc-400 dark:text-zinc-600">({kindLabel})</span>
+        </span>
+        <span className="text-xs text-emerald-600 dark:text-emerald-400">verified</span>
+        <button type="button" onClick={() => onAccept(row.client_path)} className={secondaryButtonClasses}>
+          Accept
+        </button>
+      </li>
+    )
+  }
+
+  if (row.state === 'not_found') {
+    return (
+      <li className="flex flex-col gap-1">
+        <span className="text-xs text-amber-700 dark:text-amber-400">
+          Reports <span className="font-mono">{row.client_path}</span> ({kindLabel}), which doesn't
+          exist over SSH. Which path is it here?
+        </span>
+        <div className="flex gap-2">
+          <input
+            className={inputClasses}
+            value={notFoundDraft}
+            onChange={(e) => onNotFoundDraftChange(e.target.value)}
+            placeholder="/home/user/downloads/complete"
+          />
+          <button
+            type="button"
+            onClick={() => onAccept(notFoundDraft)}
+            className={secondaryButtonClasses}
+          >
+            Add
+          </button>
+          <button type="button" onClick={onBrowse} className={secondaryButtonClasses}>
+            Browse…
+          </button>
+        </div>
+      </li>
+    )
+  }
+
+  // unverified -- never presented as a failure.
+  return (
+    <li className="flex items-center gap-2">
+      <span className="font-mono text-xs">
+        {row.client_path} <span className="text-zinc-400 dark:text-zinc-600">({kindLabel})</span>
+      </span>
+      <span className={hintClasses}>lftpweb couldn't check this path.</span>
+      <button type="button" onClick={() => onAccept(row.client_path)} className={secondaryButtonClasses}>
+        Accept anyway
+      </button>
+    </li>
+  )
+}
+
 const FAMILY_ORDER: ClientTypeOut['family'][] = ['usenet', 'torrent']
 const FAMILY_LABELS: Record<ClientTypeOut['family'], string> = { usenet: 'Usenet', torrent: 'Torrent' }
 
@@ -246,6 +358,16 @@ export function ClientsTab() {
   const [editingId, setEditingId] = useState<number | null>(null)
   const [basePathDraft, setBasePathDraft] = useState('')
   const [browseOpen, setBrowseOpen] = useState(false)
+  // Which field the Browse dialog's selection goes to -- the manual-add input, or one specific
+  // detected `not_found` row on one specific instance. `null` behaves like `'manual'` (the
+  // dialog is never opened without setting one of the two first).
+  const [browseTarget, setBrowseTarget] = useState<
+    'manual' | { instanceId: number; row: DetectedBasePathOut } | null
+  >(null)
+  // A `not_found` detected row's own SSH-path text box, keyed by `${instanceId}:${client_path}`
+  // -- local to this component, never sent anywhere until Accept/Browse turns it into a saved
+  // base path via `acceptDetectedBasePath`.
+  const [notFoundDrafts, setNotFoundDrafts] = useState<Record<string, string>>({})
   const [inferenceMessage, setInferenceMessage] = useState<string | null>(null)
 
   const [testResults, setTestResults] = useState<Record<number, DownloadClientTestResponse>>({})
@@ -301,7 +423,12 @@ export function ClientsTab() {
       config: configDraftFromExisting(type, instance.config),
       secrets: emptySecretsDraft(type),
       enabled: instance.enabled,
-      basePaths: instance.base_paths.map((bp) => bp.path),
+      basePaths: instance.base_paths.map((bp) => ({
+        path: bp.path,
+        kind: bp.kind,
+        client_path: bp.client_path,
+        source: bp.source,
+      })),
       categories: instance.categories.map((c) => ({ category: c.category, queue_id: c.queue_id })),
     })
   }
@@ -312,17 +439,48 @@ export function ClientsTab() {
     setForm(emptyForm(clientTypes[0]))
   }
 
+  /** The manual-add escape hatch (spec §8.2 correction: "manual add stays") -- for a path the
+   * connector's own `list_base_paths` doesn't expose. Always `source: 'manual'`, `kind:
+   * 'unknown'`: nothing classified it, so nothing here may guess.
+   */
   const addBasePath = (path: string) => {
     const trimmed = path.trim()
     if (trimmed === '') return
     setForm((prev) =>
-      prev.basePaths.includes(trimmed) ? prev : { ...prev, basePaths: [...prev.basePaths, trimmed] },
+      prev.basePaths.some((bp) => bp.path === trimmed)
+        ? prev
+        : {
+            ...prev,
+            basePaths: [
+              ...prev.basePaths,
+              { path: trimmed, kind: 'unknown', client_path: null, source: 'manual' },
+            ],
+          },
     )
     setBasePathDraft('')
   }
 
   const removeBasePath = (path: string) => {
-    setForm((prev) => ({ ...prev, basePaths: prev.basePaths.filter((p) => p !== path) }))
+    setForm((prev) => ({ ...prev, basePaths: prev.basePaths.filter((bp) => bp.path !== path) }))
+  }
+
+  /** Accept one detected row into the draft base paths -- switches to editing `instance` first
+   * if it isn't already being edited (accepting is only ever a draft change; nothing saves
+   * until Save is pressed). A no-op if this exact detected row was already accepted, so
+   * re-clicking Accept (or re-running detection and re-rendering the same row) never
+   * duplicates it.
+   */
+  const acceptDetectedBasePath = (
+    instance: DownloadClientOut,
+    row: DetectedBasePathOut,
+    sshPath: string,
+  ) => {
+    if (sshPath.trim() === '') return
+    if (editingId !== instance.id) startEdit(instance)
+    setForm((prev) => {
+      if (isDetectedRowAccepted(row, prev.basePaths)) return prev
+      return { ...prev, basePaths: [...prev.basePaths, buildAcceptedBasePath(row, sshPath)] }
+    })
   }
 
   const addCategoryRow = () => {
@@ -347,7 +505,7 @@ export function ClientsTab() {
    */
   const handleInferCategories = () => {
     const suggestions = inferCategoryMappings(
-      form.basePaths,
+      form.basePaths.map((bp) => bp.path),
       queues.map((q) => ({ id: q.id, remote_path: q.remote_path })),
     )
     const existingQueueIds = new Set(
@@ -382,7 +540,12 @@ export function ClientsTab() {
         client_type: form.client_type,
         config: buildConfigPayload(selectedType, form),
         enabled: form.enabled,
-        base_paths: form.basePaths.map((path) => ({ path })),
+        base_paths: form.basePaths.map((bp) => ({
+          path: bp.path,
+          kind: bp.kind,
+          client_path: bp.client_path,
+          source: bp.source,
+        })),
         categories: form.categories
           .filter((c) => c.category.trim() !== '')
           .map((c) => ({ category: c.category.trim(), queue_id: c.queue_id })),
@@ -439,6 +602,8 @@ export function ClientsTab() {
           // own API failed (spec §4.2's rule applied one layer further out than the backend's
           // own guarantee) -- render whatever was last known.
           capabilities: instance?.capabilities ?? null,
+          // A request that never reached the backend detected nothing this time either.
+          detected_base_paths: [],
         },
       }))
     } finally {
@@ -539,6 +704,43 @@ export function ClientsTab() {
                           <CapabilityReadout capabilities={capabilities} />
                         </div>
                       </details>
+                      {result != null && result.detected_base_paths.length > 0 && (
+                        <details className="mt-1" open>
+                          <summary className="cursor-pointer text-xs text-zinc-500 hover:underline dark:text-zinc-400">
+                            Detected base paths
+                          </summary>
+                          <ul className="mt-2 flex max-w-md flex-col gap-2">
+                            {result.detected_base_paths.map((row) => {
+                              const draftKey = `${instance.id}:${row.client_path}`
+                              const draftBasePaths: BasePathDraft[] =
+                                editingId === instance.id
+                                  ? form.basePaths
+                                  : instance.base_paths.map((bp) => ({
+                                      path: bp.path,
+                                      kind: bp.kind,
+                                      client_path: bp.client_path,
+                                      source: bp.source,
+                                    }))
+                              return (
+                                <DetectedBasePathRow
+                                  key={row.client_path}
+                                  row={row}
+                                  basePaths={draftBasePaths}
+                                  notFoundDraft={notFoundDrafts[draftKey] ?? ''}
+                                  onNotFoundDraftChange={(value) =>
+                                    setNotFoundDrafts((prev) => ({ ...prev, [draftKey]: value }))
+                                  }
+                                  onAccept={(sshPath) => acceptDetectedBasePath(instance, row, sshPath)}
+                                  onBrowse={() => {
+                                    setBrowseTarget({ instanceId: instance.id, row })
+                                    setBrowseOpen(true)
+                                  }}
+                                />
+                              )
+                            })}
+                          </ul>
+                        </details>
+                      )}
                     </div>
                   </td>
                   <td className="px-3 py-2 text-right whitespace-nowrap">
@@ -682,24 +884,32 @@ export function ClientsTab() {
           the poller is a later stage of this feature (spec §14 stage 2).
         </p>
 
-        {/* Base paths (spec §8.2) -- browsed and validated on save, reusing the same remote-
-         * browse dialog Settings -> Queues uses for `remote_path`. */}
+        {/* Base paths -- detected from the client and SSH-verified, not typed in (spec §8.2
+         * correction, 2026-08-22). Test (in the instances table above) proposes them; accepting
+         * one there adds it below. Manual add stays as the escape hatch for a path the
+         * connector's own API doesn't expose. */}
         <div className="flex flex-col gap-2">
           <span className={labelClasses}>Base paths</span>
           <p className={hintClasses}>
             The real roots this client's data lives under on the seedbox — the boundary a future
-            delete is authorised to act within. A wrong path here is a wrong safety boundary, so
-            it's validated for real when you Save, not accepted silently.
+            delete is authorised to act within. Detected and SSH-verified via Test above, or
+            added manually below; either way, validated for real when you Save.
           </p>
           <ul className="flex flex-col gap-1">
-            {form.basePaths.map((path) => (
-              <li key={path} className="flex items-center gap-2">
+            {form.basePaths.map((bp) => (
+              <li key={bp.path} className="flex items-center gap-2">
                 <span className="flex-1 truncate rounded-md border border-zinc-200 bg-zinc-50 px-2 py-1 font-mono text-xs dark:border-zinc-800 dark:bg-zinc-900">
-                  {path}
+                  {bp.path}
+                </span>
+                <span className="text-xs text-zinc-500 dark:text-zinc-400">
+                  {BASE_PATH_KIND_LABELS[bp.kind]}
+                </span>
+                <span className="text-xs text-zinc-400 dark:text-zinc-600">
+                  {bp.source === 'detected' ? 'detected' : 'manual'}
                 </span>
                 <button
                   type="button"
-                  onClick={() => removeBasePath(path)}
+                  onClick={() => removeBasePath(bp.path)}
                   className="text-xs text-red-600 hover:underline dark:text-red-400"
                 >
                   Remove
@@ -725,7 +935,10 @@ export function ClientsTab() {
               <button
                 type="button"
                 disabled={remoteBrowseDisabled(host)}
-                onClick={() => setBrowseOpen(true)}
+                onClick={() => {
+                  setBrowseTarget('manual')
+                  setBrowseOpen(true)
+                }}
                 className={secondaryButtonClasses}
               >
                 Browse…
@@ -811,10 +1024,21 @@ export function ClientsTab() {
           side="remote"
           initialPath={basePathDraft || '/'}
           onSelect={(path) => {
-            addBasePath(path)
+            if (browseTarget != null && browseTarget !== 'manual') {
+              const targetInstance = instances.find((i) => i.id === browseTarget.instanceId)
+              if (targetInstance != null) {
+                acceptDetectedBasePath(targetInstance, browseTarget.row, path)
+              }
+            } else {
+              addBasePath(path)
+            }
             setBrowseOpen(false)
+            setBrowseTarget(null)
           }}
-          onClose={() => setBrowseOpen(false)}
+          onClose={() => {
+            setBrowseOpen(false)
+            setBrowseTarget(null)
+          }}
         />
       )}
     </div>

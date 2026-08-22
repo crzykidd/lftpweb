@@ -13,7 +13,7 @@ import pytest
 
 from lftpweb.core.clients.base import Operation, project_transfer
 from lftpweb.core.clients.errors import CapabilityUnavailable, ClientError, ClientUnreachable
-from lftpweb.core.clients.models import TransferPhase
+from lftpweb.core.clients.models import BasePathKind, TransferPhase
 from lftpweb.core.clients.sabnzbd import SabnzbdClient
 
 
@@ -337,8 +337,8 @@ async def test_list_base_paths_reads_complete_and_incomplete_dirs(fake_sabnzbd_s
 
     paths = await client.list_base_paths()
 
-    by_label = {p.label: p.path for p in paths}
-    assert by_label == {"complete": "/x/complete", "incomplete": "/x/incomplete"}
+    by_kind = {p.kind: p.path for p in paths}
+    assert by_kind == {BasePathKind.CONTENT: "/x/complete", BasePathKind.WORKING: "/x/incomplete"}
 
 
 async def test_list_files_returns_filenames_for_a_known_nzo_id(fake_sabnzbd_server):

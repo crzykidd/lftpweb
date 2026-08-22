@@ -104,7 +104,7 @@ spellings of the same idea.
 | `get_transfer` | Exact lookup by client id — the *arr's `downloadId` (§10) | Often *derived* (filter the list) |
 | `list_trackers` | One item's announce hosts | **Its own operation, not a field** — an N-call fetch on qBittorrent and rTorrent, so a caller must be able to decide not to pay for it |
 | `list_files` | One item's file list | |
-| `list_base_paths` | The client's own configured download/complete directories | **A prefill, not the source of truth** — the user configures the real roots (§8.2). rTorrent's `directory.default` will not mention the completed folder it hardlinks into, so the client's own answer is necessarily incomplete |
+| `list_base_paths` | The client's own configured download/complete directories, each with its own role (content vs. working) | **Detected, then SSH-verified, then confirmed** (§8.2) — the connector's own answer proposes both the path and its role; whether lftpweb sees that path at the same spot over SSH is a separate question the settings UI verifies before anything is saved. Never saved on the strength of the client's report alone |
 | `free_space` | Free bytes for a path, and total where reported | Transmission is the only one reporting total |
 | `pause` / `resume` | | qBittorrent renamed `pause`→`stop` at 5.0 (§4.2) |
 | `remove` | **Unregister the item, leave the data on disk** | See §11 — this is the only removal verb a connector has |
@@ -431,22 +431,62 @@ accepted rough edge rather than an oversight — see the same conversation for t
 request, same conversation) stating that configuring a client changes no behaviour yet. It comes
 out once the section has real use behind it.
 
-### 8.2 Base paths are user-configured, browsed, and validated on save
+### 8.2 Base paths are detected from the client and SSH-verified, not typed in
 
-**Decided with the user, 2026-08-22.** The scan's roots (§11) come from the instance's settings, not
-from the client's own answer:
+**Correcting an earlier reading of this section (decided with the user, 2026-08-22).** The
+original wording here said base paths are user-configured and `list_base_paths` is a prefill
+only, justified by "rTorrent's `directory.default` will never mention the completed folder it
+hardlinks into." **That reasoning was wrong.** True as a fact, but irrelevant: that folder is
+the queue's `remote_path`, which lftpweb already knows on its own — it never needed a
+connector to name it. The correction, mirroring the same "earlier reading, why it was wrong,
+what's right instead" style §11.1c uses:
 
-- **The user enters them in Settings, with the existing path-browse dialog.** `core/browse.py`
-  already provides `resolve_remote_dir` over SFTP and `GET /api/browse/remote` is already the thin
-  wrapper Settings → Queues uses for `remote_path`. This is reuse, not new machinery.
-- **`list_base_paths` (§2.1) prefills the field where a client can answer**, and is never treated as
-  complete. rTorrent's own configured directory says nothing about the completed folder it hardlinks
-  into (§1.1), so a client-only answer would miss the tree that matters most.
-- **Save-time validation is the half that matters here.** `core/browse.py.remote_directory_error`
-  gives a real answer rather than a graceful fallback, precisely so a typo is caught at save. A
-  mistyped base path is not cosmetic in this feature: it is what the §10.2 containment check
-  authorises deletion *within*. A wrong root is a wrong safety boundary.
+- **`list_base_paths` (§2.1) already answers two things at once, not one.** `SabnzbdClient.
+  list_base_paths` returns `complete_dir` and `download_dir`, and the **role each one plays is
+  already known** because the connector knows which config key it read each path from
+  (`core.clients.models.BasePathKind` — `content` vs `working`, migration 028). Asking the user
+  to classify a path the API already answers was pushing a solved question back out to them.
+- **The one thing a connector genuinely cannot know is whether lftpweb sees a path at the same
+  spot over SSH.** A containerised client reports paths in its own filesystem view (`/complete`)
+  which need not match the SSH-visible view lftpweb actually scans and deletes within
+  (`/home/user/downloads/complete`). This repo already solved the identical problem for the
+  *arr with `path_queue.arr_visible_path` (migration 018) — this feature mirrors that design,
+  inverted: `download_client_base_path.path` is the SSH-visible, authoritative path (same role
+  `arr_visible_path`'s *counterpart* plays there); `client_path` records the client's own view,
+  present only when it differs, for display and diagnosis alone.
+- **So the flow is detect → verify → confirm, not type → browse → validate.** `POST
+  /api/settings/clients/{id}/test` calls the connector's own `list_base_paths` (when declared;
+  a connector that doesn't is not an error, it simply contributes nothing) and SSH-verifies each
+  reported path via `core/browse.py.remote_directory_error`, returning one of three states that
+  are **deliberately not collapsed**: `verified` (client and lftpweb agree), `not_found` (the
+  seedbox clearly reports it missing — the namespace mismatch, detected rather than asked
+  about; the user supplies the SSH-visible equivalent, with the existing browse dialog to find
+  it), and `unverified` (the stat failed for any other reason — permission, protocol, no SSH
+  connection to try at all — never presented as a failure, per `remote_directory_error`'s own
+  docstring). **Detection proposes; it never saves** — the settings page shows what was found,
+  and the user accepts or translates each one before Save persists anything, same rule as the
+  existing category → queue inference (§8.3).
+- **What did not change: the SSH-visible path is still authoritative for scanning and
+  deletion**, because it is the §10.2 containment boundary. Save-time validation against
+  `core/browse.py.remote_directory_error` still applies to whatever ends up in `path` — a wrong
+  root is still a wrong safety boundary, detected-and-confirmed or typed by hand through the
+  manual-add escape hatch (for a path no connector exposes). What changed is *where the
+  proposal comes from*, not which path wins once confirmed.
+- **A detection failure must never fail the connection test.** Reachability and detection are
+  different questions (§4.2's temperament) — a client that answers but whose base paths can't be
+  SSH-checked right now (no host configured, credentials not decryptable) still tests `ok`, with
+  every detected path reported `unverified`.
 - Multiple roots per instance, since a seedbox routinely spreads content across several.
+
+**Save also tests, for an enabled instance.** `POST`/`PUT /api/settings/clients` now test the
+*submitted* configuration before persisting anything when `enabled: true` — mirroring how
+Sonarr/Radarr's own Download Clients page behaves, per the user's own instruction, 2026-08-22:
+*"we should test at save and not save if enabled and test failed."* A failing test on an enabled
+save persists nothing at all (not the instance, not a partial row) and reports the real error;
+`enabled: false` never tests and always saves — the deliberate escape hatch so a temporarily
+broken client never locks the user out of editing (or disabling) their own instance. A
+successful save persists the probed capabilities and version from that same test, so a freshly
+saved instance never needs a separate Test click to show them.
 
 ### 8.3 Binding: site-level instance, category → queue
 
@@ -461,12 +501,13 @@ concept for the user to learn; it is the layout they already have. The setup UI 
 *offer to infer* the mapping from existing queue remote paths, with the user confirming rather than
 typing.
 
-**Inference reads the instance's own configured base paths (§8.2), not a live `list_base_paths`
-probe.** An earlier wording here named the client's result and read as if a probe were required,
-which contradicts §8.2's rule that the user's configuration is authoritative and the client's answer
-is only ever a prefill. Stage 1b resolved it the right way. A future live-probe prefill would be
-*additive* — one more source for the suggestion — and must not become a precondition for inferring
-at all, or a client that cannot report its own paths loses a convenience it never needed.
+**Inference reads the instance's own *saved* base paths (§8.2) — whatever was accepted after
+detect → verify → confirm, or added manually — not a fresh live `list_base_paths` probe of its
+own.** An earlier wording here named the client's result and read as if a probe were required at
+inference time specifically; that would make inference a precondition on the connector
+answering, which it must never be. §8.2's own detect-then-confirm step already is the place a
+live probe belongs; inference simply reuses whatever base paths that step produced, the same way
+it would read a manually-added one.
 
 ---
 
@@ -940,7 +981,7 @@ against the real instance. **Nothing here is confirmed; all of it is vendor-doc-
 | 4 | **`free_space` reads `diskspace2`/`diskspacetotal2`**, guessing index 2 = complete and index 1 = incomplete | Moderate; a one-character fix, but silently reports the wrong volume until noticed |
 | 5 | **Queue byte/time parsing**: `mb`/`mbleft` as MB-denominated numeric strings, `timeleft` as `"H:MM:SS"` | Moderate |
 | 6 | **History field names/shapes**: `bytes`/`completed`/`storage`/`fail_message`/`category`, including reusing `bytes` as both final size and `bytes_done` | High — `storage` is the identity source (§7.2) |
-| 7 | **`list_base_paths`** via `mode=get_config&section=misc`, reading `complete_dir`/`download_dir` | Moderate — feeds §8.2's prefill only, and the user's own config is authoritative |
+| 7 | **`list_base_paths`** via `mode=get_config&section=misc`, reading `complete_dir`/`download_dir` | Moderate → now load-bearing rather than a mere prefill (§8.2 correction, 2026-08-22): a wrong guess here surfaces as a base path the settings UI proposes, which the user must actively confirm (or reject) rather than silently absorbing — the SSH verification step is exactly the guard that turns "is SAB's reported path even valid over SSH" from an unverified guess into something the UI states outright (`verified`/`not_found`/`unverified`) instead of assuming |
 | 8 | **`list_files`** via `mode=get_files&value=<nzo_id>`, tolerant of a bare list or `{"files": [...]}` | Low |
 | 9 | **Action call shapes and the `{"status": …}` contract** — specifically that `{"status": false}` alone means *not found* while `{"status": false, "error": …}` means a real failure | **Highest risk in the connector.** Wrong in one direction turns routine not-found into false errors; wrong in the other lets a real failure pass silently |
 | 10 | **`test_connection` via `mode=version`**, plus "HTTP 200 even on auth failure, error signalled in the body" | High — a bad API key reading as success is a bad first-run experience |

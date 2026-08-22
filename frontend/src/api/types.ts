@@ -258,12 +258,49 @@ export interface ClientTypeOut {
   config_schema: ClientConfigFieldOut[]
 }
 
+/** The role a base path plays (spec §8.2 correction, migration 028, 2026-08-22) -- not
+ * cosmetic, it decides what deleting there means: freeing a `content` root that is hardlinked
+ * from a seeding torrent frees nothing; freeing a `working` root frees the space and kills the
+ * seed. `unknown` is the honest default for a connector that can't say, or a manually-added
+ * path no one has classified.
+ */
+export type BasePathKind = 'content' | 'working' | 'unknown'
+
+/** One base path to save. Base paths are **detected from the client and SSH-verified, not
+ * typed in** (spec §8.2 correction) -- `path` is the SSH-visible path lftpweb actually scans
+ * and deletes within (the §10.2 containment boundary); `client_path` records the client's own
+ * reported path only when it differs (mirrors `path_queue.arr_visible_path`, migration 018,
+ * inverted), purely for display/diagnosis. `source` distinguishes a detected proposal the user
+ * confirmed from a manually-typed escape-hatch row, so re-running detection can leave both
+ * alone.
+ */
 export interface DownloadClientBasePathIn {
   path: string
+  kind: BasePathKind
+  client_path: string | null
+  source: 'detected' | 'manual'
 }
 
 export interface DownloadClientBasePathOut extends DownloadClientBasePathIn {
   id: number
+}
+
+/** One entry in `DownloadClientTestResponse.detected_base_paths` -- what the connector's own
+ * `list_base_paths` reported, and whether lftpweb can see it at the same path over SSH.
+ * **Detection proposes; it never saves** -- turning one of these into a
+ * `DownloadClientBasePathIn` (accepting it, or supplying the SSH-visible path for a
+ * `not_found` one) is a separate, explicit action in `ClientsTab.tsx`.
+ */
+export interface DetectedBasePathOut {
+  client_path: string
+  kind: BasePathKind
+  /** `verified` -- lftpweb sees it at the same path. `not_found` -- the seedbox clearly
+   * reports it missing: the namespace mismatch, detected rather than asked about; supply the
+   * SSH-visible equivalent. `unverified` -- the stat failed for any other reason (permission,
+   * protocol, no SSH connection to try). **`not_found` and `unverified` are deliberately
+   * distinct** -- never render an `unverified` path as if it were known to be wrong.
+   */
+  state: 'verified' | 'not_found' | 'unverified'
 }
 
 export interface DownloadClientCategoryIn {
@@ -342,6 +379,10 @@ export interface DownloadClientTestResponse {
   message: string
   version: string | null
   capabilities: CapabilitySetOut | null
+  // Only ever populated on a fresh success (spec §8.2 correction) -- `[]` on any failed test
+  // (detection never runs against a connector that couldn't be reached) and `[]` for a
+  // connector that doesn't declare `list_base_paths`, which is not an error either.
+  detected_base_paths: DetectedBasePathOut[]
 }
 
 // --- Settings -> Post-processing (phase 5, DESIGN.md §6) -------------------------------

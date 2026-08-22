@@ -6,6 +6,65 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-22 — client base paths: detected + SSH-verified, and save-on-test
+
+`prompts/done/2026-08-22-client-base-paths-detected.md`. Two changes that ship together:
+
+**Base paths are detected from the client and SSH-verified, not typed in** (spec §8.2
+correction). The earlier reasoning — "the user configures the real roots because rTorrent's
+`directory.default` will never mention the completed folder it hardlinks into" — was correct
+about the fact and wrong about the conclusion: that folder is the queue's `remote_path`, which
+lftpweb already knows on its own; it never needed a connector to name it. The real reason user
+input is ever needed is path-namespace translation (a containerised client's own view vs.
+lftpweb's SSH-visible view), which the earlier wording never named. Mirrors `path_queue.
+arr_visible_path` (migration 018), inverted: `download_client_base_path.path` is the SSH-visible,
+authoritative side; the new `client_path` column records the client's own view only when it
+differs, for display/diagnosis alone. `BasePath.label` (a free string) became `BasePath.kind`
+(`BasePathKind`: `content`/`working`/`unknown`) — the role was already knowable from which
+config key a connector read a path from, so leaving it as an unclosed string was pushing a
+solved classification question needlessly wide.
+
+**`verified` / `not_found` / `unverified` are kept as three states, not collapsed to two.**
+`core/browse.py.remote_directory_error`'s own docstring already drew this line for save-time
+path validation elsewhere in this codebase — a clean "no such directory" is a verified fact; an
+ambiguous failure (permission, protocol, no SSH connection to try at all) is not the same fact
+just because both mean "can't use this path right now." Collapsing them would tell a user their
+path is wrong when lftpweb simply couldn't look, which is a worse failure mode than either state
+individually.
+
+**`core/clients/detection.py` is deliberately two functions, not one** (`report_base_paths` /
+`verify_reported_paths`), so each half is unit-testable without a live SSH connection (the
+former needs only a `DownloadClient` stub, the latter only something that duck-types
+`asyncssh.SFTPClient.stat`, the same fake-SFTP pattern `tests/test_browse.py` already uses).
+`report_base_paths` is tolerant of *any* exception, not just the declared `ClientError`
+taxonomy — a connector whose `list_base_paths` isn't wired up yet (`NotImplementedError`) must
+be exactly as harmless as one that fails for a real, declared reason.
+
+**Save-on-test (spec §3a): an enabled instance's test runs against the submitted payload, never
+a stored row.** On create there is no row yet; on update, the secret half of the config to test
+is either the submitted secret (if the request named one) or the existing encrypted secret
+decrypted — never a stripped-down stand-in for what will actually be persisted. A failing test
+on an `enabled: true` save raises before any write, so create persists nothing at all and update
+leaves the existing row completely untouched (verified by row-count/row-equality assertions,
+not just the HTTP status). `enabled: false` never tests and always saves, including a *disabling*
+update on a previously-enabled instance that has since gone bad — deliberately not paired with
+any force/save-anyway flag, since the disable path already is the escape hatch.
+
+**Disabling an update leaves previously-probed capabilities/version untouched, rather than
+clearing them.** They're still the last known truth about a real instance; only a fresh
+*successful* test (which only ever runs when `enabled: true`) resets them to the connector's
+static declaration, mirroring the standalone `/test` endpoint's own "layer 3 cleared by the next
+successful probe" rule.
+
+**Detection lives only in the standalone `POST /clients/{id}/test` endpoint's response, not in
+create/update.** A brand-new instance has no id yet, so there's nothing for a pre-save detection
+call to attach to; the natural flow is save (possibly disabled, to skip the connectivity test),
+click Test to see capabilities *and* detected base paths, then edit to accept/translate them and
+save again. This keeps `POST`/`PUT /clients` scoped to "does this config work," not conflated
+with "what did it find."
+
+---
+
 ## 2026-08-22 — download-client connector framework, stage 1b-ii (frontend: Settings → Clients)
 
 `prompts/done/2026-08-22-client-framework-stage1b-frontend.md`. Adds `frontend/src/pages/
