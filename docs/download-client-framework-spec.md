@@ -449,6 +449,66 @@ Decided with the user, 2026-08-22. One cadence cannot serve both consumers:
 Listing 500 seeding torrents every 10 seconds is waste; learning 60 seconds late that a download
 finished defeats the point of the settle-gate skip.
 
+### 9.2 Freshness and source precedence — a stale *arr reading must never overwrite a fresh one
+
+**Raised by the user, 2026-08-22**, and it is a genuine hole in every preceding section:
+
+> *"If data from sab/torrent etc is current, older stale status from arr shouldn't replace it. The
+> *arr polls its download client at an interval, and we poll the *arr, and that can be a 60+ second
+> round trip — but we'll see SAB/rTorrent directly for download status once this feature is on."*
+
+**The lag is structural and compounds.** SAB reports to the *arr on the *arr's own schedule; lftpweb
+then polls the *arr on its own (default 10 s since v0.3.1). An *arr-derived download status is
+therefore two polling intervals removed from the fact it describes, and once a client connector
+exists lftpweb is reading the *same fact* from the process actually performing the work.
+
+Two sources reporting one fact with different lag means **last-write-wins is wrong**, and it is the
+default behaviour of any naive merge.
+
+#### The precedence rule
+
+> **For a fact both sources can report, the direct client observation wins — always, not
+> "if newer."**
+
+This is deliberately *not* a timestamp comparison, because the timestamps do not exist to compare.
+**The *arr does not tell us when it last polled its own client**, so lftpweb can only know when *it*
+fetched the *arr's answer — which measures our own freshness, not the data's. A rule written on
+fetch time would confidently prefer a just-fetched relay of a two-minute-old fact over a
+ten-second-old direct reading. The client is the origin; the *arr is a relay of unknown lag. Origin
+wins.
+
+#### Three constraints that keep the rule from doing harm
+
+1. **Precedence is per-field, never per-record.** The client wins on the fields it actually
+   populates (§2.2's declaration is exactly the list). It must not blank a field it does not carry
+   just because it won on another — an *arr's `timeleft` should survive a client that reports no
+   ETA. A record-level "client wins" would silently strip data.
+2. **It applies only where the client actually reported.** §4.2 is unchanged and outranks this:
+   **absent from the client is not a verdict.** Silence from the client means the *arr's reading
+   stands, unchallenged. A blank SAB queue response — the v0.2.4 incident — must never be read as
+   "the client says this isn't downloading."
+3. **An unreachable client does not demote its last-known reading to the *arr's.** Same shape as
+   §4.2's "keep last known status": a client that stops answering keeps whatever it last said until
+   it says otherwise, and the poller's backoff (§9) is what covers the gap.
+
+#### Where this actually bites first: Preflight
+
+`core/preflight.py` already merges multiple sources into one box, and §4.6a names the download
+client as a planned third. **A release grabbed by SAB will be reported by both the *arr source and
+the client source at once** — the same underlying thing, twice, with different lag and different
+wording.
+
+The identity to dedupe on already exists and is exact: **`downloadId` *is* the client's own key**
+(§7.1), so the two rows are matchable without heuristics. The merge belongs at the point rows are
+assembled for the box, and it must respect all three constraints above — in particular
+`PreflightHold`'s flap tolerance is per-source today, and two sources holding the same identity
+must not produce two rows.
+
+**Not scoped into stage 2's poller by default.** Stage 2 adds the client as a Preflight source; this
+section is the rule that stage's merge must implement, and it should be built with a test that
+asserts a stale *arr row cannot overwrite a fresher client field — the failure is otherwise silent
+and looks like flicker.
+
 ---
 
 ## 10. Deletion — client removes the entry, lftpweb deletes the bytes
@@ -782,7 +842,28 @@ Fixtures are then built from captured bytes rather than from documentation.
 The capture is independently useful to the user: a client that will not connect becomes diagnosable
 from the log rather than by guesswork.
 
-### 13.4 The live validation loop
+### 13.4 The stage 1a correction list — every SABnzbd guess, in one place
+
+§13.3 promises that the UNVERIFIED markers become "the list of things to go correct." This is that
+list, produced by the stage 1a build (2026-08-22) and to be worked through once the capture runs
+against the real instance. **Nothing here is confirmed; all of it is vendor-doc-derived.**
+
+| # | Guess | Risk if wrong |
+|---|---|---|
+| 1 | **Queue status → phase** groupings: `Queued`/`Grabbing`→`QUEUED`; `Downloading`→`DOWNLOADING`; `Fetching`/`Propagating`/`Verifying`/`QuickCheck`/`Checking`/`Repairing`→`VERIFYING`; `Extracting`/`Moving`/`Running`→`EXTRACTING`; `Paused`→`PAUSED` | Cosmetic-to-moderate. Folding `Repairing`/`Fetching`/`Moving`/`Running` into neighbours is judgment, not observation |
+| 2 | **History status → phase**: `Completed`→`COMPLETED`, `Failed`→`FAILED` | High — this is what the settle-gate skip keys on |
+| 3 | **`Field.ADDED_AT` declared `NONE`** — the guess that neither mode exposes a queued/added timestamp | Low. A declared-absent field that turns out to exist is the safe direction |
+| 4 | **`free_space` reads `diskspace2`/`diskspacetotal2`**, guessing index 2 = complete and index 1 = incomplete | Moderate; a one-character fix, but silently reports the wrong volume until noticed |
+| 5 | **Queue byte/time parsing**: `mb`/`mbleft` as MB-denominated numeric strings, `timeleft` as `"H:MM:SS"` | Moderate |
+| 6 | **History field names/shapes**: `bytes`/`completed`/`storage`/`fail_message`/`category`, including reusing `bytes` as both final size and `bytes_done` | High — `storage` is the identity source (§7.2) |
+| 7 | **`list_base_paths`** via `mode=get_config&section=misc`, reading `complete_dir`/`download_dir` | Moderate — feeds §8.2's prefill only, and the user's own config is authoritative |
+| 8 | **`list_files`** via `mode=get_files&value=<nzo_id>`, tolerant of a bare list or `{"files": [...]}` | Low |
+| 9 | **Action call shapes and the `{"status": …}` contract** — specifically that `{"status": false}` alone means *not found* while `{"status": false, "error": …}` means a real failure | **Highest risk in the connector.** Wrong in one direction turns routine not-found into false errors; wrong in the other lets a real failure pass silently |
+| 10 | **`test_connection` via `mode=version`**, plus "HTTP 200 even on auth failure, error signalled in the body" | High — a bad API key reading as success is a bad first-run experience |
+| 11 | **`get_transfer` left `DERIVED`** (filter the merged list) rather than native by `nzo_id` | Low; §5 already flags this one |
+| 12 | **`tests/fake_sabnzbd.py` inherits every guess above** rather than independently corroborating any of them | This is the §13.2 trap by construction, and why the list exists |
+
+### 13.5 The live validation loop
 
 The test system is **https://lftpweb.crzynet.com**, running `dev`. It exposes `/api/health`,
 `/api/history/events`, `/api/logs/*`, `/api/settings/*` and `/api/files` — so a stage deployed there

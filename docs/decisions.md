@@ -6,6 +6,60 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-22 — download-client connector framework, stage 1a (SABnzbd connector)
+
+`prompts/done/2026-08-22-client-framework-stage1a-sabnzbd.md`, building
+`backend/lftpweb/core/clients/sabnzbd.py`, `backend/lftpweb/core/clients/capture.py`, the fake
+`tests/fake_sabnzbd.py`, and their tests. No database table, migration, settings API, frontend,
+or poller — that is stage 1b. **Every status mapping, field-to-endpoint pairing, and parsing
+choice in this connector is authored from vendor documentation (sabnzbd.org's API wiki,
+2026-08-22) and is UNVERIFIED against a live SABnzbd instance** — every such constant carries
+that provenance in its own docstring, on purpose, after this repo's `IMPORT_EVENT_TYPES = {3}`
+defect (a fake *arr fixture encoding the identical wrong guess as the production code it was
+meant to test).
+
+**A real bug caught during testing, worth recording because it is the kind of mistake the
+"doc-derived" discipline exists to surface early.** SABnzbd's action endpoints
+(`name=delete`/`pause`/`resume`/`change_cat`) answer `{"status": false}` for a routine, non-error
+outcome — "this id was not found here" — indistinguishable at first glance from the same
+`status: false` shape SABnzbd's own bad-API-key response uses. The first cut of `_get()`
+treated any `status: false` as a hard `ClientError`, which broke `remove()`'s own
+queue-then-history fallback (a "not in the queue" answer was never supposed to be an error at
+all). Fixed by requiring a truthy `error` key alongside `status: false` before raising —
+doc-derived, UNVERIFIED itself, and flagged in the stage-1a report as one more thing a live
+capture (spec §13.3) should confirm.
+
+**`Field.ADDED_AT` is overridden from `USENET_BASELINE`'s `NATIVE` to `Support.NONE`** for this
+connector specifically. Neither `mode=queue` nor `mode=history`, per vendor docs, appears to
+expose an "added/queued" timestamp (`history`'s own `completed` is the *finish* time). Declaring
+it `NATIVE` and then simply never populating it would have been exactly the mistake spec §2.2
+warns against ("a field declared and returned `None` is worse than one declared absent") — so
+it is declared unsupported instead, pending stage 1b's live capture proving otherwise.
+
+**`remove()` tries the queue delete first, then falls back to a history delete** — spec §10.1's
+`remove` vocabulary doesn't distinguish which side an id lives on, and SABnzbd's queue/history
+delete are two different calls. **`del_files=0` is passed explicitly on both**, never omitted
+and never left to whatever SABnzbd's own undocumented default is — the single safety-critical
+line in the method, since spec §10.1 requires `remove` to never delete data.
+
+**`free_space` reads `diskspace2`/`diskspacetotal2` off the `mode=queue` response** (spec's own
+survey note: "the cheapest free-space source of the five") and ignores its own `path` argument
+entirely — vendor docs describe SABnzbd's two diskspace pairs as tied to its own configured
+temporary/complete folders, with no per-path selection possible. Which of the two numbered pairs
+is actually the "complete" folder is itself a doc-derived guess (`diskspace2`), flagged in the
+stage-1a report as needing live confirmation — if a capture shows the pairing reversed, only
+the index this reads should change, not the surrounding logic.
+
+**`core/clients/capture.py`'s redaction helper handles two distinct secret shapes, not one**:
+`redact_secret` for a known literal value the caller holds in plaintext (SABnzbd's `apikey`
+query parameter — a plain substring replace, since the exact value is known), and
+`redact_announce_url` for a secret embedded in a URL under a tracker-specific parameter name the
+helper doesn't need to know (spec §7.3, for the rTorrent connector stage 2+ onward) — reduces
+any URL to `scheme://host[:port]` regardless of where in it a passkey sits. Redaction runs
+before capping (`capture_response`), so a secret straddling the truncation boundary is always
+fully collapsed to a fixed-width marker before the length check ever applies — a truncated half
+of a real secret can never survive into a log line.
+
 ## 2026-08-22 — download-client connector framework, stage 0 (issue #18/#21 foundation)
 
 `prompts/done/2026-08-22-client-framework-stage0.md`, building

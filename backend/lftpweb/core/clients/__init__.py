@@ -92,4 +92,5 @@ __all__ = [
 
 # Explicit adapter imports go here, one per connector, each triggering its own
 # `@register_client(...)` decorator on import (spec §6: "adding a connector is one file plus
-# one import line"). Stage 0 ships none; SABnzbd (spec §14 stage 1) is the first.
+# one import line"). Stage 0 shipped none; SABnzbd (spec §14 stage 1) is the first.
+from . import sabnzbd  # noqa: E402,F401 -- import for its @register_client side effect only

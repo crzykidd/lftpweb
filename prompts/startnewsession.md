@@ -118,8 +118,21 @@ and is the input `docs/torrent-manager-spec.md` (#21) depends on.
 **Stage 0 is built** (`core/clients/`, first subpackage under a previously flat `core/`): the
 `Operation`/`Field` closed enums, tri-state `Capability` with caveat notes, the three-layer
 `CapabilitySet` merge, the three-way error taxonomy, the registry, a fake adapter, and a 33-test
-conformance suite. **1718 backend tests, 0 skipped.** No API, no migration, no poller, no real
-client — stage 1 is the SABnzbd adapter.
+conformance suite. No API, no migration, no poller.
+
+**Stage 1a is built**: `core/clients/sabnzbd.py`, `core/clients/capture.py` (the redacted
+response capture), `tests/fake_sabnzbd.py` on a real uvicorn socket, and 56 tests.
+**1774 backend tests, 0 skipped.** Still no table, no settings API, no frontend — that is
+**stage 1b, the next thing to build**, and it also carries the README write-up of the reference
+workflow (spec §1.1).
+
+**⚠ Every SABnzbd status mapping and response shape in stage 1a is vendor-doc-derived and
+UNVERIFIED against a live instance.** Spec **§13.4 is the consolidated correction list** — twelve
+numbered guesses, ranked by risk. Work through it once the capture runs against the real SAB. The
+highest-risk one is #9: whether SAB's `{"status": false}` alone means *not found* while
+`{"status": false, "error": …}` means a real failure. This is the `IMPORT_EVENT_TYPES = {3}` trap
+(see "Traps worth knowing", first entry) deliberately guarded against rather than re-walked into —
+the fixture inherits every guess, so green tests prove nothing about the wire.
 
 **The single most important invariant in stage 0:** `base.py.degrade_from_error` degrades a
 capability **only** on `CapabilityUnavailable`. A `ClientUnreachable` or a bare `ClientError`
