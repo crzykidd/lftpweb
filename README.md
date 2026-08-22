@@ -256,9 +256,14 @@ and known limitations, recorded in full in `docs/decisions.md` and `prompts/open
   RAR compressor exists in this project's toolchain, so the fixture can't be built. The
   equivalent 7zz path *is* tested against a real encrypted zip; the rar path is assumed correct
   by analogy, which is weaker than every other claim here.
-- **Events date filters are UTC calendar days.** No timezone handling exists anywhere —
-  timestamps are stored UTC and rendered with `toLocaleString()`. Away from UTC, "yesterday" can
-  include a few hours of today.
+- **Events date filters, and the Dashboard's daily rollups, are UTC calendar days.** No timezone
+  handling exists anywhere — timestamps are stored UTC and rendered with `toLocaleString()`. Away
+  from UTC, "yesterday" can include a few hours of today.
+- **The daily rollup's 13-month retention isn't configurable.** Raw throughput retention (7-30
+  days, `GET`/`PUT /api/settings/metrics`, no Settings-page UI yet either) is user-adjustable;
+  the daily table that survives past it (`metric_daily`, feeding the Dashboard's "total
+  downloaded" and its 90d/1y ranges) is kept a fixed 13 months for everyone, by design — see
+  `docs/decisions.md`, 2026-08-21.
 - **A dismissed job has no list page that shows it anymore.** Before the Events rename
   (2026-08-20), the old History page's job list showed every terminal job including dismissed
   ones; that list is gone (the Queue tab's Complete box, its replacement, filters dismissed jobs

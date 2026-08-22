@@ -69,7 +69,17 @@ export const BYTES_RANGE_DAYS: Record<BytesRange, number> = {
   '24h': 1,
   '7d': 7,
   '30d': 30,
+  '90d': 90,
+  '1y': 365,
 }
+
+// 2026-08-21 (daily rollups, prompts/done/2026-08-21-daily-metric-rollups.md): 90d/1y are
+// answered from `metric_daily` (api/metrics.py's `_DAILY_RANGES`), not the raw tables --
+// `retentionNoteForRange`'s whole premise (the selected span outrunning the *raw*, user-
+// configurable retention setting) doesn't apply to them; any gap in a 90d/1y chart is either a
+// day predating this feature's rollout, or one that aged out of the daily table's own fixed
+// ~13-month retention, neither of which `GET /api/settings/metrics` describes.
+const DAILY_TABLE_RANGES: ReadonlySet<BytesRange> = new Set(['90d', '1y'])
 
 /** Task prompt item 5's retention-honesty note: `null` unless the selected range's span
  * exceeds what's actually retained, in which case some of the range's own buckets are
@@ -80,8 +90,21 @@ export const BYTES_RANGE_DAYS: Record<BytesRange, number> = {
  * "say nothing" rather than guessing at a number that might not match this install.
  */
 export function retentionNoteForRange(range: BytesRange, retentionDays: number | null): string | null {
+  if (DAILY_TABLE_RANGES.has(range)) return null
   if (retentionDays == null || BYTES_RANGE_DAYS[range] <= retentionDays) return null
   return retentionDays === 1
     ? 'Only the last 1 day is retained — older buckets are empty. Retention is configurable in Settings.'
     : `Only the last ${retentionDays} days are retained — older buckets are empty. Retention is configurable in Settings.`
+}
+
+/** The Dashboard's "total downloaded" readout label (task: "a user can have the option to just
+ * see their total downloaded amount") -- `since <date>` for a real earliest day, or an honest
+ * "no history yet" rather than a bare number with no context, when `metric_daily` (and today's
+ * raw samples) are both still empty (a fresh install, or a queue just added).
+ */
+export function totalSinceLabel(sinceDay: string | null): string {
+  if (!sinceDay) return 'no history yet'
+  const d = new Date(`${sinceDay}T00:00:00Z`)
+  if (Number.isNaN(d.getTime())) return `since ${sinceDay}`
+  return `since ${d.toLocaleDateString([], { year: 'numeric', month: 'short', day: 'numeric' })}`
 }

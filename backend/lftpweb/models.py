@@ -1472,12 +1472,32 @@ class MetricsBucketOut(BaseModel):
     up: bool  # False = no heartbeat fell in this bucket -- lftpweb wasn't running (a gap)
     total_bytes: int | None  # None when up is False; sum of by_queue (incl. 0) otherwise
     by_queue: dict[int, int]  # queue_id -> bytes moved in this bucket; an omitted queue moved 0
+    # 2026-08-21 (daily rollups, prompts/done/2026-08-21-daily-metric-rollups.md): fraction
+    # (0.0-1.0) of a full day's expected heartbeats actually observed -- only set for a
+    # daily-granularity bucket sourced from `metric_daily` (the 90d/1y ranges), `None` for every
+    # bucket sourced from the raw tables (1h/12h/24h/7d/30d), where `up` alone is already exact
+    # at that bucket's own width. Lets the UI distinguish a genuinely quiet day (`up: true`,
+    # `coverage` near 1.0, `total_bytes: 0`) from a day lftpweb was mostly down
+    # (`coverage` well under 1.0) -- both would otherwise look identical.
+    coverage: float | None = None
 
 
 class MetricsThroughputResponse(BaseModel):
     range: str
     bucket_seconds: int
     buckets: list[MetricsBucketOut]
+
+
+class MetricsTotalOut(BaseModel):
+    """The Dashboard's "total downloaded" readout (task: "a user can have the option to just see
+    their total downloaded amount"). `since_day` is the earliest UTC calendar day
+    (`'YYYY-MM-DD'`) this total actually covers -- `None` when there is no rolled-up history yet
+    (a fresh install) -- so the UI can say "since <date>" rather than implying an unbounded
+    history.
+    """
+
+    total_bytes: int
+    since_day: str | None
 
 
 # --- Auth (DESIGN.md §8, phase 8) --------------------------------------------------------

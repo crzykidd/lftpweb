@@ -6,6 +6,100 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-21 — Daily per-queue metric rollups: one table, rollup-before-prune, UTC days, and
+## why coverage lives on the row
+
+`prompts/done/2026-08-21-daily-metric-rollups.md`. User's ask, by name: "a year table that has
+daily totals from each queue ... so that a user can have the option to just see their total
+downloaded amount later." `core/metrics.py`'s raw tables (`metric_sample`/`metric_heartbeat`,
+2026-08-12) keep 7-30 days by design — 365 days of ~30s samples is on the order of a million
+heartbeat rows, and nobody needs 30-second granularity from nine months ago. The task was
+explicitly parked until `0.3.0` shipped (it adds a migration, a scheduler change, and new UI to
+an already-large release) and picked up the same day the release cut.
+
+**One daily table (`metric_daily`, migration 026), not daily + weekly.** A daily row is one per
+queue per day — ~790 rows for two queues over 13 months, trivial. Weekly/monthly views are
+summed from daily on read; keeping a second pre-aggregated table risks the two disagreeing with
+each other, the same "two things that can drift apart" argument that kept `metric_sample`'s own
+site-total un-materialized (2026-08-12 entry, further down).
+
+**Raw retention default raised 7 → 30 days, folded into this task rather than shipped
+separately.** The Dashboard's own offered `30d` chart range was ~77% empty out of the box before
+this; raising the default is what makes it work without the user having to know to go change a
+setting first. `MAX_RETENTION_DAYS` stays 30 — the daily table, not a higher raw ceiling, is
+what serves anything longer now.
+
+**Rollup MUST run before pruning the raw tables — the only part of this feature that can
+destroy data.** `MetricsRetentionScheduler.run_once` (`core/metrics.py`) calls
+`rollup_recent_days` then `prune_metrics`, in that order, in the same function call, every
+cycle — not two independently-scheduled loops that happen to usually run in a safe order.
+`tests/test_metrics.py::test_rollup_runs_before_prune_in_run_once` seeds a day old enough to be
+deleted by that same call's own `prune_metrics` and asserts both halves at once: the daily row
+holds the *real* byte total (proving rollup read the raw rows while they still existed), and the
+raw rows are gone afterward (proving prune ran second, in the same call). `lookback_days` for
+the rollup is `settings.retention_days` — the currently configured raw retention — so every day
+still present in raw gets a chance to be rolled up before this same call's prune can reach it.
+
+**Idempotent by recomputation, not by increment.** `rollup_day` always upserts `bytes`/
+`heartbeat_count` as a fresh `SUM(...)` over the raw tables for that `(queue_id, day)`, keyed by
+a `PRIMARY KEY (queue_id, day)` — re-rolling an already-rolled day (which happens every single
+hourly cycle, by construction, since there's no separate "already done" bookkeeping) overwrites
+with the same or an updated total, never adds to what was already stored. This is also the
+startup-backfill mechanism: there is no separate backfill entry point, `rollup_recent_days` is
+just always called with the current retention window as its lookback, so a day nobody has ever
+rolled up (the app was down, or this feature just shipped into a database with a week of raw
+data already sitting in it) is picked up the same way an already-rolled day is re-confirmed.
+
+**Coverage (`heartbeat_count`) rides along on the same row, not a second table.** The whole point
+of keeping `metric_sample`/`metric_heartbeat` separate (2026-08-12 entry) is that a bucket with
+heartbeats but no sample is a real, informative zero, and a bucket with no heartbeat at all is a
+gap — and a bytes-only daily row throws that distinction away: a day the container was off for
+20 hours would read identically to a genuinely quiet day. `heartbeat_count` is the count of
+`metric_heartbeat` rows that fell on that UTC day, site-wide (heartbeats aren't per-queue, so
+every queue's row for the same day carries the same count) — cheaper than trying to store
+"seconds of coverage" and just as informative for "was this day mostly up or mostly down," which
+is all it needs to answer. **Rejected: seconds of coverage, computed from `tick_s`.**
+`tick_s` (`TransferQueue`'s own tick interval) is a site tuning knob, not a recorded-per-day
+fact — a site that changes it would silently invalidate any stored "seconds" figure for days
+rolled up under the old cadence. A raw count sidesteps that: `EXPECTED_HEARTBEATS_PER_DAY`
+(a documented approximation assuming the common ~1 Hz/30s-sample default) is only applied at
+*read* time, by the API, to turn a count into a fraction for the UI — never baked into the
+stored row. A day absent from `metric_daily` entirely (zero heartbeats) gets no row for any
+queue, same gap semantics carried up a level: no row means no data, not a measured zero.
+
+**UTC calendar days, not a real timezone setting.** Everything in this codebase is stored UTC
+with no timezone handling anywhere (README's Known gaps already documents this for Events'
+date filters) — a daily rollup boundary at UTC midnight is the existing convention, not a new
+one. A real timezone setting would be a separate, larger feature touching History's/Events'
+filters too; out of scope here, and not built. Flagged rather than silently decided: for a
+running *total downloaded* the UTC boundary barely matters (a byte lands in "today" or
+"yesterday," never lost), but "what did I pull yesterday" can be off by a few hours away from
+UTC. If this proves untenable in practice, that's a user call, not an agent one.
+
+**"Total downloaded" is `metric_daily`, summed, plus today's own not-yet-rolled raw samples —
+not a separately maintained running counter.** A counter that's incremented on every write is
+one more thing that can drift from the tables it's supposedly summarizing (the same argument
+against a second pre-aggregated weekly table, above, and against `metric_sample`'s own
+never-materialized site total, 2026-08-12). Folding in today's raw total keeps the number live
+without waiting for the next UTC-midnight rollup; the trade-off (a scheduler that's been down for
+several days won't retroactively include an unrolled *yesterday* until it restarts and its first
+`run_once` catches up) was accepted rather than built around, since normal operation makes it
+self-healing within the hour and the alternative was a second, more expensive query on every
+read of a number nobody watches sub-hourly.
+
+**90d/1y bytes-chart ranges read `metric_daily` directly, not the raw tables** — `_DAILY_RANGES`
+in `api/metrics.py`, a second dict from `_RANGES` rather than folded in, since raw retention (30
+days max) can never serve either one. 30d itself was deliberately left reading the raw tables
+unchanged (the default-retention-to-30 decision above is what makes it work now), rather than
+switched onto the daily table too — changing 30d's data source would have also meant reworking
+the frontend's `retentionNoteForRange`/`BYTES_RANGE_DAYS` logic for a range that already works
+correctly with the simpler fix. 90d/1y are new ranges instead, and `retentionNoteForRange`
+explicitly excludes both from the raw-retention note (`DAILY_TABLE_RANGES` in
+`lib/bytesChart.ts`) since the note's whole premise — the range outrunning the user's configured
+*raw* retention — doesn't apply to a range sourced from a fixed, non-configurable 13-month table.
+
+---
+
 ## 2026-08-21 — Bandwidth from the Queue page: re-admit, never retune; and never touch a pause
 
 `prompts/done/2026-08-21-bandwidth-from-the-queue-page.md`. User's request: a slider on the Queue

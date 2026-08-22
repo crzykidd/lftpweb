@@ -44,6 +44,7 @@ import type {
   MetricsSettingsIn,
   MetricsSettingsOut,
   MetricsThroughputResponse,
+  MetricsTotalOut,
   PathQueueIn,
   PathQueueOut,
   PatternIn,
@@ -808,6 +809,13 @@ export function getThroughput(
   return getJson<MetricsThroughputResponse>(
     `/api/metrics/throughput${queryString({ range, queue_id: queueId })}`,
   )
+}
+
+/** Dashboard's "total downloaded" readout (2026-08-21, daily rollups) -- omit `queueId` for the
+ * site-wide total, pass it for one queue's own.
+ */
+export function getMetricsTotal(queueId?: number): Promise<MetricsTotalOut> {
+  return getJson<MetricsTotalOut>(`/api/metrics/total${queryString({ queue_id: queueId })}`)
 }
 
 // --- Auth (phase 8, DESIGN.md §8) ---------------------------------------------------------

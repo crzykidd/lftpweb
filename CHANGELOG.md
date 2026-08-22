@@ -54,6 +54,17 @@ Skeleton for the next roll:
   interrupted attempt reads the same way. A queued row with nothing downloaded yet is unchanged —
   no `0%`, no fill. The fill never ticks on its own — nothing samples a paused item's bytes — so
   it never suggests the item is actively transferring.
+- **Daily per-queue throughput rollups, and a "total downloaded" readout on the Dashboard** — the
+  raw sample store (`metric_sample`/`metric_heartbeat`) is kept only a matter of weeks by design,
+  nowhere near enough for "how much have I downloaded this year." A new daily table
+  (`metric_daily`, one row per queue per UTC calendar day) is rolled up from the raw tables every
+  hour, kept 13 months, and now backs a headline "total downloaded" number at the top of the
+  Dashboard plus two new bytes-chart ranges, **90d** and **1y**, alongside the existing
+  24h/7d/30d. A day the app was only partly running (heartbeat coverage below ~95%) is marked
+  distinctly from a fully-covered quiet day, both in the chart and its accessible table, so a
+  genuinely idle day is never confused with a mostly-down one. Rollup always runs before the raw
+  tables are pruned, in the same cycle — the only part of this feature that could otherwise lose
+  data — and backfills automatically on first run after upgrading into it.
 
 ### Changed
 
@@ -64,6 +75,10 @@ Skeleton for the next roll:
   The tradeoff, recorded rather than left to be rediscovered: on a deep backlog at 20 rows a
   page, a processing row can now land pages below the fold, which is what the original placement
   avoided. Accepted because such rows are transient and few.
+- **Raw throughput retention default raised from 7 to 30 days** (`MAX_RETENTION_DAYS` stays 30),
+  so the Dashboard's own offered `30d` chart range is populated out of the box instead of arriving
+  mostly empty. Only affects installs that have never touched the setting; an explicitly
+  configured value is untouched.
 
 ### Fixed
 ### Security

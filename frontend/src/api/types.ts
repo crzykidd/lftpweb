@@ -1013,7 +1013,11 @@ export type MetricsSettingsIn = MetricsSettingsOut
 // union both narrower types feed into `MetricsThroughputResponse.range`/`getThroughput`, which
 // don't otherwise care which selector a given range came from.
 export type SpeedRange = '1h' | '12h' | '24h'
-export type BytesRange = '24h' | '7d' | '30d'
+// 2026-08-21 (daily rollups, prompts/done/2026-08-21-daily-metric-rollups.md): 90d/1y read the
+// new `metric_daily` table instead of the raw ones (api/metrics.py's `_DAILY_RANGES`) -- the
+// only thing that changes for the frontend is that `retentionNoteForRange` (lib/bytesChart.ts)
+// doesn't apply the raw-retention note to them.
+export type BytesRange = '24h' | '7d' | '30d' | '90d' | '1y'
 export type MetricsRange = SpeedRange | BytesRange
 
 export interface MetricsBucketOut {
@@ -1024,12 +1028,28 @@ export interface MetricsBucketOut {
   total_bytes: number | null
   // JSON object keys are always strings on the wire -- queue_id -> bytes moved this bucket.
   by_queue: Record<string, number>
+  // 2026-08-21: fraction (0.0-1.0) of a full day's expected heartbeats actually observed --
+  // only set on a daily-granularity bucket (the 90d/1y ranges, sourced from `metric_daily`);
+  // `null` for every raw-table-sourced bucket (1h/12h/24h/7d/30d), where `up` alone is already
+  // exact at that bucket's own width. Lets the UI tell a genuinely quiet day (`up: true`,
+  // `coverage` near 1.0) apart from one lftpweb was mostly down for (`coverage` well under 1.0).
+  coverage?: number | null
 }
 
 export interface MetricsThroughputResponse {
   range: MetricsRange
   bucket_seconds: number
   buckets: MetricsBucketOut[]
+}
+
+// 2026-08-21 (daily rollups): the Dashboard's "total downloaded" readout --
+// `GET /api/metrics/total`, `core/metrics.py.total_bytes`.
+export interface MetricsTotalOut {
+  total_bytes: number
+  // Earliest UTC calendar day (`'YYYY-MM-DD'`) this total actually covers, or `null` when
+  // there's no rolled-up history yet (a fresh install) -- say "since <date>", never imply an
+  // unbounded history.
+  since_day: string | null
 }
 
 // --- Settings -> Logs (phase 7, DESIGN.md §10.1) -----------------------------------------

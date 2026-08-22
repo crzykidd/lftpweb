@@ -8,6 +8,7 @@ import asyncio
 import tempfile
 from datetime import UTC, datetime, timedelta
 
+import pytest
 from fastapi.testclient import TestClient
 
 from lftpweb.db import connect
@@ -18,7 +19,7 @@ def test_metrics_settings_default_shape(isolated_config):
     with TestClient(app) as client:
         resp = client.get("/api/settings/metrics")
         assert resp.status_code == 200
-        assert resp.json() == {"retention_days": 7}
+        assert resp.json() == {"retention_days": 30}  # 2026-08-21: default raised 7 -> 30
 
 
 def test_metrics_settings_round_trip(isolated_config):
@@ -155,3 +156,130 @@ def test_throughput_reflects_seeded_heartbeat_and_samples(isolated_config, tmp_p
         body = resp.json()
         up_buckets = [b for b in body["buckets"] if b["up"]]
         assert any(b["total_bytes"] == 12_345_678 for b in up_buckets)
+
+
+# --- Daily rollups (prompts/done/2026-08-21-daily-metric-rollups.md): 90d/1y ranges and the
+# "total downloaded" endpoint --------------------------------------------------------------
+
+
+def _seed_host_and_queue(client: TestClient) -> int:
+    resp = client.put(
+        "/api/settings/host",
+        json={
+            "name": "seedbox",
+            "address": "1.2.3.4",
+            "port": 22,
+            "username": "user",
+            "auth_method": "key",
+            "key_path": "/config/id_rsa",
+            "known_hosts_policy": "strict",
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    resp = client.post(
+        "/api/settings/queues",
+        json={"name": "TV", "remote_path": "/remote", "local_path": tempfile.mkdtemp()},
+    )
+    assert resp.status_code == 201, resp.text
+    return resp.json()["id"]
+
+
+def test_throughput_90d_range_uses_one_day_buckets_and_is_all_down_on_an_empty_database(
+    isolated_config,
+):
+    with TestClient(app) as client:
+        resp = client.get("/api/metrics/throughput", params={"range": "90d"})
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["range"] == "90d"
+        assert body["bucket_seconds"] == 86400
+        assert len(body["buckets"]) == 90
+        assert all(b["up"] is False for b in body["buckets"])
+        assert all(b["total_bytes"] is None for b in body["buckets"])
+        assert all(b["coverage"] is None for b in body["buckets"])
+
+
+def test_throughput_1y_range_uses_one_day_buckets(isolated_config):
+    with TestClient(app) as client:
+        resp = client.get("/api/metrics/throughput", params={"range": "1y"})
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["range"] == "1y"
+        assert body["bucket_seconds"] == 86400
+        assert len(body["buckets"]) == 365
+
+
+def test_throughput_90d_reflects_rolled_up_daily_rows_and_their_coverage(isolated_config, tmp_path):
+    """Unlike the raw-table ranges, 90d/1y read `metric_daily` directly -- seed a rolled-up row
+    (bypassing `core/metrics.py.rollup_day`, which is exercised in tests/test_metrics.py) and
+    prove the endpoint surfaces its bytes, up/down, and coverage correctly.
+    """
+    with TestClient(app) as client:
+        queue_id = _seed_host_and_queue(client)
+
+    async def seed():
+        conn = await connect(str(tmp_path))
+        day = (datetime.now(UTC) - timedelta(days=3)).strftime("%Y-%m-%d")
+        await conn.execute(
+            "INSERT INTO metric_daily (queue_id, day, bytes, heartbeat_count, updated_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (queue_id, day, 7_000_000, 1440, "2026-08-21T00:00:00.000000Z"),  # ~half coverage
+        )
+        await conn.commit()
+        await conn.close()
+        return day
+
+    day = asyncio.run(seed())
+
+    with TestClient(app) as client:
+        resp = client.get("/api/metrics/throughput", params={"range": "90d", "queue_id": queue_id})
+        assert resp.status_code == 200
+        body = resp.json()
+        seeded = next(b for b in body["buckets"] if b["ts"].startswith(day))
+        assert seeded["up"] is True
+        assert seeded["total_bytes"] == 7_000_000
+        assert seeded["by_queue"].get(str(queue_id)) == 7_000_000
+        assert seeded["coverage"] == pytest.approx(0.5, abs=0.01)
+
+        # Every other bucket in range has no daily row at all -- a full gap, same as "no
+        # heartbeat" on the raw-table ranges.
+        other_buckets = [b for b in body["buckets"] if not b["ts"].startswith(day)]
+        assert all(b["up"] is False and b["total_bytes"] is None for b in other_buckets)
+
+
+def test_metrics_total_is_zero_with_no_history_on_an_empty_database(isolated_config):
+    with TestClient(app) as client:
+        resp = client.get("/api/metrics/total")
+        assert resp.status_code == 200
+        assert resp.json() == {"total_bytes": 0, "since_day": None}
+
+
+def test_metrics_total_sums_daily_rows_plus_todays_raw_samples(isolated_config, tmp_path):
+    with TestClient(app) as client:
+        queue_id = _seed_host_and_queue(client)
+
+    async def seed():
+        conn = await connect(str(tmp_path))
+        past_day = (datetime.now(UTC) - timedelta(days=5)).strftime("%Y-%m-%d")
+        await conn.execute(
+            "INSERT INTO metric_daily (queue_id, day, bytes, heartbeat_count, updated_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (queue_id, past_day, 3_000_000, 2880, "2026-08-21T00:00:00.000000Z"),
+        )
+        today = datetime.now(UTC)
+        await conn.execute(
+            "INSERT INTO metric_sample (queue_id, ts, bytes_delta) VALUES (?, ?, ?)",
+            (queue_id, today.strftime("%Y-%m-%dT%H:%M:%S.%fZ"), 500_000),
+        )
+        await conn.commit()
+        await conn.close()
+        return past_day
+
+    past_day = asyncio.run(seed())
+
+    with TestClient(app) as client:
+        resp = client.get("/api/metrics/total", params={"queue_id": queue_id})
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["total_bytes"] == 3_500_000
+        assert body["since_day"] == past_day

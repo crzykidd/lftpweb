@@ -193,6 +193,24 @@ export function BytesChart({ buckets, bucketSeconds, queues, retentionNote }: By
                     </rect>
                   )
                 })}
+                {/* 2026-08-21 (daily rollups): a day with real but partial heartbeat coverage
+                 * (lftpweb was down part of the day) reads identically to a fully-covered quiet
+                 * day unless marked -- a thin muted cap at the very top of the bar, the same
+                 * visual language the down-bucket dash above uses, distinguishes "some data,
+                 * partial day" from "no data, down" and from "full day." Threshold at 0.95 so
+                 * ordinary rounding/clock-skew doesn't flag every day. */}
+                {bucket.coverage != null && bucket.coverage < 0.95 && (
+                  <rect
+                    x={x}
+                    y={baselineY - cumulative - 3}
+                    width={barWidth}
+                    height={3}
+                    rx={1}
+                    fill="var(--chart-gap-fill)"
+                  >
+                    <title>{`${label} — partial day, lftpweb was down part of the time (~${Math.round(bucket.coverage * 100)}% covered)`}</title>
+                  </rect>
+                )}
                 {showLabel && (
                   <text
                     x={x + barWidth / 2}
@@ -243,7 +261,13 @@ export function BytesChart({ buckets, bucketSeconds, queues, retentionNote }: By
           {buckets.map((bucket) => (
             <tr key={bucket.ts}>
               <td>{bucketLabel(bucket.ts, bucketSeconds)}</td>
-              <td>{bucket.up ? 'up' : 'lftpweb offline'}</td>
+              <td>
+                {!bucket.up
+                  ? 'lftpweb offline'
+                  : bucket.coverage != null && bucket.coverage < 0.95
+                    ? `partial day, ~${Math.round(bucket.coverage * 100)}% covered`
+                    : 'up'}
+              </td>
               {activeQueueIds.map((qid) => (
                 <td key={qid}>{formatBytes(bucket.by_queue[String(qid)] ?? 0)}</td>
               ))}

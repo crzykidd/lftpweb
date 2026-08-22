@@ -1,6 +1,6 @@
 # Concepts
 
-The fourteen things that actually trip people up, and what to do about each.
+The fifteen things that actually trip people up, and what to do about each.
 
 ```jump
 Nothing is downloading at all — the queue is paused|#pause
@@ -17,6 +17,7 @@ Inherit vs override|#inherit
 The Sonarr/Radarr icon|#arr-integration
 Why is this in Preflight and not downloading?|#preflight
 What's in a support bundle|#support-bundle
+Why old Dashboard detail disappears but the total doesn't|#daily-rollups
 ```
 
 ## Nothing is downloading at all — the queue is paused {#pause}
@@ -542,3 +543,29 @@ it's obvious at a glance whether the budget bought recent material. *arr log fil
 exactly as that *arr wrote them — unredacted, since lftpweb doesn't rewrite another app's own
 logs — so give one a glance before sharing it publicly. Building a bundle writes one audit event
 so there is always a record of when one was made and what it contained.
+
+## Why old Dashboard detail disappears but the total doesn't {#daily-rollups}
+
+The Dashboard's 24h/7d/30d charts read *raw* samples taken roughly every 30 seconds — enough
+detail to see a transfer's own shape, but far too much to keep for a year (30 days' worth is
+already tens of thousands of rows). Those raw rows are pruned after **30 days by default**
+(configurable, up to 30) — which is why picking a range further back than that shows nothing for
+the older part of it.
+
+The **total downloaded** figure at the top of the page, and the **90d**/**1y** chart ranges,
+read a *second*, much smaller table instead — one row per queue per day, kept for **13 months**.
+Every closed day gets rolled up into it (summed from the same raw samples) before its detailed
+rows are ever pruned, so the day's total survives even once the minute-by-minute detail behind
+it is gone. That is the whole trade: the *shape* of a transfer from nine months ago is gone for
+good, but *how much* moved that day isn't.
+
+A day the container was only partly running shows up distinctly — a thin marker on that day's
+bar, and "partial day, ~N% covered" in the chart's accessible table — rather than looking like
+either a normal quiet day or a total gap. A day with **no** marker and no bars simply never ran
+at all (before this feature existed, or the app was off that whole day); a day with bars but no
+marker ran the whole day.
+
+Both the daily table's 13-month window and the "past raw retention" boundary above are UTC
+calendar days — this app stores everything in UTC with no timezone handling anywhere, the same
+caveat History's date filters already carry. Away from UTC, "today" and "yesterday" can be off
+by a few hours.

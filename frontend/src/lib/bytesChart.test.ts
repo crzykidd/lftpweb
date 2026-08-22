@@ -6,6 +6,7 @@ import {
   retentionNoteForRange,
   sumBytesByQueue,
   sumTotalBytes,
+  totalSinceLabel,
 } from './bytesChart'
 
 function bucket(overrides: Partial<MetricsBucketOut> = {}): MetricsBucketOut {
@@ -102,5 +103,30 @@ describe('retentionNoteForRange', () => {
     expect(retentionNoteForRange('7d', 1)).toBe(
       'Only the last 1 day is retained — older buckets are empty. Retention is configurable in Settings.',
     )
+  })
+
+  // 2026-08-21 (daily rollups, prompts/done/2026-08-21-daily-metric-rollups.md): 90d/1y read
+  // metric_daily server-side, not the raw tables -- the raw-retention note's whole premise
+  // doesn't apply to them, regardless of how low retentionDays is configured.
+  it('never applies to 90d/1y, which read the daily table instead of raw retention', () => {
+    expect(retentionNoteForRange('90d', 7)).toBeNull()
+    expect(retentionNoteForRange('1y', 1)).toBeNull()
+    expect(retentionNoteForRange('90d', null)).toBeNull()
+  })
+})
+
+describe('totalSinceLabel', () => {
+  it('says there is no history yet when since_day is null', () => {
+    expect(totalSinceLabel(null)).toBe('no history yet')
+  })
+
+  it('formats a real earliest day as "since <date>"', () => {
+    expect(totalSinceLabel('2026-05-01')).toBe(
+      `since ${new Date('2026-05-01T00:00:00Z').toLocaleDateString([], { year: 'numeric', month: 'short', day: 'numeric' })}`,
+    )
+  })
+
+  it('falls back to the raw string on an unparsable date', () => {
+    expect(totalSinceLabel('not-a-date')).toBe('since not-a-date')
   })
 })

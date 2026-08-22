@@ -245,6 +245,11 @@ deleted_archive(queue_id, rel_path, deleted_at, PRIMARY KEY(queue_id, rel_path))
 metric_sample(id, queue_id, ts, bytes_delta)   -- only when that queue moved bytes in a window
 metric_heartbeat(id, ts)                       -- one row per sample tick, unconditionally
 
+-- Daily rollups (§10.4, migration 026, 2026-08-21) -- long-horizon totals past raw retention.
+-- One row per queue per UTC calendar day; heartbeat_count carries idle-vs-down up to this
+-- granularity. Recomputed/upserted, never incremented; kept 13 months.
+metric_daily(queue_id, day, bytes, heartbeat_count, updated_at, PRIMARY KEY(queue_id, day))
+
 -- One row per transfer attempt — this is the audit trail SeedSync lacks
 job(
   id, item_id, kind TEXT,           -- 'mirror' | 'pget'
@@ -2424,6 +2429,11 @@ question. **Downtime renders as a gap, never as a zero**, in both charts; that d
 the whole reason the store keeps a separate liveness heartbeat (§10.4). **The selected
 timeframe is remembered per browser** (2026-08-13, `localStorage`), read synchronously on
 first render so the chart never paints the default range and then jumps to the saved one.
+**A "total downloaded" readout, and 90d/1y bytes-chart ranges** (2026-08-21, daily rollups,
+§10.4) sit above the charts — the long-horizon answer the raw sample store alone can't give,
+served from `metric_daily` instead. A day with only partial heartbeat coverage (lftpweb was down
+part of it) is marked distinctly from a fully-covered quiet day in both the chart and its
+accessible table, never rendered identically to either a full day or a true gap.
 
 **Settings** — tabbed:
 
@@ -2568,9 +2578,33 @@ accounting**, never from a second measurement and never from lftp's output (§1.
   disk. Differencing it by job id would render a restart as a phantom spike. Subtracting the
   job's own `bytes_start` makes the tracked quantity zero at its first tick and monotonic
   thereafter, so a new attempt can never inherit a dead one's history.
-- **Retention** in days, pruned on a fixed cadence — a cheap idempotent delete, never on a
-  request path. Both charts read pre-bucketed rows from one endpoint, with the bucket width
-  chosen per range so the bar chart and the 24 h line agree on what "one slice of time" means.
+- **Retention** in days (default 30, up to `MAX_RETENTION_DAYS`), pruned on a fixed cadence — a
+  cheap idempotent delete, never on a request path. Both charts read pre-bucketed rows from one
+  endpoint, with the bucket width chosen per range so the bar chart and the 24 h line agree on
+  what "one slice of time" means.
+
+**Daily rollups** (2026-08-21, `prompts/done/2026-08-21-daily-metric-rollups.md`) extend this
+past raw retention's reach. The user's ask, by name: a long-horizon "how much have I downloaded"
+total that survives past a few weeks of raw samples. `metric_daily` (migration 026) is one row
+per `(queue_id, day)` — `day` a UTC calendar date, `bytes` a fresh `SUM` over `metric_sample` for
+that queue/day, `heartbeat_count` the same idle-vs-down coverage signal carried up to daily
+granularity (a day with full coverage and zero bytes is a genuinely quiet day; partial coverage
+means the day was mostly down; an absent row means zero heartbeats at all) — kept 13 months, long
+enough for a year-over-year glance.
+
+- **Rollup runs before the raw-table prune, in the same scheduler cycle, every time** — the one
+  part of this feature that can destroy data. A day rolled up after its raw rows are already gone
+  has nothing left to sum.
+- **Idempotent by recomputation**, upserted on `(queue_id, day)` — re-rolling an already-rolled
+  day (which happens every cycle, since there's no separate "already done" bookkeeping) overwrites
+  with a fresh sum rather than incrementing. This doubles as the startup backfill: no separate
+  entry point, just the same call with the current retention window as its lookback.
+- **Never rolls up today** — only closed UTC days.
+- **90d/1y bytes-chart ranges, and the Dashboard's "total downloaded" readout**, are served from
+  this table instead of the raw ones, since raw retention can never reach that far back. 30d
+  itself is unchanged — the raised default above is what makes it work out of the box.
+- **UTC calendar days, not a timezone setting** — the existing convention (README's Known gaps),
+  not a new one; a real timezone setting is a separate, larger feature out of scope here.
 
 ---
 
