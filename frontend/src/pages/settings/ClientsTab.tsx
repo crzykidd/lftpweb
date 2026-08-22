@@ -450,6 +450,23 @@ export function ClientsTab() {
 
   return (
     <div className="flex max-w-3xl flex-col gap-6">
+      {/* New-section notice (user's own request, 2026-08-22): this page shipped as stage 1 of
+          docs/download-client-framework-spec.md and has had no real-world use yet -- every
+          SABnzbd status mapping and response shape behind it is vendor-doc-derived and
+          unverified against a live instance (that spec's §13.4 is the correction list). Saying
+          so on the page is more honest than letting a first user assume the same maturity as
+          the tabs either side of it, and it is expected to come out once the section has been
+          exercised. */}
+      <div
+        role="note"
+        className="rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-900 dark:border-amber-900/60 dark:bg-amber-950/40 dark:text-amber-200"
+      >
+        <strong className="font-medium">This section is new and may have issues.</strong>{' '}
+        Configuring a client here does not change any lftpweb behaviour yet — nothing polls it,
+        and nothing is downloaded, skipped or deleted because of it. Please report anything that
+        looks wrong.
+      </div>
+
       <p className="text-sm text-zinc-600 dark:text-zinc-400">
         Download-client instances — SABnzbd, rTorrent, and whatever follows
         (docs/download-client-framework-spec.md). Each type declares its own connection form and

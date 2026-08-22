@@ -405,6 +405,32 @@ Decided with the user 2026-08-22. This is the same "UI driven by the declaration
 client's name" rule (§4.4) applied to setup, and it is the difference between one form and ten
 hand-written ones. Type-specific values live in a `config_json` blob whose shape the connector owns.
 
+#### Where this is eventually going: one "API Clients" page for every connector
+
+**The user's own framing, 2026-08-22 — recorded as a direction, deliberately not scoped now:**
+
+> *"In my head I think of API Clients or something. In there we have a list of all api connectors
+> we have set up, and when I click edit the edit section loads the right settings for the type, and
+> when I say add I have a dropdown list of integrations we support — sonarr/radarr/sab/rtorrent
+> etc. This creates a dynamic page where all integrations get configured."*
+
+**The mechanism for this already exists** — it is exactly what §8.1's declared config schema plus
+§6's registry produce. A unified page is a list of instances, an add-dropdown fed by the registry,
+and an edit form rendered from the selected type's `ConfigField` list. Nothing new is required
+structurally; the *arr instances would need to render through the same form machinery (whether by
+registering as connector types or by declaring an equivalent schema), which is the only real work.
+
+**Explicitly deferred.** The user's instruction is to leave Settings' layout alone until the
+download-client work is actually functioning: *"I don't want to change things yet… after some time
+testing/validating we can look at combining into a new config page."* Until then Settings → Clients
+sits beside Settings → Integrations as two tabs, and the naming overlap between them is a known,
+accepted rough edge rather than an oversight — see the same conversation for the rejected
+`Media managers` / `Download clients` rename.
+
+**Settings → Clients carries a "this section is new and may have issues" notice** (the user's
+request, same conversation) stating that configuring a client changes no behaviour yet. It comes
+out once the section has real use behind it.
+
 ### 8.2 Base paths are user-configured, browsed, and validated on save
 
 **Decided with the user, 2026-08-22.** The scan's roots (§11) come from the instance's settings, not
