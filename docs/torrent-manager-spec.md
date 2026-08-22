@@ -161,6 +161,50 @@ Three things to get right:
 - **The trigger is global; the selection is per-site.** Free space is one number for the whole
   disk, but eligibility and ranking are governed by each torrent's own site rules.
 
+## 6a. Projected free space — the reason this belongs in lftpweb and not in a standalone tool
+
+**The trigger should be what free space is *about to be*, not what it is right now.** The user's
+case (2026-08-21): 200 GB free, the *arr just grabbed 190 GB of new releases, and by the time those
+land the disk is full. A reactive threshold notices this only after the damage — and worse, notices
+it *while transfers are running*, which is the worst moment to start deleting things.
+
+**lftpweb is uniquely placed to know this, and already does.** A standalone torrent manager sees
+only the disk. lftpweb sees the incoming commitment, from three sources it already tracks:
+
+| Source | What it contributes | Already available? |
+|---|---|---|
+| Preflight rows | Releases the *arr has grabbed that have not landed yet | **Yes** — `PreflightRow` already carries a known total size and, where the source can compute it, how much is left to arrive |
+| Queued jobs | Known remote size of everything waiting for a slot | Yes — the queue already knows remote sizes |
+| Running jobs | Remaining bytes on transfers in flight | Yes — progress is derived from local-vs-remote bytes |
+
+So: **`projected_free = current_free − committed_incoming`**, and the watermark is evaluated
+against the projection. That turns "clean up after you run out" into "clean up *because* 190 GB is
+coming", which is the actual request.
+
+**Two things will go wrong if they aren't designed for:**
+
+- **Double counting.** One release can be a Preflight row *and* a queued job *and* in flight,
+  depending on timing — Preflight explicitly evicts on handover for exactly this reason. Committed
+  bytes must be computed **once, in one place**, with a single definition of what counts, the same
+  way `core/pipeline_flight.py` is one SQL string with three callers. Two encodings of "incoming"
+  will drift, and a projection that double-counts will delete torrents that never needed deleting.
+- **Unknown size is not zero.** `PreflightRow`'s size fields are `None` when the source cannot
+  compute them, by deliberate design ("never a request to enrich one that lacks it"). A `None`
+  silently coerced to 0 makes the projection quietly optimistic — the failure direction that
+  deletes nothing and lets the disk fill. Count unknowns separately and **say so in the UI**: "190
+  GB incoming, plus 4 releases of unknown size" is honest; a single confident number is not.
+
+**Which disk this lands on matters.** *arr grabs are downloaded by SAB/rTorrent onto the **seedbox**
+first, then transferred locally — so incoming commitment hits the same disk the torrent manager
+frees, and the connection is direct. The local target disk fills too, on its own schedule, but
+stopping a seed does nothing for it. If local space is also to be protected that is a **separate
+projection with a separate remedy**, and should not be folded into this one (§10, question 2).
+
+**This is also the best argument for phase A shipping alone.** A read-only panel that says "200 GB
+free, 190 GB incoming, 47 torrents eligible to stop freeing 340 GB" is genuinely useful before a
+single rule exists, and it is how the projection gets validated against reality before anything is
+allowed to act on it.
+
 ## 7. The rules
 
 A torrent becomes **eligible to stop** only once it has satisfied **both** of its site's
