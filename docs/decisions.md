@@ -6,6 +6,50 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-22 — download-client connector framework, stage 1b-ii (frontend: Settings → Clients)
+
+`prompts/done/2026-08-22-client-framework-stage1b-frontend.md`. Adds `frontend/src/pages/
+settings/ClientsTab.tsx`, its two pure-logic helpers (`lib/clientCapabilities.ts`,
+`lib/clientCategoryInference.ts`), the `api/client.ts`/`api/types.ts` wiring for
+`/api/settings/client-types` and `/api/settings/clients*`, the `Settings → Clients` nav entry,
+and the README's recommended-seedbox-layout write-up. No backend changes.
+
+**Category → queue inference is computed entirely client-side from the instance's own
+configured base paths and each existing queue's `remote_path` — it never calls a live
+`list_base_paths` round trip against the connector.** Spec §8.3's own wording ("infer the
+mapping from existing queue remote paths against the client's `list_base_paths` result") reads
+as if the *client's own* answer drives the inference. But spec §8.2 is explicit that
+`list_base_paths` is a prefill only, never authoritative, and the user's own configured base
+paths are the real roots the safety-critical containment check (§10.2) trusts. Since the
+inference only needs *some* set of root paths to match queue remote paths against, and the
+instance's already-configured (or being-typed) base paths are the authoritative set the spec
+itself says to prefer, computing the proposal from those — rather than adding a new endpoint to
+call the connector live just to render a Settings-page suggestion — avoids a network round trip
+to the download client on every visit to this tab and avoids a backend change this task's
+handoff prompt asked to justify before making. If a later stage wires `list_base_paths` up as a
+live prefill for the base-paths field itself, this inference should switch to reading *that*
+result too, additively, not as a replacement for the configured-base-paths input it already has.
+
+**The capability readout's `none`-support fallback text reuses the connector's own baseline
+`note` verbatim when one exists, and only synthesizes a sentence from the field's display label
+when the declaration truly carries none.** Several `USENET_BASELINE`/`TORRENT_BASELINE` notes
+read a little developer-flavored ("no ratio (spec §5)") rather than polished end-user copy;
+rewriting them in the UI layer would have meant maintaining a second, parallel set of "why not"
+strings that could drift from the framework's own declared reasoning. Showing the backend's own
+note is judged more honest than a prettier UI-authored fiction, per this task's own instruction
+to just be honest rather than to be polished.
+
+**This is the first component-level (render) test for a Settings tab.** `QueuesTab.test.ts`'s
+own header comment (predating this task) says "no component-render harness for Settings tabs in
+this suite," but `WhatsNewDialog.test.tsx`/`VersionLink.test.tsx` (2026-08-16, non-Settings)
+already established one — `createRoot`/`act`, no `testing-library` dependency — and this task's
+required cases (derived-capability label+note, disabled-with-reason, failed-test-preserves-
+capabilities) are genuinely about rendered output, not just pure predicates. `ClientsTab.
+test.tsx` reuses that existing harness rather than inventing a second one or stretching pure-
+function tests to cover a rendering guarantee they can't actually prove.
+
+---
+
 ## 2026-08-22 — download-client connector framework, stage 1b (backend: instance row, API, test-connection)
 
 `prompts/done/2026-08-22-client-framework-stage1b-backend.md`, building migration

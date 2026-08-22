@@ -229,6 +229,121 @@ export interface ArrPollSettingsOut {
 
 export type ArrPollSettingsIn = ArrPollSettingsOut
 
+// --- Settings -> Clients (migration 027, docs/download-client-framework-spec.md, stage 1b
+// of #18) --------------------------------------------------------------------------------
+//
+// Mirrors `backend/lftpweb/models.py`'s `ClientConfigFieldOut`/`ClientTypeOut`/
+// `DownloadClient*`. Unlike `ArrInstanceIn`'s fixed `base_url`/`api_key` pair, each connector
+// declares its own connection-form schema (spec §8.1) -- `ClientConfigFieldOut.kind` is what
+// lets `ClientsTab.tsx` render one generic form for every registered connector, with no
+// `if client_type === "sabnzbd"` anywhere in this codebase (spec §4.4/§5.1).
+
+export interface ClientConfigFieldOut {
+  key: string
+  label: string
+  kind: 'str' | 'int' | 'bool' | 'secret'
+  required: boolean
+  default: unknown
+  help_text: string | null
+}
+
+/** Display grouping only (spec §5.1) -- groups the type picker, and picks nothing else. Never
+ * read anywhere as a behavioural branch.
+ */
+export type ClientFamily = 'usenet' | 'torrent'
+
+export interface ClientTypeOut {
+  client_type: string
+  family: ClientFamily
+  config_schema: ClientConfigFieldOut[]
+}
+
+export interface DownloadClientBasePathIn {
+  path: string
+}
+
+export interface DownloadClientBasePathOut extends DownloadClientBasePathIn {
+  id: number
+}
+
+export interface DownloadClientCategoryIn {
+  category: string
+  // `null` = configured but not yet bound to a queue (spec §8.3) -- distinct from the mapping
+  // not existing at all.
+  queue_id: number | null
+}
+
+export interface DownloadClientCategoryOut extends DownloadClientCategoryIn {
+  id: number
+}
+
+/** A create/update request body. `config` carries every key the selected type's own
+ * `config_schema` names, secret and non-secret alike -- the server splits it apart
+ * (`api/settings_clients.py`). Omitting every secret key on an update keeps the stored
+ * values, the same "unchanged must not mean cleared" rule `ArrInstanceIn.api_key` follows,
+ * generalized to however many secret keys a connector's schema declares (all-or-nothing: a
+ * request either resends every secret field it wants to keep, or none at all).
+ */
+export interface DownloadClientIn {
+  name: string
+  client_type: string
+  config: Record<string, unknown>
+  enabled: boolean
+  base_paths: DownloadClientBasePathIn[]
+  categories: DownloadClientCategoryIn[]
+}
+
+/** Tri-state support level for one operation or field (spec §4.3) --
+ * `docs/download-client-api-survey.md` §4.1's conclusion. `note` carries a caveat that matters
+ * most for `derived`: the canonical case is rTorrent's seed time, wall-clock since completion
+ * rather than true accrued seed time, and the UI must say so wherever this is shown -- never
+ * render `native` and `derived` identically.
+ */
+export type Support = 'native' | 'derived' | 'none'
+
+export interface CapabilityOut {
+  support: Support
+  note: string | null
+}
+
+export interface CapabilitySetOut {
+  operations: Record<string, CapabilityOut>
+  fields: Record<string, CapabilityOut>
+}
+
+export interface DownloadClientOut {
+  id: number
+  name: string
+  client_type: string
+  // Non-secret config only -- never the secret sub-values, in any form.
+  config: Record<string, unknown>
+  has_secret: boolean
+  enabled: boolean
+  // The probed capability layer (spec §4.1). `null` = never successfully probed.
+  capabilities: CapabilitySetOut | null
+  capabilities_probed_at: string | null
+  version: string | null
+  base_paths: DownloadClientBasePathOut[]
+  categories: DownloadClientCategoryOut[]
+  created_at: string
+  updated_at: string
+}
+
+/** `POST /api/settings/clients/{id}/test` -- `capabilities` always reflects whatever is now on
+ * file: unchanged on `ClientUnreachable`/`ClientError` (a transport failure changes no
+ * capability, spec §4.2), narrowed by exactly one key on `CapabilityUnavailable`, reset to the
+ * connector's static declaration on a fresh success. **Never blanked by a failed test** -- a
+ * previously probed set stays exactly as it was; only `ok`/`error_class`/`message` report the
+ * failure.
+ */
+export interface DownloadClientTestResponse {
+  ok: boolean
+  error_class: string | null
+  message: string
+  version: string | null
+  capabilities: CapabilitySetOut | null
+}
+
 // --- Settings -> Post-processing (phase 5, DESIGN.md §6) -------------------------------
 
 export interface PostprocessSettingsOut {

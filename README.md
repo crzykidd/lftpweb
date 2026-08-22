@@ -142,6 +142,45 @@ Every verify outcome, every remote delete, and every delete withheld — with th
   Per-field help popups (`FieldHelp`) are being applied across the settings surface, starting
   with the fields whose wrong answer costs you data
 
+## Recommended seedbox layout
+
+lftpweb doesn't require any particular seedbox layout — a queue's `remote_path` can point
+anywhere. But if you're setting one up from scratch, or deciding whether to change an existing
+one, this is the layout lftpweb's download-client integration is designed against, and the one
+other layouts are worth comparing yourself to rather than treated as equally unremarkable:
+
+- **SABnzbd and rTorrent both drop into one shared completed directory tree**, matching
+  lftpweb's queue remote paths one-for-one — e.g. `/downloads/complete/tv`,
+  `/downloads/complete/movies`. Each of those becomes a queue's `remote_path` directly.
+- **For a category both clients handle — TV, most commonly — they share the same folder.** Not
+  one folder per client. A shared folder is exactly what an *arr already expects when both a
+  usenet and a torrent indexer can grab the same release, and it's what lets one lftpweb queue
+  serve both clients at once instead of needing a second queue and a second remote path per
+  client.
+- **SABnzbd downloads, then extracts into the completed structure.** The extracted files are
+  new files; SABnzbd's own working copy is gone once extraction finishes. The completed folder
+  holds the *only* copy of a SABnzbd release.
+- **rTorrent downloads, then hardlinks its files into the completed folder on completion.** The
+  torrent keeps seeding from its own data directory the whole time; the completed-folder entry
+  is a second link to the same inodes, not a second copy. rTorrent goes on seeding for as long
+  as you let it, entirely independent of whatever lftpweb does with the completed-folder link.
+
+Treat this as the baseline. A setup that departs from it — one folder per client, no
+extraction, no hardlinking — isn't wrong, but it's a deliberate departure worth naming to
+yourself, rather than a default nobody chose.
+
+One consequence of this layout is worth knowing before you turn on a `move` queue's source
+delete, because it produces the same setting doing two different things depending on which
+client produced the release. `move` mode's confirmed-import cleanup deletes
+`<queue.remote_path>/<rel_path>` on the seedbox — the completed-folder copy. For a **SABnzbd**
+release, that folder holds the only copy, so the delete reclaims that release's space
+immediately. For an **rTorrent** release, that folder entry is one of two links to the same
+data — deleting it unregisters nothing from rTorrent and frees no space at all; rTorrent goes
+on seeding the exact same bytes from its own data directory until *you* remove the torrent
+there, at which point the space actually comes back. Same queue setting, same "source deleted"
+audit event either way — genuinely different real-world outcomes depending on which client the
+release came from.
+
 ## Support bundle
 
 **Settings → Logs → "Support bundle…"** builds one downloadable zip to attach to an issue or

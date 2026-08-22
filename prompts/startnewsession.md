@@ -129,8 +129,22 @@ workflow (spec §1.1).
 **Stage 1b (backend) is built**: **migration 027** (`download_client` + `download_client_base_path`
 + `download_client_category`, all additive, defaults OFF), `api/settings_clients.py` mirroring
 `settings_arr.py`, and a test-connection endpoint that persists the **probed** capability layer and
-writes a redacted capture to the log. **1794 backend tests, 0 skipped.** Remaining in stage 1b:
-the frontend (`prompts/2026-08-22-client-framework-stage1b-frontend.md`).
+writes a redacted capture to the log.
+
+**Stage 1b (frontend) is built — stage 1 is COMPLETE**: **Settings → Clients**, with the connection
+form rendered from each connector's server-declared `ConfigField` schema (no `if client_type ===
+"sabnzbd"` anywhere — verified by grep), base-path browsing reusing the existing remote picker,
+category→queue mapping with an *offer to infer* from configured base paths, and an honest
+capability readout (derived labelled as derived with its note; missing capabilities disabled with a
+stated reason; a failed test renders last-known rather than blanking). Plus **README's "Recommended
+seedbox layout"** section. **1794 backend / 697 frontend tests, 0 skipped.**
+
+**👉 THE NEXT REAL-WORLD STEP is not more code — it is running a capture against the live SAB.**
+Settings → Clients → add the SABnzbd instance → Test. Then read the capture and work through spec
+**§13.4's twelve guesses**. Note the capture is currently at DEBUG, so it needs
+`LFTPWEB_LOG_LEVEL=DEBUG` — spec §13.3 flags that as a design problem to fix (probably return it in
+the test-connection response body instead). **Stage 2 (the poller, the Preflight source, the
+settle-gate skip) should not be built on unverified mappings.**
 
 **Two findings from stage 1b worth knowing before touching this code:**
 

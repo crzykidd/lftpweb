@@ -18,9 +18,13 @@ import type {
   BackupListResponse,
   BackupSettingsIn,
   BackupSettingsOut,
+  ClientTypeOut,
   CompleteJobsResponse,
   DeleteItemResponse,
   DismissAllResponse,
+  DownloadClientIn,
+  DownloadClientOut,
+  DownloadClientTestResponse,
   DownloadPrefixSettingsIn,
   DownloadPrefixSettingsOut,
   EffectiveLftpSettingsOut,
@@ -236,6 +240,45 @@ export function deleteArrInstance(id: number): Promise<void> {
  */
 export function testArrInstance(id: number): Promise<ArrTestResponse> {
   return sendJson<ArrTestResponse>(`/api/settings/arr/${id}/test`, 'POST')
+}
+
+// --- Settings -> Clients (migration 027, docs/download-client-framework-spec.md, stage 1b of
+// #18) -------------------------------------------------------------------------------------
+
+/** The registry's declared connector types (spec §6, §8.1) -- each with its own connection-
+ * form schema, so `ClientsTab.tsx` renders one generic form per connector instead of one
+ * hand-written form per client.
+ */
+export function listClientTypes(): Promise<ClientTypeOut[]> {
+  return getJson<ClientTypeOut[]>('/api/settings/client-types')
+}
+
+export function listClientInstances(): Promise<DownloadClientOut[]> {
+  return getJson<DownloadClientOut[]>('/api/settings/clients')
+}
+
+export function createClientInstance(body: DownloadClientIn): Promise<DownloadClientOut> {
+  return sendJson<DownloadClientOut>('/api/settings/clients', 'POST', body)
+}
+
+/** Every secret key omitted from `body.config` keeps the stored secret unchanged -- the
+ * browser never has the plaintext to send back. See `DownloadClientIn`'s own docstring.
+ */
+export function updateClientInstance(id: number, body: DownloadClientIn): Promise<DownloadClientOut> {
+  return sendJson<DownloadClientOut>(`/api/settings/clients/${id}`, 'PUT', body)
+}
+
+export function deleteClientInstance(id: number): Promise<void> {
+  return sendJson<void>(`/api/settings/clients/${id}`, 'DELETE')
+}
+
+/** The Settings UI's Test button -- never rejects for a reachable-but-erroring instance, or
+ * for an unreachable one; the failure is reported in `message`/`error_class`, the same
+ * "test tells you what's wrong, doesn't throw" shape `ArrTestResponse` already uses. Only a
+ * genuine HTTP/network failure against lftpweb's own API throws here.
+ */
+export function testClientInstance(id: number): Promise<DownloadClientTestResponse> {
+  return sendJson<DownloadClientTestResponse>(`/api/settings/clients/${id}/test`, 'POST')
 }
 
 /** *arr poll cadence (2026-08-21, issue #16) -- `core/arrsync.py.ArrSettings.poll_interval_s`

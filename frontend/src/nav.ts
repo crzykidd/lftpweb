@@ -34,6 +34,11 @@ export const SETTINGS_TABS: NavItem[] = [
   { path: '/settings/transfer', label: 'Transfer' },
   { path: '/settings/post-processing', label: 'Post-processing' },
   { path: '/settings/integrations', label: 'Integrations' },
+  // Download-client instances (docs/download-client-framework-spec.md, stage 1b of #18) --
+  // SABnzbd, rTorrent, and whatever follows. Sits beside Integrations (the *arr side of the
+  // same "external service instance" shape) rather than inside it -- a client instance and an
+  // *arr instance are configured, tested and bound to queues independently of one another.
+  { path: '/settings/clients', label: 'Clients' },
   { path: '/settings/logs', label: 'Logs' },
   { path: '/settings/backup', label: 'Backup' },
   { path: '/settings/auth', label: 'Auth' },

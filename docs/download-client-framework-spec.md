@@ -432,8 +432,15 @@ polling the same SAB twice. Queue attribution comes from a configured **category
 `/home/crzykidd/downloads/complete/ar-movies` and `/home/crzykidd/downloads/complete/ar-tv` — i.e.
 **the queue remote paths already *are* the client's category folders.** The mapping is not a new
 concept for the user to learn; it is the layout they already have. The setup UI should therefore
-*offer to infer* the mapping from existing queue remote paths against the client's `list_base_paths`
-result, with the user confirming rather than typing.
+*offer to infer* the mapping from existing queue remote paths, with the user confirming rather than
+typing.
+
+**Inference reads the instance's own configured base paths (§8.2), not a live `list_base_paths`
+probe.** An earlier wording here named the client's result and read as if a probe were required,
+which contradicts §8.2's rule that the user's configuration is authoritative and the client's answer
+is only ever a prefill. Stage 1b resolved it the right way. A future live-probe prefill would be
+*additive* — one more source for the suggestion — and must not become a precondition for inferring
+at all, or a client that cannot report its own paths loses a convenience it never needed.
 
 ---
 
