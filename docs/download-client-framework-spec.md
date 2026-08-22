@@ -319,6 +319,17 @@ api/settings_clients.py     instance CRUD, test-connection, capability readout
 7–10 adapter modules plus four framework modules, a flat `core/` would be unreadable. Flagged here
 rather than done silently.
 
+**Gap found in stage 1b (2026-08-22): the ABC does not declare a transport lifecycle.** `§6`'s
+layout named the methods a connector performs but said nothing about how its transport is opened
+and closed, so `SabnzbdClient` declares `aclose`/`__aenter__`/`__aexit__` on its own and
+`api/settings_clients.py` has to reach for them with `getattr(client, "aclose", None)`. That
+duck-typing is harmless once and a smell at seven connectors — every caller re-deciding whether
+this particular client needs closing is exactly the per-client branching §4.4 exists to forbid,
+arriving through the back door. **`DownloadClient` should declare the async-context-manager
+protocol** so every connector is closed identically and a leaked `httpx` client is impossible
+rather than merely unlikely. `core/arrclient.py` already models the shape to copy (`async with`,
+one client per use). Fix it before the second real connector lands, not after.
+
 **Registration is a decorator into a module-level registry, imported explicitly by
 `core/clients/__init__.py`.** No entry-points, no dynamic import scanning — this project ships one
 image and gains nothing from discovery machinery. Adding a connector is one file plus one import
@@ -841,6 +852,46 @@ Fixtures are then built from captured bytes rather than from documentation.
 
 The capture is independently useful to the user: a client that will not connect becomes diagnosable
 from the log rather than by guesswork.
+
+#### Open: the capture is at DEBUG, which defeats half its purpose
+
+**Stage 1b writes the capture via `logger.debug`**, so seeing it requires setting
+`LFTPWEB_LOG_LEVEL=DEBUG` on the deployment and turning it back afterwards. That is fine for
+correcting §13.4 as a one-off exercise, and **wrong for the diagnostic promise made just above** —
+"a client that will not connect becomes diagnosable from the log" does not hold if diagnosing it
+first requires a log-level change and a restart, which is exactly the moment a user is least
+inclined to keep going.
+
+Options, none decided: emit the capture at INFO (it is bounded, redacted, and only fires on an
+explicit user-triggered test, so the volume argument is weak); or return it in the
+test-connection **response body** so the settings page can show it inline, which is where a user
+looking at a failed test actually is. The second is probably right and costs little — but it makes
+the redaction guarantee load-bearing in a second place, so it should be built with the same
+log-content-style test rather than trusting the helper's return value (see the `httpx` finding
+below for why that distinction is not academic).
+
+#### The side door: `httpx` logs the full request URL, and the API key is in it
+
+**Found during stage 1b (2026-08-22) by the test that asserts no API key reaches the log** — the
+test failed even though the connector's own capture was correctly redacted.
+
+`httpx` logs every outgoing request's full URL at INFO by default. SABnzbd authenticates with
+`?apikey=…` **in the query string**, so a correctly redacted capture line was landing in the log
+immediately after an *unredacted* `HTTP Request: GET …&apikey=<real key>` line emitted by the
+library — from a code path this codebase's redaction never touches. `logsetup.py` now carries an
+`httpx: WARNING` floor alongside `asyncssh` and the others.
+
+**The generalisable lesson, and it is not "add httpx to the floors":** redaction discipline applied
+to *your own* log calls is not sufficient when a dependency logs the same secret through its own
+mechanism. Any future connector whose auth rides in a URL — and per
+`docs/download-client-api-survey.md` §4, auth is the least portable part of this whole framework,
+with a query-string API key being one of five distinct schemes — reopens this exact door. The test
+that catches it is the one that asserts on **log content**, not on the capture helper's return
+value; a helper-only test would have passed while the key leaked.
+
+This is §7.3's "hostname only, never the full announce URL" rule arriving from a completely
+different direction, which is the reason it is written down here rather than left in a commit
+message.
 
 ### 13.4 The stage 1a correction list — every SABnzbd guess, in one place
 

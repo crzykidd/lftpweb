@@ -4,7 +4,7 @@ is not modeled speculatively ahead of the phases that need it.
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -1701,6 +1701,124 @@ class ArrPollSettingsIn(ArrPollSettingsOut):
     explicitly, mirroring `api/backup.py.put_backup_settings`'s inline range check rather than a
     pydantic field constraint, so the error message can name the actual bound.
     """
+
+
+# --- Download clients (docs/download-client-framework-spec.md, stage 1b of #18) ----------------
+#
+# `api/settings_clients.py` -- instance CRUD, `client-types` (the registry's declared config
+# schemas), and test-connection. Mirrors `ArrInstanceIn`/`ArrInstanceOut`/`ArrTestResponse`
+# above closely (this task's own handoff prompt: "the shape to mirror"), widened for what the
+# framework spec adds that *arr integration never needed: a connector-declared config schema
+# (spec §8.1) instead of a fixed `base_url`/`api_key` pair, multiple base paths (spec §8.2), and
+# a category -> queue mapping (spec §8.3).
+
+
+class ClientConfigFieldOut(BaseModel):
+    """One entry in a connector's declared connection-config schema
+    (`core.clients.base.ConfigField`, spec §8.1) -- projected to the wire so stage 1b-ii's
+    Settings page can render one generic form for every registered connector without knowing
+    anything about the connector that declared it.
+    """
+
+    key: str
+    label: str
+    kind: Literal["str", "int", "bool", "secret"]
+    required: bool = True
+    default: Any = None
+    help_text: str | None = None
+
+
+class ClientTypeOut(BaseModel):
+    """One entry in `GET /api/settings/client-types` -- one registered connector
+    (`core.clients.registered_clients()`, spec §6). `family` is display grouping only, never a
+    behavioural branch (spec §5.1) -- it groups the settings picker, nothing more.
+    """
+
+    client_type: str
+    family: Literal["usenet", "torrent"]
+    config_schema: list[ClientConfigFieldOut]
+
+
+class DownloadClientBasePathIn(BaseModel):
+    path: str = Field(max_length=MAX_PATH_LEN)
+
+
+class DownloadClientBasePathOut(BaseModel):
+    id: int
+    path: str
+
+
+class DownloadClientCategoryIn(BaseModel):
+    category: str = Field(max_length=MAX_NAME_LEN)
+    # `None` = configured but not yet bound to a queue (spec §8.3) -- distinct from the mapping
+    # not existing at all.
+    queue_id: int | None = None
+
+
+class DownloadClientCategoryOut(BaseModel):
+    id: int
+    category: str
+    queue_id: int | None = None
+
+
+class DownloadClientIn(BaseModel):
+    """A create/update request for one download-client instance.
+
+    `config` carries **every** key the connector's own declared `config_schema` names --
+    secret and non-secret alike (spec §8.1: "each connector declares its own connection-form
+    schema"), unlike `ArrInstanceIn`'s fixed `base_url`/`api_key` pair. `api/settings_clients.py`
+    splits it against the registered connector's schema at request time: non-secret values go to
+    `config_json` verbatim, secret values are encrypted into `secret_enc` (`core/crypto.py`,
+    identical mechanism to `ArrInstanceIn.api_key`). A secret key **absent** from this dict on an
+    update keeps whatever is already stored for that key -- the same "unchanged must not mean
+    cleared" rule `ArrInstanceIn.api_key`/`HostIn.password` already follow, generalized from one
+    named field to however many secret keys a given connector's schema declares.
+    """
+
+    name: str = Field(max_length=MAX_NAME_LEN)
+    client_type: str = Field(max_length=MAX_NAME_LEN)
+    config: dict[str, Any] = Field(default_factory=dict)
+    enabled: bool = False
+    base_paths: list[DownloadClientBasePathIn] = Field(default_factory=list)
+    categories: list[DownloadClientCategoryIn] = Field(default_factory=list)
+
+
+class DownloadClientOut(BaseModel):
+    id: int
+    name: str
+    client_type: str
+    # Non-secret config only -- never the secret sub-values, in any form (mirrors
+    # `ArrInstanceOut.has_api_key`, generalized to "does this instance have a secret on file" for
+    # a schema that may name more than one secret key).
+    config: dict[str, Any]
+    has_secret: bool
+    enabled: bool
+    # The probed capability layer (spec §4.1), as `core.clients.base.CapabilitySet` projects to
+    # JSON in `api/settings_clients.py`. `None` = never successfully probed.
+    capabilities: dict[str, Any] | None = None
+    capabilities_probed_at: str | None = None
+    version: str | None = None
+    base_paths: list[DownloadClientBasePathOut]
+    categories: list[DownloadClientCategoryOut]
+    created_at: str
+    updated_at: str
+
+
+class DownloadClientTestResponse(BaseModel):
+    """`POST /api/settings/clients/{id}/test` -- the `ArrTestResponse` shape, widened with the
+    resolved capability set (spec §4.1) test-connection persists. `capabilities` reflects
+    whatever is now on file after this call -- unchanged from before the call for
+    `ClientUnreachable`/`ClientError` (spec §4.2: a transport failure changes no capability),
+    narrowed by exactly one degraded key for `CapabilityUnavailable`, and reset to the
+    connector's static declaration on a fresh success (layer 3 is cleared by the next successful
+    probe, spec §4.1).
+    """
+
+    ok: bool
+    error_class: str | None
+    message: str
+    version: str | None = None
+    capabilities: dict[str, Any] | None = None
 
 
 # --- Support bundle (Settings -> Logs, 2026-08-17) ---------------------------------------

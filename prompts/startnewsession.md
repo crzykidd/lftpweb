@@ -126,6 +126,24 @@ response capture), `tests/fake_sabnzbd.py` on a real uvicorn socket, and 56 test
 **stage 1b, the next thing to build**, and it also carries the README write-up of the reference
 workflow (spec §1.1).
 
+**Stage 1b (backend) is built**: **migration 027** (`download_client` + `download_client_base_path`
++ `download_client_category`, all additive, defaults OFF), `api/settings_clients.py` mirroring
+`settings_arr.py`, and a test-connection endpoint that persists the **probed** capability layer and
+writes a redacted capture to the log. **1794 backend tests, 0 skipped.** Remaining in stage 1b:
+the frontend (`prompts/2026-08-22-client-framework-stage1b-frontend.md`).
+
+**Two findings from stage 1b worth knowing before touching this code:**
+
+- **`httpx` logs every request URL at INFO, and SAB's API key rides in the query string.** A
+  correctly-redacted capture line was landing next to an *unredacted* `HTTP Request: GET
+  …&apikey=<real key>` line from the library itself. `logsetup.py` now floors `httpx` at WARNING.
+  **The generalisable lesson is not "add httpx to the floors"** — redaction of your *own* log calls
+  is insufficient when a dependency logs the same secret its own way, and the test that catches it
+  is the one asserting on **log content**, not on the helper's return value. Spec §13.3.
+- **The `DownloadClient` ABC declares no transport lifecycle**, so `api/settings_clients.py` reaches
+  for `getattr(client, "aclose", None)`. Harmless once, a smell at seven connectors. Spec §6 says
+  fix it before the second real connector lands.
+
 **⚠ Every SABnzbd status mapping and response shape in stage 1a is vendor-doc-derived and
 UNVERIFIED against a live instance.** Spec **§13.4 is the consolidated correction list** — twelve
 numbered guesses, ranked by risk. Work through it once the capture runs against the real SAB. The

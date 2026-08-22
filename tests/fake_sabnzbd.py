@@ -77,6 +77,13 @@ class FakeSabState:
     # of failure in the body rather than via a 401/403, which is exactly the shape this
     # connector's `_get` must detect itself rather than relying on `raise_for_status()` alone.
     bad_api_key_mode: bool = False
+    # Stage 1b addition (docs/download-client-framework-spec.md §13.3, tests for
+    # `api/settings_clients.py`'s test-connection capture): the real vendor `mode=version`
+    # response never echoes the API key back in its body, so this fixture cannot otherwise
+    # exercise "a secret present in *both* the request URL and the response body must not reach
+    # the log" -- a test-only knob, off by default, so every other test's `mode=version` response
+    # is unaffected.
+    echo_key_in_version_body: bool = False
 
 
 def _queue_response(state: FakeSabState) -> dict[str, Any]:
@@ -121,7 +128,10 @@ def create_fake_sabnzbd_app(state: FakeSabState) -> FastAPI:
             return {"status": False, "error": "API Key Incorrect"}
 
         if mode == "version":
-            return {"version": state.version}
+            body: dict[str, Any] = {"version": state.version}
+            if state.echo_key_in_version_body:
+                body["echoed_apikey"] = apikey  # test-only: see FakeSabState field docstring
+            return body
 
         if mode == "queue":
             name = params.get("name")

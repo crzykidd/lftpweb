@@ -6,6 +6,64 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-22 — download-client connector framework, stage 1b (backend: instance row, API, test-connection)
+
+`prompts/done/2026-08-22-client-framework-stage1b-backend.md`, building migration
+`027_download_clients.sql` (three tables: `download_client`, `download_client_base_path`,
+`download_client_category`), `backend/lftpweb/api/settings_clients.py`, and their tests.
+Backend only — no Settings page, no generic connector form, no README write-up (stage 1b-ii);
+no poller, no Preflight source (stage 2). `core/arrsync.py` untouched.
+
+**`httpx`'s own default request logging was found leaking the SABnzbd API key into the log,
+completely bypassing `core/clients/capture.py`'s "redact at the point of capture" discipline** —
+found by this task's own capture test, which failed against a *raw* key on an `httpx: HTTP
+Request: GET ...&apikey=<real key>...` line even though `SabnzbdClient.test_connection`'s own
+redacted capture line, one below it, was correctly redacted. `httpx` logs every outgoing
+request's full URL at INFO by default; nothing in `core/logsetup.py`'s `_THIRD_PARTY_FLOORS`
+constrained it (only `aiosqlite`/`asyncssh`/`websockets` had floors, for noise, not leakage).
+Fixed by adding `"httpx": logging.WARNING` to that dict — same mechanism, same file, and the
+existing `LFTPWEB_DEBUG_LIBS` escape hatch now covers it too. This is a genuine, if narrow,
+security-relevant fix outside this task's originally scoped file list
+(`backend/lftpweb/logsetup.py`); recorded here rather than silently folded in because the
+handoff prompt named specific files as off-limits and this wasn't one of them, but it also
+wasn't explicitly named as in-scope. Without it, every future connector whose secret rides a
+request URL (any client using query-string auth, not just SABnzbd) would leak it identically,
+so the fix belongs in the shared third-party-floor mechanism rather than in each connector.
+
+**`tests/fake_sabnzbd.py` gained one test-only field, `echo_key_in_version_body`** (off by
+default). The task's own test list asks for proof that "an API key present in a request URL
+does not reach the log" **with the key present in both a URL and a body** — but SABnzbd's real
+`mode=version` response never echoes the key back in its body under any documented shape, so the
+fixture could not otherwise exercise that half of the assertion. A minimal, explicitly-commented
+opt-in knob was added rather than skipping that half of the requirement.
+
+**Base-path save-time validation reuses `settings_queues.py`'s existing best-effort asymmetry
+for host *unreachability* specifically** (`core/browse.py.remote_directory_error`'s own
+docstring: "deciding that an ambiguous failure means 'allow the save' is the caller's job, not
+this function's") rather than inventing a stricter "always block" rule the word "mandatory" in
+spec §8.2 might otherwise suggest. Only a clean, live "no such directory" answer from the
+seedbox blocks a save; an unconfigured, unreachable, or `credentials_need_reentry` host still
+allows it, exactly like a queue's own `remote_path`. Flagged in the stage-1b report as a
+judgment call rather than silently narrowed.
+
+**Secrets are all-or-nothing per instance, not merged per declared key.** A connector's schema
+may in principle declare more than one `kind="secret"` field, but `secret_enc` stores them all
+encrypted together as one JSON blob (mirroring `arr_instance.api_key_enc`'s single-column
+shape). An update either resends every secret key it wants configured, or none at all — omitting
+all of them keeps the stored ciphertext blob completely untouched, byte for byte, with no
+decrypt-merge-reencrypt round trip and no `DecryptionError` exposure on a plain "didn't touch the
+secret" update. SABnzbd declares exactly one secret field today, so this hasn't yet been
+exercised by a real multi-secret connector.
+
+**`DownloadClient` has no `aclose`/context-manager contract in its ABC** — only `SabnzbdClient`
+declares `aclose`/`__aenter__`/`__aexit__` itself. `api/settings_clients.py`'s test-connection
+endpoint calls `getattr(client, "aclose", None)` rather than assuming every future connector
+manages its transport the same way. Flagged in the stage-1b report as a spec gap rather than
+silently resolved by adding an abstract method to a stage-0 module this task was told to leave
+alone except where genuinely required.
+
+---
+
 ## 2026-08-22 — download-client connector framework, stage 1a (SABnzbd connector)
 
 `prompts/done/2026-08-22-client-framework-stage1a-sabnzbd.md`, building

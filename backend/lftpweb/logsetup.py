@@ -24,10 +24,25 @@ LOG_FILENAME = "lftpweb.log"  # named here so api/logs.py never hardcodes it sep
 #
 # Each entry is a *floor*, never a ceiling: a quieter root level still wins (see the max()
 # below), so this can only suppress, never force output the operator asked to be rid of.
+#
+# `httpx` (2026-08-22, docs/download-client-framework-spec.md §13.3 stage 1b): not noise --
+# a credential leak vector. `httpx` logs every outgoing request's full URL at INFO by default,
+# completely bypassing `core/clients/capture.py`'s "redact at the point of capture, never
+# later" discipline: SABnzbd's API key rides the request *URL* (`?apikey=...`), so with this
+# logger left at its inherited root level, `SabnzbdClient`'s own carefully redacted
+# `logger.debug(...)` capture sits right next to an *unredacted* `httpx: HTTP Request: GET
+# ...&apikey=<real key>...` line one call earlier, from a code path this module's redaction
+# never touches. Found by `tests/test_settings_clients_api.py`'s capture test, which failed
+# against the raw key on the httpx line even though the connector's own capture was correctly
+# redacted -- the same class of "the secret leaked from a side door" bug §7.3's "log and display
+# hostname-only, never the full URL" rule exists to prevent for announce URLs, arriving from an
+# entirely different mechanism (a third-party library's own default logging, not this codebase's
+# own log call).
 _THIRD_PARTY_FLOORS = {
     "aiosqlite": logging.WARNING,
     "asyncssh": logging.WARNING,
     "websockets": logging.WARNING,
+    "httpx": logging.WARNING,
 }
 
 # The escape hatch, and it is load-bearing rather than a courtesy: asyncssh's own output is how
