@@ -137,7 +137,7 @@ only in a session transcript.
 proves the pending-row concept against a real feed, and its source-agnostic boundary held through
 six tasks — so a SAB adapter is now an *enrichment of a working box*, not a new foundation.
 
-### On `dev` since the release (4 commits)
+### On `dev` since the release (5 commits)
 
 **Active/pending row sort changed to running → queued → still-processing** (`6822138`, changelog
 `2c97582`). A pipeline-in-flight row is lftpweb *waiting on someone else*; `queued` is its own
@@ -167,6 +167,20 @@ row, one function, no drift), with its own zero-guard so a never-started queued 
 never `PARTIAL`/`WAITING`'s amber, which would have mismatched the chip's own base color) —
 **unverified in a real browser**, unlike the already-confirmed amber pairs. 1608 backend / 621
 frontend tests, 0 skipped.
+
+**The site bandwidth limit is now settable from the Queue page** (`prompts/done/2026-08-21-
+bandwidth-from-the-queue-page.md`) — a slider next to Pause editing the *same* site-wide
+`max_bandwidth_bps` Settings → Transfer owns (`POST /api/queue/bandwidth`, new
+`TransferQueue.set_site_bandwidth`), with two applications: future-items-only (nothing
+interrupted, §4.5's invariant untouched) or also-in-progress, which reuses `_pause_running_jobs`
+to stop and re-admit each running job at the new ceiling — **re-admission, never an in-place
+retune, so `core/scheduler.py` is untouched**. A paused queue is left completely alone (setting
+written, no child stopped, `paused_until` never overwritten — a bandwidth change must not cancel
+someone's "pause for 30 minutes", and "pause after current"'s still-running jobs must not be
+stopped); admission is held during the teardown by a transient in-memory `_admission_hold`, never
+the persisted pause flag. Zero is rejected as a limit (it is not "unlimited" — it wedges
+admission), as is anything below `min_share_floor_bps`. 1637 backend / 645 frontend tests, 0
+skipped. **Browser-unverified.**
 
 ### 🚦 2026-08-20/21 — queue **Pause**, the **Preflight** box, and the docs catch-up (all in v0.3.0)
 

@@ -6,6 +6,68 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-21 — Bandwidth from the Queue page: re-admit, never retune; and never touch a pause
+
+`prompts/done/2026-08-21-bandwidth-from-the-queue-page.md`. User's request: a slider on the Queue
+tab, with an option to apply a change to future items or to in-progress ones, "in progress will
+do a pause and unpause to reset the queue speed."
+
+**In-place adjustment was not possible, and the mechanism the user proposed is the right one.**
+`lftp -c` exits with its transfer and exposes no control channel, so `net:limit-total-rate` cannot
+be changed mid-flight — which is precisely why DESIGN.md §4.5 fixes an allocation at admission and
+never re-shapes it. The only way to give a running job a different allocation is to stop it and
+let the scheduler admit it again. **This is the invariant being obeyed, not an exception to it**:
+the job stops being a running job before it gets a new number, and `core/scheduler.py` was not
+touched at all. (The Phase 3 stdin-pipe experiment in §4.5 remains the thing that would make a
+true live retune possible; still unverified, still not leaned on.)
+
+**Reused `_pause_running_jobs` verbatim rather than writing a second stop-and-respawn path.** It
+already does exactly the required thing — SIGTERM, back to `queued` in place, no failure
+classification, no `auto_queue_suppressed`, partial bytes intact — and reusing it makes the resume
+behavior inherited rather than re-argued. The method keeps its pause-flavored name and grew a
+second-caller note; renaming it plus `_RunningProcess.pause_requested` plus `_reap_one`'s branch
+would have been churn, not clarity.
+
+**Did *not* implement "apply to in-progress" as a literal `pause(stop_running=True)` +
+`unpause()`.** Two independent reasons, either fatal on its own. (1) The pause-for-duration work
+landed the same day (`prompts/done/2026-08-21-pause-for-duration.md`): `pause()` overwrites
+`paused_until` and `unpause()` clears it, so a bandwidth change would have silently cancelled a
+user's "pause for 30 minutes" — and unpaused a queue they deliberately paused. (2) **A paused
+queue can still have running jobs**, because "pause after current" leaves them alone on purpose;
+stopping those would upgrade the user's chosen entry mode into "pause now" *and* strand them as
+`queued` with admission closed.
+
+**So a paused queue is left completely alone: write the setting, touch nothing else**, and report
+`skipped_because_paused` so the UI says so instead of implying transfers were re-admitted.
+Rejected the alternative of *refusing* the change while paused — changing the number while paused
+is reasonable (curating before resuming is what pausing is for); only the interruption is
+meaningless there.
+
+**Admission is held during the teardown by a transient `_admission_hold`, not by the real pause
+flag.** In-memory, never persisted, released in a `finally`. It keeps "the user paused" and "the
+scheduler is briefly busy" disjoint, which is the whole reason the pause state survives a
+bandwidth change.
+
+**Its own endpoint (`POST /api/queue/bandwidth`), not a flag on `PUT /api/settings/transfer`.**
+That PUT takes the whole twelve-field settings object; driving it from the Queue tab would mean
+read-modify-writing eleven fields the page doesn't display and clobbering a concurrent Settings
+edit while doing it.
+
+**Bounds reuse `min_share_floor_bps` rather than inventing one, and `<= 0` is a hard error.**
+Zero is *not* unlimited — it makes headroom zero on every pass, so the main lane admits nothing,
+ever: the same silent-deadlock shape the `B/2` reserve cap was added to prevent (and distinct
+from `<= 0`'s *other* meaning, "no site limit configured," which gates "Start now" fractions).
+The new endpoint validates; **`PUT /api/settings/transfer` deliberately stays unvalidated** — it
+is the expert surface, and several tests legitimately set `min_share_floor_bps=0` through it.
+
+**Judgement call, flagged:** the two surfaces sync by the Transfers page *polling*
+`GET /api/settings/transfer` every 5s (it previously fetched once on mount, purely for the "Start
+now" fraction gate). Cheap next to the 2s `GET /api/jobs` this page already makes, and it is what
+makes "changing it in one place is visible in the other without a reload" true rather than
+true-on-navigation.
+
+---
+
 ## 2026-08-21 — Paused-item progress: gate on partial bytes, not on the queue being paused
 
 `prompts/done/2026-08-21-paused-item-progress.md` (issue #14, progress half), landing right

@@ -824,6 +824,20 @@ export interface TransferSettingsOut {
 
 export type TransferSettingsIn = TransferSettingsOut
 
+/** `POST /api/queue/bandwidth`'s response (2026-08-21,
+ * `prompts/done/2026-08-21-bandwidth-from-the-queue-page.md`) -- what the Queue tab's bandwidth
+ * slider actually did. `interrupted` is how many running transfers were stopped and re-queued so
+ * the scheduler could re-admit them against the new ceiling (`0` for a future-items-only change,
+ * and for an apply-to-in-progress with nothing running); `skipped_because_paused` marks the case
+ * where the number was written but the queue's pause -- including a timed pause's deadline -- was
+ * deliberately left untouched.
+ */
+export interface QueueBandwidthResponse {
+  max_bandwidth_bps: number
+  interrupted: number
+  skipped_because_paused: boolean
+}
+
 // --- Settings -> Transfer's "effective lftp settings" readout (2026-08-14,
 // prompts/2026-08-14-show-effective-lftp-settings.md) -------------------------------------
 //

@@ -54,6 +54,7 @@ import type {
   PostprocessSettingsOut,
   PreflightResponse,
   QueueAutoQueueStatus,
+  QueueBandwidthResponse,
   QueueResetRequest,
   RemovalGraceSettingsOut,
   ResetItemResponse,
@@ -484,6 +485,28 @@ export function pauseQueue(
 /** Resume admission immediately, in queue-position order. */
 export function unpauseQueue(): Promise<void> {
   return sendJson<void>('/api/queue/unpause', 'POST')
+}
+
+/** The Queue tab's bandwidth slider (2026-08-21,
+ * `prompts/done/2026-08-21-bandwidth-from-the-queue-page.md`) -- writes the **site-wide**
+ * `max_bandwidth_bps`, the same single value Settings -> Transfer owns (DESIGN.md §4.5: one
+ * site, one set of transfer knobs), never a second or per-queue limit.
+ *
+ * Its own endpoint rather than `putTransferSettings` because that PUT takes the whole
+ * twelve-field settings object: sending it from here would mean read-modify-writing eleven
+ * fields this page doesn't display, clobbering a concurrent Settings edit in the process.
+ *
+ * `applyToRunning` additionally stops and re-queues every in-flight transfer so the scheduler
+ * re-admits it at the new ceiling -- a real interruption, which is why the UI confirms it first.
+ */
+export function setQueueBandwidth(
+  maxBandwidthBps: number,
+  applyToRunning: boolean,
+): Promise<QueueBandwidthResponse> {
+  return sendJson<QueueBandwidthResponse>('/api/queue/bandwidth', 'POST', {
+    max_bandwidth_bps: maxBandwidthBps,
+    apply_to_running: applyToRunning,
+  })
 }
 
 /** The Queue tab's Preflight box (docs/transfers-redesign-spec.md §4, prefigured; this task's

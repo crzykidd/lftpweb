@@ -18,6 +18,7 @@ import {
 import type { MoveDirection } from '../api/client'
 import type { FileNode, ItemEventOut, JobOut } from '../api/types'
 import { ArrIcon, ArrRowChip } from '../components/LifecycleIcons'
+import { BandwidthControl } from '../components/BandwidthControl'
 import { DismissMenu } from '../components/DismissMenu'
 import { ItemDrawer } from '../components/ItemDrawer'
 import { Pager } from '../components/Pager'
@@ -814,13 +815,19 @@ export function TransfersPage() {
   const [busyIds, setBusyIds] = useState<Set<number>>(new Set())
   const [drawerJob, setDrawerJob] = useState<JobOut | null>(null)
   const [startNowNotice, setStartNowNotice] = useState(false)
-  // Settings -> Transfer's site total limit (2026-08-19,
-  // prompts/done/2026-08-19-start-now-bandwidth-fractions.md) -- fetched once on mount, purely
-  // to decide whether the "Start now" menu's fraction options are enabled
-  // (`lib/startNow.ts.isSiteLimitConfigured`). `undefined` until the request resolves; every
-  // row's menu reads disabled in the meantime, same as "not configured" (`StartNowMenu`'s own
-  // fallback).
-  const [maxBandwidthBps, setMaxBandwidthBps] = useState<number | undefined>(undefined)
+  // Settings -> Transfer, polled (2026-08-19,
+  // prompts/done/2026-08-19-start-now-bandwidth-fractions.md, for the "Start now" menu's
+  // fraction options; **polled rather than fetched once** as of 2026-08-21,
+  // prompts/done/2026-08-21-bandwidth-from-the-queue-page.md, because the bandwidth slider below
+  // now *edits* `max_bandwidth_bps` and the two surfaces -- here and Settings -> Transfer -- have
+  // to reflect each other without a reload). Same independent-poll pattern as `health` below;
+  // one cheap settings read every 5s alongside the 2s `GET /api/jobs` this page already makes.
+  // `undefined` until the first response lands: every "Start now" fraction reads disabled in the
+  // meantime, same as "not configured" (`StartNowMenu`'s own fallback), and the slider renders
+  // disabled.
+  const transferSettingsFetcher = useCallback(getTransferSettings, [])
+  const transferSettings = usePoll(transferSettingsFetcher, 5000)
+  const maxBandwidthBps = transferSettings?.max_bandwidth_bps
   // Pause (2026-08-20, prompts/2026-08-20-queue-pause.md): `/api/health`'s `queue_paused` is
   // the one source of truth for whether the queue is currently paused -- polled independently
   // here, same "a second, independent one-shot/polled `getHealth()` call" pattern
@@ -914,26 +921,6 @@ export function TransfersPage() {
     return map
   }, [queues])
 
-  // Fetched once, not polled -- the "Start now" menu only needs to know whether a site limit is
-  // configured at all, not track it live; a page reload after a Settings -> Transfer change
-  // picks up the new value, the same freshness every other one-shot settings read on this page
-  // already has. A failed fetch leaves `maxBandwidthBps` `undefined`, which every fraction
-  // option already treats as "not configured" (`lib/startNow.ts.isSiteLimitConfigured`) --
-  // Max stays available regardless, so there is nothing to show the user beyond that.
-  useEffect(() => {
-    let cancelled = false
-    getTransferSettings()
-      .then((settings) => {
-        if (!cancelled) setMaxBandwidthBps(settings.max_bandwidth_bps)
-      })
-      .catch(() => {
-        // Deliberately silent -- see the comment above.
-      })
-    return () => {
-      cancelled = true
-    }
-  }, [])
-
   // --- Active / pending box (2026-08-19, docs/transfers-redesign-spec.md §3.2, phase 1 stage
   // 4b) -- client-side paginated, 20/page, over `jobs`. `jobs` itself (`useJobs`/`GET
   // /api/jobs`, `core/queue.py.list_jobs`) is deliberately unchanged in shape (see
@@ -949,6 +936,13 @@ export function TransfersPage() {
   // by construction rather than by two client/server rules that happen to agree today. ---------
 
   const activeJobs = useMemo(() => jobs.filter(isPipelineInFlight), [jobs])
+  // How many transfers the bandwidth slider's "also apply to in-progress" would interrupt
+  // (2026-08-21, prompts/done/2026-08-21-bandwidth-from-the-queue-page.md). Read off `jobs`
+  // rather than fetched separately -- `state === 'running'` is exactly "has an lftp child right
+  // now", the same set `POST /api/queue/bandwidth` stops server-side. It's a *preview* for the
+  // confirmation, never the authority: the response's own `interrupted` is what the result
+  // notice reports, since only the server knows what was running when the request landed.
+  const runningCount = useMemo(() => jobs.filter((job) => job.state === 'running').length, [jobs])
   // Row order (2026-08-16, `lib/transferPanel.ts.sortTransferRows`'s own docstring): running
   // before queued, in `jobs`' own scheduler order -- unaffected by this task, since `activeJobs`
   // never contains a terminal row for `sortTransferRows`'s own newest-first branch to act on.
@@ -1282,6 +1276,20 @@ export function TransfersPage() {
           </span>
         )}
       </div>
+
+      {/* The site bandwidth slider (2026-08-21,
+       * prompts/done/2026-08-21-bandwidth-from-the-queue-page.md) -- directly under Pause,
+       * because the two are the same kind of control: page-level knobs on *admission*, not
+       * per-row actions. It edits the one site-wide `max_bandwidth_bps` Settings -> Transfer
+       * also owns (DESIGN.md §4.5), never a per-queue limit, and offers the two genuinely
+       * different applications of a change: future items only (nothing is interrupted, the
+       * §4.5 invariant untouched) or also in-progress (every running transfer is stopped and
+       * re-admitted at the new rate, confirmed first because it is a real interruption). */}
+      <BandwidthControl
+        settings={transferSettings}
+        runningCount={runningCount}
+        queuePaused={health?.queue_paused ?? false}
+      />
 
       {startNowNotice && (
         <div className="flex items-start justify-between gap-3 rounded-md border border-amber-300 bg-amber-50 p-3 text-sm text-amber-900 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-200">

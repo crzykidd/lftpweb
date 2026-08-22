@@ -25,6 +25,19 @@ Skeleton for the next roll:
 
 ### Added
 
+- **Change the site bandwidth limit from the Queue page** — a slider next to the Pause control,
+  editing the *same* site-wide limit Settings → Transfer owns (not a new per-queue limit; the two
+  surfaces stay in step without a reload). Nothing commits while you drag: moving the handle just
+  proposes a value, and you then pick one of two applications. **Apply to new transfers** (the
+  default) writes the number and interrupts nothing — running transfers keep the speed they
+  started at, which is by design: lftp offers no way to retune a transfer that is already
+  running. **Also apply to in-progress** additionally stops each running transfer and immediately
+  restarts it at the new limit, resuming from the bytes already downloaded — never re-downloading,
+  never marked failed or stopped. That option confirms first, naming how many transfers it will
+  interrupt. If the queue is paused it deliberately does nothing beyond saving the number: it will
+  not resume a queue you paused, and it will not cancel a "pause for 30 minutes" you set. The
+  slider refuses a limit of 0 (which is not "unlimited" — it would stop the queue admitting
+  anything at all) or one below the configured minimum share floor.
 - **Pause the transfer queue for a fixed duration** — a dropdown (1 / 10 / 30 / 60 minutes,
   alongside the existing default "until I unpause") next to the Queue tab's Pause control,
   combinable with both entry modes (*pause after current* / *pause now*). The deadline is a

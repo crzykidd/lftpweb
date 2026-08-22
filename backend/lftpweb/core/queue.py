@@ -21,7 +21,7 @@ import json
 import logging
 import time
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -125,6 +125,32 @@ class QueuePausedError(Exception):
     `JobNotQueuedError`'s 409 below and from `move_job`'s own guard -- reordering a queued job
     stays fully functional while paused (this task's own settled decision: pause is the moment
     you curate the order), so this check lives only in `start_now`, never in `move_job`.
+    """
+
+
+class SiteBandwidthTooLowError(Exception):
+    """Raised by `TransferQueue.set_site_bandwidth` for a ceiling the scheduler cannot work
+    with (2026-08-21, `prompts/done/2026-08-21-bandwidth-from-the-queue-page.md`) -- the Queue
+    tab's bandwidth slider is a *bounded* second surface onto `max_bandwidth_bps`, so it must
+    refuse the two values that quietly wedge admission rather than write them and let the queue
+    sit there doing nothing:
+
+    - **`<= 0` is not "unlimited."** DESIGN.md §4.5's headroom is `B - reserve - allocated`, so
+      `B = 0` makes `headroom <= 0` on every pass and the main lane admits **nothing, ever** --
+      the exact silent-deadlock shape the `B/2` reserve clamp exists to prevent (that clamp's
+      own docstring on `TransferSettings.effective_small_lane_reserve_bps`). `<= 0` reads as
+      "no site limit configured" for `start_now`'s fraction check, which is a different
+      question entirely and is why the confusion is worth a hard error here.
+    - **Below `min_share_floor_bps`** the ceiling is under the per-job floor the same settings
+      object declares, i.e. the very first admission already violates it. The floor is reused
+      as the bound rather than inventing a new one (the task's own instruction).
+
+    `api/jobs.py.set_queue_bandwidth` turns this into a 400 -- a bad value, not a state
+    conflict, so deliberately not the 409 `QueuePausedError`/`JobNotQueuedError` use.
+    **Settings -> Transfer's own `PUT /api/settings/transfer` is unchanged and still
+    unvalidated**: that surface is the expert one (it can express a deliberately odd
+    configuration, and every test that sets `min_share_floor_bps=0` goes through it); the
+    slider is the safe one.
     """
 
 
@@ -353,6 +379,28 @@ class QueuePauseState:
     paused_until: str | None = None
 
 
+@dataclass(frozen=True)
+class BandwidthChangeOutcome:
+    """What `TransferQueue.set_site_bandwidth` actually did (2026-08-21,
+    `prompts/done/2026-08-21-bandwidth-from-the-queue-page.md`) -- the Queue tab's slider needs
+    to tell the user "12 transfers were re-admitted" or "nothing was interrupted, the queue is
+    paused," and neither is inferable from a 204.
+
+    `interrupted` is how many in-flight lftp children were stopped and re-queued in place so the
+    scheduler could hand them a fresh allocation against the new ceiling (DESIGN.md §4.5: a
+    running job's allocation is fixed at spawn, so re-admission is the *only* way to change it).
+    `0` for a future-items-only change, and also `0` when there was simply nothing running.
+
+    `skipped_because_paused` is the one case where "apply to in-progress" deliberately does
+    nothing beyond writing the setting -- see `set_site_bandwidth`'s own docstring for why a
+    paused queue is left completely alone.
+    """
+
+    max_bandwidth_bps: int
+    interrupted: int = 0
+    skipped_because_paused: bool = False
+
+
 PAUSE_SETTING_KEY = "queue_pause_state"
 
 
@@ -515,6 +563,17 @@ class TransferQueue:
         # load/cache/write-together discipline as `self._paused`; see `QueuePauseState`'s own
         # docstring for why this is a stored deadline rather than a running timer.
         self._paused_until: str | None = None
+        # The bandwidth slider's "also apply to in-progress" re-admit window (2026-08-21,
+        # `prompts/done/2026-08-21-bandwidth-from-the-queue-page.md`) -- **in-memory only, never
+        # persisted, and deliberately not `self._paused`**. While `set_site_bandwidth` is
+        # SIGTERMing the running children so they can be re-admitted at the new ceiling, a
+        # concurrent `tick()` must not race into the slots they are vacating; but borrowing the
+        # real pause flag for that would mean writing (and then having to un-write) the
+        # persisted pause state, which is exactly how a user's "pause for 30 minutes" would get
+        # silently cancelled. A separate transient hold keeps the two concepts disjoint: this
+        # one lasts milliseconds and survives nothing, `self._paused` is durable and only ever
+        # a user's (or an expiry's) decision.
+        self._admission_hold = False
 
     # --- lifecycle ---------------------------------------------------------------------
 
@@ -1044,6 +1103,128 @@ class TransferQueue:
             ),
         )
 
+    async def set_site_bandwidth(
+        self, max_bandwidth_bps: int, *, apply_to_running: bool
+    ) -> BandwidthChangeOutcome:
+        """The Queue tab's bandwidth slider (2026-08-21,
+        `prompts/done/2026-08-21-bandwidth-from-the-queue-page.md`) -- **a second surface onto
+        the one site-wide `TransferSettings.max_bandwidth_bps`, never a new per-queue limit**
+        (DESIGN.md §4.5: "one container serves one site... A queue governs *what* and *where*,
+        never *how fast*"). Settings -> Transfer's own field writes the identical value through
+        `PUT /api/settings/transfer`; this method exists for the *second* half, which that PUT
+        cannot express.
+
+        **Why "apply to in-progress" has to stop and re-admit, and why that does not weaken
+        §4.5's invariant.** A running job's allocation is fixed at spawn: `lftp -c` exits with
+        its transfer and offers no control channel, so `net:limit-total-rate` cannot be retuned
+        mid-flight, and `core/scheduler.py` is deliberately built so that limitation never
+        arises (it is *given* `running` allocations and never re-shapes one). Nothing here
+        changes that. Re-admission is not an exception to the invariant, it is the invariant
+        being obeyed: the job stops being a running job, becomes a queued one again, and is
+        admitted afresh -- at which point the scheduler hands it a *new* allocation the ordinary
+        way, from the current settings. `core/scheduler.py` is untouched by this feature.
+
+        **Reuses "pause now"'s per-job half verbatim** (`_pause_running_jobs`, below): SIGTERM,
+        back to `queued` **in place** -- same row, same `queue_position`, same `attempt`, same
+        partial bytes on disk, never `auto_queue_suppressed`, never a `FAILED`/`STOPPED` row.
+        There is deliberately no second stop-and-respawn path. What it does *not* reuse is
+        `pause()`/`unpause()` themselves -- see the paused case below.
+
+        Three outcomes:
+
+        - `apply_to_running=False` (the default, and the safe one): the setting is written and
+          nothing is interrupted. Running jobs keep the allocation they were admitted with,
+          exactly as before this feature existed; the new ceiling governs the next admission.
+        - `apply_to_running=True` while **not** paused: the setting is written, then every
+          in-flight child is stopped and re-queued, and admission is woken so the scheduler
+          re-admits them against the new ceiling. Jobs already running at a forced "Start now"
+          fraction recompute that fraction against the *new* `max_bandwidth_bps` on re-admission
+          -- correct and intended: the fraction is a share of the site limit (§4.5's Start now),
+          so a job asked for "50% of the site limit" should follow the site limit when it moves.
+        - `apply_to_running=True` while **paused**: the setting is written and **nothing else
+          happens at all** -- no child is stopped, and the persisted pause state (including a
+          timed pause's `paused_until` deadline) is not read, written, or cleared. This is the
+          single most important behavior in this method, for two independent reasons. (1) A
+          literal "pause now, then unpause" implementation would *resume a queue the user
+          deliberately paused*, and would overwrite -- hence silently cancel -- a "pause for 30
+          minutes" deadline they had set (2026-08-21,
+          `prompts/done/2026-08-21-pause-for-duration.md`). (2) A paused queue can still have
+          running jobs: "pause after current" leaves them alone on purpose. Stopping those would
+          turn the user's "pause after current" into a "pause now" *and* strand the jobs as
+          `queued` with admission closed, so they would not resume until the pause ended. The
+          caller is told (`skipped_because_paused`) so the UI can say so rather than imply
+          transfers were re-admitted. The new ceiling applies to everything admitted once the
+          pause ends, which is what a paused user actually wanted.
+
+        Rejected: raising instead of writing the setting while paused. Changing the *number*
+        while paused is a perfectly reasonable thing to do (curating before resuming is what
+        pausing is for, §4.5) -- only the interruption is meaningless there.
+        """
+        settings = await load_transfer_settings(self.db)
+        if max_bandwidth_bps <= 0:
+            raise SiteBandwidthTooLowError(
+                "a site bandwidth limit of 0 is not 'unlimited' -- it makes headroom zero on "
+                "every scheduling pass, so nothing would ever be admitted"
+            )
+        if max_bandwidth_bps < settings.min_share_floor_bps:
+            raise SiteBandwidthTooLowError(
+                f"site bandwidth limit {max_bandwidth_bps} B/s is below the minimum share floor "
+                f"({settings.min_share_floor_bps} B/s), so the first admission would already "
+                "violate it"
+            )
+
+        await save_transfer_settings(
+            self.db, replace(settings, max_bandwidth_bps=max_bandwidth_bps)
+        )
+
+        if not apply_to_running:
+            await audit.record_event(
+                self.db,
+                level="info",
+                kind="queue_bandwidth_changed",
+                message=(
+                    f"site bandwidth limit set to {max_bandwidth_bps} B/s (applies to newly "
+                    "admitted transfers; running transfers keep the allocation they started with)"
+                ),
+            )
+            self.request_tick()
+            return BandwidthChangeOutcome(max_bandwidth_bps=max_bandwidth_bps)
+
+        if self._paused:
+            await audit.record_event(
+                self.db,
+                level="info",
+                kind="queue_bandwidth_changed",
+                message=(
+                    f"site bandwidth limit set to {max_bandwidth_bps} B/s; 'apply to in-progress' "
+                    "had nothing to do because the queue is paused -- the pause (and any resume "
+                    "deadline) was left exactly as it was"
+                ),
+            )
+            return BandwidthChangeOutcome(
+                max_bandwidth_bps=max_bandwidth_bps, skipped_because_paused=True
+            )
+
+        interrupted = len(self._running)
+        if interrupted:
+            self._admission_hold = True
+            try:
+                await self._pause_running_jobs()
+            finally:
+                self._admission_hold = False
+        await audit.record_event(
+            self.db,
+            level="info",
+            kind="queue_bandwidth_changed",
+            message=(
+                f"site bandwidth limit set to {max_bandwidth_bps} B/s; {interrupted} running "
+                "transfer(s) stopped and re-queued in place so they re-admit at the new limit "
+                "(they resume from the bytes already on disk)"
+            ),
+        )
+        self.request_tick()
+        return BandwidthChangeOutcome(max_bandwidth_bps=max_bandwidth_bps, interrupted=interrupted)
+
     async def _pause_running_jobs(self) -> None:
         """ "Pause now"'s per-job half: SIGTERM every in-flight lftp child, concurrently -- the
         exact same reasoning as `stop()`'s graceful shutdown above (independent processes,
@@ -1051,6 +1232,15 @@ class TransferQueue:
         pause). The difference from `stop()` is what happens after each child exits:
         `_reap_one` sees `pause_requested` and returns the job straight to `queued` **in
         place** rather than tearing this process down.
+
+        **A second caller as of 2026-08-21** (`set_site_bandwidth`, above): "change the site
+        bandwidth limit and apply it to in-progress transfers" needs exactly this -- stop each
+        child, return its job to `queued` in place with its partial bytes intact -- so that the
+        scheduler can re-admit it at the new ceiling. That caller does **not** touch the
+        persisted pause state; it holds admission with `self._admission_hold` for the duration
+        instead. Nothing in this method is pause-specific beyond its name, which is kept because
+        `_RunningProcess.pause_requested` and `_reap_one`'s branch are named for the original
+        caller and renaming three things to describe two callers would be churn, not clarity.
 
         Never re-derives `queue_position` (unlike the startup rescue's own `_rescue_position`
         --- that one exists because a restart already destroyed the interrupted job's row,
@@ -2553,6 +2743,13 @@ class TransferQueue:
         # / health readout already say so continuously -- logging it every tick would just be
         # per-second noise for as long as the pause lasts.
         if self._paused:
+            return
+        # The bandwidth re-admit's transient hold (2026-08-21,
+        # `prompts/done/2026-08-21-bandwidth-from-the-queue-page.md`) -- same caller-side skip,
+        # same silence, but it lasts only as long as `set_site_bandwidth` is tearing the running
+        # children down; without it a tick landing mid-teardown could fill the slots being
+        # vacated before every child had let go of its old allocation.
+        if self._admission_hold:
             return
 
         settings = await load_transfer_settings(self.db)

@@ -800,6 +800,10 @@ that is already running. Rather than working around that, the scheduler is desig
 limitation never arises: bandwidth is handed out at **admission** time and held for the job's
 lifetime. The missing control channel stops being a constraint and becomes the design.
 
+The one user-facing consequence — "I lowered the site limit, why is my transfer still going at
+the old speed?" — is answered by "Changing the site limit while transfers are running," below.
+That path does **not** weaken this invariant; it re-admits.
+
 #### Site-level settings
 
 One container serves one site (one seedbox), so these are global to the instance — **not**
@@ -1021,6 +1025,76 @@ the backend's own clock" unconditionally. Expiry records its own audit event
 answerable from the Events page without guessing whether a human clicked Unpause. The Queue tab's
 banner and the header badge both show the deadline itself ("resumes at HH:MM") whenever one is
 set, not a bare "paused" indistinguishable from an indefinite one.
+
+#### Changing the site limit while transfers are running
+
+The Queue tab carries a **bandwidth slider** (2026-08-21,
+`prompts/done/2026-08-21-bandwidth-from-the-queue-page.md`) alongside the Pause control. It edits
+the **same site-wide `max_bandwidth` this section's own table defines** — the value Settings →
+Transfer owns — through `POST /api/queue/bandwidth`. It is a *second surface onto one setting*,
+never a per-queue limit; the "one site, one set of transfer knobs" rule above is untouched. The
+two surfaces reflect each other because the Transfers page polls `GET /api/settings/transfer`
+alongside health, and Settings → Transfer re-reads it on mount. (Settings → Transfer's own PUT
+still writes the whole twelve-field object, so a stale Settings form saved afterwards can
+overwrite a slider change — ordinary last-write-wins, unchanged by this feature.)
+
+Two applications of a change, offered explicitly:
+
+- **Future items only** (the default). The setting is written; nothing is interrupted. Running
+  jobs keep the allocation they were admitted with — the invariant above, exactly as before. The
+  next admission uses the new ceiling.
+- **Also apply to in-progress.** The setting is written, then every in-flight lftp child is
+  **stopped and re-queued in place**, and admission is woken so the scheduler re-admits each one
+  against the new ceiling.
+
+**Re-admission is the invariant being obeyed, not an exception to it.** There is no in-place
+retune and no control channel: the job stops being a running job, becomes a queued one again —
+same row, same `queue_position`, same `attempt`, same partial bytes on disk — and is then handed
+a *new* allocation the ordinary way, by `admit()`, from the current settings. `core/scheduler.py`
+is untouched by this feature; it never learns that anything unusual happened.
+
+**It reuses "pause now"'s per-job half verbatim** (`TransferQueue._pause_running_jobs`) rather
+than adding a second stop-and-respawn path — so it inherits that path's guarantees whole: a
+SIGTERM'd exit is never run through failure classification, so no `FAILED` row and no
+`error_class`; `auto_queue_suppressed` is never set (§4.6's stop semantics would be exactly
+wrong here); and the transfer resumes from its partial bytes rather than re-fetching. It does
+**not** reuse `pause()`/`unpause()` themselves — see below.
+
+**A paused queue is left completely alone.** With "apply to in-progress" on a paused queue, the
+setting is written and *nothing else happens*: no child is stopped, and the persisted pause
+state — including a timed pause's `paused_until` deadline ("Pausing for a fixed duration," above)
+— is not read, written, or cleared. Two independent reasons, either sufficient:
+
+1. A literal "pause now, then unpause" implementation would **resume a queue the user
+   deliberately paused**, and would overwrite — hence silently cancel — a "pause for 30 minutes"
+   they had set.
+2. **A paused queue can still have running jobs**: "pause after current" leaves them alone on
+   purpose. Stopping those would upgrade the user's "pause after current" into a "pause now"
+   *and* strand them as `queued` with admission closed, so they would not resume until the pause
+   ended.
+
+The API reports this back (`skipped_because_paused`) so the UI can say so rather than imply
+transfers were re-admitted. Changing the *number* while paused is still allowed and still
+useful — curating before resuming is what pausing is for.
+
+**Admission is held for the teardown by a transient, in-memory flag**
+(`TransferQueue._admission_hold`), deliberately *not* `self._paused`: it exists only so a tick
+landing mid-teardown cannot fill the slots being vacated, it lasts milliseconds, it is never
+persisted, and it keeps "the user paused the queue" and "the scheduler is briefly busy" as two
+disjoint concepts. `_admit()` short-circuits on it the same caller-side way it does for pause.
+
+**Interaction with "Start now" fractions.** A job already running at a forced fraction that is
+re-admitted recomputes `fraction × B` against the **new** `max_bandwidth`. That is correct and
+intended: the fraction is defined as a share of the site limit, so a job asked for "50% of the
+site limit" should follow the site limit when it moves.
+
+**Bounds.** The slider refuses two values rather than writing them and leaving a queue that
+silently does nothing: `<= 0` (**zero is not "unlimited"** — it makes `headroom <= 0` on every
+pass, so the main lane admits nothing, ever, the same silent-deadlock shape the `B/2` reserve cap
+above exists to prevent) and anything below `min_share_floor` (the ceiling would sit under the
+per-job floor the same settings declare). The existing `min_share_floor` is reused as the bound
+rather than inventing a new one. Settings → Transfer's own numeric field stays unvalidated on
+purpose — it is the expert surface, and can still express a deliberately odd configuration.
 
 #### Residual inefficiency, stated plainly
 

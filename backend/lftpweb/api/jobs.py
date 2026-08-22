@@ -24,6 +24,7 @@ from lftpweb.core.queue import (
     JobNotQueuedError,
     NoSiteLimitConfiguredError,
     QueuePausedError,
+    SiteBandwidthTooLowError,
     TransferSettings,
     load_transfer_settings,
     resolve_forced_rate_fraction,
@@ -49,6 +50,8 @@ from lftpweb.models import (
     PreflightGatedQueueOut,
     PreflightResponse,
     PreflightRowOut,
+    QueueBandwidthRequest,
+    QueueBandwidthResponse,
     QueueItemRequest,
     QueuePauseRequest,
     QueueResetRequest,
@@ -585,6 +588,41 @@ async def pause_queue(request: Request, body: QueuePauseRequest | None = None) -
         else None
     )
     await request.app.state.queue.pause(stop_running=stop_running, duration_s=duration_s)
+
+
+@router.post("/api/queue/bandwidth", response_model=QueueBandwidthResponse)
+async def set_queue_bandwidth(
+    body: QueueBandwidthRequest, request: Request
+) -> QueueBandwidthResponse:
+    """Transfers -> Queue tab's bandwidth slider (2026-08-21,
+    `prompts/done/2026-08-21-bandwidth-from-the-queue-page.md`). Writes the **site-wide**
+    `max_bandwidth_bps` -- the same one value `PUT /api/settings/transfer` owns, never a second
+    setting -- and, with `apply_to_running: true`, additionally stops and re-queues every
+    in-flight transfer so the scheduler re-admits it at the new ceiling (DESIGN.md §4.5: a
+    running job's allocation is fixed at spawn, so re-admission is the only mechanism there is).
+
+    Deliberately its own endpoint rather than a flag on the settings PUT: that PUT takes the
+    whole `TransferSettings` object, so the Queue tab would have to read-modify-write twelve
+    fields it does not display just to move one slider, and would clobber a concurrent Settings
+    edit while doing it. This one sends the one number it actually owns.
+
+    A ceiling the scheduler cannot work with (`<= 0`, or below `min_share_floor_bps`) is a 400
+    -- `core/queue.py.SiteBandwidthTooLowError`, whose docstring has why 0 is not "unlimited".
+    A value `<= 0` never reaches the handler at all (`QueueBandwidthRequest`'s own `gt=0` makes
+    it a 422); the queue-level check is the authority for the floor, which depends on another
+    setting.
+    """
+    try:
+        outcome = await request.app.state.queue.set_site_bandwidth(
+            body.max_bandwidth_bps, apply_to_running=body.apply_to_running
+        )
+    except SiteBandwidthTooLowError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return QueueBandwidthResponse(
+        max_bandwidth_bps=outcome.max_bandwidth_bps,
+        interrupted=outcome.interrupted,
+        skipped_because_paused=outcome.skipped_because_paused,
+    )
 
 
 @router.post("/api/queue/unpause", status_code=204)

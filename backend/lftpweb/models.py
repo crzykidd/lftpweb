@@ -829,6 +829,41 @@ class QueuePauseRequest(BaseModel):
     duration_minutes: PauseDurationMinutes | None = None
 
 
+class QueueBandwidthRequest(BaseModel):
+    """`POST /api/queue/bandwidth` -- the Transfers -> Queue tab's bandwidth slider (2026-08-21,
+    `prompts/done/2026-08-21-bandwidth-from-the-queue-page.md`). Edits the **site-wide**
+    `TransferSettings.max_bandwidth_bps`, the same single value Settings -> Transfer owns
+    (DESIGN.md §4.5: one site, one set of transfer knobs) -- deliberately not a per-queue limit
+    and not a separate setting.
+
+    `apply_to_running` defaults to `False`, the safe option: write the number, interrupt
+    nothing. `True` additionally stops and re-queues every in-flight transfer so the scheduler
+    re-admits it against the new ceiling -- see `core/queue.py.TransferQueue.set_site_bandwidth`
+    for why that is the only way a running job's allocation can change, and for what it does
+    (and pointedly does not do) while the queue is paused.
+
+    The lower bound is enforced in `set_site_bandwidth` against the *current*
+    `min_share_floor_bps`, not here, since it depends on another setting's value; `gt=0` is the
+    cheap half that can be checked without a DB read.
+    """
+
+    max_bandwidth_bps: int = Field(..., gt=0)
+    apply_to_running: bool = False
+
+
+class QueueBandwidthResponse(BaseModel):
+    """What the slider's apply actually did -- `core/queue.py.BandwidthChangeOutcome`, one for
+    one. `interrupted` is how many running transfers were stopped and re-queued (always `0` for
+    a future-items-only change, and for an apply-to-in-progress with nothing running);
+    `skipped_because_paused` marks the case where the setting was written but the queue's pause
+    was deliberately left untouched.
+    """
+
+    max_bandwidth_bps: int
+    interrupted: int
+    skipped_because_paused: bool
+
+
 class JobOut(BaseModel):
     id: int
     item_id: int
