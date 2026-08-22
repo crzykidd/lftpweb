@@ -24,6 +24,15 @@ Skeleton for the next roll:
 ## [Unreleased]
 
 ### Added
+### Changed
+### Fixed
+### Security
+### Deprecated
+### Removed
+
+## [0.3.1] — 2026-08-22
+
+### Added
 
 - **Throttle the site bandwidth from the Queue page** — a slider next to the Pause control that
   runs *within* the Settings → Transfer maximum rather than replacing it. There are now two
