@@ -59,18 +59,19 @@ inherit its temperament, not invent a looser one. See §9.
 seeding, total size, age distribution, breakdown per tracker, ratio distribution. No rules, no
 writes, nothing configurable beyond the client connection itself.
 
-**Phase B — describe the rules (still no deletion).** Tracker → site mapping, per-site seed rules,
-and a **live preview**: "if the threshold tripped right now, these 14 torrents would be stopped,
-in this order, freeing 340 GB." The preview is the whole deliverable — it is how the rules get
-debugged before they can hurt anything.
+**Phase B — rules, and manual mode (§8a).** Tracker → site mapping, per-site seed rules, the quota
+model (§6.0), and the torrent list shown **in delete-priority order** with multi-select, a running
+"space freed" total, and a manual trigger. This is where deletion first becomes possible — but only
+ever because someone clicked, on a list they can see.
 
-**Phase C — enforce.** The free-space watermark, the ranked selection, and the actual
-stop-and-delete through the client API.
+**Phase C — auto mode (§8a).** The free-space watermark honored unattended: ranked selection down
+the list until the high mark is met, no click involved.
 
-**Do not build C until A and B have run against the real seedbox for a while.** The ranking
-function (§8) is the part that cannot be designed correctly in the abstract — it needs to be
-looked at against a real seeding estate and adjusted. And unlike every other feature in this
-project, a wrong answer here has no undo.
+**Do not build C until A and B have run against the real seedbox for a while.** The ranking function
+(§8) is the part that cannot be designed correctly in the abstract — it needs to be looked at
+against a real seeding estate and adjusted. Manual mode is exactly the instrument for that: it puts
+the ranking in front of the user on every use without ever acting on it by itself. And unlike every
+other feature in this project, a wrong answer here has no undo.
 
 ## 4. Data model sketch
 
@@ -133,6 +134,48 @@ mysterious.
 
 **The seedbox's, not the local disk.** You stop seeding to reclaim space where the torrents live.
 
+### 6.0 On a shared seedbox, `df` is a lie — the unit is your quota, not the filesystem
+
+**Most seedboxes are shared.** The filesystem holding your torrents is not yours; `df` reports an
+array serving dozens of accounts, and its "free" figure is both wrong for your purposes and free to
+move for reasons that have nothing to do with you. A rule written against it would delete your
+torrents because *someone else* filled the disk.
+
+**The account quota is the real unit**, and it is configuration, not something to discover:
+
+| Setting | Meaning |
+|---|---|
+| **Account space allocated** | Your quota — what the provider sold you. User-entered. |
+| **Amount free to maintain** | The headroom to defend (the "keep xxGB free" figure), expressed against the quota. |
+| **Baseline / non-torrent usage** | Everything else consuming your quota that this feature must never delete and must never ignore. |
+
+That third row is the one that gets forgotten. A seedbox account holds more than active torrent
+data — completed files kept outside the client, non-torrent downloads, whatever else lands there by
+default. **Quota headroom computed as `quota − sum(torrent sizes)` is wrong and optimistic**, in
+exactly the direction that fills the account.
+
+So: `my_free = quota − my_total_usage`, where `my_total_usage` is measured against the *account*,
+not summed from the client's torrent list.
+
+**How to measure it, in preference order:**
+
+1. **A quota the provider reports** — some panels/APIs expose used-and-allowed directly. Best
+   answer where it exists; it is the same number the provider enforces.
+2. **`du -s` on the account root over the existing pooled SSH connection.** Truth, including the
+   non-torrent baseline. Expensive on a large tree, so measure **on a schedule and cache it** —
+   never on a page load or per-pass.
+3. **The client's torrent sum as the fast-moving delta.** Cheap and instant, but only covers torrent
+   data. Useful for tracking change *between* full measurements, not as the absolute figure.
+
+A sensible build: a cached full measurement, adjusted by the delta since, and displayed with its
+measurement age so a stale number is visibly stale.
+
+**Both constraints bind — take the tighter one.** Even with quota headroom to spare, a genuinely
+full underlying filesystem means you cannot write. `effective_free = min(quota_headroom,
+filesystem_free)`. And when the filesystem is the binding constraint, **deleting your torrents may
+not help** — it is someone else's usage. Say so rather than deleting into a problem that isn't
+yours.
+
 **Nothing in lftpweb knows this today.** The only disk-usage code is `shutil.disk_usage` in
 `core/supportbundle.py`, which reports the *local* queue paths. So this is a genuine new
 capability — with two possible sources, and **the client's own answer is preferred**:
@@ -153,7 +196,8 @@ its own data directory and a `df` on the queue's remote path can easily be diffe
 Three things to get right:
 
 - **Per-path, not per-host.** A seedbox may spread torrents across mounts. Measure the filesystem
-  holding the torrents, not `/`.
+  holding the torrents, not `/` — and remember per §6.0 that on a shared box this is the *secondary*
+  constraint, with the quota as the primary one.
 - **Two watermarks, not one.** "Keep 500 GB free" as a single threshold flaps: free one torrent's
   worth, drop back under, free another, forever. Trigger at the low mark, remove until the high
   mark, then stop. The gap between them is what makes a pass a *pass* rather than a permanent
@@ -244,6 +288,51 @@ Alternatives considered and not recommended: lexicographic (ratio excess, then d
 dimension entirely; a bytes-freed-per-regret optimizer is unpredictable in exactly the situation
 where predictability matters most.
 
+## 8a. Two modes — manual and auto
+
+**Decided with the user, 2026-08-21.** This answers what was §10's biggest open question: the
+feature does **both**, and manual is where it starts.
+
+### Manual mode
+
+The torrent view lists everything **in delete-priority order** — §8's ranking, applied and visible,
+whether or not any threshold has tripped. From there:
+
+- **Select one, or multi-select.** Ordinary selection over a ranked list.
+- **A running total of space that would be freed** updates as the selection changes: "7 selected —
+  312 GB". Against the quota model (§6.0), the useful readout is the *resulting* figure, not just
+  the delta — "312 GB freed → 486 GB free of 2 TB" answers the question the user actually has.
+- **Trigger it manually.** Nothing is time-based, nothing waits for a watermark.
+
+**The ranking is advice in this mode, not a gate.** The list is *ordered* by score, but the user
+picks. Whether an ineligible torrent (one that has not met its site's thresholds) can be selected at
+all is a real decision: **allow it, but mark it clearly and require a distinct confirmation** —
+"this is 3 days short of RED's 28-day minimum". Refusing outright would send the user to the
+seedbox's own UI to do it unsafely, which is worse than letting lftpweb do it with a warning.
+
+The multi-select total is also what makes §6a's projection concrete: the same panel can show "486 GB
+free after this, 190 GB still incoming", so the user is deciding against the projected figure rather
+than the current one.
+
+### Auto mode
+
+The watermark from §6/§6a, honored without a click: when projected free drops below the low mark,
+select down the ranked list until the high mark is met, stop and delete.
+
+**Auto mode only ever acts on eligible torrents** — no confirmation exists to override a threshold
+when nobody is watching. Everything in §9 applies with full force, especially the per-pass cap.
+
+### The relationship between them
+
+**Manual mode is the whole of auto mode minus the trigger**, and building it that way is the point:
+one ranking, one eligibility rule, one selection routine, one delete path. Auto mode is a scheduler
+calling the same code with a computed selection instead of a user-supplied one. Two separate
+implementations would drift, and the one that drifts unwatched is the one that deletes things.
+
+It also means manual mode is a **complete, useful, safe product on its own** — which is why §3 puts
+it a phase ahead. Running manual for a while is how the ranking gets tuned and trusted before
+anything is allowed to act unattended.
+
 ## 9. Safety rails — the non-negotiable list
 
 - **Never remove a torrent whose data lftpweb still needs.** A torrent still being transferred, or
@@ -278,9 +367,15 @@ where predictability matters most.
    gets settled which of §4a's capabilities each surface can actually honor, and how much of this
    feature's data comes from the client versus from SSH.
 2. **Is the space to protect only the seedbox's**, or should local free space trigger anything too?
+   (The seedbox side is now modelled as a **quota**, not a filesystem — see §6.0.)
+2b. **Does your provider expose used-vs-allowed quota** through a panel or API, or does this fall to
+   a scheduled `du` on the account root? This decides whether the headline number is authoritative
+   or measured-and-cached.
 3. **Stop-and-delete in one action, or stop first and delete later** on a second pass? The latter
    gives a recovery window at the cost of not freeing space immediately.
 4. **Do you cross-seed?** If yes, §9's shared-path rule moves from a safety rail to a core
    requirement and shapes phase A's data model.
-5. **Should enforcement ever act on its own**, or always propose a list and wait for a click? This
-   is the biggest product question in the document — everything else is mechanics.
+5. ~~**Should enforcement ever act on its own**, or always propose a list and wait for a click?~~
+   **Answered 2026-08-21: both.** Manual mode (select from a ranked list, see the total, click) and
+   auto mode (honor the watermark unattended), with manual shipping first and auto built as the same
+   code minus the trigger. See §8a.
