@@ -372,3 +372,56 @@ screen but whose state was reset would be silently dropped rather than rejected 
 "it looked like it saved."
 
 **Do not fix #8 and #11b separately until the shared cause is confirmed or ruled out.**
+
+### 11c. RESOLVED — the greyed text was a placeholder, and the user's redesign supersedes the whole control
+
+> *"Ohh ok — so it shows a greyed out 'recommendation' but doesn't tell you it won't save without a
+> value. So this interface should be simplified. First, we know the categories. So we should show
+> them all on setup and suggest the bindings, and if we aren't using that category the person
+> leaves it unbound."*
+
+**The mystery in 11b is solved, and neither hypothesis was right.** The category `<input>` carries
+`placeholder="ar-tv"` — greyed text that reads as a filled-in recommendation but is not a value.
+The save then filters rows whose `category` is blank
+(`form.categories.filter(c => c.category.trim() !== '')`), so the row is silently dropped and the
+save "succeeds" having stored nothing. Not the Test-clobbers-draft theory (#8), and not a rejected
+save. **#8 remains a separate, still-open bug** — do not close it with this.
+
+### The replacement design (the user's, 2026-08-22/23)
+
+> Show every category the client actually has, propose a binding for each, and let the user leave
+> the ones they don't use unbound.
+
+**This is strictly better than the current control, for four reasons:**
+
+1. **It eliminates the defect class, not the defect.** With no free-text field, there is no blank
+   row, so there is nothing to silently drop. 11b becomes structurally impossible rather than
+   guarded against.
+2. **It uses the direct signal** — which is exactly what #10 concluded from the other direction.
+   Path arithmetic was a proxy that only ever held for SAB and can never work for rTorrent, whose
+   labels live in `d.custom1` with no relation to any directory.
+3. **"Unbound" becomes explicit and meaningful.** Today an unmapped category is indistinguishable
+   from a category nobody has gotten around to; here it is a deliberate, visible choice — and it
+   answers #2's "why is this client contributing nothing" for free, because the user can *see* that
+   every category is unbound.
+4. **Nothing to type**, so nothing to typo. A mistyped category today fails silently and forever:
+   it matches no client output and no error is ever raised.
+
+**This makes the `list_categories` gap real, not theoretical** (#10). Categories are currently only
+observable as a *field on transfers*, so a client with an empty queue and empty history reports
+none — precisely the fresh-setup case this design is for. The operation needs adding to §2.1's
+vocabulary, with the usual care: SAB can answer it from `get_config`, rTorrent from the labels
+already returned by the `d.multicall2` the poller issues.
+
+**Worth deciding when this is built:**
+
+- **What if the client reports no categories at all** (fresh SAB, or an rTorrent with no labels)?
+  Falling back to the current path-arithmetic proposal is reasonable — but it must say which
+  mechanism produced the suggestion, not blur them.
+- **Uncategorised items.** rTorrent torrents frequently carry no label. Does an "(no category)"
+  pseudo-row bind to a queue, or are such items simply never attributable? The second is more
+  honest and matches §8.3's silent-omission rule; the first is more useful. Not obvious — decide
+  deliberately.
+- **Categories appearing later.** A category added in SAB after setup will not be in the stored
+  mapping. The page should show newly-seen-but-unmapped categories rather than requiring the user
+  to notice, which is the same visibility theme as #2.
