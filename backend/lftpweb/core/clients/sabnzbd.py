@@ -21,6 +21,19 @@ is the one method that actually exercises the capture helper end to end, for exa
 reason (spec §13.3: "a client that will not connect becomes diagnosable from the log rather
 than by guesswork").
 
+**The auth failure shape is MEASURED, not doc-derived -- against a live SABnzbd 5.1.1,
+2026-08-22** (spec §13.4 #9/#10, GitHub #23), and corrects two guesses this module shipped
+with: `mode=version` is **unauthenticated** (any key, or none, is accepted -- it proves
+reachability only, never a credential), while every other mode answers a bad key with **HTTP
+403, `Content-Type: text/html`, plain-text body `"API Key Incorrect"`** -- not the
+`{"status": false, "error": ...}` JSON envelope on a 200 this module originally assumed. `_get`
+recognises that 403 body and raises `ClientAuthenticationFailed` (`core/clients/errors.py`);
+`test_connection` now validates the key with an authenticated call (`mode=queue`) rather than
+the unauthenticated `mode=version` alone, so a bad key actually fails the test
+(the regression this corrects is GitHub #23: a deliberately wrong API key tested as
+successful). See `tests/fake_sabnzbd.py`'s own docstring for the same correction on the test
+side, and `docs/decisions.md` (2026-08-22) for the full reasoning.
+
 **Two sources, per spec §2.1**: `mode=queue` (in-flight) and `mode=history` (finished/failed).
 `list_transfers(active_only=True)` reads only the queue; the full form
 (`active_only=False`, and `list_history`'s own dedicated call) also reads history, which
@@ -53,7 +66,12 @@ from .base import (
     project_transfer,
 )
 from .capture import capture_response
-from .errors import CapabilityUnavailable, ClientError, ClientUnreachable
+from .errors import (
+    CapabilityUnavailable,
+    ClientAuthenticationFailed,
+    ClientError,
+    ClientUnreachable,
+)
 from .models import (
     BasePath,
     BasePathKind,
@@ -187,6 +205,27 @@ def _epoch_to_iso(value: Any) -> str | None:
         return None
 
 
+# SABnzbd's own auth-failure body text -- MEASURED against a live SABnzbd 5.1.1, 2026-08-22
+# (spec §13.4 #9): a 403 whose body, lowercased, contains this substring. Matched on the body
+# text rather than trusting the status code alone, so an unrelated 403 (a reverse proxy sitting
+# in front of SABnzbd, a WAF) still falls through to a plain `ClientError` -- "fall back to the
+# tolerant reading where a signal isn't recognisable" is the same discipline every other parser
+# in this module already follows.
+_SAB_AUTH_FAILURE_BODY = "api key incorrect"
+
+
+def _is_sab_auth_failure(response: httpx.Response) -> bool:
+    """`True` only for a 403 whose body is recognisably SABnzbd's own auth-failure text.
+
+    Deliberately **not** "any 403" -- a 403 is a fact about a status code, not about *why*;
+    keying off the body is what lets a genuinely unrelated 403 (see module comment above) stay
+    a plain `ClientError` instead of being misreported as a bad API key.
+    """
+    if response.status_code != 403:
+        return False
+    return _SAB_AUTH_FAILURE_BODY in response.text.strip().lower()
+
+
 def _sab_call_ok(data: Any) -> bool:
     """SABnzbd's action endpoints (`name=pause`/`resume`/`delete`/`change_cat`) -- doc-derived,
     UNVERIFIED -- typically answer `{"status": true}` on success. Tolerant of a bare boolean
@@ -277,13 +316,16 @@ class SabnzbdClient(DownloadClient):
     async def _get(self, mode: str, **params: Any) -> tuple[httpx.Response, Any]:
         """One `GET /api?mode=...` round trip. Raises `ClientUnreachable` for a transport-level
         failure (DNS, connection refused, timeout -- says nothing about what the client
-        *supports*), `ClientError` for anything the client actually answered but that this
-        connector cannot treat as success (a non-2xx status, a non-JSON body, or SABnzbd's own
-        documented `{"status": false, "error": "..."}` failure shape, which vendor docs describe
-        SABnzbd returning with an HTTP 200 rather than a 4xx/5xx). **Never `CapabilityUnavailable`
-        from this method** -- none of these failure modes are the client explicitly saying "I
-        cannot do this" (spec §4.2); that type is reserved for the two statically-declared-`NONE`
-        operations below (`list_trackers`, `recheck`), raised without ever reaching the network.
+        *supports*), `ClientAuthenticationFailed` for a recognisable bad-API-key 403 (MEASURED,
+        2026-08-22, see module docstring), and `ClientError` for anything else the client
+        actually answered but that this connector cannot treat as success (a non-2xx status not
+        recognised as the auth shape, a non-JSON body, or SABnzbd's own documented
+        `{"status": false, "error": "..."}` failure shape, which vendor docs describe SABnzbd
+        returning with an HTTP 200 rather than a 4xx/5xx -- still unverified for *non-auth*
+        action failures, per spec §13.4 #9). **Never `CapabilityUnavailable` from this method**
+        -- none of these failure modes are the client explicitly saying "I cannot do this"
+        (spec §4.2); that type is reserved for the two statically-declared-`NONE` operations
+        below (`list_trackers`, `recheck`), raised without ever reaching the network.
 
         **`{"status": false}` alone, with no `error` key, is not treated as a failure here --
         doc-derived, UNVERIFIED, 2026-08-22.** The action endpoints (`name=delete` in
@@ -300,6 +342,11 @@ class SabnzbdClient(DownloadClient):
             raise ClientUnreachable(f"sabnzbd {mode} unreachable: {exc}") from exc
         except httpx.HTTPError as exc:
             raise ClientError(f"sabnzbd {mode} failed: {exc}") from exc
+        # Checked before `raise_for_status()` -- a recognised auth-failure 403 must raise the
+        # specific `ClientAuthenticationFailed`, not the generic "returned HTTP 403" `ClientError`
+        # the status-code branch below would otherwise produce for it.
+        if _is_sab_auth_failure(response):
+            raise ClientAuthenticationFailed(f"sabnzbd {mode} rejected the configured API key")
         try:
             response.raise_for_status()
         except httpx.HTTPStatusError as exc:
@@ -377,6 +424,33 @@ class SabnzbdClient(DownloadClient):
     # ------------------------------------------------------------------------------------
 
     async def test_connection(self) -> ConnectionInfo:
+        """Two round trips, on purpose (MEASURED, 2026-08-22, spec §13.4 #10, GitHub #23):
+
+        1. `mode=version` -- unauthenticated (any key, or none, is accepted), so this alone
+           proves only that *something* answering the SABnzbd API is reachable at this URL, and
+           carries the version string. This is also where the redacted capture (spec §13.3)
+           fires, same as before -- it is the call most useful to see when nothing works at
+           all, and it always runs regardless of what the second call finds.
+        2. `self._get("queue")` -- authenticated, and thus the call that actually validates the
+           configured API key. Reusing `_get` means a bad key raises `ClientAuthenticationFailed`
+           through the exact same path every other authenticated method already does, rather
+           than a second, parallel hand-rolled auth check living only here.
+
+        **Why not fold this into one call.** `mode=queue` alone could serve both purposes (it is
+        already reachable-and-authenticated in one), but it does not carry a `version` field
+        (MEASURED: `{"queue": {...}}`, no top-level `version` key) -- losing the version report
+        to save one round trip was judged not worth it, given `test_connection` is a
+        user-triggered, low-frequency call (a manual "test" click), not something on the
+        poller's hot path. If reachability ever needs to be reported as a separate outcome from
+        "reachable but the key is wrong," the two calls already produce that distinction
+        naturally: a transport failure on step 1 raises `ClientUnreachable` before step 2 is
+        even attempted, while a bad key surfaces only from step 2 as
+        `ClientAuthenticationFailed`. This method does not currently expose that distinction to
+        its own caller beyond "which exception type propagated" -- deliberately left there
+        rather than added to `ConnectionInfo`, since `api/settings_clients.py`'s save-on-test
+        flow is out of scope for this correction (this task's own handoff prompt) and nothing
+        downstream reads that finer distinction yet.
+        """
         query = {"mode": "version", "output": "json", "apikey": self._api_key}
         try:
             response = await self._client.get("/api", params=query)
@@ -406,6 +480,14 @@ class SabnzbdClient(DownloadClient):
         if isinstance(data, dict) and data.get("status") is False and data.get("error"):
             raise ClientError(f"sabnzbd test_connection reported an error: {data.get('error')!r}")
         version = data.get("version") if isinstance(data, dict) else None
+
+        # `mode=version` is unauthenticated (MEASURED, spec §13.4 #10) -- it cannot validate the
+        # configured key by itself. `_get("queue")` is an authenticated call and raises
+        # `ClientAuthenticationFailed` through the same path every other authenticated method
+        # uses, so a bad key actually fails `test_connection` (the regression this corrects,
+        # GitHub #23) instead of silently testing as successful.
+        await self._get("queue")
+
         return ConnectionInfo(version=version, raw=data if isinstance(data, dict) else {})
 
     async def list_transfers(self, *, active_only: bool = False) -> list[Transfer]:

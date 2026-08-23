@@ -4,14 +4,28 @@ in-process between calls, not a mocked transport. Exercises `core/clients/sabnzb
 HTTP request/response cycle (the `apikey` query parameter, `output=json`, real JSON parsing)
 instead of a stand-in for it.
 
-**Every response shape this fixture produces is authored from vendor documentation
-(sabnzbd.org/wiki/configuration/5.1/api), 2026-08-22, and is UNVERIFIED against a live
-SABnzbd instance.** This repo has already shipped a defect of exactly this shape: a fake *arr
-fixture that encoded the same wrong numeric assumption the production code did, so every test
-stayed green while two live Sonarr imports were misclassified `gone`
-(`core/arrclient.py`'s own docstring; docs/download-client-framework-spec.md §13.2). **This
-fixture is the first thing to go correct** once spec §13.3's redacted capture returns real
-bytes from a live SABnzbd (stage 1b) -- nothing here should be read as confirmed behavior.
+**Most response shapes this fixture produces are still authored from vendor documentation
+(sabnzbd.org/wiki/configuration/5.1/api), 2026-08-22, and remain UNVERIFIED against a live
+SABnzbd instance** -- see `sabnzbd.py`'s own module docstring for the full list. **The
+authentication shape is the one exception: it is MEASURED against a live SABnzbd 5.1.1,
+2026-08-22** (docs/download-client-framework-spec.md §13.4 #9/#10, GitHub #23) and encoded
+below accordingly:
+
+- `mode=version` is **unauthenticated** -- it answers 200/JSON for any API key, including no
+  key at all. It proves reachability, never a credential.
+- Every other mode answers a bad key with **HTTP 403, `Content-Type: text/html`, plain-text
+  body `"API Key Incorrect"`** -- not the `{"status": false, "error": ...}` JSON envelope on a
+  200 this fixture used to encode. That was the same wrong assumption the connector's own
+  first draft made (this module's own history, and
+  docs/download-client-framework-spec.md §13.2's `IMPORT_EVENT_TYPES = {3}` precedent): a
+  fixture that only ever matches the connector it is meant to falsify cannot catch anything.
+
+This repo has already shipped a defect of exactly this shape once before: a fake *arr fixture
+that encoded the same wrong numeric assumption the production code did, so every test stayed
+green while two live Sonarr imports were misclassified `gone` (`core/arrclient.py`'s own
+docstring; docs/download-client-framework-spec.md §13.2). The auth shape above is this
+fixture's second occurrence of that trap, now corrected against measured bytes rather than a
+second guess.
 """
 
 from __future__ import annotations
@@ -27,7 +41,7 @@ from typing import Any
 import pytest
 import uvicorn
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 
 DEFAULT_API_KEY = "test-sab-key"  # noqa: S105 - test-only fixture credential, never real
 
@@ -72,11 +86,19 @@ class FakeSabState:
     # Every call 500s -- a reachable-but-erroring instance (`ClientError`, not `ClientUnreachable`
     # -- the fake server answered, just with a failure).
     fail_all: bool = False
-    # Every call answers SABnzbd's own documented "bad API key" shape: HTTP 200,
-    # `{"status": false, "error": "..."}` -- vendor docs describe SABnzbd signalling this kind
-    # of failure in the body rather than via a 401/403, which is exactly the shape this
-    # connector's `_get` must detect itself rather than relying on `raise_for_status()` alone.
+    # Forces every *authenticated* call (everything except `mode=version`, per the measured
+    # table above) to answer the real SABnzbd 403 auth-failure shape regardless of whether
+    # `apikey` actually matches `state.api_key` -- lets a test simulate "this stored key has
+    # gone bad" without also having to construct a client pointed at the wrong key string.
+    # `mode=version` is deliberately exempt even when this is set: measured behaviour is that
+    # it accepts any key unconditionally, so a fixture that let this flag override it would be
+    # re-authoring the same wrong assumption the connector used to make.
     bad_api_key_mode: bool = False
+    # A 403 the fixture produces on purpose, but whose body is *not* SABnzbd's own recognisable
+    # auth-failure text -- models an unrelated 403 (a reverse proxy, a WAF) that must still read
+    # as a plain `ClientError`, never misreported as a bad API key. Independent of
+    # `bad_api_key_mode`; when set, it wins over even a correct `apikey`.
+    unrecognized_403_mode: bool = False
     # Stage 1b addition (docs/download-client-framework-spec.md §13.3, tests for
     # `api/settings_clients.py`'s test-connection capture): the real vendor `mode=version`
     # response never echoes the API key back in its body, so this fixture cannot otherwise
@@ -122,16 +144,26 @@ def create_fake_sabnzbd_app(state: FakeSabState) -> FastAPI:
         params = request.query_params
         mode = params.get("mode", "")
         apikey = params.get("apikey", "")
-        if apikey != state.api_key or state.bad_api_key_mode:
-            # Doc-derived, UNVERIFIED: SABnzbd answers a bad key with HTTP 200 and a body-level
-            # failure, not a 401/403 -- this is the shape `SabnzbdClient._get` has to detect.
-            return {"status": False, "error": "API Key Incorrect"}
 
+        # `mode=version` is unauthenticated -- MEASURED against a live SABnzbd 5.1.1,
+        # 2026-08-22 (spec §13.4 #10): it answers for any key, including no key at all, and
+        # must therefore be checked *before* any of the auth-failure branches below, not after.
         if mode == "version":
             body: dict[str, Any] = {"version": state.version}
             if state.echo_key_in_version_body:
                 body["echoed_apikey"] = apikey  # test-only: see FakeSabState field docstring
             return body
+
+        if state.unrecognized_403_mode:
+            # A 403 that is *not* SABnzbd's own recognisable auth-failure text -- see the field
+            # docstring above.
+            return PlainTextResponse("Forbidden", status_code=403, media_type="text/html")
+
+        if apikey != state.api_key or state.bad_api_key_mode:
+            # MEASURED against a live SABnzbd 5.1.1, 2026-08-22 (spec §13.4 #9, GitHub #23):
+            # every authenticated mode answers a bad key with HTTP 403, `text/html`, plain-text
+            # body "API Key Incorrect" -- not a 200 with a `{"status": false}` JSON envelope.
+            return PlainTextResponse("API Key Incorrect", status_code=403, media_type="text/html")
 
         if mode == "queue":
             name = params.get("name")

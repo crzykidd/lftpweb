@@ -6,6 +6,59 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-22 — SABnzbd auth failures: a new `ClientAuthenticationFailed`, and `test_connection` now authenticates
+
+`prompts/done/2026-08-22-sab-auth-error-handling.md`. Corrects `core/clients/sabnzbd.py`
+against **measured** SABnzbd 5.1.1 behaviour (spec §13.4 #9/#10, GitHub #23): `mode=version` is
+unauthenticated (any key, or none, is accepted), and every other mode answers a bad key with
+**HTTP 403, `text/html`, body `"API Key Incorrect"`** — not the `{"status": false, "error":
+...}` JSON-on-200 shape the connector originally assumed from vendor docs.
+
+**Fixed the fixture first and watched the suite go red before touching the connector**
+(`tests/fake_sabnzbd.py`, then `core/clients/sabnzbd.py`) — the fixture encoded the identical
+wrong assumption the connector did, which is exactly why 1811 green tests missed this the first
+time (the second occurrence of the `IMPORT_EVENT_TYPES = {3}` failure shape, spec §13.2). Two
+tests went red from the fixture change alone, with the connector untouched:
+`test_connection_bad_api_key_raises_client_error_not_unreachable` (a bad key on `mode=version`
+stopped raising anything at all — it now tests as successful, exactly reproducing #23's live
+symptom) and `test_test_connection_failure_leaves_a_previously_persisted_set_intact`
+(`bad_api_key_mode` no longer failed `test_connection`). Both went green again once the
+connector was corrected, with no further test edits needed for either.
+
+**New `ClientAuthenticationFailed(ClientError)`** (`core/clients/errors.py`), not
+`ClientUnreachable` and not `CapabilityUnavailable`. Not `ClientUnreachable`: the two facts are
+orthogonal (SABnzbd answered fine, it just refused the key), and `ClientUnreachable`'s
+back-off-and-retry contract is wrong for a durably wrong credential — retrying will not fix it.
+Not `CapabilityUnavailable`: that type is reserved for the client explicitly saying "I cannot do
+this" (spec §4.2), which `degrade_from_error` is structurally the only path allowed to act on; a
+bad key says nothing about what the client supports, and letting it degrade a capability would
+reproduce the v0.2.4 blank-queue incident one layer up, one config typo away instead of one bad
+network minute away.
+
+**`_get` keys the auth failure off the response *body*, not the bare status code** — a 403
+whose body doesn't contain SABnzbd's own recognisable text ("api key incorrect", matched
+lowercased) still falls through to a plain `ClientError`. An unrelated 403 (a reverse proxy, a
+WAF sitting in front of the seedbox) exists in the wild and must not be misreported as "your
+API key is wrong."
+
+**`test_connection` now makes two calls, not one**: `mode=version` still supplies reachability
+and the version string (and is still where the redacted capture, spec §13.3, fires — unchanged),
+and a second, authenticated `self._get("queue")` actually validates the key. Rejected folding
+this into a single `mode=queue` call: MEASURED, `mode=queue`'s response has no top-level
+`version` field, and losing the version report to save one round trip wasn't worth it for a
+user-triggered, low-frequency call. `_get("queue")`'s failure reuses the exact same
+`ClientAuthenticationFailed` path every other authenticated method now goes through, rather than
+a second, parallel hand-rolled check living only in `test_connection`.
+
+**`api/settings_clients.py`'s save-on-test flow was explicitly left alone**, per the user's
+prior deferral pending a Settings rework — no change to when a test runs, what blocks a save, or
+the endpoint's response shape. The endpoint's existing `except ClientError` branch already
+catches `ClientAuthenticationFailed` generically (it's a subclass) and reports
+`error_class: "ClientError"`, same as before; a more specific `error_class` for this case is
+left for that later rework rather than done piecemeal here.
+
+---
+
 ## 2026-08-22 — client base paths: detected + SSH-verified, and save-on-test
 
 `prompts/done/2026-08-22-client-base-paths-detected.md`. Two changes that ship together:

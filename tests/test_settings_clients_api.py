@@ -362,10 +362,14 @@ def test_test_connection_failure_leaves_a_previously_persisted_set_intact(
         assert resp.json()["ok"] is True
         first_caps = client.get("/api/settings/clients").json()[0]["capabilities"]
 
-        # Now make the same stored config fail -- SABnzbd's own documented "bad key" shape
-        # (HTTP 200, `{"status": false, "error": ...}`) is a `ClientError`, not
-        # `ClientUnreachable` (sabnzbd.py's own `_get`/`test_connection`) -- either way, neither
-        # is a `CapabilityUnavailable`, so neither may ever degrade a capability.
+        # Now make the same stored config fail -- SABnzbd's own MEASURED "bad key" shape
+        # (HTTP 403, `text/html`, body "API Key Incorrect", spec §13.4 #9) makes `sabnzbd.py`'s
+        # `_get` raise `ClientAuthenticationFailed`, a `ClientError` subclass -- this endpoint's
+        # own except-block ordering (`api/settings_clients.py`, out of scope for this
+        # correction) reports any non-`ClientUnreachable`/`CapabilityUnavailable` `ClientError`
+        # generically as `"ClientError"`, so that string is unchanged here even though the
+        # underlying exception type is now more specific. Either way, neither is a
+        # `CapabilityUnavailable`, so neither may ever degrade a capability.
         fake_sabnzbd_server.state.bad_api_key_mode = True
         resp = client.post(f"/api/settings/clients/{client_id}/test")
         assert resp.status_code == 200

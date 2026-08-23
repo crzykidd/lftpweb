@@ -11,8 +11,13 @@ from __future__ import annotations
 
 import pytest
 
-from lftpweb.core.clients.base import Operation, project_transfer
-from lftpweb.core.clients.errors import CapabilityUnavailable, ClientError, ClientUnreachable
+from lftpweb.core.clients.base import Operation, degrade_from_error, project_transfer
+from lftpweb.core.clients.errors import (
+    CapabilityUnavailable,
+    ClientAuthenticationFailed,
+    ClientError,
+    ClientUnreachable,
+)
 from lftpweb.core.clients.models import BasePathKind, TransferPhase
 from lftpweb.core.clients.sabnzbd import SabnzbdClient
 
@@ -63,12 +68,87 @@ async def test_connection_success_reports_version(fake_sabnzbd_server):
     assert info.version == fake_sabnzbd_server.state.version
 
 
-async def test_connection_bad_api_key_raises_client_error_not_unreachable(fake_sabnzbd_server):
+async def test_connection_bad_api_key_raises_client_authentication_failed(fake_sabnzbd_server):
+    """The regression test for #23: a deliberately wrong API key must actually fail
+    `test_connection`, not test as successful (MEASURED, spec §13.4 #10 -- `mode=version` alone
+    accepts any key, which is exactly why this used to pass silently).
+    """
     client = _client(fake_sabnzbd_server, api_key="wrong-key")
-    with pytest.raises(ClientError) as exc_info:
+    with pytest.raises(ClientAuthenticationFailed) as exc_info:
         await client.test_connection()
+    # `ClientAuthenticationFailed` subclasses `ClientError` (the taxonomy's own contract), so
+    # this is also true -- asserted directly rather than left implicit.
+    assert isinstance(exc_info.value, ClientError)
     assert not isinstance(exc_info.value, ClientUnreachable)
     assert not isinstance(exc_info.value, CapabilityUnavailable)
+
+
+async def test_connection_with_no_api_key_still_parses_version(fake_sabnzbd_server):
+    """MEASURED, spec §13.4 #10: `mode=version` is genuinely unauthenticated -- SABnzbd answers
+    it even with no key at all. That must not become an error; it is the one call this
+    connector can rely on regardless of whether a credential was ever configured correctly.
+    """
+    # `_client`'s own `api_key or server.state.api_key` falls back on an empty string (falsy),
+    # so an actually-empty key is built directly here rather than through that helper.
+    client = SabnzbdClient(config={"base_url": fake_sabnzbd_server.base_url, "api_key": ""})
+    with pytest.raises(ClientAuthenticationFailed):
+        # The empty key still fails the *authenticated* half of `test_connection`
+        # (`mode=queue`) -- this test's point is narrower: that the `mode=version` half above it
+        # does not itself raise for a missing key.
+        await client.test_connection()
+
+
+async def test_bad_api_key_on_an_authenticated_call_raises_client_authentication_failed(
+    fake_sabnzbd_server,
+):
+    """MEASURED, spec §13.4 #9: every authenticated mode (`queue`, `history`, `get_config`) --
+    not only `test_connection` -- answers a bad key with the 403 auth-failure shape, and every
+    one of them must raise the specific `ClientAuthenticationFailed`, not a plain `ClientError`
+    and not a JSON-parse failure (the pre-correction connector would have raised the latter,
+    since `response.json()` on a `text/html` body raises `ValueError`).
+    """
+    client = _client(fake_sabnzbd_server, api_key="wrong-key")
+
+    with pytest.raises(ClientAuthenticationFailed):
+        await client.list_transfers(active_only=True)  # mode=queue
+    with pytest.raises(ClientAuthenticationFailed):
+        await client.list_history()  # mode=history
+    with pytest.raises(ClientAuthenticationFailed):
+        await client.list_base_paths()  # mode=get_config
+
+
+async def test_unrecognised_403_body_is_a_plain_client_error_not_an_auth_failure(
+    fake_sabnzbd_server,
+):
+    """A 403 is a fact about a status code, not about *why* -- an unrelated 403 (a reverse proxy,
+    a WAF) whose body is not SABnzbd's own recognisable text must not be misreported as a bad
+    API key.
+    """
+    fake_sabnzbd_server.state.unrecognized_403_mode = True
+    client = _client(fake_sabnzbd_server)
+
+    with pytest.raises(ClientError) as exc_info:
+        await client.list_transfers(active_only=True)
+
+    assert not isinstance(exc_info.value, ClientAuthenticationFailed)
+
+
+async def test_auth_failure_does_not_degrade_any_capability(fake_sabnzbd_server):
+    """spec §4.2's one load-bearing rule, exercised end to end with a real
+    `ClientAuthenticationFailed` a real call raised -- not merely asserted in the abstract
+    against `core/clients/base.py`'s own unit tests (`tests/test_clients_framework.py`), which
+    only ever construct the exception directly rather than triggering it through a connector."""
+    client = _client(fake_sabnzbd_server, api_key="wrong-key")
+    before = client.capabilities
+
+    try:
+        await client.list_transfers(active_only=True)
+    except ClientAuthenticationFailed as exc:
+        after = degrade_from_error(before, Operation.LIST_TRANSFERS, exc)
+    else:
+        pytest.fail("expected ClientAuthenticationFailed")
+
+    assert after == before  # unchanged -- only CapabilityUnavailable may ever narrow this
 
 
 async def test_connection_unreachable_host_raises_client_unreachable():
