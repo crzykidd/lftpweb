@@ -59,6 +59,15 @@ class HealthResponse(BaseModel):
     # plain `v<version>` rendering in that case, never a lie about the channel.
     build_sha: str | None = None
     build_channel: str | None = None
+    # 2026-08-23 (`core/clientsync.py`, this task) -- whether the download-client poller's own
+    # background loop is alive, the identical "is the scheduler task still running" signal
+    # `scheduler_alive` already surfaces for `core/queue.py.TransferQueue`. **Not** the *arr
+    # poller's own equivalent, generalized: `core/arrsync.py.ArrSyncScheduler.is_alive` has no
+    # entry in this response at all today, so there was no existing "the way the *arr poller
+    # does" pattern in this endpoint to actually mirror for a client-instance poller either --
+    # this field follows the one loop-aliveness precedent this endpoint does already have
+    # (`scheduler_alive`), not a nonexistent one; see this task's own report for the detail.
+    client_sync_alive: bool = True
 
 
 class StatsResponse(BaseModel):
@@ -1013,9 +1022,10 @@ class PreflightRowOut(BaseModel):
     here invites a per-row control (chevrons, Dismiss, Start now, Stop) that would need one.
     """
 
-    # `'arr'` or `'settle'` today (`core/preflight.py.PreflightSource`); widened, not replaced,
-    # if a further source ever lands. The frontend's own *arr-specific rendering (the brand-logo
-    # chip) is gated on this, never inferred from `source_kind` alone.
+    # `'arr'`, `'settle'`, or `'client'` today (`core/preflight.py.PreflightSource`, `'client'`
+    # added 2026-08-23 alongside `core/clientsync.py`); widened, not replaced, if a further
+    # source ever lands. The frontend's own *arr-specific rendering (the brand-logo chip) is
+    # gated on this, never inferred from `source_kind` alone.
     source: str
     queue_id: int
     # The bound queue's own display identity (2026-08-21, "the columns moved around" fix) -- so

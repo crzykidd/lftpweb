@@ -233,29 +233,33 @@ def test_gated_queue_disabled_since_no_longer_appears_in_the_banner(isolated_con
 
 
 # --- Cross-source precedence + ordering (this task, decided with the user) --------------------
-# `_merge_preflight_rows` is the one place allowed to know both sources exist -- exercised
-# directly, no app/db needed, since it's a pure function over `PreflightRow`.
+# `_merge_preflight_rows` is the one place allowed to know all three sources exist -- exercised
+# directly, no app/db needed, since it's a pure function over `PreflightRow`. `client_rows` is
+# always `[]` here -- these tests predate the download-client source (2026-08-23,
+# `tests/test_preflight_client_merge.py` is where that source's own merge behaviour, including
+# its interaction with the settle-precedence rule below, is actually exercised) and exist to
+# prove the *arr/settle precedence untouched by that addition.
 
 
 def test_settle_row_wins_over_an_arr_row_for_the_same_release():
     arr_row = _row("arr", 1, "Show.S01E01", source_label="Sonarr", source_kind="sonarr")
     settle_row = _row("settle", 1, "Show.S01E01", source_label="TV", size_bytes=100)
 
-    assert _merge_preflight_rows([arr_row], [settle_row]) == [settle_row]
+    assert _merge_preflight_rows([arr_row], [], [settle_row]) == [settle_row]
 
 
 def test_different_releases_both_survive_the_merge():
     arr_row = _row("arr", 1, "Alpha.Release")
     settle_row = _row("settle", 1, "Beta.Release")
 
-    assert _merge_preflight_rows([arr_row], [settle_row]) == [arr_row, settle_row]
+    assert _merge_preflight_rows([arr_row], [], [settle_row]) == [arr_row, settle_row]
 
 
 def test_same_title_different_queue_is_not_deduplicated():
     arr_row = _row("arr", 1, "Show.S01E01")
     settle_row = _row("settle", 2, "Show.S01E01")
 
-    merged = _merge_preflight_rows([arr_row], [settle_row])
+    merged = _merge_preflight_rows([arr_row], [], [settle_row])
     assert set(merged) == {arr_row, settle_row}
 
 
@@ -263,8 +267,8 @@ def test_merge_sorts_alphabetically_by_title_across_sources_case_insensitively()
     arr_row = _row("arr", 1, "banana")
     settle_row = _row("settle", 1, "Apple")
 
-    assert _merge_preflight_rows([arr_row], [settle_row]) == [settle_row, arr_row]
+    assert _merge_preflight_rows([arr_row], [], [settle_row]) == [settle_row, arr_row]
 
 
 def test_merge_with_no_rows_from_either_source_is_empty():
-    assert _merge_preflight_rows([], []) == []
+    assert _merge_preflight_rows([], [], []) == []

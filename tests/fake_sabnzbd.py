@@ -106,6 +106,13 @@ class FakeSabState:
     # the log" -- a test-only knob, off by default, so every other test's `mode=version` response
     # is unaffected.
     echo_key_in_version_body: bool = False
+    # `core/clientsync.py`'s own tests (2026-08-23, "the two cadences firing independently") --
+    # every request's `mode` param, recorded unconditionally regardless of auth/branch outcome,
+    # so a test can distinguish "the fast cadence's `list_transfers(active_only=True)`" (one
+    # `queue` call) from "the slow cadence's `active_only=False`" (`queue` *and* `history`)
+    # without a connector-level change. Deliberately separate from `action_calls` above, which
+    # only ever records the action sub-calls (`name=pause`/etc), not every request.
+    mode_calls: list[str] = field(default_factory=list)
 
 
 def _queue_response(state: FakeSabState) -> dict[str, Any]:
@@ -144,6 +151,7 @@ def create_fake_sabnzbd_app(state: FakeSabState) -> FastAPI:
         params = request.query_params
         mode = params.get("mode", "")
         apikey = params.get("apikey", "")
+        state.mode_calls.append(mode)
 
         # `mode=version` is unauthenticated -- MEASURED against a live SABnzbd 5.1.1,
         # 2026-08-22 (spec §13.4 #10): it answers for any key, including no key at all, and

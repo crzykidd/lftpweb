@@ -40,8 +40,11 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Literal
 
-# Widened, not replaced, when a new source lands -- see this module's own docstring.
-PreflightSource = Literal["arr", "settle"]
+# Widened, not replaced, when a new source lands -- see this module's own docstring. `"client"`
+# added 2026-08-23 (`core/clientsync.py`, docs/download-client-framework-spec.md §9) -- a
+# download client polled directly, the third source `api/jobs.py._merge_preflight_rows` now
+# knows about.
+PreflightSource = Literal["arr", "settle", "client"]
 
 
 @dataclass(frozen=True)
@@ -120,6 +123,17 @@ class PreflightRow:
     # `None` together, or neither is; a caller never sees one set without the other.
     wait_scans: int | None
     wait_since: str | None
+    # spec §9.2's merge key, added 2026-08-23 alongside the `"client"` source -- the download
+    # client's own key, which the *arr already hands over as `downloadId` (spec §7.1: "the *arr
+    # already hands us the client's own key"). `None` when a source has nothing of the kind to
+    # report: a settle-gated row (lftpweb *is* the thing fetching it -- there is no separate
+    # download client to key against) or an *arr queue record without one. The one field that
+    # lets `api/jobs.py._merge_preflight_rows` dedupe an *arr row and a download-client row for
+    # the identical release by exact identity (spec §9.2: "this needs no heuristics") rather than
+    # by title-matching -- see that function's own docstring for the per-field precedence rule
+    # this key makes possible. Optional with a default so every existing call site (both
+    # already-shipped sources) needed no change to keep constructing a valid row.
+    download_id: str | None = None
 
 
 # Comfortably longer than a poll-driven source's own refresh cadence (the *arr poller's default

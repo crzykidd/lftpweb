@@ -6,6 +6,65 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-23 — the client poller: event-per-transition, single-call cadences, and the `PreflightRow.download_id` widening
+
+`prompts/done/2026-08-23-client-poller.md` (#18 stage 2a, `core/clientsync.py`,
+docs/download-client-framework-spec.md §9). The poller, its in-memory cache, and the third
+Preflight source. No transfer behaviour changed — the settle-gate skip is stage 2b.
+
+**`ClientAuthenticationFailed` gets the identical backoff ladder as every other failure, only a
+different audit `kind`.** The credential lives in the database and can be fixed by the user at
+any time, so there is no reason to give up retrying — only the message needs to say "wrong key,"
+not "host down." `_handle_failure` reports an event once per failure *streak*, and again if the
+streak's own failure kind changes mid-outage (an unreachable client that starts answering with a
+bad-key 403 is a materially different fact), rather than once per backed-off retry attempt the
+way `core/arrsync.py._handle_failure` itself still does — a deliberately stricter reading of
+"one event per failure transition, not per failed pass" than the file this module mirrors, since
+the spec text for *this* module states the transition rule explicitly and arrsync.py was
+declared off-limits to change.
+
+**The two cadences (spec §9.1) collapse into one HTTP call per tick, not two.** The first
+implementation called `list_transfers(active_only=True)` every tick and, when the slow cadence
+was also due, *additionally* called `list_transfers(active_only=False)` — two round trips on a
+slow-due tick, the second one two whole calls (`mode=queue` + `mode=history` on SABnzbd) since
+the full-estate call already includes the active set. Corrected once a cadence-counting test
+proved it: on a tick where the slow poll is due, only the wider `active_only=False` call is
+made, and `_update_preflight` (which already filters to non-terminal transfers defensively)
+consumes it exactly as it would a narrower result.
+
+**`PreflightRow` gained an optional `download_id: str | None = None`, and `core/arrsync.py` got
+one additive line to populate it.** Spec §9.2 requires deduping an *arr Preflight row against a
+client Preflight row by exact `download_id` identity, "no heuristics" — but `PreflightRow` had no
+such field, and the *arr source (`core/arrsync.py._update_preflight`) never populated one from
+`QueueRecord.download_id`, which it has always carried. Widening the row (already an established,
+source-agnostic pattern) and adding one keyword argument to an existing `PreflightRow(...)` call
+site — `download_id=normalize_client_id(record.download_id) if record.download_id else None` —
+was judged not to violate "do not refactor `arrsync.py`": no control flow, matching logic, or
+existing behaviour changed, only one previously-uncaptured fact started being carried into an
+already-widening shared type. The alternative (dedupe by `(queue_id, title)` heuristics, matching
+the pre-existing settle/arr merge) would have directly contradicted the spec's own explicit "this
+needs no heuristics" instruction just to avoid the one-line touch. Flagged prominently in the
+session report for the user to confirm was the right call, given how emphatic the "don't touch
+arrsync.py" instruction was elsewhere in the same task.
+
+**§9.2's per-field merge lives in `api/jobs.py._merge_preflight_rows`**, extended from a two-way
+(*arr, settle) to a three-way (*arr, client, settle) merge: step 1 dedupes *arr/client rows by
+`download_id`, with the client's own value winning per-field wherever it actually reported one
+(never per-record, never when the client was silent on that field — §4.2 outranks §9.2 exactly as
+the spec numbers them); step 2 applies the pre-existing settle-wins-by-`(queue_id, title)` rule to
+the *result* of step 1, unchanged in its own logic. `core/preflight.py` still names none of the
+three sources, per its own governing rule.
+
+**`HealthResponse.client_sync_alive` mirrors `scheduler_alive` (the queue's own loop), not an
+"the way the *arr poller does" pattern — because no such pattern exists today.** The handoff
+prompt's instruction to "surface health the way the *arr poller does" doesn't hold: `/api/health`
+has never surfaced `ArrSyncScheduler.is_alive` at all. The closest actual precedent is
+`TransferQueue`'s own `scheduler_alive` boolean, which `client_sync_alive` now copies verbatim.
+Not scoped to also retrofit `arr_sync_alive` onto `/api/health` — that would be touching
+unrelated, working code outside this task's stated boundary.
+
+---
+
 ## 2026-08-22 — rTorrent connector: endpoint choice, `raw_status` synthesis, and a `TORRENT_BASELINE` correction
 
 `prompts/2026-08-22-rtorrent-connector.md` (#21's dependency, `core/clients/rtorrent.py`). Second

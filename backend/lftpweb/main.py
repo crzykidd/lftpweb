@@ -34,6 +34,7 @@ from lftpweb.core import auth
 from lftpweb.core.arrsync import ArrSyncScheduler
 from lftpweb.core.autoqueue import AutoQueue
 from lftpweb.core.backup import BackupScheduler
+from lftpweb.core.clientsync import ClientSyncScheduler
 from lftpweb.core.local_delete import DeleteInFlight, RetentionScheduler
 from lftpweb.core.metrics import MetricsRetentionScheduler
 from lftpweb.core.engine import Engine, load_host_config
@@ -159,6 +160,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         remote_pool=app.state.engine.pool,
         host_provider=_host_provider,
     )
+    # Download-client poller, stage 2a of #18 (docs/download-client-framework-spec.md §9,
+    # `core/clientsync.py`, this task): its own clock, independent of both the scan pass and
+    # the *arr poller above -- same background-loop shape, default off (every `download_client`
+    # row starts `enabled = 0`, migration 027 inserts none). No `events`/`in_flight_provider`/
+    # `delete_in_flight` seam, unlike `arr_sync` -- this scheduler never writes `item.state` or
+    # touches the filesystem (this module's own docstring), so it has nothing those seams exist
+    # to protect.
+    app.state.client_sync = ClientSyncScheduler(db=app.state.db, config_dir=settings.config_dir)
 
     await app.state.engine.start()
     await app.state.queue.start()
@@ -166,11 +175,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     await app.state.metrics_retention.start()
     await app.state.retention_scheduler.start()
     await app.state.arr_sync.start()
+    await app.state.client_sync.start()
 
     logger.info("lftpweb %s started", __version__)
     try:
         yield
     finally:
+        await app.state.client_sync.stop()
         await app.state.arr_sync.stop()
         await app.state.retention_scheduler.stop()
         await app.state.metrics_retention.stop()

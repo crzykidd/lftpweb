@@ -42,6 +42,12 @@ async def health(request: Request) -> HealthResponse:
     # resumes at, or `None` for an indefinite pause / no pause at all.
     queue_paused_until = queue.paused_until if queue is not None else None
 
+    # 2026-08-23 (`core/clientsync.py`, this task) -- the download-client poller's own loop
+    # aliveness, mirroring `scheduler_alive` above (`HealthResponse.client_sync_alive`'s own
+    # docstring: no existing *arr-poller entry in this response to actually mirror instead).
+    client_sync = getattr(request.app.state, "client_sync", None)
+    client_sync_alive = bool(client_sync is not None and client_sync.is_alive)
+
     status = "ok" if db_ok and scheduler_alive and host_reachable is not False else "degraded"
 
     return HealthResponse(
@@ -54,6 +60,7 @@ async def health(request: Request) -> HealthResponse:
         scheduler_alive=scheduler_alive,
         queue_paused=queue_paused,
         queue_paused_until=queue_paused_until,
+        client_sync_alive=client_sync_alive,
         build_sha=settings.build_sha,
         build_channel=settings.build_channel,
     )

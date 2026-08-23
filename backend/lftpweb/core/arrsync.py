@@ -140,6 +140,7 @@ from lftpweb.core.crypto import DecryptionError, decrypt_secret
 from lftpweb.core.events import EventBus
 from lftpweb.core.itemview import item_view
 from lftpweb.core.local_delete import DeleteInFlight, _do_remove_from_disk, _physical_local_root
+from lftpweb.core.clients.models import normalize_client_id
 from lftpweb.core.postprocess import perform_remote_delete
 from lftpweb.core.preflight import PreflightHold, PreflightRow
 
@@ -874,6 +875,17 @@ class ArrSyncScheduler:
                 # docstring), so both stay unset rather than a fabricated pair.
                 wait_scans=None,
                 wait_since=None,
+                # 2026-08-23 (core/clientsync.py, spec §9.2) -- the one additive field this
+                # task's own build touches here: the client's own key, already handed over as
+                # `downloadId` (spec §7.1), normalized the same way a real connector normalizes
+                # its own `client_id` (`core.clients.models.normalize_client_id`) so the two
+                # sides compare equal. Lets `api/jobs.py._merge_preflight_rows` dedupe this row
+                # against a download-client Preflight row for the identical release by exact
+                # identity rather than a title heuristic. `None` when the *arr didn't report one
+                # -- no change to this module's own matching/attribution logic above.
+                download_id=(
+                    normalize_client_id(record.download_id) if record.download_id else None
+                ),
             )
         retired = {_record_identity(record) for record in retired_records}
         hold = self._preflight_holds.setdefault(instance["id"], PreflightHold())

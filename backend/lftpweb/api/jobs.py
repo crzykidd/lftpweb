@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Coroutine
+from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Any
 
@@ -636,31 +637,113 @@ async def unpause_queue(request: Request) -> None:
     await request.app.state.queue.unpause()
 
 
-def _merge_preflight_rows(
-    arr_rows: list[PreflightRow], settle_rows: list[PreflightRow]
-) -> list[PreflightRow]:
-    """Cross-source composition for `get_preflight` below -- the one place allowed to know both
-    sources exist (`core/preflight.py`'s own docstring: nothing in that module may name either
-    one). Two decisions, both made with the user (`docs/decisions.md`):
+def _merge_client_field_into_arr(arr_row: PreflightRow, client_row: PreflightRow) -> PreflightRow:
+    """One row for one release both the *arr and a download client report at once (spec §9.2,
+    docs/download-client-framework-spec.md, `core/clientsync.py`, this task) -- the caller
+    (`_merge_arr_and_client_rows` below) has already matched `arr_row`/`client_row` by
+    `download_id` (spec §7.1's exact identity, no heuristics).
 
-    **A settle row wins over an *arr row for the same release.** A settle-gated row means the
-    bytes are actually on the seedbox, sized and fingerprinted; an *arr row only means the *arr's
-    own queue mentions a download that hasn't reached here yet -- strictly less information about
-    the identical release. In practice `core/arrsync.py._preflight_candidates` already excludes
-    any record matching an existing `item` row regardless of state, and a settle-gated item
-    always *is* one, so this only ever fires on a genuine title/attribution mismatch between the
-    two sources -- cheap insurance against showing the same release twice, not the primary
-    mechanism. Identity is `(queue_id, title)`, the same pair both sources already expose.
+    **The client wins per FIELD, never per record, and only where it actually reported
+    something** (spec §9.2's own three constraints, restated): `size_bytes`/
+    `size_remaining_bytes`/`remaining_s`/`status_label` take the client's own value whenever the
+    client populated it, and fall back to the *arr's otherwise -- an *arr's `timeleft` must
+    survive a client that reports no ETA (constraint 1), and a client that hasn't reported at all
+    this pass never reaches this function in the first place (constraint 2: `_preflight_holds`
+    only contains a client row when the client -- or its own flap-tolerant hold -- actually has
+    one; §4.2 already governs what "hasn't reported" means at that layer, not here). This is
+    deliberately **not** a timestamp/freshness comparison (spec §9.2's own reasoning: the *arr
+    never says when it last polled its own client, so there is nothing honest to compare
+    timestamps against) -- the client simply wins outright on every field it populates, always.
+
+    Display identity (`title`, the queue attribution, `source_label`/`source_kind`) is taken
+    wholesale from the more direct observation, `client_row` -- the same "direct observation
+    outranks a relay" reasoning spec §9.2 states for the numeric fields, applied to the fields
+    that aren't strictly `Field`-vocabulary but are still something both sources independently
+    compute about the identical release. `download_client` (the *arr's own "which download
+    client is handling this" tooltip fact) is kept from `arr_row`, since the client source itself
+    never populates that field (`core/clientsync.py._update_preflight`'s own reasoning: this
+    source *is* the download client).
+    """
+    return replace(
+        arr_row,
+        source=client_row.source,
+        queue_id=client_row.queue_id,
+        queue_name=client_row.queue_name,
+        queue_short_name=client_row.queue_short_name,
+        title=client_row.title or arr_row.title,
+        status_label=client_row.status_label or arr_row.status_label,
+        source_label=client_row.source_label,
+        source_kind=client_row.source_kind,
+        size_bytes=client_row.size_bytes
+        if client_row.size_bytes is not None
+        else arr_row.size_bytes,
+        size_remaining_bytes=(
+            client_row.size_remaining_bytes
+            if client_row.size_remaining_bytes is not None
+            else arr_row.size_remaining_bytes
+        ),
+        remaining_s=(
+            client_row.remaining_s if client_row.remaining_s is not None else arr_row.remaining_s
+        ),
+    )
+
+
+def _merge_arr_and_client_rows(
+    arr_rows: list[PreflightRow], client_rows: list[PreflightRow]
+) -> list[PreflightRow]:
+    """Dedupe an *arr row and a download-client row reporting the identical release (spec §9.2)
+    -- **exact identity, `download_id`, never a heuristic** (spec §7.1, §9.2: "this needs no
+    heuristics"). A row missing `download_id` entirely (either source can leave it `None` -- see
+    `core/preflight.py.PreflightRow`'s own docstring) never merges with anything; it passes
+    through standalone, on both sides, exactly as before this source existed.
+    """
+    client_by_download_id = {r.download_id: r for r in client_rows if r.download_id}
+    merged: list[PreflightRow] = []
+    consumed: set[str] = set()
+    for arr_row in arr_rows:
+        client_row = client_by_download_id.get(arr_row.download_id) if arr_row.download_id else None
+        if client_row is None:
+            merged.append(arr_row)
+            continue
+        merged.append(_merge_client_field_into_arr(arr_row, client_row))
+        consumed.add(client_row.download_id)  # type: ignore[arg-type]
+    # A client row with no matching *arr row at all -- e.g. no *arr bound to this release yet, or
+    # none configured -- is shown standalone rather than dropped.
+    merged.extend(r for r in client_rows if r.download_id not in consumed)
+    return merged
+
+
+def _merge_preflight_rows(
+    arr_rows: list[PreflightRow],
+    client_rows: list[PreflightRow],
+    settle_rows: list[PreflightRow],
+) -> list[PreflightRow]:
+    """Cross-source composition for `get_preflight` below -- the one place allowed to know all
+    three sources exist (`core/preflight.py`'s own docstring: nothing in that module may name any
+    of them). Two decisions, in order:
+
+    1. **The *arr and download-client rows for the identical release merge into one, per spec
+       §9.2** -- `_merge_arr_and_client_rows` above, by exact `download_id` identity.
+    2. **A settle row wins over anything from step 1 for the same release** (decided with the
+       user, `docs/decisions.md`). A settle-gated row means the bytes are actually on the
+       seedbox, sized and fingerprinted; a merged arr/client row only means *some* upstream is
+       still fetching it -- strictly less information about the identical release. In practice
+       `core/arrsync.py._preflight_candidates` already excludes any record matching an existing
+       `item` row regardless of state, and a settle-gated item always *is* one, so this only ever
+       fires on a genuine title/attribution mismatch -- cheap insurance, not the primary
+       mechanism. Identity here is `(queue_id, title)`, the same pair every source already
+       exposes (unlike step 1, `download_id` isn't something a settle row ever carries, so it
+       cannot be the join key for this step).
 
     **Ordering is alphabetical by title, case-insensitively, across the merged set** -- the same
-    boring-default rule `ArrSyncScheduler.preflight_rows`/`AutoQueue.preflight_rows` each already
-    apply within their own source, re-applied here so it stays true globally rather than grouping
-    by source in an arbitrary order (arr-then-settle or the reverse would just move the same
-    arbitrariness up a level).
+    boring-default rule every individual source's own `preflight_rows` already applies within
+    itself, re-applied here so it stays true globally rather than grouping by source in an
+    arbitrary order.
     """
+    step1 = _merge_arr_and_client_rows(arr_rows, client_rows)
     settle_identities = {(r.queue_id, r.title) for r in settle_rows}
-    filtered_arr = [r for r in arr_rows if (r.queue_id, r.title) not in settle_identities]
-    merged = [*filtered_arr, *settle_rows]
+    filtered = [r for r in step1 if (r.queue_id, r.title) not in settle_identities]
+    merged = [*filtered, *settle_rows]
     merged.sort(key=lambda r: r.title.casefold())
     return merged
 
@@ -673,29 +756,32 @@ async def get_preflight(request: Request) -> PreflightResponse:
     has no work to do on yet. **A pure projection**, source-agnostic at this layer
     (`core/preflight.py.PreflightRow`) -- no table, no migration, nothing persisted.
 
-    **Two sources are wired up: the *arr poller** (`core/arrsync.py.ArrSyncScheduler.
-    preflight_rows`, fed by `_update_preflight`'s attribution rule and flap-tolerance hold) **and
-    the settle gate's own eligibility check** (`core/autoqueue.py.AutoQueue.preflight_rows`, fed
-    by `on_scan`'s wholesale-replace cache). Each is gated by its own live "is this source
-    configured at all" query below -- an enabled *arr instance with an enabled bound queue for
-    the first, the settle gate on plus at least one auto-queue-enabled queue for the second --
-    ORed together into `source_configured` rather than either query changing the other's shape.
-    `_merge_preflight_rows` above is where the two sources' rows meet: cross-source precedence
-    and the final ordering, so neither `core/arrsync.py` nor `core/autoqueue.py` has to know the
-    other exists.
+    **Three sources are wired up: the *arr poller** (`core/arrsync.py.ArrSyncScheduler.
+    preflight_rows`, fed by `_update_preflight`'s attribution rule and flap-tolerance hold),
+    **the download-client poller** (`core/clientsync.py.ClientSyncScheduler.preflight_rows`,
+    2026-08-23, spec §9.2 -- this task), **and the settle gate's own eligibility check**
+    (`core/autoqueue.py.AutoQueue.preflight_rows`, fed by `on_scan`'s wholesale-replace cache).
+    Each is gated by its own live "is this source configured at all" query below -- an enabled
+    *arr instance with an enabled bound queue for the first, an enabled download-client instance
+    with at least one enabled category->queue binding for the second, the settle gate on plus at
+    least one auto-queue-enabled queue for the third -- ORed together into `source_configured`
+    rather than any one query changing another's shape. `_merge_preflight_rows` above is where
+    all three sources' rows meet: cross-source precedence and the final ordering, so none of
+    `core/arrsync.py`, `core/clientsync.py`, or `core/autoqueue.py` has to know the others exist.
 
-    Every live query below is fresh, not read off either source's own cache, so a change (an
+    Every live query below is fresh, not read off any source's own cache, so a change (an
     instance disabled, a queue's auto-queue toggled off, the settle setting flipped) hides
-    immediately rather than waiting for a cache to catch up -- `preflight_rows` on both sources
+    immediately rather than waiting for a cache to catch up -- `preflight_rows` on every source
     is filtered to exactly these same live sets for the identical reason. `ArrSyncScheduler.
-    preflight_rows` is now itself `async` for the same reason (2026-08-21, "eviction latency"):
-    it re-asks "does a matching `item` exist" fresh on every call too, rather than only when the
+    preflight_rows` is itself `async` for the same reason (2026-08-21, "eviction latency"): it
+    re-asks "does a matching `item` exist" fresh on every call too, rather than only when the
     *arr poller happens to run, closing the poll-interval-sized latency the earlier evict-on-
-    handover fix (`_update_preflight`'s own `retired` set) left behind. `source_configured =
-    False` means "no row source is configured at all" -- the frontend hides the row list for
-    that case rather than showing an empty "Nothing in preflight" that would be meaningless for a
-    user with nothing configured (`gated_queues` is independent of this and can still be
-    non-empty -- see `PreflightResponse`'s own docstring).
+    handover fix (`_update_preflight`'s own `retired` set) left behind.
+    `ClientSyncScheduler.preflight_rows` has no such re-check (that module's own docstring) and
+    is plain, synchronous. `source_configured = False` means "no row source is configured at
+    all" -- the frontend hides the row list for that case rather than showing an empty "Nothing
+    in preflight" that would be meaningless for a user with nothing configured (`gated_queues` is
+    independent of this and can still be non-empty -- see `PreflightResponse`'s own docstring).
     """
     db = request.app.state.db
     cursor = await db.execute(
@@ -709,6 +795,25 @@ async def get_preflight(request: Request) -> PreflightResponse:
     arr_rows = (
         await arr_sync.preflight_rows(enabled_instance_ids)
         if arr_sync is not None and enabled_instance_ids
+        else []
+    )
+
+    # The download-client source (2026-08-23, this task) -- `core/clientsync.py`'s own docstring
+    # for the two-cadence poll and flap-tolerant hold this reads from. "Configured" mirrors the
+    # *arr's own bar above: an enabled instance with at least one enabled bound queue, here via
+    # `download_client_category` (spec §8.3) rather than `path_queue.arr_instance_id`.
+    cursor = await db.execute(
+        "SELECT DISTINCT download_client.id FROM download_client "
+        "JOIN download_client_category ON download_client_category.client_id = download_client.id "
+        "JOIN path_queue ON path_queue.id = download_client_category.queue_id "
+        "WHERE download_client.enabled = 1 AND path_queue.enabled = 1"
+    )
+    enabled_client_ids = {row["id"] for row in await cursor.fetchall()}
+
+    client_sync = getattr(request.app.state, "client_sync", None)
+    client_rows = (
+        client_sync.preflight_rows(enabled_client_ids)
+        if client_sync is not None and enabled_client_ids
         else []
     )
 
@@ -736,7 +841,7 @@ async def get_preflight(request: Request) -> PreflightResponse:
     )
     settle_configured = settle_settings.enabled and bool(queue_names)
 
-    rows = _merge_preflight_rows(arr_rows, settle_rows)
+    rows = _merge_preflight_rows(arr_rows, client_rows, settle_rows)
 
     # The mount-gate banner (decided with the user: one line per gated queue, never one row per
     # affected item) -- `AutoQueue.gated`'s own reason string, verbatim, named against a queue
@@ -751,7 +856,9 @@ async def get_preflight(request: Request) -> PreflightResponse:
     )
 
     return PreflightResponse(
-        source_configured=bool(enabled_instance_ids) or settle_configured,
+        source_configured=(
+            bool(enabled_instance_ids) or bool(enabled_client_ids) or settle_configured
+        ),
         rows=[
             PreflightRowOut(
                 source=r.source,
