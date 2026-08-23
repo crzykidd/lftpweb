@@ -314,10 +314,19 @@ class SettleSettingsOut(BaseModel):
     # from a stored value -- the defaults here are only for the OpenAPI schema.
     required_scans: int = 2
     min_age_s: float = 60.0
+    # Stage 2b of #18 (prompts/2026-08-23-settle-gate-skip.md) -- see
+    # `core/settle.py.SettleSettings.client_skip_enabled`'s own docstring for the full "why off
+    # by default" reasoning. Nested under `enabled` behaviorally, not structurally: this field
+    # can be `True` while `enabled` is `False` (nothing enforces the pairing at this layer), but
+    # `core/autoqueue.py.on_scan` only ever reads it once `enabled`'s own check has already
+    # decided an item isn't settled, so an inconsistent combination is simply inert rather than
+    # a state the API needs to reject.
+    client_skip_enabled: bool = False
 
 
 class SettleSettingsIn(BaseModel):
     enabled: bool = True
+    client_skip_enabled: bool = False
 
 
 # --- Settings -> the removal grace period (`core/mount_sentinel.py`, DESIGN.md §7.3) -----

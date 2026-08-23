@@ -534,6 +534,22 @@ Decided with the user, 2026-08-22. One cadence cannot serve both consumers:
 Listing 500 seeding torrents every 10 seconds is waste; learning 60 seconds late that a download
 finished defeats the point of the settle-gate skip.
 
+**Correction, stage 2b build (2026-08-23): the table above is wrong about which cadence actually
+feeds the settle-gate skip.** `list_transfers(active_only=True)` (the fast row) excludes every
+terminal transfer by both connectors' own contract (SABnzbd's queue slots never reach `COMPLETED`
+at all -- that status only exists in history; rTorrent's `active_only=True` explicitly filters
+`COMPLETED` out, §13.6's own `list_transfers` note). The only cache that ever holds a `COMPLETED`
+verdict is `core/clientsync.py.ClientSyncScheduler._full_estate` -- the **slow** cadence's
+`active_only=False` result. Stage 2b's implementation therefore reads `_full_estate`
+(`completed_transfers()`), not the fast cadence's own Preflight cache, so a client-verdict skip is
+bound by `SLOW_INTERVAL_S` (5 minutes) freshness, not `FAST_INTERVAL_S` (10s) as this table implies.
+This does not defeat the feature -- the skip only ever *shortens* a wait that is already `>=
+SETTLE_MIN_AGE_S` (60s) under the plain settle gate, so a same-cadence-as-Preflight skip was never
+load-bearing the way a same-cadence Preflight *row* is -- but the table's own "Consumer" column
+should be read as aspirational for this row, not as what stage 2b actually built. Left uncorrected
+above (rather than rewritten) so this note stands as the record of the discrepancy; see
+`docs/decisions.md` (2026-08-23) for the fuller reasoning.
+
 ### 9.2 Freshness and source precedence — a stale *arr reading must never overwrite a fresh one
 
 **Raised by the user, 2026-08-22**, and it is a genuine hole in every preceding section:
@@ -1041,7 +1057,7 @@ Each stage is independently shippable. Nothing before stage 5 can delete anythin
 |---|---|---|
 | **0** | Interface, enums, capability declaration + profiles, registry, conformance suite, a fake adapter | Ships with nothing configured. **This is the piece the vocabulary must be right in**, so §13.3's capture ideally informs it |
 | **1** | SABnzbd adapter, instance CRUD, declared config form, test-connection, capability readout, **the redacted capture** (§13.3), **and the README write-up of the reference workflow** (§1.1) | First real client contact. The README section is the user's explicit ask: document the *preferred* seedbox setup, so other workflows are recognisable as departures from a stated one |
-| **2** | The poller (§9), SAB as a third Preflight source, the settle-gate skip | #18's first real user-facing payoff |
+| **2** | The poller (§9), SAB as a third Preflight source, the settle-gate skip | #18's first real user-facing payoff. **2a (the poller + Preflight source) landed 2026-08-23** (`prompts/done/2026-08-23-client-poller.md`). **2b (the settle-gate skip itself) landed 2026-08-23** (`prompts/done/2026-08-23-settle-gate-skip.md`) -- ships **off** (`settle.SettleSettings.client_skip_enabled`, default `False`) pending live confirmation of §13.4 guess #2 against a real SABnzbd; every uncertain path (setting off, no client-sync source wired, unreachable client, blank/empty response, a queue-side or `UNKNOWN` phase, a near-miss path) falls back to running the settle gate exactly as it ran before this stage |
 | **3** | Withhold on partial failure (`docs/transfers-redesign-spec.md` §4.3) | |
 | **4** | The disk review scan (§11), both buckets, review-only | Looked at against the real box before anything may delete |
 | **5** | The delete pipeline (§10), manual trigger, verification, banner | |

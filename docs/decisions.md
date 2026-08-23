@@ -6,6 +6,77 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-23 — the settle-gate skip (#18 stage 2b): site-wide toggle, `_full_estate` not the fast cadence, one-directional path containment
+
+`prompts/done/2026-08-23-settle-gate-skip.md`. A positive, terminal client verdict
+(`TransferPhase.COMPLETED`, an exact or component-boundary `content_path` match) can now satisfy
+the settle gate immediately instead of waiting out `matched_scans`/`SETTLE_MIN_AGE_S`. Ships off
+(`settle.SettleSettings.client_skip_enabled`, default `False`) -- this is the first task in the
+whole #18 feature that changes *when* a transfer starts, and it depends directly on spec §13.4
+guess #2 (SABnzbd history `Completed` -> `COMPLETED`), doc-derived, ranked High, never seen
+against a live instance.
+
+**The setting is site-wide, a second field on the existing `SettleSettings` dataclass, not a
+new per-queue column.** The handoff prompt raised the tension directly: `docs/transfers-
+redesign-spec.md` §4.5 makes a client *instance* site-level, while the settle gate's own
+*mechanics* (fingerprints, `matched_scans`) are inherently per-`(queue_id, rel_path)`. But the
+gate's own **on/off toggle** (`SettleSettings.enabled`) is already site-wide despite that --
+per-item scope and per-install configurability are different axes, and this flag governs
+configurability of a *sub-behaviour* of that same toggle (whether an unverified client
+vocabulary is trusted at all), not a per-queue transfer characteristic. A per-queue toggle would
+also be strictly harder to reason about for no real benefit: a client instance already scopes
+itself to specific queues via category -> queue mapping (spec §8.3), so "should I trust this
+client's verdict" doesn't vary by queue the way, say, download-prefix settings genuinely do.
+Implemented as a second field on `SettleSettings` (same `setting` table row, same JSON blob,
+no migration) rather than a new settings key, matching "follow the existing pattern" from the
+handoff prompt.
+
+**Fixed a latent bug while adding the second field: `PUT /api/settings/settle` was a full
+replace, not a merge.** With only one field this was invisible; adding `client_skip_enabled`
+would have meant every request from the frontend's *first* checkbox (`{enabled}` alone, via
+pydantic defaults) silently reset the second field back to `False` on every save. Corrected by
+adopting `put_postprocess_settings`'s own `body.model_fields_set` merge pattern, the same fix
+`api/settings_postprocess.py` already established for exactly this shape.
+
+**The cache actually consulted is `ClientSyncScheduler._full_estate` (the slow/`active_only=False`
+cadence), not the fast cadence spec §9.1's own table names as the settle-gate skip's consumer.**
+Both connectors built so far structurally cannot report `COMPLETED` from `active_only=True`
+(SABnzbd's queue vocabulary has no terminal states at all; rTorrent's fast call explicitly filters
+`COMPLETED` out) -- so the only place a terminal verdict this task cares about ever appears is the
+slow cadence's full-estate result, already cached by stage 2a for a different future consumer
+(#21's seeding overview) and simply reused here rather than adding a second polling path (the
+handoff prompt's own explicit instruction). Practical effect: a client-verdict skip is bound by
+`SLOW_INTERVAL_S` (5 minutes) freshness, not the ~10s spec §9.1 implies. Judged acceptable without
+raising it as a blocker first, because this task only ever *shortens* an already->=60s wait --
+worst case, the skip simply doesn't fire for up to 5 minutes and the plain settle gate runs
+exactly as it does today, which is the required fallback anyway. Flagged in-place in the spec
+(§9.1) and in the session report rather than silently building around it.
+
+**Path matching is one-directional: the item's own remote path is the anchor, and a client's
+`content_path` may equal it or be a component-boundary child of it -- never the reverse.** The
+handoff prompt's own anti-example (`/complete/ar-tv/Show.S01` must not match
+`/complete/ar-tv/Show.S01.EXTRA`) only constrains the same-direction case; a bidirectional
+containment check (also matching when `content_path` is an *ancestor* of the item path) was
+considered and rejected, since a client reporting a shared parent/category folder as its own
+`content_path` would then falsely satisfy the gate for every sibling item under it -- a strictly
+worse failure mode than the one this task exists to close. Mirrors `core/arrsync.py.
+_visible_path_contains`'s existing shape exactly (trailing slashes stripped, `==` or
+`.startswith(root + "/")`).
+
+**`QueueAutoConfig` gained `remote_path: str = ""`, threaded from `core/engine.py`'s two
+`QueueAutoConfig(...)` call sites.** Needed to build the item's absolute remote path
+(`remote_path.rstrip("/") + "/" + rel_path`, the identical join `core/postprocess.py`/
+`core/arrsync.py` already use) for the path-match. Defaults to `""`, which
+`settle._client_content_path_matches` treats as "never matches" rather than a bare-prefix bug --
+every pre-existing caller/test that doesn't set it keeps today's behaviour by construction.
+
+**`AutoQueue.client_sync` is plain-attribute wiring, not a constructor argument** -- `main.py`
+constructs `AutoQueue` before `ClientSyncScheduler` exists (the same ordering that already forces
+`Engine.postprocess`/`Engine.delete_in_flight` to be wired the same way). `None` until wired,
+treated identically to `client_skip_enabled` being off.
+
+---
+
 ## 2026-08-23 — the client poller: event-per-transition, single-call cadences, and the `PreflightRow.download_id` widening
 
 `prompts/done/2026-08-23-client-poller.md` (#18 stage 2a, `core/clientsync.py`,

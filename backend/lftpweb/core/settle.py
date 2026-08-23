@@ -52,9 +52,14 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
+from lftpweb.core.clients.models import TransferPhase
+
 if TYPE_CHECKING:
+    from collections.abc import Iterable
+
     import aiosqlite
 
+    from lftpweb.core.clients.models import Transfer
     from lftpweb.core.remote import RemoteEntry
 
 # DESIGN.md open-issues #2: "unchanged across 2 consecutive scans." A named constant, not a
@@ -418,6 +423,26 @@ class SettleSettings:
 
     enabled: bool = True
 
+    # Stage 2b of #18 (docs/download-client-framework-spec.md §14, prompts/2026-08-23-settle-
+    # gate-skip.md). **Defaults `False`** -- the fourth exception to this project's "every new
+    # capability ships off" rule would have to earn it the same way the three above did
+    # (docs/decisions.md), and this one cannot: it depends directly on spec §13.4 guess #2
+    # (SABnzbd history `Completed` -> `COMPLETED`), doc-derived, ranked **High**, and never seen
+    # against a live instance. `SettleSettings.enabled` above was flipped on only *after* the
+    # user confirmed the bug it fixes is real and live on their setup; this flag has no such
+    # confirmation yet, and a wrong guess here doesn't just delay a transfer the way a settle-
+    # gate miss would -- it *shortens* the wait on the strength of an unverified vocabulary, and
+    # the settle gate exists precisely to stop a shortened wait from transferring a half-written
+    # directory. Off until #18's stage 1a capture (spec §13.3) confirms the mapping against a
+    # real SABnzbd, or a user opts in having read what it depends on.
+    #
+    # **Nested under `enabled`, not independent of it.** `core/autoqueue.py.on_scan` only ever
+    # consults this once the settle gate's own check has already decided an item is *not*
+    # settled -- when `enabled` is `False` there is nothing to skip in the first place, so this
+    # flag's value is inert either way, the same "off means untouched" relationship every other
+    # settle-adjacent constant in this module already has to `enabled`.
+    client_skip_enabled: bool = False
+
 
 async def load_settle_settings(db: "aiosqlite.Connection") -> SettleSettings:
     cursor = await db.execute("SELECT value FROM setting WHERE key = ?", (SETTING_KEY,))
@@ -428,13 +453,95 @@ async def load_settle_settings(db: "aiosqlite.Connection") -> SettleSettings:
         data = json.loads(row["value"])
     except (ValueError, TypeError):
         return SettleSettings()
-    return SettleSettings(enabled=bool(data.get("enabled", False)))
+    return SettleSettings(
+        enabled=bool(data.get("enabled", False)),
+        client_skip_enabled=bool(data.get("client_skip_enabled", False)),
+    )
 
 
 async def save_settle_settings(db: "aiosqlite.Connection", settings: SettleSettings) -> None:
     await db.execute(
         "INSERT INTO setting (key, value, updated_at) VALUES (?, ?, STRFTIME('%Y-%m-%dT%H:%M:%fZ','now')) "
         "ON CONFLICT (key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
-        (SETTING_KEY, json.dumps({"enabled": settings.enabled})),
+        (
+            SETTING_KEY,
+            json.dumps(
+                {
+                    "enabled": settings.enabled,
+                    "client_skip_enabled": settings.client_skip_enabled,
+                }
+            ),
+        ),
     )
     await db.commit()
+
+
+# --- The client-verdict skip itself (stage 2b of #18) ---------------------------------------
+#
+# Pure, unit-tested without a database -- this module's own docstring's own rule, followed here
+# exactly as `compute_fingerprints`/`advance_settle`/`is_settled` above already do. Neither
+# function below ever talks to a client or a database; both take an already-fetched candidate
+# list (`core/clientsync.py.ClientSyncScheduler.completed_transfers`, stage 2a's own cache, spec
+# §9.1's slow/full-estate cadence) and answer a yes/no question over it.
+
+
+def _client_content_path_matches(item_remote_path: str, content_path: str) -> bool:
+    """Whether a download client's own reported `content_path` (spec §7.2: the only trustworthy
+    identity source -- never a name heuristic, never a path predicted from a release name)
+    refers to the same on-disk release as `item_remote_path` (a queue's own `remote_path` plus
+    the item's top-level `rel_path` -- `core/autoqueue.py.on_scan`'s own join, matching
+    `core/postprocess.py`/`core/arrsync.py`'s identical `remote_path.rstrip("/") + "/" +
+    rel_path` convention).
+
+    Equality, or `content_path` sitting at a *component boundary* under `item_remote_path` (the
+    client reporting a specific file inside a multi-file release directory) -- **never a bare
+    `str.startswith`**, which would let `/complete/ar-tv/Show.S01` spuriously swallow
+    `/complete/ar-tv/Show.S01.EXTRA` (a sibling directory that merely shares a name prefix, the
+    exact trap this task's own handoff prompt names). Both sides' trailing slashes are
+    normalized away first -- the identical shape `core/arrsync.py._visible_path_contains` and
+    `core/clients/rtorrent.py`'s own `free_space` matcher already use, for the identical reason.
+
+    An empty `item_remote_path` (a queue with no `remote_path` configured, or an item with no
+    `rel_path` -- neither should occur in practice, but this is a pure function with no
+    caller-enforced precondition) never matches anything, rather than degenerating into "every
+    path startswith the empty string."
+    """
+    root = item_remote_path.rstrip("/")
+    if not root:
+        return False
+    candidate = content_path.rstrip("/")
+    return candidate == root or candidate.startswith(root + "/")
+
+
+def find_client_completion(
+    item_remote_path: str, candidates: "Iterable[tuple[int, str, Transfer]]"
+) -> "tuple[int, str, Transfer] | None":
+    """The settle-gate skip's own yes/no lookup (stage 2b of #18) -- the first `candidates` entry
+    whose `Transfer` is a **terminal, history-derived `COMPLETED`** verdict (never a queue-side
+    status -- spec's own rule, and `TransferPhase.UNKNOWN` never satisfies anything either) with
+    a `content_path` that matches `item_remote_path` (`_client_content_path_matches` above).
+    `None` on no match, an empty `candidates` (an unreachable client, a blank queue/history
+    response, or `client_skip_enabled` off upstream so the caller never gathered any) -- every
+    one of those is "no information," and no information means the caller falls back to running
+    the settle gate exactly as it runs today (this task's own non-negotiable).
+
+    **Checks `phase is TransferPhase.COMPLETED` again here**, even though this function's one
+    real caller (`core/clientsync.py.ClientSyncScheduler.completed_transfers`) already filters to
+    that phase before handing candidates over -- belt and suspenders, so this function is
+    correct standing alone (and directly unit-testable against a non-`COMPLETED` `Transfer`
+    without having to go through the scheduler's own cache at all), rather than depending on a
+    caller never changing that filter.
+
+    `candidates` carries `(instance_id, instance_name, transfer)` rather than a bare `Transfer`
+    list so a caller that gets a match back has everything an audit event needs (naming the
+    client instance and the verdict that permitted the skip, this task's own explicit
+    requirement) without a second lookup.
+    """
+    for instance_id, instance_name, transfer in candidates:
+        if transfer.phase is not TransferPhase.COMPLETED:
+            continue
+        if not transfer.content_path:
+            continue  # absent is not a verdict (spec §4.2) -- no path, no match, ever
+        if _client_content_path_matches(item_remote_path, transfer.content_path):
+            return instance_id, instance_name, transfer
+    return None

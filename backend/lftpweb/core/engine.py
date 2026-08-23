@@ -864,6 +864,7 @@ class Engine:
                         name=q.name,
                         short_name=q.short_name,
                         local_path=q.local_path,
+                        remote_path=q.remote_path,
                         auto_queue_enabled=q.auto_queue_enabled,
                         patterns_only=q.auto_queue_patterns_only,
                     )
@@ -968,6 +969,7 @@ class Engine:
                         name=q.name,
                         short_name=q.short_name,
                         local_path=q.local_path,
+                        remote_path=q.remote_path,
                         auto_queue_enabled=q.auto_queue_enabled,
                         patterns_only=q.auto_queue_patterns_only,
                     )

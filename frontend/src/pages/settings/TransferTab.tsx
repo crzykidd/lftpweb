@@ -181,7 +181,12 @@ function NumberField({ label, help, hint, value, step, min = 0, onChange }: Numb
 // ever overwritten by the server's response (they're read-only, computed from
 // core/settle.py's own constants), so these two values just need to not flash something
 // implausible for the one render before the fetch lands.
-const SETTLE_EMPTY: SettleSettingsOut = { enabled: true, required_scans: 2, min_age_s: 60 }
+const SETTLE_EMPTY: SettleSettingsOut = {
+  enabled: true,
+  client_skip_enabled: false,
+  required_scans: 2,
+  min_age_s: 60,
+}
 
 /** Settings → Transfer's "the settle gate" section (prompts/open-issues.md #2,
  * `core/settle.py`; UI built in prompts/2026-08-12-settle-gate-followups.md). A self-contained
@@ -209,6 +214,24 @@ function SettleGateSection() {
     setSaved(false)
     try {
       const result = await putSettleSettings({ enabled })
+      setSettings(result)
+      setSaved(true)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  // Stage 2b of #18 (prompts/2026-08-23-settle-gate-skip.md) -- its own independent save, same
+  // shape as `handleToggle` above, so toggling one checkbox never round-trips (or risks
+  // clobbering, absent the backend's own merge) the other's value.
+  const handleClientSkipToggle = async (client_skip_enabled: boolean) => {
+    setError(null)
+    setSaving(true)
+    setSaved(false)
+    try {
+      const result = await putSettleSettings({ client_skip_enabled })
       setSettings(result)
       setSaved(true)
     } catch (err) {
@@ -252,6 +275,30 @@ function SettleGateSection() {
         only if your seedbox's landing path is atomic end to end (e.g. hardlinked torrent
         pickup) and you want to shed that latency entirely.
       </p>
+      {!loading && (
+        <>
+          <label className="flex items-center gap-2">
+            <input
+              type="checkbox"
+              checked={settings.client_skip_enabled}
+              disabled={saving}
+              onChange={(e) => handleClientSkipToggle(e.target.checked)}
+            />
+            <span className={labelClasses}>Skip the wait on a download client's own verdict</span>
+          </label>
+          <p className={hintClasses}>
+            When a configured download client (Settings → Integrations → API Clients) reports a
+            release as completed at the exact path lftpweb is watching, treat that as settled
+            immediately instead of waiting out the count/age check above. <strong>Off by
+            default</strong> — this depends on lftpweb's own reading of that client's status
+            vocabulary being correct, and that reading has not yet been confirmed against a live
+            instance for every client type. If it's ever wrong, this setting is what would let a
+            still-arriving release transfer early; leave it off unless you understand that
+            trade-off. Has no effect while the setting above is off, and never withholds a
+            transfer on a failure — it can only make the wait shorter.
+          </p>
+        </>
+      )}
       {error && <p className="text-sm text-red-600 dark:text-red-400">{error}</p>}
       {saved && !error && (
         <p className="text-sm text-emerald-600 dark:text-emerald-400">Saved.</p>

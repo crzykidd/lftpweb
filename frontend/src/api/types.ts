@@ -406,6 +406,10 @@ export type PostprocessSettingsIn = PostprocessSettingsOut
 
 export interface SettleSettingsOut {
   enabled: boolean
+  // Stage 2b of #18 (prompts/2026-08-23-settle-gate-skip.md) -- see
+  // core/settle.py.SettleSettings.client_skip_enabled's own docstring for why this defaults
+  // false independently of `enabled`.
+  client_skip_enabled: boolean
   // Read-only -- core/settle.py.REQUIRED_SETTLE_SCANS / SETTLE_MIN_AGE_S. Not settable from
   // this API; surfaced only so the Settings page can explain what the gate requires without
   // hardcoding numbers that could drift from the backend's own constants.
@@ -413,9 +417,13 @@ export interface SettleSettingsOut {
   min_age_s: number
 }
 
-// Only `enabled` is writable -- `required_scans`/`min_age_s` are informational.
+// `enabled`/`client_skip_enabled` are writable; `required_scans`/`min_age_s` are informational.
+// The backend PUT merges over the stored value for whichever of these two a request omits
+// (`api/settings_postprocess.py.put_settle_settings`), so a caller sending only one field never
+// resets the other.
 export interface SettleSettingsIn {
-  enabled: boolean
+  enabled?: boolean
+  client_skip_enabled?: boolean
 }
 
 // --- Settings -> the removal grace period (core/mount_sentinel.py, DESIGN.md §7.3) -----

@@ -168,6 +168,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # touches the filesystem (this module's own docstring), so it has nothing those seams exist
     # to protect.
     app.state.client_sync = ClientSyncScheduler(db=app.state.db, config_dir=settings.config_dir)
+    # Stage 2b of #18 (docs/download-client-framework-spec.md §14, prompts/2026-08-23-settle-
+    # gate-skip.md): AutoQueue needs the poller's completed-transfer cache for the settle-gate
+    # skip, but it's constructed above, before `ClientSyncScheduler` exists -- same
+    # plain-attribute wiring `app.state.engine.postprocess`/`delete_in_flight` use for the
+    # identical "can't hand over an instance that doesn't exist yet at construction time"
+    # reason. Off (`settle.SettleSettings.client_skip_enabled` defaults `False`) until a user
+    # opts in, so this wiring alone changes nothing for an existing install.
+    app.state.engine.autoqueue.client_sync = app.state.client_sync
 
     await app.state.engine.start()
     await app.state.queue.start()

@@ -10,6 +10,7 @@ import aiosqlite
 import pytest
 
 from lftpweb.core import settle
+from lftpweb.core.clients.models import Transfer, TransferPhase
 from lftpweb.core.remote import RemoteEntry
 from lftpweb.db import migrate
 
@@ -414,3 +415,156 @@ async def test_settle_settings_default_on_and_round_trip(db):
     await settle.save_settle_settings(db, settle.SettleSettings(enabled=True))
     settings = await settle.load_settle_settings(db)
     assert settings.enabled is True
+
+
+async def test_client_skip_enabled_defaults_off_and_round_trips(db):
+    """Stage 2b of #18 (prompts/2026-08-23-settle-gate-skip.md): unlike `enabled` above,
+    `client_skip_enabled` must default `False` on a fresh install -- it depends directly on an
+    unverified guess (spec §13.4 #2), so "every new capability ships off" applies here without
+    exception. Also asserts the two fields are independently persisted -- a save that touches
+    only one via `SettleSettings(...)` (this module's own dataclass, not the API's merge logic)
+    naturally carries whatever the caller passed for the other, exercised here by round-
+    tripping both combinations.
+    """
+    settings = await settle.load_settle_settings(db)
+    assert settings.enabled is True
+    assert settings.client_skip_enabled is False
+
+    await settle.save_settle_settings(
+        db, settle.SettleSettings(enabled=True, client_skip_enabled=True)
+    )
+    settings = await settle.load_settle_settings(db)
+    assert settings.enabled is True
+    assert settings.client_skip_enabled is True
+
+    await settle.save_settle_settings(
+        db, settle.SettleSettings(enabled=False, client_skip_enabled=True)
+    )
+    settings = await settle.load_settle_settings(db)
+    assert settings.enabled is False
+    assert settings.client_skip_enabled is True
+
+
+# --- The client-verdict skip's own matching (stage 2b of #18) -----------------------------
+#
+# Pure functions, no database, no scheduler -- `core/clientsync.py.ClientSyncScheduler.
+# completed_transfers`'s own candidate shape (`(instance_id, instance_name, Transfer)`)
+# constructed directly here rather than through the real poller/fake SABnzbd, the same "unit
+# test the pure half separately from the wired-up half" split this module's own docstring
+# describes for `compute_fingerprints`/`advance_settle`/`is_settled` above.
+# `tests/test_autoqueue.py` and `tests/test_clientsync.py` cover the wired-up half.
+
+
+def _transfer(*, phase: TransferPhase, content_path: str | None) -> Transfer:
+    return Transfer(
+        client_id="nzo-1",
+        name="Show.S01.1080p-GRP",
+        phase=phase,
+        raw_status=phase.value,
+        raw={},
+        content_path=content_path,
+    )
+
+
+def test_find_client_completion_matches_on_exact_path_equality():
+    candidates = [
+        (
+            1,
+            "SABnzbd",
+            _transfer(phase=TransferPhase.COMPLETED, content_path="/complete/ar-tv/Show.S01"),
+        )
+    ]
+    result = settle.find_client_completion("/complete/ar-tv/Show.S01", candidates)
+    assert result is not None
+    instance_id, instance_name, transfer = result
+    assert instance_id == 1
+    assert instance_name == "SABnzbd"
+    assert transfer.content_path == "/complete/ar-tv/Show.S01"
+
+
+def test_find_client_completion_matches_a_component_boundary_child():
+    # A client reporting a specific file inside a multi-file release directory.
+    candidates = [
+        (
+            1,
+            "SABnzbd",
+            _transfer(
+                phase=TransferPhase.COMPLETED,
+                content_path="/complete/ar-tv/Show.S01/Show.S01E01.mkv",
+            ),
+        )
+    ]
+    result = settle.find_client_completion("/complete/ar-tv/Show.S01", candidates)
+    assert result is not None
+
+
+def test_find_client_completion_rejects_a_bare_prefix_that_straddles_a_name_boundary():
+    """The exact anti-example this task's own handoff prompt names: a sibling directory that
+    merely shares a name prefix must never read as a match -- the bug a bare `str.startswith`
+    would produce.
+    """
+    candidates = [
+        (
+            1,
+            "SABnzbd",
+            _transfer(
+                phase=TransferPhase.COMPLETED,
+                content_path="/complete/ar-tv/Show.S01.EXTRA",
+            ),
+        )
+    ]
+    result = settle.find_client_completion("/complete/ar-tv/Show.S01", candidates)
+    assert result is None
+
+
+def test_find_client_completion_ignores_a_queue_side_non_terminal_status():
+    """A queue-side status (still downloading/verifying/etc) must never satisfy the gate, even
+    with an exact path match -- only a terminal, history-derived `COMPLETED` counts.
+    """
+    for phase in (
+        TransferPhase.QUEUED,
+        TransferPhase.DOWNLOADING,
+        TransferPhase.PAUSED,
+        TransferPhase.VERIFYING,
+        TransferPhase.EXTRACTING,
+        TransferPhase.SEEDING,
+        TransferPhase.FAILED,
+        TransferPhase.UNKNOWN,
+    ):
+        candidates = [
+            (1, "SABnzbd", _transfer(phase=phase, content_path="/complete/ar-tv/Show.S01"))
+        ]
+        assert settle.find_client_completion("/complete/ar-tv/Show.S01", candidates) is None
+
+
+def test_find_client_completion_ignores_a_completed_transfer_with_no_content_path():
+    """Absent is not a verdict (spec §4.2): a `COMPLETED` transfer that never reports
+    `content_path` at all (declared-unsupported, or the connector simply didn't populate it)
+    must never match -- there is nothing to compare against, so this must not fall back to
+    matching on name.
+    """
+    candidates = [(1, "SABnzbd", _transfer(phase=TransferPhase.COMPLETED, content_path=None))]
+    assert settle.find_client_completion("/complete/ar-tv/Show.S01", candidates) is None
+
+
+def test_find_client_completion_empty_candidates_is_not_a_match():
+    """An unreachable client / blank queue-and-history response / `client_skip_enabled` off
+    upstream all converge on an empty candidate list -- must read as "no information," never as
+    an error.
+    """
+    assert settle.find_client_completion("/complete/ar-tv/Show.S01", []) is None
+
+
+def test_find_client_completion_empty_item_path_never_matches():
+    candidates = [(1, "SABnzbd", _transfer(phase=TransferPhase.COMPLETED, content_path="/x"))]
+    assert settle.find_client_completion("", candidates) is None
+
+
+def test_find_client_completion_returns_the_first_match_among_several_candidates():
+    unrelated = _transfer(phase=TransferPhase.COMPLETED, content_path="/complete/ar-tv/Other")
+    matching = _transfer(phase=TransferPhase.COMPLETED, content_path="/complete/ar-tv/Show.S01")
+    candidates = [(1, "SABnzbd", unrelated), (2, "rTorrent", matching)]
+    result = settle.find_client_completion("/complete/ar-tv/Show.S01", candidates)
+    assert result is not None
+    assert result[0] == 2
+    assert result[1] == "rTorrent"

@@ -179,6 +179,23 @@ class ClientSyncScheduler:
         # flap-tolerant shape `core/arrsync.py.ArrSyncScheduler._preflight_holds` uses, for the
         # identical reason (this module's own docstring).
         self._preflight_holds: dict[int, PreflightHold] = {}
+        # The settle-gate skip's own read (stage 2b of #18, `core/settle.py.
+        # find_client_completion`) -- `instance_id -> name`, refreshed every `_process_instance`
+        # call, so `completed_transfers` below can name the client instance in an audit event
+        # without a second database round trip. Never pruned on its own (matching
+        # `_last_slow_poll_at`/`_preflight_holds`'s own already-accepted non-pruning behavior in
+        # this module) -- a stale entry for a since-removed instance costs nothing, since
+        # `_enabled_instance_ids` below is what actually gates which ids `completed_transfers`
+        # ever looks at.
+        self._instance_names: dict[int, str] = {}
+        # This pass's own live "which instances did `run_once` actually consider" set (spec:
+        # "a disabled instance is never contacted") -- refreshed at the top of every `run_once`,
+        # *before* any per-instance processing, so `completed_transfers` can restrict itself to
+        # it and a since-disabled instance's stale `_full_estate` entry can never satisfy the
+        # settle-gate skip merely because nothing has overwritten it yet. Empty until the first
+        # `run_once` call, which is exactly "nothing enabled yet" -- the same conservative
+        # default every other cache in this module starts from.
+        self._enabled_instance_ids: frozenset[int] = frozenset()
 
     async def start(self) -> None:
         if self._task is None:
@@ -220,12 +237,19 @@ class ClientSyncScheduler:
             "WHERE enabled = 1"
         )
         instances = await cursor.fetchall()
+        # Stage 2b of #18: refreshed *before* any per-instance processing below (not merely
+        # "eventually consistent with it"), so a `completed_transfers()` call racing this pass
+        # -- from a concurrent scan, in production `AutoQueue.on_scan` and this loop share one
+        # event loop but not one call stack -- never sees an instance this very pass is about to
+        # skip (backed off, or freshly disabled) as still "enabled."
+        self._enabled_instance_ids = frozenset(row["id"] for row in instances)
         for instance in instances:
             await self._process_instance(instance, now)
 
     async def _process_instance(self, instance: aiosqlite.Row, now: float) -> None:
         instance_id = instance["id"]
         instance_name = instance["name"]
+        self._instance_names[instance_id] = instance_name
 
         backoff = self._backoff.get(instance_id)
         if backoff is not None and now < backoff.next_attempt_at:
@@ -410,3 +434,43 @@ class ClientSyncScheduler:
             rows.extend(hold.rows())
         rows.sort(key=lambda r: r.title.casefold())
         return rows
+
+    # --- The settle-gate skip's own read (stage 2b of #18, docs/download-client-framework-
+    # spec.md §14) -- `core/autoqueue.py.on_scan` is the one caller, only when `settle.
+    # SettleSettings.client_skip_enabled` is on. -------------------------------------------
+
+    def completed_transfers(self) -> list[tuple[int, str, Transfer]]:
+        """Every currently cached **terminal, history-derived `COMPLETED`** transfer across
+        every currently enabled instance's full-estate cache (`_full_estate`, populated by
+        spec §9.1's slow cadence) -- `core/settle.py.find_client_completion`'s own candidate
+        list, paired with the instance id and name an audit event needs to name the client
+        instance that permitted a skip (this task's own explicit requirement).
+
+        **Restricted to `_enabled_instance_ids`**, this pass's own live enabled set (refreshed
+        at the top of every `run_once`, before this method could ever be called from a
+        concurrent `AutoQueue.on_scan` mid-pass) -- so a since-disabled instance's stale
+        `_full_estate` entry can never satisfy the gate merely because nothing has overwritten
+        it since. Same "a disabled instance is never contacted" rule this class's own docstring
+        states for polling, extended here to its cache.
+
+        **Does not poll.** A pure read of whatever the slow cadence already cached; an instance
+        whose slow poll hasn't run yet (freshly added, or still backing off after a failure)
+        simply contributes nothing here, which is exactly spec §4.2's "absent is not a verdict"
+        -- the caller's own fallback (run the settle gate as it runs today) is triggered by an
+        empty return, never by this method raising or guessing.
+
+        Only `TransferPhase.COMPLETED` transfers are ever included -- a queue-side (non-
+        terminal) status must never satisfy the settle-gate skip (this task's own rule), and
+        both connectors' own `map_phase` only ever produce `COMPLETED` from a history/terminal
+        record in the first place (`sabnzbd.py`'s queue-status map has no `COMPLETED` entry at
+        all; `rtorrent.py`'s only reaches it via `complete and not is_active`) -- this filter is
+        therefore also a second, independent guard against the same mistake, not merely a
+        restatement of it.
+        """
+        out: list[tuple[int, str, Transfer]] = []
+        for instance_id in self._enabled_instance_ids:
+            name = self._instance_names.get(instance_id, f"instance {instance_id}")
+            for transfer in self._full_estate.get(instance_id, {}).values():
+                if transfer.phase is TransferPhase.COMPLETED:
+                    out.append((instance_id, name, transfer))
+        return out

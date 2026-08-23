@@ -150,7 +150,7 @@ describe('preflightChipTooltip', () => {
           wait_scans: 1,
           wait_since: '2026-08-21T00:00:00.000000Z',
         },
-        { enabled: true, required_scans: 2, min_age_s: 60 },
+        { enabled: true, client_skip_enabled: false, required_scans: 2, min_age_s: 60 },
       ),
     ).toMatch(/^Waiting for changes -- 1 of 2 scans, \d+s of 60s$/)
   })
@@ -166,7 +166,7 @@ describe('preflightChipTooltip', () => {
           wait_scans: null,
           wait_since: null,
         },
-        { enabled: true, required_scans: 2, min_age_s: 60 },
+        { enabled: true, client_skip_enabled: false, required_scans: 2, min_age_s: 60 },
       ),
     ).toBe('Waiting for changes')
   })

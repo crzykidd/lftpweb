@@ -133,6 +133,7 @@ async def get_settle_settings(request: Request) -> SettleSettingsOut:
     settings = await load_settle_settings(request.app.state.db)
     return SettleSettingsOut(
         enabled=settings.enabled,
+        client_skip_enabled=settings.client_skip_enabled,
         required_scans=REQUIRED_SETTLE_SCANS,
         min_age_s=SETTLE_MIN_AGE_S,
     )
@@ -140,10 +141,29 @@ async def get_settle_settings(request: Request) -> SettleSettingsOut:
 
 @router.put("/settle", response_model=SettleSettingsOut)
 async def put_settle_settings(body: SettleSettingsIn, request: Request) -> SettleSettingsOut:
-    settings = SettleSettings(enabled=body.enabled)
+    """Merges over the previously-stored settings rather than replacing them wholesale --
+    `put_postprocess_settings`'s own precedent, needed as of stage 2b of #18
+    (prompts/2026-08-23-settle-gate-skip.md) adding a second field here: the frontend's two
+    checkboxes each save independently (`SettleGateSection`'s own two `handle*Toggle`
+    functions), so a request toggling only `enabled` must not silently reset
+    `client_skip_enabled` back to its pydantic default, and vice versa. `body.
+    model_fields_set` is which keys the *request JSON* actually carried, the same mechanism
+    `put_postprocess_settings` above already uses.
+    """
+    current = await load_settle_settings(request.app.state.db)
+    provided = body.model_fields_set
+    settings = SettleSettings(
+        enabled=body.enabled if "enabled" in provided else current.enabled,
+        client_skip_enabled=(
+            body.client_skip_enabled
+            if "client_skip_enabled" in provided
+            else current.client_skip_enabled
+        ),
+    )
     await save_settle_settings(request.app.state.db, settings)
     return SettleSettingsOut(
         enabled=settings.enabled,
+        client_skip_enabled=settings.client_skip_enabled,
         required_scans=REQUIRED_SETTLE_SCANS,
         min_age_s=SETTLE_MIN_AGE_S,
     )

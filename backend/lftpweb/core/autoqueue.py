@@ -72,12 +72,16 @@ import json
 import logging
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import aiosqlite
 
 from lftpweb.core import audit, mount_sentinel, patterns, settle
 from lftpweb.core.extract import FAILED_PREFIX, UNPACK_PREFIX
 from lftpweb.core.preflight import PreflightRow
+
+if TYPE_CHECKING:
+    from lftpweb.core.clientsync import ClientSyncScheduler
 
 logger = logging.getLogger(__name__)
 
@@ -227,6 +231,16 @@ class QueueAutoConfig:
     local_path: str
     auto_queue_enabled: bool
     patterns_only: bool
+    # Stage 2b of #18 (prompts/2026-08-23-settle-gate-skip.md): the settle-gate skip needs this
+    # queue's own root to turn an item's `rel_path` into the absolute remote path a download
+    # client's own `content_path` can be compared against (`remote_path.rstrip("/") + "/" +
+    # rel_path`, the identical join `core/postprocess.py`/`core/arrsync.py` already use for the
+    # same purpose). `""` is the conservative default for every call site/test built before this
+    # field existed -- `settle._client_content_path_matches` reads an empty `item_remote_path`
+    # as "never matches anything" rather than degenerating into a bare-prefix bug, so an old
+    # caller that never sets this simply never gets a client-verdict skip, which is exactly
+    # today's behavior.
+    remote_path: str = ""
     # Migration 024 ("a short display name per queue"), threaded through here (2026-08-21, "the
     # columns moved around" fix) so a settle-gated Preflight row can carry the same queue tag
     # every other row on the page shows (`core/preflight.py.PreflightRow.queue_short_name`).
@@ -259,6 +273,18 @@ class AutoQueue:
         # -- auto-queue off, or mount-gated -- mirroring `self.gated`'s own "silent pop" idiom
         # just above, since both mean "nothing about this queue is being evaluated right now."
         self._settle_preflight: dict[int, dict[int, PreflightRow]] = {}
+        # Stage 2b of #18 (prompts/2026-08-23-settle-gate-skip.md) -- the download-client
+        # poller's own completed-transfer cache, consulted only when `settle.SettleSettings.
+        # client_skip_enabled` is on. **Plain-attribute wiring, not a constructor argument** --
+        # the same "can't hand over an instance that doesn't exist yet at construction time"
+        # reason `Engine.postprocess`/`Engine.delete_in_flight` are wired this way in
+        # `main.py`'s lifespan: `ClientSyncScheduler` is constructed *after* `AutoQueue` there
+        # (`TransferQueue`/`AutoQueue`/`Engine` all have to exist first). `None` -- every
+        # existing test in this module, and any deployment before this task ships -- means "no
+        # client-sync source available," treated identically to `client_skip_enabled` being off
+        # (this task's own "every uncertain path falls back to today's behavior" rule), never as
+        # an error.
+        self.client_sync: "ClientSyncScheduler | None" = None
 
     async def on_scan(self, queue: QueueAutoConfig) -> int:
         """Evaluate one queue's newly- *and* previously-seen eligible items. Called after
@@ -379,6 +405,52 @@ class AutoQueue:
                 else None
             )
             if settle_settings.enabled and not settle.is_settled_from_progress(settle_progress):
+                # Stage 2b of #18 (prompts/2026-08-23-settle-gate-skip.md): reached only once
+                # the settle gate's own fingerprint-based check above has already decided this
+                # item is NOT settled -- a positive, terminal client verdict is a *second*, more
+                # direct way to reach the same "safe to transfer" conclusion (spec §4.3: "SAB
+                # completing *is* that same fact, reported by the process doing the writing"),
+                # never a way to skip the gate faster than "not settled" already earned.
+                #
+                # **Every one of the following makes this a no-op, falling through to the exact
+                # same hold-and-Preflight-row behavior below (this task's own non-negotiable):**
+                # `client_skip_enabled` off (default), `self.client_sync` never wired (a
+                # deployment/test that predates this task), `queue.remote_path` empty (a
+                # `QueueAutoConfig` built before this field existed --
+                # `settle._client_content_path_matches`'s own empty-root guard), an unreachable
+                # client / blank queue-or-history response (`completed_transfers()` returns
+                # nothing), a queue-side or `UNKNOWN` phase (`find_client_completion` only ever
+                # matches a terminal `COMPLETED`), or a near-miss path that isn't a genuine
+                # component-boundary match.
+                client_verdict = (
+                    settle.find_client_completion(
+                        queue.remote_path.rstrip("/") + "/" + row["rel_path"],
+                        self.client_sync.completed_transfers(),
+                    )
+                    if settle_settings.client_skip_enabled and self.client_sync is not None
+                    else None
+                )
+                if client_verdict is not None:
+                    instance_id, instance_name, transfer = client_verdict
+                    # The audit trail this task's own handoff prompt calls "not optional
+                    # decoration" -- naming the client instance and the verdict that permitted
+                    # the skip is the only way anyone will work out why, the day this feature
+                    # ever transfers something half-written on a wrong guess.
+                    await audit.record_event(
+                        self.db,
+                        level="info",
+                        item_id=row["id"],
+                        kind="settle_client_skip",
+                        message=(
+                            f"queue {queue.id} ('{queue.name}'): item {row['rel_path']!r} "
+                            f"skipped the settle gate -- download client {instance_name!r} "
+                            f"(id={instance_id}) reports it COMPLETED at "
+                            f"{transfer.content_path!r}"
+                        ),
+                    )
+                    await self._enqueue_item(row["id"])
+                    queued += 1
+                    continue
                 # Preflight (prompts/2026-08-20-preflight-waiting-sources.md, this module's own
                 # "Preflight" section below) -- reached only once every *other* eligibility
                 # check above has already passed (pattern match, no active job via the query's
