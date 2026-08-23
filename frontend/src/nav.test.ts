@@ -61,6 +61,10 @@ describe('nav items', () => {
   })
 
   it('puts Queue before Files -- Queue is the default/working-surface tab', () => {
-    expect(TRANSFERS_TABS.map((t) => t.path)).toEqual(['/transfers/queue', '/transfers/files'])
+    expect(TRANSFERS_TABS.map((t) => t.path)).toEqual([
+      '/transfers/queue',
+      '/transfers/files',
+      '/transfers/disk-review',
+    ])
   })
 })

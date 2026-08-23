@@ -385,6 +385,63 @@ export interface DownloadClientTestResponse {
   detected_base_paths: DetectedBasePathOut[]
 }
 
+// --- The disk review scan (docs/download-client-framework-spec.md §11, stage 4 of #18) -----
+//
+// `POST /api/disk-review/scan` (`api/disk_review.py`, `core/disk_review.py`) -- review-only,
+// manual trigger, deletes nothing. `debris` is the only selectable pile; `seeding_estate` is
+// shown for visibility only (spec §11.1d). `link_paths` is every on-disk path sharing a
+// candidate's inode (including itself) when `nlink > 1` -- the frontend's own `freedBytes`
+// (`lib/diskReview.ts`) mirrors `core/disk_review.py.freed_bytes` exactly, so a partial
+// selection of a hardlinked pair never reports bytes that a delete wouldn't actually reclaim.
+
+export interface DiskReviewDebrisOut {
+  root: string
+  rel_path: string
+  abs_path: string
+  size: number
+  mtime: number
+  inode: number | null
+  nlink: number | null
+  link_paths: string[]
+}
+
+export interface DiskReviewSeedingEstateOut {
+  root: string
+  rel_path: string
+  abs_path: string
+  size: number
+  claimed_by_client_id: number
+  claimed_by_client_name: string
+}
+
+export interface DiskReviewBrokenSeedOut {
+  client_id: number
+  client_name: string
+  transfer_id: string
+  transfer_name: string
+  content_path: string
+}
+
+export interface DiskReviewSkippedBasePathOut {
+  root: string
+  reason: string
+}
+
+export interface DiskReviewClientFailureOut {
+  client_id: number
+  client_name: string
+  reason: string
+}
+
+export interface DiskReviewScanResponse {
+  debris: DiskReviewDebrisOut[]
+  seeding_estate: DiskReviewSeedingEstateOut[]
+  broken_seeds: DiskReviewBrokenSeedOut[]
+  skipped_base_paths: DiskReviewSkippedBasePathOut[]
+  client_failures: DiskReviewClientFailureOut[]
+  scanned_at: string
+}
+
 // --- Settings -> Post-processing (phase 5, DESIGN.md §6) -------------------------------
 
 export interface PostprocessSettingsOut {

@@ -205,12 +205,20 @@ class RemoteEntry:
     """One remote filesystem entry, keyed by `rel_path` (POSIX-style, relative to the queue's
     `remote_path`). `size` is the file's own size; always 0 for directories — see module
     docstring on why directory totals are computed by the reconciler instead.
+
+    `inode`/`nlink` are `None` for the ordinary scan path (`scan()`/`records_to_entries`) —
+    populated only by `scan_with_inodes`/`inode_records_to_entries`
+    (docs/download-client-framework-spec.md §11.1b, `core/disk_review.py`), which is the only
+    caller that needs them. Kept on this one dataclass rather than a parallel type so
+    `core/disk_review.py` can consume either scan's output through one shape.
     """
 
     rel_path: str
     is_dir: bool
     size: int = 0
     mtime: float = 0.0
+    inode: int | None = None
+    nlink: int | None = None
 
 
 def parse_find_records(raw: str) -> list[RemoteRecord]:
@@ -270,6 +278,101 @@ def records_to_entries(records: list[RemoteRecord], root: str) -> dict[str, Remo
             skipped += 1
     if skipped:
         logger.debug("remote scan of %s: skipped %d non-file/dir entries", root, skipped)
+    return entries
+
+
+@dataclass(frozen=True)
+class InodeRemoteRecord:
+    """One raw parsed line from the inode-aware `find -printf` / `scan_fs.py --inodes` wire
+    format (docs/download-client-framework-spec.md §11.1b), before root-relativization.
+    """
+
+    type_char: str
+    inode: int
+    nlink: int
+    size: int
+    mtime: float
+    path: str
+
+
+# Five leading fields instead of `_RECORD_RE`'s three -- `<type>\t<inode>\t<nlink>\t<size>\t
+# <mtime>\t`. A distinct regex (not a generalization of `_RECORD_RE`) because the two wire
+# formats are two different `find -printf` invocations (`scan()` vs. `scan_with_inodes()`), and
+# conflating their parsers is exactly the kind of "one format grows an optional field" trap
+# that would make the ordinary scan path start silently expecting inode data it never asked
+# for.
+_INODE_RECORD_RE = re.compile(
+    r"(?m)^(?P<type>[a-zA-Z])\t(?P<inode>\d+)\t(?P<nlink>\d+)\t(?P<size>-?\d+)\t"
+    r"(?P<mtime>-?\d+(?:\.\d+)?)\t"
+)
+
+
+def parse_inode_find_records(raw: str) -> list[InodeRemoteRecord]:
+    """`parse_find_records`'s twin for the inode-aware wire format. Same header-anchored
+    approach (a path can itself contain a tab or newline, DESIGN.md §15.10), same
+    `surrogateescape` expectation on `raw`.
+    """
+    matches = list(_INODE_RECORD_RE.finditer(raw))
+    records: list[InodeRemoteRecord] = []
+    for i, m in enumerate(matches):
+        start = m.end()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(raw)
+        path = raw[start:end]
+        if path.endswith("\n"):
+            path = path[:-1]
+        if not path:
+            continue
+        records.append(
+            InodeRemoteRecord(
+                type_char=m.group("type"),
+                inode=int(m.group("inode")),
+                nlink=int(m.group("nlink")),
+                size=int(m.group("size")),
+                mtime=float(m.group("mtime")),
+                path=path,
+            )
+        )
+    return records
+
+
+def inode_records_to_entries(records: list[InodeRemoteRecord], root: str) -> dict[str, RemoteEntry]:
+    """`records_to_entries`'s twin: root-relativize inode-aware records into `RemoteEntry`,
+    with `inode`/`nlink` populated. Same non-file/dir skip behavior.
+    """
+    root_norm = root.rstrip("/")
+    prefix = root_norm + "/"
+    entries: dict[str, RemoteEntry] = {}
+    skipped = 0
+    for rec in records:
+        if rec.path == root_norm:
+            continue
+        if rec.path.startswith(prefix):
+            rel_path = rec.path[len(prefix) :]
+        else:
+            rel_path = rec.path.lstrip("/")
+
+        if rec.type_char in _DIR_TYPES:
+            entries[rel_path] = RemoteEntry(
+                rel_path=rel_path,
+                is_dir=True,
+                size=0,
+                mtime=rec.mtime,
+                inode=rec.inode,
+                nlink=rec.nlink,
+            )
+        elif rec.type_char in _FILE_TYPES:
+            entries[rel_path] = RemoteEntry(
+                rel_path=rel_path,
+                is_dir=False,
+                size=rec.size,
+                mtime=rec.mtime,
+                inode=rec.inode,
+                nlink=rec.nlink,
+            )
+        else:
+            skipped += 1
+    if skipped:
+        logger.debug("inode scan of %s: skipped %d non-file/dir entries", root, skipped)
     return entries
 
 
@@ -643,6 +746,84 @@ class RemoteConnectionPool:
         if outcome.warning:
             logger.warning("scan of %s: %s", remote_path, outcome.warning)
         return outcome.raw, outcome.warning
+
+    async def scan_with_inodes(
+        self, host: HostConfig, remote_path: str
+    ) -> tuple[dict[str, RemoteEntry], str | None]:
+        """`scan()`'s twin for the disk review scan (docs/download-client-framework-spec.md
+        §11.1b, `core/disk_review.py`) -- identical primary/fallback shape, but every entry
+        also carries `inode`/`nlink`, because claiming there is by inode, not path.
+
+        **Never silently degrades to path-only matching.** GNU `find -printf` has supported
+        `%i`/`%n` for as long as it has supported `-printf` at all, so the primary path gets
+        them for free once `-printf` itself is supported. The BusyBox/fallback path
+        (`remote_agent/scan_fs.py --inodes`) supplies them too -- `os.lstat` reports
+        `st_ino`/`st_nlink` on every POSIX filesystem a seedbox is realistically running,
+        stdlib-only, no BusyBox `find` capability required at all. So both paths *can* supply
+        inodes, and this method raises `RemoteScanError` rather than returning path-only data
+        if either one genuinely fails (SFTP upload failure, no remote `python3`, or a
+        filesystem that doesn't report meaningful inode numbers) -- the caller
+        (`core/disk_review.py.run_scan`) turns that into "this base path is unavailable this
+        pass," never into a quiet fallback that would reintroduce spec §11.1b's catastrophe.
+        """
+        conn = await self.get_connection(host)
+
+        if self._supports_printf is not False:
+            raw, warning = await self._run_primary_inodes(conn, remote_path)
+            if raw is not None:
+                self._supports_printf = True
+                records = parse_inode_find_records(raw)
+                return inode_records_to_entries(records, remote_path), warning
+            self._supports_printf = False
+            logger.info(
+                "find -printf unsupported on %s:%s; falling back to "
+                "remote_agent/scan_fs.py --inodes",
+                host.address,
+                host.port,
+            )
+
+        raw = await self._run_fallback_inodes(conn, remote_path)
+        records = parse_inode_find_records(raw)
+        return inode_records_to_entries(records, remote_path), None
+
+    async def _run_primary_inodes(
+        self, conn: asyncssh.SSHClientConnection, remote_path: str
+    ) -> tuple[str | None, str | None]:
+        cmd = (
+            f"find {shlex.quote(remote_path)} -mindepth 1 "
+            "-printf '%y\\t%i\\t%n\\t%s\\t%T@\\t%p\\n'"
+        )
+        result = await conn.run(cmd, check=False, encoding=None)
+        stdout = result.stdout if isinstance(result.stdout, (bytes, bytearray)) else b""
+        stderr = result.stderr if isinstance(result.stderr, (bytes, bytearray)) else b""
+        # `interpret_primary_scan_result` only classifies exit status/stdout/stderr shape --
+        # it has no opinion about which `-printf` format string produced the text, so it
+        # serves this five-field command exactly as it serves `_run_primary`'s three-field one.
+        outcome = interpret_primary_scan_result(result.exit_status, stdout, stderr)
+        if outcome.warning:
+            logger.warning("inode scan of %s: %s", remote_path, outcome.warning)
+        return outcome.raw, outcome.warning
+
+    async def _run_fallback_inodes(
+        self, conn: asyncssh.SSHClientConnection, remote_path: str
+    ) -> str:
+        remote_tmp = f"/tmp/.lftpweb_scan_fs_{uuid4().hex}.py"
+        try:
+            async with conn.start_sftp_client() as sftp:
+                await sftp.put(str(SCAN_FS_PATH), remote_tmp)
+            cmd = f"python3 {shlex.quote(remote_tmp)} --inodes {shlex.quote(remote_path)}"
+            result = await conn.run(cmd, check=False, encoding=None)
+            stdout = result.stdout if isinstance(result.stdout, (bytes, bytearray)) else b""
+            stderr = result.stderr if isinstance(result.stderr, (bytes, bytearray)) else b""
+            if result.exit_status != 0:
+                raise RemoteScanError(
+                    f"fallback scan_fs.py --inodes failed on {remote_path} "
+                    f"(exit {result.exit_status}): "
+                    f"{stderr.decode('utf-8', errors='surrogateescape').strip()}"
+                )
+            return stdout.decode("utf-8", errors="surrogateescape")
+        finally:
+            await conn.run(f"rm -f {shlex.quote(remote_tmp)}", check=False)
 
     async def delete_path(self, host: HostConfig, remote_path: str) -> None:
         """Remove a remote file or directory tree (DESIGN.md §5, §7.4) over this same pooled

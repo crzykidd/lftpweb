@@ -820,6 +820,23 @@ The fix is to match on **inode**, which is exactly what a hardlink shares:
 - **The same inode map produces the link-aware freed-space prediction** §10.5 requires. One walk,
   both answers.
 
+**Inode numbers are unique per *filesystem*, not globally — and stage 4 shipped without a device
+component (2026-08-23).** `find -printf` offers `%D` (device number) alongside `%i`, and the key
+should eventually be `(device, inode)` rather than `inode` alone. Worth fixing, but **not urgent,
+because every consequence of a collision fails safe:**
+
+| Rule | Effect of a false inode match | Direction |
+|---|---|---|
+| "claimed if *any* link to its inode is claimed" | an unclaimed file looks claimed | **fewer** debris proposals |
+| "propose only when *every* link is a candidate" | a phantom link looks unaccounted-for | **fewer** debris proposals |
+| link-aware freed bytes (§10.5) | a phantom link suppresses the last-link case | **understates** reclaim |
+
+All three err toward proposing less and promising less, which is the correct direction for a
+feature whose next stage deletes things. A collision additionally requires base paths spanning
+filesystems *and* a number collision between them — plausible on a seedbox, but the cost when it
+happens is a missed candidate, not a wrongly-deleted one. Fix it with `%D` when convenient; do not
+treat it as a blocker.
+
 ### 11.1c Correcting an earlier reading of the *arr `move`-mode interaction
 
 An earlier draft of this document asserted that `move`-mode source deletion on the live system is
@@ -1088,7 +1105,7 @@ Each stage is independently shippable. Nothing before stage 5 can delete anythin
 | **1** | SABnzbd adapter, instance CRUD, declared config form, test-connection, capability readout, **the redacted capture** (§13.3), **and the README write-up of the reference workflow** (§1.1) | First real client contact. The README section is the user's explicit ask: document the *preferred* seedbox setup, so other workflows are recognisable as departures from a stated one |
 | **2** | The poller (§9), SAB as a third Preflight source, the settle-gate skip | #18's first real user-facing payoff. **2a (the poller + Preflight source) landed 2026-08-23** (`prompts/done/2026-08-23-client-poller.md`). **2b (the settle-gate skip itself) landed 2026-08-23** (`prompts/done/2026-08-23-settle-gate-skip.md`) -- ships **off** (`settle.SettleSettings.client_skip_enabled`, default `False`) pending live confirmation of §13.4 guess #2 against a real SABnzbd; every uncertain path (setting off, no client-sync source wired, unreachable client, blank/empty response, a queue-side or `UNKNOWN` phase, a near-miss path) falls back to running the settle gate exactly as it ran before this stage |
 | **3** | Withhold on partial failure (`docs/transfers-redesign-spec.md` §4.3), and the §9.1 poll-cadence fix | **Landed 2026-08-23** (`prompts/done/2026-08-23-withhold-and-cadence.md`). The cadence split is corrected to cheap-vs-expensive, read per-connector off `Operation.LIST_HISTORY`'s own capability declaration (§9.1's own correction note). The withhold gate ships **off** (`autoqueue.WithholdSettings.enabled`, default `False`) pending live confirmation of §13.4 guess #2 against a real SABnzbd, for the identical reason stage 2b's `client_skip_enabled` shipped off -- every uncertain path (setting off, no client-sync source wired, unreachable client, blank/empty response, a queue-side or `UNKNOWN` phase, an outright failure with no `content_path`, a near-miss path) falls back to today's behavior unchanged. No API/UI surface shipped this stage -- `AutoQueue.withheld` is public and readable, but nothing reads it yet; named as an open gap, not hidden |
-| **4** | The disk review scan (§11), both buckets, review-only | Looked at against the real box before anything may delete |
+| **4** | The disk review scan (§11), both buckets, review-only | **Landed 2026-08-23** (`prompts/done/2026-08-23-disk-review-scan.md`). `core/disk_review.py.reconcile()` is pure set math over Set A/B/C, unit-tested exhaustively without SSH -- the §11.1a union-across-clients catastrophe and the §11.1b inode-claiming catastrophe are both asserted directly. `core/remote.py.RemoteConnectionPool.scan_with_inodes` extends the existing GNU-`find`/BusyBox-fallback scan with `%i`/`%n`; the fallback (`remote_agent/scan_fs.py --inodes`) supplies inode/nlink too (`os.lstat`, stdlib-only), so there is no "BusyBox can't do this" case needing the unavailable-declaration path -- it exists (`RemoteScanError` propagates rather than degrading) but is untriggered by inode support itself, only by a genuine walk failure. `POST /api/disk-review/scan`, manual trigger only (§11.3); a Transfers → Disk review tab shows the two piles with a link-aware running total. Not yet looked at against the real box -- see this task's own final report for what remains named as a gap (multi-filesystem inode collisions, prefix-vs-exact mount-sentinel matching, empty-directory debris) before stage 5 |
 | **5** | The delete pipeline (§10), manual trigger, verification, banner | |
 
 **Deletion is stage 5 deliberately.** The scan gets built and inspected against a real seeding

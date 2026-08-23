@@ -8,14 +8,17 @@ import pytest
 
 from lftpweb.core.remote import (
     HostConfig,
+    InodeRemoteRecord,
     InvalidPrivateKeyError,
     RemoteConnectionPool,
     RemoteEntry,
     RemoteRecord,
     RemoteScanError,
     _resolve_client_keys,
+    inode_records_to_entries,
     interpret_primary_scan_result,
     parse_find_records,
+    parse_inode_find_records,
     records_to_entries,
     validate_private_key,
 )
@@ -116,6 +119,94 @@ def test_records_to_entries_handles_root_with_trailing_slash():
     records = [RemoteRecord(type_char="f", size=1, mtime=1.0, path="/data/pickup/a.txt")]
     entries = records_to_entries(records, "/data/pickup/")
     assert list(entries) == ["a.txt"]
+
+
+# --- parse_inode_find_records / inode_records_to_entries (docs/download-client-framework-
+# spec.md §11.1b, `core/disk_review.py`'s own SSH walk) -- the same header-anchored parsing
+# `parse_find_records` uses, extended to the five-field `<type>\t<inode>\t<nlink>\t<size>\t
+# <mtime>\t` wire format `find -printf '%y\t%i\t%n\t%s\t%T@\t%p\n'` / `scan_fs.py --inodes`
+# both emit.
+
+
+def test_parse_inode_find_records_basic():
+    raw = (
+        "f\t123456\t2\t1024\t1699999999.0\t/data/pickup/Release/movie.mkv\n"
+        "d\t654321\t1\t4096\t1699999998.0\t/data/pickup/Release\n"
+    )
+    records = parse_inode_find_records(raw)
+    assert records == [
+        InodeRemoteRecord(
+            type_char="f",
+            inode=123456,
+            nlink=2,
+            size=1024,
+            mtime=1699999999.0,
+            path="/data/pickup/Release/movie.mkv",
+        ),
+        InodeRemoteRecord(
+            type_char="d",
+            inode=654321,
+            nlink=1,
+            size=4096,
+            mtime=1699999998.0,
+            path="/data/pickup/Release",
+        ),
+    ]
+
+
+def test_parse_inode_find_records_path_with_embedded_tab_and_newline():
+    raw = (
+        "f\t1\t2\t5\t1.0\t/data/pickup/weird\tname.txt\n" "f\t2\t1\t6\t2.0\t/data/pickup/next.txt\n"
+    )
+    records = parse_inode_find_records(raw)
+    assert len(records) == 2
+    assert records[0].path == "/data/pickup/weird\tname.txt"
+    assert records[0].inode == 1
+    assert records[0].nlink == 2
+    assert records[1].path == "/data/pickup/next.txt"
+
+
+def test_parse_inode_find_records_empty_input():
+    assert parse_inode_find_records("") == []
+
+
+def test_inode_records_to_entries_populates_inode_and_nlink():
+    records = [
+        InodeRemoteRecord(
+            type_char="f",
+            inode=42,
+            nlink=2,
+            size=1024,
+            mtime=2.0,
+            path="/data/pickup/Release/movie.mkv",
+        ),
+    ]
+    entries = inode_records_to_entries(records, "/data/pickup")
+    assert entries == {
+        "Release/movie.mkv": RemoteEntry(
+            rel_path="Release/movie.mkv", is_dir=False, size=1024, mtime=2.0, inode=42, nlink=2
+        ),
+    }
+
+
+def test_inode_records_to_entries_skips_non_file_dir_types():
+    records = [
+        InodeRemoteRecord(type_char="l", inode=1, nlink=1, size=0, mtime=1.0, path="/data/symlink"),
+        InodeRemoteRecord(
+            type_char="f", inode=2, nlink=1, size=1, mtime=1.0, path="/data/real.txt"
+        ),
+    ]
+    entries = inode_records_to_entries(records, "/data")
+    assert list(entries) == ["real.txt"]
+
+
+def test_ordinary_scan_entries_never_carry_inode_data():
+    # The two wire formats stay independent -- `records_to_entries` (the everyday scan path)
+    # must never start silently expecting inode fields it never asked `find` for.
+    records = [RemoteRecord(type_char="f", size=1, mtime=1.0, path="/data/pickup/a.txt")]
+    entries = records_to_entries(records, "/data/pickup")
+    assert entries["a.txt"].inode is None
+    assert entries["a.txt"].nlink is None
 
 
 # --- interpret_primary_scan_result: the scan-abort bug's fix (docs/decisions.md phase 2/3) --
@@ -314,3 +405,32 @@ async def test_live_scan_skips_unreadable_subdirectory_instead_of_aborting():
     # And the queue-level warning says so, instead of the scan vanishing with no explanation.
     assert warning is not None
     assert "no-permission" in warning
+
+
+@pytest.mark.skipif(
+    not _seedbox_reachable(),
+    reason="fake seedbox not reachable on 127.0.0.1:2222 -- `docker compose -f docker-compose.test.yml up --build -d`",
+)
+async def test_live_scan_with_inodes_supplies_inode_and_nlink():
+    # docs/download-client-framework-spec.md §11.1b: the disk review scan's own walk. Confirms
+    # the real GNU `find -printf` invocation this module drives actually returns usable inode
+    # data against the real fake seedbox, not just against a hand-written wire-format string.
+    host = HostConfig(
+        id=1,
+        address=SEEDBOX_HOST,
+        port=SEEDBOX_PORT,
+        username=SEEDBOX_USER,
+        auth_method="password",
+        password=SEEDBOX_PASSWORD,
+        known_hosts_policy="insecure",
+    )
+    pool = RemoteConnectionPool(known_hosts_dir=Path("/tmp"))
+    try:
+        entries, _warning = await pool.scan_with_inodes(host, "/data/pickup")
+    finally:
+        await pool.close()
+
+    assert "loose-notes.txt" in entries
+    entry = entries["loose-notes.txt"]
+    assert entry.inode is not None and entry.inode > 0
+    assert entry.nlink is not None and entry.nlink >= 1

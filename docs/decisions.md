@@ -6,6 +6,54 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-23 — the disk review scan: pure reconciliation, inode-aware, review-only (#18 stage 4)
+
+`prompts/done/2026-08-23-disk-review-scan.md`. `core/disk_review.py` -- `reconcile()`/
+`freed_bytes()` are pure set math over three inputs (spec §11.1's Set A/B/C), tested
+exhaustively without SSH or a database; `run_scan()` is the thin I/O shell that gathers those
+three inputs and calls `reconcile()`. `POST /api/disk-review/scan` (manual trigger, spec §11.3)
+and a Transfers → Disk review tab. Deletes nothing -- stage 5 is out of scope.
+
+**The BusyBox/fallback scan path can supply inodes, so it does -- no unavailable-declaration
+was needed for that reason.** The handoff prompt asked this to be checked, on the assumption
+GNU `find -printf`'s `%i`/`%n` might have no BusyBox/stdlib equivalent. It does:
+`os.lstat().st_ino`/`st_nlink` are plain stdlib, so `remote_agent/scan_fs.py` grew an
+`--inodes` flag that emits the same five-field wire format the extended primary `find -printf
+'%y\t%i\t%n\t%s\t%T@\t%p\n'` command does (`core/remote.py.RemoteConnectionPool.
+scan_with_inodes`, parsed by the new `parse_inode_find_records`/`inode_records_to_entries`,
+kept fully separate from the ordinary `scan()`'s three-field wire format rather than
+generalizing one parser to serve both). The "declare unavailable rather than silently degrade"
+path the spec asked for still exists (`scan_with_inodes` raises `RemoteScanError` rather than
+returning path-only data on a genuine failure -- SFTP upload failure, no remote `python3`), but
+in practice both paths supply real inode data, so it is now a defensive backstop rather than the
+expected outcome for most seedboxes.
+
+**Set A's inode-claim resolution needed a second index, not implied by the union computation.**
+The first draft only tracked *whether* a path/inode was claimed (a `set`), which is enough to
+decide claimed vs. debris but not enough to say *which* claim to display in the seeding-estate
+pile for an entry claimed *only* via a sibling hardlink's inode (never named by any claim's own
+path directly) -- exactly rTorrent's completed-folder copy, the whole point of §11.1b. Fixed by
+tracking `path_claimed_by`/`inode_claimed_by` dicts alongside the claimed sets, so `_claim_for`
+can attribute an inode-only claim correctly instead of silently dropping that entry from both
+piles.
+
+**Mount-sentinel integration is exact-match, not prefix-containment, and is named as a
+simplification rather than solved fully.** `core/mount_sentinel.py` operates on a queue's local
+path; the disk review scan's roots are the client's own (remote) base paths. `run_scan`'s
+`_mount_gated_roots` only gates a configured root that is *exactly* equal to some queue's
+`remote_path` -- a base path that is a parent or child of a queue's remote path (rather than
+identical to it) isn't currently covered by this guard. Named in the task's own final report,
+not hidden.
+
+**Set C reuses `core/pipeline_flight.item_pipeline_busy_subquery` plus a plain
+`job.state IN ('queued', 'running')` read**, the identical two pieces `in_flight_expr` itself
+ORs together -- deliberately not `in_flight_expr`'s own per-row SQL expression, since this
+module wants an item-id *set* to filter against, not a boolean column on a job-oriented query.
+Tested against a real (in-memory) migrated database, not mocked, so this claim is checked
+against the predicate's actual SQL rather than a restatement of it.
+
+---
+
 ## 2026-08-23 — cadence split fixed to cheap-vs-expensive, and withhold on explicit failure (#18 stage 3)
 
 `prompts/done/2026-08-23-withhold-and-cadence.md`. Two related fixes.

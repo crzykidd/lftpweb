@@ -21,6 +21,7 @@ import type {
   ClientTypeOut,
   CompleteJobsResponse,
   DeleteItemResponse,
+  DiskReviewScanResponse,
   DismissAllResponse,
   DownloadClientIn,
   DownloadClientOut,
@@ -279,6 +280,12 @@ export function deleteClientInstance(id: number): Promise<void> {
  */
 export function testClientInstance(id: number): Promise<DownloadClientTestResponse> {
   return sendJson<DownloadClientTestResponse>(`/api/settings/clients/${id}/test`, 'POST')
+}
+
+// --- The disk review scan (docs/download-client-framework-spec.md §11, stage 4 of #18) -----
+// Manual trigger only (spec §11.3) -- never fired on a page load, only a button click.
+export function runDiskReviewScan(): Promise<DiskReviewScanResponse> {
+  return sendJson<DiskReviewScanResponse>('/api/disk-review/scan', 'POST')
 }
 
 /** *arr poll cadence (2026-08-21, issue #16) -- `core/arrsync.py.ArrSettings.poll_interval_s`

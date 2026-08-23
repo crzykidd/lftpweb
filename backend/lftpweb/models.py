@@ -1887,6 +1887,68 @@ class DownloadClientTestResponse(BaseModel):
     detected_base_paths: list[DetectedBasePathOut] = Field(default_factory=list)
 
 
+# --- The disk review scan (docs/download-client-framework-spec.md §11, stage 4 of #18) -------
+#
+# `POST /api/disk-review/scan` (`api/disk_review.py`, `core/disk_review.py`) -- review-only,
+# manual trigger, deletes nothing. Two labelled piles plus the two "why nothing was proposed
+# here" surfaces (`broken_seeds`, `skipped_base_paths`) named rather than silently absorbed.
+
+
+class DiskReviewDebrisOut(BaseModel):
+    root: str
+    rel_path: str
+    abs_path: str
+    size: int
+    mtime: float
+    inode: int | None
+    nlink: int | None
+    link_paths: list[str] = Field(default_factory=list)
+
+
+class DiskReviewSeedingEstateOut(BaseModel):
+    root: str
+    rel_path: str
+    abs_path: str
+    size: int
+    claimed_by_client_id: int
+    claimed_by_client_name: str
+
+
+class DiskReviewBrokenSeedOut(BaseModel):
+    client_id: int
+    client_name: str
+    transfer_id: str
+    transfer_name: str
+    content_path: str
+
+
+class DiskReviewSkippedBasePathOut(BaseModel):
+    root: str
+    reason: str
+
+
+class DiskReviewClientFailureOut(BaseModel):
+    client_id: int
+    client_name: str
+    reason: str
+
+
+class DiskReviewScanResponse(BaseModel):
+    """The whole scan result. `debris` is the only selectable pile; `seeding_estate` is shown
+    for visibility only (spec §11.1d). `total_debris_bytes` is the naive sum-of-sizes (every
+    candidate, unselected) -- the link-aware total for an actual *selection* is a client-side
+    computation (`freed_bytes` in `core/disk_review.py`, mirrored in the frontend) since
+    selection is never persisted server-side at this stage.
+    """
+
+    debris: list[DiskReviewDebrisOut] = Field(default_factory=list)
+    seeding_estate: list[DiskReviewSeedingEstateOut] = Field(default_factory=list)
+    broken_seeds: list[DiskReviewBrokenSeedOut] = Field(default_factory=list)
+    skipped_base_paths: list[DiskReviewSkippedBasePathOut] = Field(default_factory=list)
+    client_failures: list[DiskReviewClientFailureOut] = Field(default_factory=list)
+    scanned_at: str
+
+
 # --- Support bundle (Settings -> Logs, 2026-08-17) ---------------------------------------
 #
 # `POST /api/support-bundle` (`api/support_bundle.py`, `core/supportbundle.py`): a downloadable

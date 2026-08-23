@@ -26,6 +26,11 @@ export const NAV_ITEMS: NavItem[] = [
 export const TRANSFERS_TABS: NavItem[] = [
   { path: '/transfers/queue', label: 'Queue' },
   { path: '/transfers/files', label: 'Files' },
+  // The disk review scan (docs/download-client-framework-spec.md §11, stage 4 of #18) --
+  // review-only, manual trigger. Sits beside Files as a third tab rather than a new top-level
+  // section: both are "what's really on disk" views, and this one's scope (client base paths,
+  // not just queue remote paths) is a superset of what Files already shows.
+  { path: '/transfers/disk-review', label: 'Disk review' },
 ]
 
 export const SETTINGS_TABS: NavItem[] = [

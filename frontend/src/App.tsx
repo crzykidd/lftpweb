@@ -1,6 +1,7 @@
 import { Navigate, Route, Routes } from 'react-router-dom'
 import { Layout } from './components/Layout'
 import { FilesPage } from './pages/FilesPage'
+import { DiskReviewPage } from './pages/DiskReviewPage'
 import { TransfersPage } from './pages/TransfersPage'
 import { EventsPage } from './pages/EventsPage'
 import { DashboardPage } from './pages/DashboardPage'
@@ -54,6 +55,7 @@ function App() {
           <Route index element={<Navigate to="/transfers/queue" replace />} />
           <Route path="queue" element={<TransfersPage />} />
           <Route path="files" element={<FilesPage />} />
+          <Route path="disk-review" element={<DiskReviewPage />} />
         </Route>
         <Route path="events" element={<EventsPage />} />
         {/* `/history` was the standalone History route before this task (2026-08-20,
