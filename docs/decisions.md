@@ -6,6 +6,109 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-22 — rTorrent connector: endpoint choice, `raw_status` synthesis, and a `TORRENT_BASELINE` correction
+
+`prompts/2026-08-22-rtorrent-connector.md` (#21's dependency, `core/clients/rtorrent.py`). Second
+real connector, first torrent one. Everything below the endpoint choice is vendor-doc guesswork —
+no credentials exist for the live instance — and is enumerated risk-ranked in
+`docs/download-client-framework-spec.md` §13.6.
+
+**Endpoint: direct XML-RPC at `/RPC2`, MEASURED 2026-08-22.** All four candidate URLs on the live
+seedbox sit behind HTTP Basic auth: `/RPC2` and `/rutorrent/plugins/httprpc/action.php` both 401
+with realm `"ruTorrent Private Area"`; `/xmlrpc` 401s with a *different* realm (`"Private Area"`,
+a separate nginx location); `/rutorrent/plugins/rpc/rpc.php` 404s (absent). Chose `/RPC2` as the
+default and made the path a `ConfigField` (`rpc_path`) so a deployment can point elsewhere
+without a code change — this settles `docs/torrent-manager-spec.md` §10.1's open question (spec
+§15 #4), and it is now a cheap choice to reverse because §10's SSH-based deletion already removed
+the `erasedata` plugin from the critical path, which was the only thing that made the endpoint
+decision consequential.
+
+**Transport: `httpx` + stdlib `xmlrpc.client.dumps()`/`loads()`, never `ServerProxy`** (per the
+handoff prompt — `ServerProxy` is synchronous and would block the event loop). One POST per call;
+`_call` builds the body with `dumps()`, parses the response with `loads()`, and classifies the
+three-way error taxonomy (spec §4.2) plus a fourth judgment call: an XML-RPC `Fault` whose text
+looks like "this command does not exist" (`_looks_like_missing_method`, a substring heuristic
+against phrases like "could not find command") raises `CapabilityUnavailable`; every other fault
+raises `ClientError`. No credentials exist to confirm rTorrent's actual fault text for either
+case — flagged §13.6 #1, the highest-risk single guess in the module, because it decides which
+side of the load-bearing `ClientError`/`CapabilityUnavailable` split a fault lands on.
+
+**`raw_status` — rTorrent has no status string, so one is synthesized.** rTorrent's status is
+spread across four flags (`d.hashing`, `d.complete`, `d.is_active`, `d.state`), not a word.
+Rejected: (a) exposing a raw flag dump (`"h=0,c=1,a=1,s=1"`) — accurate but useless as the
+"client's own word" a display column shows; (b) inventing capitalized, SAB-shaped phrases
+(`"Downloading"`, `"Seeding"`) — this would look like a real vendor vocabulary and isn't one,
+misleading anyone who later assumes it is. **Chosen:** a single lowercase token —
+`"hashing"` / `"seeding"` / `"completed"` / `"downloading"` / `"paused"` / `"queued"` — composed
+from exactly the same four flags `map_phase` classifies from, via one shared function
+(`_classify_token`). This is not circular: rTorrent has no independent display word for
+`map_phase` to translate *from*, so the most honest synthesis is the same classification a human
+debugging a row would want to see next to the phase it produced — `raw_status` and `phase` can
+never disagree with each other for a single torrent, by construction. The PAUSED/QUEUED split
+(incomplete + inactive) is this connector's own elaboration on the prompt's simpler guidance,
+using `d.state` (has the download ever been `d.start`ed) as the tiebreaker `d.is_active` alone
+doesn't give — both are non-terminal phases, so a wrong split costs nothing a caller would act on
+differently, unlike a terminal/non-terminal confusion; still flagged §13.6 #2 as unverified.
+
+**`remove` is `d.stop` then `d.erase` — no code path in the module can construct
+`d.custom5.set`/`d.delete_tied`.** Not merely "unused" — those method names appear nowhere in
+`core/clients/rtorrent.py` at all. `tests/fake_rtorrent.py` reinforces this from the other side:
+any RPC method the fixture doesn't explicitly recognise (including those two, on purpose) answers
+the same "could not find command" fault a bare rTorrent gives for a genuinely unsupported command,
+so a regression that ever tried to call them would fail loudly rather than silently succeeding
+against the fixture.
+
+**A real trap caught before it shipped: infohash case on the way *back* into rTorrent.**
+`normalize_client_id` (spec §7.1) lowercases an infohash for lftpweb's own storage/comparison, so
+every `client_id` this connector's public methods receive is lowercase. But every source this
+repo has for rTorrent's own hash case says uppercase, and rTorrent's hash lookup is plausibly
+case-sensitive (unverified) — sending a lowercased id straight into `d.stop`/`d.erase`/`d.pause`/
+etc. risked silently failing to find the item on a case-sensitive deployment. Fixed with one
+helper, `_to_rtorrent_hash` (`.upper()`), applied at every per-item call site, and *tested*: the
+fixture stores torrents by uppercase hash with exact-match (not case-folded) lookup specifically
+so this regression is exercisable — `test_per_item_calls_send_the_hash_back_uppercase` fails if
+the uppercasing is ever removed. Flagged §13.6 #3 (high risk: wrong, this breaks every
+pause/resume/remove call outright, though never a data-safety issue since `remove` never deletes
+data itself).
+
+**`content_path` reads `d.base_path=`, not `d.directory=`** — chosen because `base_path` is the
+full path to the actual content (directory *and* filename for a single-file torrent), where
+`directory` would only give the parent directory for that case, misleading as a "content path."
+Per spec §1.1 this is the *seeding* location, not the hardlinked completed-folder copy; that
+copy is invisible to rTorrent's API by design, which is why spec §11.1b matches on inode.
+
+**`Field.CATEGORY` reads `d.custom1=`, kept `NATIVE`, and is the guess this module trusts
+least.** `d.custom1` is a generic per-download user slot with no core rTorrent meaning; ruTorrent's
+label plugin is documented to store label text there *by convention*, not by any core contract,
+and nothing confirms this deployment's ruTorrent (if any) follows that convention or that nothing
+else writes into the same slot (`docs/download-client-api-survey.md` §2's own `d.custom5`
+collision warning, generalized to `d.custom1`). Declared `NATIVE` anyway rather than `NONE`
+because a populated-but-possibly-wrong label is more useful to spec §8.3's category → queue
+mapping than an always-empty field — but flagged §13.6 #4 precisely so this reasoning is
+revisited once a live capture exists.
+
+**A pre-existing inconsistency found and corrected at the connector, not the baseline:**
+`TORRENT_BASELINE` (`core/clients/base.py`) declares `Field.SEED_TIME_S` as `Support.NATIVE` with
+no note — but spec §4.3's own canonical worked example is this exact field ("rTorrent has no
+seed-time field... a `derived` capability carries a note, because the semantics differ"), and
+this connector's own handoff prompt repeats the instruction explicitly. `RtorrentClient.
+capabilities` overrides it back to `DERIVED` with the wall-clock-since-completion caveat spec
+§4.3 asks for. **The baseline itself was left unchanged** — fixing `TORRENT_BASELINE` would also
+silently change what every *future* torrent connector inherits by default, which is a larger,
+separate decision than this connector's own scope; noted here and in spec §13.6 #5 so a future
+session doesn't have to rediscover the mismatch from scratch.
+
+**`free_space(path)` has no generic answer in rTorrent's own vocabulary** — `d.free_diskspace` is
+answered *per download* (and is itself the minimum across the devices that download's files span,
+spec §12's own trap), not per arbitrary filesystem path. Implemented as best-effort: find a
+currently-listed transfer whose `content_path` sits at or under the requested `path`, and read
+*its* `d.free_diskspace`; raises `ClientError` (not `CapabilityUnavailable` — the capability isn't
+in question, there is simply no torrent to answer through right now) when nothing matches. Lower
+priority than the other guesses (§13.6 #6) since #21, `free_space`'s real consumer, is not in
+scope yet.
+
+---
+
 ## 2026-08-22 — SABnzbd auth failures: a new `ClientAuthenticationFailed`, and `test_connection` now authenticates
 
 `prompts/done/2026-08-22-sab-auth-error-handling.md`. Corrects `core/clients/sabnzbd.py`

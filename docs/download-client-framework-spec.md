@@ -1006,6 +1006,31 @@ The test system is **https://lftpweb.crzynet.com**, running `dev`. It exposes `/
 can be validated by reading its events and logs directly, without asking the user to relay output.
 **It runs SABnzbd and rTorrent today**, with more clients to be added as the framework grows.
 
+### 13.6 The rTorrent correction list — every guess, risk-ranked
+
+Produced by `core/clients/rtorrent.py`'s build (2026-08-22,
+`prompts/2026-08-22-rtorrent-connector.md`), the same discipline §13.4 established for SABnzbd:
+**nothing here is confirmed; there are no credentials for the live rTorrent, so everything below
+the endpoint choice is vendor-doc guesswork.** `tests/fake_rtorrent.py` inherits every one of
+these guesses (see its own docstring) — a green suite proves internal consistency with this
+module's own reading of the docs, not correctness. Ranked by what breaks if the guess is wrong:
+a mistake that flips terminal/non-terminal phase or corrupts what a delete targets ranks above
+one that only misdraws a cosmetic label.
+
+| # | Guess | Risk if wrong |
+|---|---|---|
+| 1 | **XML-RPC fault classification** (`_looks_like_missing_method`/`_looks_like_unknown_hash` in `_call`/`remove`): substring heuristics against fault text this module has never seen from a live rTorrent, deciding `ClientError` vs. `CapabilityUnavailable` (§4.2's load-bearing split) and whether `remove` reports a routine "already gone" outcome or raises | **High.** A wrong classification here could let a genuine transport/protocol failure silently degrade a capability the client actually has (§4.2's own "must never" rule), or make `remove` raise on a case that should read as a benign no-op |
+| 2 | **`map_phase`'s PAUSED-vs-QUEUED split** (incomplete + inactive, disambiguated by `d.state`) — this connector's own elaboration on top of the simpler guidance it was handed | Low-moderate. Both outcomes are non-terminal; §4.2's "unknown never blocks anything" already bounds the damage a wrong split can do, unlike a terminal/non-terminal confusion |
+| 3 | **Infohash case sent back to rTorrent** (`_to_rtorrent_hash` uppercasing every per-item call) — no live confirmation rTorrent's own hash lookup is actually case-sensitive | **High if the underlying premise is wrong the other way** (i.e. if lowercase would have worked and uppercase doesn't) — every `pause`/`resume`/`remove`/`list_trackers`/`list_files`/`free_space` call would silently fail to find the item. Not a data-safety issue (`remove` never deletes data itself), but an operational one large enough to make every per-item control appear broken |
+| 4 | **`Field.CATEGORY` reads `d.custom1=`** on the unconfirmed assumption this deployment's ruTorrent (if any) follows the label-plugin convention of storing label text there, and that nothing else writes into the same generic slot | Moderate. A wrong or colliding value feeds spec §8.3's category → queue inference with bad data; the inference step is user-confirmed before anything saves, which is the backstop this guess leans on |
+| 5 | ~~**`TORRENT_BASELINE` declares `Field.SEED_TIME_S` `NATIVE` with no note**~~ **NOT A DEFECT — entry retracted 2026-08-22.** The baseline is the *common* case for torrent clients, and native seed time genuinely is common: qBittorrent (`seeding_time`), Transmission (`secondsSeeding`) and Deluge (`seeding_time`) all report it directly. **rTorrent is the exception**, and it overriding to `DERIVED` with a note is §5's inheritance mechanism working exactly as designed, not a workaround for a broken default. §4.3 uses rTorrent as the example of *why a derived capability needs a caveat*, not as a claim about what the baseline should say. **Do not "fix" the baseline** — setting it `DERIVED` would make three connectors understate a capability they have | None — retained only so the retraction is visible, since acting on the original entry would have been the actual defect |
+| 6 | **`free_space(path)`** matched by finding any currently-listed transfer whose `content_path` sits under the requested path, then reading that transfer's `d.free_diskspace` | Low-moderate today (no caller uses it yet — #21 is `free_space`'s real consumer and is out of scope here); will need re-examination once #21 lands, especially combined with §12's own "minimum across devices" trap |
+| 7 | **`d.base_path=` chosen over `d.directory=` for `content_path`**, on the doc-derived reasoning that they differ only for single-file torrents | Moderate. If the two are not equivalent the way vendor docs suggest for multi-file torrents either, every delete/inode-match downstream (spec §11.1b) inherits a wrong path — but §11.1b already matches by inode rather than trusting path equality, which bounds the blast radius |
+| 8 | **`d.pause`/`d.resume` chosen for the `pause`/`resume` operations, `d.stop` reserved for `remove` alone** — an unconfirmed reading that rTorrent actually distinguishes a lightweight pause from a full stop the way this module assumes | Low. Worst case, "pause" behaves more like "stop" than a user expects; does not affect data safety or terminal-phase classification |
+| 9 | **`d.multicall2`'s leading empty-string "call id" argument** (`("", "main", *commands)`) — copied from common client-library convention, not confirmed against this deployment's rTorrent version | Low. If wrong, the whole listing call fails outright (loud, not silent) rather than returning subtly wrong data |
+| 10 | **`ADDED_AT` reads `d.timestamp.started=`** — vendor docs are ambiguous on whether this timestamp resets when a torrent is restarted/resumed after being fully stopped, which would make it "last started," not "first added" | Low, per spec §13.4 #3's own precedent: a field that turns out to mean something narrower than its name is the safe direction relative to a field silently returning `None` |
+| 11 | **`tests/fake_rtorrent.py` inherits every guess above** rather than independently corroborating any of them | This is the §13.2 trap by construction, and why this list exists |
+
 ---
 
 ## 14. Build order
@@ -1044,7 +1069,11 @@ belongs to #21.
    in**; raised for a decision after stage 2. Note §10.5 lowers its urgency considerably: on the
    reference workflow the `move` delete removes a hardlink and the seed survives, so the question
    is about setups *without* the hardlink step.
-4. **Does the ruTorrent-vs-rTorrent API surface question (`docs/torrent-manager-spec.md` §10.1)
-   resolve to XML-RPC directly, or the ruTorrent HTTP plugin API?** Deferred to the rTorrent
-   connector, and now much lower stakes: §10's SSH deletion removes the `erasedata` plugin from the
-   critical path entirely, which was the main thing that made the choice consequential.
+4. ~~**Does the ruTorrent-vs-rTorrent API surface question (`docs/torrent-manager-spec.md` §10.1)
+   resolve to XML-RPC directly, or the ruTorrent HTTP plugin API?**~~ **Answered 2026-08-22,
+   MEASURED: direct XML-RPC at `/RPC2`.** All four candidate URLs on the live seedbox sit behind
+   HTTP Basic auth; `/RPC2` and the ruTorrent httprpc plugin both answered with the same realm,
+   `/xmlrpc` answered with a different one (a separate nginx location, not assumed to share a
+   backend), and the ruTorrent `rpc.php` plugin mount 404s. `/RPC2` is the default and the path is
+   a `ConfigField` (`rpc_path`), so a deployment can point elsewhere without a code change — see
+   `core/clients/rtorrent.py`'s module docstring and `docs/decisions.md` (2026-08-22).

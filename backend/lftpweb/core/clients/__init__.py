@@ -10,7 +10,8 @@ deliberate at the 7-10 adapter modules plus four framework modules this is expec
 into (spec §6); a flat `core/` would be unreadable at that size.
 
 Stage 0 (this module's first version) registers no real adapter -- SABnzbd is stage 1 (spec
-§14). `tests/fake_client.py` registers a `"fake"` connector for the conformance suite and the
+§14), rTorrent is the second real adapter (`prompts/2026-08-22-rtorrent-connector.md`).
+`tests/fake_client.py` registers a `"fake"` connector for the conformance suite and the
 capability-merge unit tests only; it is never imported here, so it never reaches the
 production registry a real deployment sees.
 """
@@ -94,3 +95,4 @@ __all__ = [
 # `@register_client(...)` decorator on import (spec §6: "adding a connector is one file plus
 # one import line"). Stage 0 shipped none; SABnzbd (spec §14 stage 1) is the first.
 from . import sabnzbd  # noqa: E402,F401 -- import for its @register_client side effect only
+from . import rtorrent  # noqa: E402,F401 -- import for its @register_client side effect only

@@ -3,18 +3,19 @@ from __future__ import annotations
 import pytest
 
 from fake_arr import fake_arr_server  # noqa: F401 - re-exported for auto-discovery below
+from fake_rtorrent import fake_rtorrent_server  # noqa: F401 - re-exported for auto-discovery below
 from fake_sabnzbd import fake_sabnzbd_server  # noqa: F401 - re-exported for auto-discovery below
 
 from lftpweb.config import settings
 
-# `fake_arr_server` (tests/fake_arr.py) and `fake_sabnzbd_server` (tests/fake_sabnzbd.py) are
-# re-exported here, not imported directly by each test module that uses them, so they are
-# auto-discovered for every test file the same way `isolated_config` below already is -- a test
-# module importing a `@pytest.fixture`-decorated function under the same name it uses as a
-# request parameter makes ruff's pyflakes read the parameter as "redefining an unused import"
-# (F811); routing the fixture through conftest.py is pytest's own idiom for sharing a fixture
-# defined outside conftest.py, and avoids the false positive entirely by construction -- no test
-# module needs to import the name at all.
+# `fake_arr_server` (tests/fake_arr.py), `fake_sabnzbd_server` (tests/fake_sabnzbd.py), and
+# `fake_rtorrent_server` (tests/fake_rtorrent.py) are re-exported here, not imported directly by
+# each test module that uses them, so they are auto-discovered for every test file the same way
+# `isolated_config` below already is -- a test module importing a `@pytest.fixture`-decorated
+# function under the same name it uses as a request parameter makes ruff's pyflakes read the
+# parameter as "redefining an unused import" (F811); routing the fixture through conftest.py is
+# pytest's own idiom for sharing a fixture defined outside conftest.py, and avoids the false
+# positive entirely by construction -- no test module needs to import the name at all.
 
 
 @pytest.fixture
