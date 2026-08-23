@@ -425,3 +425,52 @@ already returned by the `d.multicall2` the poller issues.
 - **Categories appearing later.** A category added in SAB after setup will not be in the stored
   mapping. The page should show newly-seen-but-unmapped categories rather than requiring the user
   to notice, which is the same visibility theme as #2.
+
+---
+
+## 12. Preflight shows every seeding torrent — the phase filter is a denylist
+
+> *"Now that I mapped ar-tv, preflight shows all my seeding torrents. That shouldn't be the case."*
+
+**Confirmed, with an exact cause.** `core/clientsync.py`'s Preflight projection filters by:
+
+```python
+if transfer.phase in (TransferPhase.COMPLETED, TransferPhase.FAILED):
+    continue
+```
+
+`TransferPhase.SEEDING` is not excluded. An rTorrent seeding torrent maps to `SEEDING` (not
+`COMPLETED`), and rTorrent reports it as **active** (`d.is_active`), so `active_only=True` returns
+it as well. It passes both guards and becomes a Preflight row.
+
+**The stated assumption is the bug.** That filter's own comment calls itself *"defensive only --
+every connector's `active_only=True` contract already excludes terminal transfers"*. That holds for
+**SAB**, where finished work leaves the queue for history. It is **false for rTorrent**, where
+finished work stays in the list and seeds indefinitely. The assumption was drawn from the usenet
+client and generalized to a torrent client whose whole lifecycle differs — the same shape of error
+as §8.3's category-folder assumption (#10) and §9.1's cadence split.
+
+### The fix is an allowlist, not one more exclusion
+
+Adding `SEEDING` to the denylist repeats the mistake one phase later. Preflight's definition
+(`core/preflight.py`) is *"something lftpweb already knows about but has no work to do on yet"* —
+i.e. **work that is coming**. Over a closed nine-value enum, the filter should enumerate what
+qualifies, so a phase nobody considered is excluded by default rather than admitted by default.
+
+Candidate allowlist — decide deliberately, do not copy:
+
+| Phase | In Preflight? | Reasoning |
+|---|---|---|
+| `QUEUED`, `DOWNLOADING` | **yes** | work plainly coming |
+| `VERIFYING`, `EXTRACTING` | **yes** | post-download steps before it lands |
+| `PAUSED` | **probably yes** — see #4 | it *is* known-but-not-arriving; #4 reports a paused 60% torrent missing from Preflight entirely, which this same allowlist would fix |
+| `SEEDING` | **no** | nothing is coming; this is the estate, and it belongs to Disk review / #21 (spec §11.1d's two-piles distinction) |
+| `COMPLETED` | **borderline** | complete-but-not-yet-handed-over *is* incoming; already handed over is not. Governed by retirement-on-handover, not by the phase filter |
+| `FAILED` | **no** | nothing coming (and stage 3's withhold is the surface for it) |
+| `UNKNOWN` | **no** | §4.2: unknown never blocks, and it should not populate either — a row asserting nothing helps nobody |
+
+**Note this and #4 are probably one fix.** #4 (paused torrent invisible) and #12 (seeding torrents
+all visible) are the same filter being wrong in both directions at once.
+
+**Also note the seeding estate is not homeless** — it is exactly what Disk review's second pile
+(§11.1d) is for. This is a routing error, not missing functionality.
