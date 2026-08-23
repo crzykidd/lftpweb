@@ -79,6 +79,25 @@ There is no fallback case to design for beyond "the connection is down", which i
   a tilde form was among the guesses** — if not, it is a new one, and it is the kind that would
   never have surfaced without a live instance.
 
+### Resolved 2026-08-23 — offered and expanded at the detection layer, never applied blind
+
+`prompts/done/2026-08-23-tilde-and-visibility.md`, `docs/decisions.md`, spec §8.2 correction/§13.6
+row 13. Built exactly to the user's own shape: `core.clients.detection._resolve_tilde_candidate`
+expands a `~`/relative `client_path` via `sftp.realpath` (the same primitive `resolve_remote_dir`
+already used) and re-verifies the result over SSH before ever offering it as `DetectedBasePath.
+resolved_candidate` — `None` for an already-absolute path, or when the expansion doesn't check out
+either, so a genuine miss can never manufacture a false suggestion. The `not_found` box pre-fills
+its input with the candidate and states it plainly; an explicit Add is still required. Layered at
+the detection layer specifically, not by touching `remote_directory_error`/`resolve_remote_dir`
+themselves — decided deliberately, per this task's own instruction not to just make the two
+functions identical, since they differ on purpose (one falls back gracefully, one gives a real
+answer). A second leak found while in this code (not part of the original finding):
+`unverified`'s own "Accept anyway" was handing a raw `~` string straight through as the saved
+`path` with no absoluteness check — fixed the same way, falling back to the same ask-for-the-
+SSH-visible-equivalent box for a non-absolute `client_path` in that state too. Covered by six new
+`tests/test_clients_detection.py` cases and three new `ClientsTab.test.tsx` cases (the pre-fill,
+the `unverified` guard, and its absolute-path regression check).
+
 ---
 
 ## 2. ROOT CAUSE — a client with no category→queue mapping contributes nothing, silently
@@ -144,6 +163,38 @@ signal: a last-poll outcome on the Clients row (see also the auth-failure visibi
 same session), or a first-successful-poll event per instance, or both. **Do not solve it with a
 per-poll event** — a 10-second cadence would bury the log, which is exactly why `arrsync.py`
 doesn't do it either.
+
+### Resolved 2026-08-23 — a banner, a status column, and one first-success event; no per-poll noise
+
+`prompts/done/2026-08-23-tilde-and-visibility.md`, `docs/decisions.md`, spec §9.3. All three asks
+above, built as named, none of them a per-poll event:
+
+- **The unattributed-clients banner.** `ClientSyncScheduler.unattributed_clients` counts, per
+  pass, how many Preflight-eligible transfers an enabled instance couldn't attribute — never `0`
+  for a quiet client. `GET /api/queue/preflight`'s `unattributed_clients` surfaces it in the
+  mount-gate banner's own shape, one line per affected client: *"SABnzbd: reports 2 items, none
+  attributable to a queue — check its category → queue mapping..."*
+- **Last-poll outcome on the Clients row, not just last Test.** Migration 029 adds `last_poll_at`/
+  `last_poll_ok`/`last_poll_message`/`last_success_at` to `download_client`, written every actual
+  poll attempt — a status column, not a log entry, so the "not per failed pass" event rule doesn't
+  govern it. `last_poll_message` reuses `_FAILURE_VERB`'s own wording, so a rejected credential
+  reads as that on the row, never as "unreachable." `last_success_at` is independent of the other
+  three, so a currently-failing instance that worked yesterday still shows when.
+- **One positive signal.** `client_poll_first_success` fires once, the first time an instance's
+  poll succeeds in a process's lifetime — never on any later successful pass, asserted directly
+  across five consecutive polls (`test_first_success_event_fires_once_never_per_poll`).
+
+Also fixed while in this code: finding #5's "settling and SAB said nothing" reads identically to
+the settle-gate skip being off (default). `lib/format.ts.settleWaitLabel` — shared by the Files
+tree, the lifecycle icon tooltip, and the Preflight chip tooltip — now appends "(download-client
+verdict skip is off)" whenever `client_skip_enabled` is `false`.
+
+Covered by `tests/test_clientsync.py` (`unattributed_clients` for an unmapped client, a quiet
+client's omission, an out-of-set instance, poll-status persistence for both outcomes, the
+never-polled default, and the one-event-not-per-poll assertion), `tests/test_preflight_api.py`
+(the banner's own endpoint wiring, two cases), `tests/test_settings_clients_api.py` (a fresh
+instance reports never-polled), and five new `ClientsTab.test.tsx`/`format.test.ts` cases for the
+Clients-row status states and the settle-skip note.
 
 ---
 

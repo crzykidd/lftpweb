@@ -336,9 +336,14 @@ async def test_blank_queue_blip_does_not_wipe_preflight_rows(db, fake_sabnzbd_se
     rows = scheduler.preflight_rows(frozenset({instance_id}))
     assert len(rows) == 1
     assert rows[0].download_id == "nzo1"
-    # And this was never treated as a failure -- no backoff, no event.
+    # And this was never treated as a failure -- no backoff, no *failure* event. The only event
+    # on file is the one-time `client_poll_first_success` the first (successful) pass above wrote
+    # (finding #2, 2026-08-23) -- the blank-queue blip on the second pass, itself also a success,
+    # writes no event at all (not a per-poll event, this task's own explicit rule), proving the
+    # blip specifically was never mistaken for a failure.
     assert instance_id not in scheduler._backoff
-    assert await _event_rows(db) == []
+    events = await _event_rows(db)
+    assert [e["kind"] for e in events] == ["client_poll_first_success"]
 
 
 # --- Attribution / omission (spec §8.3) ----------------------------------------------------------
@@ -393,6 +398,164 @@ async def test_transfer_with_no_category_is_omitted(db, fake_sabnzbd_server, tmp
     scheduler = ClientSyncScheduler(db=db, config_dir=str(tmp_path))
     await scheduler.run_once(now=NOW0)
     assert scheduler.preflight_rows(frozenset({instance_id})) == []
+
+
+# --- Unattributed-clients banner (finding #2, 2026-08-23) ----------------------------------
+
+
+async def test_unattributed_clients_reports_a_client_with_items_but_no_mapping(
+    db, fake_sabnzbd_server, tmp_path
+):
+    """The exact live scenario finding #2 measured: an enabled, authenticating client reporting
+    real items, none of which have a category -> queue mapping. Previously silent; now surfaced.
+    """
+    instance_id = await _seed_client(
+        db,
+        str(tmp_path),
+        base_url=fake_sabnzbd_server.base_url,
+        api_key=fake_sabnzbd_server.state.api_key,
+    )
+    fake_sabnzbd_server.state.queue_slots = [
+        _queue_slot("nzo1", cat="ar-tv"),
+        _queue_slot("nzo2", cat="ar-movies"),
+    ]
+
+    scheduler = ClientSyncScheduler(db=db, config_dir=str(tmp_path))
+    await scheduler.run_once(now=NOW0)
+    assert scheduler.preflight_rows(frozenset({instance_id})) == []
+    assert scheduler.unattributed_clients(frozenset({instance_id})) == [("SABnzbd", 2)]
+
+
+async def test_unattributed_clients_omits_a_client_with_nothing_unattributable(
+    db, fake_sabnzbd_server, tmp_path
+):
+    """A quiet, fully-attributed (or genuinely empty) client must not appear in the banner at
+    all -- "0 unattributable" is not a fact worth a line, and would bury the client that
+    actually needs attention.
+    """
+    host_id = await _seed_host(db)
+    queue_id = await _seed_queue(db, host_id)
+    instance_id = await _seed_client(
+        db,
+        str(tmp_path),
+        base_url=fake_sabnzbd_server.base_url,
+        api_key=fake_sabnzbd_server.state.api_key,
+    )
+    await _seed_category(db, instance_id, "ar-tv", queue_id)
+    fake_sabnzbd_server.state.queue_slots = [_queue_slot("nzo1")]  # cat="ar-tv" -- mapped
+
+    scheduler = ClientSyncScheduler(db=db, config_dir=str(tmp_path))
+    await scheduler.run_once(now=NOW0)
+    assert scheduler.unattributed_clients(frozenset({instance_id})) == []
+
+
+async def test_unattributed_clients_ignores_an_instance_not_in_the_enabled_set(
+    db, fake_sabnzbd_server, tmp_path
+):
+    instance_id = await _seed_client(
+        db,
+        str(tmp_path),
+        base_url=fake_sabnzbd_server.base_url,
+        api_key=fake_sabnzbd_server.state.api_key,
+    )
+    fake_sabnzbd_server.state.queue_slots = [_queue_slot("nzo1", cat="ar-movies")]
+
+    scheduler = ClientSyncScheduler(db=db, config_dir=str(tmp_path))
+    await scheduler.run_once(now=NOW0)
+    assert scheduler.unattributed_clients(frozenset()) == []
+    assert scheduler.unattributed_clients(frozenset({instance_id})) == [("SABnzbd", 1)]
+
+
+# --- Per-pass poll status (finding #2's reinforcing observation, 2026-08-23) ----------------
+
+
+async def _client_row(db: aiosqlite.Connection, instance_id: int) -> aiosqlite.Row:
+    cursor = await db.execute(
+        "SELECT last_poll_at, last_poll_ok, last_poll_message, last_success_at "
+        "FROM download_client WHERE id = ?",
+        (instance_id,),
+    )
+    return await cursor.fetchone()
+
+
+async def test_never_polled_instance_has_null_poll_columns(db, tmp_path):
+    """The row a disabled (or just-created) instance starts with -- distinguishable from both a
+    working and a failing one, never a false "healthy" default (migration 029's own reasoning).
+    """
+    instance_id = await _seed_client(
+        db, str(tmp_path), base_url="http://127.0.0.1:1", api_key="x", enabled=False
+    )
+    row = await _client_row(db, instance_id)
+    assert row["last_poll_at"] is None
+    assert row["last_poll_ok"] is None
+    assert row["last_success_at"] is None
+
+
+async def test_successful_poll_stamps_ok_and_last_success_at(db, fake_sabnzbd_server, tmp_path):
+    instance_id = await _seed_client(
+        db,
+        str(tmp_path),
+        base_url=fake_sabnzbd_server.base_url,
+        api_key=fake_sabnzbd_server.state.api_key,
+    )
+    scheduler = ClientSyncScheduler(db=db, config_dir=str(tmp_path))
+    await scheduler.run_once(now=NOW0)
+
+    row = await _client_row(db, instance_id)
+    assert row["last_poll_at"] is not None
+    assert row["last_poll_ok"] == 1
+    assert row["last_poll_message"] is None
+    assert row["last_success_at"] is not None
+
+
+async def test_failed_poll_stamps_the_failure_kinds_own_verb_not_last_success_at(
+    db, fake_sabnzbd_server, tmp_path
+):
+    """`last_poll_message` reuses `_FAILURE_VERB`'s own wording -- "rejected the configured
+    credential" reads as that on the Clients row, never as "unreachable" (this task's own stated
+    requirement), and the audit log and the row can never disagree about the same failure.
+    `last_success_at` stays `None`: this instance has never once succeeded.
+    """
+    fake_sabnzbd_server.state.bad_api_key_mode = True
+    instance_id = await _seed_client(
+        db,
+        str(tmp_path),
+        base_url=fake_sabnzbd_server.base_url,
+        api_key=fake_sabnzbd_server.state.api_key,
+    )
+    scheduler = ClientSyncScheduler(db=db, config_dir=str(tmp_path))
+    await scheduler.run_once(now=NOW0)
+
+    row = await _client_row(db, instance_id)
+    assert row["last_poll_ok"] == 0
+    assert row["last_poll_message"] == "rejected the configured credential"
+    assert row["last_success_at"] is None
+
+
+async def test_first_success_event_fires_once_never_per_poll(db, fake_sabnzbd_server, tmp_path):
+    """The positive signal itself (finding #2's reinforcing observation: "there doesn't seem to
+    be any event entries ... a fully-working client is completely invisible"). One
+    `client_poll_first_success` event on the pass that first succeeds; **no event at all** on
+    every later successful pass -- this task's own explicit "do not emit a per-poll event" rule,
+    asserted here across several passes, not just one.
+    """
+    instance_id = await _seed_client(
+        db,
+        str(tmp_path),
+        base_url=fake_sabnzbd_server.base_url,
+        api_key=fake_sabnzbd_server.state.api_key,
+    )
+    scheduler = ClientSyncScheduler(db=db, config_dir=str(tmp_path))
+
+    now = NOW0
+    for _ in range(5):
+        await scheduler.run_once(now=now)
+        now += scheduler.FAST_INTERVAL_S
+
+    events = await _event_rows(db, kind="client_poll_first_success")
+    assert len(events) == 1
+    assert f"id={instance_id}" in events[0]["message"]
+    assert "first successful poll" in events[0]["message"]
 
 
 async def test_disabled_instance_never_polled(db, fake_sabnzbd_server, tmp_path):

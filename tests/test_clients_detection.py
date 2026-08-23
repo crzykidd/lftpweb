@@ -163,6 +163,30 @@ class _DenyingSFTP:
         raise asyncssh.SFTPPermissionDenied("nope")
 
 
+class _FakeTildeSFTP:
+    """Also duck-types `realpath` -- the method `_resolve_tilde_candidate` (finding #1,
+    2026-08-23, prompts/2026-08-23-tilde-and-visibility.md) calls to expand a `~`/relative
+    `client_path` against the SSH home, the same primitive `core.browse.resolve_remote_dir`
+    already uses for the path-browse dialog. `realpath_map` is this fake server's whole
+    "home directory" -- a path not in it raises, the same "an unusual server refused" shape
+    `resolve_remote_dir`'s own fallback branch already handles.
+    """
+
+    def __init__(self, existing: set[str], realpath_map: dict[str, str] | None = None) -> None:
+        self._existing = existing
+        self._realpath_map = realpath_map or {}
+
+    async def stat(self, path: str) -> _FakeAttrs:
+        if path in self._existing:
+            return _FakeAttrs(type=asyncssh.FILEXFER_TYPE_DIRECTORY)
+        raise asyncssh.SFTPNoSuchFile(f"no such file: {path}")
+
+    async def realpath(self, path: str) -> str:
+        if path in self._realpath_map:
+            return self._realpath_map[path]
+        raise asyncssh.SFTPNoSuchPath(f"cannot resolve: {path}")
+
+
 async def test_verify_reported_paths_marks_an_existing_path_verified():
     reported = [BasePath(path="/data/pickup", kind=BasePathKind.CONTENT)]
     result = await verify_reported_paths(reported, _FakeStatSFTP(existing={"/data/pickup"}))
@@ -205,3 +229,104 @@ async def test_verify_reported_paths_checks_each_path_independently():
     ]
     result = await verify_reported_paths(reported, _FakeStatSFTP(existing={"/a"}))
     assert [r.state for r in result] == [BasePathState.VERIFIED, BasePathState.NOT_FOUND]
+
+
+async def test_verify_reported_paths_never_verifies_a_tilde_path_directly():
+    """No SFTP server expands `~`, so a `~`-reported path can never land as `verified` from the
+    literal stat alone -- it always reports `not_found` first (finding #1's own root cause);
+    what's new is the suggestion riding along with it, asserted by the tests below.
+    """
+    reported = [BasePath(path="~/downloads/rtorrent", kind=BasePathKind.WORKING)]
+    sftp = _FakeTildeSFTP(
+        existing={"/home/crzykidd/downloads/rtorrent"},
+        realpath_map={"~/downloads/rtorrent": "/home/crzykidd/downloads/rtorrent"},
+    )
+    result = await verify_reported_paths(reported, sftp)
+    assert result[0].state == BasePathState.NOT_FOUND
+
+
+# --- `resolved_candidate` (spec §8.2 correction, finding #1, 2026-08-23) ----------------------
+
+
+async def test_not_found_tilde_path_offers_its_ssh_home_expansion_when_it_exists():
+    """The user's own proposed resolution: "It appears your ~ path pwd is xxx" -- offered, not
+    applied. `remote_directory_error`'s literal stat still reports `not_found` for the raw `~`
+    string; `resolved_candidate` carries the pre-filled suggestion the settings UI shows beside
+    it.
+    """
+    reported = [BasePath(path="~/downloads/rtorrent", kind=BasePathKind.WORKING)]
+    sftp = _FakeTildeSFTP(
+        existing={"/home/crzykidd/downloads/rtorrent"},
+        realpath_map={"~/downloads/rtorrent": "/home/crzykidd/downloads/rtorrent"},
+    )
+    result = await verify_reported_paths(reported, sftp)
+    assert result[0].state == BasePathState.NOT_FOUND
+    assert result[0].resolved_candidate == "/home/crzykidd/downloads/rtorrent"
+
+
+async def test_not_found_tilde_path_offers_nothing_when_the_expansion_also_does_not_exist():
+    """A `~` path whose expansion is itself absent must not manufacture a false suggestion --
+    "the fix must not turn every miss into a false suggestion" (this task's own test list)."""
+    reported = [BasePath(path="~/downloads/rtorrent", kind=BasePathKind.WORKING)]
+    sftp = _FakeTildeSFTP(
+        existing=set(),  # the expanded path does not exist either
+        realpath_map={"~/downloads/rtorrent": "/home/crzykidd/downloads/rtorrent"},
+    )
+    result = await verify_reported_paths(reported, sftp)
+    assert result[0].state == BasePathState.NOT_FOUND
+    assert result[0].resolved_candidate is None
+
+
+async def test_not_found_absolute_path_offers_no_candidate_at_all():
+    """A genuinely missing *absolute* path (no `~`, no relative form) has nothing to expand --
+    still reports `not_found`, `resolved_candidate` stays `None` rather than echoing the same
+    already-absolute path back as its own "suggestion."
+    """
+    reported = [BasePath(path="/complete", kind=BasePathKind.CONTENT)]
+    result = await verify_reported_paths(reported, _FakeStatSFTP(existing=set()))
+    assert result[0].state == BasePathState.NOT_FOUND
+    assert result[0].resolved_candidate is None
+
+
+async def test_not_found_tilde_path_offers_no_candidate_when_realpath_itself_refuses():
+    """An unusual server that refuses `realpath` outright -- `_resolve_tilde_candidate`'s own
+    fallback (mirroring `core.browse.resolve_remote_dir`'s identical tolerance) is to offer
+    nothing rather than raise and fail the whole detection pass.
+    """
+    reported = [BasePath(path="~/downloads/rtorrent", kind=BasePathKind.WORKING)]
+    sftp = _FakeTildeSFTP(existing=set(), realpath_map={})  # realpath has no entry -- refuses
+    result = await verify_reported_paths(reported, sftp)
+    assert result[0].state == BasePathState.NOT_FOUND
+    assert result[0].resolved_candidate is None
+
+
+async def test_unverified_tilde_path_still_offers_a_resolved_candidate():
+    """An ambiguous failure (permission, protocol) on the literal `~` stat must not lose the
+    suggestion either -- `~` paths reach `unverified` too (module docstring's second branch),
+    and the settings UI's "Accept anyway" for `unverified` must have something honest to prefill
+    rather than falling back to the raw `~` string (finding #1's own stated constraint: "a `~`
+    path must never be what gets stored").
+    """
+
+    class _DenyingButResolvingSFTP:
+        async def stat(self, path: str) -> _FakeAttrs:
+            raise asyncssh.SFTPPermissionDenied("nope")
+
+        async def realpath(self, path: str) -> str:
+            assert path == "~/downloads/rtorrent"
+            return "/home/crzykidd/downloads/rtorrent"
+
+    reported = [BasePath(path="~/downloads/rtorrent", kind=BasePathKind.WORKING)]
+    result = await verify_reported_paths(reported, _DenyingButResolvingSFTP())
+    assert result[0].state == BasePathState.UNVERIFIED
+    assert result[0].resolved_candidate == "/home/crzykidd/downloads/rtorrent"
+
+
+async def test_no_sftp_at_all_offers_no_candidate_for_a_tilde_path():
+    """No SSH connection to try (`sftp is None`) can't resolve anything -- `unverified`, no
+    candidate, exactly like every other `sftp is None` case in this module.
+    """
+    reported = [BasePath(path="~/downloads/rtorrent", kind=BasePathKind.WORKING)]
+    result = await verify_reported_paths(reported, None)
+    assert result[0].state == BasePathState.UNVERIFIED
+    assert result[0].resolved_candidate is None

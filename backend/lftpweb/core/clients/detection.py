@@ -32,14 +32,14 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import TYPE_CHECKING
 
+import asyncssh
+
 from lftpweb.core import browse as browse_core
 
 from .base import CapabilitySet, Operation
 from .models import BasePathKind
 
 if TYPE_CHECKING:
-    import asyncssh
-
     from .base import DownloadClient
     from .models import BasePath
 
@@ -70,11 +70,21 @@ class DetectedBasePath:
     BasePathKind`), and whether lftpweb can see it at the same path. `client_path` is always
     the client's own literal answer -- turning a `not_found` into a saved row is the caller's
     job (supplying the SSH-visible equivalent), never this module's.
+
+    `resolved_candidate` (2026-08-23, finding #1, prompts/2026-08-23-tilde-and-visibility.md) --
+    the SSH-home expansion of a `~`/relative `client_path`, offered as a **pre-filled
+    suggestion**, never applied automatically: the same propose-don't-apply rule this module's
+    own docstring already states for base-path detection as a whole. `None` for an already-
+    absolute `client_path` (nothing to resolve), and `None` whenever it can't be computed or the
+    computed candidate doesn't itself check out over SSH -- a suggestion that might be wrong is
+    worse than no suggestion, and the caller (the settings UI) already has a manual fallback for
+    exactly that case.
     """
 
     client_path: str
     kind: BasePathKind
     state: BasePathState
+    resolved_candidate: str | None = None
 
 
 async def report_base_paths(client: DownloadClient, capabilities: CapabilitySet) -> list[BasePath]:
@@ -92,6 +102,35 @@ async def report_base_paths(client: DownloadClient, capabilities: CapabilitySet)
         return []
 
 
+async def _resolve_tilde_candidate(sftp: asyncssh.SFTPClient, client_path: str) -> str | None:
+    """The one thing this task's own handoff prompt asks for (finding #1): when a client reports
+    a `~`/relative `client_path` that `remote_directory_error`'s literal `stat` could never have
+    found -- no SFTP server expands `~` -- resolve it against the SSH user's home the same way
+    `core.browse.resolve_remote_dir` already does for the path-browse dialog (`sftp.realpath`,
+    which asyncssh delegates to the server and which does expand `~`), and confirm the result
+    actually exists before ever offering it. "It is always resolvable" (the user's own words) --
+    an SSH session always has a user and therefore a home -- so the only reasons this returns
+    `None` are "there was nothing to resolve" (already absolute) or "the resolved candidate
+    doesn't check out either" (a suggestion that turns out wrong is worse than no suggestion).
+
+    Deliberately re-verifies via `remote_directory_error` rather than trusting `realpath` alone --
+    `realpath` only canonicalizes a path string, it does not promise the result exists.
+    """
+    if client_path.startswith("/"):
+        return None  # already absolute -- nothing to resolve
+    try:
+        resolved = await sftp.realpath(client_path)
+    except asyncssh.SFTPError:
+        return None
+    try:
+        await browse_core.remote_directory_error(sftp, resolved)
+    except browse_core.RemotePathNotFoundError:
+        return None  # the expansion itself doesn't exist either -- nothing honest to offer
+    except Exception:  # noqa: BLE001 - ambiguous -- still offer it, Accept will find out for real
+        pass
+    return resolved
+
+
 async def _verify_one(sftp: asyncssh.SFTPClient | None, base_path: BasePath) -> DetectedBasePath:
     if sftp is None:
         return DetectedBasePath(base_path.path, base_path.kind, BasePathState.UNVERIFIED)
@@ -99,9 +138,25 @@ async def _verify_one(sftp: asyncssh.SFTPClient | None, base_path: BasePath) -> 
         await browse_core.remote_directory_error(sftp, base_path.path)
         return DetectedBasePath(base_path.path, base_path.kind, BasePathState.VERIFIED)
     except browse_core.RemotePathNotFoundError:
-        return DetectedBasePath(base_path.path, base_path.kind, BasePathState.NOT_FOUND)
+        # 2026-08-23, finding #1: the literal `stat` above never expands `~`, so a `~`-reported
+        # path (rTorrent's `directory.default`, spec §13.6) always lands here even when it
+        # genuinely exists over SSH under a different, expanded spelling. Offer that expansion
+        # as a pre-filled suggestion rather than a blank box -- still `not_found`, still
+        # confirmed by the user, never silently applied (module docstring).
+        candidate = await _resolve_tilde_candidate(sftp, base_path.path)
+        return DetectedBasePath(
+            base_path.path, base_path.kind, BasePathState.NOT_FOUND, resolved_candidate=candidate
+        )
     except Exception:  # noqa: BLE001 - ambiguous failure -- unverified, never presented as wrong
-        return DetectedBasePath(base_path.path, base_path.kind, BasePathState.UNVERIFIED)
+        # Same offer for the ambiguous-failure branch (a `~` path whose literal stat hit a
+        # protocol hiccup rather than a clean "no such file") -- `unverified`'s own "Accept
+        # anyway" must never be the thing that lets a raw `~` string reach the saved `path`
+        # column (the constraint this whole task exists to protect); best-effort resolving it
+        # here means the UI has an absolute candidate to offer instead whenever one exists.
+        candidate = await _resolve_tilde_candidate(sftp, base_path.path)
+        return DetectedBasePath(
+            base_path.path, base_path.kind, BasePathState.UNVERIFIED, resolved_candidate=candidate
+        )
 
 
 async def verify_reported_paths(

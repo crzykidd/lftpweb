@@ -490,6 +490,47 @@ broken client never locks the user out of editing (or disabling) their own insta
 successful save persists the probed capabilities and version from that same test, so a freshly
 saved instance never needs a separate Test click to show them.
 
+### 8.2 correction, 2026-08-23 — a `~` client_path is offered, expanded, never applied blind
+
+**Found on the live test system, 2026-08-23** (finding #1, `prompts/test-findings-2026-08-23.md`):
+rTorrent's `directory.default` answered `~/downloads/rtorrent` — a real, existing directory
+(`/home/crzykidd/downloads/rtorrent`) — and detection reported it `not_found`. Not a namespace
+mismatch; `remote_directory_error`'s literal `stat` never expands `~` (no SFTP server does), so it
+correctly reported "missing" for a path it never actually looked at.
+
+**The fix, the user's own proposed shape:** *"You are always connecting from a user context. If
+we can get home dir and pwd, we should give an option in the box with a note that says: It
+appears your ~ path pwd is xxx."* Offered, not applied — the same propose-don't-apply rule this
+section's `not_found` box already follows for every other translation. `core.clients.detection.
+_resolve_tilde_candidate` expands a `~`/relative `client_path` via `sftp.realpath` (the identical
+primitive `core.browse.resolve_remote_dir` already uses for the browse dialog) and re-verifies the
+result over SSH before ever offering it — a wrong guess is worse than no guess. The result rides
+along as `DetectedBasePath.resolved_candidate`, still `None` for an already-absolute path or one
+whose expansion doesn't check out either (a genuine miss must not turn into a false suggestion).
+The settings UI pre-fills the `not_found` (and, for the same reason, the `unverified`) box's input
+with the candidate and states it plainly, still requiring an explicit Add before anything saves.
+**Decided deliberately to layer this at the detection layer** (`core.clients.detection._verify_one`
+calling `_resolve_tilde_candidate`), not by making `core.browse.resolve_remote_dir` and
+`remote_directory_error` behave identically — the two differ on purpose (the first falls back
+gracefully for a half-typed browse-dialog field; the second exists specifically to give a real,
+blocking answer at save time), and collapsing that distinction to fix one caller's need would have
+been the wrong-shaped fix.
+
+**The constraint that matters most: a `~` path must never be what gets stored.** Every downstream
+consumer — the disk-review walk roots, and stage 5's containment check that authorises `rm -rf` —
+inherits the expansion problem otherwise; a containment check comparing `~/downloads/rtorrent`
+against `/home/crzykidd/downloads/rtorrent` matches nothing, and a delete boundary that silently
+matches nothing is a bad way to fail. This holds structurally, not just for the `not_found` box:
+`unverified`'s own "Accept anyway" (a `~` path reaches this state too, on an ambiguous stat
+failure) no longer offers a direct accept for a non-absolute `client_path` either — it falls back
+to the same ask-for-the-SSH-visible-equivalent box, pre-filled with the resolved candidate when
+one exists. `client_path` still records the client's own literal `~` form once a translation is
+accepted, exactly as this section's `client_path` column already exists to do.
+
+`not_found` and `unverified` remain deliberately distinct through this change — the resolution
+above only ever adds a suggestion to whichever state the literal stat produces; it never turns one
+into the other.
+
 ### 8.3 Binding: site-level instance, category → queue
 
 `docs/transfers-redesign-spec.md` §4.5 — **a client instance is site-level, not per-queue.** One SAB
@@ -677,6 +718,52 @@ must not produce two rows.
 section is the rule that stage's merge must implement, and it should be built with a test that
 asserts a stale *arr row cannot overwrite a fresher client field — the failure is otherwise silent
 and looks like flicker.
+
+### 9.3 Visibility — a working client must never look identical to a broken one
+
+**Found on the live test system, 2026-08-23** (finding #2 and its reinforcing observation,
+`prompts/test-findings-2026-08-23.md`): two enabled, authenticating instances (SAB 5.1.1, rTorrent
+0.9.8) produced **zero** Preflight rows and **zero** events between them, because neither had a
+category → queue mapping (§8.3) yet, and an unattributable row is *silently omitted* — the correct
+rule for the *arr source (§4.2's own "promising a release that never arrives is worse than showing
+nothing"), applied here too by inheritance. **The rule is right for the *arr and wrong here.** For
+the *arr, an unattributable queue record genuinely is noise. For a configured, authenticating,
+explicitly-enabled download client, silence is the worst outcome: a fully-working instance is
+indistinguishable from a broken one, and nothing anywhere says why. Compounding it, `core.
+clientsync.ClientSyncScheduler` mirrors `core/arrsync.py`'s transition-only event rule exactly —
+right for the *arr, which earns its silence by emitting `arr_matched`/`arr_notified`/`arr_imported`/
+`arr_cleanup` at real lifecycle points — but the client poller has no such equivalent, so a
+correctly-configured, fully-working instance was **completely invisible**: no rows, no events, no
+status anywhere. The only thing that ever proved the integration was alive was it breaking.
+
+**Three additions, none of them a per-poll event** (a 10 s cadence would bury the log — precisely
+why `arrsync.py` doesn't emit one either; events mark transitions, not heartbeats):
+
+- **The unattributed-clients banner.** `ClientSyncScheduler.unattributed_clients` counts, per
+  pass, how many Preflight-eligible-phase transfers an enabled instance reported that could not be
+  attributed to any queue (no category, or a category with no enabled mapping) — never `0` (a
+  quiet, fully-attributed client has nothing to say). `GET /api/queue/preflight`'s
+  `unattributed_clients` surfaces it, the mount-gate banner's own shape (§9.2's box, one line per
+  affected thing, never one row per dropped item): *"SABnzbd: reports 2 items, none attributable to
+  a queue — check its category → queue mapping."*
+- **Per-instance poll status, not just last Test.** Migration 029 adds `last_poll_at`/
+  `last_poll_ok`/`last_poll_message`/`last_success_at` to `download_client`, written on **every**
+  actual poll attempt (a single-row status column, not a log — the "not per failed pass" rule
+  governs the event log, not this). `last_poll_message` reuses `_FAILURE_VERB`'s own wording
+  ("rejected the configured credential" vs. "unreachable"), so a credential problem reads as that on
+  the Clients row, never as a generic network failure. `last_success_at` is independent of the other
+  three, so a currently-failing instance that worked yesterday still shows when.
+- **One positive signal.** The first time an instance's poll succeeds in a given process's
+  lifetime, one `client_poll_first_success` audit event marks the transition — a fact worth a line
+  in the log exactly once. Every later successful pass writes to the status row above and nothing
+  to the event log at all.
+
+Also addressed here: finding #5 noted that "we went into settling and SAB said nothing" is
+indistinguishable from the settle-gate skip (§14 stage 2b, `settle.SettleSettings.
+client_skip_enabled`, off by default) simply being off. `lib/format.ts.settleWaitLabel` — the one
+shared sentence the Files tree, the lifecycle icon tooltip, and the Preflight chip tooltip all
+already render through — now appends "(download-client verdict skip is off)" whenever that setting
+is off, rather than leaving a user watching an item settle to infer it.
 
 ---
 
@@ -1133,6 +1220,7 @@ one that only misdraws a cosmetic label.
 | 10 | **`ADDED_AT` reads `d.timestamp.started=`** — vendor docs are ambiguous on whether this timestamp resets when a torrent is restarted/resumed after being fully stopped, which would make it "last started," not "first added" | Low, per spec §13.4 #3's own precedent: a field that turns out to mean something narrower than its name is the safe direction relative to a field silently returning `None` |
 | 11 | **`tests/fake_rtorrent.py` inherits every guess above** rather than independently corroborating any of them | This is the §13.2 trap by construction, and why this list exists |
 | 12 | **`list_categories`** implemented as the distinct, non-empty `d.custom1` values off the same `d.multicall2` listing call every other method already issues, declared `Support.DERIVED` (added 2026-08-23, §2.1/§8.3, `prompts/2026-08-23-category-binding-redesign.md`) | Moderate — inherits guess #4's own uncertainty about whether `d.custom1` genuinely holds ruTorrent's label text on this deployment, one level up: this can only ever report labels *currently in use*, never a closed list, so a deployment with real categories that happen to have nothing currently labelled reports none and the category-binding UI falls back to path arithmetic instead. The inference step is user-confirmed before anything saves, the same backstop guess #4 already leans on |
+| 13 | **CONFIRMED LIVE, 2026-08-23** — `directory.default` (feeding `list_base_paths`'s `working` entry, guess row 7's own reasoning) returns a `~`-relative form (`~/downloads/rtorrent`) rather than an absolute path, on this deployment's rTorrent 0.9.8. Not a guess any more, and not a namespace mismatch either — §8.2 correction (2026-08-23) handles it: offered, expanded, never applied blind (finding #1, `prompts/test-findings-2026-08-23.md`) | None remaining — confirmed and handled. Named here because it is exactly the kind of thing §13.2 says would never have surfaced without a live instance, and did not appear in any pre-live guess above |
 
 ---
 

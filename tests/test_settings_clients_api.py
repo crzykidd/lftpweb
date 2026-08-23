@@ -108,6 +108,24 @@ def _sab_body(**overrides):
     return body
 
 
+# --- Poll status (migration 029, finding #2, 2026-08-23) -------------------------------------
+
+
+def test_a_freshly_created_instance_reports_never_polled(isolated_config):
+    """`last_poll_at`/`last_poll_ok`/`last_poll_message`/`last_success_at` all `None` -- the
+    poller (`core.clientsync.ClientSyncScheduler`) is what ever sets these, never this endpoint;
+    a fresh instance must not render as falsely "healthy" before its first pass.
+    """
+    with TestClient(app) as client:
+        resp = client.post("/api/settings/clients", json=_sab_body())
+        assert resp.status_code == 201, resp.text
+        created = resp.json()
+        assert created["last_poll_at"] is None
+        assert created["last_poll_ok"] is None
+        assert created["last_poll_message"] is None
+        assert created["last_success_at"] is None
+
+
 # --- CRUD round trip -----------------------------------------------------------------------
 
 

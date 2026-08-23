@@ -12,6 +12,7 @@ endpoint's own config-aware gates and merge logic agree with the database. Same 
 
 from __future__ import annotations
 
+import asyncio
 import tempfile
 
 from fastapi.testclient import TestClient
@@ -80,7 +81,12 @@ def test_no_instance_at_all_hides_the_box(isolated_config):
         resp = client.get("/api/queue/preflight")
         assert resp.status_code == 200
         body = resp.json()
-        assert body == {"source_configured": False, "rows": [], "gated_queues": []}
+        assert body == {
+            "source_configured": False,
+            "rows": [],
+            "gated_queues": [],
+            "unattributed_clients": [],
+        }
 
 
 def test_disabled_instance_hides_the_box(isolated_config):
@@ -90,7 +96,12 @@ def test_disabled_instance_hides_the_box(isolated_config):
         _create_queue(client, arr_instance_id=instance_id)
 
         resp = client.get("/api/queue/preflight")
-        assert resp.json() == {"source_configured": False, "rows": [], "gated_queues": []}
+        assert resp.json() == {
+            "source_configured": False,
+            "rows": [],
+            "gated_queues": [],
+            "unattributed_clients": [],
+        }
 
 
 def test_enabled_instance_with_no_bound_queue_hides_the_box(isolated_config):
@@ -99,7 +110,12 @@ def test_enabled_instance_with_no_bound_queue_hides_the_box(isolated_config):
         _create_instance(client, enabled=True)  # nothing bound to it
 
         resp = client.get("/api/queue/preflight")
-        assert resp.json() == {"source_configured": False, "rows": [], "gated_queues": []}
+        assert resp.json() == {
+            "source_configured": False,
+            "rows": [],
+            "gated_queues": [],
+            "unattributed_clients": [],
+        }
 
 
 def test_enabled_instance_with_disabled_queue_hides_the_box(isolated_config):
@@ -109,7 +125,12 @@ def test_enabled_instance_with_disabled_queue_hides_the_box(isolated_config):
         _create_queue(client, arr_instance_id=instance_id, enabled=False)
 
         resp = client.get("/api/queue/preflight")
-        assert resp.json() == {"source_configured": False, "rows": [], "gated_queues": []}
+        assert resp.json() == {
+            "source_configured": False,
+            "rows": [],
+            "gated_queues": [],
+            "unattributed_clients": [],
+        }
 
 
 def test_enabled_bound_instance_with_nothing_projected_yet_shows_configured(isolated_config):
@@ -124,7 +145,12 @@ def test_enabled_bound_instance_with_nothing_projected_yet_shows_configured(isol
         _create_queue(client, arr_instance_id=instance_id, enabled=True)
 
         resp = client.get("/api/queue/preflight")
-        assert resp.json() == {"source_configured": True, "rows": [], "gated_queues": []}
+        assert resp.json() == {
+            "source_configured": True,
+            "rows": [],
+            "gated_queues": [],
+            "unattributed_clients": [],
+        }
 
 
 # --- The settle-gated source's own "is it configured" gate (this task) -----------------------
@@ -230,6 +256,79 @@ def test_gated_queue_disabled_since_no_longer_appears_in_the_banner(isolated_con
 
         resp = client.get("/api/queue/preflight")
         assert resp.json()["gated_queues"] == []
+
+
+# --- The unattributed-clients banner (finding #2, 2026-08-23) ------------------------------
+
+
+def test_unattributed_client_shows_a_banner_line_with_its_count(isolated_config):
+    """An enabled download-client instance whose most recent pass saw unattributable items --
+    the exact live scenario finding #2 measured -- surfaces as a banner line, the mount-gate
+    banner's own shape. `core.clientsync.ClientSyncScheduler`'s own count is asserted directly
+    in `tests/test_clientsync.py`; this covers only this endpoint's own wiring (the live
+    `enabled` column, the response model's field mapping, sorting).
+    """
+    with TestClient(app) as client:
+        _put_host(client)
+        resp = client.post(
+            "/api/settings/clients",
+            json={
+                "name": "SABnzbd",
+                "client_type": "sabnzbd",
+                # `enabled: False` -- creating an *enabled* instance tests connectivity (spec
+                # §3a) against a real server this test has none of; `enabled` is flipped directly
+                # below instead, since the banner only reads the stored column and the
+                # scheduler's own in-memory cache, not whether Test was ever clicked.
+                "config": {"base_url": "http://sab.example.invalid", "api_key": "k"},
+                "enabled": False,
+            },
+        )
+        assert resp.status_code == 201
+        instance_id = resp.json()["id"]
+
+        async def _enable() -> None:
+            await app.state.db.execute(
+                "UPDATE download_client SET enabled = 1 WHERE id = ?", (instance_id,)
+            )
+            await app.state.db.commit()
+
+        asyncio.run(_enable())
+        # Poked directly, exactly as `test_mount_gated_queue_shows_a_banner_line_with_its_reason`
+        # above pokes `app.state.engine.autoqueue.gated` -- this test isn't exercising the poller
+        # itself, only this endpoint's read of its cache.
+        app.state.client_sync._instance_names[instance_id] = "SABnzbd"
+        app.state.client_sync._unattributed_counts[instance_id] = 3
+
+        resp = client.get("/api/queue/preflight")
+        body = resp.json()
+        assert body["unattributed_clients"] == [{"client_name": "SABnzbd", "count": 3}]
+
+
+def test_a_quiet_client_never_appears_in_the_unattributed_banner(isolated_config):
+    with TestClient(app) as client:
+        _put_host(client)
+        resp = client.post(
+            "/api/settings/clients",
+            json={
+                "name": "SABnzbd",
+                "client_type": "sabnzbd",
+                "config": {"base_url": "http://sab.example.invalid", "api_key": "k"},
+                "enabled": False,
+            },
+        )
+        instance_id = resp.json()["id"]
+
+        async def _enable() -> None:
+            await app.state.db.execute(
+                "UPDATE download_client SET enabled = 1 WHERE id = ?", (instance_id,)
+            )
+            await app.state.db.commit()
+
+        asyncio.run(_enable())
+        # Never touched `_unattributed_counts` -- a quiet client has nothing to say.
+
+        resp = client.get("/api/queue/preflight")
+        assert resp.json()["unattributed_clients"] == []
 
 
 # --- Cross-source precedence + ordering (this task, decided with the user) --------------------

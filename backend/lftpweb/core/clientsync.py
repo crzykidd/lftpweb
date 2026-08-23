@@ -108,6 +108,7 @@ import json
 import logging
 import time
 from dataclasses import dataclass
+from datetime import UTC, datetime
 
 import aiosqlite
 
@@ -120,6 +121,16 @@ from lftpweb.core.crypto import DecryptionError, decrypt_secret
 from lftpweb.core.preflight import PreflightHold, PreflightRow
 
 logger = logging.getLogger(__name__)
+
+
+def _now_iso() -> str:
+    """`api/settings_clients.py`'s own `_now_iso`, duplicated rather than imported -- a `core/`
+    module importing from `api/` would run the dependency direction backwards (DESIGN.md §12's
+    layering), and this is a four-line timestamp helper, not something worth a shared-utility
+    module for.
+    """
+    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
 
 # --- Two cadences (spec §9.1, corrected this stage -- see module docstring) --------------------
 
@@ -263,6 +274,21 @@ class ClientSyncScheduler:
         # `_enabled_instance_ids` below is what actually gates which ids `completed_transfers`
         # ever looks at.
         self._instance_names: dict[int, str] = {}
+        # Findings #2/reinforcing observation (2026-08-23, prompts/2026-08-23-tilde-and-
+        # visibility.md): instance id -> how many Preflight-eligible-phase transfers the most
+        # recent pass saw that could not be attributed to any queue (no category reported, or a
+        # category with no enabled mapping) -- `unattributed_clients` below's own source, and the
+        # Preflight box's "this client reports N items, none attributable" banner's only input.
+        # Refreshed every `_update_preflight` call, wholesale-replaced like every other per-
+        # instance cache in this module (never merged across passes).
+        self._unattributed_counts: dict[int, int] = {}
+        # Same finding: which instance ids have completed at least one successful poll *this
+        # process's lifetime* -- the guard behind the one-time `client_poll_first_success` audit
+        # event `_record_poll_result` below writes (never a per-poll event, this task's own
+        # explicit rule). Reset on restart by construction (a fresh scheduler starts with an
+        # empty set), which is accepted: a restart re-announcing "this instance is alive" once is
+        # a fact worth a line in the log, not noise.
+        self._ever_succeeded: set[int] = set()
         # This pass's own live "which instances did `run_once` actually consider" set (spec:
         # "a disabled instance is never contacted") -- refreshed at the top of every `run_once`,
         # *before* any per-instance processing, so `completed_transfers` can restrict itself to
@@ -372,6 +398,7 @@ class ClientSyncScheduler:
                 return
 
             self._backoff.pop(instance_id, None)  # reachable (and authenticated) again
+            await self._record_poll_result(instance_id, instance_name, ok=True, message=None)
             await self._update_preflight(instance, transfers, now)
             if slow_due:
                 self._full_estate[instance_id] = {t.client_id: t for t in transfers}
@@ -407,6 +434,14 @@ class ClientSyncScheduler:
         self._backoff[instance_id] = _InstanceBackoff(
             delay_s=delay, next_attempt_at=now + delay, last_kind=kind
         )
+        # Every real attempt updates the row's own "last poll" status (finding #2) -- unlike the
+        # audit event below, which stays transition-only on purpose. This is a single-row status
+        # column, not a log; "credential rejected" vs "unreachable" is exactly `_FAILURE_VERB`'s
+        # own wording, so the Clients page and the audit log can never say different things about
+        # the same failure kind.
+        await self._record_poll_result(
+            instance_id, instance_name, ok=False, message=_FAILURE_VERB[kind]
+        )
         if not should_report:
             return  # same ongoing outage, already reported once (spec: "not per failed pass")
         logger.warning(
@@ -426,6 +461,52 @@ class ClientSyncScheduler:
                 f"{_FAILURE_VERB[kind]}: {exc}; backing off {delay:.0f}s"
             ),
         )
+
+    # --- Per-pass poll status (finding #2, 2026-08-23) --------------------------------------
+
+    async def _record_poll_result(
+        self, instance_id: int, instance_name: str, *, ok: bool, message: str | None
+    ) -> None:
+        """`download_client.last_poll_at`/`last_poll_ok`/`last_poll_message`/`last_success_at`
+        (migration 029) -- written on **every** actual poll attempt, success or failure alike, so
+        the Clients page can show what the poller most recently found rather than only what the
+        last manual Test click found (this task's own "not just its last test" requirement). This
+        is a single-row status column, not a log entry, so the audit log's own "one event per
+        failure transition, not per failed pass" rule (`_handle_failure`'s own comment) does not
+        apply here -- there is nothing to flood, only ever one row per instance.
+
+        **The one exception is the positive signal itself**: the very first time this instance's
+        poll succeeds during this process's lifetime (`self._ever_succeeded`), one
+        `client_poll_first_success` audit event marks the transition from "never proven alive" to
+        "working" -- a fact worth a line in the log exactly once, never a heartbeat (this task's
+        own explicit "do not emit a per-poll event" instruction, honored by every *subsequent*
+        successful pass writing nothing to the event log at all, only to this row).
+        """
+        now_iso = _now_iso()
+        if ok:
+            await self.db.execute(
+                "UPDATE download_client SET last_poll_at = ?, last_poll_ok = 1, "
+                "last_poll_message = NULL, last_success_at = ? WHERE id = ?",
+                (now_iso, now_iso, instance_id),
+            )
+        else:
+            await self.db.execute(
+                "UPDATE download_client SET last_poll_at = ?, last_poll_ok = 0, "
+                "last_poll_message = ? WHERE id = ?",
+                (now_iso, message, instance_id),
+            )
+        await self.db.commit()
+        if ok and instance_id not in self._ever_succeeded:
+            self._ever_succeeded.add(instance_id)
+            await audit.record_event(
+                self.db,
+                level="info",
+                kind="client_poll_first_success",
+                message=(
+                    f"download client {instance_name!r} (id={instance_id}) reported its first "
+                    "successful poll"
+                ),
+            )
 
     # --- Preflight (spec §9.2) ----------------------------------------------------------------
 
@@ -461,6 +542,7 @@ class ClientSyncScheduler:
         category_map = await self._category_queue_map(instance_id)
 
         seen: dict[str, PreflightRow] = {}
+        unattributed = 0
         for transfer in transfers:
             # Allowlist, not denylist (2026-08-23, findings #12/#4 -- see `_PREFLIGHT_PHASES`'s
             # own comment for the full reasoning: a denylist admits every phase nobody thought
@@ -468,10 +550,12 @@ class ClientSyncScheduler:
             if transfer.phase not in _PREFLIGHT_PHASES:
                 continue
             if not transfer.category:
-                continue  # unattributable -- no category reported at all
+                unattributed += 1  # finding #2 -- no category reported at all
+                continue
             queue = category_map.get(transfer.category)
             if queue is None:
-                continue  # unattributable -- category not mapped to an enabled queue
+                unattributed += 1  # finding #2 -- category not mapped to an enabled queue
+                continue
 
             size_remaining_bytes = None
             if transfer.size_bytes is not None and transfer.bytes_done is not None:
@@ -506,10 +590,40 @@ class ClientSyncScheduler:
                 download_id=transfer.client_id,
             )
 
+        self._unattributed_counts[instance_id] = unattributed
+
         hold = self._preflight_holds.setdefault(instance_id, PreflightHold())
         # No `retired` set -- see this module's own docstring for why this source falls back to
         # the plain hold-then-expire path rather than `core/arrsync.py`'s active eviction.
         hold.update(seen, now=now)
+
+    def unattributed_clients(self, enabled_instance_ids: frozenset[int]) -> list[tuple[str, int]]:
+        """Finding #2 (2026-08-23): "a client with no category -> queue mapping contributes
+        nothing, silently" -- one `(instance_name, count)` entry per currently-enabled instance
+        whose most recent pass saw at least one Preflight-eligible-phase transfer it could not
+        attribute to any queue. `api/jobs.py.get_preflight` turns this into the Preflight box's
+        own banner, the mount-gate banner's own shape (one line per affected client, never one
+        row per dropped item).
+
+        **`0` is never included.** A client currently contributing nothing because it genuinely
+        has nothing incoming right now is not the same fact as one silently dropping real items,
+        and showing a permanent "0 unattributable" line for every quiet client would bury the
+        one that actually needs attention -- the same "only surface what's actually wrong"
+        instinct `AutoQueue.gated`'s own banner already follows.
+
+        `enabled_instance_ids` here is deliberately **not** the same set `preflight_rows` takes
+        (a bound, enabled category -> queue mapping) -- the whole point of this banner is to
+        catch an instance with *no* such mapping at all, so the caller must pass every enabled
+        instance id, mapped or not.
+        """
+        out: list[tuple[str, int]] = []
+        for instance_id in enabled_instance_ids:
+            count = self._unattributed_counts.get(instance_id, 0)
+            if count > 0:
+                out.append(
+                    (self._instance_names.get(instance_id, f"instance {instance_id}"), count)
+                )
+        return out
 
     def preflight_rows(self, enabled_instance_ids: frozenset[int]) -> list[PreflightRow]:
         """The Preflight box's own read (`api/jobs.py.get_preflight`) -- every currently-held row

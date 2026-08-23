@@ -1100,6 +1100,23 @@ class PreflightGatedQueueOut(BaseModel):
     reason: str
 
 
+class PreflightUnattributedClientOut(BaseModel):
+    """One line of the Preflight box's "this client reports items, none attributable" banner
+    (finding #2, 2026-08-23, prompts/2026-08-23-tilde-and-visibility.md) -- the mount-gate
+    banner's own shape (`PreflightGatedQueueOut` above), applied to a different silent-drop: a
+    configured, authenticating, enabled download-client instance whose category -> queue mapping
+    doesn't cover what it's currently reporting, so `core.clientsync.ClientSyncScheduler`'s own
+    "silently omitted" attribution rule (spec §8.3, right for the *arr source) makes it
+    indistinguishable from broken. `count` is `core.clientsync.ClientSyncScheduler.
+    unattributed_clients`'s own count of unattributable, Preflight-eligible-phase transfers from
+    that instance's most recent pass -- never zero (a quiet, fully-attributed client has nothing
+    to say here at all, so it simply isn't in the list).
+    """
+
+    client_name: str
+    count: int
+
+
 class PreflightResponse(BaseModel):
     """`GET /api/queue/preflight`. `source_configured=False` (with `rows` always empty in that
     case) means "no row source is configured at all" (no bound, enabled *arr instance anywhere,
@@ -1115,6 +1132,10 @@ class PreflightResponse(BaseModel):
     source_configured: bool
     rows: list[PreflightRowOut]
     gated_queues: list[PreflightGatedQueueOut] = []
+    # Finding #2's own banner (2026-08-23) -- independent of `source_configured`/`gated_queues`,
+    # same reasoning as the mount gate: a client can have items nothing can attribute whether or
+    # not any *arr/settle source is configured at all.
+    unattributed_clients: list[PreflightUnattributedClientOut] = []
 
 
 class CompleteJobsResponse(BaseModel):
@@ -1843,6 +1864,20 @@ class DownloadClientOut(BaseModel):
     categories: list[DownloadClientCategoryOut]
     created_at: str
     updated_at: str
+    # The poller's own last-pass status (migration 029, finding #2, 2026-08-23) -- distinct from
+    # `has_secret`/`capabilities`/`version` above, which reflect the last manual **Test** click.
+    # `None`/`None`/`None`/`None` = never actually polled yet (a disabled instance, or one just
+    # created and not yet reached by `core.clientsync.ClientSyncScheduler`'s next pass) --
+    # deliberately not defaulted to a false "healthy" reading. `last_poll_message` is `core.
+    # clientsync._FAILURE_VERB`'s own wording on a failure ("rejected the configured
+    # credential", "unreachable", ...), `None` on success. `last_success_at` is the positive
+    # signal this finding asked for -- independent of `last_poll_at`/`last_poll_ok`, which
+    # describe only the *most recent* attempt, so a currently-failing instance that worked
+    # yesterday still shows when it last actually worked.
+    last_poll_at: str | None = None
+    last_poll_ok: bool | None = None
+    last_poll_message: str | None = None
+    last_success_at: str | None = None
 
 
 class DetectedBasePathOut(BaseModel):
@@ -1862,6 +1897,11 @@ class DetectedBasePathOut(BaseModel):
     # collapsing them would tell a user their path is wrong when lftpweb simply could not look
     # (`core.browse.remote_directory_error`'s own docstring draws this exact line).
     state: Literal["verified", "not_found", "unverified"]
+    # The SSH-home expansion of a `~`/relative `client_path`, pre-filled as a suggestion in the
+    # settings UI's `not_found`/`unverified` box -- never applied automatically (spec §8.2
+    # correction, finding #1, 2026-08-23). `None` for an already-absolute `client_path`, or when
+    # nothing honest could be offered (`core.clients.detection._resolve_tilde_candidate`).
+    resolved_candidate: str | None = None
 
 
 class DownloadClientTestResponse(BaseModel):

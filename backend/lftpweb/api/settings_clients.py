@@ -311,7 +311,10 @@ def _resolve_secret_for_test(
 
 _CLIENT_COLUMNS = (
     "id, name, client_type, config_json, secret_enc, enabled, "
-    "capabilities_json, capabilities_probed_at, version, created_at, updated_at"
+    "capabilities_json, capabilities_probed_at, version, created_at, updated_at, "
+    # The poller's own last-pass status (migration 029, finding #2, 2026-08-23) -- see
+    # `DownloadClientOut`'s own docstring for why this is distinct from `capabilities_probed_at`.
+    "last_poll_at, last_poll_ok, last_poll_message, last_success_at"
 )
 
 
@@ -372,6 +375,10 @@ async def _client_out_from_row(db, row) -> DownloadClientOut:
         categories=await _get_categories(db, row["id"]),
         created_at=row["created_at"],
         updated_at=row["updated_at"],
+        last_poll_at=row["last_poll_at"],
+        last_poll_ok=bool(row["last_poll_ok"]) if row["last_poll_ok"] is not None else None,
+        last_poll_message=row["last_poll_message"],
+        last_success_at=row["last_success_at"],
     )
 
 
@@ -590,7 +597,10 @@ async def delete_client_instance(client_id: int, request: Request) -> None:
 
 def _detected_to_out(detected: DetectedBasePath) -> DetectedBasePathOut:
     return DetectedBasePathOut(
-        client_path=detected.client_path, kind=detected.kind, state=detected.state
+        client_path=detected.client_path,
+        kind=detected.kind,
+        state=detected.state,
+        resolved_candidate=detected.resolved_candidate,
     )
 
 

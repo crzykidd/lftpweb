@@ -6,6 +6,81 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-23 — `~` base paths offered and expanded at the detection layer; a working client made visible (findings #1/#2)
+
+`prompts/done/2026-08-23-tilde-and-visibility.md`. Two parts, shipped together because both are
+about lftpweb failing to say what it knows.
+
+**Part 1 — a `~` client-reported path (rTorrent's `directory.default`) verified `not_found` for a
+directory that genuinely existed.** `core.browse.remote_directory_error`'s literal `stat` never
+expands `~` (no SFTP server does), so it correctly reported "missing" for a path it never actually
+looked at. Fixed at the detection layer, not by touching `remote_directory_error` or `resolve_
+remote_dir` — those two differ *on purpose* (one falls back gracefully for a half-typed browse
+field, the other exists specifically to give a real, blocking answer at save time), and making them
+identical to serve one caller would have blurred that distinction rather than fixing the actual
+bug. `core.clients.detection._resolve_tilde_candidate` expands a `~`/relative `client_path` via
+`sftp.realpath` (the same primitive `resolve_remote_dir` already uses) and re-verifies the result
+over SSH before ever offering it as `DetectedBasePath.resolved_candidate` — a wrong guess is worse
+than no guess, so a candidate that doesn't itself check out is dropped rather than offered. The
+settings UI pre-fills the `not_found` box's input with the candidate and states it plainly
+("Reports `~/downloads/rtorrent`... it looks like your SSH home makes this
+`/home/crzykidd/downloads/rtorrent`"); an explicit Add is still required — the user's own words,
+"give an option in the box," not applied automatically.
+
+**A second leak was found while in this code, not in the original finding: `unverified`'s own
+"Accept anyway."** A `~`/relative `client_path` can only ever land in `not_found` or `unverified`
+(never `verified` — the literal stat can't succeed for one), and `unverified`'s direct-accept
+button was handing `row.client_path` straight through as the saved `path` with no absoluteness
+check at all — a real path for a raw `~` string to reach the containment-check column the whole
+task exists to protect (`~/downloads/rtorrent` matching nothing against
+`/home/crzykidd/downloads/rtorrent` in the §10.2 delete boundary). Fixed the same way: a
+non-absolute `client_path` in the `unverified` state now falls back to the same ask-for-the-
+SSH-visible-equivalent box, pre-filled with a resolved candidate when `_resolve_tilde_candidate`
+found one (it tries this branch too, on the ambiguous-stat-failure path).
+
+**Part 2 — two enabled, authenticating clients (SAB 5.1.1, rTorrent 0.9.8) produced zero Preflight
+rows and zero events, because neither had a category → queue mapping yet.** Silent omission is the
+right rule for the *arr source (noise) and the wrong rule here (a fully-working, explicitly-enabled
+client indistinguishable from a broken one). Three additions, deliberately **not** a per-poll
+event — spec §9.3 has the full reasoning:
+
+- `ClientSyncScheduler.unattributed_clients` — a mount-gate-shaped banner, one line per enabled
+  instance whose most recent pass saw unattributable items, never for a quiet client (`count`
+  is never `0` in the list).
+- Migration 029 (`last_poll_at`/`last_poll_ok`/`last_poll_message`/`last_success_at` on
+  `download_client`) — written every actual poll attempt, a status column rather than a log entry,
+  so the "not per failed pass" event rule doesn't apply to it. `last_poll_message` reuses
+  `_FAILURE_VERB`'s own wording, so "credential rejected" never renders as "unreachable."
+- One `client_poll_first_success` audit event, the first time an instance's poll succeeds in a
+  given process's lifetime — a transition worth one line, never repeated on subsequent successful
+  passes (asserted directly across five consecutive successful polls,
+  `tests/test_clientsync.py::test_first_success_event_fires_once_never_per_poll`).
+
+**Decided, not assumed: the in-memory first-success guard (`self._ever_succeeded`) resets on
+restart rather than persisting.** A restart re-announcing "this instance is alive" once more is a
+fact worth a line in the log, not noise — a persisted guard would have needed an extra DB round
+trip per successful pass for no benefit proportionate to the cost.
+
+Also fixed while in this code: finding #5's "we went into settling and SAB said nothing" is
+indistinguishable from the settle-gate skip (off by default) simply being off. `lib/format.ts.
+settleWaitLabel` — the one sentence the Files tree, the lifecycle icon tooltip, and the Preflight
+chip tooltip all already share — now appends "(download-client verdict skip is off)" whenever
+`client_skip_enabled` is `false`, rather than leaving it to infer.
+
+Guarded by `tests/test_clients_detection.py` (six new `resolved_candidate` cases, covering a
+tilde path that resolves and exists, one whose expansion also doesn't exist, an already-absolute
+miss offering no candidate, `realpath` itself refusing, and both the `not_found` and `unverified`
+branches), `tests/test_clientsync.py` (`unattributed_clients`, poll-status persistence for both
+outcomes, the never-polled default, and the one-event-not-per-poll assertion across five passes),
+`tests/test_preflight_api.py` (the banner's own endpoint wiring), `tests/test_settings_clients_
+api.py` (a fresh instance reports never-polled), plus `clientBasePathDetection.test.ts`
+(`isAbsoluteClientPath`), `format.test.ts` (the settle-skip note, both states, and that the short
+chip form never carries it), and five new `ClientsTab.test.tsx` cases (the tilde pre-fill, the
+`unverified` non-absolute guard, its absolute-path regression check, and the three poll-status
+render states).
+
+---
+
 ## 2026-08-23 — Category → queue binding redesign: `list_categories`, no free-text field, two explicit decisions (findings #10/#11)
 
 `prompts/done/2026-08-23-category-binding-redesign.md`. The category-mapping control's free-text

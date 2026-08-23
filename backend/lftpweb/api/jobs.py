@@ -51,6 +51,7 @@ from lftpweb.models import (
     PreflightGatedQueueOut,
     PreflightResponse,
     PreflightRowOut,
+    PreflightUnattributedClientOut,
     QueueBandwidthRequest,
     QueueBandwidthResponse,
     QueueItemRequest,
@@ -817,6 +818,19 @@ async def get_preflight(request: Request) -> PreflightResponse:
         else []
     )
 
+    # The unattributed-clients banner (finding #2, 2026-08-23) -- deliberately **not**
+    # `enabled_client_ids` above, which already requires a bound, enabled category -> queue
+    # mapping to exist at all. The whole point here is to catch the instance that has *no*
+    # mapping whatsoever (the live scenario the finding measured), so every enabled instance is
+    # asked, mapped or not.
+    cursor = await db.execute("SELECT id FROM download_client WHERE enabled = 1")
+    all_enabled_client_ids = frozenset(row["id"] for row in await cursor.fetchall())
+    unattributed_clients = (
+        client_sync.unattributed_clients(all_enabled_client_ids)
+        if client_sync is not None and all_enabled_client_ids
+        else []
+    )
+
     # The settle-gated source (this task) -- `core/autoqueue.py.AutoQueue` owns the eligibility
     # query the settle gate itself sits inside, so it also owns this projection; see that
     # module's own "Preflight" section. `queue_names` doubles as the live "is this queue
@@ -879,6 +893,13 @@ async def get_preflight(request: Request) -> PreflightResponse:
             for r in rows
         ],
         gated_queues=gated_queues,
+        unattributed_clients=sorted(
+            (
+                PreflightUnattributedClientOut(client_name=name, count=count)
+                for name, count in unattributed_clients
+            ),
+            key=lambda u: u.client_name.casefold(),
+        ),
     )
 
 
