@@ -435,6 +435,13 @@ export interface DiskReviewSeedingEstateOut {
   size: number
   claimed_by_client_id: number
   claimed_by_client_name: string
+  // The claim's own torrent identity (finding #7, 2026-08-23) -- two files sharing a torrent's
+  // inode (the seeding-directory copy and its completed-folder hardlink) carry the identical
+  // triple, which is what `lib/diskReview.ts.groupSeedingEstateByTorrent` groups by. Display-only
+  // -- `core/disk_review.py.reconcile()` itself is unchanged, still per-file.
+  claimed_transfer_id: string
+  claimed_transfer_name: string
+  claimed_content_path: string
 }
 
 export interface DiskReviewBrokenSeedOut {
@@ -937,6 +944,19 @@ export interface JobsResponse {
  * makes that structural" is exactly why nothing here invites a per-row control that would need
  * one.
  */
+/** One upstream's own pre-merge view of a row (finding #3, 2026-08-23) -- mirrors the backend's
+ * `PreflightContributorOut` field for field. Read-only provenance, never itself branched on
+ * beyond picking a badge/detail block to render (`lib/preflight.ts`).
+ */
+export interface PreflightContributorOut {
+  source: string
+  source_label: string
+  source_kind: string | null
+  status_label: string | null
+  size_bytes: number | null
+  size_remaining_bytes: number | null
+}
+
 export interface PreflightRowOut {
   source: string
   queue_id: number
@@ -975,6 +995,12 @@ export interface PreflightRowOut {
   // R-icon tooltip already share, rather than a third copy of that wording.
   wait_scans: number | null
   wait_since: string | null
+  // Both contributors' own pre-merge view for a row deduped across the *arr and a download
+  // client (finding #3, 2026-08-23) -- `[]` for a row from a single source (exactly one badge,
+  // no empty second slot); exactly two entries, *arr then client, for a merged one. Every field
+  // above this line already reflects the §9.2-precedence winner; this is the losing side's own
+  // reading, kept for the row's badges and its expand.
+  contributors: PreflightContributorOut[]
 }
 
 /** One line of the Preflight box's mount-gate banner (2026-08-20,

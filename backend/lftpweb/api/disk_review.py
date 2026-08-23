@@ -90,6 +90,9 @@ async def scan_for_review(request: Request) -> DiskReviewScanResponse:
                 size=s.size,
                 claimed_by_client_id=s.claimed_by_client_id,
                 claimed_by_client_name=s.claimed_by_client_name,
+                claimed_transfer_id=s.claimed_transfer_id,
+                claimed_transfer_name=s.claimed_transfer_name,
+                claimed_content_path=s.claimed_content_path,
             )
             for s in result.seeding_estate
         ],

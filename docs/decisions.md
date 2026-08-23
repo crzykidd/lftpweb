@@ -6,6 +6,81 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-23 — merged-row provenance, a Preflight expand, disk review grouped by torrent/directory, and the vanishing Edit button (findings #3/#6/#7/#8)
+
+`prompts/done/2026-08-23-preflight-provenance-and-ui.md`. The last fix in this batch — clears every
+remaining finding except #9, a design decision left for the user.
+
+**Re-verified before touching anything: §9.2's status precedence already worked.** Finding #3's
+symptom (Preflight showing the *arr's status rather than the client's) was measured with **zero**
+client rows reaching the merge at all (finding #2 — no category mappings), so §9.2's precedence had
+nothing to prefer and looked broken by omission, not by a bug. `tests/test_preflight_client_merge.
+py::test_client_status_label_always_wins_when_present` predates this task and passed unmodified —
+confirmed by running it in isolation before any change in this session. Only the genuinely-missing
+half was built: provenance *display*.
+
+**`PreflightRow` gets its first widening in six tasks: `contributors`.** A new, minimal
+`PreflightContributor` dataclass (`core/preflight.py`) — the same six display fields `PreflightRow`
+already carries per-source, nothing else — and a `contributors: tuple[PreflightContributor, ...] =
+()` field, `()` for every row a source builds for itself, populated only by
+`api/jobs.py._merge_client_field_into_arr` with both pre-merge views (*arr, then client) when a row
+folds together. Deliberately *not* a nested second `PreflightRow` — provenance, not a grab-bag, the
+same restraint the dataclass's own docstring has held everywhere else. §9.2 itself now has a note
+naming the provenance-display gap explicitly, since the section specified precedence but was silent
+on what a merged row should *show*.
+
+**The frontend renders badges/detail generically off `contributors`, never off `source === 'arr'`
+specifically.** `lib/preflight.ts.preflightBadges`/`preflightDetailEntries`: two entries → two
+badges (and two expand-detail lines); zero entries → one badge from the row's own top-level fields,
+*unless* the row is a settle row (no brand to show, unchanged). This incidentally fixes a smaller,
+related gap noticed while in this code: a **standalone client row previously showed no badge at
+all** (`SourceChip` was gated on `row.source === 'arr'` outright) — now it gets one, the same as a
+standalone *arr row always has.
+
+**The Preflight expand (finding #6) adds information, never a control.** A row's own local
+`expanded` boolean (no new prop, no handler reaching a parent) toggles `PreflightRowDetail`, which
+renders `preflightDetailEntries` — already-present response data, never a fetch. Keeps §4.6's
+"framed as a cache" rule: collapsing it back loses nothing a re-fetch wouldn't restore.
+
+**Disk review (finding #7): `reconcile()` is untouched — the rollup is `lib/diskReview.ts`'s
+own display-layer grouping, not a second reconciliation.** `groupSeedingEstateByTorrent` keys on
+`claimed_by_client_id` + `claimed_transfer_id`, which needed `SeedingEstateEntry` widened
+(`core/disk_review.py`) with the claim's own `claimed_transfer_id`/`claimed_transfer_name`/
+`claimed_content_path` — lifted straight off the `ClientClaim` `reconcile()` already resolves per
+file, not a new lookup. `groupDebrisByDirectory` groups by parent directory instead, since debris by
+definition has no torrent — **deliberately not one shared grouping function for both piles**, per
+this task's own instruction that the two piles group differently and that isn't a detail to smooth
+over. **A group's own reclaim total is computed by calling the existing `freedBytes(group.entries,
+selected)` with the *global* selection set, never a per-group `size` sum** — since every candidate
+still carries its own `link_paths` regardless of which group it's displayed under, this stays
+link-aware for free; a hardlinked pair split across two directory groups still correctly reports
+zero bytes when only one side is selected (asserted directly,
+`diskReview.test.ts`: *"a group's own reclaim total stays link-aware"*).
+
+**Finding #8 was real, but not a React state bug — it was `overflow-hidden` silently clipping
+content, not any conditional hiding it.** Exhaustive review of `ClientsTab.tsx`'s row JSX (and its
+full git history) found the Edit/Delete `<td>` unconditional on every commit since the table was
+written — there is no version where it was ever gated on a test result. The actual mechanism: a
+passing Test populates `detected_base_paths` (rendered `open` by default) and the capability
+readout, both inside the Test column, which can grow far wider than any sibling column once a real
+client reports several base paths/categories (`IntegrationsTab.tsx`'s own Test column never
+carries this much, so it never surfaced there). `overflow-hidden` on the table wrapper — used
+everywhere else in this codebase purely to clip the border-radius corners, since no other table's
+content legitimately overflows — then clips whatever pushes the table wider than its container,
+the rightmost column first. Reload clears `testResults` (in-memory only), the row narrows, and the
+button is "back" — exactly the reported symptom. Fixed by changing that one wrapper's class from
+`overflow-hidden` to `overflow-x-auto`: content scrolls instead of disappearing. **This class of
+bug is invisible to jsdom**, which performs no real layout — explaining why several prior sessions'
+component tests never caught it despite exercising the same Test-success path. The regression test
+added asserts the wrapper's class directly (`overflow-x-auto`, not `overflow-hidden`) since that is
+the only thing a layout-less test harness can actually pin down. Separately checked and found
+**not** to be a bug: a Test click while that same instance's edit form is open does not discard
+the draft — `recomputeCategoryDraft` already merges a fresh detection against `prev.categories`
+rather than replacing it, preserving a user's own queue-binding choice (asserted directly, a new
+`ClientsTab.test.tsx` case).
+
+---
+
 ## 2026-08-23 — `~` base paths offered and expanded at the detection layer; a working client made visible (findings #1/#2)
 
 `prompts/done/2026-08-23-tilde-and-visibility.md`. Two parts, shipped together because both are

@@ -1,8 +1,131 @@
 import { useState } from 'react'
 import { runDiskReviewScan } from '../api/client'
 import type { DiskReviewDebrisOut, DiskReviewScanResponse } from '../api/types'
-import { freedBytes } from '../lib/diskReview'
+import {
+  type DebrisGroup,
+  freedBytes,
+  groupDebrisByDirectory,
+  groupSeedingEstateByTorrent,
+  type SeedingEstateGroup,
+} from '../lib/diskReview'
 import { formatBytes } from '../lib/format'
+
+/** One debris group's header row -- directory, file count, and its own link-aware reclaim total
+ * (`freedBytes(group.entries, selected)`, the *global* selection set -- see `lib/diskReview.ts.
+ * groupDebrisByDirectory`'s own docstring for why this is never a naive per-group sum). Expands
+ * to the group's own files, each still individually selectable exactly as before this task --
+ * grouping changes only how the list is organised, never what a selection means.
+ */
+function DebrisGroupRow({
+  group,
+  selected,
+  expanded,
+  onToggleExpand,
+  onToggleFile,
+  onToggleGroup,
+}: {
+  group: DebrisGroup
+  selected: Set<string>
+  expanded: boolean
+  onToggleExpand: () => void
+  onToggleFile: (path: string) => void
+  onToggleGroup: (rows: DiskReviewDebrisOut[]) => void
+}) {
+  const groupTotal = freedBytes(group.entries, selected)
+  const allSelected = group.entries.every((e) => selected.has(e.abs_path))
+  return (
+    <>
+      <tr className="border-t border-zinc-100 bg-zinc-50/60 dark:border-zinc-900 dark:bg-zinc-900/40">
+        <td className="px-3 py-2">
+          <input type="checkbox" checked={allSelected} onChange={() => onToggleGroup(group.entries)} />
+        </td>
+        <td colSpan={3} className="px-3 py-2">
+          <button
+            type="button"
+            onClick={onToggleExpand}
+            aria-expanded={expanded}
+            className="flex items-center gap-2 text-left font-medium text-zinc-700 hover:underline dark:text-zinc-200"
+          >
+            <span
+              aria-hidden="true"
+              className={`text-zinc-400 transition-transform dark:text-zinc-600 ${expanded ? 'rotate-90' : ''}`}
+            >
+              ▸
+            </span>
+            <span className="font-mono text-xs break-all">{group.directory}</span>
+            <span className="text-xs font-normal text-zinc-500 dark:text-zinc-400">
+              {group.entries.length} file{group.entries.length === 1 ? '' : 's'} — {formatBytes(groupTotal)}
+              {' selected'}
+            </span>
+          </button>
+        </td>
+      </tr>
+      {expanded &&
+        group.entries.map((d) => (
+          <tr key={d.abs_path} className="border-t border-zinc-100 align-top dark:border-zinc-900">
+            <td className="px-3 py-2">
+              <input type="checkbox" checked={selected.has(d.abs_path)} onChange={() => onToggleFile(d.abs_path)} />
+            </td>
+            <td className="px-3 py-2 pl-8 font-mono text-xs break-all">{d.rel_path}</td>
+            <td className="px-3 py-2 whitespace-nowrap">{formatBytes(d.size)}</td>
+            <td className="px-3 py-2 text-xs text-zinc-500 dark:text-zinc-400">
+              {d.link_paths.length > 1 ? `${d.link_paths.length} linked copies` : '--'}
+            </td>
+          </tr>
+        ))}
+    </>
+  )
+}
+
+/** One torrent's seeding-estate files, rolled up (spec §11.1d, finding #7) -- never selectable,
+ * shown for visibility only. `group.totalSize` is a plain sum (`lib/diskReview.ts.
+ * groupSeedingEstateByTorrent`'s own docstring has why that's fine here and would not be for
+ * debris).
+ */
+function SeedingEstateGroupRow({
+  group,
+  expanded,
+  onToggleExpand,
+}: {
+  group: SeedingEstateGroup
+  expanded: boolean
+  onToggleExpand: () => void
+}) {
+  return (
+    <>
+      <tr className="border-t border-zinc-100 bg-zinc-50/60 dark:border-zinc-900 dark:bg-zinc-900/40">
+        <td colSpan={3} className="px-3 py-2">
+          <button
+            type="button"
+            onClick={onToggleExpand}
+            aria-expanded={expanded}
+            className="flex flex-wrap items-center gap-2 text-left font-medium text-zinc-700 hover:underline dark:text-zinc-200"
+          >
+            <span
+              aria-hidden="true"
+              className={`text-zinc-400 transition-transform dark:text-zinc-600 ${expanded ? 'rotate-90' : ''}`}
+            >
+              ▸
+            </span>
+            <span>{group.transferName}</span>
+            <span className="text-xs font-normal text-zinc-500 dark:text-zinc-400">
+              {group.clientName} — {group.entries.length} file{group.entries.length === 1 ? '' : 's'} —{' '}
+              {formatBytes(group.totalSize)}
+            </span>
+          </button>
+        </td>
+      </tr>
+      {expanded &&
+        group.entries.map((s) => (
+          <tr key={s.abs_path} className="border-t border-zinc-100 align-top dark:border-zinc-900">
+            <td className="px-3 py-2 pl-8 font-mono text-xs break-all">{s.rel_path}</td>
+            <td className="px-3 py-2 whitespace-nowrap">{formatBytes(s.size)}</td>
+            <td className="px-3 py-2">{s.claimed_by_client_name}</td>
+          </tr>
+        ))}
+    </>
+  )
+}
 
 /** The disk review scan (docs/download-client-framework-spec.md §11, stage 4 of #18) --
  * *"Client shows all this on disk… what is in the base folders for the client that don't exist
@@ -17,12 +140,23 @@ import { formatBytes } from '../lib/format'
  * **Seeding estate** is shown for visibility only, never selectable -- it is claimed, not
  * orphaned. `broken_seeds` and `skipped_base_paths` are named rather than hidden, the same
  * "don't silently absorb a gap" instinct this codebase applies everywhere else.
+ *
+ * **Both piles are rolled up for display (2026-08-23, finding #7): "it would be better to show
+ * Torrents and expand each torrent to see details like files etc."** `core/disk_review.py.
+ * reconcile()` itself is untouched -- still per-file, because inode accounting is inherently
+ * per-file (spec §11.1b) -- `lib/diskReview.ts.groupDebrisByDirectory`/
+ * `groupSeedingEstateByTorrent` only bucket its already-flat output for this page. The two piles
+ * group **differently on purpose**: the seeding estate groups by the claim's own torrent (it
+ * always has one); debris has no torrent to group under by definition, so it groups by directory
+ * instead.
  */
 export function DiskReviewPage() {
   const [scanning, setScanning] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [result, setResult] = useState<DiskReviewScanResponse | null>(null)
   const [selected, setSelected] = useState<Set<string>>(new Set())
+  const [expandedDebrisDirs, setExpandedDebrisDirs] = useState<Set<string>>(new Set())
+  const [expandedTorrents, setExpandedTorrents] = useState<Set<string>>(new Set())
 
   const runScan = () => {
     setScanning(true)
@@ -31,6 +165,8 @@ export function DiskReviewPage() {
       .then((res) => {
         setResult(res)
         setSelected(new Set())
+        setExpandedDebrisDirs(new Set())
+        setExpandedTorrents(new Set())
       })
       .catch((err: unknown) => setError(err instanceof Error ? err.message : String(err)))
       .finally(() => setScanning(false))
@@ -57,6 +193,15 @@ export function DiskReviewPage() {
     })
   }
 
+  const toggleSet = (set: Set<string>, setSet: (next: Set<string>) => void, key: string) => {
+    const next = new Set(set)
+    if (next.has(key)) next.delete(key)
+    else next.add(key)
+    setSet(next)
+  }
+
+  const debrisGroups = result ? groupDebrisByDirectory(result.debris) : []
+  const seedingGroups = result ? groupSeedingEstateByTorrent(result.seeding_estate) : []
   const total = result ? freedBytes(result.debris, selected) : 0
 
   return (
@@ -122,7 +267,8 @@ export function DiskReviewPage() {
           <section className="flex flex-col gap-2">
             <div className="flex items-center justify-between">
               <h2 className="text-sm font-medium text-zinc-900 dark:text-zinc-100">
-                Debris -- {result.debris.length} candidate{result.debris.length === 1 ? '' : 's'}
+                Debris -- {result.debris.length} candidate{result.debris.length === 1 ? '' : 's'} in{' '}
+                {debrisGroups.length} director{debrisGroups.length === 1 ? 'y' : 'ies'}
               </h2>
               <span className="text-sm text-zinc-500 dark:text-zinc-400">
                 {selected.size} selected -- {formatBytes(total)}
@@ -142,27 +288,24 @@ export function DiskReviewPage() {
                           onChange={() => toggleAll(result.debris)}
                         />
                       </th>
-                      <th className="px-3 py-2 font-medium">Path</th>
+                      <th className="px-3 py-2 font-medium">Directory / path</th>
                       <th className="px-3 py-2 font-medium">Size</th>
                       <th className="px-3 py-2 font-medium">Links</th>
                     </tr>
                   </thead>
                   <tbody>
-                    {result.debris.map((d) => (
-                      <tr key={d.abs_path} className="border-t border-zinc-100 align-top dark:border-zinc-900">
-                        <td className="px-3 py-2">
-                          <input
-                            type="checkbox"
-                            checked={selected.has(d.abs_path)}
-                            onChange={() => toggle(d.abs_path)}
-                          />
-                        </td>
-                        <td className="px-3 py-2 font-mono text-xs break-all">{d.abs_path}</td>
-                        <td className="px-3 py-2 whitespace-nowrap">{formatBytes(d.size)}</td>
-                        <td className="px-3 py-2 text-xs text-zinc-500 dark:text-zinc-400">
-                          {d.link_paths.length > 1 ? `${d.link_paths.length} linked copies` : '--'}
-                        </td>
-                      </tr>
+                    {debrisGroups.map((group) => (
+                      <DebrisGroupRow
+                        key={group.directory}
+                        group={group}
+                        selected={selected}
+                        expanded={expandedDebrisDirs.has(group.directory)}
+                        onToggleExpand={() =>
+                          toggleSet(expandedDebrisDirs, setExpandedDebrisDirs, group.directory)
+                        }
+                        onToggleFile={toggle}
+                        onToggleGroup={toggleAll}
+                      />
                     ))}
                   </tbody>
                 </table>
@@ -173,7 +316,8 @@ export function DiskReviewPage() {
           <section className="flex flex-col gap-2">
             <h2 className="text-sm font-medium text-zinc-900 dark:text-zinc-100">
               Seeding estate -- {result.seeding_estate.length} claimed file
-              {result.seeding_estate.length === 1 ? '' : 's'} shown for visibility
+              {result.seeding_estate.length === 1 ? '' : 's'} across {seedingGroups.length} torrent
+              {seedingGroups.length === 1 ? '' : 's'}, shown for visibility
             </h2>
             {result.seeding_estate.length === 0 ? (
               <p className="text-sm text-zinc-400">Nothing found.</p>
@@ -182,18 +326,19 @@ export function DiskReviewPage() {
                 <table className="w-full text-sm">
                   <thead className="bg-zinc-50 text-left text-zinc-500 dark:bg-zinc-900 dark:text-zinc-400">
                     <tr>
-                      <th className="px-3 py-2 font-medium">Path</th>
+                      <th className="px-3 py-2 font-medium">Torrent / path</th>
                       <th className="px-3 py-2 font-medium">Size</th>
                       <th className="px-3 py-2 font-medium">Claimed by</th>
                     </tr>
                   </thead>
                   <tbody>
-                    {result.seeding_estate.map((s) => (
-                      <tr key={s.abs_path} className="border-t border-zinc-100 align-top dark:border-zinc-900">
-                        <td className="px-3 py-2 font-mono text-xs break-all">{s.abs_path}</td>
-                        <td className="px-3 py-2 whitespace-nowrap">{formatBytes(s.size)}</td>
-                        <td className="px-3 py-2">{s.claimed_by_client_name}</td>
-                      </tr>
+                    {seedingGroups.map((group) => (
+                      <SeedingEstateGroupRow
+                        key={group.key}
+                        group={group}
+                        expanded={expandedTorrents.has(group.key)}
+                        onToggleExpand={() => toggleSet(expandedTorrents, setExpandedTorrents, group.key)}
+                      />
                     ))}
                   </tbody>
                 </table>

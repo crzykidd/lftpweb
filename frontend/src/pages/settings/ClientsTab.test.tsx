@@ -506,4 +506,150 @@ describe('ClientsTab', () => {
 
     root.unmount()
   })
+
+  // Finding #8 (prompts/test-findings-2026-08-23.md): "after testing a site and it passes I
+  // lose the edit button till I reload the page." Root cause: `overflow-hidden` on the
+  // instances-table wrapper silently clips the rightmost (Edit/Delete) column once a passing
+  // test's detected-base-paths panel (rendered `open`) widens the Test column past the
+  // container -- see `ClientsTab.tsx`'s own comment at the wrapper for the full trace. jsdom
+  // performs no layout, so this suite can't observe the clipping directly; what it *can* assert
+  // -- and what would have caught a regression back to the old class -- is that the wrapper
+  // opts into scrolling rather than clipping, and that Edit/Delete are still present and
+  // functional in the DOM after the exact sequence the finding describes.
+
+  it('keeps the table horizontally scrollable rather than clipping, so a wide test result never hides Edit/Delete', async () => {
+    mockListClientTypes.mockResolvedValue([USENET_TYPE])
+    mockListClientInstances.mockResolvedValue([instance()])
+    const root = await mount(container)
+
+    const wrapper = Array.from(container.querySelectorAll('div')).find((el) =>
+      el.className.includes('rounded-md border border-zinc-200'),
+    )
+    expect(wrapper).toBeDefined()
+    expect(wrapper?.className).toContain('overflow-x-auto')
+    expect(wrapper?.className).not.toContain('overflow-hidden')
+
+    root.unmount()
+  })
+
+  it('Edit stays present and opens the form after a passing test with a wide detected-base-paths panel', async () => {
+    mockListClientTypes.mockResolvedValue([USENET_TYPE])
+    mockListClientInstances.mockResolvedValue([instance({ name: 'ultracc SAB' })])
+    mockTestClientInstance.mockResolvedValue({
+      ok: true,
+      error_class: null,
+      message: 'connected',
+      version: '5.1.1',
+      capabilities: {
+        operations: { pause: { support: 'native', note: null } },
+        fields: { seed_time_s: { support: 'native', note: null } },
+      },
+      detected_base_paths: [
+        {
+          client_path: '~/downloads/complete',
+          kind: 'content',
+          state: 'not_found',
+          resolved_candidate: '/home/crzykidd/downloads/complete',
+        },
+      ],
+      detected_categories: ['ar-tv', 'ar-movies'],
+    })
+    const root = await mount(container)
+
+    const testButton = Array.from(container.querySelectorAll('button')).find(
+      (b) => b.textContent === 'Test',
+    )
+    await act(async () => {
+      testButton?.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    })
+    await act(async () => {
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+
+    // The wide panel this finding's own trace names is actually present in this render.
+    expect(container.textContent).toContain('It looks like your SSH home makes this')
+
+    const editButton = Array.from(container.querySelectorAll('button')).find(
+      (b) => b.textContent === 'Edit',
+    )
+    expect(editButton).toBeDefined()
+    await act(async () => {
+      editButton?.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    })
+    expect(container.textContent).toContain('Edit instance')
+    const nameInput = Array.from(container.querySelectorAll('input')).find(
+      (el) => el.value === 'ultracc SAB',
+    )
+    expect(nameInput).toBeDefined()
+
+    root.unmount()
+  })
+
+  it('a Test click while the edit form is open for that same instance does not discard the in-progress draft', async () => {
+    // This was the leading hypothesis for finding #11b before the real cause (a placeholder
+    // read as a value, findings #11b/#11c) was found -- named in this task's own prompt as
+    // still worth checking even though it wasn't the one reported. Proven safe here:
+    // `recomputeCategoryDraft`/`computeCategoryRows` merge a fresh Test's `detected_categories`
+    // against `prev.categories` (the *current* draft), keeping an already-present category's
+    // `queue_id` rather than overwriting it with a fresh suggestion -- this test exercises that
+    // path end to end, through the same select+change event this file's own type-switch test
+    // already establishes works for a React-controlled `<select>` in this harness.
+    mockListClientTypes.mockResolvedValue([USENET_TYPE])
+    const queueA = { id: 5, name: 'ar-tv', remote_path: '/data/complete/ar-tv', local_path: '/local/tv' }
+    const queueB = { id: 6, name: 'other', remote_path: '/data/complete/other', local_path: '/local/other' }
+    mockListQueues.mockResolvedValue([queueA, queueB] as never)
+    mockListClientInstances.mockResolvedValue([
+      instance({ categories: [{ id: 1, category: 'ar-tv', queue_id: null }] }),
+    ])
+    mockTestClientInstance.mockResolvedValue({
+      ok: true,
+      error_class: null,
+      message: 'connected',
+      version: '5.1.1',
+      capabilities: { operations: {}, fields: {} },
+      detected_base_paths: [],
+      detected_categories: ['ar-tv'],
+    })
+    const root = await mount(container)
+
+    const editButton = Array.from(container.querySelectorAll('button')).find(
+      (b) => b.textContent === 'Edit',
+    )
+    await act(async () => {
+      editButton?.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    })
+
+    // The category's queue binding starts unbound -- pick a queue by hand, simulating an
+    // in-progress edit not yet saved.
+    const categorySelect = Array.from(container.querySelectorAll('select')).find((s) =>
+      Array.from(s.options).some((o) => o.value === String(queueA.id)),
+    ) as HTMLSelectElement
+    expect(categorySelect).toBeDefined()
+    await act(async () => {
+      categorySelect.value = String(queueB.id)
+      categorySelect.dispatchEvent(new Event('change', { bubbles: true }))
+    })
+    expect(categorySelect.value).toBe(String(queueB.id))
+
+    const testButton = Array.from(container.querySelectorAll('button')).find(
+      (b) => b.textContent === 'Test',
+    )
+    await act(async () => {
+      testButton?.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    })
+    await act(async () => {
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+
+    // The hand-picked binding survives Test -- not reverted to unbound, and not overwritten by
+    // whatever suggestion a fresh detection would otherwise propose.
+    const categorySelectAfter = Array.from(container.querySelectorAll('select')).find((s) =>
+      Array.from(s.options).some((o) => o.value === String(queueA.id)),
+    ) as HTMLSelectElement
+    expect(categorySelectAfter.value).toBe(String(queueB.id))
+
+    root.unmount()
+  })
 })

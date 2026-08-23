@@ -163,6 +163,14 @@ class SeedingEstateEntry:
     """One on-disk file that *is* claimed -- shown for visibility (spec §11.1d: "a review page
     that omits the seeding estate would be answering a question nobody asked") but never
     selectable, and never counted in a freed-space total.
+
+    **`claimed_transfer_id`/`claimed_transfer_name`/`claimed_content_path` added 2026-08-23**
+    (finding #7: "it would be better to show Torrents and expand each torrent to see details like
+    files etc") -- the claim's own torrent identity, lifted straight from the `ClientClaim`
+    `reconcile()` already resolves per file (`_claim_for`), so the display layer can roll files up
+    by torrent without `reconcile()` itself changing shape: inode accounting stays per-file (spec
+    §11.1b), only this dataclass now also carries the *reason* a file was claimed, not just the
+    fact that it was.
     """
 
     root: str
@@ -171,6 +179,9 @@ class SeedingEstateEntry:
     size: int
     claimed_by_client_id: int
     claimed_by_client_name: str
+    claimed_transfer_id: str
+    claimed_transfer_name: str
+    claimed_content_path: str
 
 
 @dataclass(frozen=True)
@@ -351,6 +362,9 @@ def reconcile(
                         size=entry.size,
                         claimed_by_client_id=claim.client_id,
                         claimed_by_client_name=claim.client_name,
+                        claimed_transfer_id=claim.transfer_id,
+                        claimed_transfer_name=claim.transfer_name,
+                        claimed_content_path=claim.content_path,
                     )
                 )
             continue

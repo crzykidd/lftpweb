@@ -218,6 +218,22 @@ treating this as a separate defect.**
   *precedence* correctly but says nothing about *provenance display* — that a merged row should
   show both contributors. That is a genuine spec gap, not just a missing implementation.
 
+### Resolved 2026-08-23 — status precedence already worked; provenance display was the real gap
+
+`prompts/done/2026-08-23-preflight-provenance-and-ui.md`, `docs/decisions.md`, spec §9.2's own new
+note. **Re-verified before changing anything, as this finding's own text asked**: `tests/
+test_preflight_client_merge.py::test_client_status_label_always_wins_when_present` predates this
+task and passed unmodified when run in isolation first — §9.2's per-field precedence was never
+broken, it simply had nothing to prefer while finding #2 kept every client row from reaching the
+merge. The provenance half was genuinely missing and is now built: `core/preflight.py.
+PreflightRow` gets its first widening in six tasks, `contributors: tuple[PreflightContributor,
+...]` — `()` standalone, both pre-merge views (*arr, then client) on a row `api/jobs.py.
+_merge_client_field_into_arr` folds together. `lib/preflight.ts.preflightBadges` renders one badge
+per contributor, falling back to the row's own top-level fields when standalone — which also fixed
+a smaller related gap found while in this code: a standalone *client* row previously showed no
+badge at all (the old `SourceChip` was gated on `source === 'arr'` outright). Covered by six new
+`tests/test_preflight_client_merge.py` cases and eight new `lib/preflight.test.ts` cases.
+
 ---
 
 ## 4. A paused, 60%-complete torrent appears nowhere in Preflight
@@ -272,6 +288,21 @@ violate that (it adds no *controls*), but it does mean the row shape carries mor
 today. Design it against §4.6's "framed as a cache" rule so it does not quietly become a second
 source of truth.
 
+### Resolved 2026-08-23 — a chevron toggle unfolding per-contributor detail, no new fetch
+
+`prompts/done/2026-08-23-preflight-provenance-and-ui.md`, `docs/decisions.md`. Each row is now a
+`<button>` toggling its own local `expanded` state — no prop, no handler reaching outside the row
+component — that unfolds `PreflightRowDetail`, rendering `lib/preflight.ts.
+preflightDetailEntries`: one line per contributor (or the row's own single view standalone) with
+that source's own `source_label`, raw `status_label`, and its own size/remaining, formatted through
+the same `preflightSizeLabel` the row's own figure column already uses. Everything shown was
+already on the response this box holds — no second request, keeping §4.6's "framed as a cache"
+rule intact — and there is no `onClick` anywhere in the detail panel, matching this finding's own
+"add no controls" constraint. "Which category" specifically was left out: `PreflightRow` has no
+category field on any source (only `queue_id`/`queue_name`, already shown at the row's top level),
+and nothing here fabricates one that isn't there. Covered by three new `lib/preflight.test.ts`
+cases, including one asserting the detail entry's own keys carry no id/handler.
+
 ---
 
 ## 7. Disk review lists files, not torrents
@@ -291,6 +322,30 @@ Note the two piles group differently and that is not a detail: the **seeding est
 naturally by torrent, while **debris** by definition has no torrent to group under, so it should
 group by directory. Do not force one shape onto both.
 
+### Resolved 2026-08-23 — grouped for display only; `reconcile()` still per-file, reclaim total still link-aware
+
+`prompts/done/2026-08-23-preflight-provenance-and-ui.md`, `docs/decisions.md`. `core/disk_review.
+py.reconcile()` is unchanged — still per-file, because inode accounting is inherently per-file
+(spec §11.1b). The rollup lives entirely in `lib/diskReview.ts`: `groupSeedingEstateByTorrent`
+(keyed on `claimed_by_client_id` + the claim's own `claimed_transfer_id`, both newly carried on
+`SeedingEstateEntry`/`DiskReviewSeedingEstateOut` — lifted from the `ClientClaim` `reconcile()`
+already resolves per file, not a new lookup) and `groupDebrisByDirectory` (parent directory, since
+debris has no torrent by definition) — two different functions, on purpose, matching this
+finding's own instruction not to force one shape onto both. **The reclaim total stays link-aware
+through the rollup**: a group's own total is `freedBytes(group.entries, selected)` — the existing
+function, called with the *global* selection set — never a naive per-group `size` sum, because
+every candidate still carries its own `link_paths` regardless of which directory group it renders
+under. Asserted directly: a hardlinked pair split across two different directory groups (the
+seeding-directory copy vs. the completed-folder hardlink, the exact real-world shape this spec
+names) still reports zero bytes when only one side is selected
+(`diskReview.test.ts::"a group's own reclaim total stays link-aware"`). `DiskReviewPage.tsx` now
+shows both piles as expandable group rows — directory + file count + link-aware total for debris,
+torrent name + client + plain total for the seeding estate (a plain sum is fine there; that pile is
+never selectable and never counted as reclaimable, per its own existing docstring). Covered by one
+new backend test (`tests/test_disk_review.py::
+test_seeding_estate_entries_carry_their_claims_torrent_identity`) and six new `diskReview.test.ts`
+cases.
+
 ---
 
 ## 8. The edit button disappears after a successful test until the page is reloaded
@@ -299,6 +354,31 @@ group by directory. Do not force one shape onto both.
 
 Straightforward frontend state bug in `ClientsTab.tsx` — the test-result render path drops the
 row's action affordances. Low risk, high annoyance.
+
+### Resolved 2026-08-23 — not a state bug: `overflow-hidden` was clipping the row, not hiding it
+
+`prompts/done/2026-08-23-preflight-provenance-and-ui.md`, `docs/decisions.md`. The Edit/Delete
+`<td>` in `ClientsTab.tsx` was never conditionally rendered — full `git log -p` on the file shows
+it unconditional on every commit since the table was written. The actual mechanism: a *passing*
+Test populates `detected_base_paths` (rendered `open` by default) and the capability readout, both
+inside the Test column, which can grow far wider than any sibling column once a real client
+reports several base paths/categories — `IntegrationsTab.tsx`'s own Test column never carries this
+much, which is why the same wrapper class never caused a visible problem there. The instances
+table's wrapper used `overflow-hidden` (the convention every other table on this page, and most in
+the app, uses purely to clip border-radius corners, since their content never legitimately
+overflows) — which **silently clips**, rather than scrolls, whatever pushes the table wider than
+its container, the rightmost column first. Reloading resets `testResults` (in-memory-only React
+state), the row narrows back down, and the button reappears — matching "after testing ... and it
+passes" and "till I reload the page" exactly. Fixed by changing that one wrapper's class to
+`overflow-x-auto`, so wide content scrolls instead of disappearing. This class of bug is invisible
+to jsdom, which performs no real layout — the honest reason no earlier component test caught it
+despite several sessions exercising the same Test-success path; the regression test added asserts
+the wrapper's class directly, the only thing a layout-less harness can pin down. **Separately
+checked, as this finding's own follow-up asked, and found not to be a bug**: a Test click while
+that same instance's edit form is open does not discard the draft — `recomputeCategoryDraft`
+already merges a fresh detection's categories against the current draft (`prev.categories`) rather
+than replacing it, so a hand-picked queue binding survives (asserted directly, a new
+`ClientsTab.test.tsx` case simulating exactly that sequence).
 
 ---
 

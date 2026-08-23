@@ -48,6 +48,25 @@ PreflightSource = Literal["arr", "settle", "client"]
 
 
 @dataclass(frozen=True)
+class PreflightContributor:
+    """One upstream's own view of a row, captured before a cross-source merge folds it into the
+    row's own winning field values (2026-08-23, finding #3: "we should show a sonarr AND a SAB
+    icon and have the latest status from SAB" -- `api/jobs.py._merge_client_field_into_arr`).
+    Exactly the display fields `PreflightRow` itself already carries per-source, and nothing
+    else -- provenance, not a grab-bag: no id, no queue position, no control, the same discipline
+    `PreflightRow`'s own docstring states for the row itself. Read-only history of what one
+    source said; never itself re-merged or re-interpreted.
+    """
+
+    source: PreflightSource
+    source_label: str
+    source_kind: str | None
+    status_label: str | None
+    size_bytes: int | None
+    size_remaining_bytes: int | None
+
+
+@dataclass(frozen=True)
 class PreflightRow:
     """One Preflight box row -- "something we know about but have no work to do on yet."
     Deliberately thin and source-agnostic: no id, no bytes-done, no queue position -- there is no
@@ -134,6 +153,18 @@ class PreflightRow:
     # this key makes possible. Optional with a default so every existing call site (both
     # already-shipped sources) needed no change to keep constructing a valid row.
     download_id: str | None = None
+    # Provenance for a merged row (2026-08-23, finding #3) -- **the first widening of this
+    # dataclass in six tasks**. `()` for every row this module itself ever constructs (an *arr
+    # row, a client row, a settle row): a source only ever reports its own single view, so it
+    # never has a second contributor to name. Populated exclusively by `api/jobs.py.
+    # _merge_client_field_into_arr`, the one place two sources' rows for the identical release
+    # fold into one -- both pre-merge views, `arr_row` then `client_row`, preserved verbatim so
+    # the frontend can render a badge (and, on expand, the raw detail) for *each* contributor
+    # rather than only the one that won the field-level merge (§9.2 specifies precedence, not
+    # provenance display -- see that section's own note on this gap). Deliberately just the six
+    # display fields a badge/detail row needs, not a nested second `PreflightRow` -- provenance,
+    # not a grab-bag, the same restraint this dataclass has held everywhere else.
+    contributors: tuple[PreflightContributor, ...] = ()
 
 
 # Comfortably longer than a poll-driven source's own refresh cadence (the *arr poller's default

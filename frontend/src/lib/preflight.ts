@@ -205,6 +205,92 @@ export function preflightChipLabel(row: Pick<PreflightRowOut, 'source' | 'status
  * blocking the tooltip from rendering. Always non-null for a non-*arr row (`settleWaitLabel`
  * itself never returns `null`), unlike the *arr branch above.
  */
+/** One badge's worth of provenance -- exactly what `SourceChip` (`components/PreflightBox.tsx`)
+ * needs to render a brand logo or a plain text chip, nothing else (no status, no size -- that's
+ * `preflightDetailEntries` below, for the expand).
+ */
+export interface PreflightBadge {
+  source: string
+  source_kind: string | null
+  source_label: string
+}
+
+/** Which badge(s) a row renders (finding #3, 2026-08-23: "we should show a sonarr AND a SAB
+ * icon"). **Exactly one badge per contributor, never an empty second slot**:
+ *
+ * - A merged row (`row.contributors.length === 2`, *arr then client, `core/preflight.py.
+ *   PreflightRow.contributors`'s own docstring) renders one badge per contributor -- both the
+ *   *arr's and the client's own provenance, independent of which one won the field-level merge
+ *   (§9.2 governs precedence, not which badges show).
+ * - A standalone row (`contributors` empty) renders exactly one badge from the row's own
+ *   top-level `source`/`source_kind`/`source_label` -- unchanged from before this task for an
+ *   *arr row, and **newly shown** for a standalone client row (finding #3's own request read
+ *   literally: a client's own icon is provenance too, not only an *arr's).
+ * - A settle row (`contributors` always empty; settle wins outright over a merged arr/client row
+ *   rather than folding into one) renders **no** badge -- `components/PreflightBox.tsx`'s own
+ *   established reasoning: lftpweb itself is the source, and there is no brand to name.
+ */
+export function preflightBadges(
+  row: Pick<PreflightRowOut, 'source' | 'source_kind' | 'source_label' | 'contributors'>,
+): PreflightBadge[] {
+  if (row.contributors.length > 0) {
+    return row.contributors.map((c) => ({
+      source: c.source,
+      source_kind: c.source_kind,
+      source_label: c.source_label,
+    }))
+  }
+  if (row.source === 'settle') return []
+  return [{ source: row.source, source_kind: row.source_kind, source_label: row.source_label }]
+}
+
+/** One contributor's own raw detail, for the row's expand (finding #6, 2026-08-23: "add a
+ * preflight expand option that shows more detail"). Information only -- `source_label` (which
+ * client/instance), `status_label` (that source's own raw wording, unmodified), and `sizeLabel`
+ * (that source's own size/remaining, through the identical `preflightSizeLabel` formatting the
+ * row's own figure column already uses, never a second formatting rule). Mirrors
+ * `preflightBadges` above: one entry per contributor on a merged row, or the row's own single
+ * view standalone -- **never a fetch**, everything here is already present on the response this
+ * box already holds (§4.6's "framed as a cache": re-fetchable, safe to discard, never a second
+ * source of truth).
+ */
+export interface PreflightDetailEntry {
+  source: string
+  source_kind: string | null
+  source_label: string
+  status_label: string | null
+  sizeLabel: string | null
+}
+
+export function preflightDetailEntries(
+  row: Pick<
+    PreflightRowOut,
+    'source' | 'source_kind' | 'source_label' | 'status_label' | 'size_bytes' | 'size_remaining_bytes' | 'contributors'
+  >,
+): PreflightDetailEntry[] {
+  if (row.contributors.length > 0) {
+    return row.contributors.map((c) => ({
+      source: c.source,
+      source_kind: c.source_kind,
+      source_label: c.source_label,
+      status_label: c.status_label,
+      sizeLabel: preflightSizeLabel({
+        size_bytes: c.size_bytes,
+        size_remaining_bytes: c.size_remaining_bytes,
+      }),
+    }))
+  }
+  return [
+    {
+      source: row.source,
+      source_kind: row.source_kind,
+      source_label: row.source_label,
+      status_label: row.status_label,
+      sizeLabel: preflightSizeLabel(row),
+    },
+  ]
+}
+
 export function preflightChipTooltip(
   row: Pick<
     PreflightRowOut,

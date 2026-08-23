@@ -180,3 +180,52 @@ def test_three_way_merge_orders_alphabetically_by_title():
     settle_row = _row(source="settle", download_id=None, title="Mid", queue_id=2)
     merged = _merge_preflight_rows([arr_row], [client_row], [settle_row])
     assert [r.title for r in merged] == ["Alpha", "Mid", "Zeta"]
+
+
+# --- Provenance: a merged row carries both contributors (finding #3, 2026-08-23) ----------------
+#
+# Re-verification note: the symptom this finding reported (Preflight showing the *arr's status
+# rather than the client's) was measured when zero client rows existed (finding #2), so §9.2's
+# precedence had nothing to prefer -- `test_client_status_label_always_wins_when_present` above
+# already proves the precedence itself works, and it is not new to this task (see this suite's
+# own git history: it predates the `contributors` field added here). What follows is the
+# genuinely-missing half: both contributors visible on one row.
+
+
+def test_merged_row_carries_both_contributors_arr_then_client():
+    arr_row = _row(download_id="abc123", source_label="Sonarr", source_kind="sonarr")
+    client_row = _client_row(download_id="abc123", source_label="SABnzbd", source_kind="sabnzbd")
+    merged = _merge_client_field_into_arr(arr_row, client_row)
+    assert len(merged.contributors) == 2
+    assert merged.contributors[0].source == "arr"
+    assert merged.contributors[0].source_label == "Sonarr"
+    assert merged.contributors[0].source_kind == "sonarr"
+    assert merged.contributors[1].source == "client"
+    assert merged.contributors[1].source_label == "SABnzbd"
+    assert merged.contributors[1].source_kind == "sabnzbd"
+
+
+def test_contributor_snapshot_keeps_each_sources_own_pre_merge_status_and_size():
+    """`contributors` is untouched by the field-level merge -- each entry is that source's own
+    reading, not the winning value repeated twice."""
+    arr_row = _row(download_id="abc123", status_label="queued", size_bytes=5_000_000)
+    client_row = _client_row(download_id="abc123", status_label="Downloading", size_bytes=6_000_000)
+    merged = _merge_client_field_into_arr(arr_row, client_row)
+    assert merged.contributors[0].status_label == "queued"
+    assert merged.contributors[0].size_bytes == 5_000_000
+    assert merged.contributors[1].status_label == "Downloading"
+    assert merged.contributors[1].size_bytes == 6_000_000
+    # The row's own top-level fields still reflect the §9.2 winner, unaffected by the snapshot.
+    assert merged.status_label == "Downloading"
+    assert merged.size_bytes == 6_000_000
+
+
+def test_standalone_row_from_either_source_has_no_contributors():
+    """A row that never merged (no matching identity on the other side) carries `()` -- there is
+    only ever one contributor to show, so the frontend renders exactly one badge, never an empty
+    second slot."""
+    arr_row = _row(download_id="only-arr")
+    client_row = _client_row(download_id="only-client")
+    merged = _merge_arr_and_client_rows([arr_row], [client_row])
+    assert len(merged) == 2
+    assert all(r.contributors == () for r in merged)

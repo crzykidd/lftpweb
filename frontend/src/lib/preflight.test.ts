@@ -1,9 +1,11 @@
 import { describe, expect, it } from 'vitest'
 import {
   isPreflightPageSize,
+  preflightBadges,
   preflightChipLabel,
   preflightChipState,
   preflightChipTooltip,
+  preflightDetailEntries,
   preflightFillPercent,
   preflightRemainingLabel,
   preflightSizeLabel,
@@ -219,6 +221,101 @@ describe('preflightChipState -- which StateChip bucket a row\'s chip renders thr
 
   it('is SETTLING for a settle row -- deliberately never fills', () => {
     expect(preflightChipState({ source: 'settle', status_label: 'Settling' })).toBe('SETTLING')
+  })
+})
+
+// --- preflightBadges / preflightDetailEntries -- finding #3's provenance, finding #6's expand ---
+
+describe('preflightBadges', () => {
+  it('renders one badge per contributor on a merged row, arr then client', () => {
+    const badges = preflightBadges({
+      source: 'client',
+      source_kind: 'sabnzbd',
+      source_label: 'SABnzbd',
+      contributors: [
+        { source: 'arr', source_label: 'Sonarr', source_kind: 'sonarr', status_label: 'queued', size_bytes: null, size_remaining_bytes: null },
+        { source: 'client', source_label: 'SABnzbd', source_kind: 'sabnzbd', status_label: 'Downloading', size_bytes: null, size_remaining_bytes: null },
+      ],
+    })
+    expect(badges).toEqual([
+      { source: 'arr', source_kind: 'sonarr', source_label: 'Sonarr' },
+      { source: 'client', source_kind: 'sabnzbd', source_label: 'SABnzbd' },
+    ])
+  })
+
+  it('renders exactly one badge for a standalone *arr row -- no empty second slot', () => {
+    expect(
+      preflightBadges({ source: 'arr', source_kind: 'sonarr', source_label: 'Sonarr', contributors: [] }),
+    ).toEqual([{ source: 'arr', source_kind: 'sonarr', source_label: 'Sonarr' }])
+  })
+
+  it('renders exactly one badge for a standalone client row (newly shown by this task)', () => {
+    expect(
+      preflightBadges({ source: 'client', source_kind: 'sabnzbd', source_label: 'SABnzbd', contributors: [] }),
+    ).toEqual([{ source: 'client', source_kind: 'sabnzbd', source_label: 'SABnzbd' }])
+  })
+
+  it('renders no badge for a settle row -- lftpweb itself is the source, no brand to name', () => {
+    expect(
+      preflightBadges({ source: 'settle', source_kind: null, source_label: 'TV', contributors: [] }),
+    ).toEqual([])
+  })
+})
+
+describe('preflightDetailEntries', () => {
+  it('exposes each contributor\'s own raw status and size, not the merged winner repeated twice', () => {
+    const entries = preflightDetailEntries({
+      source: 'client',
+      source_kind: 'sabnzbd',
+      source_label: 'SABnzbd',
+      status_label: 'Downloading',
+      size_bytes: 6_000_000,
+      size_remaining_bytes: 1_000_000,
+      contributors: [
+        { source: 'arr', source_label: 'Sonarr', source_kind: 'sonarr', status_label: 'queued', size_bytes: 5_000_000, size_remaining_bytes: null },
+        { source: 'client', source_label: 'SABnzbd', source_kind: 'sabnzbd', status_label: 'Downloading', size_bytes: 6_000_000, size_remaining_bytes: 1_000_000 },
+      ],
+    })
+    expect(entries).toHaveLength(2)
+    expect(entries[0].status_label).toBe('queued')
+    expect(entries[0].sizeLabel).toBe('4.8 MB')
+    expect(entries[1].status_label).toBe('Downloading')
+    expect(entries[1].sizeLabel).toContain('% of')
+  })
+
+  it('falls back to the row\'s own single view when standalone', () => {
+    const entries = preflightDetailEntries({
+      source: 'arr',
+      source_kind: 'sonarr',
+      source_label: 'Sonarr',
+      status_label: 'downloading',
+      size_bytes: 1_000_000,
+      size_remaining_bytes: null,
+      contributors: [],
+    })
+    expect(entries).toEqual([
+      {
+        source: 'arr',
+        source_kind: 'sonarr',
+        source_label: 'Sonarr',
+        status_label: 'downloading',
+        sizeLabel: '976.6 KB',
+      },
+    ])
+  })
+
+  it('offers no action -- every field is display text, nothing here is an id or a handler', () => {
+    const entries = preflightDetailEntries({
+      source: 'arr',
+      source_kind: 'sonarr',
+      source_label: 'Sonarr',
+      status_label: 'downloading',
+      size_bytes: null,
+      size_remaining_bytes: null,
+      contributors: [],
+    })
+    const keys = Object.keys(entries[0]).sort()
+    expect(keys).toEqual(['source', 'sizeLabel', 'source_kind', 'source_label', 'status_label'].sort())
   })
 })
 

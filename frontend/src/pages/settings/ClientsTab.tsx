@@ -773,7 +773,24 @@ export function ClientsTab() {
 
       {error && <p className="text-sm text-red-600 dark:text-red-400">{error}</p>}
 
-      <div className="overflow-hidden rounded-md border border-zinc-200 dark:border-zinc-800">
+      {/* Finding #8, 2026-08-23: "after testing a site and it passes I lose the edit button
+       * till I reload the page." Root cause -- **not a React state bug** (the Edit/Delete `<td>`
+       * below is unconditional, on every commit since this table was written; `git log -p` on
+       * this file has no version where it was ever gated on `result`). A passing Test populates
+       * `detected_base_paths` (rendered `open` by default) and, once probed, the capability
+       * readout -- both live in the Test column, and only after a *passing* test, which lines up
+       * with "after testing ... and it passes" exactly. That content can make the Test column
+       * far wider than any other tab's (`IntegrationsTab.tsx`'s own Test column never grows past
+       * a button and a one-line status). `overflow-hidden` on this wrapper (every other table on
+       * this page, and most in the app, use it purely to clip the border-radius corners, since
+       * their content never legitimately overflows) then **silently clips** whatever content
+       * pushes the table wider than its container -- the rightmost column, Edit/Delete, first.
+       * Reloading resets `testResults` (in-memory only), the row narrows back down, and the
+       * button is "back." `overflow-x-auto` never hides content -- it scrolls instead, so
+       * Edit/Delete stays reachable regardless of how wide a test result gets. jsdom performs no
+       * layout, which is why no existing render test caught this -- there is nothing to assert
+       * against it beyond not regressing this class name back to `overflow-hidden`. */}
+      <div className="overflow-x-auto rounded-md border border-zinc-200 dark:border-zinc-800">
         <table className="w-full text-sm">
           <thead className="bg-zinc-50 text-left text-zinc-500 dark:bg-zinc-900 dark:text-zinc-400">
             <tr>

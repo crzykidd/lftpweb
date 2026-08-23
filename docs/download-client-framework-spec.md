@@ -719,6 +719,33 @@ section is the rule that stage's merge must implement, and it should be built wi
 asserts a stale *arr row cannot overwrite a fresher client field — the failure is otherwise silent
 and looks like flicker.
 
+#### The provenance-display gap (found 2026-08-23, finding #3)
+
+**This section specifies *precedence* — which value wins per field — and says nothing about
+*provenance display*: that a row deduped across two sources should still show both of them.**
+That is a real, separate gap, not a restatement of the rule above. It surfaced because the
+original symptom it was mistaken for — Preflight showing the *arr's status rather than the
+client's — was measured with **zero** client rows reaching the merge at all (§9.3's own root
+cause, finding #2): with nothing on the other side of the merge, this section's precedence had
+nothing to prefer, so it looked broken when it had simply never been exercised. Once client rows
+flowed, the precedence itself was already correct (`tests/test_preflight_client_merge.py::
+test_client_status_label_always_wins_when_present` predates this note and passed unmodified) —
+but the user's own request, verbatim, was never only about which value wins: *"We should show a
+sonarr AND a SAB icon."* `PreflightRow` carried a single `source`/`source_label`/`source_kind`
+triple, so a merged row could only ever display one badge, regardless of how correct its
+precedence was.
+
+**Resolved 2026-08-23** — `core/preflight.py.PreflightContributor` (a new, minimal dataclass: the
+same six display fields `PreflightRow` itself carries per-source, nothing else) and `PreflightRow.
+contributors: tuple[PreflightContributor, ...]`, `()` for every row a source constructs for
+itself, populated only by `api/jobs.py._merge_client_field_into_arr` with both pre-merge views
+(*arr, then client) when a row folds together. The frontend's `lib/preflight.ts.preflightBadges`/
+`preflightDetailEntries` render one badge — and, on expand, one detail line — per contributor,
+falling back to the row's own top-level fields for a standalone row so no row ever shows an empty
+second slot. Provenance display and field precedence are now both covered, by two different,
+independently testable mechanisms — this section's own rule for the latter, `PreflightRow.
+contributors` for the former.
+
 ### 9.3 Visibility — a working client must never look identical to a broken one
 
 **Found on the live test system, 2026-08-23** (finding #2 and its reinforcing observation,

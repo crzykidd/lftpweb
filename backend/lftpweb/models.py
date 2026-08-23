@@ -1024,11 +1024,30 @@ class JobsResponse(BaseModel):
 # response rather than as rows, per the user's own decision (`docs/decisions.md`). --------------
 
 
+class PreflightContributorOut(BaseModel):
+    """One upstream's own pre-merge view of a row (2026-08-23, finding #3) -- mirrors
+    `core/preflight.py.PreflightContributor` field for field. `[]` on `PreflightRowOut.
+    contributors` below for a standalone row; exactly two entries, *arr then client, for a row
+    `api/jobs.py._merge_client_field_into_arr` folded together. Read-only history, same as its
+    backend counterpart -- an expand renders this, never acts on it.
+    """
+
+    source: str
+    source_label: str
+    source_kind: str | None
+    status_label: str | None
+    size_bytes: int | None
+    size_remaining_bytes: int | None
+
+
 class PreflightRowOut(BaseModel):
     """One Preflight box row. Deliberately thin -- no `id`, no `queue_position`, no
     `bytes_done`: there is no `item` and no `job` behind this row yet, and the handoff prompt's
     own "the rows are inert, and the box is what makes that structural" is exactly why nothing
     here invites a per-row control (chevrons, Dismiss, Start now, Stop) that would need one.
+    **An expand is not such a control** -- it adds no `onClick` that reaches the backend, only
+    unfolds `contributors` (below) into a client-side detail panel already fully present on this
+    same response.
     """
 
     # `'arr'`, `'settle'`, or `'client'` today (`core/preflight.py.PreflightSource`, `'client'`
@@ -1083,6 +1102,13 @@ class PreflightRowOut(BaseModel):
     # `item_settle` history yet -- both fields together, never one alone.
     wait_scans: int | None
     wait_since: str | None
+    # Both contributors' own pre-merge view for a row deduped across the *arr and a download
+    # client (2026-08-23, finding #3: "we should show a sonarr AND a SAB icon and have the
+    # latest status from SAB") -- `[]` for a row from a single source, exactly two entries
+    # (*arr, then client) for a merged one. Every field above this line already reflects the
+    # §9.2-precedence *winner*; this is the losing side's own reading, kept for provenance
+    # display and the row's expand, never re-merged or re-interpreted client-side.
+    contributors: list[PreflightContributorOut] = Field(default_factory=list)
 
 
 class PreflightGatedQueueOut(BaseModel):
@@ -1953,12 +1979,22 @@ class DiskReviewDebrisOut(BaseModel):
 
 
 class DiskReviewSeedingEstateOut(BaseModel):
+    """`claimed_transfer_id`/`claimed_transfer_name`/`claimed_content_path` (2026-08-23, finding
+    #7) -- the claim's own torrent identity, so the frontend can roll these files up by torrent
+    (`lib/diskReview.ts.groupSeedingEstateByTorrent`) rather than listing bare files -- a
+    display-layer grouping only; `core/disk_review.py.reconcile()` itself still resolves this per
+    file, unchanged (inode accounting is inherently per-file, spec §11.1b).
+    """
+
     root: str
     rel_path: str
     abs_path: str
     size: int
     claimed_by_client_id: int
     claimed_by_client_name: str
+    claimed_transfer_id: str
+    claimed_transfer_name: str
+    claimed_content_path: str
 
 
 class DiskReviewBrokenSeedOut(BaseModel):

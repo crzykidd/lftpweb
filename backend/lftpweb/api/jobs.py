@@ -19,7 +19,7 @@ from lftpweb.core import audit, local_delete, settle
 from lftpweb.core.itemview import ITEM_VIEW_COLUMNS_QUALIFIED, item_view
 from lftpweb.core.lftp import build_transfer_command, effective_tuning_settings
 from lftpweb.core.postprocess import perform_remote_delete
-from lftpweb.core.preflight import PreflightRow
+from lftpweb.core.preflight import PreflightContributor, PreflightRow
 from lftpweb.core.queue import (
     JobNotDismissableError,
     JobNotQueuedError,
@@ -48,6 +48,7 @@ from lftpweb.models import (
     JobOut,
     JobsResponse,
     MoveJobRequest,
+    PreflightContributorOut,
     PreflightGatedQueueOut,
     PreflightResponse,
     PreflightRowOut,
@@ -638,6 +639,24 @@ async def unpause_queue(request: Request) -> None:
     await request.app.state.queue.unpause()
 
 
+def _preflight_contributor(row: PreflightRow) -> PreflightContributor:
+    """One pre-merge row's own view, captured for `PreflightRow.contributors` (2026-08-23,
+    finding #3) -- the six display fields a badge/detail entry needs, lifted straight off
+    whichever row (`arr_row`/`client_row`) is being folded, before `_merge_client_field_into_arr`
+    below decides which one's *value* wins per field. Never applied to a settle row -- settle
+    wins outright over a merged arr/client row (`_merge_preflight_rows`'s own step 2) rather than
+    folding into one, so it never needs a contributor snapshot of its own.
+    """
+    return PreflightContributor(
+        source=row.source,
+        source_label=row.source_label,
+        source_kind=row.source_kind,
+        status_label=row.status_label,
+        size_bytes=row.size_bytes,
+        size_remaining_bytes=row.size_remaining_bytes,
+    )
+
+
 def _merge_client_field_into_arr(arr_row: PreflightRow, client_row: PreflightRow) -> PreflightRow:
     """One row for one release both the *arr and a download client report at once (spec §9.2,
     docs/download-client-framework-spec.md, `core/clientsync.py`, this task) -- the caller
@@ -664,6 +683,14 @@ def _merge_client_field_into_arr(arr_row: PreflightRow, client_row: PreflightRow
     client is handling this" tooltip fact) is kept from `arr_row`, since the client source itself
     never populates that field (`core/clientsync.py._update_preflight`'s own reasoning: this
     source *is* the download client).
+
+    **`contributors` carries both pre-merge views, `arr_row` then `client_row`** (2026-08-23,
+    finding #3: "we should show a sonarr AND a SAB icon" -- §9.2 specifies field precedence but
+    says nothing about provenance display, a gap this task closes). This is the one place either
+    ever gets a value -- neither source constructs one for itself (`core/preflight.py.
+    PreflightRow.contributors`'s own docstring). Order is fixed (*arr, then client) rather than
+    "winner first," so the frontend never has to infer which contributor is which from field
+    values that just happen to match the merge result.
     """
     return replace(
         arr_row,
@@ -686,6 +713,7 @@ def _merge_client_field_into_arr(arr_row: PreflightRow, client_row: PreflightRow
         remaining_s=(
             client_row.remaining_s if client_row.remaining_s is not None else arr_row.remaining_s
         ),
+        contributors=(_preflight_contributor(arr_row), _preflight_contributor(client_row)),
     )
 
 
@@ -889,6 +917,17 @@ async def get_preflight(request: Request) -> PreflightResponse:
                 download_client=r.download_client,
                 wait_scans=r.wait_scans,
                 wait_since=r.wait_since,
+                contributors=[
+                    PreflightContributorOut(
+                        source=c.source,
+                        source_label=c.source_label,
+                        source_kind=c.source_kind,
+                        status_label=c.status_label,
+                        size_bytes=c.size_bytes,
+                        size_remaining_bytes=c.size_remaining_bytes,
+                    )
+                    for c in r.contributors
+                ],
             )
             for r in rows
         ],

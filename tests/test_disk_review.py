@@ -216,6 +216,48 @@ def test_inode_claim_protects_a_hardlink_never_named_by_any_claim():
     assert seed_copy.abs_path in seeding_paths
 
 
+def test_seeding_estate_entries_carry_their_claims_torrent_identity():
+    """2026-08-23, finding #7: "it would be better to show Torrents and expand each torrent."
+    The rollup is a display-layer concern (`lib/diskReview.ts.groupSeedingEstateByTorrent`), but
+    it needs each file's own claim identity to group by -- both the seeding-directory copy and
+    its completed-folder hardlink must carry the *same* `claimed_transfer_id`/
+    `claimed_transfer_name`/`claimed_content_path`, proving one torrent's two on-disk files roll
+    up together rather than needing a second lookup.
+    """
+    completed = "/complete/tv"
+    working = "/rtorrent/data"
+    seed_copy = _file(working, "Release/file.mkv", inode=77, nlink=2)
+    hardlink = _file(completed, "Release/file.mkv", inode=77, nlink=2)
+
+    result = reconcile(
+        **_base(
+            base_paths=[completed, working],
+            contributors=[
+                BasePathContributor(completed, client_id=1),
+                BasePathContributor(working, client_id=1),
+            ],
+            reachable_client_ids=[1],
+            disk_entries=[seed_copy, hardlink],
+            claims=[
+                _claim(
+                    1,
+                    "rTorrent",
+                    f"{working}/Release",
+                    transfer_id="t-release-1",
+                    transfer_name="Release.S01E01",
+                )
+            ],
+        )
+    )
+    by_path = {s.abs_path: s for s in result.seeding_estate}
+    assert by_path[seed_copy.abs_path].claimed_transfer_id == "t-release-1"
+    assert by_path[hardlink.abs_path].claimed_transfer_id == "t-release-1"
+    assert by_path[seed_copy.abs_path].claimed_transfer_name == "Release.S01E01"
+    assert by_path[hardlink.abs_path].claimed_transfer_name == "Release.S01E01"
+    assert by_path[seed_copy.abs_path].claimed_content_path == f"{working}/Release"
+    assert by_path[hardlink.abs_path].claimed_content_path == f"{working}/Release"
+
+
 def test_nlink_greater_than_found_links_is_never_proposed():
     """`nlink=2` but this scan only ever found one on-disk entry for that inode -- the other
     link lives somewhere outside every scanned base path. The conservative default: never
