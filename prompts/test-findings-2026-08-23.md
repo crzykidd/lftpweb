@@ -852,3 +852,71 @@ the opposite sign — it stops carrying information.
 **Sequenced with the per-client relevance display** (SAB: *"12 of 12 matched by folder — no mapping
 needed"*; rTorrent: *"0 of 2 matched — mapping required"*), since both change what this section
 says about an unmapped category and splitting them would mean writing that copy twice.
+
+---
+
+## 16. TWO lftpweb instances share one seedbox — "not used" is a safety boundary, not a preference
+
+> *"My seedbox goes to 2 different download locations. SAB and rtorrent see them all, but
+> sonarr/radarr don't, cause the other sonarr/radarr is at a different location running a different
+> instance of lftpweb."*
+
+**This is a deployment shape the entire framework was designed without knowing about, and it
+changes the stakes of #15.**
+
+The shape: **one seedbox, one SABnzbd, one rTorrent — but two independent lftpweb instances**, each
+with its own *arr pair, each responsible for a different subset of the download locations. Both
+lftpwebs see *everything* the clients report, because the clients serve both.
+
+So **this instance permanently sees work that is not its business**, by design, forever. That is
+not a misconfiguration to be cleaned up; it is the steady state.
+
+### Consequence 1 — #15 stops being cosmetic
+
+A category belonging to the *other* instance is exactly the "deliberately not used by lftpweb" case.
+Without an explicit saved state for it, the "none attributable" banner nags permanently about work
+this instance is correctly ignoring, and the warning becomes noise.
+
+### Consequence 2 — the disk review scan can propose the other instance's data as debris
+
+**This is the serious one, and it is a latent data-loss path once stage 5 exists.**
+
+The scan (§11) proposes `B − A − C`: on disk, unclaimed by any client, unused by *this* lftpweb.
+The other instance's content is currently protected only by set **A** — SAB/rTorrent still claim it,
+and set A is a union across clients (§11.1a).
+
+**That protection is temporary.** As soon as the other instance imports a release and SAB drops it
+from history — or its torrent is removed — that content is claimed by nobody *this* instance can
+see. Set C only knows about this lftpweb's own items. The content becomes, by the scan's own
+arithmetic, indistinguishable from debris.
+
+Stage 5 would then offer to delete another site's data, with a correct-looking reclaim figure and
+no signal anything was wrong.
+
+### What "not used by this instance" must therefore mean
+
+Not one thing, but **two**:
+
+1. **Do not warn** about it (the #15 banner behaviour), and
+2. **Never scan it, never propose it, and never let it fall inside a delete containment
+   boundary** — a hard exclusion from `core/disk_review.py`'s walk and from §10.2's containment
+   check.
+
+The second is the load-bearing half. A flag that only silences a banner would leave the delete path
+exactly as dangerous while *appearing* to have addressed the problem.
+
+### Open questions this raises — do not answer them by assumption
+
+- **Is category the right exclusion unit, or is it path?** The other instance's content is
+  identified by *where it lands*, and a category is only a proxy for that. An excluded **base path**
+  (or sub-path) may be the more direct and safer expression, with category exclusion as
+  convenience. This deserves deciding explicitly.
+- **Should two lftpwebs sharing a seedbox be a first-class documented deployment** (README, spec
+  §1.1's reference workflow) rather than an emergent surprise? It is plainly a real topology, and
+  every "unclaimed means safe to remove" assumption in §11 was written without it in mind.
+- **Does the same hazard exist for `move`-mode source deletion today**, independent of stage 5?
+  That path deletes `<queue.remote_path>/<rel_path>` on confirmed import and is scoped to this
+  instance's own items, so it looks safe — but it should be *confirmed* safe rather than assumed,
+  now that we know two instances share a tree.
+- Should the scan **refuse to run at all** on a base path known to be shared, until exclusions are
+  configured? Failing closed is the house style for anything that deletes.
