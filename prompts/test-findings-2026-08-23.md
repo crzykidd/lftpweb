@@ -650,3 +650,40 @@ denylist. `SEEDING` is now excluded — this finding's own fix. Covered by
 against a real rTorrent-shaped fixture reproducing the exact live scenario, `test_rtorrent_
 active_only_true_admits_only_incoming_rows`. Also fixed alongside #4, the same filter wrong in
 the opposite direction — see that finding's own resolution note.
+
+---
+
+## 13. The unattributable-client banner names a nonexistent page and isn't a link
+
+> *"When we have this error — `ultracc rtorrent: reports 2 items, none attributable to a queue —
+> check its category → queue mapping in Settings → Integrations → API Clients` — we should link
+> right to the place to set [it]."*
+
+Two defects in one sentence of copy (`frontend/src/components/PreflightBox.tsx:227`):
+
+**13a — the breadcrumb is wrong.** There is no "Settings → Integrations → API Clients". `nav.ts`
+has two separate tabs: `/settings/integrations` labelled **Integrations** (Sonarr/Radarr) and
+`/settings/clients` labelled **Clients** (download clients). The banner sends the user to a page
+that does not exist, and to the *arr tab if they follow it literally. This is almost certainly an
+echo of the user's own eventual "API Clients" unified-page idea (spec §8.1), written into shipped
+copy before that page exists.
+
+**13b — it should be a link, not an instruction.** The banner already knows *which* instance is
+unattributable (`unattributed_clients` carries the client id and name), so it can deep-link
+straight to that client's own row — not merely the tab. Telling someone the path to a settings page
+they must then navigate by hand, when the app knows exactly which record needs editing, is the
+avoidable half of the problem.
+
+**Worth doing properly while there:**
+
+- Deep-link to the **specific client**, ideally opening it in edit mode. `/settings/clients` alone
+  still leaves the user to find the right row.
+- **Audit for the same wrong breadcrumb elsewhere.** If this copy was written once from the
+  imagined page name, it may appear in other strings, help text, or the README.
+- Keep the banner's shape — one line per affected client, never one per dropped row (the
+  mount-gate precedent).
+- Note this is the **third** finding in this session caused by shipped text describing something
+  that isn't real (the placeholder that looked like a value, #11c; the stale
+  "`active_only=True` excludes terminal transfers" comment, #12; and now this). Worth a moment's
+  thought about whether user-facing copy naming a navigation path should be generated from `nav.ts`
+  rather than hand-written, so it cannot drift from the real routes.
