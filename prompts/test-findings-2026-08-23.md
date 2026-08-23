@@ -267,3 +267,56 @@ Worth deciding whether this replaces the immediate skip or becomes its configura
   hatch, working as intended.
 - **A bad credential at poll time raises `client_auth_failed`**, distinct from unreachability, once
   per failure streak rather than once per attempt.
+
+---
+
+## 10. "Infer mappings from base paths + queues" proposes nothing — the inference uses the wrong signal
+
+> *"I am not sure why infer mappings from base paths and queue don't resolve anything for me. The
+> category is ar-tv and the dir for that is ar-tv."*
+
+**`lib/clientCategoryInference.ts` is behaving exactly as written.** It matches each queue's
+`remote_path` against the instance's *configured* base paths and proposes the trailing segment as
+the category name. Given the live state (see #2):
+
+- **SAB has zero configured base paths** → the normalized base list is empty → the inner loop never
+  executes → zero proposals. This is the whole of the reported symptom.
+- **rTorrent's one base path is `~/downloads/rtorrent`** → no queue `remote_path`
+  (`/home/crzykidd/downloads/complete/…`) sits under it → no match. Finding #1's unexpanded `~`
+  would additionally prevent any comparison from succeeding.
+
+**Immediate unblock (config, not a fix):** add `/home/crzykidd/downloads/complete` as SAB's base
+path. It *is* the parent of the category folders, so inference should then propose both mappings.
+
+### The design problem underneath, which that workaround does not address
+
+**Base paths are a proxy for the category mapping, and rTorrent proves the proxy is wrong.**
+
+- For **SAB** the proxy happens to hold: categories are subdirectories of `complete_dir`, so
+  `<base>/<category>` path arithmetic recovers them. Spec §8.3's own observation — *"the queue
+  remote paths already **are** the client's category folders"* — was drawn from a SAB-shaped
+  layout and quietly generalized.
+- For **rTorrent it can never hold.** Labels live in `d.custom1` and have no relationship to
+  `directory.default` whatsoever. Its base path is the *seeding* directory (`working`), not a
+  parent of the completed category folders (`content`). No amount of correct configuration makes
+  path arithmetic produce rTorrent's categories — the information simply is not in the paths.
+
+**The direct signal already exists and is not being used.** Both connectors declare
+`Field.CATEGORY`; SAB additionally exposes categories in `get_config`, and rTorrent's labels come
+back on the same `d.multicall2` the poller already issues. Matching the client's *own reported
+categories* against queue names (or their trailing path segments) works for both clients, needs no
+base path configured at all, and degrades sensibly: a client reporting no categories proposes
+nothing, rather than silently proposing nothing for a reason the user cannot see.
+
+**Worth deciding as part of any fix:**
+
+- Should inference key on the client's reported categories, on path arithmetic, or on both with
+  the direct signal preferred? Path arithmetic still has value for a SAB with no items yet — it can
+  propose from an empty queue, where a category list cannot.
+- **A `list_categories` operation is arguably missing from the §2.1 vocabulary.** Today categories
+  are only observable as a *field on transfers*, so a client with an empty queue and empty history
+  reports none — exactly the fresh-setup case where inference is most wanted. Adding an operation
+  is a vocabulary change and should not be done casually, but this is a real gap.
+- Whichever signal is used, **the empty result must explain itself** (#2's theme again): "no base
+  paths configured", "the client reported no categories", and "nothing matched" are three different
+  answers, and today all three render as a silent no-op.
