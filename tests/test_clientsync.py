@@ -20,6 +20,7 @@ from datetime import UTC, datetime
 
 import aiosqlite
 import pytest
+from fake_rtorrent import run_fake_rtorrent_server
 from fake_sabnzbd import run_fake_sabnzbd_server
 
 from lftpweb.core.clientsync import (
@@ -47,6 +48,12 @@ async def db():
 @pytest.fixture
 async def fake_sabnzbd_server():
     async with run_fake_sabnzbd_server() as server:
+        yield server
+
+
+@pytest.fixture
+async def fake_rtorrent_server():
+    async with run_fake_rtorrent_server() as server:
         yield server
 
 
@@ -401,10 +408,20 @@ async def test_disabled_instance_never_polled(db, fake_sabnzbd_server, tmp_path)
     assert await _event_rows(db) == []
 
 
-# --- Two cadences firing independently (spec §9.1) -----------------------------------------------
+# --- Two cadences, corrected to split cheap-vs-expensive (spec §9.1, this stage's own fix) -----
 
 
 async def test_fast_and_slow_cadences_fire_independently(db, fake_sabnzbd_server, tmp_path):
+    """SABnzbd's own `Operation.LIST_HISTORY` is declared `NATIVE` (`USENET_BASELINE`) -- a
+    real, cheap, independent call -- so **every** pass (fast or slow) now makes both a `queue`
+    and a `history` request: the corrected split (module docstring) is cheap-vs-expensive, not
+    active-vs-everything, and for a connector with a cheap history source there is no tick where
+    skipping it would be correct. This replaces the pre-correction assertion (`history` only on
+    the slow cadence, `count == 2`) -- that was the very split stage 2b found to strand a
+    terminal verdict behind `SLOW_INTERVAL_S`; see `test_derived_history_connector_never_
+    doubles_the_expensive_call` below for the mirror-image proof on a connector where the
+    correction goes the *other* way.
+    """
     await _seed_client(
         db,
         str(tmp_path),
@@ -413,20 +430,110 @@ async def test_fast_and_slow_cadences_fire_independently(db, fake_sabnzbd_server
     )
     scheduler = ClientSyncScheduler(db=db, config_dir=str(tmp_path))
 
-    # Pass 1: the very first pass always due for both cadences (`_last_slow_poll_at` starts
-    # empty) -- one `queue` call (the fast/active-only cadence) plus one `history` call (the
-    # slow/full-estate cadence, `list_transfers(active_only=False)`'s own second request).
+    # Pass 1: the very first pass always due for the slow cadence (`_last_slow_poll_at` starts
+    # empty) -- `list_transfers(active_only=False)`'s own `queue` + `history` pair.
     await scheduler.run_once(now=NOW0)
-    # Pass 2, well inside `SLOW_INTERVAL_S`: fast only.
+    # Pass 2, well inside `SLOW_INTERVAL_S`: the fast cadence's `active_only=True` `queue` call,
+    # plus the cheap extra `list_history()` call this stage adds for a NATIVE-history connector.
     await scheduler.run_once(now=NOW0 + scheduler.FAST_INTERVAL_S)
-    # Pass 3, still inside the slow window: fast only.
+    # Pass 3, still inside the slow window: same as pass 2.
     await scheduler.run_once(now=NOW0 + 2 * scheduler.FAST_INTERVAL_S)
-    # Pass 4, `SLOW_INTERVAL_S` later: both cadences due again.
+    # Pass 4, `SLOW_INTERVAL_S` later: the slow cadence's own pair again.
     await scheduler.run_once(now=NOW0 + scheduler.SLOW_INTERVAL_S + 5.0)
 
     mode_calls = fake_sabnzbd_server.state.mode_calls
     assert mode_calls.count("queue") == 4
-    assert mode_calls.count("history") == 2
+    assert mode_calls.count("history") == 4
+
+
+async def test_sab_fast_tick_surfaces_a_fresh_terminal_verdict_without_waiting_for_the_slow_poll(
+    db, fake_sabnzbd_server, tmp_path
+):
+    """The bug stage 2b found and this stage's cadence fix corrects (spec §9.1's own correction
+    note): a finished SABnzbd item leaves the queue and appears only in history, so a terminal
+    verdict used to be stranded behind `SLOW_INTERVAL_S` (5 minutes) regardless of how often the
+    fast tick ran. After the fix, a release completing between two fast ticks must be visible to
+    `completed_transfers()` after the very next `FAST_INTERVAL_S` pass, not five minutes later.
+    """
+    await _seed_client(
+        db,
+        str(tmp_path),
+        base_url=fake_sabnzbd_server.base_url,
+        api_key=fake_sabnzbd_server.state.api_key,
+    )
+    scheduler = ClientSyncScheduler(db=db, config_dir=str(tmp_path))
+    await scheduler.run_once(now=NOW0)  # first pass, slow-due, nothing in history yet
+    assert scheduler.completed_transfers() == []
+
+    # A release finishes between passes -- now sitting in SABnzbd's own history.
+    fake_sabnzbd_server.state.history_slots = [
+        {
+            "nzo_id": "nzo1",
+            "name": "Show.S01",
+            "status": "Completed",
+            "storage": "/complete/ar-tv/Show.S01",
+            "bytes": 100,
+        }
+    ]
+    # Well inside SLOW_INTERVAL_S -- a fast-only pass.
+    await scheduler.run_once(now=NOW0 + scheduler.FAST_INTERVAL_S)
+
+    completed = scheduler.completed_transfers()
+    assert len(completed) == 1
+    instance_id, instance_name, transfer = completed[0]
+    assert instance_name == "SABnzbd"
+    assert transfer.content_path == "/complete/ar-tv/Show.S01"
+
+
+async def _seed_rtorrent_client(
+    db: aiosqlite.Connection, config_dir: str, *, base_url: str, username: str, password: str
+) -> int:
+    now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    config_json = json.dumps({"base_url": base_url, "username": username, "password": password})
+    cursor = await db.execute(
+        "INSERT INTO download_client (name, client_type, config_json, secret_enc, enabled, "
+        "created_at, updated_at) VALUES (?, 'rtorrent', ?, NULL, 1, ?, ?)",
+        ("rTorrent", config_json, now, now),
+    )
+    await db.commit()
+    return cursor.lastrowid
+
+
+async def test_derived_history_connector_never_doubles_the_expensive_call(
+    db, fake_rtorrent_server, tmp_path
+):
+    """The mirror-image proof, over a connector where the correction goes the *other* way.
+    rTorrent's own `TORRENT_BASELINE` declares `Operation.LIST_HISTORY` `DERIVED` -- "a torrent
+    never leaves the list" -- because `RtorrentClient.list_history` re-fetches the identical
+    expensive `d.multicall2` full listing `list_transfers` already pays for (there is no cheaper
+    call to make). A fast tick must therefore still issue exactly **one** `d.multicall2` call,
+    never two -- calling `list_history()` too would silently double the exact cost spec §9.1
+    exists to avoid ("listing 500 seeding torrents every 10 seconds is waste"). Decided purely
+    from `capabilities.supports(Operation.LIST_HISTORY)` -- no `client_type` branch anywhere in
+    `ClientSyncScheduler` is what makes both this test and the SABnzbd one above pass through the
+    identical scheduler code path.
+    """
+    await _seed_rtorrent_client(
+        db,
+        str(tmp_path),
+        base_url=fake_rtorrent_server.base_url,
+        username=fake_rtorrent_server.state.username,
+        password=fake_rtorrent_server.state.password,
+    )
+    scheduler = ClientSyncScheduler(db=db, config_dir=str(tmp_path))
+
+    def _multicall_count() -> int:
+        return sum(
+            1
+            for call in fake_rtorrent_server.state.action_calls
+            if call["method"] == "d.multicall2"
+        )
+
+    await scheduler.run_once(now=NOW0)  # first pass, always slow-due -- one call
+    assert _multicall_count() == 1
+
+    await scheduler.run_once(now=NOW0 + scheduler.FAST_INTERVAL_S)  # fast-only pass
+    assert _multicall_count() == 2  # exactly one more, never two more
 
 
 # --- `is_alive` / `start`/`stop` (same shape as every other scheduler in this codebase) ----------

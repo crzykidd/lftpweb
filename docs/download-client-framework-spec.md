@@ -550,6 +550,35 @@ should be read as aspirational for this row, not as what stage 2b actually built
 above (rather than rewritten) so this note stands as the record of the discrepancy; see
 `docs/decisions.md` (2026-08-23) for the fuller reasoning.
 
+**Fixed, stage 3 build (2026-08-23): the table's split was drawn along the wrong axis, and this
+correction is superseded by an actual fix, not just a documented discrepancy.** The table above
+frames the split as *active-vs-everything* (`active_only=True` vs `active_only=False`). The
+correction just above diagnosed the resulting bug correctly (a terminal verdict is structurally
+invisible to `active_only=True`) but the fix is not "wait longer" -- it is that the split should
+never have been drawn on `active_only` at all. The right axis is **cheap-vs-expensive**, and
+which side a connector falls on is a fact `Operation.LIST_HISTORY`'s own NATIVE/DERIVED
+declaration (§5) already carries:
+
+- **NATIVE** (SABnzbd, `USENET_BASELINE`) -- a real, independent, trivial call. Every non-slow
+  tick now calls `list_transfers(active_only=True)` **and** `list_history()`, and the terminal
+  results of the latter are merged into `core/clientsync.py.ClientSyncScheduler._full_estate`
+  immediately -- no more waiting for `SLOW_INTERVAL_S`.
+- **DERIVED** (rTorrent, `TORRENT_BASELINE`: "a torrent never leaves the list") -- `list_history()`
+  is not a second cheap call; it re-fetches the identical expensive full listing
+  `list_transfers(active_only=False)` already pays for. Calling it every fast tick would double
+  the exact cost this section's own "waste" framing warns against, so it stays on the slow
+  cadence, unchanged from stage 2a.
+
+`ClientSyncScheduler._process_instance` decides which case applies via
+`client.capabilities.supports(Operation.LIST_HISTORY)` alone -- no `client_type` branch anywhere
+in the scheduler (§4.4/§5.1's rule, applied here as this task's own explicit requirement). The
+"Consumer" column above is therefore accurate again for the settle-gate skip and the withhold gate
+(§14 stage 3) both: a terminal verdict is now visible within one `FAST_INTERVAL_S` tick for any
+connector whose history is cheap, exactly as this table originally promised. See
+`docs/decisions.md` (2026-08-23, "cadence split fixed to cheap-vs-expensive") for the fuller
+reasoning and the rejected alternative (a connector-authored boolean flag, rejected as a second
+truth sitting next to a capability declaration that already says the same thing).
+
 ### 9.2 Freshness and source precedence — a stale *arr reading must never overwrite a fresh one
 
 **Raised by the user, 2026-08-22**, and it is a genuine hole in every preceding section:
@@ -1058,7 +1087,7 @@ Each stage is independently shippable. Nothing before stage 5 can delete anythin
 | **0** | Interface, enums, capability declaration + profiles, registry, conformance suite, a fake adapter | Ships with nothing configured. **This is the piece the vocabulary must be right in**, so §13.3's capture ideally informs it |
 | **1** | SABnzbd adapter, instance CRUD, declared config form, test-connection, capability readout, **the redacted capture** (§13.3), **and the README write-up of the reference workflow** (§1.1) | First real client contact. The README section is the user's explicit ask: document the *preferred* seedbox setup, so other workflows are recognisable as departures from a stated one |
 | **2** | The poller (§9), SAB as a third Preflight source, the settle-gate skip | #18's first real user-facing payoff. **2a (the poller + Preflight source) landed 2026-08-23** (`prompts/done/2026-08-23-client-poller.md`). **2b (the settle-gate skip itself) landed 2026-08-23** (`prompts/done/2026-08-23-settle-gate-skip.md`) -- ships **off** (`settle.SettleSettings.client_skip_enabled`, default `False`) pending live confirmation of §13.4 guess #2 against a real SABnzbd; every uncertain path (setting off, no client-sync source wired, unreachable client, blank/empty response, a queue-side or `UNKNOWN` phase, a near-miss path) falls back to running the settle gate exactly as it ran before this stage |
-| **3** | Withhold on partial failure (`docs/transfers-redesign-spec.md` §4.3) | |
+| **3** | Withhold on partial failure (`docs/transfers-redesign-spec.md` §4.3), and the §9.1 poll-cadence fix | **Landed 2026-08-23** (`prompts/done/2026-08-23-withhold-and-cadence.md`). The cadence split is corrected to cheap-vs-expensive, read per-connector off `Operation.LIST_HISTORY`'s own capability declaration (§9.1's own correction note). The withhold gate ships **off** (`autoqueue.WithholdSettings.enabled`, default `False`) pending live confirmation of §13.4 guess #2 against a real SABnzbd, for the identical reason stage 2b's `client_skip_enabled` shipped off -- every uncertain path (setting off, no client-sync source wired, unreachable client, blank/empty response, a queue-side or `UNKNOWN` phase, an outright failure with no `content_path`, a near-miss path) falls back to today's behavior unchanged. No API/UI surface shipped this stage -- `AutoQueue.withheld` is public and readable, but nothing reads it yet; named as an open gap, not hidden |
 | **4** | The disk review scan (§11), both buckets, review-only | Looked at against the real box before anything may delete |
 | **5** | The delete pipeline (§10), manual trigger, verification, banner | |
 

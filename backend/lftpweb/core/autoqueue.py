@@ -57,6 +57,19 @@ Five things this module must get right, in order of consequence:
    `ARR_IMPORT_INELIGIBLE_STATUSES` -- `notified`/`imported`/`cleaned`, never `detected` -- is
    applied in the eligibility query, alongside the state and suppression clauses. See that
    constant's own comment for the incident and for why `detected` must stay eligible.
+7. **The withhold gate (stage 3 of #18, `docs/transfers-redesign-spec.md` §4.3,
+   `prompts/2026-08-23-withhold-and-cadence.md`).** Off by default like everything else in this
+   list (`WithholdSettings.enabled`); when on, an eligible item is skipped -- not suppressed,
+   `item.state` untouched -- when a configured download client reports an *explicit*, terminal
+   `FAILED` verdict for its own remote path (`settle.find_client_failure`), checked ahead of and
+   independent of the settle gate above so it also catches the case the settle gate's own
+   fingerprint cannot: a died-partway download or a failed unpack whose bytes have permanently
+   stopped growing reads as "settled" to a fingerprint check, and would otherwise sail straight
+   through it and into `_enqueue_item`. Self-lifting by construction -- every pass re-checks
+   `find_client_completion` on the same candidates *first*, so a later genuine success for the
+   same release always wins over a stale `FAILED` entry a client's own history may still hold.
+   `self.withheld` mirrors `self.gated`'s own "one audit event per transition, presence is the
+   live signal" idiom, one level deeper (per item rather than per queue).
 
 **Retroactive by construction.** DESIGN.md §4.7: "adding a pattern re-evaluates the whole
 known model, not just future scans." This module re-queries every eligible top-level item in
@@ -213,6 +226,70 @@ async def save_autoqueue_settings(db: aiosqlite.Connection, settings: AutoQueueS
     await db.commit()
 
 
+WITHHOLD_SETTING_KEY = "withhold_settings"
+
+
+@dataclass(frozen=True)
+class WithholdSettings:
+    """Site-level toggle for the withhold gate (stage 3 of #18,
+    `docs/transfers-redesign-spec.md` §4.3, `docs/download-client-framework-spec.md` §14,
+    `prompts/2026-08-23-withhold-and-cadence.md`) -- own JSON blob, own key, same pattern as
+    `AutoQueueSettings`/`settle.SettleSettings` above it in this file.
+
+    **Default `False` -- ship it off, same reasoning stage 2b's `client_skip_enabled` used.**
+    The gate's own matching is not what's in doubt (`settle.find_client_failure` reuses the
+    exact, already-shipped `_client_content_path_matches` component-boundary rule
+    `find_client_completion` already relies on for the *positive* verdict) -- what's unverified
+    is the vocabulary a wrong default here would act on: SABnzbd's history `status="Failed"`
+    mapping to `TransferPhase.FAILED` is `docs/download-client-framework-spec.md` §13.4 guess
+    #2, doc-derived from vendor docs and never yet confirmed against a real instance -- the
+    connector's own module docstring flags it explicitly as the settle-gate skip's highest-risk
+    guess, and this gate keys off the identical mapping.
+
+    **The two wrong-default outcomes are not symmetric, and that asymmetry is the actual
+    argument for `False`, not merely "every new capability ships off" caution.** Withholding
+    wrongly (guess #2 is subtly wrong, a non-failure status somehow maps to `FAILED`) means a
+    genuinely good release **silently never arrives** -- the audit event exists, but nothing
+    routes it to the user's attention the way a missing download itself would, so the failure
+    mode is quiet by default and a user has to go looking for the reason its own gate exists to
+    supply. Not withholding wrongly (a genuine partial failure isn't caught) reproduces exactly
+    today's behavior -- the settle gate transfers the half-written directory, precisely as it
+    already does for every install running this codebase before this stage shipped. One wrong
+    default makes things *worse than today*, silently; the other leaves things *exactly as bad
+    as today*, which is the status quo every existing install already tolerates. Given a choice
+    between those two failure directions on an unverified vocabulary, only one of them is a
+    regression -- so `False` is the safer default, not just the cautious-by-convention one.
+
+    Still switchable on (a future `Settings -> Transfer` control, out of this stage's scope) for
+    anyone who has confirmed `Failed` -> `FAILED` against their own live SABnzbd and wants the
+    protection now rather than waiting for #18's stage 1a capture (spec §13.3) to confirm it for
+    everyone.
+    """
+
+    enabled: bool = False
+
+
+async def load_withhold_settings(db: aiosqlite.Connection) -> WithholdSettings:
+    cursor = await db.execute("SELECT value FROM setting WHERE key = ?", (WITHHOLD_SETTING_KEY,))
+    row = await cursor.fetchone()
+    if row is None:
+        return WithholdSettings()
+    try:
+        data = json.loads(row["value"])
+    except (ValueError, TypeError):
+        return WithholdSettings()
+    return WithholdSettings(enabled=bool(data.get("enabled", False)))
+
+
+async def save_withhold_settings(db: aiosqlite.Connection, settings: WithholdSettings) -> None:
+    await db.execute(
+        "INSERT INTO setting (key, value, updated_at) VALUES (?, ?, STRFTIME('%Y-%m-%dT%H:%M:%fZ','now')) "
+        "ON CONFLICT (key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+        (WITHHOLD_SETTING_KEY, json.dumps({"enabled": settings.enabled})),
+    )
+    await db.commit()
+
+
 @dataclass(frozen=True)
 class QueueAutoConfig:
     """The subset of `core/engine.py.QueueConfig` this module needs, kept separate so it
@@ -285,6 +362,17 @@ class AutoQueue:
         # (this task's own "every uncertain path falls back to today's behavior" rule), never as
         # an error.
         self.client_sync: "ClientSyncScheduler | None" = None
+        # The withhold gate's own transition tracking (stage 3 of #18) -- queue_id -> {item_id:
+        # human-readable reason}, mirroring `self.gated`'s own "presence is the signal, only log
+        # on a transition" idiom, one level deeper (per-item rather than whole-queue). Public
+        # (no leading underscore), the same "a future API/UI surface can read this cheaply"
+        # reasoning `self.gated` already established -- no new endpoint is wired up by this
+        # stage, but the data is there rather than trapped behind a private name a later task
+        # would have to first go make public. Wholesale-replaced per queue on every `on_scan`
+        # pass that reaches the eligibility loop, exactly like `self._settle_preflight` -- every
+        # withhold is re-derived fresh from the client's own current candidates each pass, so
+        # there is nothing to merge and no flap tolerance to reason about.
+        self.withheld: dict[int, dict[int, str]] = {}
 
     async def on_scan(self, queue: QueueAutoConfig) -> int:
         """Evaluate one queue's newly- *and* previously-seen eligible items. Called after
@@ -298,6 +386,7 @@ class AutoQueue:
             # all, so there is nothing an "ungated" event would be reporting.
             self.gated.pop(queue.id, None)
             self._settle_preflight.pop(queue.id, None)
+            self.withheld.pop(queue.id, None)
             return 0
 
         if not mount_sentinel.check(queue.local_path):
@@ -325,6 +414,7 @@ class AutoQueue:
             # banner and a stale per-item row from before it was blocked would be the exact
             # "fifty rows burying the one fact that matters" shape the banner exists to avoid.
             self._settle_preflight.pop(queue.id, None)
+            self.withheld.pop(queue.id, None)
             return 0
         if self.gated.pop(queue.id, None) is not None:
             # A real recovery -- the gate was actually blocking this queue a moment ago, not
@@ -344,6 +434,7 @@ class AutoQueue:
 
         settle_settings = await settle.load_settle_settings(self.db)
         autoqueue_settings = await load_autoqueue_settings(self.db)
+        withhold_settings = await load_withhold_settings(self.db)
         eligible_states = (
             ELIGIBLE_STATES_WITH_EXTERNALLY_REMOVED
             if autoqueue_settings.re_download_externally_removed
@@ -375,6 +466,13 @@ class AutoQueue:
 
         queued = 0
         settle_gated: dict[int, PreflightRow] = {}
+        # The withhold gate's own this-pass result (stage 3 of #18) -- item_id -> reason,
+        # compared against `self.withheld.get(queue.id, {})` (last pass's result) once the loop
+        # below finishes, exactly the way `settle_gated` is compared against nothing (it has no
+        # transition-logging need) but `self.gated` above *is* compared, for the identical
+        # "log once per transition, not once per pass" reason.
+        withheld_this_pass: dict[int, str] = {}
+        previously_withheld = self.withheld.get(queue.id, {})
         for row in rows:
             # "Show it, don't grab it" (user decision, 2026-08-15, docs/decisions.md): a SAB
             # in-progress unpack staged under `_UNPACK_<name>` (or a `_FAILED_` leftover) on
@@ -388,6 +486,65 @@ class AutoQueue:
                 continue
             if not compiled.item_matches(row["rel_path"], is_file=not bool(row["is_dir"])):
                 continue
+            # The withhold gate (stage 3 of #18, `docs/transfers-redesign-spec.md` §4.3) -- a
+            # third gate of the same kind as the mount gate and the settle gate, checked before
+            # the settle gate's own logic and **independent of `settle_settings.enabled`**: an
+            # explicit terminal `FAILED` verdict for this item's own remote path means the
+            # seedbox is holding known-bad bytes (a died-partway download, a failed unpack), and
+            # the settle gate's own fingerprint reads exactly that as "stopped growing" --
+            # settled. Without this gate, an item whose fingerprint already reads settled (or a
+            # queue running with the settle gate off entirely) has nothing else standing between
+            # it and `_enqueue_item` below.
+            #
+            # **Every one of the following makes this a no-op, falling through to the exact same
+            # behavior as before this stage existed:** `WithholdSettings.enabled` off (default),
+            # `self.client_sync` never wired, `queue.remote_path` empty (`_client_content_path_
+            # matches`'s own empty-root guard), an unreachable client / blank queue-or-history
+            # response (`failed_transfers()` returns nothing), a queue-side or `UNKNOWN` phase
+            # (`find_client_failure` only ever matches a terminal `FAILED`), an outright failure
+            # with no on-disk path to report (no `content_path`, no match -- spec §4.3's "a
+            # client failing outright needs no code," true here by construction), or a near-miss
+            # path that isn't a genuine component-boundary match.
+            if withhold_settings.enabled and self.client_sync is not None and queue.remote_path:
+                item_remote_path = queue.remote_path.rstrip("/") + "/" + row["rel_path"]
+                # Completion is checked first, always -- this *is* the self-lift rule (this
+                # task's own non-negotiable: "a permanent block from a transient verdict is the
+                # failure mode to design against"). A re-grab/repair/manual retry that later
+                # lands a genuine `COMPLETED` verdict for the same path wins over a `FAILED`
+                # entry the client's own history may still be holding from the earlier, dead
+                # attempt -- no separate "was this withheld last pass" bookkeeping decides this;
+                # every pass re-derives the verdict fresh from the client's own current
+                # candidates, so a later success is simply "no failure match found this pass."
+                completion = settle.find_client_completion(
+                    item_remote_path, self.client_sync.completed_transfers()
+                )
+                if completion is None:
+                    failure = settle.find_client_failure(
+                        item_remote_path, self.client_sync.failed_transfers()
+                    )
+                    if failure is not None:
+                        instance_id, instance_name, transfer = failure
+                        reason = (
+                            f"download client {instance_name!r} (id={instance_id}) reports "
+                            f"{row['rel_path']!r} FAILED at {transfer.content_path!r}"
+                            + (f" -- {transfer.error_message}" if transfer.error_message else "")
+                        )
+                        if row["id"] not in previously_withheld:
+                            # Once per *transition* into withholding, not once per scan pass --
+                            # the identical debounce `self.gated`'s own "auto-queue disabled"
+                            # event already uses, one level deeper (per item, not per queue).
+                            await audit.record_event(
+                                self.db,
+                                level="warning",
+                                item_id=row["id"],
+                                kind="autoqueue_withheld",
+                                message=(
+                                    f"queue {queue.id} ('{queue.name}'): item "
+                                    f"{row['rel_path']!r} withheld from auto-queue -- {reason}"
+                                ),
+                            )
+                        withheld_this_pass[row["id"]] = reason
+                        continue
             # The settle gate's eligibility half (prompts/open-issues.md #2): skip -- not
             # suppress -- an item whose remote subtree hasn't held still yet. Left eligible
             # for the *next* pass rather than marked `auto_queue_suppressed`, since nothing
@@ -505,6 +662,25 @@ class AutoQueue:
         # even when `settle_gated` is empty (settle off, or every eligible item settled) so a
         # queue that just cleared its own gate doesn't wait for anything to expire.
         self._settle_preflight[queue.id] = settle_gated
+        # The withhold gate's own transition-out logging (stage 3 of #18): any item that was
+        # withheld last pass but isn't this pass -- whether because the client now reports it
+        # `COMPLETED` (the self-lift rule), the `FAILED` verdict simply aged out of the client's
+        # own cache, or the item left eligibility entirely (queued manually, deleted, suppressed)
+        # -- gets one "cleared" event, the same "one event when it engages, one when it lifts"
+        # rule the mount gate's `autoqueue_gated`/`autoqueue_ungated` pair already establishes.
+        for item_id, reason in previously_withheld.items():
+            if item_id not in withheld_this_pass:
+                await audit.record_event(
+                    self.db,
+                    level="info",
+                    item_id=item_id,
+                    kind="autoqueue_withhold_lifted",
+                    message=(
+                        f"queue {queue.id} ('{queue.name}'): withhold on item {item_id} "
+                        f"cleared -- was: {reason}"
+                    ),
+                )
+        self.withheld[queue.id] = withheld_this_pass
         if queued:
             logger.info("auto-queue: queued %d item(s) for queue %d", queued, queue.id)
         return queued

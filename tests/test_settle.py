@@ -568,3 +568,106 @@ def test_find_client_completion_returns_the_first_match_among_several_candidates
     assert result is not None
     assert result[0] == 2
     assert result[1] == "rTorrent"
+
+
+# --- The withhold gate's own matching (stage 3 of #18) -- `find_client_failure`'s mirror-image
+# coverage of `find_client_completion` above, over the identical pure `_transfer` helper.
+
+
+def test_find_client_failure_matches_on_exact_path_equality():
+    candidates = [
+        (
+            1,
+            "SABnzbd",
+            _transfer(phase=TransferPhase.FAILED, content_path="/complete/ar-tv/Show.S01"),
+        )
+    ]
+    result = settle.find_client_failure("/complete/ar-tv/Show.S01", candidates)
+    assert result is not None
+    instance_id, instance_name, transfer = result
+    assert instance_id == 1
+    assert instance_name == "SABnzbd"
+    assert transfer.content_path == "/complete/ar-tv/Show.S01"
+
+
+def test_find_client_failure_matches_a_component_boundary_child():
+    candidates = [
+        (
+            1,
+            "SABnzbd",
+            _transfer(
+                phase=TransferPhase.FAILED,
+                content_path="/complete/ar-tv/Show.S01/Show.S01E01.mkv",
+            ),
+        )
+    ]
+    result = settle.find_client_failure("/complete/ar-tv/Show.S01", candidates)
+    assert result is not None
+
+
+def test_find_client_failure_rejects_a_bare_prefix_that_straddles_a_name_boundary():
+    """The identical anti-example `find_client_completion`'s own test names: a sibling directory
+    that merely shares a name prefix must never read as a match.
+    """
+    candidates = [
+        (
+            1,
+            "SABnzbd",
+            _transfer(phase=TransferPhase.FAILED, content_path="/complete/ar-tv/Show.S01.EXTRA"),
+        )
+    ]
+    result = settle.find_client_failure("/complete/ar-tv/Show.S01", candidates)
+    assert result is None
+
+
+def test_find_client_failure_ignores_a_non_terminal_status():
+    """Only an explicit, terminal `FAILED` verdict may ever withhold anything (spec §4.2) -- a
+    queue-side status, `UNKNOWN`, and even `COMPLETED` (a different question entirely, answered
+    by `find_client_completion`) must never satisfy this gate.
+    """
+    for phase in (
+        TransferPhase.QUEUED,
+        TransferPhase.DOWNLOADING,
+        TransferPhase.PAUSED,
+        TransferPhase.VERIFYING,
+        TransferPhase.EXTRACTING,
+        TransferPhase.SEEDING,
+        TransferPhase.COMPLETED,
+        TransferPhase.UNKNOWN,
+    ):
+        candidates = [
+            (1, "SABnzbd", _transfer(phase=phase, content_path="/complete/ar-tv/Show.S01"))
+        ]
+        assert settle.find_client_failure("/complete/ar-tv/Show.S01", candidates) is None
+
+
+def test_find_client_failure_ignores_an_outright_failure_with_no_content_path():
+    """`docs/transfers-redesign-spec.md` §4.3: "a client failing outright needs no code" -- an
+    outright failure never lands any bytes, so it has no on-disk path to report at all. Absent is
+    not a verdict (spec §4.2): no `content_path`, no match, ever, never a name-based fallback.
+    """
+    candidates = [(1, "SABnzbd", _transfer(phase=TransferPhase.FAILED, content_path=None))]
+    assert settle.find_client_failure("/complete/ar-tv/Show.S01", candidates) is None
+
+
+def test_find_client_failure_empty_candidates_is_not_a_match():
+    """An unreachable client / blank queue-and-history response / `WithholdSettings.enabled` off
+    upstream all converge on an empty candidate list -- must read as "no information," never as a
+    withhold.
+    """
+    assert settle.find_client_failure("/complete/ar-tv/Show.S01", []) is None
+
+
+def test_find_client_failure_empty_item_path_never_matches():
+    candidates = [(1, "SABnzbd", _transfer(phase=TransferPhase.FAILED, content_path="/x"))]
+    assert settle.find_client_failure("", candidates) is None
+
+
+def test_find_client_failure_returns_the_first_match_among_several_candidates():
+    unrelated = _transfer(phase=TransferPhase.FAILED, content_path="/complete/ar-tv/Other")
+    matching = _transfer(phase=TransferPhase.FAILED, content_path="/complete/ar-tv/Show.S01")
+    candidates = [(1, "SABnzbd", unrelated), (2, "rTorrent", matching)]
+    result = settle.find_client_failure("/complete/ar-tv/Show.S01", candidates)
+    assert result is not None
+    assert result[0] == 2
+    assert result[1] == "rTorrent"

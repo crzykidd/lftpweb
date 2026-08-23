@@ -476,13 +476,13 @@ async def save_settle_settings(db: "aiosqlite.Connection", settings: SettleSetti
     await db.commit()
 
 
-# --- The client-verdict skip itself (stage 2b of #18) ---------------------------------------
+# --- The client-verdict skip and withhold gate (stage 2b and stage 3 of #18) -----------------
 #
 # Pure, unit-tested without a database -- this module's own docstring's own rule, followed here
 # exactly as `compute_fingerprints`/`advance_settle`/`is_settled` above already do. Neither
 # function below ever talks to a client or a database; both take an already-fetched candidate
-# list (`core/clientsync.py.ClientSyncScheduler.completed_transfers`, stage 2a's own cache, spec
-# §9.1's slow/full-estate cadence) and answer a yes/no question over it.
+# list (`core/clientsync.py.ClientSyncScheduler.completed_transfers`/`failed_transfers`, spec
+# §9.1's poller cache) and answer a yes/no question over it.
 
 
 def _client_content_path_matches(item_remote_path: str, content_path: str) -> bool:
@@ -539,6 +539,48 @@ def find_client_completion(
     """
     for instance_id, instance_name, transfer in candidates:
         if transfer.phase is not TransferPhase.COMPLETED:
+            continue
+        if not transfer.content_path:
+            continue  # absent is not a verdict (spec §4.2) -- no path, no match, ever
+        if _client_content_path_matches(item_remote_path, transfer.content_path):
+            return instance_id, instance_name, transfer
+    return None
+
+
+def find_client_failure(
+    item_remote_path: str, candidates: "Iterable[tuple[int, str, Transfer]]"
+) -> "tuple[int, str, Transfer] | None":
+    """The withhold gate's own yes/no lookup (stage 3 of #18, `docs/transfers-redesign-spec.md`
+    §4.3, `core/autoqueue.py.on_scan`'s own third gate) -- `find_client_completion`'s mirror
+    image, checking `TransferPhase.FAILED` instead of `COMPLETED`. The first `candidates` entry
+    that is a **terminal, explicit `FAILED`** verdict with a `content_path` matching
+    `item_remote_path` (`_client_content_path_matches` above, the identical component-boundary
+    rule -- never a bare `str.startswith`).
+
+    **Why this alone is already "explicit failure, not silence" (spec §4.2).** A client failing a
+    release outright -- nothing ever landed -- has no on-disk path to report, so its history
+    entry's `content_path` is empty and the `continue` below rejects it before matching is even
+    attempted; "a client failing outright needs no code" (`docs/transfers-redesign-spec.md` §4.3)
+    holds by construction here, the same way it does for a `COMPLETED` verdict with no path. Only
+    a **partial** failure -- the download died partway, or unpack failed, leaving a half-written
+    directory the client can still name -- ever reaches a real match, which is exactly the single
+    case spec §4.3 says needs an explicit withhold at all.
+
+    `None` on no match, or an empty `candidates` (an unreachable client, a blank queue/history
+    response, `WithholdSettings.enabled` off upstream, or `AutoQueue.client_sync` never wired) --
+    every one of those is "no information," and no information means auto-queue proceeds exactly
+    as it does today (spec §4.2's "absent is not a verdict," restated for this gate).
+
+    **Does not itself implement the self-lift rule** -- that is `AutoQueue.on_scan`'s own
+    responsibility (checking `find_client_completion` first, on the same candidates set, and only
+    consulting this function when that returns `None`), so a later genuine success always wins
+    over a stale `FAILED` entry the client's own history may still be holding from a dead earlier
+    attempt. Kept out of this function because it has no opinion about *why* it was called --
+    the caller's own ordering is what makes the whole gate self-lifting, not anything this pure
+    lookup could enforce on its own.
+    """
+    for instance_id, instance_name, transfer in candidates:
+        if transfer.phase is not TransferPhase.FAILED:
             continue
         if not transfer.content_path:
             continue  # absent is not a verdict (spec §4.2) -- no path, no match, ever

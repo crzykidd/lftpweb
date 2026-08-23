@@ -16,18 +16,45 @@ writes `item.state`, directly or through a helper, for any reason.** It caches w
 reports and projects it into the Preflight box (spec §9.2) -- exactly the same "observes, never
 decides" boundary `core/preflight.py`'s existing sources already respect.
 
-**Two cadences per instance (spec §9.1)**, driven by one loop tick (`FAST_INTERVAL_S`), not two
-separate tasks or two separate calls: every tick, `list_transfers(active_only=True)` feeds the
-Preflight box; at most once every `SLOW_INTERVAL_S`, that call widens to `active_only=False` (the
-full estate) instead, and the result is cached for a future consumer (#21's seeding overview --
-nothing reads `_full_estate` yet in stage 2a, but the cache exists so that work doesn't also have
-to build the poll). **One call per tick, never two** -- the full-estate result is a strict
-superset of the active-only one (every connector's own contract), so a tick that's due for the
-slow cadence simply asks the wider question instead of asking both; `_update_preflight` already
-filters to non-terminal transfers regardless of which shape it was handed. Both cadences share
-one instance-level backoff: a failure on either question means the identical thing (this
-instance cannot currently be reached/authenticated), so there is no value in tracking them as two
-independent health signals.
+**Two cadences per instance (spec §9.1), split along *cheap-vs-expensive*, not *active-vs-
+everything*.** The original stage 2a build drew the split on `active_only` alone: fast tick asks
+`list_transfers(active_only=True)`, slow tick (`SLOW_INTERVAL_S`) widens to the full estate. Stage
+2b then discovered that split **structurally cannot carry a terminal verdict**: a finished
+SABnzbd item leaves the queue entirely and appears only in history, and `active_only=True` never
+sees it -- both connectors' own contract excludes every terminal transfer from that call. So a
+"completed" or "failed" fact was always stranded behind `SLOW_INTERVAL_S` (5 minutes), no matter
+how often the fast tick ran, largely defeating spec §4.3's whole point (skip/withhold exist to
+replace a wait with a direct, *prompt* observation).
+
+**The fix (this stage): the split is a per-connector fact, read off the same `CapabilitySet`
+every other layer of this framework already consults -- never `if client_type == ...`.**
+`Operation.LIST_HISTORY`'s own NATIVE/DERIVED declaration (spec §5) already says exactly which
+half a connector falls into:
+
+- **NATIVE** (SABnzbd, `USENET_BASELINE`) means a real, independent, trivial call --
+  `mode=history` costs nothing extra to make every fast tick, and it is where every terminal
+  verdict lives. So a non-slow tick calls `list_transfers(active_only=True)` **and**
+  `list_history()`, and the terminal (`COMPLETED`/`FAILED`) results of the latter are merged
+  straight into `_full_estate` -- the cache `completed_transfers()`/`failed_transfers()` read --
+  without waiting for the next slow pass.
+- **DERIVED** (rTorrent, `TORRENT_BASELINE`: "a torrent never leaves the list") means
+  `list_history()` is not a second cheap call at all -- it re-fetches the *same* expensive full
+  listing `list_transfers(active_only=False)` already pays for (`RtorrentClient.list_transfers`/
+  `list_history` both call `_list_all()`). Calling it every fast tick would double the exact cost
+  spec §9.1 exists to avoid ("listing 500 seeding torrents every 10 seconds is waste"), so it is
+  left to the slow cadence, unchanged from stage 2a.
+
+`capabilities.supports(Operation.LIST_HISTORY)` (native only, `accept_derived` left `False`) is
+the one query this module makes to decide -- the entire per-connector distinction, with no
+connector-specific branch anywhere in this scheduler. The slow cadence's own full-estate refresh
+(`active_only=False`, at most once every `SLOW_INTERVAL_S`) is unchanged: still the only call for
+a genuinely expensive listing, still cached wholesale for #21's future seeding-overview consumer.
+**One call per tick on a slow-due pass, never two** -- the full-estate result is a strict superset
+of the active-only one, so a tick due for the slow cadence never also pays for a separate
+fast-only call. Both cadences (and the cheap extra history call, when made) share one
+instance-level backoff: a failure on any of them means the identical thing (this instance cannot
+currently be reached/authenticated), so there is no value in tracking them as independent health
+signals.
 
 **No connector-level timeout is set here.** Every real connector already opens its own
 `httpx.AsyncClient` with a 10s timeout at construction (`SabnzbdClient`/`RtorrentClient`'s own
@@ -86,6 +113,7 @@ import aiosqlite
 
 from lftpweb.core import audit
 from lftpweb.core.clients import get_client_class
+from lftpweb.core.clients.base import Operation
 from lftpweb.core.clients.errors import ClientAuthenticationFailed, ClientError, ClientUnreachable
 from lftpweb.core.clients.models import Transfer, TransferPhase
 from lftpweb.core.crypto import DecryptionError, decrypt_secret
@@ -93,13 +121,15 @@ from lftpweb.core.preflight import PreflightHold, PreflightRow
 
 logger = logging.getLogger(__name__)
 
-# --- Two cadences (spec §9.1) ------------------------------------------------------------------
+# --- Two cadences (spec §9.1, corrected this stage -- see module docstring) --------------------
 
 # Matches `core/arrsync.py.ArrSettings`'s own current default (10s, 2026-08-21's issue #16) --
-# this is the cadence the settle-gate skip (#18's own stage 2b, out of scope here) and Preflight
-# both need, per spec §9.1's own table. Not settings-driven (unlike the *arr's own cadence) --
-# this task's scope is the poller and its cache, not a Settings UI knob nobody has asked for yet;
-# a fixed constant is the honest reflection of that until real use says otherwise.
+# this is the cadence the settle-gate skip, the withhold gate (#18's stage 3), and Preflight all
+# need. On a non-slow-due tick, this drives `list_transfers(active_only=True)` always, plus
+# `list_history()` too for any connector whose `Operation.LIST_HISTORY` is declared `NATIVE`
+# (module docstring). Not settings-driven (unlike the *arr's own cadence) -- this task's scope is
+# the poller and its cache, not a Settings UI knob nobody has asked for yet; a fixed constant is
+# the honest reflection of that until real use says otherwise.
 FAST_INTERVAL_S = 10.0
 
 # "Minutes," per spec §9.1's own table -- 5 minutes is a deliberate, round, un-agonized-over
@@ -277,12 +307,21 @@ class ClientSyncScheduler:
             # table) -- so on a tick where the slow poll is due, there is no reason to also pay
             # for a separate fast-only call; `_update_preflight` already filters out terminal
             # transfers defensively, so the full-estate result feeds the Preflight projection
-            # exactly as a fast-only result would have. Only on a tick where the slow poll is
-            # *not* due does this actually make the cheaper `active_only=True` call.
+            # exactly as a fast-only result would have.
             last_slow = self._last_slow_poll_at.get(instance_id, 0.0)
             slow_due = now - last_slow >= self.SLOW_INTERVAL_S
+            cheap_history = client.capabilities.supports(Operation.LIST_HISTORY)
             try:
-                transfers = await client.list_transfers(active_only=not slow_due)
+                if slow_due:
+                    transfers = await client.list_transfers(active_only=False)
+                else:
+                    # The corrected cheap/expensive split (module docstring, spec §9.1): always
+                    # the active-only call, plus this connector's own cheap terminal-verdict
+                    # source when it has one -- decided purely from `capabilities`, never from
+                    # `client_type`.
+                    transfers = await client.list_transfers(active_only=True)
+                    if cheap_history:
+                        transfers = transfers + await client.list_history()
             except ClientError as exc:
                 await self._handle_failure(instance_id, instance_name, exc, now)
                 return
@@ -292,6 +331,18 @@ class ClientSyncScheduler:
             if slow_due:
                 self._full_estate[instance_id] = {t.client_id: t for t in transfers}
                 self._last_slow_poll_at[instance_id] = now
+            elif cheap_history:
+                # Merge just the terminal transfers this fast tick's own cheap history call
+                # learned about into the full-estate cache -- the fix stage 2b's own correction
+                # (spec §9.1) called for: a terminal verdict is now visible to
+                # `completed_transfers()`/`failed_transfers()` within one `FAST_INTERVAL_S` tick,
+                # not stranded behind `SLOW_INTERVAL_S`. Deliberately leaves every non-terminal
+                # entry the last slow pass cached untouched -- this fast tick never asked about
+                # those, and overwriting them with nothing would be a regression, not a fix.
+                cache = self._full_estate.setdefault(instance_id, {})
+                for transfer in transfers:
+                    if transfer.phase in (TransferPhase.COMPLETED, TransferPhase.FAILED):
+                        cache[transfer.client_id] = transfer
         finally:
             aclose = getattr(client, "aclose", None)
             if aclose is not None:
@@ -435,9 +486,10 @@ class ClientSyncScheduler:
         rows.sort(key=lambda r: r.title.casefold())
         return rows
 
-    # --- The settle-gate skip's own read (stage 2b of #18, docs/download-client-framework-
-    # spec.md §14) -- `core/autoqueue.py.on_scan` is the one caller, only when `settle.
-    # SettleSettings.client_skip_enabled` is on. -------------------------------------------
+    # --- The settle-gate skip's and withhold gate's own reads (stage 2b and stage 3 of #18,
+    # docs/download-client-framework-spec.md §14) -- `core/autoqueue.py.on_scan` is the one
+    # caller of each, gated by its own independent setting (`settle.SettleSettings.
+    # client_skip_enabled`, `autoqueue.WithholdSettings.enabled`). ---------------------------
 
     def completed_transfers(self) -> list[tuple[int, str, Transfer]]:
         """Every currently cached **terminal, history-derived `COMPLETED`** transfer across
@@ -472,5 +524,31 @@ class ClientSyncScheduler:
             name = self._instance_names.get(instance_id, f"instance {instance_id}")
             for transfer in self._full_estate.get(instance_id, {}).values():
                 if transfer.phase is TransferPhase.COMPLETED:
+                    out.append((instance_id, name, transfer))
+        return out
+
+    def failed_transfers(self) -> list[tuple[int, str, Transfer]]:
+        """`completed_transfers`'s mirror image, for the withhold gate (stage 3 of #18,
+        docs/transfers-redesign-spec.md §4.3): every currently cached **terminal, explicit
+        `FAILED`** transfer across every currently enabled instance's full-estate cache.
+
+        Same shape, same guarantees, same reasons, as `completed_transfers` above -- restricted
+        to `_enabled_instance_ids`, a pure read that never polls, and empty (never raising) for
+        an instance whose slow poll (or fast cheap-history call, this stage's own fix) hasn't
+        run yet. `core/settle.py.find_client_failure` is this method's own one caller's own
+        candidate list, exactly as `find_client_completion` consumes this method's twin.
+
+        Only `TransferPhase.FAILED` is ever included here -- a queue-side, non-terminal status
+        must never satisfy the withhold gate (spec §4.2: "only an *explicit* failure blocks
+        anything"), and an outright failure that never landed any bytes reports no
+        `content_path` at all (both connectors' own history mapping), so it can never match
+        anything downstream either -- "a client failing outright needs no code" (spec §4.3) is
+        true by construction, not by a separate check here.
+        """
+        out: list[tuple[int, str, Transfer]] = []
+        for instance_id in self._enabled_instance_ids:
+            name = self._instance_names.get(instance_id, f"instance {instance_id}")
+            for transfer in self._full_estate.get(instance_id, {}).values():
+                if transfer.phase is TransferPhase.FAILED:
                     out.append((instance_id, name, transfer))
         return out

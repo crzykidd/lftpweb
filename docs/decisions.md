@@ -6,6 +6,77 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-23 — cadence split fixed to cheap-vs-expensive, and withhold on explicit failure (#18 stage 3)
+
+`prompts/done/2026-08-23-withhold-and-cadence.md`. Two related fixes.
+
+**Part 1 — the poll cadence split was drawn along the wrong axis.** Stage 2a split the poller's
+two cadences on `active_only` (fast: `list_transfers(active_only=True)`; slow: full estate).
+Stage 2b then found this **structurally cannot carry a terminal verdict** -- a finished SABnzbd
+item leaves the queue and appears only in history, and `active_only=True` excludes every terminal
+transfer by both connectors' own contract, so a "completed"/"failed" fact was always stranded
+behind `SLOW_INTERVAL_S` (5 minutes) regardless of how often the fast tick ran. The fix: split on
+*cheap-vs-expensive* instead, read as a **per-connector capability**, never a `client_type`
+branch -- `Operation.LIST_HISTORY`'s own existing NATIVE/DERIVED declaration already says which
+side a connector falls on (`USENET_BASELINE`: NATIVE, a real independent trivial call;
+`TORRENT_BASELINE`: DERIVED, "a torrent never leaves the list" -- `list_history()` re-fetches the
+identical expensive full listing `list_transfers(active_only=False)` already pays for, so calling
+it every fast tick would double the exact cost spec §9.1 exists to avoid). A non-slow tick now
+calls `list_transfers(active_only=True)` always, plus `list_history()` too when
+`capabilities.supports(Operation.LIST_HISTORY)` -- for SABnzbd, that means every tick, not just
+the slow one; for rTorrent, unchanged from stage 2a. The terminal results of that extra call are
+merged into `_full_estate` (not wholesale-replaced -- only the slow pass does that), so
+`completed_transfers()`/`failed_transfers()` see a fresh verdict within one `FAST_INTERVAL_S`
+tick. `docs/download-client-framework-spec.md` §9.1 is annotated with this as a further
+correction, alongside stage 2b's own note, rather than rewritten -- the same "leave the
+discrepancy on record" style §11.1c and §9.1's own prior correction already use.
+
+**Rejected alternative: a boolean flag on the connector class (`cheap_terminal_source = True`).**
+Would have worked, but would have been a second, connector-authored fact sitting right next to a
+capability declaration that already says the identical thing -- exactly the kind of duplicated
+truth that drifts. Reusing `Operation.LIST_HISTORY`'s existing NATIVE/DERIVED value costs nothing
+new to author per connector and can never disagree with itself.
+
+**Part 2 — withhold on an explicit terminal FAILED verdict** (`docs/transfers-redesign-spec.md`
+§4.3): a third gate in `core/autoqueue.py.on_scan`, of the same kind as the mount gate and the
+settle gate, checked *before* and *independent of* the settle gate's own fingerprint logic --
+the whole reason it needs to exist is that a died-partway download or a failed unpack leaves
+bytes that have permanently stopped growing, which the settle gate's own fingerprint reads as
+"settled," not "dead." `settle.find_client_failure` mirrors `find_client_completion` exactly
+(the identical `_client_content_path_matches` component-boundary rule), over a new
+`ClientSyncScheduler.failed_transfers()` that mirrors `completed_transfers()`.
+
+**Ships off** (`autoqueue.WithholdSettings.enabled`, default `False`) -- per the handoff prompt's
+own instruction, and for the same underlying reason stage 2b's `client_skip_enabled` shipped off:
+this gate keys off the identical unverified vocabulary (SABnzbd history `status="Failed"` ->
+`TransferPhase.FAILED`, spec §13.4 guess #2). The asymmetry argument, recorded here because the
+handoff prompt asked for it explicitly: withholding wrongly makes a genuinely good release
+**silently never arrive** (worse than today, and quiet about it); not withholding wrongly
+reproduces exactly today's behavior (the settle gate transfers the half-written directory, same
+as every install already tolerates). One wrong default is a regression; the other is the status
+quo. `False` is therefore the safer default, not merely the cautious-by-convention one -- see
+`core/autoqueue.py.WithholdSettings`'s own docstring for the full argument.
+
+**Self-lift is ordering, not state.** No "was this withheld last pass" persistence decides
+whether a withhold continues -- every `on_scan` pass re-derives the verdict fresh from the
+client's own current candidates, checking `find_client_completion` *first* and only consulting
+`find_client_failure` when that returns `None`. A later genuine `COMPLETED` verdict for the same
+release therefore always wins over a stale `FAILED` entry a client's own history may still be
+holding from the dead earlier attempt, with no separate code path needed to "clear" anything.
+`AutoQueue.withheld` (public, mirroring `self.gated`) exists only for a future API/UI surface to
+read -- no endpoint or frontend change shipped in this stage; named as an open gap rather than
+silently deferred.
+
+**Rejected alternative: reusing `auto_queue_suppressed`.** The handoff prompt ruled this out
+explicitly, by name, citing the v0.2.6 `REMOTE_GONE` incident (`ELIGIBLE_STATES`'s own long
+comment in `core/autoqueue.py`) as the shape of bug conflating two different "don't queue this"
+reasons produces. A withhold is a per-pass, self-lifting *skip*; `auto_queue_suppressed` is a
+permanent, only-explicitly-cleared *stop*. Reusing the flag would have meant a lifted withhold
+needing its own unsuppression code path -- exactly the kind of extra state this design avoids by
+re-deriving the verdict fresh every pass instead.
+
+---
+
 ## 2026-08-23 — the settle-gate skip (#18 stage 2b): site-wide toggle, `_full_estate` not the fast cadence, one-directional path containment
 
 `prompts/done/2026-08-23-settle-gate-skip.md`. A positive, terminal client verdict
