@@ -77,9 +77,20 @@ export interface QueueForCategorySuggestion extends QueueForInference {
   name: string
 }
 
+// Round 4 (2026-08-23, prompts/2026-08-23-path-attribution-and-category-escape-hatch.md):
+// restores a manual "Add category" escape hatch, mirroring `BasePathDraft.source`
+// ('detected' | 'manual') exactly, for the identical reason -- rTorrent's `list_categories` is
+// DERIVED (spec §5): it can only report labels *currently in use*, so a category that will exist
+// later (e.g. "ar-movies" before the first movie is grabbed) can never be detected, and the
+// prior redesign (2026-08-23-category-binding-redesign.md) removed the only way to enter one.
+// `'client'` covers both a directly-detected category and a path-arithmetic guess -- neither was
+// typed by a person, so neither is `'manual'`.
+export type CategoryRowSource = 'client' | 'manual'
+
 export interface CategoryRowDraft {
   category: string
   queue_id: number | null
+  source: CategoryRowSource
 }
 
 function trailingSegment(path: string): string {
@@ -141,8 +152,14 @@ export function computeCategoryRows(
   if (detectedCategories != null && detectedCategories.length > 0) {
     const rows: CategoryRowDraft[] = detectedCategories.map((category) => {
       const saved = byCategory.get(category)
-      if (saved != null) return saved
-      return { category, queue_id: suggestQueueForCategory(category, queues) }
+      // A category the client now genuinely reports is no longer speculative, even if a
+      // manually-added row for it already existed (someone typed "ar-movies" ahead of its first
+      // download, and the first download has now happened) -- `source` flips to `'client'` so
+      // Remove's own "only on a stale row" rule (round 3's #14c) governs it going forward,
+      // rather than the manual row's own "always removable" escape hatch staying live for a
+      // category that is, in fact, live.
+      if (saved != null) return { ...saved, source: 'client' }
+      return { category, queue_id: suggestQueueForCategory(category, queues), source: 'client' }
     })
     const detectedSet = new Set(detectedCategories)
     for (const row of existing) {
@@ -156,7 +173,7 @@ export function computeCategoryRows(
   let addedAny = false
   for (const p of proposals) {
     if (!byCategory.has(p.category)) {
-      rows.push({ category: p.category, queue_id: p.queue_id })
+      rows.push({ category: p.category, queue_id: p.queue_id, source: 'client' })
       addedAny = true
     }
   }
@@ -210,4 +227,25 @@ export function describeCategorySource(
 export function isStaleCategoryRow(category: string, detectedCategories: string[] | null): boolean {
   if (detectedCategories == null) return false
   return !detectedCategories.includes(category)
+}
+
+/** Whether Remove should appear at all for a given row (round 4, 2026-08-23: restores the manual
+ * "Add category" escape hatch). Two independent reasons, either one sufficient:
+ *
+ * - **`source === 'manual'`** -- a hand-added row is never auto-produced by `computeCategoryRows`
+ *   (unless the client has since started actually reporting it, at which point `source` flips to
+ *   `'client'` there -- see that function's own comment), so nothing will silently bring it back
+ *   the way removing a still-reported row would. Always removable, mirroring base paths' own
+ *   manual escape hatch, which is unconditionally removable for the identical reason.
+ * - **`isStaleCategoryRow`** -- unchanged from round 3 (#14c): a saved mapping for a category the
+ *   client no longer reports.
+ *
+ * A row that is neither -- a `'client'`-sourced row the client currently still reports -- can
+ * only ever be left unbound; Remove would just reappear on the next Test.
+ */
+export function canRemoveCategoryRow(
+  row: Pick<CategoryRowDraft, 'category' | 'source'>,
+  detectedCategories: string[] | null,
+): boolean {
+  return row.source === 'manual' || isStaleCategoryRow(row.category, detectedCategories)
 }

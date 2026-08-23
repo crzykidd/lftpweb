@@ -9,7 +9,7 @@
 // box's own display logic lives here, unit-tested, rather than inlined in
 // `components/PreflightBox.tsx`.
 
-import type { PreflightRowOut, SettleSettingsOut } from '../api/types'
+import type { PreflightRowOut, PreflightUnattributedClientOut, SettleSettingsOut } from '../api/types'
 import { formatBytes, formatEta, percentValue, settleWaitLabel } from './format'
 
 /** The page-size selector's own default -- "5 rows by default" is the user's own original
@@ -308,4 +308,32 @@ export function preflightChipTooltip(
   return row.download_client
     ? `Downloading from "${row.download_client}" — reported by ${row.source_label}`
     : `Reported by ${row.source_label}`
+}
+
+/** The unattributed-clients banner's own detail clause (round 4, 2026-08-23, live evidence): the
+ * count alone told a user *that* a client had unattributable items, never *which* categories to
+ * go map -- a client that already had `ar-tv` mapped was left guessing what else needed one.
+ * `no_category_count` is called out distinctly from `categories` -- "this client isn't labelling
+ * its downloads" and "reported a category with no mapping" are different problems with different
+ * fixes, and conflating them would send a user chasing a mapping that was never the issue.
+ *
+ * Composes only the "in ar-movies" / "1 with no category" clause(s); `PreflightBox.tsx` wraps
+ * this in the client name and the "reports N items ... none attributable" framing so the two
+ * pieces of copy are never allowed to drift out of sync with each other.
+ */
+export function unattributedClientDetail(
+  info: Pick<PreflightUnattributedClientOut, 'count' | 'categories' | 'no_category_count'>,
+): string | null {
+  const clauses: string[] = []
+  if (info.categories.length > 0) {
+    clauses.push(`in ${info.categories.join(', ')}`)
+  }
+  if (info.no_category_count > 0) {
+    clauses.push(
+      info.no_category_count === info.count
+        ? 'with no category'
+        : `${info.no_category_count} with no category`,
+    )
+  }
+  return clauses.length > 0 ? clauses.join(', ') : null
 }

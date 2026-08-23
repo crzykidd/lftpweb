@@ -111,6 +111,22 @@ async def _persist_capabilities(
     await db.commit()
 
 
+async def _persist_detected_categories(db, client_id: int, categories: list[str]) -> None:
+    """Migration 030 (this task): persists a fresh Test's own `detected_categories` alongside the
+    instance, stamped with when -- see `DownloadClientOut.detected_categories`'s own docstring
+    for why this exists. Written on **every** successful Test, including one that detects `[]`
+    (a client currently reporting no categories at all is real, current information too, not
+    "nothing happened") -- the same "success writes, failure leaves the prior value alone" rule
+    `_persist_capabilities` above already follows for capabilities, applied to this field.
+    """
+    await db.execute(
+        "UPDATE download_client SET detected_categories_json = ?, detected_categories_at = ? "
+        "WHERE id = ?",
+        (json.dumps(categories), _now_iso(), client_id),
+    )
+    await db.commit()
+
+
 # --------------------------------------------------------------------------------------------
 # Config-schema-driven request validation (spec §8.1) -- each connector declares its own
 # connection-config schema (`DownloadClient.config_schema`, a tuple of `ConfigField`), so there
@@ -226,9 +242,9 @@ async def _replace_categories(
     await db.execute("DELETE FROM download_client_category WHERE client_id = ?", (client_id,))
     for cat in categories:
         await db.execute(
-            "INSERT INTO download_client_category (client_id, category, queue_id) "
-            "VALUES (?, ?, ?)",
-            (client_id, cat.category, cat.queue_id),
+            "INSERT INTO download_client_category (client_id, category, queue_id, source) "
+            "VALUES (?, ?, ?, ?)",
+            (client_id, cat.category, cat.queue_id, cat.source),
         )
 
 
@@ -314,7 +330,11 @@ _CLIENT_COLUMNS = (
     "capabilities_json, capabilities_probed_at, version, created_at, updated_at, "
     # The poller's own last-pass status (migration 029, finding #2, 2026-08-23) -- see
     # `DownloadClientOut`'s own docstring for why this is distinct from `capabilities_probed_at`.
-    "last_poll_at, last_poll_ok, last_poll_message, last_success_at"
+    "last_poll_at, last_poll_ok, last_poll_message, last_success_at, "
+    # The last successful Test's own persisted `detected_categories` (migration 030, this task) --
+    # see `DownloadClientOut`'s own docstring for why this exists distinctly from the always-
+    # in-memory-only `testResults[editingId]` the settings page previously relied on alone.
+    "detected_categories_json, detected_categories_at"
 )
 
 
@@ -346,13 +366,15 @@ async def _get_base_paths(db, client_id: int) -> list[DownloadClientBasePathOut]
 
 async def _get_categories(db, client_id: int) -> list[DownloadClientCategoryOut]:
     cursor = await db.execute(
-        "SELECT id, category, queue_id FROM download_client_category "
+        "SELECT id, category, queue_id, source FROM download_client_category "
         "WHERE client_id = ? ORDER BY id",
         (client_id,),
     )
     rows = await cursor.fetchall()
     return [
-        DownloadClientCategoryOut(id=r["id"], category=r["category"], queue_id=r["queue_id"])
+        DownloadClientCategoryOut(
+            id=r["id"], category=r["category"], queue_id=r["queue_id"], source=r["source"]
+        )
         for r in rows
     ]
 
@@ -379,6 +401,10 @@ async def _client_out_from_row(db, row) -> DownloadClientOut:
         last_poll_ok=bool(row["last_poll_ok"]) if row["last_poll_ok"] is not None else None,
         last_poll_message=row["last_poll_message"],
         last_success_at=row["last_success_at"],
+        detected_categories=(
+            json.loads(row["detected_categories_json"]) if row["detected_categories_json"] else None
+        ),
+        detected_categories_at=row["detected_categories_at"],
     )
 
 
@@ -756,6 +782,7 @@ async def test_client_instance(client_id: int, request: Request) -> DownloadClie
             await aclose()
 
     await _persist_capabilities(db, client_id, client_class.capabilities, version=info.version)
+    await _persist_detected_categories(db, client_id, detected_categories)
     return DownloadClientTestResponse(
         ok=True,
         error_class=None,

@@ -298,11 +298,23 @@ def test_unattributed_client_shows_a_banner_line_with_its_count(isolated_config)
         # itself, only this endpoint's read of its cache.
         app.state.client_sync._instance_names[instance_id] = "SABnzbd"
         app.state.client_sync._unattributed_counts[instance_id] = 3
+        # Round 4's own category breakdown (`core.clientsync.UnattributedClientInfo`) -- poked
+        # the same way, so this test also covers this endpoint's own field mapping for it.
+        app.state.client_sync._unattributed_categories[instance_id] = {
+            "ar-movies": 2,
+            None: 1,
+        }
 
         resp = client.get("/api/queue/preflight")
         body = resp.json()
         assert body["unattributed_clients"] == [
-            {"client_id": instance_id, "client_name": "SABnzbd", "count": 3}
+            {
+                "client_id": instance_id,
+                "client_name": "SABnzbd",
+                "count": 3,
+                "categories": ["ar-movies"],
+                "no_category_count": 1,
+            }
         ]
 
 

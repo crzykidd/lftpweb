@@ -10,6 +10,7 @@ import {
   preflightRemainingLabel,
   preflightSizeLabel,
   preflightStatusLabel,
+  unattributedClientDetail,
 } from './preflight'
 
 describe('preflightSizeLabel', () => {
@@ -316,6 +317,40 @@ describe('preflightDetailEntries', () => {
     })
     const keys = Object.keys(entries[0]).sort()
     expect(keys).toEqual(['source', 'sizeLabel', 'source_kind', 'source_label', 'status_label'].sort())
+  })
+})
+
+describe('unattributedClientDetail', () => {
+  it('is null when there is nothing to break down (defensive only)', () => {
+    expect(unattributedClientDetail({ count: 0, categories: [], no_category_count: 0 })).toBeNull()
+  })
+
+  it('names the unmatched categories', () => {
+    expect(
+      unattributedClientDetail({ count: 2, categories: ['ar-movies'], no_category_count: 0 }),
+    ).toBe('in ar-movies')
+  })
+
+  it('joins several categories', () => {
+    expect(
+      unattributedClientDetail({
+        count: 3,
+        categories: ['ar-books', 'ar-movies'],
+        no_category_count: 0,
+      }),
+    ).toBe('in ar-books, ar-movies')
+  })
+
+  it('calls out "no category at all" distinctly, without a redundant count when it is the whole total', () => {
+    expect(
+      unattributedClientDetail({ count: 2, categories: [], no_category_count: 2 }),
+    ).toBe('with no category')
+  })
+
+  it('gives "no category" its own count when mixed with mapped-but-unmatched categories', () => {
+    expect(
+      unattributedClientDetail({ count: 3, categories: ['ar-movies'], no_category_count: 2 }),
+    ).toBe('in ar-movies, 2 with no category')
   })
 })
 

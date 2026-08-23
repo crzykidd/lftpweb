@@ -314,6 +314,12 @@ export interface DownloadClientCategoryIn {
   // `null` = configured but not yet bound to a queue (spec §8.3) -- distinct from the mapping
   // not existing at all.
   queue_id: number | null
+  // Migration 030 (round 4, 2026-08-23) -- mirrors `DownloadClientBasePathIn.source` exactly:
+  // whether this row was produced by detection/path-arithmetic (`'client'`) or typed by hand via
+  // the "Add category" escape hatch (`'manual'`) -- rTorrent's `list_categories` is DERIVED and
+  // can only report labels currently in use, so a category that will exist later can never be
+  // detected on its own.
+  source: 'client' | 'manual'
 }
 
 export interface DownloadClientCategoryOut extends DownloadClientCategoryIn {
@@ -383,6 +389,14 @@ export interface DownloadClientOut {
   last_poll_ok: boolean | null
   last_poll_message: string | null
   last_success_at: string | null
+  /** Migration 030 (round 4, 2026-08-23) -- the last successful Test's own `detected_categories`,
+   * persisted alongside the instance rather than living only in the settings page's own
+   * in-memory `testResults[editingId]`, so re-opening a saved instance for edit in a fresh
+   * session shows what was last detected (with its age) instead of an empty "never tested" hint.
+   * Both `null` until the first successful Test; `[]` is a real, successful "reported none."
+   */
+  detected_categories: string[] | null
+  detected_categories_at: string | null
 }
 
 /** `POST /api/settings/clients/{id}/test` -- `capabilities` always reflects whatever is now on
@@ -1027,6 +1041,18 @@ export interface PreflightUnattributedClientOut {
   client_id: number
   client_name: string
   count: number
+  /** Widened round 4 (2026-08-23, live evidence): `count` alone told a user *that* a client had
+   * unattributable items, never *which* categories to go map -- a client that already had
+   * `ar-tv` mapped left the user guessing what else needed one. Distinct, sorted category names
+   * seen among this pass's unattributable items, **excluding** "no category at all" -- that's
+   * `no_category_count`'s own job below, a different problem with a different fix.
+   */
+  categories: string[]
+  /** Count of unattributable items that carried no category at all -- "this client isn't
+   * labelling its downloads" is a different problem than "map this category," and conflating the
+   * two would send a user chasing a mapping that was never the issue.
+   */
+  no_category_count: number
 }
 
 /** `source_configured=false` (with `rows` always empty in that case) means "no row source is

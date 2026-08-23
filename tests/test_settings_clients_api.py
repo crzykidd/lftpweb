@@ -285,7 +285,12 @@ def test_unbound_category_survives_a_save_and_a_re_edit(isolated_config):
         assert resp.status_code == 201, resp.text
         client_id = resp.json()["id"]
         assert resp.json()["categories"] == [
-            {"id": resp.json()["categories"][0]["id"], "category": "movies", "queue_id": None}
+            {
+                "id": resp.json()["categories"][0]["id"],
+                "category": "movies",
+                "queue_id": None,
+                "source": "client",
+            }
         ]
 
         # Re-fetch (simulating a page reload / re-opening Edit) -- the row must still be there.
@@ -798,9 +803,13 @@ def test_test_connection_reports_the_clients_own_categories(isolated_config, fak
         assert body["ok"] is True
         assert sorted(body["detected_categories"]) == ["movies", "tv"]
 
-        # Detection proposes; it never saves -- exactly like base paths.
+        # Detection proposes; it never saves a category -> queue mapping -- exactly like base
+        # paths. It **does** now persist the raw detected list itself (migration 030, this task)
+        # -- a different thing, the settings page's own "what did the last Test see" memory.
         stored = client.get("/api/settings/clients").json()[0]
         assert stored["categories"] == []
+        assert sorted(stored["detected_categories"]) == ["movies", "tv"]
+        assert stored["detected_categories_at"] is not None
 
 
 def test_test_connection_reports_no_categories_when_the_client_has_none_configured(
@@ -815,6 +824,12 @@ def test_test_connection_reports_no_categories_when_the_client_has_none_configur
         assert resp.status_code == 200
         assert resp.json()["detected_categories"] == []
 
+        # A successful Test that finds nothing still persists `[]`, stamped with when -- distinct
+        # from "never tested" (`None`), which the next test below covers.
+        stored = client.get("/api/settings/clients").json()[0]
+        assert stored["detected_categories"] == []
+        assert stored["detected_categories_at"] is not None
+
 
 def test_a_failed_test_reports_no_detected_categories(isolated_config):
     with TestClient(app) as client:
@@ -826,6 +841,51 @@ def test_a_failed_test_reports_no_detected_categories(isolated_config):
         assert resp.status_code == 200
         assert resp.json()["ok"] is False
         assert resp.json()["detected_categories"] == []
+
+        # A failed test never persists anything -- this instance has never had a *successful*
+        # Test, so `detected_categories`/`detected_categories_at` both read as "never tested",
+        # not a false empty list.
+        stored = client.get("/api/settings/clients").json()[0]
+        assert stored["detected_categories"] is None
+        assert stored["detected_categories_at"] is None
+
+
+# --- The manual "Add category" escape hatch (2026-08-23,
+# prompts/2026-08-23-path-attribution-and-category-escape-hatch.md) ---------------------------
+
+
+def test_manual_category_persists_with_its_source(isolated_config):
+    """rTorrent's `list_categories` is DERIVED -- it can only report labels currently in use, so
+    a category that will exist later can never be detected. A hand-added row must round-trip
+    with `source: "manual"`, distinguishing it from a detected/guessed one.
+    """
+    with TestClient(app) as client:
+        resp = client.post(
+            "/api/settings/clients",
+            json=_sab_body(
+                categories=[{"category": "ar-movies", "queue_id": None, "source": "manual"}]
+            ),
+        )
+        assert resp.status_code == 201, resp.text
+        assert resp.json()["categories"][0]["source"] == "manual"
+
+        client_id = resp.json()["id"]
+        reread = client.get("/api/settings/clients").json()[0]
+        assert reread["id"] == client_id
+        assert reread["categories"][0]["source"] == "manual"
+
+
+def test_blank_category_is_rejected_visibly_not_silently_dropped(isolated_config):
+    """The exact defect class findings #11b/#11c already eliminated for the detected/guessed
+    rows must not reappear at the one place a blank string can still originate: the manual-add
+    escape hatch. A blank `category` is a 422, never a 2xx with the row quietly missing.
+    """
+    with TestClient(app) as client:
+        resp = client.post(
+            "/api/settings/clients",
+            json=_sab_body(categories=[{"category": "", "queue_id": None, "source": "manual"}]),
+        )
+        assert resp.status_code == 422
 
 
 @pytest.mark.skipif(not SEEDBOX_UP, reason=_SEEDBOX_SKIP_REASON)

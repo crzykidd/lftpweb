@@ -27,6 +27,7 @@ import {
 } from '../../lib/clientBasePathDetection'
 import { capabilityRows, type CapabilityRow } from '../../lib/clientCapabilities'
 import {
+  canRemoveCategoryRow,
   computeCategoryRows,
   describeCategorySource,
   isStaleCategoryRow,
@@ -472,6 +473,15 @@ export function ClientsTab() {
   // base path via `acceptDetectedBasePath`.
   const [notFoundDrafts, setNotFoundDrafts] = useState<Record<string, string>>({})
 
+  // The manual "Add category" escape hatch (round 4, 2026-08-23) -- restored for exactly the
+  // case the capability declaration already named: rTorrent's `list_categories` is DERIVED, so
+  // it can only report a label currently in use, and a category that will exist later (e.g.
+  // "ar-movies" before the first movie is grabbed) can never be detected on its own.
+  const [categoryDraft, setCategoryDraft] = useState('')
+  // A blank/duplicate Add must be **rejected visibly**, not silently ignored -- #11b/#11c's own
+  // defect class, restated at this one remaining place a blank category string could originate.
+  const [categoryDraftError, setCategoryDraftError] = useState<string | null>(null)
+
   const [testResults, setTestResults] = useState<Record<number, DownloadClientTestResponse>>({})
   const [testingId, setTestingId] = useState<number | null>(null)
 
@@ -496,6 +506,20 @@ export function ClientsTab() {
   }, [])
 
   const selectedType = clientTypes.find((t) => t.client_type === form.client_type)
+
+  // The category list's own "what did we last see" read (round 4, 2026-08-23) -- this session's
+  // Test result when there is one, else the instance's own **persisted** `detected_categories`
+  // (migration 030), else `null` ("never tested, ever"). One shared value for every place in this
+  // render that needs it (the source hint, each row's staleness/removability), rather than three
+  // call sites independently re-deriving the same fallback chain and risking them drifting apart.
+  const editingInstance = editingId != null ? instances.find((i) => i.id === editingId) : undefined
+  const sessionDetectedCategories = editingId != null ? testResults[editingId]?.detected_categories : undefined
+  const detectedCategories: string[] | null =
+    sessionDetectedCategories ?? editingInstance?.detected_categories ?? null
+  // Only true when the value above came from a *previous* session's Test, never this one's --
+  // gates the "(detected N ago)" age suffix, which would be meaningless for a result just fetched.
+  const detectedCategoriesIsPersisted =
+    sessionDetectedCategories == null && editingInstance?.detected_categories != null
 
   const groupedTypes = FAMILY_ORDER.map((family) => ({
     family,
@@ -562,11 +586,18 @@ export function ClientsTab() {
     const existingCategories: CategoryRowDraft[] = instance.categories.map((c) => ({
       category: c.category,
       queue_id: c.queue_id,
+      source: c.source,
     }))
     // `testResults[instance.id]` is only populated if Test was clicked this session (the same
-    // asymmetry `detected_base_paths` already has) -- `null` when it hasn't, which
-    // `recomputeCategoryDraft` reads as "never tested," not "reported none."
-    const detected = testResults[instance.id]?.detected_categories ?? null
+    // asymmetry `detected_base_paths` already has). Falls back to the instance's own **persisted**
+    // `detected_categories` (migration 030, round 4, 2026-08-23) -- a previous session's Test,
+    // not this one's -- before finally reading as `null` ("never tested, ever"), which
+    // `recomputeCategoryDraft` reads as "never tested," not "reported none." Without this
+    // fallback, re-opening a saved instance for edit in a fresh session showed an empty "never
+    // tested" hint even though a previous session's Test had reported real data (finding #14's
+    // own follow-up: "the previous round chose to reword the hint instead of persisting; on the
+    // user's evidence that was the wrong call").
+    const detected = testResults[instance.id]?.detected_categories ?? instance.detected_categories ?? null
     const { categories, categorySource } = recomputeCategoryDraft(
       existingCategories,
       detected,
@@ -660,6 +691,37 @@ export function ClientsTab() {
     }))
   }
 
+  /** The manual "Add category" escape hatch (round 4, 2026-08-23) -- restored for exactly the
+   * case the capability declaration already named: rTorrent's `list_categories` is DERIVED, so
+   * it can only report a label currently *in use*, and a category that will exist later can
+   * never be detected on its own (`docs/download-client-api-survey.md`'s own guess #12).
+   *
+   * **A blank name is rejected visibly, not silently ignored** -- this is the one remaining
+   * place a blank category string could originate now that the detected/guessed rows carry no
+   * free-text field at all; `#11b/#11c`'s defect (a blank row silently dropped at submit time)
+   * must not reappear here in a new shape. A duplicate name is rejected the same way, rather than
+   * silently no-op'd like `addBasePath`'s own dedup -- adding a category by name is rare enough,
+   * and the name specific enough, that a duplicate almost certainly means the user forgot they
+   * already added it, which is worth telling them rather than quietly doing nothing.
+   */
+  const addCategoryRow = (name: string) => {
+    const trimmed = name.trim()
+    if (trimmed === '') {
+      setCategoryDraftError('Category name cannot be blank.')
+      return
+    }
+    if (form.categories.some((c) => c.category === trimmed)) {
+      setCategoryDraftError(`"${trimmed}" is already in the list below.`)
+      return
+    }
+    setCategoryDraftError(null)
+    setForm((prev) => ({
+      ...prev,
+      categories: [...prev.categories, { category: trimmed, queue_id: null, source: 'manual' }],
+    }))
+    setCategoryDraft('')
+  }
+
   /** Drops one row entirely -- for a category the client no longer reports and the user wants
    * gone, not merely left unbound. A row that just isn't used stays and is left `queue_id: null`
    * instead (see the "— not used —" option in the dropdown below).
@@ -684,10 +746,16 @@ export function ClientsTab() {
           source: bp.source,
         })),
         // No blank-row filter here on purpose (findings #11b/#11c): every row in `form.categories`
-        // came from the client's own report, a saved mapping, or a labelled path-arithmetic
-        // guess -- never free typing -- so there is no blank category string this could ever
-        // need to drop. An unbound row (`queue_id: null`) is saved exactly as it is.
-        categories: form.categories.map((c) => ({ category: c.category, queue_id: c.queue_id })),
+        // came from the client's own report, a saved mapping, a labelled path-arithmetic guess,
+        // or the manual "Add category" escape hatch (round 4) -- `addCategoryRow` above already
+        // refuses a blank name visibly, before it can ever become a row here -- so there is no
+        // blank category string this could ever need to drop. An unbound row (`queue_id: null`)
+        // is saved exactly as it is.
+        categories: form.categories.map((c) => ({
+          category: c.category,
+          queue_id: c.queue_id,
+          source: c.source,
+        })),
       }
       if (editingId != null) {
         await updateClientInstance(editingId, body)
@@ -790,9 +858,10 @@ export function ClientsTab() {
       <p className="text-sm text-zinc-600 dark:text-zinc-400">
         Download-client instances — SABnzbd, rTorrent, and whatever follows
         (docs/download-client-framework-spec.md). Each type declares its own connection form and
-        its own capabilities; this page never hard-codes either. A category mapped to a queue
-        lets lftpweb attribute that queue's completed items to this client once the poller
-        (a later stage) is built.
+        its own capabilities; this page never hard-codes either. lftpweb attributes a client's
+        items to a queue mainly by comparing where they land on disk against each queue's own
+        folder — the category → queue mapping below is a fallback for whichever items that
+        doesn't cover (see that section for which clients still need it).
       </p>
 
       {error && <p className="text-sm text-red-600 dark:text-red-400">{error}</p>}
@@ -1131,26 +1200,31 @@ export function ClientsTab() {
         </div>
 
         {/* Category -> queue mapping (spec §8.3, redesigned 2026-08-23 -- findings #10/#11 in
-         * prompts/test-findings-2026-08-23.md). One row per category the client actually
-         * reports (direct signal, preferred) or, only when it reports none at all, a labelled
-         * guess from base-path arithmetic (the old, sole mechanism, now a documented fallback).
-         * **No free-text field anywhere here** -- the prior control's category `<input>` carried
+         * prompts/test-findings-2026-08-23.md; demoted to a fallback, round 4, 2026-08-23 --
+         * prompts/2026-08-23-path-attribution-and-category-escape-hatch.md). One row per
+         * category the client actually reports (direct signal, preferred), one row per
+         * base-path-arithmetic guess when it reports none at all, and one row per manually-added
+         * category (the escape hatch this round restores). **No free-text field on a
+         * detected/guessed row** -- the prior control's category `<input>` carried
          * `placeholder="ar-tv"`, greyed text that read as a filled-in value but wasn't one, and
-         * the save silently dropped any row whose (never-typed) value was blank. With every row
-         * always carrying a real category string, there is no blank row this could ever produce
-         * to drop -- #11b/#11c's defect class, not merely its symptom. */}
+         * the save silently dropped any row whose (never-typed) value was blank; that defect
+         * class is gone (#11b/#11c). The one remaining place a blank string could originate --
+         * the manual-add box below -- refuses to submit one (`addCategoryRow`, above). */}
         <div className="flex flex-col gap-2">
           <span className={labelClasses}>Category → queue mapping</span>
           <p className={hintClasses}>
-            This client sorts downloads into categories. Tell lftpweb which queue each one
-            belongs to — leave the ones you don&rsquo;t use unbound.
+            Most downloads are matched to a queue automatically, by comparing where they land on
+            disk against each queue&rsquo;s own folder — no configuration needed for that. This
+            mapping is still the only route for a client that reports its own working/seeding
+            location rather than the queue&rsquo;s folder (rTorrent, under the common hardlink
+            layout) — and for binding a category before its first download exists to match
+            against, since path matching needs something on disk to check.
           </p>
           {editingId != null && (
             <p className={hintClasses}>
-              {describeCategorySource(
-                form.categorySource,
-                testResults[editingId]?.detected_categories ?? null,
-                form.categories.length > 0,
+              {describeCategorySource(form.categorySource, detectedCategories, form.categories.length > 0)}
+              {detectedCategoriesIsPersisted && editingInstance?.detected_categories_at != null && (
+                <> (detected {formatRelativeTimeIntl(editingInstance.detected_categories_at)})</>
               )}
             </p>
           )}
@@ -1176,9 +1250,8 @@ export function ClientsTab() {
               </div>
               <ul className="flex flex-col gap-2">
                 {form.categories.map((cat, i) => {
-                  const detectedCategories =
-                    editingId != null ? (testResults[editingId]?.detected_categories ?? null) : null
                   const stale = isStaleCategoryRow(cat.category, detectedCategories)
+                  const removable = canRemoveCategoryRow(cat, detectedCategories)
                   const selectedQueue = queues.find((q) => q.id === cat.queue_id)
                   return (
                     <li key={cat.category} className="flex flex-col gap-1">
@@ -1192,6 +1265,12 @@ export function ClientsTab() {
                           title={cat.category}
                         >
                           {cat.category}
+                          {/* A manual row is marked as such (round 4) -- mirrors base paths' own
+                           * "detected"/"manual" tag, so a hand-added category never reads as
+                           * something the client itself reported. */}
+                          {cat.source === 'manual' && (
+                            <span className="ml-1 text-zinc-400 dark:text-zinc-600">(manual)</span>
+                          )}
                         </span>
                         <span
                           aria-hidden="true"
@@ -1227,12 +1306,15 @@ export function ClientsTab() {
                             ))}
                           </select>
                         </span>
-                        {/* Remove only on a stale row -- a category the client still reports can
+                        {/* Remove on a stale row, or **always** on a manual one (round 4) --
+                         * a category the client still reports (and never manually added) can
                          * only be left unbound (finding #14c: "you cannot remove a category the
                          * client currently reports -- leaving it unbound is how you ignore it...
-                         * removing it just makes the row reappear on the next Test"). */}
+                         * removing it just makes the row reappear on the next Test"). A manual
+                         * row is never auto-produced that way, so nothing will silently bring it
+                         * back -- `canRemoveCategoryRow`. */}
                         <span className="w-40 shrink-0 text-right">
-                          {stale && (
+                          {removable && (
                             <button
                               type="button"
                               onClick={() => removeCategoryRow(i)}
@@ -1243,7 +1325,7 @@ export function ClientsTab() {
                           )}
                         </span>
                       </div>
-                      {stale && (
+                      {cat.source !== 'manual' && stale && (
                         <p className="pl-0.5 text-[11px] text-amber-600 dark:text-amber-400">
                           Not currently reported by this client — its queue binding is kept until
                           you remove it.
@@ -1255,6 +1337,35 @@ export function ClientsTab() {
               </ul>
             </div>
           )}
+          {/* The manual "Add category" escape hatch (round 4, 2026-08-23) -- clearly secondary
+           * to the detected list above, for exactly the case its own capability declaration
+           * named: rTorrent's `list_categories` is DERIVED and can only report a label currently
+           * in use, so a category that will exist later (e.g. "ar-movies" before the first movie
+           * is grabbed) can never be detected. A blank or duplicate name is rejected visibly
+           * (`addCategoryRow`) rather than silently ignored. */}
+          <div className="flex flex-col gap-1 pt-1">
+            <div className="flex gap-2">
+              <input
+                className={inputClasses}
+                value={categoryDraft}
+                onChange={(e) => {
+                  setCategoryDraft(e.target.value)
+                  setCategoryDraftError(null)
+                }}
+                placeholder="Add a category by name, e.g. ar-movies"
+              />
+              <button
+                type="button"
+                onClick={() => addCategoryRow(categoryDraft)}
+                className={secondaryButtonClasses}
+              >
+                Add category
+              </button>
+            </div>
+            {categoryDraftError && (
+              <p className="text-xs text-red-600 dark:text-red-400">{categoryDraftError}</p>
+            )}
+          </div>
         </div>
 
         <div className="flex gap-2">

@@ -1,10 +1,12 @@
 import { describe, expect, it } from 'vitest'
 import {
+  canRemoveCategoryRow,
   computeCategoryRows,
   describeCategorySource,
   inferCategoryMappings,
   isStaleCategoryRow,
   suggestQueueForCategory,
+  type CategoryRowDraft,
   type QueueForCategorySuggestion,
 } from './clientCategoryInference'
 
@@ -99,15 +101,15 @@ describe('computeCategoryRows', () => {
     const { rows, source } = computeCategoryRows([], ['ar-tv', 'ar-movies'], [], QUEUES)
     expect(source).toBe('client')
     expect(rows).toEqual([
-      { category: 'ar-tv', queue_id: 1 },
-      { category: 'ar-movies', queue_id: 2 },
+      { category: 'ar-tv', queue_id: 1, source: 'client' },
+      { category: 'ar-movies', queue_id: 2, source: 'client' },
     ])
   })
 
   it('keeps an already-saved binding instead of overwriting it with a suggestion', () => {
-    const existing = [{ category: 'ar-tv', queue_id: 2 }]
+    const existing: CategoryRowDraft[] = [{ category: 'ar-tv', queue_id: 2, source: 'client' }]
     const { rows } = computeCategoryRows(existing, ['ar-tv'], [], QUEUES)
-    expect(rows).toEqual([{ category: 'ar-tv', queue_id: 2 }])
+    expect(rows).toEqual([{ category: 'ar-tv', queue_id: 2, source: 'client' }])
   })
 
   it('a suggested (unsaved) binding defaults to a selected value, not unbound', () => {
@@ -116,11 +118,13 @@ describe('computeCategoryRows', () => {
   })
 
   it('preserves a saved mapping for a category the client no longer reports', () => {
-    const existing = [{ category: 'stale-category', queue_id: 2 }]
+    const existing: CategoryRowDraft[] = [
+      { category: 'stale-category', queue_id: 2, source: 'client' },
+    ]
     const { rows, source } = computeCategoryRows(existing, ['ar-tv'], [], QUEUES)
     expect(source).toBe('client')
-    expect(rows).toContainEqual({ category: 'stale-category', queue_id: 2 })
-    expect(rows).toContainEqual({ category: 'ar-tv', queue_id: 1 })
+    expect(rows).toContainEqual({ category: 'stale-category', queue_id: 2, source: 'client' })
+    expect(rows).toContainEqual({ category: 'ar-tv', queue_id: 1, source: 'client' })
   })
 
   it('falls back to path-arithmetic proposals when the client reports no categories', () => {
@@ -131,7 +135,7 @@ describe('computeCategoryRows', () => {
       [{ id: 3, name: 'q', remote_path: '/home/crzykidd/downloads/complete/ar-tv' }],
     )
     expect(source).toBe('path_arithmetic')
-    expect(rows).toEqual([{ category: 'ar-tv', queue_id: 3 }])
+    expect(rows).toEqual([{ category: 'ar-tv', queue_id: 3, source: 'client' }])
   })
 
   it('falls back to path arithmetic when the client has never been tested (null)', () => {
@@ -142,7 +146,7 @@ describe('computeCategoryRows', () => {
       [{ id: 3, name: 'q', remote_path: '/home/crzykidd/downloads/complete/ar-tv' }],
     )
     expect(source).toBe('path_arithmetic')
-    expect(rows).toEqual([{ category: 'ar-tv', queue_id: 3 }])
+    expect(rows).toEqual([{ category: 'ar-tv', queue_id: 3, source: 'client' }])
   })
 
   it('reports source "none" when nothing can be proposed either way', () => {
@@ -152,7 +156,7 @@ describe('computeCategoryRows', () => {
   })
 
   it('does not duplicate an already-existing category with a path-arithmetic proposal', () => {
-    const existing = [{ category: 'ar-tv', queue_id: 1 }]
+    const existing: CategoryRowDraft[] = [{ category: 'ar-tv', queue_id: 1, source: 'client' }]
     const { rows, source } = computeCategoryRows(
       existing,
       [],
@@ -160,7 +164,26 @@ describe('computeCategoryRows', () => {
       [{ id: 1, name: 'ar-tv', remote_path: '/home/crzykidd/downloads/complete/ar-tv' }],
     )
     expect(source).toBe('none')
-    expect(rows).toEqual([{ category: 'ar-tv', queue_id: 1 }])
+    expect(rows).toEqual([{ category: 'ar-tv', queue_id: 1, source: 'client' }])
+  })
+
+  // Round 4 (2026-08-23): the manual "Add category" escape hatch.
+
+  it('preserves a manually-added row the client does not (yet) report', () => {
+    const existing: CategoryRowDraft[] = [
+      { category: 'ar-movies', queue_id: null, source: 'manual' },
+    ]
+    const { rows, source } = computeCategoryRows(existing, ['ar-tv'], [], QUEUES)
+    expect(source).toBe('client')
+    expect(rows).toContainEqual({ category: 'ar-movies', queue_id: null, source: 'manual' })
+  })
+
+  it('flips a manual row to source "client" once the client actually reports it', () => {
+    const existing: CategoryRowDraft[] = [
+      { category: 'ar-movies', queue_id: 2, source: 'manual' },
+    ]
+    const { rows } = computeCategoryRows(existing, ['ar-movies'], [], QUEUES)
+    expect(rows).toEqual([{ category: 'ar-movies', queue_id: 2, source: 'client' }])
   })
 })
 
@@ -208,5 +231,28 @@ describe('isStaleCategoryRow', () => {
 
   it('is false when never tested this session -- staleness cannot be known from nothing', () => {
     expect(isStaleCategoryRow('anything', null)).toBe(false)
+  })
+})
+
+describe('canRemoveCategoryRow', () => {
+  // Round 4 (2026-08-23): the manual escape hatch's own rows must always be removable, even
+  // before any Test has run this session (`detectedCategories === null`) -- a manual row is
+  // never auto-produced by `computeCategoryRows`, so nothing will silently bring it back.
+
+  it('is always true for a manual row, even when never tested this session', () => {
+    expect(canRemoveCategoryRow({ category: 'ar-movies', source: 'manual' }, null)).toBe(true)
+  })
+
+  it('is always true for a manual row the client also currently reports', () => {
+    expect(canRemoveCategoryRow({ category: 'ar-tv', source: 'manual' }, ['ar-tv'])).toBe(true)
+  })
+
+  it('falls back to staleness for a client-sourced row', () => {
+    expect(canRemoveCategoryRow({ category: 'ar-tv', source: 'client' }, ['ar-tv'])).toBe(false)
+    expect(canRemoveCategoryRow({ category: 'old-cat', source: 'client' }, ['ar-tv'])).toBe(true)
+  })
+
+  it('is false for a client-sourced row when never tested this session', () => {
+    expect(canRemoveCategoryRow({ category: 'anything', source: 'client' }, null)).toBe(false)
   })
 })

@@ -589,6 +589,68 @@ suggestion; the two are never blurred together.
   freshly detected list immediately; nothing auto-probes on page load, matching §8.2's own
   base-path detection, which also only ever runs on an explicit Test click.
 
+### 8.3 correction, round 4, 2026-08-23 — path attribution is primary; the mapping is a fallback
+
+**The above was still wrong, one level up from the round-3 correction.** Round 3 fixed the
+*control* (no free-text field, nothing to silently drop) but left the underlying rule unchanged:
+`core/clientsync.py._update_preflight` attributed a transfer to a queue **only** through the
+category mapping, dropping anything without a category — or with an unmapped one — before ever
+looking at where its bytes actually are. Live use (`prompts/test-findings-2026-08-23.md` #2/#10)
+surfaced the user's own words twice: *"the category is ar-tv and the dir for that is ar-tv"*, and
+*"this makes zero sense to me"* — they were made to configure something the filesystem already
+answers. SABnzbd's history `storage` field, and rTorrent's `content_path`, both land inside (or
+at) a queue's own `remote_path` in the reference layout; a queue's `remote_path` **is** the
+on-disk root a connector's finished items land under, for a connector whose reported path sits
+there at all (see the caveat below — it does not for every connector).
+
+**Attribution order, decided:**
+
+1. `content_path` matches an enabled queue's `remote_path` — component-boundary containment or
+   equality, **never a bare prefix** (`/complete/ar-tv` must not match `/complete/ar-tv-extra`) —
+   → that queue. No category mapping consulted, no configuration needed.
+2. Otherwise (most commonly: nothing on disk yet, still queued at the client with no
+   `content_path` to check) — the configured category → queue mapping, if one exists. This is now
+   that mapping's **whole remaining job**.
+3. Otherwise — silently omitted, unchanged from every earlier round.
+
+**Path wins on disagreement.** A transfer whose path matches one queue but whose category is
+mapped to a different one is not a tie: the path is where the bytes actually are, a stale or wrong
+category mapping is not. The mismatch is logged, not silently resolved in the mapping's favour —
+a disagreement is a signal the user's configuration is wrong, not noise to suppress.
+
+**Reused, not reimplemented.** The component-boundary matching rule is exactly
+`core/settle.py._client_content_path_matches` — already built for the stage 2b settle-gate skip
+and the stage 3 withhold gate, which match a transfer's `content_path` against one *item's*
+remote path (`queue.remote_path` + `rel_path`) the identical way. This section's own attribution
+matches against a *queue's* remote path directly (there is no single item yet — the question is
+"which queue," not "is this settled"), but the underlying rule — equality or containment at a `/`
+boundary — is the same fact about paths either way, so it is imported and reused rather than
+forked into a second copy that could drift from the first.
+
+**This does not make the category mapping optional for every connector — corrected, 2026-08-23,
+same day, on further live evidence.** An earlier draft of this correction claimed most setups
+would need the mapping "not at all" once path attribution shipped. That is true for SABnzbd,
+whose history `storage` field points inside the queue's own folder, and **false for rTorrent**:
+per §1.1, rTorrent reports its own *seeding* directory as `content_path`, not the hardlinked copy
+under the queue's `remote_path` (`/home/crzykidd/downloads/rtorrent/...` vs.
+`/home/crzykidd/downloads/complete/ar-tv`) — two different trees under the common hardlink
+layout. An rTorrent transfer's path therefore essentially never matches a queue root, and the
+category mapping remains **rTorrent's only attribution route**, exactly as before this task. Path
+attribution's real win is narrower than first stated: it removes the mapping requirement entirely
+for a usenet-style connector whose reported path already lands in the queue's folder, and it
+still helps a torrent client only insofar as its `content_path` happens to coincide with a
+queue's `remote_path` (an unusual layout where the queue points at the seeding directory itself).
+The settings UI states this per-connector, not as a blanket "most setups won't need this."
+
+**Open question this correction surfaces, deliberately left unresolved by this task:** an
+rTorrent torrent with no `d.custom1` label *and* a `content_path` that doesn't match any queue
+(the ordinary case under a hardlink layout) has **no attribution route at all** — not by path, not
+by category — and is silently omitted, identically to before this task. §8.3's own prior decision
+("uncategorised items are never given a bindable pseudo-row," above) may need revisiting in light
+of this — a torrent client's unlabelled item is now the one case with genuinely no way to ever
+become visible, where a SAB item under no category at least has an on-disk path a future
+mechanism could reach. Not decided here; see `docs/decisions.md`.
+
 ---
 
 ## 9. Polling
@@ -768,11 +830,17 @@ why `arrsync.py` doesn't emit one either; events mark transitions, not heartbeat
 
 - **The unattributed-clients banner.** `ClientSyncScheduler.unattributed_clients` counts, per
   pass, how many Preflight-eligible-phase transfers an enabled instance reported that could not be
-  attributed to any queue (no category, or a category with no enabled mapping) — never `0` (a
-  quiet, fully-attributed client has nothing to say). `GET /api/queue/preflight`'s
+  attributed to any queue (no path match and no category, or a category with no enabled mapping)
+  — never `0` (a quiet, fully-attributed client has nothing to say). `GET /api/queue/preflight`'s
   `unattributed_clients` surfaces it, the mount-gate banner's own shape (§9.2's box, one line per
   affected thing, never one row per dropped item): *"SABnzbd: reports 2 items, none attributable to
-  a queue — check its category → queue mapping."*
+  a queue — check its category → queue mapping."* **Widened, round 4 (2026-08-23, live evidence):**
+  the count alone left a user with `ar-tv` already mapped guessing what else needed one, so the
+  banner now names which categories the unattributable items actually carried, and calls out "no
+  category at all" as its own distinct clause rather than folding it into the same count — *"reports
+  2 items in ar-movies, 1 with no category, none attributable to a queue."* Two different problems
+  (an unmapped category vs. a client not labelling its downloads at all) with two different fixes,
+  so the copy no longer blurs them into one number.
 - **Per-instance poll status, not just last Test.** Migration 029 adds `last_poll_at`/
   `last_poll_ok`/`last_poll_message`/`last_success_at` to `download_client`, written on **every**
   actual poll attempt (a single-row status column, not a log — the "not per failed pass" rule
@@ -1262,7 +1330,7 @@ Each stage is independently shippable. Nothing before stage 5 can delete anythin
 | **2** | The poller (§9), SAB as a third Preflight source, the settle-gate skip | #18's first real user-facing payoff. **2a (the poller + Preflight source) landed 2026-08-23** (`prompts/done/2026-08-23-client-poller.md`). **2b (the settle-gate skip itself) landed 2026-08-23** (`prompts/done/2026-08-23-settle-gate-skip.md`) -- ships **off** (`settle.SettleSettings.client_skip_enabled`, default `False`) pending live confirmation of §13.4 guess #2 against a real SABnzbd; every uncertain path (setting off, no client-sync source wired, unreachable client, blank/empty response, a queue-side or `UNKNOWN` phase, a near-miss path) falls back to running the settle gate exactly as it ran before this stage. **A terminal `COMPLETED` verdict no longer satisfies the gate the instant it's seen** (2026-08-23, `prompts/done/2026-08-23-client-completion-delay.md`, finding #9) -- it now holds `settle.CLIENT_COMPLETION_HOLD_S` (10s) first, measured from the client's own `completed_at` (a completion already older than the hold satisfies it immediately; falls back to lftpweb's own first-observation time only when a connector reports no `completed_at`) |
 | **3** | Withhold on partial failure (`docs/transfers-redesign-spec.md` §4.3), and the §9.1 poll-cadence fix | **Landed 2026-08-23** (`prompts/done/2026-08-23-withhold-and-cadence.md`). The cadence split is corrected to cheap-vs-expensive, read per-connector off `Operation.LIST_HISTORY`'s own capability declaration (§9.1's own correction note). The withhold gate ships **off** (`autoqueue.WithholdSettings.enabled`, default `False`) pending live confirmation of §13.4 guess #2 against a real SABnzbd, for the identical reason stage 2b's `client_skip_enabled` shipped off -- every uncertain path (setting off, no client-sync source wired, unreachable client, blank/empty response, a queue-side or `UNKNOWN` phase, an outright failure with no `content_path`, a near-miss path) falls back to today's behavior unchanged. No API/UI surface shipped this stage -- `AutoQueue.withheld` is public and readable, but nothing reads it yet; named as an open gap, not hidden |
 | **4** | The disk review scan (§11), both buckets, review-only | **Landed 2026-08-23** (`prompts/done/2026-08-23-disk-review-scan.md`). `core/disk_review.py.reconcile()` is pure set math over Set A/B/C, unit-tested exhaustively without SSH -- the §11.1a union-across-clients catastrophe and the §11.1b inode-claiming catastrophe are both asserted directly. `core/remote.py.RemoteConnectionPool.scan_with_inodes` extends the existing GNU-`find`/BusyBox-fallback scan with `%i`/`%n`; the fallback (`remote_agent/scan_fs.py --inodes`) supplies inode/nlink too (`os.lstat`, stdlib-only), so there is no "BusyBox can't do this" case needing the unavailable-declaration path -- it exists (`RemoteScanError` propagates rather than degrading) but is untriggered by inode support itself, only by a genuine walk failure. `POST /api/disk-review/scan`, manual trigger only (§11.3); a Transfers → Disk review tab shows the two piles with a link-aware running total. Not yet looked at against the real box -- see this task's own final report for what remains named as a gap (multi-filesystem inode collisions, prefix-vs-exact mount-sentinel matching, empty-directory debris) before stage 5 |
-| **5** | The delete pipeline (§10), manual trigger, verification, banner | |
+| **5** | The delete pipeline (§10), manual trigger, verification, banner | 🛑 **BLOCKED — do not build.** Gated by the user 2026-08-23 on findings #15 and #16. The user runs **two lftpweb instances against one seedbox**; the other instance's content is protected from §11's debris pile *only* by set A (the clients still claim it), and that protection expires silently once SAB drops the release from history. Stage 5 would then offer to delete another site's data with a correct-looking reclaim figure. #15's explicit "not used by this instance" state is the fix, and it must mean **never scanned, never proposed, never inside §10.2's containment boundary** — not merely "don't warn" |
 
 **Deletion is stage 5 deliberately.** The scan gets built and inspected against a real seeding
 estate before any code path is allowed to remove. Auto mode is the same code minus the trigger, and

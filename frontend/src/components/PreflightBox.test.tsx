@@ -61,7 +61,15 @@ describe('PreflightBox unattributed-clients banner', () => {
     const root = await mount(
       container,
       baseResponse({
-        unattributed_clients: [{ client_id: 7, client_name: 'ultracc rtorrent', count: 2 }],
+        unattributed_clients: [
+          {
+            client_id: 7,
+            client_name: 'ultracc rtorrent',
+            count: 2,
+            categories: [],
+            no_category_count: 0,
+          },
+        ],
       }),
     )
 
@@ -80,6 +88,50 @@ describe('PreflightBox unattributed-clients banner', () => {
   it('renders nothing when there is nothing unattributable', async () => {
     const root = await mount(container, baseResponse())
     expect(container.querySelector('a')).toBeNull()
+    root.unmount()
+  })
+
+  // Round 4 (2026-08-23, live evidence): the banner must name *which* categories went
+  // unmatched, and call out "no category at all" distinctly from an unmapped category.
+
+  it('names the unmatched categories, not just the count', async () => {
+    const root = await mount(
+      container,
+      baseResponse({
+        unattributed_clients: [
+          {
+            client_id: 7,
+            client_name: 'ultracc rtorrent',
+            count: 2,
+            categories: ['ar-movies'],
+            no_category_count: 0,
+          },
+        ],
+      }),
+    )
+
+    expect(container.textContent).toContain('in ar-movies')
+    root.unmount()
+  })
+
+  it('calls out items with no category at all distinctly from an unmapped category', async () => {
+    const root = await mount(
+      container,
+      baseResponse({
+        unattributed_clients: [
+          {
+            client_id: 7,
+            client_name: 'ultracc rtorrent',
+            count: 3,
+            categories: ['ar-movies'],
+            no_category_count: 2,
+          },
+        ],
+      }),
+    )
+
+    expect(container.textContent).toContain('in ar-movies')
+    expect(container.textContent).toContain('2 with no category')
     root.unmount()
   })
 })

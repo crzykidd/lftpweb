@@ -15,6 +15,7 @@ import {
   preflightDetailEntries,
   preflightFillPercent,
   preflightRemainingLabel,
+  unattributedClientDetail,
   type PreflightBadge,
   type PreflightPageSize,
 } from '../lib/preflight'
@@ -232,16 +233,25 @@ function UnattributedClientBanner({
   if (unattributed.length === 0) return null
   return (
     <div className="flex flex-col gap-1 rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-xs text-amber-900 dark:border-amber-800 dark:bg-amber-950 dark:text-amber-200">
-      {unattributed.map((u) => (
-        <p key={u.client_id}>
-          <span className="font-semibold">{u.client_name}:</span> reports {u.count}{' '}
-          {u.count === 1 ? 'item' : 'items'}, none attributable to a queue —{' '}
-          <Link to={clientEditHref(u.client_id)} className="underline hover:no-underline">
-            fix its category → queue mapping
-          </Link>
-          .
-        </p>
-      ))}
+      {unattributed.map((u) => {
+        // Round 4 (2026-08-23, live evidence): naming *which* categories went unmatched, not
+        // just the count -- a client that already has `ar-tv` mapped otherwise leaves the user
+        // guessing what else needs one. `null` (defensive only -- `count > 0` should always
+        // carry a breakdown) falls back to the original, un-detailed wording rather than
+        // rendering a broken sentence.
+        const detail = unattributedClientDetail(u)
+        return (
+          <p key={u.client_id}>
+            <span className="font-semibold">{u.client_name}:</span> reports {u.count}{' '}
+            {u.count === 1 ? 'item' : 'items'}
+            {detail != null ? ` ${detail}` : ''}, none attributable to a queue —{' '}
+            <Link to={clientEditHref(u.client_id)} className="underline hover:no-underline">
+              fix its category → queue mapping
+            </Link>
+            .
+          </p>
+        )
+      })}
     </div>
   )
 }

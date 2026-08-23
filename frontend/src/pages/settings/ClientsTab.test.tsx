@@ -8,6 +8,7 @@ import {
   listClientTypes,
   listQueues,
   testClientInstance,
+  updateClientInstance,
 } from '../../api/client'
 import type { ClientTypeOut, DownloadClientOut, DownloadClientTestResponse } from '../../api/types'
 import { ClientsTab } from './ClientsTab'
@@ -35,6 +36,7 @@ const mockListClientInstances = vi.mocked(listClientInstances)
 const mockListQueues = vi.mocked(listQueues)
 const mockGetHost = vi.mocked(getHost)
 const mockTestClientInstance = vi.mocked(testClientInstance)
+const mockUpdateClientInstance = vi.mocked(updateClientInstance)
 
 const USENET_TYPE: ClientTypeOut = {
   client_type: 'sabnzbd',
@@ -80,8 +82,24 @@ function instance(overrides: Partial<DownloadClientOut> = {}): DownloadClientOut
     last_poll_ok: null,
     last_poll_message: null,
     last_success_at: null,
+    detected_categories: null,
+    detected_categories_at: null,
     ...overrides,
   }
+}
+
+/** Types into a React-controlled text `<input>` without React Testing Library: a plain
+ * `el.value = ...` followed by dispatching `'input'` is silently ignored, because React
+ * instruments the native value setter on the element to track "did this change since I last
+ * rendered it" -- an assignment through that instrumented setter never trips the tracker. Calling
+ * the *native* prototype setter directly bypasses React's own wrapper, so the subsequent
+ * `'input'` event is seen as a real change (the same well-known workaround React Testing
+ * Library's own `fireEvent.change` performs internally).
+ */
+function typeInto(el: HTMLInputElement, value: string) {
+  const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set
+  nativeSetter?.call(el, value)
+  el.dispatchEvent(new Event('input', { bubbles: true }))
 }
 
 // `MemoryRouter` (`WhatsNewDialog.test.tsx`'s own idiom) -- `ClientsTab` reads `useSearchParams`
@@ -357,8 +375,8 @@ describe('ClientsTab', () => {
     mockListClientInstances.mockResolvedValue([
       instance({
         categories: [
-          { id: 1, category: 'ar-tv', queue_id: 5 },
-          { id: 2, category: 'old-cat', queue_id: 5 },
+          { id: 1, category: 'ar-tv', queue_id: 5, source: 'client' },
+          { id: 2, category: 'old-cat', queue_id: 5, source: 'client' },
         ],
       }),
     ])
@@ -715,7 +733,7 @@ describe('ClientsTab', () => {
     const queueB = { id: 6, name: 'other', remote_path: '/data/complete/other', local_path: '/local/other' }
     mockListQueues.mockResolvedValue([queueA, queueB] as never)
     mockListClientInstances.mockResolvedValue([
-      instance({ categories: [{ id: 1, category: 'ar-tv', queue_id: null }] }),
+      instance({ categories: [{ id: 1, category: 'ar-tv', queue_id: null, source: 'client' }] }),
     ])
     mockTestClientInstance.mockResolvedValue({
       ok: true,
@@ -764,6 +782,160 @@ describe('ClientsTab', () => {
       Array.from(s.options).some((o) => o.value === String(queueA.id)),
     ) as HTMLSelectElement
     expect(categorySelectAfter.value).toBe(String(queueB.id))
+
+    root.unmount()
+  })
+
+  // Round 4 (2026-08-23, prompts/2026-08-23-path-attribution-and-category-escape-hatch.md): the
+  // manual "Add category" escape hatch, restored for exactly the case its own capability
+  // declaration named -- rTorrent's `list_categories` is DERIVED and can only report a label
+  // currently in use, so a category that will exist later can never be detected on its own.
+
+  it('adds a manual category row, tags it as such, and saves it with source "manual"', async () => {
+    mockListClientTypes.mockResolvedValue([USENET_TYPE])
+    mockListClientInstances.mockResolvedValue([instance()])
+    mockUpdateClientInstance.mockResolvedValue(instance())
+    const root = await mount(container)
+
+    const editButton = Array.from(container.querySelectorAll('button')).find(
+      (b) => b.textContent === 'Edit',
+    )
+    await act(async () => {
+      editButton?.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    })
+
+    const draftInput = Array.from(container.querySelectorAll('input')).find(
+      (el) => el.placeholder === 'Add a category by name, e.g. ar-movies',
+    ) as HTMLInputElement
+    expect(draftInput).toBeDefined()
+    await act(async () => {
+      typeInto(draftInput, 'ar-movies')
+    })
+    const addCategoryButton = Array.from(container.querySelectorAll('button')).find(
+      (b) => b.textContent === 'Add category',
+    )
+    await act(async () => {
+      addCategoryButton?.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    })
+
+    // The row is present, tagged as manual, and always removable (never gated on staleness).
+    expect(container.textContent).toContain('ar-movies')
+    expect(container.textContent).toContain('(manual)')
+    const removeButtons = Array.from(container.querySelectorAll('button')).filter(
+      (b) => b.textContent === 'Remove',
+    )
+    expect(removeButtons).toHaveLength(1)
+
+    const saveButton = Array.from(container.querySelectorAll('button')).find(
+      (b) => b.textContent === 'Save',
+    )
+    await act(async () => {
+      saveButton?.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    })
+    await act(async () => {
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+
+    expect(mockUpdateClientInstance).toHaveBeenCalled()
+    const body = mockUpdateClientInstance.mock.calls[0][1] as { categories: unknown[] }
+    expect(body.categories).toContainEqual({
+      category: 'ar-movies',
+      queue_id: null,
+      source: 'manual',
+    })
+
+    root.unmount()
+  })
+
+  it('rejects a blank "Add category" attempt visibly, rather than silently doing nothing', async () => {
+    mockListClientTypes.mockResolvedValue([USENET_TYPE])
+    mockListClientInstances.mockResolvedValue([instance()])
+    const root = await mount(container)
+
+    const editButton = Array.from(container.querySelectorAll('button')).find(
+      (b) => b.textContent === 'Edit',
+    )
+    await act(async () => {
+      editButton?.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    })
+
+    const addCategoryButton = Array.from(container.querySelectorAll('button')).find(
+      (b) => b.textContent === 'Add category',
+    )
+    await act(async () => {
+      addCategoryButton?.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    })
+
+    expect(container.textContent).toContain('cannot be blank')
+    expect(container.querySelectorAll('button').length).toBeGreaterThan(0) // sanity: still rendered
+    const removeButtons = Array.from(container.querySelectorAll('button')).filter(
+      (b) => b.textContent === 'Remove',
+    )
+    expect(removeButtons).toHaveLength(0) // no row was silently created either
+
+    root.unmount()
+  })
+
+  it('rejects a duplicate "Add category" attempt visibly', async () => {
+    mockListClientTypes.mockResolvedValue([USENET_TYPE])
+    mockListClientInstances.mockResolvedValue([
+      instance({ categories: [{ id: 1, category: 'ar-tv', queue_id: null, source: 'manual' }] }),
+    ])
+    const root = await mount(container)
+
+    const editButton = Array.from(container.querySelectorAll('button')).find(
+      (b) => b.textContent === 'Edit',
+    )
+    await act(async () => {
+      editButton?.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    })
+
+    const draftInput = Array.from(container.querySelectorAll('input')).find(
+      (el) => el.placeholder === 'Add a category by name, e.g. ar-movies',
+    ) as HTMLInputElement
+    await act(async () => {
+      typeInto(draftInput, 'ar-tv')
+    })
+    const addCategoryButton = Array.from(container.querySelectorAll('button')).find(
+      (b) => b.textContent === 'Add category',
+    )
+    await act(async () => {
+      addCategoryButton?.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    })
+
+    expect(container.textContent).toContain('already in the list')
+
+    root.unmount()
+  })
+
+  // Round 4: detected categories persist across a reload (finding #14's own follow-up) -- a
+  // previous session's Test, read back from the instance itself rather than living only in
+  // this-session-only `testResults` state.
+
+  it('shows categories detected in a previous session, with their age, without re-testing', async () => {
+    mockListClientTypes.mockResolvedValue([USENET_TYPE])
+    mockListClientInstances.mockResolvedValue([
+      instance({
+        categories: [],
+        detected_categories: ['ar-tv'],
+        detected_categories_at: '2026-08-20T00:00:00.000000Z',
+      }),
+    ])
+    const root = await mount(container)
+
+    const editButton = Array.from(container.querySelectorAll('button')).find(
+      (b) => b.textContent === 'Edit',
+    )
+    await act(async () => {
+      editButton?.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    })
+
+    // The row is there -- not an empty "never tested" hint -- and its age is stated, without
+    // clicking Test at all this session.
+    expect(container.textContent).toContain('ar-tv')
+    expect(container.textContent).toContain('directly from this client')
+    expect(container.textContent).toContain('detected')
 
     root.unmount()
   })

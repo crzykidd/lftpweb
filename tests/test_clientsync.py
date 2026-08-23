@@ -16,6 +16,7 @@ not.
 from __future__ import annotations
 
 import json
+import logging
 from datetime import UTC, datetime
 
 import aiosqlite
@@ -28,6 +29,7 @@ from lftpweb.core.clientsync import (
     INITIAL_BACKOFF_S,
     MAX_BACKOFF_S,
     ClientSyncScheduler,
+    UnattributedClientInfo,
     _PREFLIGHT_PHASES,
 )
 from lftpweb.core.clients.models import Transfer, TransferPhase
@@ -67,11 +69,18 @@ async def _seed_host(db: aiosqlite.Connection) -> int:
     return cursor.lastrowid
 
 
-async def _seed_queue(db: aiosqlite.Connection, host_id: int, *, name: str = "q", enabled=True):
+async def _seed_queue(
+    db: aiosqlite.Connection,
+    host_id: int,
+    *,
+    name: str = "q",
+    remote_path: str = "/r",
+    enabled=True,
+):
     cursor = await db.execute(
         "INSERT INTO path_queue (host_id, name, remote_path, local_path, enabled) "
-        "VALUES (?, ?, '/r', '/l', ?)",
-        (host_id, name, 1 if enabled else 0),
+        "VALUES (?, ?, ?, '/l', ?)",
+        (host_id, name, remote_path, 1 if enabled else 0),
     )
     await db.commit()
     return cursor.lastrowid
@@ -105,6 +114,45 @@ async def _seed_category(db: aiosqlite.Connection, client_id: int, category: str
         (client_id, category, queue_id),
     )
     await db.commit()
+
+
+async def _preflight_instance_row(db: aiosqlite.Connection, client_id: int) -> aiosqlite.Row:
+    """The minimal `instance` row `_update_preflight` itself reads (`id`/`name`/`client_type`) --
+    for the path-attribution tests below, which call `_update_preflight` directly against
+    hand-built `Transfer`s rather than a fake server, since the attribution decision itself has
+    nothing to do with any one connector's wire format. Named distinctly from the
+    poll-status-focused `_client_row` helper further down this file (a different column set,
+    same table) so the two never shadow each other.
+    """
+    cursor = await db.execute(
+        "SELECT id, name, client_type FROM download_client WHERE id = ?", (client_id,)
+    )
+    row = await cursor.fetchone()
+    assert row is not None
+    return row
+
+
+def _content_transfer(
+    client_id: str = "t1",
+    *,
+    phase: TransferPhase = TransferPhase.DOWNLOADING,
+    category: str | None = None,
+    content_path: str | None = None,
+) -> Transfer:
+    """Named distinctly from the phase-allowlist section's own `_transfer(client_id, phase,
+    **kwargs)` helper further down this file (which defaults `category` to `"ar-tv"` -- wrong for
+    these tests, which care about `category`/`content_path` precisely) -- two helpers building
+    the same dataclass for two different sections' own needs, not one trying to serve both.
+    """
+    return Transfer(
+        client_id=client_id,
+        name=f"Show.{client_id}",
+        phase=phase,
+        raw_status="Downloading",
+        raw={},
+        category=category,
+        content_path=content_path,
+    )
 
 
 async def _event_rows(db: aiosqlite.Connection, kind: str | None = None):
@@ -400,6 +448,117 @@ async def test_transfer_with_no_category_is_omitted(db, fake_sabnzbd_server, tmp
     assert scheduler.preflight_rows(frozenset({instance_id})) == []
 
 
+# --- Path-based attribution (spec §8.3 correction, round 4, 2026-08-23) --------------------
+#
+# `_update_preflight` is called directly against hand-built `Transfer`s here, bypassing the fake
+# server entirely -- the attribution decision itself (path vs. category vs. neither) has nothing
+# to do with any one connector's wire format, and `_preflight_instance_row` gives these tests the
+# same `instance` row shape `_process_instance` would otherwise have to fetch through a real poll
+# pass.
+
+
+async def test_path_attribution_needs_no_category_mapping(db, tmp_path):
+    """The headline behaviour (prompts/2026-08-23-path-attribution-and-category-escape-hatch.md):
+    a transfer whose `content_path` sits under a queue's `remote_path` is attributed with **no**
+    category mapping configured at all.
+    """
+    host_id = await _seed_host(db)
+    queue_id = await _seed_queue(db, host_id, remote_path="/home/crzykidd/downloads/complete/ar-tv")
+    instance_id = await _seed_client(db, str(tmp_path), base_url="http://x.invalid", api_key="k")
+    instance_row = await _preflight_instance_row(db, instance_id)
+    transfer = _content_transfer(
+        content_path="/home/crzykidd/downloads/complete/ar-tv/Show.S01/Show.S01E01.mkv"
+    )
+
+    scheduler = ClientSyncScheduler(db=db, config_dir=str(tmp_path))
+    await scheduler._update_preflight(instance_row, [transfer], now=NOW0)
+
+    rows = scheduler.preflight_rows(frozenset({instance_id}))
+    assert len(rows) == 1
+    assert rows[0].queue_id == queue_id
+    assert scheduler.unattributed_clients(frozenset({instance_id})) == []
+
+
+async def test_path_attribution_is_component_boundary_not_prefix(db, tmp_path):
+    """`/complete/ar-tv` must not match `/complete/ar-tv-extra` -- a bare `str.startswith` would
+    let a sibling directory that merely shares a name prefix swallow the wrong queue.
+    """
+    host_id = await _seed_host(db)
+    await _seed_queue(db, host_id, remote_path="/complete/ar-tv")
+    instance_id = await _seed_client(db, str(tmp_path), base_url="http://x.invalid", api_key="k")
+    instance_row = await _preflight_instance_row(db, instance_id)
+    transfer = _content_transfer(content_path="/complete/ar-tv-extra/Show.S01")
+
+    scheduler = ClientSyncScheduler(db=db, config_dir=str(tmp_path))
+    await scheduler._update_preflight(instance_row, [transfer], now=NOW0)
+
+    assert scheduler.preflight_rows(frozenset({instance_id})) == []
+    info = scheduler.unattributed_clients(frozenset({instance_id}))
+    assert len(info) == 1
+    assert info[0].no_category_count == 1  # no category on this transfer either
+
+
+async def test_no_content_path_falls_back_to_category_mapping(db, tmp_path):
+    """A transfer with no `content_path` yet (still queued at the client, nothing on disk) is
+    exactly and only where the category mapping is still needed.
+    """
+    host_id = await _seed_host(db)
+    queue_id = await _seed_queue(db, host_id, remote_path="/complete/ar-tv")
+    instance_id = await _seed_client(db, str(tmp_path), base_url="http://x.invalid", api_key="k")
+    await _seed_category(db, instance_id, "ar-tv", queue_id)
+    instance_row = await _preflight_instance_row(db, instance_id)
+    transfer = _content_transfer(category="ar-tv", content_path=None)
+
+    scheduler = ClientSyncScheduler(db=db, config_dir=str(tmp_path))
+    await scheduler._update_preflight(instance_row, [transfer], now=NOW0)
+
+    rows = scheduler.preflight_rows(frozenset({instance_id}))
+    assert len(rows) == 1
+    assert rows[0].queue_id == queue_id
+
+
+async def test_no_path_and_no_mapping_is_unattributable(db, tmp_path):
+    """Unchanged: a transfer with neither a matching path nor a mapped category is silently
+    omitted, exactly as before this task.
+    """
+    instance_id = await _seed_client(db, str(tmp_path), base_url="http://x.invalid", api_key="k")
+    instance_row = await _preflight_instance_row(db, instance_id)
+    transfer = _content_transfer(category=None, content_path=None)
+
+    scheduler = ClientSyncScheduler(db=db, config_dir=str(tmp_path))
+    await scheduler._update_preflight(instance_row, [transfer], now=NOW0)
+
+    assert scheduler.preflight_rows(frozenset({instance_id})) == []
+    info = scheduler.unattributed_clients(frozenset({instance_id}))
+    assert len(info) == 1
+    assert info[0].categories == ()
+    assert info[0].no_category_count == 1
+
+
+async def test_path_and_category_disagree_path_wins_and_is_logged(db, tmp_path, caplog):
+    """Path and mapping disagreeing: the path wins (the bytes are actually there; a mapping can
+    be stale), and the disagreement is visible rather than silently resolved.
+    """
+    host_id = await _seed_host(db)
+    path_queue_id = await _seed_queue(db, host_id, name="by-path", remote_path="/complete/ar-tv")
+    category_queue_id = await _seed_queue(
+        db, host_id, name="by-category", remote_path="/complete/other"
+    )
+    instance_id = await _seed_client(db, str(tmp_path), base_url="http://x.invalid", api_key="k")
+    await _seed_category(db, instance_id, "ar-movies", category_queue_id)
+    instance_row = await _preflight_instance_row(db, instance_id)
+    transfer = _content_transfer(category="ar-movies", content_path="/complete/ar-tv/Show.S01")
+
+    scheduler = ClientSyncScheduler(db=db, config_dir=str(tmp_path))
+    with caplog.at_level(logging.WARNING):
+        await scheduler._update_preflight(instance_row, [transfer], now=NOW0)
+
+    rows = scheduler.preflight_rows(frozenset({instance_id}))
+    assert len(rows) == 1
+    assert rows[0].queue_id == path_queue_id  # path wins over the mapped category
+    assert any("path wins" in record.message for record in caplog.records)
+
+
 # --- Unattributed-clients banner (finding #2, 2026-08-23) ----------------------------------
 
 
@@ -407,7 +566,8 @@ async def test_unattributed_clients_reports_a_client_with_items_but_no_mapping(
     db, fake_sabnzbd_server, tmp_path
 ):
     """The exact live scenario finding #2 measured: an enabled, authenticating client reporting
-    real items, none of which have a category -> queue mapping. Previously silent; now surfaced.
+    real items, none of which have a category -> queue mapping. Previously silent; now surfaced,
+    now widened (round 4, live evidence) with which category names those items actually carried.
     """
     instance_id = await _seed_client(
         db,
@@ -423,7 +583,50 @@ async def test_unattributed_clients_reports_a_client_with_items_but_no_mapping(
     scheduler = ClientSyncScheduler(db=db, config_dir=str(tmp_path))
     await scheduler.run_once(now=NOW0)
     assert scheduler.preflight_rows(frozenset({instance_id})) == []
-    assert scheduler.unattributed_clients(frozenset({instance_id})) == [(instance_id, "SABnzbd", 2)]
+    assert scheduler.unattributed_clients(frozenset({instance_id})) == [
+        UnattributedClientInfo(
+            instance_id=instance_id,
+            name="SABnzbd",
+            count=2,
+            categories=("ar-movies", "ar-tv"),
+            no_category_count=0,
+        )
+    ]
+
+
+async def test_unattributed_clients_breaks_out_items_with_no_category_at_all(
+    db, fake_sabnzbd_server, tmp_path
+):
+    """Live evidence, round 4: "no category at all" and "a category with no mapping" are
+    different problems with different fixes -- conflating them into one count sends the user
+    chasing a category mapping that was never the issue. One item carries a real, unmapped
+    category; the other carries none at all -- the banner must be able to tell them apart.
+    """
+    instance_id = await _seed_client(
+        db,
+        str(tmp_path),
+        base_url=fake_sabnzbd_server.base_url,
+        api_key=fake_sabnzbd_server.state.api_key,
+    )
+    no_cat_slot = _queue_slot("nzo1")
+    no_cat_slot["cat"] = ""  # SABnzbd's own "no category" shape
+    fake_sabnzbd_server.state.queue_slots = [
+        no_cat_slot,
+        _queue_slot("nzo2", cat="ar-movies"),
+    ]
+
+    scheduler = ClientSyncScheduler(db=db, config_dir=str(tmp_path))
+    await scheduler.run_once(now=NOW0)
+    info = scheduler.unattributed_clients(frozenset({instance_id}))
+    assert info == [
+        UnattributedClientInfo(
+            instance_id=instance_id,
+            name="SABnzbd",
+            count=2,
+            categories=("ar-movies",),
+            no_category_count=1,
+        )
+    ]
 
 
 async def test_unattributed_clients_omits_a_client_with_nothing_unattributable(
@@ -463,7 +666,15 @@ async def test_unattributed_clients_ignores_an_instance_not_in_the_enabled_set(
     scheduler = ClientSyncScheduler(db=db, config_dir=str(tmp_path))
     await scheduler.run_once(now=NOW0)
     assert scheduler.unattributed_clients(frozenset()) == []
-    assert scheduler.unattributed_clients(frozenset({instance_id})) == [(instance_id, "SABnzbd", 1)]
+    assert scheduler.unattributed_clients(frozenset({instance_id})) == [
+        UnattributedClientInfo(
+            instance_id=instance_id,
+            name="SABnzbd",
+            count=1,
+            categories=("ar-movies",),
+            no_category_count=0,
+        )
+    ]
 
 
 # --- Per-pass poll status (finding #2's reinforcing observation, 2026-08-23) ----------------

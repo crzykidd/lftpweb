@@ -196,6 +196,23 @@ never-polled default, and the one-event-not-per-poll assertion), `tests/test_pre
 instance reports never-polled), and five new `ClientsTab.test.tsx`/`format.test.ts` cases for the
 Clients-row status states and the settle-skip note.
 
+### Round 4 (2026-08-23) — the banner now names which categories, not just how many
+
+`prompts/done/2026-08-23-path-attribution-and-category-escape-hatch.md`. Live evidence during
+this round: rTorrent reported 2 unattributable items while the user already had `ar-tv` mapped --
+the count alone gave no way to tell what else needed mapping. `ClientSyncScheduler.
+UnattributedClientInfo` widens the banner's own source with `categories: tuple[str, ...]` (the
+distinct category names actually seen among this pass's unattributable items) and
+`no_category_count: int`, counted separately -- "reported a category with no mapping" and
+"reported no category at all" are different problems with different fixes, and folding them into
+one number sends a user chasing a mapping that was never the issue. The banner now reads *"reports
+2 items in ar-movies, 1 with no category, none attributable to a queue."* This round's other
+headline fix (below) also changes what reaches this banner at all: an item now only lands here
+once *both* path attribution and the category mapping have failed it, not the category mapping
+alone. Covered by two new `tests/test_clientsync.py` cases (the category breakdown, the
+no-category count kept distinct), one widened `tests/test_preflight_api.py` case, and two new
+`lib/preflight.test.ts`/`PreflightBox.test.tsx` cases for the composed message.
+
 ---
 
 ## 3. Preflight shows the *arr's status, not the client's — and only one source icon
@@ -479,6 +496,24 @@ reports none at all, and the UI now states which mechanism produced a row's sugg
 than rendering all three "empty" cases as the same silent no-op. See #11's own resolution note
 below for the control redesign this enabled.
 
+### Round 4 (2026-08-23) — the underlying premise was still wrong; path beats both signals
+
+`prompts/done/2026-08-23-path-attribution-and-category-escape-hatch.md`, `docs/decisions.md`, spec
+§8.3's own round-4 correction. This finding's own conclusion -- "the direct signal (the client's
+own reported categories) is better than a path-arithmetic proxy" -- was correct for *inferring a
+mapping*, but round 4 found the deeper issue: attribution itself should not go through any
+category signal at all, direct or guessed, when a transfer's `content_path` already answers the
+question by matching a queue's `remote_path`. `core/clientsync.py._update_preflight` now checks
+path first (`core/settle.py._client_content_path_matches`, reused rather than reimplemented),
+falling back to the category mapping only for a transfer with no `content_path` yet. **This closes
+the SABnzbd side of the gap entirely** (history `storage` lands inside the queue's folder, so a
+SAB item needs no category configuration once it has a path) but **not the rTorrent side** --
+rTorrent reports its own seeding directory as `content_path` (spec §1.1), a different tree from
+the queue's `remote_path` under the common hardlink layout, so its category mapping remains as
+necessary as it was before this task. Covered by five new `tests/test_clientsync.py` cases (the
+headline no-mapping-needed case, the component-boundary guard, the no-path fallback, the
+no-information case, and the path-wins-on-disagreement case with its own log assertion).
+
 ---
 
 ## 11. Category mappings do not survive a save — and the field is unexplained
@@ -600,6 +635,25 @@ category); a category appearing later is picked up by re-testing while the insta
 Edit, not a background poll. Covered by `tests/test_settings_clients_api.py::
 test_unbound_category_survives_a_save_and_a_re_edit` (the round-trip regression test this finding
 asked for) and `frontend/src/pages/settings/ClientsTab.test.tsx`'s new cases.
+
+### Round 4 (2026-08-23) — the mapping is demoted to a fallback; the escape hatch is back
+
+`prompts/done/2026-08-23-path-attribution-and-category-escape-hatch.md`, `docs/decisions.md`.
+Two follow-ons to the redesign above, both from live use:
+
+- **Attribution no longer goes through this control at all when a transfer's path already answers
+  the question** -- see #10's own round-4 note and spec §8.3's round-4 correction. The mapping
+  this finding redesigned is now genuinely optional for a connector like SABnzbd once a transfer
+  has a path; it remains load-bearing for rTorrent, unchanged.
+- **The manual "Add category" row is back**, deliberately not as a regression to the free-text
+  field 11b/11c eliminated: `rtorrent.list_categories` is `DERIVED` and can only report a label
+  *currently in use*, so a category that will exist later can never be detected, and the redesign
+  above removed the only way to enter one. The new control adds a category as its own row
+  (`source: 'manual'`, mirroring base paths' identical escape hatch), never as free text mixed
+  into the detected rows -- **a blank or duplicate name is rejected visibly** (`addCategoryRow`),
+  so 11b/11c's defect class cannot reappear at this one remaining place a typed string could
+  originate. Detected categories also now persist across a reload (migration 030) -- see #14's own
+  round-4 note, which is where the reload-shows-nothing complaint was actually raised.
 
 ---
 
@@ -806,6 +860,24 @@ hint, the untouched two-argument default) and two new `ClientsTab.test.tsx` case
 stale-vs-live Remove visibility, and the option text/title split). **What remains unverified**:
 the actual crushed-chip layout, at real and narrow browser widths, and the header row's alignment
 against the rows below it -- both need a human with a browser, not another test.
+
+### Round 4 (2026-08-23) — reversed: detected categories now persist, on the user's own evidence
+
+`prompts/done/2026-08-23-path-attribution-and-category-escape-hatch.md`, `docs/decisions.md`. The
+"reworded rather than persisted" decision immediately above is reversed here, explicitly on new
+evidence rather than a change of mind in the abstract: the user showed a saved instance's category
+rows reading as data loss on reload, which a reworded hint cannot fix for anyone who has not yet
+clicked Test again this session. Migration 030 adds `detected_categories_json`/
+`detected_categories_at` to `download_client`, written on every successful Test
+(`api/settings_clients.py._persist_detected_categories`) and read back into `DownloadClientOut`.
+`ClientsTab.tsx` now falls back through three sources in order -- this session's `testResults`,
+then the instance's own persisted value, then `null` ("never tested, ever") -- and shows the
+persisted value's age when that is the one in use. Also fixed while in this code: the manual "Add
+category" escape hatch (see #11's own round-4 note) is tagged `(manual)` and always removable,
+distinct from a detected row's staleness-gated Remove. Covered by
+`tests/test_settings_clients_api.py` (persisted-categories round trip, the "never tested" vs.
+"tested and found none" distinction) and four new `ClientsTab.test.tsx` cases (the manual add, the
+visible blank/duplicate rejection, and the persisted-categories-survive-a-reload case).
 
 ---
 

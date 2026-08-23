@@ -6,6 +6,79 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-23 — path attribution becomes primary; the category mapping is demoted to a fallback (round 4)
+
+`prompts/done/2026-08-23-path-attribution-and-category-escape-hatch.md`, resolving findings
+#2/#10/#11/#14 in `prompts/test-findings-2026-08-23.md` a fourth time. The core mistake, stated by
+the user twice: *"the category is ar-tv and the dir for that is ar-tv"* and *"this makes zero
+sense to me"* -- `core/clientsync.py._update_preflight` attributed a transfer to a queue only
+through the category mapping, dropping anything without one before ever looking at the path, even
+though a queue's own `remote_path` already answers the question for a connector whose reported
+`content_path` lands there.
+
+**Reused `core/settle.py._client_content_path_matches` rather than writing a second
+component-boundary matcher.** The handoff prompt was explicit about this, and it was the right
+call: the settle-gate skip and this attribution are the same underlying fact (does a reported path
+sit at or under a given root, at a `/` boundary, never a bare prefix) applied to two different
+roots (an *item's* remote path there, a *queue's* remote path here) -- one helper, imported across
+`core/`, not two copies that could drift apart on the exact same edge case
+(`/complete/ar-tv` vs. `/complete/ar-tv-extra`) independently.
+
+**Attribution order:** path match (no configuration) -> category mapping (only for a transfer with
+no `content_path` yet) -> silently omitted. Path wins on disagreement, logged rather than silently
+resolved, since a mismatch is a signal the user's mapping is stale, not noise.
+
+**Reversal of the 2026-08-23 "reword the hint, don't persist" decision (above, findings
+#13/#14).** That entry deliberately chose not to persist detected categories, judging it
+disproportionate backend work for what was diagnosed as a wording problem. Directly instructed to
+revisit on **the user's own evidence** this time (a live screenshot showing a saved instance's
+category rows reading as data loss on reload) -- wording alone does not fix "the rows are gone
+until I click Test again" for a user who has not yet clicked Test this session. Persisted as two
+additive columns on `download_client` (migration 030: `detected_categories_json`,
+`detected_categories_at`), written by `api/settings_clients.py._persist_detected_categories` on
+every successful Test (including one that detects `[]` -- a real, current fact, not "nothing
+happened"), read back into `DownloadClientOut.detected_categories`/`detected_categories_at`.
+Chosen over reusing the `capabilities_json`/`capabilities_probed_at` pair's own storage shape
+verbatim rather than overloading it: categories are a different kind of fact from the capability
+declaration, and giving them their own two columns (the same shape, deliberately mirrored rather
+than shared) keeps each pair's meaning unambiguous. `ClientsTab.tsx`'s `detectedCategories`
+read is now a three-way fallback -- this session's `testResults`, then the instance's own
+persisted value, then `null` ("never tested, ever") -- computed once per render and shared by
+every place in the form that needs it (the source hint, each row's staleness/removability),
+rather than three call sites independently re-deriving the same chain and risking drift.
+
+**The manual "Add category" escape hatch is restored, mirroring base paths' own `source:
+'detected' | 'manual'` exactly.** `rtorrent.list_categories` is declared `DERIVED` specifically
+because it can only report a label *currently in use* -- a category that will exist later (e.g.
+"ar-movies" before the first movie is grabbed) can never be detected, and the round-3 redesign
+removed the only way to enter one along with the free-text field it was rightly eliminating.
+`DownloadClientCategoryIn/Out` gained `source: 'client' | 'manual'` (migration 030, default
+`'client'` for every pre-existing row, since none of them were ever free-typed). **A blank or
+duplicate name is rejected visibly** (`addCategoryRow` in `ClientsTab.tsx`, backed by
+`min_length=1` on the Pydantic field as defense-in-depth) -- the exact defect class findings
+#11b/#11c already eliminated for detected/guessed rows must not reappear in a new shape at the
+one remaining place a blank category string could originate. A manual row is always removable
+(`canRemoveCategoryRow`), unlike a `'client'`-sourced row (removable only when stale) -- nothing
+auto-reproduces a manual row the way `computeCategoryRows` reproduces a still-reported one, so
+there is no "it'll just come back" concern to guard against. If the client later actually starts
+reporting a category a user added manually, `computeCategoryRows` flips its `source` to `'client'`
+the moment it appears in a fresh detection -- it is no longer speculative at that point, and
+"always removable" would otherwise quietly outlive the reason it existed.
+
+**Open question surfaced, deliberately not resolved by this task.** Corrected mid-task on live
+evidence: path attribution's win is narrower than first drafted. It removes the category-mapping
+requirement entirely for SABnzbd (history `storage` lands inside the queue's folder) but not for
+rTorrent, which reports its own *seeding* directory as `content_path` (spec §1.1) -- a different
+tree from the queue's `remote_path` under the common hardlink layout, so the mapping remains
+rTorrent's only route, unchanged from before this task. That means an **rTorrent torrent with no
+label and a non-matching path has no attribution route at all** -- neither by path nor by
+category -- and is silently omitted, identically to every earlier round. §8.3's own existing
+decision ("uncategorised items are never given a bindable pseudo-row") may need revisiting given
+this is now the one case with no path forward at all, but changing that behaviour was out of this
+task's scope and is left as a named gap (spec §8.3's own round-4 correction carries the same note).
+
+---
+
 ## 2026-08-23 — category control legibility + the banner deep link (findings #13/#14)
 
 `prompts/done/2026-08-23-category-control-and-banner-link.md`. Two presentation-layer fixes on

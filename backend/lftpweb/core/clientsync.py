@@ -99,6 +99,24 @@ hold, a blank response would wipe every active row from this source's Preflight 
 single pass, then have them reappear -- the exact flicker spec §4.2 exists to prevent.
 `tests/fake_sabnzbd.py`'s `queue_empty_for_requests` (this fixture's own blank-queue mode, built
 for precisely this incident) is what this module's own tests drive to prove it.
+
+**Attribution correction, round 4 (2026-08-23, live evidence,
+`prompts/2026-08-23-path-attribution-and-category-escape-hatch.md`).** `_update_preflight`'s
+attribution used to be category -> queue only, dropping any transfer with no category (or an
+unmapped one) before ever looking at where its bytes actually are -- forcing configuration for a
+fact the filesystem already answers (a queue's own `remote_path` **is** the folder a client's
+finished items land in, for a connector whose reported `content_path` sits there). Attribution is
+now path-first: `content_path` matched against every enabled queue's `remote_path`
+(`core/settle.py._client_content_path_matches`'s own component-boundary rule, reused rather than
+reimplemented), falling back to the category mapping only for a transfer with no `content_path`
+yet. **This does not make the category mapping optional for every connector** -- rTorrent reports
+its own *seeding* directory as `content_path` (spec §1.1), a different tree from a queue's
+`remote_path` under the common hardlink layout, so path attribution essentially never fires for
+it and the category mapping remains its only route. See `docs/download-client-framework-spec.md`
+§8.3's own round-4 correction for the fuller reasoning, including the open question this
+correction surfaced (an uncategorised rTorrent torrent with a non-matching path has *no*
+attribution route at all, silently, and this task deliberately left that behaviour unchanged --
+`docs/decisions.md`).
 """
 
 from __future__ import annotations
@@ -119,6 +137,7 @@ from lftpweb.core.clients.errors import ClientAuthenticationFailed, ClientError,
 from lftpweb.core.clients.models import Transfer, TransferPhase
 from lftpweb.core.crypto import DecryptionError, decrypt_secret
 from lftpweb.core.preflight import PreflightHold, PreflightRow
+from lftpweb.core.settle import _client_content_path_matches
 
 logger = logging.getLogger(__name__)
 
@@ -167,6 +186,28 @@ class _InstanceBackoff:
     # same streak's failure mode itself changing, e.g. unreachable -> auth failure), never on
     # every backed-off retry attempt.
     last_kind: str
+
+
+@dataclass(frozen=True)
+class UnattributedClientInfo:
+    """One line of the Preflight box's unattributed-clients banner (finding #2, widened
+    2026-08-23 round 4 on live evidence: the banner said *that* a client had unattributable
+    items but never *which* categories to go map, leaving a user with `ar-tv` already mapped no
+    way to tell what else needed one). `unattributed_clients` below is this dataclass's one
+    producer; `api/jobs.py.get_preflight` is its one consumer.
+
+    `categories` -- sorted, distinct category names seen among this pass's unattributable items,
+    **excluding** "no category at all" (that's `no_category_count`'s own job, a different
+    problem with a different fix: "map this category" vs. "this client isn't labelling its
+    downloads"). `count` is the same total this class's fields are a breakdown of, not a second,
+    possibly-inconsistent measurement.
+    """
+
+    instance_id: int
+    name: str
+    count: int
+    categories: tuple[str, ...]
+    no_category_count: int
 
 
 def _failure_kind(exc: Exception) -> str:
@@ -282,6 +323,11 @@ class ClientSyncScheduler:
         # Refreshed every `_update_preflight` call, wholesale-replaced like every other per-
         # instance cache in this module (never merged across passes).
         self._unattributed_counts: dict[int, int] = {}
+        # Round 4 of the same finding (live evidence, 2026-08-23): the banner's own category
+        # breakdown for the count above -- instance id -> {category name (or `None` for "no
+        # category at all"): count}. Refreshed alongside `_unattributed_counts` every
+        # `_update_preflight` call, same wholesale-replace-per-pass shape.
+        self._unattributed_categories: dict[int, dict[str | None, int]] = {}
         # Same finding: which instance ids have completed at least one successful poll *this
         # process's lifetime* -- the guard behind the one-time `client_poll_first_success` audit
         # event `_record_poll_result` below writes (never a per-poll event, this task's own
@@ -516,6 +562,11 @@ class ClientSyncScheduler:
         as one mapped to nothing at all. Fresh every pass, the same "no cache staleness on a
         config change" reasoning every other live query in this codebase's poller-adjacent code
         already follows.
+
+        **Fallback only, since the §8.3 correction below** -- a transfer that already reports a
+        `content_path` is attributed by path first (`_update_preflight`); this map is consulted
+        only for a transfer with no path yet, which is the one case a category mapping still
+        answers something the filesystem can't.
         """
         cursor = await self.db.execute(
             "SELECT download_client_category.category AS category, path_queue.id AS id, "
@@ -528,33 +579,110 @@ class ClientSyncScheduler:
         rows = await cursor.fetchall()
         return {r["category"]: r for r in rows}
 
+    async def _enabled_queues(self) -> list[aiosqlite.Row]:
+        """Every currently **enabled** queue's own `id`/`name`/`short_name`/`remote_path` --
+        docs/download-client-framework-spec.md §8.3 correction (round 4, 2026-08-23): a
+        transfer's own `content_path` is matched against *every* enabled queue's `remote_path`,
+        not merely one this instance happens to have a category mapping for. That is the whole
+        point of the correction -- path attribution needs no configuration on this instance at
+        all, unlike `_category_queue_map` above, which is scoped to this instance's own bound
+        categories by construction.
+        """
+        cursor = await self.db.execute(
+            "SELECT id, name, short_name, remote_path FROM path_queue WHERE enabled = 1"
+        )
+        return await cursor.fetchall()
+
     async def _update_preflight(
         self, instance: aiosqlite.Row, transfers: list[Transfer], now: float
     ) -> None:
         """Project this pass's active transfers into Preflight rows (spec §9.2, "The Preflight
-        source") and refresh this instance's own `PreflightHold`. Attribution is category ->
-        queue (spec §8.3); a transfer whose category doesn't map to a currently-enabled queue is
-        **silently omitted** -- `core/preflight.py`'s own established rule, restated by this
-        task's own handoff prompt: "promising a release that never arrives is worse than showing
-        nothing."
+        source") and refresh this instance's own `PreflightHold`.
+
+        **Attribution (spec §8.3 correction, round 4, 2026-08-23): path first, category as
+        fallback.** A transfer's own `content_path` -- when the client has one to report --
+        already answers "which queue does this belong to" with no configuration at all: a queue's
+        `remote_path` **is** the on-disk root its finished items land under, so
+        `core/settle.py._client_content_path_matches`'s own component-boundary rule (never a bare
+        prefix -- `/complete/ar-tv` must not match `/complete/ar-tv-extra`, the same trap that
+        rule already guards the settle-gate skip against) is reused here rather than reimplemented
+        a second time. Order, exactly as decided:
+
+        1. `content_path` matches an enabled queue's `remote_path` -> that queue. No category
+           mapping consulted at all.
+        2. Otherwise (most commonly: nothing on disk yet -- still queued at the client, no
+           `content_path` to check), the configured category -> queue mapping, if one exists.
+        3. Otherwise, **silently omitted** -- `core/preflight.py`'s own established rule,
+           restated by the original handoff prompt: "promising a release that never arrives is
+           worse than showing nothing."
+
+        **Path wins on disagreement.** A transfer whose `content_path` matches one queue but
+        whose category is mapped to a *different* one is not a tie -- the path is where the bytes
+        actually are, a stale/wrong category mapping is not, and silently preferring the mapping
+        would hide exactly the config error that needs fixing. Logged, not raised or blocked,
+        since a mismatch here changes nothing about whether the transfer is shown, only which
+        queue it's shown under.
+
+        **This does not make the category mapping optional for every connector.** SABnzbd's
+        history `storage` field lands inside the queue's own category folder, so path attribution
+        covers it; rTorrent reports its own *seeding* directory as `content_path` (spec §1.1),
+        which under the common hardlink layout is a different tree entirely from the queue's
+        `remote_path` (the hardlinked completed-folder copy) -- so an rTorrent transfer's path
+        essentially never matches a queue root, and the category mapping remains that
+        connector's *only* attribution route, exactly as before this task. See this module's own
+        docstring correction and the spec §8.3 correction (round 4) for the fuller reasoning --
+        this is not a claim that most setups need this control less; it depends entirely on
+        whether the connector's own `content_path` happens to sit under a queue's `remote_path`.
         """
         instance_id = instance["id"]
         category_map = await self._category_queue_map(instance_id)
+        path_queues = await self._enabled_queues()
 
         seen: dict[str, PreflightRow] = {}
         unattributed = 0
+        # finding #2's banner, widened (live evidence, 2026-08-23): *which* categories are going
+        # unattributed, not merely how many -- `None` keys a transfer that reported no category
+        # at all, a distinct problem from "reported a category with no mapping" (different fix).
+        unattributed_categories: dict[str | None, int] = {}
         for transfer in transfers:
             # Allowlist, not denylist (2026-08-23, findings #12/#4 -- see `_PREFLIGHT_PHASES`'s
             # own comment for the full reasoning: a denylist admits every phase nobody thought
             # about by default, and one already had, in both directions at once).
             if transfer.phase not in _PREFLIGHT_PHASES:
                 continue
-            if not transfer.category:
-                unattributed += 1  # finding #2 -- no category reported at all
-                continue
-            queue = category_map.get(transfer.category)
-            if queue is None:
-                unattributed += 1  # finding #2 -- category not mapped to an enabled queue
+
+            path_queue = None
+            if transfer.content_path:
+                for candidate in path_queues:
+                    remote_path = candidate["remote_path"]
+                    if remote_path and _client_content_path_matches(
+                        remote_path, transfer.content_path
+                    ):
+                        path_queue = candidate
+                        break
+            category_queue = category_map.get(transfer.category) if transfer.category else None
+
+            if path_queue is not None:
+                queue = path_queue
+                if category_queue is not None and category_queue["id"] != path_queue["id"]:
+                    logger.warning(
+                        "download client %d (%s): transfer %r content_path %r matches queue "
+                        "%r by path, but category %r is mapped to queue %r -- path wins "
+                        "(the category mapping is likely stale)",
+                        instance_id,
+                        instance["name"],
+                        transfer.client_id,
+                        transfer.content_path,
+                        path_queue["name"],
+                        transfer.category,
+                        category_queue["name"],
+                    )
+            elif category_queue is not None:
+                queue = category_queue
+            else:
+                unattributed += 1
+                key = transfer.category or None
+                unattributed_categories[key] = unattributed_categories.get(key, 0) + 1
                 continue
 
             size_remaining_bytes = None
@@ -591,6 +719,7 @@ class ClientSyncScheduler:
             )
 
         self._unattributed_counts[instance_id] = unattributed
+        self._unattributed_categories[instance_id] = unattributed_categories
 
         hold = self._preflight_holds.setdefault(instance_id, PreflightHold())
         # No `retired` set -- see this module's own docstring for why this source falls back to
@@ -599,15 +728,25 @@ class ClientSyncScheduler:
 
     def unattributed_clients(
         self, enabled_instance_ids: frozenset[int]
-    ) -> list[tuple[int, str, int]]:
+    ) -> list["UnattributedClientInfo"]:
         """Finding #2 (2026-08-23): "a client with no category -> queue mapping contributes
-        nothing, silently" -- one `(instance_id, instance_name, count)` entry per currently-enabled
-        instance whose most recent pass saw at least one Preflight-eligible-phase transfer it
-        could not attribute to any queue. `api/jobs.py.get_preflight` turns this into the
-        Preflight box's own banner, the mount-gate banner's own shape (one line per affected
-        client, never one row per dropped item). `instance_id` (finding #13, 2026-08-23) rides
-        along so that banner line can deep-link straight to this specific instance rather than
-        naming a settings path for the user to navigate by hand.
+        nothing, silently" -- one `UnattributedClientInfo` per currently-enabled instance whose
+        most recent pass saw at least one Preflight-eligible-phase transfer it could not
+        attribute to any queue. `api/jobs.py.get_preflight` turns this into the Preflight box's
+        own banner, the mount-gate banner's own shape (one line per affected client, never one
+        row per dropped item). `instance_id` (finding #13, 2026-08-23) rides along so that banner
+        line can deep-link straight to this specific instance rather than naming a settings path
+        for the user to navigate by hand.
+
+        **Widened with a category breakdown (live evidence, 2026-08-23, round 4).** The count
+        alone told a user *that* a client had unattributable items, never *which* categories to
+        go map -- "reports 2 items, none attributable" with a client that already has `ar-tv`
+        mapped leaves the user guessing what else needs mapping. `categories` is every distinct
+        category name seen among this pass's unattributable items (sorted, so the banner's text
+        is stable across passes with the same set); `no_category_count` is counted separately
+        because "the client reported no category at all" and "reported a category with no
+        mapping" are different problems with different fixes -- conflating them would send a
+        user chasing a category mapping that was never the issue.
 
         **`0` is never included.** A client currently contributing nothing because it genuinely
         has nothing incoming right now is not the same fact as one silently dropping real items,
@@ -620,15 +759,20 @@ class ClientSyncScheduler:
         catch an instance with *no* such mapping at all, so the caller must pass every enabled
         instance id, mapped or not.
         """
-        out: list[tuple[int, str, int]] = []
+        out: list[UnattributedClientInfo] = []
         for instance_id in enabled_instance_ids:
             count = self._unattributed_counts.get(instance_id, 0)
             if count > 0:
+                breakdown = self._unattributed_categories.get(instance_id, {})
+                categories = tuple(sorted(c for c in breakdown if c is not None))
+                no_category_count = breakdown.get(None, 0)
                 out.append(
-                    (
-                        instance_id,
-                        self._instance_names.get(instance_id, f"instance {instance_id}"),
-                        count,
+                    UnattributedClientInfo(
+                        instance_id=instance_id,
+                        name=self._instance_names.get(instance_id, f"instance {instance_id}"),
+                        count=count,
+                        categories=categories,
+                        no_category_count=no_category_count,
                     )
                 )
         return out

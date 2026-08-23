@@ -1145,6 +1145,14 @@ class PreflightUnattributedClientOut(BaseModel):
     client_id: int
     client_name: str
     count: int
+    # Widened 2026-08-23 (round 4, live evidence) -- `count` alone told a user *that* a client
+    # had unattributable items, never *which* categories to go map: a client that already had
+    # `ar-tv` mapped left the user guessing what else needed one. `categories` is every distinct
+    # category name seen among this pass's unattributable items, sorted, **excluding** "no
+    # category at all" -- that is `no_category_count`'s own job, a different problem (a client
+    # simply not labelling its downloads) with a different fix than "map this category."
+    categories: list[str] = []
+    no_category_count: int = 0
 
 
 class PreflightResponse(BaseModel):
@@ -1841,16 +1849,34 @@ class DownloadClientBasePathOut(DownloadClientBasePathIn):
 
 
 class DownloadClientCategoryIn(BaseModel):
-    category: str = Field(max_length=MAX_NAME_LEN)
+    # `min_length=1`: a blank category must be **rejected visibly** (a 422), never silently
+    # saved or silently dropped -- the exact defect class (#11b/#11c, then repeated at the
+    # "Add category" escape hatch this task restores) this control has already been rebuilt once
+    # to eliminate. The redesigned control never produces a blank string on its own (no free-text
+    # field for a detected/guessed row); this is defense-in-depth for the one place a blank
+    # string can still originate, the manual-add box, whose own frontend validation already
+    # refuses to submit one.
+    category: str = Field(max_length=MAX_NAME_LEN, min_length=1)
     # `None` = configured but not yet bound to a queue (spec §8.3) -- distinct from the mapping
     # not existing at all.
     queue_id: int | None = None
+    # Migration 030, mirrors `DownloadClientBasePathIn.source` exactly, for the identical reason:
+    # whether this row was produced by detection (the client's own `list_categories` answer, or
+    # the base-path-arithmetic fallback) or typed by hand via the "Add category" escape hatch
+    # restored by this task -- rTorrent's `list_categories` is DERIVED (it can only report labels
+    # *currently in use*), so a category that will exist later (e.g. "ar-movies" before the first
+    # movie is grabbed) can never be detected, and the prior redesign removed the only way to
+    # enter one. `'client'` is the default so every row saved before this column existed reads as
+    # what it always was -- system-produced, never free-typed (findings #11b/#11c already
+    # eliminated that possibility).
+    source: Literal["client", "manual"] = "client"
 
 
 class DownloadClientCategoryOut(BaseModel):
     id: int
     category: str
     queue_id: int | None = None
+    source: Literal["client", "manual"] = "client"
 
 
 class DownloadClientIn(BaseModel):
@@ -1908,6 +1934,17 @@ class DownloadClientOut(BaseModel):
     last_poll_ok: bool | None = None
     last_poll_message: str | None = None
     last_success_at: str | None = None
+    # Migration 030 (this task): the last successful Test's own `detected_categories` (spec
+    # §8.3), persisted alongside the instance rather than living only in the settings page's own
+    # `testResults[editingId]` React state -- before this, re-opening a saved instance for edit
+    # in a fresh session showed an empty "never tested" hint even though a previous session's
+    # Test had reported real data (finding #14's own follow-up: "the previous round chose to
+    # reword the hint instead of persisting; on the user's evidence that was the wrong call").
+    # Both `None` until the first successful Test after this migration -- an existing install
+    # reads exactly as "never tested" until then. Refreshed on every successful
+    # `POST /clients/{id}/test`, the same call that already refreshes `capabilities`/`version`.
+    detected_categories: list[str] | None = None
+    detected_categories_at: str | None = None
 
 
 class DetectedBasePathOut(BaseModel):
