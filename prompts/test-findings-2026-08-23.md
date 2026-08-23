@@ -687,3 +687,45 @@ avoidable half of the problem.
   "`active_only=True` excludes terminal transfers" comment, #12; and now this). Worth a moment's
   thought about whether user-facing copy naming a navigation path should be generated from `nav.ts`
   rather than hand-written, so it cannot drift from the real routes.
+
+---
+
+## 14. The new category control doesn't read as a mapping
+
+> *"I don't understand the category queue mapping now. I only see a drop down list with them in
+> it."*
+
+The redesign (#11c) fixed the *data* problem — no free-text, nothing silently dropped — and
+introduced a *presentation* one. Each row renders as
+`[category chip] [queue dropdown] [Remove]`, but:
+
+**14a — no column headers.** Nothing labels which side is the category and which is the queue. The
+prose hint above explains the concept, but the control itself is three unlabelled controls in a
+row, so it reads as a list rather than a mapping.
+
+**14b — the dropdown option text is far too long.** Options render as
+`{q.name} ({q.remote_path})` — e.g. `ar-movies (/home/crzykidd/downloads/complete/ar-movies)`.
+That blows the row width out, wraps the layout, and clips the trailing button to "Rem". **Same
+family as #8's clipped Edit button** (that was `overflow-hidden`; this is unbounded content), and
+the second time in one session that over-long content has destroyed a row's layout. The queue
+*name* is the identifier the user thinks in; the path belongs in a `title` tooltip or a second
+muted line, not inline in a `<select>` option.
+
+**14c — "Remove" is offered on categories the client currently reports, where it means nothing.**
+You cannot remove a category SAB has — leaving it unbound is the way to ignore it, which is exactly
+what the redesign intends. Removing it just makes the row reappear on the next Test.
+
+`computeCategoryRows` **deliberately preserves a stored mapping for a category the client no longer
+reports** (its own docstring: *"a stale mapping is still real configuration the user should see —
+and can remove — rather than lose"*). That is the **only** case where Remove is meaningful. So the
+button should appear only on stale rows, and those rows should say why they are different — e.g.
+*"not currently reported by this client"*.
+
+**Worth doing together:**
+
+- Header row (`Category` / `Queue`), or an explicit per-row `→` so the direction is visible.
+- Queue options show the name; the path moves to a tooltip or muted secondary text.
+- `Remove` only on stale rows, with a marker explaining the row's status.
+- Re-check the row cannot clip at narrow widths — #8 and #14b are both "content wider than its
+  container, silently truncated", and jsdom cannot catch either (no real layout), so this needs
+  eyes on a real browser rather than a test.
