@@ -320,3 +320,55 @@ nothing, rather than silently proposing nothing for a reason the user cannot see
 - Whichever signal is used, **the empty result must explain itself** (#2's theme again): "no base
   paths configured", "the client reported no categories", and "nothing matched" are three different
   answers, and today all three render as a silent no-op.
+
+---
+
+## 11. Category mappings do not survive a save — and the field is unexplained
+
+> *"I don't actually understand those and you can't save them anyway — they go away when I edit
+> again after saving."*
+
+### 11a. The concept is undocumented in the UI
+
+The user could not tell what a category mapping is *for*. That is a UI failure, not a user one:
+the section has no explanatory text, and the concept is genuinely non-obvious — it only exists
+because a client instance is **site-level** (spec §4.5), so one SAB serves several queues and
+something has to say which category belongs to which. Every other consequence in this findings
+file (#2, #3, #5, #10) flows from this mapping being absent, which makes it the single most
+important field on the page and the least explained.
+
+Any fix should state it in one line where the field is: *"SABnzbd sorts downloads into categories.
+Tell lftpweb which of your queues each category belongs to, or its downloads can't be matched to a
+queue."*
+
+### 11b. The mappings are lost — and the backend is NOT the cause
+
+**Proven by direct probe against the live box (2026-08-23):** a throwaway *disabled* instance was
+created via `POST /api/settings/clients` carrying one base path and one category, read back
+complete and correct, then deleted (the user's own two instances were never touched).
+
+So persistence works:
+
+- `_replace_categories` / `_replace_base_paths` write correctly.
+- `_get_categories` reads them back.
+- `startEdit` (`ClientsTab.tsx`) *does* hydrate `form.categories` from `instance.categories`.
+- The category `<input>` is correctly wired (`value={cat.category}` +
+  `updateCategoryRow(i, {category: …})`).
+
+**The loss is in the form layer, and the leading hypothesis links it to #8.** Finding #8 reports
+that after a successful **Test**, the edit affordance disappears until a page reload — i.e. the
+test action disturbs edit-mode state. If Test also discards the in-progress form draft, then any
+category typed *before* testing is gone before Save is ever pressed, and the user's two symptoms
+have one cause.
+
+**Not yet proven.** The decisive observation, which needs the user: **on save, was an error shown,
+or did it appear to succeed?** An appeared-to-succeed save points at an empty `categories: []`
+payload (draft lost). A 400 points at the enabled-client connection test rejecting the save
+(§3a) — a different bug entirely, and one where the mappings were never sent at all.
+
+Note the save payload deliberately filters rows whose `category` is blank
+(`form.categories.filter(c => c.category.trim() !== '')`), so a row that *looks* filled in on
+screen but whose state was reset would be silently dropped rather than rejected — consistent with
+"it looked like it saved."
+
+**Do not fix #8 and #11b separately until the shared cause is confirmed or ruled out.**
