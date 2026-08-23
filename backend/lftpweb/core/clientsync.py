@@ -181,6 +181,51 @@ _FAILURE_VERB: dict[str, str] = {
     "client_error": "returned an error",
 }
 
+# --- The Preflight phase filter (spec §9.2) -- an allowlist, not a denylist -----------------
+#
+# 2026-08-23 (findings #12/#4): the original filter excluded `COMPLETED`/`FAILED` and admitted
+# everything else, on the stated assumption that "every connector's own `active_only=True`
+# contract already excludes terminal transfers." True for SABnzbd, where a finished item leaves
+# the queue for history. **False for rTorrent**, where a finished torrent stays in the active
+# list and seeds indefinitely -- so `SEEDING` slipped through the denylist and every seeding
+# torrent became a Preflight row. The same filter failed in the opposite direction at the same
+# time: `PAUSED` was never excluded either, yet nothing added it to any allowlist-shaped
+# reasoning, so a paused-but-incomplete transfer -- exactly Preflight's own definition of "work
+# that is coming" if someone intervenes -- had no path to appear. Adding `SEEDING` to the
+# denylist would have been the identical mistake one phase later: an open-ended enum behind a
+# denylist admits every case nobody has thought about yet, by construction.
+#
+# Preflight's own definition (`core/preflight.py`'s module docstring): "something lftpweb
+# already knows about but has no work to do on yet" -- i.e. work that is coming. Decided
+# deliberately, phase by phase, over the closed nine-value `TransferPhase` enum:
+#   QUEUED, DOWNLOADING  -- work plainly coming.
+#   PAUSED               -- known-but-not-arriving-yet; this is finding #4's fix. A paused,
+#                            incomplete transfer is arguably the single most useful thing
+#                            Preflight can show, since nothing else in lftpweb would otherwise
+#                            tell you it is stuck.
+#   VERIFYING, EXTRACTING -- post-download steps still between the transfer and landing.
+# Deliberately excluded, each for its own reason rather than by default:
+#   SEEDING    -- nothing is coming; this is the estate, not incoming work. It belongs to Disk
+#                 review's second pile (spec §11.1d) -- a routing error, not missing coverage.
+#   COMPLETED  -- retirement-on-handover's job, not this filter's (out of this task's scope --
+#                 do not fold handover behaviour into this allowlist).
+#   FAILED     -- nothing is coming; stage 3's withhold gate is the surface for a failure.
+#   UNKNOWN    -- spec §4.2: unknown never blocks anything, and it must not populate anything
+#                 either -- a row asserting nothing helps nobody.
+# A `TransferPhase` member added later belongs to neither list until a person decides which --
+# `tests/test_clientsync.py::test_preflight_phase_allowlist_covers_every_transfer_phase` fails
+# the moment the two sets stop covering the enum exactly, so that decision can never again be
+# skipped by accident the way `SEEDING`'s was.
+_PREFLIGHT_PHASES: frozenset[TransferPhase] = frozenset(
+    {
+        TransferPhase.QUEUED,
+        TransferPhase.DOWNLOADING,
+        TransferPhase.PAUSED,
+        TransferPhase.VERIFYING,
+        TransferPhase.EXTRACTING,
+    }
+)
+
 
 class ClientSyncScheduler:
     """Background loop, one pass over every **enabled** `download_client` instance per tick
@@ -417,10 +462,10 @@ class ClientSyncScheduler:
 
         seen: dict[str, PreflightRow] = {}
         for transfer in transfers:
-            # Defensive only -- every connector's own `active_only=True` contract already
-            # excludes terminal transfers (spec §9.1's own table); this is a second guard
-            # against a connector that doesn't honor the flag perfectly, never load-bearing.
-            if transfer.phase in (TransferPhase.COMPLETED, TransferPhase.FAILED):
+            # Allowlist, not denylist (2026-08-23, findings #12/#4 -- see `_PREFLIGHT_PHASES`'s
+            # own comment for the full reasoning: a denylist admits every phase nobody thought
+            # about by default, and one already had, in both directions at once).
+            if transfer.phase not in _PREFLIGHT_PHASES:
                 continue
             if not transfer.category:
                 continue  # unattributable -- no category reported at all

@@ -20,7 +20,7 @@ from datetime import UTC, datetime
 
 import aiosqlite
 import pytest
-from fake_rtorrent import run_fake_rtorrent_server
+from fake_rtorrent import FakeRtorrentTorrent, run_fake_rtorrent_server
 from fake_sabnzbd import run_fake_sabnzbd_server
 
 from lftpweb.core.clientsync import (
@@ -28,7 +28,9 @@ from lftpweb.core.clientsync import (
     INITIAL_BACKOFF_S,
     MAX_BACKOFF_S,
     ClientSyncScheduler,
+    _PREFLIGHT_PHASES,
 )
+from lftpweb.core.clients.models import Transfer, TransferPhase
 from lftpweb.core.crypto import encrypt_secret
 from lftpweb.db import migrate
 
@@ -406,6 +408,201 @@ async def test_disabled_instance_never_polled(db, fake_sabnzbd_server, tmp_path)
     await scheduler.run_once(now=NOW0)
     assert instance_id not in scheduler._backoff
     assert await _event_rows(db) == []
+
+
+# --- Preflight phase allowlist (spec §9.2, findings #12/#4, 2026-08-23) -------------------------
+#
+# `_update_preflight` is exercised directly here, with hand-built `Transfer` objects, rather
+# than round-tripped through a fake server per phase -- the allowlist is a pure function of
+# `transfer.phase`, and building nine fake-SABnzbd-status strings just to reach the same branch
+# would test SABnzbd's own `map_phase` a second time, not this filter. The live, end-to-end
+# rTorrent scenario the two findings were actually observed against is covered separately below
+# (`test_rtorrent_active_only_true_admits_only_incoming_rows`), through the real fixture.
+
+
+def _transfer(client_id: str, phase: TransferPhase, **kwargs) -> Transfer:
+    kwargs.setdefault("category", "ar-tv")
+    return Transfer(
+        client_id=client_id,
+        name=f"Release.{client_id}",
+        phase=phase,
+        raw_status=phase.value,
+        raw={},
+        **kwargs,
+    )
+
+
+async def test_preflight_phase_allowlist_covers_every_transfer_phase():
+    """The guard against this bug class recurring (the task's own explicit ask): a denylist over
+    an open-ended enum silently admits every phase nobody has thought about, which is exactly how
+    `SEEDING` slipped into Preflight (#12) while `PAUSED` fell out of it (#4) at the same time.
+    This asserts the allowlist plus its explicit, named exclusions cover the entire nine-value
+    `TransferPhase` enum with no leftover -- a `TransferPhase` member added later and decided for
+    neither list fails this test immediately, rather than silently landing on whichever side a
+    denylist-shaped filter would have defaulted it to.
+    """
+    excluded_by_decision = {
+        TransferPhase.SEEDING,  # the estate, not incoming work -- Disk review's business (#12)
+        TransferPhase.COMPLETED,  # retirement-on-handover's job, not this filter's
+        TransferPhase.FAILED,  # nothing coming -- the withhold gate is the surface for this
+        TransferPhase.UNKNOWN,  # never blocks, and must not populate either (spec §4.2)
+    }
+    assert _PREFLIGHT_PHASES.isdisjoint(excluded_by_decision)
+    assert _PREFLIGHT_PHASES | excluded_by_decision == set(TransferPhase)
+
+
+async def test_seeding_transfer_produces_no_preflight_row(db, tmp_path):
+    """Finding #12, asserted directly: a `SEEDING` transfer must never become a Preflight row."""
+    host_id = await _seed_host(db)
+    queue_id = await _seed_queue(db, host_id)
+    instance_id = await _seed_client(db, str(tmp_path), base_url="http://unused.test", api_key="k")
+    await _seed_category(db, instance_id, "ar-tv", queue_id)
+    row = await (
+        await db.execute(
+            "SELECT id, name, client_type FROM download_client WHERE id = ?", (instance_id,)
+        )
+    ).fetchone()
+
+    scheduler = ClientSyncScheduler(db=db, config_dir=str(tmp_path))
+    await scheduler._update_preflight(row, [_transfer("t1", TransferPhase.SEEDING)], NOW0)
+
+    assert scheduler.preflight_rows(frozenset({instance_id})) == []
+
+
+async def test_paused_partial_transfer_appears_in_preflight(db, tmp_path):
+    """Finding #4, asserted directly: a paused, partially-complete transfer must produce a row --
+    it is known-but-not-arriving, exactly Preflight's own definition of useful, and previously
+    the same filter excluded it for no stated reason at all.
+    """
+    host_id = await _seed_host(db)
+    queue_id = await _seed_queue(db, host_id)
+    instance_id = await _seed_client(db, str(tmp_path), base_url="http://unused.test", api_key="k")
+    await _seed_category(db, instance_id, "ar-tv", queue_id)
+    row = await (
+        await db.execute(
+            "SELECT id, name, client_type FROM download_client WHERE id = ?", (instance_id,)
+        )
+    ).fetchone()
+
+    scheduler = ClientSyncScheduler(db=db, config_dir=str(tmp_path))
+    paused = _transfer("t1", TransferPhase.PAUSED, size_bytes=1000, bytes_done=600)
+    await scheduler._update_preflight(row, [paused], NOW0)
+
+    rows = scheduler.preflight_rows(frozenset({instance_id}))
+    assert len(rows) == 1
+    assert rows[0].download_id == "t1"
+
+
+async def test_incoming_phases_all_produce_preflight_rows(db, tmp_path):
+    """`QUEUED`/`DOWNLOADING`/`VERIFYING`/`EXTRACTING` -- the allowlist's other four members --
+    each produce a row.
+    """
+    host_id = await _seed_host(db)
+    queue_id = await _seed_queue(db, host_id)
+    instance_id = await _seed_client(db, str(tmp_path), base_url="http://unused.test", api_key="k")
+    await _seed_category(db, instance_id, "ar-tv", queue_id)
+    row = await (
+        await db.execute(
+            "SELECT id, name, client_type FROM download_client WHERE id = ?", (instance_id,)
+        )
+    ).fetchone()
+
+    incoming = [
+        TransferPhase.QUEUED,
+        TransferPhase.DOWNLOADING,
+        TransferPhase.VERIFYING,
+        TransferPhase.EXTRACTING,
+    ]
+    transfers = [_transfer(f"t{i}", phase) for i, phase in enumerate(incoming)]
+
+    scheduler = ClientSyncScheduler(db=db, config_dir=str(tmp_path))
+    await scheduler._update_preflight(row, transfers, NOW0)
+
+    rows = scheduler.preflight_rows(frozenset({instance_id}))
+    assert {r.download_id for r in rows} == {f"t{i}" for i in range(len(incoming))}
+
+
+async def test_terminal_and_unknown_phases_produce_no_preflight_rows(db, tmp_path):
+    """`COMPLETED`/`FAILED`/`UNKNOWN` -- the allowlist's three non-`SEEDING` exclusions -- each
+    produce no row.
+    """
+    host_id = await _seed_host(db)
+    queue_id = await _seed_queue(db, host_id)
+    instance_id = await _seed_client(db, str(tmp_path), base_url="http://unused.test", api_key="k")
+    await _seed_category(db, instance_id, "ar-tv", queue_id)
+    row = await (
+        await db.execute(
+            "SELECT id, name, client_type FROM download_client WHERE id = ?", (instance_id,)
+        )
+    ).fetchone()
+
+    excluded = [TransferPhase.COMPLETED, TransferPhase.FAILED, TransferPhase.UNKNOWN]
+    transfers = [_transfer(f"t{i}", phase) for i, phase in enumerate(excluded)]
+
+    scheduler = ClientSyncScheduler(db=db, config_dir=str(tmp_path))
+    await scheduler._update_preflight(row, transfers, NOW0)
+
+    assert scheduler.preflight_rows(frozenset({instance_id})) == []
+
+
+async def test_rtorrent_active_only_true_admits_only_incoming_rows(
+    db, fake_rtorrent_server, tmp_path
+):
+    """The live scenario, end to end (finding #12): rTorrent's own `active_only=True` filter
+    excludes only `COMPLETED` (`core/clients/rtorrent.py.list_transfers`'s own doc-derived
+    contract -- "a torrent never leaves the list") -- a seeding torrent passes that filter as
+    readily as a downloading one. Without an allowlist at the Preflight projection itself, every
+    seeding torrent in the estate becomes a Preflight row; with it, only the transfer still
+    incoming does.
+    """
+    host_id = await _seed_host(db)
+    queue_id = await _seed_queue(db, host_id)
+    instance_id = await _seed_rtorrent_client(
+        db,
+        str(tmp_path),
+        base_url=fake_rtorrent_server.base_url,
+        username=fake_rtorrent_server.state.username,
+        password=fake_rtorrent_server.state.password,
+    )
+    await _seed_category(db, instance_id, "ar-tv", queue_id)
+
+    # A seeding torrent -- complete and active, rTorrent's own shape for "fully downloaded and
+    # still uploading to peers" (`_classify_token`: complete + is_active -> "seeding").
+    fake_rtorrent_server.state.add(
+        FakeRtorrentTorrent(
+            torrent_hash="A" * 40,
+            name="Old.Seeding.Release",
+            size_bytes=1000,
+            completed_bytes=1000,
+            complete=1,
+            is_active=1,
+            state=1,
+            custom1="ar-tv",
+        )
+    )
+    # A transfer still actually incoming.
+    fake_rtorrent_server.state.add(
+        FakeRtorrentTorrent(
+            torrent_hash="B" * 40,
+            name="New.Incoming.Release",
+            size_bytes=1000,
+            completed_bytes=200,
+            left_bytes=800,
+            complete=0,
+            is_active=1,
+            state=1,
+            custom1="ar-tv",
+        )
+    )
+
+    scheduler = ClientSyncScheduler(db=db, config_dir=str(tmp_path))
+    # Pass 1: always slow-due (active_only=False) -- populates the cache either way.
+    await scheduler.run_once(now=NOW0)
+    # Pass 2: fast-only, `active_only=True` -- the exact call the live bug was observed through.
+    await scheduler.run_once(now=NOW0 + scheduler.FAST_INTERVAL_S)
+
+    rows = scheduler.preflight_rows(frozenset({instance_id}))
+    assert [r.title for r in rows] == ["New.Incoming.Release"]
 
 
 # --- Two cadences, corrected to split cheap-vs-expensive (spec §9.1, this stage's own fix) -----

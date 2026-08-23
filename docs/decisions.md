@@ -6,6 +6,36 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-23 — Preflight's client phase filter: allowlist, not denylist (findings #12/#4)
+
+`prompts/done/2026-08-23-preflight-phase-allowlist.md`. `core/clientsync.py`'s Preflight
+projection excluded `COMPLETED`/`FAILED` by denylist, on the stated (and false, for rTorrent)
+assumption that every connector's own `active_only=True` already excludes every terminal
+transfer. `SEEDING` slipped through and flooded Preflight with the entire seeding estate (#12);
+`PAUSED` fell out the other side and never appeared at all, even though a paused, incomplete
+transfer is exactly Preflight's own "work that is coming if someone intervenes" (#4) — the same
+filter wrong in both directions at once.
+
+Replaced with a named module-level allowlist, `_PREFLIGHT_PHASES` (`QUEUED`, `DOWNLOADING`,
+`PAUSED`, `VERIFYING`, `EXTRACTING`), so a phase nobody has decided about is excluded by default
+rather than admitted by default. `PAUSED` was included per the handoff prompt's own reasoning —
+the single most useful row Preflight can show, since nothing else in lftpweb surfaces a stuck
+transfer. `UNKNOWN` was excluded per spec §4.2 ("unknown never blocks anything," extended here to
+"and must not populate anything either" — a row asserting nothing helps nobody). `COMPLETED` was
+left out of scope deliberately: it is retirement-on-handover's business, not this filter's, and
+the handoff prompt explicitly forbade touching handover behaviour in this task.
+
+The guard against this recurring: `tests/test_clientsync.py::
+test_preflight_phase_allowlist_covers_every_transfer_phase` asserts the allowlist plus its four
+named exclusions cover the entire nine-value `TransferPhase` enum with no leftover — a new
+`TransferPhase` member added later and decided for neither list fails this test immediately,
+rather than silently landing on whichever side a denylist-shaped filter would have defaulted it
+to. The live rTorrent scenario the two findings were actually observed against is covered
+end-to-end through `tests/fake_rtorrent.py` (`test_rtorrent_active_only_true_admits_only_
+incoming_rows`), since `RtorrentClient.list_transfers(active_only=True)` only ever excludes
+`COMPLETED` — a seeding torrent passes that filter as readily as a downloading one, so the fix
+has to live at the Preflight projection itself, not at the connector's `active_only` call.
+
 ## 2026-08-23 — the disk review scan: pure reconciliation, inode-aware, review-only (#18 stage 4)
 
 `prompts/done/2026-08-23-disk-review-scan.md`. `core/disk_review.py` -- `reconcile()`/

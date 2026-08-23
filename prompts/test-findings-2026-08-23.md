@@ -186,6 +186,14 @@ Possibly #2 again. But worth checking independently, because there are two other
 that will never arrive unless someone intervenes, and there is currently no other surface in
 lftpweb that would tell you.
 
+**Resolved 2026-08-23** — `prompts/done/2026-08-23-preflight-phase-allowlist.md`,
+`docs/decisions.md`. Confirmed as the second candidate named above: `PAUSED` was never on the old
+denylist, and had no allowlist to land on either. `core/clientsync.py`'s Preflight filter is now a
+named allowlist (`_PREFLIGHT_PHASES`) that includes `PAUSED` explicitly, on exactly the reasoning
+this finding gives. Covered by `tests/test_clientsync.py::
+test_paused_partial_transfer_appears_in_preflight`. Fixed alongside #12, the same filter wrong in
+the opposite direction — see that finding's own resolution note.
+
 ---
 
 ## 5. Nothing from SAB/rTorrent appears in the transfer queue's expanded detail
@@ -474,3 +482,12 @@ all visible) are the same filter being wrong in both directions at once.
 
 **Also note the seeding estate is not homeless** — it is exactly what Disk review's second pile
 (§11.1d) is for. This is a routing error, not missing functionality.
+
+**Resolved 2026-08-23** — `prompts/done/2026-08-23-preflight-phase-allowlist.md`,
+`docs/decisions.md`. `core/clientsync.py`'s Preflight filter is now a named allowlist
+(`_PREFLIGHT_PHASES`: `QUEUED`, `DOWNLOADING`, `PAUSED`, `VERIFYING`, `EXTRACTING`) rather than a
+denylist. `SEEDING` is now excluded — this finding's own fix. Covered by
+`tests/test_clientsync.py::test_seeding_transfer_produces_no_preflight_row` and, end-to-end
+against a real rTorrent-shaped fixture reproducing the exact live scenario, `test_rtorrent_
+active_only_true_admits_only_incoming_rows`. Also fixed alongside #4, the same filter wrong in
+the opposite direction — see that finding's own resolution note.
