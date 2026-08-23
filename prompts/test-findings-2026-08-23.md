@@ -703,13 +703,26 @@ introduced a *presentation* one. Each row renders as
 prose hint above explains the concept, but the control itself is three unlabelled controls in a
 row, so it reads as a list rather than a mapping.
 
-**14b — the dropdown option text is far too long.** Options render as
-`{q.name} ({q.remote_path})` — e.g. `ar-movies (/home/crzykidd/downloads/complete/ar-movies)`.
-That blows the row width out, wraps the layout, and clips the trailing button to "Rem". **Same
-family as #8's clipped Edit button** (that was `overflow-hidden`; this is unbounded content), and
-the second time in one session that over-long content has destroyed a row's layout. The queue
-*name* is the identifier the user thinks in; the path belongs in a `title` tooltip or a second
-muted line, not inline in a `<select>` option.
+**14b — CONFIRMED BY SCREENSHOT: the category chip is crushed to one character.**
+(`private_data/screenshots/Screenshot 2026-08-23 110515.png`, supplied by the user.) An earlier
+reading of this finding guessed the row was *wrapping*. It is not. The row renders as a sliver
+reading `a`, then a full-width `<select>`, then `Remove`.
+
+**Cause:** `inputClasses` (shared by every text input on the page) contains **`w-full`**, and it is
+applied to the `<select>` inside a `flex` row. The select demands the full row width and wins
+against the category chip's `flex-1 truncate`, collapsing it to a single character.
+
+**This is why the user said "I only see a drop down list with them in it."** The one legible
+control shows *queue* names, so the control reads as a list of queues with no visible category
+side at all — the mapping's left-hand operand is invisible.
+
+The over-long option text (`{q.name} ({q.remote_path})`) compounds it but is not the cause. The
+queue *name* is the identifier a user thinks in; the path belongs in a `title` tooltip or muted
+secondary text, not inline in a `<select>` option.
+
+**Method note worth keeping:** two guesses from the reported text (wrapping, then mis-binding) were
+both wrong, and one screenshot settled it immediately. For any layout complaint, ask for the image
+first — jsdom has no layout engine, so neither the tests nor the code can show this.
 
 **14c — "Remove" is offered on categories the client currently reports, where it means nothing.**
 You cannot remove a category SAB has — leaving it unbound is the way to ignore it, which is exactly
