@@ -73,6 +73,12 @@ class FakeSabState:
     queue_empty_for_requests: int = 0
     misc_complete_dir: str = "/downloads/complete"
     misc_download_dir: str = "/downloads/incomplete"
+    # `mode=get_config&section=categories` -- doc-derived, UNVERIFIED, 2026-08-23 (spec §8.3,
+    # §13.4 new row). SAB always carries the special `"*"` "Default" pseudo-category alongside
+    # whatever real ones a user configured; the connector's own `list_categories` excludes it on
+    # purpose (see its own docstring), so a test seeding the real-category half of this list
+    # doesn't also need to remember to add "*" every time.
+    category_names: list[str] = field(default_factory=lambda: ["*", "movies", "tv"])
     # get_files: `nzo_id -> list[filename]`, modeling `mode=get_files&value=<nzo_id>`.
     files_by_nzo_id: dict[str, list[str]] = field(default_factory=dict)
     # Every action call (`name=pause`/`resume`/`delete`/`change_cat`) records its own params
@@ -205,6 +211,9 @@ def create_fake_sabnzbd_app(state: FakeSabState) -> FastAPI:
             return {"status": True}
 
         if mode == "get_config":
+            section = params.get("section")
+            if section == "categories":
+                return {"config": {"categories": [{"name": n} for n in state.category_names]}}
             return {
                 "config": {
                     "misc": {

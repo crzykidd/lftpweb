@@ -32,6 +32,7 @@ from lftpweb.core.clients import (
 from lftpweb.core.clients.detection import (
     DetectedBasePath,
     report_base_paths,
+    report_categories,
     verify_reported_paths,
 )
 from lftpweb.core.clients.errors import CapabilityUnavailable, ClientError, ClientUnreachable
@@ -628,8 +629,9 @@ async def _detect_and_verify_base_paths(
 async def test_client_instance(client_id: int, request: Request) -> DownloadClientTestResponse:
     """Construct the registered connector, call `test_connection()`, and persist the resolved
     capability set (spec §4.1) plus the client's own reported version. On a fresh success, also
-    detects and SSH-verifies this connector's own base paths (spec §8.2 correction) -- **only**
-    on success, since a connector that could not even be reached has nothing to detect from.
+    detects and SSH-verifies this connector's own base paths (spec §8.2 correction) and detects
+    its own categories (spec §8.3, joined 2026-08-23) -- **only** on success, since a connector
+    that could not even be reached has nothing to detect from.
 
     **The redacted capture (spec §13.3) is not duplicated here.** `SabnzbdClient.test_connection`
     already writes it via `core/clients/capture.py` before doing anything else with the
@@ -708,6 +710,7 @@ async def test_client_instance(client_id: int, request: Request) -> DownloadClie
                 version=row["version"],
                 capabilities=_capabilities_to_json(degraded),
                 detected_base_paths=[],
+                detected_categories=[],
             )
         except ClientUnreachable as exc:
             return DownloadClientTestResponse(
@@ -717,6 +720,7 @@ async def test_client_instance(client_id: int, request: Request) -> DownloadClie
                 version=row["version"],
                 capabilities=_capabilities_to_json(last_known),
                 detected_base_paths=[],
+                detected_categories=[],
             )
         except ClientError as exc:
             return DownloadClientTestResponse(
@@ -726,10 +730,12 @@ async def test_client_instance(client_id: int, request: Request) -> DownloadClie
                 version=row["version"],
                 capabilities=_capabilities_to_json(last_known),
                 detected_base_paths=[],
+                detected_categories=[],
             )
-        # Success -- detect base paths while the connector is still open (its own HTTP session
-        # is torn down in `finally`, below).
+        # Success -- detect base paths and categories while the connector is still open (its own
+        # HTTP session is torn down in `finally`, below).
         detected = await _detect_and_verify_base_paths(request, client, client_class.capabilities)
+        detected_categories = await report_categories(client, client_class.capabilities)
     finally:
         # Not part of the `DownloadClient` ABC (only `SabnzbdClient` itself declares
         # `aclose`/`__aenter__`/`__aexit__`) -- see this task's own report for why that is a
@@ -747,4 +753,5 @@ async def test_client_instance(client_id: int, request: Request) -> DownloadClie
         version=info.version,
         capabilities=_capabilities_to_json(client_class.capabilities),
         detected_base_paths=[_detected_to_out(d) for d in detected],
+        detected_categories=detected_categories,
     )

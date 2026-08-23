@@ -15,6 +15,7 @@ from lftpweb.core.clients import Capability, Operation, Support, USENET_BASELINE
 from lftpweb.core.clients.detection import (
     BasePathState,
     report_base_paths,
+    report_categories,
     verify_reported_paths,
 )
 from lftpweb.core.clients.errors import ClientError
@@ -24,12 +25,19 @@ from lftpweb.core.clients.models import BasePath, BasePathKind
 
 
 class _StubClient:
-    """The one method `report_base_paths` calls -- a bare stand-in, not a full `DownloadClient`
-    (nothing else in the ABC is needed to exercise detection in isolation).
+    """The one method `report_base_paths`/`report_categories` calls -- a bare stand-in, not a
+    full `DownloadClient` (nothing else in the ABC is needed to exercise detection in isolation).
     """
 
-    def __init__(self, *, paths: list[BasePath] | None = None, raises: Exception | None = None):
+    def __init__(
+        self,
+        *,
+        paths: list[BasePath] | None = None,
+        categories: list[str] | None = None,
+        raises: Exception | None = None,
+    ):
         self._paths = paths or []
+        self._categories = categories or []
         self._raises = raises
         self.calls = 0
 
@@ -38,6 +46,12 @@ class _StubClient:
         if self._raises is not None:
             raise self._raises
         return list(self._paths)
+
+    async def list_categories(self) -> list[str]:
+        self.calls += 1
+        if self._raises is not None:
+            raise self._raises
+        return list(self._categories)
 
 
 async def test_report_base_paths_returns_the_connectors_own_answer():
@@ -73,6 +87,46 @@ async def test_report_base_paths_swallows_a_not_implemented_connector_too():
     # harmless as one that raises `ClientError` for real (this module's own docstring).
     client = _StubClient(raises=NotImplementedError("not wired up yet"))
     result = await report_base_paths(client, USENET_BASELINE)
+    assert result == []
+
+
+# --- report_categories (spec §8.3, joined 2026-08-23) --------------------------------------
+
+
+async def test_report_categories_returns_the_connectors_own_answer():
+    client = _StubClient(categories=["movies", "tv"])
+    result = await report_categories(client, USENET_BASELINE)
+    assert result == ["movies", "tv"]
+
+
+async def test_report_categories_never_calls_a_connector_that_does_not_declare_it():
+    caps = USENET_BASELINE.overridden(
+        operations={Operation.LIST_CATEGORIES: Capability(Support.NONE)}
+    )
+    client = _StubClient(categories=["movies"])
+    result = await report_categories(client, caps)
+    assert result == []
+    assert client.calls == 0
+
+
+async def test_report_categories_accepts_a_derived_declaration():
+    caps = USENET_BASELINE.overridden(
+        operations={Operation.LIST_CATEGORIES: Capability(Support.DERIVED, note="labels in use")}
+    )
+    client = _StubClient(categories=["tv"])
+    result = await report_categories(client, caps)
+    assert result == ["tv"]
+
+
+async def test_report_categories_swallows_a_client_error_without_failing_the_connection_test():
+    client = _StubClient(raises=ClientError("boom"))
+    result = await report_categories(client, USENET_BASELINE)
+    assert result == []
+
+
+async def test_report_categories_swallows_a_not_implemented_connector_too():
+    client = _StubClient(raises=NotImplementedError("not wired up yet"))
+    result = await report_categories(client, USENET_BASELINE)
     assert result == []
 
 

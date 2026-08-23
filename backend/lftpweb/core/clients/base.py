@@ -55,6 +55,16 @@ from .models import (
 # leave the data*, and lftpweb deletes the bytes itself over SSH as a separate step outside any
 # connector (see `docs/decisions.md` for the full reasoning).
 # --------------------------------------------------------------------------------------------
+# `LIST_CATEGORIES` joined the vocabulary 2026-08-23 (docs/download-client-framework-spec.md
+# §2.1, §8.3, prompts/2026-08-23-category-binding-redesign.md) -- the category -> queue mapping
+# UI used to propose bindings by matching queue `remote_path`s against configured base paths,
+# which only ever worked for a client whose categories genuinely are subdirectories of a base
+# path (SAB), and can never work for one whose categories are unrelated labels (rTorrent's
+# `d.custom1`). This operation asks the client directly for its own categories -- the field
+# `Field.CATEGORY` already exists on a `Transfer`, but that only ever reports a category *in
+# use* on an existing item, so a client with an empty queue and empty history (precisely the
+# fresh-setup case the binding UI is for) reports none. A connector that cannot answer this
+# declares `Support.NONE` and the settings UI falls back to the path-arithmetic proposal instead.
 class Operation(StrEnum):
     TEST_CONNECTION = "test_connection"
     LIST_TRANSFERS = "list_transfers"
@@ -63,6 +73,7 @@ class Operation(StrEnum):
     LIST_TRACKERS = "list_trackers"
     LIST_FILES = "list_files"
     LIST_BASE_PATHS = "list_base_paths"
+    LIST_CATEGORIES = "list_categories"
     FREE_SPACE = "free_space"
     PAUSE = "pause"
     RESUME = "resume"
@@ -313,6 +324,9 @@ USENET_BASELINE = CapabilitySet(
             Operation.LIST_TRACKERS: Capability(Support.NONE, note="usenet has no trackers"),
             Operation.LIST_FILES: Capability(Support.NATIVE),
             Operation.LIST_BASE_PATHS: Capability(Support.NATIVE, note="the completed folder"),
+            Operation.LIST_CATEGORIES: Capability(
+                Support.NATIVE, note="the client's own configured categories"
+            ),
             Operation.FREE_SPACE: Capability(Support.NATIVE),
             Operation.PAUSE: Capability(Support.NATIVE),
             Operation.RESUME: Capability(Support.NATIVE),
@@ -471,6 +485,17 @@ class DownloadClient(ABC):
     async def list_base_paths(self) -> list[BasePath]:
         """The client's own configured download/complete directories (spec §2.1, §8.2) -- a
         prefill, never treated as the complete or authoritative set of roots.
+        """
+
+    @abstractmethod
+    async def list_categories(self) -> list[str]:
+        """The client's own categories/labels, by name (spec §2.1, §8.3, joined 2026-08-23) --
+        detected, then offered as a queue-binding proposal, never saved on the strength of this
+        answer alone (mirrors `list_base_paths`'s own "detect, propose, confirm" contract).
+        Distinct from `Field.CATEGORY`, which only ever reports a category *in use* on an
+        existing transfer -- a client with nothing in its queue or history yet still answers
+        this with whatever categories it has configured (SAB) or none at all if it genuinely has
+        no closed category list to enumerate (rTorrent, whose `d.custom1` labels are free-form).
         """
 
     @abstractmethod

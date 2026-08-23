@@ -194,6 +194,7 @@ describe('ClientsTab', () => {
       version: null,
       capabilities: lastKnown,
       detected_base_paths: [],
+      detected_categories: [],
     }
     mockTestClientInstance.mockResolvedValue(failedResult)
     const root = await mount(container)
@@ -216,6 +217,108 @@ describe('ClientsTab', () => {
     expect(container.textContent).toContain('connection refused')
     // ...and the previously known capability is still rendered, not blanked.
     expect(container.textContent).toContain('Pause')
+
+    root.unmount()
+  })
+
+  // Findings #10/#11 (prompts/2026-08-23-category-binding-redesign.md): the category ->
+  // queue control is redesigned so there is no free-text field anywhere, and a suggested
+  // binding is a pre-selected dropdown value rather than placeholder text.
+
+  it('renders one row per category the client reports, with no free-text input and a pre-selected suggestion', async () => {
+    mockListClientTypes.mockResolvedValue([USENET_TYPE])
+    const queue = { id: 5, name: 'ar-tv', remote_path: '/data/complete/ar-tv', local_path: '/local/tv' }
+    mockListQueues.mockResolvedValue([queue] as never)
+    mockListClientInstances.mockResolvedValue([instance()])
+    mockTestClientInstance.mockResolvedValue({
+      ok: true,
+      error_class: null,
+      message: 'connected',
+      version: '4.0.0',
+      capabilities: { operations: {}, fields: {} },
+      detected_base_paths: [],
+      detected_categories: ['ar-tv'],
+    })
+    const root = await mount(container)
+
+    const testButton = Array.from(container.querySelectorAll('button')).find(
+      (b) => b.textContent === 'Test',
+    )
+    await act(async () => {
+      testButton?.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    })
+    await act(async () => {
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+
+    const editButton = Array.from(container.querySelectorAll('button')).find(
+      (b) => b.textContent === 'Edit',
+    )
+    await act(async () => {
+      editButton?.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    })
+
+    // The category renders as plain text -- no input anywhere on the page carries it as a value.
+    expect(container.textContent).toContain('ar-tv')
+    const inputValues = Array.from(container.querySelectorAll('input')).map((el) => el.value)
+    expect(inputValues).not.toContain('ar-tv')
+
+    // The suggested binding (queue name matches the category) is already selected, not blank --
+    // saving without touching it is expected to persist that value.
+    const selects = Array.from(container.querySelectorAll('select'))
+    const categorySelect = selects.find((s) =>
+      Array.from(s.options).some((o) => o.textContent?.includes('ar-tv (')),
+    )
+    expect(categorySelect).toBeDefined()
+    expect(categorySelect?.value).toBe(String(queue.id))
+
+    root.unmount()
+  })
+
+  it('falls back to a labelled path-arithmetic guess when the client reports no categories', async () => {
+    mockListClientTypes.mockResolvedValue([USENET_TYPE])
+    mockListClientInstances.mockResolvedValue([
+      instance({
+        base_paths: [
+          { id: 1, path: '/data/complete', kind: 'content', client_path: null, source: 'detected' },
+        ],
+      }),
+    ])
+    mockListQueues.mockResolvedValue([
+      { id: 7, name: 'tv-queue', remote_path: '/data/complete/ar-tv', local_path: '/local/tv' },
+    ] as never)
+    mockTestClientInstance.mockResolvedValue({
+      ok: true,
+      error_class: null,
+      message: 'connected',
+      version: '4.0.0',
+      capabilities: { operations: {}, fields: {} },
+      detected_base_paths: [],
+      detected_categories: [],
+    })
+    const root = await mount(container)
+
+    const testButton = Array.from(container.querySelectorAll('button')).find(
+      (b) => b.textContent === 'Test',
+    )
+    await act(async () => {
+      testButton?.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    })
+    await act(async () => {
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+
+    const editButton = Array.from(container.querySelectorAll('button')).find(
+      (b) => b.textContent === 'Edit',
+    )
+    await act(async () => {
+      editButton?.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    })
+
+    expect(container.textContent).toContain('guessed from your')
+    expect(container.textContent).toContain('ar-tv')
 
     root.unmount()
   })

@@ -1877,6 +1877,12 @@ class DownloadClientTestResponse(BaseModel):
     `[]` on any failed test (detection never runs against a connector that couldn't even be
     reached) and `[]` for a connector that doesn't declare `list_base_paths`, which is not an
     error either.
+
+    `detected_categories` follows the identical rule (spec §8.3, joined 2026-08-23,
+    prompts/2026-08-23-category-binding-redesign.md) -- the client's own reported category
+    names, `[]` on any failed test or for a connector that doesn't declare `list_categories`
+    (accepting derived). Unlike base paths, a category has nothing to SSH-verify, so this is a
+    bare name list rather than a per-entry state.
     """
 
     ok: bool
@@ -1885,6 +1891,7 @@ class DownloadClientTestResponse(BaseModel):
     version: str | None = None
     capabilities: dict[str, Any] | None = None
     detected_base_paths: list[DetectedBasePathOut] = Field(default_factory=list)
+    detected_categories: list[str] = Field(default_factory=list)
 
 
 # --- The disk review scan (docs/download-client-framework-spec.md §11, stage 4 of #18) -------

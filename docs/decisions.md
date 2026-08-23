@@ -6,6 +6,59 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-23 — Category → queue binding redesign: `list_categories`, no free-text field, two explicit decisions (findings #10/#11)
+
+`prompts/done/2026-08-23-category-binding-redesign.md`. The category-mapping control's free-text
+`<input>` proposed nothing for a real setup (path arithmetic is a proxy that only ever holds for
+SABnzbd's `<base>/<category>` layout, and can never work for rTorrent's unrelated `d.custom1`
+labels) and silently discarded whatever the user typed: the field carried `placeholder="ar-tv"`
+— greyed text that read as a filled-in value but wasn't one — and the save filtered any row whose
+`category` was blank. The user's own diagnosis and fix (2026-08-23): stop asking the user to type
+anything at all. Show every category the client actually reports, one row each, bound to a queue
+dropdown defaulting to unbound. This required adding `Operation.LIST_CATEGORIES` to the closed
+operation vocabulary (spec §2.1, §5's baseline tables) — a vocabulary change, treated with the
+same care as any other — and implementing it on both connectors (SABnzbd: doc-derived,
+`mode=get_config&section=categories`; rTorrent: the distinct in-use `d.custom1` values off the
+existing listing multicall, declared `Support.DERIVED` since it can only ever report labels
+*currently in use*, never a closed list — both UNVERIFIED against a live instance, spec §13.4/
+§13.6). The frontend control was rebuilt: no free-text input anywhere, a suggested binding is a
+pre-selected dropdown value (never placeholder text), and the old "Infer mappings…" button is
+gone — path-arithmetic proposal is retained only as an automatic, clearly-labelled fallback for a
+client that reports no categories at all.
+
+Two decisions the task's own prompt required making explicitly rather than by default:
+
+- **Uncategorised items get no bindable pseudo-row.** rTorrent torrents frequently carry no
+  `d.custom1` label. Rejected an explicit "(no category)" row that could bind to a queue: it
+  would conflate "genuinely unlabelled" with "the user chose not to map this," and would funnel
+  every unlabelled torrent from every client instance into one queue by construction — a much
+  larger blast radius than the mapping problem this feature exists to solve. Chosen instead: an
+  uncategorised item is simply never attributable, the same silent-omission rule spec §8.3's own
+  mapping already applies to any unmatched category. More honest than useful, per the prompt's
+  own framing, and consistent with how the rest of the framework already treats "nothing to
+  attribute this to."
+- **A category that appears later is surfaced by re-testing, not a background poll.** Clicking
+  Test while an instance is open in the edit form now recomputes its category rows against the
+  freshly detected list immediately (`ClientsTab.tsx`'s `handleTest`), so a newly-added SAB
+  category or rTorrent label shows up without the user having to notice on their own. Rejected
+  auto-probing every configured client on every Settings page load: no other part of this feature
+  auto-probes (`detected_base_paths` also only ever populates on an explicit Test click), and
+  doing so here alone would mean the category control is the one part of the page issuing
+  background network calls to real seedbox clients on every page open — expensive and
+  inconsistent with the established pattern for zero clear benefit over "the next time you touch
+  this instance's settings, it's current."
+
+Guarded by `tests/test_clients_detection.py::test_report_categories_*`, `tests/
+test_clients_sabnzbd.py::test_list_categories_*`, `tests/test_clients_rtorrent.py::
+test_list_categories_*` (including the chosen uncategorised behaviour, asserted directly),
+`tests/test_settings_clients_api.py::test_unbound_category_survives_a_save_and_a_re_edit` (the
+#11b regression test — the round trip, not just the request) and `tests/test_settings_clients_
+api.py::test_test_connection_reports_the_clients_own_categories`, plus `frontend/src/lib/
+clientCategoryInference.test.ts` and two new `ClientsTab.test.tsx` cases for "no free-text input
+renders" and "a suggested binding is pre-selected and labelled by mechanism."
+
+---
+
 ## 2026-08-23 — Preflight's client phase filter: allowlist, not denylist (findings #12/#4)
 
 `prompts/done/2026-08-23-preflight-phase-allowlist.md`. `core/clientsync.py`'s Preflight

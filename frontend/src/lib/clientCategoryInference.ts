@@ -1,17 +1,30 @@
-// Category -> queue inference (spec §8.3) -- kept out of `ClientsTab.tsx` per this repo's
-// settled pattern for a pure, Vitest-able predicate.
+// Category -> queue inference and binding (spec §8.3) -- kept out of `ClientsTab.tsx` per this
+// repo's settled pattern for pure, Vitest-able predicates.
 //
-// "Observed on the live test system, 2026-08-22: its two queues are
-// /home/crzykidd/downloads/complete/ar-movies and .../ar-tv -- i.e. the queue remote paths
-// already *are* the client's category folders." (spec §8.3). This matches every already-
-// configured queue's `remote_path` against the instance's own configured base paths (spec
-// §8.2 -- user-entered, never the client's own `list_base_paths` answer, which is a prefill
-// only and is not wired to any endpoint in this stage) and proposes the trailing path segment
-// as the category name.
+// **Redesigned 2026-08-23** (prompts/2026-08-23-category-binding-redesign.md, findings #10/#11
+// in prompts/test-findings-2026-08-23.md): the free-text category field that used to sit next
+// to this inference offer is gone. It proposed nothing for a real setup (base-path arithmetic
+// only ever holds for SABnzbd's `<base>/<category>` layout, and can never work for rTorrent,
+// whose labels live in `d.custom1` with no relation to any directory) and silently dropped a
+// blank row on save because its `placeholder` text looked like a filled-in value but wasn't
+// one. The replacement, the user's own design: show every category the client actually has
+// (`list_categories`, spec §2.1/§8.3), one row each, a queue dropdown defaulting to unbound --
+// nothing to type, so nothing to typo and nothing blank to drop.
 //
-// **Propose, never auto-apply** (spec §8.3's own words) -- this function only returns
-// suggestions; `ClientsTab.tsx` is responsible for showing them to the user for confirmation
-// before anything is saved.
+// `inferCategoryMappings` (the original base-path-arithmetic proposal) is kept as the fallback
+// mechanism `computeCategoryRows` reaches for only when the client itself reports no categories
+// at all -- a fresh SAB with an empty queue and empty history is exactly the case a category
+// list can't help with, and path arithmetic can still propose something there. `suggestQueue
+// ForCategory` and `computeCategoryRows` are the new, preferred path: matching the client's own
+// reported category names directly against queue names / remote-path trailing segments, per
+// finding #10's own conclusion that this is the *direct* signal and path arithmetic was always
+// a proxy for it.
+//
+// **Propose, never auto-apply the wrong thing; always propose the right thing as a pre-selected
+// value.** Unlike the old free-text control, a suggested binding here *is* the dropdown's
+// initial value -- saving without touching it is supposed to persist the suggestion, not silently
+// discard an unconfirmed guess (spec §8.3's own words, still honoured: the user can always
+// change or unbind a row before Save).
 
 export interface QueueForInference {
   id: number
@@ -54,4 +67,121 @@ export function inferCategoryMappings(
     }
   }
   return results
+}
+
+// --------------------------------------------------------------------------------------------
+// The redesigned control (2026-08-23) -- direct signal preferred, path arithmetic as fallback.
+// --------------------------------------------------------------------------------------------
+
+export interface QueueForCategorySuggestion extends QueueForInference {
+  name: string
+}
+
+export interface CategoryRowDraft {
+  category: string
+  queue_id: number | null
+}
+
+function trailingSegment(path: string): string {
+  const trimmed = stripTrailingSlash(path)
+  const idx = trimmed.lastIndexOf('/')
+  return idx === -1 ? trimmed : trimmed.slice(idx + 1)
+}
+
+/** Suggest a queue for one category the client itself reported -- spec's own words: "a queue's
+ * name or the trailing segment of its remote_path matches the category." A pure lookup; never
+ * applied to anything except as `computeCategoryRows`'s pre-selected initial value below.
+ */
+export function suggestQueueForCategory(
+  category: string,
+  queues: QueueForCategorySuggestion[],
+): number | null {
+  const byName = queues.find((q) => q.name === category)
+  if (byName != null) return byName.id
+  const bySegment = queues.find((q) => trailingSegment(q.remote_path) === category)
+  return bySegment ? bySegment.id : null
+}
+
+/** Which mechanism produced the rows `computeCategoryRows` returned -- #10's own conclusion,
+ * applied to the UI: "the empty result must explain itself... never blur 'the client told us'
+ * with 'we guessed from your paths.'" `'none'` means neither mechanism has anything new to
+ * offer beyond whatever was already saved (`existing`).
+ */
+export type CategorySource = 'client' | 'path_arithmetic' | 'none'
+
+export interface ComputedCategoryRows {
+  rows: CategoryRowDraft[]
+  source: CategorySource
+}
+
+/** One row per category to show in the settings form -- the redesigned control's whole point:
+ * no free-text row, nothing to type, and a suggested binding is always a pre-selected dropdown
+ * value rather than placeholder text (findings #10/#11c).
+ *
+ * - **`detectedCategories` non-null and non-empty** -- the direct signal: one row per reported
+ *   category, keeping the already-saved `queue_id` for a category already mapped (`existing`),
+ *   or suggesting one otherwise. Any `existing` row for a category the client no longer reports
+ *   is preserved, never dropped -- "categories appearing later" cuts both ways, and a stale
+ *   mapping is still real configuration the user should see (and can remove) rather than lose
+ *   silently because one probe didn't happen to repeat it. `source: 'client'`.
+ * - **`detectedCategories` null or empty** -- never tested this session, or the client
+ *   genuinely has none configured yet (a fresh SAB, an rTorrent with nothing labelled). Falls
+ *   back to `inferCategoryMappings`'s base-path arithmetic for anything not already in
+ *   `existing` (`source: 'path_arithmetic'` if it proposed something new), or `source: 'none'`
+ *   if it didn't either -- distinguishing "nothing to add" from "here's a guess" is the point.
+ */
+export function computeCategoryRows(
+  existing: CategoryRowDraft[],
+  detectedCategories: string[] | null,
+  basePaths: string[],
+  queues: QueueForCategorySuggestion[],
+): ComputedCategoryRows {
+  const byCategory = new Map(existing.map((c) => [c.category, c]))
+
+  if (detectedCategories != null && detectedCategories.length > 0) {
+    const rows: CategoryRowDraft[] = detectedCategories.map((category) => {
+      const saved = byCategory.get(category)
+      if (saved != null) return saved
+      return { category, queue_id: suggestQueueForCategory(category, queues) }
+    })
+    const detectedSet = new Set(detectedCategories)
+    for (const row of existing) {
+      if (!detectedSet.has(row.category)) rows.push(row)
+    }
+    return { rows, source: 'client' }
+  }
+
+  const proposals = inferCategoryMappings(basePaths, queues)
+  const rows = [...existing]
+  let addedAny = false
+  for (const p of proposals) {
+    if (!byCategory.has(p.category)) {
+      rows.push({ category: p.category, queue_id: p.queue_id })
+      addedAny = true
+    }
+  }
+  return { rows, source: addedAny ? 'path_arithmetic' : 'none' }
+}
+
+/** The one-line explanation of *why* these rows are what they are (finding #11a: "the section
+ * has no explanatory text, and the concept is genuinely non-obvious"; #10: "the empty result
+ * must explain itself"). Never blur which mechanism produced a suggestion.
+ */
+export function describeCategorySource(
+  source: CategorySource,
+  detectedCategories: string[] | null,
+): string {
+  if (source === 'client') {
+    return 'These categories come directly from this client.'
+  }
+  if (source === 'path_arithmetic') {
+    return (
+      'This client did not report its categories directly, so these are guessed from your ' +
+      'configured base paths and existing queues instead — review before saving.'
+    )
+  }
+  if (detectedCategories == null) {
+    return 'Test the connection above to see this client’s own categories.'
+  }
+  return 'This client reported no categories, and nothing could be guessed from your base paths.'
 }

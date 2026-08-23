@@ -514,6 +514,55 @@ async def test_set_label_writes_custom1(fake_rtorrent_server):
 
 
 # ------------------------------------------------------------------------------------
+# list_categories (spec §2.1, §8.3, joined 2026-08-23) -- doc-derived, UNVERIFIED. Deduplicated
+# `d.custom1` off the same listing multicall; declared `Support.DERIVED` on `capabilities`
+# because this can only ever report labels currently in use, never rTorrent's full universe of
+# labels ever typed.
+# ------------------------------------------------------------------------------------
+
+
+async def test_list_categories_declared_derived_not_native():
+    from lftpweb.core.clients.base import Operation, Support
+
+    cap = RtorrentClient.capabilities.operations[Operation.LIST_CATEGORIES]
+    assert cap.support is Support.DERIVED
+    assert "labels currently assigned" in (cap.note or "")
+
+
+async def test_list_categories_returns_distinct_labels_in_use(fake_rtorrent_server):
+    fake_rtorrent_server.state.add(_torrent(torrent_hash="A" * 40, custom1="tv"))
+    fake_rtorrent_server.state.add(_torrent(torrent_hash="B" * 40, custom1="movies"))
+    fake_rtorrent_server.state.add(_torrent(torrent_hash="C" * 40, custom1="tv"))
+    client = _client(fake_rtorrent_server)
+
+    categories = await client.list_categories()
+
+    assert categories == ["movies", "tv"]
+
+
+async def test_list_categories_excludes_torrents_with_no_label(fake_rtorrent_server):
+    """Decision (a) of prompts/2026-08-23-category-binding-redesign.md: an rTorrent torrent with
+    no `d.custom1` label contributes no category, and this connector never invents an
+    "(no category)" pseudo-entry for it -- `list_categories` simply omits it, the same silent-
+    omission rule spec §8.3 already applies to an item that can't be attributed to a queue.
+    """
+    fake_rtorrent_server.state.add(_torrent(torrent_hash="A" * 40, custom1=""))
+    fake_rtorrent_server.state.add(_torrent(torrent_hash="B" * 40, custom1="tv"))
+    client = _client(fake_rtorrent_server)
+
+    categories = await client.list_categories()
+
+    assert categories == ["tv"]
+
+
+async def test_list_categories_empty_when_nothing_is_labelled(fake_rtorrent_server):
+    fake_rtorrent_server.state.add(_torrent(torrent_hash="A" * 40, custom1=""))
+    client = _client(fake_rtorrent_server)
+
+    assert await client.list_categories() == []
+
+
+# ------------------------------------------------------------------------------------
 # The capability declaration matches what this connector can actually populate.
 # ------------------------------------------------------------------------------------
 

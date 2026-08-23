@@ -1,26 +1,29 @@
-"""Base-path detection (docs/download-client-framework-spec.md §8.2 correction, migration 028;
-prompts/2026-08-22-client-base-paths-detected.md) -- what a connector's own `list_base_paths`
-(spec §2.1) reports, checked over SSH against `core.browse.remote_directory_error` so a save
-never has to trust the client's word alone.
+"""Base-path and category detection (docs/download-client-framework-spec.md §8.2 correction,
+migration 028; §8.3, prompts/2026-08-22-client-base-paths-detected.md,
+prompts/2026-08-23-category-binding-redesign.md) -- what a connector's own `list_base_paths` /
+`list_categories` (spec §2.1) reports, so a save never has to trust the client's word alone.
 
 **Detection proposes; it never saves.** Nothing in this module writes to
-`download_client_base_path` -- `api/settings_clients.py`'s `POST .../test` only ever returns
-what it found; a caller (the settings UI) decides whether and how to turn a proposal into a
-saved row, same rule as the existing category -> queue inference.
+`download_client_base_path` or `download_client_category` -- `api/settings_clients.py`'s
+`POST .../test` only ever returns what it found; a caller (the settings UI) decides whether and
+how to turn a proposal into a saved row.
 
 **A detection failure must never fail the connection test.** Reachability and detection are
 different questions (spec §4.2's temperament, applied here): every function below resolves to
 a result -- an empty list, or a per-path `BasePathState` -- never lets an exception escape to
-its caller. `report_base_paths` is deliberately tolerant of *any* exception a connector's
-`list_base_paths` can raise, not just the declared `ClientError` taxonomy, because a connector
-that hasn't implemented the method yet (`NotImplementedError`, a test double) must be just as
-harmless as one that raises `ClientError` for real.
+its caller. `report_base_paths`/`report_categories` are deliberately tolerant of *any* exception
+a connector's `list_base_paths`/`list_categories` can raise, not just the declared `ClientError`
+taxonomy, because a connector that hasn't implemented the method yet (`NotImplementedError`, a
+test double) must be just as harmless as one that raises `ClientError` for real.
 
-Split into two functions, not one, so each half is independently unit-testable without a live
-SSH connection: `report_base_paths` needs only a `DownloadClient` and its `CapabilitySet`;
-`verify_reported_paths` needs only something that duck-types `asyncssh.SFTPClient.stat`
-(`tests/test_browse.py`'s own `_FakeSFTP` pattern) -- `api/settings_clients.py` is the only
-caller that ever has both a real connector and a real SFTP client at once.
+Split base-path detection into two functions, not one, so each half is independently
+unit-testable without a live SSH connection: `report_base_paths` needs only a `DownloadClient`
+and its `CapabilitySet`; `verify_reported_paths` needs only something that duck-types
+`asyncssh.SFTPClient.stat` (`tests/test_browse.py`'s own `_FakeSFTP` pattern) --
+`api/settings_clients.py` is the only caller that ever has both a real connector and a real SFTP
+client at once. **`report_categories` has no SSH-verification counterpart** -- a category is a
+name the client itself owns, not a filesystem path lftpweb needs to independently confirm it can
+see, so "detect, propose, confirm" collapses to just "detect, propose" for this one.
 """
 
 from __future__ import annotations
@@ -110,3 +113,20 @@ async def verify_reported_paths(
     not the same fact as the seedbox saying no.
     """
     return [await _verify_one(sftp, bp) for bp in reported]
+
+
+async def report_categories(client: DownloadClient, capabilities: CapabilitySet) -> list[str]:
+    """The client's own categories, verbatim (spec §8.3, joined 2026-08-23) -- `[]` if the
+    connector doesn't declare `Operation.LIST_CATEGORIES` (accepting derived) at all, which is
+    **not an error**: a connector that cannot answer this simply contributes nothing, and the
+    settings UI falls back to proposing from base-path arithmetic instead. `[]` also on *any*
+    exception `list_categories()` raises, mirroring `report_base_paths`'s own tolerance -- a
+    category-detection failure must never fail the connection test that already succeeded to get
+    here.
+    """
+    if not capabilities.supports(Operation.LIST_CATEGORIES, accept_derived=True):
+        return []
+    try:
+        return await client.list_categories()
+    except Exception:  # noqa: BLE001 - a detection failure must never fail the connection test
+        return []

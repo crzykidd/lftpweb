@@ -153,6 +153,10 @@ class FakeDownloadClient(DownloadClient):
         self._check(Operation.LIST_BASE_PATHS)
         return list(self.state.base_paths)
 
+    async def list_categories(self) -> list[str]:
+        self._check(Operation.LIST_CATEGORIES)
+        return sorted({t.category for t in self.state.transfers if t.category})
+
     async def free_space(self, path: str) -> SpaceInfo:
         self._check(Operation.FREE_SPACE)
         return SpaceInfo(free_bytes=self.state.free_bytes)

@@ -24,7 +24,13 @@ import {
   type BasePathDraft,
 } from '../../lib/clientBasePathDetection'
 import { capabilityRows, type CapabilityRow } from '../../lib/clientCapabilities'
-import { inferCategoryMappings } from '../../lib/clientCategoryInference'
+import {
+  computeCategoryRows,
+  describeCategorySource,
+  type CategoryRowDraft,
+  type CategorySource,
+  type QueueForCategorySuggestion,
+} from '../../lib/clientCategoryInference'
 import { remoteBrowseDisabled } from '../../lib/pathBrowse'
 import { PathBrowseDialog } from '../../components/PathBrowseDialog'
 
@@ -42,11 +48,6 @@ const buttonClasses =
   'w-fit rounded-md bg-zinc-900 px-3 py-1.5 text-sm font-medium text-white hover:bg-zinc-700 disabled:opacity-50 dark:bg-zinc-100 dark:text-zinc-900 dark:hover:bg-zinc-300'
 const secondaryButtonClasses =
   'w-fit rounded-md border border-zinc-300 px-2 py-1 text-xs font-medium text-zinc-700 hover:bg-zinc-50 disabled:opacity-50 dark:border-zinc-700 dark:text-zinc-200 dark:hover:bg-zinc-900'
-
-interface CategoryDraft {
-  category: string
-  queue_id: number | null
-}
 
 interface FormState {
   name: string
@@ -67,7 +68,13 @@ interface FormState {
   // a re-detect can tell a manual row and an already-resolved translation apart from a fresh
   // proposal (see `lib/clientBasePathDetection.ts`).
   basePaths: BasePathDraft[]
-  categories: CategoryDraft[]
+  // One row per category to show (spec §8.3, redesigned 2026-08-23) -- never hand-typed;
+  // populated by `recomputeCategoryDraft` (below) from whichever mechanism produced it, and
+  // edited only by picking a queue in its dropdown or removing a stale row entirely.
+  categories: CategoryRowDraft[]
+  // Which mechanism produced `categories` right now -- drives `describeCategorySource`'s label
+  // so the UI never blurs "the client told us" with "we guessed from your paths" (finding #10).
+  categorySource: CategorySource
 }
 
 function emptyConfigDraft(type: ClientTypeOut | undefined): Record<string, string | boolean> {
@@ -113,6 +120,7 @@ function emptyForm(type: ClientTypeOut | undefined): FormState {
     enabled: false,
     basePaths: [],
     categories: [],
+    categorySource: 'none',
   }
 }
 
@@ -368,7 +376,6 @@ export function ClientsTab() {
   // -- local to this component, never sent anywhere until Accept/Browse turns it into a saved
   // base path via `acceptDetectedBasePath`.
   const [notFoundDrafts, setNotFoundDrafts] = useState<Record<string, string>>({})
-  const [inferenceMessage, setInferenceMessage] = useState<string | null>(null)
 
   const [testResults, setTestResults] = useState<Record<number, DownloadClientTestResponse>>({})
   const [testingId, setTestingId] = useState<number | null>(null)
@@ -402,6 +409,36 @@ export function ClientsTab() {
     setForm((prev) => ({ ...prev, secrets: { ...prev.secrets, [key]: value } }))
   }
 
+  /** Every registered queue, in the shape `computeCategoryRows`/`suggestQueueForCategory` need
+   * to match a category name against (spec §8.3's own wording: "a queue's name or the trailing
+   * segment of its remote_path"). Recomputed each render from `queues` state -- cheap, and this
+   * component already re-derives `selectedType`/`groupedTypes` the same way.
+   */
+  const queuesForCategorySuggestion: QueueForCategorySuggestion[] = queues.map((q) => ({
+    id: q.id,
+    remote_path: q.remote_path,
+    name: q.name,
+  }))
+
+  /** Recompute the category rows to show, given whatever the client most recently reported
+   * (`null` = never tested this session) and the draft's current base paths -- the single place
+   * both `startEdit` and a fresh `Test` (below) funnel through, so the two moments this task's
+   * own decision (b) cares about ("categories appearing later") both go through identical logic.
+   */
+  const recomputeCategoryDraft = (
+    existing: CategoryRowDraft[],
+    detectedCategories: string[] | null,
+    basePaths: BasePathDraft[],
+  ): { categories: CategoryRowDraft[]; categorySource: CategorySource } => {
+    const { rows, source } = computeCategoryRows(
+      existing,
+      detectedCategories,
+      basePaths.map((bp) => bp.path),
+      queuesForCategorySuggestion,
+    )
+    return { categories: rows, categorySource: source }
+  }
+
   const handleTypeChange = (client_type: string) => {
     const type = clientTypes.find((t) => t.client_type === client_type)
     setForm((prev) => ({
@@ -415,27 +452,40 @@ export function ClientsTab() {
   const startEdit = (instance: DownloadClientOut) => {
     setEditingId(instance.id)
     setError(null)
-    setInferenceMessage(null)
     const type = clientTypes.find((t) => t.client_type === instance.client_type)
+    const basePaths = instance.base_paths.map((bp) => ({
+      path: bp.path,
+      kind: bp.kind,
+      client_path: bp.client_path,
+      source: bp.source,
+    }))
+    const existingCategories: CategoryRowDraft[] = instance.categories.map((c) => ({
+      category: c.category,
+      queue_id: c.queue_id,
+    }))
+    // `testResults[instance.id]` is only populated if Test was clicked this session (the same
+    // asymmetry `detected_base_paths` already has) -- `null` when it hasn't, which
+    // `recomputeCategoryDraft` reads as "never tested," not "reported none."
+    const detected = testResults[instance.id]?.detected_categories ?? null
+    const { categories, categorySource } = recomputeCategoryDraft(
+      existingCategories,
+      detected,
+      basePaths,
+    )
     setForm({
       name: instance.name,
       client_type: instance.client_type,
       config: configDraftFromExisting(type, instance.config),
       secrets: emptySecretsDraft(type),
       enabled: instance.enabled,
-      basePaths: instance.base_paths.map((bp) => ({
-        path: bp.path,
-        kind: bp.kind,
-        client_path: bp.client_path,
-        source: bp.source,
-      })),
-      categories: instance.categories.map((c) => ({ category: c.category, queue_id: c.queue_id })),
+      basePaths,
+      categories,
+      categorySource,
     })
   }
 
   const cancelEdit = () => {
     setEditingId(null)
-    setInferenceMessage(null)
     setForm(emptyForm(clientTypes[0]))
   }
 
@@ -483,52 +533,23 @@ export function ClientsTab() {
     })
   }
 
-  const addCategoryRow = () => {
-    setForm((prev) => ({ ...prev, categories: [...prev.categories, { category: '', queue_id: null }] }))
-  }
-
-  const updateCategoryRow = (index: number, patch: Partial<CategoryDraft>) => {
+  /** A category row's only editable field is its queue binding (spec §8.3, redesigned
+   * 2026-08-23) -- the category name itself is never typed, so there is nothing else here to
+   * patch.
+   */
+  const updateCategoryRow = (index: number, patch: Partial<CategoryRowDraft>) => {
     setForm((prev) => ({
       ...prev,
       categories: prev.categories.map((c, i) => (i === index ? { ...c, ...patch } : c)),
     }))
   }
 
+  /** Drops one row entirely -- for a category the client no longer reports and the user wants
+   * gone, not merely left unbound. A row that just isn't used stays and is left `queue_id: null`
+   * instead (see the "— not used —" option in the dropdown below).
+   */
   const removeCategoryRow = (index: number) => {
     setForm((prev) => ({ ...prev, categories: prev.categories.filter((_, i) => i !== index) }))
-  }
-
-  /** Spec §8.3: "the setup UI should therefore offer to infer the mapping ... with the user
-   * confirming rather than typing." Proposes into the *draft* form only -- nothing is saved
-   * until Save is pressed, and every proposed row is an ordinary editable/removable row like
-   * any typed one, so confirming is just leaving it alone through Save.
-   */
-  const handleInferCategories = () => {
-    const suggestions = inferCategoryMappings(
-      form.basePaths.map((bp) => bp.path),
-      queues.map((q) => ({ id: q.id, remote_path: q.remote_path })),
-    )
-    const existingQueueIds = new Set(
-      form.categories.map((c) => c.queue_id).filter((id): id is number => id != null),
-    )
-    const additions = suggestions.filter((s) => !existingQueueIds.has(s.queue_id))
-    if (additions.length === 0) {
-      setInferenceMessage(
-        'No new mappings found — either every matching queue is already mapped, or no configured base path contains one of your queues.',
-      )
-      return
-    }
-    setForm((prev) => ({
-      ...prev,
-      categories: [
-        ...prev.categories,
-        ...additions.map((a) => ({ category: a.category, queue_id: a.queue_id })),
-      ],
-    }))
-    setInferenceMessage(
-      `Proposed ${additions.length} mapping${additions.length === 1 ? '' : 's'} below from your ` +
-        `configured base paths and existing queues — review, then Save to confirm.`,
-    )
   }
 
   const handleSubmit = async () => {
@@ -546,9 +567,11 @@ export function ClientsTab() {
           client_path: bp.client_path,
           source: bp.source,
         })),
-        categories: form.categories
-          .filter((c) => c.category.trim() !== '')
-          .map((c) => ({ category: c.category.trim(), queue_id: c.queue_id })),
+        // No blank-row filter here on purpose (findings #11b/#11c): every row in `form.categories`
+        // came from the client's own report, a saved mapping, or a labelled path-arithmetic
+        // guess -- never free typing -- so there is no blank category string this could ever
+        // need to drop. An unbound row (`queue_id: null`) is saved exactly as it is.
+        categories: form.categories.map((c) => ({ category: c.category, queue_id: c.queue_id })),
       }
       if (editingId != null) {
         await updateClientInstance(editingId, body)
@@ -589,6 +612,21 @@ export function ClientsTab() {
       // (what every render of this row reads before Test is next clicked) stays in step,
       // rather than only living in `testResults` until some unrelated refresh happens.
       await refreshInstances()
+      // Decision (b), prompts/2026-08-23-category-binding-redesign.md: a category the client
+      // has added since the row was last saved should be surfaced rather than requiring the
+      // user to notice on their own. Re-testing while this exact instance is open in the edit
+      // form recomputes its category rows against the freshly detected list immediately,
+      // without waiting for a page reload.
+      if (editingId === id) {
+        setForm((prev) => {
+          const { categories, categorySource } = recomputeCategoryDraft(
+            prev.categories,
+            result.detected_categories,
+            prev.basePaths,
+          )
+          return { ...prev, categories, categorySource }
+        })
+      }
     } catch (err) {
       const instance = instances.find((i) => i.id === id)
       setTestResults((prev) => ({
@@ -604,6 +642,7 @@ export function ClientsTab() {
           capabilities: instance?.capabilities ?? null,
           // A request that never reached the backend detected nothing this time either.
           detected_base_paths: [],
+          detected_categories: [],
         },
       }))
     } finally {
@@ -952,55 +991,66 @@ export function ClientsTab() {
           </div>
         </div>
 
-        {/* Category -> queue mapping (spec §8.3) -- a site-level instance's completed-folder
-         * categories, each optionally bound to one of this app's own queues. */}
+        {/* Category -> queue mapping (spec §8.3, redesigned 2026-08-23 -- findings #10/#11 in
+         * prompts/test-findings-2026-08-23.md). One row per category the client actually
+         * reports (direct signal, preferred) or, only when it reports none at all, a labelled
+         * guess from base-path arithmetic (the old, sole mechanism, now a documented fallback).
+         * **No free-text field anywhere here** -- the prior control's category `<input>` carried
+         * `placeholder="ar-tv"`, greyed text that read as a filled-in value but wasn't one, and
+         * the save silently dropped any row whose (never-typed) value was blank. With every row
+         * always carrying a real category string, there is no blank row this could ever produce
+         * to drop -- #11b/#11c's defect class, not merely its symptom. */}
         <div className="flex flex-col gap-2">
           <span className={labelClasses}>Category → queue mapping</span>
           <p className={hintClasses}>
-            On the reference workflow, a queue's remote path <em>is</em> this client's category
-            folder (spec §8.3) — Infer proposes that mapping from your configured base paths and
-            existing queues; nothing is saved until you press Save below.
+            This client sorts downloads into categories. Tell lftpweb which queue each one
+            belongs to — leave the ones you don&rsquo;t use unbound.
           </p>
-          <button type="button" onClick={handleInferCategories} className={secondaryButtonClasses}>
-            Infer mappings from base paths + queues
-          </button>
-          {inferenceMessage && <p className={hintClasses}>{inferenceMessage}</p>}
-          <ul className="flex flex-col gap-2">
-            {form.categories.map((cat, i) => (
-              <li key={i} className="flex items-center gap-2">
-                <input
-                  className={inputClasses}
-                  value={cat.category}
-                  onChange={(e) => updateCategoryRow(i, { category: e.target.value })}
-                  placeholder="ar-tv"
-                />
-                <select
-                  className={inputClasses}
-                  value={cat.queue_id ?? ''}
-                  onChange={(e) =>
-                    updateCategoryRow(i, { queue_id: e.target.value === '' ? null : Number(e.target.value) })
-                  }
-                >
-                  <option value="">— not bound —</option>
-                  {queues.map((q) => (
-                    <option key={q.id} value={q.id}>
-                      {q.name} ({q.remote_path})
-                    </option>
-                  ))}
-                </select>
-                <button
-                  type="button"
-                  onClick={() => removeCategoryRow(i)}
-                  className="text-xs text-red-600 hover:underline dark:text-red-400"
-                >
-                  Remove
-                </button>
-              </li>
-            ))}
-          </ul>
-          <button type="button" onClick={addCategoryRow} className={secondaryButtonClasses}>
-            + Add mapping
-          </button>
+          {editingId != null && (
+            <p className={hintClasses}>
+              {describeCategorySource(
+                form.categorySource,
+                testResults[editingId]?.detected_categories ?? null,
+              )}
+            </p>
+          )}
+          {editingId == null && (
+            <p className={hintClasses}>
+              Save this instance, then Test it, to detect its categories.
+            </p>
+          )}
+          {form.categories.length > 0 && (
+            <ul className="flex flex-col gap-2">
+              {form.categories.map((cat, i) => (
+                <li key={cat.category} className="flex items-center gap-2">
+                  <span className="flex-1 truncate rounded-md border border-zinc-200 bg-zinc-50 px-2 py-1 font-mono text-xs dark:border-zinc-800 dark:bg-zinc-900">
+                    {cat.category}
+                  </span>
+                  <select
+                    className={inputClasses}
+                    value={cat.queue_id ?? ''}
+                    onChange={(e) =>
+                      updateCategoryRow(i, { queue_id: e.target.value === '' ? null : Number(e.target.value) })
+                    }
+                  >
+                    <option value="">— not used —</option>
+                    {queues.map((q) => (
+                      <option key={q.id} value={q.id}>
+                        {q.name} ({q.remote_path})
+                      </option>
+                    ))}
+                  </select>
+                  <button
+                    type="button"
+                    onClick={() => removeCategoryRow(i)}
+                    className="text-xs text-red-600 hover:underline dark:text-red-400"
+                  >
+                    Remove
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
         </div>
 
         <div className="flex gap-2">

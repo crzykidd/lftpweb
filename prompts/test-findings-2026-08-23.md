@@ -329,6 +329,17 @@ nothing, rather than silently proposing nothing for a reason the user cannot see
   paths configured", "the client reported no categories", and "nothing matched" are three different
   answers, and today all three render as a silent no-op.
 
+### Resolved 2026-08-23 — `list_categories` joined the vocabulary; direct signal preferred
+
+`prompts/done/2026-08-23-category-binding-redesign.md`, `docs/decisions.md`. Both open questions
+above are answered: inference now keys on the client's own reported categories first
+(`Operation.LIST_CATEGORIES`, spec §2.1/§8.3, implemented on both connectors — SAB via
+`mode=get_config&section=categories`, rTorrent via the in-use `d.custom1` values, both
+doc-derived and UNVERIFIED, §13.4/§13.6), falling back to path arithmetic only when the client
+reports none at all, and the UI now states which mechanism produced a row's suggestion rather
+than rendering all three "empty" cases as the same silent no-op. See #11's own resolution note
+below for the control redesign this enabled.
+
 ---
 
 ## 11. Category mappings do not survive a save — and the field is unexplained
@@ -433,6 +444,23 @@ already returned by the `d.multicall2` the poller issues.
 - **Categories appearing later.** A category added in SAB after setup will not be in the stored
   mapping. The page should show newly-seen-but-unmapped categories rather than requiring the user
   to notice, which is the same visibility theme as #2.
+
+### Resolved 2026-08-23 — free-text control removed; one row per reported category
+
+`prompts/done/2026-08-23-category-binding-redesign.md`, `docs/decisions.md`. Built exactly as
+designed above: `ClientsTab.tsx`'s category section is now one row per category the client
+reports (or, only when it reports none, a labelled base-path-arithmetic guess), the category name
+rendered as plain text, a queue `<select>` defaulting to "— not used —", and a suggested binding
+is always a pre-selected dropdown value. **No `<input>` exists in this control any more** — 11b's
+proven mechanism (a `placeholder` that read as a filled-in value, silently filtered on save) is
+now structurally impossible, since nothing here can ever produce a blank category string to
+filter. 11a's missing explanation is now a one-line sentence above the rows. The two "worth
+deciding" items are both decided, with reasoning, in `docs/decisions.md`'s 2026-08-23 entry:
+uncategorised items get no bindable pseudo-row (silent omission, same rule as any other unmatched
+category); a category appearing later is picked up by re-testing while the instance is open in
+Edit, not a background poll. Covered by `tests/test_settings_clients_api.py::
+test_unbound_category_survives_a_save_and_a_re_edit` (the round-trip regression test this finding
+asked for) and `frontend/src/pages/settings/ClientsTab.test.tsx`'s new cases.
 
 ---
 

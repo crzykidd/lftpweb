@@ -67,6 +67,7 @@ from .base import (
     ConfigField,
     DownloadClient,
     Field,
+    Operation,
     Support,
     TORRENT_BASELINE,
     project_transfer,
@@ -338,6 +339,26 @@ class RtorrentClient(DownloadClient):
                     "wall-clock since d.timestamp.finished, not time actually spent seeding -- "
                     "a stopped torrent still accrues (spec §4.3's own canonical example). "
                     "None while incomplete."
+                ),
+            ),
+        },
+    ).overridden(
+        operations={
+            # `Operation.LIST_CATEGORIES` joined the vocabulary 2026-08-23 (spec §2.1, §8.3,
+            # §13.6 new row) -- both baselines declare it `NATIVE` (most torrent clients have a
+            # real, enumerable category/label list), but rTorrent does not: `d.custom1` is a
+            # free-form per-download slot with no closed set of valid values to ask for. The
+            # only honest answer is "labels currently assigned to at least one torrent right
+            # now" (`list_categories` below, deduplicating `d.custom1` off the same
+            # `d.multicall2` the poller already issues) -- `DERIVED`, with a note, same pattern
+            # `Field.SEED_TIME_S` already uses for the identical "the baseline's common case
+            # doesn't hold for this connector" reason (§13.6 #5). Doc-derived, UNVERIFIED.
+            Operation.LIST_CATEGORIES: Capability(
+                Support.DERIVED,
+                note=(
+                    "only labels currently assigned to at least one torrent -- rTorrent has no "
+                    "closed category list to enumerate directly, unlike SABnzbd's configured "
+                    "categories. doc-derived, UNVERIFIED 2026-08-23"
                 ),
             ),
         },
@@ -644,6 +665,19 @@ class RtorrentClient(DownloadClient):
         if not path:
             return []
         return [BasePath(path=path, kind=BasePathKind.WORKING)]
+
+    async def list_categories(self) -> list[str]:
+        """Doc-derived, UNVERIFIED, 2026-08-23 (spec §2.1, §8.3, §13.6 new row): the distinct,
+        non-empty `d.custom1` values off the same `d.multicall2` listing call every other method
+        here already issues -- no separate RPC round trip. **This can only ever report labels
+        currently assigned to at least one torrent**, never rTorrent's full universe of labels
+        ever typed (there is no such list to ask for) -- declared `Support.DERIVED` on
+        `capabilities` above for exactly that reason. Sorted for a stable, deterministic order
+        (a UI rendering these as proposal rows should not reshuffle them between one Test click
+        and the next with no configuration change in between).
+        """
+        transfers = await self._list_all()
+        return sorted({t.category for t in transfers if t.category})
 
     async def free_space(self, path: str) -> SpaceInfo:
         """No generic "free space at an arbitrary path" call exists in rTorrent's own vocabulary

@@ -436,6 +436,38 @@ async def test_list_files_unknown_id_returns_empty_list(fake_sabnzbd_server):
 
 
 # ------------------------------------------------------------------------------------
+# list_categories (spec §2.1, §8.3, joined 2026-08-23) -- doc-derived, UNVERIFIED.
+# ------------------------------------------------------------------------------------
+
+
+async def test_list_categories_returns_configured_names_excluding_the_default_pseudo_category(
+    fake_sabnzbd_server,
+):
+    fake_sabnzbd_server.state.category_names = ["*", "movies", "tv"]
+    client = _client(fake_sabnzbd_server)
+
+    categories = await client.list_categories()
+
+    assert categories == ["movies", "tv"]
+    assert "*" not in categories
+
+
+async def test_list_categories_empty_when_none_configured(fake_sabnzbd_server):
+    fake_sabnzbd_server.state.category_names = ["*"]
+    client = _client(fake_sabnzbd_server)
+
+    assert await client.list_categories() == []
+
+
+async def test_list_categories_bad_api_key_raises_client_authentication_failed(
+    fake_sabnzbd_server,
+):
+    client = _client(fake_sabnzbd_server, api_key="wrong-key")
+    with pytest.raises(ClientAuthenticationFailed):
+        await client.list_categories()
+
+
+# ------------------------------------------------------------------------------------
 # Declared-`NONE` operations -- raise `CapabilityUnavailable` immediately, no network call.
 # ------------------------------------------------------------------------------------
 

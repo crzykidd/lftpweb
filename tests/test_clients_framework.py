@@ -338,6 +338,15 @@ def test_torrent_baseline_differs_from_usenet_baseline_exactly_as_specced():
     assert set(TORRENT_BASELINE.fields) == set(Field)
 
 
+def test_both_baselines_declare_list_categories_native():
+    # spec §5, §2.1 (LIST_CATEGORIES joined the vocabulary 2026-08-23): both baselines start
+    # from "the client can enumerate its own categories" -- a connector without a real, closed
+    # category list (rTorrent) is expected to override this down itself, the same way it
+    # overrides `Field.SEED_TIME_S` down from the baseline's own NATIVE claim (§13.6 #5).
+    assert USENET_BASELINE.operations[Operation.LIST_CATEGORIES].support is Support.NATIVE
+    assert TORRENT_BASELINE.operations[Operation.LIST_CATEGORIES].support is Support.NATIVE
+
+
 def test_overridden_can_raise_support_freely_unlike_narrowed_by():
     # `.overridden` is the authoring-time tool (spec §5) -- unlike `.narrowed_by`, it may raise
     # a key's support, which is exactly what a connector declaring "actually, I have this one

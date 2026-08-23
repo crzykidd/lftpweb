@@ -383,6 +383,10 @@ export interface DownloadClientTestResponse {
   // (detection never runs against a connector that couldn't be reached) and `[]` for a
   // connector that doesn't declare `list_base_paths`, which is not an error either.
   detected_base_paths: DetectedBasePathOut[]
+  // The client's own reported category names (spec §8.3, joined 2026-08-23) -- same "only on a
+  // fresh success" rule as `detected_base_paths`. Unlike a base path, a category has nothing to
+  // SSH-verify, so this is a bare name list rather than a per-entry state.
+  detected_categories: string[]
 }
 
 // --- The disk review scan (docs/download-client-framework-spec.md §11, stage 4 of #18) -----

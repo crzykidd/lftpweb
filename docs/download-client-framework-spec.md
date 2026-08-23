@@ -105,6 +105,7 @@ spellings of the same idea.
 | `list_trackers` | One item's announce hosts | **Its own operation, not a field** — an N-call fetch on qBittorrent and rTorrent, so a caller must be able to decide not to pay for it |
 | `list_files` | One item's file list | |
 | `list_base_paths` | The client's own configured download/complete directories, each with its own role (content vs. working) | **Detected, then SSH-verified, then confirmed** (§8.2) — the connector's own answer proposes both the path and its role; whether lftpweb sees that path at the same spot over SSH is a separate question the settings UI verifies before anything is saved. Never saved on the strength of the client's report alone |
+| `list_categories` | The client's own categories/labels, by name | **Joined the vocabulary 2026-08-23** (§8.3 correction, `prompts/2026-08-23-category-binding-redesign.md`) — `Field.CATEGORY` only ever reports a category *in use* on an existing transfer, so a client with an empty queue and empty history (precisely the fresh-setup case the binding UI is for) reports none. This operation asks the client directly. **Detected, then proposed, then confirmed**, same shape as `list_base_paths` — except there is nothing to SSH-verify, since a category is a name the client owns, not a filesystem path |
 | `free_space` | Free bytes for a path, and total where reported | Transmission is the only one reporting total |
 | `pause` / `resume` | | qBittorrent renamed `pause`→`stop` at 5.0 (§4.2) |
 | `remove` | **Unregister the item, leave the data on disk** | See §11 — this is the only removal verb a connector has |
@@ -266,6 +267,7 @@ ends up with a complete declaration — which is what §6.2's "every key is decl
 | `list_trackers` | **none** — usenet has no trackers | **native** |
 | `list_files` | native | native |
 | `list_base_paths` | native | native |
+| `list_categories` | native | native — **joined 2026-08-23**; both baselines assume a real, enumerable category list (true for most torrent clients too), so a connector without one (rTorrent) is expected to override down itself, same pattern `Field.SEED_TIME_S` already uses |
 | `free_space` | native | native |
 | `pause` / `resume` | native | native |
 | `remove` | native | native |
@@ -508,6 +510,43 @@ inference time specifically; that would make inference a precondition on the con
 answering, which it must never be. §8.2's own detect-then-confirm step already is the place a
 live probe belongs; inference simply reuses whatever base paths that step produced, the same way
 it would read a manually-added one.
+
+### 8.3 correction, 2026-08-23 — the control is redesigned; path arithmetic is now the fallback
+
+**The above was wrong as a *primary* mechanism, and real use proved it within one session**
+(findings #10, #11a-c, `prompts/test-findings-2026-08-23.md`). Path arithmetic is a proxy for the
+category mapping that only ever holds for SABnzbd's `<base>/<category>` layout, and can never
+work for rTorrent, whose `d.custom1` labels have no relationship to any directory. On the live
+test system it also proposed nothing for SAB, because no base path had been configured yet — the
+exact fresh-setup case the binding UI exists for. Compounding it, the free-text category
+`<input>` carried `placeholder="ar-tv"` — greyed text that read as a filled-in recommendation but
+was not a value — and the save silently filtered rows whose `category` was blank, so the user's
+mappings vanished on every edit (#11b/#11c).
+
+**The fix, the user's own design (2026-08-22/23):** `list_categories` (§2.1) joins the operation
+vocabulary. The settings UI now shows one row per category the client actually reports — the
+category name as **text, not an input** — bound to a queue dropdown defaulting to **"— not
+used —"**. A binding is suggested (pre-selected, never placeholder text) when a queue's name or
+the trailing segment of its `remote_path` matches the category. **There is no free-text category
+field anywhere in this control any more** — #11b/#11c's defect class, not merely its symptom, is
+gone: with nothing to type, there is no blank row the save could ever silently drop.
+
+Path-arithmetic inference (this section's original text, above) is **retained only as a labelled
+fallback** for a client that reports no categories at all (a fresh SAB with nothing configured
+yet, an rTorrent with nothing labelled) — it can still propose something from an empty queue,
+where a category list genuinely cannot. The UI states which mechanism produced a row's
+suggestion; the two are never blurred together.
+
+**Two decisions made explicitly, not by default (`docs/decisions.md`, 2026-08-23):**
+
+- **Uncategorised items are never given a bindable pseudo-row.** An rTorrent torrent with no
+  `d.custom1` label, or a SAB item under no category, is simply not attributable — the same
+  silent-omission rule §8.3's own mapping already applies to any unmatched item, not a new
+  exception carved out for "no category."
+- **A category that appears later is surfaced by re-testing, not by a background poll.** Clicking
+  Test while an instance is open in the edit form recomputes its category rows against the
+  freshly detected list immediately; nothing auto-probes on page load, matching §8.2's own
+  base-path detection, which also only ever runs on an explicit Test click.
 
 ---
 
@@ -1060,6 +1099,7 @@ against the real instance. **Nothing here is confirmed; all of it is vendor-doc-
 | 10 | ~~**`test_connection` via `mode=version`**, plus "HTTP 200 even on auth failure, error signalled in the body"~~ **CORRECTED, 2026-08-22, by real use within hours — [#23](https://github.com/crzykidd/lftpweb/issues/23)).** `mode=version` is **unauthenticated**: SAB answers it for any key, so an invalid API key tested as success. `test_connection` now makes two calls: `mode=version` still supplies reachability + the version string (and is still where the redacted capture fires), and a second, authenticated `self._get("queue")` actually validates the key, raising `ClientAuthenticationFailed` on a bad one. The save-on-test *flow* in `api/settings_clients.py` (when a test runs, what blocks a save) was left untouched, per the user's explicit deferral pending the Settings rework — only the connector's own error handling and endpoint choice changed | Corrected and tested; was ranked highest-risk here, and was the first guess reality falsified |
 | 11 | **`get_transfer` left `DERIVED`** (filter the merged list) rather than native by `nzo_id` | Low; §5 already flags this one |
 | 12 | **`tests/fake_sabnzbd.py` inherits every guess above** rather than independently corroborating any of them | This is the §13.2 trap by construction, and why the list exists |
+| 13 | **`list_categories`** via `mode=get_config&section=categories`, reading `config.categories` as a list of `{"name": ...}` dicts, excluding SAB's own `"*"` "Default" pseudo-category (added 2026-08-23, §2.1/§8.3, `prompts/2026-08-23-category-binding-redesign.md`) | Moderate — now load-bearing for the category → queue binding UI's *primary* proposal mechanism, same load-bearing shift `list_base_paths` (row 7) got in the §8.2 correction. A wrong section name or shape means this silently returns `[]`, which the UI reads as "the client reported no categories" and falls back to the (also fallible) path-arithmetic guess rather than erroring loudly |
 
 ### 13.5 The live validation loop
 
@@ -1092,6 +1132,7 @@ one that only misdraws a cosmetic label.
 | 9 | **`d.multicall2`'s leading empty-string "call id" argument** (`("", "main", *commands)`) — copied from common client-library convention, not confirmed against this deployment's rTorrent version | Low. If wrong, the whole listing call fails outright (loud, not silent) rather than returning subtly wrong data |
 | 10 | **`ADDED_AT` reads `d.timestamp.started=`** — vendor docs are ambiguous on whether this timestamp resets when a torrent is restarted/resumed after being fully stopped, which would make it "last started," not "first added" | Low, per spec §13.4 #3's own precedent: a field that turns out to mean something narrower than its name is the safe direction relative to a field silently returning `None` |
 | 11 | **`tests/fake_rtorrent.py` inherits every guess above** rather than independently corroborating any of them | This is the §13.2 trap by construction, and why this list exists |
+| 12 | **`list_categories`** implemented as the distinct, non-empty `d.custom1` values off the same `d.multicall2` listing call every other method already issues, declared `Support.DERIVED` (added 2026-08-23, §2.1/§8.3, `prompts/2026-08-23-category-binding-redesign.md`) | Moderate — inherits guess #4's own uncertainty about whether `d.custom1` genuinely holds ruTorrent's label text on this deployment, one level up: this can only ever report labels *currently in use*, never a closed list, so a deployment with real categories that happen to have nothing currently labelled reports none and the category-binding UI falls back to path arithmetic instead. The inference step is user-confirmed before anything saves, the same backstop guess #4 already leans on |
 
 ---
 

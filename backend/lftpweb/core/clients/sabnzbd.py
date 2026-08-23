@@ -563,6 +563,29 @@ class SabnzbdClient(DownloadClient):
             paths.append(BasePath(path=str(download_dir), kind=BasePathKind.WORKING))
         return paths
 
+    async def list_categories(self) -> list[str]:
+        """Doc-derived, UNVERIFIED, 2026-08-23 (spec §2.1, §8.3, §13.4 new row):
+        `mode=get_config&section=categories`, reading `config.categories`, a list of dicts each
+        carrying a `name`. **`"*"` is excluded on purpose** -- vendor docs describe it as SAB's
+        own "Default" pseudo-category (items with no category assigned still show `cat: "*"` in
+        some SAB versions per the same docs), not a real folder-backed category a queue could
+        ever bind to; including it would offer a binding target that means "everything
+        uncategorized," which is a materially different promise than every other row on this
+        list makes. Tolerant of a missing/malformed `config`/`categories` shape -- returns `[]`
+        rather than raising, same discipline every other doc-derived parser in this module
+        follows.
+        """
+        _, data = await self._get("get_config", section="categories")
+        categories: list[dict[str, Any]] = []
+        if isinstance(data, dict):
+            config = data.get("config")
+            if isinstance(config, dict):
+                candidate = config.get("categories")
+                if isinstance(candidate, list):
+                    categories = [c for c in candidate if isinstance(c, dict)]
+        names = [str(c["name"]) for c in categories if c.get("name")]
+        return [name for name in names if name != "*"]
+
     async def free_space(self, path: str) -> SpaceInfo:
         """`path` is accepted for interface conformance but not used to select a value --
         SABnzbd's `mode=queue` response exposes exactly two numbered pairs (`diskspace1`/

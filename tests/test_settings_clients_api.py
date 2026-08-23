@@ -251,6 +251,43 @@ def test_category_rejects_a_nonexistent_queue_id(isolated_config):
         assert "999" in resp.text
 
 
+def test_unbound_category_survives_a_save_and_a_re_edit(isolated_config):
+    """The #11b regression test from prompts/2026-08-23-category-binding-redesign.md: a category
+    left unbound (`queue_id: None`) must be stored, not silently dropped, and must still be there
+    on a later read -- the round trip, not merely a 2xx from the save. The old free-text control
+    dropped exactly this shape of row because its client-side filter treated an unfilled row as
+    "nothing to save"; the redesigned UI never produces a blank category string in the first
+    place, but the backend contract this asserts is unchanged and is the actual guarantee.
+    """
+    with TestClient(app) as client:
+        resp = client.post(
+            "/api/settings/clients",
+            json=_sab_body(categories=[{"category": "movies", "queue_id": None}]),
+        )
+        assert resp.status_code == 201, resp.text
+        client_id = resp.json()["id"]
+        assert resp.json()["categories"] == [
+            {"id": resp.json()["categories"][0]["id"], "category": "movies", "queue_id": None}
+        ]
+
+        # Re-fetch (simulating a page reload / re-opening Edit) -- the row must still be there.
+        reread = client.get("/api/settings/clients").json()[0]
+        assert reread["id"] == client_id
+        assert len(reread["categories"]) == 1
+        assert reread["categories"][0]["category"] == "movies"
+        assert reread["categories"][0]["queue_id"] is None
+
+        # Saving again (the "re-edit" half of the round trip) with the same unbound row present
+        # must not lose it either.
+        resp = client.put(
+            f"/api/settings/clients/{client_id}",
+            json=_sab_body(categories=[{"category": "movies", "queue_id": None}]),
+        )
+        assert resp.status_code == 200, resp.text
+        assert len(resp.json()["categories"]) == 1
+        assert resp.json()["categories"][0]["queue_id"] is None
+
+
 # --- GET /api/settings/client-types ----------------------------------------------------------
 
 
@@ -500,6 +537,9 @@ class _ProbeClient(DownloadClient):
     async def list_base_paths(self) -> list[BasePath]:
         raise NotImplementedError
 
+    async def list_categories(self) -> list[str]:
+        raise NotImplementedError
+
     async def free_space(self, path: str) -> SpaceInfo:
         raise NotImplementedError
 
@@ -723,6 +763,51 @@ def test_test_connection_detects_sabnzbds_base_paths_as_unverified_with_no_host_
         # Detection proposes; it never saves.
         stored = client.get("/api/settings/clients").json()[0]
         assert stored["base_paths"] == []
+
+
+# --- Category detection on test-connection (spec §8.3, joined 2026-08-23) --------------------
+
+
+def test_test_connection_reports_the_clients_own_categories(isolated_config, fake_sabnzbd_server):
+    fake_sabnzbd_server.state.category_names = ["*", "movies", "tv"]
+    with TestClient(app) as client:
+        resp = client.post("/api/settings/clients", json=_sab_body_for(fake_sabnzbd_server))
+        client_id = resp.json()["id"]
+
+        resp = client.post(f"/api/settings/clients/{client_id}/test")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["ok"] is True
+        assert sorted(body["detected_categories"]) == ["movies", "tv"]
+
+        # Detection proposes; it never saves -- exactly like base paths.
+        stored = client.get("/api/settings/clients").json()[0]
+        assert stored["categories"] == []
+
+
+def test_test_connection_reports_no_categories_when_the_client_has_none_configured(
+    isolated_config, fake_sabnzbd_server
+):
+    fake_sabnzbd_server.state.category_names = ["*"]
+    with TestClient(app) as client:
+        resp = client.post("/api/settings/clients", json=_sab_body_for(fake_sabnzbd_server))
+        client_id = resp.json()["id"]
+
+        resp = client.post(f"/api/settings/clients/{client_id}/test")
+        assert resp.status_code == 200
+        assert resp.json()["detected_categories"] == []
+
+
+def test_a_failed_test_reports_no_detected_categories(isolated_config):
+    with TestClient(app) as client:
+        resp = client.post("/api/settings/clients", json=_probe_body("ok"))
+        client_id = resp.json()["id"]
+        client.put(f"/api/settings/clients/{client_id}", json=_probe_body("unreachable"))
+
+        resp = client.post(f"/api/settings/clients/{client_id}/test")
+        assert resp.status_code == 200
+        assert resp.json()["ok"] is False
+        assert resp.json()["detected_categories"] == []
 
 
 @pytest.mark.skipif(not SEEDBOX_UP, reason=_SEEDBOX_SKIP_REASON)
