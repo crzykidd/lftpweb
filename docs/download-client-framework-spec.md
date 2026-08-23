@@ -973,6 +973,17 @@ message.
 list, produced by the stage 1a build (2026-08-22) and to be worked through once the capture runs
 against the real instance. **Nothing here is confirmed; all of it is vendor-doc-derived.**
 
+> **The list is already earning its keep.** Guess #10 — the one ranked highest-risk — was falsified
+> within hours of the Clients page reaching a real SABnzbd, by a user typing a deliberately bad API
+> key and watching the test pass ([#23](https://github.com/crzykidd/lftpweb/issues/23)). The suite
+> was green throughout, because `tests/fake_sabnzbd.py` encodes the same wrong assumption the
+> connector does. **That is the second occurrence in this repo of the §13.2 failure**, after
+> `IMPORT_EVENT_TYPES = {3}`. The lesson to draw is not "we guessed badly" — it is that a
+> self-authored fixture cannot falsify a self-authored assumption, and that **the remaining eleven
+> rows deserve the same suspicion this one has now earned.** When fixing any of them, correct the
+> fixture *first* and watch the test fail before touching the connector; a fixture edited only to
+> match new code repeats the original mistake exactly.
+
 | # | Guess | Risk if wrong |
 |---|---|---|
 | 1 | **Queue status → phase** groupings: `Queued`/`Grabbing`→`QUEUED`; `Downloading`→`DOWNLOADING`; `Fetching`/`Propagating`/`Verifying`/`QuickCheck`/`Checking`/`Repairing`→`VERIFYING`; `Extracting`/`Moving`/`Running`→`EXTRACTING`; `Paused`→`PAUSED` | Cosmetic-to-moderate. Folding `Repairing`/`Fetching`/`Moving`/`Running` into neighbours is judgment, not observation |
@@ -984,7 +995,7 @@ against the real instance. **Nothing here is confirmed; all of it is vendor-doc-
 | 7 | **`list_base_paths`** via `mode=get_config&section=misc`, reading `complete_dir`/`download_dir` | Moderate → now load-bearing rather than a mere prefill (§8.2 correction, 2026-08-22): a wrong guess here surfaces as a base path the settings UI proposes, which the user must actively confirm (or reject) rather than silently absorbing — the SSH verification step is exactly the guard that turns "is SAB's reported path even valid over SSH" from an unverified guess into something the UI states outright (`verified`/`not_found`/`unverified`) instead of assuming |
 | 8 | **`list_files`** via `mode=get_files&value=<nzo_id>`, tolerant of a bare list or `{"files": [...]}` | Low |
 | 9 | **Action call shapes and the `{"status": …}` contract** — specifically that `{"status": false}` alone means *not found* while `{"status": false, "error": …}` means a real failure | **Highest risk in the connector.** Wrong in one direction turns routine not-found into false errors; wrong in the other lets a real failure pass silently |
-| 10 | **`test_connection` via `mode=version`**, plus "HTTP 200 even on auth failure, error signalled in the body" | High — a bad API key reading as success is a bad first-run experience |
+| 10 | ~~**`test_connection` via `mode=version`**, plus "HTTP 200 even on auth failure, error signalled in the body"~~ **CONFIRMED WRONG, 2026-08-22, by real use within hours — [#23](https://github.com/crzykidd/lftpweb/issues/23).** `mode=version` is **unauthenticated**: SAB answers it for any key, so an invalid API key tests as success. The connector's `{"status": false, "error": …}` detection is fine and would have caught a real rejection; the endpoint simply never rejects. Fix = validate against an authenticated mode (`mode=queue`). **Deferred by the user** pending the Settings rework | Was ranked highest-risk here, and was the first guess reality falsified |
 | 11 | **`get_transfer` left `DERIVED`** (filter the merged list) rather than native by `nzo_id` | Low; §5 already flags this one |
 | 12 | **`tests/fake_sabnzbd.py` inherits every guess above** rather than independently corroborating any of them | This is the §13.2 trap by construction, and why the list exists |
 
