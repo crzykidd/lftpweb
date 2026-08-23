@@ -413,7 +413,7 @@ describe('settleWaitLabel / settleWaitShortLabel', () => {
     vi.useRealTimers()
   })
 
-  const settle = { required_scans: 2, min_age_s: 60 }
+  const settle = { required_scans: 2, min_age_s: 60, client_skip_enabled: true }
 
   it('degrades to a bare label when settle constants are unavailable', () => {
     expect(
@@ -436,9 +436,39 @@ describe('settleWaitLabel / settleWaitShortLabel', () => {
     ).toBe('Waiting for changes -- 1 of 2 scans, 35s of 60s')
   })
 
+  // Finding #5 (2026-08-23, prompts/2026-08-23-tilde-and-visibility.md): "we went into settling
+  // and SAB said nothing" is indistinguishable from the client-verdict skip simply being off
+  // (off by default) -- the full sentence now says so plainly rather than leaving it to infer.
+  it('notes when the client-verdict skip is off', () => {
+    expect(
+      settleWaitLabel(
+        { settle_matched_scans: 1, settle_first_matched_at: '2026-08-13T12:00:00.000Z' },
+        { ...settle, client_skip_enabled: false },
+      ),
+    ).toBe('Waiting for changes -- 1 of 2 scans, 35s of 60s (download-client verdict skip is off)')
+  })
+
+  it('says nothing extra when the client-verdict skip is on', () => {
+    expect(
+      settleWaitLabel(
+        { settle_matched_scans: 1, settle_first_matched_at: '2026-08-13T12:00:00.000Z' },
+        { ...settle, client_skip_enabled: true },
+      ),
+    ).toBe('Waiting for changes -- 1 of 2 scans, 35s of 60s')
+  })
+
   it('renders the short chip form with the same numbers', () => {
     expect(
       settleWaitShortLabel({ settle_matched_scans: 1, settle_first_matched_at: '2026-08-13T12:00:00.000Z' }, settle),
+    ).toBe('Waiting 1/2 · 35s')
+  })
+
+  it('the short chip form never appends the client-skip note (space-constrained; the full sentence survives on hover)', () => {
+    expect(
+      settleWaitShortLabel(
+        { settle_matched_scans: 1, settle_first_matched_at: '2026-08-13T12:00:00.000Z' },
+        { ...settle, client_skip_enabled: false },
+      ),
     ).toBe('Waiting 1/2 · 35s')
   })
 })

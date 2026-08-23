@@ -301,6 +301,12 @@ export interface DetectedBasePathOut {
    * distinct** -- never render an `unverified` path as if it were known to be wrong.
    */
   state: 'verified' | 'not_found' | 'unverified'
+  /** The SSH-home expansion of a `~`/relative `client_path`, pre-filled as a suggestion in the
+   * `not_found`/`unverified` box below -- never applied automatically (finding #1, 2026-08-23:
+   * "give an option in the box with a note ... it appears your ~ path pwd is xxx"). `null` for
+   * an already-absolute `client_path`, or when nothing honest could be offered.
+   */
+  resolved_candidate: string | null
 }
 
 export interface DownloadClientCategoryIn {
@@ -364,6 +370,19 @@ export interface DownloadClientOut {
   categories: DownloadClientCategoryOut[]
   created_at: string
   updated_at: string
+  /** The poller's own last-pass status (migration 029, finding #2, 2026-08-23) -- distinct from
+   * `has_secret`/`capabilities`/`version` above, which reflect the last manual **Test** click,
+   * not what `core.clientsync.ClientSyncScheduler`'s own background pass most recently found.
+   * All four `null` = never actually polled yet (a disabled instance, or one too new for the
+   * poller's next pass) -- never a false "healthy" default. `last_poll_message` is the failure's
+   * own wording ("rejected the configured credential", "unreachable", ...), `null` on success.
+   * `last_success_at` is independent of the other three -- it's the positive "has this instance
+   * ever worked" signal, so a currently-failing instance that worked yesterday still shows when.
+   */
+  last_poll_at: string | null
+  last_poll_ok: boolean | null
+  last_poll_message: string | null
+  last_success_at: string | null
 }
 
 /** `POST /api/settings/clients/{id}/test` -- `capabilities` always reflects whatever is now on
@@ -969,17 +988,30 @@ export interface PreflightGatedQueueOut {
   reason: string
 }
 
+/** One line of the Preflight box's "this client reports items, none attributable" banner
+ * (finding #2, 2026-08-23, prompts/2026-08-23-tilde-and-visibility.md) -- the mount-gate
+ * banner's own shape, applied to a different silent drop: a configured, authenticating, enabled
+ * download-client instance whose category -> queue mapping doesn't cover what it's currently
+ * reporting. `count` is never `0` -- a quiet, fully-attributed client has nothing to say here,
+ * so it simply isn't in the list.
+ */
+export interface PreflightUnattributedClientOut {
+  client_name: string
+  count: number
+}
+
 /** `source_configured=false` (with `rows` always empty in that case) means "no row source is
  * configured at all" -- `components/PreflightBox.tsx` hides the row list for that case rather
  * than showing an empty "Nothing in preflight" that would be meaningless for a user with nothing
- * configured. `gated_queues` is independent of `source_configured` -- the mount gate can block a
- * queue whether or not either row source is configured, so the box itself renders whenever
- * *either* has something to say.
+ * configured. `gated_queues`/`unattributed_clients` are both independent of `source_configured`
+ * -- the mount gate, and an unattributable client, can each have something to say whether or not
+ * either row source is configured, so the box itself renders whenever *any* of the three does.
  */
 export interface PreflightResponse {
   source_configured: boolean
   rows: PreflightRowOut[]
   gated_queues: PreflightGatedQueueOut[]
+  unattributed_clients: PreflightUnattributedClientOut[]
 }
 
 /** `GET /api/jobs/complete` (2026-08-19, docs/transfers-redesign-spec.md §3.2, phase 1 stage

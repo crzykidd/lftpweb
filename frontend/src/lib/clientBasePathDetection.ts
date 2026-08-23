@@ -73,3 +73,17 @@ export function buildAcceptedBasePath(
     source: 'detected',
   }
 }
+
+/** Whether a detected row's own `client_path` is already SSH-visible as written -- `false` for
+ * `~/downloads/rtorrent` or a bare relative path, `true` for `/home/crzykidd/downloads/rtorrent`.
+ * 2026-08-23 (finding #1): **the one guard standing between "Accept anyway" and a `~` literal
+ * ending up in the saved `path` column** -- a `~`/relative path can never be verified by
+ * `core.browse.remote_directory_error`'s literal `stat` (no SFTP server expands `~`), so it can
+ * only ever reach `ClientsTab.tsx` in the `not_found` or `unverified` state; `not_found` already
+ * asks for an SSH-visible equivalent instead of a direct Accept, and this is what makes
+ * `unverified` do the same rather than letting its own "Accept anyway" button hand the literal
+ * `client_path` straight to `buildAcceptedBasePath` as `sshPath`.
+ */
+export function isAbsoluteClientPath(clientPath: string): boolean {
+  return clientPath.startsWith('/')
+}

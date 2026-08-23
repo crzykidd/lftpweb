@@ -20,6 +20,7 @@ import type {
 import {
   acceptedPathFor,
   buildAcceptedBasePath,
+  isAbsoluteClientPath,
   isDetectedRowAccepted,
   type BasePathDraft,
 } from '../../lib/clientBasePathDetection'
@@ -31,6 +32,7 @@ import {
   type CategorySource,
   type QueueForCategorySuggestion,
 } from '../../lib/clientCategoryInference'
+import { formatRelativeTimeIntl } from '../../lib/format'
 import { remoteBrowseDisabled } from '../../lib/pathBrowse'
 import { PathBrowseDialog } from '../../components/PathBrowseDialog'
 
@@ -168,6 +170,42 @@ function useHostForBrowse(): HostOut | null {
   return host
 }
 
+/** The poller's own last-pass outcome for this instance (finding #2, 2026-08-23,
+ * prompts/2026-08-23-tilde-and-visibility.md) -- **not** the Test column above, which reflects
+ * only the last manual click. Before this, an instance whose credential broke after setup looked
+ * exactly as fine on this page as one still working; the only proof was reading the audit log.
+ *
+ * `null` (never polled) is its own grey state, deliberately not defaulted to either "healthy" or
+ * "broken" -- a disabled instance, or one too new for the poller's next pass, has said nothing
+ * yet, which is a third fact. A failing poll is visibly red, and its message is the failure's own
+ * wording (`core.clientsync._FAILURE_VERB`, e.g. "rejected the configured credential") -- never
+ * generic "unreachable" text, so a credential problem reads as that, not as a network problem.
+ * `last_success_at` -- the positive signal this finding also asked for -- surfaces underneath
+ * only while the instance is *currently* failing, so a user can see "it did work, as recently as
+ * X" rather than only "it's broken right now."
+ */
+function ClientPollStatus({ instance }: { instance: DownloadClientOut }) {
+  if (instance.last_poll_at == null) {
+    return <span className="text-zinc-400 dark:text-zinc-600">Never polled</span>
+  }
+  const when = formatRelativeTimeIntl(instance.last_poll_at)
+  if (instance.last_poll_ok) {
+    return <span className="text-emerald-600 dark:text-emerald-400">OK — {when}</span>
+  }
+  return (
+    <div className="flex flex-col gap-0.5">
+      <span className="text-red-600 dark:text-red-400">
+        {instance.last_poll_message ?? 'failed'} — {when}
+      </span>
+      {instance.last_success_at != null && (
+        <span className="text-xs text-zinc-400 dark:text-zinc-600">
+          Last worked {formatRelativeTimeIntl(instance.last_success_at)}
+        </span>
+      )}
+    </div>
+  )
+}
+
 function CapabilityRowView({ row }: { row: CapabilityRow }) {
   const dotClasses =
     row.support === 'native'
@@ -300,8 +338,19 @@ function DetectedBasePathRow({
     return (
       <li className="flex flex-col gap-1">
         <span className="text-xs text-amber-700 dark:text-amber-400">
-          Reports <span className="font-mono">{row.client_path}</span> ({kindLabel}), which doesn't
-          exist over SSH. Which path is it here?
+          {row.resolved_candidate != null ? (
+            <>
+              Reports <span className="font-mono">{row.client_path}</span> ({kindLabel}), which
+              doesn't exist over SSH as written. It looks like your SSH home makes this{' '}
+              <span className="font-mono">{row.resolved_candidate}</span> — check it and Add, or
+              Browse…
+            </>
+          ) : (
+            <>
+              Reports <span className="font-mono">{row.client_path}</span> ({kindLabel}), which
+              doesn't exist over SSH. Which path is it here?
+            </>
+          )}
         </span>
         <div className="flex gap-2">
           <input
@@ -325,7 +374,50 @@ function DetectedBasePathRow({
     )
   }
 
-  // unverified -- never presented as a failure.
+  // unverified -- never presented as a failure. A `~`/relative `client_path` still needs its
+  // SSH-visible equivalent supplied explicitly here too (finding #1's own constraint: "a `~`
+  // path must never be what gets stored") -- `remote_directory_error`'s literal stat can never
+  // verify one, so it can only ever arrive in this state or `not_found`, and "Accept anyway"
+  // must not be the back door that lets the literal `~` string through as the saved `path`.
+  if (!isAbsoluteClientPath(row.client_path)) {
+    return (
+      <li className="flex flex-col gap-1">
+        <span className={hintClasses}>
+          Reports <span className="font-mono">{row.client_path}</span> ({kindLabel}) —
+          lftpweb couldn't check this path, and it isn't SSH-visible as written.
+          {row.resolved_candidate != null ? (
+            <>
+              {' '}
+              It looks like your SSH home makes this{' '}
+              <span className="font-mono">{row.resolved_candidate}</span> — check it and Add, or
+              Browse…
+            </>
+          ) : (
+            ' Which path is it here?'
+          )}
+        </span>
+        <div className="flex gap-2">
+          <input
+            className={inputClasses}
+            value={notFoundDraft}
+            onChange={(e) => onNotFoundDraftChange(e.target.value)}
+            placeholder="/home/user/downloads/complete"
+          />
+          <button
+            type="button"
+            onClick={() => onAccept(notFoundDraft)}
+            className={secondaryButtonClasses}
+          >
+            Add
+          </button>
+          <button type="button" onClick={onBrowse} className={secondaryButtonClasses}>
+            Browse…
+          </button>
+        </div>
+      </li>
+    )
+  }
+
   return (
     <li className="flex items-center gap-2">
       <span className="font-mono text-xs">
@@ -690,6 +782,7 @@ export function ClientsTab() {
               <th className="px-3 py-2 font-medium">Enabled</th>
               <th className="px-3 py-2 font-medium">Base paths</th>
               <th className="px-3 py-2 font-medium">Categories</th>
+              <th className="px-3 py-2 font-medium">Last poll</th>
               <th className="px-3 py-2 font-medium">Test</th>
               <th className="px-3 py-2" />
             </tr>
@@ -697,7 +790,7 @@ export function ClientsTab() {
           <tbody>
             {instances.length === 0 && (
               <tr>
-                <td colSpan={7} className="px-3 py-4 text-center text-zinc-400">
+                <td colSpan={8} className="px-3 py-4 text-center text-zinc-400">
                   No instances yet.
                 </td>
               </tr>
@@ -712,6 +805,9 @@ export function ClientsTab() {
                   <td className="px-3 py-2">{instance.enabled ? 'yes' : 'no'}</td>
                   <td className="px-3 py-2 text-xs">{instance.base_paths.length}</td>
                   <td className="px-3 py-2 text-xs">{instance.categories.length}</td>
+                  <td className="px-3 py-2 text-xs">
+                    <ClientPollStatus instance={instance} />
+                  </td>
                   <td className="px-3 py-2">
                     <div className="flex flex-col gap-1">
                       <button
@@ -765,7 +861,9 @@ export function ClientsTab() {
                                   key={row.client_path}
                                   row={row}
                                   basePaths={draftBasePaths}
-                                  notFoundDraft={notFoundDrafts[draftKey] ?? ''}
+                                  notFoundDraft={
+                                    notFoundDrafts[draftKey] ?? row.resolved_candidate ?? ''
+                                  }
                                   onNotFoundDraftChange={(value) =>
                                     setNotFoundDrafts((prev) => ({ ...prev, [draftKey]: value }))
                                   }

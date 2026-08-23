@@ -130,6 +130,36 @@ function GatedQueueBanner({ gated }: { gated: PreflightResponse['gated_queues'] 
   )
 }
 
+/** The unattributed-clients banner (finding #2, 2026-08-23,
+ * prompts/2026-08-23-tilde-and-visibility.md) -- `GatedQueueBanner`'s own shape (one line per
+ * affected thing, never one row per dropped item), applied to a different silent drop: a
+ * configured, authenticating, enabled download-client instance whose category -> queue mapping
+ * doesn't cover what it's currently reporting. Before this, that client contributed nothing here
+ * and said nothing anywhere -- indistinguishable from broken. A separate box from
+ * `GatedQueueBanner` above (a different amber fact, named as its own thing) rather than merged
+ * into it -- "this queue is blocked" and "this client's items aren't reaching any queue" are
+ * different problems with different fixes (a mount, vs. Settings -> Clients' own category
+ * mapping), and folding them into one list would blur which fix applies to which line.
+ */
+function UnattributedClientBanner({
+  unattributed,
+}: {
+  unattributed: PreflightResponse['unattributed_clients']
+}) {
+  if (unattributed.length === 0) return null
+  return (
+    <div className="flex flex-col gap-1 rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-xs text-amber-900 dark:border-amber-800 dark:bg-amber-950 dark:text-amber-200">
+      {unattributed.map((u) => (
+        <p key={u.client_name}>
+          <span className="font-semibold">{u.client_name}:</span> reports {u.count}{' '}
+          {u.count === 1 ? 'item' : 'items'}, none attributable to a queue — check its category →
+          queue mapping in Settings → Integrations → API Clients.
+        </p>
+      ))}
+    </div>
+  )
+}
+
 /** The Queue tab's third, small box (docs/transfers-redesign-spec.md §4, prefigured; this task's
  * own handoff prompt, prompts/done/2026-08-20-preflight-box.md, plus its follow-ups
  * prompts/2026-08-20-preflight-waiting-sources.md and
@@ -138,12 +168,14 @@ function GatedQueueBanner({ gated }: { gated: PreflightResponse['gated_queues'] 
  * first in the pipeline. `TransfersPage.tsx` feeds this `usePreflight()`'s return value directly,
  * unchanged.
  *
- * **Hidden entirely while `response` hasn't loaded yet, or neither `source_configured` nor
- * `gated_queues` has anything to say** -- the first task's own explicit case (with no row source
- * configured anywhere, "Nothing in preflight" would be permanently true and meaningless)
- * widened, not replaced, by the mount-gate banner: a queue can be mount-gated whether or not
- * either row source is configured, so the box exists whenever *either* half has something to
- * show, and stays gone for a user with neither.
+ * **Hidden entirely while `response` hasn't loaded yet, or none of `source_configured`,
+ * `gated_queues`, or `unattributed_clients` has anything to say** -- the first task's own
+ * explicit case (with no row source configured anywhere, "Nothing in preflight" would be
+ * permanently true and meaningless) widened twice since: once by the mount-gate banner (a queue
+ * can be mount-gated whether or not either row source is configured) and again by the
+ * unattributed-clients banner (finding #2, 2026-08-23 -- an unattributable client can have
+ * something to say under the identical reasoning), so the box exists whenever *any* of the three
+ * has something to show, and stays gone only when none do.
  *
  * **Scales to its content, not to a reserved row count** -- zero rows collapses to the header
  * plus one line ("Nothing in preflight."), never a page's worth of empty space; the row list
@@ -189,7 +221,12 @@ export function PreflightBox({ response }: { response: PreflightResponse | undef
   }, [])
 
   if (response == null) return null
-  if (!response.source_configured && response.gated_queues.length === 0) return null
+  if (
+    !response.source_configured &&
+    response.gated_queues.length === 0 &&
+    response.unattributed_clients.length === 0
+  )
+    return null
 
   const rows = response.rows
   const count = pageCount(rows.length, pageSize)
@@ -202,6 +239,7 @@ export function PreflightBox({ response }: { response: PreflightResponse | undef
       </h2>
 
       <GatedQueueBanner gated={response.gated_queues} />
+      <UnattributedClientBanner unattributed={response.unattributed_clients} />
 
       {/* The row list only exists when a row source is actually configured -- a queue can be
        * mount-gated (the banner above) whether or not either source is, and "Nothing in

@@ -75,6 +75,10 @@ function instance(overrides: Partial<DownloadClientOut> = {}): DownloadClientOut
     categories: [],
     created_at: '2026-08-01T00:00:00Z',
     updated_at: '2026-08-01T00:00:00Z',
+    last_poll_at: null,
+    last_poll_ok: null,
+    last_poll_message: null,
+    last_success_at: null,
     ...overrides,
   }
 }
@@ -319,6 +323,186 @@ describe('ClientsTab', () => {
 
     expect(container.textContent).toContain('guessed from your')
     expect(container.textContent).toContain('ar-tv')
+
+    root.unmount()
+  })
+
+  // Finding #1 (prompts/2026-08-23-tilde-and-visibility.md): a `~`-reported base path is offered
+  // as a pre-filled, explained suggestion -- never applied automatically.
+
+  it('pre-fills a not_found tilde path with its resolved SSH-home candidate and explains it', async () => {
+    mockListClientTypes.mockResolvedValue([USENET_TYPE])
+    mockListClientInstances.mockResolvedValue([instance()])
+    mockTestClientInstance.mockResolvedValue({
+      ok: true,
+      error_class: null,
+      message: 'connected',
+      version: '0.9.8',
+      capabilities: { operations: {}, fields: {} },
+      detected_base_paths: [
+        {
+          client_path: '~/downloads/rtorrent',
+          kind: 'working',
+          state: 'not_found',
+          resolved_candidate: '/home/crzykidd/downloads/rtorrent',
+        },
+      ],
+      detected_categories: [],
+    })
+    const root = await mount(container)
+
+    const testButton = Array.from(container.querySelectorAll('button')).find(
+      (b) => b.textContent === 'Test',
+    )
+    await act(async () => {
+      testButton?.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    })
+    await act(async () => {
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+
+    expect(container.textContent).toContain('It looks like your SSH home makes this')
+    expect(container.textContent).toContain('/home/crzykidd/downloads/rtorrent')
+    const input = Array.from(container.querySelectorAll('input')).find(
+      (el) => el.value === '/home/crzykidd/downloads/rtorrent',
+    )
+    expect(input).toBeDefined()
+
+    root.unmount()
+  })
+
+  it('never offers a direct Accept for an unverified non-absolute client_path', async () => {
+    // A `~`/relative path can only ever reach `not_found` or `unverified` -- never `verified`,
+    // since no SFTP server expands `~` for the literal stat. "Accept anyway" handing the raw
+    // `client_path` straight through as the saved path would be exactly the leak finding #1's
+    // own constraint forbids ("a `~` path must never be what gets stored").
+    mockListClientTypes.mockResolvedValue([USENET_TYPE])
+    mockListClientInstances.mockResolvedValue([instance()])
+    mockTestClientInstance.mockResolvedValue({
+      ok: true,
+      error_class: null,
+      message: 'connected',
+      version: '0.9.8',
+      capabilities: { operations: {}, fields: {} },
+      detected_base_paths: [
+        {
+          client_path: '~/downloads/rtorrent',
+          kind: 'working',
+          state: 'unverified',
+          resolved_candidate: null,
+        },
+      ],
+      detected_categories: [],
+    })
+    const root = await mount(container)
+
+    const testButton = Array.from(container.querySelectorAll('button')).find(
+      (b) => b.textContent === 'Test',
+    )
+    await act(async () => {
+      testButton?.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    })
+    await act(async () => {
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+
+    const acceptAnyway = Array.from(container.querySelectorAll('button')).find(
+      (b) => b.textContent === 'Accept anyway',
+    )
+    expect(acceptAnyway).toBeUndefined()
+    expect(container.textContent).toContain("isn't SSH-visible as written")
+    const addButtons = Array.from(container.querySelectorAll('button')).filter(
+      (b) => b.textContent === 'Add',
+    )
+    expect(addButtons.length).toBeGreaterThan(0)
+
+    root.unmount()
+  })
+
+  it('still offers a direct Accept for an unverified already-absolute client_path', async () => {
+    mockListClientTypes.mockResolvedValue([USENET_TYPE])
+    mockListClientInstances.mockResolvedValue([instance()])
+    mockTestClientInstance.mockResolvedValue({
+      ok: true,
+      error_class: null,
+      message: 'connected',
+      version: '0.9.8',
+      capabilities: { operations: {}, fields: {} },
+      detected_base_paths: [
+        {
+          client_path: '/data/complete',
+          kind: 'content',
+          state: 'unverified',
+          resolved_candidate: null,
+        },
+      ],
+      detected_categories: [],
+    })
+    const root = await mount(container)
+
+    const testButton = Array.from(container.querySelectorAll('button')).find(
+      (b) => b.textContent === 'Test',
+    )
+    await act(async () => {
+      testButton?.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    })
+    await act(async () => {
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+
+    const acceptAnyway = Array.from(container.querySelectorAll('button')).find(
+      (b) => b.textContent === 'Accept anyway',
+    )
+    expect(acceptAnyway).toBeDefined()
+
+    root.unmount()
+  })
+
+  // Finding #2 (prompts/2026-08-23-tilde-and-visibility.md): the Clients row shows the poller's
+  // own last-pass outcome, not just the last manual Test click.
+
+  it('shows "Never polled" for an instance the poller has not reached yet', async () => {
+    mockListClientTypes.mockResolvedValue([USENET_TYPE])
+    mockListClientInstances.mockResolvedValue([instance()])
+    const root = await mount(container)
+
+    expect(container.textContent).toContain('Never polled')
+
+    root.unmount()
+  })
+
+  it('shows a green OK status for a successful last poll', async () => {
+    mockListClientTypes.mockResolvedValue([USENET_TYPE])
+    mockListClientInstances.mockResolvedValue([
+      instance({ last_poll_at: '2026-08-23T12:00:00.000000Z', last_poll_ok: true }),
+    ])
+    const root = await mount(container)
+
+    expect(container.textContent).toContain('OK')
+    expect(container.textContent).not.toContain('Never polled')
+
+    root.unmount()
+  })
+
+  it('shows a red failure status with the failure kind\'s own message, and when it last worked', async () => {
+    mockListClientTypes.mockResolvedValue([USENET_TYPE])
+    mockListClientInstances.mockResolvedValue([
+      instance({
+        last_poll_at: '2026-08-23T12:00:00.000000Z',
+        last_poll_ok: false,
+        last_poll_message: 'rejected the configured credential',
+        last_success_at: '2026-08-22T12:00:00.000000Z',
+      }),
+    ])
+    const root = await mount(container)
+
+    expect(container.textContent).toContain('rejected the configured credential')
+    // Never rendered as generic "unreachable" text for a credential failure.
+    expect(container.textContent).not.toContain('unreachable')
+    expect(container.textContent).toContain('Last worked')
 
     root.unmount()
   })

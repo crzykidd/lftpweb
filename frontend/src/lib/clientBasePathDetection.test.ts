@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import {
   acceptedPathFor,
   buildAcceptedBasePath,
+  isAbsoluteClientPath,
   isDetectedRowAccepted,
   type BasePathDraft,
 } from './clientBasePathDetection'
@@ -106,5 +107,22 @@ describe('isDetectedRowAccepted / acceptedPathFor', () => {
     expect(isDetectedRowAccepted({ client_path: '/complete' }, draft)).toBe(true)
     expect(draft).toContainEqual(manualRow) // untouched
     expect(draft).toHaveLength(2) // nothing duplicated, nothing removed
+  })
+})
+
+// 2026-08-23, finding #1 -- the guard that keeps "Accept anyway" (the `unverified` state's own
+// direct-accept button) from ever handing a literal `~`/relative `client_path` to
+// `buildAcceptedBasePath` as `sshPath`, which is the one thing this whole task exists to prevent.
+describe('isAbsoluteClientPath', () => {
+  it('is true for an SSH-visible absolute path', () => {
+    expect(isAbsoluteClientPath('/home/crzykidd/downloads/rtorrent')).toBe(true)
+  })
+
+  it('is false for a `~`-relative path', () => {
+    expect(isAbsoluteClientPath('~/downloads/rtorrent')).toBe(false)
+  })
+
+  it('is false for a bare relative path', () => {
+    expect(isAbsoluteClientPath('downloads/rtorrent')).toBe(false)
   })
 })

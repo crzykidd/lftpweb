@@ -152,7 +152,9 @@ describe('preflightChipTooltip', () => {
         },
         { enabled: true, client_skip_enabled: false, required_scans: 2, min_age_s: 60 },
       ),
-    ).toMatch(/^Waiting for changes -- 1 of 2 scans, \d+s of 60s$/)
+      // `client_skip_enabled: false` here -- `lib/format.ts.settleWaitLabel`'s own note
+      // (finding #5, 2026-08-23) rides along on this shared tooltip too.
+    ).toMatch(/^Waiting for changes -- 1 of 2 scans, \d+s of 60s \(download-client verdict skip is off\)$/)
   })
 
   it('degrades to the bare sentence for a settle row with no progress yet', () => {

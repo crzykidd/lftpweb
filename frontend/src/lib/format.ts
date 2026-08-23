@@ -351,6 +351,12 @@ interface SettleProgressNode {
 interface SettleConstants {
   required_scans: number
   min_age_s: number
+  // 2026-08-23, finding #5 ("we went into settling and SAB said nothing ... indistinguishable
+  // from the settle-gate skip simply being off"): carried here so `settleWaitLabel` can say so
+  // itself, wherever settling is surfaced, rather than leaving the user to infer it. Any caller
+  // passing the full `SettleSettingsOut` (every one of them, today) already satisfies this
+  // structurally -- no call site needs to change to pick it up.
+  client_skip_enabled: boolean
 }
 
 /** `settle` is `null` before `getSettleSettings()`'s one site-wide fetch resolves
@@ -358,6 +364,13 @@ interface SettleConstants {
  * `_first_matched_at` are `null` whenever `core/itemview.py.item_view` didn't have both a join
  * match and `substate === 'settling'` for this row. Either way this degrades to the bare label
  * rather than showing a stale or fabricated count -- never blocks the row from rendering.
+ *
+ * Appends "(download-client verdict skip is off)" whenever `client_skip_enabled` is `false` --
+ * off by default (`core/settle.py.SettleSettings.client_skip_enabled`'s own docstring), so this
+ * is what a user watching an item settle sees on *most* installs. Without it, "SAB just finished
+ * and we're still settling" reads as lftpweb ignoring the client's own report; with it, the same
+ * wait states plainly why. Only on the full sentence, not `settleWaitShortLabel` below -- that
+ * one is already space-constrained and the full sentence survives on hover regardless.
  */
 export function settleWaitLabel(node: SettleProgressNode, settle: SettleConstants | null): string {
   if (settle == null || node.settle_matched_scans == null || node.settle_first_matched_at == null) {
@@ -367,10 +380,10 @@ export function settleWaitLabel(node: SettleProgressNode, settle: SettleConstant
     0,
     Math.floor((Date.now() - new Date(node.settle_first_matched_at).getTime()) / 1000),
   )
-  return (
+  const base =
     `Waiting for changes -- ${node.settle_matched_scans} of ${settle.required_scans} scans, ` +
     `${elapsedS}s of ${Math.round(settle.min_age_s)}s`
-  )
+  return settle.client_skip_enabled ? base : `${base} (download-client verdict skip is off)`
 }
 
 /** The Status chip's own in-cell text (2026-08-13, prompts/2026-08-13-resizable-file-
