@@ -597,13 +597,17 @@ class ClientSyncScheduler:
         # the plain hold-then-expire path rather than `core/arrsync.py`'s active eviction.
         hold.update(seen, now=now)
 
-    def unattributed_clients(self, enabled_instance_ids: frozenset[int]) -> list[tuple[str, int]]:
+    def unattributed_clients(
+        self, enabled_instance_ids: frozenset[int]
+    ) -> list[tuple[int, str, int]]:
         """Finding #2 (2026-08-23): "a client with no category -> queue mapping contributes
-        nothing, silently" -- one `(instance_name, count)` entry per currently-enabled instance
-        whose most recent pass saw at least one Preflight-eligible-phase transfer it could not
-        attribute to any queue. `api/jobs.py.get_preflight` turns this into the Preflight box's
-        own banner, the mount-gate banner's own shape (one line per affected client, never one
-        row per dropped item).
+        nothing, silently" -- one `(instance_id, instance_name, count)` entry per currently-enabled
+        instance whose most recent pass saw at least one Preflight-eligible-phase transfer it
+        could not attribute to any queue. `api/jobs.py.get_preflight` turns this into the
+        Preflight box's own banner, the mount-gate banner's own shape (one line per affected
+        client, never one row per dropped item). `instance_id` (finding #13, 2026-08-23) rides
+        along so that banner line can deep-link straight to this specific instance rather than
+        naming a settings path for the user to navigate by hand.
 
         **`0` is never included.** A client currently contributing nothing because it genuinely
         has nothing incoming right now is not the same fact as one silently dropping real items,
@@ -616,12 +620,16 @@ class ClientSyncScheduler:
         catch an instance with *no* such mapping at all, so the caller must pass every enabled
         instance id, mapped or not.
         """
-        out: list[tuple[str, int]] = []
+        out: list[tuple[int, str, int]] = []
         for instance_id in enabled_instance_ids:
             count = self._unattributed_counts.get(instance_id, 0)
             if count > 0:
                 out.append(
-                    (self._instance_names.get(instance_id, f"instance {instance_id}"), count)
+                    (
+                        instance_id,
+                        self._instance_names.get(instance_id, f"instance {instance_id}"),
+                        count,
+                    )
                 )
         return out
 

@@ -301,7 +301,9 @@ def test_unattributed_client_shows_a_banner_line_with_its_count(isolated_config)
 
         resp = client.get("/api/queue/preflight")
         body = resp.json()
-        assert body["unattributed_clients"] == [{"client_name": "SABnzbd", "count": 3}]
+        assert body["unattributed_clients"] == [
+            {"client_id": instance_id, "client_name": "SABnzbd", "count": 3}
+        ]
 
 
 def test_a_quiet_client_never_appears_in_the_unattributed_banner(isolated_config):

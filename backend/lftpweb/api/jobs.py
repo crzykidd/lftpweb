@@ -934,8 +934,8 @@ async def get_preflight(request: Request) -> PreflightResponse:
         gated_queues=gated_queues,
         unattributed_clients=sorted(
             (
-                PreflightUnattributedClientOut(client_name=name, count=count)
-                for name, count in unattributed_clients
+                PreflightUnattributedClientOut(client_id=cid, client_name=name, count=count)
+                for cid, name, count in unattributed_clients
             ),
             key=lambda u: u.client_name.casefold(),
         ),

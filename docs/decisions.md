@@ -6,6 +6,75 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-23 — category control legibility + the banner deep link (findings #13/#14)
+
+`prompts/done/2026-08-23-category-control-and-banner-link.md`. Two presentation-layer fixes on
+top of the category-binding redesign (#10/#11c) and the unattributed-clients banner (#2), both
+confirmed against real evidence rather than guessed from the reported text.
+
+**#14b's fix is scoped to this one control, not to `inputClasses`.** The crushed-chip bug
+(screenshot-confirmed: the row rendered as a one-character sliver, a full-width `<select>`, then
+`Remove`) was `inputClasses`'s own `w-full` winning against the category chip's `flex-1
+truncate` inside a `flex` row. `inputClasses` is shared by every other input on the page and they
+depend on `w-full` filling their own (non-flex-row) container, so the fix is a fixed-width
+wrapper (`<span className="w-48 shrink-0">`) around the `<select>` in `ClientsTab.tsx`, not a
+change to the shared constant or a Tailwind class-order gamble (two same-property utility
+classes on one element are resolved by generated CSS order, not source order, which is not
+something to rely on for a fix this size).
+
+**"Remove" is now conditional on staleness, computed presentationally, not by widening
+`CategoryRowDraft`.** A category the client still reports can only ever be left unbound (#14c) --
+`Remove` there would just make the row reappear on the next Test. Rather than adding a `stale`
+field to `CategoryRowDraft` (which would have broken several `toEqual` exact-object assertions in
+`clientCategoryInference.test.ts` for no real benefit), staleness is a new pure function,
+`isStaleCategoryRow(category, detectedCategories)`, computed at render time in `ClientsTab.tsx`
+from `testResults[editingId]?.detected_categories` -- exactly the same signal `computeCategoryRows`
+itself uses to decide the row set, just not persisted onto the row shape. `detectedCategories ===
+null` (never tested this session) reports every row as non-stale, since staleness genuinely can't
+be known from nothing.
+
+**Decision: reword the hint, don't persist detected categories.** The screenshot showed "Test the
+connection above to see this client's own categories" rendered while editing a saved instance
+whose rows were already on screen -- true categories from a prior save, not something the
+instruction implied hadn't happened yet. Persisting the last-detected set per instance (a new
+column/table, a migration, write-path changes in `core/clients/detection.py` and
+`api/settings_clients.py`) is real backend work disproportionate to what's actually broken here,
+which is a wording problem: the rows shown are already correct, they just needed to say so.
+`describeCategorySource` gained an optional third parameter, `hasSavedRows` (default `false`, so
+every existing two-argument call site is unchanged), and the `'none'`+`null` branch now reads
+"Showing the categories saved with this instance. Test the connection above to refresh them from
+the client directly" whenever the form already has rows to show.
+
+**#13's deep link required widening a tuple/model the finding's own prose assumed was already
+wide enough.** The handoff prompt states "the banner already carries the client's id and name" --
+untrue at the time: `ClientSyncScheduler.unattributed_clients` returned `list[tuple[str, int]]`
+(name, count only) and `PreflightUnattributedClientOut` had no `client_id` field. Threaded
+`client_id` through the whole chain instead of stopping at "carries a name": the scheduler method
+now returns `(instance_id, instance_name, count)`, the Pydantic model gained `client_id: int`, and
+`api/jobs.py`'s comprehension passes it through. The frontend banner is now a real `<Link
+to={clientEditHref(u.client_id)}>` (`lib/clientEditLink.ts`, `eventsLink.ts`'s own
+href-builder/parser shape) rather than prose naming a path.
+
+**The deep link opens edit mode, not just the tab.** `ClientsTab.tsx` reads `?edit=<id>` via
+`useSearchParams` (adding the first `react-router-dom` hook to this component, which meant every
+existing `ClientsTab.test.tsx` mount now needs a `MemoryRouter` wrapper -- `useSearchParams`
+throws outside a Router context) once instances have loaded, calls its own `startEdit`, then
+clears the param immediately (`setSearchParams({}, { replace: true })`) so a reload or the back
+button doesn't reopen it a second time. An id that matches nothing (a deleted instance, a
+hand-edited URL) degrades to just clearing the param, never a crash.
+
+**The second occurrence of the same wrong breadcrumb, found by the grep the finding itself asked
+for:** `TransferTab.tsx`'s settle-skip help text also named "Settings → Integrations → API
+Clients." Corrected to "Settings → Clients" in the same commit -- it isn't a link (this is plain
+help text, not a per-instance deep link), just the right tab name.
+
+**Generating nav copy from `nav.ts` was considered and deferred, not built.** After this fix,
+there is exactly one remaining hand-written breadcrumb string in the whole frontend (the corrected
+`TransferTab.tsx` line) -- the banner itself no longer names a path at all, it links. Building a
+generator (a lookup from tab path to label, threaded through every place that might want to name a
+settings tab in prose) to guard a single remaining string is more machinery than the problem left
+behind justifies; noted for reconsideration only if a third instance of this class of bug shows up.
+
 ## 2026-08-23 — a short delay after a client reports completion, before queuing (finding #9)
 
 `prompts/done/2026-08-23-client-completion-delay.md`. Stage 2b's settle-gate skip

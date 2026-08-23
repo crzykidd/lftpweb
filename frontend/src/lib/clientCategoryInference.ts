@@ -166,10 +166,19 @@ export function computeCategoryRows(
 /** The one-line explanation of *why* these rows are what they are (finding #11a: "the section
  * has no explanatory text, and the concept is genuinely non-obvious"; #10: "the empty result
  * must explain itself"). Never blur which mechanism produced a suggestion.
+ *
+ * `hasSavedRows` (finding #14, 2026-08-23) distinguishes two different reasons `source === 'none'
+ * && detectedCategories == null` can be true: a genuinely fresh instance nobody has tested yet
+ * (nothing to show, "Test... to see"), versus re-opening a *saved* instance for edit in a session
+ * that hasn't re-tested it -- the screenshot evidence for this finding. The rows on screen in the
+ * second case are real, previously-detected categories (`startEdit` hydrates them from what was
+ * saved), not something the instruction "Test the connection above" implies the user hasn't done
+ * yet. Defaults to `false` so every existing two-argument call site keeps its prior behaviour.
  */
 export function describeCategorySource(
   source: CategorySource,
   detectedCategories: string[] | null,
+  hasSavedRows: boolean = false,
 ): string {
   if (source === 'client') {
     return 'These categories come directly from this client.'
@@ -181,7 +190,24 @@ export function describeCategorySource(
     )
   }
   if (detectedCategories == null) {
-    return 'Test the connection above to see this client’s own categories.'
+    return hasSavedRows
+      ? 'Showing the categories saved with this instance. Test the connection above to refresh them from the client directly.'
+      : 'Test the connection above to see this client’s own categories.'
   }
   return 'This client reported no categories, and nothing could be guessed from your base paths.'
+}
+
+/** Whether a category row is "stale" -- a saved mapping for a category the client no longer
+ * reports (finding #14c, 2026-08-23: "computeCategoryRows deliberately preserves a stored
+ * mapping for a category the client no longer reports... that is the only case where Remove is
+ * meaningful"). A category the client still reports can only ever be left unbound in the UI --
+ * removing it would just make the row reappear on the next Test, since `computeCategoryRows`
+ * rebuilds one row per currently-reported category unconditionally.
+ *
+ * `detectedCategories === null` means "never tested this session" -- staleness genuinely can't
+ * be determined from nothing, so every row reports `false` in that state rather than guessing.
+ */
+export function isStaleCategoryRow(category: string, detectedCategories: string[] | null): boolean {
+  if (detectedCategories == null) return false
+  return !detectedCategories.includes(category)
 }

@@ -1019,9 +1019,12 @@ export interface PreflightGatedQueueOut {
  * banner's own shape, applied to a different silent drop: a configured, authenticating, enabled
  * download-client instance whose category -> queue mapping doesn't cover what it's currently
  * reporting. `count` is never `0` -- a quiet, fully-attributed client has nothing to say here,
- * so it simply isn't in the list.
+ * so it simply isn't in the list. `client_id` (finding #13, 2026-08-23) lets the banner deep-link
+ * straight to this specific instance in Settings -> Clients (`lib/clientEditLink.ts`) rather than
+ * naming a settings path for the user to navigate by hand.
  */
 export interface PreflightUnattributedClientOut {
+  client_id: number
   client_name: string
   count: number
 }

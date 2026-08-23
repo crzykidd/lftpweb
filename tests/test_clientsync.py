@@ -423,7 +423,7 @@ async def test_unattributed_clients_reports_a_client_with_items_but_no_mapping(
     scheduler = ClientSyncScheduler(db=db, config_dir=str(tmp_path))
     await scheduler.run_once(now=NOW0)
     assert scheduler.preflight_rows(frozenset({instance_id})) == []
-    assert scheduler.unattributed_clients(frozenset({instance_id})) == [("SABnzbd", 2)]
+    assert scheduler.unattributed_clients(frozenset({instance_id})) == [(instance_id, "SABnzbd", 2)]
 
 
 async def test_unattributed_clients_omits_a_client_with_nothing_unattributable(
@@ -463,7 +463,7 @@ async def test_unattributed_clients_ignores_an_instance_not_in_the_enabled_set(
     scheduler = ClientSyncScheduler(db=db, config_dir=str(tmp_path))
     await scheduler.run_once(now=NOW0)
     assert scheduler.unattributed_clients(frozenset()) == []
-    assert scheduler.unattributed_clients(frozenset({instance_id})) == [("SABnzbd", 1)]
+    assert scheduler.unattributed_clients(frozenset({instance_id})) == [(instance_id, "SABnzbd", 1)]
 
 
 # --- Per-pass poll status (finding #2's reinforcing observation, 2026-08-23) ----------------

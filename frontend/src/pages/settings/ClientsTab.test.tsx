@@ -1,5 +1,6 @@
 import { act } from 'react'
 import { createRoot } from 'react-dom/client'
+import { MemoryRouter } from 'react-router-dom'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   getHost,
@@ -83,10 +84,17 @@ function instance(overrides: Partial<DownloadClientOut> = {}): DownloadClientOut
   }
 }
 
-async function mount(container: HTMLDivElement) {
+// `MemoryRouter` (`WhatsNewDialog.test.tsx`'s own idiom) -- `ClientsTab` reads `useSearchParams`
+// now (finding #13's deep link), which throws outside a Router context. `initialEntries` lets a
+// test exercise the `?edit=<id>` deep link itself without a real browser location.
+async function mount(container: HTMLDivElement, initialEntries: string[] = ['/settings/clients']) {
   const root = createRoot(container)
   await act(async () => {
-    root.render(<ClientsTab />)
+    root.render(
+      <MemoryRouter initialEntries={initialEntries}>
+        <ClientsTab />
+      </MemoryRouter>,
+    )
   })
   // Flush the microtasks `Promise.all` in the component's mount effect needs to resolve and
   // re-render with the fetched data.
@@ -269,13 +277,21 @@ describe('ClientsTab', () => {
     expect(inputValues).not.toContain('ar-tv')
 
     // The suggested binding (queue name matches the category) is already selected, not blank --
-    // saving without touching it is expected to persist that value.
+    // saving without touching it is expected to persist that value. Finding #14: an option's
+    // visible text is the queue *name* only -- the remote path moved to the option's own
+    // `title` tooltip, not inline in the text a select box renders.
     const selects = Array.from(container.querySelectorAll('select'))
     const categorySelect = selects.find((s) =>
-      Array.from(s.options).some((o) => o.textContent?.includes('ar-tv (')),
+      Array.from(s.options).some((o) => o.textContent === queue.name),
     )
     expect(categorySelect).toBeDefined()
     expect(categorySelect?.value).toBe(String(queue.id))
+    const queueOption = Array.from(categorySelect?.options ?? []).find(
+      (o) => o.value === String(queue.id),
+    )
+    expect(queueOption?.textContent).toBe(queue.name)
+    expect(queueOption?.textContent).not.toContain(queue.remote_path)
+    expect(queueOption?.title).toBe(`${queue.name} (${queue.remote_path})`)
 
     root.unmount()
   })
@@ -323,6 +339,105 @@ describe('ClientsTab', () => {
 
     expect(container.textContent).toContain('guessed from your')
     expect(container.textContent).toContain('ar-tv')
+
+    root.unmount()
+  })
+
+  // Finding #14 (2026-08-23, prompts/2026-08-23-category-control-and-banner-link.md): column
+  // headers so the control reads as a mapping, and `Remove` shown only on a stale row (a saved
+  // category the client no longer reports) with its own explanation -- never on a category the
+  // client still reports, where "Remove" would be meaningless and just reappear on the next
+  // Test. jsdom performs no real layout (README.md's Known gaps), so this only asserts content
+  // and DOM structure -- it cannot prove the crushed-chip layout bug (screenshot-confirmed) is
+  // visually fixed; that needs a real browser.
+  it('marks a stale saved category with Remove and an explanation; a live category shows neither', async () => {
+    mockListClientTypes.mockResolvedValue([USENET_TYPE])
+    const queue = { id: 5, name: 'ar-tv', remote_path: '/data/complete/ar-tv', local_path: '/local/tv' }
+    mockListQueues.mockResolvedValue([queue] as never)
+    mockListClientInstances.mockResolvedValue([
+      instance({
+        categories: [
+          { id: 1, category: 'ar-tv', queue_id: 5 },
+          { id: 2, category: 'old-cat', queue_id: 5 },
+        ],
+      }),
+    ])
+    mockTestClientInstance.mockResolvedValue({
+      ok: true,
+      error_class: null,
+      message: 'connected',
+      version: '4.0.0',
+      capabilities: { operations: {}, fields: {} },
+      detected_base_paths: [],
+      detected_categories: ['ar-tv'], // 'old-cat' is no longer reported -- it's the stale one.
+    })
+    const root = await mount(container)
+
+    const testButton = Array.from(container.querySelectorAll('button')).find(
+      (b) => b.textContent === 'Test',
+    )
+    await act(async () => {
+      testButton?.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    })
+    await act(async () => {
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+
+    const editButton = Array.from(container.querySelectorAll('button')).find(
+      (b) => b.textContent === 'Edit',
+    )
+    await act(async () => {
+      editButton?.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    })
+
+    // Column headers are present.
+    expect(container.textContent).toContain('Category')
+    expect(container.textContent).toContain('Queue')
+
+    // Both category names render in full -- the chip carries its whole content regardless of
+    // what jsdom can or can't say about how wide it renders.
+    expect(container.textContent).toContain('ar-tv')
+    expect(container.textContent).toContain('old-cat')
+
+    // Exactly one Remove button on the page -- this instance has no base paths (default
+    // `instance()`), so the only candidate is the one stale category row.
+    const removeButtons = Array.from(container.querySelectorAll('button')).filter(
+      (b) => b.textContent === 'Remove',
+    )
+    expect(removeButtons).toHaveLength(1)
+    expect(container.textContent).toContain('Not currently reported by this client')
+
+    root.unmount()
+  })
+
+  // Finding #13 (2026-08-23): the Preflight unattributed-clients banner deep-links straight to
+  // the specific instance rather than naming a settings path for the user to navigate by hand.
+  it('opens edit mode directly for the client named by a ?edit= deep link', async () => {
+    mockListClientTypes.mockResolvedValue([USENET_TYPE])
+    mockListQueues.mockResolvedValue([])
+    mockListClientInstances.mockResolvedValue([instance({ id: 42, name: 'ultracc rtorrent' })])
+
+    const root = await mount(container, ['/settings/clients?edit=42'])
+
+    expect(container.textContent).toContain('Edit instance')
+    const nameInput = Array.from(container.querySelectorAll('input')).find(
+      (i) => i.value === 'ultracc rtorrent',
+    )
+    expect(nameInput).toBeDefined()
+
+    root.unmount()
+  })
+
+  it('ignores an ?edit= id that matches no known instance, rather than crashing', async () => {
+    mockListClientTypes.mockResolvedValue([USENET_TYPE])
+    mockListQueues.mockResolvedValue([])
+    mockListClientInstances.mockResolvedValue([instance({ id: 1, name: 'Main SABnzbd' })])
+
+    const root = await mount(container, ['/settings/clients?edit=999'])
+
+    expect(container.textContent).toContain('Add an instance')
+    expect(container.textContent).not.toContain('Edit instance')
 
     root.unmount()
   })

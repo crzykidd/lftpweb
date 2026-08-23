@@ -696,6 +696,28 @@ avoidable half of the problem.
   thought about whether user-facing copy naming a navigation path should be generated from `nav.ts`
   rather than hand-written, so it cannot drift from the real routes.
 
+### Resolved 2026-08-23 — a real deep link, not corrected prose; a second occurrence found and fixed
+
+`prompts/done/2026-08-23-category-control-and-banner-link.md`, `docs/decisions.md`. The banner
+(`PreflightBox.tsx`) now renders a react-router `<Link to={clientEditHref(u.client_id)}>` straight
+to the specific instance, opened in edit mode -- not corrected prose naming a tab. Getting there
+required widening the data the finding's own prose assumed already existed: `client_id` did not
+reach the banner before this task (`ClientSyncScheduler.unattributed_clients` returned only `(name,
+count)`, and `PreflightUnattributedClientOut` had no id field), so it was threaded through
+`core/clientsync.py`, `models.py`, and `api/jobs.py`. `ClientsTab.tsx` reads the resulting
+`?edit=<id>` via `useSearchParams`, calls its own `startEdit` once instances have loaded, then
+clears the param; a stale or malformed id degrades to a no-op, never a crash. The audit this
+finding asked for turned up one more occurrence of the same wrong breadcrumb --
+`TransferTab.tsx`'s settle-skip help text -- corrected to "Settings → Clients" in the same change.
+Generating nav copy from `nav.ts` was considered and deliberately deferred: after this fix only one
+hand-written breadcrumb string remains anywhere in the frontend, and building a generator to guard
+a single string is more machinery than the remaining problem justifies (see `docs/decisions.md`'s
+own reasoning). Covered by `tests/test_clientsync.py` (the widened tuple), `tests/
+test_preflight_api.py` (the widened response field), `frontend/src/lib/clientEditLink.test.ts`
+(the href builder/parser), `frontend/src/components/PreflightBox.test.tsx` (the link itself, and
+its old text no longer appearing), and two new `ClientsTab.test.tsx` cases (the deep link opening
+edit mode, and a stale id being ignored).
+
 ---
 
 ## 14. The new category control doesn't read as a mapping
@@ -750,3 +772,37 @@ button should appear only on stale rows, and those rows should say why they are 
 - Re-check the row cannot clip at narrow widths — #8 and #14b are both "content wider than its
   container, silently truncated", and jsdom cannot catch either (no real layout), so this needs
   eyes on a real browser rather than a test.
+
+### Resolved 2026-08-23 — all four sub-findings addressed; the layout fix is UNVERIFIED without a browser
+
+`prompts/done/2026-08-23-category-control-and-banner-link.md`, `docs/decisions.md`. Every "worth
+doing together" item is built:
+
+- **14a** — a header row (`Category` / `Queue`) above the list, plus a per-row `→`, both hidden
+  from assistive tech (`aria-hidden`) since the labels are decorative alongside the `<select>`'s
+  own accessible name.
+- **14b** — the crushed chip's root cause (`inputClasses`'s `w-full` winning inside the flex row)
+  is fixed by wrapping the `<select>` in its own fixed-width `<span className="w-48 shrink-0">`,
+  scoped to this one control -- `inputClasses` itself is untouched, so nothing else on the page
+  moves. **This is UNVERIFIED against a real browser.** jsdom performs no layout at all (this
+  finding's own "Method note" said as much), so no test in this repo can prove a `flex`/width
+  computation renders correctly -- the same honest limitation #8's own resolution note already
+  recorded for an identical class of bug. The regression tests added assert content (both category
+  names present in full, in DOM order) and structure (a fixed-width wrapper class exists), which is
+  the most a layout-less harness can pin down; a human needs to look at the actual rendered row
+  before this is called done.
+- **14c** — `Remove` now renders only on a stale row (`isStaleCategoryRow`, a new pure function
+  computed from `testResults[editingId]?.detected_categories` at render time, not stored on
+  `CategoryRowDraft`), paired with "Not currently reported by this client — its queue binding is
+  kept until you remove it." A category the client still reports shows neither.
+- **Queue options** render the queue name only; the full `name (remote_path)` moved to a `title`
+  attribute on both the `<option>` and the `<select>` itself.
+- **The detected-categories hint** (screenshot evidence, the same image that settled 14b) is
+  reworded rather than the categories being persisted -- see `docs/decisions.md`'s own reasoning
+  for why persistence was judged disproportionate to the actual problem (wording, not data loss).
+
+Covered by `frontend/src/lib/clientCategoryInference.test.ts` (`isStaleCategoryRow`, the reworded
+hint, the untouched two-argument default) and two new `ClientsTab.test.tsx` cases (headers +
+stale-vs-live Remove visibility, and the option text/title split). **What remains unverified**:
+the actual crushed-chip layout, at real and narrow browser widths, and the header row's alignment
+against the rows below it -- both need a human with a browser, not another test.

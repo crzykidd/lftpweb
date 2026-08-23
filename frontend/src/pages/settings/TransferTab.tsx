@@ -287,7 +287,7 @@ function SettleGateSection() {
             <span className={labelClasses}>Skip the wait on a download client's own verdict</span>
           </label>
           <p className={hintClasses}>
-            When a configured download client (Settings → Integrations → API Clients) reports a
+            When a configured download client (Settings → Clients) reports a
             release as completed at the exact path lftpweb is watching, treat that as settled
             immediately instead of waiting out the count/age check above. <strong>Off by
             default</strong> — this depends on lftpweb's own reading of that client's status

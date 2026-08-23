@@ -1136,9 +1136,13 @@ class PreflightUnattributedClientOut(BaseModel):
     indistinguishable from broken. `count` is `core.clientsync.ClientSyncScheduler.
     unattributed_clients`'s own count of unattributable, Preflight-eligible-phase transfers from
     that instance's most recent pass -- never zero (a quiet, fully-attributed client has nothing
-    to say here at all, so it simply isn't in the list).
+    to say here at all, so it simply isn't in the list). `client_id` (finding #13, 2026-08-23,
+    prompts/2026-08-23-category-control-and-banner-link.md) lets the frontend banner deep-link
+    straight to this specific instance in Settings -> Clients, rather than naming a settings path
+    the user has to navigate by hand.
     """
 
+    client_id: int
     client_name: str
     count: int
 

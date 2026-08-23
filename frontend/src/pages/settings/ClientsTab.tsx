@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react'
+import { useSearchParams } from 'react-router-dom'
 import {
   createClientInstance,
   deleteClientInstance,
@@ -28,10 +29,12 @@ import { capabilityRows, type CapabilityRow } from '../../lib/clientCapabilities
 import {
   computeCategoryRows,
   describeCategorySource,
+  isStaleCategoryRow,
   type CategoryRowDraft,
   type CategorySource,
   type QueueForCategorySuggestion,
 } from '../../lib/clientCategoryInference'
+import { parseClientEditParam } from '../../lib/clientEditLink'
 import { formatRelativeTimeIntl } from '../../lib/format'
 import { remoteBrowseDisabled } from '../../lib/pathBrowse'
 import { PathBrowseDialog } from '../../components/PathBrowseDialog'
@@ -472,6 +475,11 @@ export function ClientsTab() {
   const [testResults, setTestResults] = useState<Record<number, DownloadClientTestResponse>>({})
   const [testingId, setTestingId] = useState<number | null>(null)
 
+  // The Preflight unattributed-clients banner's deep link (finding #13, 2026-08-23,
+  // prompts/2026-08-23-category-control-and-banner-link.md) -- read once via `useSearchParams`,
+  // `EventsPage.tsx`'s own idiom for a URL-carried one-time target.
+  const [searchParams, setSearchParams] = useSearchParams()
+
   const host = useHostForBrowse()
 
   const refreshInstances = () => listClientInstances().then(setInstances)
@@ -580,6 +588,22 @@ export function ClientsTab() {
     setEditingId(null)
     setForm(emptyForm(clientTypes[0]))
   }
+
+  // The Preflight unattributed-clients banner's deep link (finding #13, 2026-08-23) --
+  // `clientEditHref`'s own read side. Waits for `instances` to have actually loaded (`startEdit`
+  // needs the full instance, not just its id) and clears the param immediately after opening
+  // edit mode, so a reload or the back button doesn't reopen it a second time. A stale/unknown id
+  // (a deleted instance, a hand-edited URL) degrades to just clearing the param -- never a crash,
+  // matching `parseClientEditParam`'s own "malformed input, no target" contract.
+  useEffect(() => {
+    if (loading) return
+    const editId = parseClientEditParam(searchParams)
+    if (editId == null) return
+    const target = instances.find((i) => i.id === editId)
+    if (target != null) startEdit(target)
+    setSearchParams({}, { replace: true })
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [loading, instances])
 
   /** The manual-add escape hatch (spec §8.2 correction: "manual add stays") -- for a path the
    * connector's own `list_base_paths` doesn't expose. Always `source: 'manual'`, `kind:
@@ -1126,6 +1150,7 @@ export function ClientsTab() {
               {describeCategorySource(
                 form.categorySource,
                 testResults[editingId]?.detected_categories ?? null,
+                form.categories.length > 0,
               )}
             </p>
           )}
@@ -1135,36 +1160,100 @@ export function ClientsTab() {
             </p>
           )}
           {form.categories.length > 0 && (
-            <ul className="flex flex-col gap-2">
-              {form.categories.map((cat, i) => (
-                <li key={cat.category} className="flex items-center gap-2">
-                  <span className="flex-1 truncate rounded-md border border-zinc-200 bg-zinc-50 px-2 py-1 font-mono text-xs dark:border-zinc-800 dark:bg-zinc-900">
-                    {cat.category}
-                  </span>
-                  <select
-                    className={inputClasses}
-                    value={cat.queue_id ?? ''}
-                    onChange={(e) =>
-                      updateCategoryRow(i, { queue_id: e.target.value === '' ? null : Number(e.target.value) })
-                    }
-                  >
-                    <option value="">— not used —</option>
-                    {queues.map((q) => (
-                      <option key={q.id} value={q.id}>
-                        {q.name} ({q.remote_path})
-                      </option>
-                    ))}
-                  </select>
-                  <button
-                    type="button"
-                    onClick={() => removeCategoryRow(i)}
-                    className="text-xs text-red-600 hover:underline dark:text-red-400"
-                  >
-                    Remove
-                  </button>
-                </li>
-              ))}
-            </ul>
+            <div className="flex flex-col gap-1.5">
+              {/* Column headers (finding #14a, 2026-08-23: "nothing labels which side is the
+               * category and which is the queue... reads as a list rather than a mapping").
+               * Widths mirror each row below exactly, so the header lines up with what it
+               * labels. */}
+              <div
+                aria-hidden="true"
+                className="flex items-center gap-2 px-0.5 text-[11px] font-medium tracking-wide text-zinc-400 uppercase dark:text-zinc-600"
+              >
+                <span className="min-w-0 flex-1">Category</span>
+                <span className="w-4 shrink-0" />
+                <span className="w-48 shrink-0">Queue</span>
+                <span className="w-40 shrink-0" />
+              </div>
+              <ul className="flex flex-col gap-2">
+                {form.categories.map((cat, i) => {
+                  const detectedCategories =
+                    editingId != null ? (testResults[editingId]?.detected_categories ?? null) : null
+                  const stale = isStaleCategoryRow(cat.category, detectedCategories)
+                  const selectedQueue = queues.find((q) => q.id === cat.queue_id)
+                  return (
+                    <li key={cat.category} className="flex flex-col gap-1">
+                      <div className="flex items-center gap-2">
+                        {/* The category chip (finding #14b, screenshot-confirmed): a fixed-width
+                         * `<select>` wrapper below, not a shared `w-full` on the select itself,
+                         * so this chip keeps its `flex-1` share of the row instead of being
+                         * crushed to a sliver by a select that used to claim the whole row. */}
+                        <span
+                          className="min-w-0 flex-1 truncate rounded-md border border-zinc-200 bg-zinc-50 px-2 py-1 font-mono text-xs dark:border-zinc-800 dark:bg-zinc-900"
+                          title={cat.category}
+                        >
+                          {cat.category}
+                        </span>
+                        <span
+                          aria-hidden="true"
+                          className="w-4 shrink-0 text-center text-zinc-400 dark:text-zinc-600"
+                        >
+                          →
+                        </span>
+                        {/* Fixed-width wrapper, not the `w-full` in `inputClasses` directly on
+                         * this row -- `inputClasses` is shared by every other input on this page
+                         * and they depend on `w-full` filling their own (non-flex-row) container.
+                         * Scoping the width here, rather than editing `inputClasses`, keeps this
+                         * one control's layout local to itself. */}
+                        <span className="w-48 shrink-0">
+                          <select
+                            className={inputClasses}
+                            value={cat.queue_id ?? ''}
+                            title={
+                              selectedQueue
+                                ? `${selectedQueue.name} (${selectedQueue.remote_path})`
+                                : undefined
+                            }
+                            onChange={(e) =>
+                              updateCategoryRow(i, {
+                                queue_id: e.target.value === '' ? null : Number(e.target.value),
+                              })
+                            }
+                          >
+                            <option value="">— not used —</option>
+                            {queues.map((q) => (
+                              <option key={q.id} value={q.id} title={`${q.name} (${q.remote_path})`}>
+                                {q.name}
+                              </option>
+                            ))}
+                          </select>
+                        </span>
+                        {/* Remove only on a stale row -- a category the client still reports can
+                         * only be left unbound (finding #14c: "you cannot remove a category the
+                         * client currently reports -- leaving it unbound is how you ignore it...
+                         * removing it just makes the row reappear on the next Test"). */}
+                        <span className="w-40 shrink-0 text-right">
+                          {stale && (
+                            <button
+                              type="button"
+                              onClick={() => removeCategoryRow(i)}
+                              className="text-xs text-red-600 hover:underline dark:text-red-400"
+                            >
+                              Remove
+                            </button>
+                          )}
+                        </span>
+                      </div>
+                      {stale && (
+                        <p className="pl-0.5 text-[11px] text-amber-600 dark:text-amber-400">
+                          Not currently reported by this client — its queue binding is kept until
+                          you remove it.
+                        </p>
+                      )}
+                    </li>
+                  )
+                })}
+              </ul>
+            </div>
           )}
         </div>
 

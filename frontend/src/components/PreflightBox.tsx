@@ -1,6 +1,8 @@
 import { useEffect, useState } from 'react'
+import { Link } from 'react-router-dom'
 import { getSettleSettings } from '../api/client'
 import type { PreflightResponse, PreflightRowOut, SettleSettingsOut } from '../api/types'
+import { clientEditHref } from '../lib/clientEditLink'
 import { pageCount, pageReadout, paginateClientSide } from '../lib/pagination'
 import {
   isPreflightPageSize,
@@ -212,6 +214,15 @@ function GatedQueueBanner({ gated }: { gated: PreflightResponse['gated_queues'] 
  * into it -- "this queue is blocked" and "this client's items aren't reaching any queue" are
  * different problems with different fixes (a mount, vs. Settings -> Clients' own category
  * mapping), and folding them into one list would blur which fix applies to which line.
+ *
+ * **Deep-links to the specific instance** (finding #13, 2026-08-23,
+ * prompts/2026-08-23-category-control-and-banner-link.md), rather than naming a settings path in
+ * prose. The prose it replaced -- "Settings → Integrations → API Clients" -- named a page that
+ * does not exist: `nav.ts` has `/settings/integrations` (Sonarr/Radarr) and `/settings/clients`
+ * (download clients) as two separate tabs, and "API Clients" is the user's own *eventual*
+ * unified-page idea (spec §8.1) leaking into shipped copy before that page exists. `clientEditHref`
+ * (`lib/clientEditLink.ts`) opens Settings → Clients with this exact instance already in edit
+ * mode (`ClientsTab.tsx`'s own read side), so there's no tab or row left for the user to hunt for.
  */
 function UnattributedClientBanner({
   unattributed,
@@ -222,10 +233,13 @@ function UnattributedClientBanner({
   return (
     <div className="flex flex-col gap-1 rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-xs text-amber-900 dark:border-amber-800 dark:bg-amber-950 dark:text-amber-200">
       {unattributed.map((u) => (
-        <p key={u.client_name}>
+        <p key={u.client_id}>
           <span className="font-semibold">{u.client_name}:</span> reports {u.count}{' '}
-          {u.count === 1 ? 'item' : 'items'}, none attributable to a queue — check its category →
-          queue mapping in Settings → Integrations → API Clients.
+          {u.count === 1 ? 'item' : 'items'}, none attributable to a queue —{' '}
+          <Link to={clientEditHref(u.client_id)} className="underline hover:no-underline">
+            fix its category → queue mapping
+          </Link>
+          .
         </p>
       ))}
     </div>

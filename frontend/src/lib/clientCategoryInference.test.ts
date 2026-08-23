@@ -3,6 +3,7 @@ import {
   computeCategoryRows,
   describeCategorySource,
   inferCategoryMappings,
+  isStaleCategoryRow,
   suggestQueueForCategory,
   type QueueForCategorySuggestion,
 } from './clientCategoryInference'
@@ -178,5 +179,34 @@ describe('describeCategorySource', () => {
     const neverTested = describeCategorySource('none', null)
     const reportedNone = describeCategorySource('none', [])
     expect(neverTested).not.toEqual(reportedNone)
+  })
+
+  // Finding #14 (2026-08-23): the screenshot evidence showed this exact hint -- "Test the
+  // connection above to see this client's own categories" -- rendered while editing a *saved*
+  // instance whose rows were already on screen, reading as an instruction the user hadn't
+  // followed rather than an explanation of what they were looking at.
+  it('explains saved rows differently from a genuinely untested instance', () => {
+    const untested = describeCategorySource('none', null, false)
+    const savedButNotRetested = describeCategorySource('none', null, true)
+    expect(untested).not.toEqual(savedButNotRetested)
+    expect(savedButNotRetested).toMatch(/saved with this instance/)
+  })
+
+  it('defaults hasSavedRows to false, so every existing two-argument call site is unchanged', () => {
+    expect(describeCategorySource('none', null)).toBe(describeCategorySource('none', null, false))
+  })
+})
+
+describe('isStaleCategoryRow', () => {
+  it('is false when the client currently reports this category', () => {
+    expect(isStaleCategoryRow('ar-tv', ['ar-tv', 'ar-movies'])).toBe(false)
+  })
+
+  it('is true for a saved category the client no longer reports', () => {
+    expect(isStaleCategoryRow('old-cat', ['ar-tv'])).toBe(true)
+  })
+
+  it('is false when never tested this session -- staleness cannot be known from nothing', () => {
+    expect(isStaleCategoryRow('anything', null)).toBe(false)
   })
 })
