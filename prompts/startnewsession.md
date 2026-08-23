@@ -156,6 +156,33 @@ deliberate escape hatch**, so a temporarily-unreachable client can still be edit
 fix, re-enable). There is deliberately **no force/save-anyway flag**. A successful save also
 persists the probed capabilities, so no second Test click is needed.
 
+### 🛑 STAGE 5 (the delete pipeline) IS BLOCKED — user's explicit instruction, 2026-08-23
+
+**Do not build stage 5 until findings #15 and #16 in `prompts/test-findings-2026-08-23.md` are
+resolved.** This is a hard gate, not a preference.
+
+**Why (#16):** the user runs **two lftpweb instances against one seedbox** — one SABnzbd, one
+rTorrent, both serving both instances, each lftpweb with its own *arr pair and its own subset of
+the download locations. So each instance permanently sees work that is not its business.
+
+The disk review scan proposes `B − A − C` as debris. The *other* instance's content is protected
+today **only** by set A (the clients still claim it). That protection is temporary: once the other
+instance imports a release and SAB drops it from history, the content is claimed by nobody *this*
+instance can see — set C only knows this lftpweb's own items — and it becomes arithmetically
+indistinguishable from debris. **Stage 5 would then offer to delete another site's data, with a
+correct-looking reclaim figure and no signal anything was wrong.**
+
+**#15 is the mechanism that fixes it**, and "not used by this instance" must mean **two** things:
+don't warn about it, *and* never scan it, never propose it, never let it inside §10.2's delete
+containment boundary. A flag that only silences a banner leaves the delete path exactly as
+dangerous while appearing to have addressed it.
+
+Open and deliberately unanswered — see finding #16: whether the exclusion unit should be the
+**path** rather than the category (a category is only a proxy for where content lands); whether a
+two-instance seedbox should become a documented deployment in README/§1.1; whether `move`-mode
+source deletion has the same hazard *today*; and whether the scan should refuse to run on a
+known-shared base path until exclusions exist.
+
 **👉 THE NEXT REAL-WORLD STEP is not more code — it is running a capture against the live SAB.**
 Settings → Clients → add the SABnzbd instance → Test. Then read the capture and work through spec
 **§13.4's twelve guesses**. Note the capture is currently at DEBUG, so it needs
