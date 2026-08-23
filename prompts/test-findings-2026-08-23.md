@@ -806,3 +806,49 @@ hint, the untouched two-argument default) and two new `ClientsTab.test.tsx` case
 stale-vs-live Remove visibility, and the option text/title split). **What remains unverified**:
 the actual crushed-chip layout, at real and narrow browser widths, and the header row's alignment
 against the rows below it -- both need a human with a browser, not another test.
+
+---
+
+## 15. "Not used" must be an explicit saved state, not the absence of a mapping
+
+> *"You have to plan for having a category you see in SAB or torrents not being used with lftp. So
+> it is best to show all the categories and then map them to a path or flag them as 'Not used by
+> this instance'."*
+
+**The current design collapses two different states into one.** A category row's dropdown defaults
+to `— not used —`, which is also what a never-configured category shows. So lftpweb cannot
+distinguish:
+
+| State | Should the banner warn? |
+|---|---|
+| Not configured yet — the user has not looked at it | **yes** |
+| Deliberately not used by lftpweb | **never again** |
+
+Today both render identically and both count toward the "reports N items, none attributable"
+banner. **Consequence: once a user decides a category is irrelevant, they get nagged about it
+forever**, with no way to silence it short of inventing a queue binding they do not want.
+
+### What this requires
+
+- **Show every category the client reports**, not only those already saved or detected in the
+  current browser session (see #11c's persistence problem, and the reload-shows-nothing case).
+- Each category resolves to one of **three** states, saved explicitly:
+  1. bound to a queue,
+  2. **explicitly marked "not used by this instance"**,
+  3. undecided (the only state that warns).
+- **The banner counts only state 3.** A client whose every category is bound or explicitly excluded
+  is fully configured and must be silent — that is the whole point.
+- A category that appears *later* (rTorrent labels are `DERIVED` — only ones in use are reportable)
+  arrives in state 3, which is correct: it genuinely is undecided, and the banner surfacing it is
+  the desired behaviour rather than noise.
+
+### Why this matters beyond tidiness
+
+It is the difference between a warning that means something and one the user learns to ignore. The
+"none attributable" banner exists because finding #2 showed a silently-contributing-nothing client
+is indistinguishable from a broken one. A banner that cannot be resolved is the same failure with
+the opposite sign — it stops carrying information.
+
+**Sequenced with the per-client relevance display** (SAB: *"12 of 12 matched by folder — no mapping
+needed"*; rTorrent: *"0 of 2 matched — mapping required"*), since both change what this section
+says about an unmapped category and splitting them would mean writing that copy twice.
