@@ -175,11 +175,17 @@ async def test_completed_verdict_with_exact_path_match_satisfies_the_gate(
             "status": "Completed",
             "storage": f"{REMOTE_PATH}/{RELEASE}",
             "bytes": 100,
+            # Completed well over `CLIENT_COMPLETION_HOLD_S` ago (2026-08-23,
+            # prompts/2026-08-23-client-completion-delay.md) -- this test's own point is the
+            # match-and-skip wiring, not the delay, so the completion is already old enough to
+            # satisfy the gate with no added wait. `test_a_young_completion_holds_...` below
+            # covers the delay itself.
+            "completed": 1_000_000 - 3600,
         }
     ]
 
     aq, recorder, _ = await _wire(db, tmp_path, fake_sabnzbd_server, queue_id=queue_id)
-    queued = await aq.on_scan(_queue_config(queue_id, tmp_path))
+    queued = await aq.on_scan(_queue_config(queue_id, tmp_path), now=1_000_000.0)
 
     assert queued == 1
     assert recorder.enqueued == [item_id]
@@ -188,6 +194,86 @@ async def test_completed_verdict_with_exact_path_match_satisfies_the_gate(
     assert events[0]["item_id"] == item_id
     assert "SABnzbd" in events[0]["message"]
     assert RELEASE in events[0]["message"]
+
+
+# --- The completion delay itself (2026-08-23, prompts/2026-08-23-client-completion-delay.md,
+# finding #9) -- a terminal COMPLETED verdict must hold `settle.CLIENT_COMPLETION_HOLD_S` before
+# it satisfies the gate, measured from the client's own completion time.
+
+
+async def test_a_young_completion_holds_back_and_later_satisfies_the_gate(
+    db, tmp_path, fake_sabnzbd_server
+):
+    write_if_needed(str(tmp_path))
+    queue_id = await _make_queue(db, tmp_path)
+    item_id = await _make_item(db, queue_id, RELEASE)
+    await _set_settle_record(db, queue_id, RELEASE)
+    fake_sabnzbd_server.state.history_slots = [
+        {
+            "nzo_id": "nzo1",
+            "name": RELEASE,
+            "status": "Completed",
+            "storage": f"{REMOTE_PATH}/{RELEASE}",
+            "bytes": 100,
+            "completed": 1_000_000,  # completes exactly at this pass's own `now`
+        }
+    ]
+
+    aq, recorder, _ = await _wire(db, tmp_path, fake_sabnzbd_server, queue_id=queue_id)
+
+    # First pass, 3s after the client's own completion time -- younger than the 10s hold.
+    queued = await aq.on_scan(_queue_config(queue_id, tmp_path), now=1_000_003.0)
+    assert queued == 0
+    assert recorder.enqueued == []
+    assert await _events(db, "settle_client_skip") == []
+
+    # Second pass, once the hold has actually elapsed -- the same item now satisfies the gate.
+    queued = await aq.on_scan(_queue_config(queue_id, tmp_path), now=1_000_010.0)
+    assert queued == 1
+    assert recorder.enqueued == [item_id]
+    events = await _events(db, "settle_client_skip")
+    assert len(events) == 1
+    assert events[0]["item_id"] == item_id
+
+
+async def test_no_completed_at_falls_back_to_first_observation(db, tmp_path, fake_sabnzbd_server):
+    """A connector reporting no `completed` field at all (`_epoch_to_iso` on a missing value
+    returns `None`) must fall back to measuring the hold from the first pass lftpweb itself
+    observed the verdict -- not satisfy the gate immediately, and not stay held forever either.
+    """
+    write_if_needed(str(tmp_path))
+    queue_id = await _make_queue(db, tmp_path)
+    item_id = await _make_item(db, queue_id, RELEASE)
+    await _set_settle_record(db, queue_id, RELEASE)
+    fake_sabnzbd_server.state.history_slots = [
+        {
+            "nzo_id": "nzo1",
+            "name": RELEASE,
+            "status": "Completed",
+            "storage": f"{REMOTE_PATH}/{RELEASE}",
+            "bytes": 100,
+            # No "completed" key at all -- `completed_at` on the resulting `Transfer` is `None`.
+        }
+    ]
+
+    aq, recorder, _ = await _wire(db, tmp_path, fake_sabnzbd_server, queue_id=queue_id)
+
+    # First pass -- this is the very first time lftpweb has seen the verdict, so
+    # `first_observed_at` is set to this pass's own `now`; the hold has not elapsed yet.
+    queued = await aq.on_scan(_queue_config(queue_id, tmp_path), now=1_000_000.0)
+    assert queued == 0
+    assert recorder.enqueued == []
+
+    # Second pass, still under 10s after the first observation -- still held.
+    queued = await aq.on_scan(_queue_config(queue_id, tmp_path), now=1_000_005.0)
+    assert queued == 0
+    assert recorder.enqueued == []
+
+    # Third pass, 10s after the *first* observation (not the second) -- proves the clock started
+    # on the first sighting and was carried forward, not reset by the intervening pass.
+    queued = await aq.on_scan(_queue_config(queue_id, tmp_path), now=1_000_010.0)
+    assert queued == 1
+    assert recorder.enqueued == [item_id]
 
 
 # --- Non-negotiable: setting off is byte-identical to today --------------------------------

@@ -296,6 +296,16 @@ replaces an inference with a direct observation, keeping the inference as fallba
 ~60 s settle tax and is *more* correct — a stalled upload that happens to look still stops
 reading as settled.
 
+**Correction, 2026-08-23 (finding #9, `prompts/done/2026-08-23-client-completion-delay.md`): the
+skip is not instant.** A terminal verdict alone doesn't prove every byte is where it will stay —
+the client can report "complete" a moment before the last write flushes, a final rename lands, or
+— rTorrent specifically (§1.1 of `docs/download-client-framework-spec.md`) — before the hardlink
+into the shared completed folder exists at all. The skip now holds a short delay
+(`core/settle.py.CLIENT_COMPLETION_HOLD_S`, 10s, the conservative end of the user's own "5-10
+seconds" range) before it satisfies the gate, measured from the client's own reported completion
+time rather than from when lftpweb noticed it — a completion already older than the delay
+satisfies the gate with no added wait.
+
 **Withhold on partial failure.** If SAB fails outright, nothing lands and there is nothing to
 auto-queue — the block is automatic and needs no code. The case that genuinely needs an explicit
 withhold is a **partial** failure: the download dies partway, or unpack fails, leaving a

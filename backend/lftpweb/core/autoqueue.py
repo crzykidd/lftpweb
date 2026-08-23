@@ -34,7 +34,10 @@ Five things this module must get right, in order of consequence:
    item skipped for this reason alone is also projected into the Preflight box** (this module's
    own "Preflight" section below, prompts/2026-08-20-preflight-waiting-sources.md) -- it is
    exactly "would be queued this pass if only the gate weren't holding it," the box's own
-   definition of "waiting."
+   definition of "waiting." A terminal client verdict (stage 2b of #18, below) can lift this
+   gate early, but only once `settle.CLIENT_COMPLETION_HOLD_S` has elapsed since the client's
+   own completion time (2026-08-23, prompts/2026-08-23-client-completion-delay.md, finding #9)
+   -- see `settle.client_completion_ready`'s own docstring.
 5. **`_UNPACK_`/`_FAILED_` top-level items are never auto-queued** (2026-08-15,
    `prompts/done/2026-08-15-arr-eventtype-and-unpack-autoqueue.md`; "show it, don't grab it,"
    user decision same date, `docs/decisions.md`). The user's seedbox runs SABnzbd, which stages
@@ -83,6 +86,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -373,13 +377,35 @@ class AutoQueue:
         # withhold is re-derived fresh from the client's own current candidates each pass, so
         # there is nothing to merge and no flap tolerance to reason about.
         self.withheld: dict[int, dict[int, str]] = {}
+        # The settle-gate skip's own completion-delay tracking (2026-08-23,
+        # prompts/2026-08-23-client-completion-delay.md, finding #9) -- queue_id -> {item_id:
+        # wall-clock `time.time()` this item's client verdict was first seen}, the fallback clock
+        # `settle.client_completion_ready` uses only when the matched `Transfer` itself reports
+        # no `completed_at` (see that function's own docstring for why the client's own timestamp
+        # is always preferred over this one when it's available). Wholesale-replaced per queue at
+        # the end of every `on_scan` pass that reaches the eligibility loop, exactly like
+        # `self.withheld`/`self._settle_preflight` above -- so an item that stops matching (queued
+        # manually, suppressed, or the client verdict itself disappears) simply drops out rather
+        # than leaking a stale timestamp forward. A *matching* item's own first-seen time is
+        # carried forward unchanged pass over pass (looked up from this same dict before being
+        # copied into the replacement), which is the whole point: this clock must not reset just
+        # because `on_scan` ran again.
+        self._client_completion_first_seen: dict[int, dict[int, float]] = {}
 
-    async def on_scan(self, queue: QueueAutoConfig) -> int:
+    async def on_scan(self, queue: QueueAutoConfig, *, now: float | None = None) -> int:
         """Evaluate one queue's newly- *and* previously-seen eligible items. Called after
         every successful scan pass, whether or not auto-queue is enabled for this queue (so
         `self.gated` and logging stay accurate either way). Returns how many items were
         queued, for logging/tests.
+
+        `now` (`time.time()`-comparable epoch seconds) is the completion-delay's own clock
+        (2026-08-23, prompts/2026-08-23-client-completion-delay.md) -- injectable rather than
+        read internally, the same `now`-override shape `core/settle.py.advance_settle`/
+        `is_settled` and `core/clientsync.py.ClientSyncScheduler.run_once` already use, so a test
+        can drive the hold without sleeping real wall-clock seconds. Defaults to `time.time()`;
+        every call site that predates this task (and every production caller) leaves it unset.
         """
+        now = time.time() if now is None else now
         if not queue.auto_queue_enabled:
             # Silent pop, deliberately (mid-run scope addition, docs/decisions.md): turning
             # auto-queue *off* is not a gate recovery, it's the user choosing not to run it at
@@ -387,6 +413,7 @@ class AutoQueue:
             self.gated.pop(queue.id, None)
             self._settle_preflight.pop(queue.id, None)
             self.withheld.pop(queue.id, None)
+            self._client_completion_first_seen.pop(queue.id, None)
             return 0
 
         if not mount_sentinel.check(queue.local_path):
@@ -415,6 +442,7 @@ class AutoQueue:
             # "fifty rows burying the one fact that matters" shape the banner exists to avoid.
             self._settle_preflight.pop(queue.id, None)
             self.withheld.pop(queue.id, None)
+            self._client_completion_first_seen.pop(queue.id, None)
             return 0
         if self.gated.pop(queue.id, None) is not None:
             # A real recovery -- the gate was actually blocking this queue a moment ago, not
@@ -473,6 +501,14 @@ class AutoQueue:
         # "log once per transition, not once per pass" reason.
         withheld_this_pass: dict[int, str] = {}
         previously_withheld = self.withheld.get(queue.id, {})
+        # The completion-delay's own this-pass result (2026-08-23,
+        # prompts/2026-08-23-client-completion-delay.md) -- item_id -> the wall-clock time this
+        # item's client verdict was first seen, carried forward from `previously_first_seen` when
+        # already present there, or started fresh at `now` (this method's own parameter -- one
+        # value for the whole pass, matching `core/settle.py.advance_settle`'s own "caller's own
+        # single now" convention) on a first sighting.
+        client_completion_first_seen_this_pass: dict[int, float] = {}
+        previously_first_seen = self._client_completion_first_seen.get(queue.id, {})
         for row in rows:
             # "Show it, don't grab it" (user decision, 2026-08-15, docs/decisions.md): a SAB
             # in-progress unpack staged under `_UNPACK_<name>` (or a `_FAILED_` leftover) on
@@ -589,25 +625,43 @@ class AutoQueue:
                 )
                 if client_verdict is not None:
                     instance_id, instance_name, transfer = client_verdict
-                    # The audit trail this task's own handoff prompt calls "not optional
-                    # decoration" -- naming the client instance and the verdict that permitted
-                    # the skip is the only way anyone will work out why, the day this feature
-                    # ever transfers something half-written on a wrong guess.
-                    await audit.record_event(
-                        self.db,
-                        level="info",
-                        item_id=row["id"],
-                        kind="settle_client_skip",
-                        message=(
-                            f"queue {queue.id} ('{queue.name}'): item {row['rel_path']!r} "
-                            f"skipped the settle gate -- download client {instance_name!r} "
-                            f"(id={instance_id}) reports it COMPLETED at "
-                            f"{transfer.content_path!r}"
-                        ),
-                    )
-                    await self._enqueue_item(row["id"])
-                    queued += 1
-                    continue
+                    # The completion-delay's own bookkeeping (2026-08-23, prompts/2026-08-23-
+                    # client-completion-delay.md, finding #9) -- carried forward from last pass's
+                    # own record for this item when one exists, so the fallback clock
+                    # `settle.client_completion_ready` uses (only when `transfer.completed_at`
+                    # itself is absent) measures from the *first* pass this verdict was seen, not
+                    # from every pass that merely re-observes the same still-standing verdict.
+                    first_seen = previously_first_seen.get(row["id"], now)
+                    client_completion_first_seen_this_pass[row["id"]] = first_seen
+                    if settle.client_completion_ready(
+                        transfer, first_observed_at=first_seen, now=now
+                    ):
+                        # The audit trail this task's own handoff prompt calls "not optional
+                        # decoration" -- naming the client instance and the verdict that permitted
+                        # the skip is the only way anyone will work out why, the day this feature
+                        # ever transfers something half-written on a wrong guess.
+                        await audit.record_event(
+                            self.db,
+                            level="info",
+                            item_id=row["id"],
+                            kind="settle_client_skip",
+                            message=(
+                                f"queue {queue.id} ('{queue.name}'): item {row['rel_path']!r} "
+                                f"skipped the settle gate -- download client {instance_name!r} "
+                                f"(id={instance_id}) reports it COMPLETED at "
+                                f"{transfer.content_path!r}"
+                            ),
+                        )
+                        await self._enqueue_item(row["id"])
+                        queued += 1
+                        continue
+                    # Not ready yet -- `client_completion_ready` says `CLIENT_COMPLETION_HOLD_S`
+                    # hasn't elapsed since this release actually finished. Falls through to the
+                    # exact same hold-and-Preflight-row behavior below as a `client_verdict` of
+                    # `None` would, on purpose: this delay only ever makes an already-shortened
+                    # wait slightly longer, never a way to skip faster than "not settled" earned,
+                    # and never a way to hold an item back harder than the settle gate itself
+                    # would on its own.
                 # Preflight (prompts/2026-08-20-preflight-waiting-sources.md, this module's own
                 # "Preflight" section below) -- reached only once every *other* eligibility
                 # check above has already passed (pattern match, no active job via the query's
@@ -681,6 +735,11 @@ class AutoQueue:
                     ),
                 )
         self.withheld[queue.id] = withheld_this_pass
+        # Wholesale replace, matching `self.withheld`/`self._settle_preflight` above -- an item
+        # that stopped having a client verdict this pass (queued manually, suppressed, or the
+        # verdict itself aged out of the client's cache) has nothing left to carry its first-seen
+        # time forward for.
+        self._client_completion_first_seen[queue.id] = client_completion_first_seen_this_pass
         if queued:
             logger.info("auto-queue: queued %d item(s) for queue %d", queued, queue.id)
         return queued

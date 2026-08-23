@@ -6,6 +6,57 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-23 — a short delay after a client reports completion, before queuing (finding #9)
+
+`prompts/done/2026-08-23-client-completion-delay.md`. Stage 2b's settle-gate skip
+(`prompts/done/2026-08-23-settle-gate-skip.md`) satisfied the settle gate the instant a client
+reported a terminal `COMPLETED` verdict. Per finding #9 (user, 2026-08-23: "wait 5-10 seconds
+after complete before queuing"), that was slightly too eager — a client can say "done" a moment
+before the last bytes flush, a final rename lands, or — rTorrent specifically (spec §1.1) —
+before the hardlink into the shared completed folder lftpweb actually scans exists at all.
+
+**Measured from the client's own `completed_at`, not from when lftpweb noticed the verdict.**
+The alternative — starting the hold the moment lftpweb's poller happens to observe the
+verdict — would stack the hold on top of the poll cadence's own latency instead of overlapping
+it: a release that genuinely finished five minutes before lftpweb's poller got around to it
+would still pay the full 10s hold for no reason. Anchoring on the client's own timestamp means a
+completion already older than the hold satisfies it with **no** added wait — the common case for
+anything a slower-polling queue only picks up well after the fact. Falls back to
+lftpweb's own first-observation time only when a connector reports no `completed_at` at all
+(spec §4.2's "absent is not a verdict," narrowed to one field) — tracked in-process, per item,
+in a new `AutoQueue._client_completion_first_seen` dict, the same wholesale-replaced-per-pass
+idiom `self.withheld`/`self._settle_preflight` already use, rather than anything persisted.
+
+**10 seconds, the conservative (safe) end of the user's own "5-10 seconds" range.** The two
+costs are not symmetric: waiting the extra few seconds costs exactly that; not waiting risks
+transferring a directory that is not finished being written — the identical directory-corruption
+failure mode the settle gate's own `REQUIRED_SETTLE_SCANS`/`SETTLE_MIN_AGE_S` exist to catch.
+
+**Shipped as a named module constant (`settle.CLIENT_COMPLETION_HOLD_S`), not a settings
+field — deliberately, per the handoff prompt's own instruction not to add one speculatively.**
+Argued both ways before deciding:
+- *For a setting:* every other settle-adjacent number in this codebase that a real seedbox shape
+  could plausibly want tuned (`SETTLE_MIN_AGE_S`, the *arr poll cadence, `PREFLIGHT_HOLD_S`) is
+  either already a setting or has an open issue asking for one; a fixed 10s could in principle be
+  wrong for an unusually slow filesystem flush.
+- *Against, and the reasoning that won:* this project's own established habit (`AutoQueueSettings`,
+  `WithholdSettings`, `SettleSettings.client_skip_enabled` itself) is to ship a constant first and
+  promote it to a setting only once a real use pushes back — never ahead of that. No one has
+  asked for this number to be different; it is a data point on an already-existing "cost of
+  waiting vs. cost of not waiting" spectrum (`SETTLE_MIN_AGE_S` costs ~60s; this costs ~10s and
+  only after `client_skip_enabled` is already opted into), not a knob with a plausible per-site
+  answer the way a poll interval or a retention window is. Adding a field for a number nobody has
+  contested would be exactly the "settings field added speculatively" the handoff prompt rules
+  out.
+
+**`AutoQueue.on_scan` gains an injectable `now` parameter** (`time.time()`-comparable, defaults
+to `time.time()`), the same override shape `core/settle.py.advance_settle`/`is_settled` and
+`core/clientsync.py.ClientSyncScheduler.run_once` already use — needed so
+`tests/test_settle_client_skip.py` can drive the hold across scan passes without a real sleep.
+Purely additive (keyword-only, defaulted); every existing call site is untouched.
+
+---
+
 ## 2026-08-23 — merged-row provenance, a Preflight expand, disk review grouped by torrent/directory, and the vanishing Edit button (findings #3/#6/#7/#8)
 
 `prompts/done/2026-08-23-preflight-provenance-and-ui.md`. The last fix in this batch — clears every

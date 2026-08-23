@@ -396,6 +396,14 @@ two separate events (spec §1.1).
 
 Worth deciding whether this replaces the immediate skip or becomes its configurable value.
 
+**Resolved** (`prompts/done/2026-08-23-client-completion-delay.md`): the immediate skip now holds
+`core/settle.py.CLIENT_COMPLETION_HOLD_S` (10s, the conservative end of the user's own range)
+before it satisfies the gate, measured from the client's own `completed_at` rather than from when
+lftpweb noticed the verdict — a completion already older than the hold satisfies it with no added
+wait, so this only ever lengthens an already-shortened wait, never a normal one. Falls back to
+first-observation only when a connector reports no `completed_at` at all. Shipped as a named
+constant, not a setting — see `docs/decisions.md` for the argument.
+
 ---
 
 ## Working as designed — confirmed by this session, no action needed

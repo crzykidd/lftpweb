@@ -547,6 +547,77 @@ def find_client_completion(
     return None
 
 
+# 2026-08-23, prompts/2026-08-23-client-completion-delay.md (finding #9, user decision: "wait
+# 5-10 seconds after complete before queuing"). `find_client_completion` above answers "did any
+# client ever claim this release is done"; `client_completion_ready` below answers a narrower,
+# second question -- has enough time passed since that claim to actually trust it. A terminal
+# `COMPLETED` verdict can land a moment before the last bytes are flushed, a final rename lands,
+# or -- rTorrent specifically (spec §1.1) -- before the hardlink into the shared completed folder
+# lftpweb actually scans exists at all; those are the same "still arriving" risk the settle gate's
+# own fingerprint exists to catch, just reached by a faster, more direct route this time.
+#
+# Ten seconds -- the conservative (safe) end of the user's own "5-10 seconds" range, not the
+# middle or the fast end. Named and commented the same way `REQUIRED_SETTLE_SCANS`/
+# `SETTLE_MIN_AGE_S` above are ("a decision, not an accident"): the two costs on either side of
+# this number are not symmetric. Waiting the extra few seconds costs exactly that; not waiting
+# risks transferring a directory that is not finished being written -- the identical
+# directory-corruption failure mode `REQUIRED_SETTLE_SCANS`/`SETTLE_MIN_AGE_S` themselves guard
+# against. Kept a plain module constant rather than a user-facing setting for now -- this
+# project's own habit (docs/decisions.md) is to expose a knob once someone actually needs it
+# different, not speculatively ahead of any real request for one; see that file for the fuller
+# argument recorded alongside this task.
+CLIENT_COMPLETION_HOLD_S = 10.0
+
+
+def client_completion_ready(
+    transfer: "Transfer", *, first_observed_at: float, now: float | None = None
+) -> bool:
+    """True once at least `CLIENT_COMPLETION_HOLD_S` has elapsed since the release actually
+    finished. The settle-gate skip's own second gate -- called only once `find_client_completion`
+    above has already found a matching terminal `COMPLETED` verdict; this function has no opinion
+    about matching, only about timing.
+
+    **Measured from the client's own completion time (`Field.COMPLETED_AT` / `transfer.
+    completed_at`), never from when lftpweb happened to notice the verdict.** Getting this
+    backwards is the exact mistake this task's own handoff prompt calls out by name: the poll
+    cadence (`core/clientsync.py.FAST_INTERVAL_S`/`SLOW_INTERVAL_S`) already sits between the
+    client finishing and lftpweb observing that fact, so a hold measured from observation would
+    stack on top of that latency instead of overlapping it -- a release that actually finished
+    five minutes ago, but which lftpweb's poller only just got around to noticing, would
+    pointlessly wait another `CLIENT_COMPLETION_HOLD_S` for no reason. Measuring from the
+    client's own timestamp instead means **a completion already older than the hold satisfies it
+    immediately, with no added wait at all** -- the ordinary case for anything the poller picks
+    up on a later pass, which is most of the time given `FAST_INTERVAL_S`/`SLOW_INTERVAL_S` are
+    both already several times `CLIENT_COMPLETION_HOLD_S`.
+
+    **Falls back to `first_observed_at` only when `transfer.completed_at` is absent or fails to
+    parse** -- an undeclared `Field.COMPLETED_AT` (a connector that has not implemented it), or a
+    value this connector's own mapping could not produce in the first place (`sabnzbd.py.
+    _epoch_to_iso`'s own tolerant-of-garbage contract already returns `None` rather than raising
+    on a bad value). Both read identically here: spec §4.2's "absent is not a verdict," applied
+    to one field instead of the whole record. `first_observed_at` is deliberately not this
+    module's own clock -- it is the caller's (`core/autoqueue.py.AutoQueue`'s in-memory record of
+    the first scan pass on which this item's client verdict was seen at all), the best available
+    substitute for "when it actually finished" when the client itself won't say. This is the one
+    branch where the hold ends up measured from lftpweb's own observation after all, and only
+    because there is no better clock to measure it from -- never a silent, unconditional
+    substitute for the primary measurement above.
+
+    A value that fails to parse is treated exactly like an absent one (falls back to
+    `first_observed_at`), never as "already old enough" -- the conservative direction on an
+    unparseable timestamp is to wait, the same direction every other uncertain path in this
+    module already falls back to.
+    """
+    now = time.time() if now is None else now
+    since = first_observed_at
+    if transfer.completed_at:
+        try:
+            since = _parse_iso(transfer.completed_at)
+        except ValueError:
+            since = first_observed_at
+    return (now - since) >= CLIENT_COMPLETION_HOLD_S
+
+
 def find_client_failure(
     item_remote_path: str, candidates: "Iterable[tuple[int, str, Transfer]]"
 ) -> "tuple[int, str, Transfer] | None":

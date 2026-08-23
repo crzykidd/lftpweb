@@ -455,7 +455,9 @@ async def test_client_skip_enabled_defaults_off_and_round_trips(db):
 # `tests/test_autoqueue.py` and `tests/test_clientsync.py` cover the wired-up half.
 
 
-def _transfer(*, phase: TransferPhase, content_path: str | None) -> Transfer:
+def _transfer(
+    *, phase: TransferPhase, content_path: str | None, completed_at: str | None = None
+) -> Transfer:
     return Transfer(
         client_id="nzo-1",
         name="Show.S01.1080p-GRP",
@@ -463,6 +465,7 @@ def _transfer(*, phase: TransferPhase, content_path: str | None) -> Transfer:
         raw_status=phase.value,
         raw={},
         content_path=content_path,
+        completed_at=completed_at,
     )
 
 
@@ -568,6 +571,101 @@ def test_find_client_completion_returns_the_first_match_among_several_candidates
     assert result is not None
     assert result[0] == 2
     assert result[1] == "rTorrent"
+
+
+# --- The settle-gate skip's own completion delay (2026-08-23,
+# prompts/2026-08-23-client-completion-delay.md, finding #9) -- `client_completion_ready`'s own
+# timing question, checked only once `find_client_completion` above has already found a match.
+
+
+def test_client_completion_ready_holds_a_young_completion():
+    """A completion reported an instant ago must not satisfy the gate yet -- the whole point of
+    the delay this task adds.
+    """
+    transfer = _transfer(
+        phase=TransferPhase.COMPLETED,
+        content_path="/complete/ar-tv/Show.S01",
+        completed_at="2026-08-23T12:00:00+00:00",
+    )
+    now = settle._parse_iso("2026-08-23T12:00:00+00:00") + 3.0  # 3s after completion
+    assert settle.client_completion_ready(transfer, first_observed_at=now, now=now) is False
+
+
+def test_client_completion_ready_satisfies_once_the_hold_elapses():
+    """The identical item as above, on a later pass once `CLIENT_COMPLETION_HOLD_S` has actually
+    elapsed since the client's own completion time.
+    """
+    completed_epoch = settle._parse_iso("2026-08-23T12:00:00+00:00")
+    transfer = _transfer(
+        phase=TransferPhase.COMPLETED,
+        content_path="/complete/ar-tv/Show.S01",
+        completed_at="2026-08-23T12:00:00+00:00",
+    )
+    now = completed_epoch + settle.CLIENT_COMPLETION_HOLD_S
+    assert settle.client_completion_ready(transfer, first_observed_at=now, now=now) is True
+
+
+def test_client_completion_ready_is_immediate_for_a_completion_already_older_than_the_hold():
+    """The ordinary case for anything the poller only picks up on a later pass: a release that
+    finished five minutes ago must not wait a further `CLIENT_COMPLETION_HOLD_S` -- there must be
+    no added latency at all here.
+    """
+    completed_epoch = settle._parse_iso("2026-08-23T12:00:00+00:00")
+    transfer = _transfer(
+        phase=TransferPhase.COMPLETED,
+        content_path="/complete/ar-tv/Show.S01",
+        completed_at="2026-08-23T12:00:00+00:00",
+    )
+    now = completed_epoch + 300.0  # 5 minutes later
+    assert settle.client_completion_ready(transfer, first_observed_at=now, now=now) is True
+
+
+def test_client_completion_ready_falls_back_to_first_observed_at_with_no_completed_at():
+    """A connector that reports no `completed_at` at all (an undeclared `Field.COMPLETED_AT`, or
+    a value its own mapping couldn't parse) must fall back to `first_observed_at` -- asserted
+    explicitly here, not merely incidentally by some other test happening to leave
+    `completed_at` unset.
+    """
+    transfer = _transfer(
+        phase=TransferPhase.COMPLETED, content_path="/complete/ar-tv/Show.S01", completed_at=None
+    )
+    first_observed_at = 1_000_000.0
+    # Younger than the hold, measured from `first_observed_at` -- must not be ready yet. If this
+    # were (wrongly) measured from some other clock, this assertion could pass for the wrong
+    # reason, so the "ready once the hold elapses" case right below is what actually proves the
+    # fallback clock is the one being used.
+    assert (
+        settle.client_completion_ready(
+            transfer, first_observed_at=first_observed_at, now=first_observed_at + 3.0
+        )
+        is False
+    )
+    assert (
+        settle.client_completion_ready(
+            transfer,
+            first_observed_at=first_observed_at,
+            now=first_observed_at + settle.CLIENT_COMPLETION_HOLD_S,
+        )
+        is True
+    )
+
+
+def test_client_completion_ready_falls_back_on_an_unparseable_completed_at():
+    """An unparseable `completed_at` must read exactly like an absent one -- fall back to
+    `first_observed_at`, never "already old enough."
+    """
+    transfer = _transfer(
+        phase=TransferPhase.COMPLETED,
+        content_path="/complete/ar-tv/Show.S01",
+        completed_at="not-a-timestamp",
+    )
+    first_observed_at = 1_000_000.0
+    assert (
+        settle.client_completion_ready(
+            transfer, first_observed_at=first_observed_at, now=first_observed_at + 3.0
+        )
+        is False
+    )
 
 
 # --- The withhold gate's own matching (stage 3 of #18) -- `find_client_failure`'s mirror-image
