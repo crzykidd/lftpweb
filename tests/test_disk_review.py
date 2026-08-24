@@ -22,8 +22,11 @@ from lftpweb.core.disk_review import (
     InUsePath,
     SkippedBasePath,
     _load_in_use_paths,  # testing Set C's own I/O helper directly, see the section below
+    _resolve_client_exclusions,  # the pure derivation step behind `run_scan`'s own gathering
     freed_bytes,
+    is_authorized_delete_target,
     reconcile,
+    resolve_category_exclusion_paths,
 )
 from lftpweb.db import migrate
 
@@ -532,6 +535,221 @@ def test_broken_seed_not_reported_when_the_walk_itself_failed():
         )
     )
     assert result.broken_seeds == ()
+
+
+# ================================================================================================
+# Excluded paths -- "not used by this instance" as a hard safety boundary, not a preference
+# (migration 031, findings #15/#16, 2026-08-23,
+# prompts/2026-08-23-category-tristate-and-exclusion.md). The deployment shape: two lftpweb
+# instances share one seedbox, one SABnzbd, one rTorrent -- each instance permanently sees the
+# other's work. An excluded path must be never scanned, never proposed as debris, and never
+# inside the future delete-containment boundary.
+# ================================================================================================
+
+
+def test_excluded_path_is_never_proposed_as_debris():
+    """An excluded sub-path (the enforceable primitive, `download_client_excluded_path`) is
+    dropped before any candidate logic runs -- it must never appear in the debris pile even
+    though every other guard (contributor reachable, old enough, unclaimed) would otherwise let
+    it through.
+    """
+    root = "/complete/tv"
+    others_release = _file(root, "OtherInstance.Release/file.mkv", inode=9)
+    ours = _file(root, "Our.Release/file.mkv", inode=10)
+    result = reconcile(
+        **_base(
+            base_paths=[root],
+            contributors=[BasePathContributor(root, client_id=1)],
+            reachable_client_ids=[1],
+            disk_entries=[others_release, ours],
+            excluded_paths=[f"{root}/OtherInstance.Release"],
+        )
+    )
+    debris_paths = {d.abs_path for d in result.debris}
+    assert others_release.abs_path not in debris_paths
+    assert ours.abs_path in debris_paths  # unaffected -- a different tree entirely
+
+
+def test_excluded_path_is_also_never_shown_as_seeding_estate():
+    """Not merely kept out of debris -- an excluded path must not surface anywhere in the review
+    at all, including the "claimed, shown for visibility" pile, since that pile is still
+    information about content this instance has no business describing.
+    """
+    root = "/complete/tv"
+    entry = _file(root, "OtherInstance.Release/file.mkv", inode=9)
+    result = reconcile(
+        **_base(
+            base_paths=[root],
+            contributors=[BasePathContributor(root, client_id=1)],
+            reachable_client_ids=[1],
+            disk_entries=[entry],
+            claims=[_claim(1, "SAB", f"{root}/OtherInstance.Release")],
+            excluded_paths=[f"{root}/OtherInstance.Release"],
+        )
+    )
+    assert result.debris == ()
+    assert result.seeding_estate == ()
+
+
+def test_excluded_path_suppresses_broken_seed_reporting_too():
+    """A claim under an excluded path with nothing found on disk must not be reported as a
+    broken seed either -- this instance has no business judging "present" or "broken" for a tree
+    that belongs to the other lftpweb instance sharing this seedbox.
+    """
+    root = "/complete/tv"
+    result = reconcile(
+        **_base(
+            base_paths=[root],
+            contributors=[BasePathContributor(root, client_id=1)],
+            reachable_client_ids=[1],
+            disk_entries=[],
+            claims=[_claim(1, "SAB", f"{root}/OtherInstance.Release", transfer_id="nzo9")],
+            excluded_paths=[f"{root}/OtherInstance.Release"],
+        )
+    )
+    assert result.broken_seeds == ()
+
+
+def test_excluding_a_whole_base_path_protects_everything_under_it():
+    """Fail-closed's own shape (finding #16's "hard part"): when a category can't be resolved to
+    a path, `run_scan` excludes the client's *entire* declared base path -- asserted here at the
+    `reconcile()` level, where that shows up as the base path itself being in `excluded_paths`.
+    """
+    root = "/rtorrent/data"
+    entry = _file(root, "Some.Release/file.mkv")
+    result = reconcile(
+        **_base(
+            base_paths=[root],
+            contributors=[BasePathContributor(root, client_id=1)],
+            reachable_client_ids=[1],
+            disk_entries=[entry],
+            excluded_paths=[root],
+        )
+    )
+    assert result.debris == ()
+
+
+def test_resolve_category_exclusion_paths_joins_base_and_category():
+    """Finding #16's own resolution rule: spec §1.1's `<base>/<category>` layout, for every
+    combination of a client's content-kind base paths and its excluded categories.
+    """
+    paths = resolve_category_exclusion_paths(
+        ["/downloads/complete"], ["other-site-tv", "other-site-movies"]
+    )
+    assert paths == ["/downloads/complete/other-site-movies", "/downloads/complete/other-site-tv"]
+
+
+def test_resolve_category_exclusion_paths_handles_multiple_base_paths():
+    paths = resolve_category_exclusion_paths(["/a", "/b"], ["cat"])
+    assert set(paths) == {"/a/cat", "/b/cat"}
+
+
+def test_is_authorized_delete_target_refuses_an_excluded_path():
+    """The seed of §10.2's future containment check -- an excluded path must be refused even
+    though it sits inside a declared base path, which is exactly the scenario finding #16 exists
+    to guard against.
+    """
+    assert (
+        is_authorized_delete_target(
+            "/complete/tv/OtherInstance.Release",
+            base_paths=["/complete/tv"],
+            excluded_paths=["/complete/tv/OtherInstance.Release"],
+        )
+        is False
+    )
+
+
+def test_is_authorized_delete_target_refuses_a_sub_path_of_an_excluded_path():
+    assert (
+        is_authorized_delete_target(
+            "/complete/tv/OtherInstance.Release/episode.mkv",
+            base_paths=["/complete/tv"],
+            excluded_paths=["/complete/tv/OtherInstance.Release"],
+        )
+        is False
+    )
+
+
+def test_is_authorized_delete_target_allows_a_base_path_target_outside_any_exclusion():
+    assert (
+        is_authorized_delete_target(
+            "/complete/tv/Our.Release",
+            base_paths=["/complete/tv"],
+            excluded_paths=["/complete/tv/OtherInstance.Release"],
+        )
+        is True
+    )
+
+
+def test_is_authorized_delete_target_refuses_anything_outside_every_base_path():
+    assert (
+        is_authorized_delete_target(
+            "/somewhere/else", base_paths=["/complete/tv"], excluded_paths=[]
+        )
+        is False
+    )
+
+
+# --- `run_scan`'s own derivation step, isolated from the database/SSH (finding #16) ------------
+
+
+def test_resolve_client_exclusions_derives_a_path_from_a_content_kind_base_path():
+    """The SAB-shaped case: a `content`-kind base path exists, so the excluded category resolves
+    precisely -- no fail-closed root at all.
+    """
+    excluded_paths, fail_closed = _resolve_client_exclusions(
+        manual_excluded_paths=[],
+        base_paths_by_client={1: [("/downloads/complete", "content")]},
+        excluded_categories_by_client={1: ["other-site-tv"]},
+    )
+    assert excluded_paths == {"/downloads/complete/other-site-tv"}
+    assert fail_closed == {}
+
+
+def test_resolve_client_exclusions_fails_closed_with_no_content_base_path():
+    """The rTorrent-shaped "hard part" (finding #16): the client's only declared base path is
+    `working` (its seeding directory), unrelated to any category folder -- the exclusion cannot
+    be resolved to a path, so the client's entire declared base path is suppressed instead, with
+    a stated reason, rather than silently proposing nothing is wrong.
+    """
+    excluded_paths, fail_closed = _resolve_client_exclusions(
+        manual_excluded_paths=[],
+        base_paths_by_client={2: [("/rtorrent/data", "working")]},
+        excluded_categories_by_client={2: ["other-site-movies"]},
+    )
+    assert excluded_paths == set()
+    assert list(fail_closed) == ["/rtorrent/data"]
+    assert "other-site-movies" in fail_closed["/rtorrent/data"]
+    assert "cannot be resolved" in fail_closed["/rtorrent/data"]
+
+
+def test_resolve_client_exclusions_only_fails_closed_the_client_with_no_content_base_path():
+    """One client's unresolvable exclusion must not spill over onto a different client's own,
+    perfectly resolvable one.
+    """
+    excluded_paths, fail_closed = _resolve_client_exclusions(
+        manual_excluded_paths=[],
+        base_paths_by_client={
+            1: [("/downloads/complete", "content")],  # SAB -- resolves fine
+            2: [("/rtorrent/data", "working")],  # rTorrent -- cannot resolve
+        },
+        excluded_categories_by_client={1: ["other-site-tv"], 2: ["other-site-movies"]},
+    )
+    assert excluded_paths == {"/downloads/complete/other-site-tv"}
+    assert list(fail_closed) == ["/rtorrent/data"]
+
+
+def test_resolve_client_exclusions_combines_manual_and_derived_paths():
+    excluded_paths, fail_closed = _resolve_client_exclusions(
+        manual_excluded_paths=["/complete/manually-excluded"],
+        base_paths_by_client={1: [("/downloads/complete", "content")]},
+        excluded_categories_by_client={1: ["other-site-tv"]},
+    )
+    assert excluded_paths == {
+        "/complete/manually-excluded",
+        "/downloads/complete/other-site-tv",
+    }
+    assert fail_closed == {}
 
 
 # ================================================================================================

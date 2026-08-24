@@ -925,6 +925,24 @@ the opposite sign — it stops carrying information.
 needed"*; rTorrent: *"0 of 2 matched — mapping required"*), since both change what this section
 says about an unmapped category and splitting them would mean writing that copy twice.
 
+### Resolved 2026-08-23 — three-state, persisted; the banner counts only undecided
+
+`prompts/done/2026-08-23-category-tristate-and-exclusion.md`, `docs/decisions.md`, spec §8.3
+round 5. Built exactly as specified: migration 031 adds `download_client_category.excluded`
+(mutually exclusive with `queue_id`, enforced by `DownloadClientCategoryIn`'s own
+`model_validator`, not a table-level `CHECK` — SQLite's `ADD COLUMN` can't add one without a full
+rebuild). `core.clientsync.ClientSyncScheduler._update_preflight` now consults each instance's
+excluded-category set and skips it before it can reach `unattributed_clients`'s own count —
+asserted directly (`test_client_fully_bound_or_excluded_produces_no_banner`): a client whose
+every category is bound or explicitly excluded produces **no banner entry at all**, not a reduced
+one. A category appearing later still arrives undecided and still warns
+(`computeCategoryRows`/`withQueueSelection`/`withExcludedToggle` on the frontend keep the
+mutual-exclusion rule identical to the backend's). The per-client relevance copy this finding
+asked to be sequenced with landed in the same task — see #16's own resolution note, since the two
+were built together. Covered by three new `tests/test_clientsync.py` cases, two new
+`tests/test_settings_clients_api.py` cases (the round trip and the 422 on setting both), and new
+`clientCategoryInference.test.ts` cases for the mutual-exclusion helpers.
+
 ---
 
 ## 16. TWO lftpweb instances share one seedbox — "not used" is a safety boundary, not a preference
@@ -992,3 +1010,50 @@ exactly as dangerous while *appearing* to have addressed the problem.
   now that we know two instances share a tree.
 - Should the scan **refuse to run at all** on a base path known to be shared, until exclusions are
   configured? Failing closed is the house style for anything that deletes.
+
+### Resolved 2026-08-23 — path exclusion as the enforceable primitive; fail-closed where it can't resolve
+
+`prompts/done/2026-08-23-category-tristate-and-exclusion.md`, `docs/decisions.md`, spec §8.3
+round 5/§10.2/§11.2. **Category is the wrong exclusion unit on its own, decided explicitly** (the
+first open question above) — implemented as path exclusion (`download_client_excluded_path`,
+migration 031, the enforceable primitive, addable directly in Settings → Clients) with category
+exclusion as a convenience that resolves into it wherever spec §1.1's `<base>/<category>` layout
+holds (`core/disk_review.resolve_category_exclusion_paths`, run against a client's own
+`content`-kind base paths). `core/disk_review.py.reconcile()` takes a new `excluded_paths`
+parameter and drops every entry under one before any candidate/claim logic runs — never proposed
+as debris, never shown as seeding estate, never counted as a broken seed
+(`test_excluded_path_is_never_proposed_as_debris`,
+`test_excluded_path_is_also_never_shown_as_seeding_estate`,
+`test_excluded_path_suppresses_broken_seed_reporting_too`).
+
+**The hard part's own rule, built literally:** a client with no `content`-kind base path at all
+(rTorrent, under the reference layout — its only declared base path is the seeding/`working`
+directory) cannot have an excluded category resolved to a path. `run_scan` fails closed by
+suppressing debris for **every one of that client's declared base paths**, via the existing
+`unavailable_roots` mechanism (§11.1a's own "a contributor that didn't report blocks the whole
+root," reused rather than reinvented) — and because that mechanism is populated *before* the walk
+loop runs, the fail-closed case is genuinely never scanned at the SSH level, not merely discarded
+after (`test_resolve_client_exclusions_fails_closed_with_no_content_base_path`,
+`test_excluding_a_whole_base_path_protects_everything_under_it`). A manually-excluded *sub*-path
+is still walked over the wire and filtered inside `reconcile()` — pruning the remote `find`
+command itself was judged out of scope (it touches `core/remote.py`, load-bearing) and is named,
+not hidden, in `docs/decisions.md`.
+
+**§10.2's future containment check got its seed now, not deferred to stage 5:**
+`core/disk_review.py.is_authorized_delete_target(path, base_paths, excluded_paths)` is pure,
+unit-tested, and unused by anything yet — stage 5's own delete sequence must call it rather than
+re-derive containment. The second open question above (should this be a first-class documented
+topology) is answered in the affirmative by this task's own spec §8.3 round-5 section, which
+states the two-instance shape as the reason the whole correction exists; a README/reference-
+workflow write-up specifically for it was judged out of this task's scope and is not yet done.
+The third question (does `move`-mode source deletion have the same hazard) was not investigated
+here — it remains open. The fourth (should the scan refuse to run at all on a shared base path)
+was answered narrowly rather than broadly: it refuses **debris on that specific path**, not the
+whole scan, since the seeding-estate pile and other, unrelated base paths are still useful to see.
+
+Covered by fourteen new `tests/test_disk_review.py` cases (the `reconcile()`-level exclusion
+behaviour, `resolve_category_exclusion_paths`, `is_authorized_delete_target`, and the pure
+`_resolve_client_exclusions` derivation step in isolation from any database or SSH connection)
+and two new `tests/test_settings_clients_api.py` cases (the excluded-paths CRUD round trip and
+cascade-delete). **Not verified against the user's real two-instance deployment** — see this
+task's own final report for what that leaves standing before stage 5.

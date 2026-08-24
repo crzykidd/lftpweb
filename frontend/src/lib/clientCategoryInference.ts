@@ -91,6 +91,30 @@ export interface CategoryRowDraft {
   category: string
   queue_id: number | null
   source: CategoryRowSource
+  // Finding #15 (2026-08-23, prompts/2026-08-23-category-tristate-and-exclusion.md): "not used
+  // by this instance," saved explicitly -- the third state, distinct from `queue_id === null`
+  // meaning merely undecided. Mutually exclusive with a non-null `queue_id`, enforced by
+  // `withQueueSelection`/`withExcludedToggle` below (and re-enforced server-side).
+  excluded: boolean
+}
+
+/** Apply a queue selection to one row, clearing `excluded` -- picking a queue is a decision that
+ * supersedes any prior "not used" mark (finding #15's mutual-exclusion rule, the same one
+ * `DownloadClientCategoryIn`'s backend validator enforces). Picking "— not used —" itself
+ * (`queueId === null`) lands the row back in the *undecided* state, not excluded -- only the
+ * explicit "not used by this instance" toggle produces `excluded: true`.
+ */
+export function withQueueSelection(row: CategoryRowDraft, queueId: number | null): CategoryRowDraft {
+  return { ...row, queue_id: queueId, excluded: false }
+}
+
+/** Apply the "not used by this instance" toggle to one row -- checking it clears any queue
+ * binding (the two are mutually exclusive); unchecking it returns the row to undecided, never
+ * back to whatever queue was previously selected (an explicit re-pick is required, the same
+ * "propose, never auto-apply" instinct this control already follows elsewhere).
+ */
+export function withExcludedToggle(row: CategoryRowDraft, excluded: boolean): CategoryRowDraft {
+  return excluded ? { ...row, excluded: true, queue_id: null } : { ...row, excluded: false }
 }
 
 function trailingSegment(path: string): string {
@@ -159,7 +183,12 @@ export function computeCategoryRows(
       // rather than the manual row's own "always removable" escape hatch staying live for a
       // category that is, in fact, live.
       if (saved != null) return { ...saved, source: 'client' }
-      return { category, queue_id: suggestQueueForCategory(category, queues), source: 'client' }
+      return {
+        category,
+        queue_id: suggestQueueForCategory(category, queues),
+        source: 'client',
+        excluded: false,
+      }
     })
     const detectedSet = new Set(detectedCategories)
     for (const row of existing) {
@@ -173,7 +202,7 @@ export function computeCategoryRows(
   let addedAny = false
   for (const p of proposals) {
     if (!byCategory.has(p.category)) {
-      rows.push({ category: p.category, queue_id: p.queue_id, source: 'client' })
+      rows.push({ category: p.category, queue_id: p.queue_id, source: 'client', excluded: false })
       addedAny = true
     }
   }

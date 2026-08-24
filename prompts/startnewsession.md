@@ -156,32 +156,61 @@ deliberate escape hatch**, so a temporarily-unreachable client can still be edit
 fix, re-enable). There is deliberately **no force/save-anyway flag**. A successful save also
 persists the probed capabilities, so no second Test click is needed.
 
-### 🛑 STAGE 5 (the delete pipeline) IS BLOCKED — user's explicit instruction, 2026-08-23
+### ✅ Findings #15/#16's gate is cleared (2026-08-23) — stage 5 itself is still not built
 
-**Do not build stage 5 until findings #15 and #16 in `prompts/test-findings-2026-08-23.md` are
-resolved.** This is a hard gate, not a preference.
+**Resolved**: `prompts/done/2026-08-23-category-tristate-and-exclusion.md`,
+`docs/decisions.md`, spec §8.3 round 5/§10.2/§11.2. The two-lftpweb-instances-one-seedbox shape
+this gate exists for is unchanged (see below, kept for context) — what changed is that the fix is
+now built and tested, not merely designed.
 
-**Why (#16):** the user runs **two lftpweb instances against one seedbox** — one SABnzbd, one
-rTorrent, both serving both instances, each lftpweb with its own *arr pair and its own subset of
-the download locations. So each instance permanently sees work that is not its business.
+**What landed:** categories are three-state and persisted (migration 031,
+`download_client_category.excluded`, mutually exclusive with `queue_id`) — bound / explicitly
+"not used by this instance" / undecided — and the unattributed-clients banner counts only the
+undecided state (`core.clientsync._update_preflight`), asserted directly: a client whose every
+category is bound or excluded produces no banner line at all. "Not used" is also now a hard scan
+boundary, not merely a silenced banner: `download_client_excluded_path` (migration 031) is the
+enforceable primitive, an excluded category resolves into a path wherever a `content`-kind base
+path exists to resolve it onto (`core.disk_review.resolve_category_exclusion_paths`), and
+`core.disk_review.reconcile()` drops everything under an excluded path before any candidate/claim
+logic runs. **Fails closed** where resolution is impossible (rTorrent has no `content`-kind base
+path under the reference layout) by suppressing debris for that client's *entire* declared base
+path, before the walk even reaches it — genuinely never scanned in that case, not merely
+discarded after. `core.disk_review.is_authorized_delete_target(path, base_paths, excluded_paths)`
+seeds §10.2's future two-sided containment check (inside a base path **and** outside every
+excluded path), unit-tested now even though nothing calls it in anger yet. The per-client
+relevance copy findings #15 asked to be sequenced with (SAB: "12 of 12 matched by folder, no
+mapping needed"; rTorrent: "0 of 2 matched, mapping required") also landed, derived from two new
+observed columns (`attribution_sample_size`/`attribution_matched_by_path`), never from
+`client_type`.
+
+**What still stands in the way of actually building stage 5** (see spec §14's own stage-5 row for
+the fuller version): (1) none of this has been run against the user's real two-instance
+deployment yet — a live scan, a real excluded category, and a real fail-closed base path all need
+verification before anything is trusted to delete; (2) `is_authorized_delete_target` is tested
+but unused — stage 5's own delete sequence must actually call it; (3) the new excluded-paths/
+exclusion-checkbox UI in `ClientsTab.tsx` is unverified in a real browser (jsdom has no layout
+engine, the same honest limitation every other layout-sensitive change in this feature already
+carries); (4) stage 4's own real-box verification (named in its own §14 row) is still outstanding
+and should happen before stage 5, not after. Two of finding #16's own open questions were answered
+explicitly (path is the exclusion unit, not category — the enforceable primitive; the scan refuses
+debris on the specific shared path, not the whole scan) and two were left open: whether a
+two-instance seedbox becomes a documented deployment in README/§1.1, and whether `move`-mode
+source deletion has the same hazard today.
+
+<details>
+<summary>Original blocking rationale (2026-08-22/23), kept for context</summary>
 
 The disk review scan proposes `B − A − C` as debris. The *other* instance's content is protected
 today **only** by set A (the clients still claim it). That protection is temporary: once the other
 instance imports a release and SAB drops it from history, the content is claimed by nobody *this*
 instance can see — set C only knows this lftpweb's own items — and it becomes arithmetically
-indistinguishable from debris. **Stage 5 would then offer to delete another site's data, with a
-correct-looking reclaim figure and no signal anything was wrong.**
+indistinguishable from debris. Stage 5 would then offer to delete another site's data, with a
+correct-looking reclaim figure and no signal anything was wrong. "Not used by this instance" had
+to mean **two** things: don't warn about it, *and* never scan it, never propose it, never let it
+inside §10.2's delete containment boundary — a flag that only silences a banner would have left
+the delete path exactly as dangerous while appearing to have addressed it.
 
-**#15 is the mechanism that fixes it**, and "not used by this instance" must mean **two** things:
-don't warn about it, *and* never scan it, never propose it, never let it inside §10.2's delete
-containment boundary. A flag that only silences a banner leaves the delete path exactly as
-dangerous while appearing to have addressed it.
-
-Open and deliberately unanswered — see finding #16: whether the exclusion unit should be the
-**path** rather than the category (a category is only a proxy for where content lands); whether a
-two-instance seedbox should become a documented deployment in README/§1.1; whether `move`-mode
-source deletion has the same hazard *today*; and whether the scan should refuse to run on a
-known-shared base path until exclusions exist.
+</details>
 
 **👉 THE NEXT REAL-WORLD STEP is not more code — it is running a capture against the live SAB.**
 Settings → Clients → add the SABnzbd instance → Test. Then read the capture and work through spec

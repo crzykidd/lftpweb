@@ -1849,6 +1849,15 @@ class DownloadClientBasePathOut(DownloadClientBasePathIn):
 
 
 class DownloadClientCategoryIn(BaseModel):
+    """Three-state (finding #15, 2026-08-23,
+    prompts/2026-08-23-category-tristate-and-exclusion.md): a category is **bound** (`queue_id`
+    set), **explicitly excluded** ("not used by this instance," `excluded=True`), or
+    **undecided** (neither -- the only state the unattributed-clients banner should ever warn
+    about). Before this, "not used" and "never looked at" were the same on-disk state
+    (`queue_id=None`), so a user who deliberately dismissed a category the client reports got
+    nagged about it forever, with no way to record the decision.
+    """
+
     # `min_length=1`: a blank category must be **rejected visibly** (a 422), never silently
     # saved or silently dropped -- the exact defect class (#11b/#11c, then repeated at the
     # "Add category" escape hatch this task restores) this control has already been rebuilt once
@@ -1857,8 +1866,8 @@ class DownloadClientCategoryIn(BaseModel):
     # string can still originate, the manual-add box, whose own frontend validation already
     # refuses to submit one.
     category: str = Field(max_length=MAX_NAME_LEN, min_length=1)
-    # `None` = configured but not yet bound to a queue (spec §8.3) -- distinct from the mapping
-    # not existing at all.
+    # `None` = not bound to a queue -- either undecided or explicitly excluded, see `excluded`
+    # below for which. Distinct from the mapping not existing at all (spec §8.3).
     queue_id: int | None = None
     # Migration 030, mirrors `DownloadClientBasePathIn.source` exactly, for the identical reason:
     # whether this row was produced by detection (the client's own `list_categories` answer, or
@@ -1870,6 +1879,25 @@ class DownloadClientCategoryIn(BaseModel):
     # what it always was -- system-produced, never free-typed (findings #11b/#11c already
     # eliminated that possibility).
     source: Literal["client", "manual"] = "client"
+    # Migration 031 (finding #15/#16): "not used by this instance," saved explicitly rather than
+    # inferred from `queue_id` being empty. **This is a safety boundary, not merely a UI
+    # preference** (finding #16) -- `core/disk_review.py.run_scan` resolves an excluded category
+    # into an excluded path wherever it can (SAB: `<content base path>/<category>`) and, where it
+    # can't (rTorrent's `content_path` is unrelated to any category folder), fails closed by
+    # suppressing debris for that client's entire declared base path rather than guessing. Mutually
+    # exclusive with `queue_id` -- a row is never both bound and excluded, enforced below rather
+    # than by a table-level CHECK (SQLite's `ADD COLUMN` cannot add a cross-column constraint
+    # without a full table rebuild).
+    excluded: bool = False
+
+    @model_validator(mode="after")
+    def _queue_id_and_excluded_are_mutually_exclusive(self) -> "DownloadClientCategoryIn":
+        if self.excluded and self.queue_id is not None:
+            raise ValueError(
+                "a category cannot be both bound to a queue and marked "
+                "'not used by this instance' -- pick one"
+            )
+        return self
 
 
 class DownloadClientCategoryOut(BaseModel):
@@ -1877,6 +1905,24 @@ class DownloadClientCategoryOut(BaseModel):
     category: str
     queue_id: int | None = None
     source: Literal["client", "manual"] = "client"
+    excluded: bool = False
+
+
+class DownloadClientExcludedPathIn(BaseModel):
+    """One path (or sub-path) never scanned, never proposed as debris, and never inside §10.2's
+    delete containment boundary on this client's behalf (migration 031, finding #16, this task).
+    **The enforceable primitive** the task's own instruction asked for: a category exclusion is
+    only ever a convenience that *resolves into* a path like this one at scan time
+    (`core/disk_review.py.run_scan`); this is the direct, always-available expression of "this
+    tree belongs to the other lftpweb instance sharing this seedbox," and the only thing that
+    works when a client's category has no relationship to any path at all (rTorrent).
+    """
+
+    path: str = Field(max_length=MAX_PATH_LEN)
+
+
+class DownloadClientExcludedPathOut(DownloadClientExcludedPathIn):
+    id: int
 
 
 class DownloadClientIn(BaseModel):
@@ -1899,6 +1945,8 @@ class DownloadClientIn(BaseModel):
     enabled: bool = False
     base_paths: list[DownloadClientBasePathIn] = Field(default_factory=list)
     categories: list[DownloadClientCategoryIn] = Field(default_factory=list)
+    # Migration 031, finding #16 -- see `DownloadClientExcludedPathIn`'s own docstring.
+    excluded_paths: list[DownloadClientExcludedPathIn] = Field(default_factory=list)
 
 
 class DownloadClientOut(BaseModel):
@@ -1918,6 +1966,8 @@ class DownloadClientOut(BaseModel):
     version: str | None = None
     base_paths: list[DownloadClientBasePathOut]
     categories: list[DownloadClientCategoryOut]
+    # Migration 031, finding #16 -- see `DownloadClientExcludedPathIn`'s own docstring.
+    excluded_paths: list[DownloadClientExcludedPathOut] = []
     created_at: str
     updated_at: str
     # The poller's own last-pass status (migration 029, finding #2, 2026-08-23) -- distinct from
@@ -1945,6 +1995,18 @@ class DownloadClientOut(BaseModel):
     # `POST /clients/{id}/test`, the same call that already refreshes `capabilities`/`version`.
     detected_categories: list[str] | None = None
     detected_categories_at: str | None = None
+    # Migration 031 (this task, Part 3): "derive the per-client 'do you even need this control'
+    # copy from OBSERVED attribution counts ... never from client_type." Written every poll pass
+    # (`core.clientsync.ClientSyncScheduler._update_preflight`) -- `attribution_sample_size` is
+    # how many of this pass's transfers had something to attribute (a `content_path` or a
+    # `category`); `attribution_matched_by_path` is how many of those needed no category mapping
+    # at all, because their own `content_path` already matched a queue. Both `None` until the
+    # poller's first pass after this migration -- the settings page renders "not yet observed,"
+    # never a fabricated "0 of 0." The frontend copy this drives (`lib/clientAttribution.ts`) has
+    # no `client_type` branch anywhere -- SABnzbd and rTorrent read identically true or false
+    # sentences from these same two numbers.
+    attribution_sample_size: int | None = None
+    attribution_matched_by_path: int | None = None
 
 
 class DetectedBasePathOut(BaseModel):

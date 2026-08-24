@@ -6,6 +6,8 @@ import {
   inferCategoryMappings,
   isStaleCategoryRow,
   suggestQueueForCategory,
+  withExcludedToggle,
+  withQueueSelection,
   type CategoryRowDraft,
   type QueueForCategorySuggestion,
 } from './clientCategoryInference'
@@ -101,15 +103,27 @@ describe('computeCategoryRows', () => {
     const { rows, source } = computeCategoryRows([], ['ar-tv', 'ar-movies'], [], QUEUES)
     expect(source).toBe('client')
     expect(rows).toEqual([
-      { category: 'ar-tv', queue_id: 1, source: 'client' },
-      { category: 'ar-movies', queue_id: 2, source: 'client' },
+      { category: 'ar-tv', queue_id: 1, source: 'client', excluded: false },
+      { category: 'ar-movies', queue_id: 2, source: 'client', excluded: false },
     ])
   })
 
   it('keeps an already-saved binding instead of overwriting it with a suggestion', () => {
-    const existing: CategoryRowDraft[] = [{ category: 'ar-tv', queue_id: 2, source: 'client' }]
+    const existing: CategoryRowDraft[] = [
+      { category: 'ar-tv', queue_id: 2, source: 'client', excluded: false },
+    ]
     const { rows } = computeCategoryRows(existing, ['ar-tv'], [], QUEUES)
-    expect(rows).toEqual([{ category: 'ar-tv', queue_id: 2, source: 'client' }])
+    expect(rows).toEqual([{ category: 'ar-tv', queue_id: 2, source: 'client', excluded: false }])
+  })
+
+  it('keeps an already-saved exclusion instead of overwriting it with a suggestion', () => {
+    // Finding #15: "not used by this instance" is a saved decision -- a category the client
+    // still reports must not silently regain a queue suggestion once it's been excluded.
+    const existing: CategoryRowDraft[] = [
+      { category: 'ar-tv', queue_id: null, source: 'client', excluded: true },
+    ]
+    const { rows } = computeCategoryRows(existing, ['ar-tv'], [], QUEUES)
+    expect(rows).toEqual([{ category: 'ar-tv', queue_id: null, source: 'client', excluded: true }])
   })
 
   it('a suggested (unsaved) binding defaults to a selected value, not unbound', () => {
@@ -119,12 +133,17 @@ describe('computeCategoryRows', () => {
 
   it('preserves a saved mapping for a category the client no longer reports', () => {
     const existing: CategoryRowDraft[] = [
-      { category: 'stale-category', queue_id: 2, source: 'client' },
+      { category: 'stale-category', queue_id: 2, source: 'client', excluded: false },
     ]
     const { rows, source } = computeCategoryRows(existing, ['ar-tv'], [], QUEUES)
     expect(source).toBe('client')
-    expect(rows).toContainEqual({ category: 'stale-category', queue_id: 2, source: 'client' })
-    expect(rows).toContainEqual({ category: 'ar-tv', queue_id: 1, source: 'client' })
+    expect(rows).toContainEqual({
+      category: 'stale-category',
+      queue_id: 2,
+      source: 'client',
+      excluded: false,
+    })
+    expect(rows).toContainEqual({ category: 'ar-tv', queue_id: 1, source: 'client', excluded: false })
   })
 
   it('falls back to path-arithmetic proposals when the client reports no categories', () => {
@@ -135,7 +154,7 @@ describe('computeCategoryRows', () => {
       [{ id: 3, name: 'q', remote_path: '/home/crzykidd/downloads/complete/ar-tv' }],
     )
     expect(source).toBe('path_arithmetic')
-    expect(rows).toEqual([{ category: 'ar-tv', queue_id: 3, source: 'client' }])
+    expect(rows).toEqual([{ category: 'ar-tv', queue_id: 3, source: 'client', excluded: false }])
   })
 
   it('falls back to path arithmetic when the client has never been tested (null)', () => {
@@ -146,7 +165,7 @@ describe('computeCategoryRows', () => {
       [{ id: 3, name: 'q', remote_path: '/home/crzykidd/downloads/complete/ar-tv' }],
     )
     expect(source).toBe('path_arithmetic')
-    expect(rows).toEqual([{ category: 'ar-tv', queue_id: 3, source: 'client' }])
+    expect(rows).toEqual([{ category: 'ar-tv', queue_id: 3, source: 'client', excluded: false }])
   })
 
   it('reports source "none" when nothing can be proposed either way', () => {
@@ -156,7 +175,9 @@ describe('computeCategoryRows', () => {
   })
 
   it('does not duplicate an already-existing category with a path-arithmetic proposal', () => {
-    const existing: CategoryRowDraft[] = [{ category: 'ar-tv', queue_id: 1, source: 'client' }]
+    const existing: CategoryRowDraft[] = [
+      { category: 'ar-tv', queue_id: 1, source: 'client', excluded: false },
+    ]
     const { rows, source } = computeCategoryRows(
       existing,
       [],
@@ -164,26 +185,31 @@ describe('computeCategoryRows', () => {
       [{ id: 1, name: 'ar-tv', remote_path: '/home/crzykidd/downloads/complete/ar-tv' }],
     )
     expect(source).toBe('none')
-    expect(rows).toEqual([{ category: 'ar-tv', queue_id: 1, source: 'client' }])
+    expect(rows).toEqual([{ category: 'ar-tv', queue_id: 1, source: 'client', excluded: false }])
   })
 
   // Round 4 (2026-08-23): the manual "Add category" escape hatch.
 
   it('preserves a manually-added row the client does not (yet) report', () => {
     const existing: CategoryRowDraft[] = [
-      { category: 'ar-movies', queue_id: null, source: 'manual' },
+      { category: 'ar-movies', queue_id: null, source: 'manual', excluded: false },
     ]
     const { rows, source } = computeCategoryRows(existing, ['ar-tv'], [], QUEUES)
     expect(source).toBe('client')
-    expect(rows).toContainEqual({ category: 'ar-movies', queue_id: null, source: 'manual' })
+    expect(rows).toContainEqual({
+      category: 'ar-movies',
+      queue_id: null,
+      source: 'manual',
+      excluded: false,
+    })
   })
 
   it('flips a manual row to source "client" once the client actually reports it', () => {
     const existing: CategoryRowDraft[] = [
-      { category: 'ar-movies', queue_id: 2, source: 'manual' },
+      { category: 'ar-movies', queue_id: 2, source: 'manual', excluded: false },
     ]
     const { rows } = computeCategoryRows(existing, ['ar-movies'], [], QUEUES)
-    expect(rows).toEqual([{ category: 'ar-movies', queue_id: 2, source: 'client' }])
+    expect(rows).toEqual([{ category: 'ar-movies', queue_id: 2, source: 'client', excluded: false }])
   })
 })
 
@@ -254,5 +280,57 @@ describe('canRemoveCategoryRow', () => {
 
   it('is false for a client-sourced row when never tested this session', () => {
     expect(canRemoveCategoryRow({ category: 'anything', source: 'client' }, null)).toBe(false)
+  })
+})
+
+// --- Finding #15 (2026-08-23): three-state categories -- mutual exclusion between a queue
+// binding and "not used by this instance," enforced identically to the backend's own validator.
+
+describe('withQueueSelection / withExcludedToggle', () => {
+  const excludedRow: CategoryRowDraft = {
+    category: 'other-site-tv',
+    queue_id: null,
+    source: 'client',
+    excluded: true,
+  }
+  const boundRow: CategoryRowDraft = {
+    category: 'ar-tv',
+    queue_id: 1,
+    source: 'client',
+    excluded: false,
+  }
+
+  it('picking a queue clears any prior exclusion', () => {
+    const result = withQueueSelection(excludedRow, 5)
+    expect(result).toEqual({ category: 'other-site-tv', queue_id: 5, source: 'client', excluded: false })
+  })
+
+  it('picking "undecided" (null) also clears exclusion, landing on undecided rather than excluded', () => {
+    const result = withQueueSelection(excludedRow, null)
+    expect(result.excluded).toBe(false)
+    expect(result.queue_id).toBeNull()
+  })
+
+  it('checking "not used" clears any existing queue binding', () => {
+    const result = withExcludedToggle(boundRow, true)
+    expect(result).toEqual({ category: 'ar-tv', queue_id: null, source: 'client', excluded: true })
+  })
+
+  it('unchecking "not used" returns to undecided, not back to the prior queue binding', () => {
+    const excludedWasBound: CategoryRowDraft = {
+      category: 'ar-tv',
+      queue_id: null,
+      source: 'client',
+      excluded: true,
+    }
+    const result = withExcludedToggle(excludedWasBound, false)
+    expect(result).toEqual({ category: 'ar-tv', queue_id: null, source: 'client', excluded: false })
+  })
+
+  it('the two functions never produce a row that is both bound and excluded', () => {
+    const afterQueue = withQueueSelection(excludedRow, 5)
+    expect(afterQueue.excluded && afterQueue.queue_id != null).toBe(false)
+    const afterExclude = withExcludedToggle(boundRow, true)
+    expect(afterExclude.excluded && afterExclude.queue_id != null).toBe(false)
   })
 })

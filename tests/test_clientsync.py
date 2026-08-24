@@ -108,10 +108,18 @@ async def _seed_client(
     return cursor.lastrowid
 
 
-async def _seed_category(db: aiosqlite.Connection, client_id: int, category: str, queue_id: int):
+async def _seed_category(
+    db: aiosqlite.Connection,
+    client_id: int,
+    category: str,
+    queue_id: int | None,
+    *,
+    excluded: bool = False,
+):
     await db.execute(
-        "INSERT INTO download_client_category (client_id, category, queue_id) VALUES (?, ?, ?)",
-        (client_id, category, queue_id),
+        "INSERT INTO download_client_category (client_id, category, queue_id, excluded) "
+        "VALUES (?, ?, ?, ?)",
+        (client_id, category, queue_id, 1 if excluded else 0),
     )
     await db.commit()
 
@@ -675,6 +683,150 @@ async def test_unattributed_clients_ignores_an_instance_not_in_the_enabled_set(
             no_category_count=0,
         )
     ]
+
+
+# --- Three-state categories / exclusion (finding #15/#16, 2026-08-23) --------------------------
+
+
+async def test_excluded_category_transfer_is_omitted_and_not_counted(db, tmp_path):
+    """Finding #15/#16: a category explicitly marked "not used by this instance" behaves like
+    silent omission (no Preflight row) but crucially must never count toward the unattributed
+    banner -- that is the entire point of the three-state redesign, and the deployment reason is
+    the two-lftpweb-instances-one-seedbox shape finding #16 names: this category belongs to the
+    other instance, permanently, and the user has already said so.
+    """
+    instance_id = await _seed_client(db, str(tmp_path), base_url="http://x.invalid", api_key="k")
+    await _seed_category(db, instance_id, "other-site-tv", queue_id=None, excluded=True)
+    instance_row = await _preflight_instance_row(db, instance_id)
+    transfer = _content_transfer(category="other-site-tv", content_path=None)
+
+    scheduler = ClientSyncScheduler(db=db, config_dir=str(tmp_path))
+    await scheduler._update_preflight(instance_row, [transfer], now=NOW0)
+
+    assert scheduler.preflight_rows(frozenset({instance_id})) == []
+    assert scheduler.unattributed_clients(frozenset({instance_id})) == []
+
+
+async def test_client_fully_bound_or_excluded_produces_no_banner(db, tmp_path):
+    """The direct assertion finding #15 asked for: a client whose every category is bound or
+    explicitly excluded is fully configured, and the banner must be silent -- not merely reduced.
+    """
+    host_id = await _seed_host(db)
+    queue_id = await _seed_queue(db, host_id, remote_path="/complete/ar-tv")
+    instance_id = await _seed_client(db, str(tmp_path), base_url="http://x.invalid", api_key="k")
+    await _seed_category(db, instance_id, "ar-tv", queue_id=queue_id)
+    await _seed_category(db, instance_id, "other-site-movies", queue_id=None, excluded=True)
+    instance_row = await _preflight_instance_row(db, instance_id)
+    transfers = [
+        _content_transfer(client_id="t1", category="ar-tv", content_path=None),
+        _content_transfer(client_id="t2", category="other-site-movies", content_path=None),
+    ]
+
+    scheduler = ClientSyncScheduler(db=db, config_dir=str(tmp_path))
+    await scheduler._update_preflight(instance_row, transfers, now=NOW0)
+
+    assert scheduler.unattributed_clients(frozenset({instance_id})) == []
+    rows = scheduler.preflight_rows(frozenset({instance_id}))
+    assert len(rows) == 1
+    assert rows[0].download_id == "t1"
+
+
+async def test_excluded_category_does_not_suppress_a_genuinely_unattributed_sibling(db, tmp_path):
+    """Excluding one category must not blur a different, genuinely-undecided one -- the banner
+    should still fire for the category nobody has looked at.
+    """
+    instance_id = await _seed_client(db, str(tmp_path), base_url="http://x.invalid", api_key="k")
+    await _seed_category(db, instance_id, "other-site-movies", queue_id=None, excluded=True)
+    instance_row = await _preflight_instance_row(db, instance_id)
+    transfers = [
+        _content_transfer(client_id="t1", category="other-site-movies", content_path=None),
+        _content_transfer(client_id="t2", category="ar-books", content_path=None),
+    ]
+
+    scheduler = ClientSyncScheduler(db=db, config_dir=str(tmp_path))
+    await scheduler._update_preflight(instance_row, transfers, now=NOW0)
+
+    info = scheduler.unattributed_clients(frozenset({instance_id}))
+    assert len(info) == 1
+    assert info[0].categories == ("ar-books",)
+    assert info[0].count == 1
+
+
+# --- Observed attribution stats (Part 3, 2026-08-23) --------------------------------------------
+
+
+async def _attribution_row(db: aiosqlite.Connection, instance_id: int) -> aiosqlite.Row:
+    cursor = await db.execute(
+        "SELECT attribution_sample_size, attribution_matched_by_path FROM download_client "
+        "WHERE id = ?",
+        (instance_id,),
+    )
+    return await cursor.fetchone()
+
+
+async def test_attribution_stats_all_matched_by_path(db, tmp_path):
+    """The SABnzbd-shaped case: every transfer's own `content_path` already answers the question,
+    so the relevance copy should read "N of N matched by folder" -- computed from observation,
+    never from `client_type`.
+    """
+    host_id = await _seed_host(db)
+    await _seed_queue(db, host_id, remote_path="/complete/ar-tv")
+    instance_id = await _seed_client(db, str(tmp_path), base_url="http://x.invalid", api_key="k")
+    instance_row = await _preflight_instance_row(db, instance_id)
+    transfers = [
+        _content_transfer(client_id=f"t{i}", content_path=f"/complete/ar-tv/Show.S0{i}")
+        for i in range(3)
+    ]
+
+    scheduler = ClientSyncScheduler(db=db, config_dir=str(tmp_path))
+    await scheduler._update_preflight(instance_row, transfers, now=NOW0)
+
+    row = await _attribution_row(db, instance_id)
+    assert row["attribution_sample_size"] == 3
+    assert row["attribution_matched_by_path"] == 3
+
+
+async def test_attribution_stats_none_matched_needs_category(db, tmp_path):
+    """The rTorrent-shaped case: `content_path` is the seeding directory, unrelated to the
+    queue's own `remote_path` -- 0 of N matched by folder, so the mapping is genuinely required.
+    """
+    host_id = await _seed_host(db)
+    queue_id = await _seed_queue(db, host_id, remote_path="/complete/ar-tv")
+    instance_id = await _seed_client(db, str(tmp_path), base_url="http://x.invalid", api_key="k")
+    await _seed_category(db, instance_id, "ar-tv", queue_id=queue_id)
+    instance_row = await _preflight_instance_row(db, instance_id)
+    transfers = [
+        _content_transfer(client_id="t1", category="ar-tv", content_path="/rtorrent/data/Show.S01"),
+        _content_transfer(client_id="t2", category="ar-tv", content_path="/rtorrent/data/Show.S02"),
+    ]
+
+    scheduler = ClientSyncScheduler(db=db, config_dir=str(tmp_path))
+    await scheduler._update_preflight(instance_row, transfers, now=NOW0)
+
+    row = await _attribution_row(db, instance_id)
+    assert row["attribution_sample_size"] == 2
+    assert row["attribution_matched_by_path"] == 0
+
+
+async def test_attribution_stats_never_regress_to_zero_on_a_quiet_pass(db, tmp_path):
+    """A pass with nothing to attribute leaves the last real reading on the row -- overwriting a
+    real "1 of 1" with a fabricated "0 of 0" during a quiet pass would make the relevance copy
+    flicker for no reason.
+    """
+    host_id = await _seed_host(db)
+    await _seed_queue(db, host_id, remote_path="/complete/ar-tv")
+    instance_id = await _seed_client(db, str(tmp_path), base_url="http://x.invalid", api_key="k")
+    instance_row = await _preflight_instance_row(db, instance_id)
+    transfer = _content_transfer(content_path="/complete/ar-tv/Show.S01")
+
+    scheduler = ClientSyncScheduler(db=db, config_dir=str(tmp_path))
+    await scheduler._update_preflight(instance_row, [transfer], now=NOW0)
+    row = await _attribution_row(db, instance_id)
+    assert row["attribution_sample_size"] == 1
+
+    await scheduler._update_preflight(instance_row, [], now=NOW0 + 10.0)
+    row = await _attribution_row(db, instance_id)
+    assert row["attribution_sample_size"] == 1  # unchanged, not reset to 0
 
 
 # --- Per-pass poll status (finding #2's reinforcing observation, 2026-08-23) ----------------

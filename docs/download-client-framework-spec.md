@@ -651,6 +651,61 @@ of this — a torrent client's unlabelled item is now the one case with genuinel
 become visible, where a SAB item under no category at least has an on-disk path a future
 mechanism could reach. Not decided here; see `docs/decisions.md`.
 
+### 8.3 correction, round 5 (2026-08-23) — categories are three-state; exclusion is a safety
+boundary, not a preference
+
+**The deployment shape that forces this:** the user runs **two lftpweb instances against one
+seedbox** — one SABnzbd, one rTorrent, both serving both instances, each lftpweb with its own
+*arr pair and its own subset of the download locations. Each instance permanently sees work that
+is not its business; that is the steady state, not a misconfiguration
+(`prompts/2026-08-23-category-tristate-and-exclusion.md`, findings #15/#16).
+
+**A category is now three-state, saved explicitly** (migration 031,
+`download_client_category.excluded`):
+
+| State | Persisted as | Does the unattributed-clients banner warn? |
+|---|---|---|
+| **Bound** to a queue | `queue_id` set, `excluded = 0` | No |
+| **Explicitly "not used by this instance"** | `queue_id = NULL`, `excluded = 1` | **Never again** |
+| **Undecided** — never looked at | `queue_id = NULL`, `excluded = 0` | Yes |
+
+Mutually exclusive by construction — `DownloadClientCategoryIn`'s own validator rejects a row
+that sets both `queue_id` and `excluded`. `core.clientsync.ClientSyncScheduler._update_preflight`
+consults the excluded set per instance and skips it before it can ever reach
+`unattributed_clients`'s own count — a client whose every category is bound or explicitly
+excluded now produces a **silent** banner, which is the entire point: a warning that can never be
+resolved stops carrying information (the same failure §2's silence named, with the opposite
+sign).
+
+**Exclusion is a hard scan/delete boundary, not merely a silenced banner (finding #16's own
+load-bearing half).** The disk review scan (§11) proposes `B − A − C`; the other instance's
+content is protected only by set A, and that protection expires the moment the other instance's
+release drops out of its own client's history or active list. "Not used by this instance" must
+therefore also mean: never scanned, never proposed as debris, never inside §10.2's containment
+boundary. Two mechanisms, deliberately layered:
+
+- **`download_client_excluded_path` (migration 031) is the enforceable primitive** — a path (or
+  sub-path) typed directly, exactly expressing "this tree belongs to the other instance." It is
+  what `core/disk_review.py.reconcile`'s new `excluded_paths` parameter consumes, and the only
+  thing that works when a category has no relationship to any path at all.
+- **An excluded *category* is a convenience that resolves into a path wherever spec §1.1's
+  `<base>/<category>` layout holds** — `core/disk_review.py.resolve_category_exclusion_paths`,
+  called by `run_scan` against the owning client's `content`-kind base paths only.
+- **Where it cannot resolve — FAIL CLOSED.** A client with no `content`-kind base path at all
+  (rTorrent: its only declared base path is its seeding/`working` directory, unrelated to any
+  category folder) cannot have its excluded category translated into a path. `run_scan` then
+  suppresses debris for **every one of that client's declared base paths**, via `unavailable_
+  roots`, with a stated reason — never a guess at a path arithmetic cannot produce. "A scan that
+  proposes less is always preferable to one that proposes someone else's data."
+
+**The per-client relevance copy is computed from observation, never from `client_type`**
+(`core.clientsync._attribution_sample`, migration 031's `attribution_sample_size`/
+`attribution_matched_by_path` columns, `frontend/src/lib/clientAttribution.ts`) — "12 of 12
+recent downloads matched by folder, no mapping needed" or "0 of 2 matched, a mapping is
+required," the same sentence template for SABnzbd and rTorrent alike, driven by what was actually
+observed rather than a hardcoded "usenet doesn't need it, torrent does." That generalisation had
+already been wrong four times before this correction (§8.3's own round-3/round-4 history above).
+
 ---
 
 ## 9. Polling
@@ -899,12 +954,20 @@ delete.
 
 | Step | What | Why |
 |---|---|---|
-| 1 | **Pre-check before touching the client**: SSH reachable, path exists, and the path is **inside one of the client's declared base paths** | The containment check is what stops a wrong or hostile `content_path` from `rm -rf`-ing something catastrophic. `delete_path`'s own root-path refusal is defense in depth *behind* this, not instead of it |
+| 1 | **Pre-check before touching the client**: SSH reachable, path exists, and the path is **inside one of the client's declared base paths and outside every excluded path** | The containment check is what stops a wrong or hostile `content_path` from `rm -rf`-ing something catastrophic. `delete_path`'s own root-path refusal is defense in depth *behind* this, not instead of it |
 | 2 | Shared-path check (§10.4) | |
 | 3 | `remove(id)` in the client — unregister, data stays | |
 | 4 | `delete_path()` over SSH | |
 | 5 | **Verify**: re-stat the path, and measure free space before/after | `rm`'s exit code is not the same as "the bytes are gone" |
 | 6 | One audit event either way; failure raises an in-app banner | |
+
+**Step 1's containment check is two-sided (added 2026-08-23, §8.3 round 5, finding #16).**
+`core/disk_review.py.is_authorized_delete_target(path, base_paths, excluded_paths)` is the seed
+of this check, built and unit-tested against `reconcile()`'s own excluded-path set now, ahead of
+stage 5's own build — a target must sit inside a declared base path **and** outside every
+excluded path (manual `download_client_excluded_path` rows, plus any category exclusion
+`run_scan` resolved into a path). Whichever build implements this step must call that function
+(or its stage-5 equivalent) rather than re-deriving containment a second time.
 
 **Order is client-first on purpose.** Deleting the data first leaves the client seeing vanished
 files: it errors, may re-check, and briefly reports a broken torrent. Removing the entry first means
@@ -1119,6 +1182,14 @@ torrent data for deletion.
   yet appeared in the client's list, must never be proposed. Same instinct as §7.3's removal grace
   period.
 - **Containment.** Only paths under declared base paths are scanned or proposed. Ever.
+- **Exclusion (added 2026-08-23, §8.3 round 5, finding #16).** A path under
+  `download_client_excluded_path`, or resolved there from an excluded category, is dropped before
+  any candidate/claim logic runs — never proposed as debris, never shown as seeding estate, never
+  reported as a broken seed. Where an excluded category cannot be resolved to a path at all (no
+  `content`-kind base path for that client), every one of that client's declared base paths is
+  suppressed for debris entirely, fail-closed, with a stated reason — the same "clients must have
+  all reported successfully" shape §11.1a already uses, applied to a self-imposed exclusion rather
+  than a missing report.
 - **The C set reuses `core/pipeline_flight.py`'s existing predicate and `in_flight_item_ids()` —
   never a second definition of "busy."** `docs/torrent-manager-spec.md` §9 names this specifically,
   and it is the v0.2.6 `REMOTE_GONE` defect class: deleting a seedbox source out from under a queued
@@ -1330,7 +1401,7 @@ Each stage is independently shippable. Nothing before stage 5 can delete anythin
 | **2** | The poller (§9), SAB as a third Preflight source, the settle-gate skip | #18's first real user-facing payoff. **2a (the poller + Preflight source) landed 2026-08-23** (`prompts/done/2026-08-23-client-poller.md`). **2b (the settle-gate skip itself) landed 2026-08-23** (`prompts/done/2026-08-23-settle-gate-skip.md`) -- ships **off** (`settle.SettleSettings.client_skip_enabled`, default `False`) pending live confirmation of §13.4 guess #2 against a real SABnzbd; every uncertain path (setting off, no client-sync source wired, unreachable client, blank/empty response, a queue-side or `UNKNOWN` phase, a near-miss path) falls back to running the settle gate exactly as it ran before this stage. **A terminal `COMPLETED` verdict no longer satisfies the gate the instant it's seen** (2026-08-23, `prompts/done/2026-08-23-client-completion-delay.md`, finding #9) -- it now holds `settle.CLIENT_COMPLETION_HOLD_S` (10s) first, measured from the client's own `completed_at` (a completion already older than the hold satisfies it immediately; falls back to lftpweb's own first-observation time only when a connector reports no `completed_at`) |
 | **3** | Withhold on partial failure (`docs/transfers-redesign-spec.md` §4.3), and the §9.1 poll-cadence fix | **Landed 2026-08-23** (`prompts/done/2026-08-23-withhold-and-cadence.md`). The cadence split is corrected to cheap-vs-expensive, read per-connector off `Operation.LIST_HISTORY`'s own capability declaration (§9.1's own correction note). The withhold gate ships **off** (`autoqueue.WithholdSettings.enabled`, default `False`) pending live confirmation of §13.4 guess #2 against a real SABnzbd, for the identical reason stage 2b's `client_skip_enabled` shipped off -- every uncertain path (setting off, no client-sync source wired, unreachable client, blank/empty response, a queue-side or `UNKNOWN` phase, an outright failure with no `content_path`, a near-miss path) falls back to today's behavior unchanged. No API/UI surface shipped this stage -- `AutoQueue.withheld` is public and readable, but nothing reads it yet; named as an open gap, not hidden |
 | **4** | The disk review scan (§11), both buckets, review-only | **Landed 2026-08-23** (`prompts/done/2026-08-23-disk-review-scan.md`). `core/disk_review.py.reconcile()` is pure set math over Set A/B/C, unit-tested exhaustively without SSH -- the §11.1a union-across-clients catastrophe and the §11.1b inode-claiming catastrophe are both asserted directly. `core/remote.py.RemoteConnectionPool.scan_with_inodes` extends the existing GNU-`find`/BusyBox-fallback scan with `%i`/`%n`; the fallback (`remote_agent/scan_fs.py --inodes`) supplies inode/nlink too (`os.lstat`, stdlib-only), so there is no "BusyBox can't do this" case needing the unavailable-declaration path -- it exists (`RemoteScanError` propagates rather than degrading) but is untriggered by inode support itself, only by a genuine walk failure. `POST /api/disk-review/scan`, manual trigger only (§11.3); a Transfers → Disk review tab shows the two piles with a link-aware running total. Not yet looked at against the real box -- see this task's own final report for what remains named as a gap (multi-filesystem inode collisions, prefix-vs-exact mount-sentinel matching, empty-directory debris) before stage 5 |
-| **5** | The delete pipeline (§10), manual trigger, verification, banner | 🛑 **BLOCKED — do not build.** Gated by the user 2026-08-23 on findings #15 and #16. The user runs **two lftpweb instances against one seedbox**; the other instance's content is protected from §11's debris pile *only* by set A (the clients still claim it), and that protection expires silently once SAB drops the release from history. Stage 5 would then offer to delete another site's data with a correct-looking reclaim figure. #15's explicit "not used by this instance" state is the fix, and it must mean **never scanned, never proposed, never inside §10.2's containment boundary** — not merely "don't warn" |
+| **5** | The delete pipeline (§10), manual trigger, verification, banner | **Findings #15/#16's gate is cleared** (2026-08-23, `prompts/done/2026-08-23-category-tristate-and-exclusion.md`, §8.3 round 5). Categories are three-state and persisted (migration 031); the unattributed-clients banner counts only the undecided state; excluded categories/paths are dropped from `core/disk_review.py.reconcile()` before any candidate logic runs, with a fail-closed suppression of a client's whole base path where a category can't be resolved to one; `core/disk_review.py.is_authorized_delete_target` gives stage 5 a ready-made, already-tested two-sided containment check (base path **and** outside every excluded path). **What still stands in the way of building stage 5 itself:** (1) none of this has been exercised against the user's real two-instance deployment — a scan, an excluded category, and a fail-closed base path all need a live run before anything is trusted to delete; (2) `is_authorized_delete_target` is unit-tested but unused — stage 5's own delete sequence (§10.2) must actually call it, not re-derive containment; (3) the manual excluded-paths UI (`ClientsTab.tsx`) is unverified in a real browser, same as every other layout change in this feature; (4) §11.1c/§10.4/§10.5's own named gaps (cross-seeding, multi-filesystem inode collisions) remain open regardless of this task. Stage 4's own real-box verification (named in its own §14 row) is still outstanding too and should happen before, not after, stage 5 |
 
 **Deletion is stage 5 deliberately.** The scan gets built and inspected against a real seeding
 estate before any code path is allowed to remove. Auto mode is the same code minus the trigger, and

@@ -46,6 +46,8 @@ from lftpweb.models import (
     DownloadClientBasePathOut,
     DownloadClientCategoryIn,
     DownloadClientCategoryOut,
+    DownloadClientExcludedPathIn,
+    DownloadClientExcludedPathOut,
     DownloadClientIn,
     DownloadClientOut,
     DownloadClientTestResponse,
@@ -242,9 +244,26 @@ async def _replace_categories(
     await db.execute("DELETE FROM download_client_category WHERE client_id = ?", (client_id,))
     for cat in categories:
         await db.execute(
-            "INSERT INTO download_client_category (client_id, category, queue_id, source) "
-            "VALUES (?, ?, ?, ?)",
-            (client_id, cat.category, cat.queue_id, cat.source),
+            "INSERT INTO download_client_category (client_id, category, queue_id, source, "
+            "excluded) VALUES (?, ?, ?, ?, ?)",
+            (client_id, cat.category, cat.queue_id, cat.source, 1 if cat.excluded else 0),
+        )
+
+
+async def _replace_excluded_paths(
+    db, client_id: int, excluded_paths: list[DownloadClientExcludedPathIn]
+) -> None:
+    """Migration 031, finding #16 -- the same full-replace shape `_replace_base_paths`/
+    `_replace_categories` already use, for the identical reason: no stage 1b-ii-era client UI
+    depends on a stable child-row id surviving an edit.
+    """
+    await db.execute("DELETE FROM download_client_excluded_path WHERE client_id = ?", (client_id,))
+    now = _now_iso()
+    for ep in excluded_paths:
+        await db.execute(
+            "INSERT INTO download_client_excluded_path (client_id, path, created_at) "
+            "VALUES (?, ?, ?)",
+            (client_id, ep.path, now),
         )
 
 
@@ -334,7 +353,10 @@ _CLIENT_COLUMNS = (
     # The last successful Test's own persisted `detected_categories` (migration 030, this task) --
     # see `DownloadClientOut`'s own docstring for why this exists distinctly from the always-
     # in-memory-only `testResults[editingId]` the settings page previously relied on alone.
-    "detected_categories_json, detected_categories_at"
+    "detected_categories_json, detected_categories_at, "
+    # The poller's own observed attribution counts (migration 031, Part 3 of this task) -- see
+    # `DownloadClientOut.attribution_sample_size`'s own docstring.
+    "attribution_sample_size, attribution_matched_by_path"
 )
 
 
@@ -366,17 +388,30 @@ async def _get_base_paths(db, client_id: int) -> list[DownloadClientBasePathOut]
 
 async def _get_categories(db, client_id: int) -> list[DownloadClientCategoryOut]:
     cursor = await db.execute(
-        "SELECT id, category, queue_id, source FROM download_client_category "
+        "SELECT id, category, queue_id, source, excluded FROM download_client_category "
         "WHERE client_id = ? ORDER BY id",
         (client_id,),
     )
     rows = await cursor.fetchall()
     return [
         DownloadClientCategoryOut(
-            id=r["id"], category=r["category"], queue_id=r["queue_id"], source=r["source"]
+            id=r["id"],
+            category=r["category"],
+            queue_id=r["queue_id"],
+            source=r["source"],
+            excluded=bool(r["excluded"]),
         )
         for r in rows
     ]
+
+
+async def _get_excluded_paths(db, client_id: int) -> list[DownloadClientExcludedPathOut]:
+    cursor = await db.execute(
+        "SELECT id, path FROM download_client_excluded_path WHERE client_id = ? ORDER BY id",
+        (client_id,),
+    )
+    rows = await cursor.fetchall()
+    return [DownloadClientExcludedPathOut(id=r["id"], path=r["path"]) for r in rows]
 
 
 async def _client_out_from_row(db, row) -> DownloadClientOut:
@@ -395,6 +430,7 @@ async def _client_out_from_row(db, row) -> DownloadClientOut:
         version=row["version"],
         base_paths=await _get_base_paths(db, row["id"]),
         categories=await _get_categories(db, row["id"]),
+        excluded_paths=await _get_excluded_paths(db, row["id"]),
         created_at=row["created_at"],
         updated_at=row["updated_at"],
         last_poll_at=row["last_poll_at"],
@@ -405,6 +441,8 @@ async def _client_out_from_row(db, row) -> DownloadClientOut:
             json.loads(row["detected_categories_json"]) if row["detected_categories_json"] else None
         ),
         detected_categories_at=row["detected_categories_at"],
+        attribution_sample_size=row["attribution_sample_size"],
+        attribution_matched_by_path=row["attribution_matched_by_path"],
     )
 
 
@@ -505,6 +543,7 @@ async def create_client_instance(body: DownloadClientIn, request: Request) -> Do
     client_id = cursor.lastrowid
     await _replace_base_paths(db, client_id, body.base_paths)
     await _replace_categories(db, client_id, body.categories)
+    await _replace_excluded_paths(db, client_id, body.excluded_paths)
     await db.commit()
 
     row = await _get_client_row(db, client_id)
@@ -595,6 +634,7 @@ async def update_client_instance(
         )
     await _replace_base_paths(db, client_id, body.base_paths)
     await _replace_categories(db, client_id, body.categories)
+    await _replace_excluded_paths(db, client_id, body.excluded_paths)
     await db.commit()
 
     row = await _get_client_row(db, client_id)

@@ -76,6 +76,7 @@ function instance(overrides: Partial<DownloadClientOut> = {}): DownloadClientOut
     version: null,
     base_paths: [],
     categories: [],
+    excluded_paths: [],
     created_at: '2026-08-01T00:00:00Z',
     updated_at: '2026-08-01T00:00:00Z',
     last_poll_at: null,
@@ -84,6 +85,8 @@ function instance(overrides: Partial<DownloadClientOut> = {}): DownloadClientOut
     last_success_at: null,
     detected_categories: null,
     detected_categories_at: null,
+    attribution_sample_size: null,
+    attribution_matched_by_path: null,
     ...overrides,
   }
 }
@@ -375,8 +378,8 @@ describe('ClientsTab', () => {
     mockListClientInstances.mockResolvedValue([
       instance({
         categories: [
-          { id: 1, category: 'ar-tv', queue_id: 5, source: 'client' },
-          { id: 2, category: 'old-cat', queue_id: 5, source: 'client' },
+          { id: 1, category: 'ar-tv', queue_id: 5, source: 'client', excluded: false },
+          { id: 2, category: 'old-cat', queue_id: 5, source: 'client', excluded: false },
         ],
       }),
     ])
@@ -733,7 +736,9 @@ describe('ClientsTab', () => {
     const queueB = { id: 6, name: 'other', remote_path: '/data/complete/other', local_path: '/local/other' }
     mockListQueues.mockResolvedValue([queueA, queueB] as never)
     mockListClientInstances.mockResolvedValue([
-      instance({ categories: [{ id: 1, category: 'ar-tv', queue_id: null, source: 'client' }] }),
+      instance({
+        categories: [{ id: 1, category: 'ar-tv', queue_id: null, source: 'client', excluded: false }],
+      }),
     ])
     mockTestClientInstance.mockResolvedValue({
       ok: true,
@@ -843,6 +848,7 @@ describe('ClientsTab', () => {
       category: 'ar-movies',
       queue_id: null,
       source: 'manual',
+      excluded: false,
     })
 
     root.unmount()
@@ -880,7 +886,9 @@ describe('ClientsTab', () => {
   it('rejects a duplicate "Add category" attempt visibly', async () => {
     mockListClientTypes.mockResolvedValue([USENET_TYPE])
     mockListClientInstances.mockResolvedValue([
-      instance({ categories: [{ id: 1, category: 'ar-tv', queue_id: null, source: 'manual' }] }),
+      instance({
+        categories: [{ id: 1, category: 'ar-tv', queue_id: null, source: 'manual', excluded: false }],
+      }),
     ])
     const root = await mount(container)
 

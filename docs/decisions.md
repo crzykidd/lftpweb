@@ -6,6 +6,75 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-23 — three-state categories, path exclusion as the enforceable primitive, and observed-attribution copy (round 5)
+
+`prompts/done/2026-08-23-category-tristate-and-exclusion.md`, resolving findings #15/#16 in
+`prompts/test-findings-2026-08-23.md` — the gate stage 5 (§14) was blocked on. The deployment
+shape: the user runs **two lftpweb instances against one shared seedbox** (one SABnzbd, one
+rTorrent, each instance with its own *arr pair and its own subset of the download locations), so
+each instance permanently sees the other's work. That is the steady state, not a
+misconfiguration, and every "unclaimed means safe to remove" assumption in §11 was written
+without it in mind.
+
+**Path exclusion is the enforceable primitive; category exclusion is the convenience that
+resolves into it.** Considered making the category flag itself the enforcement point (simpler,
+one fewer table), and rejected it per the task's own explicit instruction: a category is only
+ever a *proxy* for "where does this land on disk," and the proxy is provably broken for rTorrent
+(§1.1 — its `content_path` is the seeding directory, unrelated to any category folder). A new
+table, `download_client_excluded_path` (migration 031), holds the primitive directly; an excluded
+category is resolved into rows *shaped like* that table at scan time
+(`core/disk_review.resolve_category_exclusion_paths`), never persisted redundantly, so the two
+can never drift apart.
+
+**Fail closed, decided literally rather than loosely.** Where a client has no `content`-kind base
+path to resolve an excluded category onto (rTorrent, always, under the reference layout), the
+chosen behaviour is not "warn and scan anyway" or "exclude nothing" — it is **suppress debris for
+every one of that client's declared base paths**, via the existing `unavailable_roots` mechanism
+`reconcile()` already had for an unreachable contributor (§11.1a). Reusing that mechanism rather
+than inventing a second "don't propose here" concept kept the change small and gave the fail-
+closed case a real, already-tested "never scanned" property for free (the walk loop in `run_scan`
+now skips a root already in `unavailable_roots` before ever calling `scan_with_inodes` on it) —
+distinct from a manually-excluded *sub*-path, which is still walked over the wire and filtered
+inside `reconcile()`, since only a whole root is known before the walk runs. Named honestly rather
+than glossed over: the sub-path case is not literally "never scanned" at the SSH level, only
+"never considered" — pruning the remote `find` command itself to skip a sub-path was judged out of
+scope for this task (it would touch `core/remote.py`, load-bearing per this repo's own convention)
+and is a reasonable future refinement if the I/O cost of walking an excluded subtree ever matters.
+
+**Mutual exclusion (bound vs. excluded) enforced with a Pydantic `model_validator`, not a
+table-level `CHECK`.** SQLite's `ALTER TABLE ADD COLUMN` cannot add a cross-column constraint
+without a full table rebuild, and this codebase's precedent for a comparable invariant (base-path
+kind vs. source) is API-layer validation, not a DB constraint — followed here rather than
+reaching for a table rebuild to enforce something the request layer already guards.
+
+**A pure `is_authorized_delete_target(path, base_paths, excluded_paths)` was added to
+`core/disk_review.py` and unit-tested now, even though stage 5 (which would call it) is not built
+yet.** The alternative — leave the containment-plus-exclusion logic undesigned until stage 5
+starts — was rejected because the whole point of this task is to leave stage 5 with no open
+design question about how exclusion interacts with containment; the function exists and is
+proven correct in isolation, so stage 5's own build is "call this," not "figure this out."
+
+**The relevance copy (Part 3) reads two new poller-observed columns
+(`attribution_sample_size`/`attribution_matched_by_path`, migration 031), never `client_type`.**
+Considered computing this client-side from whatever Preflight rows happen to be in view, and
+rejected it: Preflight only ever shows *incoming* work (§9.2's own phase allowlist), so a quiet
+client with everything already settled would show zero rows and render a false "not yet
+observed," which is exactly the kind of case this copy exists to speak to. Persisting a running
+observation on the `download_client` row itself — mirroring `last_poll_*`/`detected_categories`'s
+own already-established pattern — means the copy reflects everything the poller has ever seen,
+not merely what's on screen right now. A quiet pass leaves the last real reading in place rather
+than overwriting it with a fabricated "0 of 0" (the same "success writes, a quiet pass doesn't
+regress a real value" rule `_persist_capabilities`/`_persist_detected_categories` already follow).
+
+**Scope not attempted:** category-derived excluded paths are computed at scan time from the
+client's *currently configured* base paths, so a base path added or changed after a category was
+marked excluded is picked up automatically on the next scan — this was a deliberate simplification
+over persisting a snapshot, not an oversight, and is worth restating if a future session is
+tempted to "fix" it by persisting the derived path instead. Also not attempted: SSH-side pruning
+of an excluded sub-path from the remote `find` walk itself (see the fail-closed paragraph above).
+
+---
+
 ## 2026-08-23 — path attribution becomes primary; the category mapping is demoted to a fallback (round 4)
 
 `prompts/done/2026-08-23-path-attribution-and-category-escape-hatch.md`, resolving findings

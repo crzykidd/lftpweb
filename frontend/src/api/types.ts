@@ -311,8 +311,8 @@ export interface DetectedBasePathOut {
 
 export interface DownloadClientCategoryIn {
   category: string
-  // `null` = configured but not yet bound to a queue (spec §8.3) -- distinct from the mapping
-  // not existing at all.
+  // `null` = not bound to a queue -- either undecided or explicitly excluded, see `excluded`
+  // below for which (spec §8.3, three-state as of migration 031).
   queue_id: number | null
   // Migration 030 (round 4, 2026-08-23) -- mirrors `DownloadClientBasePathIn.source` exactly:
   // whether this row was produced by detection/path-arithmetic (`'client'`) or typed by hand via
@@ -320,9 +320,36 @@ export interface DownloadClientCategoryIn {
   // can only report labels currently in use, so a category that will exist later can never be
   // detected on its own.
   source: 'client' | 'manual'
+  /** Migration 031 (finding #15, 2026-08-23,
+   * prompts/2026-08-23-category-tristate-and-exclusion.md): "not used by this instance," saved
+   * explicitly rather than inferred from `queue_id` being empty. A category is now three-state
+   * (bound / excluded / undecided) rather than two -- before this, "deliberately not used" and
+   * "never looked at" were the same on-disk state, so a user who dismissed a category got nagged
+   * about it forever with no way to record the decision. **This is a safety boundary, not just a
+   * UI preference** (finding #16): `core/disk_review.py` resolves an excluded category into an
+   * excluded path wherever it can, and fails closed (suppresses debris for the client's entire
+   * base path) wherever it can't. Mutually exclusive with `queue_id` -- the backend rejects a row
+   * that sets both.
+   */
+  excluded: boolean
 }
 
 export interface DownloadClientCategoryOut extends DownloadClientCategoryIn {
+  id: number
+}
+
+/** One path (or sub-path) never scanned, never proposed as debris, and never inside a future
+ * delete's containment boundary, on this client's behalf (migration 031, finding #16). **The
+ * enforceable primitive** -- an excluded *category* is only ever a convenience that resolves
+ * into a path like this one at scan time; this is the direct, always-available expression of
+ * "this tree belongs to the other lftpweb instance sharing this seedbox," and the only thing
+ * that works when a client's category has no relationship to any path at all (rTorrent).
+ */
+export interface DownloadClientExcludedPathIn {
+  path: string
+}
+
+export interface DownloadClientExcludedPathOut extends DownloadClientExcludedPathIn {
   id: number
 }
 
@@ -340,6 +367,8 @@ export interface DownloadClientIn {
   enabled: boolean
   base_paths: DownloadClientBasePathIn[]
   categories: DownloadClientCategoryIn[]
+  // Migration 031, finding #16 -- see `DownloadClientExcludedPathIn`'s own docstring.
+  excluded_paths: DownloadClientExcludedPathIn[]
 }
 
 /** Tri-state support level for one operation or field (spec §4.3) --
@@ -374,6 +403,8 @@ export interface DownloadClientOut {
   version: string | null
   base_paths: DownloadClientBasePathOut[]
   categories: DownloadClientCategoryOut[]
+  // Migration 031, finding #16 -- see `DownloadClientExcludedPathIn`'s own docstring.
+  excluded_paths: DownloadClientExcludedPathOut[]
   created_at: string
   updated_at: string
   /** The poller's own last-pass status (migration 029, finding #2, 2026-08-23) -- distinct from
@@ -397,6 +428,16 @@ export interface DownloadClientOut {
    */
   detected_categories: string[] | null
   detected_categories_at: string | null
+  /** Migration 031 (Part 3, 2026-08-23) -- the poller's own OBSERVED attribution counts for this
+   * instance's most recent informative pass: `attribution_sample_size` is how many transfers had
+   * something to attribute at all, `attribution_matched_by_path` is how many of those needed no
+   * category mapping because their own path already matched a queue. Both `null` until the
+   * poller's first pass. `lib/clientAttribution.ts` turns these into the relevance copy shown
+   * next to the category mapping control -- computed from these two numbers alone, never from
+   * `client_type`.
+   */
+  attribution_sample_size: number | null
+  attribution_matched_by_path: number | null
 }
 
 /** `POST /api/settings/clients/{id}/test` -- `capabilities` always reflects whatever is now on

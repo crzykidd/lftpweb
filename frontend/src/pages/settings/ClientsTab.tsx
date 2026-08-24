@@ -31,10 +31,13 @@ import {
   computeCategoryRows,
   describeCategorySource,
   isStaleCategoryRow,
+  withExcludedToggle,
+  withQueueSelection,
   type CategoryRowDraft,
   type CategorySource,
   type QueueForCategorySuggestion,
 } from '../../lib/clientCategoryInference'
+import { describePathAttributionRelevance } from '../../lib/clientAttribution'
 import { parseClientEditParam } from '../../lib/clientEditLink'
 import { formatRelativeTimeIntl } from '../../lib/format'
 import { remoteBrowseDisabled } from '../../lib/pathBrowse'
@@ -81,6 +84,10 @@ interface FormState {
   // Which mechanism produced `categories` right now -- drives `describeCategorySource`'s label
   // so the UI never blurs "the client told us" with "we guessed from your paths" (finding #10).
   categorySource: CategorySource
+  // Finding #16 (2026-08-23) -- paths (or sub-paths) that belong to a different lftpweb instance
+  // sharing this seedbox, never scanned/proposed/deletable regardless of what the clients report
+  // there. Plain strings: unlike base paths, nothing here is detected or SSH-verified, only typed.
+  excludedPaths: string[]
 }
 
 function emptyConfigDraft(type: ClientTypeOut | undefined): Record<string, string | boolean> {
@@ -127,6 +134,7 @@ function emptyForm(type: ClientTypeOut | undefined): FormState {
     basePaths: [],
     categories: [],
     categorySource: 'none',
+    excludedPaths: [],
   }
 }
 
@@ -482,6 +490,10 @@ export function ClientsTab() {
   // defect class, restated at this one remaining place a blank category string could originate.
   const [categoryDraftError, setCategoryDraftError] = useState<string | null>(null)
 
+  // Finding #16 (2026-08-23) -- the excluded-paths escape hatch's own manual-add draft, the same
+  // local-only-until-Save shape `basePathDraft` already uses.
+  const [excludedPathDraft, setExcludedPathDraft] = useState('')
+
   const [testResults, setTestResults] = useState<Record<number, DownloadClientTestResponse>>({})
   const [testingId, setTestingId] = useState<number | null>(null)
 
@@ -587,6 +599,7 @@ export function ClientsTab() {
       category: c.category,
       queue_id: c.queue_id,
       source: c.source,
+      excluded: c.excluded,
     }))
     // `testResults[instance.id]` is only populated if Test was clicked this session (the same
     // asymmetry `detected_base_paths` already has). Falls back to the instance's own **persisted**
@@ -612,6 +625,7 @@ export function ClientsTab() {
       basePaths,
       categories,
       categorySource,
+      excludedPaths: instance.excluded_paths.map((ep) => ep.path),
     })
   }
 
@@ -717,7 +731,10 @@ export function ClientsTab() {
     setCategoryDraftError(null)
     setForm((prev) => ({
       ...prev,
-      categories: [...prev.categories, { category: trimmed, queue_id: null, source: 'manual' }],
+      categories: [
+        ...prev.categories,
+        { category: trimmed, queue_id: null, source: 'manual', excluded: false },
+      ],
     }))
     setCategoryDraft('')
   }
@@ -728,6 +745,28 @@ export function ClientsTab() {
    */
   const removeCategoryRow = (index: number) => {
     setForm((prev) => ({ ...prev, categories: prev.categories.filter((_, i) => i !== index) }))
+  }
+
+  /** Finding #16's own enforceable primitive -- a path (or sub-path) belonging to a different
+   * lftpweb instance sharing this seedbox, added by hand (nothing here is detected). Deduped the
+   * same way `addBasePath` already is.
+   */
+  const addExcludedPath = (path: string) => {
+    const trimmed = path.trim()
+    if (trimmed === '') return
+    setForm((prev) =>
+      prev.excludedPaths.includes(trimmed)
+        ? prev
+        : { ...prev, excludedPaths: [...prev.excludedPaths, trimmed] },
+    )
+    setExcludedPathDraft('')
+  }
+
+  const removeExcludedPath = (path: string) => {
+    setForm((prev) => ({
+      ...prev,
+      excludedPaths: prev.excludedPaths.filter((p) => p !== path),
+    }))
   }
 
   const handleSubmit = async () => {
@@ -755,7 +794,11 @@ export function ClientsTab() {
           category: c.category,
           queue_id: c.queue_id,
           source: c.source,
+          excluded: c.excluded,
         })),
+        // Finding #16 -- see `DownloadClientExcludedPathIn`'s own docstring. Plain strings in
+        // the draft; the API wants `{path}` objects.
+        excluded_paths: form.excludedPaths.map((path) => ({ path })),
       }
       if (editingId != null) {
         await updateClientInstance(editingId, body)
@@ -1220,6 +1263,19 @@ export function ClientsTab() {
             layout) — and for binding a category before its first download exists to match
             against, since path matching needs something on disk to check.
           </p>
+          {/* Part 3 (2026-08-23): "the setting shows in SAB and the ui isn't clear that you
+           * don't need it in the current configuration" -- derived from this instance's own
+           * OBSERVED attribution counts (`attribution_sample_size`/`attribution_matched_by_path`,
+           * migration 031), never from `client_type`. Only shown while editing a saved instance --
+           * a new, unsaved one has never been polled and has nothing to observe yet. */}
+          {editingId != null && (
+            <p className={hintClasses}>
+              {describePathAttributionRelevance(
+                editingInstance?.attribution_sample_size ?? null,
+                editingInstance?.attribution_matched_by_path ?? null,
+              )}
+            </p>
+          )}
           {editingId != null && (
             <p className={hintClasses}>
               {describeCategorySource(form.categorySource, detectedCategories, form.categories.length > 0)}
@@ -1246,6 +1302,7 @@ export function ClientsTab() {
                 <span className="min-w-0 flex-1">Category</span>
                 <span className="w-4 shrink-0" />
                 <span className="w-48 shrink-0">Queue</span>
+                <span className="w-32 shrink-0">Not used here</span>
                 <span className="w-40 shrink-0" />
               </div>
               <ul className="flex flex-col gap-2">
@@ -1287,24 +1344,47 @@ export function ClientsTab() {
                           <select
                             className={inputClasses}
                             value={cat.queue_id ?? ''}
+                            disabled={cat.excluded}
                             title={
                               selectedQueue
                                 ? `${selectedQueue.name} (${selectedQueue.remote_path})`
                                 : undefined
                             }
                             onChange={(e) =>
-                              updateCategoryRow(i, {
-                                queue_id: e.target.value === '' ? null : Number(e.target.value),
-                              })
+                              updateCategoryRow(
+                                i,
+                                withQueueSelection(
+                                  cat,
+                                  e.target.value === '' ? null : Number(e.target.value),
+                                ),
+                              )
                             }
                           >
-                            <option value="">— not used —</option>
+                            <option value="">— undecided —</option>
                             {queues.map((q) => (
                               <option key={q.id} value={q.id} title={`${q.name} (${q.remote_path})`}>
                                 {q.name}
                               </option>
                             ))}
                           </select>
+                        </span>
+                        {/* Finding #15/#16 (2026-08-23): the third state, saved explicitly --
+                         * "undecided" (queue empty above) still warns via the unattributed-clients
+                         * banner; checking this box is a permanent decision that never warns again
+                         * and (§16) becomes a hard scan/delete exclusion, not merely a silenced
+                         * banner. Mutually exclusive with the queue selection above --
+                         * `withQueueSelection`/`withExcludedToggle` enforce it in both directions. */}
+                        <span className="w-32 shrink-0">
+                          <label className="flex items-center gap-1.5 text-xs text-zinc-600 dark:text-zinc-300">
+                            <input
+                              type="checkbox"
+                              checked={cat.excluded}
+                              onChange={(e) =>
+                                updateCategoryRow(i, withExcludedToggle(cat, e.target.checked))
+                              }
+                            />
+                            Not used here
+                          </label>
                         </span>
                         {/* Remove on a stale row, or **always** on a manual one (round 4) --
                          * a category the client still reports (and never manually added) can
@@ -1365,6 +1445,54 @@ export function ClientsTab() {
             {categoryDraftError && (
               <p className="text-xs text-red-600 dark:text-red-400">{categoryDraftError}</p>
             )}
+          </div>
+        </div>
+
+        {/* Excluded paths (finding #16, 2026-08-23,
+         * prompts/2026-08-23-category-tristate-and-exclusion.md) -- the enforceable primitive
+         * behind the "not used by this instance" checkbox above: a category exclusion is only
+         * ever a convenience that resolves into a path like these at scan time, and this is the
+         * one thing that still works when a client's category has no relationship to any path at
+         * all (rTorrent). Manual-only -- nothing here is detected or SSH-verified, unlike base
+         * paths, since it exists specifically to name a tree lftpweb should leave alone. */}
+        <div className="flex flex-col gap-2">
+          <span className={labelClasses}>Excluded paths</span>
+          <p className={hintClasses}>
+            Paths (or sub-paths) that belong to a different lftpweb instance sharing this
+            seedbox — never scanned, never proposed as debris, and never eligible for deletion,
+            regardless of what the clients report there. The safer, more direct escape hatch for
+            "this tree isn&rsquo;t mine" when a category can&rsquo;t say so on its own.
+          </p>
+          <ul className="flex flex-col gap-1">
+            {form.excludedPaths.map((path) => (
+              <li key={path} className="flex items-center gap-2">
+                <span className="flex-1 truncate rounded-md border border-zinc-200 bg-zinc-50 px-2 py-1 font-mono text-xs dark:border-zinc-800 dark:bg-zinc-900">
+                  {path}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => removeExcludedPath(path)}
+                  className="text-xs text-red-600 hover:underline dark:text-red-400"
+                >
+                  Remove
+                </button>
+              </li>
+            ))}
+          </ul>
+          <div className="flex gap-2">
+            <input
+              className={inputClasses}
+              value={excludedPathDraft}
+              onChange={(e) => setExcludedPathDraft(e.target.value)}
+              placeholder="/home/user/downloads/complete/other-site-tv"
+            />
+            <button
+              type="button"
+              onClick={() => addExcludedPath(excludedPathDraft)}
+              className={secondaryButtonClasses}
+            >
+              Add
+            </button>
           </div>
         </div>
 

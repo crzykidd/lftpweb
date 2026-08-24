@@ -241,21 +241,37 @@ def reconcile(
     in_use: Iterable[InUsePath],
     now_s: float,
     age_floor_s: float = DEFAULT_AGE_FLOOR_S,
+    excluded_paths: Iterable[str] = (),
 ) -> ReconciliationResult:
     """The whole reconciliation, pure. `unavailable_roots` is roots this scan already knows it
     cannot trust (an SSH walk failure, a fallback path unable to supply inodes, or a queue's
     failed mount-sentinel check -- `run_scan`'s job to populate, not this function's to
     discover) -- every one of them is excluded from both piles outright, same as a root gated
     off here for a missing contributor (spec §11.1a).
+
+    `excluded_paths` (migration 031, finding #16, 2026-08-23) -- "not used by this instance" as
+    a hard safety boundary, not merely a banner-silencing preference: a path (or sub-path) this
+    scan must **never propose as debris and never treat as claimed-or-unclaimed at all**, because
+    it belongs to a different lftpweb instance sharing this seedbox. Every entry under one of
+    these is dropped before any candidate/claim logic below ever sees it -- the same containment
+    filter `roots` already applies, at finer grain. `run_scan` is what resolves an excluded
+    *category* into paths here (or fails closed onto `unavailable_roots` when it can't) -- this
+    function only ever consumes the resulting flat path list.
     """
     roots = {_norm(r) for r in base_paths}
+    excluded = {_norm(p) for p in excluded_paths}
+
+    def _excluded(path: str) -> bool:
+        return any(_is_under(path, ex) for ex in excluded)
+
     disk_entries = [
         e
         for e in disk_entries
         # Containment (spec §11.2): only entries under a *configured* root are ever
         # considered, defensively re-checked here even though `run_scan` should never hand
-        # this function anything else.
-        if _norm(e.root) in roots
+        # this function anything else. An excluded path is dropped the same way, before it can
+        # ever become a claim, a debris candidate, or a seeding-estate entry (finding #16).
+        if _norm(e.root) in roots and not _excluded(_norm(e.abs_path))
     ]
 
     contrib_by_root: dict[str, set[int]] = defaultdict(set)
@@ -404,6 +420,10 @@ def reconcile(
         entries_by_root[_norm(e.root)].append(e)
 
     for claim, cp in zip(claims, claim_paths, strict=False):
+        if _excluded(cp):
+            # Finding #16: a claim under an excluded path is not this instance's business to
+            # judge "present" or "broken" either way -- the whole point of the exclusion.
+            continue
         root = _root_containing(cp, roots)
         if root is None or root in unavailable_roots:
             # Either never a scanned tree at all, or the walk itself failed there -- absent
@@ -453,6 +473,90 @@ def freed_bytes(candidates: Iterable[DebrisCandidate], selected_abs_paths: Itera
             total += c.size
             counted_groups.add(c.link_paths)
     return total
+
+
+def resolve_category_exclusion_paths(
+    content_base_paths: Iterable[str], categories: Iterable[str]
+) -> list[str]:
+    """Finding #16's own resolution rule (migration 031, 2026-08-23): a category marked "not
+    used by this instance" is a *convenience* that resolves into the enforceable primitive
+    (`download_client_excluded_path`-shaped paths) wherever spec §1.1's reference layout holds --
+    a category is a folder directly under a `content`-kind base path, `<base>/<category>`.
+
+    **Only ever called with a client's own `content`-kind base paths.** `run_scan` is what
+    decides whether any exist for a given client at all; when none do (rTorrent: its only
+    declared base path is its seeding/`working` directory, unrelated to any category folder --
+    spec §1.1), this function is never reached, and the caller fails closed instead (suppressing
+    debris for that client's entire declared base path rather than guess at a path arithmetic
+    can't produce -- see `run_scan`'s own comment for the fail-closed branch).
+    """
+    return sorted(
+        {
+            posixpath.join(_norm(base), category)
+            for base in content_base_paths
+            for category in categories
+        }
+    )
+
+
+def _resolve_client_exclusions(
+    manual_excluded_paths: Iterable[str],
+    base_paths_by_client: Mapping[int, list[tuple[str, str]]],
+    excluded_categories_by_client: Mapping[int, list[str]],
+) -> tuple[set[str], dict[str, str]]:
+    """The pure derivation step behind `run_scan`'s own excluded-paths gathering (migration 031,
+    finding #16) -- split out so the fail-closed rule and the category-to-path resolution are
+    each directly testable without a database or an SSH connection.
+
+    Returns `(excluded_paths, fail_closed_roots)`: the full excluded-path set (every manually
+    configured row, plus every excluded category resolved into a path wherever the owning client
+    declares a `content`-kind base path to resolve it onto), and a `root -> reason` mapping for
+    any base path a client's exclusion could **not** be resolved onto -- fail closed (spec §11,
+    this task's own rule: "a scan that proposes less is always preferable to one that proposes
+    someone else's data"), suppressing debris for that client's entire declared base path rather
+    than guess. `run_scan` merges the latter straight into `unavailable_roots`, before its own
+    walk ever reaches those roots.
+    """
+    excluded_paths: set[str] = {_norm(p) for p in manual_excluded_paths}
+    fail_closed_roots: dict[str, str] = {}
+    for client_id, categories in excluded_categories_by_client.items():
+        client_base_paths = base_paths_by_client.get(client_id, [])
+        content_bases = [p for p, kind in client_base_paths if kind == "content"]
+        if content_bases:
+            excluded_paths.update(resolve_category_exclusion_paths(content_bases, categories))
+        else:
+            # No `content`-kind base path exists for this client at all (rTorrent's own base
+            # path is its seeding/`working` directory, unrelated to any category folder, spec
+            # §1.1) -- resolving the exclusion precisely is impossible, so every one of this
+            # client's declared base paths is suppressed for debris entirely.
+            reason = (
+                f"client {client_id}'s excluded categor"
+                f"{'y' if len(categories) == 1 else 'ies'} {sorted(categories)!r} cannot be "
+                "resolved to a path (no content-kind base path declared for this client) -- "
+                "suppressing debris for this base path entirely rather than risk proposing "
+                "someone else's data (spec §11, finding #16)"
+            )
+            for path, _kind in client_base_paths:
+                fail_closed_roots.setdefault(path, reason)
+    return excluded_paths, fail_closed_roots
+
+
+def is_authorized_delete_target(
+    path: str, base_paths: Iterable[str], excluded_paths: Iterable[str]
+) -> bool:
+    """The seed of spec §10.2's future delete-containment check (stage 5, not yet built --
+    gated per §14's staging table until this task's own fixes landed). A target is authorized
+    only when it sits inside one of the declared base paths **and** outside every excluded path
+    -- the second half is this task's own addition (finding #16): an excluded path must be
+    "never inside the delete containment boundary," not merely absent from the debris pile.
+    Pure and independently testable now, even though stage 5 itself doesn't call it yet.
+    """
+    p = _norm(path)
+    roots = {_norm(r) for r in base_paths}
+    excluded = {_norm(e) for e in excluded_paths}
+    if any(_is_under(p, ex) for ex in excluded):
+        return False
+    return any(_is_under(p, r) for r in roots)
 
 
 # ================================================================================================
@@ -553,7 +657,7 @@ async def run_scan(
     now_s = now_s if now_s is not None else time.time()
 
     cursor = await db.execute(
-        "SELECT id, path, client_id FROM download_client_base_path ORDER BY id"
+        "SELECT id, path, client_id, kind FROM download_client_base_path ORDER BY id"
     )
     base_path_rows = await cursor.fetchall()
     contributors = [
@@ -564,6 +668,34 @@ async def run_scan(
 
     unavailable_roots: dict[str, str] = {}
     disk_entries: list[DiskEntry] = []
+
+    # --- Excluded paths (migration 031, finding #16, 2026-08-23) -- "not used by this instance"
+    # as a hard safety boundary. Manual rows (`download_client_excluded_path`) are the enforceable
+    # primitive, used verbatim; an excluded *category* is a convenience resolved into paths here,
+    # wherever the client declares at least one `content`-kind base path for the resolution to
+    # land on (spec §1.1's `<base>/<category>` layout) -- and **fails closed** onto
+    # `unavailable_roots` (suppressing debris for every one of that client's declared base paths,
+    # before the walk below even reaches them) when it can't, exactly the case rTorrent's own
+    # `content_path` (its seeding directory, unrelated to any category folder) makes unavoidable.
+    cursor = await db.execute("SELECT path FROM download_client_excluded_path")
+    manual_excluded_paths = [row["path"] for row in await cursor.fetchall()]
+
+    base_paths_by_client: dict[int, list[tuple[str, str]]] = defaultdict(list)
+    for row in base_path_rows:
+        base_paths_by_client[row["client_id"]].append((_norm(row["path"]), row["kind"]))
+
+    cursor = await db.execute(
+        "SELECT client_id, category FROM download_client_category WHERE excluded = 1"
+    )
+    excluded_categories_by_client: dict[int, list[str]] = defaultdict(list)
+    for row in await cursor.fetchall():
+        excluded_categories_by_client[row["client_id"]].append(row["category"])
+
+    excluded_paths, fail_closed_roots = _resolve_client_exclusions(
+        manual_excluded_paths, base_paths_by_client, excluded_categories_by_client
+    )
+    for root, reason in fail_closed_roots.items():
+        unavailable_roots.setdefault(root, reason)
 
     if host is None:
         for root in roots:
@@ -578,6 +710,12 @@ async def run_scan(
             unavailable_roots[root] = "seedbox host credentials need re-entry"
     else:
         for root in roots:
+            if root in unavailable_roots:
+                # Already ruled out before the walk -- the fail-closed exclusion branch above
+                # (finding #16), or (in principle) some other pre-walk reason a future caller
+                # adds. Skipping the walk itself here is what makes the fail-closed case genuinely
+                # "never scanned," not merely "scanned and then discarded."
+                continue
             try:
                 entries, _warning = await pool.scan_with_inodes(host, root)
             except RemoteScanError as exc:
@@ -664,5 +802,6 @@ async def run_scan(
         in_use=in_use,
         now_s=now_s,
         age_floor_s=age_floor_s,
+        excluded_paths=excluded_paths,
     )
     return ScanOutcome(result=result, client_failures=tuple(failures))

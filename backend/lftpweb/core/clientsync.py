@@ -279,6 +279,43 @@ _PREFLIGHT_PHASES: frozenset[TransferPhase] = frozenset(
 )
 
 
+def _attribution_sample(
+    transfers: list[Transfer], path_queues: list[aiosqlite.Row]
+) -> tuple[int, int]:
+    """Part 3 of this task (2026-08-23,
+    prompts/2026-08-23-category-tristate-and-exclusion.md): "derive the per-client 'do you even
+    need this control' copy from OBSERVED attribution counts... never from client_type."
+    Hardcoding "usenet doesn't need it, torrent does" would be exactly the client-name branching
+    §4.4/§5.1 forbid -- this counts, over **every** transfer this pass reported (not just the
+    Preflight-eligible-phase subset `_update_preflight`'s own loop filters to -- a seeding or
+    just-completed transfer's `content_path` is just as informative a data point about whether
+    this client's downloads land where a queue can already find them):
+
+    - `sample_size` -- how many transfers had *something* to attribute at all (a `content_path`
+      or a `category`; a transfer reporting neither is not a data point either way, so it's
+      excluded from both numbers rather than silently counted as "didn't match").
+    - `matched_by_path` -- of those, how many were resolved by path alone (`_client_content_path_
+      matches` against an enabled queue's `remote_path`), needing no category mapping at all.
+
+    `ClientsTab.tsx`'s relevance copy (`lib/clientAttribution.ts`) reads these two numbers
+    straight -- SABnzbd's "12 of 12 matched by folder" and rTorrent's "0 of 2 matched" are the
+    same sentence template over different observed counts, never a branch on `client_type`.
+    """
+    sample_size = 0
+    matched_by_path = 0
+    for transfer in transfers:
+        if not transfer.content_path and not transfer.category:
+            continue
+        sample_size += 1
+        if transfer.content_path and any(
+            candidate["remote_path"]
+            and _client_content_path_matches(candidate["remote_path"], transfer.content_path)
+            for candidate in path_queues
+        ):
+            matched_by_path += 1
+    return sample_size, matched_by_path
+
+
 class ClientSyncScheduler:
     """Background loop, one pass over every **enabled** `download_client` instance per tick
     (spec §9: "A disabled instance is never contacted"). See this module's own docstring for the
@@ -554,6 +591,24 @@ class ClientSyncScheduler:
                 ),
             )
 
+    async def _record_attribution_stats(
+        self, instance_id: int, sample_size: int, matched_by_path: int
+    ) -> None:
+        """Migration 031 (Part 3, this task) -- persists `_attribution_sample`'s own count for
+        this pass. **Only called when `sample_size > 0`** (`_update_preflight`'s own call site) --
+        a pass with nothing to attribute leaves the last informative reading on the row exactly
+        as it was, the same "success writes, a quiet pass leaves the prior value alone" pattern
+        `_persist_capabilities`/`_persist_detected_categories` already follow elsewhere in this
+        codebase; overwriting a real "12 of 12" with a fabricated "0 of 0" during a temporary lull
+        would make the relevance copy flicker for no reason.
+        """
+        await self.db.execute(
+            "UPDATE download_client SET attribution_sample_size = ?, "
+            "attribution_matched_by_path = ? WHERE id = ?",
+            (sample_size, matched_by_path, instance_id),
+        )
+        await self.db.commit()
+
     # --- Preflight (spec §9.2) ----------------------------------------------------------------
 
     async def _category_queue_map(self, instance_id: int) -> dict[str, aiosqlite.Row]:
@@ -578,6 +633,22 @@ class ClientSyncScheduler:
         )
         rows = await cursor.fetchall()
         return {r["category"]: r for r in rows}
+
+    async def _excluded_categories(self, instance_id: int) -> frozenset[str]:
+        """This instance's own categories explicitly marked "not used by this instance"
+        (migration 031, finding #15/#16, 2026-08-23) -- a *saved decision*, not merely the
+        absence of a binding. Consulted by `_update_preflight` so a transfer in an excluded
+        category is silently omitted **without** counting toward `unattributed_clients`'s own
+        banner -- the whole point of the three-state redesign (finding #15: "the banner counts
+        only undecided categories... a client whose every category is bound or explicitly
+        excluded is fully configured and the banner must be silent").
+        """
+        cursor = await self.db.execute(
+            "SELECT category FROM download_client_category " "WHERE client_id = ? AND excluded = 1",
+            (instance_id,),
+        )
+        rows = await cursor.fetchall()
+        return frozenset(r["category"] for r in rows)
 
     async def _enabled_queues(self) -> list[aiosqlite.Row]:
         """Every currently **enabled** queue's own `id`/`name`/`short_name`/`remote_path` --
@@ -633,10 +704,18 @@ class ClientSyncScheduler:
         docstring correction and the spec §8.3 correction (round 4) for the fuller reasoning --
         this is not a claim that most setups need this control less; it depends entirely on
         whether the connector's own `content_path` happens to sit under a queue's `remote_path`.
+
+        **Excluded categories never reach the unattributed count** (finding #15/#16, 2026-08-23):
+        a category explicitly marked "not used by this instance" is exactly the deployment shape
+        this task exists for -- two lftpweb instances sharing one SABnzbd/rTorrent, each
+        permanently seeing the other's work. Counting it toward `unattributed_clients`'s own
+        banner would nag forever about work this instance is correctly ignoring, which is finding
+        #15's own "a banner that cannot be resolved stops carrying information."
         """
         instance_id = instance["id"]
         category_map = await self._category_queue_map(instance_id)
         path_queues = await self._enabled_queues()
+        excluded_categories = await self._excluded_categories(instance_id)
 
         seen: dict[str, PreflightRow] = {}
         unattributed = 0
@@ -680,6 +759,13 @@ class ClientSyncScheduler:
             elif category_queue is not None:
                 queue = category_queue
             else:
+                # Finding #15/#16: a category the user has explicitly marked "not used by this
+                # instance" is silently omitted **without** counting toward the unattributed
+                # banner -- the whole point of the three-state redesign. A transfer with no
+                # category at all is unaffected (that's `no_category_count`'s own, different,
+                # problem).
+                if transfer.category is not None and transfer.category in excluded_categories:
+                    continue
                 unattributed += 1
                 key = transfer.category or None
                 unattributed_categories[key] = unattributed_categories.get(key, 0) + 1
@@ -720,6 +806,15 @@ class ClientSyncScheduler:
 
         self._unattributed_counts[instance_id] = unattributed
         self._unattributed_categories[instance_id] = unattributed_categories
+
+        # Part 3 (2026-08-23): the observed attribution sample this pass produced -- over every
+        # transfer reported, not just the Preflight-eligible-phase subset the loop above filters
+        # to (see `_attribution_sample`'s own docstring for why). Only persisted when there was
+        # something to observe; a pass with nothing to attribute leaves the last real reading in
+        # place rather than fabricating a "0 of 0."
+        sample_size, matched_by_path = _attribution_sample(transfers, path_queues)
+        if sample_size > 0:
+            await self._record_attribution_stats(instance_id, sample_size, matched_by_path)
 
         hold = self._preflight_holds.setdefault(instance_id, PreflightHold())
         # No `retired` set -- see this module's own docstring for why this source falls back to

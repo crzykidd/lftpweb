@@ -229,12 +229,14 @@ def test_delete_cascades_base_paths_and_categories(isolated_config):
             json=_sab_body(
                 base_paths=[{"path": "/downloads/complete"}],
                 categories=[{"category": "tv", "queue_id": queue_id}],
+                excluded_paths=[{"path": "/downloads/complete/other-site-tv"}],
             ),
         )
         assert resp.status_code == 201, resp.text
         body = resp.json()
         assert len(body["base_paths"]) == 1
         assert len(body["categories"]) == 1
+        assert len(body["excluded_paths"]) == 1
         client_id = body["id"]
 
         # The delete itself, through the real app connection -- `core/db.py.connect()` sets
@@ -253,10 +255,15 @@ def test_delete_cascades_base_paths_and_categories(isolated_config):
         (cat_count,) = raw.execute(
             "SELECT COUNT(*) FROM download_client_category WHERE client_id = ?", (client_id,)
         ).fetchone()
+        (excl_count,) = raw.execute(
+            "SELECT COUNT(*) FROM download_client_excluded_path WHERE client_id = ?",
+            (client_id,),
+        ).fetchone()
     finally:
         raw.close()
     assert bp_count == 0
     assert cat_count == 0
+    assert excl_count == 0
 
 
 def test_category_rejects_a_nonexistent_queue_id(isolated_config):
@@ -290,6 +297,7 @@ def test_unbound_category_survives_a_save_and_a_re_edit(isolated_config):
                 "category": "movies",
                 "queue_id": None,
                 "source": "client",
+                "excluded": False,
             }
         ]
 
@@ -309,6 +317,116 @@ def test_unbound_category_survives_a_save_and_a_re_edit(isolated_config):
         assert resp.status_code == 200, resp.text
         assert len(resp.json()["categories"]) == 1
         assert resp.json()["categories"][0]["queue_id"] is None
+
+
+# --- Three-state categories + path exclusion (migration 031, findings #15/#16, 2026-08-23,
+# prompts/2026-08-23-category-tristate-and-exclusion.md) ---------------------------------------
+
+
+def test_excluded_category_survives_a_save_and_a_re_edit(isolated_config):
+    """The #15 round trip: "not used by this instance" is a **saved decision**, not the absence
+    of one -- it must persist exactly like a bound mapping does.
+    """
+    with TestClient(app) as client:
+        resp = client.post(
+            "/api/settings/clients",
+            json=_sab_body(
+                categories=[{"category": "other-site-tv", "queue_id": None, "excluded": True}]
+            ),
+        )
+        assert resp.status_code == 201, resp.text
+        assert resp.json()["categories"] == [
+            {
+                "id": resp.json()["categories"][0]["id"],
+                "category": "other-site-tv",
+                "queue_id": None,
+                "source": "client",
+                "excluded": True,
+            }
+        ]
+        client_id = resp.json()["id"]
+
+        reread = client.get("/api/settings/clients").json()[0]
+        assert reread["categories"][0]["excluded"] is True
+
+        resp = client.put(
+            f"/api/settings/clients/{client_id}",
+            json=_sab_body(
+                categories=[{"category": "other-site-tv", "queue_id": None, "excluded": True}]
+            ),
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["categories"][0]["excluded"] is True
+
+
+def test_category_rejects_being_both_bound_and_excluded(isolated_config):
+    """Finding #15's mutual-exclusion rule -- a category is never both bound to a queue and
+    marked "not used by this instance" at once. Rejected visibly (422), never silently resolved
+    one way or the other.
+    """
+    with TestClient(app) as client:
+        _put_unreachable_host(client)
+        resp = client.post(
+            "/api/settings/queues",
+            json={"name": "TV", "remote_path": "/data/tv", "local_path": tempfile.mkdtemp()},
+        )
+        queue_id = resp.json()["id"]
+
+        resp = client.post(
+            "/api/settings/clients",
+            json=_sab_body(categories=[{"category": "tv", "queue_id": queue_id, "excluded": True}]),
+        )
+        assert resp.status_code == 422
+
+
+def test_excluded_paths_round_trip(isolated_config):
+    """Finding #16's own enforceable primitive: a manually-added excluded path must persist and
+    read back, distinct from a base path or a category.
+    """
+    with TestClient(app) as client:
+        resp = client.post(
+            "/api/settings/clients",
+            json=_sab_body(
+                excluded_paths=[
+                    {"path": "/downloads/complete/other-site-tv"},
+                    {"path": "/downloads/complete/other-site-movies"},
+                ]
+            ),
+        )
+        assert resp.status_code == 201, resp.text
+        paths = {ep["path"] for ep in resp.json()["excluded_paths"]}
+        assert paths == {
+            "/downloads/complete/other-site-tv",
+            "/downloads/complete/other-site-movies",
+        }
+        client_id = resp.json()["id"]
+
+        reread = client.get("/api/settings/clients").json()[0]
+        assert {ep["path"] for ep in reread["excluded_paths"]} == paths
+
+        # A save that submits fewer excluded paths fully replaces the set, same shape as base
+        # paths/categories.
+        resp = client.put(
+            f"/api/settings/clients/{client_id}",
+            json=_sab_body(excluded_paths=[{"path": "/downloads/complete/other-site-tv"}]),
+        )
+        assert resp.status_code == 200, resp.text
+        assert [ep["path"] for ep in resp.json()["excluded_paths"]] == [
+            "/downloads/complete/other-site-tv"
+        ]
+
+
+def test_attribution_stats_are_none_before_the_poller_has_ever_run(isolated_config):
+    """Migration 031, Part 3 -- a freshly created instance has never been observed, so both
+    fields read `None` ("not yet observed"), never a fabricated "0 of 0" (this endpoint never
+    writes these columns itself; only `core.clientsync.ClientSyncScheduler` does).
+    """
+    with TestClient(app) as client:
+        resp = client.post("/api/settings/clients", json=_sab_body())
+        assert resp.status_code == 201, resp.text
+        created = resp.json()
+        assert created["attribution_sample_size"] is None
+        assert created["attribution_matched_by_path"] is None
 
 
 # --- GET /api/settings/client-types ----------------------------------------------------------
