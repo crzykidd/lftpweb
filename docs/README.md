@@ -37,11 +37,42 @@ against placeholder image paths. GitHub-only by design: it is not wired to an in
 because screenshots of the app are useless inside the app. Images live in
 [`images/`](images/) — see that directory's own README for the exact filenames expected.
 
-**[`transfers-redesign-spec.md`](transfers-redesign-spec.md)** — a **proposal, not built yet**:
-where the Transfers/Files/History surfaces are going (Transfers as the main section with Queue
-and Files tabs, one globally-ordered ungrouped queue list, History becoming Events) and the
-advisory download-client integration (SAB first, ruTorrent after) that feeds pre-arrival rows
-into it. Carries the reasoning, the two earlier decisions it reverses, the open questions, and a
-staged build order. `DESIGN.md` still describes what actually exists.
+**[`audit-v0.1.0.md`](audit-v0.1.0.md)** — the codebase audit run against the first release.
+Historical.
+
+### Feature specs
+
+**These are *proposal* documents by convention, and they describe more than exists.** Each one
+records the reasoning, the decisions it reverses (in place, with their cause — preserve that
+convention when editing), the open questions, and a staged build order. **`DESIGN.md` is what
+describes reality**; where a spec and `DESIGN.md` disagree about whether something is built,
+`DESIGN.md` wins.
+
+**[`transfers-redesign-spec.md`](transfers-redesign-spec.md)** — where the
+Transfers/Files/History surfaces went: Transfers as the main section with Queue and Files tabs,
+one globally-ordered ungrouped queue list, History becoming Events, and the Preflight box.
+**Phase 1 is built and shipped in `v0.3.0`.** Its §4 (the advisory download-client integration)
+is the sketch the framework spec below supersedes.
+
+**[`arr-integration-spec.md`](arr-integration-spec.md)** — the Sonarr/Radarr integration: data
+model, association lifecycle, matching rules, the poller, the fully-done gate. **Built**;
+`DESIGN.md` §16 is its architectural summary.
+
+**[`download-client-framework-spec.md`](download-client-framework-spec.md)** — the pluggable
+download-client connector layer (SABnzbd, rTorrent, and whatever follows): the two vocabularies,
+the tri-state capability declaration, deletion-over-SSH, the disk review scan, and a six-stage
+build order. **Stages 0–4 are built and unreleased on `dev`; stage 5, the delete pipeline, is
+not.** `DESIGN.md` §17 is the architectural summary and the description of what exists. **§13.4
+and §13.6 are its two correction lists** — every SABnzbd and rTorrent guess authored from vendor
+docs and never confirmed against a live instance, risk-ranked. The test suite cannot falsify
+them; the fixtures encode the same assumptions.
+
+**[`download-client-api-survey.md`](download-client-api-survey.md)** — what rTorrent/ruTorrent,
+qBittorrent, Transmission, Deluge and SABnzbd can each actually report, researched from vendor
+docs 2026-08-22. **Re-confirm anything against a real instance before relying on it.**
+
+**[`torrent-manager-spec.md`](torrent-manager-spec.md)** — issue #21: seeding overview, per-site
+stop-seeding rules, space reclamation. **Not started**, and it depends on the connector framework
+above.
 
 Architecture lives in [`../DESIGN.md`](../DESIGN.md), not here.

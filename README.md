@@ -107,6 +107,25 @@ Every verify outcome, every remote delete, and every delete withheld — with th
   (filterable on its own, since that one usually needs a look). Stragglers are cleaned up from
   the app: the delete dialog offers independent **Local** and **Source (seedbox)** scopes, so
   failed or abandoned releases can be cleared from both sides without ever SSHing in
+- **Optional download-client connections — SABnzbd and rTorrent** (`docs/download-client-framework-spec.md`,
+  off at every level by default): add an instance at Settings → Clients and lftpweb reads the
+  process actually doing the downloading, instead of inferring it from bytes appearing on the
+  seedbox or from Sonarr/Radarr's relay of the same answer. What that buys today: a client's
+  in-progress work shows in the **Preflight** box alongside the *arr's view of it, with both
+  source badges on one row and an expand showing each source's own status and size; a paused,
+  half-finished download becomes visible instead of silently never arriving; the Clients row shows
+  a real last-poll outcome, so a working client no longer looks identical to a broken one; and
+  **Transfers → Disk review** scans the client's own base paths over SSH and reports what is on
+  disk but claimed by nobody. The setup flow detects the client's own directories and *verifies
+  each one over SSH* before you accept it (a containerised client reports paths in its own
+  filesystem view, which need not match what lftpweb sees), and a client's categories are read
+  from the client rather than typed. **The section is marked new in the UI** and carries three
+  deliberate limits: **nothing here deletes anything** — Disk review has no delete button and
+  won't until it has been used against real seedboxes for a while; two behaviours that *act* on a
+  client's verdict (shortening the settle gate, and holding back an auto-queue for a release the
+  client says failed) **ship off**, pending confirmation of one status mapping against a live
+  SABnzbd; and the wire vocabularies of both connectors are still partly guesswork — see "Known
+  gaps"
 - **Transfers is the main section, with Queue and Files tabs** (`/transfers/queue`,
   `/transfers/files` — the old standalone Files nav entry and `/files` both redirect here). The
   Queue tab is **one globally-ordered list, not one section per queue** — admission is entirely
@@ -132,13 +151,16 @@ Every verify outcome, every remote delete, and every delete withheld — with th
   password login or trust a reverse proxy's identity header, both from Settings → Auth. See
   "Locked out?" below before you flip it on.
 - **In-app user documentation**, under **Docs** in the left nav: a quick start walking the real
-  first-run sequence, and a Concepts page covering the thirteen things that actually confuse
+  first-run sequence, and a Concepts page covering the twenty things that actually confuse
   people (the queue being paused, why a row still reads "Awaiting import" instead of Complete,
   what Mark complete/Mark failed does and doesn't do, the settle gate, the removal grace period,
   auto-queue suppression, the difference between Dismiss / Clear events / Reset item tracking,
   the lifecycle icons, `copy` vs `move`, inherit-vs-override on the post-processing toggles, the
-  Sonarr/Radarr icon, why a release sits in Preflight instead of downloading, and what's in a
-  support bundle). Every step links straight to the settings page it describes.
+  Sonarr/Radarr icon, what connecting a download client does and doesn't add, category → queue
+  mapping and "not used here", a client's content-vs-working base paths, Disk review's three
+  piles, the two client verdicts that ship off, why a release sits in Preflight instead of
+  downloading, and what's in a support bundle). Every step links straight to the settings page it
+  describes.
   Per-field help popups (`FieldHelp`) are being applied across the settings surface, starting
   with the fields whose wrong answer costs you data
 
@@ -180,6 +202,32 @@ on seeding the exact same bytes from its own data directory until *you* remove t
 there, at which point the space actually comes back. Same queue setting, same "source deleted"
 audit event either way — genuinely different real-world outcomes depending on which client the
 release came from.
+
+### Two lftpwebs sharing one seedbox
+
+**Supported, and newly so — added 2026-08-23, lightly tested.** If one seedbox feeds two
+independent lftpweb installs — one SABnzbd and one rTorrent serving both, but each lftpweb with
+its own Sonarr/Radarr pair and its own subset of the download folders — then **each install
+permanently sees work that isn't its business.** Both clients report everything to both
+lftpwebs. That is the steady state of this topology, not a misconfiguration, and it changes what
+two settings mean:
+
+- **Mark the other install's categories "not used here"** at Settings → Clients. This is not
+  just a way to silence the "none attributable to a queue" warning. It also means *never scanned,
+  never proposed as debris, never inside a delete boundary.* A newly-observed category arrives
+  marked "not used here" by default for exactly this reason — you opt content **in**, rather than
+  discovering too late that you never opted it out.
+- **Add the other install's trees under "Excluded paths"** on the same page when a category
+  can't express it. A category is only ever a proxy for *where content lands*; an excluded path
+  says it directly, and it is the only thing that works for a client whose labels have no
+  relationship to any directory (rTorrent). Where an excluded category can't be resolved to a
+  path, Disk review holds the ambiguous files back from its debris list and shows them in a
+  separate **Unclaimed** pile instead — visible, deliberately not selectable.
+
+**Be honest about the state of this:** the mechanisms exist and are unit-tested, but they have
+not been run against a real two-instance deployment yet. Since nothing in lftpweb deletes
+anything found by Disk review today, the current risk is a wrong *report*, not a wrong deletion —
+but check the piles against what you know is yours before trusting them.
 
 ## Support bundle
 
@@ -350,6 +398,45 @@ and known limitations, recorded in full in `docs/decisions.md` and `prompts/open
   for the standing reason every Settings page in this project carries the same caveat. The item
   drawer also doesn't surface `arr_status` yet; only the Files-row icon and its hover text do.
 
+Gaps specific to the **download-client connections** (SABnzbd / rTorrent), all named rather than
+worked around:
+
+- **Nothing deletes anything.** Disk review finds debris and computes what removing it would
+  reclaim, and then stops — there is no delete button on that page and no delete pipeline behind
+  it. That is the deliberate build order (`DESIGN.md` §17.8): the scan gets looked at against real
+  seeding estates before any code path is allowed to remove. Until then, act on its findings by
+  hand.
+- **Both connectors' wire vocabularies carry unverified guesses.** Every SABnzbd status mapping,
+  field name, endpoint and response shape, and the same for rTorrent's XML-RPC calls, was authored
+  from vendor documentation and — apart from a handful since corrected by live use — has never
+  been confirmed against a real instance. They are enumerated and risk-ranked in
+  `docs/download-client-framework-spec.md` §13.4 (SABnzbd) and §13.6 (rTorrent). **The test suite
+  being green says nothing about these**: the fake SABnzbd and fake rTorrent it runs against encode
+  the same assumptions the connectors do. This has already bitten twice in this project — once for
+  Sonarr's event types, once for SABnzbd accepting an invalid API key — so it is stated plainly
+  rather than treated as unlikely.
+- **Two behaviours ship off and cannot be turned on from the UI in one case.** The settle-gate
+  skip (a client's "this finished" verdict shortening the settle wait) has a checkbox at
+  Settings → Transfer, off by default. The withhold gate (not auto-queueing a release the client
+  explicitly says failed) has **no settings page and no API endpoint at all** — it exists only as
+  a stored value, so turning it on today means editing the database. Both are off for the same
+  reason: they act on a status mapping not yet confirmed against a live SABnzbd.
+- **Cross-seed handling ships unwitnessed.** Deleting one torrent's data breaks the other torrents
+  sharing that save path, so the design detects shared save paths and refuses. It is
+  correct-by-unit-test and has never run against a real cross-seeding setup, because the author's
+  own seedbox doesn't cross-seed.
+- **Disk review's inode key has no device number.** Inode numbers are unique per filesystem, not
+  globally, so base paths spanning two filesystems could in principle collide. Every consequence
+  of a collision errs toward proposing *less* and promising *less* reclaim, which is the right
+  direction, so this is recorded rather than treated as a blocker.
+- **The two-lftpwebs-on-one-seedbox exclusions have not been run against a real two-instance
+  deployment** — see "Two lftpwebs sharing one seedbox" above.
+- **Settings → Clients and the Disk review page have never been rendered in a browser by anyone
+  who built them.** Two separate bugs in this feature turned out to be pure layout problems
+  (content silently clipped rather than scrolled; a control crushed to one character by a
+  competing width class), and jsdom performs no layout at all, so no test in this repo could have
+  caught either. A human with a browser is the only check that exists for these pages.
+
 ## Locked out?
 
 `AUTH_MODE` defaults to `none` — a fresh pull of this image, or an existing install that has
@@ -411,7 +498,7 @@ see `DESIGN.md` §11.2.
 
 ## Design
 
-**[`DESIGN.md`](DESIGN.md)** is the architectural source of truth, in 15 numbered sections.
+**[`DESIGN.md`](DESIGN.md)** is the architectural source of truth, in 17 numbered sections.
 Worth reading §1.3 before anything else, because the whole codebase follows from it:
 
 > **lftp is a transfer engine, not a status API.** Progress is derived from the filesystem —

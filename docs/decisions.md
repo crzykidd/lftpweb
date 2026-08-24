@@ -6,6 +6,68 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-23 — docs currency for `0.4.0`: `DESIGN.md` gets §17, the two-instance topology becomes documented, and stage 5's gate grows a second condition
+
+`prompts/done/2026-08-23-docs-currency-for-0.4.0.md`. Documentation-only pass ahead of the
+`0.4.0` release prep. Four decisions worth recording, not just the prose.
+
+**1 — `DESIGN.md` §17 describes what exists, and says so explicitly.** The connector framework
+had shipped six stages' worth of work with `DESIGN.md` completely silent on it — the largest doc
+gap in the repo, and a real hazard, since `DESIGN.md` is the one document `CLAUDE.md` requires be
+read before writing code. The alternative considered and rejected was pointing §17 at the spec
+and leaving it at that (the shape §16 uses for the *arr integration). That works for §16 because
+`docs/arr-integration-spec.md` describes something fully built; it fails here because
+`docs/download-client-framework-spec.md` is a proposal document whose stage 5 does not exist, so
+a reader following the pointer would come back believing lftpweb has a delete pipeline. §17
+therefore carries its own "what is built and what is not" table and states the precedence rule
+outright: **where the spec describes an intention and §17 describes what runs, §17 wins.**
+`docs/README.md` now states the same rule for every spec in the directory.
+
+**2 — the two-lftpwebs-on-one-seedbox topology is documented in `README.md`.** Finding #16's
+second open question ("should this be a first-class documented deployment?") was answered in the
+affirmative *for the spec* by the round-5 task, which explicitly deferred the README write-up.
+Doing it now rather than later, on the reasoning that the safe default it produces (a newly
+observed category arrives excluded) is *surprising* if you don't know why it exists — a user who
+runs a single install and sees their new category default to "not used here" will read it as a
+bug unless the topology it protects against is written down somewhere they'll find it. Labelled
+honestly as newly supported and lightly tested, with the current risk stated precisely: since
+nothing deletes anything yet, the exposure is a wrong *report*, not a wrong deletion.
+
+**3 — stage 5's gate now has a second condition, and it is time-based on purpose.** The existing
+condition (findings #15/#16 resolved) is met. The added one: **`0.4.0` running in the user's real
+two-instance setup for several days.** The reasoning, which matters more than the rule: the
+dangerous case is *the other install's content losing its client claim* — a release the other
+lftpweb imports, which SAB then drops from history, or a torrent the other side removes. **That
+cannot be staged.** It depends on the other install's own import schedule and the client's own
+history retention; a fixture can assert the set arithmetic, but only elapsed time in the real
+deployment shows whether the exclusions actually cover what they need to cover as claims age out.
+Rejected: treating the existing unit tests as sufficient, on the grounds that fourteen tests
+already cover `reconcile()`'s exclusion behaviour. They cover the arithmetic, which was never the
+uncertain part.
+
+**4 — `prompts/startnewsession.md` is now split by a "everything below this line is history"
+divider, rather than pruned by deletion.** The brief had accreted to ~2,000 lines, with the
+current state buried above eight releases of superseded narrative and the still-current
+**Operating rules** and **Traps** sections stranded at the very bottom, below all of it. Those two
+sections were moved *above* the divider; the release-by-release history was left intact below it.
+Considered and rejected: deleting the older release notes outright. The reasoning in them is
+frequently the only record of why an existing behaviour is shaped the way it is, and this project
+has a standing preference for naming things rather than quietly closing them. What *was* deleted
+is the stage-0-era account of #18, which had become actively wrong (it stated base paths are
+user-configured with the client's answer as a prefill — a decision reversed in §8.2 the following
+day). Two entries in the Traps list that had become false were struck through with their
+correction rather than removed, matching the reversal-with-cause convention the framework spec
+uses.
+
+**Scope not attempted:** no code, no tests, no behaviour changed. `CLAUDE.md`'s own "Status:"
+summary line is still stale (it names `0.3.1` and nine build phases, and says nothing about #18)
+— left alone deliberately rather than edited by a subagent, and reported instead. The screenshots
+remain stale, unchanged from `v0.3.0`; README's second hero is still captioned "The Events page"
+while showing the removed History page, which is the one actively-wrong thing on the front page
+and needs a human with a browser.
+
+---
+
 ## 2026-08-23 — the unclaimed pile: fail-closed means "no action without a gate," not "no display" (finding #17)
 
 `prompts/done/2026-08-23-unclaimed-pile.md`, spec §11.1d/§11.2/§11.4, `core/disk_review.py`,

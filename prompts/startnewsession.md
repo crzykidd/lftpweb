@@ -18,9 +18,12 @@ and optionally verifies / extracts / relocates finished items.
 
 - **Stack:** Python 3.13 / FastAPI / SQLite / asyncssh backend; React + TypeScript + Vite +
   Tailwind frontend; one Alpine container; lftp for transfers.
-- **Current version: `0.3.1`** (released 2026-08-22 — see "Where we are"). Version lives in
-  `backend/lftpweb/__init__.py`, **bare, no `v`**; the `v` prefix appears in exactly one place, the
-  git tag and matching GitHub release name.
+- **Current released version: `0.3.1`** (2026-08-22). **`dev` carries a large unreleased body of
+  work — the download-client connector framework — and the next release is `0.4.0`**, decided by
+  the user 2026-08-23 on the grounds that SABnzbd/rTorrent queue visibility is a substantial
+  feature set (a departure from this project's usual sequential-patch preference; see "Where we
+  are"). Version lives in `backend/lftpweb/__init__.py`, **bare, no `v`**; the `v` prefix appears
+  in exactly one place, the git tag and matching GitHub release name.
 - **Licence: AGPL-3.0** (`LICENSE`). Bundled third-party programs in the image — lftp, OpenSSH,
   7-Zip, su-exec, tini — are aggregated, not linked, and are recorded in `NOTICE`.
 - **Repo: https://github.com/crzykidd/lftpweb** — public, created 2026-08-11.
@@ -37,23 +40,35 @@ length — it is the single most important thing to read before touching the tra
 
 ## Read first, in this order
 
-1. **`DESIGN.md`** — the architectural source of truth, 15 numbered sections. Cite sections as
-   `§4.5` when discussing it. **Required reading before writing any code.**
+1. **`DESIGN.md`** — the architectural source of truth, 17 numbered sections. Cite sections as
+   `§4.5` when discussing it. **Required reading before writing any code.** **§17 is the
+   download-client connector framework**, and it is the section to read for what actually *exists*
+   in that feature; the spec below is a proposal document and describes more than was built.
 2. **`CLAUDE.md`** — per-session operating rules (the handoff-prompt workflow, in full).
 3. **`docs/decisions.md`** — the "why" log, newest first. Check it before re-deriving anything;
    several decisions have non-obvious rejected alternatives.
 4. **`standards.md`** — which homelab standards this repo implements, pinned.
-5. **`docs/transfers-redesign-spec.md`** — the plan behind the Transfers/Queue/Preflight UI as it
+5. **`docs/download-client-framework-spec.md`** — *if working on #18 or #21, which is most of the
+   unreleased work.* The governing spec, 15 numbered sections. **It carries several corrections
+   where an earlier decision was reversed with its cause recorded in place** (§8.2, §8.3 rounds
+   3–6, §9.1, §11.1c, §13.4 rows 9/10) — that convention is deliberate; preserve it, and do not
+   rewrite history to look like it was always right. §13.4 and §13.6 are the two correction lists,
+   and are the highest-value outstanding work in this repo.
+6. **`docs/transfers-redesign-spec.md`** — the plan behind the Transfers/Queue/Preflight UI as it
    exists today. **Phase 1 is built and released in `v0.3.0`**; §4 (phase 2, download clients) is
-   specced but deliberately not started. Read it before touching the Transfers page,
-   `core/scheduler.py`, the queue ordering, or `core/preflight.py`.
-6. **The open GitHub issues** — `gh issue list`. Since 2026-08-21 deferred work is tracked there,
+   the sketch `docs/download-client-framework-spec.md` supersedes and #18 has now largely built.
+   Read it before touching the Transfers page, `core/scheduler.py`, the queue ordering, or
+   `core/preflight.py`.
+7. **The open GitHub issues** — `gh issue list`. Since 2026-08-21 deferred work is tracked there,
    not only in `prompts/`. Check before assuming something is untracked or unstarted.
-7. **`docs/download-client-api-survey.md`** — *only if working on #18 or #21.* What each client's API
+8. **`prompts/test-findings-2026-08-23.md`** — *if working on #18.* Seventeen findings from live
+   use against a real seedbox, each with its own resolution note. **Several changed the design,
+   not just the code**, and #15/#16 are what gate stage 5.
+9. **`docs/download-client-api-survey.md`** — *only if working on #18 or #21.* What each client's API
    can actually report (rTorrent/ruTorrent, qBittorrent, Transmission, Deluge, SABnzbd), researched
    from vendor docs 2026-08-22. Re-confirm against a real instance before relying on any of it.
-8. **`docs/torrent-manager-spec.md`** — *only if working on #21.* A proposal document, not a
-   description of reality. Depends on #18.
+10. **`docs/torrent-manager-spec.md`** — *only if working on #21.* A proposal document, not a
+    description of reality. Depends on #18.
 
 ---
 
@@ -90,189 +105,188 @@ than a first. Two things that bit the first time and will bit again:
 
 ## Where we are
 
-### 👉 IN PROGRESS: #18, the download-client connector framework — **stage 0 landed 2026-08-22**
+### 👉 THE NEXT SESSION'S JOB: pre-release bug hunting for `0.4.0`
 
-**[`docs/download-client-framework-spec.md`](../docs/download-client-framework-spec.md) is now the
-governing document for this work — read it before anything else in this section.** Written
-2026-08-22 from a long design session with the user; 15 numbered sections, six staged deliverables.
-It supersedes `docs/transfers-redesign-spec.md` §4's sketch (which remains correct, just thinner)
-and is the input `docs/torrent-manager-spec.md` (#21) depends on.
+**Not new features.** `dev` carries a large, unreleased body of work (below) that has had six
+rounds of live-use corrections in a single day and has never been through a deliberate
+pre-release pass. The next session hunts bugs in what exists, and the user drives a browser while
+it does — most of the defects this feature produced were only ever findable that way.
 
-**The four decisions that shaped it, all the user's:**
+**The release will be `0.4.0`** — the user's explicit decision, 2026-08-23, on the grounds that
+SABnzbd/rTorrent queue visibility is a substantial feature set. That is a deliberate departure
+from this project's usual preference for the next sequential number (`0.3.0` and `0.3.1` were
+both chosen over `0.4.0` for exactly that reason), so do not "correct" it back.
 
-1. **Deletion never goes through the client.** `remove` means *unregister, leave the data*; lftpweb
-   deletes the bytes itself over SSH (`core/remote.py.delete_path`), verifies by re-stat, and logs
-   an event. This deletes `remove_with_data` from the vocabulary entirely and removes rTorrent's
-   `erasedata`-hook detection — the survey's worst corner — from the design. Spec §10.
-2. **A disk review scan** over the client's base paths: `B − A − C` → debris, `A − B` → broken
-   seeds. Review-only; never auto-deletes. Spec §11.
-3. **The reference workflow is documented, and it is load-bearing** (spec §1.1): SAB and rTorrent
-   share a completed folder, SAB *extracts* into it, rTorrent *hardlinks* into it. This forces
-   inode-based claiming (§11.1b), union-across-clients set arithmetic (§11.1a), and link-aware
-   freed-space prediction (§10.5). A README write-up of this preferred setup is a stage 1
-   deliverable.
-4. **Base paths are user-configured** with the existing `core/browse.py` remote picker; the
-   client's own `list_base_paths` is a prefill only. Save-time validation matters here because a
-   base path is the boundary the delete containment check authorises removal *within*. Spec §8.2.
+**`/release-prep` is forbidden from touching `DESIGN.md`.** `DESIGN.md` §17 (the connector
+framework's architectural section) must therefore be committed **before** the release prep runs,
+not after it. This bit once already at `v0.1.0` and left four false statements in `DESIGN.md`
+that had to be fixed on `dev` afterwards.
 
-**Stage 0 is built** (`core/clients/`, first subpackage under a previously flat `core/`): the
-`Operation`/`Field` closed enums, tri-state `Capability` with caveat notes, the three-layer
-`CapabilitySet` merge, the three-way error taxonomy, the registry, a fake adapter, and a 33-test
-conformance suite. No API, no migration, no poller.
+### 📦 What is unreleased on `dev`: #18, the download-client connector framework
 
-**Stage 1a is built**: `core/clients/sabnzbd.py`, `core/clients/capture.py` (the redacted
-response capture), `tests/fake_sabnzbd.py` on a real uvicorn socket, and 56 tests.
-**1774 backend tests, 0 skipped.** Still no table, no settings API, no frontend — that is
-**stage 1b, the next thing to build**, and it also carries the README write-up of the reference
-workflow (spec §1.1).
+**Read `DESIGN.md` §17 first for what exists**, then
+`docs/download-client-framework-spec.md` for the full reasoning. The spec is a *proposal*
+document and describes more than was built; §17 is the description of reality. **17 live findings
+are in `prompts/test-findings-2026-08-23.md`**, each with its own resolution note.
 
-**Stage 1b (backend) is built**: **migration 027** (`download_client` + `download_client_base_path`
-+ `download_client_category`, all additive, defaults OFF), `api/settings_clients.py` mirroring
-`settings_arr.py`, and a test-connection endpoint that persists the **probed** capability layer and
-writes a redacted capture to the log.
+**What it is:** a pluggable connector layer that talks to the program actually doing the
+downloading on the seedbox. **SABnzbd and rTorrent ship**; 7–10 connectors are expected. Until
+now lftpweb learned what was coming either from bytes appearing on the seedbox or from
+Sonarr/Radarr relaying its own download client's answer — two polling intervals of lag and one
+layer of paraphrase. A connector removes both.
 
-**Stage 1b (frontend) is built — stage 1 is COMPLETE**: **Settings → Clients**, with the connection
-form rendered from each connector's server-declared `ConfigField` schema (no `if client_type ===
-"sabnzbd"` anywhere — verified by grep), base-path browsing reusing the existing remote picker,
-category→queue mapping with an *offer to infer* from configured base paths, and an honest
-capability readout (derived labelled as derived with its note; missing capabilities disabled with a
-stated reason; a failed test renders last-known rather than blanking). Plus **README's "Recommended
-seedbox layout"** section. **1794 backend / 697 frontend tests, 0 skipped.**
+**Built: stages 0–4, migrations 027–032, ~500 new tests.**
 
-**Base paths are DETECTED, not typed** (2026-08-22, **migration 028**) — a correction to an earlier
-wrong call, recorded as a reversal in spec §8.2 and `docs/decisions.md`. The client already reports
-its own directories *and* their roles (`content` vs `working`, because the connector knows which
-config key it read each from), so the flow is **detect → SSH-verify → confirm**. The one thing a
-client cannot know is whether lftpweb sees a path at the same spot over SSH — that is
-path-namespace translation, the same problem `path_queue.arr_visible_path` already solves for the
-*arr, and it is now *detected* rather than asked about up front. **`verified` / `not_found` /
-`unverified` are three distinct states and must never be collapsed** — "the seedbox says it isn't
-there" is a fact; "lftpweb couldn't look" is not the same fact, and `core/browse.py.
-remote_directory_error` draws that line deliberately.
+| Stage | What landed |
+|---|---|
+| **0** | `core/clients/` (the first subpackage under a previously flat `core/`): `Operation`/`Field` closed enums, tri-state `Capability` with caveat notes, the three-layer `CapabilitySet`, the three-way error taxonomy, the registry, a fake adapter, a registry-wide conformance suite |
+| **1** | `core/clients/sabnzbd.py`, `core/clients/rtorrent.py` (direct XML-RPC at `/RPC2`), `core/clients/capture.py` (redacted response capture), `core/clients/detection.py`, `api/settings_clients.py`, **Settings → Clients** with per-connector server-declared config forms, base-path detect → SSH-verify → confirm, and README's "Recommended seedbox layout" (migrations 027, 028) |
+| **2** | `core/clientsync.py` — the poller — plus the client as a **third Preflight source** with per-field precedence and both source badges on a merged row, and the settle-gate skip (migration 029) |
+| **3** | Withhold auto-queue on an explicit client failure verdict, and the poll-cadence split fixed to **cheap-vs-expensive** (read per-connector off `Operation.LIST_HISTORY`'s own declaration, never a `client_type` branch) |
+| **4** | `core/disk_review.py` — the disk review scan, three piles, review-only — plus `api/disk_review.py` and a **Transfers → Disk review** tab (migrations 030, 031, 032) |
 
-**Saving an ENABLED client tests it first and persists nothing on failure** (user's requirement,
-matching how the *arr apps behave). `enabled: false` never tests and always saves — **that is the
-deliberate escape hatch**, so a temporarily-unreachable client can still be edited (uncheck, save,
-fix, re-enable). There is deliberately **no force/save-anyway flag**. A successful save also
-persists the probed capabilities, so no second Test click is needed.
+**NOT built: stage 5, the delete pipeline. Nothing in this feature deletes anything.** Disk
+review has no delete button anywhere on it; its checkboxes exist only to drive a link-aware
+reclaim preview. `core/disk_review.py.is_authorized_delete_target` is pure, unit-tested, and
+called by nothing — stage 5 must call it rather than re-derive containment a second time.
 
-### ✅ Findings #15/#16's gate is cleared (2026-08-23) — stage 5 itself is still not built
+**The rules that hold the whole thing up** — each is in §17, and each is a place the obvious
+implementation is wrong:
 
-**Resolved**: `prompts/done/2026-08-23-category-tristate-and-exclusion.md`,
-`docs/decisions.md`, spec §8.3 round 5/§10.2/§11.2. The two-lftpweb-instances-one-seedbox shape
-this gate exists for is unchanged (see below, kept for context) — what changed is that the fix is
-now built and tested, not merely designed.
+1. **Advisory only, enforced structurally.** A connector is handed **no database handle**;
+   `DownloadClient.__init__` takes connection config and nothing else, so it *cannot* write
+   `item.state`. A change that wants to pass a connection into a connector is this rule being
+   violated.
+2. **A transport failure must never degrade a capability.** Only `CapabilityUnavailable` degrades
+   (`base.py.degrade_from_error`); `ClientUnreachable` and a bare `ClientError` change nothing,
+   ever. One bad network minute must not permanently disable a feature.
+3. **Deletion never goes through the client.** `remove` means *unregister, leave the data*;
+   lftpweb deletes the bytes itself over SSH. This removed rTorrent's `erasedata` hook — the API
+   survey's worst corner, where a bare rTorrent accepts all three calls and deletes nothing,
+   silently — from the design entirely.
+4. **Attribution is path first, category as fallback.** A transfer whose `content_path` matches an
+   enabled queue's `remote_path` (component-boundary containment, never a bare prefix) needs no
+   configuration at all. **But rTorrent reports its own seeding directory**, a different tree from
+   the hardlinked completed copy, so its category mapping stays its only route. Path wins on
+   disagreement, and the mismatch is logged.
+5. **Claiming is by inode, not path.** rTorrent's hardlinked copy is invisible to its own API, so
+   path matching alone would flag every rTorrent release in the completed folder as an orphan. A
+   file is claimed if *any* link to its inode is claimed; a candidate is proposed only when
+   *every* link is also a candidate.
+6. **Never keyed on the client's name.** No `if client_type == "rtorrent"` exists anywhere in this
+   subsystem. `family` is display metadata with no runtime authority.
 
-**What landed:** categories are three-state and persisted (migration 031,
-`download_client_category.excluded`, mutually exclusive with `queue_id`) — bound / explicitly
-"not used by this instance" / undecided — and the unattributed-clients banner counts only the
-undecided state (`core.clientsync._update_preflight`), asserted directly: a client whose every
-category is bound or excluded produces no banner line at all. "Not used" is also now a hard scan
-boundary, not merely a silenced banner: `download_client_excluded_path` (migration 031) is the
-enforceable primitive, an excluded category resolves into a path wherever a `content`-kind base
-path exists to resolve it onto (`core.disk_review.resolve_category_exclusion_paths`), and
-`core.disk_review.reconcile()` drops everything under an excluded path before any candidate/claim
-logic runs. **Fails closed** where resolution is impossible (rTorrent has no `content`-kind base
-path under the reference layout) by suppressing debris for that client's *entire* declared base
-path, before the walk even reaches it — genuinely never scanned in that case, not merely
-discarded after. `core.disk_review.is_authorized_delete_target(path, base_paths, excluded_paths)`
-seeds §10.2's future two-sided containment check (inside a base path **and** outside every
-excluded path), unit-tested now even though nothing calls it in anger yet. The per-client
-relevance copy findings #15 asked to be sequenced with (SAB: "12 of 12 matched by folder, no
-mapping needed"; rTorrent: "0 of 2 matched, mapping required") also landed, derived from two new
-observed columns (`attribution_sample_size`/`attribution_matched_by_path`), never from
-`client_type`.
+**Two things ship OFF, for one specific reason.** The settle-gate skip
+(`settle.SettleSettings.client_skip_enabled`, a checkbox at Settings → Transfer) and the withhold
+gate (`autoqueue.WithholdSettings.enabled`, **no API and no UI at all** — stored value only) both
+act on SABnzbd's history status mapping (`Completed`→`COMPLETED`, `Failed`→`FAILED`), which is
+spec §13.4 guess #2 and **has never been confirmed against a real SABnzbd**. Every uncertain path
+in both falls back to pre-stage behaviour. Turn them on after the mapping is confirmed, not
+before. The withhold gate having no settings surface is a real gap, named in README.
 
-**What still stands in the way of actually building stage 5** (see spec §14's own stage-5 row for
-the fuller version): (1) none of this has been run against the user's real two-instance
-deployment yet — a live scan, a real excluded category, and a real fail-closed base path all need
-verification before anything is trusted to delete; (2) `is_authorized_delete_target` is tested
-but unused — stage 5's own delete sequence must actually call it; (3) the new excluded-paths/
-exclusion-checkbox UI in `ClientsTab.tsx` is unverified in a real browser (jsdom has no layout
-engine, the same honest limitation every other layout-sensitive change in this feature already
-carries); (4) stage 4's own real-box verification (named in its own §14 row) is still outstanding
-and should happen before stage 5, not after. Two of finding #16's own open questions were answered
-explicitly (path is the exclusion unit, not category — the enforceable primitive; the scan refuses
-debris on the specific shared path, not the whole scan) and two were left open: whether a
-two-instance seedbox becomes a documented deployment in README/§1.1, and whether `move`-mode
-source deletion has the same hazard today.
+### 🔴 Stage 5's gate — two conditions now, not one
 
-<details>
-<summary>Original blocking rationale (2026-08-22/23), kept for context</summary>
+Stage 5 is the delete pipeline. **It is blocked, and the gate got stronger on 2026-08-23.**
 
-The disk review scan proposes `B − A − C` as debris. The *other* instance's content is protected
-today **only** by set A (the clients still claim it). That protection is temporary: once the other
-instance imports a release and SAB drops it from history, the content is claimed by nobody *this*
-instance can see — set C only knows this lftpweb's own items — and it becomes arithmetically
-indistinguishable from debris. Stage 5 would then offer to delete another site's data, with a
-correct-looking reclaim figure and no signal anything was wrong. "Not used by this instance" had
-to mean **two** things: don't warn about it, *and* never scan it, never propose it, never let it
-inside §10.2's delete containment boundary — a flag that only silences a banner would have left
-the delete path exactly as dangerous while appearing to have addressed it.
+**Condition 1 — findings #15/#16 resolved.** ✅ **Done.** The two-lftpwebs-share-one-seedbox shape
+(finding #16) is real: one seedbox, one SABnzbd, one rTorrent, **two independent lftpweb
+installs**, each with its own *arr pair and its own subset of the download folders. Each install
+permanently sees work that is not its business — the steady state, not a misconfiguration. The
+danger is that the scan proposes `B − A − C` as debris, and the other install's content is
+protected **only** by set A (the clients still claim it). *That protection expires* the moment the
+other install imports a release and SAB drops it from history: set C only knows about *this*
+lftpweb's items, so the content becomes arithmetically indistinguishable from debris and stage 5
+would offer to delete another site's data with a correct-looking reclaim figure. Fixed by
+three-state categories (migration 031), every observed category auto-recorded and **defaulting to
+excluded** (migration 032), `download_client_excluded_path` as the enforceable primitive, and a
+per-file fail-closed rule that surfaces genuinely-unknown files as a visible **Unclaimed** pile
+rather than suppressing them.
 
-</details>
+**Condition 2 — `0.4.0` running in the user's TWO-INSTANCE setup for several days.** ⛔ **Not
+met, and it cannot be short-circuited.** This is the condition added 2026-08-23, and the reasoning
+matters more than the rule:
 
-**👉 THE NEXT REAL-WORLD STEP is not more code — it is running a capture against the live SAB.**
-Settings → Clients → add the SABnzbd instance → Test. Then read the capture and work through spec
-**§13.4's twelve guesses**. Note the capture is currently at DEBUG, so it needs
-`LFTPWEB_LOG_LEVEL=DEBUG` — spec §13.3 flags that as a design problem to fix (probably return it in
-the test-connection response body instead). **Stage 2 (the poller, the Preflight source, the
-settle-gate skip) should not be built on unverified mappings.**
+> **The dangerous case cannot be staged.** What has to be observed is *the other install's content
+> losing its client claim* — a release the other lftpweb imports, which SAB then drops from
+> history, or a torrent the other side removes. Nothing about that is reproducible on demand: it
+> depends on the other install's own import schedule and the client's own retention. A fixture can
+> assert the arithmetic; only elapsed time in the real deployment can show whether the exclusions
+> actually cover what they need to cover as claims age out. **Several days of ordinary use, with
+> Disk review run and its piles compared against what the user knows is theirs, is the only
+> evidence that exists for this.**
 
-**Two findings from stage 1b worth knowing before touching this code:**
+Since nothing deletes anything today, the exposure while waiting is a wrong *report*, not a wrong
+deletion — which is exactly why the waiting is affordable and should actually be done rather than
+rationalised away.
 
-- **`httpx` logs every request URL at INFO, and SAB's API key rides in the query string.** A
-  correctly-redacted capture line was landing next to an *unredacted* `HTTP Request: GET
+**Also still standing in stage 5's way**, in the spec's own §14 stage-5 row: stage 4's own
+real-box verification is outstanding; `is_authorized_delete_target` is tested but unused; the
+manual excluded-paths UI, the "+N new" category signal and the Unclaimed pile are all unverified
+in a real browser; the unclaimed pile's own **gate does not exist** (spec §11.4 records the
+recommended shape — a distinct, separately-reachable action, *not* a confirm dialog bolted onto
+the debris flow — for stage 5 to implement deliberately rather than reinvent); and §10.4/§10.5's
+cross-seed and multi-filesystem-inode gaps are open regardless.
+
+### 🎯 The highest-value outstanding work: the two correction lists (§13.4, §13.6)
+
+**Spec §13.4 (SABnzbd, 13 rows) and §13.6 (rTorrent, 13 rows) enumerate every status mapping,
+field name, endpoint and response shape authored from vendor documentation and never confirmed
+against a live instance**, risk-ranked. Working through them against the real seedbox is worth
+more than any new code in this subsystem.
+
+**A green test suite does not touch them, and this is not a hedge.** `tests/fake_sabnzbd.py` and
+`tests/fake_rtorrent.py` encode the *identical* assumptions the connectors do — a self-authored
+fixture cannot falsify a self-authored assumption. This repo has been burned by exactly that
+twice: `IMPORT_EVENT_TYPES = {3}` (two live Sonarr imports misclassified `gone`, every test green
+throughout) and SABnzbd's `mode=version` accepting an invalid API key (issue #23, falsified by the
+user typing a bad key within hours of shipping, suite green throughout). **When correcting any
+row: fix the fixture first and watch the test fail, then fix the connector.** A fixture edited
+only to match new code repeats the original mistake exactly.
+
+Getting the capture out of the client is the practical first step. `test_connection` writes a
+redacted raw sample of each call, **but at DEBUG**, so reading it needs `LFTPWEB_LOG_LEVEL=DEBUG`
+and a restart — which spec §13.3 flags as defeating half its purpose. The likely fix (undecided)
+is returning it in the test-connection response body so the settings page can show it inline; if
+that is built, its redaction needs a **log-content** test, not a test of the helper's return
+value.
+
+### ⚠ Traps this feature produced, worth knowing before touching its code
+
+- **`httpx` logs every request URL at INFO, and SABnzbd's API key rides in the query string.** A
+  correctly-redacted capture line was landing next to an unredacted `HTTP Request: GET
   …&apikey=<real key>` line from the library itself. `logsetup.py` now floors `httpx` at WARNING.
-  **The generalisable lesson is not "add httpx to the floors"** — redaction of your *own* log calls
-  is insufficient when a dependency logs the same secret its own way, and the test that catches it
-  is the one asserting on **log content**, not on the helper's return value. Spec §13.3.
-- **The `DownloadClient` ABC declares no transport lifecycle**, so `api/settings_clients.py` reaches
-  for `getattr(client, "aclose", None)`. Harmless once, a smell at seven connectors. Spec §6 says
-  fix it before the second real connector lands.
+  **The lesson is not "add httpx to the floors"** — redaction of your *own* log calls is
+  insufficient when a dependency logs the same secret its own way, and the test that catches it
+  asserts on **log content**, not on the helper's return value.
+- **Announce URLs are credentials.** Store, match, log and display the announce *hostname* only;
+  the full URL is never persisted, logged, rendered, or put in a support bundle.
+- **Two separate bugs in this feature were pure layout problems invisible to every test in the
+  repo.** A wrapper's `overflow-hidden` silently *clipping* a wide table's rightmost column
+  (reported as "the Edit button disappears after a test"), and a shared `w-full` on a `<select>`
+  crushing its sibling category chip to one character. **jsdom performs no layout at all.** For
+  any layout complaint, ask for a screenshot first — two guesses from the reported text were both
+  wrong and one image settled it immediately.
+- **Anything computed from configuration must be re-derived at read time, never cached per poll.**
+  The unattributed-clients banner was computed at poll time, so excluding a category in Settings
+  didn't clear it until the next pass. This is `core/arrsync.py.preflight_rows`'s own 2026-08-21
+  eviction-latency fix, and it has now recurred twice more here — treat it as a known bug shape in
+  this codebase, not a one-off.
+- **The `DownloadClient` ABC declares no transport lifecycle**, so `api/settings_clients.py`
+  reaches for `getattr(client, "aclose", None)`. Harmless at two connectors, a smell at seven —
+  every caller re-deciding whether *this* client needs closing is the per-client branching §17.2
+  forbids, arriving through the back door. Spec §6 says fix it before the next real connector
+  lands.
+- **`d.free_diskspace` is the minimum across the devices an item spans**, and qBittorrent's free
+  space is for its *default* save path, not where a given item lives. Nothing consumes `free_space`
+  yet (#21 is its real consumer); re-examine both when something does.
 
-**⚠ Every SABnzbd status mapping and response shape in stage 1a is vendor-doc-derived and
-UNVERIFIED against a live instance.** Spec **§13.4 is the consolidated correction list** — twelve
-numbered guesses, ranked by risk. Work through it once the capture runs against the real SAB. The
-highest-risk one is #9: whether SAB's `{"status": false}` alone means *not found* while
-`{"status": false, "error": …}` means a real failure. This is the `IMPORT_EVENT_TYPES = {3}` trap
-(see "Traps worth knowing", first entry) deliberately guarded against rather than re-walked into —
-the fixture inherits every guess, so green tests prove nothing about the wire.
+**Live validation loop:** **https://lftpweb.crzynet.com is the TEST system**, running `dev`, with
+real SABnzbd 5.1.1 and rTorrent 0.9.8 behind it sharing the TV completed folder. It answers
+`/api/health`, `/api/history/events`, `/api/logs/*`, `/api/settings/*` and `/api/files`
+unauthenticated from the dev host, so a deployed change can be verified by reading its own events
+rather than by relaying output. **The user's production install is a different, unreachable
+deployment** — ask which one a report is about rather than assuming.
 
-**The single most important invariant in stage 0:** `base.py.degrade_from_error` degrades a
-capability **only** on `CapabilityUnavailable`. A `ClientUnreachable` or a bare `ClientError`
-changes nothing, ever — that is §4.2's "absent from the client is not a verdict" applied to
-configuration, and it is what stops one bad network minute from permanently disabling a feature.
-
-**Live validation loop:** https://lftpweb.crzynet.com answers `/api/health`, `/api/history/events`,
-`/api/logs/*`, `/api/settings/*` and `/api/files` unauthenticated from the dev host, so a deployed
-stage can be verified by reading its own events rather than by relaying output. It runs **SAB and
-rTorrent** today, sharing the TV completed folder.
-
-Background reading, in this order:
-
-1. **[`docs/download-client-api-survey.md`](../docs/download-client-api-survey.md)** — what
-   rTorrent/ruTorrent, qBittorrent, Transmission, Deluge and SABnzbd can each actually report, from
-   vendor docs (2026-08-22). **Read §2 before designing anything**: rTorrent has no native
-   delete-with-data; it goes through `d.custom5.set=1` + `d.delete_tied` + `d.erase` in one
-   `system.multicall` (order is load-bearing), and the deletion is performed by an
-   `event.download.erased` hook that ruTorrent's `erasedata` plugin installs — so the capability
-   depends on the *deployment*, and a bare rTorrent accepts all three calls and deletes nothing,
-   silently. §4 has the framework conclusions.
-2. **`docs/transfers-redesign-spec.md` §4** — the original phase-2 plan. Still governing:
-   **advisory only**, a client may never write `item.state`; **"absent from the client is not a
-   verdict."**
-3. **[`docs/torrent-manager-spec.md`](../docs/torrent-manager-spec.md)** — issue #21, the *consumer*
-   of this framework. Worth skimming so the connector isn't painted into a corner, but **not** part
-   of #18.
-
-**The user's own added requirement (2026-08-21):** every client module **declares what it supports**,
-and lftpweb enables/disables features from that declaration. Survey §4 concludes the declaration must
-be **per-function and tri-state — native / derived / none** — not a boolean and never keyed on the
-client's name. rTorrent's seed time is the proof: derivable from `d.timestamp.finished` but
-semantically different (wall-clock since completion, so a stopped torrent still accrues). A derived
-capability must say it is derived. **Design the interface to Transmission's shape** — richest, best
-specified — then discover what each other client cannot do, rather than designing to rTorrent's limits.
 
 ### 📋 Open work lives in GitHub issues — check there first
 
@@ -281,15 +295,16 @@ in `prompts/`.** A written handoff prompt is linked from its issue. **Read the i
 something is untracked**, and open one for anything deferred rather than letting it live only in a
 session transcript.
 
-**Five are open.** #14/#15/#16/#17/#19 all shipped in v0.3.1 and were closed 2026-08-22; #22 was opened 2026-08-22.
+**Five are open** (verified via `gh issue list`, 2026-08-23). #14/#15/#16/#17/#19 all shipped in
+v0.3.1 and were closed 2026-08-22.
 
-| Issue | What | Prompt |
+| Issue | What | Where it stands |
 |---|---|---|
-| [#18](https://github.com/crzykidd/lftpweb/issues/18) | **Phase 2 — the download-client connector framework (SAB, then ruTorrent).** In progress: **stage 0 of 5 landed 2026-08-22** | `docs/download-client-framework-spec.md` is the governing spec; stage 0's own prompt is in `prompts/done/2026-08-22-client-framework-stage0.md` |
-| [#21](https://github.com/crzykidd/lftpweb/issues/21) | Torrent manager — seeding overview, per-site stop-seeding rules, space reclamation. **Depends on #18** | `docs/torrent-manager-spec.md` |
-| [#23](https://github.com/crzykidd/lftpweb/issues/23) | **SABnzbd test-connection accepts an invalid API key** — `mode=version` is unauthenticated, so any key passes. Spec §13.4 guess #10, falsified by real use hours after shipping, with a green suite throughout because the fake encodes the same assumption. **Deferred by the user** pending the Settings rework | — |
-| [#22](https://github.com/crzykidd/lftpweb/issues/22) | Startup log shows only `__version__`, so a `dev` build announces the last *released* version and cannot be told apart from a real release. `build_sha`/`build_channel` already exist in config and are already surfaced by `/api/health` and the support bundle | — |
-| [#1](https://github.com/crzykidd/lftpweb/issues/1) | (older) Decide item-row lifetime — nothing ever deletes `item` rows | — |
+| [#18](https://github.com/crzykidd/lftpweb/issues/18) | **The download-client connector framework (SABnzbd, then rTorrent)** | **Stages 0–4 built and unreleased on `dev`; stage 5 not built and gated** — see "What is unreleased on `dev`" above. `docs/download-client-framework-spec.md` is the governing spec, `DESIGN.md` §17 is what exists. Every stage's own prompt is in `prompts/done/` |
+| [#21](https://github.com/crzykidd/lftpweb/issues/21) | Torrent manager — seeding overview, per-site stop-seeding rules, space reclamation. **Depends on #18** | Not started. `docs/torrent-manager-spec.md` is a proposal document |
+| [#23](https://github.com/crzykidd/lftpweb/issues/23) | **SABnzbd test-connection accepts an invalid API key** — `mode=version` is unauthenticated, so any key passes. Spec §13.4 guess #10, falsified by real use hours after shipping, with a green suite throughout because the fake encoded the same assumption | **The connector-level fix is on `dev`** (`082f9d6`, `1d12690`): `test_connection` now makes a second, authenticated call, and a measured SAB 5.1.1 403 `API Key Incorrect` body raises `ClientAuthenticationFailed`. The issue is still open because the **save-on-test flow** was deliberately left untouched pending the Settings rework. Close it at `0.4.0` or restate what remains |
+| [#22](https://github.com/crzykidd/lftpweb/issues/22) | Startup log shows only `__version__`, so a `dev` build announces the last *released* version and cannot be told apart from a real release. `build_sha`/`build_channel` already exist in config and are already surfaced by `/api/health` and the support bundle | Not started. Small |
+| [#1](https://github.com/crzykidd/lftpweb/issues/1) | (older) Decide item-row lifetime — nothing ever deletes `item` rows | Not started |
 
 ### 🚀 v0.3.1 released 2026-08-22 — a day of queue-control work, browser-tested before the cut
 
@@ -333,6 +348,316 @@ public README are the **Blender open movies** (CC-BY, real TMDB entries) and **S
 (CC0). Presence on archive.org is not a licensing determination (community uploads, DMCA safe
 harbour); **PBS is not a route** (private non-profit, § 105 does not apply). Don't hunt for
 public-domain TV — use the generated tree for the Sonarr side.
+
+---
+
+## Operating rules
+
+**Scope**
+- Work only the phase or task the user names. Don't fan out into later phases or add
+  "while I'm here" changes. Offer them as a one-liner, then wait.
+- **Surface major design decisions discovered during a build** rather than silently resolving
+  them. If the build reveals that `DESIGN.md` is wrong or underspecified, say so — the doc gets
+  corrected, it isn't quietly diverged from.
+
+**Handoff prompts** (`handoff-prompt-workflow` @ v2.0.0 — full rules in `CLAUDE.md`)
+- Anything beyond ~1–2 files goes into a `prompts/` file executed by a **spawned subagent**.
+  Opus for research/planning, **Sonnet for coding**.
+- The prompt self-updates its frontmatter and `git mv`s to `prompts/done/` (or `failed/`).
+- **One commit at the end**, prompt bundled in. Ask `y/n`. Never `git add -A`, never
+  auto-commit, never push.
+
+**Git**
+- Day-to-day work is on `dev`.
+- **Never a `Co-authored-by:` trailer** — explicitly reaffirmed by the user 2026-08-11, and true
+  of every commit in the history so far. Conventional-Commit prefixes required:
+  `feat:` / `fix:` / `chore:` / `docs:`.
+- `code-checkin-and-pr` and `release-prep-and-cut` were adopted 2026-08-11 alongside repo
+  creation; `standards.md` is the in-repo source of truth for what is actually wired.
+  **Branch protection on `main` is live** (see "Repo, branches, and what's on GitHub" above,
+  confirmed via `gh api` — not a pending step). Treat `main` as fully protected: PR + all
+  required checks green, no direct push, no force-push, no exceptions.
+- `repo-sandbox-permissions` is **deliberately not adopted** — dedicated dev host, same call
+  the user made when de-adopting it from AmmoLedger. Don't "helpfully" add it.
+
+**Docs**
+- Non-obvious decisions go in `docs/decisions.md`, newest at top, with rejected alternatives.
+- Doc updates ship in the same commit as the code they describe.
+- Local scratch, fixtures, and generated files go under `private_data/` (gitignored).
+
+---
+
+## Traps worth knowing before you touch the code
+
+These are the places where the obvious implementation is wrong. Each is written up in
+`DESIGN.md`; this list exists so a fresh session knows to go read it. **The newest ones — from
+the download-client framework — are in "Traps this feature produced" under "Where we are" above,
+not repeated here.**
+
+**Added 2026-08-15 (first real Sonarr live-testing run) — read this one first, it's the newest:**
+
+- ***arr enums are strings in bodies, ints in query params — the fixture must model the wire,
+  not the assumption.*** The Sonarr/Radarr v3 API serializes `eventType` as a camelCase
+  **string** (`"downloadFolderImported"`) in every response body; the numeric codes this
+  integration was originally built against exist only as query-parameter values. Two genuine
+  live imports were misclassified `gone` because `IMPORT_EVENT_TYPES = {3}` could never match a
+  real record — and every test stayed green because the fake-*arr test data encoded the same
+  wrong numeric assumption instead of the real wire shape. `docs/decisions.md` (2026-08-15) has
+  the full account; `core/arrclient.py.HistoryEvent.is_import_event()` is the one place the
+  comparison now happens, with a numeric fallback kept for tolerance only. **The general lesson:
+  when a spec flags a vocabulary "unverified against a live instance," the test fixture that
+  data drives must not itself be trusted as ground truth for that vocabulary — it can encode the
+  identical wrong guess the production code does, and then prove nothing.**
+- ***Missing-vs-the-sidecar at verify time always means the remote lacked it too, never "still
+  arriving."*** `core/verify.py` only runs from `core/postprocess.py`, which only fires after
+  `core/queue.py`'s local-vs-remote completeness gate has already passed — so a file a
+  `.sfv`/`.md5` references but can't find locally was *also* absent on the remote by the time
+  completeness was measured. That's what makes "every referenced file absent" a safe signal for
+  an upstream anomaly (a release rar'd at origin, extracted upstream, rars deleted before this
+  ever reached local disk) rather than a partial transfer — see the fix below and
+  `docs/decisions.md` (2026-08-15).
+- ***An upstream-extracted release verifies `SKIPPED`, not `CORRUPT` — but only when nothing
+  is provably missing.*** Live case: `National.Lampoons.Animal.House.1978.iNTERNAL.1080p.BluRay
+  .x264-EwDp` on the ar-movies queue arrived `movie.mkv` + `.sfv`, the `.sfv` still listing the
+  rar volumes SABnzbd had already extracted and deleted upstream. Treating every sidecar entry
+  as "missing" reported `CORRUPT` and permanently withheld the `move`-mode delete. The fix
+  (`core/verify.py`) narrows on purpose: every referenced entry absent **and** other content
+  present → `SKIPPED`; *any* referenced entry present (including a half-deleted archive set) →
+  unchanged, stays `CORRUPT`; sidecar and nothing else → stays `CORRUPT` (nothing to have been
+  vouching for). Don't widen the relaxation to mixed presence — that's the still-open pipeline-
+  ordering question, `prompts/open-issues.md` #2 / G1.
+
+**Added 2026-08-12 (post-phase-9 session):**
+
+- **`relevant == 0` on a directory means two different things**, and only one of them is
+  `DOWNLOADED`. Every child excluded by a `file_exclude` pattern → vacuously `DOWNLOADED`, and
+  that is load-bearing (§4.7/§3.2 rule 8: it is what stops a filtered release sitting `PARTIAL`
+  and being auto-queued forever). A genuinely empty remote directory → `REMOTE_ONLY` until
+  mirrored. `core/reconcile.py` tells them apart with `remote_file_totals`, a rollup counting
+  remote files *before* the predicate runs. **Do not "simplify" this by keying on local
+  presence** — an all-excluded directory legitimately has no local presence either (lftp never
+  creates a directory with nothing to put in), so that reintroduces the infinite re-queue loop.
+- **A state that is merely protected is a state that can never be un-stuck.** Post-processing
+  outcomes beat a freshly computed `DOWNLOADED` and *only* that: `PARTIAL` beats them (rule 2 —
+  the bytes are not all there) and absence goes to §7.3's grace period, or an item an importer
+  moved out would never reach `REMOVED_LOCAL` and auto-queue would re-download the whole
+  release. Transient `VERIFYING`/`EXTRACTING` are protected by the **live worker's existence**
+  (`PostprocessPipeline.in_flight_item_ids()`), never by the state string, so a crashed worker
+  cannot wedge an item — an in-memory registry empties on death, exception, and shutdown alike.
+- **Nothing may publish a state it did not read back from the `item` table.** `scan_queue`'s
+  order is the invariant: reconcile → persist → read back → diff → publish, with
+  `core/itemview.py` the single projection shared by the socket, the snapshot, and
+  `GET /api/files`. The reconciler's field is `structural_state` — a *candidate* — and if you
+  find yourself publishing it directly, that is the bug this rename exists to make visible.
+- **`_project`'s `rel_paths` filter is load-bearing, not tidiness.** Nothing deletes `item`
+  rows, so projecting unfiltered would resurrect rows that left both trees *and* leave
+  `diff_nodes`'s `removed` permanently empty.
+- **Extraction must never write a final-named file where an `*arr` can see it.** It stages into
+  a `_UNPACK_<name>` **sibling** (not a child — a child sits inside the tree the reconciler
+  walks and inside anything a later move relocates) and merges into place only on full success;
+  failure leaves `_FAILED_<name>` as evidence. Both prefixes, and `.lftpweb-mount-ok`, are
+  filtered out in `core/local_scan.py` — lftpweb's own bookkeeping must never reconcile to a
+  `LOCAL_ONLY` node. Downloads were already safe via `xfer:use-temp-file`/`*.lftp`.
+- **`job.bytes_done` is not monotonic** — a retry or resume resets it, which is why
+  `bytes_start` exists. Any code differencing it (the metrics sampler, anything new) must
+  compute deltas per job and clamp, or a restart renders as a phantom throughput spike.
+- **The dev image is not the runtime image.** It has no entrypoint, so anything
+  `docker/entrypoint.sh` does for production (creating/chowning `/run/lftpweb`, writing
+  `/etc/passwd` for the running uid) must be arranged another way in
+  `docker-compose.dev.yml`/the `dev` stage — see the session notes above. A dev-only breakage
+  that production does not share is easy to misdiagnose as an application bug.
+- **Vite's `/api` proxy needs `ws: true`.** The one WebSocket is opened at
+  `window.location.host`, which in dev is the Vite server, not the backend. Without it the
+  Files page connects to nothing and renders empty while every REST call succeeds.
+- **`root.setLevel()` sets the level for every library in the process.** `logsetup.py` applies
+  per-logger floors for exactly this reason; `LFTPWEB_DEBUG_LIBS` lifts them when you actually
+  need transport-level output.
+- **`VACUUM` cannot run on a connection anyone else might have a transaction open on.**
+  `core/backup.py.create_backup` learned this the hard way (fixed 2026-08-12, above) — it now
+  opens its own connection just for the `VACUUM INTO` rather than reusing the caller's.
+
+- **Excluded files break completeness** (§4.7, §3.2 rule 8). A `file_exclude` of `*.nfo` means
+  those files never arrive — so if the reconciler counts them as missing, every filtered
+  release is permanently `PARTIAL` and re-queued forever. One evaluator (`core/patterns.py`),
+  used by both the lftp command builder and the reconciler.
+- **Stop must suppress auto-queue** (§4.6). A stopped item still matches its pattern; without
+  `auto_queue_suppressed`, auto-queue restarts it 30 s later, forever.
+- **Sparse files lie** (§4.4). `pget` writes sparse files, so `st_size` is wrong — read the
+  `.lftp-pget-status` sidecar, and account for the `.lftp` temp suffix.
+- **Allocations are never re-shaped** (§4.5). Bandwidth is assigned at admission and fixed for
+  the job's lifetime. That's what makes the missing lftp control channel a non-issue.
+- **NFS + `root_squash`** (§11.2). Chown `/config` only; a chown failure on a data volume is a
+  warning, not a fatal.
+- **`cap_drop: ALL` breaks the PUID/PGID entrypoint unless you add capabilities back**
+  (found in phase 1, see `docs/decisions.md`). `chown`/`setuid`/`setgid` are capability-gated
+  even for uid 0; `docker-compose.yml` adds back `CHOWN`, `SETUID`, `SETGID` on top of
+  `cap_drop: ALL`. Also: `read_only: true` means the entrypoint can never write
+  `/etc/passwd`/`/etc/group` (no `addgroup`/`adduser` — use numeric `uid:gid` everywhere).
+- **A venv's shebangs bake in an absolute path.** Build and copy it forward at the *same*
+  path in every Docker stage, or `COPY --from=` carries a venv whose scripts point at a
+  directory that no longer exists (phase 1 hit this: `docker/Dockerfile` uses `WORKDIR /app`
+  everywhere for exactly this reason).
+- **`asyncssh.connect()` crashes under lftpweb's own numeric-uid convention** (found in phase
+  2, see `docs/decisions.md`). It unconditionally calls `getpass.getuser()` for SSH-config `%u`
+  templating; on Python 3.13, an unregistered uid (exactly §11.2's PUID/PGID and native `user:`
+  identity model) makes that raise `OSError`, which asyncssh's own `except KeyError:` doesn't
+  catch — every connection fails, for every auth method. `core/remote.py` sets a fallback
+  `LOGNAME` at import time (only if nothing already identifies the user) as the fix.
+- **`asyncssh.connect(known_hosts=None)` doesn't just skip verification — it skips your own
+  callback too** (found in phase 2). `validate_host_public_key` is only invoked when
+  `known_hosts` is a real (even empty) `SSHKnownHosts` object; passing `None` sets an internal
+  flag that trusts any server key *and* never asks the client factory anything. Pass
+  `asyncssh.SSHKnownHosts()` (empty, non-`None`) to actually enforce your own policy.
+- **`find`'s `\n`-terminated wire format and "paths can contain newlines" are in tension**
+  (§5 vs §15.10, phase 2). `core/remote.py`'s parser anchors on the record header rather than
+  splitting lines, which handles it in practice, but a path containing the *exact* bytes of a
+  header immediately after a literal newline would still misparse — a property of the
+  specified `find -printf` command, not fixed by deviating from it. See the phase 2 report.
+- **`mirror`'s local target is the item's *parent* directory, not the item's own directory**
+  (found in phase 3). `mirror -c 'REMOTE/item' 'LOCAL/'` creates `LOCAL/item/...` itself —
+  passing `LOCAL/item/`, the "obviously" symmetric choice with `pget`'s exact-file-path target,
+  produces a doubly-nested `LOCAL/item/item/...` tree. `core/lftp.py.build_transfer_command`'s
+  docstring has the full explanation; `core/queue.py` computes the two differently on purpose.
+- **A bare `open sftp://user@host` makes lftp prompt for a password itself, even under key
+  auth** (found in phase 3) — `GetPass() failed -- assume anonymous login` /
+  `Login failed: Password required`, despite the connect-program's ssh having already
+  authenticated successfully via the key. Always use `open -u user,password`, with an *empty*
+  password field for `key`/`agent` auth.
+- **`pget:save-status` defaults to 10s** (found in phase 3) — far too coarse for a ~1 Hz
+  progress sampler; a transfer inspected at the 1s/2s/3s marks under the default has no
+  `.lftp-pget-status` sidecar yet at all. Every job's rc file sets `pget:save-status 1s`.
+- **`GET /api/files` must read `item.state` from the database, not `core/engine.py`'s
+  in-memory scan model** (found live in phase 3, through the running API). The in-memory model
+  is `core/reconcile.py`'s pure structural output — it has no notion of QUEUED/DOWNLOADING/
+  STOPPED/FAILED, so serving it from an API a stop/queue action is supposed to affect silently
+  reverts the visible state on the very next read. `api/files.py` queries `item` directly.
+- **A periodic rescan can silently overwrite a job-lifecycle state back to a structural one**
+  (found in phase 3) — a `STOPPED` item with a still-partial file reads as `PARTIAL` again on
+  the next scan unless something stops it. `core/engine.py._persist` leaves `state` alone for
+  any item with a `queued`/`running` job or `auto_queue_suppressed` set; everything else still
+  gets recomputed every pass.
+- **`pget -o <path>` does not create its target's parent directory** (found in phase 3, unlike
+  `mirror`, which creates its own subtree). `core/queue.py._spawn_decision` `mkdir -p`s it
+  first — a no-op for a genuinely top-level item, load-bearing for anything nested.
+- **A leading blank line in an lftp `-c`/`source`d script corrupts quote-stripping on the next
+  `set key "value with spaces"` line** (found in phase 3, real lftp 4.9.2). Reproducible on
+  demand; `core/lftp.py.build_rc_text` never emits one.
+- **Never publish a full node list except on WebSocket connect** (found/fixed in phase 3b, see
+  `docs/decisions.md`). Every update after the initial `snapshot` must be a `queue_delta`
+  (`core/engine.py.diff_nodes`, scan-driven) or an `item_delta` (`core/queue.py`, lifecycle- or
+  progress-tick-driven) — both proportional to what changed, never to tree size. A future change
+  that starts putting a full `nodes` array on anything but the connect-time `snapshot` message
+  is this same regression coming back.
+- **GNU `find -printf` exits nonzero the instant it can't read *one* subdirectory, but keeps
+  scanning everything else and still prints what it found** (named in phase 3, fixed in phase
+  3b — see `docs/decisions.md`). Any nonzero exit with usable stdout is a *partial* success
+  (`core/remote.py.interpret_primary_scan_result`), not a hard failure — only an exit with *no*
+  stdout at all means the scan genuinely failed.
+- **`core/queue.py.list_jobs()` is not "queued + running jobs" — it also includes an item's most
+  recent `failed`/`cancelled` job** (found in phase 3b). DESIGN.md §9.2 requires the Transfers
+  page to show failed rows' error class/output tail and a stopped row going `STOPPED`; the
+  phase 3a query structurally couldn't produce either, since a job vanishes from that query the
+  instant it stops being active. A manual retry's fresh `queued` row naturally supersedes the
+  old terminal one — no separate cleanup needed.
+- **The Files page needs `POST /api/items/{id}/stop`, not `POST /api/jobs/{id}/stop`** (added in
+  phase 3b). Unlike the Transfers page, the Files page only ever has an item id, never the job
+  id currently servicing it — `GET /api/files` deliberately doesn't expose one, since an item
+  can outlive several job attempts. `TransferQueue.stop_item` resolves item → active job.
+- **A `file_exclude` pattern must reach the reconciler, not just lftp's `--exclude-glob`**
+  (phase 4). `core/patterns.py.build_counts_predicate` marks the matched file `EXCLUDED` and
+  removes it from its parent directory's completeness accounting; skip this and every
+  filtered release sits `PARTIAL` forever. `core/reconcile.py` and `core/queue.py` both
+  consume the identical compiled pattern set for exactly this reason — see docs/decisions.md.
+- **`CompiledPatterns.compile()` iterating its input three times silently breaks on a
+  generator** (found building the pattern-preview endpoint, phase 4, before it ever shipped).
+  Fixed by materializing the iterable first. A reminder that "one evaluator, two consumers"
+  doesn't protect against a bug *inside* the evaluator itself.
+- **The mount gate blocks all auto-queue action for a queue, not just the `REMOVED_LOCAL`
+  transition** (phase 4). A blanket per-queue check (`AutoQueue.on_scan` returns immediately
+  if `core/mount_sentinel.py.check()` fails) is what also protects a **brand-new** queue
+  whose local root never mounted — every item would read `REMOTE_ONLY` from the very first
+  scan, with no history to compare against, so only a blanket gate stops auto-queue from
+  queueing transfers into a directory that isn't really there.
+- **DESIGN.md §9's "TanStack Query for REST" was never actually adopted** (found in phase 3b,
+  flagged rather than silently followed or silently fixed). Phases 1–3a built a hand-rolled
+  `fetch` client + poll hook instead, with no record of the substitution. Phase 3b's `useJobs.ts`
+  continues that convention on purpose rather than introducing the library mid-project — a
+  future session should either correct DESIGN.md §9 or do the migration as its own scoped phase,
+  not as a side effect of whichever phase next touches data-fetching.
+- **`path_queue.local_path` is still where lftp downloads to and what the reconciler scans —
+  `staging_path` is the phase 5 post-processing Move step's *destination*, not a download
+  target** (phase 5, resolved ambiguity — see docs/decisions.md). DESIGN.md names the field
+  `staging_path` and describes Move as "staging → final destination," which reads naturally as
+  "downloads land in staging first," but making that true would mean the reconciler comparing
+  remote vs. local at a *different* root during a transfer than after one completes — reaching
+  back into phase 2/3's already-verified scan/reconcile code for a phase whose brief is
+  post-processing. The chosen reading needs zero changes there; the frontend labels the field
+  "Final destination" to match, without renaming the column.
+- **A `move`-mode item's verification always runs, bypassing the "global setting AND per-queue
+  toggle" rule every other post-processing step follows** (phase 5). It is the sole gate on an
+  irreversible remote delete (DESIGN.md §7.3); muting it via an unrelated site-wide default
+  (`PostprocessSettings.verify_enabled`) would silently turn `move` into "downloads, never
+  deletes, never explains why." `core/postprocess.py.process_item`'s `verify_effective`
+  computation is the one step that ORs in `sync_mode == "move"` rather than ANDing two toggles.
+- **A `move`-mode delete sets `item.remote_deleted_at` but never changes `item.state`** (phase
+  5). DESIGN.md's `REMOVED_BOTH` is the wrong state for this — its own definition implies local
+  absence too, and `move` never removes the local copy. The item's state stays whatever verify/
+  extract last set (`VERIFIED`/`EXTRACTED`); if the item is *also* relocated by the Move step,
+  the resulting local absence is picked up by phase 4's existing `REMOVED_LOCAL` grace-period
+  machinery on the next scan, exactly as if a human or an `*arr` importer had moved it — no new
+  state, no new code path.
+- **The user's live queue's `sync_mode = 'move'` row went from inert to live the moment phase
+  5 shipped, and was deliberately left untouched** — see item 1 of the decisions-awaited list
+  near the top of "Where we are", and docs/decisions.md's phase 5 entry, point 0. The user has
+  been told; they had not answered as of the last session. Don't change the row for them.
+- **A list endpoint over an unbounded table must not inline a per-row blob just because a
+  bounded sibling endpoint does** (phase 6). `api/jobs.py`'s `JobOut` inlines `output_tail`
+  (~4KB) because that endpoint's row set is bounded by construction (`list_jobs()`'s own
+  docstring). `api/history.py` reads the same `job` table with no such bound, so it carries
+  only `has_output_tail` in the list and adds `GET /api/history/jobs/{id}/output` to fetch the
+  blob on demand — copying `JobOut`'s shape onto an unbounded endpoint would have silently
+  reintroduced the "thousands of rows × 4KB" cost the row cap exists to prevent.
+- ~~**`Settings → Transfer` (`TransferTab.tsx`) still renders `PagePlaceholder`.**~~
+  **SUPERSEDED** — that tab is a real form now (it owns the bandwidth ceiling, the settle-gate
+  settings including the download-client verdict skip, and the folder-prefix toggle). **The
+  underlying lesson still holds and is why this entry is kept: don't assume every Settings tab
+  has a form behind it just because the others do — check `nav.ts` against the page component
+  before relying on one.** Local retention is the current instance of the same gap (backend, API
+  and scheduler all exist and default off; no settings screen), as is the withhold gate, which
+  has no API surface at all. See `README.md`'s "Known gaps."
+- ~~**The Files page's bulk actions cover Queue/Stop only, not the "Delete local"/"Delete
+  remote" DESIGN.md §9.2 also lists.** There is no manual per-item or bulk delete endpoint
+  anywhere in the API.~~ **SUPERSEDED, 2026-08-16.** `POST /api/items/{item_id}/delete` exists,
+  and the Files page's delete dialog offers two independent checkbox-driven scopes — Delete local
+  copy and Delete source (seedbox) — with bulk selection, path containment, no-active-job and
+  mount-sentinel guards. Kept here only so a reader who saw the old claim knows it changed;
+  `move` mode's automatic verification-gated pipeline is no longer the only deletion in the
+  codebase.
+- **`FileTree.tsx`'s text/state filters ignore `collapsed` entirely while a filter is active**
+  (phase 9) — a match inside a collapsed directory must still surface, so a filtered view is
+  computed by flattening the *whole* tree fully expanded, then keeping only matches and their
+  ancestor directories, rather than trying to reconcile filtering with whatever the user had
+  manually collapsed. Collapse state is restored the instant both filters clear.
+
+---
+
+## Everything below this line is history
+
+**A fresh session does not need to read any of it to be productive.** It is the release-by-release
+record from `v0.1.0` (2026-08-14) through `v0.3.0` (2026-08-21), the nine build phases, and the
+post-phase-9 sessions — kept because the *reasoning* in it is often the only record of why
+something is shaped the way it is, and pruned only where a statement became actively false.
+**Everything genuinely still-current has been lifted above this line.** Read down here when you
+need the "why" behind a specific existing behaviour, not to find out where the project is.
+
+Two general things to carry forward from it, since they keep recurring:
+
+- **`CHANGELOG.md` is the release-notes source of truth**, and the archive step (splitting closed
+  minor series into `docs/CHANGELOG-<minor>.x.md`) has been **deferred at every release so far**.
+  `0.1.x` and `0.2.x` are still inline in full; the `[0.1.0]` section alone is ~100 k characters.
+  Decide it or keep deferring it deliberately.
+- **A PR body caps at 65,536 characters; a release body at 125,000.** The `[0.1.0]` section
+  overflowed the PR body once. Later releases have been far smaller.
 
 ### 🚀 v0.3.0 released 2026-08-21 — the Transfers redesign, Preflight, and queue Pause
 
@@ -1698,296 +2023,9 @@ typecheck, Config validation, Compose validation, Image build, Test suite); **CI
 seen the two newer commits.** **489 tests pass** with the fake seedbox up (367 at phase 9),
 both lint gates clean, `npm run build` clean.
 
-**Still uncommitted, and not ours:** `CHANGELOG.md`, `standards.md`,
+~~**Still uncommitted, and not ours:** `CHANGELOG.md`, `standards.md`,
 `.claude/commands/release-prep.md`, and this file carry a pre-2026-08-12-session documentation
-sweep that no agent touched. Its `docs/decisions.md` entry ("Post-phase-9 documentation
-currency sweep") rode along in `16a1a2f` because it sat in the same contiguous block as the
-session's own entries — so that entry is committed while the files it describes are not. Commit
-them and the ordering resolves itself.
-
----
-
-## Operating rules
-
-**Scope**
-- Work only the phase or task the user names. Don't fan out into later phases or add
-  "while I'm here" changes. Offer them as a one-liner, then wait.
-- **Surface major design decisions discovered during a build** rather than silently resolving
-  them. If the build reveals that `DESIGN.md` is wrong or underspecified, say so — the doc gets
-  corrected, it isn't quietly diverged from.
-
-**Handoff prompts** (`handoff-prompt-workflow` @ v2.0.0 — full rules in `CLAUDE.md`)
-- Anything beyond ~1–2 files goes into a `prompts/` file executed by a **spawned subagent**.
-  Opus for research/planning, **Sonnet for coding**.
-- The prompt self-updates its frontmatter and `git mv`s to `prompts/done/` (or `failed/`).
-- **One commit at the end**, prompt bundled in. Ask `y/n`. Never `git add -A`, never
-  auto-commit, never push.
-
-**Git**
-- Day-to-day work is on `dev`.
-- **Never a `Co-authored-by:` trailer** — explicitly reaffirmed by the user 2026-08-11, and true
-  of every commit in the history so far. Conventional-Commit prefixes required:
-  `feat:` / `fix:` / `chore:` / `docs:`.
-- `code-checkin-and-pr` and `release-prep-and-cut` were adopted 2026-08-11 alongside repo
-  creation; `standards.md` is the in-repo source of truth for what is actually wired.
-  **Branch protection on `main` is live** (see "Repo, branches, and what's on GitHub" above,
-  confirmed via `gh api` — not a pending step). Treat `main` as fully protected: PR + all
-  required checks green, no direct push, no force-push, no exceptions.
-- `repo-sandbox-permissions` is **deliberately not adopted** — dedicated dev host, same call
-  the user made when de-adopting it from AmmoLedger. Don't "helpfully" add it.
-
-**Docs**
-- Non-obvious decisions go in `docs/decisions.md`, newest at top, with rejected alternatives.
-- Doc updates ship in the same commit as the code they describe.
-- Local scratch, fixtures, and generated files go under `private_data/` (gitignored).
-
----
-
-## Traps worth knowing before you touch the code
-
-These are the places where the obvious implementation is wrong. Each is written up in
-`DESIGN.md`; this list exists so a fresh session knows to go read it.
-
-**Added 2026-08-15 (first real Sonarr live-testing run) — read this one first, it's the newest:**
-
-- ***arr enums are strings in bodies, ints in query params — the fixture must model the wire,
-  not the assumption.*** The Sonarr/Radarr v3 API serializes `eventType` as a camelCase
-  **string** (`"downloadFolderImported"`) in every response body; the numeric codes this
-  integration was originally built against exist only as query-parameter values. Two genuine
-  live imports were misclassified `gone` because `IMPORT_EVENT_TYPES = {3}` could never match a
-  real record — and every test stayed green because the fake-*arr test data encoded the same
-  wrong numeric assumption instead of the real wire shape. `docs/decisions.md` (2026-08-15) has
-  the full account; `core/arrclient.py.HistoryEvent.is_import_event()` is the one place the
-  comparison now happens, with a numeric fallback kept for tolerance only. **The general lesson:
-  when a spec flags a vocabulary "unverified against a live instance," the test fixture that
-  data drives must not itself be trusted as ground truth for that vocabulary — it can encode the
-  identical wrong guess the production code does, and then prove nothing.**
-- ***Missing-vs-the-sidecar at verify time always means the remote lacked it too, never "still
-  arriving."*** `core/verify.py` only runs from `core/postprocess.py`, which only fires after
-  `core/queue.py`'s local-vs-remote completeness gate has already passed — so a file a
-  `.sfv`/`.md5` references but can't find locally was *also* absent on the remote by the time
-  completeness was measured. That's what makes "every referenced file absent" a safe signal for
-  an upstream anomaly (a release rar'd at origin, extracted upstream, rars deleted before this
-  ever reached local disk) rather than a partial transfer — see the fix below and
-  `docs/decisions.md` (2026-08-15).
-- ***An upstream-extracted release verifies `SKIPPED`, not `CORRUPT` — but only when nothing
-  is provably missing.*** Live case: `National.Lampoons.Animal.House.1978.iNTERNAL.1080p.BluRay
-  .x264-EwDp` on the ar-movies queue arrived `movie.mkv` + `.sfv`, the `.sfv` still listing the
-  rar volumes SABnzbd had already extracted and deleted upstream. Treating every sidecar entry
-  as "missing" reported `CORRUPT` and permanently withheld the `move`-mode delete. The fix
-  (`core/verify.py`) narrows on purpose: every referenced entry absent **and** other content
-  present → `SKIPPED`; *any* referenced entry present (including a half-deleted archive set) →
-  unchanged, stays `CORRUPT`; sidecar and nothing else → stays `CORRUPT` (nothing to have been
-  vouching for). Don't widen the relaxation to mixed presence — that's the still-open pipeline-
-  ordering question, `prompts/open-issues.md` #2 / G1.
-
-**Added 2026-08-12 (post-phase-9 session):**
-
-- **`relevant == 0` on a directory means two different things**, and only one of them is
-  `DOWNLOADED`. Every child excluded by a `file_exclude` pattern → vacuously `DOWNLOADED`, and
-  that is load-bearing (§4.7/§3.2 rule 8: it is what stops a filtered release sitting `PARTIAL`
-  and being auto-queued forever). A genuinely empty remote directory → `REMOTE_ONLY` until
-  mirrored. `core/reconcile.py` tells them apart with `remote_file_totals`, a rollup counting
-  remote files *before* the predicate runs. **Do not "simplify" this by keying on local
-  presence** — an all-excluded directory legitimately has no local presence either (lftp never
-  creates a directory with nothing to put in), so that reintroduces the infinite re-queue loop.
-- **A state that is merely protected is a state that can never be un-stuck.** Post-processing
-  outcomes beat a freshly computed `DOWNLOADED` and *only* that: `PARTIAL` beats them (rule 2 —
-  the bytes are not all there) and absence goes to §7.3's grace period, or an item an importer
-  moved out would never reach `REMOVED_LOCAL` and auto-queue would re-download the whole
-  release. Transient `VERIFYING`/`EXTRACTING` are protected by the **live worker's existence**
-  (`PostprocessPipeline.in_flight_item_ids()`), never by the state string, so a crashed worker
-  cannot wedge an item — an in-memory registry empties on death, exception, and shutdown alike.
-- **Nothing may publish a state it did not read back from the `item` table.** `scan_queue`'s
-  order is the invariant: reconcile → persist → read back → diff → publish, with
-  `core/itemview.py` the single projection shared by the socket, the snapshot, and
-  `GET /api/files`. The reconciler's field is `structural_state` — a *candidate* — and if you
-  find yourself publishing it directly, that is the bug this rename exists to make visible.
-- **`_project`'s `rel_paths` filter is load-bearing, not tidiness.** Nothing deletes `item`
-  rows, so projecting unfiltered would resurrect rows that left both trees *and* leave
-  `diff_nodes`'s `removed` permanently empty.
-- **Extraction must never write a final-named file where an `*arr` can see it.** It stages into
-  a `_UNPACK_<name>` **sibling** (not a child — a child sits inside the tree the reconciler
-  walks and inside anything a later move relocates) and merges into place only on full success;
-  failure leaves `_FAILED_<name>` as evidence. Both prefixes, and `.lftpweb-mount-ok`, are
-  filtered out in `core/local_scan.py` — lftpweb's own bookkeeping must never reconcile to a
-  `LOCAL_ONLY` node. Downloads were already safe via `xfer:use-temp-file`/`*.lftp`.
-- **`job.bytes_done` is not monotonic** — a retry or resume resets it, which is why
-  `bytes_start` exists. Any code differencing it (the metrics sampler, anything new) must
-  compute deltas per job and clamp, or a restart renders as a phantom throughput spike.
-- **The dev image is not the runtime image.** It has no entrypoint, so anything
-  `docker/entrypoint.sh` does for production (creating/chowning `/run/lftpweb`, writing
-  `/etc/passwd` for the running uid) must be arranged another way in
-  `docker-compose.dev.yml`/the `dev` stage — see the session notes above. A dev-only breakage
-  that production does not share is easy to misdiagnose as an application bug.
-- **Vite's `/api` proxy needs `ws: true`.** The one WebSocket is opened at
-  `window.location.host`, which in dev is the Vite server, not the backend. Without it the
-  Files page connects to nothing and renders empty while every REST call succeeds.
-- **`root.setLevel()` sets the level for every library in the process.** `logsetup.py` applies
-  per-logger floors for exactly this reason; `LFTPWEB_DEBUG_LIBS` lifts them when you actually
-  need transport-level output.
-- **`VACUUM` cannot run on a connection anyone else might have a transaction open on.**
-  `core/backup.py.create_backup` learned this the hard way (fixed 2026-08-12, above) — it now
-  opens its own connection just for the `VACUUM INTO` rather than reusing the caller's.
-
-- **Excluded files break completeness** (§4.7, §3.2 rule 8). A `file_exclude` of `*.nfo` means
-  those files never arrive — so if the reconciler counts them as missing, every filtered
-  release is permanently `PARTIAL` and re-queued forever. One evaluator (`core/patterns.py`),
-  used by both the lftp command builder and the reconciler.
-- **Stop must suppress auto-queue** (§4.6). A stopped item still matches its pattern; without
-  `auto_queue_suppressed`, auto-queue restarts it 30 s later, forever.
-- **Sparse files lie** (§4.4). `pget` writes sparse files, so `st_size` is wrong — read the
-  `.lftp-pget-status` sidecar, and account for the `.lftp` temp suffix.
-- **Allocations are never re-shaped** (§4.5). Bandwidth is assigned at admission and fixed for
-  the job's lifetime. That's what makes the missing lftp control channel a non-issue.
-- **NFS + `root_squash`** (§11.2). Chown `/config` only; a chown failure on a data volume is a
-  warning, not a fatal.
-- **`cap_drop: ALL` breaks the PUID/PGID entrypoint unless you add capabilities back**
-  (found in phase 1, see `docs/decisions.md`). `chown`/`setuid`/`setgid` are capability-gated
-  even for uid 0; `docker-compose.yml` adds back `CHOWN`, `SETUID`, `SETGID` on top of
-  `cap_drop: ALL`. Also: `read_only: true` means the entrypoint can never write
-  `/etc/passwd`/`/etc/group` (no `addgroup`/`adduser` — use numeric `uid:gid` everywhere).
-- **A venv's shebangs bake in an absolute path.** Build and copy it forward at the *same*
-  path in every Docker stage, or `COPY --from=` carries a venv whose scripts point at a
-  directory that no longer exists (phase 1 hit this: `docker/Dockerfile` uses `WORKDIR /app`
-  everywhere for exactly this reason).
-- **`asyncssh.connect()` crashes under lftpweb's own numeric-uid convention** (found in phase
-  2, see `docs/decisions.md`). It unconditionally calls `getpass.getuser()` for SSH-config `%u`
-  templating; on Python 3.13, an unregistered uid (exactly §11.2's PUID/PGID and native `user:`
-  identity model) makes that raise `OSError`, which asyncssh's own `except KeyError:` doesn't
-  catch — every connection fails, for every auth method. `core/remote.py` sets a fallback
-  `LOGNAME` at import time (only if nothing already identifies the user) as the fix.
-- **`asyncssh.connect(known_hosts=None)` doesn't just skip verification — it skips your own
-  callback too** (found in phase 2). `validate_host_public_key` is only invoked when
-  `known_hosts` is a real (even empty) `SSHKnownHosts` object; passing `None` sets an internal
-  flag that trusts any server key *and* never asks the client factory anything. Pass
-  `asyncssh.SSHKnownHosts()` (empty, non-`None`) to actually enforce your own policy.
-- **`find`'s `\n`-terminated wire format and "paths can contain newlines" are in tension**
-  (§5 vs §15.10, phase 2). `core/remote.py`'s parser anchors on the record header rather than
-  splitting lines, which handles it in practice, but a path containing the *exact* bytes of a
-  header immediately after a literal newline would still misparse — a property of the
-  specified `find -printf` command, not fixed by deviating from it. See the phase 2 report.
-- **`mirror`'s local target is the item's *parent* directory, not the item's own directory**
-  (found in phase 3). `mirror -c 'REMOTE/item' 'LOCAL/'` creates `LOCAL/item/...` itself —
-  passing `LOCAL/item/`, the "obviously" symmetric choice with `pget`'s exact-file-path target,
-  produces a doubly-nested `LOCAL/item/item/...` tree. `core/lftp.py.build_transfer_command`'s
-  docstring has the full explanation; `core/queue.py` computes the two differently on purpose.
-- **A bare `open sftp://user@host` makes lftp prompt for a password itself, even under key
-  auth** (found in phase 3) — `GetPass() failed -- assume anonymous login` /
-  `Login failed: Password required`, despite the connect-program's ssh having already
-  authenticated successfully via the key. Always use `open -u user,password`, with an *empty*
-  password field for `key`/`agent` auth.
-- **`pget:save-status` defaults to 10s** (found in phase 3) — far too coarse for a ~1 Hz
-  progress sampler; a transfer inspected at the 1s/2s/3s marks under the default has no
-  `.lftp-pget-status` sidecar yet at all. Every job's rc file sets `pget:save-status 1s`.
-- **`GET /api/files` must read `item.state` from the database, not `core/engine.py`'s
-  in-memory scan model** (found live in phase 3, through the running API). The in-memory model
-  is `core/reconcile.py`'s pure structural output — it has no notion of QUEUED/DOWNLOADING/
-  STOPPED/FAILED, so serving it from an API a stop/queue action is supposed to affect silently
-  reverts the visible state on the very next read. `api/files.py` queries `item` directly.
-- **A periodic rescan can silently overwrite a job-lifecycle state back to a structural one**
-  (found in phase 3) — a `STOPPED` item with a still-partial file reads as `PARTIAL` again on
-  the next scan unless something stops it. `core/engine.py._persist` leaves `state` alone for
-  any item with a `queued`/`running` job or `auto_queue_suppressed` set; everything else still
-  gets recomputed every pass.
-- **`pget -o <path>` does not create its target's parent directory** (found in phase 3, unlike
-  `mirror`, which creates its own subtree). `core/queue.py._spawn_decision` `mkdir -p`s it
-  first — a no-op for a genuinely top-level item, load-bearing for anything nested.
-- **A leading blank line in an lftp `-c`/`source`d script corrupts quote-stripping on the next
-  `set key "value with spaces"` line** (found in phase 3, real lftp 4.9.2). Reproducible on
-  demand; `core/lftp.py.build_rc_text` never emits one.
-- **Never publish a full node list except on WebSocket connect** (found/fixed in phase 3b, see
-  `docs/decisions.md`). Every update after the initial `snapshot` must be a `queue_delta`
-  (`core/engine.py.diff_nodes`, scan-driven) or an `item_delta` (`core/queue.py`, lifecycle- or
-  progress-tick-driven) — both proportional to what changed, never to tree size. A future change
-  that starts putting a full `nodes` array on anything but the connect-time `snapshot` message
-  is this same regression coming back.
-- **GNU `find -printf` exits nonzero the instant it can't read *one* subdirectory, but keeps
-  scanning everything else and still prints what it found** (named in phase 3, fixed in phase
-  3b — see `docs/decisions.md`). Any nonzero exit with usable stdout is a *partial* success
-  (`core/remote.py.interpret_primary_scan_result`), not a hard failure — only an exit with *no*
-  stdout at all means the scan genuinely failed.
-- **`core/queue.py.list_jobs()` is not "queued + running jobs" — it also includes an item's most
-  recent `failed`/`cancelled` job** (found in phase 3b). DESIGN.md §9.2 requires the Transfers
-  page to show failed rows' error class/output tail and a stopped row going `STOPPED`; the
-  phase 3a query structurally couldn't produce either, since a job vanishes from that query the
-  instant it stops being active. A manual retry's fresh `queued` row naturally supersedes the
-  old terminal one — no separate cleanup needed.
-- **The Files page needs `POST /api/items/{id}/stop`, not `POST /api/jobs/{id}/stop`** (added in
-  phase 3b). Unlike the Transfers page, the Files page only ever has an item id, never the job
-  id currently servicing it — `GET /api/files` deliberately doesn't expose one, since an item
-  can outlive several job attempts. `TransferQueue.stop_item` resolves item → active job.
-- **A `file_exclude` pattern must reach the reconciler, not just lftp's `--exclude-glob`**
-  (phase 4). `core/patterns.py.build_counts_predicate` marks the matched file `EXCLUDED` and
-  removes it from its parent directory's completeness accounting; skip this and every
-  filtered release sits `PARTIAL` forever. `core/reconcile.py` and `core/queue.py` both
-  consume the identical compiled pattern set for exactly this reason — see docs/decisions.md.
-- **`CompiledPatterns.compile()` iterating its input three times silently breaks on a
-  generator** (found building the pattern-preview endpoint, phase 4, before it ever shipped).
-  Fixed by materializing the iterable first. A reminder that "one evaluator, two consumers"
-  doesn't protect against a bug *inside* the evaluator itself.
-- **The mount gate blocks all auto-queue action for a queue, not just the `REMOVED_LOCAL`
-  transition** (phase 4). A blanket per-queue check (`AutoQueue.on_scan` returns immediately
-  if `core/mount_sentinel.py.check()` fails) is what also protects a **brand-new** queue
-  whose local root never mounted — every item would read `REMOTE_ONLY` from the very first
-  scan, with no history to compare against, so only a blanket gate stops auto-queue from
-  queueing transfers into a directory that isn't really there.
-- **DESIGN.md §9's "TanStack Query for REST" was never actually adopted** (found in phase 3b,
-  flagged rather than silently followed or silently fixed). Phases 1–3a built a hand-rolled
-  `fetch` client + poll hook instead, with no record of the substitution. Phase 3b's `useJobs.ts`
-  continues that convention on purpose rather than introducing the library mid-project — a
-  future session should either correct DESIGN.md §9 or do the migration as its own scoped phase,
-  not as a side effect of whichever phase next touches data-fetching.
-- **`path_queue.local_path` is still where lftp downloads to and what the reconciler scans —
-  `staging_path` is the phase 5 post-processing Move step's *destination*, not a download
-  target** (phase 5, resolved ambiguity — see docs/decisions.md). DESIGN.md names the field
-  `staging_path` and describes Move as "staging → final destination," which reads naturally as
-  "downloads land in staging first," but making that true would mean the reconciler comparing
-  remote vs. local at a *different* root during a transfer than after one completes — reaching
-  back into phase 2/3's already-verified scan/reconcile code for a phase whose brief is
-  post-processing. The chosen reading needs zero changes there; the frontend labels the field
-  "Final destination" to match, without renaming the column.
-- **A `move`-mode item's verification always runs, bypassing the "global setting AND per-queue
-  toggle" rule every other post-processing step follows** (phase 5). It is the sole gate on an
-  irreversible remote delete (DESIGN.md §7.3); muting it via an unrelated site-wide default
-  (`PostprocessSettings.verify_enabled`) would silently turn `move` into "downloads, never
-  deletes, never explains why." `core/postprocess.py.process_item`'s `verify_effective`
-  computation is the one step that ORs in `sync_mode == "move"` rather than ANDing two toggles.
-- **A `move`-mode delete sets `item.remote_deleted_at` but never changes `item.state`** (phase
-  5). DESIGN.md's `REMOVED_BOTH` is the wrong state for this — its own definition implies local
-  absence too, and `move` never removes the local copy. The item's state stays whatever verify/
-  extract last set (`VERIFIED`/`EXTRACTED`); if the item is *also* relocated by the Move step,
-  the resulting local absence is picked up by phase 4's existing `REMOVED_LOCAL` grace-period
-  machinery on the next scan, exactly as if a human or an `*arr` importer had moved it — no new
-  state, no new code path.
-- **The user's live queue's `sync_mode = 'move'` row went from inert to live the moment phase
-  5 shipped, and was deliberately left untouched** — see item 1 of the decisions-awaited list
-  near the top of "Where we are", and docs/decisions.md's phase 5 entry, point 0. The user has
-  been told; they had not answered as of the last session. Don't change the row for them.
-- **A list endpoint over an unbounded table must not inline a per-row blob just because a
-  bounded sibling endpoint does** (phase 6). `api/jobs.py`'s `JobOut` inlines `output_tail`
-  (~4KB) because that endpoint's row set is bounded by construction (`list_jobs()`'s own
-  docstring). `api/history.py` reads the same `job` table with no such bound, so it carries
-  only `has_output_tail` in the list and adds `GET /api/history/jobs/{id}/output` to fetch the
-  blob on demand — copying `JobOut`'s shape onto an unbounded endpoint would have silently
-  reintroduced the "thousands of rows × 4KB" cost the row cap exists to prevent.
-- **`Settings → Transfer` (`TransferTab.tsx`) still renders `PagePlaceholder`, despite
-  `core/queue.py`'s `TransferSettings` and `api/settings.py`'s `/api/settings/transfer` being
-  complete and tested since phase 3a** (found reconciling docs at phase 9 — phase 5's own
-  `docs/decisions.md` entry had already flagged this as "likely phase 9" territory, but phase
-  9's actual prompt scoped its UI work narrowly and never named this tab). Don't assume every
-  Settings tab has a form behind it just because the others do — check `nav.ts` against the
-  page component before relying on one. Site bandwidth/concurrency/fast-lane tuning, the §9.3
-  live connection-count warning, and the free-text "extra lftp settings" box are all reachable
-  today only via direct API calls. See `README.md`'s "Known gaps."
-- **The Files page's bulk actions cover Queue/Stop only, not the "Delete local"/"Delete
-  remote" DESIGN.md §9.2 also lists** (phase 9's own explicit scope — see its prompt and
-  `docs/decisions.md`). There is no manual per-item or bulk delete endpoint anywhere in the
-  API; the only deletion in this codebase is `move` mode's automatic, verification-gated
-  pipeline (`core/postprocess.py`). Don't assume a "Delete" button exists on the Files page
-  just because DESIGN.md's mockup shows one.
-- **`FileTree.tsx`'s text/state filters ignore `collapsed` entirely while a filter is active**
-  (phase 9) — a match inside a collapsed directory must still surface, so a filtered view is
-  computed by flattening the *whole* tree fully expanded, then keeping only matches and their
-  ancestor directories, rather than trying to reconcile filtering with whatever the user had
-  manually collapsed. Collapse state is restored the instant both filters clear.
+sweep that no agent touched.~~ **Resolved long since** — all four were committed in the
+2026-08-12/13 overnight session. Left struck through rather than deleted so the
+`docs/decisions.md` entry it explains ("Post-phase-9 documentation currency sweep", which landed
+in `16a1a2f` ahead of the files it described) still has its account somewhere.

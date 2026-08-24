@@ -9,7 +9,9 @@ Sections are numbered so feedback can be given by reference (e.g. "§4.3 — no,
 surfaced. **First release cut 2026-08-14: `v0.1.0`, a beta.** This line said "nothing
 implemented yet" until 2026-08-13 and "still pre-release, the first version will be `0.0.1`"
 until the tag existed; §13 is the authoritative record of what is actually built and what is
-still open.
+still open. **§16 and §17 describe two feature sets built *after* the nine phases** — the
+Sonarr/Radarr integration and the download-client connectors — and each says plainly which of
+its own parts exist and which do not.
 
 ---
 
@@ -3306,3 +3308,435 @@ states, not one dimmed glyph, and `gone` is independently filterable since it is
 that usually needs a human (`dropped` deliberately is not — it's a transient state, not yet
 actionable). See `docs/arr-integration-spec.md`'s own "UI" section for the full icon-state
 table.
+
+---
+
+## 17. Download-client connectors
+
+Built 2026-08-22/23 across a stage-per-prompt run plus six rounds of corrections driven by live
+use against a real seedbox. Full detail — the two correction lists, the build order, every
+reversal with its cause — lives in
+[`docs/download-client-framework-spec.md`](docs/download-client-framework-spec.md); this section
+is the architectural summary DESIGN.md's own rule requires, not a restatement.
+
+**Where that spec describes an intention and this section describes what runs, this section is
+the one to trust.** The spec is a proposal document with six staged deliverables; **only stages
+0–4 exist. Stage 5 — the delete pipeline — is not built, and nothing in this feature deletes
+anything today** (§17.8).
+
+**The shape of it:** a **connector** is a module that talks to one kind of download client.
+SABnzbd and rTorrent ship; 7–10 are expected. Until this feature existed, lftpweb learned what
+was coming either from bytes appearing on the seedbox or from a Sonarr/Radarr relay of its own
+download client's answer (§16). A connector reads **the process actually doing the work**, which
+removes two polling intervals of lag and one layer of paraphrase. That is the whole payoff, and
+everything below is what it costs to take it safely.
+
+### 17.1 Two vocabularies, not one flat capability list
+
+A capability matrix that mixes **verbs the client can perform** (pause, remove, report free
+space) with **facts a record can carry** (ratio, seed time, tracker hosts) serves neither
+consumer, because the two are consumed differently:
+
+- A missing **operation** disables a **control**. *"Your client can't recheck."*
+- A missing **field** disables a **rule**. *"Your client doesn't report seed time, so a 14-day
+  rule is unavailable."*
+
+So `core/clients/base.py` declares two closed enums — `Operation` (14 members) and `Field` (12)
+— and never free strings. Ten connectors authored against free strings produce ten spellings of
+one idea.
+
+**Two absences from `Operation` are deliberate and should not be re-litigated at connector #6.**
+`add_transfer` is permanently out of scope — lftpweb does not grab, the *arr does, and nothing
+here writes a client's own configuration. `remove_with_data` is out for the reason §17.4 gives.
+
+**Four fields are mandatory and never declared**: `client_id`, `name`, `phase`, `raw_status`.
+Everything else is per-connector. **A connector must never declare a field it cannot populate**
+— a field declared and then returned `None` is worse than one declared absent, because a
+consumer offers a rule that silently never matches. That is enforced rather than trusted:
+`base.py.project_transfer` nulls every undeclared field on the way out of `list_transfers`/
+`list_history`/`get_transfer`, and the registry-wide conformance suite checks it against every
+registered connector.
+
+**The normalized phase vocabulary is nine values** — `queued | downloading | paused | verifying
+| extracting | seeding | completed | failed | unknown` — with the client's own word preserved
+alongside in `raw_status`, the same "narrow projection + `raw`" shape `core/arrclient.py` already
+uses: display shows the client's word, logic reads `phase`. **`unknown` is the safe default and
+`unknown` never blocks anything**, and every connector's `map_phase` must be *total* — it may
+never raise on a status string this codebase has not seen.
+
+### 17.2 The capability declaration is three layers, tri-state, and a transport failure must never degrade it
+
+One static dict is not enough, for two reasons found in the API survey: qBittorrent renamed
+`pause`→`stop` at 5.0, so version detection is a requirement rather than a nicety; and several
+capabilities are properties of the **deployment**, not of the client version. So:
+
+| Layer | What it is | Where it lives |
+|---|---|---|
+| **Static** | What this connector *type* could ever do | A class attribute, so the settings UI can render "if you configured a qBittorrent you'd get…" before any connection exists |
+| **Probed** | Refined at `test_connection` time | Persisted on the instance row (`capabilities_json`, `capabilities_probed_at`), so rendering never has to hit the client |
+| **Runtime-degraded** | A capability that failed *in use* | In-memory per instance, cleared by the next successful probe |
+
+> **The one invariant of the whole layer stack: a transport failure must never degrade a
+> capability.**
+
+An unreachable client, a timeout, a 500 — none of these say anything about what the client
+*supports*. Degrading on them turns one bad network minute into a permanently disabled feature.
+This is §16's "absent is not a verdict" applied to *configuration* rather than to status, and it
+forces a three-way error taxonomy where `core/arrclient.py` deliberately collapses everything
+into one class: `ClientUnreachable` (back off, change nothing), `ClientError` (surface it, change
+nothing), `CapabilityUnavailable` (degrade, write an audit event). **Only the third ever
+degrades** — `base.py.degrade_from_error` is the single place that decision is made, and it is
+the most important five lines in the subsystem.
+
+Support is **tri-state — `native` / `derived` / `none`** — because a boolean lies about the
+middle case, **and a `derived` capability carries a caveat string**. rTorrent has no seed-time
+field; it is derivable from `d.timestamp.finished`, but that measures *wall-clock since
+completion*, so a stopped torrent still accrues. A site rule meaning "actually seeding for 14
+days" cannot be honored faithfully there, and the UI must say so **where the user writes the
+rule** rather than quietly redefining it. Consumers therefore ask two different questions
+(`supports(Field.SEED_TIME_S)` vs `supports(..., accept_derived=True)`).
+
+**A missing capability disables a feature; it never fakes one** — lftpweb does not estimate ratio
+from uploaded bytes and present it as ratio. **And the UI is driven by the declaration, never by
+the client's name**: there is no `if client_type == "rtorrent"` anywhere in this subsystem, which
+is checked by grep and by the conformance suite rather than merely intended. A connector's
+`family` (`usenet` / `torrent`) exists to group the settings picker and pick a default config
+form, and carries **no runtime authority at all** — the moment something reads
+`if family == "torrent": has_labels`, a Deluge without the label plugin is silently broken, which
+is exactly the class of bug the declaration exists to prevent.
+
+That rule has already earned itself twice. The poll-cadence split (§17.8) chooses cheap-vs-
+expensive per instance by reading `Operation.LIST_HISTORY`'s own declaration, not by branching on
+the client type. And the per-client "do you need a category mapping" copy in Settings is computed
+from *observed* attribution counts, never from `client_type` — a hardcoded "usenet doesn't need
+it, torrent does" had already been wrong four times before it was removed.
+
+### 17.3 Advisory only, and it is enforced structurally
+
+> A client may **skip work** (satisfy the settle gate), **withhold work** (block a transfer that
+> would move known-bad bytes), or **explain** (annotate rows, write audit events). It may
+> **never write `item.state`.**
+
+Inherited unchanged from `docs/transfers-redesign-spec.md` §4.1, and — unlike most rules of this
+shape — it is not a matter of discipline. **A connector is handed no database handle.**
+`DownloadClient.__init__` takes connection config and nothing else; it is pure client I/O and it
+*cannot* write `item.state` because it has nothing to write to. Every decision made from a
+connector's output is made by a caller that owns the database, outside the connector boundary.
+**A future change that wants to pass a connection into a connector is this rule being violated,
+and should be read as such rather than accepted as a convenience.**
+
+The companion rule is §16's, restated because this feature is where it gets tested hardest:
+**absent from the client is not a verdict.** Only an *explicit* failure blocks anything. Silence
+means no information, and no information means fall back to today's behavior; an unreachable
+client keeps its last known status and never downgrades a verdict. That is not hypothetical here
+— the amber `dropped` state (§16, v0.2.4) exists because SABnzbd returned a blank queue to
+Sonarr's poll once and eight mid-download items flipped terminal in a single pass.
+
+**Source precedence follows from the same asymmetry.** For a fact both the *arr and the client
+report, **the direct client observation wins — always, not "if newer."** This is deliberately
+*not* a timestamp comparison, because the timestamps to compare do not exist: the *arr never
+tells us when *it* last polled its own client, so lftpweb can only know when it fetched the
+*arr's answer, which measures our own freshness rather than the data's. The client is the origin;
+the *arr is a relay of unknown lag. Three constraints keep that from doing harm — precedence is
+**per-field, never per-record** (a client that reports no ETA must not blank the *arr's
+`timeleft`), it applies **only where the client actually reported**, and an unreachable client
+does not demote its last-known reading to the *arr's.
+
+**Precedence and provenance are two different problems, and conflating them cost a round.** A
+merged row must still *show* both contributors — `core/preflight.py.PreflightRow` carries
+`contributors`, and the box renders one badge per contributor — which is a separate mechanism
+from which value wins per field. When the user reported "Preflight shows Sonarr's status, not
+SAB's," precedence turned out to have been correct all along and untested only because **zero
+client rows were reaching the merge** (§17.5).
+
+### 17.4 Deletion never goes through the client
+
+> **Remove the item in the client, then delete the bytes over SSH, then verify, then log the
+> event. The client is never asked to delete data.**
+
+This is the design's largest simplification, and it deletes work rather than adding it:
+
+- **`remove_with_data` leaves the vocabulary entirely.** `remove` means *unregister, leave the
+  data*, which every surveyed client does natively and honestly.
+- **rTorrent's `erasedata` hook leaves the design entirely.** rTorrent has no remove-with-data
+  primitive; ruTorrent's plugin sequence (`d.custom5.set=1` → `d.delete_tied` → `d.erase`, order
+  load-bearing) only deletes anything because the plugin installs an `event.download.erased`
+  hook. **A bare rTorrent accepts all three calls and deletes nothing, with no error** — and the
+  documented failure modes are worse (silent no-op on a permissions problem; timeout on torrents
+  with 100+ files), both invisible to the caller. A capability that is a property of the user's
+  *plugin configuration* stops existing.
+- **Runtime capability degradation loses most of its job.** Kept for the general case, no longer
+  load-bearing.
+- **lftpweb already deletes on the seedbox reliably.** `core/remote.py.delete_path` issues
+  `rm -rf --` over the pooled connection, refuses empty/root-looking paths, and raises on a
+  nonzero exit — *a real error when it fails*, which is exactly what the hook path cannot offer.
+
+The only remaining capability gate on deletion is the `content_path` **field**. No path, no
+delete.
+
+**The containment check is two-sided, and it exists now even though stage 5 does not.**
+`core/disk_review.py.is_authorized_delete_target(path, base_paths, excluded_paths)` is pure,
+unit-tested, and **currently called by nothing** — a target must sit inside a declared base path
+**and** outside every excluded path. Stage 5's delete sequence must call it rather than re-derive
+containment a second time that can drift from the first.
+
+**Order is client-first on purpose.** Deleting the data first leaves the client watching files
+vanish: it errors, may re-check, and briefly reports a broken torrent. Removing the entry first
+means nothing is watching when the bytes go. The bad window is the inverse — client removed, SSH
+delete failed, so the seed is lost *and* the space is not reclaimed — which is why the review
+scan (§17.6) is its structural backstop rather than merely a convenience.
+
+**Hardlinks are the normal case for torrent content, not an anomaly.** Under the recommended
+layout (README, "Recommended seedbox layout") rTorrent hardlinks into the completed folder and
+keeps seeding from its own directory, so every rTorrent release is two links to one set of
+inodes. Deleting the completed-folder copy frees **zero bytes**; deleting the torrent's data
+alone frees zero bytes; only removing the last link reclaims anything. A divergence check written
+as an anomaly detector would therefore fire on every single rTorrent release. Two consequences
+are first-class requirements rather than polish: **predicted freed space must count a file's
+bytes only when the deletion removes its last link** ("7 selected — 312 GB" is a lie if half of
+it is still linked from a seeding torrent), and **a delete that frees nothing is not necessarily
+a failure** — verification must distinguish *the path is gone* (the real post-condition) from
+*free space moved* (informational, and expected to be zero for a link removal).
+
+**This also settles a question about a feature that already ships.** `move`-mode source deletion
+(§7) removes the completed-folder copy on confirmed *arr import. For a SABnzbd release that is
+the only copy and the space comes back immediately; for an rTorrent release that is one of two
+links, so seeding is unaffected and nothing is reclaimed until the torrent itself goes. Same
+code, same audit event, two genuinely different real-world outcomes — now stated in README rather
+than left to be discovered.
+
+### 17.5 Attribution is path first, category as fallback
+
+A client instance is **site-level, not per-queue** — one SABnzbd serves `ar-tv` and `ar-movies`
+both, and copying the *arr's per-queue binding would mean configuring and polling the same
+SABnzbd twice. So something has to say which of a client's transfers belongs to which queue.
+
+**This took four rounds to get right, and the shape of the mistake is worth keeping.** The
+original answer was a configured **category → queue mapping**, inferred from path arithmetic over
+the client's base paths. That is a *proxy* for the question, and it only ever held for SABnzbd's
+`<base>/<category>` layout. Live use produced the user's own verdict — *"the category is ar-tv
+and the dir for that is ar-tv… this makes zero sense to me"* — because they were being made to
+configure something the filesystem already answers.
+
+**The order that shipped:**
+
+1. **`content_path` matches an enabled queue's `remote_path`** — equality or containment at a
+   component boundary, **never a bare prefix** (`/complete/ar-tv` must not match
+   `/complete/ar-tv-extra`) → that queue. No category mapping consulted, nothing configured.
+2. Otherwise — the configured **category → queue** mapping, if one exists. This is now that
+   mapping's whole remaining job.
+3. Otherwise — **silently omitted**, but *counted* (§17.5's banner, below).
+
+**Path wins on disagreement**, and the mismatch is logged rather than resolved quietly in the
+mapping's favour: the path is where the bytes actually are, a stale category mapping is not, and
+a disagreement is a signal the user's configuration is wrong rather than noise to suppress. The
+containment rule is imported from `core/settle.py`, not forked — one fact about paths, one
+implementation.
+
+**But path attribution does not make the mapping optional for every connector, and the honest
+version of that is narrower than it first looked.** SABnzbd's history `storage` lands inside the
+queue's own folder, so a SAB item needs no category configuration once it has a path. **rTorrent
+reports its own *seeding* directory as `content_path`, not the hardlinked copy** — two different
+trees under the hardlink layout — so an rTorrent transfer's path essentially never matches a
+queue root, and the category mapping remains rTorrent's **only** attribution route. The Settings
+copy states this per-connector, computed from that instance's own observed match rate, rather
+than as a blanket claim.
+
+**Silence is the worst possible outcome for a configured, authenticating, explicitly-enabled
+client, and the original design produced exactly that.** The silent-omission rule is correct for
+the *arr source — an unattributable *arr queue record genuinely is noise, a release for a queue
+lftpweb does not manage — and was inherited here by reflex. The result was two working clients
+producing **zero** Preflight rows and **zero** events between them, with a fully-working instance
+indistinguishable from a broken one and nothing anywhere saying why. Three fixes, **none of them
+a per-poll event** (a 10-second cadence would bury the log, which is why `core/arrsync.py` does
+not emit one either — events mark transitions, not heartbeats):
+
+- **An unattributed-clients banner**, one line per affected client in the mount-gate banner's own
+  shape, naming *which categories* the unattributable items carried and counting "no category at
+  all" as its own separate clause — two different problems with two different fixes, so the copy
+  no longer folds them into one number. It deep-links to that instance's own edit form.
+- **Per-instance poll status on the Clients row** (migration 029) — a status column, not a log
+  entry, written on every poll attempt, wording a rejected credential as that rather than as
+  "unreachable," with `last_success_at` independent so a currently-failing instance that worked
+  yesterday still shows when.
+- **One positive signal**: `client_poll_first_success`, once per instance per process lifetime.
+
+**Anything computed from configuration is re-derived at read time, never cached per poll.** The
+banner caches only the raw per-category breakdown and re-applies a freshly read exclusion set on
+every call — otherwise excluding a category in Settings does not clear the warning until the next
+poll pass happens to run. This is `core/arrsync.py`'s own 2026-08-21 eviction-latency fix,
+applied twice more here; it is a recurring bug shape in this codebase, not a one-off.
+
+### 17.6 The disk review scan: three piles, claimed by inode
+
+lftpweb's Files page shows only its queues' remote paths. A torrent client's seeding folders
+generally sit *outside* those paths entirely, so a seedbox accumulates content lftpweb cannot see
+at all. The scan (Transfers → Disk review, manual trigger only) reconciles three sets over the
+clients' declared base paths: **A** what every client claims, **B** what is actually on disk over
+SSH, **C** what lftpweb itself is using. `B − A − C` is the review list; `A − B` is broken seeds.
+
+**Three piles come out, and only one is actionable:**
+
+| Pile | What | Actionable |
+|---|---|---|
+| **Debris** | Unclaimed by any client, unused by lftpweb, in a resolvable path — failed extractions, aborted grabs, and the client-removed-but-SSH-delete-failed window | Selectable, for a delete pipeline that does not exist yet |
+| **Seeding estate** | Claimed by live torrents, accumulating until someone cleans it by hand | No — informational, and #21's territory |
+| **Unclaimed** | Ownership **genuinely undeterminable** — unclaimed, in a tree where an exclusion cannot be resolved to a path | Shown, but reachable by no control at all |
+
+**Three properties of set A are correctness requirements, not niceties, and each is a place the
+obvious implementation quietly destroys data.**
+
+**Set A is a union across clients, never per-client.** SABnzbd and rTorrent share the TV completed
+folder under the recommended layout, so a scan that evaluates one client's claims against a shared
+folder sees *the other client's entire estate as orphaned*. With deletion on the other end of that
+list, this is the single most dangerous mistake available in the feature.
+
+**Claiming is by inode, not by path.** rTorrent's `content_path` is its seeding directory; the
+hardlinked entry in the completed folder is invisible to the client's own API, so path matching
+alone would flag every rTorrent-sourced release in the completed folder as an orphan — the same
+catastrophe by a different route. The SSH walk therefore collects **inode and link count** per
+file (GNU `find -printf`'s `%i`/`%n`, with the stdlib fallback agent supplying both, so there is
+no "BusyBox can't do this" degradation path). A file is claimed if **any** link to its inode is
+claimed, and a candidate is proposed only when **every** link to its inode is itself a candidate.
+One walk answers both this and the link-aware freed-space prediction §17.4 requires.
+
+**A base path with a contributor that did not report this pass proposes nothing at all.** A client
+that did not answer has not told us its releases are unclaimed — it has told us nothing. §17.3's
+rule, applied to the scan.
+
+**Inode numbers are unique per filesystem, not globally, and the shipped key has no device
+component.** `find -printf` offers `%D` and the key should eventually be `(device, inode)`. This
+is named rather than hidden because it is *not* urgent: every consequence of a collision fails
+safe — a false match makes an unclaimed file look claimed (fewer proposals), makes a phantom link
+look unaccounted-for (fewer proposals), and suppresses a last-link case (understated reclaim). All
+three err toward proposing and promising less, which is the correct direction for a feature whose
+next stage deletes things. Fix it with `%D` when convenient; do not treat it as a blocker.
+
+**The scan never deletes. It has no delete button anywhere on it**, and the selection checkboxes
+exist only to drive a link-aware reclaim preview.
+
+### 17.7 Two lftpweb instances on one seedbox — "not used here" is a safety boundary, not a preference
+
+**A deployment shape the entire framework was designed without knowing about**, and the reason a
+whole round of work exists: one seedbox, one SABnzbd, one rTorrent, but **two independent lftpweb
+instances**, each with its own *arr pair and its own subset of the download locations. Both
+lftpwebs see *everything* the clients report, because the clients serve both. **This instance
+permanently sees work that is not its business, by design, forever** — that is the steady state,
+not a misconfiguration to be cleaned up.
+
+Two consequences, and the second is the load-bearing one:
+
+1. **A warning that can never be resolved stops carrying information.** Without an explicit saved
+   state for "belongs to the other instance," the unattributed-clients banner nags permanently
+   about work this instance is correctly ignoring. That is §17.5's silence failure with the
+   opposite sign.
+2. **The scan can propose the other instance's data as debris, and that is a latent data-loss
+   path the moment stage 5 exists.** The other instance's content is protected *only* by set A
+   today — and that protection expires the instant the other instance imports a release and SAB
+   drops it from history, or its torrent is removed. Set C only knows about *this* lftpweb's
+   items. The content then becomes, by the scan's own arithmetic, indistinguishable from debris,
+   and stage 5 would offer to delete another site's data with a correct-looking reclaim figure
+   and no signal anything was wrong.
+
+**So "not used by this instance" had to mean two things — don't warn about it, *and* never scan
+it, never propose it, never let it inside the delete containment boundary.** A flag that only
+silenced a banner would have left the delete path exactly as dangerous while appearing to have
+addressed the problem.
+
+What shipped:
+
+- **A category is three-state, saved explicitly** (migration 031): bound to a queue / explicitly
+  excluded / undecided. Mutually exclusive by construction. **Only "undecided" warns.**
+- **Every observed category is recorded automatically**, from the poller as well as from a manual
+  Test (migration 032, one function so "have I seen this before" is answered in one place) — and
+  **it lands excluded by default**. That reverses an earlier decision deliberately: arriving
+  excluded means the other instance's content is never walked and never inside the containment
+  boundary until a person opts it in, rather than sitting exposed until someone notices.
+  "Undecided" is kept rather than removed because deleting a bound category's queue still
+  produces it (`ON DELETE SET NULL`), and the banner correctly *should* warn about a mapping that
+  just broke.
+- **Excluding by default means a brand-new category could do nothing unnoticed** — handled with a
+  calm "+N new" count on the Clients row, cleared by opening the instance for edit, rather than a
+  second banner. (This project's standing preference is fewer clicks, not more confirmation.)
+- **An excluded *path* is the enforceable primitive** (`download_client_excluded_path`, migration
+  031); an excluded *category* is a convenience that resolves into a path wherever the
+  `<base>/<category>` layout holds. **Category is the wrong exclusion unit on its own** — the
+  other instance's content is identified by where it lands, and a category is only a proxy for
+  that.
+- **Where a category cannot be resolved to a path — fail closed, but per file.** rTorrent's only
+  declared base path is its seeding directory, so its excluded categories resolve to nothing. A
+  **claimed** file is resolved directly off its own transfer's category, which needs no path
+  arithmetic and works for every client; only a genuinely **unclaimed** file under such a root is
+  ambiguous, and it is held back from debris and shown in the unclaimed pile instead. An earlier
+  version of this rule suppressed the client's whole base path and hid legitimate, already-claimed
+  seeding content that was never at risk — *"there are things in there in ar-tv that it doesn't
+  show now."*
+- **Fail-closed means "never act without an explicit gate," not "never display."** Suppressing the
+  ambiguous pile suppressed the feature's most valuable output — content that exists and is never
+  surfaced is indistinguishable from content that is not there, which is §17.5's failure again.
+  The pile is shown, grouped by directory, with a link-aware reclaim figure and plain language
+  saying it is abnormal.
+- **The line that must stay sharp:** a file claimed by an **excluded** category is *known* to
+  belong to the other instance. It is a hard exclusion, dropped before any claim/debris logic
+  runs, and it appears in **no** pile, unclaimed included. The unclaimed pile is only for
+  ownership that is genuinely *unknown*. Letting an excluded claim fall through to "nobody claims
+  this" was a real bug caught by a test written specifically to assert the distinction.
+
+**None of this has been verified against the user's actual two-instance deployment.** It is
+correct by unit test against fixtures the same authors wrote, which §17.8 explains is a weaker
+claim than it sounds.
+
+### 17.8 What is built, and what is not
+
+| Stage | State |
+|---|---|
+| **0** — interface, enums, capability layers, registry, conformance suite | **Built** |
+| **1** — SABnzbd + rTorrent connectors, instance CRUD, declared config forms, test-connection, redacted response capture, Settings → Clients, base-path detect→SSH-verify→confirm | **Built** (migrations 027, 028) |
+| **2** — the poller, client as a third Preflight source, the settle-gate skip | **Built** (migration 029). The skip itself ships **off** |
+| **3** — withhold auto-queue on an explicit client failure verdict, and the cheap-vs-expensive cadence split | **Built.** The withhold gate ships **off**, and has **no API or UI surface at all** — the setting exists only in the database blob |
+| **4** — the disk review scan, three piles, review-only | **Built** (migrations 030, 031, 032) |
+| **5** — the delete pipeline, verification, banner | **NOT BUILT.** Nothing in this feature deletes anything |
+
+**Two features ship off by default and that is not timidity — it is one specific unverified
+assumption.** Both the settle-gate skip and the withhold gate act on SABnzbd's history status
+mapping (`Completed`→`COMPLETED`, `Failed`→`FAILED`), which is **vendor-doc-derived and has never
+been confirmed against a real instance**. Every uncertain path in both — setting off, no client
+source wired, unreachable client, blank response, a queue-side or `UNKNOWN` phase, a near-miss
+path — falls back to the behavior that existed before the stage. Turn them on once the mapping is
+confirmed, not before.
+
+**A terminal `COMPLETED` verdict does not satisfy the settle gate the instant it is seen.** It
+holds `core/settle.py.CLIENT_COMPLETION_HOLD_S` (10s) first, measured from the client's *own*
+`completed_at` rather than from when lftpweb noticed — so a completion already older than the
+hold satisfies it with no added wait, and this only ever lengthens an already-shortened wait,
+never a normal one. Cheap insurance against a client reporting "complete" a moment before the
+last bytes are flushed or a final move lands, which matters most for rTorrent, where completion
+and the hardlink into the completed folder are two separate events.
+
+**Polling is split cheap-vs-expensive, not active-vs-everything.** The obvious split
+(`active_only=True` fast, `active_only=False` slow) is drawn on the wrong axis and structurally
+hides terminal verdicts: SABnzbd's queue slots never reach `COMPLETED` at all, and rTorrent's
+`active_only=True` filters it out. The axis that works is whether a connector's `list_history` is
+a real independent call or a re-fetch of the same expensive listing — which
+`Operation.LIST_HISTORY`'s own `native`/`derived` declaration already says, with no client-type
+branch anywhere in the scheduler.
+
+**The highest-value outstanding work on this subsystem is not code — it is two correction lists.**
+Spec §13.4 (SABnzbd, thirteen numbered guesses) and §13.6 (rTorrent, thirteen) enumerate every
+status mapping, field name, endpoint and response shape that was authored from vendor
+documentation and never confirmed against a live instance, ranked by what breaks if the guess is
+wrong. **A green test suite does not touch them**, because `tests/fake_sabnzbd.py` and
+`tests/fake_rtorrent.py` encode the identical assumptions the connectors do — a self-authored
+fixture cannot falsify a self-authored assumption. This repo has been burned by exactly that twice
+already: `IMPORT_EVENT_TYPES = {3}` (§16, two live imports misclassified while every test stayed
+green) and SABnzbd's `mode=version` accepting an invalid API key ([#23](https://github.com/crzykidd/lftpweb/issues/23),
+falsified by a user typing a bad key within hours of shipping). **When correcting any of these
+rows, correct the fixture first and watch the test fail before touching the connector**; a fixture
+edited only to match new code repeats the original mistake exactly.
+
+Named gaps beyond that, none of them hidden: cross-seed detection ships correct-by-unit-test and
+**unwitnessed against a real cross-seeding setup**; the inode key has no device component (§17.6);
+`is_authorized_delete_target` is tested and unused; every layout change in Settings → Clients and
+on the Disk review page is **unverified in a real browser**, because jsdom performs no layout at
+all and two separate bugs in this feature were pure layout problems invisible to every test in the
+repo.

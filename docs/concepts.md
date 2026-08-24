@@ -1,6 +1,6 @@
 # Concepts
 
-The fifteen things that actually trip people up, and what to do about each.
+The twenty things that actually trip people up, and what to do about each.
 
 ```jump
 Nothing is downloading at all — the queue is paused|#pause
@@ -15,6 +15,11 @@ The lifecycle icons|#icons
 copy vs move|#copy-move
 Inherit vs override|#inherit
 The Sonarr/Radarr icon|#arr-integration
+What a download client connection adds|#download-clients
+Category → queue mapping, and "not used here"|#client-categories
+A client's base paths: content vs working|#client-base-paths
+Disk review's three piles|#disk-review
+The settle-gate skip and the withhold gate|#client-verdicts
 Why is this in Preflight and not downloading?|#preflight
 What's in a support bundle|#support-bundle
 Why old Dashboard detail disappears but the total doesn't|#daily-rollups
@@ -482,6 +487,216 @@ Hover the mark for which instance matched it and when.
 > anything as finished. A release simply vanishing from the *arr's queue with no import evidence
 > is never treated as imported — that is exactly the amber-pending case above, and only turns red
 > once it has genuinely sat unconfirmed for the full 6-hour window.
+
+## What a download client connection adds — and what it doesn't {#download-clients}
+
+A **download client** here means the program that actually fetches things on the seedbox —
+SABnzbd for usenet, rTorrent for torrents. lftpweb has always worked without knowing about them:
+it watches a folder, and whatever lands there gets synced. Connecting one at
+[Settings → Clients](/settings/clients) adds a *second* source of truth about work that hasn't
+landed yet.
+
+**Why bother, when Sonarr/Radarr already tells you the same thing?** Because it doesn't, quite.
+SABnzbd reports to Sonarr on Sonarr's own schedule, and lftpweb then polls Sonarr on its own — so
+an *arr-derived download status is two polling intervals removed from the fact it describes.
+Reading the client directly removes both, and it also covers work no *arr knows about (something
+you grabbed by hand).
+
+**What you actually get today:**
+
+- **Preflight rows from the client**, alongside the *arr's view of the same release. A row
+  matched by both shows **both** source badges, and expands to each source's own status and size.
+  Where the two disagree about status, the client wins — it's the origin, the *arr is a relay of
+  unknown lag.
+- **A paused, half-finished download becomes visible.** That's the single most useful thing this
+  adds: work that will never arrive unless somebody intervenes, which nothing else in lftpweb
+  would have told you about.
+- **A last-poll outcome on the Clients row**, so a working client stops looking identical to a
+  broken one — with a rejected password reading as that, not as "unreachable."
+- **[Disk review](#disk-review)**, which is its own entry below.
+
+**What it deliberately doesn't do:**
+
+- **It never changes an item's state.** A client can *skip* work, *withhold* work, or *explain* —
+  it can never mark something downloaded, failed, or complete. That stays lftpweb's own
+  filesystem-derived answer.
+- **It never deletes anything, and lftpweb never asks it to.** The design is: unregister the entry
+  in the client, then delete the bytes over SSH, then verify. Neither half exists yet — see
+  [Disk review](#disk-review).
+- **Silence is never a verdict.** A client that stops answering keeps its last known status; it
+  never downgrades anything. An unreachable client is not the same as a client saying "no."
+- **It never adds a download.** lftpweb doesn't grab; your *arr does.
+
+**Everything is off until you turn it on**, and a new instance is created disabled. Saving an
+instance with **Enabled** ticked tests the connection first and saves nothing if the test fails —
+the same way Sonarr's own Download Clients page behaves. Saving it *unticked* never tests and
+always saves, which is the deliberate escape hatch: a temporarily broken client can still be
+edited or disabled instead of locking you out of your own settings.
+
+## Category → queue mapping, and "not used here" {#client-categories}
+
+Your client sorts downloads into **categories** (SABnzbd's own word) or **labels** (rTorrent's).
+lftpweb sorts them into **queues**. Something has to connect the two — but usually not you.
+
+**Most downloads are matched by where they land, not by category.** If a release's folder sits
+inside one of your queue's own remote paths, that's the queue, full stop — no configuration, no
+mapping consulted. Path matching is exact at folder boundaries, so `/complete/tv` never
+accidentally claims `/complete/tv-extra`.
+
+**The mapping is the fallback, and it's load-bearing in exactly two situations:**
+
+| Situation | Why path matching can't answer |
+|---|---|
+| A download that hasn't started yet | There's nothing on disk to check. Only a category can say where it's headed. |
+| **rTorrent, under the hardlink layout** | rTorrent reports its own *seeding* directory, not the hardlinked copy in the completed folder — a different tree entirely. Its path essentially never matches a queue, so its label is the only route there is. |
+
+The Clients page tells you which case you're in, from what it has actually observed on your own
+instance — *"12 of 12 recent downloads matched by folder, no mapping needed"* versus *"0 of 2
+matched, a mapping is required"*. That's measured, not assumed from the type of client.
+
+**Each category is one of three things, and the third is the one worth understanding:**
+
+| State | What it means | Does the "none attributable" banner warn? |
+|---|---|---|
+| **Bound** to a queue | Downloads in this category belong to that queue | No |
+| **Not used here** (the checkbox) | This category is deliberately none of this install's business | **Never again** |
+| Undecided | Nobody has looked at it yet | Yes — that's what the warning is for |
+
+**A category lftpweb sees for the first time arrives marked "not used here."** That's a
+deliberate, safe default rather than a quiet one, and it exists for the
+[two-lftpwebs-on-one-seedbox](#disk-review) case: content that isn't opted in is never walked and
+never proposed for removal, instead of sitting exposed until somebody notices. The Clients row
+shows a small **"+N new"** count so a category you *did* want doesn't sit ignored; opening the
+instance for edit clears it.
+
+**"Not used here" is not just a way to silence a warning.** It's also a hard boundary: that
+content is never scanned, never proposed as debris, and never inside a delete boundary. A flag
+that only quietened a banner would leave the dangerous half unaddressed while looking like it had
+been handled.
+
+**There's nothing to type here, on purpose.** Categories come from the client itself; you pick a
+queue from a dropdown or leave it unbound. (An earlier version had a free-text field with a greyed
+"example" that looked like a filled-in value and was silently discarded on save. That's why.) The
+one exception is the explicit **Add a category** box, for a label that doesn't exist yet — it
+refuses blank and duplicate names visibly rather than dropping them.
+
+## A client's base paths: content vs working {#client-base-paths}
+
+A **base path** is a directory the client itself owns, and lftpweb needs to know them for one
+reason: it's the boundary that would ever authorise a deletion, and the roots
+[Disk review](#disk-review) walks. They come in two kinds, and the difference matters:
+
+| Kind | What it is | Example |
+|---|---|---|
+| **content** | Where finished work lands — the completed tree | SABnzbd's `complete_dir` |
+| **working** | Where the client keeps its own copy while it works, or seeds from | rTorrent's data directory |
+
+**You don't type these — the client is asked, and then lftpweb checks the answer over SSH.** Click
+**Test** on an instance and it reports its own directories, each already classified content or
+working (the client knows which config key it read each one from). Each is then stat'd over your
+own SSH connection, and lands in one of three states that are deliberately *not* collapsed
+together:
+
+- **Verified** — the client and lftpweb agree this path exists at this spot. Accept it.
+- **Not found** — your seedbox clearly says there's nothing there. Usually this means the client
+  is containerised and reports paths in its own filesystem view (`/complete`) that don't match
+  what lftpweb sees over SSH (`/home/you/downloads/complete`). Give it the SSH-visible equivalent;
+  the browse dialog is there to find it.
+- **Unverified** — lftpweb couldn't look. No SSH connection right now, a permissions problem,
+  something ambiguous. **This is not the same fact as "not found"** and is never presented as a
+  failure.
+
+**Detection proposes; it never saves.** Nothing is stored until you accept it, and a failed
+detection never fails the connection test — reachability and path visibility are different
+questions.
+
+**One specific translation is offered rather than guessed at.** rTorrent commonly reports a path
+like `~/downloads/rtorrent`. SFTP doesn't expand `~`, so a literal check on that string reports
+"missing" for a directory that plainly exists. When lftpweb can expand it against your SSH home
+*and* confirm the result exists, it pre-fills the box with what it found and says so — you still
+have to click Add. **A `~` path is never what gets stored**, because every later use of it (the
+scan's walk roots, any future delete boundary) would inherit the same problem, and a delete
+boundary that silently matches nothing is a bad way to fail.
+
+**Excluded paths** sit just below on the same page and are the opposite instruction: a tree
+lftpweb should leave entirely alone, never scan, and never propose. Nothing about them is detected
+or verified — they exist precisely to name something that isn't yours.
+
+## Disk review's three piles: debris, seeding estate, unclaimed {#disk-review}
+
+**[Transfers → Disk review](/transfers/disk-review)** answers a question the Files page
+structurally can't: *what's sitting in my download client's own folders that nothing accounts
+for?* The Files page only ever shows your queues' remote paths, and a torrent client's seeding
+directory usually sits outside them entirely.
+
+Click **Scan** and it walks the clients' base paths over SSH, compares what's there against what
+every client claims and what lftpweb itself is using, and sorts the result into three piles:
+
+| Pile | What it is | Can you act on it? |
+|---|---|---|
+| **Debris** | On disk, claimed by no client, not in use by lftpweb — failed extractions, aborted grabs, leftovers from an interrupted cleanup | Selectable, and its reclaim total is honest (below). But there is **no delete button** yet |
+| **Seeding estate** | Claimed by live torrents, accumulating until somebody cleans it up by hand | No — it's shown so you can see it, not so you can remove it |
+| **Unclaimed** | Ownership genuinely undeterminable | No control exists for it at all |
+
+**The reclaim figure accounts for hardlinks, and that's the whole reason to trust it.** Under the
+recommended layout an rTorrent release exists as two links to the same bytes — the seeding copy
+and the completed-folder copy. Deleting *one* of them frees **nothing**. So "7 selected — 312 GB"
+counts a file's bytes only when the selection removes its *last* link; a naive sum would be a lie,
+including within a single directory group.
+
+**Nothing here deletes anything, and that's deliberate rather than unfinished.** The scan gets
+looked at against real seedboxes before any code is allowed to remove. Act on what it finds by
+hand for now.
+
+**About the Unclaimed pile: an empty one is the normal case.** A populated one means one of two
+things and lftpweb genuinely can't tell them apart — debris from an interrupted operation, or
+**another lftpweb instance's content** sharing this seedbox. If two installs share one seedbox,
+mark the other one's categories "not used here" and add its trees under Excluded paths
+(see [base paths](#client-base-paths)); content excluded that way appears in **no** pile at all,
+because it's *known* to belong elsewhere rather than merely unproven.
+
+**Two things the scan refuses to do, both on purpose.** If a client that contributes to a folder
+didn't answer this pass, **no debris is proposed for that folder at all** — a client that didn't
+answer hasn't told you its releases are unclaimed, it's told you nothing. And where an exclusion
+can't be resolved to an actual path, ambiguous files are held out of Debris and shown as Unclaimed
+instead of being quietly assumed safe.
+
+## The settle-gate skip and the withhold gate {#client-verdicts}
+
+Two behaviours let a download client's opinion change what lftpweb does. **Both ship off**, and
+this entry exists mostly to explain why you might see nothing happening.
+
+**The settle-gate skip** (Settings → Transfer, a checkbox). Normally lftpweb waits for a release's
+remote fingerprint to hold still across two scans and at least 60 seconds before transferring —
+see [the settle gate](#settle). If the client that produced the release says it has *finished*,
+that wait is largely redundant, so this shortens it. Two details:
+
+- It only ever **shortens** a wait that would otherwise have run its full course; it never makes
+  one longer, and it never overrides anything else holding the item back.
+- The skip still holds a **10-second cushion** after the client's own completion time before
+  releasing. rTorrent finishes downloading and hardlinks into the completed folder as two separate
+  events, and SABnzbd can report done a moment before the last flush lands. If the completion is
+  already older than the cushion, there's no added wait at all.
+
+**When it's off, the settle-wait tooltip says so** — *"(download-client verdict skip is off)"* —
+because "we went into settling and SAB said nothing" and "the feature is switched off" are
+otherwise indistinguishable.
+
+**The withhold gate.** If a client explicitly reports a release **failed**, auto-queue skips it
+rather than transferring bytes already known to be bad, and writes one audit event saying why.
+This has **no settings page and no API endpoint** — it exists only as a stored value, so turning
+it on today means editing the database directly. That's a real gap, named in the README rather
+than hidden.
+
+**Why both are off.** They act on one specific mapping — SABnzbd reporting `Completed` and
+`Failed` in its history — that was written from vendor documentation and has never been confirmed
+against a real SABnzbd. Every uncertain path in both features falls back to exactly the behaviour
+that existed before them: the setting off, no client connected, an unreachable client, a blank
+response, an unrecognised status, a path that nearly-but-not-quite matches. They get turned on
+once that mapping is confirmed, not before.
+
+**Neither ever writes an item's state.** A client can shorten a wait or hold back a queueing
+decision; it can't mark anything downloaded, complete, or failed.
 
 ## Why is this in Preflight and not downloading? {#preflight}
 
