@@ -282,6 +282,14 @@ export function testClientInstance(id: number): Promise<DownloadClientTestRespon
   return sendJson<DownloadClientTestResponse>(`/api/settings/clients/${id}/test`, 'POST')
 }
 
+/** The "new since you last looked" signal's own write side (migration 032, 2026-08-23) --
+ * fired the moment `ClientsTab.tsx` opens an instance for edit, no separate button and no
+ * confirmation. See `DownloadClientOut.categories_acknowledged_at`'s own docstring.
+ */
+export function acknowledgeClientCategories(id: number): Promise<DownloadClientOut> {
+  return sendJson<DownloadClientOut>(`/api/settings/clients/${id}/acknowledge-categories`, 'POST')
+}
+
 // --- The disk review scan (docs/download-client-framework-spec.md §11, stage 4 of #18) -----
 // Manual trigger only (spec §11.3) -- never fired on a page load, only a button click.
 export function runDiskReviewScan(): Promise<DiskReviewScanResponse> {

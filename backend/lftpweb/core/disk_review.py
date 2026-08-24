@@ -119,6 +119,13 @@ class ClientClaim:
     pass. Only ever constructed for a client already known to be reachable this pass -- an
     unreachable client's *last* claims must never be trusted as current (spec §4.2), and the
     root-level gate above already excludes its declared paths from debris regardless.
+
+    `category` (2026-08-23, live use, finding #16's own follow-up -- see `reconcile`'s own
+    `excluded_categories_by_client` docstring) is the transfer's own reported category, `None`
+    when the client didn't report one. It carries no attribution meaning by itself; it exists
+    only so `reconcile` can drop a claim outright when its category is one this client has
+    explicitly marked "not used by this instance" -- the per-file version of finding #16's
+    exclusion, for exactly the shape a category can never be resolved to a path (rTorrent).
     """
 
     client_id: int
@@ -126,6 +133,7 @@ class ClientClaim:
     transfer_id: str
     transfer_name: str
     content_path: str
+    category: str | None = None
 
 
 @dataclass(frozen=True)
@@ -201,12 +209,34 @@ class BrokenSeed:
 
 @dataclass(frozen=True)
 class SkippedBasePath:
-    """One configured root this scan did not propose debris for, and why -- surfaced to the
-    review page rather than silently absorbed, the same "name gaps, don't hide them" instinct
-    every other guard in this codebase follows.
+    """One configured root this scan did not walk **at all**, and why -- a genuine "we have no
+    information," surfaced to the review page rather than silently absorbed, the same "name gaps,
+    don't hide them" instinct every other guard in this codebase follows. Reserved for a root
+    this scan truly never looked at (no host, credentials, a failed SSH walk, a missing
+    contributor, a failed mount-sentinel check) -- see `SuppressedDebrisItem` below for the
+    different, narrower case of a root that *was* walked but whose debris pile is incomplete.
     """
 
     root: str
+    reason: str
+
+
+@dataclass(frozen=True)
+class SuppressedDebrisItem:
+    """A root this scan **did** walk (its seeding estate is populated normally, live use,
+    2026-08-23: *"this is true, but there are things in there in ar-tv that it doesn't show
+    now"* -- a whole-root fail-closed suppression had been hiding legitimate, already-claimed
+    content that was never in danger), but where some number of genuinely **unclaimed** files
+    could not be cleared for debris -- an excluded category with no `content`-kind base path to
+    resolve onto (rTorrent, spec §1.1) means an unclaimed file here might be the leftover of a
+    transfer that belonged to a since-vanished, excluded-category claim, and there is no path
+    arithmetic that can tell. Fail-closed, narrowed to exactly the ambiguous files: a **claimed**
+    file's own transfer category already answers the question directly (`reconcile`'s own
+    `excluded_categories_by_client` filtering), so only unclaimed files ever land in `count` here.
+    """
+
+    root: str
+    count: int
     reason: str
 
 
@@ -216,6 +246,7 @@ class ReconciliationResult:
     seeding_estate: tuple[SeedingEstateEntry, ...] = ()
     broken_seeds: tuple[BrokenSeed, ...] = ()
     skipped_base_paths: tuple[SkippedBasePath, ...] = ()
+    suppressed_debris: tuple[SuppressedDebrisItem, ...] = ()
 
 
 def _root_containing(path: str, roots: Iterable[str]) -> str | None:
@@ -242,6 +273,8 @@ def reconcile(
     now_s: float,
     age_floor_s: float = DEFAULT_AGE_FLOOR_S,
     excluded_paths: Iterable[str] = (),
+    excluded_categories_by_client: Mapping[int, frozenset[str]] | None = None,
+    debris_ambiguous_roots: Mapping[str, str] | None = None,
 ) -> ReconciliationResult:
     """The whole reconciliation, pure. `unavailable_roots` is roots this scan already knows it
     cannot trust (an SSH walk failure, a fallback path unable to supply inodes, or a queue's
@@ -255,11 +288,36 @@ def reconcile(
     it belongs to a different lftpweb instance sharing this seedbox. Every entry under one of
     these is dropped before any candidate/claim logic below ever sees it -- the same containment
     filter `roots` already applies, at finer grain. `run_scan` is what resolves an excluded
-    *category* into paths here (or fails closed onto `unavailable_roots` when it can't) -- this
-    function only ever consumes the resulting flat path list.
+    *category* into paths here wherever a client declares a `content`-kind base path to resolve
+    it onto -- this function only ever consumes the resulting flat path list.
+
+    `excluded_categories_by_client` (live use, 2026-08-23, follow-up to finding #16 --
+    *"there are things in there in ar-tv that it doesn't show now"*) is the per-file counterpart
+    for the client shape `excluded_paths` cannot reach: rTorrent's own `content_path` is its
+    seeding directory, unrelated to any category folder, so an excluded category can never
+    resolve to a path for it at all. A **claimed** file already carries the answer directly on
+    its own claim (`ClientClaim.category`) -- no path arithmetic needed -- so a claim whose
+    category is in this client's excluded set is dropped *before* any claiming logic below ever
+    sees it, exactly as if that transfer had never reported a `content_path`. This is universal
+    (every client, not only the ones `excluded_paths` can't reach) and strictly narrower than the
+    old whole-base-path fail-closed suppression: a bound category's claims on the very same root
+    are completely unaffected.
+
+    `debris_ambiguous_roots` (same follow-up) is the genuinely irreducible remainder: an
+    **unclaimed** file under a root where some client's excluded category could not be resolved
+    to a path. There is no claim to read a category off of for a file nobody currently claims --
+    it might be the leftover of a transfer that belonged to a since-vanished, excluded-category
+    claim, or it might be genuine debris, and there is no way to tell which. Fail-closed for
+    *these files only* (`SuppressedDebrisItem`, counted, never silently dropped) -- **the root is
+    still walked and its seeding estate still populated normally**, unlike `unavailable_roots`,
+    which skips the walk outright. This is the whole point of the fix: the old design conflated
+    "cannot resolve a category to a path" with "cannot trust anything under this root at all,"
+    which suppressed legitimate, already-claimed content that was never at risk.
     """
     roots = {_norm(r) for r in base_paths}
     excluded = {_norm(p) for p in excluded_paths}
+    excluded_categories_by_client = excluded_categories_by_client or {}
+    ambiguous_roots: dict[str, str] = dict(debris_ambiguous_roots or {})
 
     def _excluded(path: str) -> bool:
         return any(_is_under(path, ex) for ex in excluded)
@@ -272,6 +330,17 @@ def reconcile(
         # this function anything else. An excluded path is dropped the same way, before it can
         # ever become a claim, a debris candidate, or a seeding-estate entry (finding #16).
         if _norm(e.root) in roots and not _excluded(_norm(e.abs_path))
+    ]
+
+    # A claim in an excluded category is dropped outright -- never a claim at all, for any
+    # client, not only the ones a category can't resolve to a path for (this function's own
+    # docstring, `excluded_categories_by_client`). The file it named becomes "unclaimed" for
+    # every purpose below, including the `debris_ambiguous_roots` fail-closed gate further down.
+    claims = [
+        c
+        for c in claims
+        if c.category is None
+        or c.category not in excluded_categories_by_client.get(c.client_id, ())
     ]
 
     contrib_by_root: dict[str, set[int]] = defaultdict(set)
@@ -293,6 +362,12 @@ def reconcile(
                 f"client(s) {sorted(missing)} did not report successfully this pass "
                 "(unreachable, disabled, or never configured to answer) -- spec §11.1a"
             )
+        elif root in ambiguous_roots:
+            # Narrower than `unavailable_roots` on purpose (this function's own docstring): the
+            # walk already happened and the seeding estate is unaffected -- only an *unclaimed*
+            # file here is fail-closed, tallied into `suppressed_debris` below, never folded into
+            # `skipped_base_paths` (which would wrongly imply the whole root was never looked at).
+            root_available_for_debris[root] = False
         else:
             root_available_for_debris[root] = True
 
@@ -359,8 +434,25 @@ def reconcile(
             return False
         return _passes_age_floor(entry)
 
+    def _ambiguous_suppressed(entry: DiskEntry) -> bool:
+        """True when `entry` is an **unclaimed** file that would otherwise have been debris-
+        eligible, except that its root is in `ambiguous_roots` -- the genuinely irreducible
+        fail-closed remainder this function's own docstring describes. Never true for an entry
+        that fails eligibility for an unrelated reason (in use, too fresh, or a root that's
+        `unavailable`/missing-contributor rather than merely ambiguous) -- `suppressed_debris`
+        must count only what this specific gate actually suppressed.
+        """
+        root = _norm(entry.root)
+        if root not in ambiguous_roots:
+            return False
+        abs_p = _norm(entry.abs_path)
+        if _is_in_use(abs_p):
+            return False
+        return _passes_age_floor(entry)
+
     debris: list[DebrisCandidate] = []
     seeding_estate: list[SeedingEstateEntry] = []
+    suppressed_counts: dict[str, int] = defaultdict(int)
 
     for entry in disk_entries:
         if entry.is_dir:
@@ -386,6 +478,8 @@ def reconcile(
             continue
 
         if not _entry_eligible(entry):
+            if _ambiguous_suppressed(entry):
+                suppressed_counts[_norm(entry.root)] += 1
             continue
 
         link_paths: tuple[str, ...] = ()
@@ -448,6 +542,11 @@ def reconcile(
         skipped_base_paths=tuple(
             SkippedBasePath(root=root, reason=reason) for root, reason in sorted(skipped.items())
         ),
+        suppressed_debris=tuple(
+            SuppressedDebrisItem(root=root, count=count, reason=ambiguous_roots[root])
+            for root, count in sorted(suppressed_counts.items())
+            if count > 0
+        ),
     )
 
 
@@ -505,17 +604,22 @@ def _resolve_client_exclusions(
     excluded_categories_by_client: Mapping[int, list[str]],
 ) -> tuple[set[str], dict[str, str]]:
     """The pure derivation step behind `run_scan`'s own excluded-paths gathering (migration 031,
-    finding #16) -- split out so the fail-closed rule and the category-to-path resolution are
-    each directly testable without a database or an SSH connection.
+    finding #16, narrowed 2026-08-23 by live use -- see `reconcile`'s own
+    `debris_ambiguous_roots` docstring) -- split out so the fail-closed rule and the
+    category-to-path resolution are each directly testable without a database or an SSH
+    connection.
 
     Returns `(excluded_paths, fail_closed_roots)`: the full excluded-path set (every manually
     configured row, plus every excluded category resolved into a path wherever the owning client
     declares a `content`-kind base path to resolve it onto), and a `root -> reason` mapping for
-    any base path a client's exclusion could **not** be resolved onto -- fail closed (spec §11,
-    this task's own rule: "a scan that proposes less is always preferable to one that proposes
-    someone else's data"), suppressing debris for that client's entire declared base path rather
-    than guess. `run_scan` merges the latter straight into `unavailable_roots`, before its own
-    walk ever reaches those roots.
+    any base path a client's exclusion could **not** be resolved onto by path. `run_scan` passes
+    the latter to `reconcile` as `debris_ambiguous_roots` -- **no longer merged into
+    `unavailable_roots`** (that would skip the walk and hide legitimate, already-claimed content
+    that was never at risk, exactly the live-use complaint this narrowing fixes). `reconcile`
+    itself is what actually fails closed, and only for the genuinely ambiguous remainder: an
+    *unclaimed* file under one of these roots, once every claimed file has already been resolved
+    directly against its own transfer's category (`ClientClaim.category`, universal, no path
+    arithmetic needed).
     """
     excluded_paths: set[str] = {_norm(p) for p in manual_excluded_paths}
     fail_closed_roots: dict[str, str] = {}
@@ -527,14 +631,17 @@ def _resolve_client_exclusions(
         else:
             # No `content`-kind base path exists for this client at all (rTorrent's own base
             # path is its seeding/`working` directory, unrelated to any category folder, spec
-            # §1.1) -- resolving the exclusion precisely is impossible, so every one of this
-            # client's declared base paths is suppressed for debris entirely.
+            # §1.1) -- resolving the exclusion precisely is impossible for an *unclaimed* file
+            # here (a claimed one is already handled directly via its own transfer's category,
+            # `reconcile`'s own `excluded_categories_by_client` filtering).
             reason = (
                 f"client {client_id}'s excluded categor"
                 f"{'y' if len(categories) == 1 else 'ies'} {sorted(categories)!r} cannot be "
-                "resolved to a path (no content-kind base path declared for this client) -- "
-                "suppressing debris for this base path entirely rather than risk proposing "
-                "someone else's data (spec §11, finding #16)"
+                "resolved to a path (no content-kind base path declared for this client) -- an "
+                "unclaimed file here cannot be told apart from the leftover of a since-vanished "
+                "claim in that category, so it is suppressed from debris rather than risk "
+                "proposing someone else's data (spec §11, finding #16); claimed content is "
+                "unaffected and still shown normally"
             )
             for path, _kind in client_base_paths:
                 fail_closed_roots.setdefault(path, reason)
@@ -673,10 +780,7 @@ async def run_scan(
     # as a hard safety boundary. Manual rows (`download_client_excluded_path`) are the enforceable
     # primitive, used verbatim; an excluded *category* is a convenience resolved into paths here,
     # wherever the client declares at least one `content`-kind base path for the resolution to
-    # land on (spec §1.1's `<base>/<category>` layout) -- and **fails closed** onto
-    # `unavailable_roots` (suppressing debris for every one of that client's declared base paths,
-    # before the walk below even reaches them) when it can't, exactly the case rTorrent's own
-    # `content_path` (its seeding directory, unrelated to any category folder) makes unavoidable.
+    # land on (spec §1.1's `<base>/<category>` layout).
     cursor = await db.execute("SELECT path FROM download_client_excluded_path")
     manual_excluded_paths = [row["path"] for row in await cursor.fetchall()]
 
@@ -687,15 +791,24 @@ async def run_scan(
     cursor = await db.execute(
         "SELECT client_id, category FROM download_client_category WHERE excluded = 1"
     )
-    excluded_categories_by_client: dict[int, list[str]] = defaultdict(list)
+    excluded_categories_by_client_list: dict[int, list[str]] = defaultdict(list)
     for row in await cursor.fetchall():
-        excluded_categories_by_client[row["client_id"]].append(row["category"])
+        excluded_categories_by_client_list[row["client_id"]].append(row["category"])
+    # `reconcile`'s own claim-filtering wants a per-client *set*, not the list shape
+    # `_resolve_client_exclusions` (below) and its own tests already settled on.
+    excluded_categories_by_client: dict[int, frozenset[str]] = {
+        cid: frozenset(cats) for cid, cats in excluded_categories_by_client_list.items()
+    }
 
-    excluded_paths, fail_closed_roots = _resolve_client_exclusions(
-        manual_excluded_paths, base_paths_by_client, excluded_categories_by_client
+    # `debris_ambiguous_roots` (live use, 2026-08-23, narrowing finding #16's own fail-closed
+    # rule -- see `reconcile`'s own docstring) -- **no longer merged into `unavailable_roots`**.
+    # The old merge skipped the walk entirely for a root like rTorrent's whose category can't
+    # resolve to a path, which hid its seeding estate too, not just debris -- legitimate,
+    # already-claimed content that was never at risk. `reconcile` itself now does the actual
+    # fail-closed narrowing, scoped to just the unclaimed remainder.
+    excluded_paths, debris_ambiguous_roots = _resolve_client_exclusions(
+        manual_excluded_paths, base_paths_by_client, excluded_categories_by_client_list
     )
-    for root, reason in fail_closed_roots.items():
-        unavailable_roots.setdefault(root, reason)
 
     if host is None:
         for root in roots:
@@ -709,13 +822,13 @@ async def run_scan(
         for root in roots:
             unavailable_roots[root] = "seedbox host credentials need re-entry"
     else:
+        # Every declared root is walked here -- including one in `debris_ambiguous_roots`
+        # (2026-08-23 narrowing, this function's own comment above): a category that can't
+        # resolve to a path no longer skips the walk, only narrows what `reconcile` may propose
+        # as debris from what the walk finds. `unavailable_roots` is still empty at this point in
+        # this branch (host configured, credentials fine) -- only a per-root scan failure below,
+        # or the mount-sentinel check after this loop, can still add to it.
         for root in roots:
-            if root in unavailable_roots:
-                # Already ruled out before the walk -- the fail-closed exclusion branch above
-                # (finding #16), or (in principle) some other pre-walk reason a future caller
-                # adds. Skipping the walk itself here is what makes the fail-closed case genuinely
-                # "never scanned," not merely "scanned and then discarded."
-                continue
             try:
                 entries, _warning = await pool.scan_with_inodes(host, root)
             except RemoteScanError as exc:
@@ -787,6 +900,11 @@ async def run_scan(
                     transfer_id=transfer.client_id,
                     transfer_name=transfer.name,
                     content_path=transfer.content_path,
+                    # 2026-08-23, live use -- see `ClientClaim`'s own docstring: the transfer's
+                    # own category, so `reconcile` can drop a claim outright when it's in a
+                    # category this client has explicitly marked "not used by this instance,"
+                    # with no path arithmetic needed.
+                    category=transfer.category,
                 )
             )
 
@@ -803,5 +921,7 @@ async def run_scan(
         now_s=now_s,
         age_floor_s=age_floor_s,
         excluded_paths=excluded_paths,
+        excluded_categories_by_client=excluded_categories_by_client,
+        debris_ambiguous_roots=debris_ambiguous_roots,
     )
     return ScanOutcome(result=result, client_failures=tuple(failures))

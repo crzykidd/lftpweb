@@ -248,6 +248,30 @@ export function DiskReviewPage() {
             </div>
           )}
 
+          {/* Narrower than the "base paths skipped" banner above on purpose (2026-08-23): these
+           * roots WERE walked -- their seeding estate below is complete -- only some number of
+           * unclaimed files couldn't be cleared for the debris pile. A whole-root skip used to
+           * hide legitimate, already-claimed content along with the genuinely ambiguous files;
+           * this reads as "N items suppressed," never "N base paths skipped." */}
+          {result.suppressed_debris.length > 0 && (
+            <div className="rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-900 dark:border-amber-900/60 dark:bg-amber-950/40 dark:text-amber-200">
+              <p className="font-medium">
+                {result.suppressed_debris.reduce((sum, s) => sum + s.count, 0)} item
+                {result.suppressed_debris.reduce((sum, s) => sum + s.count, 0) === 1 ? '' : 's'}{' '}
+                suppressed from debris this pass -- claimed content in these paths is unaffected
+                and still shown below
+              </p>
+              <ul className="mt-1 list-inside list-disc">
+                {result.suppressed_debris.map((s) => (
+                  <li key={s.root}>
+                    <span className="font-mono text-xs">{s.root}</span> -- {s.count} item
+                    {s.count === 1 ? '' : 's'}: {s.reason}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+
           {result.client_failures.length > 0 && (
             <div className="rounded-md border border-zinc-200 bg-zinc-50 px-3 py-2 text-sm text-zinc-600 dark:border-zinc-800 dark:bg-zinc-900/60 dark:text-zinc-400">
               <p className="font-medium text-zinc-700 dark:text-zinc-300">

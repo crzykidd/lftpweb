@@ -336,6 +336,15 @@ export interface DownloadClientCategoryIn {
 
 export interface DownloadClientCategoryOut extends DownloadClientCategoryIn {
   id: number
+  /** Migration 032 (2026-08-23, prompts/2026-08-23-auto-add-categories-default-excluded.md):
+   * when this category was first automatically recorded (a poll pass or a Test, never a manual
+   * save) -- `null` for anything that predates this migration, was typed by hand, or survived a
+   * Settings save (a pre-existing row's own value carries forward; a save's brand-new row gets
+   * `null`, since the user just typed it themselves). `lib/clientCategoryInference.ts.
+   * newCategoryCount` compares this against `DownloadClientOut.categories_acknowledged_at` for
+   * the "N new since you last looked" signal.
+   */
+  first_seen_at: string | null
 }
 
 /** One path (or sub-path) never scanned, never proposed as debris, and never inside a future
@@ -438,6 +447,13 @@ export interface DownloadClientOut {
    */
   attribution_sample_size: number | null
   attribution_matched_by_path: number | null
+  /** Migration 032 (2026-08-23) -- the other half of the "new since you last looked" signal
+   * (`DownloadClientCategoryOut.first_seen_at`'s own docstring). `null` = never acknowledged, so
+   * every observed category with a `first_seen_at` counts as new. Stamped by
+   * `acknowledgeClientCategories`, fired the moment `ClientsTab.tsx` opens this instance for
+   * edit -- no separate button, no confirmation.
+   */
+  categories_acknowledged_at: string | null
 }
 
 /** `POST /api/settings/clients/{id}/test` -- `capabilities` always reflects whatever is now on
@@ -512,6 +528,16 @@ export interface DiskReviewSkippedBasePathOut {
   reason: string
 }
 
+// A root that WAS walked (its seeding estate is populated normally) but where some unclaimed
+// files couldn't be cleared for debris -- narrower than DiskReviewSkippedBasePathOut on purpose
+// (2026-08-23: a whole-root fail-closed suppression had been hiding legitimate, already-claimed
+// content that was never in danger). See core.disk_review.SuppressedDebrisItem's own docstring.
+export interface DiskReviewSuppressedDebrisOut {
+  root: string
+  count: number
+  reason: string
+}
+
 export interface DiskReviewClientFailureOut {
   client_id: number
   client_name: string
@@ -523,6 +549,7 @@ export interface DiskReviewScanResponse {
   seeding_estate: DiskReviewSeedingEstateOut[]
   broken_seeds: DiskReviewBrokenSeedOut[]
   skipped_base_paths: DiskReviewSkippedBasePathOut[]
+  suppressed_debris: DiskReviewSuppressedDebrisOut[]
   client_failures: DiskReviewClientFailureOut[]
   scanned_at: string
 }

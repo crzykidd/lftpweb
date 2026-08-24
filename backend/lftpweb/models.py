@@ -1906,6 +1906,14 @@ class DownloadClientCategoryOut(BaseModel):
     queue_id: int | None = None
     source: Literal["client", "manual"] = "client"
     excluded: bool = False
+    # Migration 032 (2026-08-23, prompts/2026-08-23-auto-add-categories-default-excluded.md):
+    # when `core.clientsync.persist_observed_categories` first recorded this category -- `None`
+    # for anything that predates this migration, was typed by hand, or survived a Settings save
+    # (`api/settings_clients.py._replace_categories` carries a pre-existing row's own value
+    # forward; a save's own brand-new row gets `None`, since the user just typed it themselves).
+    # `ClientsTab.tsx` compares this against `DownloadClientOut.categories_acknowledged_at` to
+    # decide whether a row counts toward the "N new since you last looked" signal.
+    first_seen_at: str | None = None
 
 
 class DownloadClientExcludedPathIn(BaseModel):
@@ -2007,6 +2015,13 @@ class DownloadClientOut(BaseModel):
     # sentences from these same two numbers.
     attribution_sample_size: int | None = None
     attribution_matched_by_path: int | None = None
+    # Migration 032 (2026-08-23) -- the other half of the "new since you last looked" signal
+    # (`DownloadClientCategoryOut.first_seen_at`'s own docstring). Stamped by
+    # `POST /api/settings/clients/{id}/acknowledge-categories`, fired the moment a person opens
+    # this instance for edit -- no separate button, no confirmation. `None` = never acknowledged,
+    # so every observed category with a `first_seen_at` counts as new until the instance is
+    # first opened.
+    categories_acknowledged_at: str | None = None
 
 
 class DetectedBasePathOut(BaseModel):
@@ -2113,6 +2128,20 @@ class DiskReviewSkippedBasePathOut(BaseModel):
     reason: str
 
 
+class DiskReviewSuppressedDebrisOut(BaseModel):
+    """A root this scan **did** walk (its seeding estate is populated normally) but where some
+    number of genuinely unclaimed files could not be cleared for the debris pile -- narrower than
+    `DiskReviewSkippedBasePathOut` on purpose (live use, 2026-08-23,
+    prompts/2026-08-23-auto-add-categories-default-excluded.md: a whole-root fail-closed
+    suppression had been hiding legitimate, already-claimed content that was never in danger).
+    See `core.disk_review.SuppressedDebrisItem`'s own docstring for the full reasoning.
+    """
+
+    root: str
+    count: int
+    reason: str
+
+
 class DiskReviewClientFailureOut(BaseModel):
     client_id: int
     client_name: str
@@ -2131,6 +2160,9 @@ class DiskReviewScanResponse(BaseModel):
     seeding_estate: list[DiskReviewSeedingEstateOut] = Field(default_factory=list)
     broken_seeds: list[DiskReviewBrokenSeedOut] = Field(default_factory=list)
     skipped_base_paths: list[DiskReviewSkippedBasePathOut] = Field(default_factory=list)
+    # 2026-08-23 -- see `DiskReviewSuppressedDebrisOut`'s own docstring for how this differs from
+    # `skipped_base_paths` above.
+    suppressed_debris: list[DiskReviewSuppressedDebrisOut] = Field(default_factory=list)
     client_failures: list[DiskReviewClientFailureOut] = Field(default_factory=list)
     scanned_at: str
 

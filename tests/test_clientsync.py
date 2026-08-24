@@ -31,6 +31,7 @@ from lftpweb.core.clientsync import (
     ClientSyncScheduler,
     UnattributedClientInfo,
     _PREFLIGHT_PHASES,
+    persist_observed_categories,
 )
 from lftpweb.core.clients.models import Transfer, TransferPhase
 from lftpweb.core.crypto import encrypt_secret
@@ -484,7 +485,7 @@ async def test_path_attribution_needs_no_category_mapping(db, tmp_path):
     rows = scheduler.preflight_rows(frozenset({instance_id}))
     assert len(rows) == 1
     assert rows[0].queue_id == queue_id
-    assert scheduler.unattributed_clients(frozenset({instance_id})) == []
+    assert await scheduler.unattributed_clients(frozenset({instance_id})) == []
 
 
 async def test_path_attribution_is_component_boundary_not_prefix(db, tmp_path):
@@ -501,7 +502,7 @@ async def test_path_attribution_is_component_boundary_not_prefix(db, tmp_path):
     await scheduler._update_preflight(instance_row, [transfer], now=NOW0)
 
     assert scheduler.preflight_rows(frozenset({instance_id})) == []
-    info = scheduler.unattributed_clients(frozenset({instance_id}))
+    info = await scheduler.unattributed_clients(frozenset({instance_id}))
     assert len(info) == 1
     assert info[0].no_category_count == 1  # no category on this transfer either
 
@@ -537,7 +538,7 @@ async def test_no_path_and_no_mapping_is_unattributable(db, tmp_path):
     await scheduler._update_preflight(instance_row, [transfer], now=NOW0)
 
     assert scheduler.preflight_rows(frozenset({instance_id})) == []
-    info = scheduler.unattributed_clients(frozenset({instance_id}))
+    info = await scheduler.unattributed_clients(frozenset({instance_id}))
     assert len(info) == 1
     assert info[0].categories == ()
     assert info[0].no_category_count == 1
@@ -570,12 +571,20 @@ async def test_path_and_category_disagree_path_wins_and_is_logged(db, tmp_path, 
 # --- Unattributed-clients banner (finding #2, 2026-08-23) ----------------------------------
 
 
-async def test_unattributed_clients_reports_a_client_with_items_but_no_mapping(
+async def test_unattributed_clients_is_silent_for_a_category_seen_for_the_first_time(
     db, fake_sabnzbd_server, tmp_path
 ):
-    """The exact live scenario finding #2 measured: an enabled, authenticating client reporting
-    real items, none of which have a category -> queue mapping. Previously silent; now surfaced,
-    now widened (round 4, live evidence) with which category names those items actually carried.
+    """**Superseded by 2026-08-23's own follow-up task** (finding #2's original live scenario:
+    an enabled, authenticating client reporting real items with no category -> queue mapping,
+    which used to surface here immediately). `persist_observed_categories` now runs *before*
+    this same pass's own `_update_preflight` (`_process_instance`'s own ordering), so a category
+    genuinely never seen before is auto-recorded as excluded ("not used here," the safer
+    default) before the banner's own request-time exclusion check ever runs -- so the very first
+    pass a brand-new category appears on produces **no** banner entry, immediately, not merely
+    "eventually." This is intentional: the old always-on nagging for a fresh category is exactly
+    what `ClientsTab.tsx`'s own "N new since you last looked" signal replaces it with.
+    `test_unattributed_clients_breaks_out_items_with_no_category_at_all` below covers the case
+    that still *does* fire -- a category already on file as undecided.
     """
     instance_id = await _seed_client(
         db,
@@ -591,14 +600,19 @@ async def test_unattributed_clients_reports_a_client_with_items_but_no_mapping(
     scheduler = ClientSyncScheduler(db=db, config_dir=str(tmp_path))
     await scheduler.run_once(now=NOW0)
     assert scheduler.preflight_rows(frozenset({instance_id})) == []
-    assert scheduler.unattributed_clients(frozenset({instance_id})) == [
-        UnattributedClientInfo(
-            instance_id=instance_id,
-            name="SABnzbd",
-            count=2,
-            categories=("ar-movies", "ar-tv"),
-            no_category_count=0,
-        )
+    assert await scheduler.unattributed_clients(frozenset({instance_id})) == []
+
+    # And Settings now shows both categories, excluded by default -- defect 1's own fix: they
+    # reached the database at all, not just the (now-silent) Preflight banner.
+    cursor = await db.execute(
+        "SELECT category, queue_id, excluded FROM download_client_category "
+        "WHERE client_id = ? ORDER BY category",
+        (instance_id,),
+    )
+    rows = await cursor.fetchall()
+    assert [(r["category"], r["queue_id"], bool(r["excluded"])) for r in rows] == [
+        ("ar-movies", None, True),
+        ("ar-tv", None, True),
     ]
 
 
@@ -609,6 +623,13 @@ async def test_unattributed_clients_breaks_out_items_with_no_category_at_all(
     different problems with different fixes -- conflating them into one count sends the user
     chasing a category mapping that was never the issue. One item carries a real, unmapped
     category; the other carries none at all -- the banner must be able to tell them apart.
+
+    **"ar-movies" is pre-seeded as an already-undecided row** (2026-08-23 follow-up,
+    `test_unattributed_clients_is_silent_for_a_category_seen_for_the_first_time` above) --
+    `persist_observed_categories` only ever inserts a category never seen before, so a category
+    already on file as undecided (a pre-migration row, or one a person manually reset) is left
+    exactly as it was, and the banner still fires for it. A category with no name at all is a
+    different, always-live case (`no_category_count`), never auto-excludable by category name.
     """
     instance_id = await _seed_client(
         db,
@@ -616,6 +637,7 @@ async def test_unattributed_clients_breaks_out_items_with_no_category_at_all(
         base_url=fake_sabnzbd_server.base_url,
         api_key=fake_sabnzbd_server.state.api_key,
     )
+    await _seed_category(db, instance_id, "ar-movies", queue_id=None, excluded=False)
     no_cat_slot = _queue_slot("nzo1")
     no_cat_slot["cat"] = ""  # SABnzbd's own "no category" shape
     fake_sabnzbd_server.state.queue_slots = [
@@ -625,7 +647,7 @@ async def test_unattributed_clients_breaks_out_items_with_no_category_at_all(
 
     scheduler = ClientSyncScheduler(db=db, config_dir=str(tmp_path))
     await scheduler.run_once(now=NOW0)
-    info = scheduler.unattributed_clients(frozenset({instance_id}))
+    info = await scheduler.unattributed_clients(frozenset({instance_id}))
     assert info == [
         UnattributedClientInfo(
             instance_id=instance_id,
@@ -657,24 +679,30 @@ async def test_unattributed_clients_omits_a_client_with_nothing_unattributable(
 
     scheduler = ClientSyncScheduler(db=db, config_dir=str(tmp_path))
     await scheduler.run_once(now=NOW0)
-    assert scheduler.unattributed_clients(frozenset({instance_id})) == []
+    assert await scheduler.unattributed_clients(frozenset({instance_id})) == []
 
 
 async def test_unattributed_clients_ignores_an_instance_not_in_the_enabled_set(
     db, fake_sabnzbd_server, tmp_path
 ):
+    """`ar-movies` is pre-seeded undecided -- see
+    `test_unattributed_clients_is_silent_for_a_category_seen_for_the_first_time`'s own docstring
+    for why a category never seen before would otherwise auto-exclude before this test's own
+    enabled-set assertion ever got to matter.
+    """
     instance_id = await _seed_client(
         db,
         str(tmp_path),
         base_url=fake_sabnzbd_server.base_url,
         api_key=fake_sabnzbd_server.state.api_key,
     )
+    await _seed_category(db, instance_id, "ar-movies", queue_id=None, excluded=False)
     fake_sabnzbd_server.state.queue_slots = [_queue_slot("nzo1", cat="ar-movies")]
 
     scheduler = ClientSyncScheduler(db=db, config_dir=str(tmp_path))
     await scheduler.run_once(now=NOW0)
-    assert scheduler.unattributed_clients(frozenset()) == []
-    assert scheduler.unattributed_clients(frozenset({instance_id})) == [
+    assert await scheduler.unattributed_clients(frozenset()) == []
+    assert await scheduler.unattributed_clients(frozenset({instance_id})) == [
         UnattributedClientInfo(
             instance_id=instance_id,
             name="SABnzbd",
@@ -704,7 +732,7 @@ async def test_excluded_category_transfer_is_omitted_and_not_counted(db, tmp_pat
     await scheduler._update_preflight(instance_row, [transfer], now=NOW0)
 
     assert scheduler.preflight_rows(frozenset({instance_id})) == []
-    assert scheduler.unattributed_clients(frozenset({instance_id})) == []
+    assert await scheduler.unattributed_clients(frozenset({instance_id})) == []
 
 
 async def test_client_fully_bound_or_excluded_produces_no_banner(db, tmp_path):
@@ -725,7 +753,7 @@ async def test_client_fully_bound_or_excluded_produces_no_banner(db, tmp_path):
     scheduler = ClientSyncScheduler(db=db, config_dir=str(tmp_path))
     await scheduler._update_preflight(instance_row, transfers, now=NOW0)
 
-    assert scheduler.unattributed_clients(frozenset({instance_id})) == []
+    assert await scheduler.unattributed_clients(frozenset({instance_id})) == []
     rows = scheduler.preflight_rows(frozenset({instance_id}))
     assert len(rows) == 1
     assert rows[0].download_id == "t1"
@@ -746,10 +774,170 @@ async def test_excluded_category_does_not_suppress_a_genuinely_unattributed_sibl
     scheduler = ClientSyncScheduler(db=db, config_dir=str(tmp_path))
     await scheduler._update_preflight(instance_row, transfers, now=NOW0)
 
-    info = scheduler.unattributed_clients(frozenset({instance_id}))
+    info = await scheduler.unattributed_clients(frozenset({instance_id}))
     assert len(info) == 1
     assert info[0].categories == ("ar-books",)
     assert info[0].count == 1
+
+
+async def test_excluding_a_category_clears_the_banner_without_another_poll_pass(db, tmp_path):
+    """The regression test for the live defect (2026-08-23,
+    prompts/2026-08-23-auto-add-categories-default-excluded.md): marking a category excluded in
+    Settings used to keep showing the banner until the *next poll pass* happened to run, because
+    the exclusion filter was baked into the cached count at poll time. `unattributed_clients` now
+    re-derives its verdict against a *fresh* `_excluded_categories` read on every call -- so
+    excluding a category between two calls, with no intervening `_update_preflight`, must be
+    reflected on the very next read. This must fail against the pre-fix code (where the poll-time
+    bake-in meant the banner kept showing the now-excluded category until another pass ran).
+    """
+    instance_id = await _seed_client(db, str(tmp_path), base_url="http://x.invalid", api_key="k")
+    await _seed_category(db, instance_id, "dc-tv", queue_id=None, excluded=False)
+    instance_row = await _preflight_instance_row(db, instance_id)
+    transfer = _content_transfer(category="dc-tv", content_path=None)
+
+    scheduler = ClientSyncScheduler(db=db, config_dir=str(tmp_path))
+    await scheduler._update_preflight(instance_row, [transfer], now=NOW0)
+
+    # Before excluding: the category is undecided, so the banner fires.
+    info = await scheduler.unattributed_clients(frozenset({instance_id}))
+    assert len(info) == 1
+    assert info[0].categories == ("dc-tv",)
+
+    # The user marks it excluded in Settings -- no poll pass happens in between.
+    await db.execute(
+        "UPDATE download_client_category SET excluded = 1, queue_id = NULL "
+        "WHERE client_id = ? AND category = ?",
+        (instance_id, "dc-tv"),
+    )
+    await db.commit()
+
+    # The very next read must already reflect it -- not "eventually, next poll."
+    assert await scheduler.unattributed_clients(frozenset({instance_id})) == []
+
+
+# --- Poller-observed categories are persisted (defect 1, 2026-08-23,
+# prompts/2026-08-23-auto-add-categories-default-excluded.md) -------------------------------
+
+
+async def test_persist_observed_categories_defaults_a_new_category_to_excluded(db, tmp_path):
+    """Defect 2, same task: a newly recorded category defaults to excluded ("not used here"),
+    not undecided -- the safer default for the two-lftpweb-instances-one-seedbox shape finding
+    #16 named (the other instance's categories keep appearing here forever; arriving excluded
+    means they're never walked, never proposed as debris, and never inside the delete
+    containment boundary until deliberately opted in).
+    """
+    instance_id = await _seed_client(db, str(tmp_path), base_url="http://x.invalid", api_key="k")
+    await persist_observed_categories(db, instance_id, ["dc-tv"])
+
+    cursor = await db.execute(
+        "SELECT queue_id, excluded, source, first_seen_at FROM download_client_category "
+        "WHERE client_id = ? AND category = ?",
+        (instance_id, "dc-tv"),
+    )
+    row = await cursor.fetchone()
+    assert row is not None
+    assert row["queue_id"] is None
+    assert bool(row["excluded"]) is True
+    assert row["source"] == "client"
+    assert row["first_seen_at"] is not None
+
+
+async def test_a_full_poll_pass_persists_every_category_it_observes(
+    db, fake_sabnzbd_server, tmp_path
+):
+    """End to end through `run_once` -- a category reported by a real poll pass (not a Test)
+    reaches `download_client_category` on its own, with no manual persistence call needed.
+    """
+    instance_id = await _seed_client(
+        db,
+        str(tmp_path),
+        base_url=fake_sabnzbd_server.base_url,
+        api_key=fake_sabnzbd_server.state.api_key,
+    )
+    fake_sabnzbd_server.state.queue_slots = [_queue_slot("nzo1", cat="dc-tv")]
+
+    scheduler = ClientSyncScheduler(db=db, config_dir=str(tmp_path))
+    await scheduler.run_once(now=NOW0)
+
+    cursor = await db.execute(
+        "SELECT queue_id, excluded FROM download_client_category "
+        "WHERE client_id = ? AND category = ?",
+        (instance_id, "dc-tv"),
+    )
+    row = await cursor.fetchone()
+    assert row is not None
+    assert row["queue_id"] is None
+    assert bool(row["excluded"]) is True
+
+
+async def test_banner_is_silent_for_a_client_whose_categories_are_all_newly_recorded_defaults(
+    db, tmp_path
+):
+    """The direct round trip: `persist_observed_categories` (defect 2's default) followed by a
+    poll pass reporting only that category must produce no banner entry at all -- the default
+    is quiet by construction, the same as an explicitly hand-excluded category (finding #15).
+    """
+    instance_id = await _seed_client(db, str(tmp_path), base_url="http://x.invalid", api_key="k")
+    await persist_observed_categories(db, instance_id, ["dc-tv"])
+    instance_row = await _preflight_instance_row(db, instance_id)
+    transfer = _content_transfer(category="dc-tv", content_path=None)
+
+    scheduler = ClientSyncScheduler(db=db, config_dir=str(tmp_path))
+    await scheduler._update_preflight(instance_row, [transfer], now=NOW0)
+
+    assert scheduler.preflight_rows(frozenset({instance_id})) == []
+    assert await scheduler.unattributed_clients(frozenset({instance_id})) == []
+
+
+async def test_opting_a_newly_recorded_category_into_a_queue_makes_it_attributable(db, tmp_path):
+    """A newly observed category defaults to excluded, but that is never permanent -- binding it
+    to a queue (the opt-in) must make its content attributable and scannable again, exactly as if
+    it had been bound from the start.
+    """
+    host_id = await _seed_host(db)
+    queue_id = await _seed_queue(db, host_id, remote_path="/complete/dc-tv")
+    instance_id = await _seed_client(db, str(tmp_path), base_url="http://x.invalid", api_key="k")
+    await persist_observed_categories(db, instance_id, ["dc-tv"])
+
+    # The opt-in: the user binds the category to a queue, which also clears `excluded`
+    # (mutually exclusive, `DownloadClientCategoryIn`'s own validator).
+    await db.execute(
+        "UPDATE download_client_category SET queue_id = ?, excluded = 0 "
+        "WHERE client_id = ? AND category = ?",
+        (queue_id, instance_id, "dc-tv"),
+    )
+    await db.commit()
+
+    instance_row = await _preflight_instance_row(db, instance_id)
+    transfer = _content_transfer(category="dc-tv", content_path=None)
+    scheduler = ClientSyncScheduler(db=db, config_dir=str(tmp_path))
+    await scheduler._update_preflight(instance_row, [transfer], now=NOW0)
+
+    rows = scheduler.preflight_rows(frozenset({instance_id}))
+    assert len(rows) == 1
+    assert rows[0].queue_id == queue_id
+    assert await scheduler.unattributed_clients(frozenset({instance_id})) == []
+
+
+async def test_persist_observed_categories_never_touches_an_already_decided_row(db, tmp_path):
+    """This function must never overwrite a saved decision -- an already-bound or already-
+    excluded category re-observed on a later pass is left completely alone.
+    """
+    host_id = await _seed_host(db)
+    queue_id = await _seed_queue(db, host_id)
+    instance_id = await _seed_client(db, str(tmp_path), base_url="http://x.invalid", api_key="k")
+    await _seed_category(db, instance_id, "ar-tv", queue_id=queue_id)
+
+    await persist_observed_categories(db, instance_id, ["ar-tv"])
+
+    cursor = await db.execute(
+        "SELECT queue_id, excluded FROM download_client_category "
+        "WHERE client_id = ? AND category = ?",
+        (instance_id, "ar-tv"),
+    )
+    row = await cursor.fetchone()
+    assert row["queue_id"] == queue_id
+    assert bool(row["excluded"]) is False
 
 
 # --- Observed attribution stats (Part 3, 2026-08-23) --------------------------------------------

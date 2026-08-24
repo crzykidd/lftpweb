@@ -36,6 +36,7 @@ from lftpweb.core.clients.detection import (
     verify_reported_paths,
 )
 from lftpweb.core.clients.errors import CapabilityUnavailable, ClientError, ClientUnreachable
+from lftpweb.core.clientsync import persist_observed_categories
 from lftpweb.core.crypto import DecryptionError, decrypt_secret, encrypt_secret
 from lftpweb.core.engine import load_host_config
 from lftpweb.models import (
@@ -241,12 +242,34 @@ async def _replace_base_paths(
 async def _replace_categories(
     db, client_id: int, categories: list[DownloadClientCategoryIn]
 ) -> None:
+    """Full replace (see this function's own module-level note on why), with one addition
+    (migration 032, 2026-08-23): a category's own `first_seen_at` -- when
+    `core.clientsync.persist_observed_categories` recorded it -- must survive the delete-then-
+    reinsert, or every Settings save would silently erase the "new since you last looked" signal
+    for every row already on file. Looked up before the `DELETE` below and carried forward for
+    any category name that already existed; a category new to *this* save (typed by hand via the
+    "Add category" escape hatch, or otherwise absent before) gets `NULL` -- the user just typed
+    or is otherwise directly asserting it in this very save, so it was never an unattended
+    observation to flag as new.
+    """
+    cursor = await db.execute(
+        "SELECT category, first_seen_at FROM download_client_category WHERE client_id = ?",
+        (client_id,),
+    )
+    prior_first_seen = {r["category"]: r["first_seen_at"] for r in await cursor.fetchall()}
     await db.execute("DELETE FROM download_client_category WHERE client_id = ?", (client_id,))
     for cat in categories:
         await db.execute(
             "INSERT INTO download_client_category (client_id, category, queue_id, source, "
-            "excluded) VALUES (?, ?, ?, ?, ?)",
-            (client_id, cat.category, cat.queue_id, cat.source, 1 if cat.excluded else 0),
+            "excluded, first_seen_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                client_id,
+                cat.category,
+                cat.queue_id,
+                cat.source,
+                1 if cat.excluded else 0,
+                prior_first_seen.get(cat.category),
+            ),
         )
 
 
@@ -356,7 +379,10 @@ _CLIENT_COLUMNS = (
     "detected_categories_json, detected_categories_at, "
     # The poller's own observed attribution counts (migration 031, Part 3 of this task) -- see
     # `DownloadClientOut.attribution_sample_size`'s own docstring.
-    "attribution_sample_size, attribution_matched_by_path"
+    "attribution_sample_size, attribution_matched_by_path, "
+    # The "new since you last looked" signal's own half (migration 032, 2026-08-23) -- see
+    # `DownloadClientOut.categories_acknowledged_at`'s own docstring.
+    "categories_acknowledged_at"
 )
 
 
@@ -388,8 +414,8 @@ async def _get_base_paths(db, client_id: int) -> list[DownloadClientBasePathOut]
 
 async def _get_categories(db, client_id: int) -> list[DownloadClientCategoryOut]:
     cursor = await db.execute(
-        "SELECT id, category, queue_id, source, excluded FROM download_client_category "
-        "WHERE client_id = ? ORDER BY id",
+        "SELECT id, category, queue_id, source, excluded, first_seen_at "
+        "FROM download_client_category WHERE client_id = ? ORDER BY id",
         (client_id,),
     )
     rows = await cursor.fetchall()
@@ -400,6 +426,7 @@ async def _get_categories(db, client_id: int) -> list[DownloadClientCategoryOut]
             queue_id=r["queue_id"],
             source=r["source"],
             excluded=bool(r["excluded"]),
+            first_seen_at=r["first_seen_at"],
         )
         for r in rows
     ]
@@ -443,6 +470,7 @@ async def _client_out_from_row(db, row) -> DownloadClientOut:
         detected_categories_at=row["detected_categories_at"],
         attribution_sample_size=row["attribution_sample_size"],
         attribution_matched_by_path=row["attribution_matched_by_path"],
+        categories_acknowledged_at=row["categories_acknowledged_at"],
     )
 
 
@@ -655,6 +683,33 @@ async def delete_client_instance(client_id: int, request: Request) -> None:
     await db.commit()
 
 
+@router.post("/clients/{client_id}/acknowledge-categories", response_model=DownloadClientOut)
+async def acknowledge_client_categories(client_id: int, request: Request) -> DownloadClientOut:
+    """The "new since you last looked" signal's own write side (migration 032, 2026-08-23,
+    prompts/2026-08-23-auto-add-categories-default-excluded.md) -- fired the moment
+    `ClientsTab.tsx` opens this instance for edit, no separate button and no confirmation (this
+    project's own "fewer clicks, not confirmations" house style). Deliberately the calm
+    replacement for the unattributed-clients banner's old always-on nagging: a newly observed
+    category now defaults to excluded (fail-closed, the safer default for a client shared with
+    another lftpweb instance on the same seedbox), so the banner falls silent for it -- but that
+    means one of the user's *own* new categories could otherwise sit unnoticed forever.
+    `categories_acknowledged_at` is what lets `ClientsTab.tsx` show "N new since you last looked"
+    on the Clients row and then clear it the instant the row is actually looked at, without ever
+    reintroducing a warning that never stops.
+    """
+    db = request.app.state.db
+    now = _now_iso()
+    cursor = await db.execute(
+        "UPDATE download_client SET categories_acknowledged_at = ? WHERE id = ?",
+        (now, client_id),
+    )
+    if cursor.rowcount == 0:
+        raise HTTPException(status_code=404, detail="download client not found")
+    await db.commit()
+    row = await _get_client_row(db, client_id)
+    return await _client_out_from_row(db, row)
+
+
 # --------------------------------------------------------------------------------------------
 # Test-connection, the probed capability layer, the capture (spec §4.1, §13.3), and base-path
 # detection (spec §8.2 correction, migration 028).
@@ -823,6 +878,14 @@ async def test_client_instance(client_id: int, request: Request) -> DownloadClie
 
     await _persist_capabilities(db, client_id, client_class.capabilities, version=info.version)
     await _persist_detected_categories(db, client_id, detected_categories)
+    # Defect 1 (2026-08-23, prompts/2026-08-23-auto-add-categories-default-excluded.md): "any
+    # category observed by EITHER route -- a Test, or a normal poll pass -- is recorded against
+    # the instance." `_persist_detected_categories` above only ever wrote the JSON hint blob this
+    # endpoint's own response/settings-page-reopen reads back; it never created a
+    # `download_client_category` row, so a category a Test reported but the user hadn't yet saved
+    # the form for was invisible to the poller's own attribution and to the banner. Same shared
+    # helper the poller calls -- one place decides "is this category new," never two.
+    await persist_observed_categories(db, client_id, detected_categories)
     return DownloadClientTestResponse(
         ok=True,
         error_class=None,

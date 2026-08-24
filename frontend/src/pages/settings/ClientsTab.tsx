@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { useSearchParams } from 'react-router-dom'
 import {
+  acknowledgeClientCategories,
   createClientInstance,
   deleteClientInstance,
   getHost,
@@ -31,6 +32,7 @@ import {
   computeCategoryRows,
   describeCategorySource,
   isStaleCategoryRow,
+  newCategoryCount,
   withExcludedToggle,
   withQueueSelection,
   type CategoryRowDraft,
@@ -627,6 +629,21 @@ export function ClientsTab() {
       categorySource,
       excludedPaths: instance.excluded_paths.map((ep) => ep.path),
     })
+
+    // The "new since you last looked" signal's own write side (2026-08-23) -- opening Edit *is*
+    // the acknowledgment, no separate button or confirmation (this project's own "fewer clicks,
+    // not confirmations" house style). Only fired when there's actually something to
+    // acknowledge, and fire-and-forget: a failure here just leaves the badge showing a little
+    // longer, never blocks editing.
+    if (newCategoryCount(instance.categories, instance.categories_acknowledged_at) > 0) {
+      acknowledgeClientCategories(instance.id)
+        .then((updated) => {
+          setInstances((prev) => prev.map((i) => (i.id === updated.id ? updated : i)))
+        })
+        .catch(() => {
+          // Best-effort -- see comment above.
+        })
+    }
   }
 
   const cancelEdit = () => {
@@ -951,13 +968,35 @@ export function ClientsTab() {
             {instances.map((instance) => {
               const result = testResults[instance.id]
               const capabilities = result?.capabilities ?? instance.capabilities
+              const newCategories = newCategoryCount(
+                instance.categories,
+                instance.categories_acknowledged_at,
+              )
               return (
                 <tr key={instance.id} className="border-t border-zinc-100 align-top dark:border-zinc-900">
                   <td className="px-3 py-2">{instance.name}</td>
                   <td className="px-3 py-2 font-mono text-xs">{instance.client_type}</td>
                   <td className="px-3 py-2">{instance.enabled ? 'yes' : 'no'}</td>
                   <td className="px-3 py-2 text-xs">{instance.base_paths.length}</td>
-                  <td className="px-3 py-2 text-xs">{instance.categories.length}</td>
+                  <td className="px-3 py-2 text-xs">
+                    <div className="flex items-center gap-1.5">
+                      <span>{instance.categories.length}</span>
+                      {/* The "new since you last looked" signal (2026-08-23) -- a calm count,
+                       * never a warning banner, replacing the unattributed-clients banner's old
+                       * always-on nagging now that a newly observed category defaults to
+                       * excluded and arrives silent there. Clears itself the instant Edit opens
+                       * this row (`startEdit`'s own `acknowledgeClientCategories` call) -- no
+                       * button, no confirmation. */}
+                      {newCategories > 0 && (
+                        <span
+                          title={`${newCategories} new categor${newCategories === 1 ? 'y' : 'ies'} since you last looked -- click Edit to review`}
+                          className="rounded-full bg-blue-100 px-1.5 py-0.5 text-[10px] font-medium text-blue-800 dark:bg-blue-900/50 dark:text-blue-200"
+                        >
+                          +{newCategories} new
+                        </span>
+                      )}
+                    </div>
+                  </td>
                   <td className="px-3 py-2 text-xs">
                     <ClientPollStatus instance={instance} />
                   </td>

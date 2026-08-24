@@ -21,6 +21,7 @@ from lftpweb.core.disk_review import (
     DiskEntry,
     InUsePath,
     SkippedBasePath,
+    SuppressedDebrisItem,
     _load_in_use_paths,  # testing Set C's own I/O helper directly, see the section below
     _resolve_client_exclusions,  # the pure derivation step behind `run_scan`'s own gathering
     freed_bytes,
@@ -48,13 +49,22 @@ def _file(root, rel_path, *, size=100, mtime=OLD_MTIME, inode=None, nlink=1, is_
     )
 
 
-def _claim(client_id, client_name, content_path, *, transfer_id="t1", transfer_name="Release"):
+def _claim(
+    client_id,
+    client_name,
+    content_path,
+    *,
+    transfer_id="t1",
+    transfer_name="Release",
+    category=None,
+):
     return ClientClaim(
         client_id=client_id,
         client_name=client_name,
         transfer_id=transfer_id,
         transfer_name=transfer_name,
         content_path=content_path,
+        category=category,
     )
 
 
@@ -611,9 +621,12 @@ def test_excluded_path_suppresses_broken_seed_reporting_too():
 
 
 def test_excluding_a_whole_base_path_protects_everything_under_it():
-    """Fail-closed's own shape (finding #16's "hard part"): when a category can't be resolved to
-    a path, `run_scan` excludes the client's *entire* declared base path -- asserted here at the
-    `reconcile()` level, where that shows up as the base path itself being in `excluded_paths`.
+    """A generic property of `excluded_paths`, not (as of 2026-08-23's narrowing, see the
+    "per-file fail-closed" section below) what `run_scan` does for a category that can't resolve
+    to a path anymore -- that case no longer excludes the whole root at all, only the genuinely
+    ambiguous unclaimed remainder (`debris_ambiguous_roots`). This still holds as a direct
+    property of `excluded_paths` itself: naming an entire root there (e.g. a manually-configured
+    exclusion covering a whole tree) protects everything under it, same as any sub-path.
     """
     root = "/rtorrent/data"
     entry = _file(root, "Some.Release/file.mkv")
@@ -627,6 +640,96 @@ def test_excluding_a_whole_base_path_protects_everything_under_it():
         )
     )
     assert result.debris == ()
+
+
+# ================================================================================================
+# Per-file fail-closed (live use, 2026-08-23, follow-up to finding #16): a category that cannot
+# resolve to a path (rTorrent) no longer suppresses its owning client's entire base path. A
+# CLAIMED file is resolved directly off its own transfer's category; only a genuinely UNCLAIMED
+# file under such a root is fail-closed, and even then the root's seeding estate stays populated.
+# ================================================================================================
+
+
+def test_claimed_content_in_an_excluded_category_is_hard_excluded_without_touching_the_root():
+    """A base path with both a bound category's claim and an excluded category's claim: the
+    bound content survives normally (seeding estate), the excluded content is dropped entirely --
+    and neither pile is suppressed for the *whole* root, unlike the old whole-base-path fail
+    closed behaviour.
+    """
+    root = "/rtorrent/data"
+    bound_file = _file(root, "Bound.Release/file.mkv", inode=1)
+    excluded_file = _file(root, "Excluded.Release/file.mkv", inode=2)
+    result = reconcile(
+        **_base(
+            base_paths=[root],
+            contributors=[BasePathContributor(root, client_id=2)],
+            reachable_client_ids=[2],
+            disk_entries=[bound_file, excluded_file],
+            claims=[
+                _claim(2, "rTorrent", f"{root}/Bound.Release", transfer_id="rt1", category="ar-tv"),
+                _claim(
+                    2,
+                    "rTorrent",
+                    f"{root}/Excluded.Release",
+                    transfer_id="rt2",
+                    category="other-site-movies",
+                ),
+            ],
+            excluded_categories_by_client={2: frozenset({"other-site-movies"})},
+            debris_ambiguous_roots={root: "other-site-movies cannot be resolved to a path"},
+        )
+    )
+    seeding_paths = {e.abs_path for e in result.seeding_estate}
+    debris_paths = {d.abs_path for d in result.debris}
+    assert bound_file.abs_path in seeding_paths
+    assert excluded_file.abs_path not in seeding_paths
+    assert excluded_file.abs_path not in debris_paths
+
+
+def test_a_genuinely_unclaimed_file_under_an_ambiguous_root_is_suppressed_with_a_reason():
+    """The one truly irreducible case: nobody claims this file at all, so there is no category to
+    read off a claim -- it might be the leftover of a since-vanished excluded-category transfer,
+    or genuine debris, and `reconcile` cannot tell which. Fail-closed, and named as
+    `suppressed_debris`, not silently dropped.
+    """
+    root = "/rtorrent/data"
+    orphan = _file(root, "Orphan.Release/file.mkv")
+    result = reconcile(
+        **_base(
+            base_paths=[root],
+            contributors=[BasePathContributor(root, client_id=2)],
+            reachable_client_ids=[2],
+            disk_entries=[orphan],
+            debris_ambiguous_roots={root: "other-site-movies cannot be resolved to a path"},
+        )
+    )
+    assert result.debris == ()
+    assert result.suppressed_debris == (
+        SuppressedDebrisItem(
+            root=root, count=1, reason="other-site-movies cannot be resolved to a path"
+        ),
+    )
+
+
+def test_seeding_estate_is_populated_even_when_debris_is_suppressed_for_that_path():
+    """The whole point of the narrowing: a root in `debris_ambiguous_roots` is still walked, and
+    its claimed content is still shown -- the old design's actual defect (live use: "there are
+    things in there in ar-tv that it doesn't show now") was suppressing this too.
+    """
+    root = "/rtorrent/data"
+    claimed = _file(root, "Bound.Release/file.mkv")
+    result = reconcile(
+        **_base(
+            base_paths=[root],
+            contributors=[BasePathContributor(root, client_id=2)],
+            reachable_client_ids=[2],
+            disk_entries=[claimed],
+            claims=[_claim(2, "rTorrent", f"{root}/Bound.Release", category="ar-tv")],
+            debris_ambiguous_roots={root: "some-other-category cannot be resolved to a path"},
+        )
+    )
+    assert len(result.seeding_estate) == 1
+    assert result.seeding_estate[0].abs_path == claimed.abs_path
 
 
 def test_resolve_category_exclusion_paths_joins_base_and_category():

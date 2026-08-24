@@ -5,6 +5,7 @@ import {
   describeCategorySource,
   inferCategoryMappings,
   isStaleCategoryRow,
+  newCategoryCount,
   suggestQueueForCategory,
   withExcludedToggle,
   withQueueSelection,
@@ -106,6 +107,15 @@ describe('computeCategoryRows', () => {
       { category: 'ar-tv', queue_id: 1, source: 'client', excluded: false },
       { category: 'ar-movies', queue_id: 2, source: 'client', excluded: false },
     ])
+  })
+
+  it('defaults a newly detected category with no suggested queue to excluded, not undecided', () => {
+    // 2026-08-23, prompts/2026-08-23-auto-add-categories-default-excluded.md, defect 2: a
+    // category with no direct name/path match to propose lands excluded ("not used here"), the
+    // safer default -- never undecided, which would put it inside the delete containment
+    // boundary and the scan's proposal set until someone happened to notice and act.
+    const { rows } = computeCategoryRows([], ['music'], [], QUEUES)
+    expect(rows).toEqual([{ category: 'music', queue_id: null, source: 'client', excluded: true }])
   })
 
   it('keeps an already-saved binding instead of overwriting it with a suggestion', () => {
@@ -332,5 +342,34 @@ describe('withQueueSelection / withExcludedToggle', () => {
     expect(afterQueue.excluded && afterQueue.queue_id != null).toBe(false)
     const afterExclude = withExcludedToggle(boundRow, true)
     expect(afterExclude.excluded && afterExclude.queue_id != null).toBe(false)
+  })
+})
+
+// --- "New since you last looked" (2026-08-23,
+// prompts/2026-08-23-auto-add-categories-default-excluded.md) -- the calm signal replacing the
+// unattributed-clients banner's old always-on nagging.
+
+describe('newCategoryCount', () => {
+  it('counts an observed category never acknowledged', () => {
+    const categories = [{ first_seen_at: '2026-08-23T10:00:00Z' }]
+    expect(newCategoryCount(categories, null)).toBe(1)
+  })
+
+  it('counts only categories observed after the acknowledgment', () => {
+    const categories = [
+      { first_seen_at: '2026-08-23T09:00:00Z' }, // before -- not new
+      { first_seen_at: '2026-08-23T11:00:00Z' }, // after -- new
+    ]
+    expect(newCategoryCount(categories, '2026-08-23T10:00:00Z')).toBe(1)
+  })
+
+  it('clears to zero once every observed category is acknowledged', () => {
+    const categories = [{ first_seen_at: '2026-08-23T10:00:00Z' }]
+    expect(newCategoryCount(categories, '2026-08-23T12:00:00Z')).toBe(0)
+  })
+
+  it('never counts a category with no first_seen_at (predates the migration, hand-typed, or survived a save)', () => {
+    const categories = [{ first_seen_at: null }]
+    expect(newCategoryCount(categories, null)).toBe(0)
   })
 })

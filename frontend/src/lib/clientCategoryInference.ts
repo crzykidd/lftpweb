@@ -183,11 +183,21 @@ export function computeCategoryRows(
       // rather than the manual row's own "always removable" escape hatch staying live for a
       // category that is, in fact, live.
       if (saved != null) return { ...saved, source: 'client' }
+      // A category with no `saved` row at all -- brand new to this draft. Propose the direct
+      // name/path-segment match when there is one (unchanged, spec §8.3's own "propose the
+      // right thing as a pre-selected value"); otherwise default to excluded, not undecided
+      // (2026-08-23, prompts/2026-08-23-auto-add-categories-default-excluded.md, defect 2 --
+      // the safer default for a category this client might share with another lftpweb instance
+      // on the same seedbox). In practice the backend now persists an observed category as
+      // excluded the moment it's first seen (`core.clientsync.persist_observed_categories`), so
+      // this branch mostly only matters for the same session's own Test response racing ahead
+      // of a re-fetch -- but it must never silently disagree with the backend's own default.
+      const suggestedQueueId = suggestQueueForCategory(category, queues)
       return {
         category,
-        queue_id: suggestQueueForCategory(category, queues),
+        queue_id: suggestedQueueId,
         source: 'client',
-        excluded: false,
+        excluded: suggestedQueueId == null,
       }
     })
     const detectedSet = new Set(detectedCategories)
@@ -277,4 +287,39 @@ export function canRemoveCategoryRow(
   detectedCategories: string[] | null,
 ): boolean {
   return row.source === 'manual' || isStaleCategoryRow(row.category, detectedCategories)
+}
+
+// --------------------------------------------------------------------------------------------
+// "New since you last looked" (migration 032, 2026-08-23,
+// prompts/2026-08-23-auto-add-categories-default-excluded.md) -- the calm replacement for the
+// unattributed-clients banner's old always-on nagging. A newly observed category now defaults to
+// excluded ("not used here," the safer default -- this instance may share a seedbox with another
+// lftpweb instance whose categories should never be walked or proposed as debris), so the banner
+// falls silent for it. Consequence handled here rather than ignored: one of the user's OWN new
+// categories would otherwise do nothing until noticed, with nothing left to nag about it. Chosen
+// signal: a plain count on the Clients row ("3 new categories since you last looked"), not a
+// warning banner -- that would just reintroduce the nagging this whole task removes. It clears
+// itself the instant the instance is opened for edit (`acknowledgeClientCategories`), no button,
+// no confirmation.
+// --------------------------------------------------------------------------------------------
+
+export interface CategoryForNewCount {
+  first_seen_at: string | null
+}
+
+/** How many of `categories` count as "new since you last looked" -- a category with a
+ * `first_seen_at` (only ever set by an automatic observation, never a manual add or a plain
+ * Settings save) that postdates `acknowledgedAt`, or `acknowledgedAt` is `null` ("never
+ * acknowledged," so every observed category counts). A category with no `first_seen_at` at all
+ * (predates migration 032, hand-typed, or survived a save) never counts -- there is nothing to
+ * be newly surprised by.
+ */
+export function newCategoryCount(
+  categories: CategoryForNewCount[],
+  acknowledgedAt: string | null,
+): number {
+  return categories.filter((c) => {
+    if (c.first_seen_at == null) return false
+    return acknowledgedAt == null || c.first_seen_at > acknowledgedAt
+  }).length
 }

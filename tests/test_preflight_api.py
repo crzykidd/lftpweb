@@ -297,9 +297,11 @@ def test_unattributed_client_shows_a_banner_line_with_its_count(isolated_config)
         # above pokes `app.state.engine.autoqueue.gated` -- this test isn't exercising the poller
         # itself, only this endpoint's read of its cache.
         app.state.client_sync._instance_names[instance_id] = "SABnzbd"
-        app.state.client_sync._unattributed_counts[instance_id] = 3
         # Round 4's own category breakdown (`core.clientsync.UnattributedClientInfo`) -- poked
-        # the same way, so this test also covers this endpoint's own field mapping for it.
+        # directly, so this test also covers this endpoint's own field mapping for it. `count`
+        # (3) is no longer a separate poked field (2026-08-23 fix) -- `unattributed_clients` now
+        # derives it fresh from this raw breakdown, filtered against a live exclusion read, every
+        # call, rather than trusting a second, possibly-stale cached number.
         app.state.client_sync._unattributed_categories[instance_id] = {
             "ar-movies": 2,
             None: 1,
@@ -339,7 +341,7 @@ def test_a_quiet_client_never_appears_in_the_unattributed_banner(isolated_config
             await app.state.db.commit()
 
         asyncio.run(_enable())
-        # Never touched `_unattributed_counts` -- a quiet client has nothing to say.
+        # Never touched `_unattributed_categories` -- a quiet client has nothing to say.
 
         resp = client.get("/api/queue/preflight")
         assert resp.json()["unattributed_clients"] == []

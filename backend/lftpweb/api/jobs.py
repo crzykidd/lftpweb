@@ -854,7 +854,7 @@ async def get_preflight(request: Request) -> PreflightResponse:
     cursor = await db.execute("SELECT id FROM download_client WHERE enabled = 1")
     all_enabled_client_ids = frozenset(row["id"] for row in await cursor.fetchall())
     unattributed_clients = (
-        client_sync.unattributed_clients(all_enabled_client_ids)
+        await client_sync.unattributed_clients(all_enabled_client_ids)
         if client_sync is not None and all_enabled_client_ids
         else []
     )

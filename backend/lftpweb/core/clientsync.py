@@ -125,6 +125,7 @@ import asyncio
 import json
 import logging
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
@@ -149,6 +150,61 @@ def _now_iso() -> str:
     module for.
     """
     return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
+async def persist_observed_categories(
+    db: aiosqlite.Connection, client_id: int, categories: Iterable[str]
+) -> None:
+    """Any category observed by **either** route -- a Test, or a normal poll pass -- is recorded
+    against the instance (live use, 2026-08-23,
+    prompts/2026-08-23-auto-add-categories-default-excluded.md, defect 1: *"the transfer page
+    says it sees dc-tv, but when I go to category it doesn't show it."*). Before this, only a
+    successful **Test**'s own `detected_categories` reached the database at all
+    (`api/settings_clients.py._persist_detected_categories`, JSON blob only, never a
+    `download_client_category` row) -- the poller observed a category on every single pass and
+    then discarded the observation, so a category that only ever appears *after* setup (the
+    normal case: rTorrent's own `list_categories` is `DERIVED`, spec §5, and can only report a
+    label *currently in use*) showed up on the Transfers page and was permanently invisible in
+    Settings, exactly backwards from what the user needs to go act on it.
+
+    Shared, module-level, and called from both routes (`_process_instance` below, and
+    `api/settings_clients.py.test_client_instance`) rather than living only on
+    `ClientSyncScheduler` -- the Test endpoint has no scheduler instance to call a method on, and
+    this has no per-instance state of its own to justify being one.
+
+    **Only ever INSERTs a category never before seen for this client; an already-known one
+    (bound, explicitly excluded, or still undecided -- e.g. a bound category whose queue was
+    since deleted, `ON DELETE SET NULL`) is left completely alone.** This function must never
+    overwrite a saved decision -- it only ever adds rows for names this instance has never
+    reported before.
+
+    **A newly recorded row defaults to `excluded = 1`, "not used here," not undecided** (the
+    same day's paired defect 2: the user runs two lftpweb instances against one shared seedbox,
+    so the other instance's categories keep appearing here forever; landing undecided put them
+    inside the delete-containment boundary and the scan's proposal set until someone happened to
+    notice and act, which is backwards for anything that leads to deletion). `first_seen_at`
+    (migration 032) stamps when, the source `ClientsTab.tsx`'s own "N new since you last looked"
+    signal reads from.
+    """
+    wanted = {c for c in categories if c}
+    if not wanted:
+        return
+    cursor = await db.execute(
+        "SELECT category FROM download_client_category WHERE client_id = ?", (client_id,)
+    )
+    existing = {row["category"] for row in await cursor.fetchall()}
+    new_categories = sorted(wanted - existing)
+    if not new_categories:
+        return
+    now = _now_iso()
+    for category in new_categories:
+        await db.execute(
+            "INSERT INTO download_client_category "
+            "(client_id, category, queue_id, source, excluded, first_seen_at) "
+            "VALUES (?, ?, NULL, 'client', 1, ?)",
+            (client_id, category, now),
+        )
+    await db.commit()
 
 
 # --- Two cadences (spec §9.1, corrected this stage -- see module docstring) --------------------
@@ -353,17 +409,17 @@ class ClientSyncScheduler:
         # ever looks at.
         self._instance_names: dict[int, str] = {}
         # Findings #2/reinforcing observation (2026-08-23, prompts/2026-08-23-tilde-and-
-        # visibility.md): instance id -> how many Preflight-eligible-phase transfers the most
-        # recent pass saw that could not be attributed to any queue (no category reported, or a
-        # category with no enabled mapping) -- `unattributed_clients` below's own source, and the
-        # Preflight box's "this client reports N items, none attributable" banner's only input.
-        # Refreshed every `_update_preflight` call, wholesale-replaced like every other per-
-        # instance cache in this module (never merged across passes).
-        self._unattributed_counts: dict[int, int] = {}
-        # Round 4 of the same finding (live evidence, 2026-08-23): the banner's own category
-        # breakdown for the count above -- instance id -> {category name (or `None` for "no
-        # category at all"): count}. Refreshed alongside `_unattributed_counts` every
-        # `_update_preflight` call, same wholesale-replace-per-pass shape.
+        # visibility.md), widened round 4 (live evidence, same day): instance id -> {category
+        # name (or `None` for "no category at all"): count} -- every Preflight-eligible-phase
+        # transfer the most recent pass saw that could not be attributed to any queue.
+        # `unattributed_clients` below's own source, and the Preflight box's "this client reports
+        # N items, none attributable" banner's only input. **Raw, not exclusion-filtered** (fix,
+        # 2026-08-23, prompts/2026-08-23-auto-add-categories-default-excluded.md) -- which
+        # categories are currently excluded is applied fresh on every `unattributed_clients` call,
+        # never baked in at poll time, or marking a category excluded in Settings would keep
+        # showing the banner until the next poll pass happened to run. Refreshed every
+        # `_update_preflight` call, wholesale-replaced like every other per-instance cache in this
+        # module (never merged across passes).
         self._unattributed_categories: dict[int, dict[str | None, int]] = {}
         # Same finding: which instance ids have completed at least one successful poll *this
         # process's lifetime* -- the guard behind the one-time `client_poll_first_success` audit
@@ -482,6 +538,15 @@ class ClientSyncScheduler:
 
             self._backoff.pop(instance_id, None)  # reachable (and authenticated) again
             await self._record_poll_result(instance_id, instance_name, ok=True, message=None)
+            # Defect 1 (2026-08-23, prompts/2026-08-23-auto-add-categories-default-excluded.md):
+            # every category this pass actually reported, over the whole transfer list -- not
+            # just the Preflight-eligible-phase subset `_update_preflight`'s own loop filters to
+            # (the identical "over every transfer this pass reported" reasoning
+            # `_attribution_sample` already uses) -- so a category only ever seen on a seeding or
+            # already-completed transfer still reaches Settings.
+            await persist_observed_categories(
+                self.db, instance_id, (t.category for t in transfers if t.category)
+            )
             await self._update_preflight(instance, transfers, now)
             if slow_due:
                 self._full_estate[instance_id] = {t.client_id: t for t in transfers}
@@ -705,23 +770,39 @@ class ClientSyncScheduler:
         this is not a claim that most setups need this control less; it depends entirely on
         whether the connector's own `content_path` happens to sit under a queue's `remote_path`.
 
-        **Excluded categories never reach the unattributed count** (finding #15/#16, 2026-08-23):
-        a category explicitly marked "not used by this instance" is exactly the deployment shape
-        this task exists for -- two lftpweb instances sharing one SABnzbd/rTorrent, each
-        permanently seeing the other's work. Counting it toward `unattributed_clients`'s own
-        banner would nag forever about work this instance is correctly ignoring, which is finding
-        #15's own "a banner that cannot be resolved stops carrying information."
+        **Excluded categories never reach the unattributed banner** (finding #15/#16,
+        2026-08-23): a category explicitly marked "not used by this instance" is exactly the
+        deployment shape this task exists for -- two lftpweb instances sharing one
+        SABnzbd/rTorrent, each permanently seeing the other's work. Counting it toward
+        `unattributed_clients`'s own banner would nag forever about work this instance is
+        correctly ignoring, which is finding #15's own "a banner that cannot be resolved stops
+        carrying information."
+
+        **The exclusion filter itself is applied at *request* time, not baked in here**
+        (defect, live use, 2026-08-23,
+        prompts/2026-08-23-auto-add-categories-default-excluded.md: marking a category excluded
+        in Settings kept showing the banner until the *next poll pass* happened to run --
+        "goes away a little later" -- because this method used to consult
+        `self._excluded_categories(instance_id)` once per poll and bake the resulting omission
+        straight into the cached count). `unattributed_categories` below is deliberately the
+        **raw** per-category breakdown -- every category a Preflight-eligible-phase transfer
+        this pass couldn't attribute to a queue, whether or not it happens to be excluded right
+        now -- and `unattributed_clients()` is what applies a *freshly read* exclusion set to it
+        on every call, exactly mirroring `core/arrsync.py.ArrSyncScheduler.preflight_rows`'s own
+        2026-08-21 "eviction latency" fix: cache the raw observation, re-derive the
+        currently-true verdict against live configuration on each read, one predicate
+        (`_excluded_categories`), never two.
         """
         instance_id = instance["id"]
         category_map = await self._category_queue_map(instance_id)
         path_queues = await self._enabled_queues()
-        excluded_categories = await self._excluded_categories(instance_id)
 
         seen: dict[str, PreflightRow] = {}
-        unattributed = 0
         # finding #2's banner, widened (live evidence, 2026-08-23): *which* categories are going
         # unattributed, not merely how many -- `None` keys a transfer that reported no category
         # at all, a distinct problem from "reported a category with no mapping" (different fix).
+        # **Raw** -- not yet filtered against which categories are currently excluded; see this
+        # method's own docstring above for why that filter moved to request time.
         unattributed_categories: dict[str | None, int] = {}
         for transfer in transfers:
             # Allowlist, not denylist (2026-08-23, findings #12/#4 -- see `_PREFLIGHT_PHASES`'s
@@ -759,14 +840,10 @@ class ClientSyncScheduler:
             elif category_queue is not None:
                 queue = category_queue
             else:
-                # Finding #15/#16: a category the user has explicitly marked "not used by this
-                # instance" is silently omitted **without** counting toward the unattributed
-                # banner -- the whole point of the three-state redesign. A transfer with no
+                # Raw tally -- whether this category is currently excluded is decided at request
+                # time (`unattributed_clients`'s own docstring), not here. A transfer with no
                 # category at all is unaffected (that's `no_category_count`'s own, different,
                 # problem).
-                if transfer.category is not None and transfer.category in excluded_categories:
-                    continue
-                unattributed += 1
                 key = transfer.category or None
                 unattributed_categories[key] = unattributed_categories.get(key, 0) + 1
                 continue
@@ -804,7 +881,6 @@ class ClientSyncScheduler:
                 download_id=transfer.client_id,
             )
 
-        self._unattributed_counts[instance_id] = unattributed
         self._unattributed_categories[instance_id] = unattributed_categories
 
         # Part 3 (2026-08-23): the observed attribution sample this pass produced -- over every
@@ -821,7 +897,7 @@ class ClientSyncScheduler:
         # the plain hold-then-expire path rather than `core/arrsync.py`'s active eviction.
         hold.update(seen, now=now)
 
-    def unattributed_clients(
+    async def unattributed_clients(
         self, enabled_instance_ids: frozenset[int]
     ) -> list["UnattributedClientInfo"]:
         """Finding #2 (2026-08-23): "a client with no category -> queue mapping contributes
@@ -843,11 +919,26 @@ class ClientSyncScheduler:
         mapping" are different problems with different fixes -- conflating them would send a
         user chasing a category mapping that was never the issue.
 
+        **Now `async`, and now a request-time exclusion re-check** (fix, 2026-08-23,
+        prompts/2026-08-23-auto-add-categories-default-excluded.md -- live use: marking a
+        category excluded didn't clear this banner until the *next poll pass* happened to run).
+        `_update_preflight`'s own `_unattributed_categories` cache is the **raw** breakdown, over
+        every category that failed attribution whether or not it happens to be excluded right
+        now; this method re-derives the currently-true verdict on every call, against a *fresh*
+        `_excluded_categories(instance_id)` read (the identical predicate `_update_preflight`
+        itself would have used pre-fix, now the one and only place that question is asked) --
+        mirrors `core/arrsync.py.ArrSyncScheduler.preflight_rows`'s own 2026-08-21 "eviction
+        latency" fix in shape: cache the raw poll-time observation, re-check it live on read,
+        never bake a config-dependent verdict into a cache that only refreshes once per poll
+        interval.
+
         **`0` is never included.** A client currently contributing nothing because it genuinely
         has nothing incoming right now is not the same fact as one silently dropping real items,
         and showing a permanent "0 unattributable" line for every quiet client would bury the
         one that actually needs attention -- the same "only surface what's actually wrong"
-        instinct `AutoQueue.gated`'s own banner already follows.
+        instinct `AutoQueue.gated`'s own banner already follows. A client whose raw breakdown is
+        entirely excluded categories now also produces nothing here, immediately -- not merely
+        "eventually, next poll."
 
         `enabled_instance_ids` here is deliberately **not** the same set `preflight_rows` takes
         (a bound, enabled category -> queue mapping) -- the whole point of this banner is to
@@ -856,9 +947,17 @@ class ClientSyncScheduler:
         """
         out: list[UnattributedClientInfo] = []
         for instance_id in enabled_instance_ids:
-            count = self._unattributed_counts.get(instance_id, 0)
+            raw = self._unattributed_categories.get(instance_id, {})
+            if not raw:
+                continue
+            excluded_categories = await self._excluded_categories(instance_id)
+            breakdown = {
+                category: n
+                for category, n in raw.items()
+                if category is None or category not in excluded_categories
+            }
+            count = sum(breakdown.values())
             if count > 0:
-                breakdown = self._unattributed_categories.get(instance_id, {})
                 categories = tuple(sorted(c for c in breakdown if c is not None))
                 no_category_count = breakdown.get(None, 0)
                 out.append(

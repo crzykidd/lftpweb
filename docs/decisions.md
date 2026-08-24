@@ -6,6 +6,72 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-23 — every observed category is recorded, defaulting to excluded (a reversal of round 5's own default) — plus two staleness fixes found in the same code
+
+`prompts/done/2026-08-23-auto-add-categories-default-excluded.md`, spec §8.3 round 6 (the section
+below, round 5, is what this reverses part of), findings #15/#16's own follow-up notes in
+`prompts/test-findings-2026-08-23.md`. Four defects reported from live use against the real
+seedbox the same day round 5 shipped:
+
+**1 — the poller never persisted a category, only a Test did.** `core.clientsync.
+persist_observed_categories` (migration 032) is now called from both routes (`_process_instance`
+and `test_client_instance`) — one function, so a category's "have I seen this before" question is
+answered in exactly one place regardless of which route asked it.
+
+**2 — REVERSAL: a newly recorded category now defaults to `excluded = 1`, not `queue_id = NULL,
+excluded = 0` (undecided).** Round 5 built the three-state model and correctly said the banner
+should warn only for undecided — but left *new* observations landing undecided, which is unsafe
+for the two-instances-one-seedbox shape the whole feature exists for: the other instance's
+categories would sit exposed (walkable, proposable as debris, inside the delete containment
+boundary) until someone happened to notice and exclude them by hand. Landing excluded by default
+is fail-closed, this project's house style for anything that leads to deletion, and matches the
+user's own words: *"By default a category should be not used here until the user overrides the
+setting."*
+
+**Kept, not removed: the "undecided" state.** Tempting to call it dead now that nothing produces
+it fresh, but `download_client_category.queue_id REFERENCES path_queue (id) ON DELETE SET NULL`
+(migration 027) means deleting a bound category's queue produces exactly this state as a live,
+ongoing side effect — and the banner correctly *should* still warn about that (a broken mapping
+is real information, not noise). Verified this wasn't a theoretical concern before deciding to
+keep the state: it's a genuine, reachable path today, just not one a fresh poll/Test observation
+takes anymore.
+
+**3 — the calm replacement for the (now largely silent) banner: "N new categories since you last
+looked" on the Clients row**, not a second warning banner (explicitly rejected — that's exactly
+what this task removes). `download_client.categories_acknowledged_at` +
+`download_client_category.first_seen_at` (migration 032), compared by the pure
+`newCategoryCount` (`lib/clientCategoryInference.ts`). Cleared by opening the instance for edit
+(`POST .../acknowledge-categories`) — no button, no confirmation, matching this project's
+established "fewer clicks, not confirmations" preference. Considered and rejected: sorting new
+categories to the top of the settings list with a visual mark — a plain count was judged calmer
+and needed no change to the category table's existing ordering.
+
+**4 — two staleness bugs found mid-session, in the code this task was already touching, both
+fixed the same way: cache the raw observation, re-derive the live verdict on every read, never
+bake a config-dependent answer into a once-per-poll-interval cache.** This is `core/arrsync.py.
+ArrSyncScheduler.preflight_rows`'s own 2026-08-21 "eviction latency" fix, applied twice more:
+
+- The unattributed-clients banner was filtering by exclusion at *poll* time
+  (`_update_preflight`), so excluding a category in Settings didn't clear the banner until the
+  next poll pass ran. `ClientSyncScheduler.unattributed_clients` is now `async`, and re-reads the
+  current exclusion set on every call against a raw, unfiltered per-category cache.
+- The disk-review scan's fail-closed rule for an unresolvable-category client (rTorrent) was
+  suppressing debris for that client's **entire declared base path** — which also hid its seeding
+  estate, live evidence: *"there are things in there in ar-tv that it doesn't show now."* Narrowed
+  to a per-file rule: `ClientClaim` now carries the claiming transfer's own `category`, so a
+  **claimed** file is resolved directly (bound survives, excluded is dropped) with no path
+  arithmetic and no per-client special case; only a genuinely **unclaimed** file under such a root
+  is still ambiguous (it might be the leftover of a since-vanished excluded-category claim) and
+  is fail-closed, reported as `SuppressedDebrisItem` ("N items suppressed"), never a whole-root
+  `SkippedBasePath` ("N base paths skipped"). The root is always walked now; only its unclaimed
+  remainder's debris eligibility is narrowed.
+
+Not verified against the user's real two-instance deployment or in a real browser — same
+limitation every round of this feature has named; `newCategoryCount`/the acknowledge endpoint's
+UI wiring is covered by unit/component tests only.
+
+---
+
 ## 2026-08-23 — three-state categories, path exclusion as the enforceable primitive, and observed-attribution copy (round 5)
 
 `prompts/done/2026-08-23-category-tristate-and-exclusion.md`, resolving findings #15/#16 in

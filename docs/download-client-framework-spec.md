@@ -706,6 +706,60 @@ required," the same sentence template for SABnzbd and rTorrent alike, driven by 
 observed rather than a hardcoded "usenet doesn't need it, torrent does." That generalisation had
 already been wrong four times before this correction (§8.3's own round-3/round-4 history above).
 
+### 8.3 correction, round 6 (2026-08-23) — every observed category is recorded, defaulting to
+excluded; the banner and the scan's fail-closed rule are both narrowed to what's actually true
+
+Four defects reported the same day, against a real seedbox, in the code round 5 above just
+shipped (`prompts/2026-08-23-auto-add-categories-default-excluded.md`):
+
+1. **A category the poller sees never reached Settings.** Only a manual **Test**'s own
+   `detected_categories` were ever written to `download_client_category` — the poller observed a
+   category on every pass and discarded the observation. `core.clientsync.
+   persist_observed_categories` (migration 032) is now called from **both** routes (a poll pass,
+   in `_process_instance`, and `test_client_instance`) — one function, so "is this category new"
+   is never answered twice. Only ever **inserts** a category never seen before; an already-decided
+   row (bound, excluded, or a queue-deleted-back-to-undecided one, below) is never touched.
+2. **This reverses round 5's own default.** A newly recorded category now lands **`excluded = 1`**
+   ("not used here"), not undecided — the safer default, not merely the quieter one, for the
+   two-instances-one-seedbox shape this whole correction exists for: arriving excluded means the
+   content is never walked, never proposed as debris, and never inside the §10.2 containment
+   boundary until a person deliberately opts it in, rather than sitting exposed until someone
+   happens to notice and act.
+3. **The "undecided" state is kept, not removed** — it is not actually unreachable: `download_
+   client_category.queue_id REFERENCES path_queue (id) ON DELETE SET NULL` (migration 027) means
+   deleting a bound category's queue produces exactly this state as a side effect, and the banner
+   correctly should still warn about it (a broken mapping the user needs to know about). What
+   changed is only which state a *fresh observation* lands in.
+4. **Consequence handled, not ignored: the banner going quiet for excluded categories means one of
+   the user's own new categories could do nothing unnoticed.** Not solved with a second banner —
+   `download_client.categories_acknowledged_at` (migration 032) plus each category's own
+   `first_seen_at` drive a calm count on the Clients row (`newCategoryCount`, "+N new"), cleared
+   the instant the instance is opened for edit (`POST .../acknowledge-categories`), no button, no
+   confirmation.
+
+**Two more defects surfaced in the same live session, both about staleness in the code this
+correction touches:**
+
+5. **The unattributed-clients banner was computed and cached at *poll* time**, so excluding a
+   category in Settings didn't clear it until the next poll pass happened to run.
+   `ClientSyncScheduler.unattributed_clients` now mirrors `core/arrsync.py.ArrSyncScheduler.
+   preflight_rows`'s own 2026-08-21 "eviction latency" fix exactly: `_update_preflight` caches
+   only the **raw**, unfiltered per-category breakdown; `unattributed_clients` re-applies a
+   **freshly read** exclusion set on every call. One predicate, one place the question is asked,
+   never baked into a once-per-poll-interval cache.
+6. **Round 5's fail-closed rule (`### round 5` above) was too blunt.** Suppressing debris for a
+   client's *entire* declared base path when a category couldn't resolve to a path also hid that
+   root's **seeding estate** — legitimate, already-claimed content that was never at risk, live
+   evidence: *"there are things in there in ar-tv that it doesn't show now."* Narrowed to a
+   per-file rule: a **claimed** file is resolved directly off its own transfer's category
+   (`ClientClaim.category`, universal, no path arithmetic needed) — bound survives normally,
+   excluded is dropped outright, for every client, not only the ones a category can't resolve a
+   path for. Only a genuinely **unclaimed** file under such a root remains ambiguous (it might be
+   the leftover of a since-vanished excluded-category claim) and is fail-closed —
+   `core/disk_review.py`'s new `debris_ambiguous_roots`/`SuppressedDebrisItem`, reported as "N
+   items suppressed," never "N base paths skipped." The root is still walked; only debris
+   proposals for its unclaimed remainder are narrowed.
+
 ---
 
 ## 9. Polling
@@ -1401,7 +1455,7 @@ Each stage is independently shippable. Nothing before stage 5 can delete anythin
 | **2** | The poller (§9), SAB as a third Preflight source, the settle-gate skip | #18's first real user-facing payoff. **2a (the poller + Preflight source) landed 2026-08-23** (`prompts/done/2026-08-23-client-poller.md`). **2b (the settle-gate skip itself) landed 2026-08-23** (`prompts/done/2026-08-23-settle-gate-skip.md`) -- ships **off** (`settle.SettleSettings.client_skip_enabled`, default `False`) pending live confirmation of §13.4 guess #2 against a real SABnzbd; every uncertain path (setting off, no client-sync source wired, unreachable client, blank/empty response, a queue-side or `UNKNOWN` phase, a near-miss path) falls back to running the settle gate exactly as it ran before this stage. **A terminal `COMPLETED` verdict no longer satisfies the gate the instant it's seen** (2026-08-23, `prompts/done/2026-08-23-client-completion-delay.md`, finding #9) -- it now holds `settle.CLIENT_COMPLETION_HOLD_S` (10s) first, measured from the client's own `completed_at` (a completion already older than the hold satisfies it immediately; falls back to lftpweb's own first-observation time only when a connector reports no `completed_at`) |
 | **3** | Withhold on partial failure (`docs/transfers-redesign-spec.md` §4.3), and the §9.1 poll-cadence fix | **Landed 2026-08-23** (`prompts/done/2026-08-23-withhold-and-cadence.md`). The cadence split is corrected to cheap-vs-expensive, read per-connector off `Operation.LIST_HISTORY`'s own capability declaration (§9.1's own correction note). The withhold gate ships **off** (`autoqueue.WithholdSettings.enabled`, default `False`) pending live confirmation of §13.4 guess #2 against a real SABnzbd, for the identical reason stage 2b's `client_skip_enabled` shipped off -- every uncertain path (setting off, no client-sync source wired, unreachable client, blank/empty response, a queue-side or `UNKNOWN` phase, an outright failure with no `content_path`, a near-miss path) falls back to today's behavior unchanged. No API/UI surface shipped this stage -- `AutoQueue.withheld` is public and readable, but nothing reads it yet; named as an open gap, not hidden |
 | **4** | The disk review scan (§11), both buckets, review-only | **Landed 2026-08-23** (`prompts/done/2026-08-23-disk-review-scan.md`). `core/disk_review.py.reconcile()` is pure set math over Set A/B/C, unit-tested exhaustively without SSH -- the §11.1a union-across-clients catastrophe and the §11.1b inode-claiming catastrophe are both asserted directly. `core/remote.py.RemoteConnectionPool.scan_with_inodes` extends the existing GNU-`find`/BusyBox-fallback scan with `%i`/`%n`; the fallback (`remote_agent/scan_fs.py --inodes`) supplies inode/nlink too (`os.lstat`, stdlib-only), so there is no "BusyBox can't do this" case needing the unavailable-declaration path -- it exists (`RemoteScanError` propagates rather than degrading) but is untriggered by inode support itself, only by a genuine walk failure. `POST /api/disk-review/scan`, manual trigger only (§11.3); a Transfers → Disk review tab shows the two piles with a link-aware running total. Not yet looked at against the real box -- see this task's own final report for what remains named as a gap (multi-filesystem inode collisions, prefix-vs-exact mount-sentinel matching, empty-directory debris) before stage 5 |
-| **5** | The delete pipeline (§10), manual trigger, verification, banner | **Findings #15/#16's gate is cleared** (2026-08-23, `prompts/done/2026-08-23-category-tristate-and-exclusion.md`, §8.3 round 5). Categories are three-state and persisted (migration 031); the unattributed-clients banner counts only the undecided state; excluded categories/paths are dropped from `core/disk_review.py.reconcile()` before any candidate logic runs, with a fail-closed suppression of a client's whole base path where a category can't be resolved to one; `core/disk_review.py.is_authorized_delete_target` gives stage 5 a ready-made, already-tested two-sided containment check (base path **and** outside every excluded path). **What still stands in the way of building stage 5 itself:** (1) none of this has been exercised against the user's real two-instance deployment — a scan, an excluded category, and a fail-closed base path all need a live run before anything is trusted to delete; (2) `is_authorized_delete_target` is unit-tested but unused — stage 5's own delete sequence (§10.2) must actually call it, not re-derive containment; (3) the manual excluded-paths UI (`ClientsTab.tsx`) is unverified in a real browser, same as every other layout change in this feature; (4) §11.1c/§10.4/§10.5's own named gaps (cross-seeding, multi-filesystem inode collisions) remain open regardless of this task. Stage 4's own real-box verification (named in its own §14 row) is still outstanding too and should happen before, not after, stage 5 |
+| **5** | The delete pipeline (§10), manual trigger, verification, banner | **Findings #15/#16's gate is cleared** (2026-08-23, `prompts/done/2026-08-23-category-tristate-and-exclusion.md`, §8.3 round 5, **corrected in round 6 the same day** by live use against the real box, `prompts/done/2026-08-23-auto-add-categories-default-excluded.md`). Categories are three-state and persisted (migration 031, every observation now recorded via migration 032, not just a manual Test); the unattributed-clients banner counts only the undecided state, re-derived at **request time** against a live exclusion read (round 6 fixed a poll-interval staleness bug here); excluded categories are dropped per-file off their own claim's category (round 6, universal, no path arithmetic needed) with a narrower fail-closed rule for the genuinely unclaimed remainder only — a whole base path is never blanket-suppressed anymore, only ambiguous unclaimed files (round 5's version of this rule hid legitimate, already-claimed content that was never at risk); `core/disk_review.py.is_authorized_delete_target` gives stage 5 a ready-made, already-tested two-sided containment check (base path **and** outside every excluded path). **What still stands in the way of building stage 5 itself:** (1) none of this has been exercised against the user's real two-instance deployment beyond the live findings rounds 5/6 already fixed — a scan, an excluded category, and the narrowed fail-closed rule all still need a full live run before anything is trusted to delete; (2) `is_authorized_delete_target` is unit-tested but unused — stage 5's own delete sequence (§10.2) must actually call it, not re-derive containment; (3) the manual excluded-paths UI (`ClientsTab.tsx`) and the new "N new categories" signal are unverified in a real browser, same as every other layout change in this feature; (4) §11.1c/§10.4/§10.5's own named gaps (cross-seeding, multi-filesystem inode collisions) remain open regardless of this task. Stage 4's own real-box verification (named in its own §14 row) is still outstanding too and should happen before, not after, stage 5 |
 
 **Deletion is stage 5 deliberately.** The scan gets built and inspected against a real seeding
 estate before any code path is allowed to remove. Auto mode is the same code minus the trigger, and

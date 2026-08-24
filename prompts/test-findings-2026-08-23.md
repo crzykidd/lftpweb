@@ -1058,6 +1058,32 @@ and two new `tests/test_settings_clients_api.py` cases (the excluded-paths CRUD 
 cascade-delete). **Not verified against the user's real two-instance deployment** — see this
 task's own final report for what that leaves standing before stage 5.
 
+### Follow-up 2026-08-23 — four more defects from the same live use, one of them a reversal
+
+`prompts/done/2026-08-23-auto-add-categories-default-excluded.md`, `docs/decisions.md`, spec §8.3
+round 6. The user kept using the box after round 5 shipped and found four more things wrong with
+it the same day:
+
+- **#15's poller/Test asymmetry was still there in practice**: only a Test wrote a
+  `download_client_category` row, so a category the poller saw (the normal case for rTorrent,
+  whose `list_categories` only reports labels currently in use) never reached Settings at all —
+  *"the transfer page says it sees dc-tv, but when I go to category it doesn't show it."* Fixed:
+  `core.clientsync.persist_observed_categories`, called from both routes.
+- **REVERSES round 5's own default**: *"By default a category should be not used here until the
+  user overrides the setting"* — correct, and safer, not merely quieter, given #16's shared-seedbox
+  shape. A newly recorded category now lands excluded, not undecided. The "undecided" state
+  itself is kept — verified it's still reachable via a bound category's queue being deleted
+  (`ON DELETE SET NULL`), not vestigial.
+- **Consequence handled, not hidden**: excluding-by-default means the banner goes quiet for a
+  brand-new category, including the user's own. Resolved with a calm count, not a second banner —
+  see `docs/decisions.md`'s own entry for the exact shape.
+- **Two staleness bugs, found mid-session, in this same code**: the unattributed-clients banner
+  was computed at poll time (excluding a category in Settings didn't clear it until the next poll
+  pass — mirrors `core/arrsync.py`'s own 2026-08-21 "eviction latency" fix, now applied here too),
+  and round 5's fail-closed rule was suppressing a whole base path's seeding estate along with its
+  debris — *"there are things in there in ar-tv that it doesn't show now."* Narrowed to a per-file
+  rule off each claim's own category; only a genuinely unclaimed file stays fail-closed.
+
 ---
 
 ## 17. Ambiguous items should be SHOWN as a third "unclaimed" pile, not suppressed

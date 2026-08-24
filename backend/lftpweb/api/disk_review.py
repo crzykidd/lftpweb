@@ -27,6 +27,7 @@ from lftpweb.models import (
     DiskReviewScanResponse,
     DiskReviewSeedingEstateOut,
     DiskReviewSkippedBasePathOut,
+    DiskReviewSuppressedDebrisOut,
 )
 
 router = APIRouter(prefix="/api/disk-review")
@@ -109,6 +110,10 @@ async def scan_for_review(request: Request) -> DiskReviewScanResponse:
         skipped_base_paths=[
             DiskReviewSkippedBasePathOut(root=s.root, reason=s.reason)
             for s in result.skipped_base_paths
+        ],
+        suppressed_debris=[
+            DiskReviewSuppressedDebrisOut(root=s.root, count=s.count, reason=s.reason)
+            for s in result.suppressed_debris
         ],
         client_failures=[
             DiskReviewClientFailureOut(

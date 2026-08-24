@@ -298,6 +298,10 @@ def test_unbound_category_survives_a_save_and_a_re_edit(isolated_config):
                 "queue_id": None,
                 "source": "client",
                 "excluded": False,
+                # A category introduced via a direct Settings save, never an observation
+                # (migration 032) -- the user just asserted it themselves, so it was never "new
+                # to them" the way an unattended poll/Test observation is.
+                "first_seen_at": None,
             }
         ]
 
@@ -342,6 +346,7 @@ def test_excluded_category_survives_a_save_and_a_re_edit(isolated_config):
                 "queue_id": None,
                 "source": "client",
                 "excluded": True,
+                "first_seen_at": None,
             }
         ]
         client_id = resp.json()["id"]
@@ -429,6 +434,75 @@ def test_attribution_stats_are_none_before_the_poller_has_ever_run(isolated_conf
         assert created["attribution_matched_by_path"] is None
 
 
+# --- "New since you last looked" (migration 032, 2026-08-23,
+# prompts/2026-08-23-auto-add-categories-default-excluded.md) -- the calm replacement for the
+# unattributed-clients banner's old always-on nagging, now that a newly observed category
+# defaults to excluded and the banner falls silent for it. -------------------------------------
+
+
+def test_a_freshly_created_instance_has_never_acknowledged_categories(isolated_config):
+    with TestClient(app) as client:
+        resp = client.post("/api/settings/clients", json=_sab_body())
+        assert resp.status_code == 201, resp.text
+        assert resp.json()["categories_acknowledged_at"] is None
+
+
+def test_acknowledge_categories_stamps_the_instance_and_survives_a_reread(isolated_config):
+    with TestClient(app) as client:
+        resp = client.post("/api/settings/clients", json=_sab_body())
+        client_id = resp.json()["id"]
+        assert resp.json()["categories_acknowledged_at"] is None
+
+        resp = client.post(f"/api/settings/clients/{client_id}/acknowledge-categories")
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["categories_acknowledged_at"] is not None
+
+        reread = client.get("/api/settings/clients").json()[0]
+        assert reread["categories_acknowledged_at"] is not None
+
+
+def test_acknowledge_categories_requires_an_existing_instance(isolated_config):
+    with TestClient(app) as client:
+        resp = client.post("/api/settings/clients/999999/acknowledge-categories")
+        assert resp.status_code == 404
+
+
+def test_a_settings_save_carries_a_category_s_first_seen_at_across_the_replace(
+    isolated_config, fake_sabnzbd_server
+):
+    """`_replace_categories` fully deletes and reinserts on every save (no stage 1b-ii-era client
+    UI depends on a stable child-row id surviving an edit) -- but a category's own `first_seen_at`
+    must survive that round trip regardless, or the "new since you last looked" signal would reset
+    to `None` (never new again, forever) the moment a user saved Settings for any unrelated reason.
+    """
+    fake_sabnzbd_server.state.category_names = ["*", "dc-tv"]
+    with TestClient(app) as client:
+        resp = client.post("/api/settings/clients", json=_sab_body_for(fake_sabnzbd_server))
+        client_id = resp.json()["id"]
+
+        resp = client.post(f"/api/settings/clients/{client_id}/test")
+        assert resp.status_code == 200
+
+        stored = client.get("/api/settings/clients").json()[0]
+        first_seen_at = next(
+            c["first_seen_at"] for c in stored["categories"] if c["category"] == "dc-tv"
+        )
+        assert first_seen_at is not None
+
+        # A save that keeps the same category (still excluded) must not blank out its
+        # `first_seen_at`.
+        resp = client.put(
+            f"/api/settings/clients/{client_id}",
+            json=_sab_body_for(
+                fake_sabnzbd_server,
+                categories=[{"category": "dc-tv", "queue_id": None, "excluded": True}],
+            ),
+        )
+        assert resp.status_code == 200, resp.text
+        saved = next(c for c in resp.json()["categories"] if c["category"] == "dc-tv")
+        assert saved["first_seen_at"] == first_seen_at
+
+
 # --- GET /api/settings/client-types ----------------------------------------------------------
 
 
@@ -501,8 +575,10 @@ def test_create_accepts_a_base_path_that_really_exists_on_the_live_seedbox(isola
 # --- Test-connection against the real SABnzbd connector + fake server ------------------------
 
 
-def _sab_body_for(server) -> dict:
-    return _sab_body(config={"base_url": server.base_url, "api_key": server.state.api_key})
+def _sab_body_for(server, **overrides) -> dict:
+    return _sab_body(
+        config={"base_url": server.base_url, "api_key": server.state.api_key}, **overrides
+    )
 
 
 def test_test_connection_success_persists_capabilities_and_version(
@@ -921,13 +997,23 @@ def test_test_connection_reports_the_clients_own_categories(isolated_config, fak
         assert body["ok"] is True
         assert sorted(body["detected_categories"]) == ["movies", "tv"]
 
-        # Detection proposes; it never saves a category -> queue mapping -- exactly like base
-        # paths. It **does** now persist the raw detected list itself (migration 030, this task)
-        # -- a different thing, the settings page's own "what did the last Test see" memory.
+        # Detection never saves a category -> queue *mapping* -- exactly like base paths, a
+        # binding is still a deliberate opt-in, never auto-applied. It **does** now persist the
+        # raw detected list itself (migration 030, this task, "what did the last Test see"
+        # memory), and (2026-08-23, defect 1 -- "any category observed by either route is
+        # recorded") a `download_client_category` **row** for each one never seen before,
+        # defaulting to excluded ("not used here," defect 2 -- the safer default) rather than
+        # undecided.
         stored = client.get("/api/settings/clients").json()[0]
-        assert stored["categories"] == []
         assert sorted(stored["detected_categories"]) == ["movies", "tv"]
         assert stored["detected_categories_at"] is not None
+        by_name = {c["category"]: c for c in stored["categories"]}
+        assert set(by_name) == {"movies", "tv"}
+        for cat in by_name.values():
+            assert cat["queue_id"] is None
+            assert cat["excluded"] is True
+            assert cat["source"] == "client"
+            assert cat["first_seen_at"] is not None
 
 
 def test_test_connection_reports_no_categories_when_the_client_has_none_configured(

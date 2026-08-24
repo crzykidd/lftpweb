@@ -87,6 +87,7 @@ function instance(overrides: Partial<DownloadClientOut> = {}): DownloadClientOut
     detected_categories_at: null,
     attribution_sample_size: null,
     attribution_matched_by_path: null,
+    categories_acknowledged_at: null,
     ...overrides,
   }
 }
@@ -378,8 +379,8 @@ describe('ClientsTab', () => {
     mockListClientInstances.mockResolvedValue([
       instance({
         categories: [
-          { id: 1, category: 'ar-tv', queue_id: 5, source: 'client', excluded: false },
-          { id: 2, category: 'old-cat', queue_id: 5, source: 'client', excluded: false },
+          { id: 1, category: 'ar-tv', queue_id: 5, source: 'client', excluded: false, first_seen_at: null },
+          { id: 2, category: 'old-cat', queue_id: 5, source: 'client', excluded: false, first_seen_at: null },
         ],
       }),
     ])
@@ -737,7 +738,9 @@ describe('ClientsTab', () => {
     mockListQueues.mockResolvedValue([queueA, queueB] as never)
     mockListClientInstances.mockResolvedValue([
       instance({
-        categories: [{ id: 1, category: 'ar-tv', queue_id: null, source: 'client', excluded: false }],
+        categories: [
+          { id: 1, category: 'ar-tv', queue_id: null, source: 'client', excluded: false, first_seen_at: null },
+        ],
       }),
     ])
     mockTestClientInstance.mockResolvedValue({
@@ -887,7 +890,9 @@ describe('ClientsTab', () => {
     mockListClientTypes.mockResolvedValue([USENET_TYPE])
     mockListClientInstances.mockResolvedValue([
       instance({
-        categories: [{ id: 1, category: 'ar-tv', queue_id: null, source: 'manual', excluded: false }],
+        categories: [
+          { id: 1, category: 'ar-tv', queue_id: null, source: 'manual', excluded: false, first_seen_at: null },
+        ],
       }),
     ])
     const root = await mount(container)
