@@ -1057,3 +1057,56 @@ behaviour, `resolve_category_exclusion_paths`, `is_authorized_delete_target`, an
 and two new `tests/test_settings_clients_api.py` cases (the excluded-paths CRUD round trip and
 cascade-delete). **Not verified against the user's real two-instance deployment** — see this
 task's own final report for what that leaves standing before stage 5.
+
+---
+
+## 17. Ambiguous items should be SHOWN as a third "unclaimed" pile, not suppressed
+
+> *"I think we should actually show these as 'unclaimed' so the user can see them and possibly act
+> on them, but we call out that this is not the norm and requires a confirmation dialog or
+> something. Things can show up in weird categories etc — we might want to clean up."*
+
+**This corrects the reading of "fail closed" used in findings #16 and the round that followed it.**
+
+Fail-closed was implemented as *do not show* — a base path with unresolvable exclusions had its
+debris suppressed entirely, and the user saw only a line saying so. But **suppression is the same
+failure as finding #2**: content that exists and is never surfaced is indistinguishable from
+content that isn't there, and the user cannot act on what they cannot see.
+
+> **Fail-closed should mean "never act without explicit confirmation", not "never display".**
+
+### The shape
+
+Three piles, not two (extending §11.1d):
+
+| Pile | What | Selectable? |
+|---|---|---|
+| **Debris** | unclaimed by any client, unused by lftpweb, in a resolvable path | yes |
+| **Seeding estate** | claimed and seeding — informational | no (#21's territory) |
+| **Unclaimed** *(new)* | ownership genuinely undeterminable — unclaimed, in a tree where exclusions cannot be resolved to paths | **only behind an explicit gate** |
+
+The unclaimed pile must **state plainly why it is abnormal**: in a single-instance setup it should
+be empty or near-empty, and a populated one usually means either debris from an interrupted
+operation or another lftpweb instance's content (finding #16).
+
+### On the gate mechanism — decide deliberately
+
+The user said "a confirmation dialog **or something**". Note a **standing preference against
+confirmation dialogs** recorded earlier in this project (the pause/bandwidth controls were
+deliberately built as a checkbox plus a debounced auto-commit plus a result banner, *never* a
+confirm dialog). This is plausibly the exception that earns one — the failure mode is deleting
+another site's data — but it is worth choosing between:
+
+- a distinct action, visually separated, that cannot be reached by the normal select-and-remove
+  flow (accident-proof without being repetitive), or
+- an actual confirmation step naming what is unresolvable and why.
+
+**Ask or decide explicitly; do not default to a modal because it is easiest.**
+
+### Why this matters beyond convenience
+
+The user's own reason — *"things can show up in weird categories, we might want to clean up"* — is
+the real one. A seedbox accumulates content from aborted grabs, renamed categories, and manual
+operations. That material is **exactly** what the disk review exists to find, and it is precisely
+the material most likely to be unattributable. Suppressing the ambiguous pile suppresses the
+feature's most valuable output.
