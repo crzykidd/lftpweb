@@ -528,13 +528,13 @@ export interface DiskReviewSkippedBasePathOut {
   reason: string
 }
 
-// A root that WAS walked (its seeding estate is populated normally) but where some unclaimed
-// files couldn't be cleared for debris -- narrower than DiskReviewSkippedBasePathOut on purpose
-// (2026-08-23: a whole-root fail-closed suppression had been hiding legitimate, already-claimed
-// content that was never in danger). See core.disk_review.SuppressedDebrisItem's own docstring.
-export interface DiskReviewSuppressedDebrisOut {
-  root: string
-  count: number
+// The third pile (finding #17, 2026-08-23) -- a genuinely unclaimed file under a root where some
+// client's excluded category could not be resolved to a path. Shown, not counted -- replaces the
+// earlier bare-count `DiskReviewSuppressedDebrisOut`. Same shape as DiskReviewDebrisOut plus
+// `reason`, so it groups and reclaim-totals the same way (lib/diskReview.ts), but it is never
+// selectable through the ordinary debris flow. See core.disk_review.UnclaimedItem's own
+// docstring for why a file claimed by an excluded category never appears here (or anywhere).
+export interface DiskReviewUnclaimedOut extends DiskReviewDebrisOut {
   reason: string
 }
 
@@ -549,7 +549,9 @@ export interface DiskReviewScanResponse {
   seeding_estate: DiskReviewSeedingEstateOut[]
   broken_seeds: DiskReviewBrokenSeedOut[]
   skipped_base_paths: DiskReviewSkippedBasePathOut[]
-  suppressed_debris: DiskReviewSuppressedDebrisOut[]
+  // 2026-08-23, finding #17 -- shown as its own pile, not selectable through the ordinary debris
+  // flow. See DiskReviewUnclaimedOut's own comment for how this differs from skipped_base_paths.
+  unclaimed: DiskReviewUnclaimedOut[]
   client_failures: DiskReviewClientFailureOut[]
   scanned_at: string
 }

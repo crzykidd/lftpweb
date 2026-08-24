@@ -1,8 +1,10 @@
 """The disk review scan (docs/download-client-framework-spec.md §11, stage 4 of #18) --
 **review-only, deletes nothing**. Walks the clients' configured base paths over SSH,
-reconciles against what the clients claim and what lftpweb itself is using, and produces two
-labelled piles: debris (safe to review) and the seeding estate (claimed, shown for
-visibility only). Stage 5 (the delete path) is not built here -- see this module's own
+reconciles against what the clients claim and what lftpweb itself is using, and produces three
+labelled piles: debris (safe to review, selectable), the seeding estate (claimed, shown for
+visibility only), and the unclaimed pile (finding #17, 2026-08-23 -- ownership genuinely
+undeterminable, shown for visibility, gated off the ordinary select-and-remove flow, never
+hidden). Stage 5 (the delete path) is not built here -- see this module's own
 `run_scan`, which never calls `core/remote.py.RemoteConnectionPool.delete_path`.
 
 **This module is split in two, on purpose.** `reconcile()` below is pure set math over three
@@ -213,8 +215,8 @@ class SkippedBasePath:
     information," surfaced to the review page rather than silently absorbed, the same "name gaps,
     don't hide them" instinct every other guard in this codebase follows. Reserved for a root
     this scan truly never looked at (no host, credentials, a failed SSH walk, a missing
-    contributor, a failed mount-sentinel check) -- see `SuppressedDebrisItem` below for the
-    different, narrower case of a root that *was* walked but whose debris pile is incomplete.
+    contributor, a failed mount-sentinel check) -- see `UnclaimedItem` below for the different,
+    narrower case of a root that *was* walked but whose debris pile is incomplete.
     """
 
     root: str
@@ -222,22 +224,46 @@ class SkippedBasePath:
 
 
 @dataclass(frozen=True)
-class SuppressedDebrisItem:
-    """A root this scan **did** walk (its seeding estate is populated normally, live use,
-    2026-08-23: *"this is true, but there are things in there in ar-tv that it doesn't show
-    now"* -- a whole-root fail-closed suppression had been hiding legitimate, already-claimed
-    content that was never in danger), but where some number of genuinely **unclaimed** files
-    could not be cleared for debris -- an excluded category with no `content`-kind base path to
-    resolve onto (rTorrent, spec §1.1) means an unclaimed file here might be the leftover of a
-    transfer that belonged to a since-vanished, excluded-category claim, and there is no path
-    arithmetic that can tell. Fail-closed, narrowed to exactly the ambiguous files: a **claimed**
-    file's own transfer category already answers the question directly (`reconcile`'s own
-    `excluded_categories_by_client` filtering), so only unclaimed files ever land in `count` here.
+class UnclaimedItem:
+    """The third pile (spec §11.1d, finding #17, 2026-08-23) -- one **genuinely unclaimed** file
+    under a root where some client's excluded category could not be resolved to a path (an
+    excluded category with no `content`-kind base path to resolve onto -- rTorrent, spec §1.1).
+    It might be the leftover of a transfer that belonged to a since-vanished, excluded-category
+    claim, or it might be ordinary debris from an interrupted operation, or it might be **another
+    lftpweb instance's content** (finding #16) -- there is no path arithmetic that can tell, and
+    that is precisely why this pile exists rather than a silent count.
+
+    **This replaces the earlier `SuppressedDebrisItem`, which counted these files but never
+    surfaced them** (finding #17: *"content that exists and is never surfaced is
+    indistinguishable from content that is not there"* -- the same failure as finding #2, applied
+    to fail-closed instead of a stale banner). Fail-closed now means "never treat as debris
+    without a human looking at it," not "never display" -- so this dataclass carries the same
+    shape as `DebrisCandidate` (including `link_paths`, so the pile's own reclaim figure stays
+    link-aware, spec §10.5) plus `reason`, the same string `SuppressedDebrisItem.reason` used to
+    carry.
+
+    A **claimed** file's own transfer category already answers the ownership question directly
+    (`reconcile`'s own `excluded_categories_by_client` filtering, dropping the claim outright) --
+    a file claimed by an excluded category is dropped before any claim/candidate logic runs and
+    never appears in *any* pile, `unclaimed` included. Only a file with **no claim at all**, under
+    an ambiguous root, ever lands here -- the line between "known to be someone else's" (excluded,
+    invisible) and "ownership genuinely unknown" (this pile) is the one this whole task exists to
+    keep sharp.
+
+    **Not selectable by the ordinary select-and-remove flow that debris uses** -- see
+    `DiskReviewPage.tsx` and this task's own `docs/decisions.md` entry for the gate stage 5 must
+    implement before anything acts on this pile.
     """
 
     root: str
-    count: int
-    reason: str
+    rel_path: str
+    abs_path: str
+    size: int
+    mtime: float
+    inode: int | None
+    nlink: int | None
+    link_paths: tuple[str, ...] = ()
+    reason: str = ""
 
 
 @dataclass(frozen=True)
@@ -246,7 +272,9 @@ class ReconciliationResult:
     seeding_estate: tuple[SeedingEstateEntry, ...] = ()
     broken_seeds: tuple[BrokenSeed, ...] = ()
     skipped_base_paths: tuple[SkippedBasePath, ...] = ()
-    suppressed_debris: tuple[SuppressedDebrisItem, ...] = ()
+    # The third pile (finding #17, 2026-08-23) -- see `UnclaimedItem`'s own docstring for why
+    # this replaced a bare count.
+    unclaimed: tuple[UnclaimedItem, ...] = ()
 
 
 def _root_containing(path: str, roots: Iterable[str]) -> str | None:
@@ -303,21 +331,41 @@ def reconcile(
     old whole-base-path fail-closed suppression: a bound category's claims on the very same root
     are completely unaffected.
 
-    `debris_ambiguous_roots` (same follow-up) is the genuinely irreducible remainder: an
-    **unclaimed** file under a root where some client's excluded category could not be resolved
-    to a path. There is no claim to read a category off of for a file nobody currently claims --
-    it might be the leftover of a transfer that belonged to a since-vanished, excluded-category
-    claim, or it might be genuine debris, and there is no way to tell which. Fail-closed for
-    *these files only* (`SuppressedDebrisItem`, counted, never silently dropped) -- **the root is
+    `debris_ambiguous_roots` (same follow-up, narrowed further by finding #17, 2026-08-23) is the
+    genuinely irreducible remainder: an **unclaimed** file under a root where some client's
+    excluded category could not be resolved to a path. There is no claim to read a category off
+    of for a file nobody currently claims -- it might be the leftover of a transfer that belonged
+    to a since-vanished, excluded-category claim, or it might be genuine debris, and there is no
+    way to tell which. **Never proposed as debris, but never hidden either** -- these files land
+    in `unclaimed` (`UnclaimedItem`, shown as their own pile, not selectable by the ordinary
+    debris flow) instead of being silently counted, which is finding #17's own correction: fail-
+    closed means "never act without a human looking at it," not "never display." **The root is
     still walked and its seeding estate still populated normally**, unlike `unavailable_roots`,
     which skips the walk outright. This is the whole point of the fix: the old design conflated
     "cannot resolve a category to a path" with "cannot trust anything under this root at all,"
     which suppressed legitimate, already-claimed content that was never at risk.
+
+    **Finding #17's own line, kept sharp here:** a claim whose category is excluded is *known* to
+    belong to the other lftpweb instance -- it must never land in `unclaimed` either, which is
+    reserved for ownership that is genuinely *unknown*. So its `content_path` is folded into the
+    same hard-exclusion set `excluded_paths` uses, **before** the claim itself is dropped below --
+    a disk entry under it is removed from consideration entirely, exactly like a manually
+    excluded path (finding #16), rather than falling through to "nobody claims this" and landing
+    in the ambiguous-root fail-closed pile by accident.
     """
     roots = {_norm(r) for r in base_paths}
-    excluded = {_norm(p) for p in excluded_paths}
     excluded_categories_by_client = excluded_categories_by_client or {}
     ambiguous_roots: dict[str, str] = dict(debris_ambiguous_roots or {})
+    claims = list(claims)
+
+    def _category_excluded(claim: ClientClaim) -> bool:
+        return claim.category is not None and claim.category in excluded_categories_by_client.get(
+            claim.client_id, ()
+        )
+
+    excluded = {_norm(p) for p in excluded_paths} | {
+        _norm(c.content_path) for c in claims if _category_excluded(c)
+    }
 
     def _excluded(path: str) -> bool:
         return any(_is_under(path, ex) for ex in excluded)
@@ -328,20 +376,17 @@ def reconcile(
         # Containment (spec §11.2): only entries under a *configured* root are ever
         # considered, defensively re-checked here even though `run_scan` should never hand
         # this function anything else. An excluded path is dropped the same way, before it can
-        # ever become a claim, a debris candidate, or a seeding-estate entry (finding #16).
+        # ever become a claim, a debris candidate, an unclaimed item, or a seeding-estate entry
+        # (finding #16, sharpened by finding #17 for the per-claim-category fallback above).
         if _norm(e.root) in roots and not _excluded(_norm(e.abs_path))
     ]
 
     # A claim in an excluded category is dropped outright -- never a claim at all, for any
     # client, not only the ones a category can't resolve to a path for (this function's own
-    # docstring, `excluded_categories_by_client`). The file it named becomes "unclaimed" for
-    # every purpose below, including the `debris_ambiguous_roots` fail-closed gate further down.
-    claims = [
-        c
-        for c in claims
-        if c.category is None
-        or c.category not in excluded_categories_by_client.get(c.client_id, ())
-    ]
+    # docstring, `excluded_categories_by_client`). Its own `content_path` is already hard-excluded
+    # above, so the file it named never reaches the disk-entry loop at all -- it does not fall
+    # through to "unclaimed" the way a truly ownerless file does.
+    claims = [c for c in claims if not _category_excluded(c)]
 
     contrib_by_root: dict[str, set[int]] = defaultdict(set)
     for c in contributors:
@@ -365,8 +410,9 @@ def reconcile(
         elif root in ambiguous_roots:
             # Narrower than `unavailable_roots` on purpose (this function's own docstring): the
             # walk already happened and the seeding estate is unaffected -- only an *unclaimed*
-            # file here is fail-closed, tallied into `suppressed_debris` below, never folded into
-            # `skipped_base_paths` (which would wrongly imply the whole root was never looked at).
+            # file here is kept out of debris and shown in `unclaimed` below instead, never folded
+            # into `skipped_base_paths` (which would wrongly imply the whole root was never
+            # looked at).
             root_available_for_debris[root] = False
         else:
             root_available_for_debris[root] = True
@@ -434,13 +480,13 @@ def reconcile(
             return False
         return _passes_age_floor(entry)
 
-    def _ambiguous_suppressed(entry: DiskEntry) -> bool:
+    def _ambiguous_unclaimed(entry: DiskEntry) -> bool:
         """True when `entry` is an **unclaimed** file that would otherwise have been debris-
         eligible, except that its root is in `ambiguous_roots` -- the genuinely irreducible
-        fail-closed remainder this function's own docstring describes. Never true for an entry
-        that fails eligibility for an unrelated reason (in use, too fresh, or a root that's
-        `unavailable`/missing-contributor rather than merely ambiguous) -- `suppressed_debris`
-        must count only what this specific gate actually suppressed.
+        remainder this function's own docstring describes, shown as its own pile (finding #17)
+        rather than hidden. Never true for an entry that fails eligibility for an unrelated
+        reason (in use, too fresh, or a root that's `unavailable`/missing-contributor rather than
+        merely ambiguous) -- `unclaimed` must contain only what this specific gate actually caught.
         """
         root = _norm(entry.root)
         if root not in ambiguous_roots:
@@ -450,9 +496,31 @@ def reconcile(
             return False
         return _passes_age_floor(entry)
 
+    def _link_group(
+        entry: DiskEntry, is_candidate: Callable[[DiskEntry], bool]
+    ) -> tuple[str, ...] | None:
+        """Shared by the debris and unclaimed piles (spec §11.1b, extended to the unclaimed pile
+        by finding #17: its own reclaim figure must be link-aware too, spec §10.5, not just
+        debris's -- a naive sum would reintroduce exactly the lie that section exists to prevent).
+
+        Returns `()` for an ordinary single-link file (nothing to group); `None` when an
+        unaccounted-for link exists outside every scanned tree, or when any link in the group
+        fails `is_candidate` -- the conservative default, never propose either pile from a
+        partial or contaminated group (spec §11.1b: "every link must itself be a candidate, or
+        none of them are"); otherwise the sorted tuple of every on-disk path sharing the inode.
+        """
+        if not (entry.nlink and entry.nlink > 1 and entry.inode is not None):
+            return ()
+        links = by_inode.get(entry.inode, [])
+        if len(links) < entry.nlink:
+            return None
+        if not all(is_candidate(link) for link in links):
+            return None
+        return tuple(sorted(_norm(link.abs_path) for link in links))
+
     debris: list[DebrisCandidate] = []
     seeding_estate: list[SeedingEstateEntry] = []
-    suppressed_counts: dict[str, int] = defaultdict(int)
+    unclaimed: list[UnclaimedItem] = []
 
     for entry in disk_entries:
         if entry.is_dir:
@@ -478,21 +546,30 @@ def reconcile(
             continue
 
         if not _entry_eligible(entry):
-            if _ambiguous_suppressed(entry):
-                suppressed_counts[_norm(entry.root)] += 1
+            if _ambiguous_unclaimed(entry):
+                group = _link_group(
+                    entry,
+                    lambda link: not _entry_claimed(link) and _ambiguous_unclaimed(link),
+                )
+                if group is not None:
+                    unclaimed.append(
+                        UnclaimedItem(
+                            root=_norm(entry.root),
+                            rel_path=entry.rel_path,
+                            abs_path=abs_p,
+                            size=entry.size,
+                            mtime=entry.mtime,
+                            inode=entry.inode,
+                            nlink=entry.nlink,
+                            link_paths=group,
+                            reason=ambiguous_roots[_norm(entry.root)],
+                        )
+                    )
             continue
 
-        link_paths: tuple[str, ...] = ()
-        if entry.nlink and entry.nlink > 1 and entry.inode is not None:
-            links = by_inode.get(entry.inode, [])
-            if len(links) < entry.nlink:
-                # An unaccounted-for link exists outside every scanned tree -- the conservative
-                # default (spec §11.1b), never proposed.
-                continue
-            if any(_entry_claimed(link) or not _entry_eligible(link) for link in links):
-                # Every link must itself be a candidate, or none of them are.
-                continue
-            link_paths = tuple(sorted(_norm(link.abs_path) for link in links))
+        group = _link_group(entry, lambda link: not _entry_claimed(link) and _entry_eligible(link))
+        if group is None:
+            continue
 
         debris.append(
             DebrisCandidate(
@@ -503,7 +580,7 @@ def reconcile(
                 mtime=entry.mtime,
                 inode=entry.inode,
                 nlink=entry.nlink,
-                link_paths=link_paths,
+                link_paths=group,
             )
         )
 
@@ -542,19 +619,22 @@ def reconcile(
         skipped_base_paths=tuple(
             SkippedBasePath(root=root, reason=reason) for root, reason in sorted(skipped.items())
         ),
-        suppressed_debris=tuple(
-            SuppressedDebrisItem(root=root, count=count, reason=ambiguous_roots[root])
-            for root, count in sorted(suppressed_counts.items())
-            if count > 0
-        ),
+        unclaimed=tuple(unclaimed),
     )
 
 
-def freed_bytes(candidates: Iterable[DebrisCandidate], selected_abs_paths: Iterable[str]) -> int:
+def freed_bytes(
+    candidates: Iterable[DebrisCandidate | UnclaimedItem], selected_abs_paths: Iterable[str]
+) -> int:
     """The link-aware reclaim total (spec §10.5, §11.1b's "same inode map produces both
     answers"). A linked file's bytes are counted once, and only when the selection includes
     *every* one of `link_paths` -- selecting one of two hardlinked candidates without the other
     reclaims nothing, because the other link still holds the inode.
+
+    Shared verbatim by the debris pile (a real selection) and the unclaimed pile (finding #17:
+    passed the pile's own full set of `abs_path`s as `selected_abs_paths` to get an "if this were
+    all dealt with" total -- the unclaimed pile has no partial-selection UI, but its reclaim
+    figure must still be link-aware, never a naive sum, for the same reason debris's is).
     """
     selected = {_norm(p) for p in selected_abs_paths}
     counted_groups: set[tuple[str, ...]] = set()

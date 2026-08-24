@@ -1,6 +1,11 @@
 import { describe, expect, it } from 'vitest'
-import type { DiskReviewDebrisOut, DiskReviewSeedingEstateOut } from '../api/types'
-import { freedBytes, groupDebrisByDirectory, groupSeedingEstateByTorrent } from './diskReview'
+import type { DiskReviewDebrisOut, DiskReviewSeedingEstateOut, DiskReviewUnclaimedOut } from '../api/types'
+import {
+  freedBytes,
+  groupDebrisByDirectory,
+  groupSeedingEstateByTorrent,
+  groupUnclaimedByDirectory,
+} from './diskReview'
 
 function candidate(overrides: Partial<DiskReviewDebrisOut>): DiskReviewDebrisOut {
   return {
@@ -12,6 +17,14 @@ function candidate(overrides: Partial<DiskReviewDebrisOut>): DiskReviewDebrisOut
     inode: null,
     nlink: null,
     link_paths: [],
+    ...overrides,
+  }
+}
+
+function unclaimedItem(overrides: Partial<DiskReviewUnclaimedOut>): DiskReviewUnclaimedOut {
+  return {
+    ...candidate({}),
+    reason: 'some-category cannot be resolved to a path',
     ...overrides,
   }
 }
@@ -87,6 +100,35 @@ describe('groupDebrisByDirectory', () => {
     expect(freedBytes(seedGroup.entries, new Set([seedCopy.abs_path]))).toBe(0)
     // Both links selected -- now it's real.
     expect(freedBytes(seedGroup.entries, new Set(linkPaths))).toBe(40_000_000_000)
+  })
+})
+
+describe('groupUnclaimedByDirectory', () => {
+  it('buckets unclaimed items by directory, sorted, same as debris', () => {
+    const a = unclaimedItem({ abs_path: '/rtorrent/data/Zeta.Release/a.mkv' })
+    const b = unclaimedItem({ abs_path: '/rtorrent/data/Alpha.Release/b.mkv' })
+    const groups = groupUnclaimedByDirectory([a, b])
+    expect(groups.map((g) => g.directory)).toEqual([
+      '/rtorrent/data/Alpha.Release',
+      '/rtorrent/data/Zeta.Release',
+    ])
+  })
+
+  it('carries each item\'s own reason through to the group', () => {
+    const a = unclaimedItem({
+      abs_path: '/rtorrent/data/Orphan.Release/a.mkv',
+      reason: 'other-site-movies cannot be resolved to a path',
+    })
+    const groups = groupUnclaimedByDirectory([a])
+    expect(groups[0].entries[0].reason).toBe('other-site-movies cannot be resolved to a path')
+  })
+
+  it('reclaim total stays link-aware -- selecting one of two hardlinks reports zero (finding #17)', () => {
+    const linkPaths = ['/rtorrent/data/Release/file.mkv', '/complete/tv/Release/file.mkv']
+    const seedCopy = unclaimedItem({ abs_path: linkPaths[0], size: 40_000_000_000, link_paths: linkPaths })
+    const hardlink = unclaimedItem({ abs_path: linkPaths[1], size: 40_000_000_000, link_paths: linkPaths })
+    expect(freedBytes([seedCopy, hardlink], new Set([seedCopy.abs_path]))).toBe(0)
+    expect(freedBytes([seedCopy, hardlink], new Set(linkPaths))).toBe(40_000_000_000)
   })
 })
 

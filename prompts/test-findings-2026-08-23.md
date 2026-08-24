@@ -1136,3 +1136,43 @@ the real one. A seedbox accumulates content from aborted grabs, renamed categori
 operations. That material is **exactly** what the disk review exists to find, and it is precisely
 the material most likely to be unattributable. Suppressing the ambiguous pile suppresses the
 feature's most valuable output.
+
+### Resolved 2026-08-23 — a third, visible pile; the gate deferred by name to stage 5
+
+`prompts/done/2026-08-23-unclaimed-pile.md`, `docs/decisions.md`, spec §11.1d/§11.2/§11.4.
+`core/disk_review.py`'s `SuppressedDebrisItem` (root, count, reason) became `UnclaimedItem` — the
+same shape `DebrisCandidate` has, plus `reason` — and `ReconciliationResult.suppressed_debris`
+became `unclaimed`, a real list of items rather than a per-root count. The fail-closed *rule*
+itself did not change: a genuinely unclaimed file under an ambiguous root still never becomes a
+debris candidate. What changed is what happens to it instead — it is shown, grouped by directory
+in `DiskReviewPage.tsx` exactly the way debris is (a genuinely unclaimed item has no torrent to
+group under either), with a link-aware reclaim figure (`freed_bytes` reused verbatim) and plain
+language explaining the pile is abnormal: empty in a single-instance setup, populated usually
+means an interrupted operation or another lftpweb instance's content (finding #16).
+
+**The line between "known to belong to someone else" and "genuinely unknown" needed an actual
+fix, not just a test.** The first implementation let a claim dropped for having an excluded
+category fall through to the generic ambiguous-root path, which would have surfaced it in the
+*new, now-visible* unclaimed pile — exactly the case this task's own non-negotiable said must
+never happen. `test_excluded_category_claim_appears_in_no_pile_not_even_unclaimed` caught it.
+Fixed by folding an excluded claim's own `content_path` into the same hard-exclusion set finding
+#16's manually-excluded paths already use, before the claim is dropped, so the file it named is
+removed from consideration entirely rather than falling through to "nobody claims this."
+
+**The gate itself was deliberately not built.** Stage 5 doesn't exist, so this task adds no
+confirmation flow — the pile is inert by construction (`DiskReviewPage.tsx` renders no checkbox
+for it anywhere). Spec §11.4 and `docs/decisions.md` record the recommended shape for stage 5 to
+implement deliberately: a distinct, separately-reachable action naming what is unresolvable and
+why, not a confirm dialog bolted onto the debris flow — consistent with this project's standing
+preference against confirmation dialogs (pause/bandwidth: checkbox + debounced auto-commit +
+result banner), while still taking the user's "confirmation dialog or something" seriously as a
+request for *some* extra friction on specifically this action, given the failure mode is deleting
+another lftpweb instance's data.
+
+Covered by three new `tests/test_disk_review.py` cases plus one rewritten in place (the earlier
+suppression test now asserts the pile shows the item instead of counting it) — the excluded-
+category/no-pile-at-all assertion, a link-aware reclaim total for the unclaimed pile, and a
+single-instance-shaped fixture proving the normal case still looks normal (empty pile) — and three
+new `frontend/src/lib/diskReview.test.ts` cases for the matching directory-grouping and reclaim
+logic. Not verified against the user's real two-instance deployment, same as every other change to
+this feature today (spec §14's stage 4/5 rows).

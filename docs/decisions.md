@@ -6,6 +6,73 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-23 — the unclaimed pile: fail-closed means "no action without a gate," not "no display" (finding #17)
+
+`prompts/done/2026-08-23-unclaimed-pile.md`, spec §11.1d/§11.2/§11.4, `core/disk_review.py`,
+`DiskReviewPage.tsx`. Corrects the same day's own earlier work (finding #16 and its live-use
+follow-up): a base path whose exclusions could not be resolved to paths had its genuinely
+unclaimed files fail-closed by *suppression* — counted (`SuppressedDebrisItem`), never shown. The
+user's own words are why that's wrong: *"I think we should actually show these as 'unclaimed' so
+the user can see them and possibly act on them... things can show up in weird categories etc — we
+might want to clean up."* Content that exists and is never surfaced is indistinguishable from
+content that is not there (the same failure as finding #2), and this is precisely the material a
+disk review exists to find.
+
+**The correction: `SuppressedDebrisItem` (root, count, reason) became `UnclaimedItem` (the full
+`DebrisCandidate` shape plus `reason`) — a third pile, not a bigger count.** `reconcile()`'s own
+fail-closed *rule* is unchanged: a genuinely unclaimed file under an ambiguous root still never
+becomes a debris candidate. What changed is what happens to it instead — it is appended to
+`ReconciliationResult.unclaimed` rather than merely counted, grouped by directory in the frontend
+exactly like debris (a genuinely unclaimed item has no torrent to group under either), with a
+link-aware reclaim figure (`freed_bytes` reused verbatim, passing the pile's own full path set as
+"selected" since there is no partial-selection UI) and the explanation stated plainly: normal is
+empty, a populated pile usually means an interrupted operation or another lftpweb instance's
+content (finding #16).
+
+**A real bug surfaced while building this, and it is the sharpest part of the fix.** The original
+plan was: drop a claim whose category is excluded, then let the now-unclaimed file fall through to
+the existing ambiguous-root logic. That's wrong — it makes "known to belong to another instance"
+(excluded category) indistinguishable from "ownership genuinely unknown" (no claim at all), and
+the dropped-claim file would have landed in the *new, now-visible* unclaimed pile instead of
+nowhere. Caught by a test written specifically to assert the distinction
+(`test_excluded_category_claim_appears_in_no_pile_not_even_unclaimed`), which failed on the first
+implementation. Fixed by folding an excluded claim's own `content_path` into the same
+hard-exclusion set `excluded_paths` already uses, *before* the claim is dropped — a disk entry
+under it is removed from consideration entirely, at the same point and by the same mechanism
+finding #16's manually-excluded paths already use, so it never falls through to "unclaimed" by
+accident. This is the load-bearing invariant of the whole task: excluded is a hard, invisible
+exclusion; unclaimed is a visible, genuinely-unknown pile; the two must never blur.
+
+**The gate stage 5 must build — deferred deliberately, recorded rather than guessed at.** Stage 5
+(the delete pipeline) does not exist, so this task builds no confirmation flow: that would be
+speculative UI designed against an unwritten delete sequence. What it does instead is make the
+pile **inert by construction** (no checkbox is rendered for it anywhere in `DiskReviewPage.tsx` —
+not disabled, absent) and record the recommended shape for stage 5 in spec §11.4:
+
+- This project has a standing, recorded preference against confirmation dialogs — the pause and
+  bandwidth controls were deliberately built as a checkbox plus a debounced auto-commit plus a
+  result banner, never a modal, on the principle that fewer clicks beat more confirmation.
+- The user's own phrasing was "a confirmation dialog **or something**" — an acknowledgment that
+  *some* extra friction is warranted here, not a mandate for a modal specifically. The failure
+  mode (deleting another lftpweb instance's data) plausibly earns friction that an ordinary delete
+  wouldn't.
+- **Recommendation: a distinct, separately-reachable action, not a modal bolted onto the debris
+  flow.** Keep the unclaimed pile permanently unreachable from the ordinary select-and-remove
+  flow (already true), and give it its own explicit entry point that names what is unresolvable
+  and why before it can be used. This is accident-proof (it can't be reached by habit the way
+  clicking through a confirm dialog can) without being repetitive (it costs an extra step only on
+  the one action that is genuinely unusual, not on every ordinary debris removal).
+- Stage 5 should treat this as the starting design and implement it deliberately, not reopen the
+  question or default to a modal because it's the easiest thing to reach for.
+
+**Scope not attempted:** no live verification against the user's real two-instance deployment
+(named in spec §14's stage 4/5 rows as still outstanding, same as every other change to this
+feature today); no attempt to distinguish "debris from an interrupted operation" from "another
+instance's content" within the unclaimed pile itself — both explanations are stated together
+because `reconcile()` genuinely cannot tell them apart, which is the entire premise of the pile.
+
+---
+
 ## 2026-08-23 — every observed category is recorded, defaulting to excluded (a reversal of round 5's own default) — plus two staleness fixes found in the same code
 
 `prompts/done/2026-08-23-auto-add-categories-default-excluded.md`, spec §8.3 round 6 (the section

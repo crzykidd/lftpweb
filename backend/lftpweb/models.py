@@ -2128,17 +2128,23 @@ class DiskReviewSkippedBasePathOut(BaseModel):
     reason: str
 
 
-class DiskReviewSuppressedDebrisOut(BaseModel):
-    """A root this scan **did** walk (its seeding estate is populated normally) but where some
-    number of genuinely unclaimed files could not be cleared for the debris pile -- narrower than
-    `DiskReviewSkippedBasePathOut` on purpose (live use, 2026-08-23,
-    prompts/2026-08-23-auto-add-categories-default-excluded.md: a whole-root fail-closed
-    suppression had been hiding legitimate, already-claimed content that was never in danger).
-    See `core.disk_review.SuppressedDebrisItem`'s own docstring for the full reasoning.
+class DiskReviewUnclaimedOut(BaseModel):
+    """The third pile (finding #17, 2026-08-23) -- one genuinely unclaimed file under a root
+    where some client's excluded category could not be resolved to a path. Shown, not counted --
+    see `core.disk_review.UnclaimedItem`'s own docstring for the full reasoning, including why a
+    file claimed by an excluded category never appears here (or anywhere) at all. Same shape as
+    `DiskReviewDebrisOut` plus `reason`, so the frontend can group and reclaim-total it the same
+    way (`lib/diskReview.ts`) -- but it is never selectable through the ordinary debris flow.
     """
 
     root: str
-    count: int
+    rel_path: str
+    abs_path: str
+    size: int
+    mtime: float
+    inode: int | None
+    nlink: int | None
+    link_paths: list[str] = Field(default_factory=list)
     reason: str
 
 
@@ -2150,19 +2156,21 @@ class DiskReviewClientFailureOut(BaseModel):
 
 class DiskReviewScanResponse(BaseModel):
     """The whole scan result. `debris` is the only selectable pile; `seeding_estate` is shown
-    for visibility only (spec §11.1d). `total_debris_bytes` is the naive sum-of-sizes (every
-    candidate, unselected) -- the link-aware total for an actual *selection* is a client-side
-    computation (`freed_bytes` in `core/disk_review.py`, mirrored in the frontend) since
-    selection is never persisted server-side at this stage.
+    for visibility only, and `unclaimed` (finding #17) is shown but gated off the ordinary
+    select-and-remove flow -- see `DiskReviewUnclaimedOut`'s own docstring (spec §11.1d).
+    `total_debris_bytes` is the naive sum-of-sizes (every candidate, unselected) -- the link-aware
+    total for an actual *selection* is a client-side computation (`freed_bytes` in
+    `core/disk_review.py`, mirrored in the frontend) since selection is never persisted
+    server-side at this stage.
     """
 
     debris: list[DiskReviewDebrisOut] = Field(default_factory=list)
     seeding_estate: list[DiskReviewSeedingEstateOut] = Field(default_factory=list)
     broken_seeds: list[DiskReviewBrokenSeedOut] = Field(default_factory=list)
     skipped_base_paths: list[DiskReviewSkippedBasePathOut] = Field(default_factory=list)
-    # 2026-08-23 -- see `DiskReviewSuppressedDebrisOut`'s own docstring for how this differs from
-    # `skipped_base_paths` above.
-    suppressed_debris: list[DiskReviewSuppressedDebrisOut] = Field(default_factory=list)
+    # 2026-08-23, finding #17 -- see `DiskReviewUnclaimedOut`'s own docstring for how this differs
+    # from `skipped_base_paths` above, and why it replaced the earlier bare-count field.
+    unclaimed: list[DiskReviewUnclaimedOut] = Field(default_factory=list)
     client_failures: list[DiskReviewClientFailureOut] = Field(default_factory=list)
     scanned_at: str
 

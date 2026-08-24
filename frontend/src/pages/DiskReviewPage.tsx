@@ -6,7 +6,9 @@ import {
   freedBytes,
   groupDebrisByDirectory,
   groupSeedingEstateByTorrent,
+  groupUnclaimedByDirectory,
   type SeedingEstateGroup,
+  type UnclaimedGroup,
 } from '../lib/diskReview'
 import { formatBytes } from '../lib/format'
 
@@ -127,6 +129,63 @@ function SeedingEstateGroupRow({
   )
 }
 
+/** One directory's worth of the unclaimed pile (spec §11.1d, finding #17, 2026-08-23) --
+ * **deliberately has no checkbox column at all**, unlike `DebrisGroupRow` above. This pile is
+ * visible but not selectable through the ordinary select-and-remove flow: ownership here is
+ * genuinely undeterminable, and nothing acts on it until stage 5 builds its own, separate gate
+ * (see this task's own `docs/decisions.md` entry). `allAbsPaths` is the *entire* unclaimed pile's
+ * own path set, passed to `freedBytes` as "selected" so this group's reclaim figure answers "if
+ * this were all resolved," staying link-aware the same way debris's running total does (spec
+ * §10.5) -- there is no partial selection to reflect here.
+ */
+function UnclaimedGroupRow({
+  group,
+  allAbsPaths,
+  expanded,
+  onToggleExpand,
+}: {
+  group: UnclaimedGroup
+  allAbsPaths: Set<string>
+  expanded: boolean
+  onToggleExpand: () => void
+}) {
+  const groupTotal = freedBytes(group.entries, allAbsPaths)
+  return (
+    <>
+      <tr className="border-t border-zinc-100 bg-zinc-50/60 dark:border-zinc-900 dark:bg-zinc-900/40">
+        <td colSpan={3} className="px-3 py-2">
+          <button
+            type="button"
+            onClick={onToggleExpand}
+            aria-expanded={expanded}
+            className="flex flex-wrap items-center gap-2 text-left font-medium text-zinc-700 hover:underline dark:text-zinc-200"
+          >
+            <span
+              aria-hidden="true"
+              className={`text-zinc-400 transition-transform dark:text-zinc-600 ${expanded ? 'rotate-90' : ''}`}
+            >
+              ▸
+            </span>
+            <span className="font-mono text-xs break-all">{group.directory}</span>
+            <span className="text-xs font-normal text-zinc-500 dark:text-zinc-400">
+              {group.entries.length} file{group.entries.length === 1 ? '' : 's'} —{' '}
+              {formatBytes(groupTotal)} if resolved
+            </span>
+          </button>
+        </td>
+      </tr>
+      {expanded &&
+        group.entries.map((u) => (
+          <tr key={u.abs_path} className="border-t border-zinc-100 align-top dark:border-zinc-900">
+            <td className="px-3 py-2 pl-8 font-mono text-xs break-all">{u.rel_path}</td>
+            <td className="px-3 py-2 whitespace-nowrap">{formatBytes(u.size)}</td>
+            <td className="px-3 py-2 text-xs text-zinc-500 dark:text-zinc-400">{u.reason}</td>
+          </tr>
+        ))}
+    </>
+  )
+}
+
 /** The disk review scan (docs/download-client-framework-spec.md §11, stage 4 of #18) --
  * *"Client shows all this on disk… what is in the base folders for the client that don't exist
  * in the UI that could be cleaned up with a review option."* Review-only: this page has no
@@ -134,21 +193,28 @@ function SeedingEstateGroupRow({
  * separate control. Manual trigger only (spec §11.3) -- the scan is an SSH walk over
  * potentially large trees, so nothing here runs on page load; the user clicks Scan.
  *
- * Two piles, labelled distinctly (spec §11.1d): **Debris** is selectable, its running total
+ * Three piles, labelled distinctly (spec §11.1d): **Debris** is selectable, its running total
  * link-aware (`freedBytes`, mirrors `core/disk_review.py.freed_bytes` exactly -- selecting one
  * side of a hardlinked pair reports zero bytes, because the other link still holds the data).
  * **Seeding estate** is shown for visibility only, never selectable -- it is claimed, not
- * orphaned. `broken_seeds` and `skipped_base_paths` are named rather than hidden, the same
- * "don't silently absorb a gap" instinct this codebase applies everywhere else.
+ * orphaned. **Unclaimed** (finding #17, 2026-08-23) is ownership genuinely undeterminable --
+ * shown, grouped by directory the same as debris, its own reclaim figure link-aware the same way
+ * -- but with no checkbox anywhere, so it cannot be reached by the ordinary select-and-remove
+ * flow. Fail-closed used to mean "don't show it"; that was the same mistake as finding #2
+ * (content never surfaced is indistinguishable from content that doesn't exist) applied to this
+ * feature's own most valuable output. `broken_seeds` and `skipped_base_paths` are named rather
+ * than hidden, the same "don't silently absorb a gap" instinct this codebase applies everywhere
+ * else.
  *
- * **Both piles are rolled up for display (2026-08-23, finding #7): "it would be better to show
- * Torrents and expand each torrent to see details like files etc."** `core/disk_review.py.
+ * **All three piles are rolled up for display (2026-08-23, finding #7): "it would be better to
+ * show Torrents and expand each torrent to see details like files etc."** `core/disk_review.py.
  * reconcile()` itself is untouched -- still per-file, because inode accounting is inherently
  * per-file (spec §11.1b) -- `lib/diskReview.ts.groupDebrisByDirectory`/
- * `groupSeedingEstateByTorrent` only bucket its already-flat output for this page. The two piles
- * group **differently on purpose**: the seeding estate groups by the claim's own torrent (it
- * always has one); debris has no torrent to group under by definition, so it groups by directory
- * instead.
+ * `groupSeedingEstateByTorrent`/`groupUnclaimedByDirectory` only bucket its already-flat output
+ * for this page. **The piles group differently on purpose**: the seeding estate groups by the
+ * claim's own torrent (it always has one); debris and unclaimed have no torrent to group under by
+ * definition, so both group by directory instead (finding #17 extends debris's own grouping
+ * choice to the third pile rather than inventing a different one).
  */
 export function DiskReviewPage() {
   const [scanning, setScanning] = useState(false)
@@ -157,6 +223,7 @@ export function DiskReviewPage() {
   const [selected, setSelected] = useState<Set<string>>(new Set())
   const [expandedDebrisDirs, setExpandedDebrisDirs] = useState<Set<string>>(new Set())
   const [expandedTorrents, setExpandedTorrents] = useState<Set<string>>(new Set())
+  const [expandedUnclaimedDirs, setExpandedUnclaimedDirs] = useState<Set<string>>(new Set())
 
   const runScan = () => {
     setScanning(true)
@@ -167,6 +234,7 @@ export function DiskReviewPage() {
         setSelected(new Set())
         setExpandedDebrisDirs(new Set())
         setExpandedTorrents(new Set())
+        setExpandedUnclaimedDirs(new Set())
       })
       .catch((err: unknown) => setError(err instanceof Error ? err.message : String(err)))
       .finally(() => setScanning(false))
@@ -202,7 +270,10 @@ export function DiskReviewPage() {
 
   const debrisGroups = result ? groupDebrisByDirectory(result.debris) : []
   const seedingGroups = result ? groupSeedingEstateByTorrent(result.seeding_estate) : []
+  const unclaimedGroups = result ? groupUnclaimedByDirectory(result.unclaimed) : []
   const total = result ? freedBytes(result.debris, selected) : 0
+  const unclaimedAbsPaths = new Set(result?.unclaimed.map((u) => u.abs_path) ?? [])
+  const unclaimedTotal = result ? freedBytes(result.unclaimed, unclaimedAbsPaths) : 0
 
   return (
     <div className="flex flex-col gap-4">
@@ -242,30 +313,6 @@ export function DiskReviewPage() {
                 {result.skipped_base_paths.map((s) => (
                   <li key={s.root}>
                     <span className="font-mono text-xs">{s.root}</span> -- {s.reason}
-                  </li>
-                ))}
-              </ul>
-            </div>
-          )}
-
-          {/* Narrower than the "base paths skipped" banner above on purpose (2026-08-23): these
-           * roots WERE walked -- their seeding estate below is complete -- only some number of
-           * unclaimed files couldn't be cleared for the debris pile. A whole-root skip used to
-           * hide legitimate, already-claimed content along with the genuinely ambiguous files;
-           * this reads as "N items suppressed," never "N base paths skipped." */}
-          {result.suppressed_debris.length > 0 && (
-            <div className="rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-900 dark:border-amber-900/60 dark:bg-amber-950/40 dark:text-amber-200">
-              <p className="font-medium">
-                {result.suppressed_debris.reduce((sum, s) => sum + s.count, 0)} item
-                {result.suppressed_debris.reduce((sum, s) => sum + s.count, 0) === 1 ? '' : 's'}{' '}
-                suppressed from debris this pass -- claimed content in these paths is unaffected
-                and still shown below
-              </p>
-              <ul className="mt-1 list-inside list-disc">
-                {result.suppressed_debris.map((s) => (
-                  <li key={s.root}>
-                    <span className="font-mono text-xs">{s.root}</span> -- {s.count} item
-                    {s.count === 1 ? '' : 's'}: {s.reason}
                   </li>
                 ))}
               </ul>
@@ -369,6 +416,58 @@ export function DiskReviewPage() {
               </div>
             )}
           </section>
+
+          {result.unclaimed.length > 0 && (
+            <section className="flex flex-col gap-2">
+              <div className="rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-900 dark:border-amber-900/60 dark:bg-amber-950/40 dark:text-amber-200">
+                <p className="font-medium">
+                  Unclaimed -- {result.unclaimed.length} item{result.unclaimed.length === 1 ? '' : 's'}{' '}
+                  of undeterminable ownership
+                </p>
+                <p className="mt-1">
+                  This is not the norm -- a single-lftpweb setup should see this pile empty. A
+                  populated pile usually means debris left behind by an interrupted operation, or
+                  another lftpweb instance&apos;s content sharing this seedbox (a category this
+                  instance cannot resolve to a path, so it cannot tell the two apart). Nothing
+                  below is selectable through the debris flow above -- reviewing and acting on it
+                  needs its own, deliberate step, which does not exist yet.
+                </p>
+              </div>
+              <div className="flex items-center justify-between">
+                <h2 className="text-sm font-medium text-zinc-900 dark:text-zinc-100">
+                  {result.unclaimed.length} item{result.unclaimed.length === 1 ? '' : 's'} in{' '}
+                  {unclaimedGroups.length} director{unclaimedGroups.length === 1 ? 'y' : 'ies'}
+                </h2>
+                <span className="text-sm text-zinc-500 dark:text-zinc-400">
+                  {formatBytes(unclaimedTotal)} if resolved
+                </span>
+              </div>
+              <div className="overflow-hidden rounded-md border border-zinc-200 dark:border-zinc-800">
+                <table className="w-full text-sm">
+                  <thead className="bg-zinc-50 text-left text-zinc-500 dark:bg-zinc-900 dark:text-zinc-400">
+                    <tr>
+                      <th className="px-3 py-2 font-medium">Directory / path</th>
+                      <th className="px-3 py-2 font-medium">Size</th>
+                      <th className="px-3 py-2 font-medium">Why unclaimed</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {unclaimedGroups.map((group) => (
+                      <UnclaimedGroupRow
+                        key={group.directory}
+                        group={group}
+                        allAbsPaths={unclaimedAbsPaths}
+                        expanded={expandedUnclaimedDirs.has(group.directory)}
+                        onToggleExpand={() =>
+                          toggleSet(expandedUnclaimedDirs, setExpandedUnclaimedDirs, group.directory)
+                        }
+                      />
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </section>
+          )}
 
           {result.broken_seeds.length > 0 && (
             <section className="flex flex-col gap-2">

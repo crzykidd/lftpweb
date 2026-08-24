@@ -21,7 +21,7 @@ from lftpweb.core.disk_review import (
     DiskEntry,
     InUsePath,
     SkippedBasePath,
-    SuppressedDebrisItem,
+    UnclaimedItem,
     _load_in_use_paths,  # testing Set C's own I/O helper directly, see the section below
     _resolve_client_exclusions,  # the pure derivation step behind `run_scan`'s own gathering
     freed_bytes,
@@ -686,11 +686,49 @@ def test_claimed_content_in_an_excluded_category_is_hard_excluded_without_touchi
     assert excluded_file.abs_path not in debris_paths
 
 
-def test_a_genuinely_unclaimed_file_under_an_ambiguous_root_is_suppressed_with_a_reason():
-    """The one truly irreducible case: nobody claims this file at all, so there is no category to
-    read off a claim -- it might be the leftover of a since-vanished excluded-category transfer,
-    or genuine debris, and `reconcile` cannot tell which. Fail-closed, and named as
-    `suppressed_debris`, not silently dropped.
+def test_excluded_category_claim_appears_in_no_pile_not_even_unclaimed():
+    """Finding #17's own line to keep sharp: a file claimed by an EXCLUDED category is *known* to
+    belong to the other lftpweb instance -- it must never appear in debris, seeding_estate,
+    broken_seeds, *or* the new unclaimed pile. The unclaimed pile is for ownership that is
+    genuinely UNKNOWN, never for something already known to be someone else's. This is the same
+    root as the ambiguous-root case (`debris_ambiguous_roots` is set here too), so this is a
+    direct assertion that hard exclusion wins over the ambiguous-root fail-closed path, not an
+    accident of an otherwise-empty fixture.
+    """
+    root = "/rtorrent/data"
+    excluded_file = _file(root, "Excluded.Release/file.mkv")
+    result = reconcile(
+        **_base(
+            base_paths=[root],
+            contributors=[BasePathContributor(root, client_id=2)],
+            reachable_client_ids=[2],
+            disk_entries=[excluded_file],
+            claims=[
+                _claim(
+                    2,
+                    "rTorrent",
+                    f"{root}/Excluded.Release",
+                    transfer_id="rt2",
+                    category="other-site-movies",
+                )
+            ],
+            excluded_categories_by_client={2: frozenset({"other-site-movies"})},
+            debris_ambiguous_roots={root: "other-site-movies cannot be resolved to a path"},
+        )
+    )
+    assert excluded_file.abs_path not in {d.abs_path for d in result.debris}
+    assert excluded_file.abs_path not in {e.abs_path for e in result.seeding_estate}
+    assert excluded_file.abs_path not in {b.content_path for b in result.broken_seeds}
+    assert excluded_file.abs_path not in {u.abs_path for u in result.unclaimed}
+    assert result.unclaimed == ()
+
+
+def test_a_genuinely_unclaimed_file_under_an_ambiguous_root_is_shown_in_the_unclaimed_pile():
+    """Finding #17's correction: the one truly irreducible case (nobody claims this file at all,
+    so there is no category to read off a claim -- it might be the leftover of a since-vanished
+    excluded-category transfer, or genuine debris, and `reconcile` cannot tell which) is no
+    longer a silent count. It is shown as its own pile item, with its reason, never selectable
+    through the debris flow (it is not in `result.debris`).
     """
     root = "/rtorrent/data"
     orphan = _file(root, "Orphan.Release/file.mkv")
@@ -704,11 +742,71 @@ def test_a_genuinely_unclaimed_file_under_an_ambiguous_root_is_suppressed_with_a
         )
     )
     assert result.debris == ()
-    assert result.suppressed_debris == (
-        SuppressedDebrisItem(
-            root=root, count=1, reason="other-site-movies cannot be resolved to a path"
+    assert result.unclaimed == (
+        UnclaimedItem(
+            root=root,
+            rel_path=orphan.rel_path,
+            abs_path=orphan.abs_path,
+            size=orphan.size,
+            mtime=orphan.mtime,
+            inode=orphan.inode,
+            nlink=orphan.nlink,
+            link_paths=(),
+            reason="other-site-movies cannot be resolved to a path",
         ),
     )
+    # The "not selectable through the debris flow" property, at the level this module can assert
+    # it (the frontend enforces it further by never rendering a checkbox for this pile at all,
+    # see `DiskReviewPage.tsx`): an unclaimed item is never also a debris candidate.
+    assert orphan.abs_path not in {d.abs_path for d in result.debris}
+
+
+def test_single_instance_shaped_fixture_produces_an_empty_unclaimed_pile():
+    """The normal case must look normal (finding #17's own "in a single-instance setup it should
+    be empty" requirement): no exclusions, every category resolvable, nothing ambiguous -- the
+    unclaimed pile stays empty even though there is genuine, ordinary debris to find.
+    """
+    root = "/complete/tv"
+    debris_file = _file(root, "Orphan.Release/file.mkv")
+    result = reconcile(
+        **_base(
+            base_paths=[root],
+            contributors=[BasePathContributor(root, client_id=1)],
+            reachable_client_ids=[1],
+            disk_entries=[debris_file],
+        )
+    )
+    assert result.unclaimed == ()
+    assert len(result.debris) == 1
+
+
+def test_unclaimed_pile_reclaim_total_is_link_aware():
+    """§10.5's own requirement extended to the third pile (finding #17): a naive sum would
+    reintroduce the lie that section exists to prevent. Selecting only one of two hardlinked
+    unclaimed items must report zero bytes freed; selecting both reports the real total.
+    """
+    root = "/rtorrent/data"
+    link_a = _file(root, "Orphan.Release/file.mkv", size=5_000, inode=7, nlink=2)
+    link_b = _file("/complete/tv", "Orphan.Release/file.mkv", size=5_000, inode=7, nlink=2)
+    result = reconcile(
+        **_base(
+            base_paths=[root, "/complete/tv"],
+            contributors=[
+                BasePathContributor(root, client_id=2),
+                BasePathContributor("/complete/tv", client_id=2),
+            ],
+            reachable_client_ids=[2],
+            disk_entries=[link_a, link_b],
+            debris_ambiguous_roots={
+                root: "reason A",
+                "/complete/tv": "reason A",
+            },
+        )
+    )
+    assert len(result.unclaimed) == 2
+    all_paths = {u.abs_path for u in result.unclaimed}
+    assert freed_bytes(result.unclaimed, {link_a.abs_path}) == 0
+    assert freed_bytes(result.unclaimed, all_paths) == 5_000
 
 
 def test_seeding_estate_is_populated_even_when_debris_is_suppressed_for_that_path():

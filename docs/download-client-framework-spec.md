@@ -1193,20 +1193,51 @@ state.
 completed directory and that is it. we pick up from completed and delete on success import. the
 torrent keeps seeding till I manually clean today."*
 
-### 11.1d Two different piles — and only one of them is orphans
+### 11.1d Three piles — and only one of them is orphans
 
-That confirmation separates two things this section could easily have conflated, and they want
+That confirmation separates things this section could easily have conflated, and they want
 different features:
 
 | Pile | What it is | Whose problem |
 |---|---|---|
-| **Debris** | Data under a base path that **no client claims and lftpweb is not using** — failed extractions, aborted grabs, and the §10.3 window where the client entry was removed but the SSH delete failed | §11, the orphan scan. Genuinely unclaimed; safe to review and remove |
+| **Debris** | Data under a base path that **no client claims and lftpweb is not using** — failed extractions, aborted grabs, and the §10.3 window where the client entry was removed but the SSH delete failed | §11, the orphan scan. Genuinely unclaimed, in a resolvable path; safe to review and select for removal |
 | **The seeding estate** | rTorrent's downloads directory, still **claimed** by live torrents, accumulating until the user cleans it by hand | Not orphans. This is #21 — eligibility by site rules, ranking, then §10's delete path |
+| **Unclaimed** *(finding #17, 2026-08-23)* | Unclaimed by any client, in a tree where an exclusion cannot be resolved to a path — ownership is **genuinely undeterminable**, not merely unproven | §11, shown but not selectable through the ordinary debris flow — see below |
 
-**The manual cleanup the user does today is the second pile**, and naming it correctly keeps the
-orphan scan from ever proposing a live seeding torrent's data as debris. The scan still *shows*
-both — a review page that omits the seeding estate would be answering a question nobody asked — but
-the two are labelled distinctly and only debris is selectable for removal before #21 exists.
+**The manual cleanup the user does today is the seeding-estate pile**, and naming it correctly
+keeps the orphan scan from ever proposing a live seeding torrent's data as debris. The scan still
+*shows* all three — a review page that omits any of them would be answering a question nobody
+asked, and finding #17 corrects an earlier reading that treated "cannot resolve to a path" as
+license to hide the third pile entirely — but they are labelled distinctly and only debris is
+selectable for removal before #21 exists.
+
+**The unclaimed pile, and why it exists as a pile rather than a count (finding #17).** §11.2's own
+fail-closed rule (below) still refuses to let a genuinely unclaimed file under an ambiguous root
+land in debris — the safety property is unchanged. What changed is what happens to it instead:
+earlier, it was tallied into a bare "N items suppressed" count and never shown. That is the same
+failure as finding #2 — content that exists and is never surfaced is indistinguishable from
+content that is not there — applied to the exact material a disk review exists to find (*"things
+can show up in weird categories etc — we might want to clean up"*, the user, 2026-08-23). So:
+
+- **Fail-closed now means "never act without an explicit gate," not "never display."** The file
+  is shown, grouped by directory the same way debris is (a genuinely unclaimed item has no
+  torrent to group under either), with the reason it landed here.
+- **It states plainly why it is abnormal.** In a single-lftpweb setup this pile should be empty or
+  near-empty. A populated one usually means either debris left behind by an interrupted operation,
+  or **another lftpweb instance's content** sharing this seedbox (finding #16) — say both, not a
+  generic warning.
+- **Its reclaim figure is link-aware**, exactly like debris's (§10.5) — a naive sum would
+  reintroduce the lie that section exists to prevent.
+- **It is not reachable through the ordinary select-and-remove flow.** No checkbox exists for it
+  at all in this task's own implementation — see §11.4 below for the gate stage 5 must build
+  before anything can act on this pile.
+- **The line that must stay sharp:** a file claimed by an **excluded** category is *known* to
+  belong to the other lftpweb instance — it is a hard exclusion, dropped before any claim/debris
+  logic runs, and it appears in **no** pile, unclaimed included. The unclaimed pile is only for
+  ownership that is genuinely *unknown*. `core/disk_review.py.reconcile()` enforces this by
+  folding an excluded claim's own `content_path` into the same hard-exclusion set a manually
+  excluded path uses, before the claim is dropped — so the file it named never falls through to
+  "nobody claims this" by accident.
 
 **One useful property falls out of the workflow.** Once lftpweb's `move`-mode delete has removed the
 completed-folder link on confirmed import, the torrent's own copy is the **only** remaining link.
@@ -1236,14 +1267,18 @@ torrent data for deletion.
   yet appeared in the client's list, must never be proposed. Same instinct as §7.3's removal grace
   period.
 - **Containment.** Only paths under declared base paths are scanned or proposed. Ever.
-- **Exclusion (added 2026-08-23, §8.3 round 5, finding #16).** A path under
-  `download_client_excluded_path`, or resolved there from an excluded category, is dropped before
-  any candidate/claim logic runs — never proposed as debris, never shown as seeding estate, never
-  reported as a broken seed. Where an excluded category cannot be resolved to a path at all (no
-  `content`-kind base path for that client), every one of that client's declared base paths is
-  suppressed for debris entirely, fail-closed, with a stated reason — the same "clients must have
-  all reported successfully" shape §11.1a already uses, applied to a self-imposed exclusion rather
-  than a missing report.
+- **Exclusion (added 2026-08-23, §8.3 round 5, finding #16; narrowed the same day by live use,
+  then corrected again by finding #17).** A path under `download_client_excluded_path`, or
+  resolved there from an excluded category, is dropped before any candidate/claim logic runs —
+  never proposed as debris, never shown as seeding estate, never reported as a broken seed, never
+  shown in the unclaimed pile either. A claim whose own category is excluded is folded into this
+  same hard-exclusion set via its `content_path` (finding #17) — it is *known* to belong to
+  another instance, not merely unproven. Where an excluded category cannot be resolved to a path
+  at all (no `content`-kind base path for that client, rTorrent under the reference layout), the
+  root is still walked and its seeding estate stays populated normally — **only a genuinely
+  unclaimed file** under that root is held back from debris, and it is shown in the **unclaimed**
+  pile (§11.1d), not silently suppressed. (An earlier version of this rule suppressed the file
+  entirely, and an even earlier one suppressed the client's whole base path — both superseded.)
 - **The C set reuses `core/pipeline_flight.py`'s existing predicate and `in_flight_item_ids()` —
   never a second definition of "busy."** `docs/torrent-manager-spec.md` §9 names this specifically,
   and it is the v0.2.6 `REMOTE_GONE` defect class: deleting a seedbox source out from under a queued
@@ -1256,14 +1291,40 @@ torrent data for deletion.
 - **Shared cross-seed paths** (§10.4) apply here identically.
 - **Review-only. The scan never deletes.** It produces a list with per-candidate size and a
   **link-aware** reclaim total (§10.5); a human selects; the selection goes through §10's sequence.
-- **Debris and the seeding estate are labelled distinctly, and only debris is selectable** before
-  #21 exists (§11.1d).
+- **All three piles are labelled distinctly, and only debris is selectable** before #21 exists
+  (§11.1d) — the unclaimed pile is visible but gated off the ordinary select-and-remove flow by
+  construction (no checkbox exists for it), not merely by a UI convention that could be bypassed.
 
 ### 11.3 Manual trigger
 
 The user asked for a manual scan, and manual is right for a first version: the scan is an SSH walk
 over potentially large trees and should not ride a page load. A scheduled cadence is a later
 addition, not a launch requirement.
+
+### 11.4 The unclaimed pile's own gate — deferred to stage 5, deliberately
+
+Finding #17 makes the unclaimed pile visible but explicitly builds no action for it — stage 5
+(§14) doesn't exist yet, so there is nothing to gate. Building a confirmation flow now would be
+speculative UI, designed against guesses about a delete sequence not yet written. What this task
+*does* do is record the shape stage 5 should implement, so that stage rather than a future guess
+decides it:
+
+- **This project has a standing preference against confirmation dialogs.** The pause and
+  bandwidth controls (§8) were deliberately built as a checkbox plus a debounced auto-commit plus
+  a result banner, *never* a modal, on the recorded principle that fewer clicks beat more
+  confirmation.
+- **The user's own request was "a confirmation dialog or something"** — not a mandate for a modal,
+  an acknowledgment that *some* extra friction is warranted here specifically, because the failure
+  mode is deleting another lftpweb instance's data.
+- **The recommendation: a distinct, separately-reachable action, not a modal.** Keep the unclaimed
+  pile permanently unreachable from the ordinary debris checkbox-and-remove flow (as this task
+  already builds), and give it its own explicit action — visually separated, naming what is
+  unresolvable and why before it can be used — rather than a confirm dialog bolted onto the same
+  flow debris uses. This is accident-proof (it cannot be reached by habit, the way clicking through
+  a modal can) without being repetitive (it is not a second click on every ordinary action, only
+  on the one action that is genuinely unusual). See `docs/decisions.md`'s 2026-08-23 entry for this
+  task for the full reasoning; stage 5 should treat this as the starting design, not reopen the
+  question from scratch.
 
 ---
 
@@ -1454,8 +1515,8 @@ Each stage is independently shippable. Nothing before stage 5 can delete anythin
 | **1** | SABnzbd adapter, instance CRUD, declared config form, test-connection, capability readout, **the redacted capture** (§13.3), **and the README write-up of the reference workflow** (§1.1) | First real client contact. The README section is the user's explicit ask: document the *preferred* seedbox setup, so other workflows are recognisable as departures from a stated one |
 | **2** | The poller (§9), SAB as a third Preflight source, the settle-gate skip | #18's first real user-facing payoff. **2a (the poller + Preflight source) landed 2026-08-23** (`prompts/done/2026-08-23-client-poller.md`). **2b (the settle-gate skip itself) landed 2026-08-23** (`prompts/done/2026-08-23-settle-gate-skip.md`) -- ships **off** (`settle.SettleSettings.client_skip_enabled`, default `False`) pending live confirmation of §13.4 guess #2 against a real SABnzbd; every uncertain path (setting off, no client-sync source wired, unreachable client, blank/empty response, a queue-side or `UNKNOWN` phase, a near-miss path) falls back to running the settle gate exactly as it ran before this stage. **A terminal `COMPLETED` verdict no longer satisfies the gate the instant it's seen** (2026-08-23, `prompts/done/2026-08-23-client-completion-delay.md`, finding #9) -- it now holds `settle.CLIENT_COMPLETION_HOLD_S` (10s) first, measured from the client's own `completed_at` (a completion already older than the hold satisfies it immediately; falls back to lftpweb's own first-observation time only when a connector reports no `completed_at`) |
 | **3** | Withhold on partial failure (`docs/transfers-redesign-spec.md` §4.3), and the §9.1 poll-cadence fix | **Landed 2026-08-23** (`prompts/done/2026-08-23-withhold-and-cadence.md`). The cadence split is corrected to cheap-vs-expensive, read per-connector off `Operation.LIST_HISTORY`'s own capability declaration (§9.1's own correction note). The withhold gate ships **off** (`autoqueue.WithholdSettings.enabled`, default `False`) pending live confirmation of §13.4 guess #2 against a real SABnzbd, for the identical reason stage 2b's `client_skip_enabled` shipped off -- every uncertain path (setting off, no client-sync source wired, unreachable client, blank/empty response, a queue-side or `UNKNOWN` phase, an outright failure with no `content_path`, a near-miss path) falls back to today's behavior unchanged. No API/UI surface shipped this stage -- `AutoQueue.withheld` is public and readable, but nothing reads it yet; named as an open gap, not hidden |
-| **4** | The disk review scan (§11), both buckets, review-only | **Landed 2026-08-23** (`prompts/done/2026-08-23-disk-review-scan.md`). `core/disk_review.py.reconcile()` is pure set math over Set A/B/C, unit-tested exhaustively without SSH -- the §11.1a union-across-clients catastrophe and the §11.1b inode-claiming catastrophe are both asserted directly. `core/remote.py.RemoteConnectionPool.scan_with_inodes` extends the existing GNU-`find`/BusyBox-fallback scan with `%i`/`%n`; the fallback (`remote_agent/scan_fs.py --inodes`) supplies inode/nlink too (`os.lstat`, stdlib-only), so there is no "BusyBox can't do this" case needing the unavailable-declaration path -- it exists (`RemoteScanError` propagates rather than degrading) but is untriggered by inode support itself, only by a genuine walk failure. `POST /api/disk-review/scan`, manual trigger only (§11.3); a Transfers → Disk review tab shows the two piles with a link-aware running total. Not yet looked at against the real box -- see this task's own final report for what remains named as a gap (multi-filesystem inode collisions, prefix-vs-exact mount-sentinel matching, empty-directory debris) before stage 5 |
-| **5** | The delete pipeline (§10), manual trigger, verification, banner | **Findings #15/#16's gate is cleared** (2026-08-23, `prompts/done/2026-08-23-category-tristate-and-exclusion.md`, §8.3 round 5, **corrected in round 6 the same day** by live use against the real box, `prompts/done/2026-08-23-auto-add-categories-default-excluded.md`). Categories are three-state and persisted (migration 031, every observation now recorded via migration 032, not just a manual Test); the unattributed-clients banner counts only the undecided state, re-derived at **request time** against a live exclusion read (round 6 fixed a poll-interval staleness bug here); excluded categories are dropped per-file off their own claim's category (round 6, universal, no path arithmetic needed) with a narrower fail-closed rule for the genuinely unclaimed remainder only — a whole base path is never blanket-suppressed anymore, only ambiguous unclaimed files (round 5's version of this rule hid legitimate, already-claimed content that was never at risk); `core/disk_review.py.is_authorized_delete_target` gives stage 5 a ready-made, already-tested two-sided containment check (base path **and** outside every excluded path). **What still stands in the way of building stage 5 itself:** (1) none of this has been exercised against the user's real two-instance deployment beyond the live findings rounds 5/6 already fixed — a scan, an excluded category, and the narrowed fail-closed rule all still need a full live run before anything is trusted to delete; (2) `is_authorized_delete_target` is unit-tested but unused — stage 5's own delete sequence (§10.2) must actually call it, not re-derive containment; (3) the manual excluded-paths UI (`ClientsTab.tsx`) and the new "N new categories" signal are unverified in a real browser, same as every other layout change in this feature; (4) §11.1c/§10.4/§10.5's own named gaps (cross-seeding, multi-filesystem inode collisions) remain open regardless of this task. Stage 4's own real-box verification (named in its own §14 row) is still outstanding too and should happen before, not after, stage 5 |
+| **4** | The disk review scan (§11), three piles, review-only | **Landed 2026-08-23** (`prompts/done/2026-08-23-disk-review-scan.md`), **extended the same day to a third pile** by finding #17 (`prompts/done/2026-08-23-unclaimed-pile.md`). `core/disk_review.py.reconcile()` is pure set math over Set A/B/C, unit-tested exhaustively without SSH -- the §11.1a union-across-clients catastrophe and the §11.1b inode-claiming catastrophe are both asserted directly. `core/remote.py.RemoteConnectionPool.scan_with_inodes` extends the existing GNU-`find`/BusyBox-fallback scan with `%i`/`%n`; the fallback (`remote_agent/scan_fs.py --inodes`) supplies inode/nlink too (`os.lstat`, stdlib-only), so there is no "BusyBox can't do this" case needing the unavailable-declaration path -- it exists (`RemoteScanError` propagates rather than degrading) but is untriggered by inode support itself, only by a genuine walk failure. **The third pile (finding #17):** a genuinely unclaimed file under a root where an excluded category cannot be resolved to a path is no longer a silent count (`SuppressedDebrisItem`) -- it is now `UnclaimedItem`, shown as its own pile (§11.1d), grouped by directory, link-aware reclaim figure, gated off the ordinary select-and-remove flow by construction (no checkbox rendered for it at all). A claim whose category is excluded is folded into the same hard-exclusion set a manually excluded path uses, so it never falls through to "unclaimed" by accident (`test_excluded_category_claim_appears_in_no_pile_not_even_unclaimed`). `POST /api/disk-review/scan`, manual trigger only (§11.3); a Transfers → Disk review tab shows all three piles with a link-aware running total each. Not yet looked at against the real box -- see this task's own final report for what remains named as a gap (multi-filesystem inode collisions, prefix-vs-exact mount-sentinel matching, empty-directory debris) before stage 5 |
+| **5** | The delete pipeline (§10), manual trigger, verification, banner | **Findings #15/#16's gate is cleared** (2026-08-23, `prompts/done/2026-08-23-category-tristate-and-exclusion.md`, §8.3 round 5, **corrected in round 6 the same day** by live use against the real box, `prompts/done/2026-08-23-auto-add-categories-default-excluded.md`). Categories are three-state and persisted (migration 031, every observation now recorded via migration 032, not just a manual Test); the unattributed-clients banner counts only the undecided state, re-derived at **request time** against a live exclusion read (round 6 fixed a poll-interval staleness bug here); excluded categories are dropped per-file off their own claim's category (round 6, universal, no path arithmetic needed) with a narrower fail-closed rule for the genuinely unclaimed remainder only — a whole base path is never blanket-suppressed anymore, only ambiguous unclaimed files (round 5's version of this rule hid legitimate, already-claimed content that was never at risk); `core/disk_review.py.is_authorized_delete_target` gives stage 5 a ready-made, already-tested two-sided containment check (base path **and** outside every excluded path). **Finding #17 (2026-08-23) adds a requirement to this stage's own scope**: the unclaimed pile is now visible (§11.1d, §11.4) but deliberately inert, so stage 5 must build its own gate before that pile can be acted on at all -- §11.4 records the recommended shape (a distinct, separately-reachable action, not a confirm dialog) for stage 5 to implement deliberately rather than invent. **What still stands in the way of building stage 5 itself:** (1) none of this has been exercised against the user's real two-instance deployment beyond the live findings rounds 5/6/17 already fixed — a scan, an excluded category, the narrowed fail-closed rule, and the unclaimed pile itself all still need a full live run before anything is trusted to delete; (2) `is_authorized_delete_target` is unit-tested but unused — stage 5's own delete sequence (§10.2) must actually call it, not re-derive containment; (3) the manual excluded-paths UI (`ClientsTab.tsx`), the new "N new categories" signal, and the unclaimed pile's own display are all unverified in a real browser, same as every other layout change in this feature; (4) §11.1c/§10.4/§10.5's own named gaps (cross-seeding, multi-filesystem inode collisions) remain open regardless of this task; (5) the unclaimed pile's own gate (§11.4) does not exist yet — stage 5 must design and build it, not merely wire a delete call to the pile that already renders. Stage 4's own real-box verification (named in its own §14 row) is still outstanding too and should happen before, not after, stage 5 |
 
 **Deletion is stage 5 deliberately.** The scan gets built and inspected against a real seeding
 estate before any code path is allowed to remove. Auto mode is the same code minus the trigger, and
