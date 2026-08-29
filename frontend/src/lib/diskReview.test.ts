@@ -1,8 +1,17 @@
 import { describe, expect, it } from 'vitest'
-import type { DiskReviewDebrisOut, DiskReviewSeedingEstateOut, DiskReviewUnclaimedOut } from '../api/types'
+import type {
+  DiskReviewDebrisOut,
+  DiskReviewExcludedContentOut,
+  DiskReviewSeedingEstateOut,
+  DiskReviewUnclaimedOut,
+} from '../api/types'
 import {
+  filesByClaimKey,
+  formatRatio,
+  formatSeedTime,
   freedBytes,
   groupDebrisByDirectory,
+  groupExcludedContentByDirectory,
   groupSeedingEstateByTorrent,
   groupUnclaimedByDirectory,
 } from './diskReview'
@@ -40,6 +49,22 @@ function seedingEntry(overrides: Partial<DiskReviewSeedingEstateOut>): DiskRevie
     claimed_transfer_id: 't1',
     claimed_transfer_name: 'Release.S01E01',
     claimed_content_path: '/rtorrent/data/Release',
+    // 2026-08-24 (this task): attribution/claim_key added alongside the new per-client torrent
+    // table -- defaults picked to match this file's other default 'client_id=1, transfer_id=t1'.
+    attribution: 'bound',
+    claim_key: '1:t1',
+    ...overrides,
+  }
+}
+
+function excludedContentEntry(overrides: Partial<DiskReviewExcludedContentOut>): DiskReviewExcludedContentOut {
+  return {
+    root: '/rtorrent/data',
+    rel_path: 'OtherInstance.Release/file.mkv',
+    abs_path: '/rtorrent/data/OtherInstance.Release/file.mkv',
+    size: 100,
+    excluded_path: '/rtorrent/data/OtherInstance.Release',
+    link_paths: [],
     ...overrides,
   }
 }
@@ -155,5 +180,67 @@ describe('groupSeedingEstateByTorrent', () => {
     const b = seedingEntry({ claimed_by_client_id: 2, claimed_transfer_id: 't1', claimed_transfer_name: 'Alpha' })
     const groups = groupSeedingEstateByTorrent([a, b])
     expect(groups).toHaveLength(2)
+  })
+})
+
+// --- filesByClaimKey (2026-08-24, this task) -- the per-client torrent table's own row-expand
+// lookup, `SeedingEstateGroup.key` reused verbatim since it's already `claim_key`'s own format. --
+
+describe('filesByClaimKey', () => {
+  it('looks up a torrent\'s own files by claim_key, matching DiskReviewTorrentOut.claim_key\'s format', () => {
+    const seedCopy = seedingEntry({ abs_path: '/rtorrent/data/Release/file.mkv', size: 100 })
+    const map = filesByClaimKey([seedCopy])
+    expect(map.get('1:t1')?.entries).toEqual([seedCopy])
+    expect(map.get('nonexistent:key')).toBeUndefined()
+  })
+})
+
+// --- The fourth pile (2026-08-24, spec §11.1e/§17.6) ----------------------------------------
+
+describe('groupExcludedContentByDirectory', () => {
+  it('buckets excluded content by directory, sorted, same as debris and unclaimed', () => {
+    const a = excludedContentEntry({ abs_path: '/rtorrent/data/Zeta.Release/a.mkv' })
+    const b = excludedContentEntry({ abs_path: '/rtorrent/data/Alpha.Release/b.mkv' })
+    const groups = groupExcludedContentByDirectory([a, b])
+    expect(groups.map((g) => g.directory)).toEqual(['/rtorrent/data/Alpha.Release', '/rtorrent/data/Zeta.Release'])
+  })
+
+  it('carries each entry\'s own excluded_path through to the group', () => {
+    const a = excludedContentEntry({ excluded_path: '/rtorrent/data/OtherInstance.Release' })
+    const groups = groupExcludedContentByDirectory([a])
+    expect(groups[0].entries[0].excluded_path).toBe('/rtorrent/data/OtherInstance.Release')
+  })
+
+  it('link-aware size stays correct for a hardlinked pair, same technique as debris/unclaimed', () => {
+    const linkPaths = ['/rtorrent/data/Release/file.mkv', '/complete/tv/Release/file.mkv']
+    const a = excludedContentEntry({ abs_path: linkPaths[0], size: 40_000_000_000, link_paths: linkPaths })
+    const b = excludedContentEntry({ abs_path: linkPaths[1], size: 40_000_000_000, link_paths: linkPaths })
+    expect(freedBytes([a, b], new Set([a.abs_path]))).toBe(0)
+    expect(freedBytes([a, b], new Set(linkPaths))).toBe(40_000_000_000)
+  })
+})
+
+describe('formatSeedTime', () => {
+  it('renders null as an em dash, never a fabricated zero', () => {
+    expect(formatSeedTime(null)).toBe('—')
+  })
+
+  it('renders a real zero as 0s, not an em dash', () => {
+    expect(formatSeedTime(0)).toBe('0s')
+  })
+
+  it('scales through minutes, hours and days', () => {
+    expect(formatSeedTime(45)).toBe('45s')
+    expect(formatSeedTime(5 * 60)).toBe('5m')
+    expect(formatSeedTime(3 * 3600 + 15 * 60)).toBe('3h 15m')
+    expect(formatSeedTime(9 * 86400 + 4 * 3600)).toBe('9d 4h')
+  })
+})
+
+describe('formatRatio', () => {
+  it('renders null as an em dash and a real value to two decimals', () => {
+    expect(formatRatio(null)).toBe('—')
+    expect(formatRatio(1.5)).toBe('1.50')
+    expect(formatRatio(0)).toBe('0.00')
   })
 })

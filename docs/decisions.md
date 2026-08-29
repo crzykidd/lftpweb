@@ -6,6 +6,63 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-24 — disk review table: a global label filter, per-section sort, and "debris"/"unclaimed" become on-screen wording only
+
+`prompts/done/2026-08-24-disk-review-table-frontend.md`. Rebuilt the Disk review page around a
+section per download client, each a sortable/filterable torrent table driven by the backend's new
+`torrents`/`clients` shapes (`prompts/done/2026-08-24-disk-review-visibility-backend.md`). Four
+decisions worth recording:
+
+**The label filter is global, not per-section** — resolving the question the backend task above
+explicitly left open. The user's original ask was "finding content across the seedbox," which is
+a global question by nature; a per-section filter would need its own selection state times however
+many clients exist, for no benefit today, since there is exactly one seedbox host
+(`core/engine.py.load_host_config` is "single, v1") and a category name is a seedbox-wide concept,
+not a per-client one — the same category can appear on torrents from two different clients (SAB
+and rTorrent sharing a category convention), and a person asking "where is everything in
+`ar-music`" wants that answered across both at once, not filtered one section at a time.
+**Rejected alternative: per-section filter state.** Considered because it would let one section
+stay filtered while another doesn't, but that flexibility doesn't map to any question the user
+actually asked, and it interacts awkwardly with sort state already being per-section — two
+independent pieces of per-section state would make "why does this table look different from that
+one" harder to reason about for no payoff. Sort stays per-section regardless (`ClientSection`'s
+own local `useState`) — sorting is inherently a per-table concern (column headers only exist
+inside one section), unlike a label, which is a cross-cutting property of the data itself.
+
+**The label option list is a pure function of the full, unfiltered `torrents` array, never of
+whatever the current filter/view happens to show.** This is what satisfies "a label with no rows
+in the current scan must still appear in the list" — `lib/diskReviewSort.ts.getCategoryLabels`
+takes the whole response's `torrents`, not a filtered subset, so selecting one label (or a client
+section legitimately having nothing to show) can never make another label vanish from the
+dropdown. A category's attribution in the filter/chip is picked from the *first* torrent that
+category is seen on; two torrents sharing a category name are expected to share its attribution
+state (attribution belongs to the category's own three-state row, not to the individual torrent),
+so reconciling a disagreement was judged not worth the complexity for a case that shouldn't occur
+in practice.
+
+**"Debris" and "Unclaimed" become on-screen wording only — "Not claimed by any client" and
+"Ownership unknown."** Per this task's own instruction: "Debris" is a verdict, and this feature is
+strictly review-only (no delete button exists yet, stage 5 is still gated off). The code-level
+names (`debris`, `unclaimed`), every variable, every spec/DESIGN.md reference, and the response
+field names themselves are all untouched — this is a rename of two `<h2>` strings in
+`DiskReviewPage.tsx`, not a rename through the codebase, so a future search for `debris` or
+`unclaimed` in the backend still finds everything it should.
+
+**The old top-of-page "Clients that did not report this pass" banner is dropped, not kept
+alongside the new per-client sections.** The backend task's `DiskReviewClientOut` roster
+(`clients`) already carries `reachable`/`failure_reason` per instance, built from the exact same
+`ClientReportFailure` list `client_failures` restates (`core/disk_review.py.run_scan`'s own
+comment: "keep `client_failures` working" — kept for API compatibility, not because the frontend
+still needs a second copy of the same information). Since every client now gets its own section
+that shows its failure reason in place of a table when unreachable, the old flat banner would be
+pure duplication with no additional information. `client_failures` itself stays in
+`api/types.ts`/`DiskReviewScanResponse` unused by this page, exactly as `broken_seeds` is retired
+outright rather than kept unused — the difference is `client_failures` is still a legitimate,
+documented part of the wire contract another consumer could reasonably read, while `broken_seeds`
+was fully superseded by `torrents` rows carrying `missing_on_disk: true`.
+
+---
+
 ## 2026-08-24 — exclusion is a delete-safety boundary, not a visibility boundary: the disk review scan retains excluded claims instead of dropping them
 
 `prompts/done/2026-08-24-disk-review-visibility-backend.md`. The disk review page was showing

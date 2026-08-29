@@ -487,6 +487,13 @@ export interface DownloadClientTestResponse {
 // candidate's inode (including itself) when `nlink > 1` -- the frontend's own `freedBytes`
 // (`lib/diskReview.ts`) mirrors `core/disk_review.py.freed_bytes` exactly, so a partial
 // selection of a hardlinked pair never reports bytes that a delete wouldn't actually reclaim.
+//
+// 2026-08-24 (prompts/done/2026-08-24-disk-review-visibility-backend.md, spec §11.1e/§17.6) --
+// "exclusion is a delete-safety boundary, not a visibility boundary." `excluded_content` is a
+// new fourth pile, and `torrents`/`clients` are new response-level shapes the per-client table
+// (this task, prompts/done/2026-08-24-disk-review-table-frontend.md) sections and columns by --
+// `broken_seeds`/`DiskReviewBrokenSeedOut` are retired entirely, superseded by `torrents` rows
+// with `missing_on_disk=true`.
 
 export interface DiskReviewDebrisOut {
   root: string
@@ -513,14 +520,31 @@ export interface DiskReviewSeedingEstateOut {
   claimed_transfer_id: string
   claimed_transfer_name: string
   claimed_content_path: string
+  // 2026-08-24 -- migration 031's three-state category, copied onto the claim purely for display
+  // (`'bound' | 'excluded' | 'undecided'`, kept as `string` since this mirrors the backend's own
+  // `Literal` alias rather than re-declaring it as a union here). A row tagged `'excluded'`
+  // appearing in this array (rather than being hidden) is the point of this task's backend half,
+  // not a bug -- see `DiskReviewScanResponse`'s own comment.
+  attribution: string
+  // `${claimed_by_client_id}:${claimed_transfer_id}` -- joins a file row to its own summary row
+  // in `DiskReviewScanResponse.torrents` without a second fetch. Matches `DiskReviewTorrentOut.
+  // claim_key` exactly.
+  claim_key: string
 }
 
-export interface DiskReviewBrokenSeedOut {
-  client_id: number
-  client_name: string
-  transfer_id: string
-  transfer_name: string
-  content_path: string
+/** The fourth pile, 2026-08-24 (spec §11.1e/§17.6) -- one on-disk file under an excluded path
+ * with no claim currently covering it right now (the other lftpweb instance's client dropped its
+ * history entry, or the torrent was removed, while the bytes are still sitting there). Never
+ * selectable, never debris, never counted toward a reclaim total -- `excluded_path` names which
+ * excluded root matched, so its absence from every other pile is explained, not merely felt.
+ */
+export interface DiskReviewExcludedContentOut {
+  root: string
+  rel_path: string
+  abs_path: string
+  size: number
+  excluded_path: string
+  link_paths: string[]
 }
 
 export interface DiskReviewSkippedBasePathOut {
@@ -538,20 +562,91 @@ export interface DiskReviewUnclaimedOut extends DiskReviewDebrisOut {
   reason: string
 }
 
+/** One row per claim, 2026-08-24 (spec §11.1e/§17.6) -- supersedes the retired
+ * `DiskReviewBrokenSeedOut`/`broken_seeds` entirely (a broken seed is exactly
+ * `missing_on_disk=true` here). `size_bytes`/`uploaded_bytes`/`ratio`/`seed_time_s` are `null`
+ * rather than `0` whenever the reporting client doesn't declare the equivalent field capability
+ * (every SABnzbd row's `ratio`/`uploaded_bytes`/`seed_time_s`, per `USENET_BASELINE`) -- see
+ * `lib/diskReviewSort.ts.visibleTorrentColumns`, the one place that turns a client's declared
+ * capabilities into which of those three columns render at all, never a `client_type` check.
+ * `file_count`/`size_on_disk` are `null` (not `0`) whenever the claim's own root was never
+ * walked, or the claim reported no `content_path` at all -- absent information is not a verdict.
+ * `missing_on_disk=true, file_count=0` is the one case that *is* a real, walked, empty zero.
+ */
+export interface DiskReviewTorrentOut {
+  client_id: number
+  transfer_id: string
+  transfer_name: string
+  content_path: string | null
+  category: string | null
+  attribution: string
+  size_bytes: number | null
+  uploaded_bytes: number | null
+  ratio: number | null
+  seed_time_s: number | null
+  added_at: string | null
+  raw_status: string | null
+  phase: string | null
+  file_count: number | null
+  size_on_disk: number | null
+  missing_on_disk: boolean
+  claim_key: string
+}
+
 export interface DiskReviewClientFailureOut {
   client_id: number
   client_name: string
   reason: string
 }
 
+/** One row per **enabled** `download_client` instance, 2026-08-24 (spec §11.1e/§17.6) -- the
+ * roster `DiskReviewPage.tsx` sections the torrent table by. `capabilities` is a flat
+ * `Field name -> support level` mapping (`'native' | 'derived' | 'none'`), the same flattened
+ * shape `core.disk_review.ClientSummary`'s own docstring explains -- deliberately not the typed
+ * `CapabilitySetOut` used elsewhere on the wire, because the only decision this page makes from
+ * it is "does this client declare `ratio`/`uploaded_bytes`/`seed_time_s`" (spec §17.2's "the UI
+ * is driven by the declaration, never by the client's name" -- `client_type` below is display
+ * metadata only, read by nothing that decides what renders). Empty for a client never
+ * successfully probed.
+ */
+export interface DiskReviewClientOut {
+  client_id: number
+  name: string
+  client_type: string
+  reachable: boolean
+  failure_reason: string | null
+  capabilities: Record<string, string>
+}
+
+/** The whole scan result. `debris` is the only selectable pile; `seeding_estate` is shown for
+ * visibility only, `unclaimed` (finding #17) is shown but gated off the ordinary
+ * select-and-remove flow, and `excluded_content` (2026-08-24) is shown but never selectable
+ * either -- see each pile's own `*Out` docstring.
+ *
+ * **2026-08-24 -- the governing principle this whole shape follows: exclusion is a delete-safety
+ * boundary, not a visibility boundary.** A claim whose category is marked "not used by this
+ * instance" is no longer dropped before it can appear anywhere; its files show up in
+ * `seeding_estate` tagged `attribution: 'excluded'`, and its own row in `torrents` can be
+ * reported `missing_on_disk` like any other claim. None of this touches what may ever be
+ * deleted.
+ */
 export interface DiskReviewScanResponse {
   debris: DiskReviewDebrisOut[]
   seeding_estate: DiskReviewSeedingEstateOut[]
-  broken_seeds: DiskReviewBrokenSeedOut[]
   skipped_base_paths: DiskReviewSkippedBasePathOut[]
   // 2026-08-23, finding #17 -- shown as its own pile, not selectable through the ordinary debris
   // flow. See DiskReviewUnclaimedOut's own comment for how this differs from skipped_base_paths.
   unclaimed: DiskReviewUnclaimedOut[]
+  // The fourth pile, 2026-08-24 -- see DiskReviewExcludedContentOut's own comment.
+  excluded_content: DiskReviewExcludedContentOut[]
+  // One row per claim, 2026-08-24 -- see DiskReviewTorrentOut's own comment. Supersedes the
+  // retired `broken_seeds` field entirely.
+  torrents: DiskReviewTorrentOut[]
+  // The per-client roster, 2026-08-24 -- see DiskReviewClientOut's own comment. This is what
+  // DiskReviewPage.tsx sections the torrent table by -- there is exactly one seedbox host in
+  // this product today (core/engine.py.load_host_config is "single, v1"), so the client is the
+  // only grouping axis worth building.
+  clients: DiskReviewClientOut[]
   client_failures: DiskReviewClientFailureOut[]
   scanned_at: string
 }
