@@ -121,11 +121,12 @@ Every verify outcome, every remote delete, and every delete withheld — with th
   filesystem view, which need not match what lftpweb sees), and a client's categories are read
   from the client rather than typed. **The section is marked new in the UI** and carries three
   deliberate limits: **nothing here deletes anything** — Disk review has no delete button and
-  won't until it has been used against real seedboxes for a while; two behaviours that *act* on a
-  client's verdict (shortening the settle gate, and holding back an auto-queue for a release the
-  client says failed) **ship off**, pending confirmation of one status mapping against a live
-  SABnzbd; and the wire vocabularies of both connectors are still partly guesswork — see "Known
-  gaps"
+  won't until it has been used against real seedboxes for a while; holding back an auto-queue for
+  a release the client says failed **ships off**, pending confirmation of one status mapping
+  against a live SABnzbd (shortening the settle gate on a client's verdict used to share that same
+  off-by-default reasoning, but now re-verifies on the filesystem instead of trusting the verdict
+  outright, so it ships on); and the wire vocabularies of both connectors are still partly
+  guesswork — see "Known gaps"
 - **Transfers is the main section, with Queue and Files tabs** (`/transfers/queue`,
   `/transfers/files` — the old standalone Files nav entry and `/files` both redirect here). The
   Queue tab is **one globally-ordered list, not one section per queue** — admission is entirely
@@ -158,7 +159,7 @@ Every verify outcome, every remote delete, and every delete withheld — with th
   the lifecycle icons, `copy` vs `move`, inherit-vs-override on the post-processing toggles, the
   Sonarr/Radarr icon, what connecting a download client does and doesn't add, category → queue
   mapping and "not used here", a client's content-vs-working base paths, Disk review's three
-  piles, the two client verdicts that ship off, why a release sits in Preflight instead of
+  piles, the withhold gate that ships off, why a release sits in Preflight instead of
   downloading, and what's in a support bundle). Every step links straight to the settings page it
   describes.
   Per-field help popups (`FieldHelp`) are being applied across the settings surface, starting
@@ -415,12 +416,15 @@ worked around:
   the same assumptions the connectors do. This has already bitten twice in this project — once for
   Sonarr's event types, once for SABnzbd accepting an invalid API key — so it is stated plainly
   rather than treated as unlikely.
-- **Two behaviours ship off and cannot be turned on from the UI in one case.** The settle-gate
-  skip (a client's "this finished" verdict shortening the settle wait) has a checkbox at
-  Settings → Transfer, off by default. The withhold gate (not auto-queueing a release the client
-  explicitly says failed) has **no settings page and no API endpoint at all** — it exists only as
-  a stored value, so turning it on today means editing the database. Both are off for the same
-  reason: they act on a status mapping not yet confirmed against a live SABnzbd.
+- **The withhold gate ships off and cannot be turned on from the UI at all.** Not auto-queueing a
+  release the client explicitly says failed has **no settings page and no API endpoint** — it
+  exists only as a stored value, so turning it on today means editing the database. Off because
+  it acts on a status mapping not yet confirmed against a live SABnzbd (`Failed`→`FAILED`,
+  §13.4 guess #2). The settle-gate skip (Settings → Transfer, a client's "this finished" verdict
+  shortening the settle wait) used to share this same "off, unverified vocabulary" reasoning, but
+  no longer does: as of 2026-08-29 it re-fingerprints the filesystem before queuing rather than
+  trusting the client's status string outright, so a wrong or missing verdict costs nothing —
+  it now ships **on** by default (`docs/decisions.md`).
 - **Cross-seed handling ships unwitnessed.** Deleting one torrent's data breaks the other torrents
   sharing that save path, so the design detects shared save paths and refuses. It is
   correct-by-unit-test and has never run against a real cross-seeding setup, because the author's

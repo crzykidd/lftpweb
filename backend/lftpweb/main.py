@@ -169,13 +169,21 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # to protect.
     app.state.client_sync = ClientSyncScheduler(db=app.state.db, config_dir=settings.config_dir)
     # Stage 2b of #18 (docs/download-client-framework-spec.md §14, prompts/2026-08-23-settle-
-    # gate-skip.md): AutoQueue needs the poller's completed-transfer cache for the settle-gate
-    # skip, but it's constructed above, before `ClientSyncScheduler` exists -- same
+    # gate-skip.md): AutoQueue needs the poller's finished-transfer cache for the client-shortened
+    # settle (below), but it's constructed above, before `ClientSyncScheduler` exists -- same
     # plain-attribute wiring `app.state.engine.postprocess`/`delete_in_flight` use for the
-    # identical "can't hand over an instance that doesn't exist yet at construction time"
-    # reason. Off (`settle.SettleSettings.client_skip_enabled` defaults `False`) until a user
-    # opts in, so this wiring alone changes nothing for an existing install.
+    # identical "can't hand over an instance that doesn't exist yet at construction time" reason.
     app.state.engine.autoqueue.client_sync = app.state.client_sync
+    # The client-shortened settle (2026-08-24, prompts/2026-08-24-client-shortened-settle.md,
+    # reworked 2026-08-29, prompts/done/2026-08-29-settle-verify-under-existing-toggle.md;
+    # `core/autoqueue.py` item 8 -- gated on `settle.SettleSettings.client_skip_enabled`, on by
+    # default): its own background ticker needs to re-fingerprint an item's remote subtree
+    # independently of both the scan pass and the client poller, so it gets the identical
+    # `remote_pool`/`host_provider` seam `app.state.postprocess`/`app.state.arr_sync` already use
+    # above, for the identical "can't hand over an instance that doesn't exist yet at
+    # construction time" reason.
+    app.state.engine.autoqueue.remote_pool = app.state.engine.pool
+    app.state.engine.autoqueue.host_provider = _host_provider
 
     await app.state.engine.start()
     await app.state.queue.start()
@@ -184,11 +192,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     await app.state.retention_scheduler.start()
     await app.state.arr_sync.start()
     await app.state.client_sync.start()
+    await app.state.engine.autoqueue.start()
 
     logger.info("lftpweb %s started", __version__)
     try:
         yield
     finally:
+        await app.state.engine.autoqueue.stop()
         await app.state.client_sync.stop()
         await app.state.arr_sync.stop()
         await app.state.retention_scheduler.stop()

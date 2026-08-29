@@ -672,9 +672,10 @@ export type PostprocessSettingsIn = PostprocessSettingsOut
 
 export interface SettleSettingsOut {
   enabled: boolean
-  // Stage 2b of #18 (prompts/2026-08-23-settle-gate-skip.md) -- see
-  // core/settle.py.SettleSettings.client_skip_enabled's own docstring for why this defaults
-  // false independently of `enabled`.
+  // Stage 2b of #18 (prompts/2026-08-23-settle-gate-skip.md), reworked 2026-08-29
+  // (prompts/done/2026-08-29-settle-verify-under-existing-toggle.md) -- see
+  // core/settle.py.SettleSettings.client_skip_enabled's own docstring for why this now defaults
+  // true independently of `enabled`.
   client_skip_enabled: boolean
   // Read-only -- core/settle.py.REQUIRED_SETTLE_SCANS / SETTLE_MIN_AGE_S. Not settable from
   // this API; surfaced only so the Settings page can explain what the gate requires without

@@ -176,13 +176,18 @@ implementation is wrong:
 6. **Never keyed on the client's name.** No `if client_type == "rtorrent"` exists anywhere in this
    subsystem. `family` is display metadata with no runtime authority.
 
-**Two things ship OFF, for one specific reason.** The settle-gate skip
-(`settle.SettleSettings.client_skip_enabled`, a checkbox at Settings → Transfer) and the withhold
-gate (`autoqueue.WithholdSettings.enabled`, **no API and no UI at all** — stored value only) both
-act on SABnzbd's history status mapping (`Completed`→`COMPLETED`, `Failed`→`FAILED`), which is
-spec §13.4 guess #2 and **has never been confirmed against a real SABnzbd**. Every uncertain path
-in both falls back to pre-stage behaviour. Turn them on after the mapping is confirmed, not
-before. The withhold gate having no settings surface is a real gap, named in README.
+**One thing ships OFF, for one specific reason; the settle-gate skip now ships ON, because it
+verifies rather than trusts (2026-08-29).** The withhold gate (`autoqueue.WithholdSettings.enabled`,
+**no API and no UI at all** — stored value only) acts on SABnzbd's history status mapping
+(`Failed`→`FAILED`), which is spec §13.4 guess #2 and **has never been confirmed against a real
+SABnzbd**; every uncertain path falls back to pre-stage behaviour, and it stays off until the
+mapping is confirmed. The withhold gate having no settings surface is a real gap, named in README.
+The settle-gate skip (`settle.SettleSettings.client_skip_enabled`, a checkbox at Settings →
+Transfer) used to share this exact reasoning, but as of `prompts/done/2026-08-29-settle-verify-
+under-existing-toggle.md` it re-fingerprints the item's remote subtree twice, 5s apart, before
+queuing — it no longer trusts SABnzbd/rTorrent's status mapping outright, so a wrong or missing
+verdict costs nothing, and it now defaults **on** (`docs/decisions.md`). There is no longer a pure
+time-hold variant of this toggle at all — that path was deleted, not merely defaulted off.
 
 ### 🔴 Stage 5's gate — two conditions now, not one
 

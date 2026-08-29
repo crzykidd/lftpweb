@@ -6,6 +6,173 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-29 — fold the client-shortened settle under the existing toggle, drop the window to 5s, delete the trust-only path, and default the toggle on
+
+`prompts/done/2026-08-29-settle-verify-under-existing-toggle.md`. Reworks the 2026-08-24 decision
+below, not a follow-on to it -- that task shipped the re-fingerprint verify as a *second*
+mechanism, default ON with no toggle of its own, alongside the older `client_skip_enabled` pure
+time-hold, still off by default. The user rejected both properties in the same breath: *"There is
+a toggle already for Skip the wait on a download client's own verdict. This setting should be the
+one that still does the 5s verify."* Four decisions worth recording, the fourth landing as a
+mid-task scope change once the first three made the reasoning explicit.
+
+**One toggle, one meaning: `client_skip_enabled` now gates the re-fingerprint verify directly,
+and gates nothing else.** `core/autoqueue.py.on_scan`'s pending-recheck registration (item 8 of
+that module's own docstring) now requires `settle_settings.client_skip_enabled` in addition to
+`settle_settings.enabled` -- with the toggle off, behavior is byte-identical to the ordinary
+settle gate: no registration, no ticker work, no remote I/O. **Rejected alternative: leave the
+re-fingerprint verify unconditional (as it shipped 2026-08-24) and repurpose `client_skip_enabled`
+for something else, or add a third setting.** Both were on the table implicitly in how the
+2026-08-24 version was built; both were rejected because the user's own framing was explicit
+about reusing the *existing* toggle for the *existing* meaning-shift, not about growing the
+settings surface -- "this setting should be the one," not "a setting."
+
+**5s, not 10s -- the user's own explicit instruction, overriding the 2026-08-24 pick.** The
+10s figure only ever justified itself as "the conservative end of the user's own 5-10 seconds
+range" for a *different* wait (`CLIENT_COMPLETION_HOLD_S`, see below); once that anchor is gone,
+there was no remaining argument for 10 over 5, and the user asked for 5 directly. **Also changed,
+not left equal by accident: `AutoQueue.RECHECK_TICK_S` drops from 5.0 to 2.5** (still exactly half
+of `CLIENT_RECHECK_INTERVAL_S`, preserving the 2:1 ratio the original 10s/5s pair used). Leaving
+the tick at 5.0 while the window dropped to 5.0 would have made the two equal -- `advance_pending_
+rechecks` only checks due-ness at its own tick boundaries, so an equal tick and window means the
+second fingerprint's due-check can land anywhere from just over one tick to just over two ticks
+after the first, i.e. "often close to 5s, but routinely rounding up to a full 10s" -- exactly
+doubling the wait a user who asked for "5 seconds" would observe on an unluckily-timed item.
+Halving the tick bounds the real observed window to 5.0-7.5s instead.
+
+**The old trust-only path is deleted outright, not kept as a degraded fallback.**
+`settle.CLIENT_COMPLETION_HOLD_S` and `client_completion_ready` -- a pure clock comparison that
+queued on a terminal verdict once it was merely old enough, no re-fingerprint at all -- are
+removed from `core/settle.py` entirely, along with the `on_scan` branch that called them and
+`AutoQueue._client_completion_first_seen`, the in-memory bookkeeping that existed only to feed
+that branch's fallback clock. **Rejected alternative: keep the time-hold as a degraded fallback
+for when the re-fingerprint verify can't run (no remote-scan capability, an unreachable host).**
+Rejected because that is precisely the shape the user's own words rule out -- "this setting
+should be the one that still does the 5s verify," not "verify when possible, otherwise trust the
+client's word after a delay." When the verify genuinely can't run, `AutoQueue.
+advance_pending_rechecks` already has the correct fallback: drop the pending entry and let the
+item fall back to the *ordinary settle gate*, never to trusting the client's verdict. There is no
+longer any code path in this subsystem that queues on a download client's word alone.
+
+**The toggle's own default flips from `False` to `True` -- a mid-task scope change, the user's
+own words: "yes, make it on by default since it verifies."** This was not part of the task's
+original brief (which only asked to fold the mechanism under the existing toggle at its existing,
+off, default) but was added once the first three decisions above made the underlying reasoning
+explicit: `client_skip_enabled`'s `False` default was earned by a real, specific risk -- the old
+time-hold trusting an unconfirmed SABnzbd/rTorrent status-mapping guess (spec §13.4 guess #2)
+enough to transfer a half-written directory on the strength of a string. That risk does not exist
+for the mechanism the flag now gates: a wrong or missing client verdict under the re-fingerprint
+verify costs nothing, because the ordinary settle gate keeps running underneath it regardless, so
+there is no longer a "wrong guess corrupts a transfer" failure mode for `False` to be protecting
+against. Every place in the codebase that reads or writes this default was updated to match --
+`core/settle.py.SettleSettings.client_skip_enabled`'s dataclass default, `load_settle_settings`'s
+own `data.get(..., True)` fallback for a stored blob that predates the field (so an install that
+has never touched this setting reads the *current* default, not one frozen from before 2026-08-23),
+`backend/lftpweb/models.py`'s `SettleSettingsOut`/`SettleSettingsIn`, and the frontend's own
+pre-fetch placeholder default in `TransferTab.tsx`. **This is, once again, a default-on behavior
+change for existing installs**, the same shape CHANGELOG.md already had to state plainly for the
+settle gate's own `enabled` default (2026-08-12) and for `move`-mode verification -- recorded
+there rather than only here.
+
+---
+
+## 2026-08-24 — the client-shortened settle: verify with a 10s re-fingerprint, ship it on, and leave the old skip alone
+
+`prompts/done/2026-08-24-client-shortened-settle.md`. The user's own framing: *"Once a client
+marks complete it should be 100% done with all work. So we should be good, but putting a short
+check allows us to verify."* Five decisions worth recording.
+
+**`SEEDING` now satisfies the settle-gate skip and the withhold gate's self-lift check, alongside
+`COMPLETED`.** The existing rule — "never let a queue-side status satisfy the gate" — is *not*
+being relaxed; it's being applied correctly. `core/clients/rtorrent.py._classify_token` maps a
+finished, actively-seeding torrent to `SEEDING`, not `COMPLETED` (`complete and is_active` reads
+"seeding"; a torrent only reaches `COMPLETED` once it stops being active, i.e. once it finishes
+seeding entirely, which for most setups is "never, until a ratio/time limit or a manual stop").
+Before this task, both the settle-gate skip and the withhold gate's own self-lift check filtered
+strictly to `COMPLETED`, which made them **structurally unreachable for the ordinary case of a
+seeding rTorrent torrent** — not a rare edge case, the normal outcome of a torrent finishing.
+**Rejected alternative: change `_classify_token`/`_RTORRENT_STATUS_MAP` so a complete, active
+torrent reports `COMPLETED`.** This was the handoff prompt's own explicit "wrong fix" to rule
+out: `SEEDING` is the correct phase for a complete, actively-seeding torrent everywhere else in
+the product (Preflight, the disk review scan), and making the connector lie about its own state
+just to satisfy one gate would be exactly the kind of `if client_type == "rtorrent"` special-
+casing §17 rule 6 forbids in spirit even without the literal branch. The fix belongs in what the
+gate *accepts*, not in what the connector *reports* — `find_client_completion` and
+`ClientSyncScheduler.completed_transfers` (renamed `finished_transfers`) now check
+`settle.FINISHED_TRANSFER_PHASES` (`COMPLETED` or `SEEDING`) instead of `COMPLETED` alone.
+`VERIFYING` stays excluded regardless — rTorrent's `hashing` overrides every other flag, so a
+torrent re-checking its own data is not known-good no matter what `complete`/`is_active` said a
+moment before.
+
+**The new client-shortened settle ships ON by default — the fifth reasoned exception to this
+project's "every new capability ships off" rule**, after `move`-mode forced verification, the
+phase 7 scheduled backup, the settle gate itself (`SettleSettings.enabled`), and "folder prefix
+during transfer" (2026-08-14, CHANGELOG.md). It earns the exception on the same grounds those
+four did, but for a reason specific to this feature: the existing `client_skip_enabled` shipped
+**off** because it trusts an unverified SABnzbd status mapping (spec §13.4 guess #2) with nothing
+behind that trust but a fixed time hold — a wrong guess there means transferring a half-written
+directory on the strength of a string. The client-shortened settle doesn't have that failure
+mode: it **verifies on the filesystem** before queuing anything, the identical fingerprint
+comparison the ordinary settle gate already trusts. A wrong or missing client verdict costs
+nothing under this mechanism — the ordinary ≥60s gate simply keeps running underneath it,
+exactly as it does today. There is deliberately no separate settings flag for this mechanism
+(unlike `client_skip_enabled`/`WithholdSettings.enabled`, which each have one because they need a
+way to be turned *on* once their underlying assumption is confirmed) — it is governed entirely by
+`SettleSettings.enabled` (the master switch for the settle gate as a whole) and by whether a
+download client is actually wired up; per this project's own "expose a knob once someone actually
+needs it different" habit (`core/settle.py.CLIENT_COMPLETION_HOLD_S`'s own precedent), a second
+toggle wasn't added speculatively ahead of any request for one.
+
+**Pending-recheck state is kept in memory, not persisted.** `AutoQueue._pending_recheck` (a
+`queue_id -> item_id -> _PendingClientRecheck` dict) never touches the database — a restart
+mid-recheck simply loses the in-flight fingerprint and timestamp, and the item falls back to the
+ordinary settle gate on the very next scan, which is the safe direction, not a data-loss risk.
+This is a deliberate reuse of the exact reasoning `AutoQueue._client_completion_first_seen`
+already established for the old skip's own completion-delay clock (2026-08-23), not a new
+argument. The "nothing may publish a state it did not read back from a table" invariant
+(`core/itemview.py`'s own docstring) governs *published item state* (what goes out over the
+WebSocket); this is internal gate bookkeeping that is never itself published, so the invariant
+doesn't apply to it, the same way it never applied to `_client_completion_first_seen` either.
+
+**The recheck runs on its own independent ~5s ticker (`AutoQueue.start`/`stop`/
+`_recheck_loop`), not on `core/engine.py`'s own scan cadence.** An item sitting at the settle
+gate with no job of its own yet does not qualify for `queue_is_active`'s fast ~5s local-only
+pass — that predicate's own `substate == 'settling'` branch only fires *after* a job has already
+run once, which this item, by definition, hasn't. Relying on `on_scan`'s own call cadence (up to
+`scan_interval_s`, default 30s, for a queue with nothing else active) for the two fingerprints
+this mechanism needs would mean the second one might not land for up to a full scan interval —
+defeating "roughly ten seconds" entirely, sometimes by 3x or more. **Rejected alternative:
+broaden `queue_is_active` to also cover an item with a pending client verdict**, so the existing
+fast local-only pass would pick up the cadence for free. Rejected because it reaches into
+`core/engine.py`'s own scan-cadence machinery for a need specific to one gate inside
+`AutoQueue`, and because the local-only pass explicitly never re-reads the remote
+(`_scan_queue_local_only`'s own docstring: `fingerprints=None`, "this pass never re-read the
+remote") — it exists to reconcile local-vs-cached-remote, not to re-fingerprint the remote side
+at all, so widening its trigger condition wouldn't even supply what this mechanism needs. A
+small, independent ticker — the same "several small schedulers, each with one narrow job" shape
+`ClientSyncScheduler`/`ArrSyncScheduler`/`BackupScheduler` already establish — keeps the concern
+local to `AutoQueue` and costs nothing when idle (`advance_pending_rechecks` does no I/O at all
+when `self._pending_recheck` is empty). The ticker fingerprints by scanning the item's **queue**
+remote root (`RemoteConnectionPool.scan`, the identical call `Engine.scan_queue` already makes),
+never a narrower per-item scan — reusing `settle.compute_fingerprints` exactly as it already
+works, with no file-vs-top-level-item special case of its own, and correctly handling a
+top-level item that is itself a bare file (which a `find <file> -mindepth 1` scan directly at the
+item would silently return nothing for).
+
+**Two overlapping mechanisms for one job, named as a gap rather than consolidated.** The user
+explicitly chose "default on, alongside the existing skip" over "replace the existing skip
+entirely" — `client_skip_enabled` and `CLIENT_COMPLETION_HOLD_S` stay exactly as they were, still
+off by default, still a pure time-hold with no re-fingerprint. The client-shortened settle is
+evaluated first in `on_scan`; the old skip is evaluated after, and only does anything for a
+queue where a user has explicitly switched it on. Both read from the same widened
+`finished_transfers()` candidates, so whichever converges first wins for a given item —
+`_enqueue_item` is idempotent, so this is never a double-queue risk, only a "which audit event
+gets written" question. Consolidating the two into one mechanism (the old skip is, in effect, a
+strictly-weaker-but-instant special case of the new one) is a deliberate follow-up someone should
+decide on purpose, not a side effect of this task — recorded in `README.md`'s "Known gaps."
+
+---
+
 ## 2026-08-24 — disk review table: a global label filter, per-section sort, and "debris"/"unclaimed" become on-screen wording only
 
 `prompts/done/2026-08-24-disk-review-table-frontend.md`. Rebuilt the Disk review page around a

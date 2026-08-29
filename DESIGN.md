@@ -644,6 +644,18 @@ before** — stated plainly (CHANGELOG.md's `### Changed` entry), not left for s
 Still switchable off (`GET`/`PUT /api/settings/settle`, Settings → Transfer) for anyone whose
 seedbox landing path is atomic end to end and would rather not pay the delay at all.
 
+**A download client's own "finished" verdict can shorten this wait to roughly five seconds — by
+re-verifying on the filesystem, not by trusting the client** (2026-08-24, `core/autoqueue.py`'s
+own docstring item 8; reworked 2026-08-29; full detail in §17.8). Once a configured client
+reports a release finished, `AutoQueue` fingerprints the item's remote subtree (the identical
+fingerprint above), waits `settle.CLIENT_RECHECK_INTERVAL_S` (5s), fingerprints it again, and
+queues only on a match — falling straight back to the ordinary `REQUIRED_SETTLE_SCANS`/
+`SETTLE_MIN_AGE_S` gate above on any mismatch or missing information. Gated by `settle.
+SettleSettings.client_skip_enabled`, on by default: unlike a mechanism that trusts a download
+client's own status vocabulary outright, this one verifies before acting on it, so a wrong or
+missing verdict costs nothing — the gate described in this section keeps running underneath it
+regardless.
+
 ---
 
 ## 4. The transfer engine
@@ -3730,26 +3742,59 @@ claim than it sounds.
 |---|---|
 | **0** — interface, enums, capability layers, registry, conformance suite | **Built** |
 | **1** — SABnzbd + rTorrent connectors, instance CRUD, declared config forms, test-connection, redacted response capture, Settings → Clients, base-path detect→SSH-verify→confirm | **Built** (migrations 027, 028) |
-| **2** — the poller, client as a third Preflight source, the settle-gate skip | **Built** (migration 029). The skip itself ships **off** |
+| **2** — the poller, client as a third Preflight source, the settle-gate skip | **Built** (migration 029). One toggle, one meaning: the settle-gate skip verifies a client's completion verdict by re-fingerprinting the filesystem (below) rather than trusting it outright, and ships **on** by default |
 | **3** — withhold auto-queue on an explicit client failure verdict, and the cheap-vs-expensive cadence split | **Built.** The withhold gate ships **off**, and has **no API or UI surface at all** — the setting exists only in the database blob |
 | **4** — the disk review scan, four piles plus a torrent summary, review-only | **Built** (migrations 030, 031, 032) |
 | **5** — the delete pipeline, verification, banner | **NOT BUILT.** Nothing in this feature deletes anything |
 
-**Two features ship off by default and that is not timidity — it is one specific unverified
-assumption.** Both the settle-gate skip and the withhold gate act on SABnzbd's history status
-mapping (`Completed`→`COMPLETED`, `Failed`→`FAILED`), which is **vendor-doc-derived and has never
-been confirmed against a real instance**. Every uncertain path in both — setting off, no client
-source wired, unreachable client, blank response, a queue-side or `UNKNOWN` phase, a near-miss
-path — falls back to the behavior that existed before the stage. Turn them on once the mapping is
-confirmed, not before.
+**One feature ships off by default and that is not timidity — it is one specific unverified
+assumption.** The withhold gate acts on SABnzbd's history status mapping (`Failed`→`FAILED`),
+which is **vendor-doc-derived and has never been confirmed against a real instance**. Every
+uncertain path — setting off, no client source wired, unreachable client, blank response, a
+queue-side or `UNKNOWN` phase, a near-miss path — falls back to the behavior that existed before
+the stage. Turn it on once the mapping is confirmed, not before.
 
-**A terminal `COMPLETED` verdict does not satisfy the settle gate the instant it is seen.** It
-holds `core/settle.py.CLIENT_COMPLETION_HOLD_S` (10s) first, measured from the client's *own*
-`completed_at` rather than from when lftpweb noticed — so a completion already older than the
-hold satisfies it with no added wait, and this only ever lengthens an already-shortened wait,
-never a normal one. Cheap insurance against a client reporting "complete" a moment before the
-last bytes are flushed or a final move lands, which matters most for rTorrent, where completion
-and the hardlink into the completed folder are two separate events.
+**The client-shortened settle (2026-08-24, `prompts/2026-08-24-client-shortened-settle.md`;
+reworked 2026-08-29, `prompts/done/2026-08-29-settle-verify-under-existing-toggle.md`;
+`core/autoqueue.py`'s own docstring item 8) — gated by `settle.SettleSettings.
+client_skip_enabled`, on by default.** Once a client reports an item finished (`settle.
+FINISHED_TRANSFER_PHASES` — `COMPLETED` *or* `SEEDING`, not `COMPLETED` alone; see below for
+why), `AutoQueue`'s own background ticker fingerprints the item's remote subtree (the ordinary
+settle gate's own `(file_count, total_bytes, max_mtime)`), waits `settle.
+CLIENT_RECHECK_INTERVAL_S` (5s), fingerprints it again, and queues only if the two match —
+falling back to the ordinary settle gate on any mismatch, unfetchable scan, or missing
+remote-scan capability. It earns "on by default" where the withhold gate above doesn't: it never
+trusts a client's vocabulary alone, so a wrong or missing verdict costs nothing — the ordinary
+≥60s gate simply keeps running underneath it, exactly as it does today.
+
+**One toggle, one meaning now, not two mechanisms.** The 2026-08-24 version of this feature
+shipped this re-fingerprint verify default ON with no toggle of its own, *alongside* an older
+pure time-hold (`settle.CLIENT_COMPLETION_HOLD_S`/`client_completion_ready`) that trusted a
+terminal verdict once it was merely old enough, gated by `client_skip_enabled` but still off by
+default — two overlapping mechanisms for one job, deliberately left unconsolidated (named as a
+gap in `docs/decisions.md` and `README.md`'s "Known gaps" at the time). 2026-08-29 reworked this:
+the user's own words, *"There is a toggle already for Skip the wait on a download client's own
+verdict. This setting should be the one that still does the 5s verify."* The old time-hold path
+is deleted outright, not kept as a degraded fallback, and `client_skip_enabled` now gates the
+re-fingerprint verify directly — there is no code path anywhere in this subsystem that queues on
+a download client's word alone. The toggle's own default flipped to `True` in the same task, on
+the same footing as the mechanism it now gates: it verifies rather than trusts, so the risk the
+old `False` default protected against (a wrong status-mapping guess transferring a half-written
+directory) no longer applies (the user's own call: *"yes, make it on by default since it
+verifies"*).
+
+**Why `SEEDING`, not just `COMPLETED`.** `core/clients/rtorrent.py._classify_token` maps a
+finished, actively-seeding torrent to `SEEDING`, never `COMPLETED` (`complete and is_active`
+reads "seeding"; a torrent stops being active, and so reaches `COMPLETED`, only once it finishes
+seeding entirely — for most setups, "never, until a ratio/time limit or a manual stop"). Before
+2026-08-24, `find_client_completion`/`ClientSyncScheduler.completed_transfers` (renamed
+`finished_transfers`) accepted only `COMPLETED`, which made **both** the settle-gate skip and the
+withhold gate's own self-lift check structurally unreachable for an ordinary seeding rTorrent
+torrent. The fix is in what the gate accepts, not what the connector reports — `SEEDING` stays
+the correct phase for a complete, actively-seeding torrent everywhere else in the product
+(Preflight, the disk review scan); `VERIFYING` (rTorrent's `hashing`, which overrides every other
+flag) stays excluded from the gate either way, since a torrent re-checking its data is not
+known-good regardless of what its `complete`/`is_active` flags said a moment before.
 
 **Polling is split cheap-vs-expensive, not active-vs-everything.** The obvious split
 (`active_only=True` fast, `active_only=False` slow) is drawn on the wrong axis and structurally

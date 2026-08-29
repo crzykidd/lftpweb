@@ -424,24 +424,45 @@ class SettleSettings:
     enabled: bool = True
 
     # Stage 2b of #18 (docs/download-client-framework-spec.md §14, prompts/2026-08-23-settle-
-    # gate-skip.md). **Defaults `False`** -- the fourth exception to this project's "every new
-    # capability ships off" rule would have to earn it the same way the three above did
-    # (docs/decisions.md), and this one cannot: it depends directly on spec §13.4 guess #2
-    # (SABnzbd history `Completed` -> `COMPLETED`), doc-derived, ranked **High**, and never seen
-    # against a live instance. `SettleSettings.enabled` above was flipped on only *after* the
-    # user confirmed the bug it fixes is real and live on their setup; this flag has no such
-    # confirmation yet, and a wrong guess here doesn't just delay a transfer the way a settle-
-    # gate miss would -- it *shortens* the wait on the strength of an unverified vocabulary, and
-    # the settle gate exists precisely to stop a shortened wait from transferring a half-written
-    # directory. Off until #18's stage 1a capture (spec §13.3) confirms the mapping against a
-    # real SABnzbd, or a user opts in having read what it depends on.
+    # gate-skip.md); reworked twice since -- 2026-08-24 (prompts/done/2026-08-24-client-
+    # shortened-settle.md) and 2026-08-29 (prompts/done/2026-08-29-settle-verify-under-existing-
+    # toggle.md, docs/decisions.md has the full history of both). **One toggle, one meaning:
+    # turning this on means "verify a client's completion verdict by re-fingerprinting the
+    # filesystem," never "trust the client's word."** When on, `core/autoqueue.py.on_scan`'s
+    # client-shortened-settle mechanism (module docstring item 8) registers a pending recheck for
+    # any eligible item a configured download client reports finished (`find_client_completion`
+    # below) -- the background ticker then fingerprints the item's remote subtree, waits
+    # `CLIENT_RECHECK_INTERVAL_S` (5s), fingerprints it again, and queues only if the two match.
+    # A wrong or missing client verdict costs nothing under this mechanism: it never substitutes
+    # for the ordinary settle gate's own fingerprint comparison, it only offers a faster path to
+    # the identical "did anything move" answer.
+    #
+    # **Defaults `True`** -- a same-day reversal (2026-08-29) of the `False` this same flag
+    # shipped with on 2026-08-23/24, and worth stating plainly rather than dressing up as if it
+    # was always this way. The earlier `False` was earned by a real risk: back then, this flag
+    # gated a *pure time-hold* (`CLIENT_COMPLETION_HOLD_S`/`client_completion_ready`, deleted
+    # 2026-08-29) that trusted a terminal verdict once it was merely old enough, with no
+    # re-fingerprint at all -- a wrong guess there meant transferring a half-written directory on
+    # the strength of an unconfirmed status string (spec §13.4 guess #2). That risk is gone: the
+    # flag now gates a mechanism that *verifies* on the filesystem before queuing anything, the
+    # identical fingerprint comparison the ordinary settle gate already trusts, so there is no
+    # longer a "wrong guess transfers something half-written" failure mode to default away from.
+    # The user's own call, once that distinction was made explicit: *"yes, make it on by default
+    # since it verifies."* The residual, narrower risk this default still carries -- candidate
+    # selection runs through `find_client_completion`, which still depends on spec §13.4 guess #2
+    # (a connector's history status mapping to `COMPLETED`/`SEEDING`) to decide which items are
+    # even considered -- can only ever cost a missed opportunity to go faster (falls back to the
+    # ordinary gate, which keeps running regardless), never a wrong "settled" verdict, so it does
+    # not carry the same weight the old default-`False` reasoning did.
     #
     # **Nested under `enabled`, not independent of it.** `core/autoqueue.py.on_scan` only ever
     # consults this once the settle gate's own check has already decided an item is *not*
-    # settled -- when `enabled` is `False` there is nothing to skip in the first place, so this
+    # settled -- when `enabled` is `False` there is nothing to verify in the first place, so this
     # flag's value is inert either way, the same "off means untouched" relationship every other
-    # settle-adjacent constant in this module already has to `enabled`.
-    client_skip_enabled: bool = False
+    # settle-adjacent constant in this module already has to `enabled`. Still switchable off
+    # (Settings -> Transfer) for anyone who would rather always wait out the full
+    # `REQUIRED_SETTLE_SCANS`/`SETTLE_MIN_AGE_S` gate regardless of what a download client says.
+    client_skip_enabled: bool = True
 
 
 async def load_settle_settings(db: "aiosqlite.Connection") -> SettleSettings:
@@ -455,7 +476,14 @@ async def load_settle_settings(db: "aiosqlite.Connection") -> SettleSettings:
         return SettleSettings()
     return SettleSettings(
         enabled=bool(data.get("enabled", False)),
-        client_skip_enabled=bool(data.get("client_skip_enabled", False)),
+        # `True` -- matching `SettleSettings.client_skip_enabled`'s own dataclass default above
+        # (flipped 2026-08-29). This fallback fires when a stored blob predates this field
+        # entirely (saved before 2026-08-23's stage 2b even existed) -- an install that has never
+        # touched this setting should read the *current* default, not a value frozen from before
+        # the field was introduced. A blob that already has the key (any install that has run
+        # since 2026-08-23) is completely unaffected either way -- `.get` only ever falls back
+        # when the key itself is absent, never when it's present and `False`.
+        client_skip_enabled=bool(data.get("client_skip_enabled", True)),
     )
 
 
@@ -481,8 +509,38 @@ async def save_settle_settings(db: "aiosqlite.Connection", settings: SettleSetti
 # Pure, unit-tested without a database -- this module's own docstring's own rule, followed here
 # exactly as `compute_fingerprints`/`advance_settle`/`is_settled` above already do. Neither
 # function below ever talks to a client or a database; both take an already-fetched candidate
-# list (`core/clientsync.py.ClientSyncScheduler.completed_transfers`/`failed_transfers`, spec
+# list (`core/clientsync.py.ClientSyncScheduler.finished_transfers`/`failed_transfers`, spec
 # §9.1's poller cache) and answer a yes/no question over it.
+
+# 2026-08-24, prompts/2026-08-24-client-shortened-settle.md. `find_client_completion` below used
+# to accept only `TransferPhase.COMPLETED` -- correct for SABnzbd (usenet has no seeding), but
+# **structurally unreachable for an ordinary rTorrent torrent**: `core/clients/rtorrent.py.
+# _classify_token` maps a finished, actively-seeding torrent to `SEEDING`, not `COMPLETED` --
+# `complete and is_active` reads "seeding" -- and a torrent stops being active (and so reaches
+# `COMPLETED`) only once it finishes seeding entirely, which for most setups is "never, until a
+# ratio/time limit or a manual stop." The client-verdict skip therefore never fired for the
+# ordinary case at all; `tests/test_clients_rtorrent.py`'s own
+# `test_active_only_excludes_completed_but_keeps_seeding` documents that mapping as correct, and
+# it stays correct here -- **the fix is what this gate accepts, not what the connector reports**
+# (this task's own explicit rule: no `if client_type == "rtorrent"` branch anywhere in this
+# subsystem, DESIGN.md §17 rule 6).
+#
+# `SEEDING` is not a queue-side status -- it is "finished and now uploading to peers," the
+# terminal, done-with-all-its-own-work state for a torrent that will never itself transition to
+# `COMPLETED` under ordinary operation. The existing rule this widens ("never let a queue-side
+# status satisfy the gate," `find_client_completion`'s own docstring below) survives intact:
+# `DOWNLOADING`, `QUEUED`, `PAUSED` and `FAILED` are still never a match, and -- decisively --
+# `VERIFYING` (rTorrent's `hashing`, which overrides every other flag per `_classify_token`'s own
+# total ordering) stays excluded too, because a torrent re-checking its data is not known-good
+# regardless of what its `complete`/`is_active` flags said a moment before the recheck began.
+#
+# This widening changes nothing for SABnzbd (usenet has no seeding phase, so `SEEDING` never
+# appears from that connector) and applies identically to the withhold gate's own self-lift check
+# (`core/autoqueue.py.on_scan`, which calls `find_client_completion` on the same candidates before
+# ever consulting `find_client_failure`) and to the pre-existing, still-off-by-default
+# `client_skip_enabled` time-hold below -- both share this one function, so both get the fix
+# together rather than needing two.
+FINISHED_TRANSFER_PHASES = frozenset({TransferPhase.COMPLETED, TransferPhase.SEEDING})
 
 
 def _client_content_path_matches(item_remote_path: str, content_path: str) -> bool:
@@ -517,18 +575,19 @@ def find_client_completion(
     item_remote_path: str, candidates: "Iterable[tuple[int, str, Transfer]]"
 ) -> "tuple[int, str, Transfer] | None":
     """The settle-gate skip's own yes/no lookup (stage 2b of #18) -- the first `candidates` entry
-    whose `Transfer` is a **terminal, history-derived `COMPLETED`** verdict (never a queue-side
-    status -- spec's own rule, and `TransferPhase.UNKNOWN` never satisfies anything either) with
-    a `content_path` that matches `item_remote_path` (`_client_content_path_matches` above).
-    `None` on no match, an empty `candidates` (an unreachable client, a blank queue/history
-    response, or `client_skip_enabled` off upstream so the caller never gathered any) -- every
-    one of those is "no information," and no information means the caller falls back to running
-    the settle gate exactly as it runs today (this task's own non-negotiable).
+    whose `Transfer` is a **terminal, history-derived, finished verdict** (`FINISHED_TRANSFER_
+    PHASES` above -- `COMPLETED` or `SEEDING`, never a queue-side status, and `TransferPhase.
+    UNKNOWN` never satisfies anything either) with a `content_path` that matches
+    `item_remote_path` (`_client_content_path_matches` above). `None` on no match, an empty
+    `candidates` (an unreachable client, a blank queue/history response, or `client_skip_enabled`
+    off upstream so the caller never gathered any) -- every one of those is "no information," and
+    no information means the caller falls back to running the settle gate exactly as it runs
+    today (this task's own non-negotiable).
 
-    **Checks `phase is TransferPhase.COMPLETED` again here**, even though this function's one
-    real caller (`core/clientsync.py.ClientSyncScheduler.completed_transfers`) already filters to
-    that phase before handing candidates over -- belt and suspenders, so this function is
-    correct standing alone (and directly unit-testable against a non-`COMPLETED` `Transfer`
+    **Checks `transfer.phase in FINISHED_TRANSFER_PHASES` again here**, even though this
+    function's real callers (`core/clientsync.py.ClientSyncScheduler.finished_transfers`) already
+    filter to those phases before handing candidates over -- belt and suspenders, so this function
+    is correct standing alone (and directly unit-testable against a non-finished `Transfer`
     without having to go through the scheduler's own cache at all), rather than depending on a
     caller never changing that filter.
 
@@ -538,7 +597,7 @@ def find_client_completion(
     requirement) without a second lookup.
     """
     for instance_id, instance_name, transfer in candidates:
-        if transfer.phase is not TransferPhase.COMPLETED:
+        if transfer.phase not in FINISHED_TRANSFER_PHASES:
             continue
         if not transfer.content_path:
             continue  # absent is not a verdict (spec §4.2) -- no path, no match, ever
@@ -547,75 +606,45 @@ def find_client_completion(
     return None
 
 
-# 2026-08-23, prompts/2026-08-23-client-completion-delay.md (finding #9, user decision: "wait
-# 5-10 seconds after complete before queuing"). `find_client_completion` above answers "did any
-# client ever claim this release is done"; `client_completion_ready` below answers a narrower,
-# second question -- has enough time passed since that claim to actually trust it. A terminal
-# `COMPLETED` verdict can land a moment before the last bytes are flushed, a final rename lands,
-# or -- rTorrent specifically (spec §1.1) -- before the hardlink into the shared completed folder
-# lftpweb actually scans exists at all; those are the same "still arriving" risk the settle gate's
-# own fingerprint exists to catch, just reached by a faster, more direct route this time.
+# 2026-08-29, prompts/done/2026-08-29-settle-verify-under-existing-toggle.md -- reworks the
+# 2026-08-24 decision this constant and the two functions above it were part of
+# (prompts/done/2026-08-24-client-shortened-settle.md), rather than extending it. That task
+# shipped two mechanisms side by side: this re-fingerprint verify (then default OFF, with no
+# toggle of its own) alongside `CLIENT_COMPLETION_HOLD_S`/`client_completion_ready` -- a pure
+# time-hold that trusted a terminal verdict once it was merely old enough, with no re-fingerprint
+# at all, gated by `SettleSettings.client_skip_enabled`. The user's own words: *"There is a
+# toggle already for Skip the wait on a download client's own verdict. This setting should be the
+# one that still does the 5s verify."* **One toggle, one meaning: skipping the wait means
+# verifying that nothing moved.** `CLIENT_COMPLETION_HOLD_S` and `client_completion_ready` are
+# deleted outright here, not kept as a degraded fallback -- `client_skip_enabled` now gates this
+# re-fingerprint verify directly (`core/autoqueue.py.on_scan`'s own registration branch), so
+# there is no code path left anywhere in this subsystem that queues on a download client's word
+# alone. See `docs/decisions.md` for the rejected alternatives.
 #
-# Ten seconds -- the conservative (safe) end of the user's own "5-10 seconds" range, not the
-# middle or the fast end. Named and commented the same way `REQUIRED_SETTLE_SCANS`/
-# `SETTLE_MIN_AGE_S` above are ("a decision, not an accident"): the two costs on either side of
-# this number are not symmetric. Waiting the extra few seconds costs exactly that; not waiting
-# risks transferring a directory that is not finished being written -- the identical
-# directory-corruption failure mode `REQUIRED_SETTLE_SCANS`/`SETTLE_MIN_AGE_S` themselves guard
-# against. Kept a plain module constant rather than a user-facing setting for now -- this
-# project's own habit (docs/decisions.md) is to expose a knob once someone actually needs it
-# different, not speculatively ahead of any real request for one; see that file for the fuller
-# argument recorded alongside this task.
-CLIENT_COMPLETION_HOLD_S = 10.0
-
-
-def client_completion_ready(
-    transfer: "Transfer", *, first_observed_at: float, now: float | None = None
-) -> bool:
-    """True once at least `CLIENT_COMPLETION_HOLD_S` has elapsed since the release actually
-    finished. The settle-gate skip's own second gate -- called only once `find_client_completion`
-    above has already found a matching terminal `COMPLETED` verdict; this function has no opinion
-    about matching, only about timing.
-
-    **Measured from the client's own completion time (`Field.COMPLETED_AT` / `transfer.
-    completed_at`), never from when lftpweb happened to notice the verdict.** Getting this
-    backwards is the exact mistake this task's own handoff prompt calls out by name: the poll
-    cadence (`core/clientsync.py.FAST_INTERVAL_S`/`SLOW_INTERVAL_S`) already sits between the
-    client finishing and lftpweb observing that fact, so a hold measured from observation would
-    stack on top of that latency instead of overlapping it -- a release that actually finished
-    five minutes ago, but which lftpweb's poller only just got around to noticing, would
-    pointlessly wait another `CLIENT_COMPLETION_HOLD_S` for no reason. Measuring from the
-    client's own timestamp instead means **a completion already older than the hold satisfies it
-    immediately, with no added wait at all** -- the ordinary case for anything the poller picks
-    up on a later pass, which is most of the time given `FAST_INTERVAL_S`/`SLOW_INTERVAL_S` are
-    both already several times `CLIENT_COMPLETION_HOLD_S`.
-
-    **Falls back to `first_observed_at` only when `transfer.completed_at` is absent or fails to
-    parse** -- an undeclared `Field.COMPLETED_AT` (a connector that has not implemented it), or a
-    value this connector's own mapping could not produce in the first place (`sabnzbd.py.
-    _epoch_to_iso`'s own tolerant-of-garbage contract already returns `None` rather than raising
-    on a bad value). Both read identically here: spec §4.2's "absent is not a verdict," applied
-    to one field instead of the whole record. `first_observed_at` is deliberately not this
-    module's own clock -- it is the caller's (`core/autoqueue.py.AutoQueue`'s in-memory record of
-    the first scan pass on which this item's client verdict was seen at all), the best available
-    substitute for "when it actually finished" when the client itself won't say. This is the one
-    branch where the hold ends up measured from lftpweb's own observation after all, and only
-    because there is no better clock to measure it from -- never a silent, unconditional
-    substitute for the primary measurement above.
-
-    A value that fails to parse is treated exactly like an absent one (falls back to
-    `first_observed_at`), never as "already old enough" -- the conservative direction on an
-    unparseable timestamp is to wait, the same direction every other uncertain path in this
-    module already falls back to.
-    """
-    now = time.time() if now is None else now
-    since = first_observed_at
-    if transfer.completed_at:
-        try:
-            since = _parse_iso(transfer.completed_at)
-        except ValueError:
-            since = first_observed_at
-    return (now - since) >= CLIENT_COMPLETION_HOLD_S
+# `core/autoqueue.py`'s own client-shortened-settle mechanism (module docstring item 8)
+# fingerprints the item's remote subtree (the identical `compute_fingerprints` this module
+# already computes for the ordinary settle gate -- reused, not reinvented), waits
+# `CLIENT_RECHECK_INTERVAL_S` seconds, and fingerprints it again -- **queuing only if the two
+# fingerprints are equal**, exactly the ordinary settle gate's own stability test, just run on
+# its own faster clock rather than waiting for `REQUIRED_SETTLE_SCANS` * `SETTLE_MIN_AGE_S`
+# (>= 60s) of normal scan cadence. When the verify can't run at all -- no remote-scan capability
+# wired, an unreachable host, a partial scan, or the item vanishing from the remote before the
+# second fingerprint -- `AutoQueue.advance_pending_rechecks` drops the pending entry and the item
+# falls back to the ordinary settle gate, never to trusting the client's verdict; there is no
+# other fallback left to reach for now that `client_completion_ready` is gone.
+#
+# **Five seconds, not ten -- the user's own explicit instruction** for this task, overriding the
+# 2026-08-24 pick of ten (which only justified itself as "the same number
+# `CLIENT_COMPLETION_HOLD_S` already settled on," a constant that no longer exists to anchor it).
+# The tradeoff is the identical one `REQUIRED_SETTLE_SCANS`/`SETTLE_MIN_AGE_S` balance -- waiting
+# longer costs latency, waiting less risks a false "stable" reading on a release whose last bytes
+# are still landing -- just drawn at a different point on it, because the prior this mechanism
+# starts from is already strong: a client has already reported the release *terminal*, not merely
+# quiescent, so a single confirming re-fingerprint five seconds later is still proportionate
+# insurance, not a weakened check. Two fingerprints five seconds apart is the whole mechanism (not
+# `REQUIRED_SETTLE_SCANS`-many) -- see `core/autoqueue.py.RECHECK_TICK_S` for why the tick that
+# drives these two fetches had to shrink along with this number, not stay pinned at its old value.
+CLIENT_RECHECK_INTERVAL_S = 5.0
 
 
 def find_client_failure(

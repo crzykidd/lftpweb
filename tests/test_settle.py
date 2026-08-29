@@ -417,38 +417,61 @@ async def test_settle_settings_default_on_and_round_trip(db):
     assert settings.enabled is True
 
 
-async def test_client_skip_enabled_defaults_off_and_round_trips(db):
-    """Stage 2b of #18 (prompts/2026-08-23-settle-gate-skip.md): unlike `enabled` above,
-    `client_skip_enabled` must default `False` on a fresh install -- it depends directly on an
-    unverified guess (spec §13.4 #2), so "every new capability ships off" applies here without
-    exception. Also asserts the two fields are independently persisted -- a save that touches
-    only one via `SettleSettings(...)` (this module's own dataclass, not the API's merge logic)
-    naturally carries whatever the caller passed for the other, exercised here by round-
-    tripping both combinations.
+async def test_client_skip_enabled_defaults_on_and_round_trips(db):
+    """Stage 2b of #18 (prompts/2026-08-23-settle-gate-skip.md), reworked 2026-08-29
+    (prompts/done/2026-08-29-settle-verify-under-existing-toggle.md): `client_skip_enabled` now
+    defaults `True` on a fresh install -- a same-day reversal of the `False` this same flag
+    shipped with, once it stopped meaning "trust the client's word" and started meaning "verify
+    it on the filesystem" (the user's own call: "yes, make it on by default since it verifies").
+    Also asserts the two fields are independently persisted -- a save that touches only one via
+    `SettleSettings(...)` (this module's own dataclass, not the API's merge logic) naturally
+    carries whatever the caller passed for the other, exercised here by round-tripping both
+    combinations.
     """
-    settings = await settle.load_settle_settings(db)
-    assert settings.enabled is True
-    assert settings.client_skip_enabled is False
-
-    await settle.save_settle_settings(
-        db, settle.SettleSettings(enabled=True, client_skip_enabled=True)
-    )
     settings = await settle.load_settle_settings(db)
     assert settings.enabled is True
     assert settings.client_skip_enabled is True
 
     await settle.save_settle_settings(
-        db, settle.SettleSettings(enabled=False, client_skip_enabled=True)
+        db, settle.SettleSettings(enabled=True, client_skip_enabled=False)
+    )
+    settings = await settle.load_settle_settings(db)
+    assert settings.enabled is True
+    assert settings.client_skip_enabled is False
+
+    await settle.save_settle_settings(
+        db, settle.SettleSettings(enabled=False, client_skip_enabled=False)
     )
     settings = await settle.load_settle_settings(db)
     assert settings.enabled is False
+    assert settings.client_skip_enabled is False
+
+
+async def test_client_skip_enabled_fallback_reads_true_for_a_blob_predating_the_field(db):
+    """`load_settle_settings`'s own `data.get("client_skip_enabled", True)` fallback -- fires
+    only when a stored blob predates this field entirely (saved before 2026-08-23's stage 2b
+    ever existed), so an install that has never touched this setting reads the *current* default
+    rather than a value frozen from before the field was introduced. Modelled here by writing a
+    blob with only `enabled` set, the exact shape a pre-stage-2b install's stored settings would
+    have.
+    """
+    await settle.save_settle_settings(db, settle.SettleSettings(enabled=True))
+    # Overwrite with the pre-stage-2b shape directly -- `SettleSettings` itself can't produce a
+    # blob missing the key, since `save_settle_settings` always writes both fields.
+    await db.execute(
+        "UPDATE setting SET value = '{\"enabled\": true}' WHERE key = ?", (settle.SETTING_KEY,)
+    )
+    await db.commit()
+
+    settings = await settle.load_settle_settings(db)
+    assert settings.enabled is True
     assert settings.client_skip_enabled is True
 
 
 # --- The client-verdict skip's own matching (stage 2b of #18) -----------------------------
 #
 # Pure functions, no database, no scheduler -- `core/clientsync.py.ClientSyncScheduler.
-# completed_transfers`'s own candidate shape (`(instance_id, instance_name, Transfer)`)
+# finished_transfers`'s own candidate shape (`(instance_id, instance_name, Transfer)`)
 # constructed directly here rather than through the real poller/fake SABnzbd, the same "unit
 # test the pure half separately from the wired-up half" split this module's own docstring
 # describes for `compute_fingerprints`/`advance_settle`/`is_settled` above.
@@ -522,7 +545,10 @@ def test_find_client_completion_rejects_a_bare_prefix_that_straddles_a_name_boun
 
 def test_find_client_completion_ignores_a_queue_side_non_terminal_status():
     """A queue-side status (still downloading/verifying/etc) must never satisfy the gate, even
-    with an exact path match -- only a terminal, history-derived `COMPLETED` counts.
+    with an exact path match -- only a terminal, history-derived, *finished* verdict counts
+    (`settle.FINISHED_TRANSFER_PHASES` -- `COMPLETED` or `SEEDING`; see the test below for
+    `SEEDING` now matching, and `test_find_client_completion_still_rejects_verifying` for why
+    `VERIFYING` stays excluded even though it can coexist with a `complete` torrent flag).
     """
     for phase in (
         TransferPhase.QUEUED,
@@ -530,7 +556,6 @@ def test_find_client_completion_ignores_a_queue_side_non_terminal_status():
         TransferPhase.PAUSED,
         TransferPhase.VERIFYING,
         TransferPhase.EXTRACTING,
-        TransferPhase.SEEDING,
         TransferPhase.FAILED,
         TransferPhase.UNKNOWN,
     ):
@@ -538,6 +563,46 @@ def test_find_client_completion_ignores_a_queue_side_non_terminal_status():
             (1, "SABnzbd", _transfer(phase=phase, content_path="/complete/ar-tv/Show.S01"))
         ]
         assert settle.find_client_completion("/complete/ar-tv/Show.S01", candidates) is None
+
+
+def test_find_client_completion_matches_a_seeding_verdict():
+    """2026-08-24, prompts/2026-08-24-client-shortened-settle.md: the defect this task fixes --
+    `core/clients/rtorrent.py._classify_token` maps a finished, actively-seeding torrent to
+    `SEEDING`, never `COMPLETED`, so the gate must accept `SEEDING` too or it can never fire for
+    an ordinary seeding torrent at all. Watched this assertion fail (`assert result is not None`
+    against `None`) before widening `find_client_completion`'s phase check -- see this task's own
+    final report for the exact failure.
+    """
+    candidates = [
+        (
+            2,
+            "rTorrent",
+            _transfer(phase=TransferPhase.SEEDING, content_path="/complete/ar-tv/Show.S01"),
+        )
+    ]
+    result = settle.find_client_completion("/complete/ar-tv/Show.S01", candidates)
+    assert result is not None
+    instance_id, instance_name, transfer = result
+    assert instance_id == 2
+    assert instance_name == "rTorrent"
+    assert transfer.phase is TransferPhase.SEEDING
+
+
+def test_find_client_completion_still_rejects_verifying():
+    """`VERIFYING` (rTorrent's `hashing`, which overrides every other flag per `_classify_token`'s
+    own total ordering) must never satisfy the gate even with an exact path match -- a torrent
+    re-checking its own data is not known-good regardless of what `complete`/`is_active` said a
+    moment before the recheck began. The one phase this task's widening deliberately does NOT
+    also accept.
+    """
+    candidates = [
+        (
+            2,
+            "rTorrent",
+            _transfer(phase=TransferPhase.VERIFYING, content_path="/complete/ar-tv/Show.S01"),
+        )
+    ]
+    assert settle.find_client_completion("/complete/ar-tv/Show.S01", candidates) is None
 
 
 def test_find_client_completion_ignores_a_completed_transfer_with_no_content_path():
@@ -573,103 +638,16 @@ def test_find_client_completion_returns_the_first_match_among_several_candidates
     assert result[1] == "rTorrent"
 
 
-# --- The settle-gate skip's own completion delay (2026-08-23,
-# prompts/2026-08-23-client-completion-delay.md, finding #9) -- `client_completion_ready`'s own
-# timing question, checked only once `find_client_completion` above has already found a match.
-
-
-def test_client_completion_ready_holds_a_young_completion():
-    """A completion reported an instant ago must not satisfy the gate yet -- the whole point of
-    the delay this task adds.
-    """
-    transfer = _transfer(
-        phase=TransferPhase.COMPLETED,
-        content_path="/complete/ar-tv/Show.S01",
-        completed_at="2026-08-23T12:00:00+00:00",
-    )
-    now = settle._parse_iso("2026-08-23T12:00:00+00:00") + 3.0  # 3s after completion
-    assert settle.client_completion_ready(transfer, first_observed_at=now, now=now) is False
-
-
-def test_client_completion_ready_satisfies_once_the_hold_elapses():
-    """The identical item as above, on a later pass once `CLIENT_COMPLETION_HOLD_S` has actually
-    elapsed since the client's own completion time.
-    """
-    completed_epoch = settle._parse_iso("2026-08-23T12:00:00+00:00")
-    transfer = _transfer(
-        phase=TransferPhase.COMPLETED,
-        content_path="/complete/ar-tv/Show.S01",
-        completed_at="2026-08-23T12:00:00+00:00",
-    )
-    now = completed_epoch + settle.CLIENT_COMPLETION_HOLD_S
-    assert settle.client_completion_ready(transfer, first_observed_at=now, now=now) is True
-
-
-def test_client_completion_ready_is_immediate_for_a_completion_already_older_than_the_hold():
-    """The ordinary case for anything the poller only picks up on a later pass: a release that
-    finished five minutes ago must not wait a further `CLIENT_COMPLETION_HOLD_S` -- there must be
-    no added latency at all here.
-    """
-    completed_epoch = settle._parse_iso("2026-08-23T12:00:00+00:00")
-    transfer = _transfer(
-        phase=TransferPhase.COMPLETED,
-        content_path="/complete/ar-tv/Show.S01",
-        completed_at="2026-08-23T12:00:00+00:00",
-    )
-    now = completed_epoch + 300.0  # 5 minutes later
-    assert settle.client_completion_ready(transfer, first_observed_at=now, now=now) is True
-
-
-def test_client_completion_ready_falls_back_to_first_observed_at_with_no_completed_at():
-    """A connector that reports no `completed_at` at all (an undeclared `Field.COMPLETED_AT`, or
-    a value its own mapping couldn't parse) must fall back to `first_observed_at` -- asserted
-    explicitly here, not merely incidentally by some other test happening to leave
-    `completed_at` unset.
-    """
-    transfer = _transfer(
-        phase=TransferPhase.COMPLETED, content_path="/complete/ar-tv/Show.S01", completed_at=None
-    )
-    first_observed_at = 1_000_000.0
-    # Younger than the hold, measured from `first_observed_at` -- must not be ready yet. If this
-    # were (wrongly) measured from some other clock, this assertion could pass for the wrong
-    # reason, so the "ready once the hold elapses" case right below is what actually proves the
-    # fallback clock is the one being used.
-    assert (
-        settle.client_completion_ready(
-            transfer, first_observed_at=first_observed_at, now=first_observed_at + 3.0
-        )
-        is False
-    )
-    assert (
-        settle.client_completion_ready(
-            transfer,
-            first_observed_at=first_observed_at,
-            now=first_observed_at + settle.CLIENT_COMPLETION_HOLD_S,
-        )
-        is True
-    )
-
-
-def test_client_completion_ready_falls_back_on_an_unparseable_completed_at():
-    """An unparseable `completed_at` must read exactly like an absent one -- fall back to
-    `first_observed_at`, never "already old enough."
-    """
-    transfer = _transfer(
-        phase=TransferPhase.COMPLETED,
-        content_path="/complete/ar-tv/Show.S01",
-        completed_at="not-a-timestamp",
-    )
-    first_observed_at = 1_000_000.0
-    assert (
-        settle.client_completion_ready(
-            transfer, first_observed_at=first_observed_at, now=first_observed_at + 3.0
-        )
-        is False
-    )
-
-
 # --- The withhold gate's own matching (stage 3 of #18) -- `find_client_failure`'s mirror-image
 # coverage of `find_client_completion` above, over the identical pure `_transfer` helper.
+#
+# `client_completion_ready` and its own coverage (the settle-gate skip's pure time-hold, "wait
+# CLIENT_COMPLETION_HOLD_S before trusting a terminal verdict") lived here until 2026-08-29
+# (prompts/done/2026-08-29-settle-verify-under-existing-toggle.md) -- deleted outright alongside
+# the function itself, not weakened into asserting nothing. See `docs/decisions.md` and
+# `tests/test_client_shortened_settle.py` for what replaced it: a re-fingerprint verify under the
+# same `client_skip_enabled` toggle, covered end to end in that file rather than as a pure-timing
+# unit test here, since there is no longer a pure clock comparison to unit-test in isolation.
 
 
 def test_find_client_failure_matches_on_exact_path_equality():

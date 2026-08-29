@@ -24,11 +24,44 @@ Skeleton for the next roll:
 ## [Unreleased]
 
 ### Added
+
+- **The settle-gate skip (Settings → Transfer) now verifies a client-reported "finished" release
+  on the filesystem in roughly five seconds, instead of trusting the client's status string.**
+  Once a configured download client (SABnzbd or rTorrent) reports a release finished, lftpweb
+  fingerprints its remote subtree, waits five seconds, fingerprints it again, and queues the item
+  only if nothing moved — falling straight back to the ordinary ≥60s settle gate on any mismatch
+  or missing information. This is the same existing toggle, now with a stronger meaning: turning
+  it on means "verify," never "trust outright." Also fixes a real gap this surfaced: a finished,
+  actively-seeding rTorrent torrent reports `SEEDING`, not `COMPLETED`, so this check could never
+  fire for an ordinary seeding torrent before this release — it now recognizes `SEEDING` too.
+
 ### Changed
+
+- **The settle-gate skip now defaults ON** — the fifth deliberate exception to this project's
+  "every new capability ships off" rule, after `move`-mode forced verification, the phase 7
+  scheduled backup, the settle gate itself, and "folder prefix during transfer." It earns the
+  exception because it now verifies on the filesystem rather than trusting a client's own
+  vocabulary outright, so a wrong or missing verdict costs nothing — the withhold gate, which has
+  no equivalent verification step, stays off by default, unchanged. **This is a default-on
+  behavior change for existing installs, and for anyone who had already switched this setting on
+  under its old meaning: a configured download client's finished releases will typically start
+  transferring sooner than before** — around five seconds after the client reports done and the
+  filesystem confirms it, instead of the full ~60s+ wait every release used to sit through. Turn
+  the toggle off to keep every release waiting out the full gate regardless of what a client
+  reports. A release with no download-client involvement, or one the client hasn't yet reported,
+  is completely unaffected either way.
+
 ### Fixed
 ### Security
 ### Deprecated
+
 ### Removed
+
+- **The settle-gate skip's old pure time-hold is gone.** A short-lived, never-recommended-default
+  variant of the skip above briefly trusted a client's terminal verdict once it was merely old
+  enough (no filesystem re-check at all) before this same release replaced it with the
+  verify-based mechanism described above. Anyone who had it switched on now gets the
+  filesystem-verified version under the identical setting, automatically.
 
 ## [0.3.1] — 2026-08-22
 

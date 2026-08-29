@@ -183,7 +183,7 @@ function NumberField({ label, help, hint, value, step, min = 0, onChange }: Numb
 // implausible for the one render before the fetch lands.
 const SETTLE_EMPTY: SettleSettingsOut = {
   enabled: true,
-  client_skip_enabled: false,
+  client_skip_enabled: true,
   required_scans: 2,
   min_age_s: 60,
 }
@@ -223,9 +223,10 @@ function SettleGateSection() {
     }
   }
 
-  // Stage 2b of #18 (prompts/2026-08-23-settle-gate-skip.md) -- its own independent save, same
-  // shape as `handleToggle` above, so toggling one checkbox never round-trips (or risks
-  // clobbering, absent the backend's own merge) the other's value.
+  // Stage 2b of #18 (prompts/2026-08-23-settle-gate-skip.md), reworked 2026-08-29
+  // (prompts/done/2026-08-29-settle-verify-under-existing-toggle.md) -- its own independent
+  // save, same shape as `handleToggle` above, so toggling one checkbox never round-trips (or
+  // risks clobbering, absent the backend's own merge) the other's value.
   const handleClientSkipToggle = async (client_skip_enabled: boolean) => {
     setError(null)
     setSaving(true)
@@ -284,18 +285,20 @@ function SettleGateSection() {
               disabled={saving}
               onChange={(e) => handleClientSkipToggle(e.target.checked)}
             />
-            <span className={labelClasses}>Skip the wait on a download client's own verdict</span>
+            <span className={labelClasses}>
+              Verify a download client's completion verdict on the filesystem
+            </span>
           </label>
           <p className={hintClasses}>
-            When a configured download client (Settings → Clients) reports a
-            release as completed at the exact path lftpweb is watching, treat that as settled
-            immediately instead of waiting out the count/age check above. <strong>Off by
-            default</strong> — this depends on lftpweb's own reading of that client's status
-            vocabulary being correct, and that reading has not yet been confirmed against a live
-            instance for every client type. If it's ever wrong, this setting is what would let a
-            still-arriving release transfer early; leave it off unless you understand that
-            trade-off. Has no effect while the setting above is off, and never withholds a
-            transfer on a failure — it can only make the wait shorter.
+            When a configured download client (Settings → Clients) reports a release finished at
+            the exact path lftpweb is watching, re-check the filesystem twice, about 5 seconds
+            apart, and queue the release as soon as nothing has moved — instead of waiting out
+            the full count/age check above. This never takes the client's word alone: a wrong or
+            missing verdict simply falls back to the ordinary gate above, which keeps running
+            underneath it regardless, so it can only make the wait shorter, never less safe.
+            <strong> On by default</strong> — turn this off only if you'd rather every release
+            always wait out the full gate above, however long that takes, even once a download
+            client has already reported it done.
           </p>
         </>
       )}

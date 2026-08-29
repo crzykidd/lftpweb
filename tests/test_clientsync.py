@@ -1364,7 +1364,7 @@ async def test_sab_fast_tick_surfaces_a_fresh_terminal_verdict_without_waiting_f
     note): a finished SABnzbd item leaves the queue and appears only in history, so a terminal
     verdict used to be stranded behind `SLOW_INTERVAL_S` (5 minutes) regardless of how often the
     fast tick ran. After the fix, a release completing between two fast ticks must be visible to
-    `completed_transfers()` after the very next `FAST_INTERVAL_S` pass, not five minutes later.
+    `finished_transfers()` after the very next `FAST_INTERVAL_S` pass, not five minutes later.
     """
     await _seed_client(
         db,
@@ -1374,7 +1374,7 @@ async def test_sab_fast_tick_surfaces_a_fresh_terminal_verdict_without_waiting_f
     )
     scheduler = ClientSyncScheduler(db=db, config_dir=str(tmp_path))
     await scheduler.run_once(now=NOW0)  # first pass, slow-due, nothing in history yet
-    assert scheduler.completed_transfers() == []
+    assert scheduler.finished_transfers() == []
 
     # A release finishes between passes -- now sitting in SABnzbd's own history.
     fake_sabnzbd_server.state.history_slots = [
@@ -1389,7 +1389,7 @@ async def test_sab_fast_tick_surfaces_a_fresh_terminal_verdict_without_waiting_f
     # Well inside SLOW_INTERVAL_S -- a fast-only pass.
     await scheduler.run_once(now=NOW0 + scheduler.FAST_INTERVAL_S)
 
-    completed = scheduler.completed_transfers()
+    completed = scheduler.finished_transfers()
     assert len(completed) == 1
     instance_id, instance_name, transfer = completed[0]
     assert instance_name == "SABnzbd"

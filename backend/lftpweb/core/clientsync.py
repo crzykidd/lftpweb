@@ -34,9 +34,9 @@ half a connector falls into:
 - **NATIVE** (SABnzbd, `USENET_BASELINE`) means a real, independent, trivial call --
   `mode=history` costs nothing extra to make every fast tick, and it is where every terminal
   verdict lives. So a non-slow tick calls `list_transfers(active_only=True)` **and**
-  `list_history()`, and the terminal (`COMPLETED`/`FAILED`) results of the latter are merged
-  straight into `_full_estate` -- the cache `completed_transfers()`/`failed_transfers()` read --
-  without waiting for the next slow pass.
+  `list_history()`, and the terminal (`COMPLETED`/`SEEDING`/`FAILED`) results of the latter are
+  merged straight into `_full_estate` -- the cache `finished_transfers()`/`failed_transfers()`
+  read -- without waiting for the next slow pass.
 - **DERIVED** (rTorrent, `TORRENT_BASELINE`: "a torrent never leaves the list") means
   `list_history()` is not a second cheap call at all -- it re-fetches the *same* expensive full
   listing `list_transfers(active_only=False)` already pays for (`RtorrentClient.list_transfers`/
@@ -138,7 +138,7 @@ from lftpweb.core.clients.errors import ClientAuthenticationFailed, ClientError,
 from lftpweb.core.clients.models import Transfer, TransferPhase
 from lftpweb.core.crypto import DecryptionError, decrypt_secret
 from lftpweb.core.preflight import PreflightHold, PreflightRow
-from lftpweb.core.settle import _client_content_path_matches
+from lftpweb.core.settle import FINISHED_TRANSFER_PHASES, _client_content_path_matches
 
 logger = logging.getLogger(__name__)
 
@@ -401,11 +401,11 @@ class ClientSyncScheduler:
         self._preflight_holds: dict[int, PreflightHold] = {}
         # The settle-gate skip's own read (stage 2b of #18, `core/settle.py.
         # find_client_completion`) -- `instance_id -> name`, refreshed every `_process_instance`
-        # call, so `completed_transfers` below can name the client instance in an audit event
+        # call, so `finished_transfers` below can name the client instance in an audit event
         # without a second database round trip. Never pruned on its own (matching
         # `_last_slow_poll_at`/`_preflight_holds`'s own already-accepted non-pruning behavior in
         # this module) -- a stale entry for a since-removed instance costs nothing, since
-        # `_enabled_instance_ids` below is what actually gates which ids `completed_transfers`
+        # `_enabled_instance_ids` below is what actually gates which ids `finished_transfers`
         # ever looks at.
         self._instance_names: dict[int, str] = {}
         # Findings #2/reinforcing observation (2026-08-23, prompts/2026-08-23-tilde-and-
@@ -430,7 +430,7 @@ class ClientSyncScheduler:
         self._ever_succeeded: set[int] = set()
         # This pass's own live "which instances did `run_once` actually consider" set (spec:
         # "a disabled instance is never contacted") -- refreshed at the top of every `run_once`,
-        # *before* any per-instance processing, so `completed_transfers` can restrict itself to
+        # *before* any per-instance processing, so `finished_transfers` can restrict itself to
         # it and a since-disabled instance's stale `_full_estate` entry can never satisfy the
         # settle-gate skip merely because nothing has overwritten it yet. Empty until the first
         # `run_once` call, which is exactly "nothing enabled yet" -- the same conservative
@@ -478,7 +478,7 @@ class ClientSyncScheduler:
         )
         instances = await cursor.fetchall()
         # Stage 2b of #18: refreshed *before* any per-instance processing below (not merely
-        # "eventually consistent with it"), so a `completed_transfers()` call racing this pass
+        # "eventually consistent with it"), so a `finished_transfers()` call racing this pass
         # -- from a concurrent scan, in production `AutoQueue.on_scan` and this loop share one
         # event loop but not one call stack -- never sees an instance this very pass is about to
         # skip (backed off, or freshly disabled) as still "enabled."
@@ -555,7 +555,7 @@ class ClientSyncScheduler:
                 # Merge just the terminal transfers this fast tick's own cheap history call
                 # learned about into the full-estate cache -- the fix stage 2b's own correction
                 # (spec §9.1) called for: a terminal verdict is now visible to
-                # `completed_transfers()`/`failed_transfers()` within one `FAST_INTERVAL_S` tick,
+                # `finished_transfers()`/`failed_transfers()` within one `FAST_INTERVAL_S` tick,
                 # not stranded behind `SLOW_INTERVAL_S`. Deliberately leaves every non-terminal
                 # entry the last slow pass cached untouched -- this fast tick never asked about
                 # those, and overwriting them with nothing would be a regression, not a fix.
@@ -996,12 +996,22 @@ class ClientSyncScheduler:
     # caller of each, gated by its own independent setting (`settle.SettleSettings.
     # client_skip_enabled`, `autoqueue.WithholdSettings.enabled`). ---------------------------
 
-    def completed_transfers(self) -> list[tuple[int, str, Transfer]]:
-        """Every currently cached **terminal, history-derived `COMPLETED`** transfer across
-        every currently enabled instance's full-estate cache (`_full_estate`, populated by
-        spec §9.1's slow cadence) -- `core/settle.py.find_client_completion`'s own candidate
-        list, paired with the instance id and name an audit event needs to name the client
-        instance that permitted a skip (this task's own explicit requirement).
+    def finished_transfers(self) -> list[tuple[int, str, Transfer]]:
+        """Every currently cached **terminal, history-derived, finished** transfer (`settle.
+        FINISHED_TRANSFER_PHASES` -- `COMPLETED` or `SEEDING`) across every currently enabled
+        instance's full-estate cache (`_full_estate`, populated by spec §9.1's slow cadence) --
+        `core/settle.py.find_client_completion`'s own candidate list, paired with the instance id
+        and name an audit event needs to name the client instance that permitted a skip (this
+        task's own explicit requirement).
+
+        **Named `finished_transfers`, not `completed_transfers`** (renamed 2026-08-24,
+        prompts/2026-08-24-client-shortened-settle.md) -- the old name was a lie for the ordinary
+        rTorrent case: `core/clients/rtorrent.py._classify_token` maps a finished, actively-
+        seeding torrent to `SEEDING`, not `COMPLETED` (`complete and is_active` reads "seeding"),
+        so a method that only ever returned `COMPLETED` rows was structurally unreachable for a
+        torrent doing exactly what it's supposed to do after finishing. `SEEDING` now included --
+        see `settle.FINISHED_TRANSFER_PHASES`'s own comment for the full reasoning, including why
+        `VERIFYING` stays excluded even though rTorrent's `hashing` can coexist with `complete`.
 
         **Restricted to `_enabled_instance_ids`**, this pass's own live enabled set (refreshed
         at the top of every `run_once`, before this method could ever be called from a
@@ -1016,28 +1026,26 @@ class ClientSyncScheduler:
         -- the caller's own fallback (run the settle gate as it runs today) is triggered by an
         empty return, never by this method raising or guessing.
 
-        Only `TransferPhase.COMPLETED` transfers are ever included -- a queue-side (non-
+        Only `FINISHED_TRANSFER_PHASES` transfers are ever included -- a queue-side (non-
         terminal) status must never satisfy the settle-gate skip (this task's own rule), and
-        both connectors' own `map_phase` only ever produce `COMPLETED` from a history/terminal
-        record in the first place (`sabnzbd.py`'s queue-status map has no `COMPLETED` entry at
-        all; `rtorrent.py`'s only reaches it via `complete and not is_active`) -- this filter is
-        therefore also a second, independent guard against the same mistake, not merely a
-        restatement of it.
+        both connectors' own `map_phase` only ever produce `COMPLETED`/`SEEDING` from a
+        history/terminal record in the first place -- this filter is therefore also a second,
+        independent guard against the same mistake, not merely a restatement of it.
         """
         out: list[tuple[int, str, Transfer]] = []
         for instance_id in self._enabled_instance_ids:
             name = self._instance_names.get(instance_id, f"instance {instance_id}")
             for transfer in self._full_estate.get(instance_id, {}).values():
-                if transfer.phase is TransferPhase.COMPLETED:
+                if transfer.phase in FINISHED_TRANSFER_PHASES:
                     out.append((instance_id, name, transfer))
         return out
 
     def failed_transfers(self) -> list[tuple[int, str, Transfer]]:
-        """`completed_transfers`'s mirror image, for the withhold gate (stage 3 of #18,
+        """`finished_transfers`'s mirror image, for the withhold gate (stage 3 of #18,
         docs/transfers-redesign-spec.md §4.3): every currently cached **terminal, explicit
         `FAILED`** transfer across every currently enabled instance's full-estate cache.
 
-        Same shape, same guarantees, same reasons, as `completed_transfers` above -- restricted
+        Same shape, same guarantees, same reasons, as `finished_transfers` above -- restricted
         to `_enabled_instance_ids`, a pure read that never polls, and empty (never raising) for
         an instance whose slow poll (or fast cheap-history call, this stage's own fix) hasn't
         run yet. `core/settle.py.find_client_failure` is this method's own one caller's own

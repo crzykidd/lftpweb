@@ -34,10 +34,10 @@ Five things this module must get right, in order of consequence:
    item skipped for this reason alone is also projected into the Preflight box** (this module's
    own "Preflight" section below, prompts/2026-08-20-preflight-waiting-sources.md) -- it is
    exactly "would be queued this pass if only the gate weren't holding it," the box's own
-   definition of "waiting." A terminal client verdict (stage 2b of #18, below) can lift this
-   gate early, but only once `settle.CLIENT_COMPLETION_HOLD_S` has elapsed since the client's
-   own completion time (2026-08-23, prompts/2026-08-23-client-completion-delay.md, finding #9)
-   -- see `settle.client_completion_ready`'s own docstring.
+   definition of "waiting." A terminal client verdict (item 8 below) can lift this gate early,
+   but only once a re-fingerprint has confirmed nothing moved across `settle.
+   CLIENT_RECHECK_INTERVAL_S` (5s) -- see that item's own docstring. Gated behind `settle.
+   SettleSettings.client_skip_enabled`, on by default (2026-08-29, docs/decisions.md).
 5. **`_UNPACK_`/`_FAILED_` top-level items are never auto-queued** (2026-08-15,
    `prompts/done/2026-08-15-arr-eventtype-and-unpack-autoqueue.md`; "show it, don't grab it,"
    user decision same date, `docs/decisions.md`). The user's seedbox runs SABnzbd, which stages
@@ -73,6 +73,37 @@ Five things this module must get right, in order of consequence:
    same release always wins over a stale `FAILED` entry a client's own history may still hold.
    `self.withheld` mirrors `self.gated`'s own "one audit event per transition, presence is the
    live signal" idiom, one level deeper (per item rather than per queue).
+8. **The client-shortened settle (2026-08-24, `prompts/2026-08-24-client-shortened-settle.md`;
+   reworked 2026-08-29, `prompts/done/2026-08-29-settle-verify-under-existing-toggle.md`) -- gated
+   by `settle.SettleSettings.client_skip_enabled`, on by default.** Once a client reports an item
+   finished (`settle.find_client_completion`, matching `SEEDING` as well as `COMPLETED` -- see
+   `settle.FINISHED_TRANSFER_PHASES`'s own comment), this instance's own background ticker
+   (`start`/`_recheck_loop`/`advance_pending_rechecks` below) fingerprints the item's remote
+   subtree (the ordinary settle gate's own `settle.compute_fingerprints`, reused rather than
+   reinvented), waits `settle.CLIENT_RECHECK_INTERVAL_S` (5s), and fingerprints it again --
+   queuing only if the two match, exactly the ordinary settle gate's own stability test on a
+   faster clock. `on_scan` only *registers* a pending recheck here (never sleeps or fetches inside
+   a scan pass); the ticker owns the actual wait and the eventual `_enqueue_item` call.
+
+   **This used to be two mechanisms, and the toggle used to default off.** The 2026-08-24 version
+   shipped this re-fingerprint verify default ON with no toggle of its own, alongside an older
+   pure time-hold (`settle.CLIENT_COMPLETION_HOLD_S`/`client_completion_ready`) that trusted a
+   terminal verdict once it was merely old enough, gated by this same
+   `client_skip_enabled` flag but still off by default. The user rejected both properties in the
+   same breath: *"There is a toggle already for Skip the wait on a download client's own verdict.
+   This setting should be the one that still does the 5s verify."* The old time-hold path is
+   deleted outright here, not kept as a degraded fallback -- **one toggle, one meaning: skipping
+   the wait means verifying that nothing moved**, and there is no code path anywhere in this
+   subsystem that queues on a download client's word alone (`docs/decisions.md` has the rejected
+   alternatives).
+
+   **The toggle itself flips to on by default the same day**, a second, independent reversal: the
+   `False` default `client_skip_enabled` shipped with only ever protected against the old
+   time-hold's failure mode (a wrong status-mapping guess transferring a half-written directory on
+   the strength of a string). That failure mode is gone now that the flag gates a mechanism that
+   verifies on the filesystem before queuing anything -- a wrong or missing client verdict costs
+   nothing, since the ordinary settle gate above simply keeps running underneath it either way.
+   The user's own call: *"yes, make it on by default since it verifies."*
 
 **Retroactive by construction.** DESIGN.md §4.7: "adding a pattern re-evaluates the whole
 known model, not just future scans." This module re-queries every eligible top-level item in
@@ -84,6 +115,7 @@ is applied to everything already sitting there the very next scan, with no separ
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
@@ -99,6 +131,7 @@ from lftpweb.core.preflight import PreflightRow
 
 if TYPE_CHECKING:
     from lftpweb.core.clientsync import ClientSyncScheduler
+    from lftpweb.core.remote import HostConfig, RemoteConnectionPool
 
 logger = logging.getLogger(__name__)
 
@@ -240,8 +273,14 @@ class WithholdSettings:
     `prompts/2026-08-23-withhold-and-cadence.md`) -- own JSON blob, own key, same pattern as
     `AutoQueueSettings`/`settle.SettleSettings` above it in this file.
 
-    **Default `False` -- ship it off, same reasoning stage 2b's `client_skip_enabled` used.**
-    The gate's own matching is not what's in doubt (`settle.find_client_failure` reuses the
+    **Default `False` -- ship it off, the same caution `settle.SettleSettings.
+    client_skip_enabled` used to carry before it earned its own on-by-default reversal
+    (2026-08-29, docs/decisions.md).** That flag now defaults on *because* it verifies a client's
+    verdict on the filesystem before acting on it, rather than trusting the verdict outright --
+    this gate has no equivalent verification step to fall back on (it acts on an explicit
+    `FAILED` the moment it's seen, not a fingerprint comparison), so the reasoning that let
+    `client_skip_enabled` flip does not transfer here. The gate's own matching is not what's in
+    doubt (`settle.find_client_failure` reuses the
     exact, already-shipped `_client_content_path_matches` component-boundary rule
     `find_client_completion` already relies on for the *positive* verdict) -- what's unverified
     is the vocabulary a wrong default here would act on: SABnzbd's history `status="Failed"`
@@ -331,6 +370,70 @@ class QueueAutoConfig:
     short_name: str | None = None
 
 
+@dataclass(frozen=True)
+class _PendingClientRecheck:
+    """One item's own in-flight client-shortened-settle state (2026-08-24,
+    `prompts/2026-08-24-client-shortened-settle.md`) -- **in-memory only**, a deliberate choice:
+    a restart mid-recheck simply loses this bookkeeping, and the item falls back to the ordinary
+    settle gate on the very next scan -- the safe direction, not a data-loss risk. The "nothing
+    may publish a state it did not read back from a table" invariant (`core/itemview.py`'s own
+    docstring) governs *published item state*; this is internal gate bookkeeping that is never
+    itself published, so it does not apply here.
+
+    `on_scan` only ever *creates* an entry (when a finished client verdict first appears for an
+    item with no entry yet) or *drops* one (when the verdict, or the item's own eligibility,
+    disappears) -- it never mutates `first_fingerprint`/`first_taken_at`. Only this instance's own
+    background ticker (`AutoQueue.advance_pending_rechecks`) ever does that, and always by
+    replacing the dict entry with a new, frozen instance rather than mutating fields in place --
+    asyncio is single-threaded but interleaves at every `await`, so a frozen replace-not-mutate
+    discipline means a reader mid-iteration never observes a half-updated record.
+    """
+
+    queue_id: int
+    queue_name: str
+    queue_remote_path: str
+    rel_path: str
+    instance_id: int
+    instance_name: str
+    # Both `None` until the ticker's first fetch actually lands -- registration never fetches
+    # anything itself (`on_scan` must never sleep or do I/O inside a scan pass, this task's own
+    # non-negotiable); only `advance_pending_rechecks` below does.
+    first_fingerprint: "settle.Fingerprint | None" = None
+    first_taken_at: float | None = None
+
+
+# The pending-recheck ticker's own cadence (2026-08-24,
+# prompts/2026-08-24-client-shortened-settle.md; recalibrated 2026-08-29,
+# prompts/done/2026-08-29-settle-verify-under-existing-toggle.md, alongside `settle.
+# CLIENT_RECHECK_INTERVAL_S`'s own drop from 10s to 5s) -- a decision, not an accident, the same
+# way `settle.REQUIRED_SETTLE_SCANS`/`SETTLE_MIN_AGE_S`/`CLIENT_RECHECK_INTERVAL_S` are.
+# Deliberately **independent of, and faster than, `core/engine.py`'s own scan cadence**
+# (`DEFAULT_SCAN_INTERVAL_S`, 30s): an item sitting at the settle gate with no job of its own yet
+# does not qualify for `queue_is_active`'s fast ~5s local-only pass (that predicate's own
+# `substate == 'settling'` branch only ever fires *after* a job has already run once), so relying
+# on `on_scan`'s own call cadence for the two fingerprints this mechanism needs would mean the
+# second one might not land for up to a full `scan_interval_s` -- defeating "roughly 5 seconds"
+# entirely.
+#
+# **Kept at half of `settle.CLIENT_RECHECK_INTERVAL_S`, not left equal to it.** The original
+# 10s/5s pair used that same 2:1 ratio; simply leaving the tick pinned at its old absolute value
+# while only the window shrank would have made the two equal (5s and 5s) -- the wrong choice, and
+# specifically the one this task's own handoff prompt calls out by name. `advance_pending_rechecks`
+# only ever checks whether the interval has elapsed *at its own tick boundaries*, so a tick equal
+# to the window means the second fingerprint's due-check can land anywhere from just over one tick
+# to just over two ticks after the first, depending on exactly where in the ticker's own cycle
+# that first fingerprint happened to be taken -- for a 5s window with a 5s tick, that is "often
+# close to 5s, but routinely rounding up to a full 10s," exactly doubling the wait a user who
+# asked for "5 seconds" would actually observe on an unluckily-timed item. Halving the tick to
+# 2.5s instead bounds the second fingerprint's due-check to at most one 2.5s tick past the 5s
+# mark -- a real observed window of 5.0-7.5s, not 5-10s -- while still keeping the tick
+# meaningfully coarser than the window it measures, so the ticker isn't doing needless extra
+# fetches for items nowhere near due. Cheap when idle regardless of the exact number: a tick with
+# nothing in `self._pending_recheck` does no I/O at all (`advance_pending_rechecks`'s own first
+# check).
+RECHECK_TICK_S = 2.5
+
+
 class AutoQueue:
     def __init__(
         self, db: aiosqlite.Connection, enqueue_item: Callable[[int], Awaitable[int]]
@@ -377,20 +480,49 @@ class AutoQueue:
         # withhold is re-derived fresh from the client's own current candidates each pass, so
         # there is nothing to merge and no flap tolerance to reason about.
         self.withheld: dict[int, dict[int, str]] = {}
-        # The settle-gate skip's own completion-delay tracking (2026-08-23,
-        # prompts/2026-08-23-client-completion-delay.md, finding #9) -- queue_id -> {item_id:
-        # wall-clock `time.time()` this item's client verdict was first seen}, the fallback clock
-        # `settle.client_completion_ready` uses only when the matched `Transfer` itself reports
-        # no `completed_at` (see that function's own docstring for why the client's own timestamp
-        # is always preferred over this one when it's available). Wholesale-replaced per queue at
-        # the end of every `on_scan` pass that reaches the eligibility loop, exactly like
-        # `self.withheld`/`self._settle_preflight` above -- so an item that stops matching (queued
-        # manually, suppressed, or the client verdict itself disappears) simply drops out rather
-        # than leaking a stale timestamp forward. A *matching* item's own first-seen time is
-        # carried forward unchanged pass over pass (looked up from this same dict before being
-        # copied into the replacement), which is the whole point: this clock must not reset just
-        # because `on_scan` ran again.
-        self._client_completion_first_seen: dict[int, dict[int, float]] = {}
+
+        # The client-shortened settle's own pending-recheck state (2026-08-24,
+        # prompts/2026-08-24-client-shortened-settle.md) -- queue_id -> {item_id:
+        # _PendingClientRecheck}. `on_scan` only creates/drops entries; `advance_pending_rechecks`
+        # (this instance's own background ticker) owns every mutation once an entry exists. See
+        # `_PendingClientRecheck`'s own docstring for why in-memory is deliberate here.
+        self._pending_recheck: dict[int, dict[int, _PendingClientRecheck]] = {}
+        # Plain-attribute wiring, the identical "can't hand over an instance that doesn't exist
+        # yet at construction time" reason `self.client_sync` above is wired this way --
+        # `core/engine.py.Engine.pool` (a `core/remote.py.RemoteConnectionPool`) and the
+        # site's `HostConfig` provider both come from `main.py`'s lifespan, after `AutoQueue`
+        # itself is constructed. `None` -- every test, and any deployment before this task ships
+        # -- means "no remote-scan capability available," which `_fetch_item_fingerprint` below
+        # treats exactly like an unreachable client: no information, fall back to the ordinary
+        # settle gate, never an error.
+        self.remote_pool: "RemoteConnectionPool | None" = None
+        self.host_provider: "Callable[[], Awaitable[HostConfig | None]] | None" = None
+        self._recheck_task: asyncio.Task | None = None
+
+    async def start(self) -> None:
+        """Starts this instance's own background recheck ticker (`_recheck_loop`,
+        `RECHECK_TICK_S`) -- independent of, and not a replacement for, `core/engine.py.Engine`'s
+        own scan loop, the same "several small independent schedulers, each with one narrow job"
+        shape `ClientSyncScheduler`/`ArrSyncScheduler`/`BackupScheduler` already establish.
+        Idempotent (a second call while already started is a no-op), matching every sibling
+        scheduler's own `start()`.
+        """
+        if self._recheck_task is None:
+            self._recheck_task = asyncio.create_task(
+                self._recheck_loop(), name="lftpweb-autoqueue-recheck-loop"
+            )
+
+    async def stop(self) -> None:
+        """Cancels and awaits the recheck ticker -- must run before `self.db`/`self.remote_pool`
+        close, the same ordering constraint every other scheduler's `stop()` documents at its own
+        call site in `main.py`."""
+        if self._recheck_task is not None:
+            self._recheck_task.cancel()
+            try:
+                await self._recheck_task
+            except asyncio.CancelledError:
+                pass
+            self._recheck_task = None
 
     async def on_scan(self, queue: QueueAutoConfig, *, now: float | None = None) -> int:
         """Evaluate one queue's newly- *and* previously-seen eligible items. Called after
@@ -398,12 +530,16 @@ class AutoQueue:
         `self.gated` and logging stay accurate either way). Returns how many items were
         queued, for logging/tests.
 
-        `now` (`time.time()`-comparable epoch seconds) is the completion-delay's own clock
-        (2026-08-23, prompts/2026-08-23-client-completion-delay.md) -- injectable rather than
-        read internally, the same `now`-override shape `core/settle.py.advance_settle`/
-        `is_settled` and `core/clientsync.py.ClientSyncScheduler.run_once` already use, so a test
-        can drive the hold without sleeping real wall-clock seconds. Defaults to `time.time()`;
-        every call site that predates this task (and every production caller) leaves it unset.
+        `now` (`time.time()`-comparable epoch seconds) -- injectable rather than read internally,
+        the same `now`-override shape `core/settle.py.advance_settle`/`is_settled` and
+        `core/clientsync.py.ClientSyncScheduler.run_once` already use. **Not currently consulted
+        by anything in this method's own body** (2026-08-29,
+        prompts/done/2026-08-29-settle-verify-under-existing-toggle.md, deleted alongside the
+        completion-delay clock this parameter used to feed) -- kept in the signature anyway so
+        existing call sites/tests that already pass it don't need touching, and so a future
+        timing-sensitive check added here has somewhere to read a caller-injected clock from
+        without re-threading a new parameter through every test. Defaults to `time.time()`; every
+        production caller leaves it unset.
         """
         now = time.time() if now is None else now
         if not queue.auto_queue_enabled:
@@ -413,7 +549,7 @@ class AutoQueue:
             self.gated.pop(queue.id, None)
             self._settle_preflight.pop(queue.id, None)
             self.withheld.pop(queue.id, None)
-            self._client_completion_first_seen.pop(queue.id, None)
+            self._pending_recheck.pop(queue.id, None)
             return 0
 
         if not mount_sentinel.check(queue.local_path):
@@ -442,7 +578,7 @@ class AutoQueue:
             # "fifty rows burying the one fact that matters" shape the banner exists to avoid.
             self._settle_preflight.pop(queue.id, None)
             self.withheld.pop(queue.id, None)
-            self._client_completion_first_seen.pop(queue.id, None)
+            self._pending_recheck.pop(queue.id, None)
             return 0
         if self.gated.pop(queue.id, None) is not None:
             # A real recovery -- the gate was actually blocking this queue a moment ago, not
@@ -501,14 +637,16 @@ class AutoQueue:
         # "log once per transition, not once per pass" reason.
         withheld_this_pass: dict[int, str] = {}
         previously_withheld = self.withheld.get(queue.id, {})
-        # The completion-delay's own this-pass result (2026-08-23,
-        # prompts/2026-08-23-client-completion-delay.md) -- item_id -> the wall-clock time this
-        # item's client verdict was first seen, carried forward from `previously_first_seen` when
-        # already present there, or started fresh at `now` (this method's own parameter -- one
-        # value for the whole pass, matching `core/settle.py.advance_settle`'s own "caller's own
-        # single now" convention) on a first sighting.
-        client_completion_first_seen_this_pass: dict[int, float] = {}
-        previously_first_seen = self._client_completion_first_seen.get(queue.id, {})
+        # The client-shortened settle's own this-pass result (2026-08-24,
+        # prompts/2026-08-24-client-shortened-settle.md) -- every item id that still has a
+        # finished client verdict AND is still not settled this pass, so any pending entry for an
+        # item that drops out of that set (settled by the ordinary gate, verdict gone, no longer
+        # matching, suppressed) can be dropped from `self._pending_recheck[queue.id]` once the
+        # loop finishes -- a "wholesale replace, carry forward what's still present" idiom applied
+        # by set membership rather than by rebuilding the dict, since the ticker (not `on_scan`)
+        # owns every *value* in this dict once an entry exists (`_PendingClientRecheck`'s own
+        # docstring).
+        pending_recheck_candidates_this_pass: set[int] = set()
         for row in rows:
             # "Show it, don't grab it" (user decision, 2026-08-15, docs/decisions.md): a SAB
             # in-progress unpack staged under `_UNPACK_<name>` (or a `_FAILED_` leftover) on
@@ -552,7 +690,7 @@ class AutoQueue:
                 # every pass re-derives the verdict fresh from the client's own current
                 # candidates, so a later success is simply "no failure match found this pass."
                 completion = settle.find_client_completion(
-                    item_remote_path, self.client_sync.completed_transfers()
+                    item_remote_path, self.client_sync.finished_transfers()
                 )
                 if completion is None:
                     failure = settle.find_client_failure(
@@ -598,70 +736,44 @@ class AutoQueue:
                 else None
             )
             if settle_settings.enabled and not settle.is_settled_from_progress(settle_progress):
-                # Stage 2b of #18 (prompts/2026-08-23-settle-gate-skip.md): reached only once
-                # the settle gate's own fingerprint-based check above has already decided this
-                # item is NOT settled -- a positive, terminal client verdict is a *second*, more
-                # direct way to reach the same "safe to transfer" conclusion (spec §4.3: "SAB
-                # completing *is* that same fact, reported by the process doing the writing"),
-                # never a way to skip the gate faster than "not settled" already earned.
-                #
-                # **Every one of the following makes this a no-op, falling through to the exact
-                # same hold-and-Preflight-row behavior below (this task's own non-negotiable):**
-                # `client_skip_enabled` off (default), `self.client_sync` never wired (a
-                # deployment/test that predates this task), `queue.remote_path` empty (a
-                # `QueueAutoConfig` built before this field existed --
-                # `settle._client_content_path_matches`'s own empty-root guard), an unreachable
-                # client / blank queue-or-history response (`completed_transfers()` returns
-                # nothing), a queue-side or `UNKNOWN` phase (`find_client_completion` only ever
-                # matches a terminal `COMPLETED`), or a near-miss path that isn't a genuine
-                # component-boundary match.
-                client_verdict = (
-                    settle.find_client_completion(
-                        queue.remote_path.rstrip("/") + "/" + row["rel_path"],
-                        self.client_sync.completed_transfers(),
+                # The client-shortened settle (item 8 of this module's own docstring) -- gated on
+                # `settle.SettleSettings.client_skip_enabled`, on by default (2026-08-29,
+                # prompts/done/2026-08-29-settle-verify-under-existing-toggle.md; see that item's
+                # own docstring for the full history, including the second, now-deleted mechanism
+                # this toggle used to also gate). Only *registers* this item's pending recheck
+                # when the toggle is on AND a finished verdict (`settle.FINISHED_TRANSFER_PHASES`
+                # -- `COMPLETED` or `SEEDING`) exists and no entry is tracking it yet -- it never
+                # fetches a fingerprint, sleeps, or enqueues here; `self.advance_pending_rechecks`
+                # (this instance's own background ticker) owns all of that. The toggle off, a
+                # `None` verdict, `self.client_sync` never wired, or `queue.remote_path` empty,
+                # all mean the same thing: nothing to register, no remote I/O, exactly the
+                # ordinary settle-gate behavior for this item.
+                if (
+                    settle_settings.client_skip_enabled
+                    and self.client_sync is not None
+                    and queue.remote_path
+                ):
+                    item_remote_path = queue.remote_path.rstrip("/") + "/" + row["rel_path"]
+                    recheck_verdict = settle.find_client_completion(
+                        item_remote_path, self.client_sync.finished_transfers()
                     )
-                    if settle_settings.client_skip_enabled and self.client_sync is not None
-                    else None
-                )
-                if client_verdict is not None:
-                    instance_id, instance_name, transfer = client_verdict
-                    # The completion-delay's own bookkeeping (2026-08-23, prompts/2026-08-23-
-                    # client-completion-delay.md, finding #9) -- carried forward from last pass's
-                    # own record for this item when one exists, so the fallback clock
-                    # `settle.client_completion_ready` uses (only when `transfer.completed_at`
-                    # itself is absent) measures from the *first* pass this verdict was seen, not
-                    # from every pass that merely re-observes the same still-standing verdict.
-                    first_seen = previously_first_seen.get(row["id"], now)
-                    client_completion_first_seen_this_pass[row["id"]] = first_seen
-                    if settle.client_completion_ready(
-                        transfer, first_observed_at=first_seen, now=now
-                    ):
-                        # The audit trail this task's own handoff prompt calls "not optional
-                        # decoration" -- naming the client instance and the verdict that permitted
-                        # the skip is the only way anyone will work out why, the day this feature
-                        # ever transfers something half-written on a wrong guess.
-                        await audit.record_event(
-                            self.db,
-                            level="info",
-                            item_id=row["id"],
-                            kind="settle_client_skip",
-                            message=(
-                                f"queue {queue.id} ('{queue.name}'): item {row['rel_path']!r} "
-                                f"skipped the settle gate -- download client {instance_name!r} "
-                                f"(id={instance_id}) reports it COMPLETED at "
-                                f"{transfer.content_path!r}"
-                            ),
-                        )
-                        await self._enqueue_item(row["id"])
-                        queued += 1
-                        continue
-                    # Not ready yet -- `client_completion_ready` says `CLIENT_COMPLETION_HOLD_S`
-                    # hasn't elapsed since this release actually finished. Falls through to the
-                    # exact same hold-and-Preflight-row behavior below as a `client_verdict` of
-                    # `None` would, on purpose: this delay only ever makes an already-shortened
-                    # wait slightly longer, never a way to skip faster than "not settled" earned,
-                    # and never a way to hold an item back harder than the settle gate itself
-                    # would on its own.
+                    if recheck_verdict is not None:
+                        instance_id, instance_name, _transfer = recheck_verdict
+                        pending_recheck_candidates_this_pass.add(row["id"])
+                        queue_pending = self._pending_recheck.setdefault(queue.id, {})
+                        if row["id"] not in queue_pending:
+                            queue_pending[row["id"]] = _PendingClientRecheck(
+                                queue_id=queue.id,
+                                queue_name=queue.name,
+                                queue_remote_path=queue.remote_path,
+                                rel_path=row["rel_path"],
+                                instance_id=instance_id,
+                                instance_name=instance_name,
+                            )
+                        # Else: already tracked -- left alone. The ticker may be mid-recheck for
+                        # it right now; `on_scan` never touches an existing entry's fingerprint/
+                        # timing fields (`_PendingClientRecheck`'s own docstring).
+
                 # Preflight (prompts/2026-08-20-preflight-waiting-sources.md, this module's own
                 # "Preflight" section below) -- reached only once every *other* eligibility
                 # check above has already passed (pattern match, no active job via the query's
@@ -735,14 +847,194 @@ class AutoQueue:
                     ),
                 )
         self.withheld[queue.id] = withheld_this_pass
-        # Wholesale replace, matching `self.withheld`/`self._settle_preflight` above -- an item
-        # that stopped having a client verdict this pass (queued manually, suppressed, or the
-        # verdict itself aged out of the client's cache) has nothing left to carry its first-seen
-        # time forward for.
-        self._client_completion_first_seen[queue.id] = client_completion_first_seen_this_pass
+        # Drop any pending recheck for an item that dropped out of this pass's own candidate set
+        # -- settled by the ordinary gate, the client verdict disappeared, no longer matching, or
+        # suppressed. **In place, not a wholesale dict replace** (unlike `self.withheld` above):
+        # the ticker owns every *value* in this dict once an entry exists, so `on_scan` only ever
+        # adds a brand-new entry or removes a stale one, never rebuilds the dict itself --
+        # rebuilding wholesale here could drop an update the ticker made between this pass's own
+        # top-of-loop read and this line (`_PendingClientRecheck`'s own docstring has the full
+        # reasoning).
+        queue_pending = self._pending_recheck.get(queue.id, {})
+        for stale_item_id in list(queue_pending):
+            if stale_item_id not in pending_recheck_candidates_this_pass:
+                queue_pending.pop(stale_item_id, None)
         if queued:
             logger.info("auto-queue: queued %d item(s) for queue %d", queued, queue.id)
         return queued
+
+    # --- The client-shortened settle's own ticker (2026-08-24,
+    # prompts/2026-08-24-client-shortened-settle.md, item 8 of this module's own docstring) --
+    # `on_scan` above only registers a pending recheck; everything below actually advances one:
+    # fetching a fingerprint, waiting `settle.CLIENT_RECHECK_INTERVAL_S`, fetching again, and
+    # queuing only on a match. Runs on its own `RECHECK_TICK_S` clock, independent of `on_scan`'s
+    # own call cadence, so it never sleeps or blocks a scan pass. ------------------------------
+
+    async def _recheck_loop(self) -> None:
+        while True:
+            try:
+                await self.advance_pending_rechecks()
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - one bad tick must not kill the loop
+                logger.exception("client-shortened settle: recheck tick failed")
+            await asyncio.sleep(RECHECK_TICK_S)
+
+    async def advance_pending_rechecks(self, *, now: float | None = None) -> int:
+        """One tick's worth of work over every queue's pending recheck. `now` is overridable
+        (`time.time()`-comparable), the same shape `on_scan`'s own `now` parameter already uses,
+        so a test can drive the 5s comparison window without sleeping real wall-clock seconds.
+        Returns how many items this call actually queued, for tests/logging -- `on_scan`'s own
+        `queued` return value's shape.
+
+        For each pending item, in order:
+
+        - **No fingerprint taken yet** -- fetch one now (`_fetch_item_fingerprint`). `None` back
+          (no remote-scan capability wired, an unreachable host, a partial/failed scan, or the
+          item no longer has any remote entries at all) means "no information" -- drop the entry
+          and fall back to the ordinary settle gate, the identical "every uncertain path falls
+          back to today's behavior" rule this whole subsystem already follows. Otherwise, record
+          the fingerprint and `now` and wait for the next tick.
+        - **A fingerprint was taken, but `settle.CLIENT_RECHECK_INTERVAL_S` hasn't elapsed since**
+          -- not due yet; left untouched for a later tick.
+        - **Due** -- fetch a second fingerprint and compare. **Different (or unfetchable this
+          time) -> never shortcut: drop the entry and fall back to the ordinary settle gate**,
+          exactly as this task's own brief requires. **Equal -> verified stable.** Re-verifies
+          this item is still auto-queue-eligible right now (`_still_auto_queue_eligible`) before
+          actually enqueuing -- the SQL eligibility check that first admitted this item into
+          `self._pending_recheck` (in `on_scan`) can be up to several `RECHECK_TICK_S` ticks
+          stale by the time a recheck actually converges, and the one thing that can genuinely
+          change in that window without another `on_scan` pass observing it first is a user
+          action (a manual suppress, stop, or delete) -- `_enqueue_item` itself is idempotent
+          against a since-queued item but does **not** check suppression, so this re-check is
+          the one thing standing between a stale registration and resurrecting a release the
+          user explicitly told lftpweb to leave alone. Either way, the entry is dropped: settled
+          or not, this pending recheck is finished.
+        """
+        now = time.time() if now is None else now
+        queued = 0
+        if not self._pending_recheck:
+            return queued  # cheap no-op when idle -- no I/O at all
+        for queue_id, items in list(self._pending_recheck.items()):
+            for item_id, pending in list(items.items()):
+                if pending.first_fingerprint is None:
+                    fingerprint = await self._fetch_item_fingerprint(
+                        pending.queue_remote_path, pending.rel_path
+                    )
+                    if fingerprint is None:
+                        items.pop(item_id, None)
+                        continue
+                    items[item_id] = _PendingClientRecheck(
+                        queue_id=pending.queue_id,
+                        queue_name=pending.queue_name,
+                        queue_remote_path=pending.queue_remote_path,
+                        rel_path=pending.rel_path,
+                        instance_id=pending.instance_id,
+                        instance_name=pending.instance_name,
+                        first_fingerprint=fingerprint,
+                        first_taken_at=now,
+                    )
+                    continue
+                if now - pending.first_taken_at < settle.CLIENT_RECHECK_INTERVAL_S:
+                    continue  # not due yet
+                second_fingerprint = await self._fetch_item_fingerprint(
+                    pending.queue_remote_path, pending.rel_path
+                )
+                if second_fingerprint is None or second_fingerprint != pending.first_fingerprint:
+                    # Different, or unfetchable this time -- never shortcut on a changed (or
+                    # unconfirmed) fingerprint. Dropped, not retried in place; `on_scan` re-arms
+                    # a fresh recheck next pass if the client still reports this item finished
+                    # and it's still not settled -- a fresh two-fingerprint comparison starting
+                    # from now, never treated as a continuation of the one that just failed.
+                    items.pop(item_id, None)
+                    continue
+                items.pop(item_id, None)
+                if not await self._still_auto_queue_eligible(item_id):
+                    continue
+                await audit.record_event(
+                    self.db,
+                    level="info",
+                    item_id=item_id,
+                    kind="settle_client_recheck_skip",
+                    message=(
+                        f"queue {queue_id} ('{pending.queue_name}'): item {pending.rel_path!r} "
+                        f"skipped the settle gate -- download client {pending.instance_name!r} "
+                        f"(id={pending.instance_id}) reports it finished, and its remote subtree "
+                        f"fingerprint held unchanged across a {settle.CLIENT_RECHECK_INTERVAL_S:.0f}s "
+                        "re-verification (verified, not just trusted)"
+                    ),
+                )
+                await self._enqueue_item(item_id)
+                queued += 1
+        return queued
+
+    async def _fetch_item_fingerprint(
+        self, queue_remote_path: str, rel_path: str
+    ) -> "settle.Fingerprint | None":
+        """Fingerprints one top-level item's remote subtree by scanning its **queue's** own
+        remote root (`queue_remote_path`) -- not a narrower per-item scan -- through the same
+        `core/remote.py.RemoteConnectionPool.scan` `core/engine.py.Engine.scan_queue` already
+        uses for the ordinary full scan, then reading `settle.compute_fingerprints`'s own output
+        back out for just this `rel_path`. Scanning one level up (rather than `queue_remote_path
+        + "/" + rel_path` directly) is deliberate, not incidental: a top-level item can itself be
+        a bare file (DESIGN.md §4.7's granularity allows it), and `find <file> -mindepth 1`
+        returns nothing for a file with no children -- scanning the parent instead means this
+        reuses `compute_fingerprints` exactly as it already works for the ordinary settle gate,
+        with no file-vs-directory special case of its own.
+
+        Returns `None` -- "no information," never a fabricated verdict -- when: `self.
+        remote_pool`/`self.host_provider` aren't wired (no test, and no deployment before this
+        task shipped, has them); the host provider itself returns `None` (no host configured
+        yet); the scan raises for any reason (network failure, auth failure, a busybox fallback
+        that also fails); the scan comes back **partial** (`interpret_primary_scan_result`'s own
+        warning) -- the identical "a partial scan proves nothing, hold rather than trust it" rule
+        `core/settle.py.advance_settle`'s own docstring states for the ordinary gate, applied
+        here to a single comparison rather than a persisted counter; or the item simply has no
+        fingerprint in this scan's own output (vanished from the remote entirely). Every one of
+        these reads as "abandon this recheck attempt," never as an error the ticker should raise
+        (`_recheck_loop`'s own `except Exception` is the last-resort backstop, not the intended
+        path for any of these).
+        """
+        if self.remote_pool is None or self.host_provider is None:
+            return None
+        try:
+            host = await self.host_provider()
+            if host is None:
+                return None
+            remote_tree, warning = await self.remote_pool.scan(host, queue_remote_path)
+        except Exception:  # noqa: BLE001 - one bad fetch must never crash the ticker
+            logger.warning(
+                "client-shortened settle: re-fingerprint scan of %r failed",
+                queue_remote_path,
+                exc_info=True,
+            )
+            return None
+        if warning:
+            return None  # partial scan -- no reliable evidence either way, never trust it
+        return settle.compute_fingerprints(remote_tree).get(rel_path)
+
+    async def _still_auto_queue_eligible(self, item_id: int) -> bool:
+        """Re-verified immediately before `advance_pending_rechecks` above actually enqueues a
+        recheck-confirmed item -- see that method's own docstring for why. Mirrors `on_scan`'s
+        own eligibility clauses (suppression, state, the *arr hand-off) minus the pattern match
+        itself (pattern membership doesn't change from outside `on_scan`, and this item already
+        matched a few ticks ago) and minus the active-job clause (`_enqueue_item` already
+        re-checks that itself, idempotently).
+        """
+        autoqueue_settings = await load_autoqueue_settings(self.db)
+        eligible_states = (
+            ELIGIBLE_STATES_WITH_EXTERNALLY_REMOVED
+            if autoqueue_settings.re_download_externally_removed
+            else ELIGIBLE_STATES
+        )
+        cursor = await self.db.execute(
+            "SELECT 1 FROM item WHERE id = ? AND auto_queue_suppressed = 0 "
+            f"AND state IN ({','.join('?' for _ in eligible_states)}) "
+            f"AND COALESCE(arr_status, '') NOT IN "
+            f"({','.join('?' for _ in ARR_IMPORT_INELIGIBLE_STATUSES)})",
+            (item_id, *eligible_states, *ARR_IMPORT_INELIGIBLE_STATUSES),
+        )
+        return await cursor.fetchone() is not None
 
     # --- Preflight (docs/transfers-redesign-spec.md §4; this task,
     # prompts/2026-08-20-preflight-waiting-sources.md) -- the settle gate's own eligibility
