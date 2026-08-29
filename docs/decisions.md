@@ -6,6 +6,61 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-24 — exclusion is a delete-safety boundary, not a visibility boundary: the disk review scan retains excluded claims instead of dropping them
+
+`prompts/done/2026-08-24-disk-review-visibility-backend.md`. The disk review page was showing
+almost nothing on a real seedbox: content in an excluded category was deleted from consideration
+before any pile logic ran, and migration 032 makes every newly observed category default to
+excluded — so a real two-instance deployment reads as nearly empty. This is the same lesson
+findings #16 and #17 already taught twice (a manually excluded path must be dropped from *delete
+authorization*, not from the screen; an ambiguous-root unclaimed file must be shown, not silently
+counted), applied a third time to the one path that still got it wrong: an excluded-category
+claim.
+
+**The decision: retain the claim instead of dropping it, and let a structural per-entry order
+(claimed, then excluded, then ambiguous-unclaimed, then debris) do the work the old
+fold-into-hard-exclusion machinery used to do by data manipulation.** An excluded-category claim's
+files now land in the seeding estate, tagged `attribution="excluded"`. A manually excluded path
+with no claim currently covering it lands in a new `excluded_content` pile — visible, never
+selectable, never counted toward a reclaim total. **Nothing about delete containment moved**:
+`core/disk_review.py.is_authorized_delete_target(path, base_paths, excluded_paths)` keeps its
+exact signature and behaviour, still receiving the full resolved excluded-path set and still
+refusing everything under it, unconditionally. A test
+(`test_hard_invariant_excluded_content_stays_unauthorized_for_delete_after_becoming_visible`)
+asserts this directly for both new visibility routes.
+
+**Rejected alternative: keep the display filter, and add a separate "show excluded" toggle
+(defaulting off).** This was the obvious minimal patch — leave the existing suppression in place
+and let a person opt back into seeing what it hides. Rejected because a toggle defaulting off
+reproduces the exact bug being fixed: the whole failure mode here is that excluded content is
+invisible *by default*, and migration 032 already made "newly observed = excluded" the default
+specifically so a person doesn't have to notice and act before their own data is protected. Adding
+a second off-by-default flag on top would mean the fix ships permanently disabled for exactly the
+deployment shape (a real two-instance seedbox, categories arriving excluded automatically) that
+motivated it — someone would have to already know to look for a hidden toggle to see their own
+seedbox's true contents. The governing principle this task is named for — *exclusion is a
+delete-safety boundary, not a visibility boundary* — is precisely the argument against a toggle:
+visibility should not be a preference at all, only delete-eligibility should be gated.
+
+**A second, smaller correctness fix fell out of removing the pre-filter.** Once excluded disk
+entries stop being dropped from the walk before `by_inode` is built, `_entry_eligible` and
+`_ambiguous_unclaimed` (both called by `_link_group` against *every* on-disk sibling of an inode,
+not just the entry the outer loop is currently on) had to gain their own `_excluded` guard —
+otherwise a debris-eligible file's hardlink sibling sitting under an excluded path would read as
+"eligible" (nothing else checked exclusion) and ride the pair into `debris` by satisfying the
+"every link is a candidate" requirement. Caught while reasoning through the hard invariant, not by
+a failing test first; a regression test
+(`test_excluded_sibling_cannot_ride_a_hardlink_group_into_debris`) was added afterward specifically
+to pin it down.
+
+**A third, unresolved design question, explicitly not decided here and left for the follow-up
+`prompts/2026-08-24-disk-review-table-frontend.md` task:** whether the label filter that task adds
+is global across client sections or per-section. Noted here only so the two decisions aren't
+confused with each other — this entry is backend-only, a visibility change with no UI shape of its
+own.
+
+---
+
 ## 2026-08-23 — docs currency for `0.4.0`: `DESIGN.md` gets §17, the two-instance topology becomes documented, and stage 5's gate grows a second condition
 
 `prompts/done/2026-08-23-docs-currency-for-0.4.0.md`. Documentation-only pass ahead of the

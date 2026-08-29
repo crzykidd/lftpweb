@@ -1,11 +1,34 @@
 """The disk review scan (docs/download-client-framework-spec.md §11, stage 4 of #18) --
 **review-only, deletes nothing**. Walks the clients' configured base paths over SSH,
-reconciles against what the clients claim and what lftpweb itself is using, and produces three
+reconciles against what the clients claim and what lftpweb itself is using, and produces
 labelled piles: debris (safe to review, selectable), the seeding estate (claimed, shown for
-visibility only), and the unclaimed pile (finding #17, 2026-08-23 -- ownership genuinely
+visibility only, each row carrying which category-attribution state its claim has), excluded
+content (2026-08-24 -- unclaimed content under an excluded path, shown for visibility, never
+selectable), and the unclaimed pile (finding #17, 2026-08-23 -- ownership genuinely
 undeterminable, shown for visibility, gated off the ordinary select-and-remove flow, never
-hidden). Stage 5 (the delete path) is not built here -- see this module's own
-`run_scan`, which never calls `core/remote.py.RemoteConnectionPool.delete_path`.
+hidden). Alongside the piles, `reconcile()` also emits a `torrents` summary -- one row per
+claim, carrying the client's own reported figures (ratio, uploaded bytes, seed time, ...) and
+two disk-derived ones (`file_count`, `size_on_disk`) -- and `run_scan()` emits a `clients`
+roster naming which instances reported this pass and what fields they declare. Stage 5 (the
+delete path) is not built here -- see this module's own `run_scan`, which never calls
+`core/remote.py.RemoteConnectionPool.delete_path`.
+
+**The governing principle for this whole module, sharpened 2026-08-24 (see
+`docs/decisions.md`): exclusion is a delete-safety boundary, not a visibility boundary.**
+Findings #16 and #17 (2026-08-23) already established this for two of the paths through this
+module -- a manually excluded path must be dropped from *delete authorization*, not from the
+screen, and an ambiguous-root unclaimed file must be shown, not silently counted. This task
+applies the same correction a third time, to the one path that still got it wrong: a claim
+whose own category was marked "not used by this instance" used to be dropped outright, before
+any claim/candidate logic ever saw it -- which meant the files it named fell through to
+whichever pile the *absence* of a claim produced (nothing, if they were also under a resolved
+exclusion path; the unclaimed pile, if the exclusion couldn't resolve to a path). **That claim
+is now retained.** An excluded-category claim's files are still claimed, so they still land in
+the seeding estate -- shown, tagged `attribution="excluded"`, and by construction unreachable
+by the debris or unclaimed branches, which only ever run for a file with no claim behind it at
+all. Nothing about *containment* changes: `is_authorized_delete_target` still receives the same
+resolved excluded-path set and still refuses everything under it, unconditionally, whether or
+not that content is now visible somewhere on the page.
 
 **This module is split in two, on purpose.** `reconcile()` below is pure set math over three
 inputs (spec §11.1's Set A/B/C) -- no SSH, no database, no clock but the one passed in --
@@ -47,6 +70,7 @@ import time
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
+from typing import Literal
 
 from lftpweb.core import mount_sentinel
 from lftpweb.core.pipeline_flight import item_pipeline_busy_subquery
@@ -59,6 +83,13 @@ logger = logging.getLogger(__name__)
 # constant rather than inventing a second magic number for the same "give it a few minutes"
 # idea.
 DEFAULT_AGE_FLOOR_S = mount_sentinel.DEFAULT_GRACE_S
+
+# Migration 031's three-state category (spec §17.7, `download_client_category.excluded`/
+# `queue_id`), copied onto a claim by `reconcile` purely for display -- see `ClientClaim.
+# category`'s own docstring and `run_scan`'s widened category query. `reconcile` never branches
+# on this value; the file it is attached to is placed by claim-vs-path logic alone, unconditioned
+# on which of the three states this is.
+Attribution = Literal["bound", "excluded", "undecided"]
 
 
 # ================================================================================================
@@ -117,25 +148,47 @@ class BasePathContributor:
 
 @dataclass(frozen=True)
 class ClientClaim:
-    """One transfer's `content_path`, from a client instance that answered successfully this
-    pass. Only ever constructed for a client already known to be reachable this pass -- an
-    unreachable client's *last* claims must never be trusted as current (spec §4.2), and the
-    root-level gate above already excludes its declared paths from debris regardless.
+    """One transfer, from a client instance that answered successfully this pass. Only ever
+    constructed for a client already known to be reachable this pass -- an unreachable client's
+    *last* claims must never be trusted as current (spec §4.2), and the root-level gate above
+    already excludes its declared paths from debris regardless.
 
-    `category` (2026-08-23, live use, finding #16's own follow-up -- see `reconcile`'s own
-    `excluded_categories_by_client` docstring) is the transfer's own reported category, `None`
-    when the client didn't report one. It carries no attribution meaning by itself; it exists
-    only so `reconcile` can drop a claim outright when its category is one this client has
-    explicitly marked "not used by this instance" -- the per-file version of finding #16's
-    exclusion, for exactly the shape a category can never be resolved to a path (rTorrent).
+    **`content_path` is `None`-able as of 2026-08-24** (this task, spec §11.4's own "surface the
+    two things currently dropped silently"): `run_scan` used to skip a transfer outright when the
+    client reported no path for it at all, which made it vanish from the review entirely even
+    though the client's own figures for it (ratio, seed time, ...) were real. Such a claim can
+    never match a disk entry -- `reconcile` keeps it out of the path/inode matching loop
+    entirely -- but it still gets a row in `torrents`, with `file_count`/`size_on_disk` reported
+    `None` (genuinely unknown, not zero) rather than being dropped.
+
+    `category` (2026-08-23, live use, finding #16's own follow-up) is the transfer's own reported
+    category, `None` when the client didn't report one. **As of 2026-08-24 it no longer drives
+    whether the claim survives at all** -- see this module's own docstring for why an excluded
+    claim is retained rather than dropped. It now only feeds `reconcile`'s own `attribution`
+    tagging (`Attribution`, purely for display).
+
+    Every field below `category` is 2026-08-24, this task's own widening (spec §11.4): optional,
+    `None` whenever the connector's own `CapabilitySet` doesn't declare the equivalent `Field` --
+    **never fabricated as `0`/`0.0`/`""`, ever** (a SABnzbd claim's `ratio`/`uploaded_bytes`/
+    `seed_time_s` are always `None`, per `USENET_BASELINE`; a `0.00` sitting beside a real ratio
+    is exactly the "guess dressed up as a fact" `SpaceInfo`'s own docstring warns against).
+    `reconcile` never interprets any of these -- it copies them onto the `torrents` row verbatim,
+    straight off the `Transfer` record `run_scan` already has in hand.
     """
 
     client_id: int
     client_name: str
     transfer_id: str
     transfer_name: str
-    content_path: str
+    content_path: str | None
     category: str | None = None
+    size_bytes: int | None = None
+    uploaded_bytes: int | None = None
+    ratio: float | None = None
+    seed_time_s: int | None = None
+    added_at: str | None = None
+    raw_status: str | None = None
+    phase: str | None = None
 
 
 @dataclass(frozen=True)
@@ -181,6 +234,12 @@ class SeedingEstateEntry:
     by torrent without `reconcile()` itself changing shape: inode accounting stays per-file (spec
     §11.1b), only this dataclass now also carries the *reason* a file was claimed, not just the
     fact that it was.
+
+    **`attribution`/`claim_key` added 2026-08-24** (this task, spec §11.4): `attribution` is the
+    claim's own `Attribution` state, copied verbatim (see `ClientClaim.category`'s own docstring
+    -- this file's presence here is never conditioned on the value, only its *label* is);
+    `claim_key` (`f"{client_id}:{transfer_id}"`) is what lets the frontend join a seeding-estate
+    file row to its own row in `torrents` without a second lookup.
     """
 
     root: str
@@ -192,21 +251,87 @@ class SeedingEstateEntry:
     claimed_transfer_id: str
     claimed_transfer_name: str
     claimed_content_path: str
+    attribution: Attribution
+    claim_key: str
 
 
 @dataclass(frozen=True)
-class BrokenSeed:
-    """One `A - B` entry -- a client's own claimed `content_path` under a base path this scan
-    actually walked, with nothing found there. Never reported for a claim whose root wasn't
-    walked at all (spec: absent information is not a verdict) -- see `reconcile`'s own
-    `_root_containing`.
+class ExcludedContentEntry:
+    """One on-disk file under an excluded path (`download_client_excluded_path`, or a category
+    resolved onto one via `resolve_category_exclusion_paths`) with **no claim currently covering
+    it** -- 2026-08-24, this task, spec §11.4's own "route excluded-path content into its own
+    pile, never into debris."
+
+    Before this task, an excluded path's entries were dropped from `disk_entries` before any
+    pile logic ran at all, which was correct for *delete safety* but wrong for *visibility*
+    (this module's own docstring, the governing principle): a claim can vanish (the other
+    lftpweb instance's client removes its history entry, or the torrent itself is removed) while
+    the bytes are still sitting there, and a scan that only ever excluded-and-hid could never
+    show that this had happened (§17.7's own "latent data-loss path" -- the content becomes
+    indistinguishable from ordinary debris the moment set A stops claiming it). This pile is
+    exactly that moment, made visible instead of silent.
+
+    **Never selectable, never debris, never counted toward a reclaim total.** `link_paths` is
+    computed the same link-aware way `DebrisCandidate`'s is (`_link_group`), so a hardlinked
+    file's size is not double-counted just because it happens to be shown rather than actionable.
+    """
+
+    root: str
+    rel_path: str
+    abs_path: str
+    size: int
+    excluded_path: str
+    link_paths: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class TorrentEntry:
+    """One claim's own summary row -- 2026-08-24, this task, spec §11.4. Supersedes `BrokenSeed`
+    entirely (a `BrokenSeed` is just a claim whose root was walked and whose own tree turned up
+    empty -- `file_count == 0`, `missing_on_disk=True` here) and adds what `BrokenSeed` never
+    carried: the client's own reported figures (`ClientClaim`'s new fields, passed through
+    unverified) plus two disk-derived ones this dataclass alone can answer, `file_count` and
+    `size_on_disk`.
+
+    **`file_count`/`size_on_disk` are `None`, not `0`, whenever the claim's own root was never
+    walked, or the claim itself never reported a `content_path`** -- absent information is not a
+    verdict (spec §4.2's instinct, restated here for the third time this module leans on it).
+    Only a claim whose root *was* walked, and whose own tree turned up genuinely empty, gets
+    `file_count=0` and `missing_on_disk=True`.
+
+    **`size_on_disk` answers a different question from `freed_bytes`, deliberately.** It counts
+    an inode once per *torrent* (so a claim whose own tree happens to contain two hardlinked
+    copies of the same file isn't double-counted) but, unlike `freed_bytes`, never requires every
+    link to an inode to be present before counting it -- the ordinary rTorrent shape is a claim's
+    seeding-directory copy with its sibling hardlink sitting in a completely different claim's
+    tree (the completed folder), and answering "how big is this torrent" with `0` because the
+    other copy lives elsewhere would be exactly the fabricated-looking figure this task's own
+    `ClientClaim` docstring warns against, just computed instead of reported.
+
+    `claim_key` matches `SeedingEstateEntry.claim_key` -- see that dataclass's own docstring.
+    `client_name` is deliberately not carried here: the response's `clients` array is the section
+    a torrent lives under, so repeating the name on every row would be the exact "repeated on
+    every file row" waste this module's own `TorrentEntry`-vs-per-file split exists to avoid --
+    here it is per-torrent instead of per-file, but the same instinct.
     """
 
     client_id: int
-    client_name: str
     transfer_id: str
     transfer_name: str
-    content_path: str
+    content_path: str | None
+    category: str | None
+    attribution: Attribution
+    size_bytes: int | None
+    uploaded_bytes: int | None
+    ratio: float | None
+    seed_time_s: int | None
+    added_at: str | None
+    raw_status: str | None
+    phase: str | None
+    file_count: int | None
+    size_on_disk: int | None
+    missing_on_disk: bool
+    claim_key: str
 
 
 @dataclass(frozen=True)
@@ -242,13 +367,16 @@ class UnclaimedItem:
     link-aware, spec §10.5) plus `reason`, the same string `SuppressedDebrisItem.reason` used to
     carry.
 
-    A **claimed** file's own transfer category already answers the ownership question directly
-    (`reconcile`'s own `excluded_categories_by_client` filtering, dropping the claim outright) --
-    a file claimed by an excluded category is dropped before any claim/candidate logic runs and
-    never appears in *any* pile, `unclaimed` included. Only a file with **no claim at all**, under
-    an ambiguous root, ever lands here -- the line between "known to be someone else's" (excluded,
-    invisible) and "ownership genuinely unknown" (this pile) is the one this whole task exists to
-    keep sharp.
+    A **claimed** file's own transfer category already answers the ownership question directly.
+    **2026-08-24 correction:** it used to be that a file claimed by an excluded category was
+    dropped before any claim/candidate logic ran, so it never appeared in *any* pile, `unclaimed`
+    included -- correct for keeping it out of `unclaimed`, but wrong for hiding it altogether
+    (this module's own governing principle). The claim is now retained, so that file lands in the
+    **seeding estate** instead, tagged `attribution="excluded"` -- shown, but nowhere near this
+    pile, because "claimed" is checked before "excluded path" in `reconcile`'s own per-entry
+    order. Only a file with **no claim at all**, under an ambiguous root, ever lands here -- the
+    line between "known to be someone else's" (claimed, shown in the seeding estate) and
+    "ownership genuinely unknown" (this pile) is the one this whole task exists to keep sharp.
 
     **Not selectable by the ordinary select-and-remove flow that debris uses** -- see
     `DiskReviewPage.tsx` and this task's own `docs/decisions.md` entry for the gate stage 5 must
@@ -270,11 +398,16 @@ class UnclaimedItem:
 class ReconciliationResult:
     debris: tuple[DebrisCandidate, ...] = ()
     seeding_estate: tuple[SeedingEstateEntry, ...] = ()
-    broken_seeds: tuple[BrokenSeed, ...] = ()
     skipped_base_paths: tuple[SkippedBasePath, ...] = ()
     # The third pile (finding #17, 2026-08-23) -- see `UnclaimedItem`'s own docstring for why
     # this replaced a bare count.
     unclaimed: tuple[UnclaimedItem, ...] = ()
+    # The fourth pile, 2026-08-24 (this task, spec §11.4) -- see `ExcludedContentEntry`'s own
+    # docstring.
+    excluded_content: tuple[ExcludedContentEntry, ...] = ()
+    # One row per claim, 2026-08-24 (this task) -- see `TorrentEntry`'s own docstring. Supersedes
+    # `broken_seeds` (retired): a broken seed is exactly `missing_on_disk=True` here.
+    torrents: tuple[TorrentEntry, ...] = ()
 
 
 def _root_containing(path: str, roots: Iterable[str]) -> str | None:
@@ -303,6 +436,7 @@ def reconcile(
     excluded_paths: Iterable[str] = (),
     excluded_categories_by_client: Mapping[int, frozenset[str]] | None = None,
     debris_ambiguous_roots: Mapping[str, str] | None = None,
+    category_attribution_by_client: Mapping[int, Mapping[str, Attribution]] | None = None,
 ) -> ReconciliationResult:
     """The whole reconciliation, pure. `unavailable_roots` is roots this scan already knows it
     cannot trust (an SSH walk failure, a fallback path unable to supply inodes, or a queue's
@@ -311,25 +445,34 @@ def reconcile(
     off here for a missing contributor (spec §11.1a).
 
     `excluded_paths` (migration 031, finding #16, 2026-08-23) -- "not used by this instance" as
-    a hard safety boundary, not merely a banner-silencing preference: a path (or sub-path) this
-    scan must **never propose as debris and never treat as claimed-or-unclaimed at all**, because
-    it belongs to a different lftpweb instance sharing this seedbox. Every entry under one of
-    these is dropped before any candidate/claim logic below ever sees it -- the same containment
-    filter `roots` already applies, at finer grain. `run_scan` is what resolves an excluded
-    *category* into paths here wherever a client declares a `content`-kind base path to resolve
-    it onto -- this function only ever consumes the resulting flat path list.
+    a hard **delete-safety** boundary. `run_scan` is what resolves an excluded *category* into
+    paths here wherever a client declares a `content`-kind base path to resolve it onto -- this
+    function only ever consumes the resulting flat path list. **2026-08-24 correction (this
+    module's own governing principle): it is not, and was never meant to be, a visibility
+    boundary.** An entry under one of these paths is no longer dropped before candidate/claim
+    logic runs -- it is routed to its own `excluded_content` pile (or, if a claim still covers
+    it, the seeding estate) instead of being silently absorbed. What it still guarantees,
+    unconditionally, is that nothing under it is ever eligible for `debris`: see `_entry_eligible`
+    and `_ambiguous_unclaimed` below, both of which refuse an excluded entry directly, and see
+    `is_authorized_delete_target` (unchanged, still the seed of the future containment check) for
+    the other half of the guarantee.
 
-    `excluded_categories_by_client` (live use, 2026-08-23, follow-up to finding #16 --
-    *"there are things in there in ar-tv that it doesn't show now"*) is the per-file counterpart
-    for the client shape `excluded_paths` cannot reach: rTorrent's own `content_path` is its
-    seeding directory, unrelated to any category folder, so an excluded category can never
-    resolve to a path for it at all. A **claimed** file already carries the answer directly on
-    its own claim (`ClientClaim.category`) -- no path arithmetic needed -- so a claim whose
-    category is in this client's excluded set is dropped *before* any claiming logic below ever
-    sees it, exactly as if that transfer had never reported a `content_path`. This is universal
-    (every client, not only the ones `excluded_paths` can't reach) and strictly narrower than the
-    old whole-base-path fail-closed suppression: a bound category's claims on the very same root
-    are completely unaffected.
+    `excluded_categories_by_client` (live use, 2026-08-23, follow-up to finding #16) used to drop
+    a claim outright when its category was marked "not used by this instance" -- **2026-08-24:
+    it no longer does.** See this module's own docstring for why the claim is retained instead.
+    Kept in this signature, separately from `category_attribution_by_client` below, so a future
+    behavioural use of category exclusion inside this function (should one ever be needed) has an
+    unambiguous home rather than overloading the display-only map -- today this function reads it
+    for nothing; the old fold-into-`excluded_paths` and claim-dropping it drove are both retired,
+    made unnecessary by claim retention itself (a claimed file is now routed to the seeding
+    estate structurally, by the per-entry order below, not by removing it from the claim list).
+
+    `category_attribution_by_client` (2026-08-24, this task, spec §11.4) is the **display-only**
+    counterpart: `run_scan`'s own widened `download_client_category` read, one of `"bound"`
+    (`queue_id IS NOT NULL`), `"excluded"` (`excluded = 1`), or `"undecided"` (neither). This
+    function copies a claim's own state onto every row it emits for that claim (`SeedingEstateEntry
+    .attribution`, `TorrentEntry.attribution`) and never branches on the value -- a claim with no
+    category, or a category absent from this map, reads `"undecided"`.
 
     `debris_ambiguous_roots` (same follow-up, narrowed further by finding #17, 2026-08-23) is the
     genuinely irreducible remainder: an **unclaimed** file under a root where some client's
@@ -345,48 +488,54 @@ def reconcile(
     "cannot resolve a category to a path" with "cannot trust anything under this root at all,"
     which suppressed legitimate, already-claimed content that was never at risk.
 
-    **Finding #17's own line, kept sharp here:** a claim whose category is excluded is *known* to
-    belong to the other lftpweb instance -- it must never land in `unclaimed` either, which is
-    reserved for ownership that is genuinely *unknown*. So its `content_path` is folded into the
-    same hard-exclusion set `excluded_paths` uses, **before** the claim itself is dropped below --
-    a disk entry under it is removed from consideration entirely, exactly like a manually
-    excluded path (finding #16), rather than falling through to "nobody claims this" and landing
-    in the ambiguous-root fail-closed pile by accident.
+    **Finding #17's own line, kept sharp here, now enforced structurally rather than by data
+    manipulation.** A claim whose category is excluded is *known* to belong to the other lftpweb
+    instance -- it must never land in `unclaimed`, which is reserved for ownership that is
+    genuinely *unknown*. Before 2026-08-24 this was guaranteed by folding the claim's own
+    `content_path` into `excluded_paths` ahead of dropping the claim, so the disk entry it named
+    never reached the unclaimed branch. **That machinery is gone -- it is no longer needed.**
+    With the claim retained, "claimed" is checked before "excluded path" or "ambiguous unclaimed"
+    in the per-entry loop below, so a claimed file can never reach either of those branches at
+    all, for any reason. The guarantee moved from data (a set an entry gets removed from) to
+    control flow (a branch order an entry can't skip past) -- a simplification, not an equivalent
+    restatement.
     """
     roots = {_norm(r) for r in base_paths}
-    excluded_categories_by_client = excluded_categories_by_client or {}
     ambiguous_roots: dict[str, str] = dict(debris_ambiguous_roots or {})
+    category_attribution_by_client = category_attribution_by_client or {}
     claims = list(claims)
 
-    def _category_excluded(claim: ClientClaim) -> bool:
-        return claim.category is not None and claim.category in excluded_categories_by_client.get(
-            claim.client_id, ()
+    def _attribution_for(claim: ClientClaim) -> Attribution:
+        if claim.category is None:
+            return "undecided"
+        return category_attribution_by_client.get(claim.client_id, {}).get(
+            claim.category, "undecided"
         )
 
-    excluded = {_norm(p) for p in excluded_paths} | {
-        _norm(c.content_path) for c in claims if _category_excluded(c)
-    }
+    def _claim_key(claim: ClientClaim) -> str:
+        return f"{claim.client_id}:{claim.transfer_id}"
+
+    excluded = {_norm(p) for p in excluded_paths}
 
     def _excluded(path: str) -> bool:
         return any(_is_under(path, ex) for ex in excluded)
 
+    def _matching_excluded_path(path: str) -> str | None:
+        best: str | None = None
+        for ex in excluded:
+            if _is_under(path, ex) and (best is None or len(ex) > len(best)):
+                best = ex
+        return best
+
     disk_entries = [
         e
         for e in disk_entries
-        # Containment (spec §11.2): only entries under a *configured* root are ever
-        # considered, defensively re-checked here even though `run_scan` should never hand
-        # this function anything else. An excluded path is dropped the same way, before it can
-        # ever become a claim, a debris candidate, an unclaimed item, or a seeding-estate entry
-        # (finding #16, sharpened by finding #17 for the per-claim-category fallback above).
-        if _norm(e.root) in roots and not _excluded(_norm(e.abs_path))
+        # Containment (spec §11.2): only entries under a *configured* root are ever considered,
+        # defensively re-checked here even though `run_scan` should never hand this function
+        # anything else. An excluded path is **no longer** dropped here (2026-08-24) -- see this
+        # function's own docstring; it is routed by the per-entry loop below instead.
+        if _norm(e.root) in roots
     ]
-
-    # A claim in an excluded category is dropped outright -- never a claim at all, for any
-    # client, not only the ones a category can't resolve to a path for (this function's own
-    # docstring, `excluded_categories_by_client`). Its own `content_path` is already hard-excluded
-    # above, so the file it named never reaches the disk-entry loop at all -- it does not fall
-    # through to "unclaimed" the way a truly ownerless file does.
-    claims = [c for c in claims if not _category_excluded(c)]
 
     contrib_by_root: dict[str, set[int]] = defaultdict(set)
     for c in contributors:
@@ -418,7 +567,12 @@ def reconcile(
             root_available_for_debris[root] = True
 
     # --- Set A: claimed paths and, via any disk entry found under one, claimed inodes ---------
-    claim_paths = [_norm(c.content_path) for c in claims]
+    # A claim with no `content_path` at all (spec §11.4's own "surface the two things currently
+    # dropped silently" -- `ClientClaim.content_path`'s own docstring) can never match a disk
+    # entry and must never enter the path/inode matching loop below; it still gets a `torrents`
+    # row further down, built directly from the claim rather than from anything matched here.
+    path_claims = [c for c in claims if c.content_path is not None]
+    claim_paths = [_norm(c.content_path) for c in path_claims]  # type: ignore[arg-type]
     claimed_paths: set[str] = set()
     claimed_inodes: set[int] = set()
     # Which claim is *responsible* for a claimed path/inode -- for the seeding-estate pile's
@@ -430,7 +584,7 @@ def reconcile(
     inode_claimed_by: dict[int, ClientClaim] = {}
     for entry in disk_entries:
         abs_p = _norm(entry.abs_path)
-        for claim, cp in zip(claims, claim_paths, strict=False):
+        for claim, cp in zip(path_claims, claim_paths, strict=False):
             if _is_under(abs_p, cp):
                 claimed_paths.add(abs_p)
                 path_claimed_by.setdefault(abs_p, claim)
@@ -472,8 +626,25 @@ def reconcile(
     def _entry_eligible(entry: DiskEntry) -> bool:
         """Everything *except* the claimed check -- shared by the single-link path and the
         nlink-group "every link is itself a candidate" check (spec §11.1b).
+
+        **The `_excluded` guard is load-bearing, added 2026-08-24.** Before this task, an
+        excluded entry was dropped from `disk_entries` before this function (or `by_inode`) ever
+        saw it, so there was nothing here to guard against. Now that excluded entries stay in the
+        walk (so they can be shown in `excluded_content`), this check is what stops one from
+        riding along into `debris` through the back door: `_link_group`'s "every link must itself
+        be a candidate" check calls `is_candidate` (which is this function, for the debris case)
+        against *every on-disk sibling of an entry's inode*, not just the entry the outer loop is
+        currently looking at. Without this line, a debris-eligible file whose hardlink sibling
+        happens to sit under an excluded path would see that sibling read as "eligible" (nothing
+        else here checks exclusion), satisfy the all-links-are-candidates requirement, and get
+        proposed as debris -- exactly the outcome this whole task's hard invariant forbids. An
+        excluded sibling failing this check instead makes the *whole group* fail closed, which is
+        the same conservative default `_link_group`'s own docstring already describes for an
+        unaccounted-for link.
         """
         abs_p = _norm(entry.abs_path)
+        if _excluded(abs_p):
+            return False
         if _is_in_use(abs_p):
             return False
         if not root_available_for_debris.get(_norm(entry.root), False):
@@ -485,13 +656,23 @@ def reconcile(
         eligible, except that its root is in `ambiguous_roots` -- the genuinely irreducible
         remainder this function's own docstring describes, shown as its own pile (finding #17)
         rather than hidden. Never true for an entry that fails eligibility for an unrelated
-        reason (in use, too fresh, or a root that's `unavailable`/missing-contributor rather than
-        merely ambiguous) -- `unclaimed` must contain only what this specific gate actually caught.
+        reason (in use, too fresh, excluded, or a root that's `unavailable`/missing-contributor
+        rather than merely ambiguous) -- `unclaimed` must contain only what this specific gate
+        actually caught.
+
+        **The `_excluded` guard is the same 2026-08-24 fix as `_entry_eligible`'s own**, for the
+        identical reason: `_link_group` calls this function against every on-disk sibling of an
+        inode, and an excluded sibling must never be able to satisfy that check -- an excluded
+        path's own abs_path must never end up inside another item's `link_paths`, which would
+        otherwise leak it into `unclaimed`'s reclaim figure despite never appearing in the pile
+        itself.
         """
         root = _norm(entry.root)
         if root not in ambiguous_roots:
             return False
         abs_p = _norm(entry.abs_path)
+        if _excluded(abs_p):
+            return False
         if _is_in_use(abs_p):
             return False
         return _passes_age_floor(entry)
@@ -518,29 +699,67 @@ def reconcile(
             return None
         return tuple(sorted(_norm(link.abs_path) for link in links))
 
+    def _excluded_and_unclaimed(entry: DiskEntry) -> bool:
+        """`_link_group`'s `is_candidate` for the `excluded_content` pile: every on-disk sibling
+        of an inode must itself be unclaimed *and* excluded, or the whole group fails closed --
+        the same conservative default `_entry_eligible`/`_ambiguous_unclaimed` apply above, for
+        the identical reason (never let a hardlink group's mixed membership produce a pile
+        member that overstates what is actually known).
+        """
+        return not _entry_claimed(entry) and _excluded(_norm(entry.abs_path))
+
     debris: list[DebrisCandidate] = []
     seeding_estate: list[SeedingEstateEntry] = []
     unclaimed: list[UnclaimedItem] = []
+    excluded_content: list[ExcludedContentEntry] = []
 
+    # Per-entry order (2026-08-24, this task, spec §11.4) -- written here because it is what
+    # makes this whole task safe: **claimed always wins**, checked before exclusion, which is
+    # checked before the ambiguous-unclaimed fallback, which is checked before debris eligibility.
+    # A file whose claim happens to be under an excluded path (the ordinary steady state of
+    # §17.7's shared seedbox: the other instance's client still lists its own active transfers)
+    # is shown in the seeding estate, not `excluded_content` -- that pile is reserved for content
+    # under an excluded path that **no current claim covers**, which is exactly the "the other
+    # instance's client dropped its history entry, or the torrent was removed" moment that used
+    # to be invisible (§17.7's own "latent data-loss path"). Because "claimed" is checked first,
+    # unconditionally, a claimed file can never reach `excluded_content`, `unclaimed`, or `debris`
+    # -- this is what retired the old fold-into-hard-exclusion machinery (see this function's own
+    # docstring): the guarantee it used to provide by removing an entry from consideration is now
+    # provided by this order instead.
     for entry in disk_entries:
         if entry.is_dir:
             continue
         abs_p = _norm(entry.abs_path)
-        claimed = _entry_claimed(entry)
-        if claimed:
-            claim = _claim_for(entry)
-            if claim is not None:
-                seeding_estate.append(
-                    SeedingEstateEntry(
+        claim = _claim_for(entry)
+        if claim is not None:
+            seeding_estate.append(
+                SeedingEstateEntry(
+                    root=_norm(entry.root),
+                    rel_path=entry.rel_path,
+                    abs_path=abs_p,
+                    size=entry.size,
+                    claimed_by_client_id=claim.client_id,
+                    claimed_by_client_name=claim.client_name,
+                    claimed_transfer_id=claim.transfer_id,
+                    claimed_transfer_name=claim.transfer_name,
+                    claimed_content_path=claim.content_path,  # type: ignore[arg-type]
+                    attribution=_attribution_for(claim),
+                    claim_key=_claim_key(claim),
+                )
+            )
+            continue
+
+        if _excluded(abs_p):
+            group = _link_group(entry, _excluded_and_unclaimed)
+            if group is not None:
+                excluded_content.append(
+                    ExcludedContentEntry(
                         root=_norm(entry.root),
                         rel_path=entry.rel_path,
                         abs_path=abs_p,
                         size=entry.size,
-                        claimed_by_client_id=claim.client_id,
-                        claimed_by_client_name=claim.client_name,
-                        claimed_transfer_id=claim.transfer_id,
-                        claimed_transfer_name=claim.transfer_name,
-                        claimed_content_path=claim.content_path,
+                        excluded_path=_matching_excluded_path(abs_p) or "",
+                        link_paths=group,
                     )
                 )
             continue
@@ -584,42 +803,81 @@ def reconcile(
             )
         )
 
-    # --- A - B: broken seeds -----------------------------------------------------------------
-    broken_seeds: list[BrokenSeed] = []
+    # --- `torrents`: one row per claim (2026-08-24, this task, spec §11.4) -------------------
+    # Supersedes the old `broken_seeds` list entirely -- see `TorrentEntry`'s own docstring.
     entries_by_root: dict[str, list[DiskEntry]] = defaultdict(list)
     for e in disk_entries:
         entries_by_root[_norm(e.root)].append(e)
 
-    for claim, cp in zip(claims, claim_paths, strict=False):
-        if _excluded(cp):
-            # Finding #16: a claim under an excluded path is not this instance's business to
-            # judge "present" or "broken" either way -- the whole point of the exclusion.
-            continue
-        root = _root_containing(cp, roots)
-        if root is None or root in unavailable_roots:
-            # Either never a scanned tree at all, or the walk itself failed there -- absent
-            # information, not a verdict either way (spec §4.2's instinct, applied here).
-            continue
-        found = any(_is_under(_norm(e.abs_path), cp) for e in entries_by_root.get(root, []))
-        if not found:
-            broken_seeds.append(
-                BrokenSeed(
-                    client_id=claim.client_id,
-                    client_name=claim.client_name,
-                    transfer_id=claim.transfer_id,
-                    transfer_name=claim.transfer_name,
-                    content_path=claim.content_path,
-                )
+    def _size_on_disk(found: list[DiskEntry]) -> int:
+        """Counts an inode once per torrent -- see `TorrentEntry`'s own docstring for why this
+        is deliberately *not* `freed_bytes`'s "every link must be present" rule: a torrent's own
+        footprint is a fact about its files, not a precondition on what else would need to be
+        deleted alongside them.
+        """
+        total = 0
+        seen_inodes: set[int] = set()
+        for e in found:
+            if e.inode is not None:
+                if e.inode in seen_inodes:
+                    continue
+                seen_inodes.add(e.inode)
+            total += e.size
+        return total
+
+    torrents: list[TorrentEntry] = []
+    for claim in claims:
+        file_count: int | None = None
+        size_on_disk: int | None = None
+        missing_on_disk = False
+        if claim.content_path is not None:
+            cp = _norm(claim.content_path)
+            root = _root_containing(cp, roots)
+            if root is not None and root not in unavailable_roots:
+                # The root was walked -- absent information is not a verdict (spec §4.2), but
+                # present information is, even for a claim under an excluded path: 2026-08-24,
+                # this task's own "excluded claim can now be reported missing too. That is
+                # correct -- it is visibility, which is the point" (see this module's own
+                # docstring). There is no `_excluded(cp)` skip here any more.
+                found = [
+                    e
+                    for e in entries_by_root.get(root, [])
+                    if not e.is_dir and _is_under(_norm(e.abs_path), cp)
+                ]
+                file_count = len(found)
+                size_on_disk = _size_on_disk(found)
+                missing_on_disk = file_count == 0
+        torrents.append(
+            TorrentEntry(
+                client_id=claim.client_id,
+                transfer_id=claim.transfer_id,
+                transfer_name=claim.transfer_name,
+                content_path=claim.content_path,
+                category=claim.category,
+                attribution=_attribution_for(claim),
+                size_bytes=claim.size_bytes,
+                uploaded_bytes=claim.uploaded_bytes,
+                ratio=claim.ratio,
+                seed_time_s=claim.seed_time_s,
+                added_at=claim.added_at,
+                raw_status=claim.raw_status,
+                phase=claim.phase,
+                file_count=file_count,
+                size_on_disk=size_on_disk,
+                missing_on_disk=missing_on_disk,
+                claim_key=_claim_key(claim),
             )
+        )
 
     return ReconciliationResult(
         debris=tuple(debris),
         seeding_estate=tuple(seeding_estate),
-        broken_seeds=tuple(broken_seeds),
         skipped_base_paths=tuple(
             SkippedBasePath(root=root, reason=reason) for root, reason in sorted(skipped.items())
         ),
         unclaimed=tuple(unclaimed),
+        excluded_content=tuple(excluded_content),
+        torrents=tuple(torrents),
     )
 
 
@@ -760,9 +1018,37 @@ class ClientReportFailure:
 
 
 @dataclass
+class ClientSummary:
+    """One row per **enabled** `download_client` instance, 2026-08-24 (this task, spec §11.4) --
+    the roster the review page sections by. `reachable`/`failure_reason` restate the same facts
+    `ClientReportFailure`/`reachable_client_ids` already carry (kept alongside, unfolded, per
+    this task's own "keep `client_failures` working" instruction -- see `run_scan`'s own comment
+    for why both exist rather than one replacing the other).
+
+    `capabilities` is a **display-only** `Field name -> support level` mapping (`"native"` /
+    `"derived"` / `"none"`), read straight off `download_client.capabilities_json` -- the same
+    JSON shape `api/settings_clients.py._capabilities_to_json` writes, parsed here without
+    importing `core/clients/base.py`'s `CapabilitySet`/`Field`/`Support` at all: this module has
+    no use for the full typed vocabulary, only the flat strings a frontend column-visibility
+    decision needs (spec §17.2: "the UI is driven by the declaration, never by the client's
+    name" -- this is what lets the disk-review table honor that rule too, not just Settings).
+    Empty for a client never successfully probed (`capabilities_json IS NULL`).
+    """
+
+    client_id: int
+    client_name: str
+    client_type: str
+    reachable: bool
+    failure_reason: str | None
+    capabilities: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
 class ScanOutcome:
     result: ReconciliationResult
     client_failures: tuple[ClientReportFailure, ...] = field(default_factory=tuple)
+    # The per-client roster (2026-08-24, this task) -- see `ClientSummary`'s own docstring.
+    clients: tuple[ClientSummary, ...] = field(default_factory=tuple)
 
 
 async def _load_in_flight_ids(db, postprocess_in_flight_ids: frozenset[int]) -> set[int]:
@@ -798,6 +1084,29 @@ async def _load_in_use_paths(db, postprocess_in_flight_ids: frozenset[int]) -> l
         )
         for row in rows
     ]
+
+
+def _field_capabilities_from_json(raw_json: str | None) -> dict[str, str]:
+    """`ClientSummary.capabilities`'s own parser -- see that dataclass's docstring for why this
+    reads the raw JSON directly rather than importing `core/clients/base.py`. Tolerant of a row
+    that was never probed (`None`) or a shape this reader doesn't recognize (never raises; an
+    unparseable blob degrades to "no declared capabilities" rather than failing the whole scan
+    over a display concern).
+    """
+    if not raw_json:
+        return {}
+    try:
+        data = json.loads(raw_json)
+    except (TypeError, ValueError):
+        return {}
+    fields = data.get("fields", {})
+    if not isinstance(fields, dict):
+        return {}
+    return {
+        name: entry["support"]
+        for name, entry in fields.items()
+        if isinstance(entry, dict) and "support" in entry
+    }
 
 
 async def _mount_gated_roots(db, roots: set[str]) -> dict[str, str]:
@@ -868,13 +1177,29 @@ async def run_scan(
     for row in base_path_rows:
         base_paths_by_client[row["client_id"]].append((_norm(row["path"]), row["kind"]))
 
+    # 2026-08-24, this task -- widened from "just the excluded subset" (which is still exactly
+    # what `excluded_categories_by_client_list`/`excluded_categories_by_client` below need, for
+    # `_resolve_client_exclusions`) to all three of migration 031's states, so `reconcile` can tag
+    # each claim's own `attribution` for display (`category_attribution_by_client`) without a
+    # second query. `excluded = 1` and `queue_id IS NOT NULL` are mutually exclusive by the API
+    # layer's own validator (031's own migration comment) -- `excluded` is checked first below
+    # purely because it is this task's own new state, not because of any real precedence question.
     cursor = await db.execute(
-        "SELECT client_id, category FROM download_client_category WHERE excluded = 1"
+        "SELECT client_id, category, excluded, queue_id FROM download_client_category"
     )
+    category_rows = await cursor.fetchall()
     excluded_categories_by_client_list: dict[int, list[str]] = defaultdict(list)
-    for row in await cursor.fetchall():
-        excluded_categories_by_client_list[row["client_id"]].append(row["category"])
-    # `reconcile`'s own claim-filtering wants a per-client *set*, not the list shape
+    category_attribution_by_client: dict[int, dict[str, Attribution]] = defaultdict(dict)
+    for row in category_rows:
+        if row["excluded"]:
+            state: Attribution = "excluded"
+            excluded_categories_by_client_list[row["client_id"]].append(row["category"])
+        elif row["queue_id"] is not None:
+            state = "bound"
+        else:
+            state = "undecided"
+        category_attribution_by_client[row["client_id"]][row["category"]] = state
+    # `reconcile`'s own signature wants a per-client *set*, not the list shape
     # `_resolve_client_exclusions` (below) and its own tests already settled on.
     excluded_categories_by_client: dict[int, frozenset[str]] = {
         cid: frozenset(cats) for cid, cats in excluded_categories_by_client_list.items()
@@ -931,7 +1256,8 @@ async def run_scan(
     unavailable_roots.update(await _mount_gated_roots(db, set(roots)))
 
     cursor = await db.execute(
-        "SELECT id, name, client_type, config_json, secret_enc FROM download_client WHERE enabled = 1"
+        "SELECT id, name, client_type, config_json, secret_enc, capabilities_json "
+        "FROM download_client WHERE enabled = 1"
     )
     client_rows = await cursor.fetchall()
 
@@ -971,20 +1297,30 @@ async def run_scan(
 
         reachable_client_ids.add(client_id)
         for transfer in transfers:
-            if not transfer.content_path:
-                continue
+            # 2026-08-24, this task, spec §11.4 -- a transfer with no `content_path` used to be
+            # skipped here outright, which dropped it from the review entirely even though the
+            # client's own figures for it were real (`ClientClaim.content_path`'s own docstring).
+            # It still becomes a claim -- `reconcile` keeps a path-less claim out of the
+            # path/inode matching loop, so it can never affect any pile, but it still gets a
+            # `torrents` row.
             claims.append(
                 ClientClaim(
                     client_id=client_id,
                     client_name=client_name,
                     transfer_id=transfer.client_id,
                     transfer_name=transfer.name,
-                    content_path=transfer.content_path,
+                    content_path=transfer.content_path or None,
                     # 2026-08-23, live use -- see `ClientClaim`'s own docstring: the transfer's
-                    # own category, so `reconcile` can drop a claim outright when it's in a
-                    # category this client has explicitly marked "not used by this instance,"
-                    # with no path arithmetic needed.
+                    # own category, now used only for display attribution (`reconcile`'s own
+                    # `category_attribution_by_client`), never to drop the claim.
                     category=transfer.category,
+                    size_bytes=transfer.size_bytes,
+                    uploaded_bytes=transfer.uploaded_bytes,
+                    ratio=transfer.ratio,
+                    seed_time_s=transfer.seed_time_s,
+                    added_at=transfer.added_at,
+                    raw_status=transfer.raw_status,
+                    phase=transfer.phase,
                 )
             )
 
@@ -1003,5 +1339,23 @@ async def run_scan(
         excluded_paths=excluded_paths,
         excluded_categories_by_client=excluded_categories_by_client,
         debris_ambiguous_roots=debris_ambiguous_roots,
+        category_attribution_by_client=category_attribution_by_client,
     )
-    return ScanOutcome(result=result, client_failures=tuple(failures))
+
+    # The per-client roster (2026-08-24, this task) -- built from the same `client_rows`/
+    # `reachable_client_ids`/`failures` the loop above already produced, restated per-row rather
+    # than replacing `client_failures` (this task's own "keep `client_failures` working").
+    failure_reason_by_client: dict[int, str] = {f.client_id: f.reason for f in failures}
+    clients = tuple(
+        ClientSummary(
+            client_id=row["id"],
+            client_name=row["name"],
+            client_type=row["client_type"],
+            reachable=row["id"] in reachable_client_ids,
+            failure_reason=failure_reason_by_client.get(row["id"]),
+            capabilities=_field_capabilities_from_json(row["capabilities_json"]),
+        )
+        for row in client_rows
+    )
+
+    return ScanOutcome(result=result, client_failures=tuple(failures), clients=clients)

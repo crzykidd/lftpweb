@@ -407,7 +407,7 @@ def test_containment_ignores_an_entry_outside_every_configured_root():
     )
     assert result.debris == ()
     assert result.seeding_estate == ()
-    assert result.broken_seeds == ()
+    assert result.torrents == ()
 
 
 def test_shared_save_path_stays_protected_by_either_claim():
@@ -490,11 +490,12 @@ def test_in_use_path_is_never_debris():
 
 
 # ================================================================================================
-# A - B: broken seeds
+# `torrents` -- one row per claim (2026-08-24, spec §11.4). Supersedes the retired `broken_seeds`:
+# a broken seed is exactly `missing_on_disk=True` here.
 # ================================================================================================
 
 
-def test_broken_seed_surfaces_as_its_own_pile():
+def test_torrent_reports_missing_on_disk_when_its_root_was_walked_and_found_empty():
     root = "/complete/tv"
     result = reconcile(
         **_base(
@@ -505,12 +506,14 @@ def test_broken_seed_surfaces_as_its_own_pile():
             claims=[_claim(1, "SAB", f"{root}/Vanished.Release", transfer_id="nzo1")],
         )
     )
-    assert len(result.broken_seeds) == 1
-    broken = result.broken_seeds[0]
-    assert broken.content_path == f"{root}/Vanished.Release"
-    assert broken.transfer_id == "nzo1"
-    # And a claim that *is* found on disk is not reported as broken.
-    present = _file(root, "Present.Release/file.mkv")
+    assert len(result.torrents) == 1
+    torrent = result.torrents[0]
+    assert torrent.content_path == f"{root}/Vanished.Release"
+    assert torrent.transfer_id == "nzo1"
+    assert torrent.file_count == 0
+    assert torrent.missing_on_disk is True
+    # And a claim that *is* found on disk is not reported as missing.
+    present = _file(root, "Present.Release/file.mkv", size=123)
     result2 = reconcile(
         **_base(
             base_paths=[root],
@@ -520,22 +523,31 @@ def test_broken_seed_surfaces_as_its_own_pile():
             claims=[_claim(1, "SAB", f"{root}/Present.Release")],
         )
     )
-    assert result2.broken_seeds == ()
+    assert len(result2.torrents) == 1
+    assert result2.torrents[0].missing_on_disk is False
+    assert result2.torrents[0].file_count == 1
+    assert result2.torrents[0].size_on_disk == 123
 
 
-def test_broken_seed_not_reported_when_its_root_was_never_walked():
+def test_torrent_file_count_is_null_not_zero_when_its_root_was_never_walked():
     # A claim whose content_path isn't under any configured base path at all -- absent
-    # information, never a verdict either way.
+    # information, never a verdict either way (spec §4.2's instinct). `file_count`/`size_on_disk`
+    # must be `None`, and `missing_on_disk` must stay `False` -- "never walked" is not "found
+    # empty."
     result = reconcile(
         **_base(
             base_paths=["/complete/tv"],
             claims=[_claim(1, "Client", "/somewhere/else/entirely")],
         )
     )
-    assert result.broken_seeds == ()
+    assert len(result.torrents) == 1
+    torrent = result.torrents[0]
+    assert torrent.file_count is None
+    assert torrent.size_on_disk is None
+    assert torrent.missing_on_disk is False
 
 
-def test_broken_seed_not_reported_when_the_walk_itself_failed():
+def test_torrent_file_count_is_null_not_zero_when_the_walk_itself_failed():
     root = "/complete/tv"
     result = reconcile(
         **_base(
@@ -544,7 +556,115 @@ def test_broken_seed_not_reported_when_the_walk_itself_failed():
             claims=[_claim(1, "Client", f"{root}/Some.Release")],
         )
     )
-    assert result.broken_seeds == ()
+    assert len(result.torrents) == 1
+    torrent = result.torrents[0]
+    assert torrent.file_count is None
+    assert torrent.size_on_disk is None
+    assert torrent.missing_on_disk is False
+
+
+def test_torrent_with_no_content_path_reports_null_files_and_claims_nothing():
+    """Spec §11.4's own "surface the two things currently dropped silently": a transfer the
+    client reports with no path at all still gets a `torrents` row (`file_count`/`size_on_disk`
+    genuinely unknown, `None`, never `0`), and it must never participate in claiming -- a disk
+    entry that would otherwise be genuine debris stays debris, unaffected by the path-less claim.
+    """
+    root = "/complete/tv"
+    entry = _file(root, "Unrelated.Release/file.mkv")
+    result = reconcile(
+        **_base(
+            base_paths=[root],
+            contributors=[BasePathContributor(root, client_id=1)],
+            reachable_client_ids=[1],
+            disk_entries=[entry],
+            claims=[
+                ClientClaim(
+                    client_id=1,
+                    client_name="SAB",
+                    transfer_id="nzo-no-path",
+                    transfer_name="Pathless",
+                    content_path=None,
+                )
+            ],
+        )
+    )
+    assert len(result.torrents) == 1
+    torrent = result.torrents[0]
+    assert torrent.content_path is None
+    assert torrent.file_count is None
+    assert torrent.size_on_disk is None
+    assert torrent.missing_on_disk is False
+    # The unrelated on-disk entry is untouched -- still genuine debris.
+    assert entry.abs_path in {d.abs_path for d in result.debris}
+    assert result.seeding_estate == ()
+
+
+def test_sabnzbd_shaped_claim_reports_none_never_zero_for_torrent_only_figures():
+    """`USENET_BASELINE` declares `RATIO`/`UPLOADED_BYTES`/`SEED_TIME_S` as `Support.NONE` --
+    every SABnzbd-sourced claim must carry `None` for all three, never a fabricated `0`/`0.0`
+    (this task's own `ClientClaim` docstring: "a fabricated 0.00 ratio sitting beside a real one
+    is exactly the guess dressed up as a fact `SpaceInfo`'s own docstring warns against").
+    """
+    root = "/complete/tv"
+    result = reconcile(
+        **_base(
+            base_paths=[root],
+            contributors=[BasePathContributor(root, client_id=1)],
+            reachable_client_ids=[1],
+            claims=[
+                ClientClaim(
+                    client_id=1,
+                    client_name="SAB",
+                    transfer_id="nzo1",
+                    transfer_name="Release",
+                    content_path=f"{root}/Release",
+                    size_bytes=5_000,
+                    uploaded_bytes=None,
+                    ratio=None,
+                    seed_time_s=None,
+                    added_at="2026-08-24T00:00:00Z",
+                    raw_status="Completed",
+                    phase="completed",
+                )
+            ],
+        )
+    )
+    assert len(result.torrents) == 1
+    torrent = result.torrents[0]
+    assert torrent.size_bytes == 5_000
+    assert torrent.uploaded_bytes is None
+    assert torrent.ratio is None
+    assert torrent.seed_time_s is None
+
+
+def test_size_on_disk_counts_a_hardlinked_torrent_file_once():
+    """`size_on_disk` answers "how big is this torrent," not "what would deleting it reclaim" --
+    it must count an inode once even though only one of its two links sits under this claim's own
+    seeding-directory tree, the ordinary rTorrent shape (the other link is the completed-folder
+    hardlink, a different claim's tree entirely).
+    """
+    working = "/rtorrent/data"
+    completed = "/complete/tv"
+    seed_copy = _file(working, "Release/file.mkv", inode=9, nlink=2, size=40_000_000_000)
+    hardlink = _file(completed, "Release/file.mkv", inode=9, nlink=2, size=40_000_000_000)
+    result = reconcile(
+        **_base(
+            base_paths=[working, completed],
+            contributors=[
+                BasePathContributor(working, client_id=1),
+                BasePathContributor(completed, client_id=1),
+            ],
+            reachable_client_ids=[1],
+            disk_entries=[seed_copy, hardlink],
+            claims=[_claim(1, "rTorrent", f"{working}/Release", transfer_id="rt1")],
+        )
+    )
+    assert len(result.torrents) == 1
+    torrent = result.torrents[0]
+    # Only `seed_copy` is under `working/Release` -- `hardlink` belongs to the completed root,
+    # outside this claim's own tree, so file_count counts the claim's own tree only.
+    assert torrent.file_count == 1
+    assert torrent.size_on_disk == 40_000_000_000
 
 
 # ================================================================================================
@@ -558,10 +678,11 @@ def test_broken_seed_not_reported_when_the_walk_itself_failed():
 
 
 def test_excluded_path_is_never_proposed_as_debris():
-    """An excluded sub-path (the enforceable primitive, `download_client_excluded_path`) is
-    dropped before any candidate logic runs -- it must never appear in the debris pile even
-    though every other guard (contributor reachable, old enough, unclaimed) would otherwise let
-    it through.
+    """An excluded sub-path (the enforceable primitive, `download_client_excluded_path`) with no
+    claim covering it must never appear in the debris pile even though every other guard
+    (contributor reachable, old enough, unclaimed) would otherwise let it through -- instead it
+    lands in `excluded_content` (2026-08-24, this task, spec §11.4), visible but never selectable
+    and never counted toward a reclaim total.
     """
     root = "/complete/tv"
     others_release = _file(root, "OtherInstance.Release/file.mkv", inode=9)
@@ -578,12 +699,21 @@ def test_excluded_path_is_never_proposed_as_debris():
     debris_paths = {d.abs_path for d in result.debris}
     assert others_release.abs_path not in debris_paths
     assert ours.abs_path in debris_paths  # unaffected -- a different tree entirely
+    assert result.unclaimed == ()
+    assert len(result.excluded_content) == 1
+    excluded_entry = result.excluded_content[0]
+    assert excluded_entry.abs_path == others_release.abs_path
+    assert excluded_entry.excluded_path == f"{root}/OtherInstance.Release"
 
 
-def test_excluded_path_is_also_never_shown_as_seeding_estate():
-    """Not merely kept out of debris -- an excluded path must not surface anywhere in the review
-    at all, including the "claimed, shown for visibility" pile, since that pile is still
-    information about content this instance has no business describing.
+def test_excluded_path_content_still_covered_by_a_claim_shows_in_the_seeding_estate():
+    """2026-08-24 correction, this task's own governing principle (exclusion is a delete-safety
+    boundary, not a visibility boundary): a claim under an excluded path is the *ordinary* steady
+    state of §17.7's shared seedbox (the other instance's client still lists its own active
+    transfers) -- it is shown in the seeding estate like any other claimed file, tagged with
+    whatever attribution its own category has, and never in `debris` or `excluded_content` (that
+    pile is reserved for excluded content **no current claim** covers -- see the sibling test
+    above and `test_excluded_content_disappears_from_the_seeding_estate_once_its_claim_is_gone`).
     """
     root = "/complete/tv"
     entry = _file(root, "OtherInstance.Release/file.mkv", inode=9)
@@ -598,13 +728,41 @@ def test_excluded_path_is_also_never_shown_as_seeding_estate():
         )
     )
     assert result.debris == ()
+    assert result.excluded_content == ()
+    assert len(result.seeding_estate) == 1
+    assert result.seeding_estate[0].abs_path == entry.abs_path
+
+
+def test_excluded_content_disappears_from_the_seeding_estate_once_its_claim_is_gone():
+    """§17.7's own "latent data-loss path," made visible instead of silent (this task's whole
+    point): the same file, once its claim vanishes (the other instance's client dropped its
+    history entry, or the torrent was removed), moves from the seeding estate into
+    `excluded_content` -- never into `debris`.
+    """
+    root = "/complete/tv"
+    entry = _file(root, "OtherInstance.Release/file.mkv", inode=9)
+    result = reconcile(
+        **_base(
+            base_paths=[root],
+            contributors=[BasePathContributor(root, client_id=1)],
+            reachable_client_ids=[1],
+            disk_entries=[entry],
+            claims=[],  # the claim is gone
+            excluded_paths=[f"{root}/OtherInstance.Release"],
+        )
+    )
+    assert result.debris == ()
     assert result.seeding_estate == ()
+    assert len(result.excluded_content) == 1
+    assert result.excluded_content[0].abs_path == entry.abs_path
 
 
-def test_excluded_path_suppresses_broken_seed_reporting_too():
-    """A claim under an excluded path with nothing found on disk must not be reported as a
-    broken seed either -- this instance has no business judging "present" or "broken" for a tree
-    that belongs to the other lftpweb instance sharing this seedbox.
+def test_excluded_path_claim_can_now_be_reported_missing_too():
+    """2026-08-24 correction: a claim under an excluded path with nothing found on disk **is now
+    reported missing** in `torrents` -- this used to be suppressed entirely, which was correct
+    for delete safety but wrong for visibility (this module's own governing principle). "An
+    excluded claim can now be reported missing too. That is correct -- it is visibility, which is
+    the point" (this task's own spec §11.4 note).
     """
     root = "/complete/tv"
     result = reconcile(
@@ -617,7 +775,9 @@ def test_excluded_path_suppresses_broken_seed_reporting_too():
             excluded_paths=[f"{root}/OtherInstance.Release"],
         )
     )
-    assert result.broken_seeds == ()
+    assert len(result.torrents) == 1
+    assert result.torrents[0].missing_on_disk is True
+    assert result.torrents[0].file_count == 0
 
 
 def test_excluding_a_whole_base_path_protects_everything_under_it():
@@ -652,9 +812,11 @@ def test_excluding_a_whole_base_path_protects_everything_under_it():
 
 def test_claimed_content_in_an_excluded_category_is_hard_excluded_without_touching_the_root():
     """A base path with both a bound category's claim and an excluded category's claim: the
-    bound content survives normally (seeding estate), the excluded content is dropped entirely --
-    and neither pile is suppressed for the *whole* root, unlike the old whole-base-path fail
-    closed behaviour.
+    bound content survives normally (seeding estate, `attribution="bound"`), and the excluded
+    content is *also* shown in the seeding estate (2026-08-24 correction -- see this module's own
+    governing principle) but tagged `attribution="excluded"` and never in `debris` -- neither
+    pile is suppressed for the *whole* root, unlike the old whole-base-path fail closed
+    behaviour.
     """
     root = "/rtorrent/data"
     bound_file = _file(root, "Bound.Release/file.mkv", inode=1)
@@ -677,23 +839,26 @@ def test_claimed_content_in_an_excluded_category_is_hard_excluded_without_touchi
             ],
             excluded_categories_by_client={2: frozenset({"other-site-movies"})},
             debris_ambiguous_roots={root: "other-site-movies cannot be resolved to a path"},
+            category_attribution_by_client={2: {"ar-tv": "bound", "other-site-movies": "excluded"}},
         )
     )
-    seeding_paths = {e.abs_path for e in result.seeding_estate}
+    seeding_by_path = {e.abs_path: e for e in result.seeding_estate}
     debris_paths = {d.abs_path for d in result.debris}
-    assert bound_file.abs_path in seeding_paths
-    assert excluded_file.abs_path not in seeding_paths
+    assert bound_file.abs_path in seeding_by_path
+    assert seeding_by_path[bound_file.abs_path].attribution == "bound"
+    assert excluded_file.abs_path in seeding_by_path
+    assert seeding_by_path[excluded_file.abs_path].attribution == "excluded"
     assert excluded_file.abs_path not in debris_paths
 
 
-def test_excluded_category_claim_appears_in_no_pile_not_even_unclaimed():
-    """Finding #17's own line to keep sharp: a file claimed by an EXCLUDED category is *known* to
-    belong to the other lftpweb instance -- it must never appear in debris, seeding_estate,
-    broken_seeds, *or* the new unclaimed pile. The unclaimed pile is for ownership that is
-    genuinely UNKNOWN, never for something already known to be someone else's. This is the same
-    root as the ambiguous-root case (`debris_ambiguous_roots` is set here too), so this is a
-    direct assertion that hard exclusion wins over the ambiguous-root fail-closed path, not an
-    accident of an otherwise-empty fixture.
+def test_excluded_category_content_appears_in_seeding_estate_tagged_excluded_not_debris():
+    """This task's own headline behaviour (2026-08-24, spec §11.4): a file claimed by an EXCLUDED
+    category is retained as a claim, so it lands in the seeding estate -- shown, tagged
+    `attribution="excluded"` -- and it must never appear in `debris`. This is the corrected
+    reading of finding #17's own line ("a file claimed by an excluded category is known to belong
+    to the other lftpweb instance"): before this task that meant *dropped entirely*; now it means
+    *shown, but never actionable*. Same fixture finding #17's own test used, so this is a direct
+    before/after of the one behaviour this task changes.
     """
     root = "/rtorrent/data"
     excluded_file = _file(root, "Excluded.Release/file.mkv")
@@ -714,13 +879,15 @@ def test_excluded_category_claim_appears_in_no_pile_not_even_unclaimed():
             ],
             excluded_categories_by_client={2: frozenset({"other-site-movies"})},
             debris_ambiguous_roots={root: "other-site-movies cannot be resolved to a path"},
+            category_attribution_by_client={2: {"other-site-movies": "excluded"}},
         )
     )
     assert excluded_file.abs_path not in {d.abs_path for d in result.debris}
-    assert excluded_file.abs_path not in {e.abs_path for e in result.seeding_estate}
-    assert excluded_file.abs_path not in {b.content_path for b in result.broken_seeds}
     assert excluded_file.abs_path not in {u.abs_path for u in result.unclaimed}
-    assert result.unclaimed == ()
+    assert excluded_file.abs_path not in {e.abs_path for e in result.excluded_content}
+    seeding_by_path = {e.abs_path: e for e in result.seeding_estate}
+    assert excluded_file.abs_path in seeding_by_path
+    assert seeding_by_path[excluded_file.abs_path].attribution == "excluded"
 
 
 def test_a_genuinely_unclaimed_file_under_an_ambiguous_root_is_shown_in_the_unclaimed_pile():
@@ -889,6 +1056,90 @@ def test_is_authorized_delete_target_refuses_anything_outside_every_base_path():
         )
         is False
     )
+
+
+def test_hard_invariant_excluded_content_stays_unauthorized_for_delete_after_becoming_visible():
+    """**The one non-negotiable this task exists to protect** (this task's own handoff prompt,
+    "the hard invariant"): making excluded content *visible* must never make it *authorized*.
+    Both routes this task adds visibility through -- a manually-excluded path with no claim
+    (`excluded_content`) and an excluded-category claim (`seeding_estate`, `attribution
+    ="excluded"`) -- must still fail `is_authorized_delete_target` for the exact same path,
+    unconditionally. `is_authorized_delete_target`'s own signature, behaviour, and the excluded-
+    path set `_resolve_client_exclusions` builds are untouched by this task; this test is the
+    direct assertion that they still compose correctly with the now-visible piles above them.
+    """
+    root = "/complete/tv"
+    manually_excluded = f"{root}/OtherInstance.Release"
+    excluded_category_release = f"{root}/Excluded.Release"
+
+    # Route 1: a manually excluded path with no claim -- shows up in `excluded_content`.
+    unclaimed_result = reconcile(
+        **_base(
+            base_paths=[root],
+            contributors=[BasePathContributor(root, client_id=1)],
+            reachable_client_ids=[1],
+            disk_entries=[_file(root, "OtherInstance.Release/file.mkv", inode=9)],
+            excluded_paths=[manually_excluded],
+        )
+    )
+    assert len(unclaimed_result.excluded_content) == 1
+    assert (
+        is_authorized_delete_target(
+            f"{manually_excluded}/file.mkv", base_paths=[root], excluded_paths=[manually_excluded]
+        )
+        is False
+    )
+
+    # Route 2: an excluded-category claim -- shows up in `seeding_estate`, `attribution="excluded"`.
+    claimed_result = reconcile(
+        **_base(
+            base_paths=[root],
+            contributors=[BasePathContributor(root, client_id=2)],
+            reachable_client_ids=[2],
+            disk_entries=[_file(root, "Excluded.Release/file.mkv", inode=5)],
+            claims=[
+                _claim(2, "rTorrent", excluded_category_release, transfer_id="rt9", category="x")
+            ],
+            excluded_categories_by_client={2: frozenset({"x"})},
+            category_attribution_by_client={2: {"x": "excluded"}},
+        )
+    )
+    assert len(claimed_result.seeding_estate) == 1
+    assert claimed_result.seeding_estate[0].attribution == "excluded"
+    assert (
+        is_authorized_delete_target(
+            f"{excluded_category_release}/file.mkv",
+            base_paths=[root],
+            excluded_paths=[excluded_category_release],
+        )
+        is False
+    )
+
+
+def test_excluded_sibling_cannot_ride_a_hardlink_group_into_debris():
+    """Regression guard for the subtle failure mode `_entry_eligible`'s own 2026-08-24 docstring
+    names: since excluded entries no longer leave `disk_entries` before `by_inode` is built, a
+    debris-eligible file's hardlink sibling landing under an excluded path must fail the whole
+    group closed, not let the excluded sibling read as "eligible" and wave the pair through.
+    """
+    debris_root = "/complete/tv"
+    excluded_root = "/complete/other-instance"
+    candidate = _file(debris_root, "Maybe.Debris/file.mkv", inode=42, nlink=2, size=999)
+    excluded_sibling = _file(excluded_root, "Maybe.Debris/file.mkv", inode=42, nlink=2, size=999)
+    result = reconcile(
+        **_base(
+            base_paths=[debris_root, excluded_root],
+            contributors=[
+                BasePathContributor(debris_root, client_id=1),
+                BasePathContributor(excluded_root, client_id=1),
+            ],
+            reachable_client_ids=[1],
+            disk_entries=[candidate, excluded_sibling],
+            excluded_paths=[excluded_root],
+        )
+    )
+    assert result.debris == ()
+    assert candidate.abs_path not in {d.abs_path for d in result.debris}
 
 
 # --- `run_scan`'s own derivation step, isolated from the database/SSH (finding #16) ------------

@@ -1193,7 +1193,7 @@ state.
 completed directory and that is it. we pick up from completed and delete on success import. the
 torrent keeps seeding till I manually clean today."*
 
-### 11.1d Three piles — and only one of them is orphans
+### 11.1d Four piles — and only one of them is orphans
 
 That confirmation separates things this section could easily have conflated, and they want
 different features:
@@ -1201,14 +1201,15 @@ different features:
 | Pile | What it is | Whose problem |
 |---|---|---|
 | **Debris** | Data under a base path that **no client claims and lftpweb is not using** — failed extractions, aborted grabs, and the §10.3 window where the client entry was removed but the SSH delete failed | §11, the orphan scan. Genuinely unclaimed, in a resolvable path; safe to review and select for removal |
-| **The seeding estate** | rTorrent's downloads directory, still **claimed** by live torrents, accumulating until the user cleans it by hand | Not orphans. This is #21 — eligibility by site rules, ranking, then §10's delete path |
+| **The seeding estate** | rTorrent's downloads directory, still **claimed** by live torrents, accumulating until the user cleans it by hand. Each row carries its claim's own `attribution` (bound/excluded/undecided) | Not orphans. This is #21 — eligibility by site rules, ranking, then §10's delete path |
+| **Excluded content** *(2026-08-24)* | Under an excluded path, **no claim currently covers it** — §17.7's "latent data-loss path" made visible instead of silent | §11, shown but never selectable, never counted toward a reclaim total |
 | **Unclaimed** *(finding #17, 2026-08-23)* | Unclaimed by any client, in a tree where an exclusion cannot be resolved to a path — ownership is **genuinely undeterminable**, not merely unproven | §11, shown but not selectable through the ordinary debris flow — see below |
 
 **The manual cleanup the user does today is the seeding-estate pile**, and naming it correctly
 keeps the orphan scan from ever proposing a live seeding torrent's data as debris. The scan still
-*shows* all three — a review page that omits any of them would be answering a question nobody
+*shows* all four — a review page that omits any of them would be answering a question nobody
 asked, and finding #17 corrects an earlier reading that treated "cannot resolve to a path" as
-license to hide the third pile entirely — but they are labelled distinctly and only debris is
+license to hide the unclaimed pile entirely — but they are labelled distinctly and only debris is
 selectable for removal before #21 exists.
 
 **The unclaimed pile, and why it exists as a pile rather than a count (finding #17).** §11.2's own
@@ -1232,12 +1233,46 @@ can show up in weird categories etc — we might want to clean up"*, the user, 2
   at all in this task's own implementation — see §11.4 below for the gate stage 5 must build
   before anything can act on this pile.
 - **The line that must stay sharp:** a file claimed by an **excluded** category is *known* to
-  belong to the other lftpweb instance — it is a hard exclusion, dropped before any claim/debris
-  logic runs, and it appears in **no** pile, unclaimed included. The unclaimed pile is only for
-  ownership that is genuinely *unknown*. `core/disk_review.py.reconcile()` enforces this by
-  folding an excluded claim's own `content_path` into the same hard-exclusion set a manually
-  excluded path uses, before the claim is dropped — so the file it named never falls through to
-  "nobody claims this" by accident.
+  belong to the other lftpweb instance — it is never eligible for `debris` or `unclaimed`, ever.
+  The unclaimed pile is only for ownership that is genuinely *unknown*. **2026-08-24 correction —
+  see §11.1e below:** this used to also mean the claim was dropped outright, before any
+  claim/debris logic ran, so the file appeared in *no* pile at all. That guaranteed the line above
+  but at the cost of hiding legitimate content; the claim is now retained instead, so the file
+  shows in the **seeding estate**, tagged `attribution="excluded"` — the same "claimed always
+  wins" per-entry order that already keeps a claimed file out of `unclaimed` now keeps it out of
+  `excluded_content` too, structurally rather than by removing it from consideration.
+
+### 11.1e Exclusion is a delete-safety boundary, not a visibility boundary (2026-08-24)
+
+Findings #16 and #17 already taught this lesson twice — a manually excluded path must be dropped
+from *delete authorization*, not from the screen (#16), and an ambiguous-root unclaimed file must
+be shown, not silently counted (#17). This task applies the same correction a third time, to the
+one path that still got it wrong: **a claim whose own category was marked "not used by this
+instance" was dropped outright, before any claim/candidate logic ever ran.** That kept it out of
+every pile correctly, but "every pile" included the seeding estate, where a claimed file
+legitimately belongs — the same file, still actively seeding on the other instance's client, had
+become invisible to a page whose whole purpose is showing what is on disk.
+
+**What changed:** the claim is now retained. Its files are still claimed, so they still land in
+the seeding estate — shown, tagged `attribution="excluded"` (migration 031's three-state
+category, copied onto the row purely for display; `reconcile()` never branches on the value) —
+and structurally unreachable by `debris` or `unclaimed`, because "claimed" is checked first in the
+per-entry order, before either of those branches runs at all. A manually excluded path with **no
+claim currently covering it** — the moment the other instance's client drops its history entry or
+removes the torrent, which is exactly the "latent data-loss path" §17.7 names — now lands in a new
+**excluded content** pile instead of vanishing: visible, never selectable, never counted toward a
+reclaim total.
+
+**What did not change, at all:** `core/disk_review.py.is_authorized_delete_target(path,
+base_paths, excluded_paths)` still receives the same resolved excluded-path set and still refuses
+everything under it, unconditionally — visibility and delete authorization are two different
+questions, and this task only ever touches the first one. `resolve_category_exclusion_paths` and
+`_resolve_client_exclusions` (the category-to-path resolution machinery §11.2 and §17.7 describe)
+are untouched too. The response gained two other shapes the same day, neither a safety change: a
+`torrents` array (one row per claim — the client's own reported figures plus disk-derived
+`file_count`/`size_on_disk`, superseding the old separate "broken seeds" list) and a `clients`
+roster (which instances reported this pass, and their declared field capabilities, so the page can
+section by client and choose columns from the declaration rather than from `client_type`).
 
 **One useful property falls out of the workflow.** Once lftpweb's `move`-mode delete has removed the
 completed-folder link on confirmed import, the torrent's own copy is the **only** remaining link.
@@ -1267,18 +1302,22 @@ torrent data for deletion.
   yet appeared in the client's list, must never be proposed. Same instinct as §7.3's removal grace
   period.
 - **Containment.** Only paths under declared base paths are scanned or proposed. Ever.
-- **Exclusion (added 2026-08-23, §8.3 round 5, finding #16; narrowed the same day by live use,
-  then corrected again by finding #17).** A path under `download_client_excluded_path`, or
-  resolved there from an excluded category, is dropped before any candidate/claim logic runs —
-  never proposed as debris, never shown as seeding estate, never reported as a broken seed, never
-  shown in the unclaimed pile either. A claim whose own category is excluded is folded into this
-  same hard-exclusion set via its `content_path` (finding #17) — it is *known* to belong to
-  another instance, not merely unproven. Where an excluded category cannot be resolved to a path
-  at all (no `content`-kind base path for that client, rTorrent under the reference layout), the
-  root is still walked and its seeding estate stays populated normally — **only a genuinely
-  unclaimed file** under that root is held back from debris, and it is shown in the **unclaimed**
-  pile (§11.1d), not silently suppressed. (An earlier version of this rule suppressed the file
-  entirely, and an even earlier one suppressed the client's whole base path — both superseded.)
+- **Exclusion is a *delete-safety* boundary, never a *debris-eligibility* one, and — as of
+  2026-08-24 — no longer a visibility boundary either (§11.1e).** A path under
+  `download_client_excluded_path`, or resolved there from an excluded category, is **never
+  eligible for `debris`, unconditionally** — that guarantee is unchanged and is what
+  `is_authorized_delete_target` also enforces independently. What *is* different since 2026-08-24:
+  such a path's content is no longer dropped from the walk before any pile logic runs. A claim
+  still covering it is shown in the **seeding estate**, tagged `attribution="excluded"` (its own
+  category is *known* to belong to another instance, not merely unproven — the same fact that used
+  to justify dropping it now just gets copied onto the row as a label); content with **no claim
+  covering it** is shown in the new **excluded content** pile instead, never `debris`, never
+  `unclaimed`. Where an excluded category cannot be resolved to a path at all (no `content`-kind
+  base path for that client, rTorrent under the reference layout), the root is still walked and
+  its seeding estate stays populated normally — **only a genuinely unclaimed file** under that
+  root is held back from debris, and it is shown in the **unclaimed** pile (§11.1d), not silently
+  suppressed. (Two earlier versions of this rule suppressed the file entirely, and — earlier
+  still — the client's whole base path; all three are superseded.)
 - **The C set reuses `core/pipeline_flight.py`'s existing predicate and `in_flight_item_ids()` —
   never a second definition of "busy."** `docs/torrent-manager-spec.md` §9 names this specifically,
   and it is the v0.2.6 `REMOTE_GONE` defect class: deleting a seedbox source out from under a queued
@@ -1291,9 +1330,10 @@ torrent data for deletion.
 - **Shared cross-seed paths** (§10.4) apply here identically.
 - **Review-only. The scan never deletes.** It produces a list with per-candidate size and a
   **link-aware** reclaim total (§10.5); a human selects; the selection goes through §10's sequence.
-- **All three piles are labelled distinctly, and only debris is selectable** before #21 exists
-  (§11.1d) — the unclaimed pile is visible but gated off the ordinary select-and-remove flow by
-  construction (no checkbox exists for it), not merely by a UI convention that could be bypassed.
+- **All four piles are labelled distinctly, and only debris is selectable** before #21 exists
+  (§11.1d) — the unclaimed and excluded-content piles are visible but gated off the ordinary
+  select-and-remove flow by construction (no checkbox exists for either), not merely by a UI
+  convention that could be bypassed.
 
 ### 11.3 Manual trigger
 
@@ -1325,6 +1365,15 @@ decides it:
   on the one action that is genuinely unusual). See `docs/decisions.md`'s 2026-08-23 entry for this
   task for the full reasoning; stage 5 should treat this as the starting design, not reopen the
   question from scratch.
+
+**The excluded content pile (2026-08-24, §11.1e) is a different case, not a second instance of
+this one — it needs no gate at all, deferred or otherwise.** The unclaimed pile is *this
+instance's own* ownership question, genuinely unresolved, and a future gated action on it is
+plausible (it might turn out to be this instance's own debris). Excluded content is the opposite:
+its owner is *known* — the other lftpweb instance sharing this seedbox — which is exactly why it
+is excluded in the first place. There is no future world in which this instance should offer any
+action on it; it stays permanently informational, same as the seeding estate, and stage 5 should
+not build a gate for it under the assumption this section merely forgot to ask for one.
 
 ---
 

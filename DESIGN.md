@@ -3567,21 +3567,53 @@ every call — otherwise excluding a category in Settings does not clear the war
 poll pass happens to run. This is `core/arrsync.py`'s own 2026-08-21 eviction-latency fix,
 applied twice more here; it is a recurring bug shape in this codebase, not a one-off.
 
-### 17.6 The disk review scan: three piles, claimed by inode
+### 17.6 The disk review scan: four piles, a torrent summary, claimed by inode
 
 lftpweb's Files page shows only its queues' remote paths. A torrent client's seeding folders
 generally sit *outside* those paths entirely, so a seedbox accumulates content lftpweb cannot see
 at all. The scan (Transfers → Disk review, manual trigger only) reconciles three sets over the
 clients' declared base paths: **A** what every client claims, **B** what is actually on disk over
-SSH, **C** what lftpweb itself is using. `B − A − C` is the review list; `A − B` is broken seeds.
+SSH, **C** what lftpweb itself is using. `B − A − C` is the review list; `A − B` is a missing-seed
+verdict, folded into the per-torrent summary below rather than a separate pile.
 
-**Three piles come out, and only one is actionable:**
+**Four piles come out, and only one is actionable — plus a `torrents` summary and a `clients`
+roster that sit alongside the piles rather than being one:**
 
 | Pile | What | Actionable |
 |---|---|---|
 | **Debris** | Unclaimed by any client, unused by lftpweb, in a resolvable path — failed extractions, aborted grabs, and the client-removed-but-SSH-delete-failed window | Selectable, for a delete pipeline that does not exist yet |
-| **Seeding estate** | Claimed by live torrents, accumulating until someone cleans it by hand | No — informational, and #21's territory |
+| **Seeding estate** | Claimed by live torrents, accumulating until someone cleans it by hand. Each row carries the claim's own `attribution` (`bound`/`excluded`/`undecided`, migration 031's three-state category) and a `claim_key` joining it to its own row in `torrents` | No — informational, and #21's territory |
+| **Excluded content** *(2026-08-24)* | Under an excluded path, **no claim currently covers it** — the moment §17.7's "latent data-loss path" actually happens, made visible instead of silent | Shown, never selectable, never counted toward a reclaim total |
 | **Unclaimed** | Ownership **genuinely undeterminable** — unclaimed, in a tree where an exclusion cannot be resolved to a path | Shown, but reachable by no control at all |
+
+`torrents` is one row per claim (not per file): the client's own reported figures — `ratio`,
+`uploaded_bytes`, `seed_time_s`, `added_at`, `raw_status`, `phase`, `size_bytes` — passed through
+verbatim (`None`, never a fabricated `0`, whenever the connector's own `CapabilitySet` doesn't
+declare the field — every SABnzbd row's `ratio`/`uploaded_bytes`/`seed_time_s` per
+`USENET_BASELINE`), plus two disk-derived figures the scan alone can answer: `file_count` and a
+link-aware `size_on_disk` (counts an inode once per torrent, but — unlike the debris pile's own
+`freed_bytes` — never requires every link to be present before counting, because "how big is this
+torrent" and "what would deleting it reclaim" are different questions). A claim whose root was
+walked and turned up genuinely empty reports `missing_on_disk: true, file_count: 0` — this
+supersedes the earlier separate "broken seeds" list entirely, including for a claim under an
+excluded path, which can now be reported missing too (visibility, not a containment change). A
+claim whose root was never walked, or one with no `content_path` at all, reports `file_count:
+null` — absent information is not a verdict either way. `clients` is a roster of every enabled
+instance (reachable this pass or not, and why not) carrying its own declared field capabilities,
+so the page can section by client and decide its column set from the declaration rather than from
+`client_type` (§17.2's own rule, applied here too).
+
+**Exclusion is a delete-safety boundary, not a visibility boundary (2026-08-24).** Before this
+date, a claim in an excluded category was dropped before any pile logic ran, and a manually
+excluded path's content was dropped from the walk outright — correct for keeping either out of
+`debris`, wrong for hiding them from the page altogether (the same lesson findings #16/#17 already
+taught twice, applied a third time). Now: a claim retains its files regardless of its category's
+state, so excluded-category content shows in the seeding estate tagged `attribution="excluded"`;
+a manually excluded path with no claim covering it shows in `excluded_content` instead of vanishing.
+**Nothing about what may ever be deleted moves** —
+`core/disk_review.py.is_authorized_delete_target(path, base_paths, excluded_paths)` still receives
+the same resolved excluded-path set and still refuses everything under it, unconditionally, whether
+or not that content is now visible somewhere on the page.
 
 **Three properties of set A are correctness requirements, not niceties, and each is a place the
 obvious implementation quietly destroys data.**
@@ -3677,10 +3709,16 @@ What shipped:
   The pile is shown, grouped by directory, with a link-aware reclaim figure and plain language
   saying it is abnormal.
 - **The line that must stay sharp:** a file claimed by an **excluded** category is *known* to
-  belong to the other instance. It is a hard exclusion, dropped before any claim/debris logic
-  runs, and it appears in **no** pile, unclaimed included. The unclaimed pile is only for
-  ownership that is genuinely *unknown*. Letting an excluded claim fall through to "nobody claims
-  this" was a real bug caught by a test written specifically to assert the distinction.
+  belong to the other instance. It is never eligible for `debris` or `unclaimed` — the unclaimed
+  pile is only for ownership that is genuinely *unknown*. **2026-08-24 correction:** it used to
+  also be dropped before any claim/debris logic ran, so it appeared in *no* pile at all — that was
+  right for keeping it out of `unclaimed`, but wrong for hiding it altogether (§17.6's own
+  "exclusion is a delete-safety boundary, not a visibility boundary"). The claim is now retained,
+  so this file shows in the **seeding estate**, tagged `attribution="excluded"` — visible, but
+  structurally unreachable by `debris` or `unclaimed` (claimed is checked before either, in
+  `reconcile()`'s own per-entry order), which is a stronger guarantee than the old one: it no
+  longer depends on remembering to fold the claim's path into a hard-exclusion set before dropping
+  it, because there is no longer anything to drop.
 
 **None of this has been verified against the user's actual two-instance deployment.** It is
 correct by unit test against fixtures the same authors wrote, which §17.8 explains is a weaker
@@ -3694,7 +3732,7 @@ claim than it sounds.
 | **1** — SABnzbd + rTorrent connectors, instance CRUD, declared config forms, test-connection, redacted response capture, Settings → Clients, base-path detect→SSH-verify→confirm | **Built** (migrations 027, 028) |
 | **2** — the poller, client as a third Preflight source, the settle-gate skip | **Built** (migration 029). The skip itself ships **off** |
 | **3** — withhold auto-queue on an explicit client failure verdict, and the cheap-vs-expensive cadence split | **Built.** The withhold gate ships **off**, and has **no API or UI surface at all** — the setting exists only in the database blob |
-| **4** — the disk review scan, three piles, review-only | **Built** (migrations 030, 031, 032) |
+| **4** — the disk review scan, four piles plus a torrent summary, review-only | **Built** (migrations 030, 031, 032) |
 | **5** — the delete pipeline, verification, banner | **NOT BUILT.** Nothing in this feature deletes anything |
 
 **Two features ship off by default and that is not timidity — it is one specific unverified

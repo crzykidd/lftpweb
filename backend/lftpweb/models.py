@@ -2081,8 +2081,10 @@ class DownloadClientTestResponse(BaseModel):
 # --- The disk review scan (docs/download-client-framework-spec.md §11, stage 4 of #18) -------
 #
 # `POST /api/disk-review/scan` (`api/disk_review.py`, `core/disk_review.py`) -- review-only,
-# manual trigger, deletes nothing. Two labelled piles plus the two "why nothing was proposed
-# here" surfaces (`broken_seeds`, `skipped_base_paths`) named rather than silently absorbed.
+# manual trigger, deletes nothing. Labelled piles plus the "why nothing was proposed here"
+# surface (`skipped_base_paths`) named rather than silently absorbed, a per-claim `torrents`
+# summary, and a per-client `clients` roster (2026-08-24, this task, spec §11.4 -- the governing
+# principle: exclusion is a delete-safety boundary, not a visibility boundary).
 
 
 class DiskReviewDebrisOut(BaseModel):
@@ -2102,6 +2104,11 @@ class DiskReviewSeedingEstateOut(BaseModel):
     (`lib/diskReview.ts.groupSeedingEstateByTorrent`) rather than listing bare files -- a
     display-layer grouping only; `core/disk_review.py.reconcile()` itself still resolves this per
     file, unchanged (inode accounting is inherently per-file, spec §11.1b).
+
+    `attribution`/`claim_key` (2026-08-24, this task) -- see `core.disk_review.SeedingEstateEntry`
+    's own docstring. `attribution` is one of `"bound"` / `"excluded"` / `"undecided"`; a claim
+    tagged `"excluded"` appearing here (rather than being hidden) is this task's own point, not a
+    bug -- see `DiskReviewScanResponse`'s own docstring.
     """
 
     root: str
@@ -2113,14 +2120,25 @@ class DiskReviewSeedingEstateOut(BaseModel):
     claimed_transfer_id: str
     claimed_transfer_name: str
     claimed_content_path: str
+    attribution: str
+    claim_key: str
 
 
-class DiskReviewBrokenSeedOut(BaseModel):
-    client_id: int
-    client_name: str
-    transfer_id: str
-    transfer_name: str
-    content_path: str
+class DiskReviewExcludedContentOut(BaseModel):
+    """The fourth pile, 2026-08-24 (this task, spec §11.4) -- one on-disk file under an excluded
+    path with no claim currently covering it. See `core.disk_review.ExcludedContentEntry`'s own
+    docstring for the full reasoning: this is what makes the "the other lftpweb instance's client
+    dropped its history entry" moment visible instead of silent. Never selectable, never debris,
+    never counted toward a reclaim total -- `excluded_path` names which excluded root matched, so
+    its absence from every other pile is explained rather than merely felt.
+    """
+
+    root: str
+    rel_path: str
+    abs_path: str
+    size: int
+    excluded_path: str
+    link_paths: list[str] = Field(default_factory=list)
 
 
 class DiskReviewSkippedBasePathOut(BaseModel):
@@ -2148,29 +2166,98 @@ class DiskReviewUnclaimedOut(BaseModel):
     reason: str
 
 
+class DiskReviewTorrentOut(BaseModel):
+    """One row per claim, 2026-08-24 (this task, spec §11.4) -- supersedes the retired
+    `DiskReviewBrokenSeedOut`/`broken_seeds` (a broken seed is exactly `missing_on_disk=True`
+    here). See `core.disk_review.TorrentEntry`'s own docstring for the full reasoning behind
+    every field, in particular why `size_bytes`/`uploaded_bytes`/`ratio`/`seed_time_s` are `None`
+    rather than `0` whenever the reporting client doesn't declare the equivalent capability
+    (every SABnzbd row's `ratio`/`uploaded_bytes`/`seed_time_s`, per `USENET_BASELINE`) and why
+    `file_count`/`size_on_disk` are `None` rather than `0` whenever the claim's own root was
+    never walked, or the claim itself reported no `content_path` at all.
+
+    `claim_key` matches `DiskReviewSeedingEstateOut.claim_key` -- the join key the frontend uses
+    to roll a torrent's own on-disk files up under its summary row without a second fetch.
+    """
+
+    client_id: int
+    transfer_id: str
+    transfer_name: str
+    content_path: str | None
+    category: str | None
+    attribution: str
+    size_bytes: int | None
+    uploaded_bytes: int | None
+    ratio: float | None
+    seed_time_s: int | None
+    added_at: str | None
+    raw_status: str | None
+    phase: str | None
+    file_count: int | None
+    size_on_disk: int | None
+    missing_on_disk: bool
+    claim_key: str
+
+
 class DiskReviewClientFailureOut(BaseModel):
     client_id: int
     client_name: str
     reason: str
 
 
+class DiskReviewClientOut(BaseModel):
+    """One row per **enabled** `download_client` instance, 2026-08-24 (this task, spec §11.4) --
+    the roster the review page sections by. See `core.disk_review.ClientSummary`'s own docstring
+    for the full reasoning, in particular why `capabilities` is a flat `Field name -> support
+    level` mapping rather than the typed `CapabilitySet`: the frontend's only use for it is a
+    capability-driven column set (spec §17.2's "the UI is driven by the declaration, never by the
+    client's name" -- `client_type` is display metadata only, never a branch condition), and a
+    flat string mapping is all that decision needs. Empty for a client never successfully probed.
+    """
+
+    client_id: int
+    name: str
+    client_type: str
+    reachable: bool
+    failure_reason: str | None
+    capabilities: dict[str, str] = Field(default_factory=dict)
+
+
 class DiskReviewScanResponse(BaseModel):
     """The whole scan result. `debris` is the only selectable pile; `seeding_estate` is shown
-    for visibility only, and `unclaimed` (finding #17) is shown but gated off the ordinary
-    select-and-remove flow -- see `DiskReviewUnclaimedOut`'s own docstring (spec §11.1d).
-    `total_debris_bytes` is the naive sum-of-sizes (every candidate, unselected) -- the link-aware
-    total for an actual *selection* is a client-side computation (`freed_bytes` in
-    `core/disk_review.py`, mirrored in the frontend) since selection is never persisted
-    server-side at this stage.
+    for visibility only, `unclaimed` (finding #17) is shown but gated off the ordinary
+    select-and-remove flow (spec §11.1d), and `excluded_content` (2026-08-24, this task) is
+    shown but never selectable either -- see each pile's own `*Out` docstring.
+
+    **2026-08-24, this task -- the governing principle this whole shape follows: exclusion is a
+    delete-safety boundary, not a visibility boundary.** A claim whose category is marked "not
+    used by this instance" is no longer dropped before it can appear anywhere; its files show up
+    in `seeding_estate` tagged `attribution="excluded"`, and its own row in `torrents` can be
+    reported `missing_on_disk` like any other claim. None of this touches what may ever be
+    deleted -- `core.disk_review.is_authorized_delete_target` still receives the same resolved
+    excluded-path set and still refuses everything under it, unconditionally.
+
+    `torrents` and `clients` are new the same day -- see `DiskReviewTorrentOut`/`DiskReviewClientOut`
+    's own docstrings. `total_debris_bytes` is the naive sum-of-sizes (every candidate,
+    unselected) -- the link-aware total for an actual *selection* is a client-side computation
+    (`freed_bytes` in `core/disk_review.py`, mirrored in the frontend) since selection is never
+    persisted server-side at this stage.
     """
 
     debris: list[DiskReviewDebrisOut] = Field(default_factory=list)
     seeding_estate: list[DiskReviewSeedingEstateOut] = Field(default_factory=list)
-    broken_seeds: list[DiskReviewBrokenSeedOut] = Field(default_factory=list)
     skipped_base_paths: list[DiskReviewSkippedBasePathOut] = Field(default_factory=list)
     # 2026-08-23, finding #17 -- see `DiskReviewUnclaimedOut`'s own docstring for how this differs
     # from `skipped_base_paths` above, and why it replaced the earlier bare-count field.
     unclaimed: list[DiskReviewUnclaimedOut] = Field(default_factory=list)
+    # The fourth pile, 2026-08-24 (this task) -- see `DiskReviewExcludedContentOut`'s own
+    # docstring.
+    excluded_content: list[DiskReviewExcludedContentOut] = Field(default_factory=list)
+    # One row per claim, 2026-08-24 (this task) -- see `DiskReviewTorrentOut`'s own docstring.
+    # Supersedes the retired `broken_seeds` field entirely.
+    torrents: list[DiskReviewTorrentOut] = Field(default_factory=list)
+    # The per-client roster, 2026-08-24 (this task) -- see `DiskReviewClientOut`'s own docstring.
+    clients: list[DiskReviewClientOut] = Field(default_factory=list)
     client_failures: list[DiskReviewClientFailureOut] = Field(default_factory=list)
     scanned_at: str
 

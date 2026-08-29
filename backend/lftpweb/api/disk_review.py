@@ -21,12 +21,14 @@ from lftpweb.core.crypto import decrypt_secret
 from lftpweb.core.disk_review import run_scan
 from lftpweb.core.engine import load_host_config
 from lftpweb.models import (
-    DiskReviewBrokenSeedOut,
     DiskReviewClientFailureOut,
+    DiskReviewClientOut,
     DiskReviewDebrisOut,
+    DiskReviewExcludedContentOut,
     DiskReviewScanResponse,
     DiskReviewSeedingEstateOut,
     DiskReviewSkippedBasePathOut,
+    DiskReviewTorrentOut,
     DiskReviewUnclaimedOut,
 )
 
@@ -94,18 +96,54 @@ async def scan_for_review(request: Request) -> DiskReviewScanResponse:
                 claimed_transfer_id=s.claimed_transfer_id,
                 claimed_transfer_name=s.claimed_transfer_name,
                 claimed_content_path=s.claimed_content_path,
+                attribution=s.attribution,
+                claim_key=s.claim_key,
             )
             for s in result.seeding_estate
         ],
-        broken_seeds=[
-            DiskReviewBrokenSeedOut(
-                client_id=b.client_id,
-                client_name=b.client_name,
-                transfer_id=b.transfer_id,
-                transfer_name=b.transfer_name,
-                content_path=b.content_path,
+        excluded_content=[
+            DiskReviewExcludedContentOut(
+                root=e.root,
+                rel_path=e.rel_path,
+                abs_path=e.abs_path,
+                size=e.size,
+                excluded_path=e.excluded_path,
+                link_paths=list(e.link_paths),
             )
-            for b in result.broken_seeds
+            for e in result.excluded_content
+        ],
+        torrents=[
+            DiskReviewTorrentOut(
+                client_id=t.client_id,
+                transfer_id=t.transfer_id,
+                transfer_name=t.transfer_name,
+                content_path=t.content_path,
+                category=t.category,
+                attribution=t.attribution,
+                size_bytes=t.size_bytes,
+                uploaded_bytes=t.uploaded_bytes,
+                ratio=t.ratio,
+                seed_time_s=t.seed_time_s,
+                added_at=t.added_at,
+                raw_status=t.raw_status,
+                phase=t.phase,
+                file_count=t.file_count,
+                size_on_disk=t.size_on_disk,
+                missing_on_disk=t.missing_on_disk,
+                claim_key=t.claim_key,
+            )
+            for t in result.torrents
+        ],
+        clients=[
+            DiskReviewClientOut(
+                client_id=c.client_id,
+                name=c.client_name,
+                client_type=c.client_type,
+                reachable=c.reachable,
+                failure_reason=c.failure_reason,
+                capabilities=c.capabilities,
+            )
+            for c in outcome.clients
         ],
         skipped_base_paths=[
             DiskReviewSkippedBasePathOut(root=s.root, reason=s.reason)
