@@ -472,5 +472,20 @@ def item_view(row: Mapping[str, Any]) -> ItemView:
         # this item to a bound *arr instance's queue.
         "arr_status": _optional(row, "arr_status"),
         "arr_status_at": _optional(row, "arr_status_at"),
+        # `download_client.name`/`client_type`, joined via `item.download_client_id` (migration
+        # 033, 2026-08-30) -- the same `_optional` shape `deleted_archive_at` above uses, for the
+        # identical reason: only the two callers that add `LEFT JOIN download_client`
+        # (`core/engine.py._project`, `api/files.py.get_files`) ever have these keys on `row` at
+        # all, so every other caller of this projection (a bare `SELECT * FROM item`, or this
+        # file's own test fixtures) must read `None` rather than `KeyError`. `None` for both
+        # whenever the item has no recorded client -- every item downloaded before migration 033
+        # shipped, or one the poller hasn't matched a transfer's own path to yet
+        # (`core/clientsync.py._write_client_attribution`'s own docstring). `client_instance_kind`
+        # is the connector registry key (`'sabnzbd'`/`'rtorrent'`), the identical name and shape
+        # `JobOut`/`HistoryJobOut` already carry (`core/queue.py.list_jobs`'s own docstring) --
+        # mirrored here rather than invented a third time, so `components/LifecycleIcons.tsx.
+        # ClientBrandMark` reads one field name regardless of which surface rendered it.
+        "client_instance_name": _optional(row, "client_instance_name"),
+        "client_instance_kind": _optional(row, "client_instance_kind"),
         "facets": _lifecycle_facets(row),
     }

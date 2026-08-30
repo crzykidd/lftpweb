@@ -653,6 +653,8 @@ function fileNode(rel_path: string, overrides: Partial<FileNode> = {}): FileNode
     deleted_archive_at: null,
     arr_status: null,
     arr_status_at: null,
+    client_instance_name: null,
+    client_instance_kind: null,
     facets: DIM_FACETS,
     ...overrides,
   }

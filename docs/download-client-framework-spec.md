@@ -815,6 +815,30 @@ path data from verbatim, ships neither a `sabnzbd` nor an `rtorrent` mark (check
 against the dataset for this task). The chip is therefore always the same text-fallback treatment
 this project already uses for an unrecognized *arr `kind`, never an invented or approximated logo.
 
+**Extended to Preflight and the Files tree the same day** (`prompts/2026-08-30-client-chip-on-
+files-tree.md`), from the user's own follow-up report: *"I don't see the SAB tag in the list on
+preflight, but I do see it in active/pending... we should show the chip for SAB in all if it was a
+SAB process."* Three surfaces now draw this chip, and each resolves `client_instance_kind`
+differently, on purpose:
+
+- **Transfers/History** — `client_instance_name`/`client_instance_kind` on `JobOut`/
+  `HistoryJobOut` directly, as this section describes.
+- **Preflight** (`PreflightBox.tsx.Badge`) — was already drawing a badge per row source (§8.3's
+  own *arr/client merge); this task only changes *which label* a client-sourced badge shows, from
+  the instance's free-text configured name to `lib/clientBrandMark.clientBrandLabel` — the
+  identical function and short label (`'SAB'`/`'rT'`) the row-line chip uses — gated on
+  `badge.source === 'client'` so an *arr badge is never affected. The configured instance name
+  survives as the hover `title`, unchanged.
+- **Files tree** (`FileTree.tsx`) — the one surface with no such field until now:
+  `item.download_client_id` joined to `download_client.name`/`client_type` in `core/itemview.py.
+  item_view`, the identical `client_instance_name`/`client_instance_kind` names and shape, added
+  to `FileNode`. **Resolved differently from the *arr chip on the same row, deliberately**: the
+  *arr *kind* isn't a per-item fact (`FileNode` carries only `arr_status`/`arr_status_at`), so
+  `FilesPage.tsx` resolves it from the item's *queue* binding and threads it down as a prop
+  (§16's own precedent). The download-client kind *is* a per-item fact already sitting on the
+  node, so `FileTree.tsx` reads it straight off `entry` — no prop, no queue-level resolution step.
+  Recorded in `docs/decisions.md` so a future reader does not "unify" the two into one shape.
+
 ---
 
 ## 9. Polling

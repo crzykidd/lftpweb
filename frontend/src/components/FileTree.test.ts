@@ -73,6 +73,8 @@ function node(rel_path: string, is_dir: boolean, overrides: Partial<FileNode> = 
     deleted_archive_at: null,
     arr_status: null,
     arr_status_at: null,
+    client_instance_name: null,
+    client_instance_kind: null,
     facets: DIM,
     ...overrides,
   }

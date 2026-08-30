@@ -776,6 +776,16 @@ class FileNode(BaseModel):
     # comment in migration 018 ("not published in the item projection").
     arr_status: str | None = None
     arr_status_at: str | None = None
+    # Which download client fetched this item (2026-08-30, prompts/2026-08-30-client-chip-on-
+    # files-tree.md, migration 033): `download_client.name`/`client_type`, joined via `item.
+    # download_client_id` the same way `arr_status` above joins `arr_instance` -- the identical
+    # `client_instance_name`/`client_instance_kind` field names `JobOut`/`HistoryJobOut` already
+    # carry (`core/queue.py.list_jobs`'s own docstring), read here straight off the item rather
+    # than resolved from a queue binding. `None` for both whenever this item has no recorded
+    # client: every item downloaded before migration 033 shipped, or one the poller hasn't
+    # matched a transfer's own path to yet.
+    client_instance_name: str | None = None
+    client_instance_kind: str | None = None
     facets: LifecycleFacets
 
 

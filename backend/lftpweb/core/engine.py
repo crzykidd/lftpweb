@@ -1748,6 +1748,16 @@ class Engine:
         Files page can tell a spent, on-purpose-removed archive volume (`EXCLUDED` for this
         reason) apart from an ordinary pattern-`EXCLUDED` file and render it as a greyed-out
         "Extracted" chip.
+
+        **`LEFT JOIN download_client`** (2026-08-30, `prompts/2026-08-30-client-chip-on-files-
+        tree.md`, migration 033): `download_client.name`/`client_type` via `item.
+        download_client_id`, the identical shape `core/queue.py.list_jobs`/`list_complete_jobs`
+        already join for `JobOut.client_instance_name`/`client_instance_kind` -- so the Files
+        tree's `ClientBrandMark` chip (`FileTree.tsx`) reads the same two field names Transfers
+        and Preflight already do. `download_client`'s primary key is its own `id`, so this is a
+        third per-row indexed lookup alongside `item_settle`/`deleted_archive` above, not a
+        second table scan -- no fresh measurement warranted for the same reason three more
+        settle columns didn't need one.
         """
         cursor = await self.db.execute(
             f"SELECT {ITEM_VIEW_COLUMNS_QUALIFIED}, "  # noqa: S608 - a module constant, not user input
@@ -1756,12 +1766,15 @@ class Engine:
             "settle.total_bytes AS settle_total_bytes, "
             "settle.first_observed_at AS settle_first_observed_at, "
             "settle.last_changed_at AS settle_last_changed_at, "
-            "deleted_archive.deleted_at AS deleted_archive_at "
+            "deleted_archive.deleted_at AS deleted_archive_at, "
+            "download_client.name AS client_instance_name, "
+            "download_client.client_type AS client_instance_kind "
             "FROM item "
             "LEFT JOIN item_settle AS settle "
             "ON settle.queue_id = item.queue_id AND settle.rel_path = item.rel_path "
             "LEFT JOIN deleted_archive "
             "ON deleted_archive.queue_id = item.queue_id AND deleted_archive.rel_path = item.rel_path "
+            "LEFT JOIN download_client ON download_client.id = item.download_client_id "
             "WHERE item.queue_id = ?",
             (queue_id,),
         )

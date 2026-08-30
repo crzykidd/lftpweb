@@ -42,6 +42,10 @@ async def get_files(request: Request) -> FilesResponse:
         # `LEFT JOIN deleted_archive` (2026-08-14,
         # prompts/2026-08-14-extracted-archives-rest-as-extracted.md): same reasoning again,
         # this endpoint and `_project` must agree on `deleted_archive_at` too.
+        # `LEFT JOIN download_client` (2026-08-30, prompts/2026-08-30-client-chip-on-files-
+        # tree.md, migration 033): same reasoning again -- this endpoint and `_project` must
+        # agree on `client_instance_name`/`client_instance_kind` too, the identical field names
+        # `JobOut`/`HistoryJobOut` already carry for the Transfers/History row chip.
         cursor = await db.execute(
             f"SELECT {ITEM_VIEW_COLUMNS_QUALIFIED}, "  # noqa: S608 - a module constant, not user input
             "settle.matched_scans AS settle_matched_scans, "
@@ -49,12 +53,15 @@ async def get_files(request: Request) -> FilesResponse:
             "settle.total_bytes AS settle_total_bytes, "
             "settle.first_observed_at AS settle_first_observed_at, "
             "settle.last_changed_at AS settle_last_changed_at, "
-            "deleted_archive.deleted_at AS deleted_archive_at "
+            "deleted_archive.deleted_at AS deleted_archive_at, "
+            "download_client.name AS client_instance_name, "
+            "download_client.client_type AS client_instance_kind "
             "FROM item "
             "LEFT JOIN item_settle AS settle "
             "ON settle.queue_id = item.queue_id AND settle.rel_path = item.rel_path "
             "LEFT JOIN deleted_archive "
             "ON deleted_archive.queue_id = item.queue_id AND deleted_archive.rel_path = item.rel_path "
+            "LEFT JOIN download_client ON download_client.id = item.download_client_id "
             "WHERE item.queue_id = ? ORDER BY item.rel_path",
             (queue_id,),
         )

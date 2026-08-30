@@ -913,6 +913,18 @@ export interface FileNode {
   // degrades an unrecognized one to the neutral icon rather than rendering nothing.
   arr_status: string | null
   arr_status_at: string | null
+  // Which download client fetched this item (2026-08-30, prompts/2026-08-30-client-chip-on-
+  // files-tree.md, migration 033): `download_client.name`/`client_type`, joined via `item.
+  // download_client_id` the same way `arr_status` above joins `arr_instance` -- the identical
+  // `client_instance_name`/`client_instance_kind` field names `JobOut`/`HistoryJobOut` already
+  // carry for the Transfers/History row chip (`components/LifecycleIcons.tsx.ClientBrandMark`).
+  // Unlike `arr_status`, this arrives per-item straight off this node -- there is no queue-level
+  // resolution step the way the *arr *kind* needs (`FileTree.tsx`'s own `ArrRowChip` call site
+  // comment explains why that one is different). null for both whenever this item has no
+  // recorded client: every item downloaded before migration 033 shipped, or one the poller
+  // hasn't matched a transfer's own path to yet.
+  client_instance_name: string | null
+  client_instance_kind: string | null
   facets: LifecycleFacets
 }
 

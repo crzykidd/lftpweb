@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { getSettleSettings } from '../api/client'
 import type { PreflightResponse, PreflightRowOut, SettleSettingsOut } from '../api/types'
+import { clientBrandLabel } from '../lib/clientBrandMark'
 import { clientEditHref } from '../lib/clientEditLink'
 import { pageCount, pageReadout, paginateClientSide } from '../lib/pagination'
 import {
@@ -26,22 +27,37 @@ import { Pager } from './Pager'
 import { PageSizeSelect } from './PageSizeSelect'
 import { StateChip } from './StateChip'
 
-/** One badge -- the real Sonarr/Radarr logo for a recognized *arr `source_kind`; a plain text
- * chip using the source's own `source_label` for anything else (a client's own `'sabnzbd'`/
- * `'rtorrent'` today, which this codebase has no brand mark for yet, or an *arr kind this
- * codebase hasn't verified). Never gated on `source === 'arr'` any more -- see `SourceBadges`
- * below for why.
+/** One badge -- the real Sonarr/Radarr logo for a recognized *arr `source_kind`; the download
+ * client's own short chip (`SAB`/`rT`) for a client row; the source's own `source_label` for
+ * anything else (an *arr kind this codebase hasn't verified). Never gated on `source === 'arr'`
+ * any more -- see `SourceBadges` below for why.
+ *
+ * **The client chip is `lib/clientBrandMark.clientBrandLabel`, the identical function the
+ * Transfers/History row line's own `ClientBrandMark` uses** (2026-08-30, the same day that
+ * component shipped -- user's own report: "I don't see the SAB tag in the list on preflight, but
+ * I do see it in active/pending... we should show the chip for SAB in all if it was a SAB
+ * process"). Preflight previously drew the *instance's configured name* here, which is the same
+ * fact rendered two different ways on two surfaces a few pixels apart. The configured name is
+ * not lost -- it stays as the hover `title`, exactly as it was.
+ *
+ * **Gated on `badge.source`, not on `source_kind`.** A client row is the only case that should
+ * get a client-shaped label; an unrecognized/future *arr kind must keep falling through to its
+ * own instance-name chip rather than being truncated to three characters by
+ * `clientBrandLabel`'s own fallback, which is written for client kinds and would be wrong here.
+ * Same "one visual language everywhere" instinct that unified `ArrRowChip` across Files,
+ * Transfers and History (2026-08-16).
  */
 function Badge({ badge }: { badge: PreflightBadge }) {
   if (badge.source_kind === 'sonarr' || badge.source_kind === 'radarr') {
     return <ArrBrandMark kind={badge.source_kind} title={badge.source_label} />
   }
+  const clientLabel = badge.source === 'client' ? clientBrandLabel(badge.source_kind) : null
   return (
     <span
       className="shrink-0 rounded-full bg-zinc-100 px-1.5 py-0.5 text-[10px] font-medium text-zinc-500 dark:bg-zinc-800 dark:text-zinc-400"
       title={badge.source_label}
     >
-      {badge.source_label}
+      {clientLabel ?? badge.source_label}
     </span>
   )
 }

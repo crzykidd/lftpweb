@@ -268,7 +268,11 @@ async def test_scan_delta_is_small_and_exact_regardless_of_tree_size(tmp_path, m
     # was for. Bumped again, 3700->3900 (2026-08-15, migration 018, docs/arr-integration-
     # spec.md): every changed node now also carries `arr_status`/`arr_status_at`, two more
     # `null` keys per node -- same fixed, not-`n`-scaling reasoning as every prior bump here.
-    assert len(json.dumps(delta)) < 3900
+    # Bumped again, 3900->4200 (2026-08-30, prompts/2026-08-30-client-chip-on-files-tree.md,
+    # migration 033): every changed node now also carries `client_instance_name`/
+    # `client_instance_kind`, two more `null` keys per node -- same fixed, not-`n`-scaling
+    # reasoning as every prior bump here.
+    assert len(json.dumps(delta)) < 4200
 
 
 async def test_scan_delta_payload_does_not_scale_with_tree_size(tmp_path, monkeypatch):
@@ -467,8 +471,10 @@ async def test_published_state_is_the_persisted_state_not_the_structural_one(
         # `core/download_prefix.py`): one more `null` key per node (`pending_download_prefix`),
         # same fixed, not-tree-size-scaling reasoning as every prior bump here. Bumped again,
         # 2900->3000 (2026-08-15, migration 018, docs/arr-integration-spec.md): two more `null`
-        # keys per node (`arr_status`/`arr_status_at`), same reasoning.
-        assert len(json.dumps(delta)) < 3000, "the delta must stay proportional to what changed"
+        # keys per node (`arr_status`/`arr_status_at`), same reasoning. Bumped again, 3000->3300
+        # (2026-08-30, prompts/2026-08-30-client-chip-on-files-tree.md, migration 033): two more
+        # `null` keys per node (`client_instance_name`/`client_instance_kind`), same reasoning.
+        assert len(json.dumps(delta)) < 3300, "the delta must stay proportional to what changed"
 
         # ...and the connect-time snapshot -- the reload path, which is how this bug was
         # actually visible to a user -- agrees with the database for every node, not just the

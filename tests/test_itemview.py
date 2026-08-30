@@ -373,6 +373,26 @@ def test_item_view_deleted_archive_at_is_not_gated_on_substate():
     assert item_view(row)["deleted_archive_at"] == "2026-08-14T22:03:25.000000Z"
 
 
+# --- client_instance_name / client_instance_kind (migration 033, 2026-08-30, --------------------
+# prompts/2026-08-30-client-chip-on-files-tree.md) -- same `_optional`-via-LEFT-JOIN shape as
+# `deleted_archive_at` above, not a plain `item` column like `arr_status`.
+
+
+def test_item_view_client_instance_defaults_none_when_row_lacks_it():
+    # `_row()`'s base dict has no `client_instance_name`/`client_instance_kind` columns at all --
+    # the exact shape of a bare `SELECT * FROM item` row, which never joins `download_client`.
+    view = item_view(_row())
+    assert view["client_instance_name"] is None
+    assert view["client_instance_kind"] is None
+
+
+def test_item_view_passes_client_instance_through_verbatim():
+    row = _row(client_instance_name="My SABnzbd", client_instance_kind="sabnzbd")
+    view = item_view(row)
+    assert view["client_instance_name"] == "My SABnzbd"
+    assert view["client_instance_kind"] == "sabnzbd"
+
+
 def test_item_view_settle_fields_are_none_when_not_settling_even_if_the_row_has_them():
     # `core/engine.py._persist` keeps advancing `item_settle` for a top-level item on every scan
     # for as long as its fingerprint keeps matching -- including long after it finished

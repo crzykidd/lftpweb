@@ -24,7 +24,7 @@ import {
 } from '../lib/format'
 import { placePopover, POPOVER_EDGE_MARGIN_PX } from '../lib/popoverPosition'
 import { readLocalStorage, writeLocalStorage } from '../lib/storage'
-import { ArrRowChip, DetailButton, LifecycleIcons } from './LifecycleIcons'
+import { ArrRowChip, ClientBrandMark, DetailButton, LifecycleIcons } from './LifecycleIcons'
 import { ItemDrawer } from './ItemDrawer'
 import { StateChip } from './StateChip'
 // Pure tree/sort/collapse/facet/column-width logic, extracted to a plain module (audit P1) --
@@ -915,6 +915,36 @@ function Row({
           arrStatusAt={entry.arr_status_at}
           instanceName={arrInstanceName}
           instanceKind={arrInstanceKind}
+        />
+      </span>
+      {/* Which download client fetched this item (2026-08-30, prompts/2026-08-30-client-chip-on-
+          files-tree.md, migration 033) -- same `ClientBrandMark` chip Transfers/History and
+          Preflight already draw, right beside the *arr chip, same render order as those two
+          surfaces (`TransfersPage.tsx`'s `Row`). Renders nothing when this item has no recorded
+          client (`entry.client_instance_kind === null`, `ClientBrandMark`'s own "no data, no
+          mark" rule).
+
+          **Deliberately NOT threaded as a prop the way `arrInstanceName`/`arrInstanceKind` are.**
+          Those two are resolved from the item's *queue* binding (`path_queue.arr_instance_id`)
+          because `FileNode` carries no *arr *kind* of its own -- see `ArrRowChip`'s call site
+          comment just above. `client_instance_name`/`client_instance_kind` are different: they
+          are per-item facts already sitting on `entry` itself, straight off the wire
+          (`core/itemview.py.item_view`), so this reads them directly. Do not "unify" this with
+          the *arr prop-threading shape above -- there is no queue-level resolution step here to
+          replicate.
+
+          Own fixed-width column (`fixedColumnStyle('client')`, `lib/fileTree.ts.
+          RESIZABLE_COLUMNS`), not shared with the 44px 'arr' column above -- two independently-
+          sized badges sharing one box sized for one is the same "invisible to jsdom, real on
+          screen" layout trap this component's other virtualized-row bugs came from (DESIGN.md
+          §17: "two separate bugs in this feature were pure layout problems invisible to every
+          test in the repo"); a dedicated column can't crush its neighbor and doesn't change row
+          height, so the virtualizer's row-size estimate stays correct. Layout itself is untested
+          here for the same reason -- jsdom performs no layout at all. */}
+      <span className="flex shrink-0 justify-end overflow-hidden" style={fixedColumnStyle('client')}>
+        <ClientBrandMark
+          instanceName={entry.client_instance_name}
+          instanceKind={entry.client_instance_kind}
         />
       </span>
       {/* Lifecycle icons (2026-08-13): R/L/V/E, one glyph per `entry.facets`

@@ -650,7 +650,7 @@ export interface ColumnDef {
   title?: string
 }
 
-/** The five (now six) fixed-width columns, in render order. Name is not here -- it flexes and
+/** The five (now seven) fixed-width columns, in render order. Name is not here -- it flexes and
  * absorbs whatever space these don't claim, which is also why only these get a drag handle. */
 export const RESIZABLE_COLUMNS: ColumnDef[] = [
   { id: 'size', label: 'Size', defaultWidth: 96, minWidth: 56, align: 'right', sortKey: 'size' },
@@ -671,6 +671,23 @@ export const RESIZABLE_COLUMNS: ColumnDef[] = [
     minWidth: 36,
     align: 'right',
     title: 'Sonarr/Radarr integration status, if this queue is bound to an instance',
+  },
+  // The download-client chip (2026-08-30, prompts/2026-08-30-client-chip-on-files-tree.md,
+  // migration 033) -- its own column rather than sharing the 44px-wide 'arr' column above.
+  // `ArrTextChip`'s fallback and `ClientBrandMark` are each a short text pill on their own, and
+  // this project's only virtualized list (`@tanstack/react-virtual`, `FileTree.tsx`) has already
+  // produced two pure-layout bugs invisible to jsdom (DESIGN.md §17: "two separate bugs in this
+  // feature were pure layout problems invisible to every test in the repo") -- cramming two
+  // independently-sized badges into one fixed-width box, sized for one, is exactly that shape of
+  // bug. A dedicated column costs nothing (`RESIZABLE_COLUMNS` already drives the header, drag
+  // handle, and saved-width persistence for every entry here) and can't crush its neighbor.
+  {
+    id: 'client',
+    label: 'Client',
+    defaultWidth: 44,
+    minWidth: 36,
+    align: 'right',
+    title: 'Which download client fetched this item, if recorded',
   },
   { id: 'lifecycle', label: 'R L V E', defaultWidth: 80, minWidth: 68, align: 'right' },
   { id: 'changed', label: 'Changed', defaultWidth: 128, minWidth: 72, align: 'right', sortKey: 'state_changed_at' },

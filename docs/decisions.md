@@ -6,6 +6,45 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-30 — the Files tree reads the download client per-item off the wire; the *arr kind stays queue-resolved, and the two are not unified
+
+`prompts/2026-08-30-client-chip-on-files-tree.md`. The user's own ask, a same-day follow-up to the
+Transfers/History row icon above: *"We should show the chip for SAB in all if it was a SAB
+process."* The Files tree (`FileTree.tsx`) already draws an *arr chip (`ArrRowChip`) beside the
+state chip, and it would have been natural to give the new download-client chip
+(`ClientBrandMark`) the identical shape: thread `instanceKind` down from `FilesPage.tsx` as a
+prop, the way `arrInstanceName`/`arrInstanceKind` already are. **Rejected, on purpose, and named
+directly in this task's own handoff prompt as the trap most likely to be walked into by analogy.**
+
+The two fields are not the same kind of fact. `FileNode` has never carried an *arr *kind* of its
+own — only `arr_status`/`arr_status_at`, which record the *arr's per-item verdict, not which
+Sonarr/Radarr *instance* produced it. Which instance is bound is a fact about the *queue*
+(`path_queue.arr_instance_id`), so `FilesPage.tsx` has to resolve it separately (`GET
+/api/settings/arr`) and hand it down. The download-client kind has no such indirection to
+replicate: `item.download_client_id` is a column on the item itself (migration 033), already
+joined to `download_client.name`/`client_type` and published on the wire as
+`client_instance_name`/`client_instance_kind` — the identical field names `JobOut`/`HistoryJobOut`
+already carry for the Transfers/History chip (`core/queue.py.list_jobs`'s own docstring), now also
+joined in `core/itemview.py.item_view` via the two callers that already add extra `LEFT JOIN`s
+(`core/engine.py._project`, `api/files.py.get_files`) — the identical `_optional`-on-a-join shape
+`deleted_archive_at` already established, not the plain-column shape `arr_status` uses. Threading
+a prop for a fact `entry` already carries would be adding indirection to solve a problem that does
+not exist here; `FileTree.tsx` reads `entry.client_instance_name`/`entry.client_instance_kind`
+directly and `FilesPage.tsx` is untouched by this task.
+
+**A dedicated `'client'` column, not a shared box with `'arr'`.** The 44px-wide `'arr'` column
+(`lib/fileTree.ts.RESIZABLE_COLUMNS`) was sized for exactly one short badge. Cramming a second
+independently-sized chip into the same fixed-width, `overflow-hidden` span would silently clip on
+a real screen while every test still passed — jsdom performs no layout at all, and this exact
+component has already produced two such bugs (an `overflow-hidden` wrapper clipping a wide row, a
+`w-full` crushing a sibling chip; DESIGN.md §17: "two separate bugs in this feature were pure
+layout problems invisible to every test in the repo"). A second `RESIZABLE_COLUMNS` entry costs
+nothing — the header, drag handle, and saved-width persistence are already driven generically off
+that list for every entry in it — and can't crush its neighbor. Untested for layout for the same
+jsdom reason every other chip on this row is.
+
+---
+
 ## 2026-08-30 — persist which client fetched an item, forward-only; a kind→label switch is not the client-name branching rule
 
 `prompts/2026-08-30-downloader-icon-on-rows.md`, migration 033. The user's own ask: *"add another

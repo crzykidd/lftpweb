@@ -3875,3 +3875,17 @@ existing precedent this one follows. **No brand logo**: simple-icons, the CC0 da
 (checked directly against the dataset for this task) — so the chip is `ArrTextChip`'s own
 text-fallback treatment (`SAB`/`rT`, or a truncated-and-uppercased fallback for an unrecognized
 future kind), never an invented or approximated logo.
+
+**Extended to Preflight and the Files tree, same day** (`prompts/2026-08-30-client-chip-on-files-
+tree.md`) — the user's own follow-up: *"we should show the chip for SAB in all if it was a SAB
+process."* Preflight's `Badge` already drew a per-source badge; this only swaps a client-sourced
+row's label from the instance's free-text name to `clientBrandLabel`'s short form, matching the
+row-line chip (the name survives as hover text). The Files tree had no client field on `FileNode`
+at all — `core/itemview.py.item_view` now joins `item.download_client_id -> download_client.name`/
+`client_type` the same way `core/queue.py` already does for `JobOut`, publishing the identical
+`client_instance_name`/`client_instance_kind` names, and `FileTree.tsx` draws `ClientBrandMark`
+beside `ArrRowChip` in its own resizable column. **Read straight off the node, not threaded as a
+prop the way the *arr chip's `instanceKind` is** — that one has to be, since `FileNode` has no
+*arr *kind* of its own and `FilesPage.tsx` resolves it from the item's queue binding; the
+download-client kind is already a per-item fact on the wire, so there is no resolution step to
+replicate. `docs/decisions.md` records why the two stay different shapes on purpose.
