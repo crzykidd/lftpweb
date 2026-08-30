@@ -198,6 +198,14 @@ def _job_out(row: dict, *, include_output_tail: bool = True) -> JobOut:
         arr_status_at=row["arr_status_at"],
         arr_instance_name=row["arr_instance_name"],
         arr_instance_kind=row["arr_instance_kind"],
+        # 2026-08-30 (prompts/2026-08-30-downloader-icon-on-rows.md, migration 033): `item.
+        # download_client_id` resolved to the bound instance's own `name`/`client_type`, the
+        # identical `LEFT JOIN download_client` shape `core/queue.py.list_jobs`/`list_complete_
+        # jobs` already carry for `arr_instance_name`/`kind` just above. Always projected (`NULL`
+        # when the item has no recorded client), never absent from the row, so plain `row[...]` is
+        # safe here too -- see that comment's own reasoning.
+        client_instance_name=row["client_instance_name"],
+        client_instance_kind=row["client_instance_kind"],
         # 2026-08-20 (docs/transfers-redesign-spec.md §3.2's pipeline-completion rule): the
         # server-computed box assignment and its reason (`core/pipeline_flight.py`), projected by
         # both listing queries under these exact aliases. `.get`, not `row[...]`: `_job_out` is

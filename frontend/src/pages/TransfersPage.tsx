@@ -17,7 +17,7 @@ import {
 } from '../api/client'
 import type { MoveDirection } from '../api/client'
 import type { FileNode, ItemEventOut, JobOut } from '../api/types'
-import { ArrIcon, ArrRowChip } from '../components/LifecycleIcons'
+import { ArrIcon, ArrRowChip, ClientBrandMark } from '../components/LifecycleIcons'
 import { BandwidthControl } from '../components/BandwidthControl'
 import { DismissMenu } from '../components/DismissMenu'
 import { ItemDrawer } from '../components/ItemDrawer'
@@ -305,6 +305,15 @@ function Row({
           arrStatusAt={job.arr_status_at}
           instanceName={job.arr_instance_name}
           instanceKind={job.arr_instance_kind}
+        />
+        {/* Which download client fetched this item (2026-08-30,
+         * prompts/2026-08-30-downloader-icon-on-rows.md, migration 033) -- right beside the *arr
+         * chip, same compact cluster; renders nothing when this item has no recorded client
+         * (`job.client_instance_kind === null`, `components/LifecycleIcons.tsx.ClientBrandMark`'s
+         * own "no data, no mark" rule). */}
+        <ClientBrandMark
+          instanceName={job.client_instance_name}
+          instanceKind={job.client_instance_kind}
         />
         {/* Completed time (2026-08-16, user report from live use): "each terminal row should
          * show when it completed" -- compact relative form, exact timestamp on hover, same

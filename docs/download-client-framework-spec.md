@@ -760,6 +760,61 @@ correction touches:**
    items suppressed," never "N base paths skipped." The root is still walked; only debris
    proposals for its unclaimed remainder are narrowed.
 
+### 8.4 Which client fetched an item — persisted forward-only, drawn as a row icon
+
+2026-08-30 (`prompts/2026-08-30-downloader-icon-on-rows.md`, migration 033): the user's own ask —
+*"add another icon to the list, right next to the ARR icon... the SAB or rtorrent icon based on
+what downloader was used."* The match already existed, computed and thrown away every pass:
+`core/settle.py.find_client_completion`'s own `content_path`↔item-remote-path component-boundary
+check (§8.3's own path-attribution rule), run by `core/autoqueue.py.on_scan` purely to decide
+whether to skip the settle wait. This task persists it as a fact about the item, not merely a
+transient signal for one gate: `item.download_client_id`/`download_client_matched_at`, joined into
+`JobOut`/`HistoryJobOut` the identical way `item.arr_status` already joins `arr_instance` (§8.1's
+own precedent) and drawn as a small `ClientBrandMark` chip beside the existing *arr chip.
+
+**Written from `core/clientsync.py.ClientSyncScheduler._update_preflight`, and from nowhere
+else.** `find_client_completion`/`find_client_failure`'s only real callers
+(`core/autoqueue.py.on_scan`) run behind `SettleSettings.client_skip_enabled` and
+`WithholdSettings.enabled` — both off for some installs (§14, §17.8). Writing attribution from
+either path would make the row icon's mere *presence* silently depend on a setting that has
+nothing to do with it — this is the one mistake this task's own handoff prompt names directly as
+the most likely to be made here. `_update_preflight` is the one call in this whole subsystem that
+runs unconditionally on every successful poll pass, so it is the only place this can be written
+from and still be true for every install regardless of what the user has switched off.
+
+**Item-level, not queue-level — a new pass over the same data, not a new matching notion.**
+§8.3's path attribution already resolves a transfer to a *queue*; this adds a second pass, over
+the same `transfers` list, against every `item` row under an enabled queue not already attributed
+to *this* instance, reusing the identical `_client_content_path_matches` component-boundary rule.
+A transfer with no `content_path` can only ever identify a queue (via the category mapping, when
+one exists) — never a specific item inside it — so a category-only transfer writes nothing,
+silently, the same "no information, no write" instinct every other attribution path in this spec
+already follows. An item that doesn't exist yet (not yet discovered by a remote scan) is equally
+silent this pass; a later pass, once the item exists, catches it — there is nothing to retry or
+remember having tried.
+
+**Write once and leave it.** An item already attributed to *this* instance is excluded from the
+candidate query outright, so a quiet repeat match issues no write and `download_client_matched_at`
+never drifts on an unchanged pass. An item currently attributed to a *different* instance (or
+never attributed) remains a candidate and IS overwritten on a fresh match — a release genuinely
+re-fetched by a different client is a real fact worth recording, not noise to suppress.
+
+**Forward-only, by explicit, informed user decision — no backfill.** The alternative considered
+and rejected was resolving this live, at *read* time, from the poller's own in-memory transfer
+cache instead of persisting it: rejected because both connectors age old jobs out of their own
+history/queue (§9.1), which would make a History row's icon silently vanish the moment the client
+forgets a job lftpweb still remembers forever. Persisting once means the icon is either right or
+absent — never flickering. Every item downloaded before migration 033 shipped has no recorded
+client and never will; see `docs/decisions.md`.
+
+**`client_instance_kind` choosing the chip's label is a display switch, not the client-name
+branching §4.4/§5.1 forbid.** That rule governs *behaviour* only — capability gating, field
+support, what gets sent over the wire — never which picture (or short text label) a row draws.
+**No brand logo**: simple-icons, the CC0 dataset this project's Sonarr/Radarr row-line marks copy
+path data from verbatim, ships neither a `sabnzbd` nor an `rtorrent` mark (checked directly
+against the dataset for this task). The chip is therefore always the same text-fallback treatment
+this project already uses for an unrecognized *arr `kind`, never an invented or approximated logo.
+
 ---
 
 ## 9. Polling

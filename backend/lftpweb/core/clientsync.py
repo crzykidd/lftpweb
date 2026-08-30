@@ -849,6 +849,92 @@ class ClientSyncScheduler:
         )
         return await cursor.fetchall()
 
+    # --- Which client fetched this item (migration 033, prompts/2026-08-30-downloader-icon-on-
+    # rows.md) -------------------------------------------------------------------------------
+
+    async def _write_client_attribution(
+        self, instance_id: int, transfers: list[Transfer], path_queues: list[aiosqlite.Row]
+    ) -> None:
+        """Persists `item.download_client_id`/`download_client_matched_at` (migration 033) so the
+        Transfers/History row's new `ClientBrandMark` (`components/LifecycleIcons.tsx`) can draw
+        the matching SAB/rTorrent icon beside the *arr chip, exactly the way `item.arr_status`
+        already drives `ArrRowChip` -- joined server-side (`core/queue.py.list_jobs`/
+        `list_complete_jobs`, `api/history.py.list_history_jobs`), never resolved client-side.
+
+        **The one rule this task's own handoff prompt names as the mistake most likely to be
+        made here: this must never be written from a path gated by a user-facing toggle.**
+        `core/settle.py.find_client_completion`/`find_client_failure` already do an almost
+        identical match, but their only callers (`core/autoqueue.py.on_scan`) are gated behind
+        `SettleSettings.client_skip_enabled` and `WithholdSettings.enabled` respectively -- both
+        off for some installs. Writing attribution from either path would make the icon's mere
+        *presence* silently depend on a setting that has nothing to do with it. `_update_preflight`
+        is the one call in this whole subsystem that runs unconditionally on every successful poll
+        pass, regardless of either toggle -- the only place this can be written from and still be
+        true for every install.
+
+        **Every transfer this pass reported, not just the Preflight-eligible-phase subset**
+        (`_PREFLIGHT_PHASES`, this method's caller's own loop below) -- a `SEEDING`/`COMPLETED`
+        transfer is exactly the case History's own row needs this for, and `_PREFLIGHT_PHASES`
+        excludes both by construction (a settled item has no more Preflight work to project).
+        Reuses this pass's own `path_queues` (`_enabled_queues`) rather than a second query --
+        the identical list `_update_preflight`'s own queue-level attribution already fetched.
+
+        **Path only -- the established match quality rule, never a third notion invented for this
+        task** (`core/settle.py._client_content_path_matches`, the identical component-boundary
+        rule `_update_preflight`'s own queue-level attribution reuses, imported once at module
+        scope). A transfer with no `content_path` can only ever identify a *queue* (via the
+        category mapping, when one exists) -- never a specific *item* inside it, so there is
+        nothing here to disambiguate which item in that queue the transfer is. A category-only
+        transfer writes nothing, silently, the same "no information, no write" instinct every
+        other attribution path in this module already follows. An item that does not exist yet
+        (not yet discovered by a remote scan) is equally silent this pass -- there is simply no
+        candidate row to match against; a later pass, once the item exists, catches it, and
+        nothing here needs to retry or remember that it tried.
+
+        **Write once and leave it** (this task's own explicit rule): the candidate query below
+        excludes any item already attributed to *this* instance, so a quiet repeat match issues no
+        `UPDATE` at all and `download_client_matched_at` never drifts on an unchanged pass. An item
+        currently attributed to a *different* instance (or never attributed at all) is still a
+        candidate and IS overwritten on a fresh match here -- a release genuinely re-fetched by a
+        different client is a real fact worth recording, not noise to suppress, and there is no
+        other signal available that could tell the two cases apart.
+        """
+        queue_remote_paths = {q["id"]: q["remote_path"] for q in path_queues if q["remote_path"]}
+        if not queue_remote_paths or not any(t.content_path for t in transfers):
+            return  # nothing here could possibly match an item -- skip the query entirely
+
+        placeholders = ",".join("?" for _ in queue_remote_paths)
+        cursor = await self.db.execute(
+            f"SELECT id, queue_id, rel_path FROM item WHERE queue_id IN ({placeholders}) "
+            "AND (download_client_id IS NULL OR download_client_id != ?)",
+            (*queue_remote_paths, instance_id),
+        )
+        candidates = await cursor.fetchall()
+        if not candidates:
+            return
+
+        now_iso = _now_iso()
+        matched_this_pass: set[int] = set()
+        for transfer in transfers:
+            if not transfer.content_path:
+                continue
+            for item in candidates:
+                if item["id"] in matched_this_pass:
+                    continue  # this pass already recorded this item for this instance
+                item_remote_path = (
+                    queue_remote_paths[item["queue_id"]].rstrip("/") + "/" + item["rel_path"]
+                )
+                if _client_content_path_matches(item_remote_path, transfer.content_path):
+                    await self.db.execute(
+                        "UPDATE item SET download_client_id = ?, download_client_matched_at = ? "
+                        "WHERE id = ?",
+                        (instance_id, now_iso, item["id"]),
+                    )
+                    matched_this_pass.add(item["id"])
+                    break
+        if matched_this_pass:
+            await self.db.commit()
+
     async def _update_preflight(
         self, instance: aiosqlite.Row, transfers: list[Transfer], now: float
     ) -> None:
@@ -916,6 +1002,17 @@ class ClientSyncScheduler:
         instance_id = instance["id"]
         category_map = await self._category_queue_map(instance_id)
         path_queues = await self._enabled_queues()
+
+        # Which client fetched this item (migration 033, this task's own handoff prompt,
+        # prompts/2026-08-30-downloader-icon-on-rows.md) -- see `_write_client_attribution`'s own
+        # docstring for why this is the one place in the whole subsystem this can be written from.
+        # Runs over every transfer this pass reported, independent of the Preflight-phase filter
+        # the loop below applies -- deliberately *before* that loop, not because ordering matters
+        # (it doesn't; the two are independent reads/writes over the same `transfers` list), but so
+        # a reader scanning this method top-to-bottom sees "record who fetched it" before "project
+        # what's still in flight," matching this task's own "persist it... write it... join it...
+        # draw it" framing.
+        await self._write_client_attribution(instance_id, transfers, path_queues)
 
         seen: dict[str, PreflightRow] = {}
         # finding #2's banner, widened (live evidence, 2026-08-23): *which* categories are going

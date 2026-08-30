@@ -1082,6 +1082,18 @@ export interface JobOut {
   // `FileNode.arr_status`'s own comment gives -- an unrecognized value degrades to a text chip
   // rather than being rejected at the type level.
   arr_instance_kind: string | null
+  // 2026-08-30 (prompts/2026-08-30-downloader-icon-on-rows.md, migration 033): the download-
+  // client instance that fetched this item, resolved server-side via `item.download_client_id ->
+  // download_client.name`/`client_type` -- the identical shape `arr_instance_name`/
+  // `arr_instance_kind` just above already have. `null` whenever this item has no recorded
+  // client: every item downloaded before migration 033 shipped (forward-only, no backfill --
+  // docs/decisions.md), or one the poller hasn't matched a transfer's own reported path to yet.
+  // `client_instance_kind` is the connector registry key ('sabnzbd' | 'rtorrent' today) --
+  // `components/LifecycleIcons.tsx.ClientBrandMark`'s own display switch, kept as `string | null`
+  // rather than a literal union for the identical "an unrecognized value degrades gracefully"
+  // reason `arr_instance_kind` above documents.
+  client_instance_name: string | null
+  client_instance_kind: string | null
   // **Which box this row belongs in** (2026-08-20, docs/transfers-redesign-spec.md §3.2's
   // pipeline-completion rule) -- `true` = Active/pending, `false` = Complete. Computed
   // server-side by `core/pipeline_flight.py`, the same expression `GET /api/jobs/complete`
@@ -1400,6 +1412,13 @@ export interface HistoryJobOut {
   arr_status_at: string | null
   arr_instance_name: string | null
   arr_instance_kind: string | null
+  // 2026-08-30 (prompts/2026-08-30-downloader-icon-on-rows.md, migration 033) -- the same
+  // `item.download_client_id -> download_client.name`/`client_type` join `JobOut` carries, joined
+  // here the identical way `arr_instance_name`/`arr_instance_kind` above are. `null` whenever this
+  // item has no recorded client (forward-only migration, no backfill -- see `JobOut`'s own
+  // comment).
+  client_instance_name: string | null
+  client_instance_kind: string | null
 }
 
 /** One queue's honest aggregate over the whole filtered set, not just the loaded page

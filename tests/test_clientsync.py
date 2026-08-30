@@ -35,6 +35,7 @@ from lftpweb.core.clientsync import (
 )
 from lftpweb.core.clients.models import Transfer, TransferPhase
 from lftpweb.core.crypto import encrypt_secret
+from lftpweb.core.settle import SettleSettings, save_settle_settings
 from lftpweb.db import migrate
 
 # --- Fixtures / helpers -------------------------------------------------------------------------
@@ -123,6 +124,38 @@ async def _seed_category(
         (client_id, category, queue_id, 1 if excluded else 0),
     )
     await db.commit()
+
+
+async def _seed_item(
+    db: aiosqlite.Connection,
+    queue_id: int,
+    rel_path: str,
+    *,
+    download_client_id: int | None = None,
+    download_client_matched_at: str | None = None,
+) -> int:
+    """A minimal `item` row for the client-attribution tests below (migration 033,
+    prompts/2026-08-30-downloader-icon-on-rows.md) -- `_write_client_attribution` matches a
+    transfer's own `content_path` against exactly `queue_id`/`rel_path` here, the same two columns
+    `_client_content_path_matches` combines with the queue's own `remote_path`.
+    """
+    cursor = await db.execute(
+        "INSERT INTO item (queue_id, rel_path, is_dir, state, download_client_id, "
+        "download_client_matched_at) VALUES (?, ?, 0, 'DOWNLOADED', ?, ?)",
+        (queue_id, rel_path, download_client_id, download_client_matched_at),
+    )
+    await db.commit()
+    return cursor.lastrowid
+
+
+async def _item_attribution(db: aiosqlite.Connection, item_id: int) -> aiosqlite.Row:
+    cursor = await db.execute(
+        "SELECT download_client_id, download_client_matched_at FROM item WHERE id = ?",
+        (item_id,),
+    )
+    row = await cursor.fetchone()
+    assert row is not None
+    return row
 
 
 async def _preflight_instance_row(db: aiosqlite.Connection, client_id: int) -> aiosqlite.Row:
@@ -570,6 +603,123 @@ async def test_path_and_category_disagree_path_wins_and_is_logged(db, tmp_path, 
     assert len(rows) == 1
     assert rows[0].queue_id == path_queue_id  # path wins over the mapped category
     assert any("path wins" in record.message for record in caplog.records)
+
+
+# --- Which client fetched this item (migration 033, 2026-08-30,
+# prompts/2026-08-30-downloader-icon-on-rows.md) -- `_write_client_attribution`, called from
+# `_update_preflight` itself so this write never depends on any user-facing toggle. ---------------
+
+
+async def test_update_preflight_writes_client_attribution_for_a_path_matched_item(db, tmp_path):
+    host_id = await _seed_host(db)
+    queue_id = await _seed_queue(db, host_id, remote_path="/complete/ar-tv")
+    item_id = await _seed_item(db, queue_id, "Show.S01")
+    instance_id = await _seed_client(db, str(tmp_path), base_url="http://x.invalid", api_key="k")
+    instance_row = await _preflight_instance_row(db, instance_id)
+    transfer = _content_transfer(content_path="/complete/ar-tv/Show.S01/Show.S01E01.mkv")
+
+    scheduler = ClientSyncScheduler(db=db, config_dir=str(tmp_path))
+    await scheduler._update_preflight(instance_row, [transfer], now=NOW0)
+
+    row = await _item_attribution(db, item_id)
+    assert row["download_client_id"] == instance_id
+    assert row["download_client_matched_at"] is not None
+
+
+async def test_update_preflight_does_not_attribute_a_category_only_transfer(db, tmp_path):
+    """A transfer with no `content_path` yet can only ever identify a *queue* (via the category
+    mapping) -- never a specific *item* inside it, so this must write nothing (this task's own
+    "match quality" rule: reuse `_client_content_path_matches`/the category map, never invent a
+    third notion that would let a category-only transfer guess an item).
+    """
+    host_id = await _seed_host(db)
+    queue_id = await _seed_queue(db, host_id, remote_path="/complete/ar-tv")
+    item_id = await _seed_item(db, queue_id, "Show.S01")
+    instance_id = await _seed_client(db, str(tmp_path), base_url="http://x.invalid", api_key="k")
+    await _seed_category(db, instance_id, "ar-tv", queue_id)
+    instance_row = await _preflight_instance_row(db, instance_id)
+    transfer = _content_transfer(category="ar-tv", content_path=None)
+
+    scheduler = ClientSyncScheduler(db=db, config_dir=str(tmp_path))
+    await scheduler._update_preflight(instance_row, [transfer], now=NOW0)
+
+    row = await _item_attribution(db, item_id)
+    assert row["download_client_id"] is None
+
+
+async def test_update_preflight_does_not_rewrite_matched_at_on_an_unchanged_repeat_pass(
+    db, tmp_path
+):
+    """Write once and leave it (this task's own explicit rule): a quiet repeat match against the
+    *same* instance must issue no `UPDATE` at all, so `download_client_matched_at` never drifts.
+    """
+    host_id = await _seed_host(db)
+    queue_id = await _seed_queue(db, host_id, remote_path="/complete/ar-tv")
+    item_id = await _seed_item(db, queue_id, "Show.S01")
+    instance_id = await _seed_client(db, str(tmp_path), base_url="http://x.invalid", api_key="k")
+    instance_row = await _preflight_instance_row(db, instance_id)
+    transfer = _content_transfer(content_path="/complete/ar-tv/Show.S01/Show.S01E01.mkv")
+
+    scheduler = ClientSyncScheduler(db=db, config_dir=str(tmp_path))
+    await scheduler._update_preflight(instance_row, [transfer], now=NOW0)
+    first = await _item_attribution(db, item_id)
+
+    await scheduler._update_preflight(instance_row, [transfer], now=NOW0)
+    second = await _item_attribution(db, item_id)
+
+    assert second["download_client_id"] == instance_id
+    assert second["download_client_matched_at"] == first["download_client_matched_at"]
+
+
+async def test_update_preflight_overwrites_attribution_from_a_different_instance(db, tmp_path):
+    """A release genuinely re-fetched by a different client is a real fact worth recording, not
+    noise -- the one case an already-attributed item is still a write candidate.
+    """
+    host_id = await _seed_host(db)
+    queue_id = await _seed_queue(db, host_id, remote_path="/complete/ar-tv")
+    old_instance_id = await _seed_client(
+        db, str(tmp_path), base_url="http://old.invalid", api_key="k", name="Old"
+    )
+    item_id = await _seed_item(
+        db,
+        queue_id,
+        "Show.S01",
+        download_client_id=old_instance_id,
+        download_client_matched_at="2026-08-01T00:00:00.000000Z",
+    )
+    new_instance_id = await _seed_client(
+        db, str(tmp_path), base_url="http://new.invalid", api_key="k", name="New"
+    )
+    instance_row = await _preflight_instance_row(db, new_instance_id)
+    transfer = _content_transfer(content_path="/complete/ar-tv/Show.S01/Show.S01E01.mkv")
+
+    scheduler = ClientSyncScheduler(db=db, config_dir=str(tmp_path))
+    await scheduler._update_preflight(instance_row, [transfer], now=NOW0)
+
+    row = await _item_attribution(db, item_id)
+    assert row["download_client_id"] == new_instance_id
+    assert row["download_client_matched_at"] != "2026-08-01T00:00:00.000000Z"
+
+
+async def test_client_attribution_is_written_independent_of_client_skip_enabled_off(db, tmp_path):
+    """The mistake this task's own handoff prompt names as most likely to be made here: writing
+    attribution from the `client_skip_enabled` recheck path instead of from `_update_preflight`
+    itself. Proven the direct way -- persist the toggle **off** and show the write still happens,
+    since `_write_client_attribution` never reads this setting at all.
+    """
+    await save_settle_settings(db, SettleSettings(enabled=True, client_skip_enabled=False))
+    host_id = await _seed_host(db)
+    queue_id = await _seed_queue(db, host_id, remote_path="/complete/ar-tv")
+    item_id = await _seed_item(db, queue_id, "Show.S01")
+    instance_id = await _seed_client(db, str(tmp_path), base_url="http://x.invalid", api_key="k")
+    instance_row = await _preflight_instance_row(db, instance_id)
+    transfer = _content_transfer(content_path="/complete/ar-tv/Show.S01/Show.S01E01.mkv")
+
+    scheduler = ClientSyncScheduler(db=db, config_dir=str(tmp_path))
+    await scheduler._update_preflight(instance_row, [transfer], now=NOW0)
+
+    row = await _item_attribution(db, item_id)
+    assert row["download_client_id"] == instance_id
 
 
 # --- Unattributed-clients banner (finding #2, 2026-08-23) ----------------------------------

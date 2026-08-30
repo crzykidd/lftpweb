@@ -3834,3 +3834,44 @@ Named gaps beyond that, none of them hidden: cross-seed detection ships correct-
 on the Disk review page is **unverified in a real browser**, because jsdom performs no layout at
 all and two separate bugs in this feature were pure layout problems invisible to every test in the
 repo.
+
+### 17.9 Which client fetched an item — a row icon, persisted forward-only
+
+`core/settle.py.find_client_completion`'s own transfer↔item path match (§17.5's component-boundary
+rule) was computed for the settle-gate skip and thrown away every pass. 2026-08-30
+(`prompts/2026-08-30-downloader-icon-on-rows.md`, migration 033) persists it: `item.
+download_client_id`/`download_client_matched_at`, joined into `JobOut`/`HistoryJobOut` exactly the
+way `item.arr_status` already joins `arr_instance`, drawn as a small `ClientBrandMark` chip on the
+Transfers/History row line, right beside the existing *arr chip.
+
+**Written from `core/clientsync.py.ClientSyncScheduler._update_preflight`, and nowhere else — the
+one call in this subsystem that runs on every successful poll pass regardless of any toggle.**
+`find_client_completion`/`find_client_failure`'s only real callers (`core/autoqueue.py.on_scan`)
+sit behind `SettleSettings.client_skip_enabled` and `WithholdSettings.enabled`, both off for some
+installs; writing attribution from either path would make the icon's mere presence depend on a
+setting that has nothing to do with it — named directly in this task's own handoff prompt as the
+mistake most likely to be made here. `_update_preflight` already computes a queue-level path match
+every pass (§17.5); this task adds an item-level pass over the same `transfers` list, against
+every item under an enabled queue not already attributed to *this* instance, using the identical
+`_client_content_path_matches` component-boundary rule — never a second matching notion. A
+transfer with no `content_path` can identify a queue (via the category mapping) but never a
+specific item, so a category-only transfer writes nothing, silently, the same "no information, no
+write" instinct the rest of this subsystem already follows.
+
+**Forward-only, and deliberately not resolved live.** The alternative — answering "who fetched
+this" at *read* time from the poller's own in-memory transfer cache, instead of persisting it —
+was considered and rejected: SABnzbd and rTorrent both age old jobs out of their own history/queue,
+which would make a History row's icon silently disappear the moment the client forgets a job
+lftpweb still remembers forever. Persisting once means the icon is either right or absent, never
+flickering. Every item downloaded before this migration shipped has no recorded client and never
+will — no backfill guesses one (`docs/decisions.md`).
+
+**`client_instance_kind` selecting the row chip's label is a display switch, not the client-name
+branching §4.4/§5.1 forbid.** That rule governs *behaviour* — which fields a connector supports,
+whether a control is shown, what gets sent over the wire — never which picture (or, here, which
+short text label) a chip draws; `ArrBrandMark`'s own `kind === 'sonarr' ? ... : ...` switch is the
+existing precedent this one follows. **No brand logo**: simple-icons, the CC0 dataset `SonarrLogo`/
+`RadarrLogo` copy path data from verbatim, ships neither a `sabnzbd` nor an `rtorrent` mark
+(checked directly against the dataset for this task) — so the chip is `ArrTextChip`'s own
+text-fallback treatment (`SAB`/`rT`, or a truncated-and-uppercased fallback for an unrecognized
+future kind), never an invented or approximated logo.

@@ -6,6 +6,52 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-30 — persist which client fetched an item, forward-only; a kind→label switch is not the client-name branching rule
+
+`prompts/2026-08-30-downloader-icon-on-rows.md`, migration 033. The user's own ask: *"add another
+icon to the list, right next to the ARR icon. We should show the SAB or rtorrent icon based on
+what downloader was used."* Two decisions worth recording.
+
+**Persisted once, forward-only — rejected the live-resolve alternative.** The match itself already
+existed and was thrown away every pass (`core/settle.py.find_client_completion`'s own
+`content_path`↔item-remote-path check, computed purely to decide whether to skip the settle wait).
+The alternative considered was answering "who fetched this" at *read* time instead — re-running
+that same match against the poller's own in-memory transfer cache whenever a row is rendered,
+rather than writing anything to `item`. Rejected: SABnzbd and rTorrent both age old jobs out of
+their own history/queue (`docs/download-client-framework-spec.md` §9.1), so a live-resolve would
+make a History row's icon silently vanish the moment the client forgets a job lftpweb still
+remembers forever — a flickering, storage-dependent fact masquerading as a stable one. Persisting
+once means the icon is either right or absent, never flickering, at the cost this task's own
+handoff prompt states plainly rather than hides: every item downloaded before migration 033
+shipped has no recorded client and never will. No backfill was written to guess one — a backfill
+would have to re-run the same live match this decision just rejected as unstable, against
+whatever the poller's cache happens to hold *today*, and stamp that guess as if it had been
+recorded at download time.
+
+**Where the write happens was the highest-risk decision in this task, and is recorded here because
+it is easy to get wrong by analogy.** `core/settle.py.find_client_completion`/`find_client_failure`
+already do almost the exact match needed, and it would have been natural to add the persisting
+write inside their existing callers (`core/autoqueue.py.on_scan`). Both of those call sites sit
+behind a user-facing toggle (`SettleSettings.client_skip_enabled`, `WithholdSettings.enabled`) that
+is off for some installs — writing from either would make the row icon's mere presence silently
+depend on a setting that has nothing to do with it. Written instead from
+`core/clientsync.py.ClientSyncScheduler._update_preflight`, the one call in this subsystem that
+runs unconditionally on every successful poll pass, and proven with a test that explicitly sets
+`client_skip_enabled` off and shows the write still happens
+(`tests/test_clientsync.py::test_client_attribution_is_written_independent_of_client_skip_enabled_off`).
+
+**A `kind → logo`/`kind → label` switch is not the client-name branching
+`docs/download-client-framework-spec.md` §4.4/§5.1 forbid.** That rule is about *behaviour* —
+capability gating, field support, what gets sent over the wire — and exists so a connector's own
+declared capabilities stay the single source of truth for what it can do. `ArrBrandMark`
+(`components/LifecycleIcons.tsx`) already switches on `kind === 'sonarr'` to choose a logo, and
+this task's `ClientBrandMark` does the identical thing for `client_instance_kind`; picking a
+picture (or, here, a short text label — simple-icons ships no `sabnzbd`/`rtorrent` mark, checked
+directly against the dataset rather than assumed) has never been "deciding what the product does."
+Recorded so a future reader does not "fix" either switch into a capability lookup.
+
+---
+
 ## 2026-08-29 — widen the fast-tick `_full_estate` merge unconditionally, and add a shorter poll cadence while an instance has Preflight work
 
 `prompts/done/2026-08-29-preflight-poll-freshness.md`. The user's own framing: *"when things are

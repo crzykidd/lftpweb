@@ -1,5 +1,6 @@
 import type { SVGProps } from 'react'
 import type { FacetLevel, FileNode, SettleSettingsOut } from '../api/types'
+import { clientBrandLabel } from '../lib/clientBrandMark'
 import { arrChipOverlay, type ArrChipOverlay, arrHoverLabel, arrIconVariant } from '../lib/fileTree'
 import { formatBytes, formatRelativeTimeIntl, settleWaitLabel } from '../lib/format'
 
@@ -588,6 +589,81 @@ export function ArrRowChip({
         <ArrTextChip instanceName={instanceName} overlay={overlay} title={title} />
       )}
       <ArrChipOverlayBadge overlay={overlay} />
+    </span>
+  )
+}
+
+// --- Download-client row chip (2026-08-30, prompts/2026-08-30-downloader-icon-on-rows.md) ------
+//
+// Which download client fetched this item -- SAB/rTorrent -- rendered immediately beside
+// `ArrRowChip` on the Transfers/History row line (`TransfersPage.tsx`'s `Row`, shared by the
+// Active/pending and Complete boxes both). `item.download_client_id` (migration 033) is the new
+// data this reads; `core/clientsync.py.ClientSyncScheduler._write_client_attribution` is what
+// writes it, from the poller's own unconditional pass -- never from a path gated behind a
+// user-facing toggle (`SettleSettings.client_skip_enabled`, `WithholdSettings.enabled`), so this
+// mark's mere presence never depends on a setting that has nothing to do with it.
+//
+// **No brand logo.** `SonarrLogo`/`RadarrLogo` above copy path data verbatim from the simple-icons
+// dataset (CC0) -- checked directly against that dataset for this task (not assumed, and not
+// recalled from memory): it ships neither a `sabnzbd` nor an `rtorrent` mark. This file's own
+// module comment ("Path data below is copied verbatim, unmodified") and `EventsLinkButton.tsx`'s
+// own restatement of the same rule leave exactly one option -- a text-chip fallback, the identical
+// treatment `ArrBrandMark` already uses for an unrecognized *arr `kind`. Never approximate a brand
+// mark's path data from memory; a wrong logo is worse than no logo.
+//
+// `kind` selecting which two-letter label renders is a **display switch, not a capability
+// branch** -- this project's "no `if client_type === 'sabnzbd'`" rule
+// (docs/download-client-framework-spec.md §4.4/§5.1) governs *behaviour*: which fields a
+// connector supports, whether a control is shown, what gets sent over the wire. It has nothing to
+// say about which two letters a text chip renders -- `ArrBrandMark`'s own `kind === 'sonarr' ? ...`
+// switch two sections up is the identical precedent, picking a picture has never been "deciding
+// what the product does." Do not "fix" this into a capability lookup.
+//
+// The label itself (`'SAB'`/`'rT'`/the unrecognized-kind fallback) is `lib/clientBrandMark.
+// clientBrandLabel`, not inlined here -- this project's test suite is plain `vitest run` over pure
+// functions, with no component-rendering tests anywhere in the repo (no `@testing-library/react`),
+// so the render-nothing/known-label/fallback-label decision has to live somewhere a test can reach
+// without mounting this component; this function stays a thin wrapper around it.
+
+/** The download-client attribution chip. Renders **nothing at all** when `instanceKind` is
+ * `null` -- the same "no data, no mark" rule `ArrRowChip` follows for a `null` `arr_status`: an
+ * item with no recorded client (every item downloaded before migration 033 shipped, or one the
+ * poller hasn't matched a transfer's path to yet) must not get a placeholder or a question mark.
+ *
+ * An unrecognized/future `kind` still renders (`clientBrandLabel`'s own fallback) rather than
+ * disappearing -- the same "never render nothing for a tracked item just because the mark is
+ * missing" instinct `ArrBrandMark`'s own fallback follows one section up.
+ *
+ * No status overlay (unlike `ArrRowChip`'s green-check/red-dot badge): a download client has no
+ * equivalent "processed" verdict for this mark to layer on top of, only "this is who fetched it" --
+ * `instanceName` (the instance's own configured display name, e.g. "SABnzbd") is hover text only,
+ * matching the *arr mark's own "chip short, hover long" split.
+ *
+ * Sizing matches `ArrTextChip`'s own treatment (border/padding/font), not `ARR_LOGO_SIZE_PX`
+ * literally -- there is no real logo here to size against, so the *fallback* chip's own visual
+ * weight is the thing to match, since that is what sits beside this mark whenever the *arr side
+ * also has no brand logo to draw. **Unverified in a real browser** -- no browser access in this
+ * environment, and jsdom performs no layout at all (this file's own docstring, DESIGN.md §17's
+ * "two bugs in this feature were pure layout problems invisible to every test" -- there is no test
+ * here that could have caught a layout regression, deliberately, rather than one that only looks
+ * like it does).
+ */
+export function ClientBrandMark({
+  instanceName,
+  instanceKind,
+}: {
+  instanceName: string | null
+  instanceKind: string | null
+}) {
+  const label = clientBrandLabel(instanceKind)
+  if (label === null) return null
+  const title = instanceName ?? instanceKind ?? undefined
+  return (
+    <span
+      className="inline-flex shrink-0 items-center rounded border border-zinc-300 px-1 text-[9px] leading-tight font-semibold uppercase text-zinc-500 dark:border-zinc-700 dark:text-zinc-400"
+      title={title}
+    >
+      {label}
     </span>
   )
 }

@@ -979,6 +979,19 @@ class JobOut(BaseModel):
     # the one field that reliably says "this is a Sonarr instance" vs. "this is a Radarr
     # instance". `null` under the same condition `arr_instance_name` is null.
     arr_instance_kind: str | None = None
+    # 2026-08-30 (prompts/2026-08-30-downloader-icon-on-rows.md, migration 033): the download-
+    # client instance that fetched this item, resolved via `item.download_client_id ->
+    # download_client.name`/`client_type` -- the same shape `arr_instance_name`/`arr_instance_kind`
+    # just above already have, one column pair per external system this item is linked to. `null`
+    # whenever this item has no recorded client: every item downloaded before migration 033 shipped
+    # (forward-only, no backfill -- docs/decisions.md), or one the poller has never matched a
+    # transfer's own reported path to (`core/clientsync.py._write_client_attribution`'s own
+    # docstring). `client_instance_kind` is the connector registry key (e.g. `'sabnzbd'`,
+    # `'rtorrent'`) -- a display switch only (`components/LifecycleIcons.tsx.ClientBrandMark`'s own
+    # comment on why that's allowed, not a capability lookup), never `download_client_id` itself,
+    # which stays server-side only -- the identical convention `arr_download_id` already sets.
+    client_instance_name: str | None = None
+    client_instance_kind: str | None = None
     # **Which box this row belongs in** (2026-08-20, docs/transfers-redesign-spec.md §3.2's
     # pipeline-completion rule) -- `true` = Active/pending, `false` = Complete. Computed
     # server-side by `core/pipeline_flight.py`, the *same* expression `GET /api/jobs/complete`
@@ -1462,6 +1475,13 @@ class HistoryJobOut(BaseModel):
     arr_status_at: str | None = None
     arr_instance_name: str | None = None
     arr_instance_kind: str | None = None
+    # 2026-08-30 (prompts/2026-08-30-downloader-icon-on-rows.md, migration 033) -- the same
+    # `item.download_client_id -> download_client.name`/`client_type` join `JobOut` above already
+    # carries, joined here via the identical `LEFT JOIN download_client` shape `arr_instance` uses.
+    # `null` whenever this item has no recorded client -- see `JobOut.client_instance_name`'s own
+    # comment for the fuller reasoning (forward-only migration, no backfill).
+    client_instance_name: str | None = None
+    client_instance_kind: str | None = None
 
 
 class HistoryQueueSummaryOut(BaseModel):

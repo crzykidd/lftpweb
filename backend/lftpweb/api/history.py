@@ -34,6 +34,12 @@ row can draw the identical chip. **Not** the phase-6 unbounded-list trap this mo
 docstring warns about above -- that trap is about shipping a *blob* (`output_tail`) on every row
 of an unbounded list; these are two short scalar strings plus a status code, no bigger than
 `queue_name` already sitting on every row.
+
+**`client_instance_name`/`client_instance_kind` on every job row** (2026-08-30,
+prompts/2026-08-30-downloader-icon-on-rows.md, migration 033) -- the identical shape one paragraph
+up, joined via `item.download_client_id -> download_client.name`/`client_type` instead of
+`arr_instance`. `null` whenever the item has no recorded client (forward-only migration, no
+backfill -- `docs/decisions.md`).
 (`_queue_summaries` below) run against the exact same `_jobs_where_clause` output as the `jobs`
 list beside it -- same filter, so the two can never disagree -- one row per queue (bounded by
 queue count, not job count), never a per-row blob (the phase-6 trap this module's own history
@@ -204,6 +210,10 @@ def _job_out(row: Any) -> HistoryJobOut:
         arr_status_at=row["arr_status_at"],
         arr_instance_name=row["arr_instance_name"],
         arr_instance_kind=row["arr_instance_kind"],
+        # 2026-08-30 (prompts/2026-08-30-downloader-icon-on-rows.md, migration 033) -- same shape,
+        # same "always projected, plain row[...] is safe" reasoning as the two lines just above.
+        client_instance_name=row["client_instance_name"],
+        client_instance_kind=row["client_instance_kind"],
     )
 
 
@@ -317,11 +327,14 @@ async def list_history_jobs(
         "job.started_at, job.finished_at, COALESCE(job.bytes_total, item.remote_size) AS bytes_total, job.bytes_done, "
         "job.exit_code, job.error_class, job.output_tail, job.dismissed_at, "
         "item.arr_status, item.arr_status_at, "
-        "arr_instance.name AS arr_instance_name, arr_instance.kind AS arr_instance_kind "
+        "arr_instance.name AS arr_instance_name, arr_instance.kind AS arr_instance_kind, "
+        "download_client.name AS client_instance_name, "
+        "download_client.client_type AS client_instance_kind "
         "FROM job "
         "JOIN item ON item.id = job.item_id "
         "JOIN path_queue ON path_queue.id = item.queue_id "
         "LEFT JOIN arr_instance ON arr_instance.id = path_queue.arr_instance_id "
+        "LEFT JOIN download_client ON download_client.id = item.download_client_id "
         f"WHERE {where_sql} "
         "ORDER BY COALESCE(job.finished_at, job.queued_at) DESC, job.id DESC "
         "LIMIT ? OFFSET ?",

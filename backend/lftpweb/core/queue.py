@@ -3462,6 +3462,14 @@ class TransferQueue:
         it as the queued-row fallback -- the identical shape `_job_out`'s own `bytes_total`
         fallback to `item.remote_size` already established for the same "queued, never spawned"
         gap.
+
+        **2026-08-30** (prompts/2026-08-30-downloader-icon-on-rows.md, migration 033): also joins
+        `download_client.name AS client_instance_name`/`client_type AS client_instance_kind` via
+        `item.download_client_id` -- the identical `LEFT JOIN` shape `arr_instance` above already
+        uses (most items have no recorded client, migration 033's own "forward-only, everything OFF
+        until the poller actually matches something" default). `client_instance_kind` is a display
+        switch only (`components/LifecycleIcons.tsx.ClientBrandMark`'s own comment on why that's
+        allowed) -- never a capability lookup.
         """
         cursor = await self.db.execute(
             "SELECT job.*, item.rel_path, item.is_dir, item.queue_id, item.remote_size, "
@@ -3472,11 +3480,14 @@ class TransferQueue:
             f"       {self._in_flight_select()}, "
             "       path_queue.name AS queue_name, path_queue.short_name AS queue_short_name, "
             "       arr_instance.name AS arr_instance_name, "
-            "       arr_instance.kind AS arr_instance_kind "
+            "       arr_instance.kind AS arr_instance_kind, "
+            "       download_client.name AS client_instance_name, "
+            "       download_client.client_type AS client_instance_kind "
             "FROM job "
             "JOIN item ON item.id = job.item_id "
             "JOIN path_queue ON path_queue.id = item.queue_id "
             "LEFT JOIN arr_instance ON arr_instance.id = path_queue.arr_instance_id "
+            "LEFT JOIN download_client ON download_client.id = item.download_client_id "
             "WHERE job.state IN ('queued','running') "
             "   OR (job.state IN ('failed','cancelled','succeeded') "
             "       AND job.dismissed_at IS NULL "
@@ -3552,6 +3563,10 @@ class TransferQueue:
         than by two rules that happen to agree today. The count query grew the same
         `path_queue`/`arr_instance` joins the page query already had, purely so that one
         expression can be evaluated identically in both.
+
+        **2026-08-30** (migration 033): the page query also joins `download_client` via
+        `item.download_client_id`, the identical shape `list_jobs`'s own docstring documents --
+        not the count query, which never selects the two columns this join exists for.
         """
         in_flight = self._postprocess_in_flight_ids()
         where = [
@@ -3588,11 +3603,14 @@ class TransferQueue:
             f"       {self._in_flight_select()}, "
             "       path_queue.name AS queue_name, path_queue.short_name AS queue_short_name, "
             "       arr_instance.name AS arr_instance_name, "
-            "       arr_instance.kind AS arr_instance_kind "
+            "       arr_instance.kind AS arr_instance_kind, "
+            "       download_client.name AS client_instance_name, "
+            "       download_client.client_type AS client_instance_kind "
             "FROM job "
             "JOIN item ON item.id = job.item_id "
             "JOIN path_queue ON path_queue.id = item.queue_id "
             "LEFT JOIN arr_instance ON arr_instance.id = path_queue.arr_instance_id "
+            "LEFT JOIN download_client ON download_client.id = item.download_client_id "
             f"WHERE {where_sql} "
             "ORDER BY COALESCE(job.finished_at, job.queued_at) DESC, job.id DESC "
             "LIMIT ? OFFSET ?",

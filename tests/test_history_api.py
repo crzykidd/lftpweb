@@ -211,6 +211,52 @@ async def test_history_job_arr_fields_are_null_when_queue_has_no_bound_instance(
     assert job.arr_instance_kind is None
 
 
+# --- Download-client attribution join (2026-08-30, prompts/2026-08-30-downloader-icon-on-
+# rows.md, migration 033) -- the identical shape the *arr join above already covers, for
+# `item.download_client_id -> download_client.name`/`client_type` instead. -----------------------
+
+
+async def _seed_download_client(db, *, name: str = "SABnzbd", client_type: str = "sabnzbd") -> int:
+    now = "2026-08-30T00:00:00.000000Z"
+    cursor = await db.execute(
+        "INSERT INTO download_client (name, client_type, config_json, secret_enc, enabled, "
+        "created_at, updated_at) VALUES (?, ?, '{}', NULL, 1, ?, ?)",
+        (name, client_type, now, now),
+    )
+    await db.commit()
+    return cursor.lastrowid
+
+
+async def test_history_job_carries_client_attribution_when_item_has_one(db):
+    queue_id = await _make_queue(db)
+    client_id = await _seed_download_client(db, name="rTorrent box", client_type="rtorrent")
+    item = await _make_item(db, queue_id, "movie.mkv")
+    await db.execute(
+        "UPDATE item SET download_client_id = ?, download_client_matched_at = ? WHERE id = ?",
+        (client_id, "2026-08-30T01:00:00.000000Z", item),
+    )
+    await db.commit()
+    await _make_job(db, item, state="succeeded")
+
+    resp = await history.list_history_jobs(_FakeRequest(db))
+    assert len(resp.jobs) == 1
+    job = resp.jobs[0]
+    assert job.client_instance_name == "rTorrent box"
+    assert job.client_instance_kind == "rtorrent"
+
+
+async def test_history_job_client_fields_are_null_when_item_has_no_recorded_client(db):
+    queue_id = await _make_queue(db)
+    item = await _make_item(db, queue_id, "movie.mkv")
+    await _make_job(db, item, state="succeeded")
+
+    resp = await history.list_history_jobs(_FakeRequest(db))
+    assert len(resp.jobs) == 1
+    job = resp.jobs[0]
+    assert job.client_instance_name is None
+    assert job.client_instance_kind is None
+
+
 async def test_job_output_fetched_on_demand(db):
     queue_id = await _make_queue(db)
     item = await _make_item(db, queue_id, "bad.txt", state="FAILED")

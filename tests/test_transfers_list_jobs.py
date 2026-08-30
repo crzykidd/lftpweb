@@ -264,6 +264,11 @@ def _job_out_row(**overrides) -> dict:
         # 2026-08-16 (prompts/2026-08-16-arr-chip-on-row-lines.md): the row chip's brand-logo
         # choice -- see test_list_jobs_carries_item_processing_and_arr_facts below.
         arr_instance_kind=None,
+        # 2026-08-30 (prompts/2026-08-30-downloader-icon-on-rows.md): `_job_out` reads these with
+        # plain `row[...]`, same as the two `arr_instance_*` keys above -- see
+        # test_list_jobs_carries_client_attribution below for the real-join case.
+        client_instance_name=None,
+        client_instance_kind=None,
     )
     base.update(overrides)
     return base
@@ -859,6 +864,85 @@ async def test_list_jobs_arr_instance_name_is_null_when_queue_has_no_bound_insta
     assert out.arr_instance_name is None
     assert out.arr_instance_kind is None
     assert out.arr_status is None
+
+
+# --- 2026-08-30 (prompts/2026-08-30-downloader-icon-on-rows.md, migration 033): the download-
+# client attribution join -- the identical shape the *arr tests just above already cover, for
+# `item.download_client_id -> download_client.name`/`client_type` instead. -----------------------
+
+
+async def _seed_download_client(db, *, name: str = "SABnzbd", client_type: str = "sabnzbd") -> int:
+    now = "2026-08-30T00:00:00.000000Z"
+    cursor = await db.execute(
+        "INSERT INTO download_client (name, client_type, config_json, secret_enc, enabled, "
+        "created_at, updated_at) VALUES (?, ?, '{}', NULL, 1, ?, ?)",
+        (name, client_type, now, now),
+    )
+    await db.commit()
+    return cursor.lastrowid
+
+
+async def test_list_jobs_carries_client_attribution(db):
+    queue_id = await _make_queue(db)
+    client_id = await _seed_download_client(db)
+    item = await _make_item(db, queue_id, "release", state="DOWNLOADED")
+    await db.execute(
+        "UPDATE item SET download_client_id = ?, download_client_matched_at = ? WHERE id = ?",
+        (client_id, "2026-08-30T00:05:00.000000Z", item),
+    )
+    await db.commit()
+    await _make_job(db, item, state="succeeded")
+
+    jobs = await _queue(db).list_jobs()
+    assert len(jobs) == 1
+    row = jobs[0]
+    assert row["client_instance_name"] == "SABnzbd"
+    assert row["client_instance_kind"] == "sabnzbd"
+
+    out = _job_out(row)
+    assert out.client_instance_name == "SABnzbd"
+    assert out.client_instance_kind == "sabnzbd"
+
+
+async def test_list_jobs_client_instance_name_is_null_when_item_has_no_recorded_client(db):
+    """The forward-only migration's own common case (`docs/decisions.md`): every item downloaded
+    before migration 033 shipped, or one the poller has never matched -- `null`, not a placeholder.
+    """
+    queue_id = await _make_queue(db)
+    item = await _make_item(db, queue_id, "release", state="DOWNLOADED")
+    await _make_job(db, item, state="succeeded")
+
+    jobs = await _queue(db).list_jobs()
+    assert len(jobs) == 1
+    assert jobs[0]["client_instance_name"] is None
+    assert jobs[0]["client_instance_kind"] is None
+
+    out = _job_out(jobs[0])
+    assert out.client_instance_name is None
+    assert out.client_instance_kind is None
+
+
+async def test_deleting_download_client_nulls_the_items_attribution_not_the_item(db):
+    """Migration 033's own `ON DELETE SET NULL` -- deleting a download-client instance in Settings
+    must never take the item down with it (the migration's own comment on why this mirrors
+    `path_queue.arr_instance_id`/`download_client_category.queue_id` rather than CASCADE).
+    """
+    queue_id = await _make_queue(db)
+    client_id = await _seed_download_client(db)
+    item = await _make_item(db, queue_id, "release", state="DOWNLOADED")
+    await db.execute(
+        "UPDATE item SET download_client_id = ?, download_client_matched_at = ? WHERE id = ?",
+        (client_id, "2026-08-30T00:05:00.000000Z", item),
+    )
+    await db.commit()
+
+    await db.execute("DELETE FROM download_client WHERE id = ?", (client_id,))
+    await db.commit()
+
+    cursor = await db.execute("SELECT id, download_client_id FROM item WHERE id = ?", (item,))
+    row = await cursor.fetchone()
+    assert row is not None  # the item itself survives
+    assert row["download_client_id"] is None
 
 
 async def test_retry_after_dismiss_produces_a_fresh_job_visible_again(db):
