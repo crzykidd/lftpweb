@@ -6,6 +6,72 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-29 — widen the fast-tick `_full_estate` merge unconditionally, and add a shorter poll cadence while an instance has Preflight work
+
+`prompts/done/2026-08-29-preflight-poll-freshness.md`. The user's own framing: *"when things are
+in preflight we should update from SAB or rtorrent more often."* Two defects in `core/
+clientsync.py`, fixed together.
+
+**Defect 1 was two stacked misses, not one -- the phase filter alone would not have fixed it.**
+Commit `cc5f75d` (the day before) widened `settle.FINISHED_TRANSFER_PHASES` to `{COMPLETED,
+SEEDING}` because rTorrent classifies a finished, actively-seeding torrent as `SEEDING`, never
+`COMPLETED`. The fast-tick merge into `_full_estate` -- a third hand-restated copy of "what
+counts as terminal" -- was not updated to match, which reading the handoff prompt in isolation
+suggested was the whole bug. **It was not**: the merge also only ran `elif cheap_history:`, i.e.
+only for a `NATIVE`-history connector (SABnzbd) -- `Operation.LIST_HISTORY` is `DERIVED` for
+rTorrent, so `cheap_history` is always `False` for it, and the merge branch never executed on a
+fast tick for rTorrent *regardless of the phase filter*. Confirmed empirically before fixing
+either half: a regression test built against `tests/fake_rtorrent.py` (a real torrent transitioning
+from downloading to seeding between two `run_once` passes) failed against the phase-filter-only
+fix, because the `elif cheap_history:` branch still never ran. **Fixed by widening the phase set
+(derived from `settle.FINISHED_TRANSFER_PHASES` plus `TransferPhase.FAILED`,
+`core/clientsync.py._MERGEABLE_TERMINAL_PHASES`) and by making the merge run on every non-slow-due
+tick unconditionally** (`elif cheap_history:` -> plain `else:`) -- the latter costs nothing extra,
+since `transfers` at that point is exactly what the tick already fetched (`active_only=True`
+alone for a `DERIVED`-history connector, plus `list_history()` for a `NATIVE` one); rTorrent's own
+`active_only=True` contract already reports `SEEDING` torrents (only `COMPLETED` is excluded), so
+no second call was ever needed to see it, only a place to put it once seen.
+
+**Circular import: none to resolve.** `core/clientsync.py` already imports `FINISHED_TRANSFER_
+PHASES` from `core/settle.py` (added the day before, for `finished_transfers()`); `core/settle.py`
+imports nothing from `core/clientsync.py`. The shared merge-filter constant
+(`_MERGEABLE_TERMINAL_PHASES`) is therefore defined in `clientsync.py` itself, built from the
+already-imported `FINISHED_TRANSFER_PHASES` plus a local `TransferPhase.FAILED` -- no new shared
+module, no cycle to design around.
+
+**Defect 2: `ACTIVE_POLL_INTERVAL_S` (4.0s) applies only to the fast, active-only call, only per
+instance, only while that instance currently has something in Preflight.** Picked as the midpoint
+of the user's own "~3-5s" suggestion, not independently re-derived. Trigger reuses `_update_
+preflight`'s own `seen` rows (`bool(seen)`, tracked in a new `_active_instances` set) rather than
+adding a second, independently-drifting notion of "busy," per the handoff prompt's own explicit
+instruction. `SLOW_INTERVAL_S` is untouched, on purpose -- Preflight's own data never comes from
+the full-estate call, so shortening the slow cadence would only add cost for no freshness gain.
+
+**This required a new per-instance due-check that did not exist before, which is a real behavior
+change beyond "add a constant."** Before this task, `_process_instance` had no internal notion of
+"is this instance due yet" outside the backoff ladder -- cadence was governed entirely by how
+often the *caller* invoked `run_once` (in production, `_loop`'s own `asyncio.sleep`). Speeding up
+only *some* instances therefore required `_loop` itself to wake up more often
+(`min(FAST_INTERVAL_S, ACTIVE_POLL_INTERVAL_S)`, replacing the old bare `FAST_INTERVAL_S` sleep)
+plus a new internal gate (`_last_active_poll_at`) so a quiet instance is not dragged along for
+free just because the loop now polls more frequently. **This broke one existing test**
+(`test_one_event_per_failure_transition_not_per_failed_pass`), which called `run_once` a bare
+`1.0`s after a recovery pass and expected an immediate second attempt -- under the new due-check,
+a quiet instance (empty queue, not in `_active_instances`) is not due again for a full
+`FAST_INTERVAL_S`, so that pass was being silently skipped rather than actually contacting the
+(now-failing) client. Fixed by changing the test's own offset to `scheduler.FAST_INTERVAL_S`,
+which is the correct new floor for a quiet instance, not a workaround -- the test's actual subject
+(one audit event per failure-kind transition) is unaffected.
+
+**The backoff ladder wins by construction, not by an added check.** The existing backoff
+short-circuit in `_process_instance` (`if backoff is not None and now < backoff.next_attempt_at:
+return`) already runs before anything this task added, so a backed-off instance is never polled
+faster merely because it has Preflight rows cached from before it broke -- tested explicitly
+anyway (`test_backoff_wins_over_the_active_poll_interval`) per the handoff prompt's own "this is
+the one interaction most likely to go wrong" instruction.
+
+---
+
 ## 2026-08-29 — fold the client-shortened settle under the existing toggle, drop the window to 5s, delete the trust-only path, and default the toggle on
 
 `prompts/done/2026-08-29-settle-verify-under-existing-toggle.md`. Reworks the 2026-08-24 decision

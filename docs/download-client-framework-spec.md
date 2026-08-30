@@ -831,6 +831,42 @@ connector whose history is cheap, exactly as this table originally promised. See
 reasoning and the rejected alternative (a connector-authored boolean flag, rejected as a second
 truth sitting next to a capability declaration that already says the same thing).
 
+**Two more corrections, 2026-08-29 (prompts/2026-08-29-preflight-poll-freshness.md), live use:
+*"when things are in preflight we should update from SAB or rtorrent more often."***
+
+**Defect 1 -- the "within one `FAST_INTERVAL_S` tick" promise just above was still broken for
+rTorrent, in a commit (`cc5f75d`) that shipped the very same day it widened `settle.
+FINISHED_TRANSFER_PHASES` to `{COMPLETED, SEEDING}`.** Two independent misses stacked:
+`_process_instance`'s own fast-tick merge into `_full_estate` still filtered on the old, narrower
+`(COMPLETED, FAILED)` pair (a third hand-restated copy of "what counts as terminal," never
+updated to match); and the merge itself only ran `elif cheap_history:` -- i.e. only for a
+`NATIVE`-history connector (SABnzbd) -- which structurally excluded rTorrent (`DERIVED`) from
+ever merging *any* fast-tick data at all, even though rTorrent's own `active_only=True` result
+already reports `SEEDING` torrents at zero extra cost ("a torrent never leaves the list,"
+`active_only` excludes only `COMPLETED`). Both are fixed together: the filter is now derived from
+the two consumers' own constants (`settle.FINISHED_TRANSFER_PHASES` plus `TransferPhase.FAILED`,
+`core/clientsync.py._MERGEABLE_TERMINAL_PHASES`) rather than hand-restated a fourth time, and the
+merge now runs on every non-slow-due tick unconditionally -- it costs nothing extra either way,
+since `transfers` at that point is exactly what the tick already fetched.
+
+**Defect 2 -- a new, shorter cadence for an instance that currently has something in Preflight.**
+`ACTIVE_POLL_INTERVAL_S` (4.0s, `core/clientsync.py`) applies only to the fast, active-only call
+for one instance, and only while `_update_preflight`'s own `seen` rows for that instance are
+non-empty (`ClientSyncScheduler._active_instances`) -- reusing what that method already computes
+rather than adding a second, independently-drifting notion of "busy." `SLOW_INTERVAL_S` is
+completely untouched: Preflight's own data never comes from the full-estate call in the first
+place, so there is nothing this constant could speed up by also shortening the slow cadence, only
+cost to add. An instance with nothing currently in Preflight is never sped up -- it falls back to
+`FAST_INTERVAL_S`, via a new per-instance due-check in `_process_instance` (`_last_active_poll_at`)
+that did not exist before this stage; previously, cadence was governed purely by how often the
+*caller* invoked `run_once` (in production, `_loop`'s own sleep), with no gate inside
+`_process_instance` itself. `_loop` now wakes every `min(FAST_INTERVAL_S, ACTIVE_POLL_INTERVAL_S)`
+so a busy instance *can* be polled that often; the due-check is what keeps a quiet one from being
+dragged along for free. **The backoff ladder wins regardless** -- the existing backoff check in
+`_process_instance` runs, and returns, before the active-poll due-check is ever consulted, so an
+instance backing off is never polled faster merely because it has Preflight rows cached from
+before it broke.
+
 ### 9.2 Freshness and source precedence — a stale *arr reading must never overwrite a fresh one
 
 **Raised by the user, 2026-08-22**, and it is a genuine hole in every preceding section:

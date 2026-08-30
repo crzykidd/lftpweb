@@ -267,7 +267,11 @@ async def test_one_event_per_failure_transition_not_per_failed_pass(
     assert instance_id not in scheduler._backoff
 
     fake_sabnzbd_server.state.fail_all = True
-    now += 1.0
+    # `FAST_INTERVAL_S`, not an arbitrary `1.0` -- this instance has nothing in Preflight (an
+    # empty queue), so Defect 2's own due-check (`ACTIVE_POLL_INTERVAL_S`'s own docstring,
+    # `_process_instance`) falls back to `FAST_INTERVAL_S` and would otherwise skip this pass
+    # entirely, never even attempting the poll that is supposed to produce the second event.
+    now += scheduler.FAST_INTERVAL_S
     await scheduler.run_once(now=now)
     events = await _event_rows(db, kind="client_error")
     assert len(events) == 2
@@ -1396,6 +1400,81 @@ async def test_sab_fast_tick_surfaces_a_fresh_terminal_verdict_without_waiting_f
     assert transfer.content_path == "/complete/ar-tv/Show.S01"
 
 
+async def test_rtorrent_seeding_on_a_fast_tick_reaches_finished_transfers_without_the_slow_poll(
+    db, fake_rtorrent_server, tmp_path
+):
+    """Defect 1 (2026-08-29, prompts/2026-08-29-preflight-poll-freshness.md). Commit cc5f75d
+    widened `settle.FINISHED_TRANSFER_PHASES` to `{COMPLETED, SEEDING}` specifically because a
+    finished, actively-seeding rTorrent torrent classifies as `SEEDING`, never `COMPLETED`
+    (`core/clients/rtorrent.py._classify_token`) -- but this fast-tick merge, a third
+    hand-restated copy of "what counts as terminal," was never updated to match, **and** its
+    `elif cheap_history:` gate excluded rTorrent from the merge entirely: `Operation.
+    LIST_HISTORY` is `DERIVED` for rTorrent (module docstring), so `cheap_history` is always
+    `False` for it, and the merge branch never ran on a fast tick regardless of phase -- even
+    though the fast tick's own `active_only=True` call already reports `SEEDING` torrents at
+    zero extra cost (rTorrent's own contract: "a torrent never leaves the list," `active_only`
+    excludes only `COMPLETED` -- see `test_rtorrent_active_only_true_admits_only_incoming_rows`
+    above). Before the fix, a torrent finishing between two fast ticks stayed invisible to
+    `finished_transfers()` for up to `SLOW_INTERVAL_S` (5 minutes) regardless of how often the
+    fast tick ran -- exactly the gap the same commit's 5s verified settle skip depends on being
+    closed for the ordinary rTorrent case.
+    """
+    host_id = await _seed_host(db)
+    queue_id = await _seed_queue(db, host_id)
+    instance_id = await _seed_rtorrent_client(
+        db,
+        str(tmp_path),
+        base_url=fake_rtorrent_server.base_url,
+        username=fake_rtorrent_server.state.username,
+        password=fake_rtorrent_server.state.password,
+    )
+    await _seed_category(db, instance_id, "ar-tv", queue_id)
+
+    torrent_hash = "C" * 40
+    fake_rtorrent_server.state.add(
+        FakeRtorrentTorrent(
+            torrent_hash=torrent_hash,
+            name="Still.Downloading",
+            size_bytes=1000,
+            completed_bytes=200,
+            left_bytes=800,
+            complete=0,
+            is_active=1,
+            state=1,
+            custom1="ar-tv",
+        )
+    )
+
+    scheduler = ClientSyncScheduler(db=db, config_dir=str(tmp_path))
+    await scheduler.run_once(now=NOW0)  # first pass, always slow-due -- nothing finished yet
+    assert scheduler.finished_transfers() == []
+
+    # The torrent finishes and starts seeding, between fast ticks (same hash -- `state.add`
+    # mutates in place, `FakeRtorrentState.add`'s own dict-by-hash shape).
+    fake_rtorrent_server.state.add(
+        FakeRtorrentTorrent(
+            torrent_hash=torrent_hash,
+            name="Still.Downloading",
+            size_bytes=1000,
+            completed_bytes=1000,
+            complete=1,
+            is_active=1,
+            state=1,
+            custom1="ar-tv",
+        )
+    )
+    # Well inside SLOW_INTERVAL_S -- a fast-only pass: `active_only=True`, no `list_history()`
+    # call at all for a DERIVED-history connector (`test_derived_history_connector_never_
+    # doubles_the_expensive_call` below proves that half separately).
+    await scheduler.run_once(now=NOW0 + scheduler.FAST_INTERVAL_S)
+
+    finished = scheduler.finished_transfers()
+    assert len(finished) == 1
+    _, name, transfer = finished[0]
+    assert name == "rTorrent"
+    assert transfer.phase == TransferPhase.SEEDING
+
+
 async def _seed_rtorrent_client(
     db: aiosqlite.Connection, config_dir: str, *, base_url: str, username: str, password: str
 ) -> int:
@@ -1445,6 +1524,149 @@ async def test_derived_history_connector_never_doubles_the_expensive_call(
 
     await scheduler.run_once(now=NOW0 + scheduler.FAST_INTERVAL_S)  # fast-only pass
     assert _multicall_count() == 2  # exactly one more, never two more
+
+
+# --- Defect 2 (2026-08-29, prompts/2026-08-29-preflight-poll-freshness.md): a shorter cadence
+# for an instance that currently has something in Preflight --------------------------------------
+
+
+async def test_active_poll_interval_applies_once_something_is_in_preflight(
+    db, fake_sabnzbd_server, tmp_path
+):
+    """ "With something in flight, the next tick is due after the new short interval, not
+    `FAST_INTERVAL_S`" -- the handoff prompt's own first cadence assertion. A pass that sees a
+    Preflight-eligible transfer marks this instance active (`_update_preflight` ->
+    `ClientSyncScheduler._active_instances`); the very next pass, only `ACTIVE_POLL_INTERVAL_S`
+    later (well short of `FAST_INTERVAL_S`), must still be due and actually contact the client.
+    """
+    host_id = await _seed_host(db)
+    queue_id = await _seed_queue(db, host_id)
+    instance_id = await _seed_client(
+        db,
+        str(tmp_path),
+        base_url=fake_sabnzbd_server.base_url,
+        api_key=fake_sabnzbd_server.state.api_key,
+    )
+    await _seed_category(db, instance_id, "ar-tv", queue_id)
+    fake_sabnzbd_server.state.queue_slots = [_queue_slot("nzo1")]
+
+    scheduler = ClientSyncScheduler(db=db, config_dir=str(tmp_path))
+    await scheduler.run_once(now=NOW0)  # first pass, slow-due -- populates `_active_instances`
+    assert instance_id in scheduler._active_instances
+    calls_before = len(fake_sabnzbd_server.state.mode_calls)
+
+    await scheduler.run_once(now=NOW0 + scheduler.ACTIVE_POLL_INTERVAL_S)
+    assert len(fake_sabnzbd_server.state.mode_calls) > calls_before
+
+
+async def test_active_poll_interval_does_not_apply_with_nothing_in_flight(
+    db, fake_sabnzbd_server, tmp_path
+):
+    """ "With nothing in flight, cadence is unchanged at `FAST_INTERVAL_S`" -- the handoff
+    prompt's own second cadence assertion, the mirror image of the test above. An instance whose
+    most recent pass saw no Preflight-eligible transfer is never sped up: a pass only
+    `ACTIVE_POLL_INTERVAL_S` later is not yet due and makes no call at all, while a pass a full
+    `FAST_INTERVAL_S` later is.
+    """
+    instance_id = await _seed_client(
+        db,
+        str(tmp_path),
+        base_url=fake_sabnzbd_server.base_url,
+        api_key=fake_sabnzbd_server.state.api_key,
+    )
+    # No category/queue mapping and an empty queue -- nothing this instance could ever attribute,
+    # so `_active_instances` stays empty throughout.
+
+    scheduler = ClientSyncScheduler(db=db, config_dir=str(tmp_path))
+    await scheduler.run_once(now=NOW0)  # first pass, slow-due
+    assert instance_id not in scheduler._active_instances
+    calls_after_first = len(fake_sabnzbd_server.state.mode_calls)
+
+    # Well short of `FAST_INTERVAL_S` -- not due, no call made.
+    await scheduler.run_once(now=NOW0 + scheduler.ACTIVE_POLL_INTERVAL_S)
+    assert len(fake_sabnzbd_server.state.mode_calls) == calls_after_first
+
+    # A full `FAST_INTERVAL_S` later -- due, exactly the pre-existing cadence.
+    await scheduler.run_once(now=NOW0 + scheduler.FAST_INTERVAL_S)
+    assert len(fake_sabnzbd_server.state.mode_calls) > calls_after_first
+
+
+async def test_backoff_wins_over_the_active_poll_interval(db, fake_sabnzbd_server, tmp_path):
+    """ "The backoff ladder wins" -- the handoff prompt's own explicit "test this" instruction, the
+    one interaction most likely to go wrong: an instance backing off must not be dragged back to
+    a fast poll merely because it has Preflight rows cached from before it broke. A pass that
+    sees a transfer marks the instance active; the client then starts failing, and a follow-up
+    pass well inside `ACTIVE_POLL_INTERVAL_S` reach (let alone `INITIAL_BACKOFF_S`) must still be
+    skipped entirely -- no call, no second failure event -- because the backoff check (spec: "a
+    backed-off instance is never contacted") runs and returns *before* the active-poll due-check
+    is ever consulted.
+    """
+    host_id = await _seed_host(db)
+    queue_id = await _seed_queue(db, host_id)
+    instance_id = await _seed_client(
+        db,
+        str(tmp_path),
+        base_url=fake_sabnzbd_server.base_url,
+        api_key=fake_sabnzbd_server.state.api_key,
+    )
+    await _seed_category(db, instance_id, "ar-tv", queue_id)
+    fake_sabnzbd_server.state.queue_slots = [_queue_slot("nzo1")]
+
+    scheduler = ClientSyncScheduler(db=db, config_dir=str(tmp_path))
+    await scheduler.run_once(now=NOW0)  # slow-due, succeeds -- marks the instance active
+    assert instance_id in scheduler._active_instances
+
+    fake_sabnzbd_server.state.fail_all = True
+    await scheduler.run_once(now=NOW0 + scheduler.FAST_INTERVAL_S)  # fails -- backoff engaged
+    assert instance_id in scheduler._backoff
+    calls_before = len(fake_sabnzbd_server.state.mode_calls)
+    events_before = await _event_rows(db, kind="client_error")
+
+    # Still active-flagged, and well inside `ACTIVE_POLL_INTERVAL_S` reach of the failure -- if
+    # the active interval were consulted before backoff, this would be "due." It must not be.
+    await scheduler.run_once(
+        now=NOW0 + scheduler.FAST_INTERVAL_S + scheduler.ACTIVE_POLL_INTERVAL_S
+    )
+    assert len(fake_sabnzbd_server.state.mode_calls) == calls_before
+    events_after = await _event_rows(db, kind="client_error")
+    assert len(events_after) == len(events_before)
+
+
+async def test_slow_cadence_is_untouched_by_the_active_poll_interval(
+    db, fake_sabnzbd_server, tmp_path
+):
+    """`ACTIVE_POLL_INTERVAL_S` applies only to the fast, active-only call -- `SLOW_INTERVAL_S`
+    stays exactly as it was, however often the fast/active cadence now runs. Driving several
+    active-interval-spaced passes, all well inside `SLOW_INTERVAL_S`, must never re-trigger the
+    full-estate call (`_last_slow_poll_at` must not advance) -- it advances only once a pass is
+    actually `SLOW_INTERVAL_S` past the first one.
+    """
+    host_id = await _seed_host(db)
+    queue_id = await _seed_queue(db, host_id)
+    instance_id = await _seed_client(
+        db,
+        str(tmp_path),
+        base_url=fake_sabnzbd_server.base_url,
+        api_key=fake_sabnzbd_server.state.api_key,
+    )
+    await _seed_category(db, instance_id, "ar-tv", queue_id)
+    fake_sabnzbd_server.state.queue_slots = [_queue_slot("nzo1")]
+
+    scheduler = ClientSyncScheduler(db=db, config_dir=str(tmp_path))
+    await scheduler.run_once(now=NOW0)  # first pass, always slow-due
+    first_slow_poll_at = scheduler._last_slow_poll_at[instance_id]
+
+    now = NOW0
+    for _ in range(5):
+        now += scheduler.ACTIVE_POLL_INTERVAL_S
+        await scheduler.run_once(now=now)
+        # Still well inside `SLOW_INTERVAL_S` from the first pass -- the fast/active cadence
+        # running frequently must never move the slow cadence's own bookkeeping.
+        assert scheduler._last_slow_poll_at[instance_id] == first_slow_poll_at
+
+    now = NOW0 + scheduler.SLOW_INTERVAL_S + 1.0
+    await scheduler.run_once(now=now)
+    assert scheduler._last_slow_poll_at[instance_id] == now
 
 
 # --- `is_alive` / `start`/`stop` (same shape as every other scheduler in this codebase) ----------

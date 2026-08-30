@@ -225,6 +225,37 @@ FAST_INTERVAL_S = 10.0
 # isn't one.
 SLOW_INTERVAL_S = 300.0
 
+# 2026-08-29 (prompts/2026-08-29-preflight-poll-freshness.md, live use: *"when things are in
+# preflight we should update from SAB or rtorrent more often"*). **Applies only to the fast,
+# active-only call, for one instance, and only while that instance actually has something in
+# Preflight** (`ClientSyncScheduler._active_instances`, set from `_update_preflight`'s own `seen`
+# rows -- reusing what that method already computes rather than adding a second, independently-
+# drifting notion of "busy"). `SLOW_INTERVAL_S` above is completely untouched by this constant --
+# the full-estate listing stays exactly as expensive as spec §9.1 already budgeted for, on
+# purpose: Preflight's own data never comes from that call in the first place (`_update_preflight`
+# is only ever fed the active-only/cheap-history result, module docstring), so there is nothing
+# this constant could speed up by also shortening the slow cadence, only cost to add.
+#
+# 4.0s -- the midpoint of the range asked for ("~3-5s"), not independently re-derived; there is no
+# measurement behind this number, only "noticeably faster than `FAST_INTERVAL_S`'s 10s without
+# turning into a second polling loop in all but name." **What it costs**: an instance with
+# something currently in Preflight gets its cheap active-only (+ history, when `NATIVE`) call made
+# roughly 2.5x as often while that stays true -- a real increase in request rate, but to the
+# identical cheap endpoint the fast cadence already hits every pass, never a new one. **What it
+# buys**: the settle-gate skip and the withhold gate (both read `finished_transfers()`/
+# `failed_transfers()`, populated by the merge Defect 1 above just fixed) see a terminal verdict
+# roughly `FAST_INTERVAL_S - ACTIVE_POLL_INTERVAL_S` (~6s) sooner on average once something is
+# actually in flight -- raising the ceiling on freshness (Defect 1) does nothing for the floor if
+# a quiet instance with real work still waits a full `FAST_INTERVAL_S` between looks; this lowers
+# that floor.
+#
+# **The backoff ladder wins regardless of this constant.** `_process_instance`'s own backoff check
+# runs first and returns before this interval is ever consulted -- a failing instance's own
+# `next_attempt_at` is never shortened by Preflight rows left over from before it broke
+# (`tests/test_clientsync.py::test_backoff_wins_over_the_active_poll_interval`). Not a settings
+# knob, for the same reason `FAST_INTERVAL_S`/`SLOW_INTERVAL_S` aren't ones.
+ACTIVE_POLL_INTERVAL_S = 4.0
+
 # --- Per-instance failure isolation (spec §9, mirrors `core/arrsync.py`'s own constants exactly
 # -- "60s -> 30min", the shape this task's own handoff prompt names as the one to reuse) --------
 
@@ -334,6 +365,29 @@ _PREFLIGHT_PHASES: frozenset[TransferPhase] = frozenset(
     }
 )
 
+# --- The fast-tick `_full_estate` merge filter (spec §9.1, `_process_instance`'s own merge below)
+# -- Defect 1, 2026-08-29 (prompts/2026-08-29-preflight-poll-freshness.md) -----------------------
+#
+# Commit cc5f75d (the previous day) widened `settle.FINISHED_TRANSFER_PHASES` to
+# `{COMPLETED, SEEDING}` for exactly the reason its own commit message states: rTorrent classifies
+# a finished, actively-seeding torrent as `SEEDING`, never `COMPLETED`
+# (`core/clients/rtorrent.py._classify_token`), so `finished_transfers()` -- the settle-gate
+# skip's own candidate list -- had to admit both. **That commit updated the reader
+# (`finished_transfers()` below) and missed this merge, a third hand-restated copy of "what counts
+# as terminal" that stayed at the old, narrower `(COMPLETED, FAILED)` pair.** The result: for the
+# ordinary rTorrent case, a torrent finishing between two fast ticks stayed invisible to
+# `finished_transfers()` for up to `SLOW_INTERVAL_S` (5 minutes) regardless of how often the fast
+# tick ran, silently defeating the 5s verified settle skip cc5f75d shipped in the same breath.
+#
+# Derived from the two consumers' own constants, not hand-restated a fourth time: `settle.
+# FINISHED_TRANSFER_PHASES` for `finished_transfers()`, plus `TransferPhase.FAILED` for
+# `failed_transfers()` -- so the next phase either consumer needs to learn about only has to be
+# added in one place, the same "one allowlist, everyone reads it" shape `_PREFLIGHT_PHASES` above
+# already uses.
+_MERGEABLE_TERMINAL_PHASES: frozenset[TransferPhase] = FINISHED_TRANSFER_PHASES | frozenset(
+    {TransferPhase.FAILED}
+)
+
 
 def _attribution_sample(
     transfers: list[Transfer], path_queues: list[aiosqlite.Row]
@@ -384,6 +438,7 @@ class ClientSyncScheduler:
 
     FAST_INTERVAL_S = FAST_INTERVAL_S
     SLOW_INTERVAL_S = SLOW_INTERVAL_S
+    ACTIVE_POLL_INTERVAL_S = ACTIVE_POLL_INTERVAL_S
 
     def __init__(self, db: aiosqlite.Connection, config_dir: str) -> None:
         self.db = db
@@ -391,6 +446,26 @@ class ClientSyncScheduler:
         self._task: asyncio.Task | None = None
         self._backoff: dict[int, _InstanceBackoff] = {}
         self._last_slow_poll_at: dict[int, float] = {}
+        # Defect 2 (2026-08-29, prompts/2026-08-29-preflight-poll-freshness.md): the fast
+        # cadence's own due-time, tracked separately from `_last_slow_poll_at` because the
+        # interval it is compared against (`ACTIVE_POLL_INTERVAL_S` or `FAST_INTERVAL_S`, per
+        # instance -- `ACTIVE_POLL_INTERVAL_S`'s own docstring above) can differ per pass, unlike
+        # the slow cadence's single fixed interval. Updated on every successful poll, slow or
+        # fast alike -- both make the identical active-only call this due-time is protecting, a
+        # slow pass is never "less due" for it than a fast one. Starts empty, so the very first
+        # pass for any instance is always due (`now - 0.0` is always `>=` either interval),
+        # matching `_last_slow_poll_at`'s own "unseen means due" default.
+        self._last_active_poll_at: dict[int, float] = {}
+        # Which instance ids the most recent successful poll found something in Preflight for
+        # (`_update_preflight`'s own `seen` rows, `bool(seen)`) -- `ACTIVE_POLL_INTERVAL_S`'s own
+        # trigger, reusing what that method already computes rather than a second, independently-
+        # drifting notion of "busy" (this task's own explicit instruction). Read by
+        # `_process_instance` to pick this instance's own fast-cadence interval *before* that
+        # pass's poll happens, so it reflects the last-known state, not this pass's not-yet-fetched
+        # one. Never pruned on its own, matching every other per-instance cache in this module --
+        # a stale `True` for a since-disabled instance costs nothing, since a disabled instance is
+        # never in `instances` for `_process_instance` to be called with in the first place.
+        self._active_instances: set[int] = set()
         # The slow cadence's own cache -- nothing in stage 2a reads this (#21's own future job);
         # it exists so that work starts from an already-running poll rather than building one.
         # Keyed by instance id -> client_id -> Transfer, wholesale-replaced each slow pass.
@@ -462,7 +537,15 @@ class ClientSyncScheduler:
                 raise
             except Exception:  # noqa: BLE001 - one bad cycle must not kill the loop
                 logger.exception("client sync cycle failed")
-            await asyncio.sleep(self.FAST_INTERVAL_S)
+            # The tightest cadence any single instance might currently need
+            # (`ACTIVE_POLL_INTERVAL_S`, always `<=` `FAST_INTERVAL_S` by construction) -- `min()`
+            # rather than a bare reference to either constant so this stays correct even if that
+            # invariant is ever loosened. `_process_instance`'s own per-instance due-check (spec
+            # §9.1, Defect 2) is what actually keeps a quiet instance polled no faster than
+            # `FAST_INTERVAL_S` despite this loop now waking up more often -- looping at the
+            # shorter interval costs one cheap DB query plus a `time.monotonic()` compare per
+            # skipped instance, not a network call.
+            await asyncio.sleep(min(self.FAST_INTERVAL_S, self.ACTIVE_POLL_INTERVAL_S))
 
     # --- One pass over every enabled instance ------------------------------------------------
 
@@ -521,6 +604,25 @@ class ClientSyncScheduler:
             last_slow = self._last_slow_poll_at.get(instance_id, 0.0)
             slow_due = now - last_slow >= self.SLOW_INTERVAL_S
             cheap_history = client.capabilities.supports(Operation.LIST_HISTORY)
+
+            # Defect 2 (2026-08-29, prompts/2026-08-29-preflight-poll-freshness.md): the fast
+            # cadence's own due-check, new this stage -- before this, every non-backed-off pass
+            # contacted the client, because `_loop`'s own sleep was the only thing pacing fast
+            # polls at `FAST_INTERVAL_S`. Now that `_loop` wakes up every `ACTIVE_POLL_INTERVAL_S`
+            # (its own docstring) so a busy instance *can* be polled that often, a quiet one needs
+            # its own gate to stay at the slower `FAST_INTERVAL_S` instead of being dragged along
+            # for free. `self._active_instances`'s own last-known state (`_update_preflight`
+            # below) picks the interval; a slow-due pass is always let through regardless -- it
+            # is going to make the (superset) call either way, so there is nothing to gate.
+            last_active = self._last_active_poll_at.get(instance_id, 0.0)
+            active_interval = (
+                self.ACTIVE_POLL_INTERVAL_S
+                if instance_id in self._active_instances
+                else self.FAST_INTERVAL_S
+            )
+            if not slow_due and now - last_active < active_interval:
+                return  # not due yet at this instance's own cadence
+
             try:
                 if slow_due:
                     transfers = await client.list_transfers(active_only=False)
@@ -537,6 +639,10 @@ class ClientSyncScheduler:
                 return
 
             self._backoff.pop(instance_id, None)  # reachable (and authenticated) again
+            # Both branches above make the identical active-only call this due-time is
+            # protecting -- a slow pass is never "less due" for it than a fast one, so this is
+            # set unconditionally rather than only `elif not slow_due`.
+            self._last_active_poll_at[instance_id] = now
             await self._record_poll_result(instance_id, instance_name, ok=True, message=None)
             # Defect 1 (2026-08-23, prompts/2026-08-23-auto-add-categories-default-excluded.md):
             # every category this pass actually reported, over the whole transfer list -- not
@@ -551,17 +657,31 @@ class ClientSyncScheduler:
             if slow_due:
                 self._full_estate[instance_id] = {t.client_id: t for t in transfers}
                 self._last_slow_poll_at[instance_id] = now
-            elif cheap_history:
-                # Merge just the terminal transfers this fast tick's own cheap history call
-                # learned about into the full-estate cache -- the fix stage 2b's own correction
-                # (spec §9.1) called for: a terminal verdict is now visible to
-                # `finished_transfers()`/`failed_transfers()` within one `FAST_INTERVAL_S` tick,
-                # not stranded behind `SLOW_INTERVAL_S`. Deliberately leaves every non-terminal
-                # entry the last slow pass cached untouched -- this fast tick never asked about
-                # those, and overwriting them with nothing would be a regression, not a fix.
+            else:
+                # Merge whatever terminal transfers this fast tick's own `transfers` already
+                # contains into the full-estate cache -- the fix stage 2b's own correction (spec
+                # §9.1) called for: a terminal verdict is now visible to `finished_transfers()`/
+                # `failed_transfers()` within one `FAST_INTERVAL_S` tick, not stranded behind
+                # `SLOW_INTERVAL_S`. Deliberately leaves every non-terminal entry the last slow
+                # pass cached untouched -- this fast tick never asked about those, and overwriting
+                # them with nothing would be a regression, not a fix.
+                #
+                # **Unconditional on `cheap_history`, corrected 2026-08-29 (Defect 1,
+                # `_MERGEABLE_TERMINAL_PHASES`'s own comment above).** The original `elif
+                # cheap_history:` gate merged only when this connector's `Operation.LIST_HISTORY`
+                # is `NATIVE` (SABnzbd) -- which structurally excluded every `DERIVED`-history
+                # connector (rTorrent) from this merge, even though rTorrent needs no extra call
+                # to learn about `SEEDING` at all: a fast tick's own `active_only=True` result
+                # already reports seeding torrents at zero extra cost (rTorrent's own contract,
+                # "a torrent never leaves the list," excludes only `COMPLETED`). `transfers` here
+                # is exactly what this tick already fetched -- `active_only=True` alone for a
+                # `DERIVED`-history connector, `active_only=True` plus `list_history()` for a
+                # `NATIVE` one -- so merging from it costs nothing extra either way; the gate was
+                # never buying anything, only silently disqualifying rTorrent's own fast tick from
+                # ever updating this cache.
                 cache = self._full_estate.setdefault(instance_id, {})
                 for transfer in transfers:
-                    if transfer.phase in (TransferPhase.COMPLETED, TransferPhase.FAILED):
+                    if transfer.phase in _MERGEABLE_TERMINAL_PHASES:
                         cache[transfer.client_id] = transfer
         finally:
             aclose = getattr(client, "aclose", None)
@@ -882,6 +1002,18 @@ class ClientSyncScheduler:
             )
 
         self._unattributed_categories[instance_id] = unattributed_categories
+
+        # Defect 2 (2026-08-29, prompts/2026-08-29-preflight-poll-freshness.md):
+        # `ACTIVE_POLL_INTERVAL_S`'s own trigger, "this instance currently has something in
+        # flight" -- exactly `seen` above, the Preflight-eligible-phase rows this very pass just
+        # built, reused rather than re-derived a second way. Read by `_process_instance`'s own
+        # due-check on the *next* pass, not this one (this pass's poll already happened) -- so an
+        # instance's fast cadence speeds up starting the pass after Preflight work first appears,
+        # and falls back to `FAST_INTERVAL_S` starting the pass after it last empties out.
+        if seen:
+            self._active_instances.add(instance_id)
+        else:
+            self._active_instances.discard(instance_id)
 
         # Part 3 (2026-08-23): the observed attribution sample this pass produced -- over every
         # transfer reported, not just the Preflight-eligible-phase subset the loop above filters

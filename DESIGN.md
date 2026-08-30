@@ -3747,6 +3747,17 @@ claim than it sounds.
 | **4** — the disk review scan, four piles plus a torrent summary, review-only | **Built** (migrations 030, 031, 032) |
 | **5** — the delete pipeline, verification, banner | **NOT BUILT.** Nothing in this feature deletes anything |
 
+**Stage 2's poller cadence, refined 2026-08-29
+(`prompts/done/2026-08-29-preflight-poll-freshness.md`), live use: *"when things are in preflight
+we should update from SAB or rtorrent more often."*** Two defects fixed together (full detail,
+`docs/download-client-framework-spec.md` §9.1): the fast-tick merge into `_full_estate` (feeding
+`finished_transfers()`/`failed_transfers()`) had silently stopped reaching rTorrent at all —
+its own `elif cheap_history:` gate excluded every `DERIVED`-history connector, and its phase
+filter had not been widened alongside `settle.FINISHED_TRANSFER_PHASES`'s own `SEEDING` addition
+the day before; and a new `ACTIVE_POLL_INTERVAL_S` (4.0s) now polls an instance's fast, active-only
+call that much more often *while it currently has something in Preflight* — `SLOW_INTERVAL_S`
+untouched, a quiet instance untouched, and the backoff ladder still wins regardless.
+
 **One feature ships off by default and that is not timidity — it is one specific unverified
 assumption.** The withhold gate acts on SABnzbd's history status mapping (`Failed`→`FAILED`),
 which is **vendor-doc-derived and has never been confirmed against a real instance**. Every
