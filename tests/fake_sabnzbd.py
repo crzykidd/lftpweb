@@ -71,6 +71,12 @@ class FakeSabState:
     # When > 0, `mode=queue` ignores `queue_slots` entirely and answers with an empty slot
     # list, decrementing this counter by one per request.
     queue_empty_for_requests: int = 0
+    # `mode=queue`'s top-level `paused` boolean (global pause, live-use finding, 2026-08-30) --
+    # a sibling of `slots`, doc-derived/UNVERIFIED same as everything else in this fixture.
+    # `None` models "the key is absent from the response entirely" (an older SABnzbd, or this
+    # doc-derived reading turning out wrong) -- distinct from `False` -- so a test can exercise
+    # the connector's own tolerant-missing-key reading, not just its true/false branches.
+    queue_paused: bool | None = False
     misc_complete_dir: str = "/downloads/complete"
     misc_download_dir: str = "/downloads/incomplete"
     # `mode=get_config&section=categories` -- doc-derived, UNVERIFIED, 2026-08-23 (spec §8.3,
@@ -127,16 +133,20 @@ def _queue_response(state: FakeSabState) -> dict[str, Any]:
         slots: list[dict[str, Any]] = []
     else:
         slots = state.queue_slots
-    return {
-        "queue": {
-            "status": "Downloading" if slots else "Idle",
-            "slots": slots,
-            "diskspace1": state.diskspace1,
-            "diskspace2": state.diskspace2,
-            "diskspacetotal1": state.diskspacetotal1,
-            "diskspacetotal2": state.diskspacetotal2,
-        }
+    payload: dict[str, Any] = {
+        "status": "Downloading" if slots else "Idle",
+        "slots": slots,
+        "diskspace1": state.diskspace1,
+        "diskspace2": state.diskspace2,
+        "diskspacetotal1": state.diskspacetotal1,
+        "diskspacetotal2": state.diskspacetotal2,
     }
+    # `None` models the key being absent from the response entirely -- see `queue_paused`'s own
+    # field docstring above -- so it is only ever added to the payload when a test has actually
+    # set a real boolean.
+    if state.queue_paused is not None:
+        payload["paused"] = state.queue_paused
+    return {"queue": payload}
 
 
 def _history_response(state: FakeSabState) -> dict[str, Any]:

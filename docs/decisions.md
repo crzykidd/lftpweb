@@ -6,6 +6,51 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-30 — SABnzbd's global pause overrides only the download-side phases, never a blanket phase override
+
+`prompts/done/2026-08-30-sab-global-pause.md`. The user's own words: *"I notice we don't pick up
+the pause status on sab... so when we refresh we should show sab as paused for the item."*
+`core/clients/sabnzbd.py.list_transfers` mapped only each queue slot's own `status` string; it
+never read `mode=queue`'s top-level `paused` boolean (a sibling of `slots`). SABnzbd's main pause
+button pauses the whole queue without touching any individual slot's `status`, so every slot kept
+reporting `Downloading`/`Queued` and lftpweb faithfully drew a stopped queue as still downloading.
+
+**Rejected: a blanket override of every phase to `PAUSED` while the queue is globally paused.**
+Vendor docs describe the global pause as gating new data fetch, not the post-download pipeline —
+an item that is `Extracting`, `Verifying`, `Repairing`, `Moving`, or running a post-processing
+script keeps doing exactly that while the queue-wide pause is on. A blanket override would have
+been actively wrong for those phases, not merely imprecise, so the override in
+`_transfer_from_queue_slot` is scoped to exactly the two phases that mean "would be pulling
+article data right now if not paused": `QUEUED` and `DOWNLOADING` (`_PAUSABLE_DOWNLOAD_PHASES`).
+A slot already reporting `PAUSED` on its own is unaffected either way.
+
+**The top-level `paused` flag is doc-derived, UNVERIFIED against a live SABnzbd** — same
+discipline this module's every other constant already follows (see its own module docstring and
+`docs/download-client-framework-spec.md` §13.4, now row 14). `_is_queue_paused` reads it
+tolerantly: only the literal `True` counts as paused; a missing key, `None`, or any other shape
+reads as "not paused," never a raise.
+
+**`raw_status` stays untouched — the display fix lives in `core/clientsync.py`, not the
+connector.** `Transfer.raw_status` is contractually the client's own word, verbatim, so the
+override only ever changes the normalized `phase`. That alone doesn't fix what the user actually
+sees: `_update_preflight` was setting `status_label=transfer.raw_status` directly, so a
+globally-paused item whose `raw_status` still says `"Downloading"` would still read that way on
+the Preflight row. Fixed with a new `_preflight_status_label` helper keyed off
+`transfer.phase is TransferPhase.PAUSED` — never off `client_type`/`source_kind` (spec §4.4/§5.1
+forbid client-name branching) — so the fix is connector-agnostic by construction: an rTorrent
+torrent individually paused (`raw_status == "paused"` already) gets the identical, correct
+treatment for free, and the helper's "already says paused" check leaves it untouched rather than
+double-wording it. Wording chosen: `"Paused (<raw_status>)"` when there's a non-empty, not-already-
+paused `raw_status` to append (e.g. `"Paused (Downloading)"`), bare `"Paused"` otherwise — states
+the fact the user asked for without discarding what the item would otherwise be doing.
+
+Scope fence held deliberately narrow: `_HISTORY_PHASE_MAP` and the history/unpacking mapping are
+untouched — a separate, open question about SABnzbd's unpacking behaviour is waiting on live API
+captures from the user's own instance, and widening either phase map on a guess is exactly the
+failure mode the module's own `UNVERIFIED` warnings exist to prevent.
+
+---
+
 ## 2026-08-30 — the Files tree reads the download client per-item off the wire; the *arr kind stays queue-resolved, and the two are not unified
 
 `prompts/2026-08-30-client-chip-on-files-tree.md`. The user's own ask, a same-day follow-up to the

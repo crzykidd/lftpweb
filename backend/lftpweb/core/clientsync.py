@@ -389,6 +389,41 @@ _MERGEABLE_TERMINAL_PHASES: frozenset[TransferPhase] = FINISHED_TRANSFER_PHASES 
 )
 
 
+def _preflight_status_label(transfer: Transfer) -> str:
+    """The label a Preflight row actually shows (live-use finding, 2026-08-30: "I notice we
+    don't pick up the pause status on sab... so when we refresh we should show sab as paused for
+    the item"). `_update_preflight` used to set `status_label=transfer.raw_status` directly, so
+    a globally-paused SABnzbd item -- whose queue slot still reports `"Downloading"`/`"Queued"`
+    verbatim (`core/clients/sabnzbd.py`'s global-pause override sets only the normalized `phase`,
+    never `raw_status` -- see `Transfer.raw_status`'s own "the client's own word, verbatim,
+    never rewritten" contract) -- kept reading "Downloading" on screen, which was the whole
+    complaint.
+
+    This is the one place that gap is closed: a **display-level derivation**, keyed off
+    `phase is TransferPhase.PAUSED` and nothing else -- never off `client_type`/`source_kind`
+    (spec §4.4/§5.1 forbid client-name branching). `phase` is the client-agnostic fact ("this
+    connector, by whatever means, currently considers this transfer paused"); `raw_status` stays
+    the client's own untouched word for the drawer and for debugging. This is connector-agnostic
+    by construction, not by a special case for SABnzbd: an rTorrent torrent individually paused
+    reports `raw_status == "paused"` already (`core/clients/rtorrent.py`), so the "already says
+    paused" check below leaves it untouched and it gets the same correct label for free.
+
+    **Wording**: `"Paused (<raw_status>)"` when `raw_status` is non-empty and doesn't already
+    say "paused" -- e.g. `"Paused (Downloading)"` -- so the row states the fact the user asked
+    for (paused) without discarding the client's own word for what it would otherwise be doing.
+    Bare `"Paused"` when there is no `raw_status` to append. A `raw_status` that already mentions
+    "paused" (case-insensitively) is left exactly as-is, so a connector that already says so
+    natively is never double-worded.
+    """
+    if transfer.phase is not TransferPhase.PAUSED:
+        return transfer.raw_status
+    if "paused" in transfer.raw_status.lower():
+        return transfer.raw_status
+    if not transfer.raw_status:
+        return "Paused"
+    return f"Paused ({transfer.raw_status})"
+
+
 def _attribution_sample(
     transfers: list[Transfer], path_queues: list[aiosqlite.Row]
 ) -> tuple[int, int]:
@@ -1080,7 +1115,7 @@ class ClientSyncScheduler:
                 queue_name=queue["name"],
                 queue_short_name=queue["short_name"],
                 title=transfer.name,
-                status_label=transfer.raw_status,
+                status_label=_preflight_status_label(transfer),
                 source_label=instance["name"],
                 source_kind=instance["client_type"],
                 size_bytes=transfer.size_bytes,

@@ -31,6 +31,7 @@ from lftpweb.core.clientsync import (
     ClientSyncScheduler,
     UnattributedClientInfo,
     _PREFLIGHT_PHASES,
+    _preflight_status_label,
     persist_observed_categories,
 )
 from lftpweb.core.clients.models import Transfer, TransferPhase
@@ -1298,6 +1299,48 @@ def _transfer(client_id: str, phase: TransferPhase, **kwargs) -> Transfer:
         raw={},
         **kwargs,
     )
+
+
+# --- `_preflight_status_label` (live-use finding, 2026-08-30, sab global pause) ----------------
+#
+# "I notice we don't pick up the pause status on sab... so when we refresh we should show sab as
+# paused for the item." `_update_preflight` used to set `status_label=transfer.raw_status`
+# directly, so a globally-paused SABnzbd item -- whose queue slot's own `raw_status` never
+# changes (`core/clients/sabnzbd.py`'s global-pause override only sets `phase`) -- kept reading
+# "Downloading" on the Preflight row. Exercised as a pure function of `Transfer`, keyed off
+# `phase` only -- never `source_kind`/`client_type` (spec §4.4/§5.1) -- so the same behaviour
+# covers every connector, not just SABnzbd.
+
+
+def _transfer_with_raw_status(phase: TransferPhase, raw_status: str) -> Transfer:
+    # Not `_transfer` above -- that helper hardcodes `raw_status=phase.value`, but these tests
+    # need to control `raw_status` independently of `phase` (exactly the point: a globally-paused
+    # SABnzbd item has `phase is PAUSED` while `raw_status` still reads "Downloading").
+    return Transfer(
+        client_id="id-1", name="Release.id-1", phase=phase, raw_status=raw_status, raw={}
+    )
+
+
+def test_paused_transfer_status_label_says_paused_and_keeps_the_original_word():
+    transfer = _transfer_with_raw_status(TransferPhase.PAUSED, "Downloading")
+    assert _preflight_status_label(transfer) == "Paused (Downloading)"
+
+
+def test_paused_transfer_with_no_raw_status_gets_a_bare_paused_label():
+    transfer = _transfer_with_raw_status(TransferPhase.PAUSED, "")
+    assert _preflight_status_label(transfer) == "Paused"
+
+
+def test_paused_transfer_already_saying_paused_is_left_alone():
+    """rTorrent's own individually-paused torrent already reports `raw_status == "paused"`
+    (`core/clients/rtorrent.py`) -- must not be double-worded into "Paused (paused)"."""
+    transfer = _transfer_with_raw_status(TransferPhase.PAUSED, "paused")
+    assert _preflight_status_label(transfer) == "paused"
+
+
+def test_non_paused_transfer_status_label_is_unchanged():
+    transfer = _transfer_with_raw_status(TransferPhase.DOWNLOADING, "Downloading")
+    assert _preflight_status_label(transfer) == "Downloading"
 
 
 async def test_preflight_phase_allowlist_covers_every_transfer_phase():

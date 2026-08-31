@@ -149,6 +149,39 @@ def _map_phase(raw_status: str) -> TransferPhase:
     return phase if phase is not None else TransferPhase.UNKNOWN
 
 
+# --------------------------------------------------------------------------------------------
+# Global pause (spec §3, live-use finding, 2026-08-30: "we don't pick up the pause status on
+# sab... so when we refresh we should show sab as paused for the item"). **Doc-derived,
+# UNVERIFIED against a live SABnzbd**, same as `_QUEUE_PHASE_MAP` above -- SABnzbd's main pause
+# button pauses the whole queue by setting a top-level `paused` boolean on the `mode=queue`
+# response (a sibling of `slots`, read by `_is_queue_paused` below), without touching any
+# individual slot's own `status`. Left unread, every slot kept faithfully reporting
+# `Downloading`/`Queued` while the whole queue sat stopped -- this is that gap's fix.
+#
+# **Only the download-side phases are eligible for the override.** A global pause stops
+# SABnzbd from fetching new article data; it does NOT stop post-download work already in
+# progress -- an item that is `Extracting`, `Verifying`, `Repairing`, `Moving`, or `Running` a
+# post-processing script keeps doing exactly that while the queue-wide pause is on (per vendor
+# docs, the pause gates the download step, not the post-processing pipeline). Mapping a
+# post-download phase to `PAUSED` here would be actively wrong, not just imprecise, so the
+# override is scoped to the two phases that mean "would be pulling article data right now if
+# not paused": `QUEUED` and `DOWNLOADING`. A slot already reporting `PAUSED` on its own is
+# unaffected either way (the override is a no-op for it).
+_PAUSABLE_DOWNLOAD_PHASES = frozenset({TransferPhase.QUEUED, TransferPhase.DOWNLOADING})
+
+
+def _is_queue_paused(queue: dict[str, Any]) -> bool:
+    """The `mode=queue` response's top-level `paused` boolean -- **doc-derived, UNVERIFIED
+    against a live SABnzbd, 2026-08-30**, per the module docstring's own discipline: this is a
+    guess from vendor documentation, not a measured fact, and is labeled as such here rather than
+    presented as one. Tolerant of anything other than the literal `True` -- a missing key (older
+    SABnzbd versions, or a shape this reading turns out to be wrong about), `None`, or any other
+    unexpected value all read as "not paused" rather than raising, the same "prefer the tolerant
+    reading" discipline every other doc-derived parser in this module already follows.
+    """
+    return queue.get("paused") is True
+
+
 def _mb_string_to_bytes(value: Any) -> int | None:
     """SABnzbd's queue slot reports size in MB as a numeric string (`"mb"`/`"mbleft"`) --
     doc-derived, UNVERIFIED. Tolerant: an unparseable or missing value is `None`, never a raise
@@ -373,9 +406,17 @@ class SabnzbdClient(DownloadClient):
     # Normalization -- queue slot / history slot -> `Transfer`.
     # ------------------------------------------------------------------------------------
 
-    def _transfer_from_queue_slot(self, slot: dict[str, Any]) -> Transfer:
+    def _transfer_from_queue_slot(self, slot: dict[str, Any], *, queue_paused: bool) -> Transfer:
         client_id = normalize_client_id(str(slot.get("nzo_id") or ""))
         raw_status = str(slot.get("status") or "")
+        phase = self.map_phase(raw_status)
+        # Global-pause override (module comment above `_PAUSABLE_DOWNLOAD_PHASES`) -- applied
+        # only to the two download-side phases; a post-download phase (`VERIFYING`, `EXTRACTING`,
+        # ...) is left exactly as mapped, since post-processing keeps running while the queue is
+        # paused. `raw_status` itself is never touched -- it stays the client's own word,
+        # verbatim, per `Transfer.raw_status`'s own contract; only the normalized `phase` changes.
+        if queue_paused and phase in _PAUSABLE_DOWNLOAD_PHASES:
+            phase = TransferPhase.PAUSED
         size_bytes = _mb_string_to_bytes(slot.get("mb"))
         left_bytes = _mb_string_to_bytes(slot.get("mbleft"))
         bytes_done = None
@@ -384,7 +425,7 @@ class SabnzbdClient(DownloadClient):
         return Transfer(
             client_id=client_id,
             name=str(slot.get("filename") or ""),
-            phase=self.map_phase(raw_status),
+            phase=phase,
             raw_status=raw_status,
             raw=slot,
             size_bytes=size_bytes,
@@ -492,7 +533,11 @@ class SabnzbdClient(DownloadClient):
 
     async def list_transfers(self, *, active_only: bool = False) -> list[Transfer]:
         queue = await self._get_queue()
-        transfers = [self._transfer_from_queue_slot(s) for s in queue.get("slots", []) or []]
+        queue_paused = _is_queue_paused(queue)
+        transfers = [
+            self._transfer_from_queue_slot(s, queue_paused=queue_paused)
+            for s in queue.get("slots", []) or []
+        ]
         if not active_only:
             history = await self._get_history()
             transfers += [

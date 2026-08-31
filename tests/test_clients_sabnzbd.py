@@ -287,6 +287,88 @@ def test_map_phase_documented_history_vocabulary(raw_status, expected):
 
 
 # ------------------------------------------------------------------------------------
+# Global pause (live-use finding, 2026-08-30, prompts/2026-08-30-sab-global-pause.md): the
+# top-level `queue["paused"]` boolean, doc-derived/UNVERIFIED -- see `_is_queue_paused`'s own
+# docstring. **Download-side phases only** -- a global pause stops downloading, not
+# post-processing, so an item already `Extracting`/`Verifying`/etc. must keep that phase.
+# ------------------------------------------------------------------------------------
+
+
+async def test_global_pause_overrides_a_downloading_slot_to_paused(fake_sabnzbd_server):
+    fake_sabnzbd_server.state.queue_slots = [_queue_slot(status="Downloading")]
+    fake_sabnzbd_server.state.queue_paused = True
+    client = _client(fake_sabnzbd_server)
+
+    (result,) = await client.list_transfers(active_only=True)
+
+    assert result.phase is TransferPhase.PAUSED
+    # `raw_status` is the client's own word, verbatim -- never rewritten by the global-pause
+    # override, only the normalized `phase` changes.
+    assert result.raw_status == "Downloading"
+
+
+async def test_global_pause_does_not_touch_post_download_phases(fake_sabnzbd_server):
+    """The nuance this whole task exists to protect: a global pause stops SABnzbd from
+    downloading, but NOT from post-processing already-fetched data. An item mid-`Extracting`
+    must stay `EXTRACTING` even while the queue-wide pause is on -- collapsing this into a
+    blanket override would be actively wrong, not just imprecise.
+    """
+    fake_sabnzbd_server.state.queue_slots = [_queue_slot(status="Extracting")]
+    fake_sabnzbd_server.state.queue_paused = True
+    client = _client(fake_sabnzbd_server)
+
+    (result,) = await client.list_transfers(active_only=True)
+
+    assert result.phase is TransferPhase.EXTRACTING
+    assert result.raw_status == "Extracting"
+
+
+async def test_global_pause_false_leaves_every_phase_exactly_as_mapped(fake_sabnzbd_server):
+    """Straight regression guard: with the queue not globally paused, mapping is untouched by
+    this task's change."""
+    fake_sabnzbd_server.state.queue_slots = [
+        _queue_slot(nzo_id="a", status="Downloading"),
+        _queue_slot(nzo_id="b", status="Queued"),
+        _queue_slot(nzo_id="c", status="Extracting"),
+        _queue_slot(nzo_id="d", status="Paused"),
+    ]
+    fake_sabnzbd_server.state.queue_paused = False
+    client = _client(fake_sabnzbd_server)
+
+    result = await client.list_transfers(active_only=True)
+
+    phases = {t.client_id: t.phase for t in result}
+    assert phases == {
+        "a": TransferPhase.DOWNLOADING,
+        "b": TransferPhase.QUEUED,
+        "c": TransferPhase.EXTRACTING,
+        "d": TransferPhase.PAUSED,
+    }
+
+
+async def test_a_slot_individually_paused_stays_paused_regardless_of_global_pause(
+    fake_sabnzbd_server,
+):
+    fake_sabnzbd_server.state.queue_slots = [_queue_slot(status="Paused")]
+    fake_sabnzbd_server.state.queue_paused = False
+    client = _client(fake_sabnzbd_server)
+
+    (result,) = await client.list_transfers(active_only=True)
+
+    assert result.phase is TransferPhase.PAUSED
+
+
+async def test_missing_paused_key_is_treated_as_not_paused_not_a_raise(fake_sabnzbd_server):
+    fake_sabnzbd_server.state.queue_slots = [_queue_slot(status="Downloading")]
+    fake_sabnzbd_server.state.queue_paused = None  # absent from the response entirely
+    client = _client(fake_sabnzbd_server)
+
+    (result,) = await client.list_transfers(active_only=True)
+
+    assert result.phase is TransferPhase.DOWNLOADING
+
+
+# ------------------------------------------------------------------------------------
 # The v0.2.4-shaped blank-queue blip (spec §1, §4.2) -- no verdict, not "everything failed."
 # ------------------------------------------------------------------------------------
 
