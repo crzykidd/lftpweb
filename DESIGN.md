@@ -3579,6 +3579,19 @@ every call — otherwise excluding a category in Settings does not clear the war
 poll pass happens to run. This is `core/arrsync.py`'s own 2026-08-21 eviction-latency fix,
 applied twice more here; it is a recurring bug shape in this codebase, not a one-off.
 
+**Binding is a prerequisite for every client-derived feature, not a separate toggle per
+feature.** A category that is unbound or recorded excluded (the default a newly-observed category
+arrives in) contributes nothing to attribution, which means it contributes nothing to anything
+downstream of attribution: Preflight freshness (§17's client-as-third-source merge), the
+settle-gate skip, the client's pause state on a row, the row's client icon (§17.9). These are not
+independent features each with their own on/off switch — they all read off the same attributed
+transfer, so an unbound category does not degrade them one at a time, it makes all of them die
+quietly together, at once, with nothing anywhere saying why. A live diagnosis on 2026-08-30/31
+found exactly this: a fully-configured, successfully-polling SABnzbd instance whose categories
+were still all recorded excluded produced zero Preflight rows, no pause state, and no row icon,
+while every diagnostic in the app read healthy — full incident and the fix in
+`docs/download-client-framework-spec.md` §8.3's round 7 correction.
+
 ### 17.6 The disk review scan: four piles, a torrent summary, claimed by inode
 
 lftpweb's Files page shows only its queues' remote paths. A torrent client's seeding folders

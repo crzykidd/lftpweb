@@ -760,6 +760,66 @@ correction touches:**
    items suppressed," never "N base paths skipped." The root is still walked; only debris
    proposals for its unclaimed remainder are narrowed.
 
+### 8.3 correction, round 7 (2026-08-31) — an excluded, unbound category is invisible to every
+diagnostic, not merely quiet
+
+A live diagnosis burned a long session on 2026-08-30/31 on a failure mode round 6 above produces
+but had never named in this specific shape. The user's own SABnzbd instance was polling
+successfully (`last_poll_ok: true`, every field `native`) — but **every one of its categories was
+`excluded: true, queue_id: null`**, round 6's "every newly observed category defaults to excluded"
+rule doing exactly what it was built to do, with nobody having yet gone to Settings → Clients to
+opt any of them in:
+
+```
+=== ultracc SAB                       === ultracc rtorrent
+   dc-movies  queue_id=None excl=True    ar-tv      queue_id=2    excl=False
+   ar-movies  queue_id=None excl=True    ar-movies  queue_id=1    excl=False
+   dc-tv      queue_id=None excl=True    dc-tv      queue_id=None excl=True
+   ar-tv      queue_id=None excl=True    ...
+```
+
+None of the consequences announced themselves:
+
+- The SAB instance contributed **zero** Preflight rows — an excluded category is dropped at
+  attribution (§8.3 round 5), the same outcome an *unmapped* category produces, even though the
+  two states mean different things: one says "not configured yet," the other says "deliberately
+  not this instance's."
+- Preflight still showed the downloads, because Sonarr also tracks the same releases —
+  `source: "arr"`, `contributors: []`, `download_client: "SABnzbd-ultracc"` (the *arr's own
+  tooltip fact, unrelated to whether the client is contributing anything to the row). The UI read
+  "downloading from SAB" while every number on the row came from Sonarr.
+- Progress therefore refreshed on the *arr's poll cadence instead of the client's — which reads as
+  freezing for tens of seconds and then jumping, rather than moving continuously.
+- SABnzbd's global pause (§13.4 row 14, shipped the day before) never appeared, because there was
+  no client-sourced row for it to appear on.
+- The download-client row icon (§8.4, below) never appeared for these items, for the same reason.
+- **`unattributed_clients` and `gated_queues` were both empty the entire time.** Round 6 point 5's
+  own banner-quieting fix is *why*: an excluded category is filtered out of the unattributed count
+  on purpose, so "a client whose every category is bound or explicitly excluded produces a silent
+  banner" — round 6's own words, and exactly the behaviour it was built to produce. It is correct
+  for the case it was built for (a second lftpweb instance's own categories, sharing a seedbox,
+  deliberately not this instance's business) and, from inside the app, indistinguishable from this
+  instance's *own* categories simply never having been configured. Every diagnostic read healthy
+  at once, for two different reasons that both bottom out in "excluded."
+
+Binding `ar-tv`/`ar-movies` to their queues and un-excluding them fixed it immediately: those rows
+became `source: "client"`, `contributors: ['arr', 'client']`, and remaining bytes moved every ~5s
+(578M → 532M → 441M → 396M → 303M over 27s) instead of holding still between *arr polls.
+
+**The wire-level tell — the fastest way to tell the two states apart without opening Settings:**
+
+| Client contributing | `source` | `contributors` |
+|---|---|---|
+| yes | `"client"` | `['arr', 'client']` |
+| no | `"arr"` | `[]` |
+
+**Not fixed here, and deliberately so** — see `README.md`'s "Known gaps." Nothing in this
+correction adds a UI signal for this specific case, changes round 6's exclusion default, or
+surfaces an excluded category in `unattributed_clients`. Any of those would blur back together the
+two states round 6 worked to keep separate (a second install's categories vs. this install's own
+unconfigured ones); telling them apart from inside the UI, without reading the database or the
+wire response by hand, is the real fix for the underlying gap and belongs to a separate task.
+
 ### 8.4 Which client fetched an item — persisted forward-only, drawn as a row icon
 
 2026-08-30 (`prompts/2026-08-30-downloader-icon-on-rows.md`, migration 033): the user's own ask —
@@ -1032,6 +1092,28 @@ falling back to the row's own top-level fields for a standalone row so no row ev
 second slot. Provenance display and field precedence are now both covered, by two different,
 independently testable mechanisms — this section's own rule for the latter, `PreflightRow.
 contributors` for the former.
+
+#### The same gap one layer earlier — no row to merge at all (2026-08-30/31)
+
+This section and the provenance-display fix above both assume the client produced *a row* for the
+merge to work with. A live diagnosis found a case where it never did: every category on a
+configured, successfully-polling SABnzbd instance was recorded `excluded` (§8.3 round 5's own
+attribution rule — an excluded category is dropped before it can ever reach the merge), so the
+client contributed **zero** Preflight rows while the *arr's own view of the same releases still
+filled the row in on its own. **An excluded or unbound category contributes no Preflight rows,
+full stop** — and when the *arr also tracks the release, the row still appears, sourced from the
+*arr, with the client simply absent from `contributors`. Same wire shape the provenance gap above
+describes, for a different underlying reason: not a precedence bug (there was no fresher client
+value being overwritten), and not a missing badge (there was no client-sourced row to badge) —
+just nothing on the client's side of the merge to begin with.
+
+| Client contributing | `source` | `contributors` |
+|---|---|---|
+| yes | `"client"` | `['arr', 'client']` |
+| no | `"arr"` | `[]` |
+
+Full incident, why it took a long session to diagnose, and what was fixed: §8.3's round 7
+correction, above.
 
 ### 9.3 Visibility — a working client must never look identical to a broken one
 
@@ -1633,7 +1715,7 @@ against the real instance. **Nothing here is confirmed; all of it is vendor-doc-
 | 11 | **`get_transfer` left `DERIVED`** (filter the merged list) rather than native by `nzo_id` | Low; §5 already flags this one |
 | 12 | **`tests/fake_sabnzbd.py` inherits every guess above** rather than independently corroborating any of them | This is the §13.2 trap by construction, and why the list exists |
 | 13 | **`list_categories`** via `mode=get_config&section=categories`, reading `config.categories` as a list of `{"name": ...}` dicts, excluding SAB's own `"*"` "Default" pseudo-category (added 2026-08-23, §2.1/§8.3, `prompts/2026-08-23-category-binding-redesign.md`) | Moderate — now load-bearing for the category → queue binding UI's *primary* proposal mechanism, same load-bearing shift `list_base_paths` (row 7) got in the §8.2 correction. A wrong section name or shape means this silently returns `[]`, which the UI reads as "the client reported no categories" and falls back to the (also fallible) path-arithmetic guess rather than erroring loudly |
-| 14 | **Global pause**: `mode=queue`'s top-level `paused` boolean (a sibling of `slots`) overrides a queue slot's `QUEUED`/`DOWNLOADING` phase to `PAUSED`; a post-download phase (`VERIFYING`/`EXTRACTING`) is left exactly as mapped, on the reading that a global pause gates the download step only, never post-processing already in flight (added 2026-08-30, `prompts/done/2026-08-30-sab-global-pause.md`, live-use finding: *"I notice we don't pick up the pause status on sab... so when we refresh we should show sab as paused for the item"*) | Moderate — wrong in the direction of also pausing post-processing phases would misreport an actively-unpacking item as stalled; the gap this closes was the opposite direction (a stopped queue silently read as still downloading) |
+| 14 | **Global pause**: `mode=queue`'s top-level `paused` boolean (a sibling of `slots`) overrides a queue slot's `QUEUED`/`DOWNLOADING` phase to `PAUSED`; a post-download phase (`VERIFYING`/`EXTRACTING`) is left exactly as mapped, on the reading that a global pause gates the download step only, never post-processing already in flight (added 2026-08-30, `prompts/done/2026-08-30-sab-global-pause.md`, live-use finding: *"I notice we don't pick up the pause status on sab... so when we refresh we should show sab as paused for the item"*). **The top-level `paused` boolean itself is CONFIRMED, 2026-08-31, against the user's live SABnzbd**: pausing the queue produced the paused state on Preflight rows | Moderate — wrong in the direction of also pausing post-processing phases would misreport an actively-unpacking item as stalled; the gap this closes was the opposite direction (a stopped queue silently read as still downloading). Confirmed correct as shipped |
 
 ### 13.5 The live validation loop
 

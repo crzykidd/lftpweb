@@ -4,7 +4,8 @@ import type { PreflightResponse } from '../api/types'
 import { usePoll } from './usePoll'
 
 // Used to be 15000ms, chosen when this box's own eviction was only ever decided once per *arr
-// poll (`core/arrsync.py.ArrSettings.poll_interval_s`, 60s default) -- polling faster than that
+// poll (`core/arrsync.py.ArrSettings.poll_interval_s`, 10s default since 2026-08-21's issue #16;
+// 60s before that) -- polling faster than that
 // just meant re-fetching data that hadn't moved yet. 2026-08-21 ("eviction latency") moved
 // retirement to request time in `GET /api/queue/preflight` itself (`ArrSyncScheduler.
 // preflight_rows` now re-asks "does a matching item exist" fresh on every call, not just once

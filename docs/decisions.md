@@ -6,6 +6,51 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-31 — a category recorded excluded is invisible to every diagnostic; the wire-level tell is the fastest way to find it again
+
+A live diagnosis on 2026-08-30/31 burned a long session before finding the cause. The user's own
+words: *"We need to make sure docs cover this well cause it gets confusing."* SABnzbd was polling
+fine (`last_poll_ok: true`, every field `native`), but **every one of its categories was
+`excluded: true, queue_id: null`** — migration 032's "every newly observed category defaults to
+excluded" rule (§8.3 round 6) doing exactly what it was built to do, with nobody having yet gone
+to Settings → Clients to bind and un-exclude any of them. Consequences, none of which announced
+themselves: zero Preflight rows from the client; Preflight still showed the same releases because
+Sonarr tracked them independently, `source: "arr"`, `contributors: []`; progress refreshed on the
+*arr's cadence, reading as freezing then jumping; SABnzbd's global pause never appeared; the
+download-client row icon never appeared; and `unattributed_clients`/`gated_queues` stayed empty
+the whole time, because §8.3 round 5's own banner-quieting fix deliberately filters an excluded
+category out of that count — correct for its actual purpose (a second lftpweb instance's own
+categories on a shared seedbox) and indistinguishable, from inside the app, from this instance's
+own categories simply never having been configured.
+
+**Why it took so long: every cadence measured correct, while the real question — did the client
+produce a row at all — was never asked.** The investigation kept re-checking *arr poll intervals,
+Preflight's own poll interval, and the settle-gate skip's timing, all of which were working exactly
+as designed, because the symptom (progress jumping instead of moving smoothly) looks exactly like
+a cadence problem. It is one, but one layer downstream of the actual fault: there was no client row
+in the merge for any cadence question to apply to. The fix, once found, was two clicks (bind
+`ar-tv`/`ar-movies` to their queues, un-exclude them) — rows immediately became
+`source: "client"`, `contributors: ['arr', 'client']`, moving every ~5s.
+
+**The first thing to check next time a client "isn't updating": the wire-level tell, not the
+timing.**
+
+| Client contributing | `source` | `contributors` |
+|---|---|---|
+| yes | `"client"` | `['arr', 'client']` |
+| no | `"arr"` | `[]` |
+
+`source: "arr"` with an empty `contributors` means the client is contributing nothing to that row
+— check Settings → Clients for an excluded, unbound category — *before* looking at any poll
+interval or cadence setting. Documented in `README.md` (a user-facing troubleshooting entry and a
+"Known gaps" line), `docs/download-client-framework-spec.md` §8.3's new round 7 correction and
+§9.2, and `DESIGN.md` §17.5. **Deliberately not fixed here**: no UI banner for this specific case,
+no change to round 6's exclusion default, no surfacing of excluded categories in
+`unattributed_clients` — any of those would blur back together the two states round 6 built to
+keep separate, and are a separate task.
+
+---
+
 ## 2026-08-30 — SABnzbd's global pause overrides only the download-side phases, never a blanket phase override
 
 `prompts/done/2026-08-30-sab-global-pause.md`. The user's own words: *"I notice we don't pick up

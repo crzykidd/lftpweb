@@ -151,10 +151,11 @@ def _map_phase(raw_status: str) -> TransferPhase:
 
 # --------------------------------------------------------------------------------------------
 # Global pause (spec §3, live-use finding, 2026-08-30: "we don't pick up the pause status on
-# sab... so when we refresh we should show sab as paused for the item"). **Doc-derived,
-# UNVERIFIED against a live SABnzbd**, same as `_QUEUE_PHASE_MAP` above -- SABnzbd's main pause
-# button pauses the whole queue by setting a top-level `paused` boolean on the `mode=queue`
-# response (a sibling of `slots`, read by `_is_queue_paused` below), without touching any
+# sab... so when we refresh we should show sab as paused for the item"). **The top-level `paused`
+# boolean itself is MEASURED, not doc-derived -- confirmed against the user's live SABnzbd,
+# 2026-08-31: pausing the queue produced the paused state on Preflight rows** (spec §13.4 row 14).
+# SABnzbd's main pause button pauses the whole queue by setting that top-level `paused` boolean on
+# the `mode=queue` response (a sibling of `slots`, read by `_is_queue_paused` below), without touching any
 # individual slot's own `status`. Left unread, every slot kept faithfully reporting
 # `Downloading`/`Queued` while the whole queue sat stopped -- this is that gap's fix.
 #
@@ -171,13 +172,14 @@ _PAUSABLE_DOWNLOAD_PHASES = frozenset({TransferPhase.QUEUED, TransferPhase.DOWNL
 
 
 def _is_queue_paused(queue: dict[str, Any]) -> bool:
-    """The `mode=queue` response's top-level `paused` boolean -- **doc-derived, UNVERIFIED
-    against a live SABnzbd, 2026-08-30**, per the module docstring's own discipline: this is a
-    guess from vendor documentation, not a measured fact, and is labeled as such here rather than
-    presented as one. Tolerant of anything other than the literal `True` -- a missing key (older
-    SABnzbd versions, or a shape this reading turns out to be wrong about), `None`, or any other
-    unexpected value all read as "not paused" rather than raising, the same "prefer the tolerant
-    reading" discipline every other doc-derived parser in this module already follows.
+    """The `mode=queue` response's top-level `paused` boolean -- **MEASURED, not doc-derived,
+    confirmed against the user's live SABnzbd, 2026-08-31**: pausing the queue produced the
+    paused state on Preflight rows (spec §13.4 row 14), per the module docstring's own discipline
+    of stating provenance rather than leaving it implied. Tolerant of anything other than the
+    literal `True` -- a missing key (older SABnzbd versions, or a shape this reading turns out to
+    be wrong about), `None`, or any other unexpected value all read as "not paused" rather than
+    raising, the same "prefer the tolerant reading" discipline every other doc-derived parser in
+    this module already follows.
     """
     return queue.get("paused") is True
 

@@ -192,6 +192,19 @@ Treat this as the baseline. A setup that departs from it — one folder per clie
 extraction, no hardlinking — isn't wrong, but it's a deliberate departure worth naming to
 yourself, rather than a default nobody chose.
 
+### Bind each category before a client does anything
+
+**Adding a download client at Settings → Clients does nothing by itself.** Every category it
+reports arrives **recorded excluded** — a newly-observed category defaults to `excluded: true,
+queue_id: null` by design (safety: more than one lftpweb instance can share a seedbox, so an
+unfamiliar category defaults to "not mine" rather than being walked, claimed, or fed into
+Preflight before anyone has said it belongs here — see "Two lftpwebs sharing one seedbox" above
+and finding #16). Until you go to Settings → Clients and, for each category you want lftpweb to
+act on, both **bind it to a queue** and **un-exclude it**, that category contributes nothing at
+all — no Preflight rows, no pause state, no download-client row icon — while the instance's own
+poll status still reads perfectly healthy. See "Preflight progress only updates every ~60s, or a
+client's pause / icon never shows" below for the symptom this produces and how to check for it.
+
 One consequence of this layout is worth knowing before you turn on a `move` queue's source
 delete, because it produces the same setting doing two different things depending on which
 client produced the release. `move` mode's confirmed-import cleanup deletes
@@ -425,6 +438,15 @@ worked around:
   no longer does: as of 2026-08-29 it re-fingerprints the filesystem before queuing rather than
   trusting the client's status string outright, so a wrong or missing verdict costs nothing —
   it now ships **on** by default (`docs/decisions.md`).
+- **An excluded, unbound category is currently invisible to every diagnostic.** It is filtered out
+  of `unattributed_clients` by design (that filter is what keeps the "categories unattributed to a
+  queue" banner quiet for a second lftpweb instance's own categories on a shared seedbox), so a
+  fully-working, correctly-polling client instance can contribute zero Preflight rows, zero pause
+  state, and zero row icons while every diagnostic in the app — the Clients row's poll status, the
+  unattributed-clients banner, `gated_queues` — reads healthy. See "Preflight progress only updates
+  every ~60s" above for the symptom and the wire-level check. The real fix is a UI signal that
+  distinguishes "excluded because it's a different instance's category" from "excluded because
+  nobody has looked at it yet" — not built here; this is named as a gap, not addressed.
 - **Cross-seed handling ships unwitnessed.** Deleting one torrent's data breaks the other torrents
   sharing that save path, so the design detects shared save paths and refuses. It is
   correct-by-unit-test and has never run against a real cross-seeding setup, because the author's
@@ -467,6 +489,34 @@ for any other reason), there are two independent ways back in — no browser nee
 
 Both routes are exercised by `tests/test_auth_api.py::test_lockout_recovery_env_var_override`
 and `::test_lockout_recovery_delete_user_row`, not just documented here.
+
+## Preflight progress only updates every ~60s, or a client's pause / icon never shows
+
+A live diagnosis on 2026-08-30/31 spent a long session on this before finding the cause: a
+download-client category recorded **excluded** (the default a brand-new category arrives in — see
+"Bind each category before a client does anything" above) contributes **nothing** to Preflight, a
+row's pause state, or its client icon, and yet none of the app's own diagnostics say so — the
+client's own poll status still reads `last_poll_ok: true`, and the "categories unattributed to a
+queue" banner is deliberately silent for an excluded category (that silence is correct for a
+category belonging to a *different* lftpweb instance sharing the same seedbox; it looks identical
+from inside the app when the category is simply this instance's own, not yet configured).
+
+**The symptom:** a release you know a download client grabbed sits in Preflight, its progress
+moves in visible jumps every ~10-60 seconds (the *arr's own poll cadence) instead of continuously,
+the client's pause state (e.g. SABnzbd's global pause) never appears on the row even when you know
+the client is paused, and the download-client icon never appears on the row either.
+
+**The check:** Settings → Clients → open the instance → look at its category list for rows with no
+queue selected and marked excluded. Any category you expect lftpweb to act on needs both a queue
+and to be un-excluded — an excluded, unbound category is invisible everywhere else in the app; see
+"Known gaps" below.
+
+**The fastest way to confirm which case you're in without opening Settings:** look at the
+Preflight row on the wire (or the API response). A client actually contributing looks like
+`source: "client"`, `contributors: ['arr', 'client']`; a client that isn't — excluded, unbound, or
+simply not grabbing that release — looks like `source: "arr"`, `contributors: []`, even though the
+row's `download_client` field may still name the instance, because that field is the *arr's own
+tooltip fact and says nothing about whether the client is actually contributing.
 
 ## Running it
 
