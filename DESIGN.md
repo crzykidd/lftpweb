@@ -677,6 +677,17 @@ lftp -c "
 Single files use `pget -c '<REMOTE>' -o '<LOCAL>/'` instead. `-c` (continue) on both makes
 every restart resumable.
 
+**Quoting (audit F1, 2026-11-26).** lftp's command language is not a POSIX shell, and every
+seedbox-derived path reaches it, so `core/lftp.py._lftp_quote` follows lftp's *measured* grammar:
+inside `'...'` a backslash is an escape (double every `\`, write `\'` for a quote). A newline,
+carriage return or NUL has no safe spelling and is **refused** (`UnsafeLftpValueError`), never
+escaped: `core/queue.py._spawn_decision` fails the job `UNSAFE_PATH` before touching the
+filesystem or lftp, and the item is suppressed so auto-queue never retries it (§4.6). The `open`
+URL and the `sftp:connect-program` string are quoted the same way (the connect program is built
+as an argv with `shlex.join`), and the host address is validated so it can never reach `ssh` as
+an option. `tests/test_lftp_quoting.py` proves all of it against the real `lftp` binary; the
+measurements are in `docs/decisions.md`.
+
 Why pipes matter: with stdin not a tty, lftp disables readline. The bracketed-paste escapes
 (upstream #117) and column-driven line wrapping (fork #260, #290) that break SeedSync's
 parser **cannot occur**. We aren't relying on that for correctness anymore, but it also keeps
@@ -713,8 +724,9 @@ the captured error text clean.
   against the job's known roots.
 - **Retry only on transient classes**, with exponential backoff, bounded by `max_attempts`
   (default 3): `HOST_UNREACHABLE`, `TLS_ERROR`, `LOCAL_FS_ERROR`, timeouts, connection resets.
-- **Never retry permanent classes.** `AUTH_FAILED`, `PERMISSION_DENIED`, `REMOTE_GONE`, and
-  `DISK_FULL` surface immediately rather than hammering the seedbox or the disk.
+- **Never retry permanent classes.** `AUTH_FAILED`, `PERMISSION_DENIED`, `REMOTE_GONE`,
+  `DISK_FULL`, and `UNSAFE_PATH` (a seedbox name lftp cannot be handed safely — never produced by
+  lftp's output, set before spawn) surface immediately rather than hammering the seedbox or the disk.
 - Attempts exhausted, or a permanent class ⇒ `FAILED`, **and no further automatic attempt from
   any path** (§4.6).
 - Concurrency: the **job queue** is ours, so reordering, priority, and pause-all are trivial.

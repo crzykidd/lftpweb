@@ -55,6 +55,7 @@ import asyncio
 import logging
 import os
 import re
+import shlex
 import stat as stat_module
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -188,13 +189,71 @@ class NoHostKeyPinError(Exception):
     """
 
 
-def _lftp_quote(value: str) -> str:
-    """Quote a value for lftp's own command parser (single-quoted, `'` doubled the POSIX-shell
-    way: `'\\''`). lftp's tokenizer follows shell-like quoting conventions; this is the same
-    escaping `shlex.quote` would produce for the single-quote case, spelled out explicitly
-    since we don't want the double-quote branch shlex sometimes chooses.
+class UnsafeLftpValueError(ValueError):
+    """A value that cannot be passed to lftp as a single literal argument (it contains a
+    newline, a carriage return or a NUL). Raised instead of escaping: see `_lftp_quote`.
+    `core/queue.py` fails the job with `UNSAFE_PATH` on this, before anything reaches lftp.
     """
-    return "'" + value.replace("'", "'\\''") + "'"
+
+
+# Bytes lftp's command parser cannot carry inside an argument, measured against lftp 4.9.3.
+_UNQUOTABLE = ("\n", "\r", "\x00")
+
+
+def check_lftp_safe(*values: str) -> None:
+    """Raise `UnsafeLftpValueError` if any value contains a newline, CR or NUL. Cheap enough
+    to call early (before touching the filesystem for the item) as well as inside
+    `_lftp_quote`, which enforces it for every value regardless.
+    """
+    for value in values:
+        if any(ch in value for ch in _UNQUOTABLE):
+            raise UnsafeLftpValueError(
+                f"refusing to hand {value!r} to lftp: a line break or NUL cannot be quoted "
+                "safely in lftp's command language"
+            )
+
+
+def _lftp_quote(value: str) -> str:
+    r"""Quote one value as a single literal lftp argument.
+
+    **lftp's tokenizer is not a POSIX shell.** The grammar below was measured against lftp
+    4.9.3 (`lftp -c` and `source`d rc files behave identically). The earlier belief that it
+    "follows shell-like quoting conventions" is what let a remote filename end its quote early
+    and run a `!` shell command.
+
+    Inside '...':
+      * `\\` yields one backslash and `\'` yields one quote -- a backslash IS an escape here,
+        unlike POSIX single quotes. So the POSIX idiom `'\''` closes the quote after the
+        backslash and leaves the rest of the name unquoted (and a name ending in `\` escapes
+        the closing quote and swallows the next argument).
+      * a backslash before any other character is kept literally, so the rule is simply:
+        double every backslash, backslash-escape every quote.
+      * `# ; & | ! $` backtick `* ? [ ] { } ~`, space, tab, double quote and non-ASCII are all
+        literal. `pget` and `mirror` do not glob-expand their arguments (verified with decoy
+        files), so `*`, `?` and `[ab]` name that literal file and nothing else.
+      * a newline ends the command even inside quotes, a carriage return is mangled, and NUL
+        cannot appear in an argv. These have no safe spelling, so they are **refused**
+        (`UnsafeLftpValueError`) rather than escaped.
+    Inside "..." (only `sftp:connect-program` uses it, via `_lftp_dquote`): `\"` and `\\` are
+    escapes; `$` and backtick are literal, and a backslash before anything else is kept.
+    A leading `-` would be read as an option by `pget`/`mirror`; every path handed in is
+    absolute, so that cannot happen.
+    """
+    check_lftp_safe(value)
+    return "'" + value.replace("\\", "\\\\").replace("'", "\\'") + "'"
+
+
+def _lftp_dquote(value: str) -> str:
+    """Double-quote a value for lftp (the measured grammar is in `_lftp_quote`'s docstring)."""
+    check_lftp_safe(value)
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+# What may appear in the seedbox address: hostname / IPv4 / IPv6. It must not start with `-`,
+# because lftp passes the host to `ssh` as a positional argument and `-oProxyCommand=...`
+# would be parsed as an *option* (it runs a command). No quotes, whitespace, `;` or control
+# characters either.
+_ADDRESS_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:%\[\]-]*")
 
 
 def _connect_program(creds: HostCreds, known_hosts_path: Path | None) -> str:
@@ -218,7 +277,9 @@ def _connect_program(creds: HostCreds, known_hosts_path: Path | None) -> str:
             )
         parts += ["-o", "StrictHostKeyChecking=yes", "-o", f"UserKnownHostsFile={known_hosts_path}"]
 
-    return " ".join(parts)
+    # lftp splits the program string into argv itself (no shell runs); `shlex.join` keeps a
+    # path containing spaces/quotes/`;` as one argument. Verified against lftp 4.9.3.
+    return shlex.join(parts)
 
 
 @dataclass(frozen=True)
@@ -415,7 +476,7 @@ def build_rc_text(
     """
     lines: list[str] = [
         "# lftpweb per-job settings + credentials — mode 0600, /run tmpfs, unlinked on exit.",
-        f'set sftp:connect-program "{_connect_program(creds, known_hosts_path)}";',
+        f"set sftp:connect-program {_lftp_dquote(_connect_program(creds, known_hosts_path))};",
     ]
     lines += [
         f"set {ts.key} {ts.value};"
@@ -453,9 +514,10 @@ def build_rc_text(
         password = creds.password
     else:
         password = ""
-    lines.append(
-        f"open -u {_lftp_quote(creds.username)},{_lftp_quote(password)} sftp://{creds.address}:{creds.port};"
-    )
+    if not _ADDRESS_RE.fullmatch(creds.address):
+        raise ValueError(f"host address {creds.address!r} is not a valid hostname or IP address")
+    url = _lftp_quote(f"sftp://{creds.address}:{int(creds.port)}")
+    lines.append(f"open -u {_lftp_quote(creds.username)},{_lftp_quote(password)} {url};")
 
     return "\n".join(lines) + "\n"
 
@@ -498,6 +560,7 @@ def build_transfer_command(
     Never set for `pget` (the branch below never reads it) and never set when the prefix feature
     is off or the item is a single file — see `core/queue.py._spawn_decision`.
     """
+    check_lftp_safe(remote_path, local_path, *exclude_globs)
     if kind == "pget":
         cmd = f"pget -c -n {pget_n} {_lftp_quote(remote_path)} -o {_lftp_quote(local_path)}"
     else:

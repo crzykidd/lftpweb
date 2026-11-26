@@ -6,6 +6,49 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-11-26 — lftp quoting: measure the grammar, refuse what cannot be quoted
+
+`prompts/done/2026-11-26-c1-lftp-quoting.md` (security audit F1 / batch C1). `_lftp_quote` quoted
+POSIX-style (`'` to `'\''`) on the belief that lftp's tokenizer "follows shell-like quoting
+conventions". It does not, and a remote filename could therefore end its quoted word and run a
+`!` shell command; auto-queue made that reachable with no click. A string-form test
+(`tests/test_lftp.py`) had pinned the wrong behavior in place.
+
+**Measured against lftp 4.9.3** (host binary and the shipped image's binary are the same
+version; `lftp -c` and `source`d rc behave identically):
+
+- Inside `'...'` a backslash IS an escape: `\\` is one backslash, `\'` is one quote, and a
+  backslash before anything else is kept. The POSIX idiom `'\''` therefore closes the quote
+  after the backslash; a name ending in `\` escapes the closing quote and swallows the next
+  argument (`-o <local>`).
+- Literal inside single quotes: `# ; & | ! $` backtick `* ? [ ] { } ~`, space, tab, `"`,
+  VT/FF, non-ASCII. Inside `"..."`: `\"` and `\\` escape, `$`/backtick are literal.
+- A newline ends the command even inside quotes; CR is not preserved reliably in a sourced
+  file; NUL cannot be in an argv.
+- `pget` and `mirror` do **not** glob-expand their arguments (verified with decoy files, locally
+  and over the fake seedbox's sftp), so `*`, `?`, `[ab]` name the literal file. No globbing
+  fix was needed.
+- `pget` reads a leading `-` as an option; every path we pass is absolute, so not reachable.
+- lftp passes the host to `ssh` positionally, so an address like `-oProxyCommand=...` is an
+  option-injection; and `sftp:connect-program` is split into argv by lftp itself (no shell).
+
+**Decisions.**
+1. Escape `\` and `'`; **refuse** newline, CR and NUL (`UnsafeLftpValueError`, job fails
+   `UNSAFE_PATH` before spawn, item suppressed like every other permanent failure). Rejected:
+   escaping them. lftp ends a command at a newline even inside quotes, so there is no spelling
+   that round-trips, and a name with a line break is far likelier hostile than real.
+2. Same treatment for every other interpolation: the `open` URL is quoted, the connect program
+   is built as an argv and `shlex.join`ed then double-quoted, the host address is regex-validated
+   (no leading `-`, no whitespace/quotes/`;`). Validation lives in `build_rc_text`, so a bad
+   address fails the spawn (`SPAWN_FAILED`) rather than only being caught at the settings API;
+   API-level validation of the host form was left for batch C3.
+3. **CI:** the test job already installs `lftp` and brings up the fake seedbox, and its skip-guard
+   already fails the job if the seedbox-gated tests skip. `tests/test_lftp_quoting.py` asserts
+   the binary exists (fails, never skips); `tests/test_lftp_quoting_e2e.py` uses the same
+   seedbox-reachable skip reason the guard greps for. No workflow change was needed.
+
+---
+
 ## 2026-08-31 — closing the gap named the same day: a fourth Preflight banner for a client with zero bindings, derived from the exact predicate that already gates it
 
 `prompts/done/2026-08-31-surface-inert-download-clients.md`, the follow-up the entry directly

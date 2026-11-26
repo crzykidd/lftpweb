@@ -53,6 +53,16 @@ Skeleton for the next roll:
 
 ### Fixed
 ### Security
+
+- **A seedbox file or folder name could run a command inside the container.** The quoting
+  lftpweb applied to names before handing them to lftp followed shell rules that lftp does not
+  share, so a specially crafted name (one containing backslashes and quotes, or a line break)
+  could end its quoting early. Auto-queue made this reachable without a click. Quoting now
+  follows lftp's real grammar and is tested against the real `lftp` binary; names containing a
+  line break, carriage return or NUL are refused with a clear `UNSAFE_PATH` failure instead of
+  being passed through (and are never retried). The same pass quotes the connection URL and
+  SSH key path, and rejects a host address that could be read as an `ssh` option.
+
 ### Deprecated
 
 ### Removed

@@ -76,7 +76,7 @@ def compute_retry_backoff(base_s: float, attempt: int) -> float:
 # same reason (see its module docstring): only retry what we can positively identify as
 # transient, never "everything that isn't in the permanent list."
 PERMANENT_ERROR_CLASSES = frozenset(
-    {"AUTH_FAILED", "PERMISSION_DENIED", "REMOTE_GONE", "DISK_FULL"}
+    {"AUTH_FAILED", "PERMISSION_DENIED", "REMOTE_GONE", "DISK_FULL", "UNSAFE_PATH"}
 )
 
 
@@ -3037,6 +3037,15 @@ class TransferQueue:
             )
             mkdir_target = local_parent
 
+        # Refuse a path lftp's command language cannot carry (newline / CR / NUL in a seedbox
+        # name -- DESIGN.md §4.1, audit F1) *before* anything touches the filesystem or lftp.
+        # Permanent: `_fail_job` suppresses the item, so auto-queue never retries it.
+        try:
+            lftp.check_lftp_safe(remote_full, local_full, mkdir_target)
+        except lftp.UnsafeLftpValueError as exc:
+            await self._fail_unsafe_path(decision.job_id, exc)
+            return
+
         # lftp creates directories *within* what it's given (mirror builds the item's own
         # subdirectory tree; pget's sparse-file preallocation happens inside its target's
         # parent) but not the parent chain leading up to it. Found running this against the
@@ -3087,6 +3096,9 @@ class TransferQueue:
 
         try:
             spawned = await lftp.spawn(spec)
+        except lftp.UnsafeLftpValueError as exc:
+            await self._fail_unsafe_path(decision.job_id, exc)
+            return
         except lftp.NoHostKeyPinError as exc:
             logger.warning("job %s: %s", decision.job_id, exc)
             await self._suppress_item(item["id"], reason="permanent_error", state="FAILED")
@@ -3293,6 +3305,11 @@ class TransferQueue:
             )
         await self.db.commit()
         return cursor.lastrowid
+
+    async def _fail_unsafe_path(self, job_id: int, exc: Exception) -> None:
+        """Fail a job whose path/pattern cannot be passed to lftp safely (`UNSAFE_PATH`)."""
+        logger.warning("job %s refused before spawn: %s", job_id, exc)
+        await self._fail_job(job_id, error_class="UNSAFE_PATH", detail=str(exc))
 
     async def _fail_job(self, job_id: int, *, error_class: str, detail: str) -> None:
         """Mark a job failed without retrying it (DESIGN.md §4.3, §4.6).

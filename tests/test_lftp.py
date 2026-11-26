@@ -159,7 +159,7 @@ def test_rc_text_password_auth_uses_open_dash_u_with_password():
         save_status_interval_s=1,
         extra_settings="",
     )
-    assert "open -u 'seeduser','hunter2' sftp://seedbox.example:2222;" in text
+    assert "open -u 'seeduser','hunter2' 'sftp://seedbox.example:2222';" in text
 
 
 def test_rc_text_key_auth_uses_empty_password_field():
@@ -177,7 +177,7 @@ def test_rc_text_key_auth_uses_empty_password_field():
         save_status_interval_s=1,
         extra_settings="",
     )
-    assert "open -u 'seeduser','' sftp://seedbox.example:2222;" in text
+    assert "open -u 'seeduser','' 'sftp://seedbox.example:2222';" in text
     assert "-i /config/keys/id_ed25519" in text
 
 
@@ -348,7 +348,9 @@ def test_mirror_command_includes_exclude_globs():
     assert "--exclude-glob '*SAMPLE*'" in cmd
 
 
-def test_quoting_escapes_embedded_single_quotes():
+def test_quoting_escapes_embedded_quotes_and_backslashes_the_lftp_way():
+    # lftp's own grammar, not POSIX: inside '...' a backslash escapes (so the POSIX `'\''` idiom is wrong).
+    # The behavior itself is proven against the real binary in tests/test_lftp_quoting.py.
     cmd = build_transfer_command(
         "pget",
         "/remote/it's a file.mkv",
@@ -357,7 +359,7 @@ def test_quoting_escapes_embedded_single_quotes():
         pget_n=1,
         exclude_globs=(),
     )
-    assert cmd == "pget -c -n 1 '/remote/it'\\''s a file.mkv' -o '/downloads/it'\\''s a file.mkv'"
+    assert cmd == "pget -c -n 1 '/remote/it\\'s a file.mkv' -o '/downloads/it\\'s a file.mkv'"
 
 
 def test_rc_always_bounds_retries_and_timeouts():
