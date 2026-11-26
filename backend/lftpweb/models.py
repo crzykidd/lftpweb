@@ -1180,6 +1180,46 @@ class PreflightUnattributedClientOut(BaseModel):
     no_category_count: int = 0
 
 
+class PreflightUnboundClientOut(BaseModel):
+    """One line of the Preflight box's "connected, but contributing nothing" banner (this task,
+    prompts/done/2026-08-31-surface-inert-download-clients.md; the incident and the gap it closes
+    are `docs/decisions.md`'s 2026-08-31 entry and `docs/download-client-framework-spec.md` §8.3's
+    round 7 correction). Round 7 named a failure mode round 6's own "every observed category
+    defaults to excluded" rule (migration 032) produces but never announces: an enabled client can
+    poll perfectly (`last_poll_ok: true`, every field `native`) while every one of its categories
+    is `excluded=True, queue_id=None`, and **nothing said so** -- `unattributed_clients` above is
+    silent by design for exactly this state (round 6 point 5's own banner-quieting fix, correct
+    for a second lftpweb instance's own categories on a shared seedbox, indistinguishable from
+    this instance's own categories simply never having been bound).
+
+    **Reported for a client the exact same way `source_configured`'s client half decides whether
+    to count it** (`api/jobs.py.get_preflight`'s own docstring: "an enabled download-client
+    instance with at least one enabled category -> queue binding"): this is every **enabled**
+    download-client instance *absent* from that same predicate's result, computed as a set
+    difference over the identical query -- never a second hand-written "is this client usable"
+    rule. `tests/test_preflight_api.py`'s invariant test asserts the two agree on every request,
+    so a future drift between them fails a test instead of quietly starting a second incident
+    like the one this task exists to prevent a repeat of.
+
+    **Never reported for a client with *some* bindings.** A client with one enabled binding and
+    nine excluded categories is the §17.7 safety boundary working exactly as designed (findings
+    #10-16: two lftpweb instances can share one seedbox, each seeing the other's categories and
+    correctly ignoring them) -- warning there would nag forever about the other instance's own
+    categories, the identical failure `unattributed_clients` above was already corrected once to
+    avoid. This field is a strict subset of "enabled clients with zero enabled bindings," not "any
+    client with an excluded category anywhere."
+
+    `category_count`/`excluded_count` carry what the banner needs to be specific -- "N categories
+    observed, M excluded" -- without a second round trip to Settings; both are `0` for a client
+    that has never observed a category at all (never polled, or a fresh install).
+    """
+
+    client_id: int
+    client_name: str
+    category_count: int
+    excluded_count: int
+
+
 class PreflightResponse(BaseModel):
     """`GET /api/queue/preflight`. `source_configured=False` (with `rows` always empty in that
     case) means "no row source is configured at all" (no bound, enabled *arr instance anywhere,
@@ -1199,6 +1239,11 @@ class PreflightResponse(BaseModel):
     # same reasoning as the mount gate: a client can have items nothing can attribute whether or
     # not any *arr/settle source is configured at all.
     unattributed_clients: list[PreflightUnattributedClientOut] = []
+    # This task, closing spec §8.3 round 7's named gap -- also independent of the other three
+    # fields, and deliberately not folded into `unattributed_clients` (that field means "reached
+    # attribution and found no home"; this one means "never reached attribution at all, because
+    # nothing is bound"). See `PreflightUnboundClientOut`'s own docstring for the full incident.
+    unbound_clients: list[PreflightUnboundClientOut] = []
 
 
 class CompleteJobsResponse(BaseModel):

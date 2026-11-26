@@ -76,6 +76,39 @@ def _create_queue(client: TestClient, **overrides) -> int:
     return resp.json()["id"]
 
 
+def _create_download_client(client: TestClient, *, name: str, categories: list[dict]) -> int:
+    """`enabled: False` on the way in, same reason every other test in this file uses it for a
+    download-client instance -- `enabled: True` tests connectivity against a real server this
+    test has none of (spec §3a). Categories are persisted regardless of `enabled`
+    (`api/settings_clients.py.create_client_instance`), so this still leaves the row set up
+    exactly as a live `download_client_category` table would after a poll pass or a Test click;
+    `_enable_download_client` below flips the stored column directly, the identical two-step shape
+    `test_unattributed_client_shows_a_banner_line_with_its_count` already established.
+    """
+    resp = client.post(
+        "/api/settings/clients",
+        json={
+            "name": name,
+            "client_type": "sabnzbd",
+            "config": {"base_url": "http://sab.example.invalid", "api_key": "k"},
+            "enabled": False,
+            "categories": categories,
+        },
+    )
+    assert resp.status_code == 201
+    return resp.json()["id"]
+
+
+def _enable_download_client(client_id: int) -> None:
+    async def _enable() -> None:
+        await app.state.db.execute(
+            "UPDATE download_client SET enabled = 1 WHERE id = ?", (client_id,)
+        )
+        await app.state.db.commit()
+
+    asyncio.run(_enable())
+
+
 def test_no_instance_at_all_hides_the_box(isolated_config):
     with TestClient(app) as client:
         resp = client.get("/api/queue/preflight")
@@ -86,6 +119,7 @@ def test_no_instance_at_all_hides_the_box(isolated_config):
             "rows": [],
             "gated_queues": [],
             "unattributed_clients": [],
+            "unbound_clients": [],
         }
 
 
@@ -101,6 +135,7 @@ def test_disabled_instance_hides_the_box(isolated_config):
             "rows": [],
             "gated_queues": [],
             "unattributed_clients": [],
+            "unbound_clients": [],
         }
 
 
@@ -115,6 +150,7 @@ def test_enabled_instance_with_no_bound_queue_hides_the_box(isolated_config):
             "rows": [],
             "gated_queues": [],
             "unattributed_clients": [],
+            "unbound_clients": [],
         }
 
 
@@ -130,6 +166,7 @@ def test_enabled_instance_with_disabled_queue_hides_the_box(isolated_config):
             "rows": [],
             "gated_queues": [],
             "unattributed_clients": [],
+            "unbound_clients": [],
         }
 
 
@@ -150,6 +187,7 @@ def test_enabled_bound_instance_with_nothing_projected_yet_shows_configured(isol
             "rows": [],
             "gated_queues": [],
             "unattributed_clients": [],
+            "unbound_clients": [],
         }
 
 
@@ -345,6 +383,140 @@ def test_a_quiet_client_never_appears_in_the_unattributed_banner(isolated_config
 
         resp = client.get("/api/queue/preflight")
         assert resp.json()["unattributed_clients"] == []
+
+
+# --- The "connected, but contributing nothing" banner (this task, spec §8.3 round 7's own named
+# gap, docs/decisions.md's 2026-08-31 entry) -- distinct from the unattributed-clients banner
+# above: that one means "reached attribution and found no home," this one means "never reached
+# attribution at all, because zero categories are bound." A client only ever appears in one of
+# the two, per `PreflightUnboundClientOut`'s own docstring. ---------------------------------
+
+
+def test_enabled_client_with_zero_enabled_bindings_is_reported(isolated_config):
+    """The exact live scenario spec §8.3 round 7 measured: four observed categories, all
+    `excluded=True, queue_id=None` -- migration 032's default doing exactly what it was built to
+    do, with nobody having bound one yet. `category_count`/`excluded_count` must carry the real
+    breakdown so the banner can say "4 categories observed, all excluded", not just a count.
+    """
+    with TestClient(app) as client:
+        _put_host(client)
+        client_id = _create_download_client(
+            client,
+            name="SABnzbd-ultracc",
+            categories=[
+                {"category": "dc-movies", "queue_id": None, "excluded": True},
+                {"category": "ar-movies", "queue_id": None, "excluded": True},
+                {"category": "dc-tv", "queue_id": None, "excluded": True},
+                {"category": "ar-tv", "queue_id": None, "excluded": True},
+            ],
+        )
+        _enable_download_client(client_id)
+
+        resp = client.get("/api/queue/preflight")
+        assert resp.json()["unbound_clients"] == [
+            {
+                "client_id": client_id,
+                "client_name": "SABnzbd-ultracc",
+                "category_count": 4,
+                "excluded_count": 4,
+            }
+        ]
+
+
+def test_client_with_one_enabled_binding_is_not_reported_even_with_other_categories_excluded(
+    isolated_config,
+):
+    """The safety boundary this task must not renag about (§17.7, findings #10-16): two lftpweb
+    instances can share one seedbox, each correctly excluding the other's categories forever. A
+    client with *one* enabled binding already satisfies `source_configured`'s own predicate, so it
+    must never appear here even though nine categories out of ten are excluded -- warning would
+    nag permanently about work this instance is correctly ignoring, the exact failure
+    `unattributed_clients` was already corrected once to avoid (spec §8.3 round 6 point 5).
+    """
+    with TestClient(app) as client:
+        _put_host(client)
+        queue_id = _create_queue(client)
+        client_id = _create_download_client(
+            client,
+            name="SABnzbd-shared",
+            categories=[
+                {"category": "ar-tv", "queue_id": queue_id, "excluded": False},
+                {"category": "dc-movies", "queue_id": None, "excluded": True},
+                {"category": "ar-movies", "queue_id": None, "excluded": True},
+            ],
+        )
+        _enable_download_client(client_id)
+
+        resp = client.get("/api/queue/preflight")
+        assert resp.json()["unbound_clients"] == []
+
+
+def test_disabled_client_with_zero_bindings_is_never_reported(isolated_config):
+    with TestClient(app) as client:
+        _put_host(client)
+        # Never enabled -- `_create_download_client`'s own default.
+        _create_download_client(
+            client,
+            name="SABnzbd-off",
+            categories=[{"category": "dc-tv", "queue_id": None, "excluded": True}],
+        )
+
+        resp = client.get("/api/queue/preflight")
+        assert resp.json()["unbound_clients"] == []
+
+
+def test_unbound_clients_and_source_configureds_client_half_agree(isolated_config):
+    """The invariant this task exists to protect: `unbound_clients` is derived from the identical
+    predicate `source_configured`'s client half uses (`api/jobs.py.get_preflight`'s own
+    `enabled_client_ids` query), never a second hand-written "is this client usable" rule. This
+    recomputes that exact predicate independently, straight off the live database, and asserts
+    the endpoint's own `unbound_clients` set is exactly the enabled clients absent from it -- if
+    the endpoint's query and this one ever drift apart, this test fails loudly instead of the
+    banner silently lying in one direction or the other, which is the whole point of this task.
+    """
+    with TestClient(app) as client:
+        _put_host(client)
+        queue_id = _create_queue(client)
+
+        bound_id = _create_download_client(
+            client,
+            name="Bound",
+            categories=[{"category": "ar-tv", "queue_id": queue_id, "excluded": False}],
+        )
+        unbound_id = _create_download_client(
+            client,
+            name="Unbound",
+            categories=[
+                {"category": "dc-movies", "queue_id": None, "excluded": True},
+                {"category": "dc-tv", "queue_id": None, "excluded": True},
+            ],
+        )
+        _enable_download_client(bound_id)
+        _enable_download_client(unbound_id)
+
+        resp = client.get("/api/queue/preflight")
+        body = resp.json()
+
+        async def _predicate_sets() -> tuple[set[int], set[int]]:
+            cursor = await app.state.db.execute(
+                "SELECT DISTINCT download_client.id FROM download_client "
+                "JOIN download_client_category "
+                "ON download_client_category.client_id = download_client.id "
+                "JOIN path_queue ON path_queue.id = download_client_category.queue_id "
+                "WHERE download_client.enabled = 1 AND path_queue.enabled = 1"
+            )
+            bound_ids = {row["id"] for row in await cursor.fetchall()}
+            cursor = await app.state.db.execute("SELECT id FROM download_client WHERE enabled = 1")
+            all_enabled_ids = {row["id"] for row in await cursor.fetchall()}
+            return bound_ids, all_enabled_ids
+
+        bound_ids, all_enabled_ids = asyncio.run(_predicate_sets())
+        expected_unbound = all_enabled_ids - bound_ids
+
+        assert {u["client_id"] for u in body["unbound_clients"]} == expected_unbound
+        assert expected_unbound == {unbound_id}
+        assert bound_id in bound_ids
+        assert body["source_configured"] is True
 
 
 # --- Cross-source precedence + ordering (this task, decided with the user) --------------------

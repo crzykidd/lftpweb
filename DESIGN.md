@@ -3589,8 +3589,23 @@ transfer, so an unbound category does not degrade them one at a time, it makes a
 quietly together, at once, with nothing anywhere saying why. A live diagnosis on 2026-08-30/31
 found exactly this: a fully-configured, successfully-polling SABnzbd instance whose categories
 were still all recorded excluded produced zero Preflight rows, no pause state, and no row icon,
-while every diagnostic in the app read healthy — full incident and the fix in
+while every diagnostic in the app read healthy — full incident in
 `docs/download-client-framework-spec.md` §8.3's round 7 correction.
+
+**Closed 2026-08-31, round 8.** A fourth Preflight banner, `unbound_clients`
+(`PreflightUnboundClientOut`), fires for exactly the shape round 7 found: an **enabled** client
+instance with **zero** enabled category → queue bindings, derived from the identical live query
+`source_configured`'s own client half already uses (a plain set difference over that query's
+result, never a second hand-written predicate — the one correctness requirement this task's own
+handoff prompt called out by name, with an invariant test in `tests/test_preflight_api.py`
+asserting the two never drift apart). It deliberately does **not** fire for a client with *some*
+bindings, however many of its other categories are excluded — that shape is §17.7's safety
+boundary working as designed (a second lftpweb instance's own categories, permanently excluded on
+this instance, forever), and warning about it would reintroduce, from a different angle, the exact
+permanent-nag failure the unattributed-clients banner was already corrected once to avoid (§17.5's
+round 6 point 5, above). Wording states what's true and what to do — connected, nothing bound, so
+it contributes nothing — and never implies the exclusion default itself was a mistake.
+`docs/download-client-framework-spec.md` §8.3's round 8 correction has the full account.
 
 ### 17.6 The disk review scan: four piles, a torrent summary, claimed by inode
 

@@ -820,6 +820,47 @@ two states round 6 worked to keep separate (a second install's categories vs. th
 unconfigured ones); telling them apart from inside the UI, without reading the database or the
 wire response by hand, is the real fix for the underlying gap and belongs to a separate task.
 
+### 8.3 correction, round 8 (2026-08-31) — the separate task above, closed: a fourth Preflight
+banner for a client with *zero* enabled bindings, never one with *some*
+
+`prompts/done/2026-08-31-surface-inert-download-clients.md`, the task round 7 named and
+deliberately deferred. The fix is a fourth field on `GET /api/queue/preflight`,
+`unbound_clients` (`PreflightUnboundClientOut`) — every **enabled** download-client instance for
+which `api/jobs.py.get_preflight`'s own "is this client's source configured" query returns zero
+rows, i.e. it satisfies no enabled category → queue binding at all. Rendered as a fourth banner in
+`components/PreflightBox.tsx`, `GatedQueueBanner`/`UnattributedClientBanner`'s own shape: *"SAB:
+connected, but nothing is bound to a queue yet, so it isn't contributing any downloads (4
+categories observed, all excluded) — bind a category to a queue."*
+
+**Round 7's own warning, honored rather than reopened: this still does not blur the two states
+round 6 built to keep separate.** The temptation, avoided on purpose, would have been to surface
+*any* client carrying an excluded category — that is exactly `unattributed_clients`'s own
+already-corrected mistake (round 6 point 5), reintroduced from a different angle: a second lftpweb
+instance on a shared seedbox (§17.7) has *some* of its categories bound (its own) and the rest
+excluded (the other instance's), permanently, by design, and would be nagged about forever. The
+new field's condition is deliberately narrower than "has an excluded category" — it is "has *no*
+enabled binding whatsoever," which a client sharing a seedbox with another lftpweb never satisfies
+once it has bound even one category of its own.
+
+**Derived from the identical predicate `source_configured`'s own client half already uses, not a
+second hand-written rule** — the one correctness requirement this task's own handoff prompt
+called out by name, because a banner computed by a second, slightly-different query is worse than
+no banner: it would eventually disagree with what actually gates a Preflight row, in either
+direction, and nothing would say so. `unbound_clients` is a plain set difference over that one
+query's own result (`all_enabled_client_ids - enabled_client_ids`, both already computed for
+`source_configured` and the `unattributed_clients` banner respectively) — never a fresh SQL
+predicate of its own. `tests/test_preflight_api.py`'s invariant test recomputes the predicate
+independently, straight off the database, and asserts it against the endpoint's own
+`unbound_clients` set on every run, so a future drift between the two fails a test instead of
+quietly starting a second incident shaped like this one.
+
+**Self-clearing, no dismissal, no acknowledgement** — computed fresh on every request from live
+configuration, the same "never baked into a once-per-poll cache" discipline round 6 point 5
+established for `unattributed_clients`. This project's own house style is fewer clicks, not more
+confirmation, and `download_client.categories_acknowledged_at` (migration 032) already owns the
+different "a new category arrived since you last looked" signal on the Settings tab — untouched by
+this task, and not the same question this banner answers.
+
 ### 8.4 Which client fetched an item — persisted forward-only, drawn as a row icon
 
 2026-08-30 (`prompts/2026-08-30-downloader-icon-on-rows.md`, migration 033): the user's own ask —

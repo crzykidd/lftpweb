@@ -9,7 +9,12 @@
 // box's own display logic lives here, unit-tested, rather than inlined in
 // `components/PreflightBox.tsx`.
 
-import type { PreflightRowOut, PreflightUnattributedClientOut, SettleSettingsOut } from '../api/types'
+import type {
+  PreflightRowOut,
+  PreflightUnattributedClientOut,
+  PreflightUnboundClientOut,
+  SettleSettingsOut,
+} from '../api/types'
 import { formatBytes, formatEta, percentValue, settleWaitLabel } from './format'
 
 /** The page-size selector's own default -- "5 rows by default" is the user's own original
@@ -336,4 +341,43 @@ export function unattributedClientDetail(
     )
   }
   return clauses.length > 0 ? clauses.join(', ') : null
+}
+
+/** The "connected, but contributing nothing" banner's own detail clause (this task, spec §8.3
+ * round 7's own named gap, `docs/decisions.md`'s 2026-08-31 entry -- the live incident this
+ * closes: an enabled SABnzbd instance polling perfectly while all four of its observed categories
+ * sat `excluded: true, queue_id: null`, contributing zero Preflight rows with nothing anywhere
+ * saying so). Mirrors `unattributedClientDetail` above -- composes only the count clause,
+ * `components/PreflightBox.tsx` wraps it in the client name and the surrounding sentence, so the
+ * two pieces of copy can't drift out of sync with each other.
+ *
+ * **Wording is deliberately plain and never implies the exclusion default was a mistake** (the
+ * handoff prompt's own instruction) -- "excluded" is this app's own ordinary word for the state
+ * already (Settings -> Clients' own category control, the disk review page's "Excluded content"),
+ * not jargon being introduced here; what changes is only that a client stuck entirely behind it
+ * now says so, rather than staying silent.
+ *
+ * - `category_count === 0`: the instance has never observed a category at all (no poll has
+ *   landed yet, or a fresh install) -- `'no category observed yet'`, distinct from the "observed
+ *   some, all excluded" case below, since the fix is different (wait for a poll / click Test,
+ *   not go bind something that doesn't exist yet).
+ * - `excluded_count === category_count` (and `> 0`): the exact shape the live incident measured
+ *   -- `'N categories observed, all excluded'`.
+ * - Otherwise: at least one category is merely **undecided** (neither bound nor excluded) rather
+ *   than excluded -- `'N categories observed, M excluded'` when some are, or just `'N categories
+ *   observed'` when none are, so "undecided" is never misreported as "excluded."
+ */
+export function unboundClientDetail(
+  info: Pick<PreflightUnboundClientOut, 'category_count' | 'excluded_count'>,
+): string {
+  const { category_count: categoryCount, excluded_count: excludedCount } = info
+  if (categoryCount === 0) return 'no category observed yet'
+  const categoryWord = categoryCount === 1 ? 'category' : 'categories'
+  if (excludedCount === categoryCount) {
+    return `${categoryCount} ${categoryWord} observed, all excluded`
+  }
+  if (excludedCount > 0) {
+    return `${categoryCount} ${categoryWord} observed, ${excludedCount} excluded`
+  }
+  return `${categoryCount} ${categoryWord} observed`
 }

@@ -17,6 +17,7 @@ import {
   preflightFillPercent,
   preflightRemainingLabel,
   unattributedClientDetail,
+  unboundClientDetail,
   type PreflightBadge,
   type PreflightPageSize,
 } from '../lib/preflight'
@@ -272,6 +273,48 @@ function UnattributedClientBanner({
   )
 }
 
+/** The "connected, but contributing nothing" banner (this task, spec §8.3 round 7's own named
+ * gap, `docs/decisions.md`'s 2026-08-31 entry -- the live incident this closes). A **third**
+ * banner in this box, distinct from both of the ones above: `GatedQueueBanner` is "a queue is
+ * mount-blocked," `UnattributedClientBanner` is "a client reached attribution and found no home
+ * for some items" -- this one is "a client never reaches attribution at all, because nothing is
+ * bound to a queue yet." A configured, authenticating, `last_poll_ok: true` SABnzbd instance can
+ * sit in exactly this state indefinitely (every category recorded `excluded` by migration 032's
+ * own default) while every other diagnostic in the app -- the Clients row's poll status, the
+ * unattributed-clients banner above, `gated_queues` -- reads healthy, which is precisely how the
+ * live incident burned a long session before anyone found the cause.
+ *
+ * **Never a dismiss button, never an acknowledgement.** It is derived live from configuration on
+ * every request (`unbound_clients` is computed fresh, `api/jobs.py.get_preflight`'s own
+ * docstring), so it disappears the instant a binding exists -- this project's house style is
+ * fewer clicks, not more, and `categories_acknowledged_at` already owns the different "new
+ * category since you last looked" signal on the Settings tab, untouched by this task.
+ *
+ * **Never implies the exclusion default was a mistake.** `unboundClientDetail`'s own docstring:
+ * the wording states what's true (connected, nothing bound, contributing nothing) and what to do
+ * (bind a category), never that excluding was wrong -- it is `§17.7`'s deliberate safety boundary
+ * for two lftpweb instances sharing one seedbox, working as designed. Deep-links via
+ * `clientEditHref`, the identical pattern `UnattributedClientBanner` above already established,
+ * so there's no settings path for the user to hunt for by hand.
+ */
+function UnboundClientBanner({ unbound }: { unbound: PreflightResponse['unbound_clients'] }) {
+  if (unbound.length === 0) return null
+  return (
+    <div className="flex flex-col gap-1 rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-xs text-amber-900 dark:border-amber-800 dark:bg-amber-950 dark:text-amber-200">
+      {unbound.map((u) => (
+        <p key={u.client_id}>
+          <span className="font-semibold">{u.client_name}:</span> connected, but nothing is bound
+          to a queue yet, so it isn't contributing any downloads ({unboundClientDetail(u)}) —{' '}
+          <Link to={clientEditHref(u.client_id)} className="underline hover:no-underline">
+            bind a category to a queue
+          </Link>
+          .
+        </p>
+      ))}
+    </div>
+  )
+}
+
 /** The Queue tab's third, small box (docs/transfers-redesign-spec.md §4, prefigured; this task's
  * own handoff prompt, prompts/done/2026-08-20-preflight-box.md, plus its follow-ups
  * prompts/2026-08-20-preflight-waiting-sources.md and
@@ -281,13 +324,26 @@ function UnattributedClientBanner({
  * unchanged.
  *
  * **Hidden entirely while `response` hasn't loaded yet, or none of `source_configured`,
- * `gated_queues`, or `unattributed_clients` has anything to say** -- the first task's own
- * explicit case (with no row source configured anywhere, "Nothing in preflight" would be
- * permanently true and meaningless) widened twice since: once by the mount-gate banner (a queue
- * can be mount-gated whether or not either row source is configured) and again by the
+ * `gated_queues`, `unattributed_clients`, or `unbound_clients` has anything to say** -- the first
+ * task's own explicit case (with no row source configured anywhere, "Nothing in preflight" would
+ * be permanently true and meaningless) widened three times since: by the mount-gate banner (a
+ * queue can be mount-gated whether or not either row source is configured), by the
  * unattributed-clients banner (finding #2, 2026-08-23 -- an unattributable client can have
- * something to say under the identical reasoning), so the box exists whenever *any* of the three
- * has something to show, and stays gone only when none do.
+ * something to say under the identical reasoning), and by the unbound-clients banner (this task,
+ * spec §8.3 round 7 -- a client with nothing bound can have something to say too, whether or not
+ * any row source happens to be configured elsewhere), so the box exists whenever *any* of the
+ * four has something to show, and stays gone only when none do.
+ *
+ * **Stacking three banners here is a layout claim jsdom cannot check.** `GatedQueueBanner`,
+ * `UnattributedClientBanner`, and `UnboundClientBanner` are three independent `flex flex-col`
+ * blocks with a shared `gap-2` from their common parent, the same shape the first two already had
+ * before this task added the third -- no wrapper, no fixed height, nothing that could clip a
+ * banner or push the row list in source. **jsdom performs no layout at all** (this file's own
+ * established discipline, `docs/decisions.md`'s 2026-08-30 client-chip entry: "two separate bugs
+ * in this feature were pure layout problems invisible to every test in the repo"), so nothing
+ * here is unit-tested for it, on purpose, rather than a test that would pass regardless of
+ * whether the real page looks right. A human with a browser is the only check that exists for
+ * this (README.md's Known gaps).
  *
  * **Scales to its content, not to a reserved row count** -- zero rows collapses to the header
  * plus one line ("Nothing in preflight."), never a page's worth of empty space; the row list
@@ -336,7 +392,8 @@ export function PreflightBox({ response }: { response: PreflightResponse | undef
   if (
     !response.source_configured &&
     response.gated_queues.length === 0 &&
-    response.unattributed_clients.length === 0
+    response.unattributed_clients.length === 0 &&
+    response.unbound_clients.length === 0
   )
     return null
 
@@ -352,6 +409,7 @@ export function PreflightBox({ response }: { response: PreflightResponse | undef
 
       <GatedQueueBanner gated={response.gated_queues} />
       <UnattributedClientBanner unattributed={response.unattributed_clients} />
+      <UnboundClientBanner unbound={response.unbound_clients} />
 
       {/* The row list only exists when a row source is actually configured -- a queue can be
        * mount-gated (the banner above) whether or not either source is, and "Nothing in

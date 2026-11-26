@@ -24,6 +24,12 @@ function baseResponse(overrides: Partial<PreflightResponse> = {}): PreflightResp
     rows: [],
     gated_queues: [],
     unattributed_clients: [],
+    // This task (spec §8.3 round 7) added a fourth banner field; kept out of this file's own
+    // test coverage per the handoff prompt's own instruction not to invent a rendering harness
+    // for one banner -- `unboundClientDetail`'s text/visibility decision is unit-tested as a pure
+    // function in `lib/preflight.test.ts` instead, this repo's established discipline for every
+    // banner's copy logic. Defaulted here only so this fixture keeps satisfying `PreflightResponse`.
+    unbound_clients: [],
     ...overrides,
   }
 }

@@ -1245,18 +1245,52 @@ export interface PreflightUnattributedClientOut {
   no_category_count: number
 }
 
+/** One line of the Preflight box's "connected, but contributing nothing" banner (this task,
+ * prompts/done/2026-08-31-surface-inert-download-clients.md; the incident is `docs/decisions.md`'s
+ * 2026-08-31 entry and `docs/download-client-framework-spec.md` §8.3's round 7 correction). Round
+ * 7 named a failure mode that announces itself nowhere: an enabled client can poll perfectly
+ * (`last_poll_ok: true`, every field `native`) while every one of its categories is
+ * `excluded: true, queue_id: null` (migration 032's own default for a newly observed category),
+ * contributing zero Preflight rows, zero pause state, zero row icon -- and `unattributed_clients`
+ * above stays silent for exactly this state by design (that field's own 2026-08-23 fix, correct
+ * for a second lftpweb instance's own categories on a shared seedbox, indistinguishable from this
+ * instance's own categories simply never having been bound).
+ *
+ * **Reported by the backend using the identical predicate `source_configured`'s client half
+ * already uses** (`api/jobs.py.get_preflight`'s own docstring) -- every enabled client instance
+ * absent from that predicate's result, never a second hand-written "is this client usable" rule.
+ * A client with *some* bindings (even if every other category is excluded) is the §17.7 safety
+ * boundary working as designed and never appears here -- see `PreflightUnboundClientOut`'s own
+ * Python docstring for the full reasoning and the invariant test that keeps this promise honest.
+ */
+export interface PreflightUnboundClientOut {
+  client_id: number
+  client_name: string
+  /** How many categories this instance has ever observed (poll or Test), `0` if it has never
+   * observed one at all -- distinct from `excluded_count`, which is always `<= category_count`.
+   */
+  category_count: number
+  /** Of `category_count`, how many are recorded `excluded`. `excluded_count === category_count`
+   * (with `category_count > 0`) is the exact shape spec §8.3 round 7's own incident measured
+   * live: "4 categories observed, all excluded."
+   */
+  excluded_count: number
+}
+
 /** `source_configured=false` (with `rows` always empty in that case) means "no row source is
  * configured at all" -- `components/PreflightBox.tsx` hides the row list for that case rather
  * than showing an empty "Nothing in preflight" that would be meaningless for a user with nothing
- * configured. `gated_queues`/`unattributed_clients` are both independent of `source_configured`
- * -- the mount gate, and an unattributable client, can each have something to say whether or not
- * either row source is configured, so the box itself renders whenever *any* of the three does.
+ * configured. `gated_queues`/`unattributed_clients`/`unbound_clients` are all independent of
+ * `source_configured` -- the mount gate, an unattributable client, and a client with nothing
+ * bound can each have something to say whether or not either row source is configured, so the box
+ * itself renders whenever *any* of the four does.
  */
 export interface PreflightResponse {
   source_configured: boolean
   rows: PreflightRowOut[]
   gated_queues: PreflightGatedQueueOut[]
   unattributed_clients: PreflightUnattributedClientOut[]
+  unbound_clients: PreflightUnboundClientOut[]
 }
 
 /** `GET /api/jobs/complete` (2026-08-19, docs/transfers-redesign-spec.md §3.2, phase 1 stage

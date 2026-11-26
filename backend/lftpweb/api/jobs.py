@@ -53,6 +53,7 @@ from lftpweb.models import (
     PreflightResponse,
     PreflightRowOut,
     PreflightUnattributedClientOut,
+    PreflightUnboundClientOut,
     QueueBandwidthRequest,
     QueueBandwidthResponse,
     QueueItemRequest,
@@ -819,6 +820,12 @@ async def get_preflight(request: Request) -> PreflightResponse:
     all" -- the frontend hides the row list for that case rather than showing an empty "Nothing
     in preflight" that would be meaningless for a user with nothing configured (`gated_queues` is
     independent of this and can still be non-empty -- see `PreflightResponse`'s own docstring).
+
+    **`unbound_clients` (this task, spec §8.3 round 7's own named gap)** is the fourth banner:
+    every enabled client instance the download-client "configured" query below finds *zero*
+    enabled bindings for, computed as a set difference over that exact query rather than a second
+    predicate -- see `PreflightUnboundClientOut`'s own docstring for the incident this closes and
+    why a client with *some* bindings must never appear here.
     """
     db = request.app.state.db
     cursor = await db.execute(
@@ -839,6 +846,12 @@ async def get_preflight(request: Request) -> PreflightResponse:
     # for the two-cadence poll and flap-tolerant hold this reads from. "Configured" mirrors the
     # *arr's own bar above: an enabled instance with at least one enabled bound queue, here via
     # `download_client_category` (spec §8.3) rather than `path_queue.arr_instance_id`.
+    #
+    # **This is THE predicate** for "can this client instance contribute anything" -- the one
+    # `PreflightUnboundClientOut` docstring below promises is never hand-duplicated. Everything
+    # that needs to ask that question (this row source's own gate, `source_configured`'s client
+    # half, and the "connected but contributing nothing" banner two blocks down) reads
+    # `enabled_client_ids`, this one query's result, rather than re-deriving the answer.
     cursor = await db.execute(
         "SELECT DISTINCT download_client.id FROM download_client "
         "JOIN download_client_category ON download_client_category.client_id = download_client.id "
@@ -866,6 +879,48 @@ async def get_preflight(request: Request) -> PreflightResponse:
         if client_sync is not None and all_enabled_client_ids
         else []
     )
+
+    # The "connected, but contributing nothing" banner (this task, spec §8.3 round 7's own named
+    # gap, `docs/decisions.md`'s 2026-08-31 entry -- the live incident this closes). **A pure set
+    # difference over the two queries just above, not a third query and not a second predicate**:
+    # every enabled instance (`all_enabled_client_ids`, already fetched for the banner above) that
+    # is absent from `enabled_client_ids` (this source's own "configured" set, the literal query
+    # `source_configured`'s client half ORs in below) currently satisfies zero enabled bindings --
+    # which is exactly, and only, `PreflightUnboundClientOut`'s own contract.
+    #
+    # Deliberately excludes a client with *some* bindings, even if its other categories are all
+    # excluded -- that client is already in `enabled_client_ids` (one enabled binding is enough to
+    # satisfy the predicate), so the set difference below never touches it. Warning about *that*
+    # client would nag forever about a second lftpweb instance's own categories on a shared
+    # seedbox (§17.7) -- the identical failure mode `unattributed_clients` above was already
+    # corrected once to avoid, and this field must not reintroduce it from a different angle.
+    unbound_client_ids = all_enabled_client_ids - enabled_client_ids
+    unbound_clients: list[PreflightUnboundClientOut] = []
+    if unbound_client_ids:
+        placeholders = ",".join("?" * len(unbound_client_ids))
+        cursor = await db.execute(
+            "SELECT download_client.id AS id, download_client.name AS name, "
+            "COUNT(download_client_category.id) AS category_count, "
+            "COALESCE(SUM(download_client_category.excluded), 0) AS excluded_count "
+            "FROM download_client "
+            "LEFT JOIN download_client_category "
+            "ON download_client_category.client_id = download_client.id "
+            f"WHERE download_client.id IN ({placeholders}) "
+            "GROUP BY download_client.id, download_client.name",
+            tuple(unbound_client_ids),
+        )
+        unbound_clients = sorted(
+            (
+                PreflightUnboundClientOut(
+                    client_id=row["id"],
+                    client_name=row["name"],
+                    category_count=row["category_count"],
+                    excluded_count=row["excluded_count"],
+                )
+                for row in await cursor.fetchall()
+            ),
+            key=lambda u: u.client_name.casefold(),
+        )
 
     # The settle-gated source (this task) -- `core/autoqueue.py.AutoQueue` owns the eligibility
     # query the settle gate itself sits inside, so it also owns this projection; see that
@@ -953,6 +1008,7 @@ async def get_preflight(request: Request) -> PreflightResponse:
             ),
             key=lambda u: u.client_name.casefold(),
         ),
+        unbound_clients=unbound_clients,
     )
 
 

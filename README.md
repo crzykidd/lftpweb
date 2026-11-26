@@ -438,15 +438,16 @@ worked around:
   no longer does: as of 2026-08-29 it re-fingerprints the filesystem before queuing rather than
   trusting the client's status string outright, so a wrong or missing verdict costs nothing —
   it now ships **on** by default (`docs/decisions.md`).
-- **An excluded, unbound category is currently invisible to every diagnostic.** It is filtered out
-  of `unattributed_clients` by design (that filter is what keeps the "categories unattributed to a
-  queue" banner quiet for a second lftpweb instance's own categories on a shared seedbox), so a
-  fully-working, correctly-polling client instance can contribute zero Preflight rows, zero pause
-  state, and zero row icons while every diagnostic in the app — the Clients row's poll status, the
-  unattributed-clients banner, `gated_queues` — reads healthy. See "Preflight progress only updates
-  every ~60s" above for the symptom and the wire-level check. The real fix is a UI signal that
-  distinguishes "excluded because it's a different instance's category" from "excluded because
-  nobody has looked at it yet" — not built here; this is named as a gap, not addressed.
+- ~~An excluded, unbound category is currently invisible to every diagnostic.~~ **Closed
+  2026-08-31.** The Preflight box now shows a banner for exactly this case: an enabled
+  download-client instance with *zero* enabled category→queue bindings — "SABnzbd-ultracc:
+  connected, but nothing is bound to a queue yet ... (4 categories observed, all excluded) — bind
+  a category to a queue." Derived from the identical live predicate `source_configured`'s client
+  half already uses, so it can never drift from what actually gates a Preflight row, and it never
+  fires for a client with *some* bindings — that's the two-lftpwebs-sharing-a-seedbox safety
+  boundary (§17.7) working as designed, not a gap. See "Preflight progress only updates every
+  ~60s" below for the symptom this closes and the wire-level check that still applies when a
+  client has *partial* bindings (the one shape this banner deliberately stays silent for).
 - **Cross-seed handling ships unwitnessed.** Deleting one torrent's data breaks the other torrents
   sharing that save path, so the design detects shared save paths and refuses. It is
   correct-by-unit-test and has never run against a real cross-seeding setup, because the author's
@@ -508,8 +509,12 @@ the client is paused, and the download-client icon never appears on the row eith
 
 **The check:** Settings → Clients → open the instance → look at its category list for rows with no
 queue selected and marked excluded. Any category you expect lftpweb to act on needs both a queue
-and to be un-excluded — an excluded, unbound category is invisible everywhere else in the app; see
-"Known gaps" below.
+and to be un-excluded. **As of 2026-08-31, an instance whose *every* category is unbound like this
+now also shows a Preflight banner saying so** ("connected, but nothing is bound to a queue yet"),
+so you no longer have to reach Settings to notice — this section stays for the deeper symptom
+(cadence, pause state, the row icon) and for the *partial*-binding case the banner deliberately
+stays silent for (a client with some bindings and some deliberately excluded categories is the
+two-lftpwebs-sharing-a-seedbox safety boundary working as designed, not this failure).
 
 **The fastest way to confirm which case you're in without opening Settings:** look at the
 Preflight row on the wire (or the API response). A client actually contributing looks like

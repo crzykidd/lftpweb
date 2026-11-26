@@ -11,6 +11,7 @@ import {
   preflightSizeLabel,
   preflightStatusLabel,
   unattributedClientDetail,
+  unboundClientDetail,
 } from './preflight'
 
 describe('preflightSizeLabel', () => {
@@ -351,6 +352,38 @@ describe('unattributedClientDetail', () => {
     expect(
       unattributedClientDetail({ count: 3, categories: ['ar-movies'], no_category_count: 2 }),
     ).toBe('in ar-movies, 2 with no category')
+  })
+})
+
+describe('unboundClientDetail -- the "connected, but contributing nothing" banner (spec §8.3 round 7)', () => {
+  it('reports "no category observed yet" when the instance has never seen one at all', () => {
+    expect(unboundClientDetail({ category_count: 0, excluded_count: 0 })).toBe(
+      'no category observed yet',
+    )
+  })
+
+  it('reports the live incident\'s own exact shape -- every observed category excluded', () => {
+    expect(unboundClientDetail({ category_count: 4, excluded_count: 4 })).toBe(
+      '4 categories observed, all excluded',
+    )
+  })
+
+  it('uses the singular "category" for exactly one, all excluded', () => {
+    expect(unboundClientDetail({ category_count: 1, excluded_count: 1 })).toBe(
+      '1 category observed, all excluded',
+    )
+  })
+
+  it('names the excluded count when some, but not all, observed categories are excluded', () => {
+    expect(unboundClientDetail({ category_count: 3, excluded_count: 1 })).toBe(
+      '3 categories observed, 1 excluded',
+    )
+  })
+
+  it('omits the excluded clause entirely when none are excluded -- every category is merely undecided', () => {
+    expect(unboundClientDetail({ category_count: 2, excluded_count: 0 })).toBe(
+      '2 categories observed',
+    )
   })
 })
 

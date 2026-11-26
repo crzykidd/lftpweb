@@ -6,6 +6,62 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-08-31 — closing the gap named the same day: a fourth Preflight banner for a client with zero bindings, derived from the exact predicate that already gates it
+
+`prompts/done/2026-08-31-surface-inert-download-clients.md`, the follow-up the entry directly
+below named and deliberately deferred: *"Not fixed here, and deliberately so ... telling them
+apart from inside the UI ... belongs to a separate task."* `GET /api/queue/preflight` gains a
+fourth field, `unbound_clients` (`PreflightUnboundClientOut`) — every **enabled** download-client
+instance for which `api/jobs.py.get_preflight`'s own "is this client's source configured" query
+returns no rows, rendered as a fourth `PreflightBox.tsx` banner: *"SABnzbd-ultracc: connected, but
+nothing is bound to a queue yet, so it isn't contributing any downloads (4 categories observed,
+all excluded) — bind a category to a queue."*
+
+**The one correctness requirement, honored by construction rather than by discipline:** the
+handoff prompt named "derive it from the identical predicate `source_configured`'s client half
+already uses" as the single thing most likely to rot silently if gotten wrong — a second
+hand-written "is this client usable" rule would eventually disagree with what actually gates a
+Preflight row, in either direction, with nothing anywhere saying so. The implementation is a plain
+Python set difference, `all_enabled_client_ids - enabled_client_ids`, over the *same two query
+results* `source_configured`'s own client half and the `unattributed_clients` banner already
+compute a few lines above it in `get_preflight` — not a third query, not a rewritten predicate.
+`tests/test_preflight_api.py::test_unbound_clients_and_source_configureds_client_half_agree`
+recomputes the predicate independently, straight off the database, and asserts it against the
+endpoint's own response on every run — the invariant test the prompt required, so a future drift
+between the two fails loudly in CI instead of quietly starting a second version of the incident
+this task exists to prevent.
+
+**Scope held to exactly what the prompt drew, both directions.** Confirmed **not** to fire for a
+client with *some* bindings, however many of its other categories are excluded
+(`test_client_with_one_enabled_binding_is_not_reported_even_with_other_categories_excluded`) — that
+shape is §17.7's two-lftpwebs-one-seedbox safety boundary working as designed, and warning about it
+would reintroduce, from a different angle, the exact permanent-nag failure `unattributed_clients`
+was already corrected once to avoid (spec §8.3 round 6 point 5). Confirmed **not** to touch the
+exclusion default, migration 032, or `categories_acknowledged_at` — the default stays exactly what
+it was; only its resulting silence is fixed. The banner has no dismiss button and no
+acknowledgement, by explicit instruction: it is computed fresh from live configuration on every
+request, so it clears itself the instant a binding exists, and this project's own house style is
+fewer clicks, not more confirmation.
+
+**Wording avoided "inert"/"unbound" as user-facing labels**, per the prompt's own instruction —
+the banner states what's true (connected, nothing bound, contributing nothing) and what to do
+(bind a category to a queue), and never implies the exclusion default itself was a mistake. Plain
+"excluded" was kept rather than paraphrased into the disk-review page's "Not monitored here" —
+unlike that page's dedicated attribution vocabulary, "excluded" is already this app's own ordinary
+word for the state elsewhere (Settings → Clients' own category control, "Excluded content" on the
+disk review page itself), so introducing a second word for the identical fact here would be the
+inconsistency, not the fix.
+
+**Left alone, on purpose:** the disk review page, `core/disk_review.py`, `api/disk_review.py`,
+attribution/matching logic, and poller cadence — none of this task's scope, per its own explicit
+fence. No layout test was written for the third stacked banner (`GatedQueueBanner`,
+`UnattributedClientBanner`, `UnboundClientBanner` now all sit in the same `flex flex-col gap-2`
+parent) — jsdom performs no layout at all, and a test that can't see clipping would pass either
+way; `components/PreflightBox.tsx`'s own docstring says so in a comment rather than pretending to
+cover it, matching this codebase's established discipline for this exact class of bug.
+
+---
+
 ## 2026-08-31 — a category recorded excluded is invisible to every diagnostic; the wire-level tell is the fastest way to find it again
 
 A live diagnosis on 2026-08-30/31 burned a long session before finding the cause. The user's own
