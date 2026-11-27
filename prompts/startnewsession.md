@@ -105,6 +105,21 @@ than a first. Two things that bit the first time and will bit again:
 
 ## Where we are
 
+### 🔒 2026-11-26 security pass (audit + three fix batches on `dev`)
+
+A pre-release security audit produced `private_data/security-audit-2026-11-26.md` (gitignored,
+private, not in the repo; findings F1-F12, fix batches in its §5). Landed on `dev`: `3aa48d6` C1
+(lftp quoting by lftp's real grammar; CR/LF/NUL names refused as `UNSAFE_PATH`), `2f717b7` D1+D2
+(base image refresh, certifi, 7-Zip 26.06 and UnRAR 7.23 from source), `985eed7` C2 (archives
+listed before extraction; links / absolute / `..` members refused). README now has a "Network
+exposure" section and the open items under "Known gaps"; CHANGELOG carries an upgrade note.
+**Deferred, not fixed (report §5):** C3 - CSRF/Host/Origin protection for `none`/`proxy` mode,
+plus restricting free-form settings to safe values (today settings write = command execution in
+the container, so anyone who can reach the port in `none` mode has it); C4 - stored secrets
+redirectable on endpoint change; C5 - public `/docs`/`/openapi.json`, proxy-aware `Secure` cookie
+and login rate limiter, current password on `PUT` password change; D3 - CI image scanning, SBOM,
+stale-layer cache, dev-dependency bumps. The test deployment is LAN-only per the user. **Do not tag `0.4.0` as safe for exposure until these land.**
+
 ### 👉 THE NEXT SESSION'S JOB: pre-release bug hunting for `0.4.0`
 
 **Not new features.** `dev` carries a large, unreleased body of work (below) that has had six
@@ -288,7 +303,7 @@ value.
 **Live validation loop:** **https://lftpweb.crzynet.com is the TEST system**, running `dev`, with
 real SABnzbd 5.1.1 and rTorrent 0.9.8 behind it sharing the TV completed folder. It answers
 `/api/health`, `/api/history/events`, `/api/logs/*`, `/api/settings/*` and `/api/files`
-unauthenticated from the dev host, so a deployed change can be verified by reading its own events
+unauthenticated from the dev host (because the test system runs `none` mode on a LAN, not because that is a safe default), so a deployed change can be verified by reading its own events
 rather than by relaying output. **The user's production install is a different, unreachable
 deployment** — ask which one a report is about rather than assuming.
 

@@ -152,7 +152,8 @@ Every verify outcome, every remote delete, and every delete withheld — with th
 - Credentials encrypted at rest
 - **Authentication is optional and defaults off** (`AUTH_MODE=none`) — turn on a single-user
   password login or trust a reverse proxy's identity header, both from Settings → Auth. See
-  "Locked out?" below before you flip it on.
+  "Locked out?" below before you flip it on, and read "Network exposure" below if you run with
+  auth off.
 - **In-app user documentation**, under **Docs** in the left nav: a quick start walking the real
   first-run sequence, and a Concepts page covering the twenty things that actually confuse
   people (the queue being paused, why a row still reads "Awaiting import" instead of Complete,
@@ -465,6 +466,43 @@ worked around:
   (content silently clipped rather than scrolled; a control crushed to one character by a
   competing width class), and jsdom performs no layout at all, so no test in this repo could have
   caught either. A human with a browser is the only check that exists for these pages.
+- **No CSRF, Host or Origin checks in `none` or `proxy` mode.** Only `password` mode's session
+  cookie gives any cross-site protection. See "Network exposure."
+- **Settings write access is equivalent to command execution in the container.** Some settings
+  are not yet restricted to safe values. Another reason `none` mode must stay on a trusted network.
+- **Stored secrets can be redirected.** Changing an endpoint's address does not require
+  re-entering its stored credential, so someone with settings write access can send it elsewhere.
+- **`/docs` and `/openapi.json` are public**, even with auth on.
+- **The session cookie's `Secure` flag and the login rate limiter don't understand a reverse
+  proxy**, so behind a TLS-terminating proxy they may misjudge the connection and every client.
+
+## Network exposure
+
+**Read this before publishing the port to anything you don't fully control.**
+
+- **`none` mode means anyone who can reach the port controls lftpweb completely** — including
+  running commands inside the container and reading the seedbox credentials. Only use it on a
+  network where every device and every person is trusted. A browser on that network that visits
+  a malicious website counts as a device on it, so "my home LAN" is not automatically safe.
+- **Prefer `password` mode**, or `proxy` mode behind a reverse proxy that authenticates people.
+- **When a reverse proxy sits in front, don't publish the port on every interface.** Bind it to
+  loopback or to one specific address in `docker-compose.yml`, for example:
+
+  ```yaml
+  ports:
+    - "127.0.0.1:8087:8087"      # or a specific LAN address, e.g. "192.168.1.10:8087:8087"
+  ```
+
+  The shipped file publishes `"8087:8087"`, which listens on all interfaces; narrowing it is
+  up to you.
+- **Never expose lftpweb directly to the internet, in any auth mode,** until the remaining
+  hardening listed under "Known gaps" has landed.
+- **If an install ever had `none` mode reachable from a network you did not trust**, treat its
+  stored credentials as exposed: rotate the seedbox SSH credential and the SABnzbd, rTorrent,
+  Sonarr and Radarr keys.
+- **Deployments do not auto-update.** Pull the new image after `0.4.0`: earlier images carry an
+  OpenSSH client with a known critical vulnerability, plus file-name quoting and archive
+  extraction weaknesses fixed in this release (see `CHANGELOG.md`).
 
 ## Locked out?
 

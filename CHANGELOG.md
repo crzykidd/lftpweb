@@ -54,6 +54,11 @@ Skeleton for the next roll:
 ### Fixed
 ### Security
 
+- **Upgrade note: this release fixes security issues. Pull the new image** (deployments do not
+  auto-update), and if you run auth mode `none`, read the README's "Network exposure" section
+  first: that mode must only be used on a network where everything that can reach the port is
+  trusted. Several hardening items remain open and are listed under "Known gaps."
+
 - **A seedbox file or folder name could run a command inside the container.** The quoting
   lftpweb applied to names before handing them to lftp followed shell rules that lftp does not
   share, so a specially crafted name (one containing backslashes and quotes, or a line break)
