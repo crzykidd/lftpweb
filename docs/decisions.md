@@ -6,6 +6,25 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-11-26 — The shipped compose file binds the UI to loopback
+
+`prompts/done/2026-11-26-compose-loopback-default.md` (security audit §3 F2).
+
+**Decision.** `docker-compose.yml` publishes `"127.0.0.1:8087:8087"` rather than `"8087:8087"`.
+
+**Why.** Fresh installs default to `none` auth, which the audit showed is full control for anyone
+who can reach the port. A shipped default should not be network-reachable until the operator
+chooses that.
+
+**Rejected.** Leaving all interfaces and only documenting how to narrow it (what the earlier G1
+docs change did): the unsafe state remained the default and relied on the operator reading.
+
+**Cost.** Someone browsing from another machine without a reverse proxy must edit one line
+(a specific LAN address is preferred). Documented in README, the in-app quick start and the
+changelog. `docker-compose.dev.yml` and `docker-compose.test.yml` are unchanged.
+
+---
+
 ## 2026-11-26 — Archives are listed and refused before extraction; one directory per archive
 
 `prompts/done/2026-11-26-c2-extraction-hardening.md` (audit batch C2, F4/F8).

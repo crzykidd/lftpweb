@@ -32,7 +32,12 @@ services:
     ports:
       # Not 8080: chosen to avoid collisions with other dev stacks on the shared build
       # host (see docs/decisions.md). Edit here if it collides on yours too.
-      - "8087:8087"
+      #
+      # Bound to loopback by default so nothing on the network can reach it until you decide.
+      # Put a reverse proxy in front, or change this to a specific LAN address
+      # ("192.168.1.10:8087:8087") or "8087:8087" (all interfaces). Read README's "Network
+      # exposure" section before doing the latter in `none` auth mode.
+      - "127.0.0.1:8087:8087"
     environment:
       # Dedicated NFS uid/gid — must match the export's expected identity. The
       # entrypoint (docker/entrypoint.sh) applies these and drops root via su-exec.

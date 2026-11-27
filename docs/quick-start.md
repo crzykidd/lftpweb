@@ -5,7 +5,8 @@ describes.
 
 ## 1. Deploy the container
 
-The UI is on port `8087`. Three volumes matter, and two of them are easy to get backwards:
+The UI is on port `8087`, bound to `127.0.0.1` by the shipped compose file: from another machine,
+use a reverse proxy or edit the `ports:` line. Three volumes matter, and two of them are easy to get backwards:
 
 - `/config` — the SQLite database, logs, backups, and the encryption key used for stored
   credentials. Back this up; everything else is replaceable.

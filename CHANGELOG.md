@@ -37,6 +37,12 @@ Skeleton for the next roll:
 
 ### Changed
 
+- **The shipped `docker-compose.yml` now publishes the UI on `127.0.0.1:8087` instead of all
+  interfaces.** A fresh install defaults to `none` auth, which is full control for anyone who can
+  reach the port, so it should not be network-reachable until the operator chooses that.
+  Deployments that use their own compose file are unaffected. **Anyone using the shipped file and
+  browsing from another machine must put a reverse proxy in front or edit the `ports:` line** (a
+  specific LAN address is preferred over `"8087:8087"`); see README's "Network exposure."
 - **The settle-gate skip now defaults ON** — the fifth deliberate exception to this project's
   "every new capability ships off" rule, after `move`-mode forced verification, the phase 7
   scheduled backup, the settle gate itself, and "folder prefix during transfer." It earns the

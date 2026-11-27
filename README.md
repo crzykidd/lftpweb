@@ -485,16 +485,18 @@ worked around:
   network where every device and every person is trusted. A browser on that network that visits
   a malicious website counts as a device on it, so "my home LAN" is not automatically safe.
 - **Prefer `password` mode**, or `proxy` mode behind a reverse proxy that authenticates people.
-- **When a reverse proxy sits in front, don't publish the port on every interface.** Bind it to
-  loopback or to one specific address in `docker-compose.yml`, for example:
+- **The shipped `docker-compose.yml` publishes the UI on loopback only** (`"127.0.0.1:8087:8087"`),
+  so a fresh install is not reachable from the network until you choose that. To reach it from
+  another machine, either put a reverse proxy in front (the proxy connects to loopback) or widen
+  the `ports:` line. Prefer one specific LAN address over all interfaces:
 
   ```yaml
   ports:
-    - "127.0.0.1:8087:8087"      # or a specific LAN address, e.g. "192.168.1.10:8087:8087"
+    - "192.168.1.10:8087:8087"   # one specific LAN address (preferred over all interfaces)
+    # - "8087:8087"              # all interfaces: only with `password`/`proxy` auth
   ```
 
-  The shipped file publishes `"8087:8087"`, which listens on all interfaces; narrowing it is
-  up to you.
+  Don't publish on all interfaces in `none` mode: anyone who can reach the port has full control.
 - **Never expose lftpweb directly to the internet, in any auth mode,** until the remaining
   hardening listed under "Known gaps" has landed.
 - **If an install ever had `none` mode reachable from a network you did not trust**, treat its
@@ -572,7 +574,9 @@ docker compose up -d          # production-shaped
 docker compose -f docker-compose.dev.yml up --build    # local development
 ```
 
-The UI is on **`8087`** (`5187` for the Vite dev server). Configure the host and your path
+The UI is on **`8087`** (`5187` for the Vite dev server). The shipped compose file listens only
+on `127.0.0.1`, so from another machine you need a reverse proxy or to edit the `ports:` line
+(see [Network exposure](#network-exposure)). Configure the host and your path
 queues under **Settings**.
 
 **Once it's up, the rest of the setup guide is in the app**, under **Docs → Quick start** — it
