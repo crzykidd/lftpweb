@@ -320,6 +320,9 @@ def test_extract_item_refuses_to_publish_an_escaping_symlink(tmp_path, monkeypat
 
     monkeypatch.setattr(extract, "extract_archive", fake_extract_archive)
     monkeypatch.setattr(extract, "check_extract_preconditions", lambda a: None)
+    # The fake archive is not listable; this test is about the post-extraction check, so the
+    # pre-extraction listing check (tests/test_extract_hardening.py) is stubbed out here.
+    monkeypatch.setattr(extract, "_listing_verdict", lambda *a, **k: None)
 
     result = extract.extract_item(item, binary="unused")
     assert not result.ok
@@ -532,7 +535,9 @@ def test_extract_never_writes_the_final_name_mid_extraction(tmp_path, monkeypatc
 
     assert result.ok, result.detail
     assert len(seen_targets) == 1
-    assert seen_targets[0].name.startswith(extract.UNPACK_PREFIX)
+    # Each archive extracts into its own fresh work directory *inside* the `_UNPACK_` staging
+    # directory (audit F4), never at the final name.
+    assert seen_targets[0].parent.name.startswith(extract.UNPACK_PREFIX)
     assert (item / "inner.txt").read_text() == "zip contents"
 
 

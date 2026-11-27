@@ -74,6 +74,17 @@ Skeleton for the next roll:
   CVE-2026-14266 (XZ decoder heap overflow, reachable via `.xz`/`.tar.xz` downloads).
 - **unrar updated to 7.23 final** (was a 7.20 beta 3 build), fixing CVE-2026-14191 and the
   cross-extraction symlink hardening.
+- **A hostile archive could write outside its own extraction directory.** Containment was only
+  checked after every archive in a release had been extracted into one shared directory, so a
+  symlink planted by one archive could be written *through* by the next, and hardlink members were
+  not considered at all. Every archive is now **listed before anything is extracted** and refused
+  outright — nothing written, the item ends `EXTRACT_FAILED` naming the reason and the member — if
+  any member is an absolute path, has a `..` component (backslashes included), is a symlink, or is
+  a hardlink; a listing that cannot be parsed is refused too. Each archive then extracts into its
+  own fresh directory and is merged into staging only after a post-check finds no symlink, no
+  hardlinked file and nothing escaping that directory; `unrar` also runs with `-ol-`. **A release
+  that carries a link now fails to extract instead of extracting** — legitimate releases
+  essentially never contain links; if one does, extract it by hand.
 
 ### Deprecated
 

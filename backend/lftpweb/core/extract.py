@@ -34,6 +34,7 @@ import logging
 import os
 import re
 import shutil
+import stat
 import subprocess
 import tempfile
 import time
@@ -327,7 +328,384 @@ def _extract_rar(
     have.
     """
     pw_arg = f"-p{password}" if password else "-p-"
-    return _run_unrar(binary, ["x", "-y", pw_arg, str(archive), f"{target_dir}{os.sep}"])
+    # `-ol-` = skip symbolic links (verified against 7.20/7.23: no link is created, and no
+    # "unsafe link" prompt). Defence in depth only -- `check_archive_listing` has already refused
+    # any archive holding a link before this runs (audit F4/F8, docs/decisions.md). It does NOT
+    # stop hardlinks/file references; the listing refusal and the post-check cover those.
+    return _run_unrar(binary, ["x", "-y", "-ol-", pw_arg, str(archive), f"{target_dir}{os.sep}"])
+
+
+# --- pre-extraction listing check (audit 2026-11-26 F4/F8, docs/decisions.md) -----------------
+#
+# Every archive is *listed* before it is extracted, and refused -- nothing written anywhere -- if
+# any member is an absolute path, has a `..` component, is a symlink, or is a hardlink. Policy is
+# refuse-the-whole-archive, not skip-the-link: legitimate releases essentially never carry links,
+# and a partially-extracted hostile archive is exactly what this exists to avoid. Fails closed: a
+# listing that cannot be parsed, or a record missing a field this relies on, refuses the archive.
+
+_NAME_MAX_LEN = 100
+_STREAM_TYPES = frozenset({"gzip", "bzip2", "xz"})
+_UNIX_LINK_MODE_RE = re.compile(r"(?:^|\s)l[-rwxsStT]{9}\s*$")
+_KV_7Z_RE = re.compile(r"^([A-Za-z][A-Za-z0-9 ]*?) =(?: (.*))?$")
+_KV_RAR_RE = re.compile(r"^\s*([A-Za-z][A-Za-z0-9 -]*?):(?: (.*))?$")
+_DRIVE_RE = re.compile(r"^[A-Za-z]:")
+
+
+class _ListingError(Exception):
+    """The listing output was not in the shape this module relies on (fail closed)."""
+
+
+def _safe_name(name: str) -> str:
+    """Member names are attacker-controlled text that ends up in logs and the UI: replace every
+    non-printable character and cap the length."""
+    cleaned = "".join(c if c.isprintable() else "?" for c in name)
+    if len(cleaned) > _NAME_MAX_LEN:
+        cleaned = cleaned[:_NAME_MAX_LEN] + "..."
+    return cleaned
+
+
+def _unsafe_path_reason(path: str) -> str | None:
+    """Why `path` (an archive member name) must not be extracted, or `None` if it is a plain
+    relative path. Backslash is normalised to `/` first -- zip members written on Windows use
+    it, and a `..\\x` member must not slip past a `/`-only check."""
+    if not path:
+        return "empty member name"
+    if "\x00" in path:
+        return "NUL in member name"
+    p = path.replace("\\", "/")
+    if p.startswith("/") or _DRIVE_RE.match(p):
+        return "absolute path"
+    if ".." in p.split("/"):
+        return "'..' path component"
+    return None
+
+
+def _parse_7z_listing(text: str) -> tuple[dict[str, str], list[dict[str, str]]]:
+    """Parse `7z l -slt` output into `(header, records)`. Raises `_ListingError` on anything
+    unexpected. The structure checks are what stop a member *name* containing a newline from
+    forging fields: only `Path` carries attacker text, and the key that really follows it is always
+    `Folder` or `Size`, so any other line there -- or a repeat of a key the real record emits
+    afterwards -- is refused."""
+    lines = text.splitlines()
+    try:
+        sep = lines.index("----------")
+    except ValueError:
+        raise _ListingError("no member section in the listing") from None
+    header: dict[str, str] = {}
+    for line in lines[:sep]:
+        m = _KV_7Z_RE.match(line)
+        if m and m.group(1) not in header:
+            header[m.group(1)] = m.group(2) or ""
+    records: list[dict[str, str]] = []
+    cur: dict[str, str] = {}
+    order: list[str] = []
+
+    def flush() -> None:
+        if not cur:
+            return
+        records.append(dict(cur))
+        cur.clear()
+        order.clear()
+
+    for line in lines[sep + 1 :]:
+        if line == "":
+            flush()
+            continue
+        m = _KV_7Z_RE.match(line)
+        if not m:
+            raise _ListingError("unrecognised line in the listing")
+        key, value = m.group(1), m.group(2) or ""
+        if key in cur:
+            raise _ListingError(f"duplicate field {key!r} in a listing record")
+        cur[key] = value
+        order.append(key)
+        if len(order) == 2 and order[0] == "Path" and key not in ("Folder", "Size"):
+            raise _ListingError("unexpected field after Path in a listing record")
+    flush()
+    if not records:
+        raise _ListingError("the listing contains no members")
+    for rec in records:
+        if "Path" not in rec:
+            # Name-less records exist only for single-stream formats (xz, bz2), which hold exactly
+            # one anonymous payload and cannot carry a name, link or path.
+            if not (header.get("Type") in _STREAM_TYPES and len(records) == 1 and "Size" in rec):
+                raise _ListingError("a listing record has no Path")
+        if rec.get("Folder", "-") not in ("+", "-"):
+            raise _ListingError("malformed Folder field in a listing record")
+    return header, records
+
+
+def _check_7z_records(
+    header: dict[str, str], records: list[dict[str, str]]
+) -> tuple[str, str] | None:
+    """`(reason, member)` for the first record that must be refused, else `None`."""
+    for rec in records:
+        path = rec.get("Path")
+        if path is None:
+            continue
+        reason = _unsafe_path_reason(path)
+        if reason:
+            return reason, path
+        if rec.get("Symbolic Link", "").strip() or rec.get("Mode", "").startswith("l"):
+            return "symbolic link", path
+        if _UNIX_LINK_MODE_RE.search(rec.get("Attributes", "")):
+            return "symbolic link", path
+        if rec.get("Hard Link", "").strip():
+            return "hard link", path
+    return None
+
+
+def _run_7z_list(binary: str, args: list[str]) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        [binary, *args],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        errors="replace",
+        timeout=_SUBPROCESS_TIMEOUT_S,
+    )
+
+
+def _list_inner_tar(binary: str, archive: Path, pw_args: list[str]) -> subprocess.CompletedProcess:
+    """Stream `archive`'s decompressed tar into `7z l -slt -ttar -si` -- lists a compound tar
+    without writing the intermediate `.tar` anywhere."""
+    p1 = subprocess.Popen(
+        [binary, "x", "-so", "-y", str(archive), *pw_args],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        p2 = subprocess.Popen(
+            [binary, "l", "-slt", "-ttar", "-si"],
+            stdin=p1.stdout,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            errors="replace",
+        )
+    except BaseException:
+        p1.kill()
+        p1.wait()
+        raise
+    assert p1.stdout is not None
+    p1.stdout.close()
+    try:
+        out, err = p2.communicate(timeout=_SUBPROCESS_TIMEOUT_S)
+        rc1 = p1.wait(timeout=_SUBPROCESS_TIMEOUT_S)
+    except BaseException:
+        p1.kill()
+        p2.kill()
+        p1.wait()
+        p2.wait()
+        raise
+    rc = p2.returncode or (rc1 and 2) or 0
+    return subprocess.CompletedProcess(p2.args, rc, out, err)
+
+
+def _check_7z_listing(
+    archive: Path, pw_args: list[str], binary: str
+) -> tuple[tuple[str, str] | None, str]:
+    """`(violation, error)`: a violation `(reason, member)` if the archive must be refused, an
+    error string if it could not be listed with these credentials, else `(None, "")`."""
+    lowered = archive.name.lower()
+    compound = _is_compound_tar(lowered)
+    outer = _run_7z_list(binary, ["l", "-slt", "-y", str(archive), *pw_args])
+    if outer.returncode != 0:
+        return None, (outer.stderr or outer.stdout).strip() or "listing failed"
+    try:
+        header, records = _parse_7z_listing(outer.stdout)
+    except _ListingError as exc:
+        return ("unparseable listing", str(exc)), ""
+    if compound and header.get("Type") not in _STREAM_TYPES:
+        return ("not a plain compressed tar", header.get("Type", "?")), ""
+    hit = _check_7z_records(header, records)
+    if hit:
+        return hit, ""
+    if compound:
+        inner = _list_inner_tar(binary, archive, pw_args)
+        if inner.returncode != 0:
+            return None, (inner.stderr or inner.stdout).strip() or "inner tar listing failed"
+        try:
+            iheader, irecords = _parse_7z_listing(inner.stdout)
+        except _ListingError as exc:
+            return ("unparseable listing", str(exc)), ""
+        hit = _check_7z_records(iheader, irecords)
+        if hit:
+            return hit, ""
+    return None, ""
+
+
+def _check_rar_listing(
+    archive: Path, password: str | None, binary: str
+) -> tuple[tuple[str, str] | None, str]:
+    pw_arg = f"-p{password}" if password else "-p-"
+    # `-v` = list ALL volumes: without it `unrar` lists only the head volume's entries, and a
+    # symlink carried by a later volume would go unseen (measured against a crafted 2-volume set).
+    res = _run_unrar(binary, ["lta", "-v", pw_arg, str(archive)])
+    if res.returncode != 0:
+        return None, (res.stderr or res.stdout).strip() or "listing failed"
+    members: list[dict[str, str]] = []
+    cur: dict[str, str] = {}
+    order: list[str] = []
+
+    def flush() -> None:
+        if cur:
+            members.append(dict(cur))
+        cur.clear()
+        order.clear()
+
+    out_lines = res.stdout.splitlines()
+    # The banner ("UNRAR 7.x ... Copyright") precedes the first "Archive:" line and is not
+    # key/value; everything from "Archive:" on must be.
+    start = next((i for i, ln in enumerate(out_lines) if ln.startswith("Archive: ")), None)
+    if start is None:
+        return ("unparseable listing", "no Archive: line in the listing"), ""
+    for line in out_lines[start:]:
+        if not line.strip():
+            flush()
+            continue
+        m = _KV_RAR_RE.match(line)
+        if not m:
+            return ("unparseable listing", "unrecognised line in the listing"), ""
+        key, value = m.group(1), m.group(2) or ""
+        if key in cur:
+            return ("unparseable listing", f"duplicate field {key!r}"), ""
+        cur[key] = value
+        order.append(key)
+        if len(order) == 2 and order[0] == "Name" and key != "Type":
+            return ("unparseable listing", "unexpected field after Name"), ""
+    flush()
+    saw_member = False
+    for rec in members:
+        if "Name" not in rec:
+            continue  # header / service record
+        saw_member = True
+        name = rec["Name"]
+        reason = _unsafe_path_reason(name)
+        if reason:
+            return (reason, name), ""
+        rtype = rec.get("Type")
+        if rtype is None:
+            return ("unparseable listing", "a listing record has no Type"), ""
+        if rtype == "Unix symbolic link" or "symbolic link" in rtype.lower():
+            return ("symbolic link", name), ""
+        if rtype == "Hard link":
+            return ("hard link", name), ""
+        if rtype not in ("File", "Directory"):
+            return (f"unsupported entry type {_safe_name(rtype)!r}", name), ""
+        if rec.get("Attributes", "").startswith("l"):
+            return ("symbolic link", name), ""
+    if not saw_member:
+        return ("unparseable listing", "the listing contains no members"), ""
+    return None, ""
+
+
+def _listing_verdict(
+    archive: Path,
+    *,
+    passwords: tuple[str, ...],
+    binary: str,
+    rar_binary: str,
+) -> tuple[Literal["refused", "unlistable"], str] | None:
+    """`("refused", msg)` -- the archive holds something this module will never extract, or its
+    listing cannot be trusted; `("unlistable", msg)` -- the listing could not be obtained at all
+    (corrupt archive, or no password in the list opens a header-encrypted one); `None` -- safe.
+    Each password is tried for the listing; an archive that lists under none is `unlistable`."""
+    is_rar = archive.name.lower().endswith(".rar")
+    last_error = ""
+    for password in list(passwords) if passwords else [None]:
+        if is_rar:
+            violation, error = _check_rar_listing(archive, password, rar_binary)
+        else:
+            pw_args = [f"-p{password}"] if password else []
+            violation, error = _check_7z_listing(archive, pw_args, binary)
+        if violation:
+            reason, member = violation
+            if reason == "unparseable listing":
+                return "refused", (
+                    f"{archive.name}: refused before extraction -- could not trust the archive "
+                    f"listing ({_safe_name(member)})"
+                )
+            shown = f": {_safe_name(member)!r}" if member else ""
+            return "refused", f"{archive.name}: refused before extraction -- {reason}{shown}"
+        if not error:
+            return None
+        last_error = error
+    tail = last_error.splitlines()[-1] if last_error else "listing failed"
+    return "unlistable", f"{archive.name}: could not list the archive ({_safe_name(tail)})"
+
+
+def check_archive_listing(
+    archive: Path,
+    *,
+    passwords: tuple[str, ...] = (),
+    binary: str = DEFAULT_BINARY,
+    rar_binary: str = DEFAULT_RAR_BINARY,
+) -> str | None:
+    """List `archive` (without extracting anything) and return a refusal message naming the
+    reason and the (sanitised) offending member, or `None` when it is safe to extract. Refuses an
+    absolute path, a `..` component (backslash-normalised), a symlink and a hardlink; fails closed
+    on an archive that cannot be listed or whose listing cannot be parsed."""
+    verdict = _listing_verdict(archive, passwords=passwords, binary=binary, rar_binary=rar_binary)
+    return verdict[1] if verdict else None
+
+
+def _walk_problem(root: Path) -> tuple[str, str] | None:
+    """First `(reason, relative name)` in `root` that is not a plain file or directory: any
+    symlink, any special file, any regular file with `st_nlink > 1`. `os.walk` never descends a
+    symlink (`followlinks=False`), so nothing is followed."""
+    for dirpath, dirnames, filenames in os.walk(root):
+        for name in [*dirnames, *filenames]:
+            full = os.path.join(dirpath, name)
+            rel = os.path.relpath(full, root)
+            try:
+                st = os.lstat(full)
+            except OSError as exc:
+                return f"unreadable entry ({exc.strerror})", rel
+            if stat.S_ISLNK(st.st_mode):
+                return "symbolic link", rel
+            if stat.S_ISDIR(st.st_mode):
+                continue
+            if not stat.S_ISREG(st.st_mode):
+                return "special file", rel
+            if st.st_nlink > 1:
+                return "hard link (st_nlink > 1)", rel
+    return None
+
+
+def check_extracted_tree(root: Path) -> str | None:
+    """Post-extraction check of one archive's own fresh output directory (defence in depth behind
+    `check_archive_listing`): `find_escaping_path` plus a refusal of any symlink at all and any
+    regular file with `st_nlink > 1`. Returns a message, or `None` when the tree is plain."""
+    escaping = find_escaping_path(root)
+    if escaping is not None:
+        return (
+            f"extraction produced a path escaping the staging root ({_safe_name(escaping.name)!r})"
+        )
+    problem = _walk_problem(root)
+    if problem is not None:
+        reason, rel = problem
+        return f"extraction produced a {reason} ({_safe_name(rel)!r})"
+    return None
+
+
+def _merge_archive_output(src: Path, dst: Path) -> None:
+    """Merge one archive's checked output into the item's staging directory. Same filesystem by
+    construction (`src` lives inside the staging directory), so every leaf is an atomic
+    `os.replace`; a later archive's file overwrites an earlier one's, as extracting every archive
+    into one shared directory with `-y` always did."""
+    dst.mkdir(parents=True, exist_ok=True)
+    for entry in sorted(src.iterdir()):
+        target = dst / entry.name
+        if entry.is_dir() and not entry.is_symlink():
+            if target.exists() and not target.is_dir():
+                target.unlink()
+            _merge_archive_output(entry, target)
+        else:
+            if target.is_dir() and not target.is_symlink():
+                shutil.rmtree(target)
+            os.replace(entry, target)
 
 
 def extract_archive(
@@ -337,8 +715,12 @@ def extract_archive(
     passwords: tuple[str, ...] = (),
     binary: str = DEFAULT_BINARY,
     rar_binary: str = DEFAULT_RAR_BINARY,
+    check_listing: bool = True,
 ) -> ExtractResult:
     """Extract one archive into `target_dir` (created if needed).
+
+    Unless `check_listing=False` (`extract_item` has already run `check_archive_listing` over
+    every archive up front), the archive is listed and refused before anything is written.
 
     Compound tar formats (`.tar.gz`/`.tgz`, `.tar.bz2`/`.tbz2`, `.tar.xz`/`.txz`) need two
     7zz passes -- one to strip the outer compression, one to unpack the resulting `.tar` --
@@ -351,6 +733,12 @@ def extract_archive(
     follows the rest of a multi-volume set on its own once given the first volume, using
     whichever naming convention (`.r00`/`.r01`/... or `.partNN.rar`) the sibling volumes use.
     """
+    if check_listing:
+        refusal = check_archive_listing(
+            archive, passwords=passwords, binary=binary, rar_binary=rar_binary
+        )
+        if refusal:
+            return ExtractResult(state="EXTRACT_FAILED", detail=refusal)
     target_dir.mkdir(parents=True, exist_ok=True)
     attempts = list(passwords) if passwords else [None]
     last_error = ""
@@ -514,6 +902,23 @@ def extract_item(
             ),
         )
 
+    # Listing check (audit F4/F8, docs/decisions.md): every archive is listed and refused -- the
+    # whole item, nothing written, no staging or `_FAILED_` directory -- if any member is an
+    # absolute path, a `..` component, a symlink or a hardlink.
+    verdicts = {
+        a: _listing_verdict(a, passwords=passwords, binary=binary, rar_binary=rar_binary)
+        for a in archives
+    }
+    refusals = [v[1] for v in verdicts.values() if v and v[0] == "refused"]
+    if refusals:
+        return ExtractResult(
+            state="EXTRACT_FAILED",
+            detail=(
+                f"{len(refusals)} of {len(archives)} archive(s) refused before extraction began: "
+                + "; ".join(refusals)
+            ),
+        )
+
     # `root` is a directory for the common case (a release), but §4.7's loose top-level file
     # can make `root` the archive itself -- "its own directory" is then `root.parent`, the
     # same containing directory the pre-staging code used as `archive.parent` for that case.
@@ -529,18 +934,45 @@ def extract_item(
     staging_dir.mkdir(parents=True, exist_ok=True)
 
     failures: list[str] = []
-    for archive in archives:
+    for index, archive in enumerate(archives):
         # An archive nested under a subdirectory of `root` (a multi-CD release, say) extracts
         # into the matching subdirectory of staging, reproducing the layout `target_dir=None`
         # would have produced extracting in place. A configured `extract_target_dir` keeps
         # its existing flat behavior (one shared destination for every archive in the item;
         # see docs/decisions.md) -- staging just interposes ahead of it.
         rel = archive.parent.relative_to(in_place_dir) if target_dir is None else Path()
+        verdict = verdicts[archive]
+        if verdict is not None:  # "unlistable": fail closed -- never extract what was not listed
+            failures.append(verdict[1])
+            continue
+        # One fresh directory per archive (audit F4): an archive extracts into its own empty
+        # work directory, so it can never see -- or write through a link planted by -- another
+        # archive's output. It is merged into staging only after its own post-check passes; a
+        # failing one stays here, inside what becomes the `_FAILED_` evidence directory.
+        work_dir = staging_dir / f".lftpweb-work-{index}"
         result = extract_archive(
-            archive, staging_dir / rel, passwords=passwords, binary=binary, rar_binary=rar_binary
+            archive,
+            work_dir,
+            passwords=passwords,
+            binary=binary,
+            rar_binary=rar_binary,
+            check_listing=False,
         )
         if not result.ok:
             failures.append(result.detail)
+            continue
+        # Audit S2 + F4/F8: never merge un-vetted archive output -- a path escaping the work
+        # directory, any symlink, any hardlinked file, any special file -- toward the published
+        # tree. Refusing is `EXTRACT_FAILED` (surfaced and audited like any extraction failure).
+        problem = check_extracted_tree(work_dir)
+        if problem is not None:
+            failures.append(f"{archive.name}: {problem}")
+            continue
+        try:
+            _merge_archive_output(work_dir, staging_dir / rel)
+            shutil.rmtree(work_dir)
+        except OSError as exc:
+            failures.append(f"{archive.name}: could not stage its output ({exc})")
 
     if failures:
         staging_dir.rename(failed_dir)
@@ -550,24 +982,6 @@ def extract_item(
                 f"{len(failures)} of {len(archives)} archive(s) failed: "
                 + "; ".join(failures)
                 + f" -- partial output kept at {failed_dir}"
-            ),
-        )
-
-    # Audit S2: never merge un-vetted archive output that escapes the staging root (a symlink
-    # member pointing outside it) into the published tree. Checked here, on the whole staged
-    # result, before the merge -- refusing is `EXTRACT_FAILED` (which withholds the rename and
-    # is surfaced/audited exactly like any other extraction failure), and the offending tree is
-    # kept as `_FAILED_` evidence rather than silently discarded.
-    escaping = find_escaping_path(staging_dir)
-    if escaping is not None:
-        if failed_dir.exists():
-            shutil.rmtree(failed_dir)
-        staging_dir.rename(failed_dir)
-        return ExtractResult(
-            state="EXTRACT_FAILED",
-            detail=(
-                f"extraction produced a path escaping the staging root ({escaping.name!r}) "
-                f"-- refusing to publish it; kept at {failed_dir}"
             ),
         )
 

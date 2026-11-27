@@ -1596,6 +1596,30 @@ the settle gate's job (§3.3), one layer earlier. A precondition failure never c
 nothing was attempted and a staging directory implying otherwise would be the same dishonesty
 the `SKIPPED` outcome exists to remove.
 
+**Archives are listed and refused before anything is extracted; each extracts into its own
+directory** (security audit 2026-11-26, F4/F8). The archive is attacker-influenceable input, and
+the extractors are not a containment boundary: `7zz` has no switch to refuse links on extraction,
+and a member written *through* a link planted by an earlier archive happens before any after-the-
+fact check can see it. So every archive is first **listed** (`7zz l -slt`; `unrar lta -v`; a
+compound `.tar.gz`/`.tar.bz2`/`.tar.xz` has its outer layer typed and its inner tar listed from a
+pipe, so the intermediate tar is never written) and **refused outright** — the whole item fails
+`EXTRACT_FAILED`, with the reason and the offending member name (sanitised: it is attacker text),
+and no staging or `_FAILED_` directory — if any member is an absolute path, has a `..` component
+(after normalising `\`, since zip members written on Windows use it), is a symlink, or is a
+hardlink or rar file reference. The check **fails closed**: a listing that cannot be parsed, or a
+record missing a field it relies on, is a refusal, and an archive that cannot be listed at all
+(corrupt, or no password in the list opens it) is never extracted — that case takes the ordinary
+`_FAILED_` path. Refusing link-bearing archives, rather than skipping their links, is deliberate:
+see `docs/decisions.md`. Extraction then gives **each archive its own fresh work directory**
+(inside the `_UNPACK_` staging directory, same filesystem), so no archive can see another's
+output while it runs. After it extracts, that directory is post-checked — `find_escaping_path`,
+plus failure on any symlink at all, any regular file with `st_nlink > 1`, and any special file —
+and only then merged into staging (a later archive's file overwriting an earlier one's, as the
+shared directory with `-y` always did). A failing archive's work directory stays inside the
+`_FAILED_` evidence directory and is never merged. `unrar` additionally runs with `-ol-` (skip
+symlinks); `7zz` 26.06 has no extract-side equivalent (`-snl`/`-snh` are store-side only), so for
+`7zz` the listing refusal and the post-check are the guards.
+
 **Ordering, including the one ordering that is not yet a decision.** The pipeline runs verify →
 (`move` mode's remote delete) → extract → (rename off the download prefix) → staging move. The
 delete sits where it does because verification is its gate and verification has just run; nothing

@@ -6,6 +6,63 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-11-26 — Archives are listed and refused before extraction; one directory per archive
+
+`prompts/done/2026-11-26-c2-extraction-hardening.md` (audit batch C2, F4/F8).
+
+**Problem.** Containment was checked only after *all* archives in an item had been extracted into
+one shared staging directory (`find_escaping_path`), so a symlink planted by archive 1 could be
+written through by archive 2 before any check ran; hardlink members were not considered at all
+(`resolve()` only follows symlinks); `unrar` ran without `-ol-`.
+
+**Decision.** (1) Every archive is listed before extraction and the whole item is refused —
+`EXTRACT_FAILED`, nothing written — if any member is absolute, has a `..` component (backslash
+normalised), is a symlink or a hardlink (rar: any `Type` other than `File`/`Directory`). Fails
+closed on an unparseable listing. (2) One fresh work directory per archive, merged into staging
+only after its own post-check (`find_escaping_path` + any symlink + any `st_nlink > 1` file + any
+special file). (3) `unrar -ol-`.
+
+**Why refuse link-bearing archives rather than skip the links.** Legitimate scene/P2P releases
+essentially never contain symlinks or hardlinks; an archive that does is either broken or hostile,
+and there is no way to tell a harmless link from a staged write-through without semantics (what
+does the next archive do?). Skipping would also leave a *partially* extracted release that looks
+complete to an *arr watching the tree. Refusing is the one policy that is both simple and
+conservative. A user who hits it should extract that archive by hand (`7z x` / `unrar x -ola`
+into a scratch directory, inspect it, move it into place) — the `_FAILED_` directory is not
+created for a refusal, so the archive itself is untouched next to its siblings.
+
+**Measured (7-Zip 26.00 host, 26.06 image; unrar 7.20b3 host, 7.23 image).** `7zz x` has no
+switch that stops link creation on extraction: `-snl`/`-snh` are store-side only (extracting a
+symlink zip with or without them yields a real symlink; an absolute target is rewritten under the
+output dir and dangles; a bare `..` target is skipped with "Dangerous link path was ignored", which is a heuristic
+not a boundary). So for `7zz` the listing refusal and the
+post-check are the only guards. `7zz l -slt` reports links as `Symbolic Link = <target>` /
+`Hard Link = <path>` and `Mode = l...` for tar, but for zip/7z there is no such field — only
+`Attributes = ... lrwxrwxrwx` — so both are checked. `unrar lta` prints `Type: Unix symbolic
+link` / `Hard link` / `File reference` / `Windows symbolic link` / `NTFS junction point` plus
+`Target:`; anything but `File`/`Directory` is refused. **`unrar l` without `-v` lists only the
+head volume** — a symlink carried by volume 2 of a set is invisible without it (reproduced), so
+the listing uses `-v`. `-ol-` really skips symlinks (7.20 and 7.23) but does *not* stop rar
+hardlinks/file references, which extract as real hardlinks — the listing refusal covers them.
+
+**Rejected.** Listing via Python's `zipfile`/`tarfile` (a second parser that can disagree with the
+extractor about what is in the archive); skipping instead of refusing links (above); checking only
+after extraction (the original bug); creating the per-archive directory as a `_UNPACK_<name>.N`
+*sibling* — the orphan-debris sweep derives an owning item from the name and could reap it mid-run,
+so the work directory lives inside the item's own `_UNPACK_` staging directory instead.
+
+**Known gaps, named.** The listing and the extractor are the same binary reading the same bytes,
+but they are two passes (no TOCTOU defence beyond the post-check). Compound `.tar.xz` etc. are
+decompressed three times (outer list, inner list, extract) — fine for releases, slow for a
+multi-GB tarball. A zip/7z hardlink (7z `-snh`) has no listing field, so only the post-check
+(`st_nlink > 1`) catches it. A member name containing a newline cannot be told apart in the `-slt`
+text format in general; 7-Zip printed it as `_` for the tar case measured here, and the parser additionally
+refuses any record whose field order or repeated keys show injected lines. Passworded rar with
+header encryption is exercised only by the listing-with-password path, not by a real fixture
+(no `rar` compressor on the dev host).
+
+---
+
 ## 2026-11-26 — 7-Zip and unrar built from upstream source; base re-pinned; apk upgrade
 
 `prompts/done/2026-11-26-d1d2-image-refresh-and-extractors.md` (audit batches D1 + D2,

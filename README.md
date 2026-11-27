@@ -89,7 +89,9 @@ Every verify outcome, every remote delete, and every delete withheld — with th
   passes (completeness → verify → extract → *arr import when tracked), all with an audited trail
   on the Events page. Extraction stages into `_UNPACK_` and merges into place only on full
   success, is gated on cheap filesystem preconditions first (zero-length head volume, a gap in a
-  multi-volume rar set), and can optionally delete a release's spent archive volumes once they
+  multi-volume rar set), **refuses any archive that contains a symlink, a hardlink, an absolute
+  path or a `..` path component** (the item ends `EXTRACT_FAILED` and nothing is written —
+  extract such an archive by hand), and can optionally delete a release's spent archive volumes once they
   have extracted — off by default
 - **Optional Sonarr/Radarr integration** (`docs/arr-integration-spec.md`, off at every level by
   default): bind a queue to a Sonarr or Radarr instance from Settings → Integrations and lftpweb
