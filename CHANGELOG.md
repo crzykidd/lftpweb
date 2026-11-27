@@ -56,6 +56,27 @@ Skeleton for the next roll:
   the toggle off to keep every release waiting out the full gate regardless of what a client
   reports. A release with no download-client involvement, or one the client hasn't yet reported,
   is completely unaffected either way.
+- **Changes made through the API now refuse a request a browser identifies as cross-site, in
+  every auth mode.** A POST/PUT/PATCH/DELETE is refused (403) only if the browser marks it
+  `Sec-Fetch-Site: cross-site`/`same-site`, or (old browsers) sends an `Origin` that matches
+  neither `Host`, `X-Forwarded-Host` nor `LFTPWEB_ALLOWED_HOSTS`; the UI's `X-Requested-With`
+  header always passes. **Scripts, API-key callers and tabs left open across the upgrade are
+  unaffected** — nothing new is required of them. `password` mode's CSRF token works as before.
+- **New `LFTPWEB_ALLOWED_HOSTS` setting (environment variable) for DNS-rebinding protection.**
+  Unset, nothing changes, but in `none` and `proxy` mode lftpweb logs a warning at startup and
+  shows a one-line banner until you set it — **recommended, not required**. **Once set, any
+  request whose `Host` isn't listed — page, API or WebSocket — gets a 403, and the WebSocket's
+  `Origin` must match**, so list every name and address you open lftpweb by
+  (`localhost`/`127.0.0.1` always work). Unset, the WebSocket is refused only when the browser
+  says it is cross-site. See README's "Network exposure."
+- **Settings → Transfer → "Extra lftp settings" now accepts only `set <key> <value>` lines**
+  (plus blank and `#` lines), using full setting names. **Saving refuses any other command, an
+  unknown or abbreviated setting name, a `;`, `&`, `|` or `!` in a value, and settings that could
+  run programs or write files, naming the line.** If a value saved before this release breaks
+  these rules, **transfers carry on**: the offending lines are skipped (the valid ones still
+  apply), and a banner and a log line say how many and which — fix them in Settings → Transfer.
+- **Settings → Connection refuses a host address that isn't a plain hostname or IP address**
+  (for example one starting with `-` or containing a space), instead of failing at transfer time.
 
 ### Fixed
 ### Security
@@ -74,6 +95,17 @@ Skeleton for the next roll:
   being passed through (and are never retried). The same pass quotes the connection URL and
   SSH key path, and rejects a host address that could be read as an `ssh` option.
 
+- **No cross-site protection in `none` or `proxy` mode, and settings write ran commands.** A
+  website a user on your network visited could change or delete things in lftpweb with a plain
+  cross-site request, or reach it as if it were the site itself by re-pointing its own hostname
+  at your instance (DNS rebinding), or read the live WebSocket stream. Separately, the free-text
+  extra lftp settings were placed into every transfer's script unchecked, so anyone able to save
+  settings could run commands inside the container. Mutating API requests a browser
+  marks as cross-site are now refused in every mode, WebSocket handshakes a browser marks as
+  cross-site are refused (and, with the host allow-list set, must match its origin), an optional
+  host allow-list closes DNS rebinding, extra lftp settings
+  are restricted to safe `set` lines and rewritten rather than passed through, and the host
+  address is validated when saved. No action is required on upgrade; setting `LFTPWEB_ALLOWED_HOSTS` is recommended.
 - **Container base refreshed and re-pinned**: `python:3.13-alpine` is now Alpine 3.24.4 / Python
   3.13.18 (was 3.24.1 / 3.13.15), and the runtime stage runs `apk upgrade`. Published `0.3.1`
   images carry OpenSSH client `10.3_p1-r0` (CVE-2026-60002, a client-side use-after-free

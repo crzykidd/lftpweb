@@ -106,8 +106,9 @@ def test_extra_lftp_settings_override_a_colliding_lftpweb_default(tmp_path):
     # test would catch a regression where extra_settings stopped being appended last, rather
     # than passing vacuously because the built-in line was never there to collide with.
     assert "set pget:min-chunk-size 1048576;" in rc
+    # Re-emitted with the value quoted (audit batch C3), which lftp reads as the same value.
     assert rc.index("set pget:min-chunk-size 1048576;") < rc.index(
-        "set pget:min-chunk-size 999999;"
+        "set pget:min-chunk-size '999999';"
     )
 
     rc_path = tmp_path / "job.rc"

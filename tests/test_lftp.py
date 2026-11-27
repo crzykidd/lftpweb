@@ -301,7 +301,9 @@ def test_rc_text_sets_temp_file_convention_matching_local_scan():
     assert 'set xfer:temp-file-name "*.lftp";' in text
 
 
-def test_rc_text_appends_extra_settings_verbatim():
+def test_rc_text_appends_extra_settings_re_emitted():
+    """Never verbatim since audit batch C3: parsed, then re-emitted with the value quoted
+    (tests/test_extra_lftp_settings.py has the refusals)."""
     text = build_rc_text(
         _creds(),
         None,
@@ -312,7 +314,7 @@ def test_rc_text_appends_extra_settings_verbatim():
         save_status_interval_s=1,
         extra_settings="set net:socket-buffer 262144;",
     )
-    assert "set net:socket-buffer 262144;" in text
+    assert "set net:socket-buffer '262144';" in text
 
 
 # --- transfer command construction --------------------------------------------------------

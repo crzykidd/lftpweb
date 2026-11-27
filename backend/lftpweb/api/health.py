@@ -48,6 +48,10 @@ async def health(request: Request) -> HealthResponse:
     client_sync = getattr(request.app.state, "client_sync", None)
     client_sync_alive = bool(client_sync is not None and client_sync.is_alive)
 
+    # Audit batch C3: stored "Extra lftp settings" lines that are being ignored (transfers are
+    # NOT held) -- a summary for the UI's banner. Not folded into `status`.
+    lftp_settings_ignored = queue.lftp_settings_ignored if queue is not None else None
+
     status = "ok" if db_ok and scheduler_alive and host_reachable is not False else "degraded"
 
     return HealthResponse(
@@ -61,6 +65,7 @@ async def health(request: Request) -> HealthResponse:
         queue_paused=queue_paused,
         queue_paused_until=queue_paused_until,
         client_sync_alive=client_sync_alive,
+        lftp_settings_ignored=lftp_settings_ignored,
         build_sha=settings.build_sha,
         build_channel=settings.build_channel,
     )

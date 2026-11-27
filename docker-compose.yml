@@ -48,6 +48,9 @@ services:
       # Empty by default: the version in the nav renders as plain text, not a dead link,
       # until this repo has a GitHub remote (DESIGN.md §9.1).
       LFTPWEB_REPO_URL: ""
+      # DNS-rebinding protection (recommended, optional): every name/address you open lftpweb by, comma-separated.
+      # Unset accepts any Host (with a warning in `none`/`proxy` auth). README "Network exposure".
+      # LFTPWEB_ALLOWED_HOSTS: "lftpweb.example.com,192.168.1.10"
     volumes:
       # NFS-backed bind mounts in production — paths are illustrative; point these at the
       # real exports. /staging is optional (DESIGN.md §6) and only needed if a queue uses

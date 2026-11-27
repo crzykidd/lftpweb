@@ -34,9 +34,16 @@ from http.cookies import SimpleCookie
 from starlette.datastructures import Headers
 
 from lftpweb.config import settings as app_settings
-from lftpweb.core import auth
+from lftpweb.core import auth, netguard
 
 logger = logging.getLogger(__name__)
+
+# Audit batch C3: the custom header the shipped UI sends on every request
+# (`frontend/src/api/client.ts`). Its *presence* on a mutating request is proof of a same-origin
+# caller: a browser will not send a non-CORS-safelisted header cross-origin without a successful
+# preflight, and lftpweb answers none (no CORS middleware). It is never *required* -- scripts
+# and integrations send nothing -- see `RequestGuardMiddleware`.
+REQUIRED_HEADER = "X-Requested-With"
 
 # Exact (method, path) pairs reachable with no authentication, in every mode. Kept minimal
 # and reviewed here rather than via a prefix wildcard, since a broad prefix is exactly the
@@ -69,6 +76,139 @@ def _get_cookie(headers: Headers, name: str) -> str | None:
         return None
     morsel = jar.get(name)
     return morsel.value if morsel else None
+
+
+async def _send_json(send, status_code: int, detail: str) -> None:
+    body = json.dumps({"detail": detail}).encode("utf-8")
+    await send(
+        {
+            "type": "http.response.start",
+            "status": status_code,
+            "headers": [(b"content-type", b"application/json")],
+        }
+    )
+    await send({"type": "http.response.body", "body": body})
+
+
+class RequestGuardMiddleware:
+    """Cross-site and DNS-rebinding defences that hold in **every** auth mode (audit batch C3,
+    DESIGN.md §8). Runs outside `AuthMiddleware`, so it applies before any credential -- an
+    `X-API-Key`, a session cookie, a proxy identity -- is even looked at. **Non-breaking by
+    design**: it refuses only what a browser positively identifies as cross-site; a request that
+    identifies nothing (curl, scripts, integrations) passes.
+
+    1. **Host allow-list** (`LFTPWEB_ALLOWED_HOSTS`, `core/netguard.py`): when set, any HTTP
+       request or WebSocket handshake, on any path, whose `Host` is not listed (loopback always
+       is) gets a 403 naming the env var. Unset: everything passes, as before.
+    2. **Mutating API requests** (`POST`/`PUT`/`PATCH`/`DELETE` under `/api/`), in order:
+       `X-Requested-With` present -> allow; else `Sec-Fetch-Site` present -> `same-origin`/`none`
+       allow, `cross-site`/`same-site` 403; else `Origin` present -> must match `Host`,
+       `X-Forwarded-Host` or the allow-list, otherwise 403 (`Origin: null` included); else allow.
+       In `password` mode the session CSRF token is still required by `AuthMiddleware`,
+       unchanged from before C3.
+    3. **WebSocket Origin**: with `LFTPWEB_ALLOWED_HOSTS` set, the handshake's `Origin` must
+       match as in `netguard.origin_allowed` (opt-in). Unset, no Origin-vs-Host comparison (a
+       Host-rewriting proxy would break live updates): the handshake is closed 4403 only when
+       `Sec-Fetch-Site` is `cross-site`/`same-site`; with no `Sec-Fetch-Site` it is allowed and
+       an Origin mismatch is logged once per distinct Origin.
+    """
+
+    def __init__(self, app) -> None:
+        self.app = app
+        self._warned_origins: set[str] = set()
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] not in ("http", "websocket"):
+            await self.app(scope, receive, send)
+            return
+
+        headers = Headers(scope=scope)
+        host = headers.get("host")
+        allowed = netguard.parse_allowed_hosts(app_settings.allowed_hosts)
+
+        if not allowed.allows(host):
+            await self._deny(
+                scope,
+                send,
+                f"Host {host!r} is not allowed: add it to {netguard.ENV_VAR} "
+                "(comma-separated) and restart lftpweb",
+            )
+            return
+
+        if scope["type"] == "websocket":
+            if not self._websocket_ok(headers, host, allowed):
+                await self._deny(scope, send, "Origin does not match Host")
+                return
+        elif scope["path"].startswith("/api/") and scope["method"] in _MUTATING_METHODS:
+            reason = self._cross_site_reason(headers, host, allowed)
+            if reason is not None:
+                await self._deny(scope, send, reason)
+                return
+
+        await self.app(scope, receive, send)
+
+    @staticmethod
+    def _cross_site_reason(headers: Headers, host: str | None, allowed) -> str | None:
+        """`None` to allow, else the 403 detail. See the class docstring, item 2."""
+        if headers.get(REQUIRED_HEADER):
+            return None
+        fetch_site = (headers.get("sec-fetch-site") or "").strip().lower()
+        if fetch_site:
+            if fetch_site in ("same-origin", "none"):
+                return None
+            return (
+                f"cross-site request refused (Sec-Fetch-Site: {fetch_site}): a page on "
+                "another site cannot change lftpweb state"
+            )
+        origin = headers.get("origin")
+        if origin is not None and not netguard.origin_allowed(
+            origin, host, headers.get("x-forwarded-host"), allowed
+        ):
+            return (
+                f"cross-site request refused (Origin {origin!r} does not match Host): "
+                f"scripts should send no Origin, or send `{REQUIRED_HEADER}: lftpweb`"
+            )
+        return None
+
+    def _websocket_ok(self, headers: Headers, host: str | None, allowed) -> bool:
+        origin = headers.get("origin")
+        if allowed.enforced:
+            if origin is not None and not netguard.origin_allowed(
+                origin, host, headers.get("x-forwarded-host"), allowed
+            ):
+                logger.warning(
+                    "refused WebSocket handshake: Origin %r does not match Host %r", origin, host
+                )
+                return False
+            return True
+        fetch_site = (headers.get("sec-fetch-site") or "").strip().lower()
+        if fetch_site in ("cross-site", "same-site"):
+            logger.warning(
+                "refused WebSocket handshake: Sec-Fetch-Site %s (Origin %r)", fetch_site, origin
+            )
+            return False
+        if (
+            not fetch_site
+            and origin is not None
+            and origin not in self._warned_origins
+            and not netguard.origin_allowed(origin, host, headers.get("x-forwarded-host"), allowed)
+        ):
+            self._warned_origins.add(origin)
+            logger.warning(
+                "WebSocket Origin %r does not match Host %r and the browser sent no "
+                "Sec-Fetch-Site; allowing it. Set %s to enforce an Origin check.",
+                origin,
+                host,
+                netguard.ENV_VAR,
+            )
+        return True
+
+    @staticmethod
+    async def _deny(scope, send, detail: str) -> None:
+        if scope["type"] == "websocket":
+            await send({"type": "websocket.close", "code": 4403})
+            return
+        await _send_json(send, 403, detail)
 
 
 class AuthMiddleware:
@@ -184,15 +324,7 @@ class AuthMiddleware:
             # otherwise look like a successful connection to the client for a moment.
             await send({"type": "websocket.close", "code": 4401 if status_code == 401 else 4403})
             return
-        body = json.dumps({"detail": detail}).encode("utf-8")
-        await send(
-            {
-                "type": "http.response.start",
-                "status": status_code,
-                "headers": [(b"content-type", b"application/json")],
-            }
-        )
-        await send({"type": "http.response.body", "body": body})
+        await _send_json(send, status_code, detail)
 
 
 # Static, request-independent defense-in-depth headers (audit S4, docs/audit-v0.1.0.md).

@@ -2,6 +2,7 @@ import { NavLink, Outlet, useLocation } from 'react-router-dom'
 import { NAV_ITEMS, tabsForPath } from '../nav'
 import { useAuth } from '../hooks/authContext'
 import { CredentialsBanner } from './CredentialsBanner'
+import { HostAllowlistBanner, LftpSettingsBanner } from './SecurityBanners'
 import { StatsHeader } from './StatsHeader'
 import { ThemeToggle } from './ThemeToggle'
 import { VersionLink } from './VersionLink'
@@ -77,6 +78,8 @@ export function Layout() {
 
       <div className="flex min-w-0 flex-1 flex-col">
         <CredentialsBanner />
+        <LftpSettingsBanner />
+        <HostAllowlistBanner />
         <StatsHeader />
         {tabs != null && (
           <nav className="flex gap-1 overflow-x-auto border-b border-zinc-200 px-4 dark:border-zinc-800">

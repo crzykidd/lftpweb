@@ -30,7 +30,7 @@ from lftpweb.api import (
 )
 from lftpweb.api import support_bundle
 from lftpweb.config import settings
-from lftpweb.core import auth
+from lftpweb.core import auth, netguard
 from lftpweb.core.arrsync import ArrSyncScheduler
 from lftpweb.core.autoqueue import AutoQueue
 from lftpweb.core.backup import BackupScheduler
@@ -43,7 +43,7 @@ from lftpweb.core.postprocess import PostprocessPipeline
 from lftpweb.core.queue import TransferQueue
 from lftpweb.db import connect, migrate
 from lftpweb.logsetup import setup_logging
-from lftpweb.middleware import AuthMiddleware, SecurityHeadersMiddleware
+from lftpweb.middleware import AuthMiddleware, RequestGuardMiddleware, SecurityHeadersMiddleware
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +58,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # unconditional whenever a migration is actually about to run, not just when Settings →
     # Backup's own schedule happens to be enabled.
     await migrate(app.state.db, settings.config_dir)
+
+    # Audit batch C3: say once, at startup, whether DNS-rebinding protection is on -- a
+    # WARNING in `none`/`proxy` mode while `LFTPWEB_ALLOWED_HOSTS` is unset (core/netguard.py).
+    stored_auth = await auth.load_auth_settings(app.state.db)
+    netguard.log_startup_posture(
+        settings.allowed_hosts, auth.effective_mode(stored_auth, settings.auth_mode)
+    )
 
     app.state.events = EventBus()
     # Phase 8 (DESIGN.md §8): in-memory only, per docs/decisions.md -- single-process (§2),
@@ -220,6 +227,10 @@ def create_app() -> FastAPI:
     # why a single ASGI middleware was chosen over a per-router Depends(). Added before any
     # router so a newly mounted router is covered without a second decision at the call site.
     app.add_middleware(AuthMiddleware)
+    # Audit batch C3: Host allow-list, WebSocket Origin, and the custom header on mutating API
+    # requests -- every auth mode. Added after AuthMiddleware so it runs *before* it (outermost-
+    # last), i.e. before any credential is looked at. See middleware.py.RequestGuardMiddleware.
+    app.add_middleware(RequestGuardMiddleware)
     # Added after AuthMiddleware so it wraps it (Starlette applies middleware outermost-last):
     # every response, including a 401/403 the auth gate itself produces and every static/SPA
     # response, carries the headers. See middleware.py for why this is the safe header subset

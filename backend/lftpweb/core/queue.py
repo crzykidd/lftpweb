@@ -637,6 +637,12 @@ class TransferQueue:
         # state instead of once per second for as long as it lasts (see `_admit` below).
         self.credentials_need_reentry = False
 
+        # Audit batch C3: a summary of the stored "Extra lftp settings" lines being ignored
+        # (`core/lftp.py.split_extra_lftp_settings`), else `None`. Informational only -- nothing
+        # is held; `/api/health` reports it and the UI shows a banner (`LftpSettingsBanner`).
+        self.lftp_settings_ignored: str | None = None
+        self._lftp_settings_logged: str | None = None
+
         # Pause (this task, 2026-08-20, `prompts/2026-08-20-queue-pause.md`) -- cached
         # in-memory, same shape as `credentials_need_reentry` above, so `_admit`'s gate and
         # `/api/health` never pay a DB read on the hot path. Loaded from its persisted setting
@@ -2837,6 +2843,25 @@ class TransferQueue:
         ]
         await self.metrics.tick(running)
 
+    def _note_ignored_lftp_settings(self, text: str) -> None:
+        _, dropped = lftp.split_extra_lftp_settings(text)
+        if not dropped:
+            self.lftp_settings_ignored = None
+            self._lftp_settings_logged = None
+            return
+        summary = f"{len(dropped)} extra lftp setting line(s) are being ignored: {dropped[0]}"
+        if len(dropped) > 1:
+            summary += f" (and {len(dropped) - 1} more)"
+        self.lftp_settings_ignored = summary
+        if text != self._lftp_settings_logged:
+            self._lftp_settings_logged = text
+            logger.warning(
+                "ignoring %d invalid extra lftp setting line(s); transfers continue without "
+                "them: %s -- fix in Settings -> Transfer",
+                len(dropped),
+                "; ".join(dropped[:3]),
+            )
+
     async def _admit(self) -> None:
         # The pause gate (this task, 2026-08-20) -- a caller-side skip, not a flag threaded
         # into `scheduler.admit()` (see `pause()`'s own docstring for why). Deliberately no log
@@ -2855,6 +2880,14 @@ class TransferQueue:
             return
 
         settings = await load_transfer_settings(self.db)
+
+        # Audit batch C3: a stored "Extra lftp settings" value with lines that fail validation
+        # (saved before validation existed, or restored from an old backup) is NOT a reason to
+        # hold anything: the spawn renders only the conforming lines (`lftp.build_rc_text`) and
+        # the dropped ones are reported here for `/api/health` and a banner. Logged once per
+        # distinct stored value, not once per tick.
+        self._note_ignored_lftp_settings(settings.extra_lftp_settings)
+
         sched_settings = settings.scheduler_settings()
 
         running = [

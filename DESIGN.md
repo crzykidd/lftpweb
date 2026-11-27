@@ -1942,6 +1942,43 @@ about keeping control of an irreversible action:
   the request originates from a configured trusted CIDR. Without the CIDR check this mode is
   a bypass, so it is not optional.
 
+**Defences that hold in every mode (audit batch C3, 2026-11-26).** `none` and `proxy` had no
+cross-site protection at all, and settings write was command execution. One raw ASGI middleware
+(`middleware.py.RequestGuardMiddleware`) runs *outside* the auth gate, before any credential is
+looked at:
+
+- **Mutating API requests: refuse only what a browser says is cross-site; require nothing.**
+  For `POST`/`PUT`/`PATCH`/`DELETE` under `/api/`, in every mode: `X-Requested-With` present
+  (the UI always sends it; a cross-site page can't add it without a preflight, and there is no
+  CORS middleware) -> allow; else `Sec-Fetch-Site` present -> `same-origin`/`none` allow,
+  `cross-site`/`same-site` 403; else `Origin` present (an old browser) -> must match `Host`,
+  `X-Forwarded-Host` or the allow-list, else 403 (`Origin: null` included); else (curl, scripts,
+  integrations) allow. Nothing is *required*, so scripts, API-key callers and pre-upgrade tabs
+  (which send `Sec-Fetch-Site: same-origin`) keep working, and a Host-rewriting proxy doesn't
+  matter because the browser computes `Sec-Fetch-Site`. `password` mode's session CSRF token is
+  unchanged from before C3.
+- **Host allow-list** (`LFTPWEB_ALLOWED_HOSTS`, `core/netguard.py`) against DNS rebinding.
+  Unset = any Host, as before, with a startup WARNING and an app-shell banner in `none`/`proxy`
+  mode. Set = any request or WebSocket handshake, on any path, whose Host isn't listed is a 403
+  naming the env var. Entries are `name`, `name:port`, IPs, `[v6]:port`, or `*.example.com`
+  (subdomains only); `localhost`/`127.0.0.1`/`::1` are always allowed (healthcheck, local
+  recovery). An env var, not a setting, for the same reason as `LFTPWEB_AUTH_MODE`.
+- **WebSocket Origin: opt-in comparison.** With `LFTPWEB_ALLOWED_HOSTS` set, a handshake's
+  `Origin` must match its `Host`, `X-Forwarded-Host` or an allow-listed name (else close 4403).
+  Unset, Origin is *not* compared to Host (a Host-rewriting proxy would lose live updates): the
+  handshake is closed 4403 only when `Sec-Fetch-Site` is `cross-site`/`same-site`; with no
+  `Sec-Fetch-Site` it is allowed and an Origin mismatch is logged (WARNING, once per Origin). No
+  `Origin` = a non-browser client, allowed.
+- **"Extra lftp settings" is no longer verbatim** (§9.3, `core/lftp.py.parse_extra_lftp_settings`):
+  `set <key> <value>` lines only (plus blank/`#` lines), exact full key names from lftp 4.9.3's
+  own list (lftp accepts abbreviations, which defeats any match on typed text), minus settings
+  that run programs, run commands on events, load code, write arbitrary files or echo the
+  credential-bearing `open` line; no `; & | !` in a value; each accepted line re-emitted with the
+  value through `_lftp_quote`. 422 at write; at spawn a stored value's bad lines are **skipped, never held**: only the
+  conforming lines are rendered (`lftp.split_extra_lftp_settings`), the rest are reported through
+  `/api/health.lftp_settings_ignored` and a banner (log: WARNING once per distinct stored value).
+- **`HostIn.address`** is checked at the API with C1's own `lftp.ADDRESS_RE` (422).
+
 Seedbox credentials are encrypted at rest with a key derived from a per-install secret in
 `/config`. Log redaction as described in §4.2.
 
@@ -2647,8 +2684,10 @@ These three numbers multiply silently (§4.5) and seedboxes refuse connections w
 the sliders will happily let you ask for. Warn when the worst case exceeds
 `net:connection-limit`, and show the resulting per-job bandwidth cap next to it.
 
-…plus a free-text **"extra lftp settings"** box injected verbatim into every job's rc file, so
-a power user is never blocked waiting for us to add a checkbox.
+…plus a free-text **"extra lftp settings"** box appended to every job's rc file, so a power
+user is never blocked waiting for us to add a checkbox. Since audit batch C3 it accepts only
+`set <key> <value>` lines with an allowed key and re-emits them rather than passing text
+through (§8).
 
 ---
 

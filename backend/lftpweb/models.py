@@ -6,7 +6,11 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
+
+from lftpweb.config import settings as _app_settings
+from lftpweb.core import lftp as _lftp
+from lftpweb.core import netguard as _netguard
 
 # Input length caps (audit S3, docs/audit-v0.1.0.md). Chosen deliberately *generous* -- large
 # enough that no legitimate value is ever rejected, small enough that an attacker can't hand the
@@ -50,6 +54,10 @@ class HealthResponse(BaseModel):
     # UI reads this to show "resumes at HH:MM" rather than a bare "paused" that would otherwise
     # look identical to an indefinite one.
     queue_paused_until: str | None = None
+    # Audit batch C3: set while stored "Extra lftp settings" lines fail validation and are being
+    # ignored (`core/queue.py.TransferQueue.lftp_settings_ignored`) -- a count and the first
+    # offending line. Transfers are not held. `None` normally.
+    lftp_settings_ignored: str | None = None
     # 2026-08-16 (docs/decisions.md): also not in §12's literal shape, same reasoning as
     # `repo_url` above -- `config.Settings.build_sha`/`.build_channel` are baked at image
     # *build* time (docker/Dockerfile's `runtime` stage, .github/workflows/publish.yml), and
@@ -110,6 +118,21 @@ class HostIn(BaseModel):
     password: str | None = Field(default=None, max_length=MAX_SECRET_LEN)
     ssh_key: str | None = Field(default=None, max_length=MAX_KEY_LEN)
     known_hosts_policy: KnownHostsPolicy = "accept-and-pin"
+
+    @field_validator("address")
+    @classmethod
+    def _address_is_safe_for_lftp(cls, value: str) -> str:
+        """Audit batch C3: the same rule `core/lftp.py.build_rc_text` enforces at spawn (one
+        definition, `lftp.ADDRESS_RE`), checked at save so a bad address is a 422 here rather
+        than a failed job later. A leading `-` would reach `ssh` as an option. Stored values
+        from before this check are not migrated; they already fail clearly at spawn.
+        """
+        if not _lftp.is_valid_address(value):
+            raise ValueError(
+                "address must be a hostname or IP address: letters, digits, '.', '-', ':', "
+                "'%', '[' and ']' only, starting with a letter or digit"
+            )
+        return value
 
 
 class HostOut(BaseModel):
@@ -1428,6 +1451,21 @@ class TransferSettingsIn(BaseModel):
     retry_backoff_base_s: float
     extra_lftp_settings: str
 
+    @field_validator("extra_lftp_settings")
+    @classmethod
+    def _extra_lftp_settings_are_safe(cls, value: str) -> str:
+        """Audit batch C3: only `set <key> <value>` lines with an allowed key (see
+        `core/lftp.py.parse_extra_lftp_settings`). A 422 names the first offending line. The
+        user's text is stored as typed; what reaches lftp is always the re-emitted form.
+
+        Input only: `TransferSettingsOut` inherits this class, and a value stored before this
+        check existed must still be *readable* (Settings → Transfer is where it gets fixed;
+        bad lines are skipped at spawn and reported, `core/queue.py._admit`).
+        """
+        if cls is TransferSettingsIn:
+            _lftp.parse_extra_lftp_settings(value)
+        return value
+
 
 class TransferSettingsOut(TransferSettingsIn):
     """...plus the one read-only number the two-value bandwidth model adds: the limit actually
@@ -1747,6 +1785,13 @@ class AuthSessionOut(BaseModel):
     # Present only when `authenticated` via a password-mode session -- what the frontend
     # attaches as `X-CSRF-Token` on every mutating request (DESIGN.md §8).
     csrf_token: str | None = None
+    # Audit batch C3: whether `LFTPWEB_ALLOWED_HOSTS` is set (DNS-rebinding protection on).
+    # The app shell shows a banner in `none`/`proxy` mode while it is not
+    # (`frontend/src/lib/securityBanners.ts`). Read from the environment on every response, so
+    # no route can forget to fill it in.
+    allowed_hosts_set: bool = Field(
+        default_factory=lambda: _netguard.parse_allowed_hosts(_app_settings.allowed_hosts).enforced
+    )
 
 
 class ApiKeyOut(BaseModel):

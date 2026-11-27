@@ -26,6 +26,7 @@ function health(overrides: Partial<HealthResponse> = {}): HealthResponse {
     scheduler_alive: true,
     queue_paused: false,
     queue_paused_until: null,
+    lftp_settings_ignored: null,
     build_sha: null,
     build_channel: null,
     ...overrides,

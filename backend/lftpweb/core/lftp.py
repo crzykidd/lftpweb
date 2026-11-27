@@ -252,8 +252,250 @@ def _lftp_dquote(value: str) -> str:
 # What may appear in the seedbox address: hostname / IPv4 / IPv6. It must not start with `-`,
 # because lftp passes the host to `ssh` as a positional argument and `-oProxyCommand=...`
 # would be parsed as an *option* (it runs a command). No quotes, whitespace, `;` or control
-# characters either.
-_ADDRESS_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:%\[\]-]*")
+# characters either. The one definition: `build_rc_text` enforces it at spawn, and
+# `models.HostIn` enforces it at the API (audit batch C3) through `is_valid_address`.
+ADDRESS_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:%\[\]-]*")
+
+
+def is_valid_address(address: str) -> bool:
+    """True when `address` is safe to hand to lftp/ssh as the seedbox host (`ADDRESS_RE`)."""
+    return ADDRESS_RE.fullmatch(address) is not None
+
+
+# --- "Extra lftp settings" (DESIGN.md §9.3, restricted by audit batch C3) -------------------
+#
+# The free-text box used to be appended to every rc file verbatim, so a `!cmd` line, a `;`
+# followed by another command, or a setting that itself runs a program was a shell in the
+# container for anyone who could write settings. It is now parsed into `set <key> <value>`
+# lines only, every key is checked against the allow-list below, and every accepted line is
+# **re-emitted** by `render_extra_lftp_settings` (key validated, value through `_lftp_quote`)
+# rather than passed through. Validated at write time (`models.TransferSettingsIn`, 422) and
+# again at spawn (`core/queue.py._admit` holds transfers; `build_rc_text` refuses), because a
+# value stored before this release was never checked.
+
+# Every variable name lftp 4.9.3 knows, as printed by `lftp -c "set -a"` in the shipped image
+# (Alpine build, closure suffixes stripped). **An allow-list of exact names, not a deny-list
+# of bad ones**, because lftp accepts any unambiguous *abbreviation* of a name (`set n:tim 30`
+# sets `net:timeout`, `set cmd:at-exi ...` would set `cmd:at-exit`) -- a deny-list matched
+# against the text the user typed is bypassed by abbreviating. Requiring the full name, and
+# that it be one of these, removes that class entirely. `torrent:*` is absent on purpose: the
+# image's lftp does not load the torrent module. `tests/test_extra_lftp_settings.py` checks
+# this list against the real binary's `set -a` so a version bump can't drift it silently.
+KNOWN_LFTP_SETTINGS: frozenset[str] = frozenset(
+    """
+    bmk:auto-sync bmk:save-passwords cache:cache-empty-listings cache:enable cache:expire
+    cache:expire-negative cache:size cmd:at-background cmd:at-exit cmd:at-exit-bg
+    cmd:at-exit-fg cmd:at-finish cmd:at-queue-finish cmd:at-terminate cmd:cls-completion-default
+    cmd:cls-default cmd:cls-exact-time cmd:csh-history cmd:default-protocol cmd:default-title
+    cmd:fail-exit cmd:interactive cmd:long-running cmd:ls-default cmd:move-background
+    cmd:move-background-detach cmd:nullglob cmd:parallel cmd:prompt cmd:queue-parallel
+    cmd:remote-completion cmd:save-cwd-history cmd:save-rl-history cmd:set-term-status
+    cmd:show-status cmd:status-interval cmd:stifle-rl-history cmd:term-status cmd:time-style
+    cmd:trace cmd:verbose cmd:verify-host cmd:verify-path cmd:verify-path-cached
+    color:dir-colors color:use-color dns:SRV-query dns:cache-enable dns:cache-expire
+    dns:cache-size dns:fatal-timeout dns:max-retries dns:name dns:order dns:use-fork
+    file:charset file:use-fallocate file:use-lock fish:auto-confirm fish:charset
+    fish:connect-program fish:shell ftp:abor-max-wait ftp:acct ftp:anon-pass ftp:anon-user
+    ftp:auto-passive-mode ftp:auto-sync-mode ftp:bind-data-socket ftp:catch-size ftp:charset
+    ftp:client ftp:compressed-re ftp:device-prefix ftp:fix-pasv-address ftp:fxp-force
+    ftp:fxp-passive-source ftp:fxp-passive-sscn ftp:home ftp:ignore-pasv-address ftp:lang
+    ftp:list-empty-ok ftp:list-options ftp:mode-z-level ftp:netkey-allow ftp:nop-interval
+    ftp:passive-mode ftp:port-ipv4 ftp:port-range ftp:prefer-epsv ftp:proxy
+    ftp:proxy-auth-type ftp:rest-list ftp:rest-stor ftp:retry-530 ftp:retry-530-anonymous
+    ftp:site ftp:site-group ftp:skey-allow ftp:skey-force ftp:ssl-allow ftp:ssl-allow-anonymous
+    ftp:ssl-auth ftp:ssl-copy-sid ftp:ssl-data-use-keys ftp:ssl-force ftp:ssl-protect-data
+    ftp:ssl-protect-fxp ftp:ssl-protect-list ftp:ssl-shutdown-timeout ftp:ssl-use-ccc
+    ftp:stat-interval ftp:strict-multiline ftp:sync-mode ftp:timezone ftp:too-many-re
+    ftp:trust-feat ftp:use-abor ftp:use-allo ftp:use-feat ftp:use-fxp ftp:use-hftp
+    ftp:use-ip-tos ftp:use-mdtm ftp:use-mdtm-overloaded ftp:use-mlsd ftp:use-mode-z
+    ftp:use-pret ftp:use-quit ftp:use-site-chmod ftp:use-site-idle ftp:use-site-utime
+    ftp:use-site-utime2 ftp:use-size ftp:use-stat ftp:use-stat-for-list ftp:use-telnet-iac
+    ftp:use-tvfs ftp:use-utf8 ftp:verify-address ftp:verify-port ftp:waiting-150-timeout
+    ftp:web-mode ftps:initial-prot hftp:cache hftp:cache-control hftp:decode hftp:proxy
+    hftp:use-allprop hftp:use-authorization hftp:use-head hftp:use-mkcol hftp:use-propfind
+    hftp:use-range hftp:use-type http:accept http:accept-charset http:accept-encoding
+    http:accept-language http:authorization http:cache http:cache-control http:cookie
+    http:decode http:post-content-type http:proxy http:put-content-type http:put-method
+    http:referer http:set-cookies http:use-allprop http:use-mkcol http:use-propfind
+    http:use-range http:user-agent https:proxy log:enabled log:file log:level log:max-size
+    log:prefix-error log:prefix-note log:prefix-recv log:prefix-send log:show-ctx log:show-pid
+    log:show-time mirror:dereference mirror:exclude-regex mirror:include-regex
+    mirror:no-empty-dirs mirror:order mirror:overwrite mirror:parallel-directories
+    mirror:parallel-transfer-count mirror:require-source mirror:set-permissions
+    mirror:skip-noaccess mirror:sort-by mirror:use-pget-n module:path net:connection-limit
+    net:connection-limit-timer net:connection-takeover net:idle net:limit-max net:limit-rate
+    net:limit-total-max net:limit-total-rate net:max-retries net:no-proxy net:persist-retries
+    net:reconnect-interval-base net:reconnect-interval-max net:reconnect-interval-multiplier
+    net:socket-bind-ipv4 net:socket-bind-ipv6 net:socket-buffer net:socket-maxseg net:timeout
+    pget:default-n pget:min-chunk-size pget:save-status sftp:auto-confirm sftp:charset
+    sftp:connect-program sftp:max-packets-in-flight sftp:protocol-version sftp:server-program
+    sftp:size-read sftp:size-write sftp:use-full-path ssl:ca-file ssl:ca-path ssl:cert-file
+    ssl:check-hostname ssl:crl-file ssl:crl-path ssl:key-file ssl:priority ssl:use-sni
+    ssl:verify-certificate xfer:auto-rename xfer:backup-suffix xfer:buffer-size xfer:clobber
+    xfer:destination-directory xfer:disk-full-fatal xfer:eta-period xfer:eta-terse
+    xfer:keep-backup xfer:make-backup xfer:max-redirections xfer:parallel xfer:rate-period
+    xfer:temp-file-name xfer:timeout xfer:use-temp-file xfer:verify xfer:verify-command
+    """.split()
+)
+
+# Known settings that are refused anyway, each with the reason shown in the 422. Researched
+# against lftp 4.9.3's man page and `set -a`; each category was the question the audit asked.
+_PROGRAM = "runs a program inside the container"
+_EVENT = "runs lftp commands (including `!` shell commands) when an event fires"
+_REMOTE = "runs a program on the seedbox"
+DENIED_LFTP_SETTINGS: dict[str, str] = {
+    "sftp:connect-program": _PROGRAM + " (lftpweb sets it to its own pinned ssh invocation)",
+    "fish:connect-program": _PROGRAM,
+    "xfer:verify-command": _PROGRAM,
+    # Turns on running `xfer:verify-command` against every downloaded file name.
+    "xfer:verify": _PROGRAM + " (it enables xfer:verify-command)",
+    "cmd:at-background": _EVENT,
+    "cmd:at-exit": _EVENT,
+    "cmd:at-exit-bg": _EVENT,
+    "cmd:at-exit-fg": _EVENT,
+    "cmd:at-finish": _EVENT,
+    "cmd:at-queue-finish": _EVENT,
+    "cmd:at-terminate": _EVENT,
+    "sftp:server-program": _REMOTE,
+    "fish:shell": _REMOTE,
+    "module:path": "loads code (lftp modules) from a path",
+    "log:file": "writes a file at an arbitrary path",
+    "xfer:destination-directory": "redirects where downloads are written",
+    # Verified against lftp 4.9.3: `cmd:trace` echoes `open -u user,PASSWORD ...` into the
+    # output lftpweb captures and stores on the job row; the debug log can carry protocol
+    # traffic into the same place.
+    "cmd:trace": "echoes the credential-bearing `open` line into the job's stored output",
+    "log:enabled": "can write protocol traffic, credentials included, into the job's output",
+}
+
+# Settings whose value becomes part of a local file name: a `/` would place that file outside
+# the transfer's own directory.
+_NO_SLASH_VALUE_SETTINGS = frozenset({"xfer:temp-file-name", "xfer:backup-suffix"})
+
+# Characters refused in a value even though `_lftp_quote` would make them literal: no lftp
+# setting a transfer needs takes them, and refusing them keeps a stored value that predates
+# the re-quoting from meaning anything other than what it says (defence in depth, audit C3).
+_FORBIDDEN_VALUE_CHARS = (";", "&", "|", "!", "\n", "\r", "\x00")
+
+# `category:name`, optionally `/closure` (lftp's per-host/per-protocol scoping). Emitted bare,
+# so the closure is limited to characters lftp's tokenizer treats literally.
+_SETTING_KEY_RE = re.compile(
+    r"(?P<base>[A-Za-z0-9-]+:[A-Za-z0-9-]+)(?:/(?P<closure>[A-Za-z0-9._*?:@/-]+))?"
+)
+
+
+class UnsafeLftpSettingsError(ValueError):
+    """A line in "Extra lftp settings" that lftpweb will not hand to lftp. Carries the 1-based
+    line number and the offending line so the 422 (write time) and the held-transfers notice
+    (spawn time) can both name it.
+    """
+
+    def __init__(self, line_no: int, line: str, reason: str) -> None:
+        self.line_no = line_no
+        self.line = line
+        self.reason = reason
+        super().__init__(f"Extra lftp settings, line {line_no} ({line.strip()!r}): {reason}")
+
+
+@dataclass(frozen=True)
+class ExtraLftpSetting:
+    key: str  # validated full name, optionally with a `/closure` suffix
+    value: str | None  # `None` for a bare `set <key>`
+
+
+def parse_extra_lftp_settings(text: str) -> list[ExtraLftpSetting]:
+    """Parse the "Extra lftp settings" box, or raise `UnsafeLftpSettingsError` on the first
+    line that isn't acceptable.
+
+    Accepted: blank lines and `#` comment lines (dropped), and `set <key> [<value>...]` with an
+    optional trailing `;` -- the exact form the Settings → Transfer placeholder has always
+    shown. The value is tokenised with POSIX quoting (`shlex`) and, like lftp's own `set`, its
+    words are joined with single spaces. Everything else -- any other command, `!`, a second
+    command after `;`, `&&`/`||`, an abbreviated or unknown key, a denied key -- is refused.
+    """
+    parsed: list[ExtraLftpSetting] = []
+    # Split on `\n` only -- lftp's own line terminator -- so an embedded CR or other separator
+    # stays inside its line and is refused there rather than silently becoming a new line.
+    for line_no, raw in enumerate(text.split("\n"), start=1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "\x00" in line or "\r" in line:
+            raise UnsafeLftpSettingsError(line_no, raw, "contains a control character")
+        body = line[:-1].rstrip() if line.endswith(";") else line
+        try:
+            tokens = shlex.split(body, posix=True)
+        except ValueError as exc:
+            raise UnsafeLftpSettingsError(line_no, raw, f"cannot be parsed ({exc})") from exc
+        if not tokens or tokens[0] != "set":
+            raise UnsafeLftpSettingsError(
+                line_no, raw, "only `set <key> <value>` lines are allowed here"
+            )
+        if len(tokens) < 2:
+            raise UnsafeLftpSettingsError(line_no, raw, "`set` needs a setting name")
+        key = tokens[1]
+        match = _SETTING_KEY_RE.fullmatch(key)
+        if match is None or match.group("base") not in KNOWN_LFTP_SETTINGS:
+            raise UnsafeLftpSettingsError(
+                line_no,
+                raw,
+                f"{key!r} is not a known lftp setting -- use the full name, e.g. net:timeout",
+            )
+        base = match.group("base")
+        if base in DENIED_LFTP_SETTINGS:
+            raise UnsafeLftpSettingsError(
+                line_no, raw, f"{base} is not allowed: it {DENIED_LFTP_SETTINGS[base]}"
+            )
+        value = " ".join(tokens[2:]) if len(tokens) > 2 else None
+        if value is not None:
+            bad = next((c for c in _FORBIDDEN_VALUE_CHARS if c in value), None)
+            if bad is not None:
+                raise UnsafeLftpSettingsError(
+                    line_no,
+                    raw,
+                    f"the value contains {bad!r}; one setting per line, and no `;`, `&`, `|` "
+                    "or `!` in a value",
+                )
+            if base in _NO_SLASH_VALUE_SETTINGS and "/" in value:
+                raise UnsafeLftpSettingsError(
+                    line_no, raw, f"{base} becomes part of a file name and cannot contain `/`"
+                )
+        parsed.append(ExtraLftpSetting(key=key, value=value))
+    return parsed
+
+
+def extra_lftp_settings_error(text: str) -> str | None:
+    """`None` when `text` is acceptable, else the human-readable reason for the first bad line."""
+    try:
+        parse_extra_lftp_settings(text)
+    except UnsafeLftpSettingsError as exc:
+        return str(exc)
+    return None
+
+
+def split_extra_lftp_settings(text: str) -> tuple[list[ExtraLftpSetting], list[str]]:
+    """Lenient form for a *stored* value: `(accepted settings, one reason string per dropped
+    line)`. Each line is judged on its own (a bad line never takes a good one down with it), so
+    an install whose stored box predates the validation keeps transferring with whatever part of
+    it is still acceptable. The write path stays strict (`parse_extra_lftp_settings`, a 422).
+    """
+    accepted: list[ExtraLftpSetting] = []
+    dropped: list[str] = []
+    for line_no, raw in enumerate(text.split("\n"), start=1):
+        try:
+            accepted += parse_extra_lftp_settings(raw)
+        except UnsafeLftpSettingsError as exc:
+            dropped.append(str(exc).replace("line 1", f"line {line_no}", 1))
+    return accepted, dropped
+
+
+def render_extra_lftp_settings(text: str) -> list[str]:
+    """The accepted lines, re-emitted: never the user's text, always `set <key> '<value>';`.
+    Lines that are not acceptable are dropped (`split_extra_lftp_settings` reports them)."""
+    return [
+        f"set {s.key};" if s.value is None else f"set {s.key} {_lftp_quote(s.value)};"
+        for s in split_extra_lftp_settings(text)[0]
+    ]
 
 
 def _connect_program(creds: HostCreds, known_hosts_path: Path | None) -> str:
@@ -492,11 +734,13 @@ def build_rc_text(
             reconnect_interval_base_s=reconnect_interval_base_s,
         )
     ]
-    if extra_settings.strip():
-        # The free-text "extra lftp settings" box (DESIGN.md §9.3) — injected verbatim, after
-        # everything above so a power user can override any of it. Not sanitized: it's a
-        # site-level admin setting, not user-submitted-per-request data.
-        lines.append(extra_settings.strip())
+    # The "extra lftp settings" box (DESIGN.md §9.3) — after everything above, so a power user
+    # can still override any lftpweb default (last `set` wins). **Never verbatim** since audit
+    # batch C3: parsed to `set` lines and re-emitted, dropping anything else
+    # (`render_extra_lftp_settings`). A stored value with a
+    # bad line has just that line dropped (transfers are never held); `core/queue.py._admit`
+    # reports the drops via `/api/health`.
+    lines += render_extra_lftp_settings(extra_settings)
 
     # `open -u user,pass` is the only lftp-level way to hand sftp a plaintext password (there
     # is no generic `set *:password` — confirmed against a real lftp binary's `set -a` dump),
@@ -514,7 +758,7 @@ def build_rc_text(
         password = creds.password
     else:
         password = ""
-    if not _ADDRESS_RE.fullmatch(creds.address):
+    if not is_valid_address(creds.address):
         raise ValueError(f"host address {creds.address!r} is not a valid hostname or IP address")
     url = _lftp_quote(f"sftp://{creds.address}:{int(creds.port)}")
     lines.append(f"open -u {_lftp_quote(creds.username)},{_lftp_quote(password)} {url};")

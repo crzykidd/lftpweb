@@ -22,7 +22,13 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       // The backend not answering yet (container still starting) reads as "not
       // authenticated" rather than crashing the shell — a reload once it's up sorts itself
       // out, and `mode: 'none'` here is just a safe placeholder, not an actual mode read.
-      setSession({ mode: 'none', authenticated: false, username: null, csrf_token: null })
+      setSession({
+        mode: 'none',
+        authenticated: false,
+        username: null,
+        csrf_token: null,
+        allowed_hosts_set: false,
+      })
     }
   }, [])
 

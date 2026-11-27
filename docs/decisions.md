@@ -6,6 +6,128 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-11-27 — C3 reworked to be non-breaking on upgrade
+
+`prompts/done/2026-11-27-c3-make-non-breaking.md`. The user's rule for `0.4.0`: an existing
+install that upgrades and changes nothing must keep working. Three parts of the first C3 broke it;
+this supersedes items 2, 3 and the spawn-time half of 4 in the 2026-11-26 entry below.
+
+1. **Header requirement -> cross-site refusal.** Requiring `X-Requested-With` 403'd every script,
+   API-key caller and tab left open across the upgrade. Now only what a browser positively marks
+   cross-site is refused: `X-Requested-With` present -> allow; `Sec-Fetch-Site`
+   `same-origin`/`none` allow, `cross-site`/`same-site` refuse; else an `Origin` that matches
+   neither `Host`, `X-Forwarded-Host` nor the allow-list (or `null`) refuse; else allow.
+   `Sec-Fetch-Site` is computed by the browser, so a Host-rewriting proxy can't break it and a
+   stale tab sends `same-origin`. `password` mode's CSRF token is byte-for-byte pre-C3. Rejected:
+   leaving the requirement with a grace period (still a breaking default). Gaps, named in README:
+   a browser sending neither header on a POST is unprotected; plain-HTTP non-localhost origins may
+   get no `Sec-Fetch-Site` (not "potentially trustworthy"), leaving the `Origin` rule.
+   `tests/conftest.py`'s header-injecting `TestClient` was removed: tests now look like curl.
+2. **Hold -> skip-and-report.** Holding every transfer for a stored bad `extra_lftp_settings`
+   value turned a harmless upgrade into a stopped queue. Write-time 422 stays (it only affects
+   someone editing the field). At spawn the conforming lines are rendered (same re-quoting) and the
+   rest dropped; `/api/health.lftp_settings_ignored` (renamed from `lftp_settings_error`) and the
+   banner say how many and the first reason; one WARNING per distinct stored value. The risk the
+   first design cited (a rate limit sharing a line with bad text silently vanishing) is real but
+   now visible; judged better than a stopped queue, and lines are judged individually.
+3. **WebSocket Origin comparison is opt-in.** Origin vs Host breaks live updates behind a proxy
+   that rewrites Host. With `LFTPWEB_ALLOWED_HOSTS` set (the user opted in to naming hosts) the
+   Origin check stays. Unset: close 4403 only on `Sec-Fetch-Site` `cross-site`/`same-site`; absent
+   header -> allow, WARNING once per distinct mismatching Origin. Fetch Metadata spec lists
+   `websocket` as a `Sec-Fetch-Mode` value and appends the headers in the generic fetch algorithm
+   (to potentially trustworthy URLs only); neither MDN nor the spec states it outright for
+   handshakes, so this relies on that implication. Wrongly relying on it only means a cross-site
+   WebSocket isn't refused (logged), never a false refusal.
+
+---
+
+## 2026-11-26 — Network-exposure hardening for every auth mode (audit batch C3)
+
+`prompts/done/2026-11-26-c3-network-exposure-hardening.md` (audit §3 F2, F12, F13).
+
+**Problem.** In `none` (the default) and `proxy` mode nothing stopped a cross-site request: a
+bodiless `POST /api/items/{id}/delete` is a CORS simple request and deleted local items; no Host
+check meant DNS rebinding gave any website a LAN user visits same-origin access; the WebSocket
+had no Origin check; `extra_lftp_settings` went into every rc file verbatim (`!cmd` = shell); the
+host address was only validated at spawn.
+
+**Decisions** (1 and 2 were the user's; the rest are this task's):
+
+1. **Host allow-list, permissive by default** — `LFTPWEB_ALLOWED_HOSTS`. Unset accepts any Host,
+   with one startup WARNING in `none`/`proxy` mode and an app-shell banner. Set, any other Host
+   gets 403 naming the env var, on every path and in every mode. **Wildcards: a leading `*.`
+   only** (subdomains, not the apex) — cheap, and safe against rebinding because an attacker
+   can't place their page under your domain; any other `*` makes the entry invalid. Invalid
+   entries are logged and ignored, never fatal (a crash loop is a worse lock-out than a 403 that
+   names the fix); set-but-all-invalid still enforces (loopback only), never "allow all".
+   `localhost`/`127.0.0.1`/`::1` always pass — a rebound page sends the attacker's name, never
+   these, and the HEALTHCHECK uses `127.0.0.1`. The allow-list checks `Host` only, never
+   `X-Forwarded-Host`: a same-origin (rebound) `fetch` can set that header.
+   **Banner placement: the app shell**, not Settings → Auth. The audience is default-`none`
+   installs whose owners may never open that tab; one amber line, no dismiss (house style),
+   gone the moment the env var is set or the mode is `password`. Not shown in `password` mode:
+   a rebound origin can't use lftpweb's cookie.
+2. **`X-Requested-With` required on every mutating `/api/` request, every mode.** Presence only;
+   the value is ignored. Applies to the public login/logout routes and to `X-API-Key` callers
+   too — one rule, nothing to audit. **In `password` mode both the header and the CSRF token are
+   required.** Rejected: "either satisfies" — it makes the rule mode-dependent, and the token
+   check covers only session requests (not login/logout, not the no-user-yet open state), so the
+   header would still be needed for those anyway. There is no `CORSMiddleware` (grepped), so a
+   preflight for the header gets a 405/401 with no `Access-Control-Allow-*` and the browser
+   never sends the real request (asserted by test). The frontend sends the header on every
+   request, reads included, from one `requestHeaders()` builder. Tests' own `TestClient`s get it
+   from a `tests/conftest.py` subclass, because they exercise the UI's requests.
+3. **WebSocket Origin.** If present it must match the handshake's `Host` (default ports by
+   scheme), its `X-Forwarded-Host`, or an allow-listed name; otherwise close 4403. Accepting
+   `X-Forwarded-Host` is safe here (and only here) because a browser cannot add headers to a
+   WebSocket handshake; it keeps reverse proxies that rewrite Host working, and the Vite dev
+   proxy (`changeOrigin`) now sets `xfwd: true` for the same reason. **A missing Origin is
+   allowed**: every browser sends one, so its absence is a non-browser client that already has
+   network access — full control via plain HTTP in `none` mode, and still gated by
+   `AuthMiddleware` in the other modes. Refusing it would buy nothing. No Origin check on plain
+   HTTP: the custom header already covers mutations.
+4. **`extra_lftp_settings`: an allow-list of exact names, not a deny-list of typed text.**
+   lftp accepts any unambiguous abbreviation (`set n:tim 30` sets `net:timeout`; verified), so
+   a deny-list matched against what the user typed is bypassed by abbreviating. The allow-list is
+   lftp 4.9.3's full `set -a` name list from the shipped image (260 names; no `torrent:*` — the
+   image doesn't load that module), minus a researched deny set: settings that run a program
+   (`sftp:`/`fish:connect-program`, `xfer:verify-command`, and `xfer:verify`, which enables it),
+   run lftp commands on an event (all `cmd:at-*`), run a program on the seedbox
+   (`sftp:server-program`, `fish:shell`), load code (`module:path`), write an arbitrary file or
+   redirect downloads (`log:file`, `xfer:destination-directory`), or leak the password into the
+   job's stored output (`cmd:trace` — verified to echo `open -u user,PASSWORD`; `log:enabled`).
+   `xfer:temp-file-name`/`xfer:backup-suffix` refuse `/`. Every other known key stays
+   overridable, so the deliberate "override a colliding lftpweb default" ability is intact.
+   Lines: blank and `#` lines dropped, optional trailing `;`, value tokenised POSIX-style and
+   joined with spaces like lftp's own `set`, no `; & | !` or CR/NUL in a value even though
+   re-quoting would neutralise them (defence in depth, and no transfer setting needs them).
+   Every accepted line is **re-emitted** as `set <key> '<value>';` via `_lftp_quote`. A test
+   pins the list against the local binary so a version bump can't drift it silently.
+   **Spawn time: hold every transfer** (like `credentials_need_reentry`), log once per
+   transition, `/api/health.lftp_settings_error`, an app-shell banner linking to Settings →
+   Transfer; resumes on its own after a valid save. Rejected: dropping bad lines with a warning
+   (a rate limit on the same line as the bad text silently vanishes — a weakened transfer);
+   failing the job (suppresses every admitted item, each needing a manual retry after the fix).
+   Write time: 422 naming the first bad line. GET still returns a stored bad value (the
+   validator is input-only) so the page that fixes it can load.
+5. **`HostIn.address`** validated with `lftp.is_valid_address` (the one `ADDRESS_RE`), 422.
+   A bracketed `[v6]` stays refused, exactly as C1's spawn check refused it. `HostTestRequest`
+   is not checked: Test connection uses asyncssh, not lftp/ssh argv. Stored values aren't
+   migrated; they already fail clearly at spawn.
+6. **Proxy mode's CSRF** is item 2's header (F13), proven by test.
+
+**Inbound non-browser callers checked:** none legitimate. The HEALTHCHECK is a `GET` on
+loopback; there are no webhook routes; the support bundle is a UI `fetch`. `X-API-Key` scripts
+(none exist, per the user) now need the header.
+
+**Cost.** An install behind a reverse proxy that rewrites `Host` without forwarding it, with the
+allow-list unset, loses the live WebSocket until the proxy preserves Host (or the public name is
+listed). A browser tab still running a pre-upgrade bundle gets 403 on its first change until
+reloaded. A stored extra-settings value that isn't plain `set` lines now holds transfers until
+it is fixed.
+
+---
+
 ## 2026-11-26 — The shipped compose file binds the UI to loopback
 
 `prompts/done/2026-11-26-compose-loopback-default.md` (security audit §3 F2).

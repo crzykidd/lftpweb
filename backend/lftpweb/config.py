@@ -55,6 +55,16 @@ class Settings(BaseSettings):
     # stored," which itself defaults to `none` for a fresh install.
     auth_mode: str | None = None
 
+    # Audit batch C3 (DESIGN.md §8, `core/netguard.py`): DNS-rebinding protection. A
+    # comma-separated list of the Host names lftpweb may be reached by (`name`, `name:port`,
+    # `1.2.3.4`, `[::1]:8087`, or `*.example.com` for any subdomain). Unset (the default) accepts
+    # any Host, as before -- with a startup WARNING and a UI banner in `none`/`proxy` mode. Set,
+    # every request (UI, API and WebSocket, every auth mode) whose Host is not listed gets a
+    # 403. `localhost`, `127.0.0.1` and `::1` are always allowed, so the container healthcheck
+    # and a local recovery path keep working. Like `LFTPWEB_AUTH_MODE`, deliberately an env var
+    # and not a setting: a wrong value is fixed by restarting, never by reaching the UI.
+    allowed_hosts: str | None = None
+
     # 2026-08-16 (docs/decisions.md): baked at image *build* time, not runtime -- unlike
     # every other setting here, these come from `docker build --build-arg` in
     # .github/workflows/publish.yml, landed as `ENV` in docker/Dockerfile's `runtime` stage,

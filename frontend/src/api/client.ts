@@ -91,8 +91,31 @@ export function setCsrfToken(token: string | null): void {
 
 const MUTATING_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE'])
 
+/** Audit batch C3 (DESIGN.md §8): the backend refuses every mutating `/api/` request that lacks
+ * this header, in every auth mode (`backend/lftpweb/middleware.py.REQUIRED_HEADER`). A browser
+ * won't send a custom header cross-origin without a preflight lftpweb never grants, so its
+ * presence proves the request came from this page. Sent on *every* request, reads included, so
+ * no call site ever has to remember which methods need it.
+ */
+export const REQUIRED_HEADER = 'X-Requested-With'
+export const REQUIRED_HEADER_VALUE = 'lftpweb'
+
+/** The headers every request from this client carries: the required header always, the
+ * password-mode CSRF token on a mutating call whenever one is held, `Content-Type` when there
+ * is a JSON body. The single place request headers are built -- exported for its unit test.
+ */
+export function requestHeaders(method: string, hasJsonBody: boolean): Record<string, string> {
+  const headers: Record<string, string> = { [REQUIRED_HEADER]: REQUIRED_HEADER_VALUE }
+  if (hasJsonBody) headers['Content-Type'] = 'application/json'
+  // Attached whenever we have one, regardless of mode — a no-op in `none`/`proxy` mode (the
+  // backend only checks it for a password-mode session, middleware.py) and required for
+  // every mutating call once a password-mode session exists.
+  if (csrfToken && MUTATING_METHODS.has(method)) headers['X-CSRF-Token'] = csrfToken
+  return headers
+}
+
 async function getJson<T>(path: string): Promise<T> {
-  const res = await fetch(path)
+  const res = await fetch(path, { headers: requestHeaders('GET', false) })
   if (!res.ok) {
     throw new Error(`${path} responded ${res.status}`)
   }
@@ -100,16 +123,9 @@ async function getJson<T>(path: string): Promise<T> {
 }
 
 async function sendJson<T>(path: string, method: string, body?: unknown): Promise<T> {
-  const headers: Record<string, string> = {}
-  if (body !== undefined) headers['Content-Type'] = 'application/json'
-  // Attached whenever we have one, regardless of mode — a no-op in `none`/`proxy` mode (the
-  // backend only checks it for a password-mode session, middleware.py) and required for
-  // every mutating call once a password-mode session exists.
-  if (csrfToken && MUTATING_METHODS.has(method)) headers['X-CSRF-Token'] = csrfToken
-
   const res = await fetch(path, {
     method,
-    headers: Object.keys(headers).length ? headers : undefined,
+    headers: requestHeaders(method, body !== undefined),
     body: body === undefined ? undefined : JSON.stringify(body),
   })
   if (!res.ok) {
@@ -808,11 +824,9 @@ export function logDownloadUrl(filename: string): string {
  * never guessed client-side, so the two can never drift.
  */
 export async function downloadSupportBundle(body: SupportBundleRequest): Promise<void> {
-  const headers: Record<string, string> = { 'Content-Type': 'application/json' }
-  if (csrfToken) headers['X-CSRF-Token'] = csrfToken
   const res = await fetch('/api/support-bundle', {
     method: 'POST',
-    headers,
+    headers: requestHeaders('POST', true),
     body: JSON.stringify(body),
   })
   if (!res.ok) {

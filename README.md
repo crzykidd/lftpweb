@@ -466,10 +466,17 @@ worked around:
   (content silently clipped rather than scrolled; a control crushed to one character by a
   competing width class), and jsdom performs no layout at all, so no test in this repo could have
   caught either. A human with a browser is the only check that exists for these pages.
-- **No CSRF, Host or Origin checks in `none` or `proxy` mode.** Only `password` mode's session
-  cookie gives any cross-site protection. See "Network exposure."
-- **Settings write access is equivalent to command execution in the container.** Some settings
-  are not yet restricted to safe values. Another reason `none` mode must stay on a trusted network.
+- **Settings write access is still powerful.** No setting can run a command in the container any
+  more, but queue paths and the extraction target can point anywhere the container can write,
+  `/config` included. Another reason `none` mode must stay on a trusted network.
+- **DNS-rebinding protection is off until you set `LFTPWEB_ALLOWED_HOSTS`.** Off by default so an
+  upgrade can't lock anyone out; see "Network exposure."
+- **The cross-site checks rely on what the browser sends.** A browser that sends neither
+  `Sec-Fetch-Site` nor `Origin` on a POST (very old browsers) is not protected. Plain-HTTP
+  pages on a non-localhost name may not get `Sec-Fetch-Site` at all (browsers send it only to
+  "potentially trustworthy" URLs), so there the `Origin` check is the protection. With
+  `LFTPWEB_ALLOWED_HOSTS` unset, a WebSocket from a browser that omits `Sec-Fetch-Site` is not
+  refused, even if its `Origin` differs from `Host`; that is only logged.
 - **Stored secrets can be redirected.** Changing an endpoint's address does not require
   re-entering its stored credential, so someone with settings write access can send it elsewhere.
 - **`/docs` and `/openapi.json` are public**, even with auth on.
@@ -497,6 +504,29 @@ worked around:
   ```
 
   Don't publish on all interfaces in `none` mode: anyone who can reach the port has full control.
+- **Set `LFTPWEB_ALLOWED_HOSTS`** to every name and address you open lftpweb by, comma-separated
+  (`lftpweb.example.com,192.168.1.10`; `name:port` limits a name to one port, `*.example.com`
+  matches its subdomains). This stops a malicious website from reaching your instance by
+  re-pointing its own hostname at it (DNS rebinding). Once set, a request for any other name gets
+  a 403 naming the variable; `localhost` and `127.0.0.1` always work. Unset, any name is accepted,
+  and in `none`/`proxy` mode lftpweb logs a warning and shows a banner. Behind a reverse proxy,
+  list the name lftpweb receives in `Host` (the public name if the proxy preserves it, which is
+  also what keeps the live updates' WebSocket working).
+
+  ```yaml
+  environment:
+    LFTPWEB_ALLOWED_HOSTS: "lftpweb.example.com,192.168.1.10"
+  ```
+- **Cross-site requests are refused in every auth mode.** A change made through the API
+  (POST/PUT/PATCH/DELETE) that the browser marks as coming from another site (`Sec-Fetch-Site:
+  cross-site`/`same-site`, or an `Origin` that isn't yours) gets a 403. Nothing is required of
+  scripts or API-key callers, which send neither. The live-updates WebSocket likewise refuses a
+  connection the browser marks as cross-site; with `LFTPWEB_ALLOWED_HOSTS` set it also requires
+  the `Origin` to match.
+- **"Extra lftp settings" accepts only `set` lines.** Settings that could run programs or write
+  files are refused when you save, along with anything that isn't a plain `set <key> <value>`.
+  A value saved by an older version that breaks this is not held against your transfers: its bad
+  lines are skipped, the good ones apply, and a banner says what was ignored.
 - **Never expose lftpweb directly to the internet, in any auth mode,** until the remaining
   hardening listed under "Known gaps" has landed.
 - **If an install ever had `none` mode reachable from a network you did not trust**, treat its

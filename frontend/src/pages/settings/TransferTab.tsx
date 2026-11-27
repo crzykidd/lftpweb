@@ -903,9 +903,8 @@ export function TransferTab() {
           Extra lftp settings
           <FieldHelp label="Extra lftp settings">
             <p>
-              A rejected line can fail in two different, both confusing, ways. An unrecognised{' '}
-              <code>set</code> key is silently ignored — the line does nothing, with no error
-              anywhere. A recognised key given a value in the wrong format is worse:{' '}
+              An unrecognised <code>set</code> key is refused when you save. A recognised key
+              given a value in the wrong format is not, and fails confusingly:{' '}
               <code>net:reconnect-interval-base</code> takes a bare number, not a duration —{' '}
               <code>5s</code> makes lftp reject that one line with{' '}
               "5s: invalid unsigned number" while the transfer keeps running on its defaults, so
@@ -919,15 +918,18 @@ export function TransferTab() {
           </FieldHelp>
         </h3>
         <p className={hintClasses}>
-          Free text, injected verbatim into every job's rc file (DESIGN.md §9.3) — the escape
-          hatch for anything not exposed as a field above.
+          Added to every job's rc file (DESIGN.md §9.3) — the escape hatch for any lftp setting
+          not exposed as a field above.
         </p>
         <p className={hintClasses}>
-          One lftp command per line, exactly as you would write it in <code>.lftprc</code>:{' '}
-          <code>set &lt;key&gt; &lt;value&gt;;</code>. Quote any value containing spaces. These
-          lines are applied <em>after</em> every setting above, so they override the fields on
-          this page. Note that lftp silently ignores a line it doesn't understand rather than
-          failing — a typo shows up as behaviour that doesn't change, not as an error.
+          One <code>set &lt;key&gt; &lt;value&gt;;</code> line per setting, using the setting's
+          full name; blank lines and <code>#</code> comment lines are fine. Quote any value
+          containing spaces. These lines are applied <em>after</em> every setting above, so they
+          override the fields on this page. Saving refuses anything else — other lftp commands,
+          unknown or abbreviated setting names, a <code>;</code>, <code>&amp;</code>,{' '}
+          <code>|</code> or <code>!</code> inside a value, and settings that could run programs
+          or write files — and names the line. A known setting given a badly formatted value is
+          still only caught by lftp itself (see the help above).
         </p>
         <textarea
           className={`${inputClasses} min-h-24 font-mono`}

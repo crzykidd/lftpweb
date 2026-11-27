@@ -16,6 +16,9 @@ export interface HealthResponse {
   // 2026-08-21 (prompts/2026-08-21-pause-for-duration.md): the absolute ISO-8601 UTC deadline
   // a timed pause resumes at, or `null` for an indefinite pause (or no pause at all).
   queue_paused_until: string | null
+  // Audit batch C3: set while stored "Extra lftp settings" lines are being ignored (transfers
+  // are NOT held) -- a count and the first offending line (`LftpSettingsBanner`).
+  lftp_settings_ignored: string | null
   // 2026-08-16 (docs/decisions.md): baked at image build time, `null` for every build that
   // never baked them (local dev, compose dev stack, a manual `docker build` with no
   // `--build-arg`) -- see `lib/versionBadge.ts` for how the nav's version readout uses them.
@@ -1721,6 +1724,8 @@ export interface AuthSessionOut {
   // Present only when authenticated via a password-mode session — attached as
   // `X-CSRF-Token` on every mutating request afterwards.
   csrf_token: string | null
+  // Audit batch C3: whether `LFTPWEB_ALLOWED_HOSTS` is set (DNS-rebinding protection on).
+  allowed_hosts_set: boolean
 }
 
 export interface ApiKeyOut {

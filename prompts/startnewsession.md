@@ -113,9 +113,17 @@ private, not in the repo; findings F1-F12, fix batches in its §5). Landed on `d
 (base image refresh, certifi, 7-Zip 26.06 and UnRAR 7.23 from source), `985eed7` C2 (archives
 listed before extraction; links / absolute / `..` members refused). README now has a "Network
 exposure" section and the open items under "Known gaps"; CHANGELOG carries an upgrade note.
-**Deferred, not fixed (report §5):** C3 - CSRF/Host/Origin protection for `none`/`proxy` mode,
-plus restricting free-form settings to safe values (today settings write = command execution in
-the container, so anyone who can reach the port in `none` mode has it); C4 - stored secrets
+**C3 done (commit pending, `prompts/done/2026-11-26-c3-network-exposure-hardening.md`):**
+**non-breaking by design** (`prompts/done/2026-11-27-c3-make-non-breaking.md`): mutating `/api/`
+requests are refused only when the browser says cross-site (`Sec-Fetch-Site`, or an `Origin`
+mismatch; `X-Requested-With` always passes; curl/scripts pass; `password` CSRF token unchanged),
+`LFTPWEB_ALLOWED_HOSTS` Host allow-list (permissive when unset, startup WARNING + shell banner in
+`none`/`proxy`), WebSocket Origin compared only when the allow-list is set (unset: refuse only
+`Sec-Fetch-Site` cross-site/same-site, log mismatches), `extra_lftp_settings` restricted to
+allow-listed `set` lines and re-emitted (a stored bad line is skipped, never holds transfers,
+reported in `/api/health.lftp_settings_ignored`), `HostIn.address` validated at the API.
+Decisions in `docs/decisions.md` 2026-11-26. Settings write still reaches any writable path via
+queue/extract paths (README Known gaps). **Deferred, not fixed (report §5):** C4 - stored secrets
 redirectable on endpoint change; C5 - public `/docs`/`/openapi.json`, proxy-aware `Secure` cookie
 and login rate limiter, current password on `PUT` password change; D3 - CI image scanning, SBOM,
 stale-layer cache, dev-dependency bumps. The test deployment is LAN-only per the user. **Do not tag `0.4.0` as safe for exposure until these land.**

@@ -45,6 +45,11 @@ export default defineConfig({
         target: process.env.LFTPWEB_DEV_API_PROXY ?? 'http://localhost:8087',
         ws: true,
         changeOrigin: true,
+        // Audit batch C3: `changeOrigin` rewrites Host to the backend's, so the WebSocket
+        // handshake's Origin (this dev server) no longer matches Host. `xfwd` forwards the
+        // original as X-Forwarded-Host, which the backend's Origin check accepts for the WS
+        // handshake (backend/lftpweb/core/netguard.py.origin_allowed).
+        xfwd: true,
       },
     },
   },
