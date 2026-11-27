@@ -63,6 +63,18 @@ Skeleton for the next roll:
   being passed through (and are never retried). The same pass quotes the connection URL and
   SSH key path, and rejects a host address that could be read as an `ssh` option.
 
+- **Container base refreshed and re-pinned**: `python:3.13-alpine` is now Alpine 3.24.4 / Python
+  3.13.18 (was 3.24.1 / 3.13.15), and the runtime stage runs `apk upgrade`. Published `0.3.1`
+  images carry OpenSSH client `10.3_p1-r0` (CVE-2026-60002, a client-side use-after-free
+  reachable from a hostile seedbox); the rebuilt image has `10.3_p1-r2`. Deployments do not
+  auto-update: pull the new image.
+- **certifi 2026.7.22 -> 2026.11.20** (GHSA-6q48-6c7w-9gw2: compromised emSign intermediates
+  were trusted).
+- **7-Zip built from upstream source (26.06)** instead of Alpine's 26.01 package, fixing
+  CVE-2026-14266 (XZ decoder heap overflow, reachable via `.xz`/`.tar.xz` downloads).
+- **unrar updated to 7.23 final** (was a 7.20 beta 3 build), fixing CVE-2026-14191 and the
+  cross-extraction symlink hardening.
+
 ### Deprecated
 
 ### Removed

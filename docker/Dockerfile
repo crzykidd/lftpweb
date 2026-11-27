@@ -10,6 +10,10 @@
 #
 # Base images are pinned by digest, not just tag, so a silent retag can't change the
 # archive tooling underneath a running deployment (§11.1). Bump deliberately.
+# 2026-11-26: python:3.13-alpine = Alpine 3.24.4 / Python 3.13.18 at this digest (the old pin
+# was 3.24.1 / 3.13.15 and carried openssh-client 10.3_p1-r0, CVE-2026-60002). A digest pin
+# freezes the *base*, but a pinned base is only as fresh as its last bump, so both stages that
+# reach the final image also run `apk upgrade` to pick up Alpine point fixes published since.
 
 FROM node:22-alpine@sha256:c610fcdfb1d5b4740dd70c284ed3cb16bb857e0f7166196e36a5501df7a3aa32 AS frontend-builder
 WORKDIR /app/frontend
@@ -52,11 +56,11 @@ CMD ["npm", "run", "dev", "--", "--host", "0.0.0.0"]
 # every one of those shebangs points at a path that no longer exists in the new stage.
 # Keeping the path identical across stages is what lets `COPY --from=` carry a working
 # venv forward at all.
-FROM python:3.13-alpine@sha256:540c7d91f98ff6880174c40e99067bf5941eb54d818a7a5e094d188b196a934d AS python-base
+FROM python:3.13-alpine@sha256:9ef1a599f863231c3d91e941389bfdc4a2d6070557243d54df1a4e57015b960e AS python-base
 # build-base covers any dependency lacking a musllinux wheel; today's dependency set
 # (fastapi, uvicorn[standard], aiosqlite, pydantic, pydantic-settings) doesn't need it, but
 # it's cheap insurance and stays out of the runtime image regardless.
-RUN apk add --no-cache build-base
+RUN apk upgrade --no-cache && apk add --no-cache build-base
 COPY --from=ghcr.io/astral-sh/uv:0.9.7@sha256:ba4857bf2a068e9bc0e64eed8563b065908a4cd6bfb66b531a9c424c8e25e142 /uv /usr/local/bin/uv
 WORKDIR /app
 COPY pyproject.toml uv.lock ./
@@ -87,21 +91,61 @@ RUN uv sync --locked --no-dev --no-editable
 # those two leaves musl libc (present in every Alpine image) as the only runtime dependency,
 # same as 7zz's own footprint.
 FROM python-base AS unrar-builder
-ARG UNRAR_VERSION=7.2.3
-ARG UNRAR_SHA256=3995af0aa32b1505a566da053725551a1f0698dc42b2fdf7ba7d65db0d004e33
+# 2026-11-26: tarball `unrarsrc-7.2.7` = **UnRAR 7.23 final** (version.hpp: 7.23, beta 0,
+# dated 2026-06-27). Tarball number and banner do NOT map obviously: the old pin `7.2.3` was
+# "UNRAR 7.20 beta 3", and the newest tarball on rarlab.com/rar_add.htm, `7.3.2`, is "7.30
+# beta 2" -- a beta, so it is deliberately NOT used. 7.2.7 is the newest *final*; it is still
+# hosted on rarlab.com though the add-on page no longer links it. 7.23 fixes CVE-2026-14191 and
+# blocks symlink placement across multiple extraction operations. The banner is asserted
+# below (build fails on "beta") and again in the image, because a file name is no evidence.
+ARG UNRAR_VERSION=7.2.7
+ARG UNRAR_SHA256=01d903a7dcf413cb2925696d7796e48e38d471f79bfe7ef3ad2aebf6c12dbefd
 WORKDIR /build
 RUN wget -qO unrarsrc.tar.gz "https://www.rarlab.com/rar/unrarsrc-${UNRAR_VERSION}.tar.gz" \
  && echo "${UNRAR_SHA256}  unrarsrc.tar.gz" | sha256sum -c - \
  && tar xzf unrarsrc.tar.gz \
  && make -C unrar -j"$(nproc)" LDFLAGS="-pthread -static-libstdc++ -static-libgcc" \
- && strip unrar/unrar
+ && strip unrar/unrar \
+ && unrar/unrar 2>&1 | head -3 \
+ && unrar/unrar 2>&1 | head -3 | grep -q 'UNRAR 7.23 freeware'
+
+# 7zz (7-Zip >= 26.02), built from upstream source (2026-11-26 audit F3, CVE-2026-14266: XZ
+# decoder heap overflow, fixed in 26.02; Alpine 3.24's `7zip` package is stuck at 26.01 and
+# trivy has no advisory for it). lftpweb hands this binary archives downloaded from the
+# seedbox, so a stale 7zz is directly reachable. 26.06 is the newest stable release
+# (2026-11-06). Source is the official GitHub release ip7z/7zip, which is what
+# https://www.7-zip.org/download.html links to -- 7-zip.org itself only hosts the 23.01 source
+# archive. The sha256 below equals the digest GitHub computes for the asset (releases API).
+#
+# `Alone2` + `makefile.gcc` is the standalone `7zz` bundle (all codecs and handlers). Plain C/
+# C++ build, no asm (`USE_ASM` is only enabled when the makefile is given an assembler), so
+# no uasm dependency. Static libstdc++/libgcc for the same reason as unrar below: the
+# runtime stage has no C++ runtime package. `-D_GNU_SOURCE` is harmless on musl; the stock
+# makefile is otherwise unpatched.
+# NOTE: unlike Alpine's package, an upstream build DOES include the RAR/RAR5 decoder (the
+# 2026-08-12 finding was about Alpine's stripped build). lftpweb still routes rar to `unrar`
+# (core/extract.py); the in-image check in docs/decisions.md asserts what 7zz can decode.
+FROM python-base AS sevenzip-builder
+ARG SEVENZIP_VERSION=26.06
+ARG SEVENZIP_SHA256=a4e374c8f864f51df48c2cfd0e1413ec3b2ea030deae852d6a655402ebb61ac4
+WORKDIR /build
+RUN SRC="7z$(echo "${SEVENZIP_VERSION}" | tr -d .)-src.tar.xz" \
+ && wget -qO sevenzip-src.tar.xz "https://github.com/ip7z/7zip/releases/download/${SEVENZIP_VERSION}/${SRC}" \
+ && echo "${SEVENZIP_SHA256}  sevenzip-src.tar.xz" | sha256sum -c - \
+ && mkdir src && tar xJf sevenzip-src.tar.xz -C src \
+ && make -C src/CPP/7zip/Bundles/Alone2 -f makefile.gcc -j"$(nproc)" \
+      MY_LIBS="-static-libstdc++ -static-libgcc" \
+ && strip src/CPP/7zip/Bundles/Alone2/_o/7zz \
+ && cp src/CPP/7zip/Bundles/Alone2/_o/7zz /build/7zz
 
 FROM python-base AS dev
 # The same transfer/archive tooling the runtime stage installs. Without it the dev container
 # can scan (asyncssh is pure Python) but every transfer dies `SPAWN_FAILED: FileNotFoundError`
 # the moment core/lftp.py tries to exec `lftp` — a failure that only surfaces on the first
 # Queue click, long after the environment looks healthy.
-RUN apk add --no-cache lftp openssh-client 7zip
+RUN apk add --no-cache lftp openssh-client
+# 7zz (see the sevenzip-builder stage above).
+COPY --from=sevenzip-builder /build/7zz /usr/local/bin/7zz
 # unrar (see the unrar-builder stage above): the dev image has historically been missing
 # tools the runtime stage had, which cost a whole debugging session (2026-08-12,
 # prompts/startnewsession.md) — copied here explicitly rather than trusting that omission
@@ -132,7 +176,7 @@ ENV PATH="/app/.venv/bin:${PATH}"
 EXPOSE 8087
 CMD ["uvicorn", "lftpweb.main:app", "--host", "0.0.0.0", "--port", "8087", "--reload", "--reload-dir", "/app/backend"]
 
-FROM python:3.13-alpine@sha256:540c7d91f98ff6880174c40e99067bf5941eb54d818a7a5e094d188b196a934d AS runtime
+FROM python:3.13-alpine@sha256:9ef1a599f863231c3d91e941389bfdc4a2d6070557243d54df1a4e57015b960e AS runtime
 # Bake the commit and channel a *dev* image was built from (2026-08-16, docs/decisions.md) so
 # a `:dev` container can identify itself in the UI as never mistaken for a release -- the
 # container has no git tree to ask at runtime. Declared only in this stage: `dev`/
@@ -144,11 +188,13 @@ FROM python:3.13-alpine@sha256:540c7d91f98ff6880174c40e99067bf5941eb54d818a7a5e0
 # `None` rather than a spurious "" value reaching `/api/health`.
 ARG BUILD_SHA=""
 ARG BUILD_CHANNEL=""
-# lftp: the transfer engine. openssh-client: ssh/sftp. 7zip: 7zz, zip/7z/tar/gz/bz2/xz — NOT
-# rar (Alpine's build has no RAR codec; see the unrar-builder stage above and
-# docs/decisions.md). su-exec: privilege drop after the entrypoint fixes ownership. tini:
-# PID 1, reaps lftp children. curl: HEALTHCHECK.
-RUN apk add --no-cache lftp openssh-client 7zip su-exec tini curl
+# lftp: the transfer engine. openssh-client: ssh/sftp. 7zz (zip/7z/tar/gz/bz2/xz) is built
+# from upstream source, not the Alpine `7zip` package (stuck at 26.01; see sevenzip-builder).
+# su-exec: privilege drop after the entrypoint fixes ownership. tini: PID 1, reaps lftp
+# children. curl: HEALTHCHECK. `apk upgrade` first so Alpine point fixes newer than the pinned
+# base (e.g. openssh-client) land; same layer as the install so it is never cached apart.
+RUN apk upgrade --no-cache && apk add --no-cache lftp openssh-client su-exec tini curl
+COPY --from=sevenzip-builder /build/7zz /usr/local/bin/7zz
 # unrar: the rar/rar5 decoder 7zz doesn't have (see the unrar-builder stage above).
 COPY --from=unrar-builder /build/unrar/unrar /usr/local/bin/unrar
 

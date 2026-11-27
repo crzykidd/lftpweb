@@ -2763,18 +2763,25 @@ Multi-stage:
 ```
 node:22-alpine        → builds the SPA (static output; base is irrelevant to the artifact)
 python:3.13-alpine    → builder: build-base + any wheels lacking musllinux builds → venv
-python:3.13-alpine    → runtime: venv + lftp, openssh-client, 7zip, su-exec, tini
+python:3.13-alpine    → sevenzip-builder / unrar-builder: 7zz and unrar built from upstream source
+python:3.13-alpine    → runtime: venv + lftp, openssh-client, su-exec, tini, plus 7zz and unrar
+                        (copied from the builders). `apk upgrade` runs first in this stage.
 ```
 
 No compiler in the final image — build tooling stays in the builder stage and only the venv is
 copied forward.
 
-**Archive tooling: two tools, chosen for what each is licensed and able to do.** `7zz` (the
-`7zip` package — 7-Zip proper, not p7zip) covers zip / 7z / tar / gz / bz2 / xz. `unrar`, built
-from RARLAB source in its own builder stage, covers rar / rar5 — Alpine's `7zz` build ships
+**Archive tooling: two tools, both built from upstream source (2026-11-26).** `7zz` (7-Zip
+proper, not p7zip) covers zip / 7z / tar / gz / bz2 / xz and is built from the official
+`ip7z/7zip` GitHub release (pinned sha256) in `sevenzip-builder`; Alpine's `7zip` package is
+no longer used because 3.24 stays at 26.01, which has CVE-2026-14266 (XZ decoder heap overflow,
+fixed in 26.02) on exactly the input this app feeds it. `unrar`, built from RARLAB source in
+`unrar-builder` (pinned sha256; the banner is asserted `UNRAR 7.23`, not a beta), covers rar /
+rar5. Bump procedure: `docs/decisions.md`, 2026-11-26. Before that, Alpine's `7zz` build shipped
 with no RAR codec at all (7-Zip's RAR decoder derives from unRAR source, whose licence Alpine's
 `main` repo won't carry), and no packaged alternative (`unrar`, `unrar-free`, `unar`, `p7zip`)
-exists in Alpine's indexes either. Both tools only ever extract; neither builds nor
+exists in Alpine's indexes either. (An *upstream* 7zz build does contain a RAR decoder, so the
+in-image check lists it; lftpweb still routes rar to `unrar`.) Both tools only ever extract; neither builds nor
 re-compresses an archive, which is what keeps unRAR's own "no RAR-compatible archiver" licence
 restriction out of scope. See `NOTICE` and `docs/decisions.md` for the full licence reasoning
 and the rejected `libarchive-tools` alternative.

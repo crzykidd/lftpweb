@@ -10,15 +10,14 @@ See LICENSE for the full text.
 Third-party software distributed in the container image
 -------------------------------------------------------
 
-The lftpweb container image bundles unmodified third-party programs from the Alpine
-Linux package repositories. They are aggregated with lftpweb, not derived from it or
+The lftpweb container image bundles unmodified third-party programs, most from the Alpine
+Linux package repositories (`7zz` and `unrar` are built from upstream source instead; see
+below). They are aggregated with lftpweb, not derived from it or
 linked into it — lftpweb invokes them as separate processes — so each remains under
 its own licence:
 
   lftp             GPL-3.0-or-later   https://lftp.yar.ru/
   openssh-client   BSD-style          https://www.openssh.com/
-  7zip (7zz)       LGPL-2.1-or-later, with the unRAR restriction applying to its
-                   RAR decoding code   https://www.7-zip.org/
   su-exec          MIT                https://github.com/ncopa/su-exec
   tini             MIT                https://github.com/krallin/tini
 
@@ -26,15 +25,26 @@ Complete corresponding source for these packages is available from the Alpine Li
 project at https://pkgs.alpinelinux.org/ — the image ships them unmodified, exactly as
 packaged there.
 
-The image also bundles a program built from third-party source, rather than an
-unmodified Alpine package — the distinction matters for where its complete
-corresponding source lives:
+The image also bundles two programs built from third-party source, rather than unmodified
+Alpine packages — the distinction matters for where their complete corresponding source
+lives:
 
+  7zz (7-Zip)      GNU LGPL, with the unRAR restriction applying to its RAR
+                   decoding code   https://www.7-zip.org/
   unrar            unRAR licence (freeware; source-derived   https://www.rarlab.com/
                    restriction below)
 
+`7zz` is compiled by `docker/Dockerfile`'s `sevenzip-builder` stage from the official 7-Zip
+source release (currently 26.06, `7z2606-src.tar.xz` from
+https://github.com/ip7z/7zip/releases, sha256 pinned in the Dockerfile), unmodified apart from
+the static-libstdc++ link flags recorded there. It replaces Alpine's `7zip` package, which
+lagged a security fix (see docs/decisions.md, 2026-11-26). Complete corresponding source is
+the same release archive; because the binary is LGPL, that URL and the pinned version above
+are the source offer for it. Unlike Alpine's build, an upstream `7zz` contains a RAR decoder,
+so the unRAR restriction (below) applies to this binary as well; lftpweb only extracts.
+
 `unrar` is compiled by `docker/Dockerfile`'s `unrar-builder` stage directly from
-RARLAB's published unrarsrc release (currently 7.2.3), unmodified apart from the build
+RARLAB's published unrarsrc release (currently `unrarsrc-7.2.7`, UnRAR 7.23), unmodified apart from the build
 flags recorded in that Dockerfile stage; the source itself is not vendored into this
 repository. It is aggregated with lftpweb the same way the Alpine packages above are —
 invoked as a separate process, not linked into lftpweb — so it remains under its own
@@ -44,11 +54,12 @@ https://www.rarlab.com/rar_add.htm.
 Note on lftp: lftpweb runs lftp as a subprocess and communicates with it at arm's
 length. It does not link against lftp, and is not a derivative work of it.
 
-Note on 7zip's RAR support: 7-Zip's RAR decoder derives from the unRAR source, whose
+Note on 7-Zip's RAR support: 7-Zip's RAR decoder derives from the unRAR source, whose
 licence forbids using it to develop a RAR-compatible archiver. lftpweb only extracts
-archives; it never creates them. Alpine's own `7zip` package ships without any RAR
-codec at all (verified against the built image, not just read about) — this is why
-`unrar` above exists in this image separately from `7zz`.
+archives; it never creates them. Alpine's own `7zip` package shipped without any RAR
+codec at all (verified against a built image, not just read about), which is why `unrar`
+was added to this image separately; the upstream `7zz` now built here does include a RAR
+decoder, but lftpweb still routes rar/rar5 to `unrar`.
 
 Note on unrar: the UnRAR source licence is freeware. It permits using and
 redistributing the UnRAR utility, including inside other software packages, without

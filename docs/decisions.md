@@ -6,6 +6,51 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-11-26 — 7-Zip and unrar built from upstream source; base re-pinned; apk upgrade
+
+`prompts/done/2026-11-26-d1d2-image-refresh-and-extractors.md` (audit batches D1 + D2,
+`private_data/security-audit-2026-11-26.md` F3/F4/F5/F7/F17).
+
+**Decision.** `7zz` is built from the official 7-Zip source (`ip7z/7zip` GitHub release 26.06,
+`7z2606-src.tar.xz`, `makefile.gcc` in `CPP/7zip/Bundles/Alone2`, static libstdc++) in a
+`sevenzip-builder` stage; Alpine's `7zip` package is dropped from both runtime and dev. `unrar`
+stays a source build, bumped to tarball `unrarsrc-7.2.7`, which is **UnRAR 7.23 final**.
+
+**Why not an Alpine edge package.** The alternative was pinning `7zip` from `edge/community`
+(26.06 there). Rejected: mixing edge into a 3.24 image pulls edge's musl/libstdc++ ABI along with
+it or risks a half-upgrade, adds an unpinned moving repository to a build whose point is pinned
+inputs, and gives no integrity anchor beyond "whatever edge has today". A tarball with a pinned
+sha256 is reproducible and fails loudly. Cost: we now own the build and must bump it.
+
+**Version-string traps.** unrar's tarball number does not map to its banner: `7.2.3` = "7.20 beta
+3", `7.2.4` = 7.20, `7.2.5`/`7.2.6` = 7.21 beta/final, `7.2.7` = 7.23 final, `7.3.1`/`7.3.2` =
+"7.30 beta 1/2". The newest file on rarlab.com (7.3.2) is a beta, so the newest *final* is used,
+and the Dockerfile build step **fails if the banner is not `UNRAR 7.23 freeware`** -- bump the
+banner string deliberately with the version. 7.2.7 is still hosted but no longer linked from
+rar_add.htm; if it ever disappears, pick the newest final then and re-check version.hpp
+(`RARVER_BETA 0`).
+
+**Hash provenance.** 7-Zip: 7-zip.org's download page links the GitHub release assets (and
+hosts no 26.06 source of its own); the pinned sha256 was computed from a download and equals the
+digest GitHub's releases API reports for the asset. unrar: computed from the download from
+rarlab.com; rarlab publishes no checksum, so there is no independent cross-check.
+
+**To bump.** 7-Zip: set `SEVENZIP_VERSION` and `SEVENZIP_SHA256` (download the
+`7zNNNN-src.tar.xz` asset, `sha256sum`, compare with `gh api repos/ip7z/7zip/releases/tags/<v>`
+asset `digest`). unrar: download candidate tarballs, read `unrar/version.hpp`, pick the newest
+with `RARVER_BETA 0`, set both ARGs and the banner assertion. Then build and run `7zz i` /
+`unrar` in the image.
+
+**Upstream 7zz has a RAR decoder** (`7zz i` lists Rar, Rar5, Rar1-3), unlike Alpine's build.
+lftpweb still sends rar to `unrar`; the 2026-08-12 rule stands: assert in the built image what
+each binary decodes, never assume from a package name. Licensing is in `NOTICE`.
+
+**Base.** Both `FROM python:3.13-alpine@sha256:...` lines now pin `9ef1a599...` (Alpine 3.24.4,
+Python 3.13.18). `apk upgrade --no-cache` runs in `python-base` and the runtime stage so
+Alpine fixes newer than the pinned digest land; a stale CI `apk add` layer cache is batch D3.
+
+---
+
 ## 2026-11-26 — lftp quoting: measure the grammar, refuse what cannot be quoted
 
 `prompts/done/2026-11-26-c1-lftp-quoting.md` (security audit F1 / batch C1). `_lftp_quote` quoted
