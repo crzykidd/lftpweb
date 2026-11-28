@@ -81,6 +81,15 @@ Skeleton for the next roll:
 ### Fixed
 ### Security
 
+- **Upgrade note: this release fixes security issues. Pull the new image** (deployments do not
+  auto-update). **No configuration change is required**: every hardening item below either
+  changes nothing until you opt in, or only applies when you take a new action (saving a
+  setting, changing an endpoint). Recommended after upgrading: set `LFTPWEB_ALLOWED_HOSTS` to the
+  names you open lftpweb by, and, behind a TLS-terminating reverse proxy, set
+  `LFTPWEB_TRUSTED_PROXIES` to the proxy's address. If you run auth mode `none`, read the
+  README's "Network exposure" section: that mode must only be used on a network where everything
+  that can reach the port is trusted. The limits that remain are listed under "Known gaps."
+
 - **Smaller auth and reverse-proxy hardening. No action needed on upgrade.** Nothing here changes
   how an existing install behaves unless you opt in or take the specific action described.
   `/docs`, `/redoc` and `/openapi.json` now sit behind the same login as the API (they were public
@@ -93,11 +102,6 @@ Skeleton for the next roll:
   unchanged. Changing the password or turning `password` mode off through the settings API now
   asks for the current password (the Settings page shows the field when needed), counted by the
   login rate limiter; first-time setup and other edits ask for nothing.
-
-- **Upgrade note: this release fixes security issues. Pull the new image** (deployments do not
-  auto-update), and if you run auth mode `none`, read the README's "Network exposure" section
-  first: that mode must only be used on a network where everything that can reach the port is
-  trusted. Several hardening items remain open and are listed under "Known gaps."
 
 - **A seedbox file or folder name could run a command inside the container.** The quoting
   lftpweb applied to names before handing them to lftp followed shell rules that lftp does not

@@ -493,10 +493,11 @@ worked around:
 
 **Read this before publishing the port to anything you don't fully control.**
 
-- **`none` mode means anyone who can reach the port controls lftpweb completely** — including
-  running commands inside the container and reading the seedbox credentials. Only use it on a
-  network where every device and every person is trusted. A browser on that network that visits
-  a malicious website counts as a device on it, so "my home LAN" is not automatically safe.
+- **`none` mode means anyone who can reach the port controls lftpweb completely** — every
+  setting, every queue and every file it can reach, including pointing paths anywhere the
+  container can write. Only use it on a network where every device and every person is trusted.
+  A browser on that network that visits a malicious website counts as a device on it, so "my
+  home LAN" is not automatically safe.
 - **Prefer `password` mode**, or `proxy` mode behind a reverse proxy that authenticates people.
 - **The shipped `docker-compose.yml` publishes the UI on loopback only** (`"127.0.0.1:8087:8087"`),
   so a fresh install is not reachable from the network until you choose that. To reach it from
@@ -551,8 +552,9 @@ worked around:
   files are refused when you save, along with anything that isn't a plain `set <key> <value>`.
   A value saved by an older version that breaks this is not held against your transfers: its bad
   lines are skipped, the good ones apply, and a banner says what was ignored.
-- **Never expose lftpweb directly to the internet, in any auth mode,** until the remaining
-  hardening listed under "Known gaps" has landed.
+- **Never expose lftpweb directly to the internet, in any auth mode.** Put it behind a reverse
+  proxy or tunnel that authenticates people, or a VPN. The limits that remain are listed under
+  "Known gaps."
 - **If an install ever had `none` mode reachable from a network you did not trust**, treat its
   stored credentials as exposed: rotate the seedbox SSH credential and the SABnzbd, rTorrent,
   Sonarr and Radarr keys.
