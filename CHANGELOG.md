@@ -89,7 +89,9 @@ Skeleton for the next roll:
   (for example one starting with `-` or containing a space), instead of failing at transfer time.
 
 ### Fixed
-### Security
+#- Pages no longer pause for several seconds every few seconds on installs with many torrents:
+  matching downloads to items is now indexed.
+## Security
 
 - **Upgrade note: this release fixes security issues. Pull the new image** (deployments do not
   auto-update). **No configuration change is required**: every hardening item below either

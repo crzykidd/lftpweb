@@ -934,6 +934,13 @@ class ClientSyncScheduler:
         candidate and IS overwritten on a fresh match here -- a release genuinely re-fetched by a
         different client is a real fact worth recording, not noise to suppress, and there is no
         other signal available that could tell the two cases apart.
+
+        **Indexed, not scanned** (F4, 2026-11-27): the candidates are indexed once by normalised
+        item path and each transfer looks up its own `content_path` and every component-boundary
+        ancestor, so the cost is O(transfers x path depth), not O(transfers x items) -- the old
+        nested loop made ~3 M matcher calls per pass on the event loop and froze the server for
+        seconds. Results are identical: the winner is still the first candidate in query order
+        that matches and was not already matched this pass.
         """
         queue_remote_paths = {q["id"]: q["remote_path"] for q in path_queues if q["remote_path"]}
         if not queue_remote_paths or not any(t.content_path for t in transfers):
@@ -949,25 +956,43 @@ class ClientSyncScheduler:
         if not candidates:
             return
 
+        # Index, don't scan (F4, 2026-11-27): every candidate's normalised item path -> its
+        # (query-order position, id), built once, so each transfer costs O(path depth) lookups
+        # instead of one `_client_content_path_matches` call per candidate.
+        by_path: dict[str, list[tuple[int, int]]] = {}
+        for pos, item in enumerate(candidates):
+            root = (
+                queue_remote_paths[item["queue_id"]].rstrip("/") + "/" + item["rel_path"]
+            ).rstrip("/")
+            if root:  # an empty root never matches anything, same as the matcher
+                by_path.setdefault(root, []).append((pos, item["id"]))
+
         now_iso = _now_iso()
         matched_this_pass: set[int] = set()
         for transfer in transfers:
             if not transfer.content_path:
                 continue
-            for item in candidates:
-                if item["id"] in matched_this_pass:
-                    continue  # this pass already recorded this item for this instance
-                item_remote_path = (
-                    queue_remote_paths[item["queue_id"]].rstrip("/") + "/" + item["rel_path"]
-                )
-                if _client_content_path_matches(item_remote_path, transfer.content_path):
-                    await self.db.execute(
-                        "UPDATE item SET download_client_id = ?, download_client_matched_at = ? "
-                        "WHERE id = ?",
-                        (instance_id, now_iso, item["id"]),
-                    )
-                    matched_this_pass.add(item["id"])
+            # Equal, or a component-boundary ancestor: the same set the matcher accepts.
+            # Winner = the lowest query-order position not already matched this pass.
+            best: tuple[int, int] | None = None
+            prefix = transfer.content_path.rstrip("/")
+            while prefix:
+                for entry in by_path.get(prefix, ()):
+                    if entry[1] not in matched_this_pass:
+                        if best is None or entry[0] < best[0]:
+                            best = entry
+                        break  # entries per path are in position order
+                cut = prefix.rfind("/")
+                if cut <= 0:
                     break
+                prefix = prefix[:cut]
+            if best is not None:
+                await self.db.execute(
+                    "UPDATE item SET download_client_id = ?, download_client_matched_at = ? "
+                    "WHERE id = ?",
+                    (instance_id, now_iso, best[1]),
+                )
+                matched_this_pass.add(best[1])
         if matched_this_pass:
             await self.db.commit()
 

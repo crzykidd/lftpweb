@@ -6,6 +6,21 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-11-27 — Client attribution matches by path index, not a nested scan
+
+`prompts/done/2026-11-27-f4-client-attribution-event-loop-stall.md` (test finding F4).
+
+1. **Cause.** `_write_client_attribution` ran every reported transfer (1,005 from rTorrent)
+   against every candidate item (~3,000) through `_client_content_path_matches`: ~3 M pure-Python
+   calls per poll on the event loop, freezing the server for ~5 s.
+2. **Fix.** Index candidates once by normalised item path (with query-order position); per
+   transfer, look up `content_path` and each component-boundary ancestor. Winner is the lowest
+   query-order position not already matched this pass, so results are identical to the old loop.
+3. **Guard.** A randomised/adversarial equivalence test against the old algorithm (kept as a
+   test-only oracle) plus a 3,000 x 1,000 timing test (0.46 s -> 0.007 s locally).
+4. **Left alone.** `_attribution_sample` and `_update_preflight` match against enabled queues
+   (a handful), `finished_transfers` is linear; none is O(n x m) at scale.
+
 ## 2026-11-27 — Vanished `REMOTE_ONLY` rows resolve to `REMOVED_BOTH`, on fresh full scans only
 
 `prompts/done/2026-11-27-f3-vanished-remote-only-ghosts.md` (test finding F3).

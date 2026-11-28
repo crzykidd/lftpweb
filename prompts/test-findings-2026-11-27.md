@@ -112,3 +112,29 @@ The rows include every file inside a release folder (nested rows), not only rele
 
 The oldest `REMOVED_BOTH` dates from 2026-08-15, so nothing ever ages out. Pruning tombstones
 older than N days is a candidate alongside hiding them by default; that is the user's call.
+
+### F4: the server freezes for about 5 s roughly every 11 s; the download-client poller is the cause (done)
+
+> "the interface doesn't feel snappy.. a refresh of the page takes 5-6 seconds"
+
+- **Seen from outside:** 100 samples of `/api/health` at 0.5 s intervals. Nine of them took
+  4.3–5.5 s, about 11 s apart. Everything else answered in about 0.03 s. Any page load that
+  lands in a stall waits it out. The Transfers page itself is light: a 4.4 KB WebSocket
+  snapshot plus about 25 KB of REST.
+- **Seen from inside:** with `PYTHONASYNCIODEBUG=1` on the test container, every slow step,
+  4.2–5.7 s each, is `ClientSyncScheduler._loop` (`core/clientsync.py:571`, `run_once`).
+- **Profiled:** cProfile ran `run_once` twice in the container against a copy of the DB.
+  About 18 s of each roughly 21 s pass (cProfile makes it about 4× slower than normal) is in
+  **`_write_client_attribution`**, which made 6.09 M calls to
+  `settle._client_content_path_matches`. It is a nested loop: every reported transfer
+  (rTorrent returns **1,005**) against every candidate `item` row (about 3,000, including nested
+  rows and `REMOVED_BOTH` tombstones), all in pure Python on the event loop, every fast tick.
+- **Ruled out:**
+  - The rTorrent fetch takes 1.6 s, mostly awaited network time.
+  - The XML parse takes 0.1 s for 797 KB.
+  - The SAB fetch takes 0.6 s.
+  - The local scan and the NFS walk didn't show up.
+- **Proposed fix:** index the candidates by their normalised remote path once per pass. For each
+  transfer, look up `content_path` and each ancestor up to the queue root. That makes it
+  O(transfers × path depth) instead of O(transfers × items), with the same component-boundary
+  rule and the same "first candidate in query order wins" result.

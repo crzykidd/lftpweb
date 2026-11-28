@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import json
 import logging
+import random
+import time
 from datetime import UTC, datetime
 
 import aiosqlite
@@ -36,7 +38,11 @@ from lftpweb.core.clientsync import (
 )
 from lftpweb.core.clients.models import Transfer, TransferPhase
 from lftpweb.core.crypto import encrypt_secret
-from lftpweb.core.settle import SettleSettings, save_settle_settings
+from lftpweb.core.settle import (
+    SettleSettings,
+    _client_content_path_matches,
+    save_settle_settings,
+)
 from lftpweb.db import migrate
 
 # --- Fixtures / helpers -------------------------------------------------------------------------
@@ -1934,3 +1940,145 @@ async def test_post_processing_history_entry_keeps_and_updates_the_row(db, tmp_p
     rows = scheduler.preflight_rows(frozenset({instance_id}))
     assert len(rows) == 1
     assert rows[0].status_label == "verifying"
+
+
+# --- F4 (2026-11-27): `_write_client_attribution` is indexed, not O(transfers x items) ----------
+
+
+def _reference_attribution(candidates, queue_remote_paths, transfers) -> dict[int, int]:
+    """The pre-F4 nested loop, kept verbatim as the oracle: item id -> index of the transfer
+    that wrote it (the write order is what the winner rule decides)."""
+    matched: dict[int, int] = {}
+    for t_idx, transfer in enumerate(transfers):
+        if not transfer.content_path:
+            continue
+        for item in candidates:
+            if item["id"] in matched:
+                continue
+            item_remote_path = (
+                queue_remote_paths[item["queue_id"]].rstrip("/") + "/" + item["rel_path"]
+            )
+            if _client_content_path_matches(item_remote_path, transfer.content_path):
+                matched[item["id"]] = t_idx
+                break
+    return matched
+
+
+async def test_write_client_attribution_matches_the_reference_algorithm(db, tmp_path):
+    rng = random.Random(20261127)
+    host_id = await _seed_host(db)
+    queue_ids = [
+        await _seed_queue(db, host_id, name="a", remote_path="/c/tv"),
+        await _seed_queue(db, host_id, name="b", remote_path="/c/tv/"),  # trailing slash
+        await _seed_queue(db, host_id, name="c", remote_path="/c/tv/Show.S01"),  # nested root
+        await _seed_queue(db, host_id, name="d", remote_path="/other"),
+    ]
+    inst = await _seed_client(db, str(tmp_path), base_url="http://x.invalid", api_key="k")
+    other = await _seed_client(
+        db, str(tmp_path), name="O", base_url="http://y.invalid", api_key="k"
+    )
+    names = ["Show.S01", "Show.S01.EXTRA", "Show.S02", "x", "Show.S01/E01", "Show.S01/E01/f.mkv"]
+    for q in queue_ids:
+        for n in names:
+            variant = n + rng.choice(["", "", "/"])
+            owner = rng.choice([None, None, inst, other])
+            try:
+                await _seed_item(db, q, variant, download_client_id=owner)
+            except aiosqlite.IntegrityError:
+                pass
+    parts = [
+        "/c/tv",
+        "/c/tv/",
+        "/c/tv/Show.S01",
+        "/c/tv/Show.S01.EXTRA",
+        "/c/tv//Show.S01",
+        "/c/tv/Show.S01/E01",
+        "/c/tv/Show.S01/E01/f.mkv",
+        "/other/x/",
+        "/other",
+        "/c",
+        "/",
+        "/c/tv/Show.S02/f.mkv",
+        "/nope",
+        "rel/x",
+    ]
+    total_written = 0
+    for round_ in range(40):
+        transfers = [
+            _content_transfer(
+                f"t{i}",
+                content_path=rng.choice(parts + [None, ""])
+                if rng.random() < 0.8
+                else rng.choice(parts) + "/" + rng.choice(names),
+            )
+            for i in range(rng.randint(1, 12))
+        ]
+        path_queues = await (
+            await db.execute("SELECT id, name, short_name, remote_path FROM path_queue")
+        ).fetchall()
+        qrp = {q["id"]: q["remote_path"] for q in path_queues}
+        await db.execute(
+            "UPDATE item SET download_client_id = NULL WHERE download_client_id = ?", (inst,)
+        )
+        before = {
+            r["id"]: r["download_client_id"]
+            for r in await (await db.execute("SELECT id, download_client_id FROM item")).fetchall()
+        }
+        candidates = await (
+            await db.execute(
+                "SELECT id, queue_id, rel_path FROM item WHERE queue_id IN (?,?,?,?) "
+                "AND (download_client_id IS NULL OR download_client_id != ?)",
+                (*qrp, inst),
+            )
+        ).fetchall()
+        expected = set(_reference_attribution(candidates, qrp, transfers))
+        scheduler = ClientSyncScheduler(db=db, config_dir=str(tmp_path))
+        await scheduler._write_client_attribution(inst, transfers, path_queues)
+        after = {
+            r["id"]: r["download_client_id"]
+            for r in await (await db.execute("SELECT id, download_client_id FROM item")).fetchall()
+        }
+        written = {i for i in after if after[i] == inst and before[i] != inst}
+        assert written == expected, f"round {round_}"
+        total_written += len(written)
+        assert all(after[i] == before[i] for i in after if i not in written)
+    assert total_written > 50  # the inputs really exercise matching
+
+
+async def test_write_client_attribution_is_fast_at_scale(db, tmp_path):
+    host_id = await _seed_host(db)
+    queue_id = await _seed_queue(db, host_id, remote_path="/complete/ar-tv")
+    inst = await _seed_client(db, str(tmp_path), base_url="http://x.invalid", api_key="k")
+    await db.executemany(
+        "INSERT INTO item (queue_id, rel_path, is_dir, state) VALUES (?, ?, 0, 'DOWNLOADED')",
+        [
+            (
+                queue_id,
+                f"Show.{i}.S01",
+            )
+            for i in range(3000)
+        ],
+    )
+    await db.commit()
+    path_queues = await (
+        await db.execute("SELECT id, name, short_name, remote_path FROM path_queue")
+    ).fetchall()
+    transfers = [
+        _content_transfer(f"t{i}", content_path=f"/seed/elsewhere/Show.{i}.S01/f.mkv")
+        for i in range(900)
+    ] + [
+        _content_transfer(f"m{i}", content_path=f"/complete/ar-tv/Show.{i}.S01/f.mkv")
+        for i in range(100)
+    ]
+    scheduler = ClientSyncScheduler(db=db, config_dir=str(tmp_path))
+    start = time.perf_counter()
+    await scheduler._write_client_attribution(inst, transfers, path_queues)
+    elapsed = time.perf_counter() - start
+    print(f"F4 attribution, 3000 candidates x 1000 transfers: {elapsed:.3f}s")
+    assert elapsed < 0.2  # old nested loop: ~0.46 s here; generous for CI
+    n = (
+        await (
+            await db.execute("SELECT COUNT(*) FROM item WHERE download_client_id = ?", (inst,))
+        ).fetchone()
+    )[0]
+    assert n == 100
