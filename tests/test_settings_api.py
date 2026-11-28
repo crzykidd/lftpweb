@@ -91,19 +91,20 @@ def test_put_host_without_new_password_keeps_previous_one(isolated_config):
                 "password": "hunter2",
             },
         )
-        # Update the address only; omit password entirely.
+        # Update something other than the endpoint (the name); omit password entirely. (An
+        # address change now needs the password again -- audit C4, tests/test_secret_redirect.py.)
         resp = client.put(
             "/api/settings/host",
             json={
-                "name": "seedbox",
-                "address": "example2.invalid",
+                "name": "seedbox renamed",
+                "address": "example.invalid",
                 "username": "seeduser",
                 "auth_method": "password",
             },
         )
         assert resp.status_code == 200
         assert resp.json()["has_password"] is True
-        assert resp.json()["address"] == "example2.invalid"
+        assert resp.json()["name"] == "seedbox renamed"
 
 
 def test_put_host_key_auth_requires_key_path(isolated_config):

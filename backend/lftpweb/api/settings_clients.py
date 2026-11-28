@@ -38,6 +38,7 @@ from lftpweb.core.clients.detection import (
 from lftpweb.core.clients.errors import CapabilityUnavailable, ClientError, ClientUnreachable
 from lftpweb.core.clientsync import persist_observed_categories
 from lftpweb.core.crypto import DecryptionError, decrypt_secret, encrypt_secret
+from lftpweb.core.endpoint_identity import url_identity
 from lftpweb.core.engine import load_host_config
 from lftpweb.models import (
     ClientConfigFieldOut,
@@ -177,6 +178,58 @@ def _secret_provided(client_class: type[DownloadClient], config: dict[str, Any])
     is left untouched, byte for byte, with no decrypt-merge-reencrypt round trip needed.
     """
     return any(config.get(f.key) for f in client_class.config_schema if f.kind == "secret")
+
+
+def _client_endpoint_identity(
+    client_type: str, client_class: type[DownloadClient], non_secret: dict[str, Any]
+):
+    """Where this connector's secret would be sent (audit batch C4, F6): the connector type, the
+    normalised `base_url`, and `rpc_path` where the schema declares one (rTorrent sends its
+    credentials to `<base_url><rpc_path>`). A schema with no `base_url` has no network endpoint to
+    redirect, so only the type counts.
+    """
+    keys = {f.key: f for f in client_class.config_schema}
+    if "base_url" not in keys:
+        return (client_type,)
+    rpc_path = None
+    if "rpc_path" in keys:
+        rpc_path = non_secret.get("rpc_path") or keys["rpc_path"].default
+    return (client_type, url_identity(non_secret.get("base_url"), rpc_path))
+
+
+def _refuse_secret_reuse_on_endpoint_change(
+    client_class: type[DownloadClient],
+    body_client_type: str,
+    body_config: dict[str, Any],
+    non_secret: dict[str, Any],
+    existing,
+) -> None:
+    """Raise 422 when the endpoint moved and the request supplied no new secret, so the stored
+    one would be sent somewhere new. Must run before anything is tested, saved or contacted.
+    Unchanged identity (normalised) keeps today's behaviour: blank means keep.
+    """
+    if not existing["secret_enc"] or _secret_provided(client_class, body_config):
+        return
+    try:
+        stored_class = get_client_class(existing["client_type"])
+        stored_non_secret = json.loads(existing["config_json"]) if existing["config_json"] else {}
+        before = _client_endpoint_identity(existing["client_type"], stored_class, stored_non_secret)
+    except KeyError:
+        before = (existing["client_type"],)
+    after = _client_endpoint_identity(body_client_type, client_class, non_secret)
+    if before == after:
+        return
+    secrets = [f for f in client_class.config_schema if f.kind == "secret"]
+    if not secrets:
+        return
+    labels = " and ".join(f.label for f in secrets)
+    raise HTTPException(
+        status_code=422,
+        detail=(
+            f"config.{secrets[0].key}: The URL changed, so re-enter the {labels} - the saved "
+            "secret is only sent to the address it was saved for."
+        ),
+    )
 
 
 async def _reject_invalid_base_paths(request: Request, paths: list[str]) -> None:
@@ -606,6 +659,10 @@ async def update_client_instance(
 
     client_class = _get_client_class_or_400(body.client_type)
     non_secret = _validate_and_split_non_secret(client_class, body.config)
+    # C4: before anything is tested, saved or contacted.
+    _refuse_secret_reuse_on_endpoint_change(
+        client_class, body.client_type, body.config, non_secret, existing
+    )
 
     config_dir = request.app.state.config_dir
     if _secret_provided(client_class, body.config):

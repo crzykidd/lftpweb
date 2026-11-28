@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import { getHost, putHost, testHost } from '../../api/client'
 import type { AuthMethod, HostOut, KnownHostsPolicy, TestConnectionResponse } from '../../api/types'
 import { FieldHelp } from '../../components/FieldHelp'
+import { sshIdentityKey } from '../../lib/endpointIdentity'
 
 const inputClasses =
   'w-full rounded-md border border-zinc-300 bg-white px-2.5 py-1.5 text-sm text-zinc-900 outline-none focus:border-zinc-500 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100'
@@ -46,6 +47,16 @@ export function ConnectionTab() {
   const [testing, setTesting] = useState(false)
   const [testResult, setTestResult] = useState<TestConnectionResponse | null>(null)
   const [error, setError] = useState<string | null>(null)
+  // Audit C4: the saved password is only sent to the address/port/username it was saved for.
+  // Advisory -- the server decides; this marks the field required and says why.
+  const passwordReentryNeeded =
+    saved != null &&
+    saved.has_password &&
+    saved.auth_method === 'password' &&
+    form.auth_method === 'password' &&
+    form.password === '' &&
+    sshIdentityKey(form.address, form.port, form.username) !==
+      sshIdentityKey(saved.address, saved.port, saved.username)
 
   useEffect(() => {
     getHost()
@@ -213,15 +224,23 @@ export function ConnectionTab() {
       {form.auth_method === 'password' && (
         <label className="flex flex-col gap-1">
           <span className={labelClasses}>
-            Password {saved?.has_password && <span className="text-zinc-400">(leave blank to keep the stored one)</span>}
+            Password{passwordReentryNeeded ? ' *' : ''} {saved?.has_password && !passwordReentryNeeded && <span className="text-zinc-400">(leave blank to keep the stored one)</span>}
           </span>
           <input
             type="password"
             className={inputClasses}
             value={form.password}
             onChange={(e) => update('password', e.target.value)}
+            aria-required={passwordReentryNeeded || undefined}
+            aria-invalid={passwordReentryNeeded || undefined}
             autoComplete="new-password"
           />
+          {passwordReentryNeeded && (
+            <p className="text-xs text-zinc-500 dark:text-zinc-400">
+              The address, port or username changed, so re-enter the password — the saved password is only sent
+              to the host it was saved for.
+            </p>
+          )}
         </label>
       )}
 

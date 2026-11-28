@@ -129,6 +129,17 @@ Skeleton for the next roll:
   that carries a link now fails to extract instead of extracting** — legitimate releases
   essentially never contain links; if one does, extract it by hand.
 
+- **A stored secret could be sent to a different server by editing the address.** Saved
+  passwords and API keys are write-only, so leaving the field blank means "keep the saved one"
+  — but changing the URL (download clients, Sonarr/Radarr) or the host address, port or username
+  (seedbox, password auth) with the field blank sent the *saved* secret to the *new* endpoint,
+  for someone who could only write settings. **Changing an endpoint now asks for the secret
+  again**: the request is refused (422) before anything is contacted, and the form marks the
+  field required with the reason. **No action is needed on upgrade**: saved configs keep
+  working, saves that don't change the endpoint still work with the secret blank, and trivial
+  edits (a trailing slash, hostname case, an explicit default port, stray whitespace) don't count
+  as a change. Key-based seedbox auth sends no secret and is unaffected.
+
 ### Deprecated
 
 ### Removed

@@ -123,8 +123,10 @@ mismatch; `X-Requested-With` always passes; curl/scripts pass; `password` CSRF t
 allow-listed `set` lines and re-emitted (a stored bad line is skipped, never holds transfers,
 reported in `/api/health.lftp_settings_ignored`), `HostIn.address` validated at the API.
 Decisions in `docs/decisions.md` 2026-11-26. Settings write still reaches any writable path via
-queue/extract paths (README Known gaps). **Deferred, not fixed (report §5):** C4 - stored secrets
-redirectable on endpoint change; C5 - public `/docs`/`/openapi.json`, proxy-aware `Secure` cookie
+queue/extract paths (README Known gaps). **C4 done (commit pending, `prompts/done/2026-11-27-c4-secrets-cannot-be-redirected.md`):** a stored
+secret is only sent to the endpoint it was saved for - changing a client/*arr URL or the seedbox
+address/port/username (password auth) with the secret blank is a 422, trivial edits normalised away
+(`core/endpoint_identity.py`), non-breaking. **Deferred, not fixed (report §5):** C5 - public `/docs`/`/openapi.json`, proxy-aware `Secure` cookie
 and login rate limiter, current password on `PUT` password change; D3 - CI image scanning, SBOM,
 stale-layer cache, dev-dependency bumps. The test deployment is LAN-only per the user. **Do not tag `0.4.0` as safe for exposure until these land.**
 

@@ -477,8 +477,12 @@ worked around:
   "potentially trustworthy" URLs), so there the `Origin` check is the protection. With
   `LFTPWEB_ALLOWED_HOSTS` unset, a WebSocket from a browser that omits `Sec-Fetch-Site` is not
   refused, even if its `Origin` differs from `Host`; that is only logged.
-- **Stored secrets can be redirected.** Changing an endpoint's address does not require
-  re-entering its stored credential, so someone with settings write access can send it elsewhere.
+- **A stored secret is only sent to the endpoint it was saved for.** Changing a download
+  client's or *arr instance's URL, or the seedbox address, port or username (password auth),
+  requires re-entering the secret; leaving it blank is refused with a 422. Edits that don't move
+  the endpoint (trailing slash, hostname case, explicit default port) still keep the saved secret.
+  Someone with settings write access can still *replace* a secret or point an endpoint at a
+  server they run by supplying a secret, but can no longer recover a saved one that way.
 - **`/docs` and `/openapi.json` are public**, even with auth on.
 - **The session cookie's `Secure` flag and the login rate limiter don't understand a reverse
   proxy**, so behind a TLS-terminating proxy they may misjudge the connection and every client.

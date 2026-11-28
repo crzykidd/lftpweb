@@ -27,6 +27,7 @@ import {
   type BasePathDraft,
 } from '../../lib/clientBasePathDetection'
 import { capabilityRows, type CapabilityRow } from '../../lib/clientCapabilities'
+import { urlIdentityKey } from '../../lib/endpointIdentity'
 import {
   canRemoveCategoryRow,
   computeCategoryRows,
@@ -527,6 +528,24 @@ export function ClientsTab() {
   // render that needs it (the source hint, each row's staleness/removability), rather than three
   // call sites independently re-deriving the same fallback chain and risking them drifting apart.
   const editingInstance = editingId != null ? instances.find((i) => i.id === editingId) : undefined
+  // Audit C4: the saved secret is only sent to the endpoint it was saved for. Advisory -- the
+  // server decides; once the connection address moves with every secret field blank, the secret
+  // fields are marked required and say why. Same normalisation as the backend.
+  const secretReentryNeeded = (() => {
+    if (!editingInstance?.has_secret || !selectedType) return false
+    const schema = selectedType.config_schema
+    if (schema.some((f) => f.kind === 'secret' && (form.secrets[f.key] ?? '') !== '')) return false
+    const rpcDefault = schema.find((f) => f.key === 'rpc_path')?.default
+    const identity = (cfg: Record<string, unknown>) =>
+      urlIdentityKey(
+        String(cfg.base_url ?? ''),
+        schema.some((f) => f.key === 'rpc_path') ? String(cfg.rpc_path || rpcDefault || '') : null,
+      )
+    return (
+      schema.some((f) => f.key === 'base_url') &&
+      identity(form.config as Record<string, unknown>) !== identity(editingInstance.config)
+    )
+  })()
   const sessionDetectedCategories = editingId != null ? testResults[editingId]?.detected_categories : undefined
   const detectedCategories: string[] | null =
     sessionDetectedCategories ?? editingInstance?.detected_categories ?? null
@@ -1150,20 +1169,30 @@ export function ClientsTab() {
               <label key={field.key} className="flex flex-col gap-1">
                 <span className={labelClasses}>
                   {field.label}
-                  {field.required ? ' *' : ''}
+                  {field.required || secretReentryNeeded ? ' *' : ''}
                 </span>
                 <input
                   type="password"
                   className={inputClasses}
                   value={form.secrets[field.key] ?? ''}
                   onChange={(e) => updateSecret(field.key, e.target.value)}
+                  aria-required={secretReentryNeeded || undefined}
+                  aria-invalid={secretReentryNeeded || undefined}
                   placeholder={
-                    editingId != null && instances.find((i) => i.id === editingId)?.has_secret
-                      ? '•••••••• (leave every secret field blank to keep the stored values)'
-                      : ''
+                    secretReentryNeeded
+                      ? 're-enter this value'
+                      : editingId != null && instances.find((i) => i.id === editingId)?.has_secret
+                        ? '•••••••• (leave every secret field blank to keep the stored values)'
+                        : ''
                   }
                   autoComplete="off"
                 />
+                {secretReentryNeeded && (
+                  <p className={hintClasses}>
+                    The connection address changed, so re-enter this value — the saved secret is only sent to
+                    the address it was saved for.
+                  </p>
+                )}
                 {field.help_text && <p className={hintClasses}>{field.help_text}</p>}
               </label>
             )

@@ -10,6 +10,7 @@ import {
 } from '../../api/client'
 import type { ArrInstanceOut, ArrKind, ArrPollSettingsOut, ArrTestResponse } from '../../api/types'
 import { FieldHelp } from '../../components/FieldHelp'
+import { urlIdentityKey } from '../../lib/endpointIdentity'
 
 const inputClasses =
   'w-full rounded-md border border-zinc-300 bg-white px-2.5 py-1.5 text-sm text-zinc-900 outline-none focus:border-zinc-500 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100'
@@ -194,6 +195,14 @@ export function IntegrationsTab() {
 
   const [form, setForm] = useState<FormState>(EMPTY_FORM)
   const [editingId, setEditingId] = useState<number | null>(null)
+  // Audit C4: the saved key is only sent to the URL it was saved for. Advisory -- the server
+  // decides; this just marks the field required and says why once the URL has moved.
+  const editingInstance = editingId != null ? instances.find((i) => i.id === editingId) : undefined
+  const keyReentryNeeded =
+    editingInstance != null &&
+    editingInstance.has_api_key &&
+    form.api_key === '' &&
+    urlIdentityKey(form.base_url) !== urlIdentityKey(editingInstance.base_url)
 
   const [testResults, setTestResults] = useState<Record<number, ArrTestResponse>>({})
   const [testingId, setTestingId] = useState<number | null>(null)
@@ -438,19 +447,29 @@ export function IntegrationsTab() {
         </label>
 
         <label className="flex flex-col gap-1">
-          <span className={labelClasses}>API key</span>
+          <span className={labelClasses}>API key{keyReentryNeeded ? ' *' : ''}</span>
           <input
             type="password"
             className={inputClasses}
             value={form.api_key}
             onChange={(e) => update('api_key', e.target.value)}
+            aria-required={keyReentryNeeded || undefined}
+            aria-invalid={keyReentryNeeded || undefined}
             placeholder={
-              editingId != null && instances.find((i) => i.id === editingId)?.has_api_key
-                ? '•••••••• (leave blank to keep the stored key)'
-                : 'paste the API key from Settings → General in Sonarr/Radarr'
+              keyReentryNeeded
+                ? 're-enter the API key'
+                : editingId != null && instances.find((i) => i.id === editingId)?.has_api_key
+                  ? '•••••••• (leave blank to keep the stored key)'
+                  : 'paste the API key from Settings → General in Sonarr/Radarr'
             }
             autoComplete="off"
           />
+          {keyReentryNeeded && (
+            <p className={hintClasses}>
+              The URL changed, so re-enter the API key — the saved key is only sent to the address it was saved
+              for.
+            </p>
+          )}
         </label>
 
         <label className="flex items-center gap-2">

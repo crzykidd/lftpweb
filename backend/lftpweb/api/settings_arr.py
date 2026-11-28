@@ -19,6 +19,7 @@ from lftpweb.core.arrsync import (
     save_arr_settings,
 )
 from lftpweb.core.crypto import DecryptionError, decrypt_secret, encrypt_secret
+from lftpweb.core.endpoint_identity import url_identity
 from lftpweb.models import (
     ArrInstanceIn,
     ArrInstanceOut,
@@ -149,6 +150,21 @@ async def update_arr_instance(
     existing = await _get_instance_row(db, instance_id)
     if existing is None:
         raise HTTPException(status_code=404, detail="arr instance not found")
+
+    # Audit batch C4 (F6): the stored key is only sent to the URL it was saved for. A trailing
+    # slash, hostname case, explicit default port or stray whitespace is not a change.
+    if (
+        not body.api_key
+        and existing["api_key_enc"]
+        and url_identity(body.base_url) != url_identity(existing["base_url"])
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "The URL changed, so re-enter the API key - the saved key is only sent to "
+                "the address it was saved for."
+            ),
+        )
 
     api_key_enc = (
         encrypt_secret(config_dir, body.api_key) if body.api_key else existing["api_key_enc"]

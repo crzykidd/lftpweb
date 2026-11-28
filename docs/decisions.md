@@ -6,6 +6,43 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-11-27 — A stored secret is only sent to the endpoint it was saved for (audit batch C4)
+
+`prompts/done/2026-11-27-c4-secrets-cannot-be-redirected.md` (audit §3 F6). Secrets are write-only
+and "blank means keep", so someone who could only write settings could change a URL or address,
+leave the secret blank, and have the stored one sent to a server they run. Fixed under the user's
+non-breaking rule for `0.4.0`: an upgrade that changes nothing must keep working.
+
+1. **What counts as identity** (`core/endpoint_identity.py`). URL: scheme, lowercased host, port
+   with the default filled in (80/443), credentials embedded in the URL, path without a trailing
+   slash, query. rTorrent's `rpc_path` is appended, because its credentials go to
+   `<base_url><rpc_path>`. SSH host: lowercased address, port, username. Download clients also
+   compare the connector type (a SABnzbd key must not be reused as an rTorrent password). Not
+   identity: display name, `kind`, enabled flags, rTorrent's username (same server, same
+   credential destination).
+2. **Why the path is included.** A different path on one host can be a different service behind a
+   reverse proxy (`/sabnzbd` vs `/other`), and it is where the secret actually goes. Rejected:
+   host-only, which would let an attacker with a path-routing proxy in front redirect a key.
+3. **Why trivial edits are normalised.** A trailing slash, hostname case, explicit `:80`/`:443`
+   and stray whitespace do not move the endpoint, and refusing them would make an upgrade ask
+   users for secrets they have no reason to retype. Stored configs are never rewritten, only
+   compared. An unparseable URL falls back to its stripped text, so a change still counts.
+4. **Where it is enforced.** Download-client `PUT` (covers test-on-save: refused before the
+   connection test), *arr `PUT`, seedbox `PUT` and `POST /host/test` with an override. Error:
+   422 with a string `detail` naming the field, matching each endpoint's existing 422s, and no
+   outbound call. Checked, no flaw: `POST /clients/{id}/test` and `POST /arr/{id}/test` take no
+   override body so they only use the stored endpoint; key-auth hosts send no secret. One
+   existing test asserted the old behaviour (address change, blank password, kept) and was
+   changed to a rename.
+5. **Client-side hint does not block.** The forms mark the secret field required (`aria-required`,
+   not the native `required`, so the browser never blocks a save) with an inline reason, using the
+   same normalisation in TypeScript. If the two ever disagree, the server's 422 is shown; the
+   server is the only gate. No confirm dialog, per the user's fewer-clicks preference.
+6. **Gap, named.** Someone with settings write can still replace a secret or point an endpoint at
+   their own server by *supplying* a secret; that is configuration, not recovery.
+
+---
+
 ## 2026-11-27 — C3 reworked to be non-breaking on upgrade
 
 `prompts/done/2026-11-27-c3-make-non-breaking.md`. The user's rule for `0.4.0`: an existing

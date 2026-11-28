@@ -1979,6 +1979,20 @@ looked at:
   `/api/health.lftp_settings_ignored` and a banner (log: WARNING once per distinct stored value).
 - **`HostIn.address`** is checked at the API with C1's own `lftp.ADDRESS_RE` (422).
 
+**A stored secret is never sent to a changed endpoint (audit batch C4, F6, 2026-11-27).**
+Secrets are write-only and "blank means keep", so editing an endpoint with the secret blank used
+to send the stored secret to the new address. `core/endpoint_identity.py` defines *endpoint
+identity* once: for a URL, scheme + lowercased host + port (scheme default filled in) + embedded
+credentials + path with no trailing slash (+ rTorrent's `rpc_path`); for the seedbox, lowercased
+address + port + username. Where a stored secret would be reused — download-client update and
+test-on-save (`api/settings_clients.py`, also the connector type), *arr instance update
+(`api/settings_arr.py`), seedbox save and the unsaved-form test (`api/settings_host.py`, password
+auth only; key auth sends no secret) — an identity change with no new secret is a 422 naming the
+field, raised before any test, save or connection. Identity unchanged (after normalisation) keeps
+the old behaviour. The standalone `/clients/{id}/test` and `/arr/{id}/test` take no override, so
+they only ever use the stored endpoint. The forms mark the secret required with an inline reason
+(`frontend/src/lib/endpointIdentity.ts`, same normalisation) but never block: the server decides.
+
 Seedbox credentials are encrypted at rest with a key derived from a per-install secret in
 `/config`. Log redaction as described in §4.2.
 

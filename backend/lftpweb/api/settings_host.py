@@ -10,6 +10,7 @@ from typing import Literal
 from fastapi import APIRouter, HTTPException, Request
 
 from lftpweb.core.crypto import DecryptionError, decrypt_secret, encrypt_secret
+from lftpweb.core.endpoint_identity import ssh_identity
 from lftpweb.core.remote import (
     HostConfig,
     InvalidPrivateKeyError,
@@ -26,6 +27,17 @@ from lftpweb.models import (
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/settings")
+
+# Audit batch C4 (F6): the stored password is only ever sent to the address/port/username it was
+# saved for. See `core/endpoint_identity.py` and docs/decisions.md (2026-11-27).
+_PASSWORD_REENTRY_MESSAGE = (
+    "The host address, port or username changed, so re-enter the password - the saved "
+    "password is only sent to the host it was saved for."
+)
+
+
+def _row_ssh_identity(row):
+    return ssh_identity(row["address"], row["port"], row["username"])
 
 
 async def _get_host_row(db):
@@ -134,6 +146,16 @@ async def put_host(body: HostIn, request: Request) -> HostOut:
     if body.auth_method == "password" and not body.password and not already_has_password:
         raise HTTPException(status_code=422, detail="auth_method 'password' requires password")
 
+    # C4: reusing the stored password for a different endpoint would send it there. Key auth sends
+    # no secret, so it is left alone. A changed endpoint with a new password is fine.
+    if (
+        already_has_password
+        and body.auth_method == "password"
+        and not body.password
+        and ssh_identity(body.address, body.port, body.username) != _row_ssh_identity(existing)
+    ):
+        raise HTTPException(status_code=422, detail=_PASSWORD_REENTRY_MESSAGE)
+
     password_enc = encrypt_secret(config_dir, body.password) if body.password else None
     ssh_key_enc = encrypt_secret(config_dir, body.ssh_key) if body.ssh_key else None
 
@@ -212,6 +234,19 @@ async def _resolve_host_config(request: Request, override: HostTestRequest | Non
                 status_code=409,
                 detail="stored credentials cannot be decrypted; re-enter the password",
             ) from exc
+
+    # C4: a test against a different address/port/username must not carry the stored password
+    # there. Refused before any connection is attempted (the caller never reaches the pool).
+    if (
+        override is not None
+        and row is not None
+        and auth_method == "password"
+        and password is not None
+        and not (override.password is not None)
+        and ssh_identity(field("address", ""), field("port", 22), field("username", ""))
+        != _row_ssh_identity(row)
+    ):
+        raise HTTPException(status_code=422, detail=_PASSWORD_REENTRY_MESSAGE)
 
     # migration 014: same "override, else stored, else nothing" resolution as password above,
     # so *Test connection* can validate a pasted-but-unsaved key too (§9.2's "test before

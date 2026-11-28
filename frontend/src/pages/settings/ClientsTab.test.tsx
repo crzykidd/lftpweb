@@ -451,6 +451,33 @@ describe('ClientsTab', () => {
     root.unmount()
   })
 
+  // Audit C4: a saved secret is only sent to the endpoint it was saved for.
+  it('marks the secret field required once the base URL moves, but not for a trailing slash', async () => {
+    mockListClientTypes.mockResolvedValue([USENET_TYPE])
+    mockListQueues.mockResolvedValue([])
+    mockListClientInstances.mockResolvedValue([instance({ id: 42 })])
+    const root = await mount(container, ['/settings/clients?edit=42'])
+
+    const urlInput = Array.from(container.querySelectorAll('input')).find(
+      (i) => i.value === 'http://seedbox:8080',
+    ) as HTMLInputElement
+    const secret = () => container.querySelector('input[type="password"]') as HTMLInputElement
+    expect(secret().getAttribute('aria-required')).toBeNull()
+
+    await act(async () => typeInto(urlInput, 'HTTP://Seedbox:8080/'))
+    expect(secret().getAttribute('aria-required')).toBeNull()
+    expect(container.textContent).not.toContain('only sent to')
+
+    await act(async () => typeInto(urlInput, 'http://elsewhere:8080'))
+    expect(secret().getAttribute('aria-required')).toBe('true')
+    expect(container.textContent).toContain('only sent to the address it was saved for')
+
+    await act(async () => typeInto(secret(), 'new-key'))
+    expect(secret().getAttribute('aria-required')).toBeNull()
+
+    root.unmount()
+  })
+
   it('ignores an ?edit= id that matches no known instance, rather than crashing', async () => {
     mockListClientTypes.mockResolvedValue([USENET_TYPE])
     mockListQueues.mockResolvedValue([])
