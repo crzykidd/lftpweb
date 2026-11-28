@@ -272,6 +272,9 @@ def resolve_absence(
 # unrelated remote scan (renamed, expired, pattern changed) would be a real regression, not a
 # fix -- see `tests/test_ws_deltas.py`'s scan-delta tests, which depend on a vanished
 # never-downloaded item being dropped from the published tree, not relabeled.
+# (2026-11-27, F3: `REMOTE_ONLY` is now resolved to `REMOVED_BOTH` by `core/engine.py._persist`
+# itself, in its own branch, gated on a fresh complete full scan -- not through this set. A
+# terminal row is still not published, so the wire behavior those tests pin is unchanged.)
 _VANISHED_FALLBACK_PREV_STATES = frozenset({"PARTIAL", "LOCAL_ONLY"})
 
 

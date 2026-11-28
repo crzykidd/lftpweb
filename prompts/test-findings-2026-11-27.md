@@ -65,11 +65,50 @@ Status key: **open**, **prompted**, **done**.
   3. Check whether `FileTree` virtualises its rows.
 - **Not a regression from C3–C5:** the per-request middleware adds nothing measurable.
 
-### Minor, noticed while diagnosing (open)
+### Minor, noticed while diagnosing (partly done)
 
-- **`_UNPACK_<name>` folders** (SAB's in-progress extraction dirs) appear on the Files tree as
+- **`_UNPACK_<name>` folders — done 2026-11-27 with F3 (same cause; they now resolve to `REMOVED_BOTH` on the next full scan).** (SAB's in-progress extraction dirs) appear on the Files tree as
   `REMOTE_ONLY` items. For example, `_UNPACK_Chicago.Fire.S11E05…` (id 29674136) and
   `_UNPACK_…S11E06…` are still listed after SAB renamed them. The settle gate rightly never
   queued them. Check whether they age out, or should be ignored like the `.nfs*` tombstones.
 - **The rTorrent settle-gate skip didn't fire for S11E07.** The ordinary 60 s gate queued it
   instead. That is harmless, but worth knowing why, given finished torrents report `SEEDING`.
+
+### F3: things that vanish from the seedbox before they're downloaded stay `REMOTE_ONLY` forever (done 2026-11-27)
+
+> "what are the 3000 lines? there were only 26 items in the complete list"
+
+- **Seedbox vs. Files tree:** the seedbox `complete/ar-tv` folder held **one** entry, checked
+  through `/api/browse/remote`. The Files tree lists **199** top-level `REMOTE_ONLY` items for
+  `ar-tv`, plus 307 nested rows under them.
+- **What those 199 are:**
+  - 197 are SAB `_UNPACK_<name>` staging folders, first seen between 2026-08-15 and today.
+  - The other four are real releases no longer on the seedbox: SNL S52E05 and S52E06, The
+    Mentalist S06 (job 573 succeeded), and Chicago Fire S11E07.
+- **Cause:** `core/engine.py`'s vanished-path loop (around line 1446) leaves any `prev_state`
+  that `resolve_absence` has no opinion about "exactly as it was". `REMOTE_ONLY` is one of
+  those. So a path that disappears from **both** trees while `REMOTE_ONLY` is never written
+  again. SAB renames every `_UNPACK_` folder away, so each extraction leaves one ghost behind.
+- **Effect:** ghost rows on Files, and a bigger `/api/files` payload (part of F2). Nothing is
+  queued, because auto-queue already skips `_UNPACK_`/`_FAILED_`.
+- **Proposed fix:**
+  - A vanished `REMOTE_ONLY` path, together with its nested rows, resolves to `REMOVED_BOTH`
+    like any other gone item. Or the row is deleted outright, if it was never downloaded.
+  - A one-time cleanup of the existing ghosts.
+  - Check this doesn't fire on a partial or failed remote scan. The existing partial-scan
+    guard must apply.
+
+### F2 follow-up: what the 3,017 rows actually are
+
+The rows include every file inside a release folder (nested rows), not only releases.
+
+| | ar-movies | ar-tv |
+|---|---|---|
+| `REMOVED_BOTH` top-level | 20 | 473 |
+| `REMOVED_BOTH` nested | 125 | 1,878 |
+| `REMOTE_ONLY` top-level (mostly F3 ghosts) | 2 | 199 |
+| `REMOTE_ONLY` nested | 2 | 307 |
+| Live (`DOWNLOADED`/`LOCAL_ONLY`/`FAILED`), all levels | 3 | 8 |
+
+The oldest `REMOVED_BOTH` dates from 2026-08-15, so nothing ever ages out. Pruning tombstones
+older than N days is a candidate alongside hiding them by default; that is the user's call.

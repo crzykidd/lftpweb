@@ -813,6 +813,7 @@ class Engine:
                 fingerprints=fingerprints,
                 partial_scan=bool(scan_warning),
                 deleted_archive_paths=deleted_archive_paths,
+                remote_fresh=not scan_warning,
             )
             published = await self._project(q.id, written)
 
@@ -1165,6 +1166,7 @@ class Engine:
         fingerprints: dict[str, settle.Fingerprint] | None = None,
         partial_scan: bool = False,
         deleted_archive_paths: frozenset[str] = frozenset(),
+        remote_fresh: bool = False,
     ) -> set[str]:
         """Write this pass's arbitrated state for every reconciled node, and return the
         `rel_path`s it wrote (already `to_safe_text`-ed, i.e. keyed exactly as the `item`
@@ -1186,6 +1188,13 @@ class Engine:
         must not be able to release an item the real gate hasn't actually cleared, merely
         because a stale cached remote total and a freshly-caught-up local tree happen to match
         (see this task's decisions.md entry for the scenario this closes).
+
+        `remote_fresh` (2026-11-27, F3) is True only from a full scan whose remote listing was
+        read this pass and came back complete (no `scan_warning`). It alone lets the vanished
+        sweep resolve a `REMOTE_ONLY` row that is now in neither tree to `REMOVED_BOTH`; the
+        local-only pass (cached remote tree) and a partial scan leave it False, so a cached or
+        incomplete listing is never taken as evidence that something left the seedbox.
+        Explicit, not inferred from `fingerprints`/`partial_scan`.
 
         `deleted_archive_paths` (2026-08-14,
         `prompts/2026-08-14-extracted-archives-rest-as-extracted.md`) is the same set both
@@ -1598,6 +1607,16 @@ class Engine:
                 else:
                     archive_paths_to_purge.add(rel_path)
                     vanished_state, vanished_first_missing_at = "REMOVED_BOTH", None
+            elif prev_state == "REMOTE_ONLY" and remote_fresh and mount_ok:
+                # 2026-11-27 (F3, prompts/2026-11-27-f3-vanished-remote-only-ghosts.md): a row
+                # last seen as remote-only and now in neither tree -- never downloaded, then
+                # gone from the seedbox (SABnzbd's `_UNPACK_<name>` staging dirs are the common
+                # case) -- used to fall through to `continue` below and freeze as "on the
+                # seedbox" forever. Resolves to `REMOVED_BOTH` like every other vanished item,
+                # but only on fresh, complete remote evidence (`remote_fresh`) and a healthy
+                # mount; a cached/partial/failed listing leaves the row exactly as it was.
+                # Nested rows resolve the same way, each by its own `prev_state`.
+                vanished_state, vanished_first_missing_at = "REMOVED_BOTH", None
             elif (
                 override := mount_sentinel.resolve_absence(
                     prev_state=resolve_prev_state,

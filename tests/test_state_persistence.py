@@ -702,20 +702,129 @@ async def test_a_vanished_local_only_row_rests_at_removed_both_not_left_alone(
         await db.close()
 
 
-async def test_a_vanished_remote_only_row_is_still_left_alone(tmp_path, monkeypatch):
-    """The narrowing's other half: `REMOTE_ONLY` -- nothing was ever fetched, so there is no
-    "removed" story to tell -- must keep the pre-`resolve_vanished` behavior of simply being
-    left out of the published tree, not relabeled `REMOVED_BOTH`. This is the common case (a
-    remote file that dropped off an unrelated scan), and `tests/test_ws_deltas.py`'s scan-delta
-    tests already depend on it at the WebSocket-payload level; this is the same guarantee
-    checked directly against the persisted row.
+async def test_a_vanished_remote_only_row_resolves_on_a_fresh_full_scan(tmp_path, monkeypatch):
+    """F3 (2026-11-27, prompts/2026-11-27-f3-vanished-remote-only-ghosts.md): a `REMOTE_ONLY`
+    row that is now in neither tree -- never downloaded, then gone from the seedbox (SABnzbd's
+    `_UNPACK_<name>` staging dirs) -- used to freeze as "on the seedbox" forever. On a fresh,
+    complete full scan it now rests at `REMOVED_BOTH`, like any other vanished item.
     """
     engine, q, host, db, item_id = await _make_move_engine(
         tmp_path, monkeypatch, local_size=None, state="REMOTE_ONLY", remote_deleted_at=None
     )
     try:
         await engine.scan_queue(q, host)
+        assert (await _state_of(db, item_id))[0] == "REMOVED_BOTH"
+    finally:
+        await db.close()
+
+
+async def test_a_vanished_remote_only_subtree_resolves_together(tmp_path, monkeypatch):
+    engine, q, host, db, item_id = await _make_move_engine(
+        tmp_path, monkeypatch, local_size=None, state="REMOTE_ONLY", remote_deleted_at=None
+    )
+    try:
+        child_ids = []
+        for child in (f"{REL_PATH}/a.rar", f"{REL_PATH}/b.rar"):
+            cursor = await db.execute(
+                "INSERT INTO item (queue_id, rel_path, is_dir, remote_size, state) "
+                "VALUES (?, ?, 0, 10, 'REMOTE_ONLY')",
+                (q.id, child),
+            )
+            child_ids.append(cursor.lastrowid)
+        await db.commit()
+        await engine.scan_queue(q, host)
+        for item in (item_id, *child_ids):
+            assert (await _state_of(db, item))[0] == "REMOVED_BOTH"
+    finally:
+        await db.close()
+
+
+async def test_a_vanished_remote_only_row_is_left_alone_by_the_local_only_pass(
+    tmp_path, monkeypatch
+):
+    """The local-only pass reconciles against a *cached* remote tree -- not fresh evidence
+    that anything left the seedbox -- so it must never resolve a `REMOTE_ONLY` row.
+    """
+    engine, q, host, db, item_id = await _make_move_engine(
+        tmp_path, monkeypatch, local_size=None, state="REMOTE_ONLY", remote_deleted_at=None
+    )
+    try:
+        engine._cached_remote_tree[q.id] = {}
+        await engine._scan_queue_local_only(q)
         assert (await _state_of(db, item_id))[0] == "REMOTE_ONLY"
+    finally:
+        await db.close()
+
+
+async def test_a_vanished_remote_only_row_is_left_alone_on_a_partial_remote_scan(
+    tmp_path, monkeypatch
+):
+    engine, q, host, db, item_id = await _make_move_engine(
+        tmp_path, monkeypatch, local_size=None, state="REMOTE_ONLY", remote_deleted_at=None
+    )
+
+    class _PartialPool:
+        async def scan(self, host, remote_path):  # noqa: ARG002
+            return {}, "some directories could not be read"
+
+    engine.pool = _PartialPool()
+    try:
+        await engine.scan_queue(q, host)
+        assert (await _state_of(db, item_id))[0] == "REMOTE_ONLY"
+    finally:
+        await db.close()
+
+
+async def test_a_failed_remote_scan_never_resolves_a_remote_only_row(tmp_path, monkeypatch):
+    engine, q, host, db, item_id = await _make_move_engine(
+        tmp_path, monkeypatch, local_size=None, state="REMOTE_ONLY", remote_deleted_at=None
+    )
+
+    class _FailingPool:
+        async def scan(self, host, remote_path):  # noqa: ARG002
+            raise engine_module.RemoteScanError("unreachable")
+
+    engine.pool = _FailingPool()
+    try:
+        await engine.scan_queue(q, host)
+        assert (await _state_of(db, item_id))[0] == "REMOTE_ONLY"
+    finally:
+        await db.close()
+
+
+async def test_a_vanished_remote_only_row_is_left_alone_when_the_mount_gate_refuses(
+    tmp_path, monkeypatch
+):
+    engine, q, host, db, item_id = await _make_move_engine(
+        tmp_path, monkeypatch, local_size=None, state="REMOTE_ONLY", remote_deleted_at=None
+    )
+    monkeypatch.setattr(engine_module.mount_sentinel, "check", lambda _root: False)
+    try:
+        await engine.scan_queue(q, host)
+        assert (await _state_of(db, item_id))[0] == "REMOTE_ONLY"
+    finally:
+        await db.close()
+
+
+async def test_an_unpack_dir_renamed_away_resolves_and_the_real_name_takes_its_normal_path(
+    tmp_path, monkeypatch
+):
+    """SABnzbd extracts into `_UNPACK_<name>` and renames it to `<name>`: the staging row
+    resolves, and `<name>` appears as an ordinary `REMOTE_ONLY` item.
+    """
+    engine, q, host, db, item_id = await _make_move_engine(
+        tmp_path, monkeypatch, local_size=None, state="REMOTE_ONLY", remote_deleted_at=None
+    )
+    await db.execute("UPDATE item SET rel_path = ? WHERE id = ?", (f"_UNPACK_{REL_PATH}", item_id))
+    await db.commit()
+    engine.pool = _FakePool(_remote_tree())
+    try:
+        await engine.scan_queue(q, host)
+        assert (await _state_of(db, item_id))[0] == "REMOVED_BOTH"
+        cursor = await db.execute(
+            "SELECT state FROM item WHERE queue_id = ? AND rel_path = ?", (q.id, REL_PATH)
+        )
+        assert (await cursor.fetchone())["state"] == "REMOTE_ONLY"
     finally:
         await db.close()
 

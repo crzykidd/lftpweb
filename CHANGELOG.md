@@ -13,6 +13,12 @@ smaller.
 Skeleton for the next roll:
 ## [Unreleased]
 
+### Fixed
+
+- Files no longer lists things that disappeared from the seedbox before they were downloaded,
+  such as SABnzbd's temporary `_UNPACK_` folders. Existing leftovers clear on the next full
+  scan; a failed, partial or between-scans pass never clears anything.
+
 ### Added
 ### Changed
 ### Fixed

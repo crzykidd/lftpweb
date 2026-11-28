@@ -6,6 +6,30 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-11-27 — Vanished `REMOTE_ONLY` rows resolve to `REMOVED_BOTH`, on fresh full scans only
+
+`prompts/done/2026-11-27-f3-vanished-remote-only-ghosts.md` (test finding F3).
+
+1. **Cause.** `_persist`'s vanished sweep left a `REMOTE_ONLY` row that was in neither tree
+   "exactly as it was", so it never changed again. SAB `_UNPACK_<name>` folders left 197 ghosts,
+   plus 4 real releases.
+2. **Fix.** A new branch resolves them to `REMOVED_BOTH`, the existing "gone from both sides"
+   state; no new `state` value. Terminal rows are not published, so Files drops them (History
+   still sees them). Nested rows resolve each by its own `prev_state`.
+3. **Gated by an explicit `remote_fresh` parameter**, not inferred from `fingerprints` or
+   `partial_scan`. `scan_queue` passes `not scan_warning`; the local-only pass leaves it False
+   because its remote tree is cached. A failed scan raises before `_persist`; an unhealthy mount
+   also blocks it. This rejects the older "REMOTE_ONLY drops off an unrelated scan" worry in
+   `mount_sentinel._VANISHED_FALLBACK_PREV_STATES` only for fresh complete evidence.
+4. **No migration.** Existing ghosts are in `previous` and absent from both trees, so the next
+   full scan resolves them.
+5. **Known imprecision.** The Local facet says "removed_by_us" for any `REMOVED_BOTH`, including
+   these never-downloaded rows. They are not shown on Files, so no distinct reason was added.
+6. **Rejected:** deleting the rows outright (loses History, and the rest of the code treats
+   `REMOVED_BOTH` as the one "gone" bucket).
+
+---
+
 ## 2026-11-27 — Preflight retires finished downloads on a positive signal; responses are gzipped
 
 `prompts/done/2026-11-27-preflight-retire-finished-and-gzip.md` (test findings F1, F2 part 1).

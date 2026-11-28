@@ -503,10 +503,14 @@ Nine rules that are easy to get wrong and that want review:
      concrete content was actually here, so a row that leaves both trees carrying either one
      rests at `REMOVED_BOTH` rather than being frozen forever, because the scan loop only
      visits nodes and a row nothing ever visits again is a row frozen on its last reading
-     forever. `REMOTE_ONLY` (nothing was ever fetched) and `EXCLUDED` (never going to be, on
-     purpose) are deliberately left out of that fallback and keep the older "simply drops from
-     the published tree" behavior — see `core/mount_sentinel.py.resolve_vanished`'s own
-     docstring for why widening it to cover them too would be a regression, not a fix.
+     forever. `EXCLUDED` (never going to be, on purpose) is deliberately left out of that fallback.
+     `REMOTE_ONLY` (nothing was ever fetched) is handled by its own branch in the persist sweep
+     (2026-11-27, F3): it rests at `REMOVED_BOTH` too, but **only on a fresh, complete full
+     scan** (`_persist(remote_fresh=True)`: remote listing read this pass, no `scan_warning`,
+     mount healthy). The local-only pass (cached remote tree), a partial scan and a failed scan
+     never resolve it, since none is evidence that something left the seedbox. This is what
+     clears SABnzbd's `_UNPACK_<name>` staging folders after SAB renames them away; nested rows
+     resolve with their parent, each by its own `prev_state`.
 
      **Written every pass regardless, published only until terminal (2026-08-13,
      `prompts/2026-08-13-vanished-rows-should-leave-the-tree.md`).** This whole mechanism exists
@@ -1823,9 +1827,10 @@ them distinguishable, because a bind mount that didn't come up has no sentinel i
   writer can leave a small file's row reading a fraction-of-a-second-true `PARTIAL` right as
   its job reaps, and post-processing can relocate the release out of both trees before any
   scan gets the chance to correct it — no rescan can fix it once that happens, because there is
-  no fresh structural reading for a path in neither tree). `REMOTE_ONLY` and `EXCLUDED` — which
-  assert the opposite, that no real content was ever here — are still left exactly as they were,
-  and a suppressed or actively-claimed row never reaches either sweep at all.
+  no fresh structural reading for a path in neither tree). `EXCLUDED` is still left exactly as it was.
+  `REMOTE_ONLY` (no content was ever here) resolves to `REMOVED_BOTH` only when `_persist` is
+  told the remote listing is fresh and complete (`remote_fresh`, true only for a full scan with
+  no `scan_warning`; 2026-11-27, F3), never from the local-only pass's cached tree. A suppressed or actively-claimed row never reaches either sweep at all.
 - **Verification gate.** The rule (revised 2026-08-14, reasoning and residual-risk acceptance
   in `docs/decisions.md`) is **verification must not have failed, not that it must have run.**
   `move` withholds the delete only on `CORRUPT` — real evidence the download is bad. A
