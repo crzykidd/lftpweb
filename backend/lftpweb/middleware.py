@@ -32,6 +32,7 @@ import secrets
 from http.cookies import SimpleCookie
 
 from starlette.datastructures import Headers
+from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 
 from lftpweb.config import settings as app_settings
 from lftpweb.core import auth, netguard
@@ -62,6 +63,27 @@ PUBLIC_API_PATHS: frozenset[tuple[str, str]] = frozenset(
     }
 )
 
+# Audit batch C5 (F11): FastAPI's generated documentation. Gated exactly like `/api/` (every auth
+# mode's own rule applies), never removed -- someone logged in who uses them keeps access.
+DOCS_PATHS: frozenset[str] = frozenset(
+    {"/docs", "/redoc", "/openapi.json", "/docs/oauth2-redirect"}
+)
+
+# ASGI scope key holding the *socket* peer (the proxy, when `LFTPWEB_TRUSTED_PROXIES` rewrote
+# `scope["client"]` to the forwarded client). Proxy auth mode must judge the peer, not the
+# client, or setting the env var would silently change which requests count as "from the proxy".
+PEER_SCOPE_KEY = "lftpweb_peer"
+
+
+def peer_host(scope) -> str | None:
+    """The address of whoever opened the TCP connection, whether or not forwarded headers were
+    honoured for the client address."""
+    if PEER_SCOPE_KEY in scope:
+        return scope[PEER_SCOPE_KEY]
+    client = scope.get("client")
+    return client[0] if client else None
+
+
 _MUTATING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 
 
@@ -88,6 +110,50 @@ async def _send_json(send, status_code: int, detail: str) -> None:
         }
     )
     await send({"type": "http.response.body", "body": body})
+
+
+class TrustedProxyMiddleware:
+    """Audit batch C5 (F9, F10): honour `X-Forwarded-For` / `X-Forwarded-Proto`, but only from
+    the peers listed in `LFTPWEB_TRUSTED_PROXIES`, by delegating to uvicorn's own
+    `ProxyHeadersMiddleware` (the same code `--forwarded-allow-ips` uses, so edge cases are
+    uvicorn's, not ours). Outermost middleware.
+
+    **Unset (the default): a pure pass-through** -- the scope is untouched, so behaviour is
+    byte-for-byte what it was. Set: a request from a listed peer gets `scope["client"]` and
+    `scope["scheme"]` rewritten, which is what the login rate limiter (`api/auth.py._client_ip`)
+    and the session cookie's `Secure` flag read. A request from any other peer is ignored, so a
+    client reaching lftpweb directly cannot forge either. The env var is read per request (it is
+    a plain attribute lookup) and the wrapped middleware cached per value.
+
+    In every case the socket peer is kept at `scope[PEER_SCOPE_KEY]`, which proxy auth mode uses
+    so its trusted-CIDR check keeps meaning "the connection came from the proxy".
+    """
+
+    def __init__(self, app) -> None:
+        self.app = app
+        self._cached_raw: str | None = None
+        self._cached: ProxyHeadersMiddleware | None = None
+
+    def _inner(self, raw: str | None) -> ProxyHeadersMiddleware | None:
+        if raw != self._cached_raw:
+            parsed = netguard.parse_trusted_proxies(raw)
+            self._cached = (
+                ProxyHeadersMiddleware(self.app, trusted_hosts=parsed) if parsed else None
+            )
+            self._cached_raw = raw
+        return self._cached
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] not in ("http", "websocket"):
+            await self.app(scope, receive, send)
+            return
+        client = scope.get("client")
+        scope[PEER_SCOPE_KEY] = client[0] if client else None
+        inner = self._inner(app_settings.trusted_proxies)
+        if inner is None:
+            await self.app(scope, receive, send)
+            return
+        await inner(scope, receive, send)
 
 
 class RequestGuardMiddleware:
@@ -225,9 +291,10 @@ class AuthMiddleware:
             return
 
         path = scope["path"]
-        if not path.startswith("/api/"):
+        if not (path.startswith("/api/") or path in DOCS_PATHS):
             # Everything else is the SPA shell / static assets -- always public so the login
-            # page itself can load (non-negotiable #2).
+            # page itself can load (non-negotiable #2). The generated API docs are NOT in this
+            # group (audit F11): they describe every route, so they sit behind the same gate.
             await self.app(scope, receive, send)
             return
 
@@ -293,8 +360,7 @@ class AuthMiddleware:
                 await self._deny(scope, send, 401, "proxy mode is misconfigured (no trusted CIDR)")
                 return
 
-            client = scope.get("client")
-            client_host = client[0] if client else None
+            client_host = peer_host(scope)
             if not auth.ip_in_trusted_cidrs(client_host, stored.proxy_trusted_cidrs):
                 await self._deny(scope, send, 401, "request did not originate from a trusted proxy")
                 return

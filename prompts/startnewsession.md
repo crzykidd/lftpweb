@@ -126,9 +126,14 @@ Decisions in `docs/decisions.md` 2026-11-26. Settings write still reaches any wr
 queue/extract paths (README Known gaps). **C4 done (commit pending, `prompts/done/2026-11-27-c4-secrets-cannot-be-redirected.md`):** a stored
 secret is only sent to the endpoint it was saved for - changing a client/*arr URL or the seedbox
 address/port/username (password auth) with the secret blank is a 422, trivial edits normalised away
-(`core/endpoint_identity.py`), non-breaking. **Deferred, not fixed (report §5):** C5 - public `/docs`/`/openapi.json`, proxy-aware `Secure` cookie
-and login rate limiter, current password on `PUT` password change; D3 - CI image scanning, SBOM,
-stale-layer cache, dev-dependency bumps. The test deployment is LAN-only per the user. **Do not tag `0.4.0` as safe for exposure until these land.**
+(`core/endpoint_identity.py`), non-breaking. **C5 done (commit pending, `prompts/done/2026-11-27-c5-auth-proxy-hardening.md`):** `/docs`,
+`/redoc`, `/openapi.json` behind auth; opt-in `LFTPWEB_TRUSTED_PROXIES` (forwarded client IP and
+scheme from listed peers: `Secure` cookie, per-client login limiter; unset = unchanged);
+`current_password` on `PUT /api/settings/auth` when replacing the password or leaving password
+mode. **D3 declined** (`docs/decisions.md`): no CI scanning; the user runs trivy by hand from time
+to time, by the same pinned digest the audit used,
+`ghcr.io/aquasecurity/trivy@sha256:8f6bb947dbc528902e11f2f5be52f7b519f6a39d5d148f41166f2040499768fb`
+(never by tag). The test deployment is LAN-only per the user.
 
 ### 👉 THE NEXT SESSION'S JOB: pre-release bug hunting for `0.4.0`
 

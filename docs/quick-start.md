@@ -7,7 +7,7 @@ describes.
 
 The UI is on port `8087`, bound to `127.0.0.1` by the shipped compose file: from another machine,
 use a reverse proxy or edit the `ports:` line. Optionally set (recommended) `LFTPWEB_ALLOWED_HOSTS` to the name(s) you open it by
-(README, "Network exposure"). Three volumes matter, and two of them are easy to get backwards:
+(README, "Network exposure"). Behind a TLS reverse proxy, also set `LFTPWEB_TRUSTED_PROXIES` to the proxy's address. Three volumes matter, and two of them are easy to get backwards:
 
 - `/config` — the SQLite database, logs, backups, and the encryption key used for stored
   credentials. Back this up; everything else is replaceable.

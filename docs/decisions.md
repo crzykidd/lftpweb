@@ -6,6 +6,53 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-11-27 — D3 (CI image scanning, SBOM, supply-chain hygiene) declined
+
+The user will run trivy by hand from time to time instead of adding it to CI. Nothing from D3 was
+done (no scan job, SBOM/provenance, cache-from change or dev-dependency bumps). The manual check
+is the one the audit used: trivy 0.76.2 invoked by digest
+`ghcr.io/aquasecurity/trivy@sha256:8f6bb947dbc528902e11f2f5be52f7b519f6a39d5d148f41166f2040499768fb`,
+never by tag (see `private_data/security-audit-2026-11-26.md` for the provenance checks and the
+2026 trivy compromise that makes the pin matter).
+
+---
+
+## 2026-11-27 — Small auth and proxy hardening, non-breaking (audit batch C5)
+
+`prompts/done/2026-11-27-c5-auth-proxy-hardening.md` (audit F9, F10, F11, F14). Same rule as C3 and
+C4: an upgrade that changes nothing keeps working exactly as before.
+
+1. **Docs are gated, not removed.** `/docs`, `/redoc`, `/openapi.json` and `/docs/oauth2-redirect`
+   go through `AuthMiddleware` like `/api/`. Unauthenticated gets the same 401 JSON as the API:
+   the SPA shell is always public and renders its own login, so there is no server-side login page
+   to redirect to. `none` mode is open as before. One difference worth knowing: in `proxy` mode
+   they now also need a trusted peer and the identity header, as the API already did.
+2. **Trusted proxies live in the app, not the Dockerfile `CMD`.** `LFTPWEB_TRUSTED_PROXIES` wraps
+   uvicorn's `ProxyHeadersMiddleware` (`middleware.TrustedProxyMiddleware`) rather than adding
+   `--forwarded-allow-ips` to the `CMD`. Reasons: testable with `TestClient`, works outside Docker,
+   and the image and its smoke test are untouched. Unset is a pure pass-through. Uvicorn's own
+   built-in default (trust `127.0.0.1`) is unchanged and still applies underneath. Rejected: an
+   entrypoint that turns the env var into a flag (untestable, Docker-only).
+3. **Proxy auth mode keeps judging the socket peer.** Rewriting `scope["client"]` would have made
+   `proxy` mode's trusted-CIDR check test the forwarded client, quietly changing what it trusts
+   when someone sets the new env var. The real peer is kept in `scope["lftpweb_peer"]` and both
+   proxy-mode checks (middleware and `/api/auth/session`) read it.
+4. **Invalid entries are dropped, `*` is allowed but warned about.** A bad entry is logged and
+   ignored (trusts fewer peers, never more); `*` logs a startup WARNING and is documented unsafe.
+5. **No per-username limiter.** With one admin account, a per-username bucket lets an attacker lock
+   the admin out by failing on purpose. The limiter stays per client address; behind a proxy that
+   address is now the real client.
+6. **`current_password` on `PUT /api/settings/auth`.** Required only when `password` is the
+   effective mode and the request replaces the password or switches away from `password`. Not
+   required for first-time enabling, with no user row, or while `none`/`proxy` is effective, which
+   is also what keeps `LFTPWEB_AUTH_MODE=none` working as the forgot-password lever. Same
+   `verify_password` as `POST /password`; wrong guesses count against the login limiter's bucket,
+   and a blocked bucket answers 429. Missing is 422, wrong is 401 (as `POST /password`). No confirm
+   dialog: the Settings → Auth form shows a "Current password" field when switching away from
+   password mode and sends it; the server error shows inline.
+
+---
+
 ## 2026-11-27 — A stored secret is only sent to the endpoint it was saved for (audit batch C4)
 
 `prompts/done/2026-11-27-c4-secrets-cannot-be-redirected.md` (audit §3 F6). Secrets are write-only

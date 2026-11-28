@@ -229,3 +229,48 @@ def origin_allowed(
     if allowed.enforced:
         return any(rule.matches(origin_host, effective_origin_port) for rule in allowed.rules)
     return False
+
+
+# --- Trusted reverse proxies (audit batch C5, F9/F10) ---------------------------------------
+
+TRUSTED_PROXIES_ENV_VAR = "LFTPWEB_TRUSTED_PROXIES"
+
+
+def parse_trusted_proxies(raw: str | None) -> list[str] | str:
+    """Parse `LFTPWEB_TRUSTED_PROXIES` into what uvicorn's `ProxyHeadersMiddleware` accepts: the
+    string `"*"` (trust every peer) or a list of IP / CIDR strings (empty = trust nobody).
+
+    An invalid entry is logged and ignored -- never fatal, and never widening: dropping an entry
+    can only make lftpweb trust *fewer* peers, which is the safe direction.
+    """
+    import ipaddress
+
+    entries = [e.strip() for e in (raw or "").split(",") if e.strip()]
+    if "*" in entries:
+        return "*"
+    valid: list[str] = []
+    for entry in entries:
+        try:
+            if "/" in entry:
+                ipaddress.ip_network(entry, strict=False)
+            else:
+                ipaddress.ip_address(entry)
+        except ValueError:
+            logger.warning("%s: ignoring invalid entry %r", TRUSTED_PROXIES_ENV_VAR, entry)
+            continue
+        valid.append(entry)
+    return valid
+
+
+def log_trusted_proxies_posture(raw: str | None) -> None:
+    """One startup line saying whether forwarded headers are honoured, and a WARNING for `*`."""
+    parsed = parse_trusted_proxies(raw)
+    if parsed == "*":
+        logger.warning(
+            "%s=* : X-Forwarded-For / X-Forwarded-Proto are trusted from ANY peer. Anyone who can "
+            "reach lftpweb directly can forge their client IP (evading the login rate limiter) "
+            "and the cookie scheme. List your proxy's address instead.",
+            TRUSTED_PROXIES_ENV_VAR,
+        )
+    elif parsed:
+        logger.info("%s: forwarded headers trusted from %s", TRUSTED_PROXIES_ENV_VAR, parsed)

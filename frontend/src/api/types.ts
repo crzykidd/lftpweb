@@ -1702,6 +1702,9 @@ export interface AuthSettingsIn {
   proxy_trusted_cidrs: string[]
   username?: string | null
   new_password?: string | null
+  // Required by the server when a password already protects the instance and this request
+  // replaces it or leaves `password` mode (audit C5, F14).
+  current_password?: string | null
 }
 
 export interface ChangePasswordIn {

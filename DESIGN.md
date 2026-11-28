@@ -1969,6 +1969,20 @@ looked at:
   handshake is closed 4403 only when `Sec-Fetch-Site` is `cross-site`/`same-site`; with no
   `Sec-Fetch-Site` it is allowed and an Origin mismatch is logged (WARNING, once per Origin). No
   `Origin` = a non-browser client, allowed.
+- **Small auth/proxy hardening (audit batch C5, 2026-11-27), all non-breaking.**
+  (F11) `/docs`, `/redoc`, `/openapi.json` (and `/docs/oauth2-redirect`) are gated by
+  `AuthMiddleware` exactly like `/api/` (`middleware.DOCS_PATHS`); `RequestGuardMiddleware`
+  (Host allow-list) still wraps them. (F9/F10) `LFTPWEB_TRUSTED_PROXIES` (`config.py`,
+  `netguard.parse_trusted_proxies`): `middleware.TrustedProxyMiddleware`, outermost, delegates to
+  uvicorn's `ProxyHeadersMiddleware` for listed peers (per request, cached per value; unset = pure
+  pass-through). It rewrites `scope["client"]`/`["scheme"]`, which the login limiter key
+  (`api/auth._client_ip`) and the cookie's `Secure` flag read. The socket peer is kept in
+  `scope["lftpweb_peer"]` (`middleware.peer_host`) and `proxy` auth mode keeps judging *that*, so
+  setting the env var cannot change which requests count as "from the proxy". Done in-app, not in
+  the Dockerfile `CMD`, so it is testable and applies to non-Docker runs. (F14)
+  `PUT /api/settings/auth` requires `current_password` (verified by `auth.verify_password`, shared
+  login rate-limit bucket, 422 missing / 401 wrong / 429 blocked) only when `password` is the
+  effective mode and the request replaces the password or leaves `password` mode.
 - **"Extra lftp settings" is no longer verbatim** (§9.3, `core/lftp.py.parse_extra_lftp_settings`):
   `set <key> <value>` lines only (plus blank/`#` lines), exact full key names from lftp 4.9.3's
   own list (lftp accepts abbreviations, which defeats any match on typed text), minus settings

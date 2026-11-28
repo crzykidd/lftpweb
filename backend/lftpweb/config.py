@@ -65,6 +65,16 @@ class Settings(BaseSettings):
     # and not a setting: a wrong value is fixed by restarting, never by reaching the UI.
     allowed_hosts: str | None = None
 
+    # Audit batch C5 (DESIGN.md §8, `core/netguard.py.parse_trusted_proxies`): a comma-separated
+    # list of IPs / CIDRs of the reverse proxies whose `X-Forwarded-For` / `X-Forwarded-Proto`
+    # lftpweb should believe (`*` trusts every peer -- unsafe, documented as such). Unset (the
+    # default) changes nothing: the headers are not read by lftpweb, so the login rate limiter
+    # keys on the socket peer and the session cookie is `Secure` only if the request itself
+    # arrived over https. Set, a request whose peer is listed has its client IP and scheme taken
+    # from those headers (`middleware.TrustedProxyMiddleware`). Like `LFTPWEB_ALLOWED_HOSTS`,
+    # an env var and not a setting: a wrong value is fixed by restarting, never from the UI.
+    trusted_proxies: str | None = None
+
     # 2026-08-16 (docs/decisions.md): baked at image *build* time, not runtime -- unlike
     # every other setting here, these come from `docker build --build-arg` in
     # .github/workflows/publish.yml, landed as `ENV` in docker/Dockerfile's `runtime` stage,

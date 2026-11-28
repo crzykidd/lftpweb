@@ -1753,6 +1753,10 @@ class AuthSettingsIn(BaseModel):
     # (see api/auth.py.put_auth_settings and core/auth.py's module docstring).
     username: str | None = Field(default=None, max_length=MAX_NAME_LEN)
     new_password: str | None = Field(default=None, max_length=MAX_SECRET_LEN)
+    # Audit batch C5 (F14): required only when a password is already protecting the instance and
+    # this request would replace it (`new_password`) or switch away from `password` mode.
+    # Verified like `POST /password`'s. Never stored or echoed.
+    current_password: str | None = Field(default=None, max_length=MAX_SECRET_LEN)
 
 
 class AuthSettingsOut(BaseModel):

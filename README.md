@@ -483,9 +483,11 @@ worked around:
   the endpoint (trailing slash, hostname case, explicit default port) still keep the saved secret.
   Someone with settings write access can still *replace* a secret or point an endpoint at a
   server they run by supplying a secret, but can no longer recover a saved one that way.
-- **`/docs` and `/openapi.json` are public**, even with auth on.
-- **The session cookie's `Secure` flag and the login rate limiter don't understand a reverse
-  proxy**, so behind a TLS-terminating proxy they may misjudge the connection and every client.
+- **Behind a reverse proxy, set `LFTPWEB_TRUSTED_PROXIES`.** It is off by default so an upgrade
+  changes nothing; without it the session cookie is not marked `Secure` behind a TLS-terminating
+  proxy and every client shares one login rate-limit bucket. See "Network exposure."
+- **The login rate limiter is per client address only, not per username.** A per-username limit
+  would let anyone lock the single admin out by guessing wrong on purpose.
 
 ## Network exposure
 
@@ -527,6 +529,24 @@ worked around:
   scripts or API-key callers, which send neither. The live-updates WebSocket likewise refuses a
   connection the browser marks as cross-site; with `LFTPWEB_ALLOWED_HOSTS` set it also requires
   the `Origin` to match.
+- **Behind a reverse proxy, set `LFTPWEB_TRUSTED_PROXIES`** to the proxy's address(es)
+  (comma-separated IPs or CIDRs, e.g. `172.18.0.0/16` for a proxy on the same Docker network).
+  Requests from those peers then have `X-Forwarded-For` and `X-Forwarded-Proto` honoured: the
+  session cookie is marked `Secure` when the original request was https, and the login rate
+  limiter counts each real client separately instead of one shared bucket. Requests from any
+  other peer have the headers ignored, so a client reaching the port directly can't forge them.
+  Unset (the default), nothing changes. `*` trusts every peer and is **unsafe**: anyone who can
+  reach the port can then forge their address. The container healthcheck and
+  `LFTPWEB_ALLOWED_HOSTS` are unaffected, and `proxy` auth mode still judges the connecting
+  proxy, not the forwarded client.
+
+  ```yaml
+  environment:
+    LFTPWEB_TRUSTED_PROXIES: "172.18.0.0/16"
+  ```
+- **`/docs`, `/redoc` and `/openapi.json` require login** in `password` and `proxy` modes, like
+  the API. Changing the password or leaving `password` mode through Settings → Auth asks for the
+  current password.
 - **"Extra lftp settings" accepts only `set` lines.** Settings that could run programs or write
   files are refused when you save, along with anything that isn't a plain `set <key> <value>`.
   A value saved by an older version that breaks this is not held against your transfers: its bad

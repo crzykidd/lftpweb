@@ -43,7 +43,12 @@ from lftpweb.core.postprocess import PostprocessPipeline
 from lftpweb.core.queue import TransferQueue
 from lftpweb.db import connect, migrate
 from lftpweb.logsetup import setup_logging
-from lftpweb.middleware import AuthMiddleware, RequestGuardMiddleware, SecurityHeadersMiddleware
+from lftpweb.middleware import (
+    AuthMiddleware,
+    RequestGuardMiddleware,
+    SecurityHeadersMiddleware,
+    TrustedProxyMiddleware,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +70,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     netguard.log_startup_posture(
         settings.allowed_hosts, auth.effective_mode(stored_auth, settings.auth_mode)
     )
+
+    netguard.log_trusted_proxies_posture(settings.trusted_proxies)
 
     app.state.events = EventBus()
     # Phase 8 (DESIGN.md §8): in-memory only, per docs/decisions.md -- single-process (§2),
@@ -236,6 +243,9 @@ def create_app() -> FastAPI:
     # response, carries the headers. See middleware.py for why this is the safe header subset
     # and why no CSP/HSTS is set here (audit S4).
     app.add_middleware(SecurityHeadersMiddleware)
+    # Audit batch C5: outermost, so every layer above sees the forwarded client IP / scheme when
+    # `LFTPWEB_TRUSTED_PROXIES` is set, and the untouched scope when it is not. See middleware.py.
+    app.add_middleware(TrustedProxyMiddleware)
 
     app.include_router(health.router)
     app.include_router(stats.router)

@@ -54,6 +54,8 @@ export function AuthTab() {
   const [newUsername, setNewUsername] = useState('')
   const [newPassword, setNewPassword] = useState('')
   const [currentPassword, setCurrentPassword] = useState('')
+  // Audit C5 (F14): leaving password mode needs the current password, same as the server asks.
+  const [leavePassword, setLeavePassword] = useState('')
   const [changePasswordValue, setChangePasswordValue] = useState('')
 
   const [apiKeys, setApiKeys] = useState<ApiKeyOut[]>([])
@@ -86,6 +88,9 @@ export function AuthTab() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
+  const needsCurrentPassword =
+    settings?.mode === 'password' && settings.has_user && mode !== 'password'
+
   const handleSaveMode = async () => {
     setError(null)
     setNotice(null)
@@ -104,8 +109,10 @@ export function AuthTab() {
         // click for an already-configured password user must not require re-entering it.
         username: mode === 'password' && !settings?.has_user ? newUsername : undefined,
         new_password: mode === 'password' && !settings?.has_user ? newPassword : undefined,
+        current_password: needsCurrentPassword ? leavePassword : undefined,
       })
       setSettings(saved)
+      setLeavePassword('')
       setNewUsername('')
       setNewPassword('')
       setNotice('Saved.')
@@ -247,6 +254,24 @@ export function AuthTab() {
               <span className="text-xs text-zinc-500 dark:text-zinc-400">
                 Required -- DESIGN.md §8 is explicit that without a trusted CIDR, proxy mode is
                 a bypass. Saving is refused with none configured.
+              </span>
+            </label>
+          </div>
+        )}
+
+        {needsCurrentPassword && (
+          <div className="flex flex-col gap-2 border-t border-zinc-200 pt-3 dark:border-zinc-800">
+            <label className="flex flex-col gap-1">
+              <span className={labelClasses}>Current password</span>
+              <input
+                type="password"
+                className={inputClasses}
+                value={leavePassword}
+                onChange={(e) => setLeavePassword(e.target.value)}
+                autoComplete="current-password"
+              />
+              <span className="text-xs text-zinc-500 dark:text-zinc-400">
+                Required to turn password protection off.
               </span>
             </label>
           </div>

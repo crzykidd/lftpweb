@@ -14,6 +14,7 @@ from fastapi import APIRouter, HTTPException, Request, Response
 
 from lftpweb.config import settings as app_settings
 from lftpweb.core import auth
+from lftpweb.middleware import peer_host
 from lftpweb.models import (
     ApiKeyCreatedOut,
     ApiKeyIn,
@@ -131,7 +132,8 @@ async def session_info(request: Request) -> AuthSessionOut:
         )
 
     if mode == "proxy":
-        client_host = request.client.host if request.client is not None else None
+        # The socket peer, not the (possibly forwarded) client -- see middleware.peer_host.
+        client_host = peer_host(request.scope)
         if not auth.ip_in_trusted_cidrs(client_host, stored.proxy_trusted_cidrs):
             return AuthSessionOut(mode=mode, authenticated=False)
         identity = request.headers.get(stored.proxy_header)
@@ -161,6 +163,34 @@ async def get_auth_settings(request: Request) -> AuthSettingsOut:
     return _settings_out(stored, user)
 
 
+async def _require_current_password(
+    request: Request, user: auth.AuthUser, current_password: str | None
+) -> None:
+    """Verify `current_password` against the stored hash (`auth.verify_password`, the same
+    constant-time argon2 check `POST /password` and login use), sharing the login rate limiter's
+    per-IP bucket: a wrong guess counts as a failed login, a blocked bucket gets the same 429.
+    Deliberately *not* also keyed per username -- with a single admin account that would let an
+    attacker lock the admin out (docs/decisions.md).
+    """
+    limiter: auth.LoginRateLimiter = request.app.state.login_rate_limiter
+    ip = _client_ip(request)
+    if limiter.is_blocked(ip):
+        retry_after = int(limiter.retry_after_s(ip)) + 1
+        raise HTTPException(
+            status_code=429,
+            detail="too many failed password attempts; try again later",
+            headers={"Retry-After": str(retry_after)},
+        )
+    if not current_password:
+        raise HTTPException(
+            status_code=422,
+            detail="current_password is required to change the password or leave password mode",
+        )
+    if not auth.verify_password(user.password_hash, current_password):
+        limiter.record_failure(ip)
+        raise HTTPException(status_code=401, detail="current password is incorrect")
+
+
 @settings_router.put("", response_model=AuthSettingsOut)
 async def put_auth_settings(body: AuthSettingsIn, request: Request) -> AuthSettingsOut:
     """DESIGN.md §8's two non-negotiables, enforced server-side (never only in the frontend
@@ -187,6 +217,22 @@ async def put_auth_settings(body: AuthSettingsIn, request: Request) -> AuthSetti
         raise HTTPException(status_code=422, detail="proxy_header must not be blank")
 
     existing_user = await auth.get_user(db)
+
+    # Audit batch C5 (F14): the same "prove you know the current password" step `POST /password`
+    # has, for the two things this endpoint can do that it also covers -- replace the password,
+    # or leave `password` mode (which drops the login gate entirely). Not asked when no password
+    # protects anything yet (first enable from `none`/`proxy`, or no user row), nor for a request
+    # that changes neither (a username rename, proxy fields, re-saving the same mode).
+    if existing_user is not None:
+        protecting = (
+            auth.effective_mode(await auth.load_auth_settings(db), app_settings.auth_mode)
+            == "password"
+        )
+        replaces_password = body.mode == "password" and bool(body.new_password)
+        leaves_password_mode = protecting and body.mode != "password"
+        if protecting and (replaces_password or leaves_password_mode):
+            await _require_current_password(request, existing_user, body.current_password)
+
     if body.mode == "password":
         if existing_user is None:
             if not body.username or not body.new_password:
