@@ -1969,6 +1969,7 @@ looked at:
   handshake is closed 4403 only when `Sec-Fetch-Site` is `cross-site`/`same-site`; with no
   `Sec-Fetch-Site` it is allowed and an Origin mismatch is logged (WARNING, once per Origin). No
   `Origin` = a non-browser client, allowed.
+- **Response compression (2026-11-27).** `GZipMiddleware(minimum_size=1000)` is added last in `main.create_app`, i.e. outermost, so it only ever wraps the finished response; `TrustedProxyMiddleware`, `RequestGuardMiddleware`, `SecurityHeadersMiddleware` and `AuthMiddleware` see and answer requests unchanged. Starlette compresses only for `Accept-Encoding: gzip`, passes WebSockets through, and skips responses that already carry `Content-Encoding`, 206s, `text/event-stream`, and zip/gzip/image types (the support-bundle zip).
 - **Small auth/proxy hardening (audit batch C5, 2026-11-27), all non-breaking.**
   (F11) `/docs`, `/redoc`, `/openapi.json` (and `/docs/oauth2-redirect`) are gated by
   `AuthMiddleware` exactly like `/api/` (`middleware.DOCS_PATHS`); `RequestGuardMiddleware`
@@ -2537,7 +2538,7 @@ Some.Release.S03E04.2160p    [downloading]   18 files   62%   4.1 MB/s   ETA 12m
   applies to a real item, for the identical SABnzbd-blank-queue-blip reason — since its own report
   can go briefly missing for reasons unrelated to the underlying fact changing; the settle source
   needs no such hold, since it's recomputed fresh from this same process's own persisted state
-  every successful scan pass, with no external flakiness to smooth over. A record/item that
+  every successful scan pass, with no external flakiness to smooth over. The download-client source (§17) shares the same hold but retires a row at once when the same poll positively reports its `client_id` as `COMPLETED`/`SEEDING`/`FAILED` (SAB history entry, rTorrent seeding); absence alone never retires, so a blank queue response still cannot flicker rows. A record/item that
   matches a real lftpweb item, or gets an active job, is never projected at all, so a release is
   never visible twice at once. **A mount-gated queue is a banner on the box, not rows** — one line
   naming the queue and `core/autoqueue.py.AutoQueue.gated`'s own reason, since the entire queue's

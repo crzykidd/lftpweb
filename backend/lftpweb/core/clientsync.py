@@ -75,20 +75,16 @@ event per failure transition, not per failed pass") -- a `ClientUnreachable` str
 starts answering with `ClientAuthenticationFailed` is a materially different fact worth a fresh
 event, even mid-outage.
 
-**No `PreflightHold` retirement set, unlike `core/arrsync.py`'s `_preflight_candidates`.** The
-*arr source actively retires a row the instant a poll pass proves it has become a real `item`
-(evicting immediately rather than waiting out `PREFLIGHT_HOLD_S`) because it can cheaply check
-"does a matching item exist" via `item.rel_path`. This source has no equivalent cheap check --
-attribution here is category -> queue (spec §8.3), not a name/path match against `item`, so
-"has this transfer become a real item yet" isn't a question this module can answer without
-re-deriving the *arr's own matching logic a second time. The un-refined fallback is exactly the
-one `core/arrsync.py`'s own docstring already blesses for a structurally identical case
-(`TRACKED_DOWNLOAD_STATE_IMPORTED` exclusion: "deliberately not added to retired... falls out
-through the ordinary hold-then-expire path"): once a transfer completes or is removed at the
-client, it simply stops appearing in `active_only=True`'s result, ages out of the hold after
-`PREFLIGHT_HOLD_S` (150s) with no special-casing, and is gone. A few minutes of possible overlap
-with a freshly-created `item` is the accepted cost, not a defect -- the same cost arrsync's
-own eviction-latency fix (2026-08-21) existed to *shrink*, not eliminate, for its own source.
+**A *positive* terminal signal retires a Preflight row at once; absence still does not (F1,
+2026-11-27).** `core/arrsync.py`'s retirement needs a cheap "did it become an item" check this
+source lacks, so it cannot retire on "has become a real item". It can, however, retire on what
+the client itself says: when the same pass reports a transfer as `COMPLETED`/`SEEDING`/`FAILED`
+(SABnzbd's history entry, rTorrent's seeding torrent), that `client_id` is passed to
+`PreflightHold.update(retired=...)` and its row is dropped immediately rather than lingering up
+to `PREFLIGHT_HOLD_S` (150s) with a stale "Extracting"/"downloading" label. A post-processing
+history entry (Verifying/Extracting) is not terminal, so its row keeps updating. A *missing* row
+(blank queue, partial or failed response) carries no such record and is still held -- that is
+the v0.2.4 anti-flicker guarantee, unchanged. See docs/decisions.md.
 
 **`PreflightHold` *is* used here**, deliberately -- this task's own handoff prompt asks the
 question directly, and the answer is yes: a download client's own queue/list endpoint blanking
@@ -355,6 +351,11 @@ _FAILURE_VERB: dict[str, str] = {
 # `tests/test_clientsync.py::test_preflight_phase_allowlist_covers_every_transfer_phase` fails
 # the moment the two sets stop covering the enum exactly, so that decision can never again be
 # skipped by accident the way `SEEDING`'s was.
+# Phases that, when a pass actually *reports* a transfer in one, positively prove it is no longer
+# incoming work (F1, 2026-11-27) -- its Preflight row is retired at once instead of lingering
+# for `PREFLIGHT_HOLD_S`. Derived from the phase model, never from a client name.
+_RETIRING_PHASES: frozenset[TransferPhase] = FINISHED_TRANSFER_PHASES | {TransferPhase.FAILED}
+
 _PREFLIGHT_PHASES: frozenset[TransferPhase] = frozenset(
     {
         TransferPhase.QUEUED,
@@ -1157,9 +1158,15 @@ class ClientSyncScheduler:
             await self._record_attribution_stats(instance_id, sample_size, matched_by_path)
 
         hold = self._preflight_holds.setdefault(instance_id, PreflightHold())
-        # No `retired` set -- see this module's own docstring for why this source falls back to
-        # the plain hold-then-expire path rather than `core/arrsync.py`'s active eviction.
-        hold.update(seen, now=now)
+        # `retired`: ids this very pass *positively* reports as terminal (module docstring, F1,
+        # 2026-11-27). A blank/partial/failed response contains no such record, so it retires
+        # nothing and the anti-flicker hold covers it exactly as before.
+        retired = {
+            t.client_id
+            for t in transfers
+            if t.phase in _RETIRING_PHASES and t.client_id not in seen
+        }
+        hold.update(seen, now=now, retired=retired)
 
     async def unattributed_clients(
         self, enabled_instance_ids: frozenset[int]

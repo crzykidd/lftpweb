@@ -15,6 +15,7 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.middleware.gzip import GZipMiddleware
 
 from lftpweb import __version__
 from lftpweb.api import auth as auth_api
@@ -246,6 +247,14 @@ def create_app() -> FastAPI:
     # Audit batch C5: outermost, so every layer above sees the forwarded client IP / scheme when
     # `LFTPWEB_TRUSTED_PROXIES` is set, and the untouched scope when it is not. See middleware.py.
     app.add_middleware(TrustedProxyMiddleware)
+    # Response compression (2026-11-27): added last, so it is the very outermost layer and only
+    # ever sees the finished response on its way out -- the proxy, guard, security-header and
+    # auth layers above all still see the request, and answer it, exactly as before. Starlette's
+    # own rules keep it safe: gzip only for clients that send `Accept-Encoding: gzip` (so the
+    # image's plain `curl` healthcheck gets identity), WebSockets and non-HTTP scopes pass
+    # straight through, and anything with its own `Content-Encoding`, a 206, or an
+    # already-compressed / `text/event-stream` content type (the support-bundle zip) is left alone.
+    app.add_middleware(GZipMiddleware, minimum_size=1000)
 
     app.include_router(health.router)
     app.include_router(stats.router)

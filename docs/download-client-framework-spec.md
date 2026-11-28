@@ -1156,6 +1156,8 @@ just nothing on the client's side of the merge to begin with.
 Full incident, why it took a long session to diagnose, and what was fixed: §8.3's round 7
 correction, above.
 
+**Retirement on a positive terminal signal (2026-11-27).** The client source's `PreflightHold` still absorbs a *missing* row for `PREFLIGHT_HOLD_S`, but a transfer the same poll reports as `COMPLETED`/`SEEDING`/`FAILED` is retired immediately. Only a returned record can say that; a blank queue cannot, so §4.2's blank-queue protection is unchanged.
+
 ### 9.3 Visibility — a working client must never look identical to a broken one
 
 **Found on the live test system, 2026-08-23** (finding #2 and its reinforcing observation,

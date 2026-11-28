@@ -6,6 +6,28 @@ leaving the reasoning only in a commit message.
 
 ---
 
+## 2026-11-27 — Preflight retires finished downloads on a positive signal; responses are gzipped
+
+`prompts/done/2026-11-27-preflight-retire-finished-and-gzip.md` (test findings F1, F2 part 1).
+
+1. **A positive terminal signal is safe to act on; a missing row is not.** `PreflightHold` exists
+   because a blank SABnzbd queue response looks identical to "everything finished" (the v0.2.4
+   incident), so *absence* must only age out. But a record the client actually returned with a
+   `COMPLETED`/`SEEDING`/`FAILED` phase is a statement, not a gap: a blank, partial or failed
+   response cannot contain one. `core/clientsync.py` therefore passes the `client_id`s this pass
+   reported in those phases as `retired` to `PreflightHold.update`, dropping their rows at once
+   instead of after `PREFLIGHT_HOLD_S`. Post-processing history entries (Verifying/Extracting) are
+   not terminal and keep updating the row. Derived from the phase model, no connector names.
+2. **`GZipMiddleware(minimum_size=1000)` is added last, so it is outermost.** It only touches the
+   outgoing response; the proxy, guard, security-header and auth layers see requests unchanged.
+   Starlette already skips non-HTTP scopes (WebSockets), responses with their own
+   `Content-Encoding`, 206s, `text/event-stream` and zip/gzip/image content types, and compresses
+   only when the request says `Accept-Encoding: gzip`, so the image's plain `curl` healthcheck
+   still gets identity. No `StreamingResponse` exists in the app; the only `FileResponse`s are the
+   SPA files, log download and backup download, all safe to compress.
+
+---
+
 ## 2026-11-27 — D3 (CI image scanning, SBOM, supply-chain hygiene) declined
 
 The user will run trivy by hand from time to time instead of adding it to CI. Nothing from D3 was

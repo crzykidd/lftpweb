@@ -37,6 +37,10 @@ Skeleton for the next roll:
 
 ### Changed
 
+- **Pages load faster: responses are compressed.** The server now gzips API and page responses
+  for browsers that ask for it (every browser does), so the Files page's large file list and the
+  JavaScript bundle download several times smaller. Nothing changes for clients that do not ask
+  for compression, and downloads of already-compressed files (support bundles) are untouched.
 - **The shipped `docker-compose.yml` now publishes the UI on `127.0.0.1:8087` instead of all
   interfaces.** A fresh install defaults to `none` auth, which is full control for anyone who can
   reach the port, so it should not be network-reachable until the operator chooses that.
@@ -284,6 +288,11 @@ Skeleton for the next roll:
 
 ### Fixed
 
+- **A finished download no longer lingers on the Preflight box.** When SABnzbd moves a release to
+  history as completed or failed, or rTorrent reports a torrent as seeding, its Preflight row now
+  disappears on that poll instead of showing a stale "Extracting" or "downloading" status for up
+  to 2.5 minutes. A blank or failed response from the client still holds rows, as before, so the
+  list does not flicker.
 - **The *arr poll-interval control was unlabeled and unexplained.** A user who had asked for the
   setting and knew it had shipped went looking on Settings → Integrations and could not find it.
   The card was headed "Poll cadence" — internal vocabulary that named neither Sonarr nor Radarr,

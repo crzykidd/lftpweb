@@ -1872,3 +1872,65 @@ async def test_start_stop_is_alive(db, tmp_path):
     assert scheduler.is_alive
     await scheduler.stop()
     assert not scheduler.is_alive
+
+
+# --- F1 (2026-11-27): a positive terminal signal retires a Preflight row at once ----------------
+
+
+async def _retire_setup(db, tmp_path):
+    host_id = await _seed_host(db)
+    queue_id = await _seed_queue(db, host_id)
+    instance_id = await _seed_client(db, str(tmp_path), base_url="http://unused.test", api_key="k")
+    await _seed_category(db, instance_id, "ar-tv", queue_id)
+    row = await (
+        await db.execute(
+            "SELECT id, name, client_type FROM download_client WHERE id = ?", (instance_id,)
+        )
+    ).fetchone()
+    return instance_id, row, ClientSyncScheduler(db=db, config_dir=str(tmp_path))
+
+
+async def test_history_completion_retires_the_row_on_that_pass(db, tmp_path):
+    instance_id, row, scheduler = await _retire_setup(db, tmp_path)
+    ids = frozenset({instance_id})
+    await scheduler._update_preflight(row, [_transfer("t1", TransferPhase.DOWNLOADING)], NOW0)
+    assert len(scheduler.preflight_rows(ids)) == 1
+    await scheduler._update_preflight(row, [_transfer("t1", TransferPhase.EXTRACTING)], NOW0 + 10)
+    assert scheduler.preflight_rows(ids)[0].status_label == "extracting"
+    # Gone from the queue, present in history as completed: retired, not held for 150 s.
+    await scheduler._update_preflight(row, [_transfer("t1", TransferPhase.COMPLETED)], NOW0 + 20)
+    assert scheduler.preflight_rows(ids) == []
+
+
+async def test_failed_history_entry_retires_the_row(db, tmp_path):
+    instance_id, row, scheduler = await _retire_setup(db, tmp_path)
+    await scheduler._update_preflight(row, [_transfer("t1", TransferPhase.DOWNLOADING)], NOW0)
+    await scheduler._update_preflight(row, [_transfer("t1", TransferPhase.FAILED)], NOW0 + 10)
+    assert scheduler.preflight_rows(frozenset({instance_id})) == []
+
+
+async def test_empty_pass_without_a_terminal_record_keeps_the_row_held(db, tmp_path):
+    instance_id, row, scheduler = await _retire_setup(db, tmp_path)
+    await scheduler._update_preflight(row, [_transfer("t1", TransferPhase.DOWNLOADING)], NOW0)
+    await scheduler._update_preflight(row, [], NOW0 + 10)  # blank response: no positive signal
+    assert len(scheduler.preflight_rows(frozenset({instance_id}))) == 1
+    # An unrelated terminal record for a different id does not retire it either.
+    await scheduler._update_preflight(row, [_transfer("other", TransferPhase.COMPLETED)], NOW0 + 20)
+    assert len(scheduler.preflight_rows(frozenset({instance_id}))) == 1
+
+
+async def test_rtorrent_style_downloading_to_seeding_retires_immediately(db, tmp_path):
+    instance_id, row, scheduler = await _retire_setup(db, tmp_path)
+    await scheduler._update_preflight(row, [_transfer("t1", TransferPhase.DOWNLOADING)], NOW0)
+    assert len(scheduler.preflight_rows(frozenset({instance_id}))) == 1
+    await scheduler._update_preflight(row, [_transfer("t1", TransferPhase.SEEDING)], NOW0 + 10)
+    assert scheduler.preflight_rows(frozenset({instance_id})) == []
+
+
+async def test_post_processing_history_entry_keeps_and_updates_the_row(db, tmp_path):
+    instance_id, row, scheduler = await _retire_setup(db, tmp_path)
+    await scheduler._update_preflight(row, [_transfer("t1", TransferPhase.EXTRACTING)], NOW0)
+    await scheduler._update_preflight(row, [_transfer("t1", TransferPhase.VERIFYING)], NOW0 + 10)
+    rows = scheduler.preflight_rows(frozenset({instance_id}))
+    assert len(rows) == 1
+    assert rows[0].status_label == "verifying"
